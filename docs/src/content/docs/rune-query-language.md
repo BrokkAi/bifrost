@@ -17,6 +17,8 @@ RQL is only a query language. It is not a second matcher or query engine.
 
 Every RQL expression lowers into [JSON `CodeQuery`](/code-query-json/) before validation and execution. MCP hosts with `query_code` call the same engine using canonical JSON inline, or they can load a complete saved `.rql` file through the exclusive `query_file` argument. MCP does not accept raw inline RQL, and the `core` toolset does not expose `query_code`; use `symbol|extended` or `searchtools`. See [MCP query and RQL availability](/mcp/#query-and-rql-availability) for the complete surface matrix and [Code Querying](/code-querying/) for the schema and engine overview.
 
+RQL omits a schema version by default and therefore targets the compatible head, currently CodeQuery schema version 3. Use a root `:schema-version 2` option when a saved query must retain the pre-CFG vocabulary; version 2 rejects the CFG forms described below.
+
 Save a complete RQL expression in a workspace `.rql` file and run it without opening the REPL:
 
 ```bash
@@ -142,6 +144,13 @@ Pipeline wrappers transform the result domain. Inner wrappers execute first:
 (receiver-targets (call :callee "run" :receiver "service"))
 (points-to :capture receiver (call :receiver (capture "receiver")))
 (member-targets (references-of :proof proven (enclosing-decl (method :name "run"))))
+(procedure-of (function :name "run"))
+(cfg-entry (procedure-of (function :name "run")))
+(cfg-exits (procedure-of (function :name "run")))
+(cfg-successor-edges (cfg-entry (procedure-of (function :name "run"))))
+(cfg-predecessor-edges (cfg-exits (procedure-of (function :name "run"))))
+(cfg-edge-source (cfg-successor-edges (cfg-entry (procedure-of (function :name "run")))))
+(cfg-edge-target (cfg-successor-edges (cfg-entry (procedure-of (function :name "run")))))
 ```
 
 Typed set forms combine complete compatible pipelines and may themselves be wrapped by another step:
@@ -158,9 +167,29 @@ Typed set forms combine complete compatible pipelines and may themselves be wrap
 
 All operands at one node must produce the same terminal domain. Union preserves first appearance by operand order; intersection and except preserve the first operand's order. Branch provenance and diagnostics use zero-based paths. See the executable [Typed Set Composition](/code-query-tutorials/set-composition/) cookbook.
 
-The fourth expression performs two direct reverse-import hops. Hierarchy traversal is direct when no option is supplied; `:depth N` returns the one-through-N closure, and `:transitive true` returns the full indexed closure under the execution budget. Call traversal is also direct by default and accepts finite `:depth N`, but not `:transitive`. `call-input` requires exactly one receiver, parameter-index, or parameter-name selector. `members` returns direct declarations and `owner` recovers their exact declaring type. Reference and call proof options may appear before the nested query. Receiver wrappers produce terminal `receiver_analysis` rows; only `file-of` may wrap them. Their optional `:capture name` is legal only over a structural match and must name a declared positive capture. `:json` renders every wrapper as an ordered `steps` array.
+The fourth expression performs two direct reverse-import hops. Hierarchy traversal is direct when no option is supplied; `:depth N` returns the one-through-N closure, and `:transitive true` returns the full indexed closure under the execution budget. Call traversal is also direct by default and accepts finite `:depth N`, but not `:transitive`. `call-input` requires exactly one receiver, parameter-index, or parameter-name selector. `members` returns direct declarations and `owner` recovers their exact declaring type. Reference and call proof options may appear before the nested query. Receiver wrappers produce terminal `receiver_analysis` rows; only `file-of` may wrap them. Their optional `:capture name` is legal only over a structural match and must name a declared positive capture. Procedure, program-point, control-edge, and receiver-analysis rows may all be projected through `file-of`. `:json` renders every wrapper as an ordered `steps` array.
 
 Receiver wrappers consume the structured facts exposed by the selected adapter. Availability is not defined by a static language list: unsupported source forms preserve an explicit `unsupported` row and capability diagnostic. See [Receiver Traversal](/code-query-tutorials/receiver-traversal/) for allocation, factory, ambiguity, reference-site, and call-input examples with exact output.
+
+## Procedure-Local CFG Inspection
+
+Schema version 3 adds an explicit typed control-flow algebra. `procedure-of` resolves the unique smallest source-backed executable procedure containing a structural match or declaration. `cfg-entry` and `cfg-exits` return validated boundary points. The successor and predecessor forms each traverse exactly one edge, and `cfg-edge-source` or `cfg-edge-target` projects an edge back to a point.
+
+<!-- code-query-test:rql:cfg-entry-successor -->
+```lisp
+(cfg-edge-target
+  (cfg-successor-edges
+    (cfg-entry
+      (procedure-of
+        (language typescript
+          (function :name "run"))))))
+```
+
+This returns `program_point` rows for targets of edges leaving `run`'s entry. Procedure, point, and edge rows include checkout-independent content-scoped IDs, exact source ranges, mandatory proof/completeness evidence, and normal CodeQuery provenance. Unsupported capabilities, partial semantic artifacts, cancellation, and exhausted budgets remain explicit diagnostics and cannot produce a falsely complete empty answer.
+
+Semantic materialization is lazy and request-scoped. It has separate finite limits of 256 materialized files, 16 MiB of source, 1,000,000 rows per semantic dimension, 64 MiB retained semantic data, and 1,000,000 traversal steps. Repeating an edge form is how an authored query asks for another hop; no form silently computes an unbounded closure.
+
+This surface is a procedure-local CFG inspection API. It does not cross call boundaries and does not provide an ICFG, data-flow, taint, typestate, finding, or witness engine.
 
 Only declarations indexed by the active workspace analyzer can appear. A visible usage of library code does not imply that the library declaration itself is indexed or queryable.
 

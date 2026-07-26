@@ -11,9 +11,9 @@
           },
           "kind": "call"
         },
-        "schema_version": 2
+        "schema_version": 3
       },
-      "schema_version": 2
+      "schema_version": 3
     },
     "type": "match"
   },

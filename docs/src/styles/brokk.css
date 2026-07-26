@@ -1,26 +1,90 @@
+/*
+ * Breakpoint contract shared by brokk.css, BifrostHeader.astro, and BifrostHero.astro:
+ *   50rem — mobile header/sidebar collapse
+ *   68rem — hero console narrows
+ *   72rem — primary navigation appears
+ *   84rem — the optional license invite appears
+ */
 :root {
-  --sl-font: "Rajdhani", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --sl-font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --bifrost-font-display: "Staatliches", Impact, Haettenschweiler, "Arial Black", system-ui, sans-serif;
+  --bifrost-font-body: "Rajdhani", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --bifrost-font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --sl-font: var(--bifrost-font-body);
+  --sl-font-mono: var(--bifrost-font-mono);
+
+  --bifrost-text-2xs: 0.5625rem;
+  --bifrost-text-xs: 0.625rem;
+  --bifrost-text-sm: 0.6875rem;
+  --bifrost-text-base: 0.75rem;
+  --bifrost-text-lg: 0.875rem;
+  --bifrost-text-xl: 1rem;
+  --bifrost-text-2xl: 1.125rem;
+  --bifrost-text-display-page: clamp(3rem, 5vw, 4.6rem);
+  --bifrost-text-display-hero: clamp(3.8rem, 6vw, 5.4rem);
+  --bifrost-text-tagline: clamp(1.02rem, 1.55vw, 1.24rem);
+
+  --bifrost-tracking-tight: 0;
+  --bifrost-tracking-tightest: -0.01em;
+  --bifrost-tracking-wide: 0.035em;
+  --bifrost-tracking-wider: 0.06em;
+  --bifrost-tracking-widest: 0.09em;
+  --bifrost-leading-hero: 0.82;
+  --bifrost-leading-display: 0.95;
+  --bifrost-leading-body: 1.55;
+  --bifrost-weight-regular: 400;
+  --bifrost-weight-medium: 500;
+  --bifrost-weight-semibold: 600;
+  --bifrost-weight-bold: 700;
+  --bifrost-weight-extrabold: 800;
+
+  --bifrost-space-1: 0.25rem;
+  --bifrost-space-2: 0.5rem;
+  --bifrost-space-3: 0.75rem;
+  --bifrost-space-4: 1rem;
+  --bifrost-space-5: 1.25rem;
+  --bifrost-space-6: 1.5rem;
+  --bifrost-space-8: 2rem;
+  --bifrost-space-10: 2.5rem;
+  --bifrost-space-12: 3rem;
+  --bifrost-space-16: 4rem;
+  --bifrost-space-20: 5rem;
+  --bifrost-space-24: 6rem;
+
+  --bifrost-chamfer-lg: polygon(0 0, calc(100% - 16px) 0, 100% 16px, 100% 100%, 16px 100%, 0 calc(100% - 16px));
+  --bifrost-chamfer-lg-inset: polygon(0 0, calc(100% - 15px) 0, 100% 15px, 100% 100%, 15px 100%, 0 calc(100% - 15px));
+  --bifrost-chamfer-sm: polygon(0 0, calc(100% - 8px) 0, 100% 8px, 100% 100%, 8px 100%, 0 calc(100% - 8px));
+  --bifrost-chamfer-sm-inset: polygon(0 0, calc(100% - 7px) 0, 100% 7px, 100% 100%, 7px 100%, 0 calc(100% - 7px));
+  --bifrost-octagon-lg: polygon(16px 0, calc(100% - 16px) 0, 100% 16px, 100% calc(100% - 16px), calc(100% - 16px) 100%, 16px 100%, 0 calc(100% - 16px), 0 16px);
+  --bifrost-octagon-lg-inset: polygon(15px 0, calc(100% - 15px) 0, 100% 15px, 100% calc(100% - 15px), calc(100% - 15px) 100%, 15px 100%, 0 calc(100% - 15px), 0 15px);
+  --bifrost-chamfer-reverse-lg: polygon(16px 0, 100% 0, 100% calc(100% - 16px), calc(100% - 16px) 100%, 0 100%, 0 16px);
+  --bifrost-chamfer-reverse-lg-inset: polygon(15px 0, 100% 0, 100% calc(100% - 15px), calc(100% - 15px) 100%, 0 100%, 0 15px);
+  --bifrost-integrated-nav: polygon(0 0, 100% 0, 100% 100%, 0 100%);
+  --bifrost-integrated-nav-inset: polygon(0 0, 100% 0, 100% 100%, 0 100%);
+
+  --bifrost-red: #eb3f33;
+  --bifrost-red-soft: #ff6a5f;
+  --bifrost-ink: #f4f1ec;
+  --bifrost-copy: #cbc4b7;
+  --bifrost-muted: #948b7e;
+  --bifrost-surface: #050505;
+  --bifrost-surface-raised: #0f0e0d;
+  --bifrost-line: rgb(255 255 255 / 0.08);
+  --bifrost-line-strong: rgb(255 255 255 / 0.13);
+
   --sl-color-accent-low: #48120f;
-  --sl-color-accent: #eb3f33;
+  --sl-color-accent: var(--bifrost-red);
   --sl-color-accent-high: #ffd7d3;
-  --sl-color-white: #f4f1ec;
+  --sl-color-white: var(--bifrost-ink);
   --sl-color-gray-1: #ece8df;
-  --sl-color-gray-2: #cbc4b7;
-  --sl-color-gray-3: #948b7e;
+  --sl-color-gray-2: var(--bifrost-copy);
+  --sl-color-gray-3: var(--bifrost-muted);
   --sl-color-gray-4: #5f5a52;
   --sl-color-gray-5: #3d3934;
   --sl-color-gray-6: #24221f;
-  --sl-color-black: #050505;
+  --sl-color-black: var(--bifrost-surface);
   --sl-content-width: 52rem;
   --sl-sidebar-width: 18.5rem;
   --sl-nav-height: 4.8rem;
-}
-
-@font-face {
-  font-family: "Brokk Docs Display";
-  src: local("Staatliches");
-  font-display: swap;
 }
 
 html[data-has-hero] {
@@ -56,17 +120,51 @@ body::before {
   pointer-events: none;
 }
 
+.bifrost-panel {
+  --bifrost-panel-shell: var(--bifrost-chamfer-lg);
+  --bifrost-panel-inner: var(--bifrost-chamfer-lg-inset);
+  position: relative;
+  isolation: isolate;
+  background: var(--bifrost-line-strong);
+  clip-path: var(--bifrost-panel-shell);
+}
+
+.bifrost-panel::after {
+  position: absolute;
+  z-index: -1;
+  inset: 1px;
+  clip-path: var(--bifrost-panel-inner);
+  content: "";
+}
+
+.bifrost-panel--octagon {
+  --bifrost-panel-shell: var(--bifrost-octagon-lg);
+  --bifrost-panel-inner: var(--bifrost-octagon-lg-inset);
+}
+
+.bifrost-panel--sm {
+  --bifrost-panel-shell: var(--bifrost-chamfer-sm);
+  --bifrost-panel-inner: var(--bifrost-chamfer-sm-inset);
+}
+
+.bifrost-panel--reverse {
+  --bifrost-panel-shell: var(--bifrost-chamfer-reverse-lg);
+  --bifrost-panel-inner: var(--bifrost-chamfer-reverse-lg-inset);
+}
+
+.query-console.bifrost-panel { position: absolute; }
+
 .site-title,
 .sl-markdown-content h1,
 .sl-markdown-content h2 {
-  font-family: "Staatliches", "Brokk Docs Display", Impact, Haettenschweiler, "Arial Black", system-ui, sans-serif;
-  font-weight: 400;
-  letter-spacing: 0;
+  font-family: var(--bifrost-font-display);
+  font-weight: var(--bifrost-weight-regular);
+  letter-spacing: var(--bifrost-tracking-tight);
 }
 
 .sl-markdown-content h1 {
-  font-size: clamp(3rem, 5vw, 4.6rem);
-  line-height: 0.95;
+  font-size: var(--bifrost-text-display-page);
+  line-height: var(--bifrost-leading-display);
 }
 
 .sl-markdown-content h2 {
@@ -87,25 +185,37 @@ body::before {
   transform: rotate(45deg);
 }
 
-/* Product rail: keep Starlight's fixed frame, but let the inner header float. */
 .page > header.header {
   height: var(--sl-nav-height);
-  padding: 0.52rem max(0.65rem, 1.4vw);
+  padding: var(--bifrost-space-2) max(0.65rem, 1.4vw);
   border-bottom: 0;
   background: linear-gradient(180deg, rgb(5 5 5 / 0.96), rgb(5 5 5 / 0.55) 72%, transparent);
 }
 
-/* Documentation frame. */
-@media (min-width: 50rem) {
+/* Interior pages join a rectangular navigation rail directly to the sidebar. */
+html:not([data-has-hero]) .page > header.header {
+  padding: 0;
+  background: var(--bifrost-surface);
+}
+
+html:not([data-has-hero]) .bifrost-header-shell {
+  --bifrost-panel-shell: var(--bifrost-integrated-nav);
+  --bifrost-panel-inner: var(--bifrost-integrated-nav-inset);
+  width: 100%;
+  max-width: none;
+  margin-inline: 0;
+}
+
+@media (width >= 50rem) {
   #starlight__sidebar.sidebar-pane {
     top: var(--sl-nav-height);
-    padding: 0.55rem 0.55rem 0;
+    padding: var(--bifrost-space-2) var(--bifrost-space-2) 0;
     border-inline-end: 0;
     background: rgb(5 5 5 / 0.76);
   }
 
   #starlight__sidebar .sidebar-content {
-    padding: 1.25rem 0.8rem 1.5rem;
+    padding: var(--bifrost-space-5) var(--bifrost-space-3) var(--bifrost-space-6);
     border: 1px solid rgb(255 255 255 / 0.075);
     border-bottom: 0;
     background:
@@ -113,10 +223,19 @@ body::before {
       rgb(13 12 11 / 0.82);
     box-shadow: inset 0 1px rgb(255 255 255 / 0.02);
   }
+
+  html:not([data-has-hero]) #starlight__sidebar.sidebar-pane {
+    padding-block-start: 0;
+    padding-inline-start: 0;
+  }
+
+  html:not([data-has-hero]) #starlight__sidebar .sidebar-content {
+    border-block-start: 0;
+  }
 }
 
 #starlight__sidebar .top-level > li + li {
-  margin-top: 1rem;
+  margin-top: var(--bifrost-space-4);
 }
 
 #starlight__sidebar summary {
@@ -126,10 +245,10 @@ body::before {
 #starlight__sidebar .group-label .large,
 #starlight__sidebar a.large {
   color: #cbc4b7;
-  font-family: var(--sl-font-mono);
-  font-size: 0.66rem;
-  font-weight: 500;
-  letter-spacing: 0.075em;
+  font-family: var(--bifrost-font-mono);
+  font-size: var(--bifrost-text-xs);
+  font-weight: var(--bifrost-weight-bold);
+  letter-spacing: var(--bifrost-tracking-widest);
   text-transform: uppercase;
 }
 
@@ -167,7 +286,7 @@ body::before {
   content: "";
 }
 
-@media (min-width: 72rem) {
+@media (width >= 72rem) {
   .right-sidebar {
     border-inline-start: 0 !important;
     padding-inline: 0.5rem;
@@ -219,8 +338,35 @@ html[data-has-hero] .sl-markdown-content {
   z-index: 3;
 }
 
-html[data-has-hero] .sl-markdown-content > .card-grid {
+html[data-has-hero] .sl-markdown-content > .capability-deck {
   margin-top: -3.5rem;
+}
+
+.capability-deck {
+  padding: 1px;
+  background: var(--bifrost-line-strong);
+  clip-path: var(--bifrost-octagon-lg);
+}
+
+.capability-deck__inner {
+  margin: 0;
+  background: var(--bifrost-surface-raised);
+  clip-path: var(--bifrost-octagon-lg-inset);
+}
+
+.capability-deck .card-grid {
+  gap: 1px;
+  margin: 0;
+  background: var(--bifrost-line-strong);
+}
+
+/* The cards are a grid with a fixed min-height, so shorter cards left their
+   content stranded at the top. align-content centres the block in the cell;
+   align-items puts the arrow on the text's centre line rather than its first
+   line, so cards of differing length still read as one row. */
+.capability-deck .sl-link-card {
+  align-content: center;
+  align-items: center;
 }
 
 .sl-link-card {
@@ -228,8 +374,8 @@ html[data-has-hero] .sl-markdown-content > .card-grid {
   overflow: hidden;
   min-height: 9rem;
   padding: clamp(1.25rem, 2vw, 1.65rem);
-  border-radius: 0.2rem;
-  border-color: rgb(235 63 51 / 0.25);
+  border: 0;
+  border-radius: 0;
   background:
     linear-gradient(145deg, rgb(255 255 255 / 0.052), transparent 50%),
     rgb(15 14 13 / 0.88);
@@ -275,21 +421,6 @@ html[data-has-hero] .sl-markdown-content > .card-grid {
   transform: translateX(0.18rem);
 }
 
-.version-strip {
-  border-top: 1px solid rgb(255 255 255 / 0.1);
-  color: #756e64;
-  font-family: var(--sl-font-mono);
-  font-size: 0.66rem;
-  letter-spacing: 0.035em;
-  margin-top: 2.5rem;
-  padding-top: 1rem;
-  text-transform: uppercase;
-}
-
-.version-strip a {
-  color: #cbc4b7;
-}
-
 .sl-markdown-content code:not(:where(.not-content *)) {
   color: #ffd7d3;
 }
@@ -298,7 +429,7 @@ html[data-has-hero] .sl-markdown-content > .card-grid {
   color: #ff6a5f;
 }
 
-@media (max-width: 49.99rem) {
+@media (width < 50rem) {
   :root {
     --sl-nav-height: 4.45rem;
   }
@@ -311,7 +442,7 @@ html[data-has-hero] .sl-markdown-content > .card-grid {
     padding-inline-end: calc(var(--sl-menu-button-size) + 1.05rem);
   }
 
-  html[data-has-hero] .sl-markdown-content > .card-grid {
+  html[data-has-hero] .sl-markdown-content > .capability-deck {
     margin-top: -5rem;
   }
 

@@ -14,7 +14,7 @@ export const BIFROST_CAPABILITIES = [
   {
     id: "symbols",
     label: "Symbols",
-    description: "Navigation, definitions, usages, graphs, and commit analysis",
+    description: "Navigation, definitions, usages, graphs, and diff analysis",
     serverToolsets: ["symbol", "slopcop"],
     toolRequirements: [
       ["search_symbols"],
@@ -22,7 +22,7 @@ export const BIFROST_CAPABILITIES = [
       ["get_summaries"],
       ["rename_symbol"],
       ["usage_graph"],
-      ["analyze_commit"],
+      ["analyze_diff"],
     ],
     toolVariants: [
       ["scan_usages_by_location", "get_definitions_by_location", "get_type_by_location"],

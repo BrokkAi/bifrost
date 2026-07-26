@@ -571,6 +571,24 @@ pub enum DeclarationSegmentKind {
     AnonymousCallable,
 }
 
+impl DeclarationSegmentKind {
+    pub const fn stable_label(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Namespace => "namespace",
+            Self::Type => "type",
+            Self::Function => "function",
+            Self::Method => "method",
+            Self::Constructor => "constructor",
+            Self::Initializer => "initializer",
+            Self::LocalFunction => "local_function",
+            Self::Lambda => "lambda",
+            Self::Closure => "closure",
+            Self::AnonymousCallable => "anonymous_callable",
+        }
+    }
+}
+
 /// One named or anonymous declaration in a lexical nesting path.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeclarationSegment {
@@ -849,25 +867,60 @@ impl SemanticArtifactKey {
         digest.push(self.dependencies.as_bytes());
         digest.finish()
     }
+
+    /// A checkout-independent fingerprint for source-facing result identity.
+    ///
+    /// Unlike [`Self::fingerprint`], this deliberately excludes the absolute
+    /// workspace mount and the ephemeral overlay snapshot token. The
+    /// workspace-relative path, exact content, adapter semantics, IR version,
+    /// configuration, and dependency identity still scope the result to the
+    /// semantic inputs that can change its meaning.
+    pub(crate) fn public_fingerprint(&self) -> StableDigest {
+        let mut digest = LengthDelimitedDigest::new(b"bifrost-semantic-public-artifact-key-v1");
+        digest.push(self.path.as_str().as_bytes());
+        digest.push(self.language.stable_label().as_bytes());
+        digest.push(self.revision.content().as_bytes());
+        digest.push(self.adapter.name().as_bytes());
+        digest.push(self.adapter.fingerprint().as_bytes());
+        digest.push(self.ir_version.as_bytes());
+        digest.push(self.configuration.as_bytes());
+        digest.push(self.dependencies.as_bytes());
+        digest.finish()
+    }
 }
 
-struct LengthDelimitedDigest(Sha256);
+pub(crate) struct LengthDelimitedDigest(Sha256);
 
 impl LengthDelimitedDigest {
-    fn new(domain: &[u8]) -> Self {
+    pub(crate) fn new(domain: &[u8]) -> Self {
         let mut value = Self(Sha256::new());
         value.push(domain);
         value
     }
 
-    fn push(&mut self, value: &[u8]) {
+    pub(crate) fn push(&mut self, value: &[u8]) {
         let length =
             u64::try_from(value.len()).expect("semantic identity input length fits in u64");
         self.0.update(length.to_le_bytes());
         self.0.update(value);
     }
 
-    fn finish(self) -> StableDigest {
+    pub(crate) fn push_anchor(&mut self, anchor: SourceAnchor) {
+        let span = anchor.span();
+        for value in [
+            span.start().byte_offset(),
+            span.start().line(),
+            span.start().byte_column(),
+            span.end().byte_offset(),
+            span.end().line(),
+            span.end().byte_column(),
+            anchor.occurrence(),
+        ] {
+            self.push(&value.to_le_bytes());
+        }
+    }
+
+    pub(crate) fn finish(self) -> StableDigest {
         let digest = self.0.finalize();
         let mut value = [0_u8; 32];
         value.copy_from_slice(&digest);

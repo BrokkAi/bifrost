@@ -569,7 +569,7 @@ fn removed_search_ast_tool_name_is_reported_as_unknown() {
 }
 
 #[test]
-fn analyze_commit_remains_available_in_tool_cli() {
+fn analyze_diff_remains_available_in_tool_cli() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path();
     let repo = Repository::init(root).expect("init repo");
@@ -582,11 +582,11 @@ fn analyze_commit_remains_available_in_tool_cli() {
         .arg("--root")
         .arg(root)
         .arg("--tool")
-        .arg("analyze_commit")
+        .arg("analyze_diff")
         .arg("--args")
-        .arg(r#"{"revision":"HEAD"}"#)
+        .arg(r#"{"target":"HEAD"}"#)
         .output()
-        .expect("run bifrost --tool analyze_commit");
+        .expect("run bifrost --tool analyze_diff");
 
     assert!(
         output.status.success(),
@@ -595,7 +595,7 @@ fn analyze_commit_remains_available_in_tool_cli() {
     );
     let payload: Value = serde_json::from_slice(&output.stdout).expect("json stdout");
     assert_eq!(payload["isError"], false, "{payload}");
-    assert!(payload["structuredContent"]["commit"]["hash"].is_string());
+    assert!(payload["structuredContent"]["endpoints"]["target"].is_string());
 }
 
 #[test]

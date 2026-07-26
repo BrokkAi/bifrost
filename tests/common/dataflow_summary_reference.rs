@@ -207,6 +207,7 @@ where
                             origin: Some(transfer.origin.clone()),
                             proof: transfer.proof.clone(),
                             completeness: transfer.completeness.clone(),
+                            boundary: None,
                         };
                         for output in transfer_outputs(problem, descriptor(&edge), path.fact, zero)
                         {
@@ -312,6 +313,7 @@ where
             origin: None,
             proof: ProofStatus::Proven,
             completeness: brokk_bifrost::analyzer::semantic::EvidenceCompleteness::Complete,
+            boundary: None,
         };
         for output in transfer_outputs(problem, descriptor(&owned), path.fact, zero) {
             reached.insert(Path {

@@ -409,6 +409,15 @@ fn budget_with_limit(dimension: SolverBudgetDimension, limit: usize) -> SolverBu
         }
         SolverBudgetDimension::SummaryApplications => limits.summary_applications = limit,
         SolverBudgetDimension::CoverageRows => limits.coverage_rows = limit,
+        SolverBudgetDimension::WitnessRelations => limits.witness_relations = limit,
+        SolverBudgetDimension::IdeRelations => limits.ide_relations = limit,
+        SolverBudgetDimension::EdgeFunctions => limits.edge_functions = limit,
+        SolverBudgetDimension::EdgeFunctionOperations => {
+            limits.edge_function_operations = limit;
+        }
+        SolverBudgetDimension::IdeValues => limits.ide_values = limit,
+        SolverBudgetDimension::ValueOperations => limits.value_operations = limit,
+        SolverBudgetDimension::IdePropagations => limits.ide_propagations = limit,
     }
     SolverBudget::new(limits)
 }

@@ -80,7 +80,7 @@ With `--fail-on never`, the complete human report is:
 
 <!-- policy-doc-test:human:dynamic-eval -->
 ```text
-note: policy bifrost.security.dynamic-eval inferred policy schema 1 and RQL schema 2
+note: policy bifrost.security.dynamic-eval inferred policy schema 1 and RQL schema 3
 [warning]  app.py:2:12
     Dynamic evaluation is forbidden
 
@@ -101,14 +101,14 @@ independently:
 | Source form | Omitted version | Explicit version |
 | --- | --- | --- |
 | `(policy ...)` or `(endpoint ...)` | Select the newest compiled-in version in the compatible policy lineage (currently 1). | An exact pin; unsupported versions fail instead of falling back. |
-| `(rql QUERY)` | Select the compatible RQL head (currently 2). | Add `:schema-version 2` for an exact RQL pin. |
+| `(rql QUERY)` | Select the compatible RQL head (currently 3). | Add `:schema-version N` for an exact RQL pin. |
 | `(rql-file :path "queries/rule.rql")` | With no wrapper pin, an explicit pin in the referenced document wins; if both omit a version, resolve the compatible RQL head. | A wrapper pin is exact; an explicit referenced-document pin must agree. |
 
 File-backed selectors have four version-resolution cases:
 
 | `rql-file` wrapper | Referenced `.rql` document | Result |
 | --- | --- | --- |
-| Omitted | Native query with no version envelope | Resolve the latest compatible RQL version (currently 2); the version is inferred. |
+| Omitted | Native query with no version envelope | Resolve the latest compatible RQL version (currently 3); the version is inferred. |
 | Exact pin `N` | Native query with no version envelope | Use exact `N`; the wrapper supplies the explicit pin. |
 | Omitted | `(rql :schema-version N QUERY)` | Use exact `N`; the referenced document supplies the explicit pin. |
 | Exact pin `N` | `(rql :schema-version N QUERY)` | Use exact `N`; the agreeing referenced-document pin is retained as the resolution origin. |

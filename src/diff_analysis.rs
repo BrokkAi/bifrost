@@ -12,9 +12,23 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct AnalyzeCommitParams {
-    pub revision: String,
+/// Endpoint label reported for the uncommitted working tree.
+pub const WORKTREE_ENDPOINT: &str = "worktree";
+
+/// Parameters for `analyze_diff`.
+///
+/// Both endpoints are optional; see [`resolve_endpoints`] for the resolution
+/// table. `{}` means "HEAD vs the working tree".
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AnalyzeDiffParams {
+    /// Revspec of the "before" endpoint. Defaults to the first parent of
+    /// `target` when `target` is a commit, and to `HEAD` when `target` is the
+    /// working tree.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// Revspec of the "after" endpoint. Omitted means the working tree.
+    #[serde(default)]
+    pub target: Option<String>,
     #[serde(default = "default_include_tests")]
     pub include_tests: bool,
 }
@@ -24,8 +38,8 @@ fn default_include_tests() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct CommitAnalysisResult {
-    pub commit: CommitPair,
+pub struct DiffAnalysisResult {
+    pub endpoints: DiffEndpoints,
     pub file_changes: Vec<FileChange>,
     pub patch_symbols: PatchSymbols,
     pub moved_symbols: Vec<MovedSymbol>,
@@ -37,10 +51,12 @@ pub struct CommitAnalysisResult {
     pub large_callsite_symbols: Vec<LargeCallsiteSymbol>,
 }
 
+/// Resolved diff endpoints. Each field is a full commit hash, or the literal
+/// [`WORKTREE_ENDPOINT`] when the endpoint is the uncommitted working tree.
 #[derive(Debug, Clone, Serialize)]
-pub struct CommitPair {
-    pub hash: String,
-    pub parent_hash: String,
+pub struct DiffEndpoints {
+    pub base: String,
+    pub target: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -174,43 +190,113 @@ struct EdgeKey {
     language: String,
 }
 
-pub fn analyze_commit(
-    analyzer: &dyn IAnalyzer,
-    params: AnalyzeCommitParams,
-) -> Result<CommitAnalysisResult, String> {
-    analyze_commit_at_root(analyzer.project().root(), params)
+/// One end of a diff: either a committed tree, or the live working tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Snapshot {
+    Commit(Oid),
+    Worktree,
 }
 
-pub fn analyze_commit_at_root(
-    root: &Path,
-    params: AnalyzeCommitParams,
-) -> Result<CommitAnalysisResult, String> {
-    let repo = Repository::open(root)
-        .map_err(|err| format!("not a git repository at project root: {err}"))?;
-    let object = repo
-        .revparse_single(params.revision.trim())
-        .map_err(|err| format!("unable to resolve revision `{}`: {err}", params.revision))?;
-    let commit = object
-        .peel_to_commit()
-        .map_err(|err| format!("revision `{}` is not a commit: {err}", params.revision))?;
-
-    match commit.parent_count() {
-        0 => return Err("analyze_commit does not support root commits".to_string()),
-        1 => {}
-        n => {
-            return Err(format!(
-                "analyze_commit does not support merge commits ({n} parents)"
-            ));
+impl Snapshot {
+    fn label(&self) -> String {
+        match self {
+            Self::Commit(oid) => oid.to_string(),
+            Self::Worktree => WORKTREE_ENDPOINT.to_string(),
         }
     }
+}
 
-    let parent = commit
-        .parent(0)
-        .map_err(|err| format!("unable to read parent commit: {err}"))?;
-    let commit_oid = commit.id();
-    let parent_oid = parent.id();
+/// Resolve `params` into `(base, target)` snapshots.
+///
+/// | params                     | base                | target      |
+/// |----------------------------|---------------------|-------------|
+/// | `{}`                       | `HEAD`              | working tree|
+/// | `{target: X}`              | first parent of `X` | `X`         |
+/// | `{base: A, target: B}`     | `A`                 | `B`         |
+/// | `{base: A}`                | `A`                 | working tree|
+///
+/// The base end is always a commit; only the target end can be the working
+/// tree.
+fn resolve_endpoints(
+    repo: &Repository,
+    params: &AnalyzeDiffParams,
+) -> Result<(Oid, Snapshot), String> {
+    let target = match params.target.as_deref().map(str::trim) {
+        Some(revision) if !revision.is_empty() => Snapshot::Commit(resolve_commit(repo, revision)?),
+        _ => Snapshot::Worktree,
+    };
 
-    let (file_changes, changed_lines) = diff_metadata(&repo, parent_oid, commit_oid)?;
+    let base = match params.base.as_deref().map(str::trim) {
+        Some(revision) if !revision.is_empty() => resolve_commit(repo, revision)?,
+        _ => default_base(repo, target, params.target.as_deref())?,
+    };
+
+    Ok((base, target))
+}
+
+fn resolve_commit(repo: &Repository, revision: &str) -> Result<Oid, String> {
+    let object = repo
+        .revparse_single(revision)
+        .map_err(|err| format!("unable to resolve revision `{revision}`: {err}"))?;
+    let commit = object
+        .peel_to_commit()
+        .map_err(|err| format!("revision `{revision}` is not a commit: {err}"))?;
+    Ok(commit.id())
+}
+
+/// Pick the implicit base when the caller omitted `base`.
+fn default_base(
+    repo: &Repository,
+    target: Snapshot,
+    target_revision: Option<&str>,
+) -> Result<Oid, String> {
+    match target {
+        Snapshot::Worktree => resolve_commit(repo, "HEAD").map_err(|err| {
+            format!("unable to default `base` to HEAD for a working-tree diff: {err}")
+        }),
+        Snapshot::Commit(oid) => {
+            let commit = repo
+                .find_commit(oid)
+                .map_err(|err| format!("unable to read commit {oid}: {err}"))?;
+            let spelling = target_revision.map(str::trim).unwrap_or_default();
+            let spelling = if spelling.is_empty() {
+                oid.to_string()
+            } else {
+                spelling.to_string()
+            };
+            match commit.parent_count() {
+                0 => Err(format!(
+                    "analyze_diff cannot default `base` for root commit `{spelling}`; \
+                     root commits have no parent, so pass an explicit `base`"
+                )),
+                1 => commit
+                    .parent_id(0)
+                    .map_err(|err| format!("unable to read parent commit: {err}")),
+                n => Err(format!(
+                    "analyze_diff cannot default `base` for merge commit `{spelling}` \
+                     ({n} parents); pass an explicit base such as `base: \"{spelling}^1\"`"
+                )),
+            }
+        }
+    }
+}
+
+pub fn analyze_diff(
+    analyzer: &dyn IAnalyzer,
+    params: AnalyzeDiffParams,
+) -> Result<DiffAnalysisResult, String> {
+    analyze_diff_at_root(analyzer.project().root(), params)
+}
+
+pub fn analyze_diff_at_root(
+    root: &Path,
+    params: AnalyzeDiffParams,
+) -> Result<DiffAnalysisResult, String> {
+    let repo = Repository::open(root)
+        .map_err(|err| format!("not a git repository at project root: {err}"))?;
+    let (base_oid, target) = resolve_endpoints(&repo, &params)?;
+
+    let (file_changes, changed_lines) = diff_metadata(&repo, base_oid, target)?;
     let changed_paths: Vec<String> = file_changes
         .iter()
         .flat_map(|change| [change.old_path.clone(), change.path.clone()])
@@ -218,14 +304,14 @@ pub fn analyze_commit_at_root(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let parent_paths: Vec<String> = file_changes
+    let base_paths: Vec<String> = file_changes
         .iter()
         .filter_map(|change| change.old_path.as_ref().or(change.path.as_ref()))
         .cloned()
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let commit_paths: Vec<String> = file_changes
+    let target_paths: Vec<String> = file_changes
         .iter()
         .filter_map(|change| change.path.as_ref())
         .cloned()
@@ -233,13 +319,13 @@ pub fn analyze_commit_at_root(
         .into_iter()
         .collect();
 
-    let parent_tree = MaterializedRevision::new(&repo, parent_oid, &parent_paths)?;
-    let commit_tree = MaterializedRevision::new(&repo, commit_oid, &commit_paths)?;
-    let parent_analyzer = build_analyzer(parent_tree.path(), parent_tree.files())?;
-    let commit_analyzer = build_analyzer(commit_tree.path(), commit_tree.files())?;
+    let base_image = RevisionImage::materialize(&repo, Snapshot::Commit(base_oid), &base_paths)?;
+    let target_image = RevisionImage::materialize(&repo, target, &target_paths)?;
+    let base_analyzer = build_analyzer(base_image.root(), base_image.files())?;
+    let target_analyzer = build_analyzer(target_image.root(), target_image.files())?;
 
-    let before = symbol_snapshot_map(parent_analyzer.analyzer(), params.include_tests);
-    let after = symbol_snapshot_map(commit_analyzer.analyzer(), params.include_tests);
+    let before = symbol_snapshot_map(base_analyzer.analyzer(), params.include_tests);
+    let after = symbol_snapshot_map(target_analyzer.analyzer(), params.include_tests);
 
     let mut postimage_introduced = Vec::new();
     let mut postimage_edited = Vec::new();
@@ -305,19 +391,19 @@ pub fn analyze_commit_at_root(
     };
 
     let import_changes = import_changes(
-        parent_analyzer.analyzer(),
-        commit_analyzer.analyzer(),
+        base_analyzer.analyzer(),
+        target_analyzer.analyzer(),
         &changed_paths,
     );
     let graph_before = usage_graph(
-        parent_analyzer.analyzer(),
+        base_analyzer.analyzer(),
         UsageGraphParams {
             include_tests: params.include_tests,
             paths: Some(changed_paths.clone()),
         },
     );
     let graph_after = usage_graph(
-        commit_analyzer.analyzer(),
+        target_analyzer.analyzer(),
         UsageGraphParams {
             include_tests: params.include_tests,
             paths: Some(changed_paths),
@@ -365,10 +451,10 @@ pub fn analyze_commit_at_root(
             .collect(),
     };
 
-    Ok(CommitAnalysisResult {
-        commit: CommitPair {
-            hash: commit_oid.to_string(),
-            parent_hash: parent_oid.to_string(),
+    Ok(DiffAnalysisResult {
+        endpoints: DiffEndpoints {
+            base: base_oid.to_string(),
+            target: target.label(),
         },
         file_changes,
         patch_symbols,
@@ -384,21 +470,34 @@ pub fn analyze_commit_at_root(
 
 fn diff_metadata(
     repo: &Repository,
-    parent_oid: Oid,
-    commit_oid: Oid,
+    base_oid: Oid,
+    target: Snapshot,
 ) -> Result<(Vec<FileChange>, BTreeMap<String, ChangedLines>), String> {
-    let parent_tree = repo
-        .find_commit(parent_oid)
+    let base_tree = repo
+        .find_commit(base_oid)
         .and_then(|commit| commit.tree())
-        .map_err(|err| format!("unable to read parent tree: {err}"))?;
-    let commit_tree = repo
-        .find_commit(commit_oid)
-        .and_then(|commit| commit.tree())
-        .map_err(|err| format!("unable to read commit tree: {err}"))?;
+        .map_err(|err| format!("unable to read base tree: {err}"))?;
     let mut opts = DiffOptions::new();
-    let mut diff = repo
-        .diff_tree_to_tree(Some(&parent_tree), Some(&commit_tree), Some(&mut opts))
-        .map_err(|err| format!("diff failed: {err}"))?;
+    let mut diff = match target {
+        Snapshot::Commit(target_oid) => {
+            let target_tree = repo
+                .find_commit(target_oid)
+                .and_then(|commit| commit.tree())
+                .map_err(|err| format!("unable to read target tree: {err}"))?;
+            repo.diff_tree_to_tree(Some(&base_tree), Some(&target_tree), Some(&mut opts))
+        }
+        Snapshot::Worktree => {
+            // `git diff <base>` semantics: staged and unstaged changes combined,
+            // plus brand-new files as `added` (ignored files stay excluded).
+            // `show_untracked_content` is what makes an untracked file's lines
+            // appear as `+` hunks, which is how its symbols get attributed.
+            opts.include_untracked(true)
+                .recurse_untracked_dirs(true)
+                .show_untracked_content(true);
+            repo.diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut opts))
+        }
+    }
+    .map_err(|err| format!("diff failed: {err}"))?;
     let _ = diff.find_similar(None);
 
     let mut changes = Vec::new();
@@ -479,25 +578,81 @@ fn diff_metadata(
     Ok((changes, changed_lines))
 }
 
-struct MaterializedRevision {
-    temp: RevisionTempDir,
-    files: Vec<PathBuf>,
+/// An analyzable image of one diff endpoint, restricted to the changed files.
+///
+/// Commit endpoints are exported into a temp directory; the working-tree
+/// endpoint is analyzed in place from the real project root. Both sides stay
+/// restricted to the changed paths so the symbol and call-edge diffs compare
+/// like for like.
+enum RevisionImage {
+    Commit {
+        temp: RevisionTempDir,
+        files: Vec<PathBuf>,
+    },
+    Worktree {
+        root: PathBuf,
+        files: Vec<PathBuf>,
+    },
 }
 
-impl MaterializedRevision {
-    fn new(repo: &Repository, oid: Oid, paths: &[String]) -> Result<Self, String> {
-        let temp = RevisionTempDir::new(oid)?;
-        let files = export_commit_files(repo, oid, temp.path(), paths)?;
-        Ok(Self { temp, files })
+impl RevisionImage {
+    fn materialize(
+        repo: &Repository,
+        snapshot: Snapshot,
+        paths: &[String],
+    ) -> Result<Self, String> {
+        match snapshot {
+            Snapshot::Commit(oid) => {
+                let temp = RevisionTempDir::new(&oid.to_string())?;
+                let files = export_commit_files(repo, oid, temp.path(), paths)?;
+                Ok(Self::Commit { temp, files })
+            }
+            Snapshot::Worktree => {
+                let root = repo
+                    .workdir()
+                    .ok_or_else(|| {
+                        "repository has no working tree; pass an explicit `target` commit"
+                            .to_string()
+                    })?
+                    .to_path_buf();
+                let files = worktree_files(&root, paths)?;
+                Ok(Self::Worktree { root, files })
+            }
+        }
     }
 
-    fn path(&self) -> &Path {
-        self.temp.path()
+    fn root(&self) -> &Path {
+        match self {
+            Self::Commit { temp, .. } => temp.path(),
+            Self::Worktree { root, .. } => root,
+        }
     }
 
     fn files(&self) -> &[PathBuf] {
-        &self.files
+        match self {
+            Self::Commit { files, .. } | Self::Worktree { files, .. } => files,
+        }
     }
+}
+
+/// Collect the changed paths that actually exist as regular files on disk.
+///
+/// A path deleted in the working tree still appears in the diff but has no file
+/// to analyze, so it is skipped the same way [`export_commit_files`] skips
+/// missing tree entries.
+fn worktree_files(root: &Path, paths: &[String]) -> Result<Vec<PathBuf>, String> {
+    let mut present = Vec::new();
+    for raw_path in paths {
+        let rel = safe_tree_entry_path(raw_path)?;
+        let absolute = root.join(&rel);
+        let is_regular_file = fs::symlink_metadata(&absolute)
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false);
+        if is_regular_file {
+            present.push(rel);
+        }
+    }
+    Ok(present)
 }
 
 struct RevisionTempDir {
@@ -505,7 +660,7 @@ struct RevisionTempDir {
 }
 
 impl RevisionTempDir {
-    fn new(oid: Oid) -> Result<Self, String> {
+    fn new(label: &str) -> Result<Self, String> {
         let base = std::env::temp_dir();
         for attempt in 0..100 {
             let nanos = SystemTime::now()
@@ -513,7 +668,7 @@ impl RevisionTempDir {
                 .map(|duration| duration.as_nanos())
                 .unwrap_or_default();
             let path = base.join(format!(
-                "bifrost-analyze-{}-{nanos}-{attempt}-{oid}",
+                "bifrost-analyze-{}-{nanos}-{attempt}-{label}",
                 std::process::id()
             ));
             match fs::create_dir(&path) {
@@ -596,13 +751,21 @@ fn is_regular_file_mode(mode: i32) -> bool {
         || mode == i32::from(FileMode::BlobExecutable)
 }
 
+/// Build a throwaway analyzer over exactly `files`.
+///
+/// This must never touch an on-disk analyzer cache: for commit endpoints the
+/// root is a temp directory that is deleted immediately afterwards, and for the
+/// working-tree endpoint the root is the *live* project root, whose real cache
+/// must not be replaced by one that only ever saw a handful of changed files.
+/// `build_ephemeral` states that requirement at the call site instead of
+/// relying on `FileSetProject::persistence_root()` happening to be `None`.
 fn build_analyzer(root: &Path, files: &[PathBuf]) -> Result<WorkspaceAnalyzer, String> {
     let project = Arc::new(FileSetProject::new(
         root.to_path_buf(),
         files.iter().cloned(),
     ));
-    WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
-        .map_err(|error| format!("Failed to build persisted commit analyzer: {error}"))
+    WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+        .map_err(|error| format!("Failed to build diff endpoint analyzer: {error}"))
 }
 
 fn symbol_snapshot_map(
@@ -877,8 +1040,11 @@ fn rel_path(file: &ProjectFile) -> String {
 
 fn delta_status(status: Delta) -> &'static str {
     match status {
-        Delta::Added => "added",
+        // A working-tree diff reports never-committed files as `Untracked`;
+        // relative to the base endpoint they are simply new.
+        Delta::Added | Delta::Untracked => "added",
         Delta::Deleted => "deleted",
+        Delta::Conflicted => "conflicted",
         Delta::Modified => "modified",
         Delta::Renamed => "renamed",
         Delta::Copied => "copied",

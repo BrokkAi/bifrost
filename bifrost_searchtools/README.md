@@ -125,18 +125,23 @@ cannot be proven. Byte offsets remain internal.
 
 ## `query_code` detail and ranges
 
-`query_code` is the version-2 typed query surface. Omit `schema_version` for v2
-or pass `schema_version=2` explicitly. Pass exactly one of `pattern`, `union`,
+`query_code` is a versioned typed query surface. Omit `schema_version` for the
+compatible head, currently v3, or pass `schema_version=2` to pin the pre-CFG
+vocabulary. Pass exactly one of `pattern`, `union`,
 `intersect`, or `except_`; set operands are complete query-plan dictionaries
 with compatible terminal domains. A structural `pattern` or composed set can be followed
 by ordered `steps` using `enclosing_decl`, `file_of`, `imports_of`,
-`importers_of`, `supertypes`, `subtypes`, `members`, and `owner`. Import
+`importers_of`, `supertypes`, `subtypes`, `members`, `owner`, `procedure_of`,
+`cfg_entry`, `cfg_exits`, `cfg_successor_edges`, `cfg_predecessor_edges`,
+`cfg_edge_source`, and `cfg_edge_target`. Import
 operations traverse one direct project-local edge per step. Hierarchy operations
 are direct by default and accept a positive `depth` or `transitive: true`.
 Declaration results are limited to declarations indexed by the workspace
 analyzer, so references into an unindexed library do not manufacture library
 declarations. Results are tagged as structural matches, declarations, reference
-sites, call sites, expression sites, or files.
+sites, call sites, expression sites, receiver analyses, procedures, program
+points, control edges, or files. The CFG operations are procedure-local and
+one-hop; they do not provide ICFG, data-flow, taint, or typestate analysis.
 Compact output retains minimal pipeline provenance. Pass `result_detail="full"`
 when follow-up tooling needs deterministic IDs and precise ranges.
 
@@ -147,7 +152,9 @@ physical plan, and scheduling decision without executing the query. Pass
 `execution_mode="profile"` to execute it and receive a `CodeQueryProfile`;
 its `.result` is the ordinary typed result, while `.explain`, `.timings_ns`,
 `.work`, `.cache_layers`, `.scheduling`, and `.operators` expose structured
-observations. Profile timings are elapsed nanoseconds, and
+observations. Explain physical nodes declare any `semantic_request`, while
+profile `.work.semantic` accounts materialization, cache reuse, CFG rows,
+retained bytes, traversal, and budget exhaustion. Profile timings are elapsed nanoseconds, and
 `temporary_capacity_bytes_lower_bound` is deliberately only a lower-bound
 container-capacity estimate. In the public v2 profile contract, top-level and
 per-operator `.cache_layers` are lists of `{layer, metrics}` records. The nested
@@ -179,7 +186,7 @@ is the canonical reference:
 | Receiver and callee | `callee.name` and `receiver.name` are derived from AST fields and terminal names, not type resolution. Chained calls stay syntactic. |
 | Decorators and annotations | Decorators/annotations are exposed through the `decorators` role. Full detail reports `node_range`, `decorator_ranges`, and `decorated_range`. |
 | Positional arguments | `args` patterns match positional arguments in order as a subsequence; v2 does not require exact positions or arity. |
-| Typed pipelines | Declaration, hierarchy, and ownership steps preserve exact indexed identities; import steps follow direct workspace file edges and may be repeated. |
+| Typed pipelines | Declaration, hierarchy, and ownership steps preserve exact indexed identities; import steps follow direct workspace file edges and may be repeated; schema-v3 CFG steps expose source-backed procedure-local points and explicit one-hop edges. |
 | Unsupported capabilities | Queries against unsupported normalized kinds or roles return diagnostics instead of silently pretending the language can answer them. |
 
 ## Semantic search

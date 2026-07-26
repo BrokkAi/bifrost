@@ -1,5 +1,6 @@
 mod common;
 
+use brokk_bifrost::analyzer::dataflow::DataflowEdge;
 use brokk_bifrost::analyzer::semantic::{
     CallableReferenceKind, CallableTargetResolution, CancellationToken, ControlEdgeKind,
     DeclarationSegmentKind, DeferredInvocationKind, IcfgEdgeKind, ProcedureInvocationKind,
@@ -975,6 +976,31 @@ fn rust_async_function_calls_are_deferred_icfg_boundaries() {
             .originating_call("async_call"),
         ],
     );
+    let (continuation_edge_id, continuation_edge) = graph
+        .snapshot()
+        .successor_edges(graph.node("async_invoke"))
+        .find(|(_, edge)| edge.kind == IcfgEdgeKind::CallToNormalContinuation)
+        .expect("deferred normal continuation edge");
+    assert!(matches!(
+        continuation_edge.boundary,
+        Some(
+            brokk_bifrost::analyzer::semantic::DispatchBoundaryKind::Deferred {
+                kind: DeferredInvocationKind::Async,
+                ..
+            }
+        )
+    ));
+    assert!(matches!(
+        DataflowEdge::from_snapshot(graph.snapshot(), continuation_edge_id)
+            .expect("bounded dataflow descriptor")
+            .boundary(),
+        Some(
+            brokk_bifrost::analyzer::semantic::DispatchBoundaryKind::Deferred {
+                kind: DeferredInvocationKind::Async,
+                ..
+            }
+        )
+    ));
     graph.assert_predecessors(
         "normal_continuation",
         &[

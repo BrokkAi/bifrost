@@ -232,6 +232,7 @@ fn capabilities() -> SemanticCapabilities {
         SemanticCapability::NormalControlFlow,
         SemanticCapability::ExceptionalControlFlow,
         SemanticCapability::Values,
+        SemanticCapability::Assignments,
         SemanticCapability::LocalFlow,
         SemanticCapability::FieldMemory,
         SemanticCapability::IndexMemory,
@@ -363,6 +364,10 @@ fn build_artifact() -> Arc<SemanticArtifact> {
         event(SemanticEffect::MemoryStore {
             kind: MemoryAccessKind::Field,
             location: MemoryLocationId::new(2),
+            value: ValueId::new(1),
+        }),
+        event(SemanticEffect::Assignment {
+            target: ValueId::new(2),
             value: ValueId::new(1),
         }),
         event(SemanticEffect::CallableReference {
@@ -1407,6 +1412,8 @@ fn value_flow_snapshots_retain_context_and_reject_multiple_arenas() {
     );
     let second = relation_arena(owner, [OracleRelationKind::ValueFlow], &fixture.evidence());
     let relation = |id| ValueFlowRelation {
+        point: fixture.point.clone(),
+        event_index: 4,
         id,
         kind: ValueFlowRelationKind::Assignment,
         source: ValueFlowEndpoint::Value(fixture.value.clone()),
@@ -1426,6 +1433,19 @@ fn value_flow_snapshots_retain_context_and_reject_multiple_arenas() {
     .expect("one value-flow arena should retain its exact context");
     assert_eq!(snapshot.context(), &context);
     assert_eq!(snapshot.relations().len(), 2);
+
+    let mut wrong_event = first_relation.clone();
+    wrong_event.event_index = 1;
+    assert_eq!(
+        ValueFlowSnapshot::new(
+            fixture.caller.clone(),
+            context.clone(),
+            vec![wrong_event],
+            CandidateCoverage::Exhaustive,
+            OracleLimits::default(),
+        ),
+        Err(OracleContractError::InvalidRelationIdentity)
+    );
 
     let other_arena_relation = relation(second.handle(OracleRelationId::new(0)).unwrap());
     assert_eq!(
@@ -1501,6 +1521,8 @@ fn oracle_quality_claims_cannot_inflate_proof_or_completeness_independently() {
             &fixture.evidence_with_quality(evidence_id),
         );
         let relation = ValueFlowRelation {
+            point: fixture.point.clone(),
+            event_index: 4,
             id: arena.handle(OracleRelationId::new(0)).unwrap(),
             kind: ValueFlowRelationKind::Assignment,
             source: ValueFlowEndpoint::Value(fixture.value.clone()),
@@ -3724,6 +3746,8 @@ fn every_non_dispatch_result_revalidates_whole_retained_arenas() {
         &fixture.evidence(),
     );
     let relation = ValueFlowRelation {
+        point: fixture.point.clone(),
+        event_index: 4,
         id: value_flow_arena.handle(OracleRelationId::new(0)).unwrap(),
         kind: ValueFlowRelationKind::Assignment,
         source: ValueFlowEndpoint::Value(fixture.value.clone()),
@@ -3882,6 +3906,8 @@ fn every_non_dispatch_result_revalidates_aggregate_retained_evidence() {
         OracleRelationKind::ValueFlow,
     );
     let relation = ValueFlowRelation {
+        point: fixture.point.clone(),
+        event_index: 4,
         id: value_flow_arena.handle(OracleRelationId::new(0)).unwrap(),
         kind: ValueFlowRelationKind::Assignment,
         source: ValueFlowEndpoint::Value(fixture.value.clone()),

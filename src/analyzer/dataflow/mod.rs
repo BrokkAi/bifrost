@@ -4,11 +4,13 @@
 //! `IcfgSnapshot`. A second runner starts from a procedure and converges through
 //! query-local entry-to-exit summaries, including recursive calls. Both retain
 //! input uncertainty, solver termination, budgets, and concrete path quality.
-//! Witnesses, IDE edge functions, and domain-specific clients remain separate
-//! follow-up work.
+//! Summary witnesses are an opt-in query-local layer; IDE edge functions and
+//! domain-specific clients remain separate follow-up work.
 
 mod budget;
 mod direct;
+mod ide;
+mod ide_result;
 mod input;
 mod problem;
 mod quality;
@@ -17,11 +19,20 @@ mod summary;
 mod summary_result;
 mod tabulation;
 mod transfer;
+mod witness;
 
 pub use budget::{
     DataflowRequest, SolverBudget, SolverBudgetDimension, SolverBudgetExceeded, SolverWork,
 };
 pub use direct::{DirectFact, DirectFlowProblem};
+pub use ide::{
+    IdeDataflowProblem, IdeDataflowSeed, IdeSummarySolveInput, IdeTransition,
+    solve_ide_with_summaries,
+};
+pub use ide_result::{
+    IdeDataflowError, IdeEdgeFunctionId, IdeMetrics, IdePointValue, IdeSummaryDataflowResult,
+    IdeValueId,
+};
 pub use input::{DataflowError, IcfgInputStatus, IcfgSolveInput, SemanticInputStatus};
 pub use problem::{
     BoundedSnapshotDataflowProblem, DataflowEdge, DataflowOutput, DataflowSeed,
@@ -36,3 +47,8 @@ pub use summary_result::{
     SummarySemanticStatus, TabulationEndSummary,
 };
 pub use tabulation::solve;
+pub use witness::{
+    MAX_WITNESS_ALTERNATIVES_PER_QUALITY, SummaryWitness, SummaryWitnessError, SummaryWitnessStep,
+    SummaryWitnessStepKind, WitnessLimitError, WitnessReconstructionLimits,
+    WitnessReconstructionWork, WitnessRetentionLimits,
+};

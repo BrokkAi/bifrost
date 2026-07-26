@@ -15,7 +15,7 @@ define_work_dimensions! {
     /// Work performed or limits applied by one data-flow solve.
     #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct SolverWork;
-    all: pub(crate) [10];
+    all: pub(crate) [17];
     InternedFacts => interned_facts = 100_000,
     ReachedStates => reached_states = 1_000_000,
     FlowEvaluations => flow_evaluations = 4_000_000,
@@ -26,6 +26,13 @@ define_work_dimensions! {
     ProviderMaterializations => provider_materializations = 100_000,
     SummaryApplications => summary_applications = 4_000_000,
     CoverageRows => coverage_rows = 1_000_000,
+    WitnessRelations => witness_relations = 4_000_000,
+    IdeRelations => ide_relations = 4_000_000,
+    EdgeFunctions => edge_functions = 1_000_000,
+    EdgeFunctionOperations => edge_function_operations = 4_000_000,
+    IdeValues => ide_values = 1_000_000,
+    ValueOperations => value_operations = 4_000_000,
+    IdePropagations => ide_propagations = 8_000_000,
 }
 
 /// Exact failed solver-budget charge.
@@ -74,7 +81,7 @@ impl fmt::Display for SolverBudgetExceeded {
 
 impl Error for SolverBudgetExceeded {}
 
-/// Ten-dimensional request-local work budget.
+/// Seventeen-dimensional request-local work budget.
 ///
 /// `callback_rows` is the single deterministic cap for each unique seed or
 /// transfer relation collected from clients. If a complete relation fits that
@@ -83,7 +90,13 @@ impl Error for SolverBudgetExceeded {}
 /// still stop emitting when requested and return cooperatively to bound their
 /// own CPU work. Summary tabulation additionally limits retained end summaries,
 /// waiting incoming calls, semantic-provider cache misses, matched-return
-/// applications, and retained incomplete-coverage rows independently.
+/// applications, retained incomplete-coverage rows, and retained witness
+/// relations independently. IDE solves additionally bound retained transition
+/// and dependency relations, unique edge functions, edge-function algebra,
+/// unique client values, and value-domain algebra. `ide_propagations` bounds
+/// graph expansion, jump-function scheduling (including cache hits), and
+/// concrete entry-value propagation independently of retained graph size.
+/// Fact-only solves never charge those IDE-specific dimensions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SolverBudget {
     ledger: BudgetLedger<SolverWork>,
@@ -155,6 +168,10 @@ impl<'request> DataflowRequest<'request> {
         }
     }
 
+    pub(crate) const fn remaining_witness_relations(&self) -> usize {
+        self.budget.remaining().witness_relations
+    }
+
     /// Reserve solver work with cancellation checkpoints around staging.
     ///
     /// The second check catches cancellation observed during staging. The
@@ -173,6 +190,39 @@ impl<'request> DataflowRequest<'request> {
         }
         *self.budget = staged;
         None
+    }
+
+    /// Atomically reserve required work while treating one independent charge
+    /// as best-effort.
+    ///
+    /// `Ok(true)` means both charges were committed, while `Ok(false)` means
+    /// only the required charge was committed because the optional charge did
+    /// not fit. Cancellation and required-budget failures commit neither.
+    pub(crate) fn reserve_optional_witness_relations(
+        &mut self,
+        required: SolverWork,
+        witness_relations: usize,
+    ) -> Result<bool, SolverTermination> {
+        if self.cancellation.is_cancelled() {
+            return Err(SolverTermination::Cancelled);
+        }
+        let required = self
+            .budget
+            .staged_charge(required)
+            .map_err(SolverTermination::ExceededBudget)?;
+        let optional = SolverWork {
+            witness_relations,
+            ..SolverWork::default()
+        };
+        let (staged, optional_retained) = match required.staged_charge(optional) {
+            Ok(combined) => (combined, true),
+            Err(_) => (required, false),
+        };
+        if self.cancellation.is_cancelled() {
+            return Err(SolverTermination::Cancelled);
+        }
+        *self.budget = staged;
+        Ok(optional_retained)
     }
 }
 
@@ -193,6 +243,8 @@ mod tests {
             provider_materializations: 10,
             summary_applications: 10,
             coverage_rows: 10,
+            witness_relations: 10,
+            ..SolverWork::default()
         });
         budget
             .charge(SolverWork {
@@ -259,5 +311,29 @@ mod tests {
 
         assert_eq!(request.reserve(charge), None);
         assert_eq!(request.budget.used(), charge);
+    }
+
+    #[test]
+    fn optional_reservation_commits_required_work_when_optional_work_does_not_fit() {
+        let cancellation = CancellationToken::default();
+        let mut budget = SolverBudget::new(SolverWork {
+            reached_states: 1,
+            witness_relations: 0,
+            ..SolverWork::uniform(10)
+        });
+        let mut request = DataflowRequest::new(&mut budget, &cancellation);
+
+        assert_eq!(
+            request.reserve_optional_witness_relations(
+                SolverWork {
+                    reached_states: 1,
+                    ..SolverWork::default()
+                },
+                1,
+            ),
+            Ok(false)
+        );
+        assert_eq!(request.budget.used().reached_states, 1);
+        assert_eq!(request.budget.used().witness_relations, 0);
     }
 }

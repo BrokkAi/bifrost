@@ -6854,6 +6854,23 @@ where
             .unwrap_or_default()
     }
 
+    fn ranges_with_limit(
+        &self,
+        code_unit: &CodeUnit,
+        max_ranges: usize,
+        cancellation: &crate::CancellationToken,
+    ) -> (Vec<Range>, usize, bool) {
+        if max_ranges == 0 || cancellation.is_cancelled() {
+            return (Vec::new(), 0, true);
+        }
+        let limited = self.ranges_limited(code_unit, max_ranges);
+        (
+            limited.rows,
+            limited.inspected,
+            !limited.complete || cancellation.is_cancelled(),
+        )
+    }
+
     fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
         let Some(config) = self.adapter.cognitive_complexity_config() else {
             return Vec::new();

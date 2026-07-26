@@ -29,8 +29,8 @@ test("normalizes capability order and builds existing Bifrost toolsets", () => {
 });
 
 test("classifies broad extended tools and excludes removed Git wrappers", () => {
-  assert.equal(capabilityForTool("analyze_commit"), "symbols");
-  assert.equal(toolBelongsToSelection("analyze_commit", ["symbols"]), true);
+  assert.equal(capabilityForTool("analyze_diff"), "symbols");
+  assert.equal(toolBelongsToSelection("analyze_diff", ["symbols"]), true);
   assert.equal(toolBelongsToSelection("compute_cyclomatic_complexity", ["symbols"]), false);
   assert.equal(capabilityForTool("query_code"), "query");
   assert.equal(capabilityForTool("list_files"), "files");

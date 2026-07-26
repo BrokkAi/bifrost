@@ -62,7 +62,7 @@ const SLOPCOP_SERVER_TOOL_NAMES = [
   "report_long_method_and_god_object_smells",
   "report_dead_code_and_unused_abstraction_smells",
   "report_secret_like_code",
-  "analyze_commit",
+  "analyze_diff",
 ];
 const EXTENDED_SERVER_TOOL_NAMES = [
   "query_code",

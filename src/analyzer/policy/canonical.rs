@@ -1800,7 +1800,14 @@ mod tests {
     fn inline_selector() -> PolicySelector {
         PolicySelector::Inline {
             schema: schema(2),
-            query: CodeQuery::from_sexp("(call :callee (name \"eval\"))").unwrap(),
+            query: CodeQuery::from_json(&json!({
+                "schema_version": 2,
+                "match": {
+                    "kind": "call",
+                    "callee": { "name": "eval" },
+                },
+            }))
+            .unwrap(),
         }
     }
 

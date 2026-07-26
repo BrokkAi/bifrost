@@ -15,6 +15,9 @@ use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
+use crate::analyzer::canonical_hash::{CanonicalHasher, write_lower_hex};
+pub use crate::analyzer::typestate::{TypestateBindingPlanHash, TypestateProtocolHash};
+
 use super::budget::PolicyBudget;
 use super::classification::{MAX_REPORT_PROSE_BYTES, TextValidationError, validate_required_text};
 use super::cvss::{CvssEvidenceContentHash, SourceScenarioSetHash};
@@ -46,8 +49,6 @@ const MAX_REPORT_WITNESS_REFS: usize = 64;
 const SOURCE_SCENARIO_SET_DOMAIN: &[u8] = b"bifrost-source-scenario-set/v1";
 const TAINT_PROJECTION_FACTS_DOMAIN: &[u8] = b"bifrost-taint-projection-facts/v1";
 const TYPESTATE_SCENARIO_SET_DOMAIN: &[u8] = b"bifrost-typestate-scenario-set/v1";
-const TYPESTATE_PROTOCOL_DOMAIN: &[u8] = b"bifrost-typestate-protocol/v1";
-const TYPESTATE_BINDING_PLAN_DOMAIN: &[u8] = b"bifrost-typestate-binding-plan/v1";
 const TYPESTATE_PROJECTION_FACTS_DOMAIN: &[u8] = b"bifrost-typestate-projection-facts/v1";
 const TYPESTATE_VIOLATION_DOMAIN: &[u8] = b"bifrost-typestate-violation/v1";
 const CVSS_STATIC_EVIDENCE_DOMAIN: &[u8] = b"bifrost-cvss-static-evidence/v1";
@@ -97,23 +98,18 @@ macro_rules! define_digest {
 
 define_digest!(TaintProjectionFactsHash);
 define_digest!(TypestateScenarioSetHash);
-define_digest!(TypestateProtocolHash);
-define_digest!(TypestateBindingPlanHash);
 define_digest!(TypestateProjectionFactsHash);
 define_digest!(TypestateViolationHash);
 
-impl TypestateProtocolHash {
-    /// Hash the canonical compiled #822 protocol bytes under the public
-    /// schema-version-1 protocol domain.
-    pub fn from_canonical_bytes(bytes: &[u8]) -> Self {
-        Self(hash_domain_bytes(TYPESTATE_PROTOCOL_DOMAIN, bytes))
+impl RetainedSize for TypestateProtocolHash {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
     }
 }
 
-impl TypestateBindingPlanHash {
-    /// Hash the canonical dominance-resolved #824 binding plan bytes.
-    pub fn from_canonical_bytes(bytes: &[u8]) -> Self {
-        Self(hash_domain_bytes(TYPESTATE_BINDING_PLAN_DOMAIN, bytes))
+impl RetainedSize for TypestateBindingPlanHash {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
     }
 }
 
@@ -2122,62 +2118,12 @@ fn hash_string_ids<T: AsRef<str>>(hasher: &mut CanonicalHasher, field: &'static 
     });
 }
 
-struct CanonicalHasher(Sha256);
-
-impl CanonicalHasher {
-    fn new(domain: &[u8]) -> Self {
-        let mut hasher = Self(Sha256::new());
-        hasher.value(domain);
-        hasher
-    }
-
-    fn field(&mut self, name: &str, value: &[u8]) {
-        self.value(name.as_bytes());
-        self.value(value);
-    }
-
-    fn value(&mut self, value: &[u8]) {
-        let length = u64::try_from(value.len()).expect("usize fits u64 on supported targets");
-        self.0.update(length.to_be_bytes());
-        self.0.update(value);
-    }
-
-    fn sequence<T>(&mut self, name: &str, values: &[T], mut update: impl FnMut(&mut Self, &T)) {
-        self.value(name.as_bytes());
-        self.value(
-            &u64::try_from(values.len())
-                .unwrap_or(u64::MAX)
-                .to_be_bytes(),
-        );
-        for value in values {
-            update(self, value);
-        }
-    }
-
-    fn finish(self) -> [u8; 32] {
-        self.0.finalize().into()
-    }
-}
-
-fn hash_domain_bytes(domain: &[u8], bytes: &[u8]) -> [u8; 32] {
-    let mut hasher = CanonicalHasher::new(domain);
-    hasher.value(bytes);
-    hasher.finish()
-}
-
 fn tighten_string(value: &mut String) {
     *value = std::mem::take(value).into_boxed_str().into_string();
 }
 
 fn tighten_vec<T>(values: &mut Vec<T>) {
     *values = std::mem::take(values).into_boxed_slice().into_vec();
-}
-
-fn write_lower_hex(bytes: &[u8; 32], formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    for byte in bytes {
-        write!(formatter, "{byte:02x}")?;
-    }
-    Ok(())
 }
 
 macro_rules! serialize_string_identifier {
