@@ -18,11 +18,11 @@ use crate::analyzer::semantic::{
     EvidenceHandle, FormalMultiplicity, IndexSelector, MemoryLocationHandle, MemoryLocationKind,
     ObjectCardinality, OracleCallContext, OracleCandidate, OracleRelationArena,
     OracleRelationHandle, OracleRelationId, OracleRelationKind, OracleRelationOwner,
-    OracleRelationRecord, ProcedureHandle, ProcedurePortHandle, ProofStatus, ScopedSemanticLocator,
-    SemanticCapability, SemanticEffect, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
-    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValueKind, SemanticWork,
-    ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle, ValueFlowRelation, ValueFlowRelationKind,
-    ValueFlowSnapshot, ValueHandle,
+    OracleRelationRecord, ProcedureHandle, ProcedurePortHandle, ProgramPointHandle, ProofStatus,
+    ScopedSemanticLocator, SemanticCapability, SemanticEffect, SemanticGapImpact, SemanticGapKind,
+    SemanticGapSubject, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValueKind,
+    SemanticWork, ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle, ValueFlowRelation,
+    ValueFlowRelationKind, ValueFlowSnapshot, ValueHandle,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -55,6 +55,8 @@ fn merge_gap_quality(
 
 #[derive(Clone)]
 struct FlowRelationDraft {
+    point: ProgramPointHandle,
+    event_index: u32,
     kind: ValueFlowRelationKind,
     source: ValueFlowEndpoint,
     target: ValueFlowEndpoint,
@@ -231,6 +233,8 @@ fn materialize_flow_snapshot(
                 .map(OracleRelationId::new)
                 .map_err(|_| SemanticProviderError::internal("value-flow relation ID overflow"))?;
             Ok(ValueFlowRelation {
+                point: draft.point,
+                event_index: draft.event_index,
                 id: arena
                     .handle(id)
                     .expect("value-flow record was inserted into the arena"),
@@ -617,7 +621,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 interrupted = Some(stop);
                 break;
             }
-            for event in &point.events {
+            for (event_index, event) in point.events.iter().enumerate() {
                 if request.cancellation.is_cancelled() {
                     interrupted = Some(Interruption::Cancelled);
                     break 'points;
@@ -919,6 +923,14 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                     open = true;
                 }
                 let draft = FlowRelationDraft {
+                    point: procedure.point_handle(point.id).ok_or_else(|| {
+                        SemanticProviderError::internal(
+                            "value-flow relation point could not be scoped",
+                        )
+                    })?,
+                    event_index: u32::try_from(event_index).map_err(|_| {
+                        SemanticProviderError::internal("value-flow event ordinal exceeds u32")
+                    })?,
                     kind,
                     source,
                     target,
