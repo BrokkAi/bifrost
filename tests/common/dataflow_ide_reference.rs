@@ -16,21 +16,48 @@ use brokk_bifrost::analyzer::dataflow::{
 use brokk_bifrost::analyzer::semantic::{
     CallTransfer, ControlContinuation, ControlEdgeKind, IcfgEdgeKind, IcfgExitProfile,
     IcfgProvider, MatchedReturnProjection, ProcedureHandle, ProcedureIcfgEdge, ProgramPointHandle,
-    ProgramPointId, ProofStatus, SemanticBudget, SemanticEffect, SemanticProviderError,
-    SemanticRequest,
+    ProgramPointId, ProofStatus, ReturnTransferKind, SemanticBudget, SemanticEffect,
+    SemanticProviderError, SemanticRequest,
 };
 
+pub type ReferenceStateKey<Fact> = (
+    ProcedureHandle,
+    ProgramPointId,
+    Fact,
+    ProgramPointHandle,
+    Fact,
+);
+
+pub type ReferenceSummaryKey<Fact> = (
+    ProcedureHandle,
+    ProgramPointId,
+    Fact,
+    ProgramPointHandle,
+    ReturnTransferKind,
+    Fact,
+);
+
 #[derive(Debug, Clone)]
-pub struct ReferenceIdeResult<Fact, Value> {
-    point_values: HashMap<(ProgramPointHandle, Fact), Value>,
+pub struct ReferenceIdeResult<Fact, Value, EdgeFunction> {
+    point_values: HashMap<ReferenceStateKey<Fact>, Value>,
+    reached_functions: HashMap<ReferenceStateKey<Fact>, EdgeFunction>,
+    summary_functions: HashMap<ReferenceSummaryKey<Fact>, EdgeFunction>,
 }
 
-impl<Fact, Value> ReferenceIdeResult<Fact, Value>
+impl<Fact, Value, EdgeFunction> ReferenceIdeResult<Fact, Value, EdgeFunction>
 where
     Fact: Copy + Eq + Hash,
 {
-    pub fn point_values(&self) -> &HashMap<(ProgramPointHandle, Fact), Value> {
+    pub fn point_values(&self) -> &HashMap<ReferenceStateKey<Fact>, Value> {
         &self.point_values
+    }
+
+    pub fn reached_functions(&self) -> &HashMap<ReferenceStateKey<Fact>, EdgeFunction> {
+        &self.reached_functions
+    }
+
+    pub fn summary_functions(&self) -> &HashMap<ReferenceSummaryKey<Fact>, EdgeFunction> {
+        &self.summary_functions
     }
 }
 
@@ -105,13 +132,22 @@ impl<Value> DataflowOutput<Value> for VecOutput<'_, Value> {
     }
 }
 
+type ReferenceSolveResult<Problem> = Result<
+    ReferenceIdeResult<
+        <Problem as IdeDataflowProblem>::Fact,
+        <Problem as IdeDataflowProblem>::Value,
+        <Problem as IdeDataflowProblem>::EdgeFunction,
+    >,
+    ReferenceIdeError,
+>;
+
 pub fn reference_ide_projection<Problem, Provider>(
     root: &ProcedureHandle,
     seeds: &[IdeDataflowSeed<Problem::Fact, Problem::Value>],
     provider: &Provider,
     problem: &Problem,
     semantic_budget: &mut SemanticBudget,
-) -> Result<ReferenceIdeResult<Problem::Fact, Problem::Value>, ReferenceIdeError>
+) -> ReferenceSolveResult<Problem>
 where
     Problem: IdeDataflowProblem,
     Provider: IcfgProvider + ?Sized,
@@ -290,32 +326,105 @@ where
         }
     }
 
-    let mut point_values = HashMap::new();
-    for (path, function) in jumps {
-        if path.entry.procedure != *root || path.entry.point != root_entry.id() {
-            continue;
+    let mut entry_values = HashMap::<Entry<Problem::Fact>, Problem::Value>::new();
+    for (fact, value) in seed_values {
+        entry_values.insert(
+            Entry {
+                procedure: root.clone(),
+                point: root_entry.id(),
+                fact,
+            },
+            value,
+        );
+    }
+    loop {
+        let frozen = entry_values.clone();
+        let mut changed = false;
+        for waiting in &incoming {
+            let Some(entry_value) = frozen.get(&waiting.caller_path.entry) else {
+                continue;
+            };
+            let caller_jump = jumps
+                .get(&waiting.caller_path)
+                .ok_or(ReferenceIdeError::MissingSeed)?;
+            let caller_value = problem.apply_edge_function(caller_jump, entry_value);
+            let candidate = problem.apply_edge_function(&waiting.call_function, &caller_value);
+            changed |= publish_value(
+                &mut entry_values,
+                waiting.callee.clone(),
+                candidate,
+                problem,
+            );
         }
-        let seed = seed_values
-            .get(&path.entry.fact)
+        if !changed {
+            break;
+        }
+    }
+
+    let mut point_values = HashMap::new();
+    let mut reached_functions = HashMap::new();
+    for (path, function) in jumps {
+        let seed = entry_values
+            .get(&path.entry)
             .ok_or(ReferenceIdeError::MissingSeed)?;
         let value = problem.apply_edge_function(&function, seed);
         let point = path
             .entry
             .procedure
             .point_handle(path.point)
-            .ok_or(ReferenceIdeError::MissingPoint("published root point"))?;
-        let key = (point, path.fact);
-        match point_values.get(&key) {
-            Some(existing) if existing != &value => {
-                point_values.insert(key, meet_values(problem, existing, &value));
-            }
-            None => {
-                point_values.insert(key, value);
-            }
-            Some(_) => {}
-        }
+            .ok_or(ReferenceIdeError::MissingPoint("published IDE point"))?;
+        let key = (
+            path.entry.procedure.clone(),
+            path.entry.point,
+            path.entry.fact,
+            point,
+            path.fact,
+        );
+        point_values.insert(key.clone(), value);
+        reached_functions.insert(key, function);
     }
-    Ok(ReferenceIdeResult { point_values })
+    let summary_functions = summaries
+        .into_iter()
+        .map(|summary| {
+            (
+                (
+                    summary.entry.procedure,
+                    summary.entry.point,
+                    summary.entry.fact,
+                    summary.exit.callee_exit().clone(),
+                    summary.exit.kind(),
+                    summary.fact,
+                ),
+                summary.function,
+            )
+        })
+        .collect();
+    Ok(ReferenceIdeResult {
+        point_values,
+        reached_functions,
+        summary_functions,
+    })
+}
+
+fn publish_value<Problem>(
+    values: &mut HashMap<Entry<Problem::Fact>, Problem::Value>,
+    entry: Entry<Problem::Fact>,
+    candidate: Problem::Value,
+    problem: &Problem,
+) -> bool
+where
+    Problem: IdeDataflowProblem,
+{
+    let next = match values.get(&entry) {
+        Some(existing) if existing != &candidate => meet_values(problem, existing, &candidate),
+        Some(_) => return false,
+        None => candidate,
+    };
+    if values.get(&entry) == Some(&next) {
+        return false;
+    }
+    values.insert(entry, next);
+    true
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -9,7 +9,10 @@ use brokk_bifrost::analyzer::dataflow::{
     solve_ide_with_summaries,
 };
 use brokk_bifrost::analyzer::semantic::{
-    CancellationToken, ControlEdgeKind, IcfgEdgeKind, SemanticBudget,
+    CallSiteHandle, CallSiteId, CallTransferSet, CancellationToken, ControlEdgeKind,
+    DispatchOracle, DispatchResult, IcfgEdgeKind, IcfgExitProfile, IcfgProvider, IcfgSnapshot,
+    IcfgSnapshotLimits, ProcedureHandle, ProgramPointId, ReturnTransferKind, SemanticBudget,
+    SemanticOutcome, SemanticProviderError, SemanticRequest, WorkspaceIcfgProvider,
 };
 use brokk_bifrost::{AnalyzerConfig, Language};
 
@@ -23,6 +26,7 @@ use common::{
 enum QualifierFact {
     Zero,
     Tracked,
+    Alternate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -68,6 +72,8 @@ impl QualifierFunction {
 struct QualifierProblem {
     cancel_on_composition: Option<CancellationToken>,
     duplicate_normal_outputs: bool,
+    reverse_duplicate_normal_outputs: bool,
+    value_meets: Option<Rc<Cell<usize>>>,
     edge_function_meets: Option<Rc<Cell<usize>>>,
 }
 
@@ -77,7 +83,7 @@ impl QualifierProblem {
         function: QualifierFunction,
         out: &mut dyn DataflowOutput<IdeTransition<QualifierFact, QualifierFunction>>,
     ) {
-        if fact == QualifierFact::Tracked {
+        if fact != QualifierFact::Zero {
             let _ = out.emit(IdeTransition::new(fact, function));
         }
     }
@@ -101,6 +107,9 @@ impl IdeDataflowProblem for QualifierProblem {
     }
 
     fn meet_values(&self, left: &Self::Value, right: &Self::Value) -> Self::Value {
+        if let Some(meets) = &self.value_meets {
+            meets.set(meets.get().saturating_add(1));
+        }
         (*left).max(*right)
     }
 
@@ -151,8 +160,11 @@ impl IdeDataflowProblem for QualifierProblem {
             }
             _ => QualifierFunction::IDENTITY,
         };
+        if self.duplicate_normal_outputs && self.reverse_duplicate_normal_outputs {
+            Self::preserve(fact, QualifierFunction::constant(Qualifier::Top), out);
+        }
         Self::preserve(fact, function, out);
-        if self.duplicate_normal_outputs {
+        if self.duplicate_normal_outputs && !self.reverse_duplicate_normal_outputs {
             Self::preserve(fact, QualifierFunction::constant(Qualifier::Top), out);
         }
     }
@@ -201,6 +213,65 @@ impl IdeDataflowProblem for QualifierProblem {
 
 type QualifierResult = IdeSummaryDataflowResult<QualifierFact, Qualifier, QualifierFunction>;
 
+#[derive(Clone, Copy)]
+struct ReversingProvider<'workspace> {
+    inner: WorkspaceIcfgProvider<'workspace>,
+    reverse: bool,
+}
+
+impl DispatchOracle for ReversingProvider<'_> {
+    fn resolve_call(
+        &self,
+        call: &CallSiteHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
+        self.inner.resolve_call(call, request)
+    }
+}
+
+impl IcfgProvider for ReversingProvider<'_> {
+    fn call_transfers(
+        &self,
+        caller: &ProcedureHandle,
+        call: CallSiteId,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<CallTransferSet>, SemanticProviderError> {
+        self.inner
+            .call_transfers(caller, call, request)
+            .map(|outcome| {
+                outcome.map(|mut transfers| {
+                    if self.reverse {
+                        let mut rows = transfers.transfers.into_vec();
+                        rows.reverse();
+                        transfers.transfers = rows.into_boxed_slice();
+                        let mut boundaries = transfers.boundaries.into_vec();
+                        boundaries.reverse();
+                        transfers.boundaries = boundaries.into_boxed_slice();
+                    }
+                    transfers
+                })
+            })
+    }
+
+    fn snapshot(
+        &self,
+        root: &ProcedureHandle,
+        limits: IcfgSnapshotLimits,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<IcfgSnapshot>, SemanticProviderError> {
+        self.inner.snapshot(root, limits, request)
+    }
+
+    fn exit_profile(
+        &self,
+        callee_entry: &brokk_bifrost::analyzer::semantic::ProgramPointHandle,
+        callee_exit: &brokk_bifrost::analyzer::semantic::ProgramPointHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<IcfgExitProfile>, SemanticProviderError> {
+        self.inner.exit_profile(callee_entry, callee_exit, request)
+    }
+}
+
 fn value_at(
     result: &QualifierResult,
     point: &brokk_bifrost::analyzer::semantic::ProgramPointHandle,
@@ -222,6 +293,9 @@ fn point_value_projection(
     result: &QualifierResult,
 ) -> HashMap<
     (
+        ProcedureHandle,
+        ProgramPointId,
+        QualifierFact,
         brokk_bifrost::analyzer::semantic::ProgramPointHandle,
         QualifierFact,
     ),
@@ -231,6 +305,11 @@ fn point_value_projection(
         .point_values()
         .iter()
         .map(|row| {
+            let entry_fact = result
+                .fact_result()
+                .fact(row.entry().entry_fact())
+                .copied()
+                .expect("point-value entry fact ID resolves");
             let fact = result
                 .fact_result()
                 .fact(row.fact())
@@ -240,7 +319,92 @@ fn point_value_projection(
                 .value(row.value())
                 .copied()
                 .expect("point-value value ID resolves");
-            ((row.point().clone(), fact), value)
+            (
+                (
+                    row.entry().procedure().clone(),
+                    row.entry().entry_point().id(),
+                    entry_fact,
+                    row.point().clone(),
+                    fact,
+                ),
+                value,
+            )
+        })
+        .collect()
+}
+
+fn reached_function_projection(
+    result: &QualifierResult,
+) -> HashMap<
+    (
+        ProcedureHandle,
+        ProgramPointId,
+        QualifierFact,
+        brokk_bifrost::analyzer::semantic::ProgramPointHandle,
+        QualifierFact,
+    ),
+    QualifierFunction,
+> {
+    result
+        .reached_jump_functions()
+        .map(|(reached, function)| {
+            let entry_fact = *result
+                .fact_result()
+                .fact(reached.entry().entry_fact())
+                .expect("reached entry fact resolves");
+            let fact = *result
+                .fact_result()
+                .fact(reached.fact())
+                .expect("reached fact resolves");
+            (
+                (
+                    reached.entry().procedure().clone(),
+                    reached.entry().entry_point().id(),
+                    entry_fact,
+                    reached.point().clone(),
+                    fact,
+                ),
+                *function,
+            )
+        })
+        .collect()
+}
+
+fn summary_function_projection(
+    result: &QualifierResult,
+) -> HashMap<
+    (
+        ProcedureHandle,
+        ProgramPointId,
+        QualifierFact,
+        brokk_bifrost::analyzer::semantic::ProgramPointHandle,
+        ReturnTransferKind,
+        QualifierFact,
+    ),
+    QualifierFunction,
+> {
+    result
+        .end_summary_jump_functions()
+        .map(|(summary, function)| {
+            let entry_fact = *result
+                .fact_result()
+                .fact(summary.entry().entry_fact())
+                .expect("summary entry fact resolves");
+            let exit_fact = *result
+                .fact_result()
+                .fact(summary.exit_fact())
+                .expect("summary exit fact resolves");
+            (
+                (
+                    summary.entry().procedure().clone(),
+                    summary.entry().entry_point().id(),
+                    entry_fact,
+                    summary.exit_point().clone(),
+                    summary.exit_kind(),
+                    exit_fact,
+                ),
+                *function,
+            )
         })
         .collect()
 }
@@ -252,6 +416,7 @@ fn ide_dimension_work(work: SolverWork, dimension: SolverBudgetDimension) -> usi
         SolverBudgetDimension::EdgeFunctionOperations => work.edge_function_operations,
         SolverBudgetDimension::IdeValues => work.ide_values,
         SolverBudgetDimension::ValueOperations => work.value_operations,
+        SolverBudgetDimension::IdePropagations => work.ide_propagations,
         _ => panic!("{dimension:?} is not IDE-specific"),
     }
 }
@@ -263,6 +428,7 @@ fn set_ide_dimension_limit(work: &mut SolverWork, dimension: SolverBudgetDimensi
         SolverBudgetDimension::EdgeFunctionOperations => work.edge_function_operations = limit,
         SolverBudgetDimension::IdeValues => work.ide_values = limit,
         SolverBudgetDimension::ValueOperations => work.value_operations = limit,
+        SolverBudgetDimension::IdePropagations => work.ide_propagations = limit,
         _ => panic!("{dimension:?} is not IDE-specific"),
     }
 }
@@ -282,19 +448,67 @@ fn solve_with_controls(
     solver_budget: &mut SolverBudget,
     cancellation: &CancellationToken,
 ) -> QualifierResult {
-    let mut semantic_budget = SemanticBudget::default();
     let seeds = [IdeDataflowSeed::new(
         QualifierFact::Tracked,
         Qualifier::Clean,
     )];
-    solve_ide_with_summaries(
-        IdeSummarySolveInput::new(root, &seeds),
+    solve_problem_with_controls(
+        root,
         provider,
         &QualifierProblem::default(),
+        &seeds,
+        solver_budget,
+        cancellation,
+    )
+}
+
+fn solve_problem_with_controls(
+    root: &brokk_bifrost::analyzer::semantic::ProcedureHandle,
+    provider: &impl brokk_bifrost::analyzer::semantic::IcfgProvider,
+    problem: &QualifierProblem,
+    seeds: &[IdeDataflowSeed<QualifierFact, Qualifier>],
+    solver_budget: &mut SolverBudget,
+    cancellation: &CancellationToken,
+) -> QualifierResult {
+    let mut semantic_budget = SemanticBudget::default();
+    solve_ide_with_summaries(
+        IdeSummarySolveInput::new(root, seeds),
+        provider,
+        problem,
         &mut semantic_budget,
         &mut DataflowRequest::new(solver_budget, cancellation),
     )
     .expect("valid IDE fixture")
+}
+
+fn assert_matches_reference(
+    root: &ProcedureHandle,
+    provider: &impl IcfgProvider,
+    result: &QualifierResult,
+) {
+    let seeds = [IdeDataflowSeed::new(
+        QualifierFact::Tracked,
+        Qualifier::Clean,
+    )];
+    let mut reference_budget =
+        SemanticBudget::uniform(100_000_000).expect("positive reference budget");
+    let reference = reference_ide_projection(
+        root,
+        &seeds,
+        provider,
+        &QualifierProblem::default(),
+        &mut reference_budget,
+    )
+    .expect("IDE reference reaches a fixed point");
+    assert_eq!(point_value_projection(result), *reference.point_values());
+    assert_eq!(
+        reached_function_projection(result),
+        *reference.reached_functions()
+    );
+    assert_eq!(
+        summary_function_projection(result),
+        *reference.summary_functions()
+    );
 }
 
 #[test]
@@ -381,6 +595,97 @@ fn branch_functions_meet_at_the_join_independently_of_path_order() {
 }
 
 #[test]
+fn provider_and_callback_permutations_produce_the_same_ide_result() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/Permutation.java",
+            r#"
+                class Permutation {
+                    static int left(String value) { return 1; }
+                    static int left(Object value) { return 2; }
+                    static int root() { return left("x"); }
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let root = resolve_procedure_handle(
+        &project,
+        &analyzer,
+        "src/Permutation.java",
+        PointSelector::new("static int root")
+            .procedure("root")
+            .effect("entry"),
+    );
+    let forward_provider = ReversingProvider {
+        inner: analyzer.icfg_provider(),
+        reverse: false,
+    };
+    let reverse_provider = ReversingProvider {
+        inner: analyzer.icfg_provider(),
+        reverse: true,
+    };
+    let semantic_call = root
+        .semantics()
+        .call_sites()
+        .first()
+        .expect("permutation fixture retains one call");
+    let cancellation = CancellationToken::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let provider_outcome = forward_provider
+        .call_transfers(
+            &root,
+            semantic_call.id,
+            &mut SemanticRequest::new(&mut semantic_budget, &cancellation),
+        )
+        .expect("permutation fixture transfers");
+    assert!(
+        provider_outcome
+            .available_value()
+            .expect("permutation fixture retains transfer payload")
+            .transfers
+            .len()
+            > 1,
+        "the reversal must exercise a genuinely multi-target provider relation",
+    );
+
+    let seeds = [IdeDataflowSeed::new(
+        QualifierFact::Tracked,
+        Qualifier::Clean,
+    )];
+    let forward_problem = QualifierProblem {
+        duplicate_normal_outputs: true,
+        reverse_duplicate_normal_outputs: false,
+        ..QualifierProblem::default()
+    };
+    let reverse_problem = QualifierProblem {
+        duplicate_normal_outputs: true,
+        reverse_duplicate_normal_outputs: true,
+        ..QualifierProblem::default()
+    };
+    let mut forward_budget = SolverBudget::default();
+    let forward = solve_problem_with_controls(
+        &root,
+        &forward_provider,
+        &forward_problem,
+        &seeds,
+        &mut forward_budget,
+        &cancellation,
+    );
+    let mut reverse_budget = SolverBudget::default();
+    let reverse = solve_problem_with_controls(
+        &root,
+        &reverse_provider,
+        &reverse_problem,
+        &seeds,
+        &mut reverse_budget,
+        &cancellation,
+    );
+
+    assert_eq!(forward, reverse);
+}
+
+#[test]
 fn each_ide_budget_dimension_returns_a_typed_atomic_partial_result() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
@@ -409,6 +714,7 @@ fn each_ide_budget_dimension_returns_a_typed_atomic_partial_result() {
         SolverBudgetDimension::EdgeFunctionOperations,
         SolverBudgetDimension::IdeValues,
         SolverBudgetDimension::ValueOperations,
+        SolverBudgetDimension::IdePropagations,
     ];
 
     for dimension in dimensions {
@@ -435,6 +741,16 @@ fn each_ide_budget_dimension_returns_a_typed_atomic_partial_result() {
             result.fact_result().termination(),
             SolverTermination::FixedPoint,
             "the completed fact topology remains available",
+        );
+        assert_eq!(
+            result.fact_result().reached(),
+            baseline.fact_result().reached(),
+            "IDE exhaustion must not truncate the completed fact topology",
+        );
+        assert_eq!(
+            result.fact_result().end_summaries(),
+            baseline.fact_result().end_summaries(),
+            "IDE exhaustion must not truncate fact summaries",
         );
     }
 }
@@ -491,6 +807,109 @@ fn capture_meet_budget_stops_before_running_client_algebra() {
         SolverBudgetDimension::EdgeFunctionOperations,
     );
     assert!(result.point_values().is_empty());
+}
+
+#[test]
+fn seed_fact_and_value_limits_stop_before_unbounded_value_algebra() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", "pub fn root(value: i32) -> i32 { value + 1 }\n")
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let root = resolve_procedure_handle(
+        &project,
+        &analyzer,
+        "lib.rs",
+        PointSelector::new("pub fn root")
+            .procedure("root")
+            .effect("entry"),
+    );
+    let provider = analyzer.icfg_provider();
+
+    let distinct_seeds = [
+        IdeDataflowSeed::new(QualifierFact::Tracked, Qualifier::Clean),
+        IdeDataflowSeed::new(QualifierFact::Alternate, Qualifier::Dirty),
+    ];
+    let mut fact_limits = SolverBudget::default().limits();
+    fact_limits.interned_facts = 2;
+    let cancellation = CancellationToken::default();
+    let fact_limited = solve_problem_with_controls(
+        &root,
+        &provider,
+        &QualifierProblem::default(),
+        &distinct_seeds,
+        &mut SolverBudget::new(fact_limits),
+        &cancellation,
+    );
+    let fact_exceeded = fact_limited
+        .termination()
+        .budget_exceeded()
+        .expect("the second explicit fact exceeds the seed fact cap");
+    assert_eq!(
+        fact_exceeded.dimension(),
+        SolverBudgetDimension::InternedFacts
+    );
+    assert_eq!(
+        fact_limited.fact_result().termination(),
+        fact_limited.termination()
+    );
+    assert!(fact_limited.point_values().is_empty());
+
+    let value_meets = Rc::new(Cell::new(0));
+    let value_problem = QualifierProblem {
+        value_meets: Some(Rc::clone(&value_meets)),
+        ..QualifierProblem::default()
+    };
+    let duplicate_seeds = [
+        IdeDataflowSeed::new(QualifierFact::Tracked, Qualifier::Clean),
+        IdeDataflowSeed::new(QualifierFact::Tracked, Qualifier::Dirty),
+    ];
+    let mut value_limits = SolverBudget::default().limits();
+    value_limits.value_operations = 0;
+    let value_limited = solve_problem_with_controls(
+        &root,
+        &provider,
+        &value_problem,
+        &duplicate_seeds,
+        &mut SolverBudget::new(value_limits),
+        &cancellation,
+    );
+    assert_eq!(value_meets.get(), 0);
+    assert_eq!(
+        value_limited.fact_result().termination(),
+        SolverTermination::FixedPoint
+    );
+    assert_eq!(
+        value_limited
+            .termination()
+            .budget_exceeded()
+            .expect("the duplicate seed requires one value meet")
+            .dimension(),
+        SolverBudgetDimension::ValueOperations,
+    );
+    assert!(value_limited.point_values().is_empty());
+
+    let cancelled_value_meets = Rc::new(Cell::new(0));
+    let cancelled_problem = QualifierProblem {
+        value_meets: Some(Rc::clone(&cancelled_value_meets)),
+        ..QualifierProblem::default()
+    };
+    let cancelled = CancellationToken::default();
+    cancelled.cancel();
+    let mut cancelled_budget = SolverBudget::uniform(0);
+    let cancelled_result = solve_problem_with_controls(
+        &root,
+        &provider,
+        &cancelled_problem,
+        &duplicate_seeds,
+        &mut cancelled_budget,
+        &cancelled,
+    );
+    assert_eq!(cancelled_value_meets.get(), 0);
+    assert_eq!(cancelled_result.termination(), SolverTermination::Cancelled);
+    assert_eq!(
+        cancelled_result.fact_result().termination(),
+        SolverTermination::Cancelled
+    );
 }
 
 #[test]
@@ -607,12 +1026,26 @@ fn helper_summary_composes_call_body_and_exact_return_in_path_order() {
         value_at(&result, &continuation, QualifierFact::Tracked),
         Qualifier::Top
     );
+    let callee_entry_value = result
+        .point_values()
+        .iter()
+        .find(|row| {
+            row.entry().procedure() != &root
+                && row.point() == row.entry().entry_point()
+                && result.fact_result().fact(row.fact()).copied() == Some(QualifierFact::Tracked)
+        })
+        .and_then(|row| result.value(row.value()))
+        .copied()
+        .expect("the helper entry exposes its propagated IDE value");
+    assert_eq!(callee_entry_value, Qualifier::Dirty);
     assert!(result.metrics().summary_relations > 0);
+    assert!(result.metrics().entry_value_relations > 0);
     assert!(result.metrics().summary_function_applications > 0);
     assert_eq!(
         result.end_summary_jump_functions().count(),
         result.fact_result().end_summaries().len(),
     );
+    assert_matches_reference(&root, &analyzer.icfg_provider(), &result);
 }
 
 #[test]
@@ -715,6 +1148,7 @@ fn exceptional_return_uses_its_exact_continuation_and_function_family() {
         value_at(&result, &continuation, QualifierFact::Tracked),
         Qualifier::Clean,
     );
+    assert_matches_reference(&root, &analyzer.icfg_provider(), &result);
     assert!(result.metrics().summary_relations > 0);
 }
 
@@ -818,6 +1252,14 @@ fn recursive_function_improvements_match_the_repeated_scan_reference() {
 
     assert_eq!(result.termination(), SolverTermination::FixedPoint);
     assert_eq!(point_value_projection(&result), *reference.point_values());
+    assert_eq!(
+        reached_function_projection(&result),
+        *reference.reached_functions()
+    );
+    assert_eq!(
+        summary_function_projection(&result),
+        *reference.summary_functions()
+    );
     assert!(result.metrics().meet_cache_misses > 0);
     assert!(result.metrics().summary_function_applications > 1);
 }
@@ -881,6 +1323,7 @@ fn two_callers_reuse_one_relative_summary_function() {
     );
     assert!(result.metrics().reused_summary_functions > 0);
     assert!(result.metrics().summary_relations >= 2);
+    assert_matches_reference(&root, &provider, &result);
 }
 
 #[test]
@@ -928,5 +1371,13 @@ fn mutual_recursion_matches_the_repeated_scan_reference() {
     .expect("mutual-recursion IDE reference reaches a fixed point");
 
     assert_eq!(point_value_projection(&result), *reference.point_values());
+    assert_eq!(
+        reached_function_projection(&result),
+        *reference.reached_functions()
+    );
+    assert_eq!(
+        summary_function_projection(&result),
+        *reference.summary_functions()
+    );
     assert!(result.metrics().summary_function_applications >= 2);
 }

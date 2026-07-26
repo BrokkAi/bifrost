@@ -7,7 +7,8 @@ use crate::analyzer::semantic::{ProgramPointHandle, SemanticWork};
 
 use super::{
     FactId, PathQualityFrontier, SolverTermination, SolverWork, SummaryCoverage,
-    SummaryDataflowError, SummaryDataflowResult, SummaryReachedFact, TabulationEndSummary,
+    SummaryDataflowError, SummaryDataflowResult, SummaryEntry, SummaryReachedFact,
+    TabulationEndSummary,
 };
 
 define_dense_id! {
@@ -35,6 +36,7 @@ define_dense_id! {
 /// One deterministic final value at a root-relative `(point, fact)` state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IdePointValue {
+    entry: SummaryEntry,
     point: ProgramPointHandle,
     fact: FactId,
     value: IdeValueId,
@@ -43,17 +45,23 @@ pub struct IdePointValue {
 
 impl IdePointValue {
     pub(crate) const fn new(
+        entry: SummaryEntry,
         point: ProgramPointHandle,
         fact: FactId,
         value: IdeValueId,
         path_qualities: PathQualityFrontier,
     ) -> Self {
         Self {
+            entry,
             point,
             fact,
             value,
             path_qualities,
         }
+    }
+
+    pub const fn entry(&self) -> &SummaryEntry {
+        &self.entry
     }
 
     pub const fn point(&self) -> &ProgramPointHandle {
@@ -79,6 +87,7 @@ pub struct IdeMetrics {
     pub captured_relations: usize,
     pub direct_relations: usize,
     pub summary_relations: usize,
+    pub entry_value_relations: usize,
     pub jump_updates: usize,
     pub composition_cache_hits: usize,
     pub composition_cache_misses: usize,

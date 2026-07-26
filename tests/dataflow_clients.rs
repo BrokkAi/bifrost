@@ -417,6 +417,7 @@ fn budget_with_limit(dimension: SolverBudgetDimension, limit: usize) -> SolverBu
         }
         SolverBudgetDimension::IdeValues => limits.ide_values = limit,
         SolverBudgetDimension::ValueOperations => limits.value_operations = limit,
+        SolverBudgetDimension::IdePropagations => limits.ide_propagations = limit,
     }
     SolverBudget::new(limits)
 }

@@ -206,6 +206,7 @@ impl<'input, Fact, Value> IdeSummarySolveInput<'input, Fact, Value> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TransferKey<Fact> {
     edge: ProcedureIcfgEdge,
+    call_transfer: Option<CallTransfer>,
     input: Fact,
 }
 
@@ -215,24 +216,33 @@ struct TraceOutput<Fact, EdgeFunction> {
     function: EdgeFunction,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct InternedTraceOutput<Fact> {
+    fact: Fact,
+    function: usize,
+}
+
 struct CollectedTransitions<Fact, EdgeFunction> {
     outputs: Vec<TraceOutput<Fact, EdgeFunction>>,
     capture_meets: usize,
 }
 
 #[derive(Debug, Clone)]
-struct TraceRecord<Fact, EdgeFunction> {
+struct TraceRecord<Fact> {
     key: TransferKey<Fact>,
-    outputs: Vec<TraceOutput<Fact, EdgeFunction>>,
+    outputs: Vec<InternedTraceOutput<Fact>>,
 }
 
 #[derive(Debug)]
 struct IdeTrace<Fact, EdgeFunction> {
-    records: Vec<TraceRecord<Fact, EdgeFunction>>,
+    records: Vec<TraceRecord<Fact>>,
     ids: HashMap<TransferKey<Fact>, usize>,
+    functions: Vec<EdgeFunction>,
+    function_ids: HashMap<EdgeFunction, usize>,
     retained_relations: usize,
     relation_limit: usize,
     capture_operation_limit: usize,
+    function_limit: usize,
     attempted_work: Option<SolverWork>,
     capture_meets: usize,
 }
@@ -240,21 +250,24 @@ struct IdeTrace<Fact, EdgeFunction> {
 impl<Fact, EdgeFunction> IdeTrace<Fact, EdgeFunction>
 where
     Fact: Copy + Eq + Hash,
-    EdgeFunction: Clone,
+    EdgeFunction: Clone + Eq + Hash,
 {
-    fn new(relation_limit: usize, capture_operation_limit: usize) -> Self {
+    fn new(relation_limit: usize, capture_operation_limit: usize, function_limit: usize) -> Self {
         Self {
             records: Vec::new(),
             ids: HashMap::default(),
+            functions: Vec::new(),
+            function_ids: HashMap::default(),
             retained_relations: 0,
             relation_limit,
             capture_operation_limit,
+            function_limit,
             attempted_work: None,
             capture_meets: 0,
         }
     }
 
-    fn get(&self, key: &TransferKey<Fact>) -> Option<&[TraceOutput<Fact, EdgeFunction>]> {
+    fn get(&self, key: &TransferKey<Fact>) -> Option<&[InternedTraceOutput<Fact>]> {
         let id = self.ids.get(key).copied()?;
         Some(&self.records[id].outputs)
     }
@@ -291,6 +304,15 @@ where
         });
     }
 
+    fn mark_functions_exhausted(&mut self, attempted_functions: usize) {
+        self.attempted_work = Some(SolverWork {
+            ide_relations: self.retained_relations,
+            edge_function_operations: self.capture_meets,
+            edge_functions: attempted_functions,
+            ..SolverWork::default()
+        });
+    }
+
     fn insert(
         &mut self,
         key: TransferKey<Fact>,
@@ -299,6 +321,34 @@ where
     ) {
         debug_assert!(!self.ids.contains_key(&key));
         debug_assert!(self.retained_relations.saturating_add(outputs.len()) <= self.relation_limit);
+        let new_functions = outputs
+            .iter()
+            .filter(|output| !self.function_ids.contains_key(&output.function))
+            .map(|output| &output.function)
+            .collect::<HashSet<_>>()
+            .len();
+        let attempted_functions = self.functions.len().saturating_add(new_functions);
+        if attempted_functions > self.function_limit {
+            self.mark_functions_exhausted(attempted_functions);
+            return;
+        }
+        let outputs: Vec<InternedTraceOutput<Fact>> = outputs
+            .into_iter()
+            .map(|output| {
+                let function = if let Some(id) = self.function_ids.get(&output.function).copied() {
+                    id
+                } else {
+                    let id = self.functions.len();
+                    self.functions.push(output.function.clone());
+                    self.function_ids.insert(output.function, id);
+                    id
+                };
+                InternedTraceOutput {
+                    fact: output.fact,
+                    function,
+                }
+            })
+            .collect();
         let id = self.records.len();
         self.retained_relations = self.retained_relations.saturating_add(outputs.len());
         self.capture_meets = self.capture_meets.saturating_add(capture_meets);
@@ -372,10 +422,7 @@ where
     Problem: IdeDataflowProblem,
 {
     fn should_continue(&self) -> bool {
-        !self.stopped
-            && !self.relation_overflowed
-            && !self.operation_overflowed
-            && self.fact_output.should_continue()
+        !self.stopped && self.fact_output.should_continue()
     }
 
     fn emit(&mut self, transition: IdeTransition<Problem::Fact, Problem::EdgeFunction>) -> bool {
@@ -384,13 +431,16 @@ where
             return false;
         }
         let (fact, function) = transition.into_parts();
+        if self.relation_overflowed || self.operation_overflowed {
+            return self.fact_output.emit(fact);
+        }
         if let Some(existing) = self.transitions.get(&fact) {
             if existing == &function {
                 return true;
             }
             if self.capture_meets >= self.max_meets {
                 self.operation_overflowed = true;
-                return false;
+                return self.fact_output.should_continue();
             }
             let merged = if existing <= &function {
                 self.problem.meet_edge_functions(existing, &function)
@@ -403,7 +453,7 @@ where
         }
         if self.transitions.len() >= self.max_outputs {
             self.relation_overflowed = true;
-            return false;
+            return self.fact_output.emit(fact);
         }
         if !self.fact_output.emit(fact) {
             self.stopped = true;
@@ -430,10 +480,15 @@ where
         problem: &'problem Problem,
         relation_limit: usize,
         capture_operation_limit: usize,
+        function_limit: usize,
     ) -> Self {
         Self {
             problem,
-            trace: RefCell::new(IdeTrace::new(relation_limit, capture_operation_limit)),
+            trace: RefCell::new(IdeTrace::new(
+                relation_limit,
+                capture_operation_limit,
+                function_limit,
+            )),
         }
     }
 
@@ -451,9 +506,11 @@ where
     ) {
         let key = TransferKey {
             edge: owned_edge(edge),
+            call_transfer: edge.call_transfer().cloned(),
             input: fact,
         };
-        if let Some(cached) = self.trace.borrow().get(&key).map(<[_]>::to_vec) {
+        let trace = self.trace.borrow();
+        if let Some(cached) = trace.get(&key) {
             for output in cached {
                 if !out.emit(output.fact) {
                     break;
@@ -461,6 +518,7 @@ where
             }
             return;
         }
+        drop(trace);
 
         let remaining = self.trace.borrow().remaining_relations();
         let remaining_operations = self.trace.borrow().remaining_capture_operations();
@@ -559,27 +617,36 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct RawDirectRelation<EdgeFunction> {
+struct RawDirectRelation {
     source: usize,
     target: usize,
-    function: EdgeFunction,
+    function: IdeEdgeFunctionId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct RawSummaryRelation<EdgeFunction> {
+struct RawSummaryRelation {
     caller: usize,
     callee_exit: usize,
     target: usize,
     end_summary: usize,
-    call_function: EdgeFunction,
-    return_function: EdgeFunction,
+    call_function: IdeEdgeFunctionId,
+    return_function: IdeEdgeFunctionId,
 }
 
-struct RawIdeGraph<EdgeFunction> {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RawEntryValueRelation {
+    caller: usize,
+    target_entry: usize,
+    function: IdeEdgeFunctionId,
+}
+
+struct RawIdeGraph {
     row_count: usize,
-    direct: Vec<RawDirectRelation<EdgeFunction>>,
-    summaries: Vec<RawSummaryRelation<EdgeFunction>>,
+    direct: Vec<RawDirectRelation>,
+    summaries: Vec<RawSummaryRelation>,
+    entry_values: Vec<RawEntryValueRelation>,
     entry_rows: Vec<usize>,
+    row_entries: Vec<usize>,
     end_summary_exit_rows: Vec<usize>,
     reused_summary_functions: usize,
 }
@@ -599,11 +666,20 @@ struct SummaryRelation {
     return_function: IdeEdgeFunctionId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct EntryValueRelation {
+    caller: usize,
+    target_entry: usize,
+    function: IdeEdgeFunctionId,
+}
+
 struct IdeGraph {
     direct_by_source: Vec<Vec<DirectRelation>>,
     summaries: Vec<SummaryRelation>,
     summaries_by_dependency: Vec<Vec<usize>>,
+    entry_values_by_entry: Vec<Vec<EntryValueRelation>>,
     entry_rows: Vec<usize>,
+    row_entries: Vec<usize>,
     end_summary_exit_rows: Vec<usize>,
 }
 
@@ -668,6 +744,17 @@ where
         self.functions.push(function.clone());
         self.ids.insert(function, id);
         Ok(id)
+    }
+
+    fn intern_ref(
+        &mut self,
+        function: &EdgeFunction,
+        request: &mut DataflowRequest<'_>,
+    ) -> Result<IdeEdgeFunctionId, IdeRunFailure> {
+        if let Some(id) = self.ids.get(function).copied() {
+            return Ok(id);
+        }
+        self.intern(function.clone(), request)
     }
 
     fn compose<Problem>(
@@ -790,6 +877,93 @@ where
     }
 }
 
+struct ValueArena<Value> {
+    values: Vec<Value>,
+    ids: HashMap<Value, IdeValueId>,
+}
+
+impl<Value> ValueArena<Value>
+where
+    Value: Clone + Eq + Hash + Ord,
+{
+    fn new() -> Self {
+        Self {
+            values: Vec::new(),
+            ids: HashMap::default(),
+        }
+    }
+
+    fn intern(
+        &mut self,
+        value: Value,
+        request: &mut DataflowRequest<'_>,
+    ) -> Result<IdeValueId, IdeRunFailure> {
+        if let Some(id) = self.ids.get(&value).copied() {
+            return Ok(id);
+        }
+        let index = self.values.len();
+        let id = IdeValueId::try_from_index(index)
+            .map_err(|_| IdeDataflowError::ValueIdOverflow { index })?;
+        reserve_ide_work(
+            SolverWork {
+                ide_values: 1,
+                ..SolverWork::default()
+            },
+            request,
+        )?;
+        self.values.push(value.clone());
+        self.ids.insert(value, id);
+        Ok(id)
+    }
+
+    fn intern_ref(
+        &mut self,
+        value: &Value,
+        request: &mut DataflowRequest<'_>,
+    ) -> Result<IdeValueId, IdeRunFailure> {
+        if let Some(id) = self.ids.get(value).copied() {
+            return Ok(id);
+        }
+        self.intern(value.clone(), request)
+    }
+
+    fn get(&self, id: IdeValueId) -> &Value {
+        &self.values[id.index()]
+    }
+
+    fn into_sorted_parts(
+        self,
+        pending: &mut [PendingPointValue],
+    ) -> Result<Vec<Value>, IdeDataflowError> {
+        let mut sorted = self.values.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let ids = sorted
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, value)| {
+                IdeValueId::try_from_index(index)
+                    .map(|id| (value, id))
+                    .map_err(|_| IdeDataflowError::ValueIdOverflow { index })
+            })
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        let remap = self
+            .values
+            .iter()
+            .map(|value| {
+                ids.get(value).copied().ok_or(IdeDataflowError::Invariant(
+                    "sorted IDE value table omitted an interned value",
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for row in pending {
+            row.value = remap[row.value.index()];
+        }
+        Ok(sorted)
+    }
+}
+
 #[derive(Debug)]
 enum IdeRunFailure {
     Terminated(SolverTermination),
@@ -814,7 +988,6 @@ struct CompleteIdePhase<Value, EdgeFunction> {
     reached_functions: Vec<Option<IdeEdgeFunctionId>>,
     summary_functions: Vec<Option<IdeEdgeFunctionId>>,
     point_values: Vec<IdePointValue>,
-    metrics: IdeMetrics,
 }
 
 type IdeSolveOutcome<Problem> = Result<
@@ -826,11 +999,8 @@ type IdeSolveOutcome<Problem> = Result<
     IdeDataflowError,
 >;
 
-struct CanonicalSeeds<Fact, Value> {
+struct BoundedSeedFacts<Fact> {
     facts: Vec<Fact>,
-    values: HashMap<Fact, Value>,
-    value_operations: usize,
-    attempted_value_operations: Option<usize>,
 }
 
 /// Solve one finite IDE problem through the existing summary-driven fact
@@ -848,15 +1018,16 @@ where
 {
     let initial_work = request.budget.used();
     let initial_semantic_work = semantic_budget.used();
+    let seed_facts = bounded_seed_facts::<Problem>(&input, problem.zero_fact(), request);
     let remaining = request.budget.remaining();
-    let canonical_seeds = canonical_seed_values(&input, problem, remaining.value_operations);
     let adapter = IdeFactAdapter::new(
         problem,
         remaining.ide_relations,
         remaining.edge_function_operations,
+        remaining.edge_functions,
     );
     let fact_result = solve_with_summaries(
-        SummarySolveInput::new(input.root(), &canonical_seeds.facts)
+        SummarySolveInput::new(input.root(), &seed_facts.facts)
             .with_witness_retention(input.witness_retention()),
         provider,
         &adapter,
@@ -864,6 +1035,10 @@ where
         request,
     )?;
     let trace = adapter.into_trace();
+    let mut metrics = IdeMetrics {
+        captured_relations: trace.retained_relations,
+        ..IdeMetrics::default()
+    };
 
     if !fact_result.termination().is_fixed_point() {
         return Ok(empty_ide_result(
@@ -873,17 +1048,10 @@ where
             semantic_budget,
             request,
             None,
+            metrics,
         ));
     }
-    if trace.attempted_work.is_some() || canonical_seeds.attempted_value_operations.is_some() {
-        let mut attempted = trace.attempted_work.unwrap_or(SolverWork {
-            ide_relations: trace.retained_relations,
-            edge_function_operations: trace.capture_meets,
-            ..SolverWork::default()
-        });
-        attempted.value_operations = canonical_seeds
-            .attempted_value_operations
-            .unwrap_or(canonical_seeds.value_operations);
+    if let Some(attempted) = trace.attempted_work {
         let termination = request
             .reserve(attempted)
             .expect("an IDE capture beyond its remaining work limit must stop");
@@ -894,12 +1062,12 @@ where
             semantic_budget,
             request,
             Some(termination),
+            metrics,
         ));
     }
     if let Some(termination) = request.reserve(SolverWork {
         ide_relations: trace.retained_relations,
         edge_function_operations: trace.capture_meets,
-        value_operations: canonical_seeds.value_operations,
         ..SolverWork::default()
     }) {
         return Ok(empty_ide_result(
@@ -909,16 +1077,32 @@ where
             semantic_budget,
             request,
             Some(termination),
+            metrics,
         ));
     }
+    let seed_values = match canonical_seed_values(&input, problem, request) {
+        Ok(values) => values,
+        Err(termination) => {
+            return Ok(empty_ide_result(
+                fact_result,
+                initial_work,
+                initial_semantic_work,
+                semantic_budget,
+                request,
+                Some(termination),
+                metrics,
+            ));
+        }
+    };
 
     let phase = match run_ide_phase(
         input.root(),
-        &canonical_seeds.values,
+        &seed_values,
         problem,
         &fact_result,
         &trace,
         request,
+        &mut metrics,
     ) {
         Ok(phase) => phase,
         Err(IdeRunFailure::Fatal(error)) => return Err(error),
@@ -930,6 +1114,7 @@ where
                 semantic_budget,
                 request,
                 Some(termination),
+                metrics,
             ));
         }
     };
@@ -945,58 +1130,92 @@ where
         SolverTermination::FixedPoint,
         work,
         semantic_work,
-        phase.metrics,
+        metrics,
     ))
+}
+
+fn bounded_seed_facts<Problem>(
+    input: &IdeSummarySolveInput<'_, Problem::Fact, Problem::Value>,
+    zero_fact: Problem::Fact,
+    request: &DataflowRequest<'_>,
+) -> BoundedSeedFacts<Problem::Fact>
+where
+    Problem: IdeDataflowProblem,
+{
+    let mut facts = Vec::new();
+    let mut unique_facts = HashSet::default();
+    unique_facts.insert(zero_fact);
+    let mut callback_rows = 0usize;
+    for seed in input.seeds() {
+        if request.cancellation.is_cancelled() {
+            break;
+        }
+        callback_rows = callback_rows.saturating_add(1);
+        let fact = *seed.fact();
+        let prospective_facts = unique_facts
+            .len()
+            .saturating_add(usize::from(!unique_facts.contains(&fact)));
+        if request
+            .budget
+            .check(SolverWork {
+                interned_facts: prospective_facts,
+                reached_states: prospective_facts,
+                callback_rows,
+                ..SolverWork::default()
+            })
+            .is_err()
+        {
+            // Retain the triggering row so summary initialization reports the
+            // same typed limit without materializing any semantic provider.
+            facts.push(fact);
+            break;
+        }
+        unique_facts.insert(fact);
+        facts.push(fact);
+    }
+    BoundedSeedFacts { facts }
 }
 
 fn canonical_seed_values<Problem>(
     input: &IdeSummarySolveInput<'_, Problem::Fact, Problem::Value>,
     problem: &Problem,
-    operation_limit: usize,
-) -> CanonicalSeeds<Problem::Fact, Problem::Value>
+    request: &mut DataflowRequest<'_>,
+) -> Result<HashMap<Problem::Fact, Problem::Value>, SolverTermination>
 where
     Problem: IdeDataflowProblem,
 {
-    let zero = problem.zero_fact();
-    let mut rows = input.seeds().to_vec();
-    rows.sort_unstable_by(|left, right| {
-        left.fact()
-            .cmp(right.fact())
-            .then_with(|| left.value().cmp(right.value()))
-    });
     let mut values = HashMap::default();
-    values.insert(zero, problem.zero_value());
-    let mut operations = 0usize;
-    let mut attempted_operations = None;
-    for seed in rows {
-        let (fact, value) = seed.into_parts();
+    values.insert(problem.zero_fact(), problem.zero_value());
+    for seed in input.seeds() {
+        if request.cancellation.is_cancelled() {
+            return Err(SolverTermination::Cancelled);
+        }
+        let fact = *seed.fact();
+        let value = seed.value();
         if let Some(existing) = values.get(&fact) {
-            if existing == &value {
+            if existing == value {
                 continue;
             }
-            if operations >= operation_limit {
-                attempted_operations = Some(operations.saturating_add(1));
-                continue;
+            if let Some(termination) = request.reserve(SolverWork {
+                value_operations: 1,
+                ..SolverWork::default()
+            }) {
+                return Err(termination);
             }
-            let merged = if existing <= &value {
-                problem.meet_values(existing, &value)
+            let merged = if existing <= value {
+                problem.meet_values(existing, value)
             } else {
-                problem.meet_values(&value, existing)
+                problem.meet_values(value, existing)
             };
-            operations = operations.saturating_add(1);
+            if request.cancellation.is_cancelled() {
+                return Err(SolverTermination::Cancelled);
+            }
             values.insert(fact, merged);
         } else {
-            values.insert(fact, value);
+            values.insert(fact, value.clone());
         }
     }
-    let mut facts = values.keys().copied().collect::<Vec<_>>();
-    facts.sort_unstable();
-    CanonicalSeeds {
-        facts,
-        values,
-        value_operations: operations,
-        attempted_value_operations: attempted_operations,
-    }
+    Ok(values)
 }
 
 fn run_ide_phase<Problem>(
@@ -1006,15 +1225,18 @@ fn run_ide_phase<Problem>(
     fact_result: &SummaryDataflowResult<Problem::Fact>,
     trace: &IdeTrace<Problem::Fact, Problem::EdgeFunction>,
     request: &mut DataflowRequest<'_>,
+    metrics: &mut IdeMetrics,
 ) -> Result<CompleteIdePhase<Problem::Value, Problem::EdgeFunction>, IdeRunFailure>
 where
     Problem: IdeDataflowProblem,
 {
-    let raw_graph = build_raw_graph(fact_result, trace, request)?;
+    let mut functions = FunctionArena::new(problem, request)?;
+    let raw_graph = build_raw_graph(fact_result, trace, &mut functions, request)?;
     let relation_count = raw_graph
         .direct
         .len()
-        .saturating_add(raw_graph.summaries.len());
+        .saturating_add(raw_graph.summaries.len())
+        .saturating_add(raw_graph.entry_values.len());
     reserve_ide_work(
         SolverWork {
             ide_relations: relation_count,
@@ -1023,14 +1245,11 @@ where
         request,
     )?;
 
-    let mut metrics = IdeMetrics {
-        captured_relations: trace.retained_relations,
-        direct_relations: raw_graph.direct.len(),
-        summary_relations: raw_graph.summaries.len(),
-        reused_summary_functions: raw_graph.reused_summary_functions,
-        ..IdeMetrics::default()
-    };
-    let (graph, mut functions) = intern_graph(raw_graph, problem, request)?;
+    metrics.direct_relations = raw_graph.direct.len();
+    metrics.summary_relations = raw_graph.summaries.len();
+    metrics.entry_value_relations = raw_graph.entry_values.len();
+    metrics.reused_summary_functions = raw_graph.reused_summary_functions;
+    let graph = build_graph(raw_graph);
     let mut jumps = vec![None; fact_result.reached().len()];
     let mut worklist = VecDeque::new();
     let mut queued = vec![false; jumps.len()];
@@ -1049,13 +1268,9 @@ where
             "queued IDE state has no jump function",
         ))?;
         for relation in graph.direct_by_source[source].iter().copied() {
-            let candidate = functions.compose(
-                source_jump,
-                relation.function,
-                problem,
-                request,
-                &mut metrics,
-            )?;
+            reserve_ide_propagation(request)?;
+            let candidate =
+                functions.compose(source_jump, relation.function, problem, request, metrics)?;
             publish_jump(
                 relation.target,
                 candidate,
@@ -1063,12 +1278,13 @@ where
                 &mut functions,
                 problem,
                 request,
-                &mut metrics,
+                metrics,
                 &mut worklist,
                 &mut queued,
             )?;
         }
         for relation_id in graph.summaries_by_dependency[source].iter().copied() {
+            reserve_ide_propagation(request)?;
             let relation = graph.summaries[relation_id];
             let (Some(caller), Some(callee)) =
                 (jumps[relation.caller], jumps[relation.callee_exit])
@@ -1077,21 +1293,11 @@ where
             };
             metrics.summary_function_applications =
                 metrics.summary_function_applications.saturating_add(1);
-            let call = functions.compose(
-                caller,
-                relation.call_function,
-                problem,
-                request,
-                &mut metrics,
-            )?;
-            let summary = functions.compose(call, callee, problem, request, &mut metrics)?;
-            let candidate = functions.compose(
-                summary,
-                relation.return_function,
-                problem,
-                request,
-                &mut metrics,
-            )?;
+            let call =
+                functions.compose(caller, relation.call_function, problem, request, metrics)?;
+            let summary = functions.compose(call, callee, problem, request, metrics)?;
+            let candidate =
+                functions.compose(summary, relation.return_function, problem, request, metrics)?;
             publish_jump(
                 relation.target,
                 candidate,
@@ -1099,7 +1305,7 @@ where
                 &mut functions,
                 problem,
                 request,
-                &mut metrics,
+                metrics,
                 &mut worklist,
                 &mut queued,
             )?;
@@ -1116,11 +1322,12 @@ where
         .iter()
         .map(|index| jumps[*index])
         .collect::<Vec<_>>();
-    let (values, point_values) = materialize_root_values(
+    let (values, point_values) = materialize_values(
         root,
         seed_values,
         problem,
         fact_result,
+        &graph,
         &jumps,
         &functions.functions,
         request,
@@ -1132,7 +1339,6 @@ where
         reached_functions: jumps,
         summary_functions,
         point_values,
-        metrics,
     })
 }
 
@@ -1171,21 +1377,12 @@ fn enqueue(row: usize, worklist: &mut VecDeque<usize>, queued: &mut [bool]) {
     }
 }
 
-fn intern_graph<Problem>(
-    raw: RawIdeGraph<Problem::EdgeFunction>,
-    problem: &Problem,
-    request: &mut DataflowRequest<'_>,
-) -> Result<(IdeGraph, FunctionArena<Problem::EdgeFunction>), IdeRunFailure>
-where
-    Problem: IdeDataflowProblem,
-{
-    let mut functions = FunctionArena::new(problem, request)?;
+fn build_graph(raw: RawIdeGraph) -> IdeGraph {
     let mut direct_by_source = vec![Vec::new(); raw.row_count];
     for relation in raw.direct {
-        let function = functions.intern(relation.function, request)?;
         direct_by_source[relation.source].push(DirectRelation {
             target: relation.target,
-            function,
+            function: relation.function,
         });
     }
     let mut summaries = Vec::with_capacity(raw.summaries.len());
@@ -1194,8 +1391,8 @@ where
             caller: relation.caller,
             callee_exit: relation.callee_exit,
             target: relation.target,
-            call_function: functions.intern(relation.call_function, request)?,
-            return_function: functions.intern(relation.return_function, request)?,
+            call_function: relation.call_function,
+            return_function: relation.return_function,
         });
     }
     let row_count = direct_by_source.len();
@@ -1206,23 +1403,32 @@ where
             summaries_by_dependency[relation.callee_exit].push(id);
         }
     }
-    Ok((
-        IdeGraph {
-            direct_by_source,
-            summaries,
-            summaries_by_dependency,
-            entry_rows: raw.entry_rows,
-            end_summary_exit_rows: raw.end_summary_exit_rows,
-        },
-        functions,
-    ))
+    let mut entry_values_by_entry = vec![Vec::new(); row_count];
+    for relation in raw.entry_values {
+        let caller_entry = raw.row_entries[relation.caller];
+        entry_values_by_entry[caller_entry].push(EntryValueRelation {
+            caller: relation.caller,
+            target_entry: relation.target_entry,
+            function: relation.function,
+        });
+    }
+    IdeGraph {
+        direct_by_source,
+        summaries,
+        summaries_by_dependency,
+        entry_values_by_entry,
+        entry_rows: raw.entry_rows,
+        row_entries: raw.row_entries,
+        end_summary_exit_rows: raw.end_summary_exit_rows,
+    }
 }
 
 fn build_raw_graph<Fact, EdgeFunction>(
     result: &SummaryDataflowResult<Fact>,
     trace: &IdeTrace<Fact, EdgeFunction>,
-    request: &DataflowRequest<'_>,
-) -> Result<RawIdeGraph<EdgeFunction>, IdeRunFailure>
+    functions: &mut FunctionArena<EdgeFunction>,
+    request: &mut DataflowRequest<'_>,
+) -> Result<RawIdeGraph, IdeRunFailure>
 where
     Fact: Copy + Eq + Hash + Ord,
     EdgeFunction: Clone + Eq + Hash + Ord,
@@ -1257,6 +1463,25 @@ where
             entry_rows.push(index);
         }
     }
+    let row_entries = result
+        .reached()
+        .iter()
+        .map(|reached| {
+            let entry_fact = result.fact(reached.entry().entry_fact()).copied().ok_or(
+                IdeDataflowError::Invariant("IDE entry fact ID is absent from its result"),
+            )?;
+            by_state
+                .get(&(
+                    reached.entry().clone(),
+                    reached.entry().entry_point().clone(),
+                    entry_fact,
+                ))
+                .copied()
+                .ok_or(IdeDataflowError::Invariant(
+                    "IDE reached row has no relative entry row",
+                ))
+        })
+        .collect::<Result<Vec<_>, IdeDataflowError>>()?;
     let mut summaries_by_entry = HashMap::<SummaryEntry, Vec<usize>>::default();
     let mut end_summary_exit_rows = Vec::with_capacity(result.end_summaries().len());
     for (index, summary) in result.end_summaries().iter().enumerate() {
@@ -1281,21 +1506,31 @@ where
 
     let mut direct = HashSet::default();
     let mut summaries = HashSet::default();
+    let mut entry_values = HashSet::default();
     let mut summary_uses = HashMap::<usize, usize>::default();
     for record in &trace.records {
-        if request.cancellation.is_cancelled() {
-            return Err(IdeRunFailure::Terminated(SolverTermination::Cancelled));
-        }
+        reserve_ide_propagation(request)?;
         let sources = by_point_fact
             .get(&(record.key.edge.source.clone(), record.key.input))
             .cloned()
             .unwrap_or_default();
         match record.key.edge.kind {
             IcfgEdgeKind::Call => {
-                let transfer = call_transfer_for_edge(&record.key.edge)?;
+                let transfer =
+                    record
+                        .key
+                        .call_transfer
+                        .as_ref()
+                        .ok_or(IdeDataflowError::Invariant(
+                            "captured call edge has no exact transfer",
+                        ))?;
                 for source in sources {
+                    reserve_ide_propagation(request)?;
                     let caller_entry = result.reached()[source].entry().clone();
                     for output in &record.outputs {
+                        reserve_ide_propagation(request)?;
+                        let call_function =
+                            functions.intern_ref(&trace.functions[output.function], request)?;
                         let output_id = fact_ids.get(&output.fact).copied().ok_or(
                             IdeDataflowError::Invariant(
                                 "captured call output fact was not interned",
@@ -1306,12 +1541,38 @@ where
                             transfer.callee_entry.clone(),
                             output_id,
                         );
+                        let target_entry = by_state
+                            .get(&(
+                                callee_entry.clone(),
+                                transfer.callee_entry.clone(),
+                                output.fact,
+                            ))
+                            .copied()
+                            .ok_or(IdeDataflowError::Invariant(
+                                "captured call output has no callee entry row",
+                            ))?;
+                        let entry_value = RawEntryValueRelation {
+                            caller: source,
+                            target_entry,
+                            function: call_function,
+                        };
+                        if !entry_values.contains(&entry_value) {
+                            ensure_relation_capacity(
+                                direct
+                                    .len()
+                                    .saturating_add(summaries.len())
+                                    .saturating_add(entry_values.len()),
+                                request,
+                            )?;
+                            entry_values.insert(entry_value);
+                        }
                         for end_summary in summaries_by_entry
                             .get(&callee_entry)
                             .into_iter()
                             .flatten()
                             .copied()
                         {
+                            reserve_ide_propagation(request)?;
                             let summary = &result.end_summaries()[end_summary];
                             let exit_fact = result.fact(summary.exit_fact()).copied().ok_or(
                                 IdeDataflowError::Invariant(
@@ -1320,19 +1581,23 @@ where
                             )?;
                             let projection = summary
                                 .exit()
-                                .project_matched_return(&transfer)
+                                .project_matched_return(transfer)
                                 .map_err(SummaryDataflowError::from)?;
                             let MatchedReturnProjection::Edge(return_edge) = projection else {
                                 continue;
                             };
                             let return_key = TransferKey {
                                 edge: return_edge,
+                                call_transfer: None,
                                 input: exit_fact,
                             };
                             let Some(return_outputs) = trace.get(&return_key) else {
                                 continue;
                             };
                             for returned in return_outputs {
+                                reserve_ide_propagation(request)?;
+                                let return_function = functions
+                                    .intern_ref(&trace.functions[returned.function], request)?;
                                 let Some(target) = by_state
                                     .get(&(
                                         caller_entry.clone(),
@@ -1348,12 +1613,15 @@ where
                                     callee_exit: end_summary_exit_rows[end_summary],
                                     target,
                                     end_summary,
-                                    call_function: output.function.clone(),
-                                    return_function: returned.function.clone(),
+                                    call_function,
+                                    return_function,
                                 };
                                 if !summaries.contains(&relation) {
                                     ensure_relation_capacity(
-                                        direct.len().saturating_add(summaries.len()),
+                                        direct
+                                            .len()
+                                            .saturating_add(summaries.len())
+                                            .saturating_add(entry_values.len()),
                                         request,
                                     )?;
                                     summaries.insert(relation);
@@ -1367,8 +1635,12 @@ where
             IcfgEdgeKind::NormalReturn | IcfgEdgeKind::ExceptionalReturn => {}
             _ => {
                 for source in sources {
+                    reserve_ide_propagation(request)?;
                     let entry = result.reached()[source].entry().clone();
                     for output in &record.outputs {
+                        reserve_ide_propagation(request)?;
+                        let function =
+                            functions.intern_ref(&trace.functions[output.function], request)?;
                         let Some(target) = by_state
                             .get(&(entry.clone(), record.key.edge.target.clone(), output.fact))
                             .copied()
@@ -1378,11 +1650,14 @@ where
                         let relation = RawDirectRelation {
                             source,
                             target,
-                            function: output.function.clone(),
+                            function,
                         };
                         if !direct.contains(&relation) {
                             ensure_relation_capacity(
-                                direct.len().saturating_add(summaries.len()),
+                                direct
+                                    .len()
+                                    .saturating_add(summaries.len())
+                                    .saturating_add(entry_values.len()),
                                 request,
                             )?;
                             direct.insert(relation);
@@ -1410,6 +1685,12 @@ where
             .then_with(|| left.call_function.cmp(&right.call_function))
             .then_with(|| left.return_function.cmp(&right.return_function))
     });
+    let mut entry_values = entry_values.into_iter().collect::<Vec<_>>();
+    entry_values.sort_unstable_by(|left, right| {
+        (left.caller, left.target_entry)
+            .cmp(&(right.caller, right.target_entry))
+            .then_with(|| left.function.cmp(&right.function))
+    });
     let reused_summary_functions = summary_uses
         .values()
         .map(|uses| uses.saturating_sub(1))
@@ -1418,7 +1699,9 @@ where
         row_count: result.reached().len(),
         direct,
         summaries,
+        entry_values,
         entry_rows,
+        row_entries,
         end_summary_exit_rows,
         reused_summary_functions,
     })
@@ -1437,43 +1720,22 @@ fn ensure_relation_capacity(
         .map_err(|exceeded| IdeRunFailure::Terminated(SolverTermination::ExceededBudget(exceeded)))
 }
 
-fn call_transfer_for_edge(edge: &ProcedureIcfgEdge) -> Result<CallTransfer, IdeDataflowError> {
-    let origin = edge.origin.clone().ok_or(IdeDataflowError::Invariant(
-        "captured call edge has no origin",
-    ))?;
-    let call = origin
-        .procedure()
-        .semantics()
-        .call_site(origin.id())
-        .ok_or(IdeDataflowError::Invariant(
-            "captured call edge origin is stale",
-        ))?;
-    let normal_continuation = call.normal_continuation;
-    let exceptional_continuation = call.exceptional_continuation;
-    Ok(CallTransfer {
-        origin,
-        callee: edge.target.procedure().clone(),
-        callee_entry: edge.target.clone(),
-        normal_continuation,
-        exceptional_continuation,
-        proof: edge.proof.clone(),
-        completeness: edge.completeness.clone(),
-    })
-}
-
 #[derive(Debug)]
-struct PendingPointValue<Value> {
+struct PendingPointValue {
+    entry: SummaryEntry,
     point: crate::analyzer::semantic::ProgramPointHandle,
     fact: FactId,
-    value: Value,
+    value: IdeValueId,
     qualities: PathQualityFrontier,
 }
 
-fn materialize_root_values<Problem>(
+#[allow(clippy::too_many_arguments)]
+fn materialize_values<Problem>(
     root: &ProcedureHandle,
     seed_values: &HashMap<Problem::Fact, Problem::Value>,
     problem: &Problem,
     result: &SummaryDataflowResult<Problem::Fact>,
+    graph: &IdeGraph,
     jumps: &[Option<IdeEdgeFunctionId>],
     functions: &[Problem::EdgeFunction],
     request: &mut DataflowRequest<'_>,
@@ -1486,9 +1748,12 @@ where
             .ok_or(IdeDataflowError::Invariant(
                 "IDE root procedure has no entry point",
             ))?;
-    let mut pending = Vec::<PendingPointValue<Problem::Value>>::new();
-    let mut pending_ids = HashMap::default();
-    for (index, reached) in result.reached().iter().enumerate() {
+    let mut values = ValueArena::new();
+    let mut entry_values = vec![None; result.reached().len()];
+    let mut entry_worklist = VecDeque::new();
+    let mut entry_queued = vec![false; result.reached().len()];
+    for entry in graph.entry_rows.iter().copied() {
+        let reached = &result.reached()[entry];
         if reached.entry().procedure() != root || reached.entry().entry_point() != &root_entry {
             continue;
         }
@@ -1500,9 +1765,94 @@ where
             .ok_or(IdeDataflowError::MissingRootSeedValue {
                 fact: reached.entry().entry_fact(),
             })?;
-        let function = jumps[index].ok_or(IdeDataflowError::Invariant(
-            "root IDE row has no jump function",
+        entry_values[entry] = Some(values.intern_ref(seed, request)?);
+        enqueue(entry, &mut entry_worklist, &mut entry_queued);
+    }
+
+    while let Some(entry) = entry_worklist.pop_front() {
+        entry_queued[entry] = false;
+        if request.cancellation.is_cancelled() {
+            return Err(IdeRunFailure::Terminated(SolverTermination::Cancelled));
+        }
+        let entry_value = entry_values[entry].ok_or(IdeDataflowError::Invariant(
+            "queued IDE entry has no concrete value",
         ))?;
+        for relation in graph.entry_values_by_entry[entry].iter().copied() {
+            reserve_ide_propagation(request)?;
+            reserve_ide_work(
+                SolverWork {
+                    value_operations: 1,
+                    ..SolverWork::default()
+                },
+                request,
+            )?;
+            let caller_value = problem.apply_edge_function(
+                &functions[jumps[relation.caller]
+                    .ok_or(IdeDataflowError::Invariant(
+                        "IDE call source has no jump function",
+                    ))?
+                    .index()],
+                values.get(entry_value),
+            );
+            if request.cancellation.is_cancelled() {
+                return Err(IdeRunFailure::Terminated(SolverTermination::Cancelled));
+            }
+            reserve_ide_work(
+                SolverWork {
+                    value_operations: 1,
+                    ..SolverWork::default()
+                },
+                request,
+            )?;
+            let candidate =
+                problem.apply_edge_function(&functions[relation.function.index()], &caller_value);
+            if request.cancellation.is_cancelled() {
+                return Err(IdeRunFailure::Terminated(SolverTermination::Cancelled));
+            }
+            let candidate = values.intern(candidate, request)?;
+            let next = match entry_values[relation.target_entry] {
+                Some(existing) if existing != candidate => {
+                    reserve_ide_work(
+                        SolverWork {
+                            value_operations: 1,
+                            ..SolverWork::default()
+                        },
+                        request,
+                    )?;
+                    let existing_value = values.get(existing);
+                    let candidate_value = values.get(candidate);
+                    let met = if existing_value <= candidate_value {
+                        problem.meet_values(existing_value, candidate_value)
+                    } else {
+                        problem.meet_values(candidate_value, existing_value)
+                    };
+                    if request.cancellation.is_cancelled() {
+                        return Err(IdeRunFailure::Terminated(SolverTermination::Cancelled));
+                    }
+                    values.intern(met, request)?
+                }
+                Some(_) => continue,
+                None => candidate,
+            };
+            if entry_values[relation.target_entry] == Some(next) {
+                continue;
+            }
+            entry_values[relation.target_entry] = Some(next);
+            enqueue(
+                relation.target_entry,
+                &mut entry_worklist,
+                &mut entry_queued,
+            );
+        }
+    }
+
+    let mut pending = Vec::<PendingPointValue>::new();
+    for (index, reached) in result.reached().iter().enumerate() {
+        let seed = entry_values[graph.row_entries[index]].ok_or(IdeDataflowError::Invariant(
+            "reachable IDE entry has no concrete value",
+        ))?;
+        let function =
+            jumps[index].ok_or(IdeDataflowError::Invariant("IDE row has no jump function"))?;
         reserve_ide_work(
             SolverWork {
                 value_operations: 1,
@@ -1510,78 +1860,24 @@ where
             },
             request,
         )?;
-        let value = problem.apply_edge_function(&functions[function.index()], seed);
+        let value = problem.apply_edge_function(&functions[function.index()], values.get(seed));
         if request.cancellation.is_cancelled() {
             return Err(IdeRunFailure::Terminated(SolverTermination::Cancelled));
         }
-        let key = (reached.point().clone(), reached.fact());
-        if let Some(existing_id) = pending_ids.get(&key).copied() {
-            let existing: &mut PendingPointValue<Problem::Value> = &mut pending[existing_id];
-            if existing.value != value {
-                reserve_ide_work(
-                    SolverWork {
-                        value_operations: 1,
-                        ..SolverWork::default()
-                    },
-                    request,
-                )?;
-                existing.value = if existing.value <= value {
-                    problem.meet_values(&existing.value, &value)
-                } else {
-                    problem.meet_values(&value, &existing.value)
-                };
-                if request.cancellation.is_cancelled() {
-                    return Err(IdeRunFailure::Terminated(SolverTermination::Cancelled));
-                }
-            }
-            for quality in reached.path_qualities().iter() {
-                existing.qualities.insert(quality);
-            }
-        } else {
-            let id = pending.len();
-            pending.push(PendingPointValue {
-                point: reached.point().clone(),
-                fact: reached.fact(),
-                value,
-                qualities: reached.path_qualities(),
-            });
-            pending_ids.insert(key, id);
-        }
+        let value = values.intern(value, request)?;
+        pending.push(PendingPointValue {
+            entry: reached.entry().clone(),
+            point: reached.point().clone(),
+            fact: reached.fact(),
+            value,
+            qualities: reached.path_qualities(),
+        });
     }
 
-    let mut values = pending
-        .iter()
-        .map(|row| row.value.clone())
-        .collect::<Vec<_>>();
-    values.sort_unstable();
-    values.dedup();
-    for index in 0..values.len() {
-        IdeValueId::try_from_index(index)
-            .map_err(|_| IdeDataflowError::ValueIdOverflow { index })?;
-    }
-    reserve_ide_work(
-        SolverWork {
-            ide_values: values.len(),
-            ..SolverWork::default()
-        },
-        request,
-    )?;
-    let value_ids = values
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(index, value)| {
-            let id = IdeValueId::try_from_index(index)
-                .expect("IDE value indices were validated before publication");
-            (value, id)
-        })
-        .collect::<HashMap<_, _>>();
+    let values = values.into_sorted_parts(&mut pending)?;
     let point_values = pending
         .into_iter()
-        .map(|row| {
-            let value = value_ids[&row.value];
-            IdePointValue::new(row.point, row.fact, value, row.qualities)
-        })
+        .map(|row| IdePointValue::new(row.entry, row.point, row.fact, row.value, row.qualities))
         .collect();
     Ok((values, point_values))
 }
@@ -1593,6 +1889,7 @@ fn empty_ide_result<Fact, Value, EdgeFunction>(
     semantic_budget: &SemanticBudget,
     request: &DataflowRequest<'_>,
     termination: Option<SolverTermination>,
+    metrics: IdeMetrics,
 ) -> IdeSummaryDataflowResult<Fact, Value, EdgeFunction> {
     let reached_len = fact_result.reached().len();
     let summary_len = fact_result.end_summaries().len();
@@ -1607,7 +1904,7 @@ fn empty_ide_result<Fact, Value, EdgeFunction>(
         termination,
         request.budget.used().saturating_sub(initial_work),
         semantic_budget.used().saturating_sub(initial_semantic_work),
-        IdeMetrics::default(),
+        metrics,
     )
 }
 
@@ -1619,6 +1916,16 @@ fn reserve_ide_work(
         Some(termination) => Err(IdeRunFailure::Terminated(termination)),
         None => Ok(()),
     }
+}
+
+fn reserve_ide_propagation(request: &mut DataflowRequest<'_>) -> Result<(), IdeRunFailure> {
+    reserve_ide_work(
+        SolverWork {
+            ide_propagations: 1,
+            ..SolverWork::default()
+        },
+        request,
+    )
 }
 
 fn owned_edge(edge: DataflowEdge<'_>) -> ProcedureIcfgEdge {

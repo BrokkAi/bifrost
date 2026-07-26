@@ -18,8 +18,8 @@ The new capability is separately named. Existing `DistributiveDataflowProblem`, 
 - [x] (2026-07-26 08:31Z) Milestone 1: defined the public finite value, edge-function, transition, input, result, and five IDE-specific budget contracts.
 - [x] (2026-07-26 08:31Z) Milestone 2: recorded canonical IDE transfer relations through the unchanged fact summary solver and implemented the bounded jump-function fixed point.
 - [x] (2026-07-26 08:31Z) Milestone 3: exposed deterministic relative jump summaries and root values, including exact call/summary/return composition and recursion reuse metrics.
-- [ ] Milestone 4: the independent repeated-scan oracle and focused identity, branch, call, recursion, exceptional, call-to-return, shared-summary, cancellation, budget, seed-order, quality, and witness regressions are green; provider/callback-order coverage and final regression validation remain.
-- [ ] Milestone 5: complete guided specialist review and the focused, strict Clippy, and full all-feature validation gates.
+- [x] (2026-07-26 09:17Z) Milestone 4: extended the independent repeated-scan oracle through relative jump functions, end-summary functions, recursive entry-value propagation, and entry-aware final values; all focused algebra, call/return, recursion, reuse, permutation, cancellation, and budget regressions are green.
+- [ ] Milestone 5: completed all five guided specialist review angles and fixed the accepted correctness, boundedness, interning, and telemetry findings; final focused, strict all-feature Clippy, and all-feature validation gates remain.
 
 ## Surprises & Discoveries
 
@@ -38,8 +38,17 @@ The new capability is separately named. Existing `DistributiveDataflowProblem`, 
 - Observation: capture-time edge-function meets need their own sink limit, not only a charge after fact discovery.
   Evidence: a duplicate IDE transition can require client algebra before a relation is committed. The collector now receives the remaining operation budget and returns an atomic typed partial result before calling `meet_edge_functions`; `capture_meet_budget_stops_before_running_client_algebra` proves the client meet counter remains zero at a zero limit.
 
-- Observation: the IDE layer can reconstruct exact call transfers without changing `SummaryState` or rematerializing the provider.
-  Evidence: a captured call edge retains its call-site origin, callee entry, proof, and completeness; the immutable caller semantics supply the two continuations. Normal, exceptional, deferred call-to-return, two-caller reuse, direct recursion, and mutual recursion fixtures all resolve through the expected targets, and the repeated-scan reference agrees on recursive root values.
+- Observation: the IDE layer can retain exact call transfers without changing `SummaryState` or rematerializing the provider.
+  Evidence: the summary callback descriptor privately carries the exact canonical provider `CallTransfer`, and the IDE trace keys the call relation with it. Normal, exceptional, deferred call-to-return, two-caller reuse, direct recursion, and mutual recursion fixtures all resolve through the expected targets.
+
+- Observation: relative jump functions alone are insufficient for a public interprocedural value result.
+  Evidence: architecture review showed that root-only materialization hid values inside reachable callees. The final phase now propagates concrete values from root seeds through caller jumps and exact call functions to every reachable `SummaryEntry`, converges recursive entry-value meets iteratively, and publishes values keyed by `(entry, point, fact)`.
+
+- Observation: an IDE overlay limit must not truncate the nested fact relation.
+  Evidence: the original transition collector stopped forwarding a new fact when relation/function capture exhausted. It now continues projecting facts to the fact solver while discarding the incomplete IDE overlay; budget tests compare the complete reached and end-summary fact topology against the baseline at every IDE limit.
+
+- Observation: retained-object limits do not bound scheduling work or clone amplification by themselves.
+  Evidence: review identified uncharged cache-hit/adjacency work and raw-graph function clones. `IdePropagations` now charges graph expansion, jump scheduling, and recursive entry-value propagation, while capture-time function interning and incremental value interning enforce unique-object limits before graph/value amplification.
 
 ## Decision Log
 
@@ -67,13 +76,21 @@ The new capability is separately named. Existing `DistributiveDataflowProblem`, 
   Rationale: proof/completeness describes semantic evidence, not a client lattice. Witness retention remains opt-in and best-effort exactly as it is today; IDE edge functions neither depend on nor disappear with witness storage.
   Date/Author: 2026-07-26 / Codex
 
+- Decision: carry the exact provider `CallTransfer` as private summary callback context.
+  Rationale: current provider validation makes static continuations equivalent, but retaining the exact transfer removes reconstruction assumptions and keeps IDE summary replay coupled to the same transfer instance used by fact tabulation.
+  Date/Author: 2026-07-26 / Codex
+
+- Decision: publish entry-aware values after a separate recursive entry-value fixed point.
+  Rationale: reusable jump functions remain relative, while concrete values require meeting every caller-derived value at the exact callee `SummaryEntry`. Entry-aware rows preserve the acceptance key and avoid context-crossing point-only aggregation.
+  Date/Author: 2026-07-26 / Codex
+
 ## Outcomes & Retrospective
 
 Milestones 1 through 3 are implemented. Ordinary fact-only code remains unchanged apart from the additive work-dimension definition and its exhaustive test match. IDE clients opt into `IdeDataflowProblem` and receive an owned `IdeSummaryDataflowResult` containing the original fact result, deterministic function/value arenas, relative reached/end-summary jump functions, root point values, and IDE-only metrics.
 
-The optimized layer currently passes 16 source-backed focused test cases (including the shared harness tests). The proving qualifier client demonstrates local identity, two-way branch meet under reversed source layout, exact normal and exceptional returns, explicit deferred call-to-return, two-caller summary reuse, cancellation during client composition, atomic exhaustion of all five IDE dimensions, capture-time algebra gating, deterministic duplicate seed meet, and witness independence. Direct and mutual recursion agree with an independent provider-backed repeated-scan oracle.
+The optimized layer currently passes 18 source-backed focused test cases (including the shared harness tests). The proving qualifier client demonstrates local identity, two-way branch meet, provider/callback permutation invariance, exact normal and exceptional returns, explicit deferred call-to-return, two-caller summary reuse, entry-aware callee values, cancellation during client composition, atomic exhaustion of all six IDE dimensions, capture-time algebra gating, deterministic duplicate seed meet, and witness independence. Helper, shared-callee, exceptional-return, direct-recursive, and mutually recursive fixtures compare final values, relative reached jump functions, and end-summary functions with the independent provider-backed repeated-scan oracle.
 
-Focused strict Clippy (`cargo clippy --test dataflow_ide --no-default-features -- -D warnings`) is green. Milestone 4 still needs final order-perturbation/regression confirmation, and Milestone 5 still needs the required specialist review, strict all-feature Clippy, and full all-feature tests.
+The five specialist angles found and drove fixes for seed canonicalization before cancellation/budget checks, exact transfer retention, incomplete fact projection on IDE exhaustion, missing callee values, unbounded fixed-point scheduling, graph/value clone amplification, differential coverage of public summaries, and partial-result telemetry. A low-risk suggestion to merge the two deliberately independent reference runners' scaffolding remains intentionally deferred so their control structures cannot drift together. Final validation remains before closure.
 
 ## Context and Orientation
 
@@ -232,3 +249,5 @@ The documented algebra requires value and edge-function meet to be associative, 
 Use only existing standard-library collections, `crate::hash::{HashMap, HashSet}`, dense-ID helpers, semantic handles, work-budget helpers, and dataflow result types. Do not add dependencies, source-text parsing, recursion, policy types, typestate branches, taint branches, or persisted summaries.
 
 Revision note, 2026-07-26 07:52Z: Initial plan written after live issue verification, remote sync, code/history diagnosis, and explicit comparison of a generic-core refactor with an IDE-only captured-topology phase. The selected design preserves the fact-only kernel and avoids a second provider traversal while still giving jump functions their own monotone fixed point.
+
+Revision note, 2026-07-26 09:17Z: Updated after the five-angle guided review. Added exact transfer callback context, fact-preserving overlay exhaustion, entry-aware recursive concrete values, capture/value interning, an IDE propagation dimension, partial metrics, provider/callback permutation coverage, and differential comparison of public reached and end-summary functions.
