@@ -18,7 +18,7 @@ use std::collections::BTreeSet;
 use std::hash::Hash;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::ThreadId;
 use tree_sitter::{Node, Parser, Tree};
 
@@ -650,6 +650,7 @@ pub(super) enum OrdinaryTypeImportResolution {
 type CallableReferenceSpecCell = Arc<OnceLock<Option<TargetSpec>>>;
 type ConditionalIncludeProjectionCache =
     HashMap<(ProjectFile, ProjectFile), Arc<[ConditionalIncludeProjection]>>;
+type VisibleParserAliasNameSetCell = Arc<OnceLock<HashSet<String>>>;
 
 pub(in crate::analyzer::usages) struct VisibilityIndex {
     cpp: CppAnalyzer,
@@ -657,6 +658,7 @@ pub(in crate::analyzer::usages) struct VisibilityIndex {
     visible_by_identifier: HashMap<ProjectFile, HashMap<String, Vec<CodeUnit>>>,
     visible_source_files_by_root: HashMap<ProjectFile, HashSet<ProjectFile>>,
     alias_cells: Mutex<HashMap<ProjectFile, AliasCell>>,
+    visible_parser_alias_name_sets: RwLock<HashMap<ProjectFile, VisibleParserAliasNameSetCell>>,
     ordinary_type_import_cells: Mutex<HashMap<ProjectFile, OrdinaryTypeImportCell>>,
     project_using_index: OnceLock<ProjectUsingIndex>,
     callable_reference_specs:
@@ -677,6 +679,8 @@ pub(in crate::analyzer::usages) struct VisibilityIndex {
     callable_reference_spec_build_count: AtomicUsize,
     #[cfg(test)]
     alias_source_parse_counts: Mutex<HashMap<ProjectFile, usize>>,
+    #[cfg(test)]
+    visible_parser_alias_name_set_build_count: AtomicUsize,
     field_type_facts: Mutex<HashMap<CodeUnit, Option<DeclaredFieldTypeFact>>>,
     structured_alias_targets: Mutex<HashMap<CodeUnit, Option<StructuredAliasTarget>>>,
     macro_event_cells: Mutex<HashMap<ProjectFile, MacroEventCell>>,
@@ -698,6 +702,8 @@ pub(in crate::analyzer::usages) struct VisibilityIndex {
     cpp_template_families: HashMap<String, Vec<CodeUnit>>,
     #[cfg(test)]
     qualified_candidate_inspections: AtomicUsize,
+    #[cfg(test)]
+    target_preserving_type_resolution_count: AtomicUsize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -910,6 +916,7 @@ impl VisibilityIndex {
             visible_by_identifier,
             visible_source_files_by_root,
             alias_cells: Mutex::new(HashMap::default()),
+            visible_parser_alias_name_sets: RwLock::new(HashMap::default()),
             ordinary_type_import_cells: Mutex::new(HashMap::default()),
             project_using_index: OnceLock::new(),
             callable_reference_specs: Mutex::new(HashMap::default()),
@@ -929,6 +936,8 @@ impl VisibilityIndex {
             callable_reference_spec_build_count: AtomicUsize::new(0),
             #[cfg(test)]
             alias_source_parse_counts: Mutex::new(HashMap::default()),
+            #[cfg(test)]
+            visible_parser_alias_name_set_build_count: AtomicUsize::new(0),
             field_type_facts: Mutex::new(HashMap::default()),
             structured_alias_targets: Mutex::new(HashMap::default()),
             macro_event_cells: Mutex::new(HashMap::default()),
@@ -945,6 +954,8 @@ impl VisibilityIndex {
             cpp_template_families,
             #[cfg(test)]
             qualified_candidate_inspections: AtomicUsize::new(0),
+            #[cfg(test)]
+            target_preserving_type_resolution_count: AtomicUsize::new(0),
         }
     }
 
@@ -1630,6 +1641,68 @@ impl VisibilityIndex {
             .is_some_and(|files| files.contains(source))
     }
 
+    fn visible_parser_alias_name_is_visible(&self, file: &ProjectFile, name: &str) -> bool {
+        let cached = self
+            .visible_parser_alias_name_sets
+            .read()
+            .expect("visible parser alias-name cache poisoned")
+            .get(file)
+            .cloned();
+        let cell = if let Some(cached) = cached {
+            cached
+        } else {
+            let mut cells = self
+                .visible_parser_alias_name_sets
+                .write()
+                .expect("visible parser alias-name cache poisoned");
+            Arc::clone(
+                cells
+                    .entry(file.clone())
+                    .or_insert_with(|| Arc::new(OnceLock::new())),
+            )
+        };
+        cell.get_or_init(|| {
+            #[cfg(test)]
+            self.visible_parser_alias_name_set_build_count
+                .fetch_add(1, Ordering::Relaxed);
+            let mut names = HashSet::default();
+            let visible_files = self
+                .visible_source_files_by_root
+                .get(file)
+                .cloned()
+                .unwrap_or_else(|| HashSet::from_iter([file.clone()]));
+            for visible_file in visible_files {
+                let aliases = {
+                    let mut cells = self.alias_cells.lock().expect("alias cell map lock");
+                    Arc::clone(
+                        cells
+                            .entry(visible_file.clone())
+                            .or_insert_with(|| Arc::new(OnceLock::new())),
+                    )
+                };
+                for alias in aliases
+                    .get_or_init(|| {
+                        #[cfg(test)]
+                        {
+                            *self
+                                .alias_source_parse_counts
+                                .lock()
+                                .expect("alias source parse count lock")
+                                .entry(visible_file.clone())
+                                .or_default() += 1;
+                        }
+                        aliases_from_prepared_source(&self.cpp, &visible_file).into_boxed_slice()
+                    })
+                    .iter()
+                {
+                    names.insert(alias.name.clone());
+                }
+            }
+            names
+        })
+        .contains(name)
+    }
+
     fn callable_arities_for_target(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -2304,6 +2377,9 @@ impl VisibilityIndex {
         lexical_scope: &[String],
         target: &CodeUnit,
     ) -> LexicalTypeResolution {
+        #[cfg(test)]
+        self.target_preserving_type_resolution_count
+            .fetch_add(1, Ordering::Relaxed);
         self.resolve_type_components_lexically_inner(
             analyzer,
             file,
@@ -2312,6 +2388,81 @@ impl VisibilityIndex {
             lexical_scope,
             TypeCandidateResolution::PreserveTarget(target),
         )
+    }
+
+    pub(super) fn coarse_unqualified_type_reference_may_resolve(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+        has_template_arguments: bool,
+    ) -> bool {
+        if has_template_arguments || name.is_empty() {
+            return true;
+        }
+        self.visible_identifier_candidates(file, name)
+            .any(|candidate| candidate.kind() == CodeUnitType::Class || is_type_alias(candidate))
+            || self.visible_parser_alias_name_is_visible(file, name)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn structured_type_reference_may_resolve_to_target(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        components: &[String],
+        global: bool,
+        lexical_scope: &[String],
+        target: &CodeUnit,
+        has_template_arguments: bool,
+    ) -> bool {
+        if components.is_empty() || has_template_arguments {
+            return true;
+        }
+        let Some(terminal) = components.last() else {
+            return true;
+        };
+        if self.visible_parser_alias_name_is_visible(file, terminal) {
+            return true;
+        }
+        let qualified_tiers = lexical_component_tiers(components, global, lexical_scope)
+            .map(|qualified| qualified.join("::"))
+            .collect::<Vec<_>>();
+        let target_name = cpp_name_for(target);
+        if qualified_tiers
+            .iter()
+            .any(|qualified| qualified == &target_name)
+        {
+            return true;
+        }
+
+        let mut saw_shape_candidate = false;
+        for candidate in self.visible_identifier_candidates(file, terminal) {
+            if candidate.kind() != CodeUnitType::Class && !declared_type_alias(analyzer, candidate)
+            {
+                continue;
+            }
+            let candidate_name = cpp_name_for(candidate);
+            let shape_matches = if global || components.len() > 1 {
+                qualified_tiers
+                    .iter()
+                    .any(|qualified| qualified == &candidate_name)
+            } else {
+                true
+            };
+            if !shape_matches {
+                continue;
+            }
+            saw_shape_candidate = true;
+            if same_visible_symbol(candidate, target)
+                || self.compatible_primary_template_redeclarations(candidate, target)
+                || (declared_type_alias(analyzer, candidate)
+                    && self.alias_candidate_may_preserve_target(analyzer, file, candidate, target))
+            {
+                return true;
+            }
+        }
+
+        !saw_shape_candidate
     }
 
     pub(super) fn resolve_imported_type_candidate(
@@ -2754,6 +2905,51 @@ impl VisibilityIndex {
                 right,
             )
             .is_some()
+    }
+
+    fn alias_candidate_may_preserve_target(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        visible_from: &ProjectFile,
+        candidate: &CodeUnit,
+        target: &CodeUnit,
+    ) -> bool {
+        let mut current = candidate.clone();
+        let mut seen = HashSet::default();
+        loop {
+            if same_visible_symbol(&current, target)
+                || self.compatible_primary_template_redeclarations(&current, target)
+            {
+                return true;
+            }
+            if self.cpp_template_metadata.contains_key(&current) {
+                return true;
+            }
+            let Some(alias_target) = self.structured_alias_target(analyzer, &current) else {
+                return false;
+            };
+            let StructuredAliasTarget::Named {
+                components,
+                global,
+                arguments,
+            } = alias_target
+            else {
+                return false;
+            };
+            if arguments.is_some() || !seen.insert(current.clone()) {
+                return true;
+            }
+            let qualified = components.join("::");
+            let next = if global {
+                unique_logical_type_candidate(self.type_candidates(visible_from, &qualified))
+            } else {
+                self.resolve_unique_type_for_declaration(visible_from, &current, &qualified)
+            };
+            let Some(next) = next else {
+                return true;
+            };
+            current = next;
+        }
     }
 
     fn resolve_unique_type_for_declaration(
@@ -3204,14 +3400,32 @@ impl VisibilityIndex {
     }
 
     #[cfg(test)]
-    fn reset_qualified_candidate_inspections(&self) {
+    pub(super) fn reset_qualified_candidate_inspections(&self) {
         self.qualified_candidate_inspections
             .store(0, Ordering::Relaxed);
     }
 
     #[cfg(test)]
-    fn qualified_candidate_inspections(&self) -> usize {
+    pub(super) fn qualified_candidate_inspections(&self) -> usize {
         self.qualified_candidate_inspections.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn reset_target_preserving_type_resolution_count(&self) {
+        self.target_preserving_type_resolution_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(super) fn target_preserving_type_resolution_count(&self) -> usize {
+        self.target_preserving_type_resolution_count
+            .load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn visible_parser_alias_name_set_build_count(&self) -> usize {
+        self.visible_parser_alias_name_set_build_count
+            .load(Ordering::Relaxed)
     }
 }
 
@@ -7241,6 +7455,7 @@ mod tests {
             visible_by_file,
             visible_source_files_by_root: HashMap::default(),
             alias_cells: Mutex::new(HashMap::default()),
+            visible_parser_alias_name_sets: RwLock::new(HashMap::default()),
             ordinary_type_import_cells: Mutex::new(HashMap::default()),
             project_using_index: OnceLock::new(),
             callable_reference_specs: Mutex::new(HashMap::default()),
@@ -7253,6 +7468,7 @@ mod tests {
             using_source_index_walk_count: AtomicUsize::new(0),
             callable_reference_spec_build_count: AtomicUsize::new(0),
             alias_source_parse_counts: Mutex::new(HashMap::default()),
+            visible_parser_alias_name_set_build_count: AtomicUsize::new(0),
             field_type_facts: Mutex::new(HashMap::default()),
             structured_alias_targets: Mutex::new(HashMap::default()),
             macro_event_cells: Mutex::new(HashMap::default()),
@@ -7265,6 +7481,7 @@ mod tests {
             cpp_template_metadata: HashMap::default(),
             cpp_template_families: HashMap::default(),
             qualified_candidate_inspections: AtomicUsize::new(0),
+            target_preserving_type_resolution_count: AtomicUsize::new(0),
         }
     }
 

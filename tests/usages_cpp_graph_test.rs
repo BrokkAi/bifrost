@@ -9220,6 +9220,104 @@ void consume() {
 }
 
 #[test]
+fn authoritative_cpp_type_resolution_keeps_exact_direct_qualified_and_alias_hits() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            r#"#pragma once
+namespace exact {
+class Direct {};
+class Qualified {};
+class Canonical {};
+class TemplateArg {};
+
+template <typename T> class Box {};
+using FileAlias = Canonical;
+template <typename T> using BoxAlias = Box<T>;
+
+struct Base {
+  using InheritedAlias = Canonical;
+};
+
+struct Derived : Base {};
+
+struct Owner {
+  using ClassAlias = Canonical;
+};
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "types.h"
+namespace exact {
+void consume() {
+    Direct direct_value;
+    ::exact::Qualified qualified_value;
+    FileAlias file_alias;
+    Owner::ClassAlias class_alias;
+    BoxAlias<TemplateArg> templated_alias;
+}
+
+struct Use : Derived {
+    InheritedAlias inherited_alias;
+};
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let target = |fq_name: &str| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Class && unit.fq_name() == fq_name && !unit.is_synthetic()
+        })
+    };
+    let range = |line: &str, token: &str| {
+        let line_start = source
+            .find(line)
+            .unwrap_or_else(|| panic!("missing fixture line {line}"));
+        let token_start = line
+            .find(token)
+            .unwrap_or_else(|| panic!("missing {token} in {line}"));
+        let start = line_start + token_start;
+        (start, start + token.len())
+    };
+
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, &[target("exact.Direct")], &consumer),
+        BTreeSet::from([range("    Direct direct_value;", "Direct")]),
+        "direct type references must remain exact"
+    );
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, &[target("exact.Qualified")], &consumer),
+        BTreeSet::from([range(
+            "    ::exact::Qualified qualified_value;",
+            "::exact::Qualified",
+        )]),
+        "qualified type references must remain exact"
+    );
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, &[target("exact.Canonical")], &consumer),
+        BTreeSet::from([
+            range("    FileAlias file_alias;", "FileAlias"),
+            range("    Owner::ClassAlias class_alias;", "Owner::ClassAlias"),
+            range("    InheritedAlias inherited_alias;", "InheritedAlias"),
+        ]),
+        "file, class-owned, and inherited aliases must remain exact canonical hits"
+    );
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, &[target("exact.Box")], &consumer),
+        BTreeSet::from([range(
+            "    BoxAlias<TemplateArg> templated_alias;",
+            "BoxAlias<TemplateArg>",
+        )]),
+        "template alias references must remain exact canonical hits"
+    );
+}
+
+#[test]
 fn authoritative_cpp_type_resolution_rejects_ambiguous_nearest_alias_tier() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
@@ -10890,6 +10988,65 @@ namespace same_file { Type incompatible; } // control-same-file-incompatible-gua
             .unwrap_or_default()
             >= 1,
         "unknown conditional visibility must retain conservative evidence: {unproven_total_by_overload:#?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_repeated_guarded_type_references_remain_exact() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "guarded_type.h",
+            r#"#pragma once
+#ifdef FEATURE
+namespace perf {
+struct Exact {};
+}
+#endif
+"#,
+        )
+        .file(
+            "consumer.h",
+            r#"#pragma once
+#include "guarded_type.h"
+#ifdef FEATURE
+namespace perf {
+struct Holder {
+    Exact first; // positive-first
+    Exact second; // positive-second
+    Exact third; // positive-third
+    Exact fourth; // positive-fourth
+};
+}
+#endif
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "perf.Exact"
+    });
+    let consumer = project.file("consumer.h");
+    let source = consumer.read_to_string().expect("guarded consumer source");
+    let expected = BTreeSet::from([
+        fixture_token_range(&source, "    Exact first; // positive-first", "Exact"),
+        fixture_token_range(&source, "    Exact second; // positive-second", "Exact"),
+        fixture_token_range(&source, "    Exact third; // positive-third", "Exact"),
+        fixture_token_range(&source, "    Exact fourth; // positive-fourth", "Exact"),
+    ]);
+
+    let authoritative =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &consumer);
+    let public = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let public_ranges = public
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == consumer)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        (&authoritative, &public_ranges),
+        (&expected, &expected),
+        "repeated guarded references must remain exact under both authoritative and public lookup"
     );
 }
 
