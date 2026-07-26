@@ -1214,7 +1214,7 @@ where
                 let incoming_quality = queued
                     .quality
                     .through_evidence(&edge.proof, &edge.completeness);
-                let descriptor = descriptor(&edge);
+                let descriptor = descriptor(&edge).with_call_transfer(transfer);
                 let outputs = match evaluate_transfer(
                     problem,
                     descriptor,

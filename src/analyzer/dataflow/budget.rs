@@ -15,7 +15,7 @@ define_work_dimensions! {
     /// Work performed or limits applied by one data-flow solve.
     #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct SolverWork;
-    all: pub(crate) [11];
+    all: pub(crate) [17];
     InternedFacts => interned_facts = 100_000,
     ReachedStates => reached_states = 1_000_000,
     FlowEvaluations => flow_evaluations = 4_000_000,
@@ -27,6 +27,12 @@ define_work_dimensions! {
     SummaryApplications => summary_applications = 4_000_000,
     CoverageRows => coverage_rows = 1_000_000,
     WitnessRelations => witness_relations = 4_000_000,
+    IdeRelations => ide_relations = 4_000_000,
+    EdgeFunctions => edge_functions = 1_000_000,
+    EdgeFunctionOperations => edge_function_operations = 4_000_000,
+    IdeValues => ide_values = 1_000_000,
+    ValueOperations => value_operations = 4_000_000,
+    IdePropagations => ide_propagations = 8_000_000,
 }
 
 /// Exact failed solver-budget charge.
@@ -75,7 +81,7 @@ impl fmt::Display for SolverBudgetExceeded {
 
 impl Error for SolverBudgetExceeded {}
 
-/// Eleven-dimensional request-local work budget.
+/// Seventeen-dimensional request-local work budget.
 ///
 /// `callback_rows` is the single deterministic cap for each unique seed or
 /// transfer relation collected from clients. If a complete relation fits that
@@ -85,7 +91,12 @@ impl Error for SolverBudgetExceeded {}
 /// own CPU work. Summary tabulation additionally limits retained end summaries,
 /// waiting incoming calls, semantic-provider cache misses, matched-return
 /// applications, retained incomplete-coverage rows, and retained witness
-/// relations independently.
+/// relations independently. IDE solves additionally bound retained transition
+/// and dependency relations, unique edge functions, edge-function algebra,
+/// unique client values, and value-domain algebra. `ide_propagations` bounds
+/// graph expansion, jump-function scheduling (including cache hits), and
+/// concrete entry-value propagation independently of retained graph size.
+/// Fact-only solves never charge those IDE-specific dimensions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SolverBudget {
     ledger: BudgetLedger<SolverWork>,
@@ -233,6 +244,7 @@ mod tests {
             summary_applications: 10,
             coverage_rows: 10,
             witness_relations: 10,
+            ..SolverWork::default()
         });
         budget
             .charge(SolverWork {

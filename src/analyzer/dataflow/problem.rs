@@ -4,8 +4,8 @@ use std::hash::Hash;
 
 use crate::analyzer::dense_id::define_dense_id;
 use crate::analyzer::semantic::{
-    CallSiteHandle, DispatchBoundaryKind, EvidenceCompleteness, IcfgEdgeId, IcfgEdgeKind,
-    IcfgNodeId, IcfgSnapshot, ProgramPointHandle, ProofStatus,
+    CallSiteHandle, CallTransfer, DispatchBoundaryKind, EvidenceCompleteness, IcfgEdgeId,
+    IcfgEdgeKind, IcfgNodeId, IcfgSnapshot, ProgramPointHandle, ProofStatus,
 };
 
 define_dense_id! {
@@ -72,6 +72,7 @@ pub struct DataflowEdge<'graph> {
     proof: &'graph ProofStatus,
     completeness: &'graph EvidenceCompleteness,
     boundary: Option<&'graph DispatchBoundaryKind>,
+    call_transfer: Option<&'graph CallTransfer>,
 }
 
 impl<'graph> DataflowEdge<'graph> {
@@ -91,11 +92,20 @@ impl<'graph> DataflowEdge<'graph> {
             proof,
             completeness,
             boundary: None,
+            call_transfer: None,
         }
     }
 
     pub const fn with_boundary(mut self, boundary: &'graph DispatchBoundaryKind) -> Self {
         self.boundary = Some(boundary);
+        self
+    }
+
+    /// Retain the exact provider transfer while a summary solver evaluates a
+    /// call edge. Snapshot-backed descriptors do not carry this optional
+    /// summary context.
+    pub(crate) const fn with_call_transfer(mut self, transfer: &'graph CallTransfer) -> Self {
+        self.call_transfer = Some(transfer);
         self
     }
 
@@ -149,6 +159,10 @@ impl<'graph> DataflowEdge<'graph> {
     /// Structured dispatch boundary that produced this edge, when any.
     pub const fn boundary(self) -> Option<&'graph DispatchBoundaryKind> {
         self.boundary
+    }
+
+    pub(crate) const fn call_transfer(self) -> Option<&'graph CallTransfer> {
+        self.call_transfer
     }
 }
 
