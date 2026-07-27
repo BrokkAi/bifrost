@@ -14,8 +14,8 @@ After this change, a contributor can run one integration test and see equivalent
 
 - [x] (2026-07-27 10:31Z) Fetched `origin`, confirmed the unrelated untracked `.brokk/` directory, and created `dave/issue-1205-value-flow-conformance` from current `origin/master` at `9d7591ad`.
 - [x] (2026-07-27 10:31Z) Diagnosed the missing seam between language adapter facts, the production value-flow client, and bounded witness reconstruction; confirmed that the first Java/TypeScript slice can use public APIs from test code.
-- [ ] Add the reusable structured selector, plan builder, exact meeting comparison, and stable witness projector under `tests/common/`.
-- [ ] Replace the reachability-only Java helper test with an exact source-to-two-sink-arguments conformance case.
+- [x] (2026-07-27 11:32Z) Added the reusable structured selector, plan builder, exact meeting comparison, stable carrier projection, compact source-backed witness rendering, and context-respecting call/return assertions under `tests/common/`.
+- [x] (2026-07-27 11:32Z) Replaced the reachability-only Java helper test with an exact source-to-two-sink-arguments conformance case; the focused Java test passes.
 - [ ] Add the equivalent TypeScript case with the same language-neutral milestone contract and explicit aggregate discovery expectations.
 - [ ] Run focused tests, formatting, strict all-feature Clippy, and the complete `nlp,python` test gate.
 - [ ] Run security, duplication, intent, operations, and architecture reviews; resolve accepted findings and record the outcome.
@@ -30,6 +30,15 @@ After this change, a contributor can run one integration test and see equivalent
 
 - Observation: The summary witness API reconstructs one deterministic witness for a meeting and path quality but does not enumerate every retained alternative of the same quality.
   Evidence: `ValueFlowSummaryResult::witness_for_meeting` delegates to the singular `witness_for_reached_index` API. This does not block the single-path Java/TypeScript baseline; alternative enumeration remains later #1205 work if the broader matrix proves it necessary.
+
+- Observation: A reusable inline analyzer harness must retain `BuiltInlineTestProject` through the solve, not only the `WorkspaceAnalyzer` and semantic handles.
+  Evidence: the first Java solve failed to recapture `src/ExactFlowFixture.java` after `build_case` dropped the temporary project. Keeping the built project in `ResolvedCase` made source recapture and ICFG construction succeed.
+
+- Observation: Binding a call-argument sink at the invoke point makes an unchanged meeting fact enter the callee as a new summary entry; the singular witness API can then select a seed-only witness for that meeting.
+  Evidence: the first successful Java solve reconstructed only a `Seed` in `sink`. Selecting the same structured argument carrier at its producing value-flow relation after effects reconstructed the complete root-to-helper-to-root path. The stable sink key remains the call site plus argument ordinal.
+
+- Observation: Java's positive helper path is proven complete even though aggregate discovery remains incomplete.
+  Evidence: the Java meeting frontier is exactly `PROVEN_COMPLETE`, its may status is `Proven`, and it is not uncertain; `ValueFlowSummaryResult::is_complete()` is false, so the unrelated argument is correctly `Inconclusive`, not `NotReached`.
 
 ## Decision Log
 
@@ -49,9 +58,13 @@ After this change, a contributor can run one integration test and see equivalent
   Rationale: TypeScript can retain a precise resolved candidate and context-respecting witness while the language's dispatch model remains open. The harness must preserve that distinction rather than weakening the positive assertion or claiming a complete negative.
   Date/Author: 2026-07-27 / Codex
 
+- Decision: Normalize expression temporaries structurally while retaining explicit parameter ports, call-argument ordinals, locals, normal returns, caller results, and sink-argument ordinals.
+  Rationale: Java emits source-backed expression temporaries around parameter uses and call arguments. The portable contract is the semantic role/port/call binding, so temporary values are omitted only by their structured `temporary` role; call and return milestones are recovered from exact ICFG edge kinds and call origins, never source-string matching.
+  Date/Author: 2026-07-27 / Codex
+
 ## Outcomes & Retrospective
 
-No implementation outcome is recorded yet. At the end of each milestone, update this section with the exact behavior delivered, validation evidence, remaining #1205 work, and anything #825 must consume.
+The Java milestone now exercises the production Java adapter, value-flow oracle, exact dispatch bindings, immutable plan, summary solver, and bounded witness reconstruction. It asserts the complete meeting set, preserves incomplete aggregate discovery as an inconclusive negative, and projects the proven positive path into language-neutral carrier milestones with compact source snippets. TypeScript parity, full validation, and specialist review remain.
 
 ## Context and Orientation
 
