@@ -4,9 +4,10 @@ use std::{cell::Cell, collections::HashMap, rc::Rc};
 
 use brokk_bifrost::analyzer::dataflow::{
     DataflowEdge, DataflowOutput, DataflowRequest, IdeDataflowProblem, IdeDataflowSeed,
-    IdeSummaryDataflowResult, IdeSummarySolveInput, IdeTransition, PathQuality, SolverBudget,
-    SolverBudgetDimension, SolverTermination, SolverWork, WitnessRetentionLimits,
-    solve_ide_with_summaries,
+    IdeSummaryDataflowResult, IdeSummarySolveInput, IdeTransition, PathQuality,
+    ReusableIdeEndSummary, ReusableIdeProcedureSummary, ReusableIdeReachedFact,
+    ReusableIdeSummaryProvider, SolverBudget, SolverBudgetDimension, SolverTermination, SolverWork,
+    WitnessRetentionLimits, solve_ide_with_reusable_summaries, solve_ide_with_summaries,
 };
 use brokk_bifrost::analyzer::semantic::{
     CallSiteHandle, CallSiteId, CallTransferSet, CancellationToken, ControlEdgeKind,
@@ -149,7 +150,7 @@ impl IdeDataflowProblem for QualifierProblem {
 
     fn normal_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<IdeTransition<Self::Fact, Self::EdgeFunction>>,
     ) {
@@ -173,7 +174,7 @@ impl IdeDataflowProblem for QualifierProblem {
 
     fn call_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<IdeTransition<Self::Fact, Self::EdgeFunction>>,
     ) {
@@ -191,7 +192,7 @@ impl IdeDataflowProblem for QualifierProblem {
 
     fn return_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<IdeTransition<Self::Fact, Self::EdgeFunction>>,
     ) {
@@ -205,7 +206,7 @@ impl IdeDataflowProblem for QualifierProblem {
 
     fn call_to_return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<IdeTransition<Self::Fact, Self::EdgeFunction>>,
     ) {
@@ -214,7 +215,7 @@ impl IdeDataflowProblem for QualifierProblem {
 
     fn exceptional_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<IdeTransition<Self::Fact, Self::EdgeFunction>>,
     ) {
@@ -223,6 +224,121 @@ impl IdeDataflowProblem for QualifierProblem {
 }
 
 type QualifierResult = IdeSummaryDataflowResult<QualifierFact, Qualifier, QualifierFunction>;
+
+struct FixedReusableIdeProvider {
+    callee: ProcedureHandle,
+    summaries:
+        HashMap<QualifierFact, ReusableIdeProcedureSummary<QualifierFact, QualifierFunction>>,
+    calls: Cell<usize>,
+}
+
+impl ReusableIdeSummaryProvider<QualifierFact, QualifierFunction> for FixedReusableIdeProvider {
+    fn summary_for(
+        &mut self,
+        procedure: &ProcedureHandle,
+        entry_fact: QualifierFact,
+        request: &mut DataflowRequest<'_>,
+    ) -> Result<
+        Option<ReusableIdeProcedureSummary<QualifierFact, QualifierFunction>>,
+        SolverTermination,
+    > {
+        if procedure != &self.callee {
+            return Ok(None);
+        }
+        let Some(summary) = self.summaries.get(&entry_fact) else {
+            return Ok(None);
+        };
+        self.calls.set(self.calls.get().saturating_add(1));
+        let rows = summary.exits.len().saturating_add(summary.reached.len());
+        if let Some(termination) = request.reserve(SolverWork {
+            callback_rows: rows,
+            propagated_outputs: rows,
+            ..SolverWork::default()
+        }) {
+            return Err(termination);
+        }
+        Ok(Some(summary.clone()))
+    }
+}
+
+fn reusable_ide_summaries_for(
+    result: &QualifierResult,
+    procedure: &ProcedureHandle,
+) -> HashMap<QualifierFact, ReusableIdeProcedureSummary<QualifierFact, QualifierFunction>> {
+    let mut exits = HashMap::<
+        QualifierFact,
+        Vec<ReusableIdeEndSummary<QualifierFact, QualifierFunction>>,
+    >::new();
+    for (summary, function) in result.end_summary_jump_functions() {
+        if summary.entry().procedure() != procedure {
+            continue;
+        }
+        let entry_fact = *result
+            .fact_result()
+            .fact(summary.entry().entry_fact())
+            .expect("reusable entry fact resolves");
+        let exit_fact = *result
+            .fact_result()
+            .fact(summary.exit_fact())
+            .expect("reusable exit fact resolves");
+        exits
+            .entry(entry_fact)
+            .or_default()
+            .push(ReusableIdeEndSummary {
+                exit_kind: summary.exit_kind(),
+                exit_fact,
+                qualities: summary
+                    .path_qualities()
+                    .iter()
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                edge_function: *function,
+            });
+    }
+    let mut reached = HashMap::<
+        QualifierFact,
+        Vec<ReusableIdeReachedFact<QualifierFact, QualifierFunction>>,
+    >::new();
+    for (row, function) in result.reached_jump_functions() {
+        if row.entry().procedure() != procedure {
+            continue;
+        }
+        let entry_fact = *result
+            .fact_result()
+            .fact(row.entry().entry_fact())
+            .expect("reusable reached entry fact resolves");
+        let fact = *result
+            .fact_result()
+            .fact(row.fact())
+            .expect("reusable reached fact resolves");
+        reached
+            .entry(entry_fact)
+            .or_default()
+            .push(ReusableIdeReachedFact {
+                point: row.point().clone(),
+                fact,
+                qualities: row
+                    .path_qualities()
+                    .iter()
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                edge_function: *function,
+            });
+    }
+    exits
+        .into_iter()
+        .map(|(entry, exits)| {
+            let reached = reached.remove(&entry).unwrap_or_default();
+            (
+                entry,
+                ReusableIdeProcedureSummary {
+                    exits: exits.into_boxed_slice(),
+                    reached: reached.into_boxed_slice(),
+                },
+            )
+        })
+        .collect()
+}
 
 #[derive(Clone, Copy)]
 struct ReversingProvider<'workspace> {
@@ -1226,6 +1342,15 @@ fn helper_summary_composes_call_body_and_exact_return_in_path_order() {
     assert_eq!(callee_entry_value, Qualifier::Dirty);
     assert!(result.metrics().summary_relations > 0);
     assert!(result.metrics().entry_value_relations > 0);
+    let entry_transfers = result.entry_transfers().collect::<Vec<_>>();
+    assert_eq!(
+        entry_transfers.len(),
+        result.metrics().entry_value_relations,
+        "every retained call-entry relation exposes its relative edge function"
+    );
+    assert!(entry_transfers.iter().all(|(transfer, _)| {
+        transfer.source().procedure() == &root && transfer.target().procedure() != &root
+    }));
     assert!(result.metrics().summary_function_applications > 0);
     assert_eq!(
         result.end_summary_jump_functions().count(),
@@ -1627,6 +1752,104 @@ fn two_callers_reuse_one_relative_summary_function() {
     assert!(result.metrics().reused_summary_functions > 0);
     assert!(result.metrics().summary_relations >= 2);
     assert_matches_reference(&root, &provider, &result);
+}
+
+#[test]
+fn cross_query_reusable_summary_restores_relative_jump_functions() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/Shared.java",
+            r#"
+                class Shared {
+                    static int leaf(int value) {
+                        if (value > 0) return value;
+                        return -value;
+                    }
+
+                    static int root(int value) {
+                        return leaf(value);
+                    }
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let root = resolve_procedure_handle(
+        &project,
+        &analyzer,
+        "src/Shared.java",
+        PointSelector::new("static int root")
+            .procedure("root")
+            .effect("entry"),
+    );
+    let leaf = resolve_procedure_handle(
+        &project,
+        &analyzer,
+        "src/Shared.java",
+        PointSelector::new("static int leaf")
+            .procedure("leaf")
+            .effect("entry"),
+    );
+    let provider = analyzer.icfg_provider();
+    let seeds = [IdeDataflowSeed::new(
+        QualifierFact::Tracked,
+        Qualifier::Clean,
+    )];
+    let cancellation = CancellationToken::default();
+    let mut leaf_budget = SolverBudget::default();
+    let mut leaf_semantic_budget = SemanticBudget::default();
+    let leaf_result = solve_ide_with_summaries(
+        IdeSummarySolveInput::new(&leaf, &seeds),
+        &provider,
+        &QualifierProblem::default(),
+        &mut leaf_semantic_budget,
+        &mut DataflowRequest::new(&mut leaf_budget, &cancellation),
+    )
+    .expect("leaf summary solve succeeds");
+    let summaries = reusable_ide_summaries_for(&leaf_result, &leaf);
+    assert!(summaries.contains_key(&QualifierFact::Tracked));
+
+    let mut uncached_budget = SolverBudget::default();
+    let uncached = solve_problem_with_controls(
+        &root,
+        &provider,
+        &QualifierProblem::default(),
+        &seeds,
+        &mut uncached_budget,
+        &cancellation,
+    );
+    let mut reusable = FixedReusableIdeProvider {
+        callee: leaf,
+        summaries,
+        calls: Cell::new(0),
+    };
+    let mut cached_budget = SolverBudget::default();
+    let mut cached_semantic_budget = SemanticBudget::default();
+    let cached = solve_ide_with_reusable_summaries(
+        IdeSummarySolveInput::new(&root, &seeds),
+        &provider,
+        &QualifierProblem::default(),
+        &mut reusable,
+        &mut cached_semantic_budget,
+        &mut DataflowRequest::new(&mut cached_budget, &cancellation),
+    )
+    .expect("cached IDE solve succeeds");
+
+    assert!(reusable.calls.get() > 0);
+    assert!(cached.fact_result().metrics().reusable_summary_hits > 0);
+    assert_eq!(cached.termination(), SolverTermination::FixedPoint);
+    assert_eq!(
+        point_value_projection(&cached),
+        point_value_projection(&uncached)
+    );
+    assert_eq!(
+        reached_function_projection(&cached),
+        reached_function_projection(&uncached)
+    );
+    assert_eq!(
+        summary_function_projection(&cached),
+        summary_function_projection(&uncached)
+    );
 }
 
 #[test]

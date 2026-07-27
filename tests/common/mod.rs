@@ -17,8 +17,6 @@ use serde_json::Value;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::{LazyLock, Mutex};
-static SEARCH_TOOL_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 use tempfile::TempDir;
 
 #[allow(dead_code)]
@@ -225,7 +223,6 @@ pub fn assert_linewise_eq(expected: &str, actual: &str) {
 
 #[allow(dead_code)]
 pub fn call_search_tool_json(root: &Path, tool: &str, args: &str) -> Value {
-    let _guard = SEARCH_TOOL_LOCK.lock().expect("search tool lock poisoned");
     let service = SearchToolsService::new_manual_without_semantic_index(root.to_path_buf())
         .unwrap_or_else(|err| panic!("failed to build searchtools service for {tool}: {err}"));
     let payload = service

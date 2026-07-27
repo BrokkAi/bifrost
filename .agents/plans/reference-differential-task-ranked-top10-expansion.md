@@ -243,6 +243,22 @@ comes through the local gate, but is not the focus.
   zero-eligible qs envelope are clean. The raw report and checksummed ledger
   are `/mnt/optane/tmp/bifrost-fird/cpp-task-top10-af0968fa.jsonl` and
   `/mnt/optane/tmp/bifrost-fird/cpp-task-top10-af0968fa-missing.tsv`.
+- [ ] (2026-07-27) Assigned C++ follow-up #1208 to `jbellis` before changing
+  code. Its two exact log4cxx witnesses expose one root cause: tree-sitter
+  recovers `typedef spi::Filter BASE_CLASS;` inside an export-macro class as a
+  qualified declarator plus a displaced `ERROR` identifier, so declaration
+  extraction published the false nested alias `LevelRangeFilter$Filter`.
+  The reviewed candidate now recovers `BASE_CLASS` structurally and resolves a
+  qualified inherited injected-class name through the nearest unambiguous base
+  tier. A negative regression prevents that best-effort path from overriding a
+  nearer lexical type alias. Focused production witnesses are consistent, the
+  complete C++ and differential integration targets pass, formatting and
+  all-target/all-feature Clippy are clean, and the full `nlp,python` matrix is
+  running outside the sandbox at niceness 10 with the normal Cargo target. The
+  release runner rebuilt from the final candidate and reproduced both exact
+  witnesses with zero actionable discrepancy; the level-range and string-match
+  JSONL SHA-256 values are respectively `e4f5fe02673bfca0` and
+  `410637db4b26dfa3`.
 - [ ] Complete C++ and publish its evidence and user summary.
 - [ ] Complete C# and publish its evidence and user summary.
 - [ ] Complete Go and publish its evidence and user summary.

@@ -565,7 +565,7 @@ mod tests {
         let root = temp.path().canonicalize().unwrap();
         let disk_source = "export const disk = call(1);\n";
         let overlay_source = "export const overlay = call(1, 2);\nexport const extra = call(3);\n";
-        std::fs::write(root.join(".gitignore"), ".brokk/\n").unwrap();
+        std::fs::write(root.join(".gitignore"), ".bifrost/\n").unwrap();
         std::fs::write(root.join("app.ts"), disk_source).unwrap();
         let repository = init_repo(&root);
         commit_all(&repository, "disk source");
@@ -614,7 +614,7 @@ mod tests {
 
         let disk_oid = git2::Oid::hash_object(git2::ObjectType::Blob, disk_source.as_bytes())
             .expect("hash committed source");
-        let committed_snapshot_rows = Connection::open(root.join(".brokk/bifrost_cache.db"))
+        let committed_snapshot_rows = Connection::open(root.join(".bifrost/bifrost_cache.db"))
             .unwrap()
             .query_row(
                 "SELECT COUNT(*) FROM structural_facts_snapshots

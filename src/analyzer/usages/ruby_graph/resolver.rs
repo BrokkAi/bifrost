@@ -185,6 +185,32 @@ impl<'a> RubySemanticIndex<'a> {
         visible
     }
 
+    /// Follows only explicit project-local `require` edges and fails closed
+    /// when the dependency closure is too broad for a latency-sensitive caller.
+    ///
+    /// Diagnostics use this instead of the navigation-oriented visibility
+    /// closure. Callers that want convention-derived Zeitwerk visibility must
+    /// continue using [`Self::visible_files_from`].
+    pub(crate) fn visible_files_from_bounded(
+        &self,
+        file: &ProjectFile,
+        max_files: usize,
+    ) -> Option<HashSet<ProjectFile>> {
+        let mut visible = HashSet::default();
+        visible.insert(file.clone());
+        let mut stack = self.ruby.required_files(file);
+        while let Some(next) = stack.pop() {
+            if !visible.insert(next.clone()) {
+                continue;
+            }
+            if visible.len() > max_files {
+                return None;
+            }
+            stack.extend(self.ruby.required_files(&next));
+        }
+        Some(visible)
+    }
+
     pub(crate) fn resolve_constant(
         &self,
         file: &ProjectFile,
@@ -200,6 +226,29 @@ impl<'a> RubySemanticIndex<'a> {
             lexical_stack,
             &path.segments,
             path.absolute,
+            true,
+        )
+    }
+
+    /// Resolves only indexed declarations in the supplied project-local
+    /// visibility closure. This avoids initializing the workspace-wide
+    /// `autoload` index for conservative, latency-sensitive diagnostics.
+    pub(crate) fn resolve_project_local_constant(
+        &self,
+        file: &ProjectFile,
+        visible_files: &HashSet<ProjectFile>,
+        lexical_stack: &[String],
+        node: Node<'_>,
+        source: &str,
+    ) -> Option<CodeUnit> {
+        let path = extract_name_path(node, source);
+        self.resolve_constant_path(
+            file,
+            visible_files,
+            lexical_stack,
+            &path.segments,
+            path.absolute,
+            false,
         )
     }
 
@@ -216,6 +265,7 @@ impl<'a> RubySemanticIndex<'a> {
             lexical_stack,
             &[name.to_string()],
             false,
+            true,
         )
     }
 
@@ -226,11 +276,16 @@ impl<'a> RubySemanticIndex<'a> {
         lexical_stack: &[String],
         segments: &[String],
         absolute: bool,
+        include_autoload: bool,
     ) -> Option<CodeUnit> {
         let candidates = constant_lookup_candidates(lexical_stack, segments, absolute)?;
 
         candidates.into_iter().find_map(|candidate| {
-            let autoload_files = self.ruby.autoload_visible_files_for_constant(&candidate);
+            let autoload_files = if include_autoload {
+                self.ruby.autoload_visible_files_for_constant(&candidate)
+            } else {
+                HashSet::default()
+            };
             self.analyzer.definitions(&candidate).find(|unit| {
                 visible_files.contains(unit.source())
                     || unit.source() == file

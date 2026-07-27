@@ -403,12 +403,17 @@ impl TargetSpec {
         file: &ProjectFile,
         prepared: &PreparedSyntaxTree,
     ) -> Cow<'a, Self> {
+        let macro_parameter_arity =
+            visibility.callable_parameter_macro_arity(&self.target, self.target.signature());
         let activated_callable_arities =
             visibility.callable_arities_for_target(analyzer, cpp, file, prepared, self);
-        if activated_callable_arities.is_empty() {
+        if macro_parameter_arity.is_none() && activated_callable_arities.is_empty() {
             return Cow::Borrowed(self);
         }
         let mut effective = self.clone();
+        if let Some(macro_parameter_arity) = macro_parameter_arity {
+            effective.callable_arity = Some(macro_parameter_arity);
+        }
         effective.activated_callable_arities = activated_callable_arities;
         Cow::Owned(effective)
     }
@@ -703,6 +708,7 @@ pub(in crate::analyzer::usages) struct VisibilityIndex<'a> {
     // immutable event and parse caches above remain shared.
     macro_environment_cursors: Mutex<HashMap<(ProjectFile, ThreadId), MacroEnvironmentCursorCell>>,
     macro_replacements: Mutex<MacroReplacementCache>,
+    callable_parameter_macro_arities: Mutex<HashMap<(ProjectFile, String), Option<CallableArity>>>,
     #[cfg(test)]
     macro_replacement_parse_count: AtomicUsize,
     #[cfg(test)]
@@ -959,6 +965,7 @@ impl<'a> VisibilityIndex<'a> {
             macro_include_protection_cells: Mutex::new(HashMap::default()),
             macro_environment_cursors: Mutex::new(HashMap::default()),
             macro_replacements: Mutex::new(HashMap::default()),
+            callable_parameter_macro_arities: Mutex::new(HashMap::default()),
             #[cfg(test)]
             macro_replacement_parse_count: AtomicUsize::new(0),
             #[cfg(test)]
@@ -1780,6 +1787,85 @@ impl<'a> VisibilityIndex<'a> {
             }
         }
         arities
+    }
+
+    fn callable_parameter_macro_arity(
+        &self,
+        target: &CodeUnit,
+        signature: Option<&str>,
+    ) -> Option<CallableArity> {
+        let parameter_types = cpp_signature_param_types(signature?)?;
+        let [macro_name] = parameter_types.as_slice() else {
+            return None;
+        };
+        if macro_name.is_empty()
+            || !macro_name
+                .chars()
+                .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+        {
+            return None;
+        }
+        let cache_key = (target.source().clone(), macro_name.clone());
+        if let Some(cached) = self
+            .callable_parameter_macro_arities
+            .lock()
+            .expect("C++ callable parameter-macro arity cache poisoned")
+            .get(&cache_key)
+            .copied()
+        {
+            return cached;
+        }
+        let mut visible_files = HashSet::default();
+        collect_include_closure(
+            self.cpp,
+            self.cpp.include_target_index(),
+            target.source(),
+            &mut visible_files,
+            None,
+        );
+        let mut arities = Vec::new();
+        for visible_file in visible_files {
+            let cell = self.macro_event_cell(&visible_file);
+            for event in
+                cell.get_or_init(|| self.collect_macro_events(&visible_file).into_boxed_slice())
+            {
+                let MacroEvent::Define { name, binding, .. } = event else {
+                    continue;
+                };
+                if name != macro_name {
+                    continue;
+                }
+                let MacroDefinition::Object { replacement } = &binding.definition else {
+                    continue;
+                };
+                let Some(arity) = parse_macro_parameter_list_arity(replacement) else {
+                    continue;
+                };
+                if !arities.contains(&arity) {
+                    arities.push(arity);
+                }
+            }
+        }
+        let resolved = (|| {
+            let required = arities
+                .iter()
+                .filter_map(|arity| (0..=arity.total()).find(|count| arity.accepts(*count)))
+                .min()?;
+            let total = arities.iter().map(|arity| arity.total()).max()?;
+            let repeated = arities
+                .iter()
+                .any(|arity| arity.accepts(arity.total().saturating_add(1)));
+            // Preprocessor conditions can leave more than one object-like parameter
+            // bundle active in the target header's include closure. Preserve their
+            // conservative callable envelope instead of choosing whichever definition
+            // happened to be visited first.
+            Some(CallableArity::new(required, total, repeated))
+        })();
+        self.callable_parameter_macro_arities
+            .lock()
+            .expect("C++ callable parameter-macro arity cache poisoned")
+            .insert(cache_key, resolved);
+        resolved
     }
 
     pub(super) fn include_activation_for_source(
@@ -4160,6 +4246,47 @@ pub(in crate::analyzer::usages) fn signature_arity(signature: Option<&str>) -> u
         return 0;
     }
     cpp_split_top_level_commas(inner).count()
+}
+
+fn parse_macro_parameter_list_arity(replacement: &str) -> Option<CallableArity> {
+    let source = format!("void __bifrost_macro_parameters({replacement});");
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(&source, None)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let declaration = root.named_child(0)?;
+    let declarator = declaration.child_by_field_name("declarator")?;
+    let parameters = declarator.child_by_field_name("parameters")?;
+    let mut required = 0;
+    let mut total = 0;
+    let mut repeated = false;
+    let mut cursor = parameters.walk();
+    for parameter in parameters.children(&mut cursor) {
+        match parameter.kind() {
+            "parameter_declaration" => {
+                if parameter.child_by_field_name("declarator").is_none()
+                    && parameter
+                        .child_by_field_name("type")
+                        .is_some_and(|type_node| node_text(type_node, &source).trim() == "void")
+                {
+                    continue;
+                }
+                required += 1;
+                total += 1;
+            }
+            "optional_parameter_declaration" => total += 1,
+            "variadic_parameter" | "variadic_parameter_declaration" | "..." => {
+                repeated = true;
+            }
+            _ => {}
+        }
+    }
+    Some(CallableArity::new(required, total, repeated))
 }
 
 pub(super) fn cpp_callable_arity(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> CallableArity {
@@ -7850,6 +7977,7 @@ mod tests {
             macro_include_protection_cells: Mutex::new(HashMap::default()),
             macro_environment_cursors: Mutex::new(HashMap::default()),
             macro_replacements: Mutex::new(HashMap::default()),
+            callable_parameter_macro_arities: Mutex::new(HashMap::default()),
             macro_replacement_parse_count: AtomicUsize::new(0),
             macro_event_application_count: AtomicUsize::new(0),
             macro_environment_copy_count: AtomicUsize::new(0),

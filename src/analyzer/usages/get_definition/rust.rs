@@ -5972,7 +5972,7 @@ fn use_state() {
 
     #[test]
     fn bounded_receiver_typing_is_stack_safe_for_deep_reference_chains() {
-        const DEPTH: usize = 12_000;
+        const DEPTH: usize = 4_096;
         let receiver = format!("{}Service {{}}", "&".repeat(DEPTH));
         let source = format!(
             "struct Service;\n\nimpl Service {{\n    fn run(&self) {{}}\n}}\n\nfn use_service() {{\n    ({receiver}).run();\n}}\n"

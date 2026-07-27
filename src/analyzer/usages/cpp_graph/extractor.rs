@@ -671,7 +671,15 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             }
             return;
         }
-        LexicalTypeResolution::Ambiguous => return,
+        LexicalTypeResolution::Ambiguous => {
+            if let Some(scopes) = static_qualifier_type_scopes(node, ctx) {
+                *ctx.raw_match_count += 1;
+                for scope in scopes {
+                    push_type_hit(scope, ctx);
+                }
+            }
+            return;
+        }
         LexicalTypeResolution::Missing => {
             let raw_resolution = resolve_type_node_lexically_for_target_without_visibility(
                 hit_node,
@@ -895,13 +903,6 @@ fn resolve_qualified_call_target(
             visibility,
             file,
         );
-    }
-    if visibility
-        .call_arity_evidence(file, call, source)
-        .exact()
-        .is_none()
-    {
-        return BareCallTargetResolution::Ambiguous;
     }
     match resolve_type_node_lexically(
         function,
@@ -1334,7 +1335,10 @@ fn static_qualifier_type_scopes<'tree>(
     node: Node<'tree>,
     ctx: &ScanCtx<'_>,
 ) -> Option<Vec<Node<'tree>>> {
-    if node.kind() != "qualified_identifier" {
+    if !matches!(
+        node.kind(),
+        "qualified_identifier" | "scoped_type_identifier"
+    ) {
         return None;
     }
     // `maybe_record_type_hit` rejects nested type nodes before this helper, so
@@ -1342,6 +1346,7 @@ fn static_qualifier_type_scopes<'tree>(
     debug_assert!(!is_nested_type_node(node));
     let qualified = qualified_owner_components(node, ctx.source)?;
     let mut matches = Vec::new();
+    let mut inherited_injected_name_is_shadowed = false;
     for component_count in 1..=qualified.names.len() {
         match resolve_type_components_lexically_at_for_target(
             node,
@@ -1371,27 +1376,104 @@ fn static_qualifier_type_scopes<'tree>(
                     matches.push(matched);
                 }
             }
-            // One ambiguous owner prefix makes the entire qualified occurrence
-            // unsafe to attribute, even if another prefix happened to match.
-            LexicalTypeResolution::Ambiguous => return None,
-            LexicalTypeResolution::Resolved { .. } | LexicalTypeResolution::Missing => {}
+            // The ordinary lexical resolver can remain ambiguous when the
+            // qualified terminal is an alias whose canonical target is not
+            // indexed (for example, `Hash::Digest` aliases an external
+            // `std::array`). The target-guided path below still requires one
+            // physically visible logical class for every emitted prefix.
+            LexicalTypeResolution::Ambiguous => {
+                return (!inherited_injected_name_is_shadowed)
+                    .then(|| inherited_injected_class_qualifier_scope(node, ctx))
+                    .flatten()
+                    .map(|scope| vec![scope])
+                    .or_else(|| target_guided_qualifier_type_scopes(node, ctx));
+            }
+            LexicalTypeResolution::Resolved { .. } => {
+                inherited_injected_name_is_shadowed |= component_count == 1;
+            }
+            LexicalTypeResolution::Missing => {}
         }
     }
     if matches.is_empty() {
-        target_guided_qualifier_type_scopes(node, ctx)
+        (!inherited_injected_name_is_shadowed)
+            .then(|| inherited_injected_class_qualifier_scope(node, ctx))
+            .flatten()
+            .map(|scope| vec![scope])
+            .or_else(|| target_guided_qualifier_type_scopes(node, ctx))
     } else {
         Some(matches)
     }
+}
+
+fn inherited_injected_class_qualifier_scope<'tree>(
+    node: Node<'tree>,
+    ctx: &ScanCtx<'_>,
+) -> Option<Node<'tree>> {
+    let qualified = qualified_owner_components(node, ctx.source)?;
+    if qualified.global || qualified.names.is_empty() {
+        return None;
+    }
+    let injected_name = &qualified.names[0];
+    if !ctx.spec.target.is_class()
+        || ctx.spec.target.identifier() != injected_name
+        || !ctx
+            .visibility
+            .is_physically_visible(ctx.file, &ctx.spec.target)
+    {
+        return None;
+    }
+    let enclosing_owner = structured_enclosing_owner(node, ctx)?;
+    let hierarchy = ctx.analyzer.type_hierarchy_provider()?;
+    let mut frontier = hierarchy.get_direct_ancestors(&enclosing_owner);
+    let mut visited = HashSet::default();
+    while !frontier.is_empty() {
+        let mut level_matches = Vec::new();
+        let mut next_frontier = Vec::new();
+        for raw_owner in frontier {
+            let owner = ctx.visibility.canonical_visible_full_type_unit(
+                ctx.analyzer,
+                ctx.file,
+                &raw_owner,
+            )?;
+            if !visited.insert(owner.clone()) {
+                continue;
+            }
+            if owner.identifier() == injected_name
+                && !level_matches
+                    .iter()
+                    .any(|existing| same_logical_symbol(existing, &owner))
+            {
+                level_matches.push(owner.clone());
+            }
+            next_frontier.extend(hierarchy.get_direct_ancestors(&owner));
+        }
+        if let Some(first) = level_matches.first() {
+            if level_matches
+                .iter()
+                .all(|candidate| same_logical_symbol(candidate, first))
+                && same_visible_symbol(first, &ctx.spec.target)
+            {
+                return qualified.nodes.first().copied();
+            }
+            // A distinct matching base at the nearest hierarchy tier makes
+            // the injected class name ambiguous and hides deeper tiers.
+            return None;
+        }
+        frontier = next_frontier;
+    }
+    None
 }
 
 fn target_guided_qualifier_type_scopes<'tree>(
     node: Node<'tree>,
     ctx: &ScanCtx<'_>,
 ) -> Option<Vec<Node<'tree>>> {
-    if node.kind() != "qualified_identifier"
-        || !ctx
-            .visibility
-            .is_physically_visible(ctx.file, &ctx.spec.target)
+    if !matches!(
+        node.kind(),
+        "qualified_identifier" | "scoped_type_identifier"
+    ) || !ctx
+        .visibility
+        .is_physically_visible(ctx.file, &ctx.spec.target)
     {
         return None;
     }

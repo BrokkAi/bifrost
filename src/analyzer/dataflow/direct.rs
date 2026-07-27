@@ -38,7 +38,7 @@ impl DistributiveDataflowProblem for DirectFlowProblem {
     // `DirectFact` is the distinguished zero fact, which the kernel preserves.
     fn normal_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         _out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -46,7 +46,7 @@ impl DistributiveDataflowProblem for DirectFlowProblem {
 
     fn call_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         _out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -54,7 +54,7 @@ impl DistributiveDataflowProblem for DirectFlowProblem {
 
     fn return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         _out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -62,7 +62,7 @@ impl DistributiveDataflowProblem for DirectFlowProblem {
 
     fn call_to_return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         _out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -70,7 +70,7 @@ impl DistributiveDataflowProblem for DirectFlowProblem {
 
     fn exceptional_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         _out: &mut dyn DataflowOutput<Self::Fact>,
     ) {

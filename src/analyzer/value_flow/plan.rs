@@ -1,11 +1,11 @@
-use std::{cmp::Ordering, error::Error, fmt, sync::Arc};
+use std::{cmp::Ordering, error::Error, fmt, mem::size_of_val, sync::Arc};
 
 use crate::analyzer::dataflow::{SemanticInputStatus, SummaryDataflowResult};
 use crate::analyzer::semantic::{
     AbstractLocation, AbstractObject, AccessPathRoot, CallArgumentEndpoint, CallBinding,
-    CallBindings, CallSiteHandle, CandidateCoverage, EvidenceCompleteness, ObjectCardinality,
-    ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticEffect, ValueFlowRelationKind,
-    ValueFlowSnapshot,
+    CallBindings, CallSiteHandle, CallSiteId, CandidateCoverage, DeclarationLocator,
+    EvidenceCompleteness, ObjectCardinality, ProcedureHandle, ProgramPointHandle, ProgramPointId,
+    ProofStatus, SemanticArtifactKey, SemanticEffect, ValueFlowRelationKind, ValueFlowSnapshot,
 };
 use crate::hash::HashMap;
 
@@ -102,11 +102,98 @@ pub(crate) struct LocalFlowRule {
     pub completeness: EvidenceCompleteness,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum CallFlowRuleKind {
     Call,
     NormalReturn,
     ExceptionalReturn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ValueFlowLocalSummaryRule {
+    point: ProgramPointId,
+    event_index: u32,
+    kind: ValueFlowRelationKind,
+    source: ValueFlowCarrierKey,
+    target: ValueFlowCarrierKey,
+    proof: ProofStatus,
+    completeness: EvidenceCompleteness,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ValueFlowCallSummaryRule {
+    call: CallSiteId,
+    callee_artifact: SemanticArtifactKey,
+    callee_declaration: DeclarationLocator,
+    kind: CallFlowRuleKind,
+    source: ValueFlowCarrierKey,
+    target: ValueFlowCarrierKey,
+    proof: ProofStatus,
+    completeness: EvidenceCompleteness,
+}
+
+/// Stable, procedure-local value-flow identity used by reusable client summaries.
+///
+/// Source, sink, sanitizer, and transform matching are intentionally absent;
+/// clients add those independently according to their invalidation contract.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ValueFlowCarrierSummaryIdentity {
+    has_snapshot: bool,
+    local_rules: Box<[ValueFlowLocalSummaryRule]>,
+    call_rules: Box<[ValueFlowCallSummaryRule]>,
+}
+
+impl ValueFlowCarrierSummaryIdentity {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let local = size_of_val(self.local_rules.as_ref()).saturating_add(
+            self.local_rules.iter().fold(0usize, |total, rule| {
+                total
+                    .saturating_add(rule.source.retained_bytes())
+                    .saturating_add(rule.target.retained_bytes())
+                    .saturating_add(proof_heap_bytes(&rule.proof))
+                    .saturating_add(completeness_heap_bytes(&rule.completeness))
+            }),
+        );
+        let calls = size_of_val(self.call_rules.as_ref()).saturating_add(
+            self.call_rules.iter().fold(0usize, |total, rule| {
+                total
+                    .saturating_add(rule.callee_artifact.path().as_str().len())
+                    .saturating_add(declaration_heap_bytes(&rule.callee_declaration))
+                    .saturating_add(rule.source.retained_bytes())
+                    .saturating_add(rule.target.retained_bytes())
+                    .saturating_add(proof_heap_bytes(&rule.proof))
+                    .saturating_add(completeness_heap_bytes(&rule.completeness))
+            }),
+        );
+        std::mem::size_of::<Self>()
+            .saturating_add(local)
+            .saturating_add(calls)
+    }
+}
+
+fn declaration_heap_bytes(declaration: &DeclarationLocator) -> usize {
+    size_of_val(declaration.segments()).saturating_add(
+        declaration
+            .segments()
+            .iter()
+            .filter_map(|segment| segment.name())
+            .map(str::len)
+            .fold(0usize, usize::saturating_add),
+    )
+}
+
+fn proof_heap_bytes(proof: &ProofStatus) -> usize {
+    match proof {
+        ProofStatus::Proven => 0,
+        ProofStatus::Unproven(reason) => reason.len(),
+    }
+}
+
+fn completeness_heap_bytes(completeness: &EvidenceCompleteness) -> usize {
+    match completeness {
+        EvidenceCompleteness::Complete => 0,
+        EvidenceCompleteness::Partial(reason) => reason.len(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -387,6 +474,26 @@ impl ValueFlowPlan {
         self.carrier_keys.get(id.index())
     }
 
+    pub(crate) fn carrier_id_for_key(
+        &self,
+        key: &ValueFlowCarrierKey,
+    ) -> Option<ValueFlowCarrierId> {
+        self.carrier_keys
+            .binary_search(key)
+            .ok()
+            .and_then(|index| ValueFlowCarrierId::try_from_index(index).ok())
+    }
+
+    pub(crate) fn sink_id_for_key(
+        &self,
+        key: &super::ValueFlowEventKey,
+    ) -> Option<ValueFlowSinkId> {
+        self.sinks
+            .binary_search_by(|sink| sink.spec.key().cmp(key))
+            .ok()
+            .map(|index| self.sinks[index].id)
+    }
+
     pub fn carrier_id(&self, carrier: &ValueFlowCarrier) -> Option<ValueFlowCarrierId> {
         self.carrier_ids.get(carrier).copied()
     }
@@ -431,10 +538,79 @@ impl ValueFlowPlan {
             .any(|candidate| candidate == procedure)
     }
 
+    pub(crate) fn summary_procedures(&self) -> impl Iterator<Item = &ProcedureHandle> {
+        std::iter::once(&self.root).chain(self.snapshot_procedures.iter())
+    }
+
     pub(crate) fn has_binding_for_call(&self, call: &CallSiteHandle) -> bool {
         self.binding_pairs
             .iter()
             .any(|(candidate, _)| candidate == call)
+    }
+
+    pub(crate) fn carrier_summary_identities(
+        &self,
+    ) -> HashMap<ProcedureHandle, ValueFlowCarrierSummaryIdentity> {
+        #[derive(Default)]
+        struct Builder {
+            has_snapshot: bool,
+            local_rules: Vec<ValueFlowLocalSummaryRule>,
+            call_rules: Vec<ValueFlowCallSummaryRule>,
+        }
+
+        let mut builders = HashMap::<ProcedureHandle, Builder>::default();
+        for procedure in self.summary_procedures() {
+            builders.entry(procedure.clone()).or_default().has_snapshot |=
+                self.has_snapshot(procedure);
+        }
+        for rule in &self.local_rules {
+            builders
+                .entry(rule.point.procedure().clone())
+                .or_default()
+                .local_rules
+                .push(ValueFlowLocalSummaryRule {
+                    point: rule.point.id(),
+                    event_index: rule.event_index,
+                    kind: rule.kind,
+                    source: self.carrier_keys[rule.source.index()].clone(),
+                    target: self.carrier_keys[rule.target.index()].clone(),
+                    proof: rule.proof.clone(),
+                    completeness: rule.completeness.clone(),
+                });
+        }
+        for rule in &self.call_rules {
+            builders
+                .entry(rule.call.procedure().clone())
+                .or_default()
+                .call_rules
+                .push(ValueFlowCallSummaryRule {
+                    call: rule.call.id(),
+                    callee_artifact: rule.callee.artifact().key().clone(),
+                    callee_declaration: rule.callee.semantics().locator().declaration().clone(),
+                    kind: rule.kind,
+                    source: self.carrier_keys[rule.source.index()].clone(),
+                    target: self.carrier_keys[rule.target.index()].clone(),
+                    proof: rule.proof.clone(),
+                    completeness: rule.completeness.clone(),
+                });
+        }
+        builders
+            .into_iter()
+            .map(|(procedure, builder)| {
+                (
+                    procedure,
+                    ValueFlowCarrierSummaryIdentity {
+                        has_snapshot: builder.has_snapshot,
+                        local_rules: builder.local_rules.into_boxed_slice(),
+                        call_rules: builder.call_rules.into_boxed_slice(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn carrier_summary_identity_total_rows(&self) -> usize {
+        self.local_rules.len().saturating_add(self.call_rules.len())
     }
 
     pub(crate) fn is_call_input(&self, call: &CallSiteHandle, carrier: ValueFlowCarrierId) -> bool {

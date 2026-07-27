@@ -7887,6 +7887,94 @@ def run():
 }
 
 #[test]
+fn bifrost_lsp_server_ruby_semantic_diagnostics_are_constant_only() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(
+        temp_root.join("app.rb"),
+        "module Billing\nend\nBilling::Missing\n",
+    )
+    .expect("write Ruby positive fixture");
+    fs::write(
+        temp_root.join("dynamic.rb"),
+        "module Billing\nend\nBilling.const_get(:Missing)\n",
+    )
+    .expect("write Ruby dynamic fixture");
+
+    let mut server = LspServer::start(&temp_root);
+    let app_uri = uri_for(&temp_root.join("app.rb"));
+    let dynamic_uri = uri_for(&temp_root.join("dynamic.rb"));
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": app_uri}}
+    }));
+    let disabled_response = server.read_message();
+    assert!(
+        disabled_response["result"]["items"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "Ruby semantic diagnostics must be disabled by default: {disabled_response}"
+    );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeConfiguration",
+        "params": {"settings": {"unrecognizedSymbolDiagnostics": true}}
+    }));
+    // This test has made only pull diagnostic requests. A configuration change
+    // republishes diagnostics only for documents that previously received a
+    // push diagnostic notification, so there is no notification to drain here.
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": app_uri}}
+    }));
+    let enabled_response = server.read_message();
+    let items = enabled_response["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected Ruby diagnostic items, got {enabled_response}"));
+    assert_eq!(
+        items.len(),
+        1,
+        "expected one Ruby constant diagnostic: {items:#?}"
+    );
+    assert_eq!(items[0]["source"], "bifrost-ruby");
+    assert_eq!(items[0]["code"], "ruby_unrecognized_symbol");
+    assert!(
+        items[0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Missing")),
+        "expected the missing terminal constant in the message: {items:#?}"
+    );
+    assert_eq!(items[0]["range"]["start"]["line"], 2);
+    assert_eq!(items[0]["range"]["start"]["character"], 9);
+    assert_eq!(items[0]["range"]["end"]["character"], 16);
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": dynamic_uri}}
+    }));
+    let dynamic_response = server.read_message();
+    assert!(
+        dynamic_response["result"]["items"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "dynamic Ruby constant lookup must suppress semantic diagnostics: {dynamic_response}"
+    );
+
+    server.notify_value(json!({"jsonrpc": "2.0", "id": 5, "method": "shutdown"}));
+    let _ = server.read_message();
+    server.exit();
+}
+
+#[test]
 fn bifrost_lsp_server_python_semantic_diagnostics_malformed_file_reports_parse_not_semantic() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
