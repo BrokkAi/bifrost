@@ -234,7 +234,7 @@ pub fn evaluate_policy_files(
 pub fn evaluate_policy_files_with_analyzer(
     root: impl AsRef<Path>,
     policy_files: &[PathBuf],
-    analyzer: &dyn IAnalyzer,
+    workspace: &WorkspaceAnalyzer,
     options: &PolicyEvaluationOptions,
     cancellation: Option<&CancellationToken>,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
@@ -265,7 +265,7 @@ pub fn evaluate_policy_files_with_analyzer(
         options,
         batch_budget,
         PolicyRegistryLimits::default(),
-        Some(analyzer),
+        Some(workspace),
         cancellation,
     )
 }

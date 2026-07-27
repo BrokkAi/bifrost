@@ -22,6 +22,7 @@ const RESOURCE_ACQUIRE: &str =
     include_str!("fixtures/policy-cli/project/policies/endpoints/resource-acquire.rqlp");
 const RESOURCE_CLOSE: &str =
     include_str!("fixtures/policy-cli/project/policies/endpoints/resource-close.rqlp");
+const RESOURCE_SOURCE: &str = include_str!("fixtures/policy-cli/project/src/resource.ts");
 
 fn evaluation_options(date: &str) -> PolicyEvaluationOptions {
     PolicyEvaluationOptions::new(date.parse().expect("fixed test date"))
@@ -336,7 +337,12 @@ fn absent_unselected_and_incomplete_policies_are_not_conflated_as_stale() {
     );
     assert!(!review.stale());
 
-    fs::write(project.root().join(POLICY_PATH), RESOURCE_POLICY).expect("typestate policy");
+    let project = InlineTestProject::new()
+        .file("src/resource.ts", RESOURCE_SOURCE)
+        .file(POLICY_PATH, RESOURCE_POLICY)
+        .file("policies/endpoints/resource-acquire.rqlp", RESOURCE_ACQUIRE)
+        .file("policies/endpoints/resource-close.rqlp", RESOURCE_CLOSE)
+        .build();
     write_suppressions(
         project.root(),
         vec![suppression_record(

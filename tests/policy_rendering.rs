@@ -311,7 +311,9 @@ fn typestate_run_renders_findings_and_completion() {
             .count(),
         1
     );
-    assert!(rendered.contains("summary: 1 finding; 1 inconclusive policy run; non-clean"));
+    assert!(rendered.contains(
+        "summary: 1 active finding; 0 suppressed findings; 1 inconclusive policy run; non-clean"
+    ));
 }
 
 #[test]

@@ -2279,7 +2279,7 @@ impl SearchToolsService {
             let outcome = evaluate_policy_files_with_analyzer(
                 &root,
                 &policy_files,
-                snapshot.analyzer(),
+                &snapshot,
                 &options,
                 cancellation,
             )

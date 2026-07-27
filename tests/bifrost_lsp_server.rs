@@ -8023,9 +8023,16 @@ fn bifrost_lsp_server_ruby_semantic_diagnostics_are_constant_only() {
         "method": "workspace/didChangeConfiguration",
         "params": {"settings": {"unrecognizedSymbolDiagnostics": true}}
     }));
-    // This test has made only pull diagnostic requests. A configuration change
-    // republishes diagnostics only for documents that previously received a
-    // push diagnostic notification, so there is no notification to drain here.
+    let republished = server.read_notification("textDocument/publishDiagnostics");
+    let republished_items = republished["params"]["diagnostics"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected republished Ruby diagnostics, got {republished}"));
+    assert_eq!(
+        republished_items.len(),
+        1,
+        "expected one republished Ruby constant diagnostic: {republished_items:#?}"
+    );
+    assert_eq!(republished_items[0]["code"], "ruby_unrecognized_symbol");
 
     server.notify_value(json!({
         "jsonrpc": "2.0",
