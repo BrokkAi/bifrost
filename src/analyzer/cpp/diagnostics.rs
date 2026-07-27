@@ -85,9 +85,7 @@ fn proven_project_type_names(
         if !visited.insert(file.abs_path()) {
             continue;
         }
-        let Some(tree) = parse_cpp_tree(&source) else {
-            return None;
-        };
+        let tree = parse_cpp_tree(&source)?;
         if has_parse_errors(tree.root_node()) {
             return None;
         }
@@ -95,12 +93,8 @@ fn proven_project_type_names(
         while let Some(node) = stack.pop() {
             match node.kind() {
                 "preproc_include" => {
-                    let Some(include) = quoted_include_path(node, &source) else {
-                        return None;
-                    };
-                    let Some(header) = resolve_project_header(&file, &include, context) else {
-                        return None;
-                    };
+                    let include = quoted_include_path(node, &source)?;
+                    let header = resolve_project_header(&file, &include, context)?;
                     let Ok(header_source) = header.read_to_string() else {
                         return None;
                     };
