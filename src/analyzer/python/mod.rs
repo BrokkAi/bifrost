@@ -56,6 +56,12 @@ pub struct PythonAnalyzer {
     inner: TreeSitterAnalyzer<PythonAdapter>,
     memo_budget: u64,
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
+    // Every source file this file's imports resolve to, keyed on the file itself -- NOT deduped by
+    // binding name like `imported_code_units` (a HashMap<String, CodeUnit> would silently drop an
+    // import whose binding name collides with another's). `could_import_file` needs the undeduped
+    // set to answer "does ANY import here resolve into `target`" without re-resolving every import
+    // on every call (previously uncached, called once per (candidate file, target) pair).
+    imported_target_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
@@ -173,6 +179,7 @@ impl PythonAnalyzer {
             inner,
             memo_budget,
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
+            imported_target_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec),
             direct_descendant_index: Arc::new(OnceLock::new()),
@@ -823,6 +830,7 @@ impl IAnalyzer for PythonAnalyzer {
             inner,
             memo_budget: self.memo_budget,
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
+            imported_target_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
             direct_descendant_index: Arc::new(OnceLock::new()),
@@ -837,6 +845,7 @@ impl IAnalyzer for PythonAnalyzer {
             inner,
             memo_budget: self.memo_budget,
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
+            imported_target_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
             direct_descendant_index: Arc::new(OnceLock::new()),

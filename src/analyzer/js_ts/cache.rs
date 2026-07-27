@@ -15,6 +15,12 @@ use std::sync::{Arc, OnceLock};
 pub(crate) struct JsTsMemoCaches {
     /// Declarations imported by a file, keyed by importing file.
     pub(crate) imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
+    /// Raw file-path resolution targets of a file's imports (module specifier -> file), keyed by the
+    /// importing file. Distinct from `imported_code_units`: this is a file-level check (does an import
+    /// statement's path resolve to this file) used by `could_import_file`, not a symbol-level one --
+    /// caching it separately avoids re-running `resolve_js_ts_import_paths` for every candidate/target
+    /// pair the shared usages candidate walker checks.
+    pub(crate) imported_target_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     /// Files that import a given file, keyed by imported file.
     pub(crate) referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     /// Import snippets textually relevant to a code unit's source.
@@ -33,6 +39,7 @@ impl JsTsMemoCaches {
     pub(crate) fn new(budget_bytes: u64) -> Self {
         Self {
             imported_code_units: build_weighted_cache(budget_bytes / 3, weight_code_unit_set),
+            imported_target_files: build_weighted_cache(budget_bytes / 6, weight_project_file_set),
             referencing_files: build_weighted_cache(budget_bytes / 6, weight_project_file_set),
             relevant_imports: build_weighted_cache(budget_bytes / 6, weight_string_set),
             direct_ancestors: build_weighted_cache(budget_bytes / 8, weight_code_unit_vec_by_unit),

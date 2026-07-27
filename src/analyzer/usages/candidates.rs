@@ -52,9 +52,17 @@ fn find_import_graph_candidates(
     let mut all_targets: HashSet<CodeUnit> = set_with_capacity(4);
     all_targets.insert(target.clone());
 
+    // A top-level function's `parent_of` is its enclosing MODULE (a plain FQN-segment pop, not a
+    // type-hierarchy relationship) -- only a class parent means "this function is a method that
+    // could be polymorphically overridden," which is the only case `get_descendants` needs to
+    // answer. Skipping the module case avoids triggering `get_descendants`' full workspace-wide
+    // class-hierarchy index build (`build_direct_descendant_index`, `OnceLock`-cached but tens of
+    // seconds on a large codebase) for a query -- "what are a module's subclasses" -- that would
+    // always return nothing anyway.
     if let Some(provider) = analyzer.type_hierarchy_provider()
         && target.is_function()
         && let Some(parent) = analyzer.parent_of(target)
+        && parent.is_class()
     {
         for descendant in provider.get_descendants(&parent) {
             if is_cancelled(cancellation) {

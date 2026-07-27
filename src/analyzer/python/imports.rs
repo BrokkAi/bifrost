@@ -15,6 +15,26 @@ impl PythonAnalyzer {
         bindings
     }
 
+    /// The set of files any of `file`'s imports resolve into, cached per file. Unlike
+    /// `resolve_import_bindings` (keyed by binding name, so a name collision drops an entry), this
+    /// keeps every resolved target so `could_import_file` can do an exact membership check.
+    fn resolve_import_target_files(&self, file: &ProjectFile) -> Arc<HashSet<ProjectFile>> {
+        if let Some(cached) = self.imported_target_files.get(file) {
+            return cached;
+        }
+        let targets: HashSet<ProjectFile> = self
+            .inner
+            .import_info_of(file)
+            .iter()
+            .flat_map(|import| self.resolve_import(file, import))
+            .map(|(_, code_unit)| code_unit.source().clone())
+            .collect();
+        let targets = Arc::new(targets);
+        self.imported_target_files
+            .insert(file.clone(), targets.clone());
+        targets
+    }
+
     pub(super) fn resolve_import(
         &self,
         file: &ProjectFile,
@@ -284,6 +304,33 @@ impl ImportAnalysisProvider for PythonAnalyzer {
         self.inner.import_info_of(file)
     }
 
+    /// Resolves from the ALREADY-FETCHED `imports` rather than `imported_code_units_of`'s own
+    /// `self.inner.import_info_of(file)` re-fetch -- the bulk-scan caller (`could_import_file`'s
+    /// fallback) already has `imports` in hand from its own bulk read.
+    fn imported_code_units_from_infos(
+        &self,
+        file: &ProjectFile,
+        imports: &[ImportInfo],
+    ) -> Option<HashSet<CodeUnit>> {
+        Some(
+            imports
+                .iter()
+                .flat_map(|import| self.resolve_import(file, import))
+                .map(|(_, code_unit)| code_unit)
+                .collect(),
+        )
+    }
+
+    /// Without this, `scan_usages` falls back to `import_info_of` one file at
+    /// a time across the whole workspace (see #602) -- the other languages
+    /// already implement this bulk hook.
+    fn import_infos_for_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> Option<HashMap<ProjectFile, Vec<ImportInfo>>> {
+        Some(self.inner.bulk_import_infos(files.iter().cloned()))
+    }
+
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
         let Some(source) = self.inner.get_source(code_unit, false) else {
             return HashSet::default();
@@ -368,36 +415,32 @@ impl ImportAnalysisProvider for PythonAnalyzer {
         imports: &[ImportInfo],
         target: &ProjectFile,
     ) -> bool {
+        // Relative imports keep their own per-import resolution (including the conservative
+        // "unresolvable -> assume yes" fallback) since that's specific to each import, not a
+        // file-wide property. Non-relative imports are checked once against the cached, file-wide
+        // resolved-target set below rather than re-resolving every import on every call -- the
+        // final answer is the same disjunction either way, just evaluated in a different order.
         for import in imports {
             let Some(details) = python_import_details(import) else {
                 continue;
             };
-            match details {
-                PythonImportDetails::FromImport { module, name, .. } if module.starts_with('.') => {
-                    let Some(resolved_module) =
-                        resolve_python_relative_module(source_file, &module)
-                    else {
-                        return true;
-                    };
-                    let candidate_module = format!("{resolved_module}.{name}");
-                    if python_module_name(target) == candidate_module
-                        || python_module_name(target) == resolved_module
-                    {
-                        return true;
-                    }
-                }
-                _ => {
-                    if self
-                        .resolve_import(source_file, import)
-                        .into_iter()
-                        .any(|(_, code_unit)| code_unit.source() == target)
-                    {
-                        return true;
-                    }
+            if let PythonImportDetails::FromImport { module, name, .. } = &details
+                && module.starts_with('.')
+            {
+                let Some(resolved_module) = resolve_python_relative_module(source_file, module)
+                else {
+                    return true;
+                };
+                let candidate_module = format!("{resolved_module}.{name}");
+                if python_module_name(target) == candidate_module
+                    || python_module_name(target) == resolved_module
+                {
+                    return true;
                 }
             }
         }
-        false
+        self.resolve_import_target_files(source_file)
+            .contains(target)
     }
 }
 
