@@ -2668,9 +2668,50 @@ fn recovered_type_alias_names(node: Node<'_>, source: &str) -> Vec<String> {
     {
         return Vec::new();
     }
+    if node_text(keyword, source) == "typedef"
+        && let Some(alias_name) = recovered_typedef_error_alias_name(node, declarator, source)
+    {
+        return vec![alias_name];
+    }
     extract_typedef_declarator_name(declarator, source)
         .into_iter()
         .collect()
+}
+
+fn recovered_typedef_error_alias_name(
+    declaration: Node<'_>,
+    declarator: Node<'_>,
+    source: &str,
+) -> Option<String> {
+    // An export macro between `class` and its name can make tree-sitter parse
+    // the recovered class body as a function body. In that shape,
+    //
+    //     typedef spi::Filter BASE_CLASS;
+    //
+    // becomes a declaration whose `declarator` is the underlying qualified
+    // type (`spi::Filter`) and whose actual alias name is displaced into the
+    // following ERROR node. Do not publish the terminal underlying type
+    // (`Filter`) as a false class-owned alias.
+    if declarator.kind() != "qualified_identifier" {
+        return None;
+    }
+    let mut cursor = declaration.walk();
+    let mut errors = declaration
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "ERROR" && child.start_byte() >= declarator.end_byte());
+    let error = errors.next()?;
+    if errors.next().is_some() || error.named_child_count() != 1 {
+        return None;
+    }
+    let name = error.named_child(0)?;
+    if !matches!(
+        name.kind(),
+        "identifier" | "field_identifier" | "type_identifier"
+    ) {
+        return None;
+    }
+    let name = normalize_cpp_whitespace(node_text(name, source));
+    (!name.is_empty()).then_some(name)
 }
 
 fn extract_typedef_alias_names(node: Node<'_>, source: &str) -> Vec<String> {
@@ -4480,6 +4521,55 @@ mod tests {
         assert_eq!(
             member_function_linkage("struct { int method() { return 1; } } instance;"),
             CallableLinkage::Internal
+        );
+    }
+
+    #[test]
+    fn recovered_export_class_typedef_uses_displaced_alias_name() {
+        let source = r#"
+namespace spi {
+class Filter {
+public:
+    enum FilterDecision { DENY, NEUTRAL, ACCEPT };
+};
+}
+namespace filter {
+class LOG4CXX_EXPORT LevelRangeFilter : public spi::Filter
+{
+public:
+    typedef spi::Filter BASE_CLASS;
+    DECLARE_LOG4CXX_OBJECT(LevelRangeFilter)
+    BEGIN_LOG4CXX_CAST_MAP()
+    LOG4CXX_CAST_ENTRY(LevelRangeFilter)
+    LOG4CXX_CAST_ENTRY_CHAIN(BASE_CLASS)
+    END_LOG4CXX_CAST_MAP()
+    FilterDecision decide() const;
+};
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let file = ProjectFile::new(std::env::temp_dir(), "log4cxx-typedef.cpp");
+        let parsed = CppAdapter.parse_file(&file, source, &tree);
+        assert!(
+            parsed.declarations().iter().any(|unit| {
+                unit.is_class()
+                    && unit.fq_name() == "filter.LevelRangeFilter$BASE_CLASS"
+                    && unit.signature() == Some("typedef spi::Filter BASE_CLASS;")
+            }),
+            "the displaced typedef alias must retain its declared name: {:#?}",
+            parsed.declarations()
+        );
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .all(|unit| unit.fq_name() != "filter.LevelRangeFilter$Filter"),
+            "the qualified underlying type must not become a false nested alias: {:#?}",
+            parsed.declarations()
         );
     }
 

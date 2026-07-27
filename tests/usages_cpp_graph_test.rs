@@ -5672,6 +5672,53 @@ void call() {
 }
 
 #[test]
+fn authoritative_cpp_injected_base_qualifier_respects_nearer_type_shadow() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.hpp",
+            r#"
+namespace spi {
+struct Filter {
+    enum Decision { ACCEPT };
+};
+}
+namespace local {
+struct Filter {
+    enum Decision { ACCEPT };
+};
+}
+"#,
+        )
+        .file(
+            "consumer.cpp",
+            r#"
+#include "types.hpp"
+struct Derived : spi::Filter {
+    using Filter = local::Filter;
+    int decide() { return Filter::ACCEPT; }
+};
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.cpp");
+    let source = consumer.read_to_string().expect("consumer source");
+    let base = definition_by(&analyzer, |unit| {
+        unit.is_class() && unit.fq_name() == "spi.Filter" && !unit.is_synthetic()
+    });
+    let shadowed_start = source
+        .find("return Filter::ACCEPT")
+        .expect("shadowed qualifier")
+        + "return ".len();
+    let ranges = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&base), &consumer);
+
+    assert!(
+        !ranges.contains(&(shadowed_start, shadowed_start + "Filter".len())),
+        "a nearer class-owned alias must hide the inherited injected class name: {ranges:#?}"
+    );
+}
+
+#[test]
 fn cpp_graph_v2_handles_static_fields_globals_and_scoped_enums() {
     let (_project, analyzer) = cpp_analyzer_with_files(&[
         (

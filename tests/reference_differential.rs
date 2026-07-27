@@ -98,6 +98,72 @@ struct HelperBackend : RemoteStorage::Backend {
 }
 
 #[test]
+fn cpp_recovered_export_class_typedef_does_not_hijack_base_qualifier() {
+    let source = r#"
+namespace spi {
+class Filter {
+public:
+    enum FilterDecision { DENY, NEUTRAL, ACCEPT };
+};
+}
+namespace decoy {
+class Filter {
+public:
+    enum FilterDecision { ACCEPT };
+};
+}
+namespace filter {
+class LOG4CXX_EXPORT LevelRangeFilter : public spi::Filter
+{
+public:
+    typedef spi::Filter BASE_CLASS;
+    DECLARE_LOG4CXX_OBJECT(LevelRangeFilter)
+    BEGIN_LOG4CXX_CAST_MAP()
+    LOG4CXX_CAST_ENTRY(LevelRangeFilter)
+    LOG4CXX_CAST_ENTRY_CHAIN(BASE_CLASS)
+    END_LOG4CXX_CAST_MAP()
+    FilterDecision decide() const;
+};
+}
+using namespace filter;
+using namespace spi;
+using namespace decoy;
+Filter::FilterDecision LevelRangeFilter::decide() const {
+    return Filter::ACCEPT;
+}
+"#;
+    let report = cpp_differential(&[("filter.cpp", source)]);
+    let expression = "return Filter::ACCEPT";
+    let owner_start = source.find(expression).expect("qualified base constant") + "return ".len();
+    let site = report
+        .sites
+        .iter()
+        .find(|site| site.start_byte == owner_start)
+        .expect("base qualifier differential site");
+
+    assert_eq!(site.forward_status, "resolved", "{site:#?}");
+    assert_eq!(
+        site.targets.first().map(|target| target.fq_name.as_str()),
+        Some("spi.Filter"),
+        "the recovered typedef must not publish its underlying type as a false nested alias: {site:#?}"
+    );
+    assert_eq!(
+        site.classification,
+        ReferenceClassification::Consistent,
+        "{site:#?}"
+    );
+    assert!(
+        site.inverse_hit.as_ref().is_some_and(|hit| {
+            hit.path == "filter.cpp"
+                && hit.start_byte == owner_start
+                && hit.end_byte == owner_start + "Filter".len()
+                && hit.exact_range
+        }),
+        "the inherited base owner must round-trip at the exact qualifier token: {site:#?}"
+    );
+}
+
+#[test]
 fn typescript_export_alias_is_excluded_as_a_declaration_site() {
     let source = r#"const createListItem = () => {};
 const createListItemWithValidation = () => {};

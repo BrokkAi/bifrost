@@ -1346,6 +1346,7 @@ fn static_qualifier_type_scopes<'tree>(
     debug_assert!(!is_nested_type_node(node));
     let qualified = qualified_owner_components(node, ctx.source)?;
     let mut matches = Vec::new();
+    let mut inherited_injected_name_is_shadowed = false;
     for component_count in 1..=qualified.names.len() {
         match resolve_type_components_lexically_at_for_target(
             node,
@@ -1381,16 +1382,86 @@ fn static_qualifier_type_scopes<'tree>(
             // `std::array`). The target-guided path below still requires one
             // physically visible logical class for every emitted prefix.
             LexicalTypeResolution::Ambiguous => {
-                return target_guided_qualifier_type_scopes(node, ctx);
+                return (!inherited_injected_name_is_shadowed)
+                    .then(|| inherited_injected_class_qualifier_scope(node, ctx))
+                    .flatten()
+                    .map(|scope| vec![scope])
+                    .or_else(|| target_guided_qualifier_type_scopes(node, ctx));
             }
-            LexicalTypeResolution::Resolved { .. } | LexicalTypeResolution::Missing => {}
+            LexicalTypeResolution::Resolved { .. } => {
+                inherited_injected_name_is_shadowed |= component_count == 1;
+            }
+            LexicalTypeResolution::Missing => {}
         }
     }
     if matches.is_empty() {
-        target_guided_qualifier_type_scopes(node, ctx)
+        (!inherited_injected_name_is_shadowed)
+            .then(|| inherited_injected_class_qualifier_scope(node, ctx))
+            .flatten()
+            .map(|scope| vec![scope])
+            .or_else(|| target_guided_qualifier_type_scopes(node, ctx))
     } else {
         Some(matches)
     }
+}
+
+fn inherited_injected_class_qualifier_scope<'tree>(
+    node: Node<'tree>,
+    ctx: &ScanCtx<'_>,
+) -> Option<Node<'tree>> {
+    let qualified = qualified_owner_components(node, ctx.source)?;
+    if qualified.global || qualified.names.is_empty() {
+        return None;
+    }
+    let injected_name = &qualified.names[0];
+    if !ctx.spec.target.is_class()
+        || ctx.spec.target.identifier() != injected_name
+        || !ctx
+            .visibility
+            .is_physically_visible(ctx.file, &ctx.spec.target)
+    {
+        return None;
+    }
+    let enclosing_owner = structured_enclosing_owner(node, ctx)?;
+    let hierarchy = ctx.analyzer.type_hierarchy_provider()?;
+    let mut frontier = hierarchy.get_direct_ancestors(&enclosing_owner);
+    let mut visited = HashSet::default();
+    while !frontier.is_empty() {
+        let mut level_matches = Vec::new();
+        let mut next_frontier = Vec::new();
+        for raw_owner in frontier {
+            let owner = ctx.visibility.canonical_visible_full_type_unit(
+                ctx.analyzer,
+                ctx.file,
+                &raw_owner,
+            )?;
+            if !visited.insert(owner.clone()) {
+                continue;
+            }
+            if owner.identifier() == injected_name
+                && !level_matches
+                    .iter()
+                    .any(|existing| same_logical_symbol(existing, &owner))
+            {
+                level_matches.push(owner.clone());
+            }
+            next_frontier.extend(hierarchy.get_direct_ancestors(&owner));
+        }
+        if let Some(first) = level_matches.first() {
+            if level_matches
+                .iter()
+                .all(|candidate| same_logical_symbol(candidate, first))
+                && same_visible_symbol(first, &ctx.spec.target)
+            {
+                return qualified.nodes.first().copied();
+            }
+            // A distinct matching base at the nearest hierarchy tier makes
+            // the injected class name ambiguous and hides deeper tiers.
+            return None;
+        }
+        frontier = next_frontier;
+    }
+    None
 }
 
 fn target_guided_qualifier_type_scopes<'tree>(
