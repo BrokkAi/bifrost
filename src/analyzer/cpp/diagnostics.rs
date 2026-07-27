@@ -1,7 +1,7 @@
 use super::{CppAnalyzer, CppCompileContext};
 use crate::analyzer::semantic_diagnostics::{node_range, node_text};
 use crate::analyzer::tree_sitter_analyzer::collect_parse_errors;
-use crate::analyzer::{IAnalyzer, ProjectFile, SemanticDiagnostic};
+use crate::analyzer::{ProjectFile, SemanticDiagnostic};
 use crate::hash::HashSet;
 use crate::text_utils::compute_line_starts;
 use tree_sitter::{Node, Parser, Tree};
@@ -25,11 +25,9 @@ pub(crate) fn collect_cpp_semantic_diagnostics(
     let Some(tree) = parse_cpp_tree(source) else {
         return Vec::new();
     };
-    if has_parse_errors(tree.root_node())
-        || !project_header_closure_is_proven(file, source, context)
-    {
+    let Some(known_type_names) = proven_project_type_names(file, source, context) else {
         return Vec::new();
-    }
+    };
 
     let line_starts = compute_line_starts(source);
     let mut diagnostics = Vec::new();
@@ -42,7 +40,7 @@ pub(crate) fn collect_cpp_semantic_diagnostics(
             let name = node_text(node, source);
             if !name.is_empty()
                 && !context.defined_macros.contains(name)
-                && analyzer.lookup_candidates_by_identifier(name).is_empty()
+                && !known_type_names.contains(name)
             {
                 diagnostics.push(SemanticDiagnostic {
                     range: node_range(node, &line_starts),
@@ -71,39 +69,40 @@ fn has_parse_errors(root: Node<'_>) -> bool {
     !errors.is_empty()
 }
 
-fn project_header_closure_is_proven(
+fn proven_project_type_names(
     source_file: &ProjectFile,
     source: &str,
     context: &CppCompileContext,
-) -> bool {
+) -> Option<HashSet<String>> {
     if !context.forced_includes.is_empty() || !context.system_include_roots.is_empty() {
-        return false;
+        return None;
     }
 
     let mut visited = HashSet::default();
+    let mut known_type_names = HashSet::default();
     let mut pending = vec![(source_file.clone(), source.to_string())];
     while let Some((file, source)) = pending.pop() {
         if !visited.insert(file.abs_path()) {
             continue;
         }
         let Some(tree) = parse_cpp_tree(&source) else {
-            return false;
+            return None;
         };
         if has_parse_errors(tree.root_node()) {
-            return false;
+            return None;
         }
         let mut stack = vec![tree.root_node()];
         while let Some(node) = stack.pop() {
             match node.kind() {
                 "preproc_include" => {
                     let Some(include) = quoted_include_path(node, &source) else {
-                        return false;
+                        return None;
                     };
                     let Some(header) = resolve_project_header(&file, &include, context) else {
-                        return false;
+                        return None;
                     };
                     let Ok(header_source) = header.read_to_string() else {
-                        return false;
+                        return None;
                     };
                     pending.push((header, header_source));
                 }
@@ -114,12 +113,28 @@ fn project_header_closure_is_proven(
                 | "preproc_ifndef"
                 | "preproc_elif"
                 | "preproc_else"
-                | "preproc_call" => return false,
+                | "preproc_call" => return None,
+                "class_specifier" | "struct_specifier" | "enum_specifier" => {
+                    if let Some(name) = declared_type_name(node, &source) {
+                        known_type_names.insert(name);
+                    }
+                    push_named_children(&mut stack, node);
+                }
                 _ => push_named_children(&mut stack, node),
             }
         }
     }
-    true
+    Some(known_type_names)
+}
+
+fn declared_type_name(node: Node<'_>, source: &str) -> Option<String> {
+    let name = node.child_by_field_name("name").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| matches!(child.kind(), "type_identifier" | "identifier"))
+    })?;
+    let name = node_text(name, source).trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 fn quoted_include_path(node: Node<'_>, source: &str) -> Option<String> {
@@ -166,7 +181,10 @@ fn is_plain_type_reference(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
-    if !matches!(parent.kind(), "type_descriptor" | "sized_type_specifier") {
+    if !matches!(
+        parent.kind(),
+        "declaration" | "type_descriptor" | "sized_type_specifier"
+    ) {
         return false;
     }
     let mut current = parent;

@@ -40,6 +40,9 @@ The feature must prefer silence to an incorrect editor error. Missing, malformed
 - Observation: the local focused test command did not expose warnings promoted to errors by CI's target-specific clippy matrix.
   Evidence: PR #1202's Linux clippy job reported two unused imports and an anonymous node-lifetime mismatch in `src/analyzer/cpp/diagnostics.rs`.
 
+- Observation: `CppAnalyzer::lookup_candidates_by_identifier` is too broad to prove a type is declared; the unknown type in the positive diagnostic fixture appears in that index as a candidate.
+  Evidence: PR #1202's cross-platform `cargo test` jobs all failed because the collector returned no diagnostic for `MissingType value;` despite a usable compilation-database entry.
+
 ## Decision Log
 
 - Decision: make compile context diagnostics-only and do not extend `src/analyzer/cpp/imports.rs`.
@@ -60,6 +63,10 @@ The feature must prefer silence to an incorrect editor error. Missing, malformed
 
 - Decision: a macro defined through `-D` suppresses a same-named type-looking token, while in-source macro directives make the enclosing translation unit non-emitting.
   Rationale: tree-sitter cannot expand macros. Both choices preserve the no-false-positive requirement without pretending a text token is a compiler-resolved type.
+  Date/Author: 2026-07-27 / Codex.
+
+- Decision: recognize project types only from structured class, struct, and enum declaration nodes in the proven source/header closure.
+  Rationale: the closure is the narrow capability boundary that makes this diagnostic trustworthy; a global candidate index may contain uses or unrelated declarations and would incorrectly suppress a true positive.
   Date/Author: 2026-07-27 / Codex.
 
 ## Outcomes & Retrospective
@@ -181,3 +188,5 @@ Plan revision (2026-07-27): completed the loader and collector. The collector no
 Plan revision (2026-07-27): completed the LSP integration proof, documentation, clippy, and feature-enabled full test suite. The plan is complete; future work should begin from the intentionally conservative exclusions recorded here rather than widening the collector silently.
 
 Plan revision (2026-07-27): corrected the post-PR CI-only clippy failures by removing unused imports and tying the traversal helper's node and stack lifetimes explicitly. Re-run the full target-aware clippy gate before treating this plan as complete again.
+
+Plan revision (2026-07-27): replaced global C++ candidate lookup with structural type-declaration collection after CI showed it hid the required positive diagnostic. The focused library test now covers the repaired behavior; re-run the cross-platform matrix after pushing.
