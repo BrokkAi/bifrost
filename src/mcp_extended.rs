@@ -41,6 +41,10 @@ fn query_step_input_variants() -> Vec<Value> {
         .value_shape()
         .string_length_bounds()
         .expect("capture-name shape has string bounds");
+    let (protocol_ref_minimum, protocol_ref_maximum) = QueryStepField::ProtocolRef
+        .value_shape()
+        .string_length_bounds()
+        .expect("protocol-ref shape has string bounds");
     let plain = ALL_QUERY_STEP_OPS
         .iter()
         .copied()
@@ -50,6 +54,8 @@ fn query_step_input_variants() -> Vec<Value> {
                 && !op.allows_call_options()
                 && !op.allows_call_site_options()
                 && !op.allows_receiver_options()
+                && !op.allows_typestate_options()
+                && !op.allows_witness_options()
                 && op.label() != "call_input"
         })
         .map(|op| op.label())
@@ -82,6 +88,18 @@ fn query_step_input_variants() -> Vec<Value> {
         .iter()
         .copied()
         .filter(|op| op.allows_receiver_options())
+        .map(|op| op.label())
+        .collect::<Vec<_>>();
+    let typestate_steps = ALL_QUERY_STEP_OPS
+        .iter()
+        .copied()
+        .filter(|op| op.allows_typestate_options())
+        .map(|op| op.label())
+        .collect::<Vec<_>>();
+    let witness_steps = ALL_QUERY_STEP_OPS
+        .iter()
+        .copied()
+        .filter(|op| op.allows_witness_options())
         .map(|op| op.label())
         .collect::<Vec<_>>();
     let reference_kinds = ALL_REFERENCE_KINDS
@@ -199,6 +217,38 @@ fn query_step_input_variants() -> Vec<Value> {
             "required": ["op"],
             "additionalProperties": false
         }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "type": "string", "enum": typestate_steps },
+                "protocol_ref": {
+                    "type": "string",
+                    "minLength": protocol_ref_minimum,
+                    "maxLength": protocol_ref_maximum,
+                    "description": QueryStepField::ProtocolRef.description()
+                }
+            },
+            "required": ["op", "protocol_ref"],
+            "additionalProperties": false
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "type": "string", "enum": witness_steps },
+                "max_steps": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": QueryStepField::MaxSteps.description()
+                },
+                "max_bytes": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": QueryStepField::MaxBytes.description()
+                }
+            },
+            "required": ["op"],
+            "additionalProperties": false
+        }),
     ]
 }
 
@@ -256,7 +306,7 @@ fn query_plan_properties(
             "type": "array",
             "maxItems": MAX_QUERY_STEPS,
             "items": { "oneOf": query_step_variants },
-            "description": "Ordered typed transformations. Hierarchy/member/owner steps consume and produce exact indexed declarations; import steps consume files; schema-v3 CFG steps consume and produce source-backed procedures, program points, and control edges."
+            "description": "Ordered typed transformations. Hierarchy/member/owner steps consume and produce exact indexed declarations; import steps consume files; schema-v3 CFG steps consume and produce source-backed procedures, program points, and control edges; schema-v4 typestate consumes a host registration and witness projects retained evidence."
         }
     })
     .as_object()
@@ -319,7 +369,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         .collect::<Vec<_>>()
         .join(", ");
     let query_code_description = format!(
-        "Query normalized code structure, compose compatible typed branches with union, intersect, or except, then optionally apply typed semantic steps. Schema version 3 supports {step_vocabulary}; explicit version-2 pins retain the pre-CFG vocabulary. Set branches must produce the same terminal domain; a common steps suffix may continue from that domain. Set execution_mode to explain for planning without workspace execution or profile for the exact ordinary result plus structured operator measurements; results is the default. Hierarchy steps are direct by default and accept either a positive depth or transitive: true. Call traversal is direct by default, accepts only finite positive depth, and can expose call sites plus one direct receiver or formal-parameter input. Reference and call steps preserve proof-bearing exact indexed targets and sites. Java, JavaScript, TypeScript, C++, C#, Go, PHP, Python, Ruby, Rust, and Scala receiver_targets, points_to, and member_targets expose bounded demand-driven receiver provenance; unsupported source forms return explicit analysis rows. Procedure-local CFG steps expose source-backed procedure, program_point, and control_edge results with proof and completeness; they are not ICFG, data-flow, taint, or typestate analysis. Results include only declarations indexed by the workspace analyzer; observing library usages does not imply that library declarations are queryable. Terminal values are tagged structural_match, declaration, procedure, program_point, control_edge, file, reference_site, call_site, expression_site, or receiver_analysis results with provenance. Minimal query: {{\"match\":{{\"kind\":\"call\",\"callee\":{{\"name\":\"eval\"}}}}}}. CFG example: {{\"schema_version\":3,\"match\":{{\"kind\":\"function\",\"name\":\"run\"}},\"steps\":[{{\"op\":\"procedure_of\"}},{{\"op\":\"cfg_entry\"}}]}}. Guide: https://bifrost.brokk.ai/code-querying/"
+        "Query normalized code structure, compose compatible typed branches with union, intersect, or except, then optionally apply typed semantic steps. Schema version 4 supports {step_vocabulary}; explicit version-2 pins retain the pre-CFG vocabulary and version-3 pins retain CFG without typestate. Set branches must produce the same terminal domain; a common steps suffix may continue from that domain. Set execution_mode to explain for planning without workspace execution or profile for the exact ordinary result plus structured operator measurements; results is the default. Hierarchy steps are direct by default and accept either a positive depth or transitive: true. Call traversal is direct by default, accepts only finite positive depth, and can expose call sites plus one direct receiver or formal-parameter input. Reference and call steps preserve proof-bearing exact indexed targets and sites. Java, JavaScript, TypeScript, C++, C#, Go, PHP, Python, Ruby, Rust, and Scala receiver_targets, points_to, and member_targets expose bounded demand-driven receiver provenance; unsupported source forms return explicit analysis rows. Procedure-local CFG steps expose source-backed procedure, program_point, and control_edge results with proof and completeness. Schema-v4 typestate accepts only a host-registered protocol_ref, maps procedure to diagnostic-neutral typestate_finding, and projects already-retained bounded typestate_witness rows without rerunning the solver; an unconfigured host returns an explicit unresolved-reference diagnostic. Results include only declarations indexed by the workspace analyzer; observing library usages does not imply that library declarations are queryable. Terminal values are tagged structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, file, reference_site, call_site, expression_site, or receiver_analysis results with provenance. Minimal query: {{\"match\":{{\"kind\":\"call\",\"callee\":{{\"name\":\"eval\"}}}}}}. Typestate example: {{\"schema_version\":4,\"match\":{{\"kind\":\"function\",\"name\":\"run\"}},\"steps\":[{{\"op\":\"procedure_of\"}},{{\"op\":\"typestate\",\"protocol_ref\":\"embedding:resource-lifecycle\"}},{{\"op\":\"witness\",\"max_steps\":32,\"max_bytes\":16384}}]}}. Guide: https://bifrost.brokk.ai/code-querying/"
     );
     let query_step_variants = query_step_input_variants();
     let query_plan_schema = query_plan_schema(&pattern_schema_description, &query_step_variants);
@@ -355,7 +405,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                 "type": "integer",
                 "default": SCHEMA_VERSION,
                 "enum": schema_versions,
-                "description": "Optional query schema version. Omit for compatible head v3; pin v2 to retain the pre-CFG query vocabulary."
+                "description": "Optional query schema version. Omit for compatible head v4; pin v3 for CFG without typestate or v2 for the pre-CFG vocabulary."
             },
             "query_file": {
                 "type": "string",
@@ -623,6 +673,29 @@ mod tests {
             })
             .expect("receiver traversal schema");
         assert_eq!(receiver_variant["properties"]["capture"]["minLength"], 1);
+        let typestate_variant = steps["items"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| {
+                variant["properties"]["op"]["enum"]
+                    .as_array()
+                    .is_some_and(|ops| ops.iter().any(|op| op == "typestate"))
+            })
+            .expect("typestate traversal schema");
+        assert_eq!(typestate_variant["required"], json!(["op", "protocol_ref"]));
+        let witness_variant = steps["items"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| {
+                variant["properties"]["op"]["enum"]
+                    .as_array()
+                    .is_some_and(|ops| ops.iter().any(|op| op == "witness"))
+            })
+            .expect("witness traversal schema");
+        assert_eq!(witness_variant["properties"]["max_steps"]["minimum"], 0);
+        assert_eq!(witness_variant["properties"]["max_bytes"]["minimum"], 0);
         assert_eq!(
             receiver_variant["properties"]["capture"]["maxLength"],
             MAX_CAPTURE_LENGTH
@@ -648,7 +721,7 @@ mod tests {
         assert_eq!(advertised, registered);
         assert_eq!(
             query_code["inputSchema"]["properties"]["schema_version"]["enum"],
-            json!([2, 3])
+            json!([2, 3, 4])
         );
         assert_eq!(
             query_code["inputSchema"]["properties"]["execution_mode"]["enum"],

@@ -45,6 +45,10 @@ use super::query::{
 use crate::analyzer::reference_candidates::{
     ReferenceCandidateRanges, reference_candidate_ranges, reference_candidate_ranges_cancellable,
 };
+use crate::analyzer::structural::analysis_context::{
+    ProtocolRef, ProtocolRegistrationSet, QueryAnalysisContext, QueryAnalysisContextError,
+    QueryAnalysisValidationLimits,
+};
 use crate::analyzer::structural::capabilities::QueryFeature;
 #[cfg(test)]
 use crate::analyzer::usages::CallArgument;
@@ -83,6 +87,7 @@ mod results;
 mod semantic;
 #[cfg(test)]
 mod tests;
+mod typestate;
 
 // `apply_pipeline_step` below (this engine's own per-step dispatch) reaches
 // into `expansions` for its three graph-traversal entry points.
@@ -93,6 +98,7 @@ use semantic::{
     SemanticControlEdgeValue, SemanticProcedureValue, SemanticProgramPointValue,
     SemanticQueryContext,
 };
+use typestate::{SemanticTypestateFindingValue, SemanticTypestateWitnessValue};
 
 // Internal wiring: hoist the handful of `expansions`-child items the moved
 // test module (tests.rs) still reaches via a bare `super::name` path, exactly
@@ -143,6 +149,16 @@ pub use results::CodeQuerySemanticWork;
 pub use results::CodeQuerySourceSite;
 pub(crate) use results::CodeQueryStableOwnerCandidate;
 pub(crate) use results::CodeQueryStableOwnerDerivation;
+pub use results::CodeQueryTypestateCertainty;
+pub use results::CodeQueryTypestateFinding;
+pub use results::CodeQueryTypestateFindingKind;
+pub use results::CodeQueryTypestateLimits;
+pub use results::CodeQueryTypestateSubject;
+pub use results::CodeQueryTypestateUncertainty;
+pub use results::CodeQueryTypestateWitness;
+pub use results::CodeQueryTypestateWitnessStep;
+pub use results::CodeQueryTypestateWitnessStepKind;
+pub use results::CodeQueryTypestateWork;
 pub(crate) use results::DetailedCodeQueryDomain;
 pub(crate) use results::DetailedCodeQueryEvidence;
 pub(crate) use results::DetailedCodeQueryIdentityCandidate;
@@ -383,6 +399,8 @@ enum SemanticPipelineValue {
     Procedure(SemanticProcedureValue),
     ProgramPoint(SemanticProgramPointValue),
     ControlEdge(SemanticControlEdgeValue),
+    TypestateFinding(SemanticTypestateFindingValue),
+    TypestateWitness(SemanticTypestateWitnessValue),
 }
 
 struct DetailedSemanticProjection<'a> {
@@ -412,6 +430,8 @@ enum SemanticPipelineKey {
     Procedure(crate::analyzer::semantic::ProcedureHandle),
     ProgramPoint(crate::analyzer::semantic::ProgramPointHandle),
     ControlEdge(crate::analyzer::semantic::ControlEdgeHandle),
+    TypestateFinding(String),
+    TypestateWitness(String),
 }
 
 impl PipelineValue {
@@ -441,6 +461,12 @@ impl SemanticPipelineValue {
             Self::Procedure(procedure) => SemanticPipelineKey::Procedure(procedure.handle.clone()),
             Self::ProgramPoint(point) => SemanticPipelineKey::ProgramPoint(point.handle.clone()),
             Self::ControlEdge(edge) => SemanticPipelineKey::ControlEdge(edge.handle.clone()),
+            Self::TypestateFinding(finding) => {
+                SemanticPipelineKey::TypestateFinding(finding.key().to_string())
+            }
+            Self::TypestateWitness(witness) => {
+                SemanticPipelineKey::TypestateWitness(witness.key().to_string())
+            }
         }
     }
 
@@ -449,6 +475,8 @@ impl SemanticPipelineValue {
             Self::Procedure(value) => value.file(),
             Self::ProgramPoint(value) => value.file(),
             Self::ControlEdge(value) => value.file(),
+            Self::TypestateFinding(value) => value.file(),
+            Self::TypestateWitness(value) => value.file(),
         }
     }
 
@@ -463,6 +491,12 @@ impl SemanticPipelineValue {
             Self::ControlEdge(value) => CodeQueryResultValue::ControlEdge {
                 value: Box::new(value.public()),
             },
+            Self::TypestateFinding(value) => CodeQueryResultValue::TypestateFinding {
+                value: Box::new(value.public),
+            },
+            Self::TypestateWitness(value) => CodeQueryResultValue::TypestateWitness {
+                value: Box::new(value.public),
+            },
         }
     }
 
@@ -471,6 +505,8 @@ impl SemanticPipelineValue {
             Self::Procedure(value) => value.public_ref(),
             Self::ProgramPoint(value) => value.public_ref(),
             Self::ControlEdge(value) => value.public_ref(),
+            Self::TypestateFinding(value) => value.public_ref(),
+            Self::TypestateWitness(value) => value.public_ref(),
         }
     }
 
@@ -520,6 +556,29 @@ impl SemanticPipelineValue {
                     stable_id: public.id,
                 }
             }
+            Self::TypestateFinding(value) => DetailedSemanticProjection {
+                domain: DetailedCodeQueryDomain::TypestateFinding,
+                key: DetailedCodeQueryKey::TypestateFinding {
+                    id: value.public.id.clone(),
+                },
+                file: value.file(),
+                byte_span: value.byte_span(),
+                display_range: value.public.range,
+                language: value.public.language,
+                stable_id: value.public.id.clone(),
+            },
+            Self::TypestateWitness(value) => DetailedSemanticProjection {
+                domain: DetailedCodeQueryDomain::TypestateWitness,
+                key: DetailedCodeQueryKey::TypestateWitness {
+                    id: value.public.id.clone(),
+                    finding_id: value.public.finding_id.clone(),
+                },
+                file: value.file(),
+                byte_span: value.byte_span(),
+                display_range: value.public.range,
+                language: value.public.language,
+                stable_id: value.public.id.clone(),
+            },
         }
     }
 }
@@ -734,7 +793,7 @@ pub fn execute_request_with_limits(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResponse {
-    execute_request_internal(analyzer, None, query, limits, None)
+    execute_request_internal(analyzer, None, query, limits, None, None)
 }
 
 /// Honor the query's root execution mode with access to generation-bound
@@ -751,7 +810,51 @@ pub fn execute_workspace_request_with_limits(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResponse {
-    execute_request_internal(workspace.analyzer(), Some(workspace), query, limits, None)
+    execute_request_internal(
+        workspace.analyzer(),
+        Some(workspace),
+        query,
+        limits,
+        None,
+        None,
+    )
+}
+
+/// Execute against an immutable host registration snapshot.
+///
+/// The generation must be the same value captured in each registration. A
+/// query-local capability context is created only for results/profile modes;
+/// explain remains planning-only.
+pub fn execute_workspace_request_with_registrations(
+    workspace: &WorkspaceAnalyzer,
+    workspace_generation: u64,
+    registrations: &ProtocolRegistrationSet,
+    query: &CodeQuery,
+) -> CodeQueryResponse {
+    execute_workspace_request_with_registration_limits(
+        workspace,
+        workspace_generation,
+        registrations,
+        query,
+        CodeQueryExecutionLimits::default(),
+    )
+}
+
+pub fn execute_workspace_request_with_registration_limits(
+    workspace: &WorkspaceAnalyzer,
+    workspace_generation: u64,
+    registrations: &ProtocolRegistrationSet,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+) -> CodeQueryResponse {
+    execute_request_internal(
+        workspace.analyzer(),
+        Some(workspace),
+        query,
+        limits,
+        None,
+        Some((workspace_generation, registrations)),
+    )
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1151,9 +1254,11 @@ pub fn execute_workspace_with_limits(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResult {
-    execute_internal(
+    execute_internal_with_analysis(
         workspace.analyzer(),
         Some(workspace),
+        None,
+        0,
         query,
         limits,
         None,
@@ -1184,7 +1289,7 @@ pub fn execute_request_with_cancellation(
     limits: CodeQueryExecutionLimits,
     cancellation: &CancellationToken,
 ) -> CodeQueryResponse {
-    execute_request_internal(analyzer, None, query, limits, Some(cancellation))
+    execute_request_internal(analyzer, None, query, limits, Some(cancellation), None)
 }
 
 /// Execute a mode-aware workspace query with explicit limits and cooperative
@@ -1202,6 +1307,25 @@ pub fn execute_workspace_request_with_cancellation(
         query,
         limits,
         Some(cancellation),
+        None,
+    )
+}
+
+pub fn execute_workspace_request_with_registration_cancellation(
+    workspace: &WorkspaceAnalyzer,
+    workspace_generation: u64,
+    registrations: &ProtocolRegistrationSet,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: &CancellationToken,
+) -> CodeQueryResponse {
+    execute_request_internal(
+        workspace.analyzer(),
+        Some(workspace),
+        query,
+        limits,
+        Some(cancellation),
+        Some((workspace_generation, registrations)),
     )
 }
 
@@ -1211,12 +1335,46 @@ fn execute_request_internal(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
+    registrations: Option<(u64, &ProtocolRegistrationSet)>,
 ) -> CodeQueryResponse {
+    if query_plan_requires_typestate(&query.plan) && !limits.typestate.is_valid() {
+        return CodeQueryResponse::Results(invalid_plan_result(
+            "typestate execution limits must be positive and no greater than their hard maxima",
+        ));
+    }
+    let analysis_context = if query.execution_mode == CodeQueryExecutionMode::Explain {
+        None
+    } else if let (Some(workspace), Some((workspace_generation, registrations))) =
+        (workspace, registrations)
+    {
+        let requested = requested_protocol_refs(&query.plan);
+        match QueryAnalysisContext::new_with_validation(
+            workspace,
+            workspace_generation,
+            registrations,
+            &requested,
+            QueryAnalysisValidationLimits::new(
+                limits.semantic.max_materialized_files,
+                limits.semantic.max_source_bytes,
+            ),
+            cancellation,
+        ) {
+            Ok(context) => Some(context),
+            Err(error) => {
+                return CodeQueryResponse::Results(query_analysis_context_error_result(error));
+            }
+        }
+    } else {
+        None
+    };
+    let workspace_generation = registrations.map_or(0, |(generation, _)| generation);
     match query.execution_mode {
         CodeQueryExecutionMode::Results => CodeQueryResponse::Results(
-            execute_internal(
+            execute_internal_with_analysis(
                 analyzer,
                 workspace,
+                analysis_context.as_ref(),
+                workspace_generation,
                 query,
                 limits,
                 cancellation,
@@ -1241,8 +1399,17 @@ fn execute_request_internal(
             Err(error) => CodeQueryResponse::Results(invalid_plan_result(error)),
         },
         CodeQueryExecutionMode::Profile => {
-            let detailed =
-                execute_internal(analyzer, workspace, query, limits, cancellation, None, true);
+            let detailed = execute_internal_with_analysis(
+                analyzer,
+                workspace,
+                analysis_context.as_ref(),
+                workspace_generation,
+                query,
+                limits,
+                cancellation,
+                None,
+                true,
+            );
             let DetailedCodeQueryResult {
                 result, profile, ..
             } = detailed;
@@ -1265,7 +1432,17 @@ pub(crate) fn execute_code_query_detailed(
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DetailedCodeQueryResult {
-    execute_internal(analyzer, None, query, limits, cancellation, None, false)
+    execute_internal_with_analysis(
+        analyzer,
+        None,
+        None,
+        0,
+        query,
+        limits,
+        cancellation,
+        None,
+        false,
+    )
 }
 
 /// Internal opt-in profile entry point used by the M2 measurement harness.
@@ -1276,7 +1453,7 @@ pub(crate) fn execute_code_query_profiled(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> DetailedCodeQueryResult {
-    execute_internal(analyzer, None, query, limits, None, None, true)
+    execute_internal_with_analysis(analyzer, None, None, 0, query, limits, None, None, true)
 }
 
 /// M4 benchmark/test entry point. A forced strategy still passes through the
@@ -1289,9 +1466,11 @@ pub(crate) fn execute_code_query_with_union_strategy(
     strategy: UnionExecutionStrategy,
     capture_profile: bool,
 ) -> DetailedCodeQueryResult {
-    execute_internal_with_strategy(
+    execute_internal_with_analysis_strategy(
         analyzer,
         None,
+        None,
+        0,
         query,
         limits,
         None,
@@ -1313,9 +1492,11 @@ pub(crate) fn execute_code_query_with_access_mode(
     capture_profile: bool,
 ) -> Result<DetailedCodeQueryResult, String> {
     let mut failure = None;
-    let detailed = execute_internal_with_strategy(
+    let detailed = execute_internal_with_analysis_strategy(
         analyzer,
         None,
+        None,
+        0,
         query,
         limits,
         None,
@@ -1338,9 +1519,11 @@ fn execute_with_receiver_budget_for_test(
     query: &CodeQuery,
     receiver_budget: ReceiverAnalysisBudget,
 ) -> CodeQueryResult {
-    execute_internal(
+    execute_internal_with_analysis(
         analyzer,
         None,
+        None,
+        0,
         query,
         CodeQueryExecutionLimits::default(),
         None,
@@ -1350,6 +1533,7 @@ fn execute_with_receiver_budget_for_test(
     .result
 }
 
+#[cfg(test)]
 fn execute_internal(
     analyzer: &dyn IAnalyzer,
     workspace: Option<&WorkspaceAnalyzer>,
@@ -1359,9 +1543,36 @@ fn execute_internal(
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
     capture_profile: bool,
 ) -> DetailedCodeQueryResult {
-    execute_internal_with_strategy(
+    execute_internal_with_analysis(
         analyzer,
         workspace,
+        None,
+        0,
+        query,
+        limits,
+        cancellation,
+        receiver_budget_override,
+        capture_profile,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_internal_with_analysis(
+    analyzer: &dyn IAnalyzer,
+    workspace: Option<&WorkspaceAnalyzer>,
+    analysis_context: Option<&QueryAnalysisContext>,
+    workspace_generation: u64,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    receiver_budget_override: Option<ReceiverAnalysisBudget>,
+    capture_profile: bool,
+) -> DetailedCodeQueryResult {
+    execute_internal_with_analysis_strategy(
+        analyzer,
+        workspace,
+        analysis_context,
+        workspace_generation,
         query,
         limits,
         cancellation,
@@ -1381,10 +1592,44 @@ fn benchmark_structural_access_mode() -> StructuralAccessMode {
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn execute_internal_with_strategy(
     analyzer: &dyn IAnalyzer,
     workspace: Option<&WorkspaceAnalyzer>,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    receiver_budget_override: Option<ReceiverAnalysisBudget>,
+    capture_profile: bool,
+    union_strategy: UnionExecutionStrategy,
+    scheduler_workers: usize,
+    access_mode: StructuralAccessMode,
+    access_failure_out: Option<&mut Option<String>>,
+) -> DetailedCodeQueryResult {
+    execute_internal_with_analysis_strategy(
+        analyzer,
+        workspace,
+        None,
+        0,
+        query,
+        limits,
+        cancellation,
+        receiver_budget_override,
+        capture_profile,
+        union_strategy,
+        scheduler_workers,
+        access_mode,
+        access_failure_out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_internal_with_analysis_strategy(
+    analyzer: &dyn IAnalyzer,
+    workspace: Option<&WorkspaceAnalyzer>,
+    analysis_context: Option<&QueryAnalysisContext>,
+    workspace_generation: u64,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
@@ -1425,6 +1670,14 @@ fn execute_internal_with_strategy(
             CodeQueryExecutionBudget::default(),
         );
     }
+    if query_plan_requires_typestate(&query.plan) && !limits.typestate.is_valid() {
+        return detailed_result_without_evidence(
+            invalid_plan_result(
+                "typestate execution limits must be positive and no greater than their hard maxima",
+            ),
+            CodeQueryExecutionBudget::default(),
+        );
+    }
     let planning_ns = planning_started.map(elapsed_ns).unwrap_or(0);
     let mut diagnostics = Vec::new();
     let mut state = QueryExecutionState {
@@ -1438,9 +1691,16 @@ fn execute_internal_with_strategy(
         reference_cache: ReferenceTraversalCache::default(),
         call_cache: CallTraversalCache::default(),
         receiver_facts: HashMap::default(),
-        semantic: workspace
-            .filter(|_| requires_semantic)
-            .map(|workspace| SemanticQueryContext::new(workspace, cancellation, limits.semantic)),
+        semantic: workspace.filter(|_| requires_semantic).map(|workspace| {
+            SemanticQueryContext::new_with_analysis(
+                workspace,
+                cancellation,
+                limits.semantic,
+                limits.typestate,
+                workspace_generation,
+                analysis_context,
+            )
+        }),
         import_graph: None,
         import_graph_generations: None,
         direct_import_layer: None,
@@ -3183,7 +3443,10 @@ fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::ReferenceCallsiteLimit
             | CodeQueryDiagnosticCode::UsesCandidateLimit
             | CodeQueryDiagnosticCode::UsesCandidatesOmitted
-            | CodeQueryDiagnosticCode::SemanticBudgetExhausted => {
+            | CodeQueryDiagnosticCode::SemanticBudgetExhausted
+            | CodeQueryDiagnosticCode::TypestateSolverBudgetExhausted
+            | CodeQueryDiagnosticCode::TypestateFindingBudgetExhausted
+            | CodeQueryDiagnosticCode::TypestateWitnessTruncated => {
                 Some(QueryOperatorTermination::AnalysisLimit)
             }
             CodeQueryDiagnosticCode::UnsupportedStructuralFeature
@@ -3191,12 +3454,19 @@ fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::UnsupportedImportAnalysis
             | CodeQueryDiagnosticCode::UsesParserUnsupported
             | CodeQueryDiagnosticCode::SemanticWorkspaceRequired
-            | CodeQueryDiagnosticCode::SemanticCapabilityUnsupported => {
+            | CodeQueryDiagnosticCode::SemanticCapabilityUnsupported
+            | CodeQueryDiagnosticCode::TypestateCapabilityUnsupported => {
                 Some(QueryOperatorTermination::UnsupportedAnalysis)
             }
             CodeQueryDiagnosticCode::SemanticResultsOmitted
             | CodeQueryDiagnosticCode::SemanticAnalysisPartial
             | CodeQueryDiagnosticCode::SemanticProviderFailed
+            | CodeQueryDiagnosticCode::UnresolvedProtocolReference
+            | CodeQueryDiagnosticCode::TypestateRegistrationStale
+            | CodeQueryDiagnosticCode::TypestateHandleStale
+            | CodeQueryDiagnosticCode::TypestateRootMismatch
+            | CodeQueryDiagnosticCode::TypestateAnalysisPartial
+            | CodeQueryDiagnosticCode::TypestateProviderFailed
             | CodeQueryDiagnosticCode::ReceiverAnalysisPartial
             | CodeQueryDiagnosticCode::ReceiverAnalysisFailed
             | CodeQueryDiagnosticCode::CallRelationParseFailed
@@ -4812,6 +5082,7 @@ fn fair_branch_limits(
         // Semantic materialization is request-scoped and shared rather than
         // divided among independently scheduled structural seed branches.
         semantic: parent.semantic,
+        typestate: parent.typestate,
     }
 }
 
@@ -4988,6 +5259,76 @@ fn query_plan_requires_semantic(plan: &CodeQueryPlan) -> bool {
         }
     }
     false
+}
+
+fn query_plan_requires_typestate(plan: &CodeQueryPlan) -> bool {
+    let mut pending = vec![plan];
+    while let Some(plan) = pending.pop() {
+        if plan
+            .steps
+            .iter()
+            .any(|step| matches!(step, QueryStep::Typestate(_)))
+        {
+            return true;
+        }
+        if let CodeQueryPlanSource::Set { branches, .. } = &plan.source {
+            pending.extend(branches);
+        }
+    }
+    false
+}
+
+fn requested_protocol_refs(plan: &CodeQueryPlan) -> Vec<ProtocolRef> {
+    let mut pending = vec![plan];
+    let mut requested = Vec::new();
+    while let Some(plan) = pending.pop() {
+        for step in &plan.steps {
+            if let QueryStep::Typestate(traversal) = step
+                && !requested.contains(&traversal.protocol_ref)
+            {
+                requested.push(traversal.protocol_ref.clone());
+            }
+        }
+        if let CodeQueryPlanSource::Set { branches, .. } = &plan.source {
+            pending.extend(branches.iter().rev());
+        }
+    }
+    requested
+}
+
+fn query_analysis_context_error_result(error: QueryAnalysisContextError) -> CodeQueryResult {
+    let code = match error {
+        QueryAnalysisContextError::UnresolvedReference { .. } => {
+            CodeQueryDiagnosticCode::UnresolvedProtocolReference
+        }
+        QueryAnalysisContextError::AnalysisRootMismatch => {
+            CodeQueryDiagnosticCode::TypestateRootMismatch
+        }
+        QueryAnalysisContextError::StaleHandle => CodeQueryDiagnosticCode::TypestateHandleStale,
+        QueryAnalysisContextError::Cancelled => CodeQueryDiagnosticCode::Cancelled,
+        QueryAnalysisContextError::ValidationBudgetExceeded { .. } => {
+            CodeQueryDiagnosticCode::SemanticBudgetExhausted
+        }
+        QueryAnalysisContextError::GenerationExhausted
+        | QueryAnalysisContextError::TooManyResolvedProtocols
+        | QueryAnalysisContextError::WorkspaceGenerationMismatch { .. }
+        | QueryAnalysisContextError::StaleArtifact { .. }
+        | QueryAnalysisContextError::ArtifactIdentityUnavailable { .. }
+        | QueryAnalysisContextError::ArtifactValidationFailed { .. } => {
+            CodeQueryDiagnosticCode::TypestateRegistrationStale
+        }
+    };
+    CodeQueryResult {
+        results: Vec::new(),
+        truncated: true,
+        diagnostics: vec![CodeQueryDiagnostic {
+            code,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message: error.to_string(),
+        }],
+    }
 }
 
 fn query_step_requires_semantic(step: &QueryStep) -> bool {
@@ -5252,6 +5593,38 @@ fn apply_pipeline_step(
                 .into_iter()
                 .map(pipeline_expansion)
                 .collect(),
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
+                QueryStep::Typestate(traversal),
+            ) => semantic
+                .as_mut()
+                .expect("typestate query service exists for semantic steps")
+                .typestate_findings(procedure, &traversal.protocol_ref)
+                .into_iter()
+                .map(SemanticPipelineValue::TypestateFinding)
+                .map(PipelineValue::Semantic)
+                .map(pipeline_expansion)
+                .collect(),
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::TypestateFinding(finding)),
+                QueryStep::Witness(traversal),
+            ) => {
+                let (witnesses, truncated_count) = finding.witnesses(
+                    workspace.expect("typestate findings require a workspace"),
+                    traversal,
+                    limits.typestate,
+                );
+                semantic
+                    .as_mut()
+                    .expect("typestate witness projection retains its semantic context")
+                    .typestate_witness_truncated(truncated_count);
+                witnesses
+                    .into_iter()
+                    .map(SemanticPipelineValue::TypestateWitness)
+                    .map(PipelineValue::Semantic)
+                    .map(pipeline_expansion)
+                    .collect()
+            }
             (PipelineValue::StructuralMatch(seed), QueryStep::EnclosingDecl) => {
                 let (enclosing, projection_omitted) =
                     enclosing_declaration_value(analyzer, seed, &mut enclosing_declarations);
@@ -5298,6 +5671,22 @@ fn apply_pipeline_step(
                 QueryStep::FileOf,
             ) => {
                 vec![pipeline_expansion(PipelineValue::File(edge.file().clone()))]
+            }
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::TypestateFinding(finding)),
+                QueryStep::FileOf,
+            ) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    finding.file().clone(),
+                ))]
+            }
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::TypestateWitness(witness)),
+                QueryStep::FileOf,
+            ) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    witness.file().clone(),
+                ))]
             }
             (PipelineValue::ReferenceSite(site), QueryStep::FileOf) => {
                 vec![pipeline_expansion(PipelineValue::File(site.file.clone()))]

@@ -40,6 +40,11 @@ from bifrost_searchtools import (
     CodeQueryReceiverAnalysis,
     CodeQueryResult,
     CodeQueryStructuralFactsCacheCounters,
+    CodeQueryTypestateCertainty,
+    CodeQueryTypestateFinding,
+    CodeQueryTypestateFindingKindType,
+    CodeQueryTypestateWitness,
+    CodeQueryTypestateWitnessStepKindType,
     ContainerKind,
     DeclarationLookupResult,
     DefinitionLookupResult,
@@ -181,6 +186,14 @@ def _code_query_profile_payload() -> dict:
                 "retained_bytes": 4096,
                 "traversal_steps": 4,
                 "budget_exhausted": False,
+                "typestate": {
+                    "solves": 1,
+                    "cache_hits": 2,
+                    "findings": 1,
+                    "witnesses": 1,
+                    "witness_steps": 3,
+                    "fixed_point_solves": 1,
+                },
             },
         },
         "cache_layers": [
@@ -437,6 +450,121 @@ class CodeQueryModelTest(unittest.TestCase):
                 }
             )
 
+    def test_schema_v4_typestate_results_are_strict_typed_and_renderable(self) -> None:
+        source_range = {
+            "start_line": 8,
+            "start_column": 3,
+            "end_line": 8,
+            "end_column": 16,
+        }
+        evidence = {"proof": "proven", "completeness": "complete"}
+        common = {
+            "protocol_ref": "embedding:resource-lifecycle",
+            "protocol_hash": "a" * 64,
+            "binding_plan_hash": "b" * 64,
+            "subject": {"class": "resource", "identity": '{"kind":"object"}'},
+            "path": "src/run.ts",
+            "language": "typescript",
+            "range": source_range,
+        }
+        finding = {
+            "result_type": "typestate_finding",
+            "id": "c" * 64,
+            **common,
+            "finding_kind": {
+                "type": "error_transition",
+                "event": "use",
+                "from_state": "closed",
+                "to_state": "error",
+            },
+            "certainty": "must",
+            "path_proven": True,
+            "path_complete": True,
+            "analysis_complete": True,
+            "retained_witnesses": 1,
+            "omitted_witnesses": 0,
+        }
+        witness = {
+            "result_type": "typestate_witness",
+            "id": "d" * 64,
+            "finding_id": finding["id"],
+            **common,
+            "witness_index": 0,
+            "observed_state": "closed",
+            "quality": evidence,
+            "steps": [
+                {
+                    "kind": {"type": "edge", "edge_kind": "normal"},
+                    "source": {"path": "src/run.ts", "range": source_range},
+                    "target": {"path": "src/run.ts", "range": source_range},
+                    "evidence": evidence,
+                }
+            ],
+            "retained_bytes": 128,
+            "omitted_steps_lower_bound": 0,
+        }
+        result = CodeQueryResult.from_dict(
+            {"results": [finding, witness], "truncated": False}
+        )
+
+        self.assertIsInstance(result.results[0], CodeQueryTypestateFinding)
+        self.assertIs(result.results[0].certainty, CodeQueryTypestateCertainty.MUST)
+        self.assertIs(
+            result.results[0].finding_kind.type,
+            CodeQueryTypestateFindingKindType.ERROR_TRANSITION,
+        )
+        self.assertIsInstance(result.results[1], CodeQueryTypestateWitness)
+        self.assertIs(
+            result.results[1].steps[0].kind.type,
+            CodeQueryTypestateWitnessStepKindType.EDGE,
+        )
+        self.assertIn("typestate finding; must", result.render_text())
+        self.assertIn("typestate witness; 1 steps", result.render_text())
+
+        malformed = deepcopy(finding)
+        del malformed["protocol_hash"]
+        with self.assertRaises(KeyError):
+            CodeQueryResult.from_dict({"results": [malformed], "truncated": False})
+        invalid = deepcopy(finding)
+        invalid["certainty"] = "certain"
+        with self.assertRaises(ValueError):
+            CodeQueryResult.from_dict({"results": [invalid], "truncated": False})
+
+        for field, malformed_value in (
+            ("path_proven", "false"),
+            ("retained_witnesses", "1"),
+            ("uncertainty", "unknown_call"),
+        ):
+            malformed = deepcopy(finding)
+            malformed[field] = malformed_value
+            with self.subTest(field=field), self.assertRaises(TypeError):
+                CodeQueryResult.from_dict(
+                    {"results": [malformed], "truncated": False}
+                )
+
+        for field, malformed_value in (
+            ("witness_index", "0"),
+            ("steps", "not-a-list"),
+            ("truncated", "false"),
+        ):
+            malformed = deepcopy(witness)
+            malformed[field] = malformed_value
+            with self.subTest(field=field), self.assertRaises(TypeError):
+                CodeQueryResult.from_dict(
+                    {"results": [malformed], "truncated": False}
+                )
+
+        malformed_terminal = deepcopy(finding)
+        malformed_terminal["finding_kind"] = {
+            "type": "terminal_expectation",
+            "expectation": "closed-on-exit",
+            "actual_states": "open",
+        }
+        with self.assertRaises(TypeError):
+            CodeQueryResult.from_dict(
+                {"results": [malformed_terminal], "truncated": False}
+            )
+
     def test_execution_mode_alias_is_reexported_from_public_import_paths(self) -> None:
         self.assertIs(CodeQueryExecutionMode, ModelCodeQueryExecutionMode)
         self.assertIs(ClientCodeQueryExecutionMode, ModelCodeQueryExecutionMode)
@@ -507,6 +635,8 @@ class CodeQueryModelTest(unittest.TestCase):
         self.assertEqual(response.work.scanned_source_bytes, 120)
         self.assertEqual(response.work.semantic.program_points, 3)
         self.assertEqual(response.work.semantic.request_cache_hits, 2)
+        self.assertEqual(response.work.semantic.typestate.solves, 1)
+        self.assertEqual(response.work.semantic.typestate.witness_steps, 3)
         self.assertEqual(response.access_path.selected, "posting:kind+name")
         self.assertEqual(response.access_path.candidate_facts, 1)
         self.assertEqual(response.access_path.selected_terms[0].label, "name")

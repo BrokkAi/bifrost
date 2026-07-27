@@ -9,6 +9,7 @@ export interface RqlQueryDocument {
 interface RqlQueryResultBase {
   uri: string;
   path: string;
+  witnessStepUris?: string[];
   provenance?: RqlQueryProvenance[];
   provenance_truncated?: boolean;
 }
@@ -24,6 +25,12 @@ export interface RqlResultRange {
   start_column: number;
   end_line: number;
   end_column: number;
+}
+
+/** Convert Bifrost's one-based Unicode code-point column to VS Code UTF-16. */
+export function codePointColumnToUtf16(line: string, column: number): number {
+  const codePointOffset = Math.max(0, column - 1);
+  return Array.from(line).slice(0, codePointOffset).join("").length;
 }
 
 export interface RqlStructuralMatchResult extends RqlQueryResultBase {
@@ -94,6 +101,94 @@ export interface RqlControlEdgeResult extends RqlQueryResultBase {
   source: RqlProgramPointRef;
   target: RqlProgramPointRef;
   evidence: RqlSemanticEvidence;
+}
+
+export interface RqlTypestateSubject {
+  class: string;
+  identity: string;
+}
+
+export type RqlTypestateFindingKind =
+  | {
+      type: "error_transition";
+      event: string;
+      from_state: string;
+      to_state: string;
+    }
+  | {
+      type: "terminal_expectation";
+      expectation: string;
+      actual_states: string[];
+    };
+
+export type RqlTypestateCertainty = "may" | "must" | "inconclusive";
+export type RqlTypestateUncertainty =
+  | "ambiguous_dispatch"
+  | "unknown_call"
+  | "external_call"
+  | "escape"
+  | "incomplete_analysis"
+  | "unmatched_event";
+
+export interface RqlTypestateFindingResult extends RqlQueryResultBase {
+  result_type: "typestate_finding";
+  id: string;
+  protocol_ref: string;
+  protocol_hash: string;
+  binding_plan_hash: string;
+  subject: RqlTypestateSubject;
+  finding_kind: RqlTypestateFindingKind;
+  certainty: RqlTypestateCertainty;
+  language: string;
+  range: RqlResultRange;
+  path_proven: boolean;
+  path_complete: boolean;
+  analysis_complete: boolean;
+  uncertainty?: RqlTypestateUncertainty[];
+  abstained?: boolean;
+  retained_witnesses: number;
+  omitted_witnesses: number;
+}
+
+export type RqlTypestateWitnessStepKind =
+  | { type: "seed" }
+  | { type: "edge"; edge_kind: string }
+  | { type: "end_summary_gap"; return_kind: string };
+
+export interface RqlSourceSite {
+  path: string;
+  range: RqlResultRange;
+}
+
+export interface RqlTypestateWitnessStep {
+  kind: RqlTypestateWitnessStepKind;
+  source: RqlSourceSite;
+  target?: RqlSourceSite;
+  origin?: RqlSourceSite;
+  evidence: RqlSemanticEvidence;
+}
+
+export interface RqlTypestateWitnessResult extends RqlQueryResultBase {
+  result_type: "typestate_witness";
+  id: string;
+  finding_id: string;
+  protocol_ref: string;
+  protocol_hash: string;
+  binding_plan_hash: string;
+  subject: RqlTypestateSubject;
+  witness_index: number;
+  observed_state?: string;
+  language: string;
+  range: RqlResultRange;
+  quality: RqlSemanticEvidence;
+  uncertainty?: RqlTypestateUncertainty[];
+  abstained?: boolean;
+  steps: RqlTypestateWitnessStep[];
+  retained_bytes: number;
+  truncated?: boolean;
+  omitted_steps_lower_bound: number;
+  alternatives_truncated?: boolean;
+  retention_truncated?: boolean;
 }
 
 export interface RqlReferenceSiteResult extends RqlQueryResultBase {
@@ -191,6 +286,8 @@ export type RqlQueryResultItem =
   | RqlProcedureResult
   | RqlProgramPointResult
   | RqlControlEdgeResult
+  | RqlTypestateFindingResult
+  | RqlTypestateWitnessResult
   | RqlFileResult
   | RqlReferenceSiteResult
   | RqlCallSiteResult
@@ -292,6 +389,10 @@ export function queryResultLabel(result: RqlQueryResultItem): string {
       return result.boundary ?? "program point";
     case "control_edge":
       return `${result.edge_kind}: ${result.source.id} → ${result.target.id}`;
+    case "typestate_finding":
+      return typestateFindingKindLabel(result.finding_kind);
+    case "typestate_witness":
+      return `witness ${result.witness_index + 1}: ${result.steps.length} step${result.steps.length === 1 ? "" : "s"}`;
     case "file":
       return result.path;
     case "reference_site":
@@ -313,6 +414,10 @@ export function queryResultDescription(result: RqlQueryResultItem): string {
       return `${result.event_count} events · ${result.evidence.proof}/${result.evidence.completeness}`;
     case "control_edge":
       return `${result.evidence.proof}/${result.evidence.completeness} · ${result.range.start_line}:${result.range.start_column}`;
+    case "typestate_finding":
+      return `${result.certainty} · ${result.protocol_ref} · ${result.range.start_line}:${result.range.start_column}`;
+    case "typestate_witness":
+      return `${semanticEvidenceLabel(result.quality)} · ${result.truncated ? "truncated" : "complete"}`;
     case "file":
       return `file · ${result.language}`;
     case "reference_site":
@@ -361,6 +466,29 @@ export function queryResultTooltip(result: RqlQueryResultItem): string {
         `\n\nTarget: \`${programPointRefLabel(result.target)}\`` +
         `\n\nEvidence: ${semanticEvidenceLabel(result.evidence)}`
       );
+    case "typestate_finding":
+      return (
+        `**Typestate finding (${result.certainty})** at ${result.path}:${result.range.start_line}:${result.range.start_column}` +
+        `\n\n${typestateFindingKindLabel(result.finding_kind)}` +
+        `\n\nProtocol: \`${result.protocol_ref}\` (${result.protocol_hash.slice(0, 12)})` +
+        `\n\nSubject: \`${result.subject.class}\` · \`${result.subject.identity}\`` +
+        `\n\nEvidence: ${result.path_proven ? "proven" : "unproven"}/${result.path_complete && result.analysis_complete ? "complete" : "partial"}` +
+        typestateUncertaintyLabel(result.uncertainty) +
+        `\n\nWitnesses: ${result.retained_witnesses} retained, ${result.omitted_witnesses} omitted`
+      );
+    case "typestate_witness":
+      return (
+        `**Typestate witness ${result.witness_index + 1}** at ${result.path}:${result.range.start_line}:${result.range.start_column}` +
+        `\n\nProtocol: \`${result.protocol_ref}\` (${result.protocol_hash.slice(0, 12)})` +
+        `\n\nEvidence: ${semanticEvidenceLabel(result.quality)}` +
+        `\n\nSteps: ${result.steps.length}; retained bytes: ${result.retained_bytes}` +
+        (result.truncated
+          ? `\n\nTruncated; at least ${result.omitted_steps_lower_bound} step(s) omitted.`
+          : "") +
+        (result.alternatives_truncated ? "\n\nAlternative witnesses were omitted." : "") +
+        (result.retention_truncated ? "\n\nWitness retention hit its request bound." : "") +
+        typestateUncertaintyLabel(result.uncertainty)
+      );
     case "file":
       return `**file** at ${result.path}\n\nLanguage: ${result.language}`;
     case "reference_site":
@@ -407,6 +535,10 @@ export function queryResultIcon(result: RqlQueryResultItem): string {
       return "debug-breakpoint";
     case "control_edge":
       return "arrow-right";
+    case "typestate_finding":
+      return "symbol-event";
+    case "typestate_witness":
+      return "debug-alt";
     case "file":
       return "file-code";
     case "reference_site":
@@ -431,6 +563,8 @@ export function queryResultRange(result: RqlQueryResultItem): RqlResultRange | u
     case "procedure":
     case "program_point":
     case "control_edge":
+    case "typestate_finding":
+    case "typestate_witness":
       return result.range;
     case "structural_match":
     case "declaration":
@@ -441,6 +575,36 @@ export function queryResultRange(result: RqlQueryResultItem): RqlResultRange | u
         end_column: 1
       };
   }
+}
+
+export interface RqlQueryNavigationTarget {
+  uri: string;
+  path: string;
+  range?: RqlResultRange;
+}
+
+export interface RqlTypestateWitnessStepTarget extends RqlQueryNavigationTarget {
+  index: number;
+  label: string;
+  description: string;
+  tooltip: string;
+}
+
+export function typestateWitnessStepTargets(
+  result: RqlTypestateWitnessResult
+): RqlTypestateWitnessStepTarget[] {
+  return result.steps.map((step, index) => ({
+    index,
+    uri: result.witnessStepUris?.[index] ?? result.uri,
+    path: step.source.path,
+    range: step.source.range,
+    label: `${index + 1}. ${typestateWitnessStepKindLabel(step.kind)}`,
+    description: `${step.source.path}:${step.source.range.start_line}:${step.source.range.start_column}`,
+    tooltip:
+      `**${typestateWitnessStepKindLabel(step.kind)}** at ` +
+      `${step.source.path}:${step.source.range.start_line}:${step.source.range.start_column}` +
+      `\n\nEvidence: ${semanticEvidenceLabel(step.evidence)}`
+  }));
 }
 
 function semanticEvidenceLabel(evidence: RqlSemanticEvidence): string {
@@ -454,4 +618,28 @@ function semanticEvidenceLabel(evidence: RqlSemanticEvidence): string {
 function programPointRefLabel(point: RqlProgramPointRef): string {
   const boundary = point.boundary ? ` ${point.boundary}` : "";
   return `${point.id}${boundary} at ${point.path}:${point.range.start_line}:${point.range.start_column}`;
+}
+
+function typestateFindingKindLabel(kind: RqlTypestateFindingKind): string {
+  if (kind.type === "error_transition") {
+    return `${kind.event}: ${kind.from_state} → ${kind.to_state}`;
+  }
+  return `${kind.expectation}: actual ${kind.actual_states.join(", ")}`;
+}
+
+function typestateWitnessStepKindLabel(kind: RqlTypestateWitnessStepKind): string {
+  switch (kind.type) {
+    case "seed":
+      return "seed";
+    case "edge":
+      return `${kind.edge_kind} edge`;
+    case "end_summary_gap":
+      return `${kind.return_kind} summary gap`;
+  }
+}
+
+function typestateUncertaintyLabel(
+  uncertainty: readonly RqlTypestateUncertainty[] | undefined
+): string {
+  return uncertainty?.length ? `\n\nUncertainty: ${uncertainty.join(", ")}` : "";
 }

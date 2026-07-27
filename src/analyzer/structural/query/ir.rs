@@ -1,3 +1,4 @@
+use super::super::analysis_context::ProtocolRef;
 use super::super::kinds::{NormalizedKind, Role};
 use super::schema::{CodeQueryExecutionMode, QueryStepOp};
 use crate::analyzer::Language;
@@ -23,7 +24,7 @@ pub const MAX_QUERY_STEPS: usize = 16;
 pub const MAX_QUERY_BRANCHES: usize = 16;
 pub const MAX_QUERY_PLAN_DEPTH: usize = 16;
 pub const MAX_QUERY_PLAN_NODES: usize = 64;
-pub const SCHEMA_VERSION: u64 = 3;
+pub const SCHEMA_VERSION: u64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryValueKind {
@@ -32,6 +33,8 @@ pub enum QueryValueKind {
     Procedure,
     ProgramPoint,
     ControlEdge,
+    TypestateFinding,
+    TypestateWitness,
     ReferenceSite,
     CallSite,
     ExpressionSite,
@@ -47,6 +50,8 @@ impl QueryValueKind {
             Self::Procedure => "procedure",
             Self::ProgramPoint => "program_point",
             Self::ControlEdge => "control_edge",
+            Self::TypestateFinding => "typestate_finding",
+            Self::TypestateWitness => "typestate_witness",
             Self::ReferenceSite => "reference_site",
             Self::CallSite => "call_site",
             Self::ExpressionSite => "expression_site",
@@ -89,6 +94,17 @@ pub struct ReceiverTraversalFilter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypestateTraversal {
+    pub protocol_ref: ProtocolRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WitnessTraversal {
+    pub max_steps: Option<usize>,
+    pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallInputSelector {
     Receiver,
     ParameterIndex(usize),
@@ -112,6 +128,8 @@ pub enum QueryStep {
     CfgPredecessorEdges,
     CfgEdgeSource,
     CfgEdgeTarget,
+    Typestate(TypestateTraversal),
+    Witness(WitnessTraversal),
     FileOf,
     ImportsOf,
     ImportersOf,
@@ -147,6 +165,8 @@ impl QueryStep {
             Self::CfgPredecessorEdges => QueryStepOp::CfgPredecessorEdges,
             Self::CfgEdgeSource => QueryStepOp::CfgEdgeSource,
             Self::CfgEdgeTarget => QueryStepOp::CfgEdgeTarget,
+            Self::Typestate(_) => QueryStepOp::Typestate,
+            Self::Witness(_) => QueryStepOp::Witness,
             Self::FileOf => QueryStepOp::FileOf,
             Self::ImportsOf => QueryStepOp::ImportsOf,
             Self::ImportersOf => QueryStepOp::ImportersOf,
@@ -178,6 +198,7 @@ impl QueryStep {
             QueryStepOp::CfgPredecessorEdges => Some(Self::CfgPredecessorEdges),
             QueryStepOp::CfgEdgeSource => Some(Self::CfgEdgeSource),
             QueryStepOp::CfgEdgeTarget => Some(Self::CfgEdgeTarget),
+            QueryStepOp::Typestate | QueryStepOp::Witness => None,
             QueryStepOp::FileOf => Some(Self::FileOf),
             QueryStepOp::ImportsOf => Some(Self::ImportsOf),
             QueryStepOp::ImportersOf => Some(Self::ImportersOf),
@@ -224,6 +245,12 @@ impl QueryStep {
             (Self::CfgEdgeSource | Self::CfgEdgeTarget, QueryValueKind::ControlEdge) => {
                 Some(QueryValueKind::ProgramPoint)
             }
+            (Self::Typestate(_), QueryValueKind::Procedure) => {
+                Some(QueryValueKind::TypestateFinding)
+            }
+            (Self::Witness(_), QueryValueKind::TypestateFinding) => {
+                Some(QueryValueKind::TypestateWitness)
+            }
             (
                 Self::FileOf,
                 QueryValueKind::StructuralMatch
@@ -231,6 +258,8 @@ impl QueryStep {
                 | QueryValueKind::Procedure
                 | QueryValueKind::ProgramPoint
                 | QueryValueKind::ControlEdge
+                | QueryValueKind::TypestateFinding
+                | QueryValueKind::TypestateWitness
                 | QueryValueKind::ReferenceSite
                 | QueryValueKind::CallSite
                 | QueryValueKind::ExpressionSite
@@ -310,8 +339,10 @@ pub(super) fn validate_query_steps(
             QueryStep::CfgEntry | QueryStep::CfgExits => "procedure",
             QueryStep::CfgSuccessorEdges | QueryStep::CfgPredecessorEdges => "program_point",
             QueryStep::CfgEdgeSource | QueryStep::CfgEdgeTarget => "control_edge",
+            QueryStep::Typestate(_) => "procedure",
+            QueryStep::Witness(_) => "typestate_finding",
             QueryStep::FileOf => {
-                "structural_match, declaration, procedure, program_point, control_edge, reference_site, call_site, expression_site, or receiver_analysis"
+                "structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, reference_site, call_site, expression_site, or receiver_analysis"
             }
             QueryStep::ImportsOf | QueryStep::ImportersOf => "file",
             QueryStep::Supertypes(_)

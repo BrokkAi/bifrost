@@ -135,6 +135,20 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::ImportersOf
         | QueryStep::Members
         | QueryStep::Owner => {}
+        QueryStep::Typestate(traversal) => {
+            object.insert(
+                "protocol_ref".to_string(),
+                json!(traversal.protocol_ref.to_string()),
+            );
+        }
+        QueryStep::Witness(traversal) => {
+            if let Some(max_steps) = traversal.max_steps {
+                object.insert("max_steps".to_string(), json!(max_steps));
+            }
+            if let Some(max_bytes) = traversal.max_bytes {
+                object.insert("max_bytes".to_string(), json!(max_bytes));
+            }
+        }
         QueryStep::ReferencesOf(filter) | QueryStep::UsedBy(filter) | QueryStep::Uses(filter) => {
             if !filter.reference_kinds.is_empty() {
                 object.insert(

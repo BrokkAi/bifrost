@@ -3,16 +3,16 @@
 use super::schema::{
     ALL_PATTERN_FIELDS, ALL_QUERY_FIELDS, ALL_QUERY_STEP_FIELDS, ALL_QUERY_STEP_OPS, ALL_RQL_FORMS,
     ALL_RQL_PROPERTIES, ALL_STRING_PREDICATE_FIELDS, CodeQueryExecutionMode, PatternField,
-    QueryField, QueryStepField, RqlForm, RqlFormClass, RqlProperty, StringPredicateField,
-    oldest_rql_schema_version, reference_kind_from_label, rql_schema_version_registry,
-    usage_proof_from_label, usage_surface_from_label,
+    QueryField, QueryStepField, QueryStepOp, RqlForm, RqlFormClass, RqlProperty,
+    StringPredicateField, oldest_rql_schema_version, reference_kind_from_label,
+    rql_schema_version_registry, usage_proof_from_label, usage_surface_from_label,
 };
 use super::sexp::{parse_query_sexp, query_to_json};
 use super::{
     CodeQuery, CodeQueryResultDetail, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES,
     MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_QUERY_BRANCHES,
     MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
-    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, QueryStep,
+    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
 };
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{
@@ -776,6 +776,107 @@ fn validate_wrapper(
                 );
             }
         }
+        RqlForm::Typestate => {
+            let option = args
+                .first()
+                .and_then(Expr::as_symbol)
+                .and_then(|label| QueryStepOp::Typestate.option_for_rql_label(label));
+            if args.len() != 3
+                || option.is_none_or(|option| option.field() != QueryStepField::ProtocolRef)
+            {
+                analysis.error(
+                    head_range.clone(),
+                    "wrong-value-shape",
+                    "typestate expects :protocol-ref namespace:name followed by a query",
+                );
+            } else {
+                analysis.add_help(
+                    args[0].range.clone(),
+                    ":protocol-ref namespace:name",
+                    option
+                        .expect("validated typestate option")
+                        .field()
+                        .description(),
+                );
+                let steps = query_to_json(query)
+                    .ok()
+                    .and_then(|value| value.get("steps").and_then(Value::as_array).map(Vec::len))
+                    .unwrap_or(0);
+                let field_path = format!(
+                    "{}[{steps}].protocol_ref",
+                    rql_query_child_path(path, "steps")
+                );
+                analysis.path(&field_path, args[1].range.clone());
+                match args[1].as_symbol().or_else(|| args[1].as_string()) {
+                    Some(value) => {
+                        if let Err(error) =
+                            value.parse::<super::super::analysis_context::ProtocolRef>()
+                        {
+                            analysis.error(
+                                args[1].range.clone(),
+                                "wrong-value-shape",
+                                error.to_string(),
+                            );
+                        }
+                    }
+                    None => analysis.error(
+                        args[1].range.clone(),
+                        "wrong-value-shape",
+                        "protocol_ref must be a symbol or string",
+                    ),
+                }
+            }
+        }
+        RqlForm::Witness => {
+            let options = &args[..args.len().saturating_sub(1)];
+            if !options.len().is_multiple_of(2) {
+                analysis.error(
+                    head_range.clone(),
+                    "wrong-value-shape",
+                    "witness expects option/value pairs followed by a query",
+                );
+            }
+            let steps = query_to_json(query)
+                .ok()
+                .and_then(|value| value.get("steps").and_then(Value::as_array).map(Vec::len))
+                .unwrap_or(0);
+            let step_path = format!("{}[{steps}]", rql_query_child_path(path, "steps"));
+            let mut seen = std::collections::HashSet::new();
+            for pair in options.chunks_exact(2) {
+                let Some(option) = pair[0]
+                    .as_symbol()
+                    .and_then(|label| QueryStepOp::Witness.option_for_rql_label(label))
+                else {
+                    analysis.error(
+                        pair[0].range.clone(),
+                        "unknown-property",
+                        "witness accepts only :max-steps and :max-bytes",
+                    );
+                    continue;
+                };
+                let field = option.field().label();
+                analysis.add_help(
+                    pair[0].range.clone(),
+                    format!(":{} non-negative-integer", field.replace('_', "-")),
+                    option.field().description(),
+                );
+                if !seen.insert(field) {
+                    analysis.error(
+                        pair[0].range.clone(),
+                        "duplicate-property",
+                        format!("duplicate witness option '{}'", field.replace('_', "-")),
+                    );
+                }
+                analysis.path(format!("{step_path}.{field}"), pair[1].range.clone());
+                if !matches!(pair[1].kind, ExprKind::Number(_)) {
+                    analysis.error(
+                        pair[1].range.clone(),
+                        "wrong-value-shape",
+                        "witness limit must be a non-negative integer",
+                    );
+                }
+            }
+        }
         RqlForm::Supertypes | RqlForm::Subtypes => match args {
             [_query] => {}
             [key, value, _query] => match key.as_symbol() {
@@ -1405,6 +1506,7 @@ fn validate_property_value(
         | super::schema::ValueShape::SchemaVersion
         | super::schema::ValueShape::UsageProof
         | super::schema::ValueShape::UsageSurface
+        | super::schema::ValueShape::ProtocolRef
         | super::schema::ValueShape::TrueBoolean => {
             unreachable!("unsupported value shape for an RQL pattern property")
         }
@@ -2472,6 +2574,8 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
             op_label,
             Some("receiver_targets" | "points_to" | "member_targets")
         );
+        let typestate_step = op_label == Some("typestate");
+        let witness_step = op_label == Some("witness");
         let mut seen_op = false;
         let mut seen_depth = false;
         let mut seen_transitive = false;
@@ -2482,6 +2586,9 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
         let mut seen_parameter_index = false;
         let mut seen_parameter_name = false;
         let mut seen_capture = false;
+        let mut seen_protocol_ref = false;
+        let mut seen_max_steps = false;
+        let mut seen_max_bytes = false;
         let mut transitive_range = None;
         for (key, child) in object {
             let child_path = join_path(&step_path, key.get_ref());
@@ -2673,6 +2780,62 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                 );
                 continue;
             }
+            if field == Some(QueryStepField::ProtocolRef) && typestate_step {
+                analysis.add_help(
+                    key.range(),
+                    QueryStepField::ProtocolRef.signature(),
+                    QueryStepField::ProtocolRef.description(),
+                );
+                if seen_protocol_ref {
+                    analysis.error(
+                        key.range(),
+                        "duplicate-property",
+                        "duplicate property 'protocol_ref'",
+                    );
+                }
+                seen_protocol_ref = true;
+                match child.as_string() {
+                    Some(value) => {
+                        if let Err(error) =
+                            value.parse::<super::super::analysis_context::ProtocolRef>()
+                        {
+                            analysis.error(child.range(), "wrong-value-shape", error.to_string());
+                        }
+                    }
+                    None => require_json_string(child, analysis),
+                }
+                continue;
+            }
+            if matches!(
+                field,
+                Some(QueryStepField::MaxSteps | QueryStepField::MaxBytes)
+            ) && witness_step
+            {
+                let field = field.expect("witness field matched above");
+                analysis.add_help(key.range(), field.signature(), field.description());
+                let seen = match field {
+                    QueryStepField::MaxSteps => &mut seen_max_steps,
+                    QueryStepField::MaxBytes => &mut seen_max_bytes,
+                    _ => unreachable!("witness field matched above"),
+                };
+                if *seen {
+                    analysis.error(
+                        key.range(),
+                        "duplicate-property",
+                        format!("duplicate property '{}'", field.label()),
+                    );
+                }
+                *seen = true;
+                if !matches!(spanned_to_json(child), Value::Number(number) if number.as_u64().is_some())
+                {
+                    analysis.error(
+                        child.range(),
+                        "wrong-value-shape",
+                        "witness limit must be a non-negative integer",
+                    );
+                }
+                continue;
+            }
             if field != Some(QueryStepField::Op) {
                 let candidates: Vec<_> = ALL_QUERY_STEP_FIELDS
                     .iter()
@@ -2704,6 +2867,12 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                                         | QueryStepField::ParameterName
                                 ))
                             || (receiver_step && **candidate == QueryStepField::Capture)
+                            || (typestate_step && **candidate == QueryStepField::ProtocolRef)
+                            || (witness_step
+                                && matches!(
+                                    candidate,
+                                    QueryStepField::MaxSteps | QueryStepField::MaxBytes
+                                ))
                     })
                     .map(|candidate| (candidate.label().to_string(), candidate.label().to_string()))
                     .collect();
@@ -2737,7 +2906,7 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                 );
                 continue;
             };
-            let Some(step) = QueryStep::from_label(label) else {
+            let Some(step) = super::schema::QueryStepOp::from_label(label) else {
                 add_spelling_error(
                     analysis,
                     child.range(),
@@ -2751,7 +2920,7 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                 );
                 continue;
             };
-            analysis.add_help(child.range(), step.label(), query_step_description(&step));
+            analysis.add_help(child.range(), step.label(), step.description());
         }
         if seen_depth && seen_transitive {
             analysis.error(
@@ -2770,6 +2939,13 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                 step.range(),
                 "invalid-query-step",
                 "call_input requires exactly one of receiver, parameter_index, or parameter_name",
+            );
+        }
+        if typestate_step && !seen_protocol_ref {
+            analysis.error(
+                step.range(),
+                "invalid-query-step",
+                "typestate requires protocol_ref",
             );
         }
     }
@@ -2846,11 +3022,7 @@ fn json_single_query_step_is_recognizable(value: &spanned::Value) -> bool {
     key.get_ref() == "op"
         && value
             .as_string()
-            .is_some_and(|label| QueryStep::from_label(label).is_some())
-}
-
-fn query_step_description(step: &QueryStep) -> &'static str {
-    step.op().description()
+            .is_some_and(|label| super::schema::QueryStepOp::from_label(label).is_some())
 }
 
 fn validate_json_result_detail(value: &spanned::Value, analysis: &mut Analysis) {
@@ -3381,6 +3553,54 @@ mod tests {
             &conflicting[diagnostic.range.clone()] == "true"
                 && diagnostic.message.contains("mutually exclusive")
         }));
+    }
+
+    #[test]
+    fn typestate_step_help_and_diagnostics_are_range_precise() {
+        let rql = "(witness :max-steps 8 :max-bytes 2048 (typestate :protocol-ref test:lifecycle (procedure-of (function))))";
+        for token in [
+            "witness",
+            ":max-steps",
+            ":max-bytes",
+            "typestate",
+            ":protocol-ref",
+        ] {
+            let offset = rql.find(token).unwrap();
+            let help = query_source_help_at(rql, offset)
+                .unwrap_or_else(|| panic!("no typestate help for {token}"));
+            assert_eq!(&rql[help.range], token);
+            assert!(!help.description.is_empty());
+        }
+        assert!(validate_query_source(rql).is_empty());
+
+        let json = r#"{"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"typestate","protocol_ref":"test:lifecycle"},{"op":"witness","max_steps":8,"max_bytes":2048}]}"#;
+        for token in [
+            "typestate",
+            "protocol_ref",
+            "witness",
+            "max_steps",
+            "max_bytes",
+        ] {
+            let offset = json.find(token).unwrap();
+            let help = query_source_help_at(json, offset)
+                .unwrap_or_else(|| panic!("no JSON typestate help for {token}"));
+            assert!(!help.description.is_empty());
+        }
+        assert!(validate_query_source(json).is_empty());
+
+        let version_three = r#"{"schema_version":3,"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"typestate","protocol_ref":"test:lifecycle"}]}"#;
+        let diagnostic = validate_query_source(version_three)
+            .into_iter()
+            .find(|diagnostic| diagnostic.message.contains("requires schema version 4"))
+            .expect("schema-version diagnostic");
+        assert_eq!(&version_three[diagnostic.range], r#""typestate""#);
+
+        let invalid_ref = r#"{"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"typestate","protocol_ref":"missing-separator"}]}"#;
+        let diagnostic = validate_query_source(invalid_ref)
+            .into_iter()
+            .find(|diagnostic| diagnostic.message.contains("namespace:name"))
+            .expect("protocol-ref diagnostic");
+        assert_eq!(&invalid_ref[diagnostic.range], r#""missing-separator""#);
     }
 
     #[test]
