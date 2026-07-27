@@ -6,7 +6,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use chrono::{Datelike, NaiveDate};
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::analyzer::semantic::{WorkspaceRelativePath, WorkspaceRelativePathError};
 use crate::workspace_document::{WorkspaceDocumentError, WorkspaceRoot, read_workspace_document};
@@ -93,6 +93,16 @@ impl Serialize for PolicyEvaluationDate {
         S: Serializer,
     {
         serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for PolicyEvaluationDate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
     }
 }
 

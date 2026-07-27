@@ -22,7 +22,7 @@ The behavior is observable by running one fixture policy, accepting its strong f
 - [x] (2026-07-27 12:35Z) Milestone 2: implemented the bounded suppression schema, typed parser, capability-confined loader, and identity/date types.
 - [x] (2026-07-27 13:30Z) Milestone 3: applied suppressions in the shared coordinator and extended the canonical report model without changing analyzer evidence or work.
 - [x] (2026-07-27 13:44Z) Milestone 4: made human, JSON, SARIF, CLI, and failure-threshold behavior suppression-aware.
-- [ ] Milestone 5: thread the same request through LSP/VS Code and add a narrow read-only MCP `run_policy` tool for explicit workspace policies.
+- [x] (2026-07-27 14:20Z) Milestone 5: threaded deterministic suppression-aware evaluation through LSP/VS Code and added a narrow cancellable MCP `run_policy` tool over the active immutable workspace snapshot.
 - [ ] Milestone 6: update public documentation, run the complete Rust/docs validation gates, perform specialist review, and record final outcomes.
 
 ## Surprises & Discoveries
@@ -50,6 +50,12 @@ The behavior is observable by running one fixture policy, accepting its strong f
 
 - Observation: this shell resolved Cargo and Rustc through rustup but resolved `clippy-driver` through Homebrew; both identify as Rust 1.96.0 but use different LLVM patch builds and therefore reject each other's crate metadata.
   Evidence: Clippy failed on a freshly isolated target with `E0514` for `cc`; rustup Rustc/Clippy report LLVM 22.1.2 while Homebrew Clippy reports LLVM 22.1.6. Prepending `/Users/dave/.cargo/bin` for the command selected the already-installed matching rustup Clippy component and the denied-warning run passed.
+
+- Observation: deserializing `PolicyEvaluationDate` through a borrowed `&str` worked for streaming JSON but failed for MCP's owned `serde_json::Value` arguments.
+  Evidence: the first cancellation test failed with `expected a borrowed string`; accepting an owned string and then applying the same strict date parser fixed both MCP and LSP decoding without changing the core date contract.
+
+- Observation: the complete MCP integration target cannot open the primary checkout's shared persisted cache inside the restricted worktree sandbox.
+  Evidence: six existing tests failed there with SQLite `disk I/O error`; the same serial 28-test target passed after granting access to the shared cache boundary, including the new `run_policy` stdio test.
 
 ## Decision Log
 
@@ -128,6 +134,12 @@ Validation for this checkpoint: `cargo check --lib`; `cargo check --all-targets`
 Milestone 4 is complete. Concise human output now omits only applied suppressed results while reporting active and suppressed finding counts plus orthogonal stale, expired, drifted, unproven, and result-omitted audit totals. Verbose output retains every result, prints accepted reason/date/reviewer/hash provenance, and emits full records for non-applied or omitted-result decisions. Canonical JSON remains the direct schema-2 report. SARIF retains every result and `bifrostFinding/v1`, adds the standard external/accepted suppression object and provenance property bag, and projects the evaluation context and complete review collection into run properties.
 
 The CLI now accepts policy-mode-only `--suppressions-file` and `--evaluation-date`. Explicit suppression paths are validated as bounded workspace-relative paths before evaluation; an omitted date is resolved once from UTC at the CLI boundary. Focused subprocess tests prove default and override loading, deterministic fixed-date JSON, concise/verbose behavior, active/suppressed/expired exit statuses, invalid-input exit 2 without lost findings, SARIF projection, parser conflicts, help text, and existing atomic output behavior. Validation for this checkpoint: all 5 policy-rendering integration tests, all 15 SARIF integration tests including offline OASIS schema validation, all 15 CLI integration tests, all 24 policy-renderer unit tests, `cargo fmt --all -- --check`, matching-toolchain `cargo clippy --all-targets -- -D warnings`, and `git diff --check`. LSP, VS Code, and MCP parity remain for milestone 5.
+
+Milestone 5 is complete. LSP policy execution now requires one explicit evaluation date, accepts one confined optional suppression override, and passes both through the existing live-source snapshot evaluation without consulting the clock. VS Code supplies today's UTC date at its host boundary, validates the complete schema-2 suppression contract, excludes applied results from the ordinary active-finding tree, and exposes a bounded suppression audit with orthogonal applied, stale, expired, drifted, unproven, and omitted-result states.
+
+The `extended` and combined MCP toolsets now advertise read-only `run_policy` for bounded explicit `.rqlp` paths only. Requests are decoded strictly, pinned to the active workspace snapshot and generation, cancellable through the existing asynchronous MCP request registry, capability-confined for policy and suppression reads, and returned as structured canonical schema-2 reports with clean, finding, or unreliable status plus the equivalent exit projection. Built-in policy discovery remains outside this tool for #1204. The stdio integration test compares the full MCP report to direct library evaluation, switches to a distinct active workspace, applies and expires an exact suppression, rejects escaping paths and invalid dates, and preserves invalid-suppression unreliability. A live current-worktree stdio call found the expected Python `exec` fixture result through `run_policy` with schema 2 and the fixed date.
+
+Validation for this checkpoint: `cargo fmt --all -- --check`; `cargo check --all-targets`; matching-toolchain `cargo clippy --all-targets --all-features -- -D warnings`; all 11 MCP cancellation/URI unit tests; the full 28-test MCP stdio target with shared-cache access; the focused LSP policy execution, symlink, configured-root, expiration, invalid-suppression, date, and confinement cases; and the complete VS Code format, type-check, lint, bundle, license, and 75-test unit suite. The restricted MCP run's shared-cache failure is recorded above; its unrestricted rerun passed.
 
 ## Context and Orientation
 

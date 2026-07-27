@@ -1,13 +1,22 @@
 mod common;
 
+use brokk_bifrost::{
+    Language,
+    policy::{PolicyEvaluationOptions, PolicyFailOn, evaluate_policy_files},
+};
 use common::InlineTestProject;
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
+
+const MCP_POLICY_APP: &str = include_str!("fixtures/policy-cli/project/src/app.py");
+const MCP_DYNAMIC_EVAL_POLICY: &str =
+    include_str!("fixtures/policy-cli/project/policies/dynamic-eval.rqlp");
 
 fn assert_same_canonical_path(actual: &str, expected: &std::path::Path) {
     assert_eq!(
@@ -190,6 +199,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "activate_workspace",
             "get_active_workspace",
             "query_code",
+            "run_policy",
             "get_symbol_locations",
             "get_symbol_ancestors",
             "find_filenames",
@@ -231,6 +241,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "activate_workspace",
             "get_active_workspace",
             "query_code",
+            "run_policy",
             "get_symbol_locations",
             "get_symbol_ancestors",
             "find_filenames",
@@ -909,6 +920,261 @@ fn bifrost_mcp_query_code_transports_explain_and_profile_reports() {
 }
 
 #[test]
+fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
+    let initial = InlineTestProject::with_language(Language::Python)
+        .file("src/app.py", "def harmless(value):\n    return value\n")
+        .file("policies/dynamic-eval.rqlp", MCP_DYNAMIC_EVAL_POLICY)
+        .build();
+    let switched = InlineTestProject::with_language(Language::Python)
+        .file("src/app.py", MCP_POLICY_APP)
+        .file("policies/dynamic-eval.rqlp", MCP_DYNAMIC_EVAL_POLICY)
+        .build();
+    let evaluation_date = "2026-07-27";
+    let expected = evaluate_policy_files(
+        switched.root(),
+        &[PathBuf::from("policies/dynamic-eval.rqlp")],
+        false,
+        &PolicyEvaluationOptions::new(evaluation_date.parse().expect("fixed evaluation date")),
+        PolicyFailOn::Warning,
+    )
+    .expect("direct policy evaluation");
+    assert_eq!(expected.exit_status(), 1);
+    let expected_report = serde_json::to_value(expected.report()).expect("serialize direct report");
+
+    let mut child = spawn_server(initial.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let list_tools = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    );
+    assert!(
+        tool_names(
+            list_tools["result"]["tools"]
+                .as_array()
+                .expect("tools array")
+        )
+        .contains(&"run_policy"),
+        "{list_tools}"
+    );
+
+    let activate = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "activate_workspace",
+                "arguments": {
+                    "workspace_path": switched.root().display().to_string()
+                }
+            }
+        }),
+    );
+    assert_eq!(activate["result"]["isError"], false, "{activate}");
+    assert_same_canonical_path(
+        activate["result"]["structuredContent"]["workspace_path"]
+            .as_str()
+            .expect("activated workspace"),
+        switched.root(),
+    );
+
+    let baseline = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "run_policy",
+                "arguments": {
+                    "policy_files": ["policies/dynamic-eval.rqlp"],
+                    "evaluation_date": evaluation_date,
+                    "fail_on": "warning"
+                }
+            }
+        }),
+    );
+    assert_eq!(baseline["result"]["isError"], false, "{baseline}");
+    let structured = &baseline["result"]["structuredContent"];
+    assert_eq!(structured["status"], "finding", "{baseline}");
+    assert_eq!(structured["exit_status"], 1, "{baseline}");
+    assert_eq!(structured["report"], expected_report, "{baseline}");
+    assert_eq!(structured["report"]["schema_version"], 2);
+    assert_eq!(
+        structured["report"]["evaluation"]["evaluation_date"],
+        evaluation_date
+    );
+    assert_eq!(
+        structured["report"]["runs"][0]["findings"][0]["primary"]["path"],
+        "src/app.py"
+    );
+
+    let policy_id = structured["report"]["rules"][0]["policy_id"].clone();
+    let policy_hash = structured["report"]["rules"][0]["policy_hash"].clone();
+    let finding_id = structured["report"]["runs"][0]["findings"][0]["id"].clone();
+    let suppression_path = switched.root().join("reviews/accepted.json");
+    fs::create_dir_all(suppression_path.parent().expect("suppression parent"))
+        .expect("create suppression directory");
+    fs::write(
+        &suppression_path,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "suppressions": [{
+                "policy_id": policy_id,
+                "finding_id": finding_id,
+                "identity_stability": "strong",
+                "status": "accepted",
+                "reason": "Reviewed through MCP",
+                "policy_hash_at_acceptance": policy_hash,
+                "accepted_by": "mcp-review",
+                "accepted_at": "2026-07-01",
+                "expires_at": evaluation_date
+            }]
+        }))
+        .expect("serialize suppressions"),
+    )
+    .expect("write suppressions");
+
+    let suppressed = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "run_policy",
+                "arguments": {
+                    "policy_files": ["policies/dynamic-eval.rqlp"],
+                    "suppression_file": "reviews/accepted.json",
+                    "evaluation_date": evaluation_date
+                }
+            }
+        }),
+    );
+    let suppressed = &suppressed["result"]["structuredContent"];
+    assert_eq!(suppressed["status"], "clean");
+    assert_eq!(suppressed["exit_status"], 0);
+    assert_eq!(
+        suppressed["report"]["runs"][0]["findings"][0]["id"],
+        finding_id
+    );
+    assert_eq!(
+        suppressed["report"]["runs"][0]["findings"][0]["suppression"]["status"],
+        "accepted"
+    );
+    assert_eq!(suppressed["report"]["suppressions"][0]["applied"], true);
+
+    let expired = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "run_policy",
+                "arguments": {
+                    "policy_files": ["policies/dynamic-eval.rqlp"],
+                    "suppression_file": "reviews/accepted.json",
+                    "evaluation_date": "2026-07-28"
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        expired["result"]["structuredContent"]["status"], "finding",
+        "{expired}"
+    );
+    assert_eq!(
+        expired["result"]["structuredContent"]["report"]["suppressions"][0]["temporal_state"],
+        "expired",
+        "{expired}"
+    );
+
+    fs::write(&suppression_path, "{ invalid suppression json").expect("invalidate suppressions");
+    let invalid_suppression = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "run_policy",
+                "arguments": {
+                    "policy_files": ["policies/dynamic-eval.rqlp"],
+                    "suppression_file": "reviews/accepted.json",
+                    "evaluation_date": evaluation_date
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        invalid_suppression["result"]["structuredContent"]["status"], "unreliable",
+        "{invalid_suppression}"
+    );
+    assert_eq!(
+        invalid_suppression["result"]["structuredContent"]["exit_status"],
+        2
+    );
+    assert_eq!(
+        invalid_suppression["result"]["structuredContent"]["report"]["diagnostics"][0]["code"],
+        "suppression-load-failed"
+    );
+
+    for (id, arguments) in [
+        (
+            7,
+            json!({
+                "policy_files": ["../outside.rqlp"],
+                "evaluation_date": evaluation_date
+            }),
+        ),
+        (
+            8,
+            json!({
+                "policy_files": ["policies/dynamic-eval.rqlp"],
+                "evaluation_date": "2026-02-30"
+            }),
+        ),
+        (9, json!({ "policy_files": ["policies/dynamic-eval.rqlp"] })),
+    ] {
+        let invalid = round_trip(
+            &mut stdin,
+            &mut reader,
+            &mut stderr,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": { "name": "run_policy", "arguments": arguments }
+            }),
+        );
+        assert_eq!(invalid["error"]["code"], -32602, "{invalid}");
+    }
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
 fn bifrost_split_servers_publish_expected_tool_sets() {
     let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -980,6 +1246,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "search_file_contents",
             "find_files_containing",
             "query_code",
+            "run_policy",
             "get_symbol_locations",
             "get_symbol_ancestors",
             "find_filenames",
@@ -995,6 +1262,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
         "extended",
         &[
             "query_code",
+            "run_policy",
             "get_symbol_locations",
             "get_symbol_ancestors",
             "find_filenames",

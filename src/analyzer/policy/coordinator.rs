@@ -166,6 +166,53 @@ pub fn evaluate_policy_files(
     )
 }
 
+/// Evaluate workspace policy files against a caller-owned immutable analyzer snapshot.
+///
+/// This is the file-backed counterpart to [`evaluate_policy_source`] for hosts
+/// that already own the active workspace snapshot, such as MCP sessions.
+pub fn evaluate_policy_files_with_analyzer(
+    root: impl AsRef<Path>,
+    policy_files: &[PathBuf],
+    require_explicit_schema_versions: bool,
+    analyzer: &dyn IAnalyzer,
+    options: &PolicyEvaluationOptions,
+    fail_on: PolicyFailOn,
+    cancellation: Option<&CancellationToken>,
+) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
+    let batch_budget = PolicyBatchBudget::default();
+    if policy_files.is_empty() {
+        return Err(PolicyCoordinatorError::new(
+            "policy evaluation requires at least one policy file",
+        ));
+    }
+    if policy_files.len() > batch_budget.max_policies() {
+        return Err(PolicyCoordinatorError::new(format!(
+            "policy evaluation accepts at most {} policy files",
+            batch_budget.max_policies()
+        )));
+    }
+
+    let (root, read_root) = open_policy_workspace_root(root.as_ref())?;
+    let mut inputs = Vec::with_capacity(policy_files.len());
+    for path in policy_files {
+        check_policy_cancellation(cancellation)?;
+        inputs.push(prepare_input(&read_root, path)?);
+    }
+    exclude_duplicate_policy_ids(&mut inputs)?;
+    evaluate_policy_inputs(
+        &root,
+        &read_root,
+        inputs,
+        require_explicit_schema_versions,
+        options,
+        fail_on,
+        batch_budget,
+        PolicyRegistryLimits::default(),
+        Some(analyzer),
+        cancellation,
+    )
+}
+
 /// Evaluate one live policy source against an analyzer snapshot that the caller owns.
 ///
 /// The root source comes from `source` rather than the filesystem, while referenced

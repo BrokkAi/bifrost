@@ -3,6 +3,12 @@ use crate::nlp::{indexer::SemanticIndexer, query::semantic_search};
 use crate::{
     AnalyzerConfig, CancellationToken, FilesystemProject, Project, ProjectChangeWatcher,
     ProjectFile, WorkspaceAnalyzer,
+    analyzer::policy::{
+        POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE, PolicyEvaluationDate,
+        PolicyEvaluationOptions, PolicyFailOn, PolicyReportDocument, PolicySuppressionOptions,
+        PolicySuppressionSource, evaluate_policy_files_with_analyzer,
+    },
+    analyzer::semantic::WorkspaceRelativePath,
     code_quality::{
         analyze_git_hotspots, compute_cognitive_complexity, compute_cyclomatic_complexity,
         report_comment_density_for_code_unit, report_comment_density_for_files,
@@ -28,7 +34,7 @@ use crate::{
     structured_data::{jq, xml_select, xml_skim},
     workspace_document::{WorkspaceDocumentError, WorkspaceRoot, read_workspace_document},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fmt;
@@ -47,6 +53,46 @@ pub enum SearchToolsServiceErrorCode {
 }
 
 const MAX_QUERY_FILE_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunPolicyParams {
+    policy_files: Vec<String>,
+    suppression_file: Option<String>,
+    evaluation_date: PolicyEvaluationDate,
+    #[serde(default)]
+    fail_on: RunPolicyFailOn,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RunPolicyFailOn {
+    Never,
+    Finding,
+    Note,
+    #[default]
+    Warning,
+    Error,
+}
+
+impl From<RunPolicyFailOn> for PolicyFailOn {
+    fn from(value: RunPolicyFailOn) -> Self {
+        match value {
+            RunPolicyFailOn::Never => Self::Never,
+            RunPolicyFailOn::Finding => Self::Finding,
+            RunPolicyFailOn::Note => Self::Note,
+            RunPolicyFailOn::Warning => Self::Warning,
+            RunPolicyFailOn::Error => Self::Error,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct RunPolicyToolResult {
+    status: &'static str,
+    exit_status: u8,
+    report: PolicyReportDocument,
+}
 
 #[derive(Debug, Clone)]
 pub struct SearchToolsServiceError {
@@ -193,6 +239,21 @@ pub(crate) struct PreparedQueryCode {
 }
 
 impl PreparedQueryCode {
+    pub(crate) const fn workspace_generation(&self) -> u64 {
+        self.workspace_generation
+    }
+}
+
+pub(crate) struct PreparedRunPolicy {
+    snapshot: WorkspaceQueryScope,
+    root: PathBuf,
+    policy_files: Vec<PathBuf>,
+    options: PolicyEvaluationOptions,
+    fail_on: PolicyFailOn,
+    workspace_generation: u64,
+}
+
+impl PreparedRunPolicy {
     pub(crate) const fn workspace_generation(&self) -> u64 {
         self.workspace_generation
     }
@@ -645,6 +706,10 @@ impl SearchToolsService {
         if name == "query_code" {
             let prepared = self.prepare_query_code(arguments)?;
             return self.execute_prepared_query_code(prepared, cancellation);
+        }
+        if name == "run_policy" {
+            let prepared = self.prepare_run_policy(arguments)?;
+            return self.execute_prepared_run_policy(prepared, cancellation);
         }
 
         let arguments = self.normalize_arguments_for_current_workspace(name, arguments)?;
@@ -2113,6 +2178,136 @@ impl SearchToolsService {
         Err(SearchToolsServiceError::invalid_params(
             "semantic_search_status is not available in this build (nlp feature disabled)",
         ))
+    }
+
+    pub(crate) fn prepare_run_policy(
+        &self,
+        arguments: Value,
+    ) -> Result<PreparedRunPolicy, SearchToolsServiceError> {
+        let params = serde_json::from_value::<RunPolicyParams>(arguments).map_err(|error| {
+            SearchToolsServiceError::invalid_params(format!(
+                "Invalid run_policy arguments: {error}"
+            ))
+        })?;
+        let max_policy_files = crate::analyzer::policy::PolicyBatchBudget::default().max_policies();
+        if params.policy_files.is_empty() || params.policy_files.len() > max_policy_files {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "run_policy requires between 1 and {max_policy_files} policy_files"
+            )));
+        }
+
+        let mut unique_paths = BTreeSet::new();
+        let mut policy_files = Vec::with_capacity(params.policy_files.len());
+        for raw_path in params.policy_files {
+            if raw_path.len() > crate::mcp_extended::MAX_RUN_POLICY_PATH_BYTES {
+                return Err(SearchToolsServiceError::invalid_params(format!(
+                    "run_policy policy path exceeds {} bytes",
+                    crate::mcp_extended::MAX_RUN_POLICY_PATH_BYTES
+                )));
+            }
+            let path = WorkspaceRelativePath::new(&raw_path).map_err(|error| {
+                SearchToolsServiceError::invalid_params(format!(
+                    "invalid run_policy policy path `{raw_path}`: {error}"
+                ))
+            })?;
+            if Path::new(path.as_str())
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("rqlp")
+            {
+                return Err(SearchToolsServiceError::invalid_params(format!(
+                    "run_policy policy path `{}` must use the .rqlp extension",
+                    path.as_str()
+                )));
+            }
+            if !unique_paths.insert(path.as_str().to_owned()) {
+                return Err(SearchToolsServiceError::invalid_params(format!(
+                    "run_policy policy path `{}` is duplicated",
+                    path.as_str()
+                )));
+            }
+            policy_files.push(PathBuf::from(path.as_str()));
+        }
+
+        let suppressions = params
+            .suppression_file
+            .map(PolicySuppressionSource::explicit_portable)
+            .transpose()
+            .map_err(|error| {
+                SearchToolsServiceError::invalid_params(format!(
+                    "invalid run_policy suppression_file: {error}"
+                ))
+            })?
+            .map_or_else(
+                PolicySuppressionOptions::default,
+                PolicySuppressionOptions::new,
+            );
+        let options =
+            PolicyEvaluationOptions::with_suppressions(params.evaluation_date, suppressions);
+        let fail_on = PolicyFailOn::from(params.fail_on);
+
+        loop {
+            let workspace_generation = self.workspace_generation();
+            let snapshot = self.snapshot_for_query()?;
+            if workspace_generation != self.workspace_generation() {
+                continue;
+            }
+            let root = snapshot.analyzer().project().root().to_path_buf();
+            return Ok(PreparedRunPolicy {
+                snapshot,
+                root,
+                policy_files,
+                options,
+                fail_on,
+                workspace_generation,
+            });
+        }
+    }
+
+    pub(crate) fn execute_prepared_run_policy(
+        &self,
+        prepared: PreparedRunPolicy,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
+        let PreparedRunPolicy {
+            snapshot,
+            root,
+            policy_files,
+            options,
+            fail_on,
+            workspace_generation: _,
+        } = prepared;
+        let result = (|| {
+            let outcome = evaluate_policy_files_with_analyzer(
+                &root,
+                &policy_files,
+                false,
+                snapshot.analyzer(),
+                &options,
+                fail_on,
+                cancellation,
+            )
+            .map_err(|error| {
+                SearchToolsServiceError::internal(format!("run_policy evaluation failed: {error}"))
+            })?;
+            let exit_status = outcome.exit_status();
+            let status = match exit_status {
+                POLICY_EXIT_CLEAN => "clean",
+                POLICY_EXIT_FINDING => "finding",
+                POLICY_EXIT_UNRELIABLE => "unreliable",
+                _ => {
+                    return Err(SearchToolsServiceError::internal(format!(
+                        "run_policy returned unknown status {exit_status}"
+                    )));
+                }
+            };
+            Self::structured_only(RunPolicyToolResult {
+                status,
+                exit_status,
+                report: outcome.into_report(),
+            })
+        })();
+        snapshot.finish("run_policy", result)
     }
 
     fn structured_only<R: Serialize>(result: R) -> Result<ToolOutput, SearchToolsServiceError> {

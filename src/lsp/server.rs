@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use chrono::{Datelike, Utc};
 use lsp_server::{
     Connection, ErrorCode, ExtractError, IoThreads, Message, Notification, Request, RequestId,
     Response,
@@ -43,9 +42,9 @@ use lsp_types::{
 
 use crate::NavigationOperation;
 use crate::analyzer::policy::{
-    PolicyEvaluationDate, PolicyEvaluationOptions, PolicyReportDocument,
-    PolicySourceDiagnosticSeverity, PolicySourceIdentity, evaluate_policy_source,
-    rqlp_source_completion_at, rqlp_source_help_at, validate_rqlp_source,
+    PolicyEvaluationOptions, PolicyReportDocument, PolicySourceDiagnosticSeverity,
+    PolicySourceIdentity, PolicySuppressionOptions, PolicySuppressionSource,
+    evaluate_policy_source, rqlp_source_completion_at, rqlp_source_help_at, validate_rqlp_source,
 };
 use crate::analyzer::semantic::WorkspaceRelativePath;
 use crate::analyzer::structural::query::{
@@ -1207,6 +1206,24 @@ fn handle_run_rql_policy_request(
                     .map_err(|err| format!("Failed to send LSP response: {err}"));
             }
         };
+    let suppressions = match params.suppression_file {
+        Some(path) => match PolicySuppressionSource::explicit_portable(path) {
+            Ok(source) => PolicySuppressionOptions::new(source),
+            Err(error) => {
+                let response = Response::new_err(
+                    id,
+                    ErrorCode::InvalidParams as i32,
+                    format!("Invalid suppression file path: {error}"),
+                );
+                return connection
+                    .sender
+                    .send(Message::Response(response))
+                    .map_err(|err| format!("Failed to send LSP response: {err}"));
+            }
+        },
+        None => PolicySuppressionOptions::default(),
+    };
+    let options = PolicyEvaluationOptions::with_suppressions(params.evaluation_date, suppressions);
     let source = params.source;
     // Policy dependencies are confined to `workspace_root`, while analyzer
     // result paths are relative to the active project's report coordinate root.
@@ -1228,16 +1245,6 @@ fn handle_run_rql_policy_request(
         },
         move |workspace, _project, context, cancellation| {
             context.report("Evaluating policy");
-            let today = Utc::now().date_naive();
-            let options = PolicyEvaluationOptions::new(
-                PolicyEvaluationDate::from_ymd(today.year(), today.month(), today.day()).map_err(
-                    |error| {
-                        CancellableWorkerError::Failed(format!(
-                            "Failed to determine the policy evaluation date: {error}"
-                        ))
-                    },
-                )?,
-            );
             let outcome = evaluate_policy_source(
                 &workspace_root,
                 source_identity,
@@ -2173,6 +2180,9 @@ impl lsp_types::request::Request for RunRqlPolicy {
 struct RunRqlPolicyParams {
     document_uri: Uri,
     source: String,
+    evaluation_date: crate::analyzer::policy::PolicyEvaluationDate,
+    #[serde(default)]
+    suppression_file: Option<String>,
 }
 
 #[derive(serde::Serialize)]
