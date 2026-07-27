@@ -9,8 +9,8 @@ use crate::analyzer::store::{
 use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, CodeUnitType, CppTemplateMetadata, DeclarationInfo,
     GlobalUsageDefinitionIndex, IAnalyzer, ImportInfo, Language, LanguageDialect, Project,
-    ProjectFile, Range, RubyMethodDispatchMode, SearchSymbolCandidate, SignatureMetadata,
-    SummaryFileProjection, UsageFactsIndex,
+    ProjectFile, Range, RubyMethodDispatchMode, SearchSymbolCandidate, SearchSymbolCandidates,
+    SearchSymbolPatternBatch, SignatureMetadata, SummaryFileProjection, UsageFactsIndex,
 };
 use crate::cancellation::CancellationToken;
 use crate::gitblob;
@@ -4164,19 +4164,47 @@ where
         )
     }
 
+    fn sql_nonpersisted_workspace_declarations_vec_matching_cancellable(
+        &self,
+        keep: impl FnMut(&CodeUnit) -> bool,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<LimitedQueryRows<CodeUnit>> {
+        self.store_query_or_record(
+            self.try_sql_nonpersisted_workspace_declarations_vec_matching_limited(keep, || {
+                !cancellation.is_some_and(CancellationToken::is_cancelled)
+            }),
+            "querying non-persisted workspace declarations with cancellation",
+        )
+    }
+
     fn try_sql_nonpersisted_workspace_declarations_vec_matching(
         &self,
-        mut keep: impl FnMut(&CodeUnit) -> bool,
+        keep: impl FnMut(&CodeUnit) -> bool,
     ) -> std::result::Result<Vec<CodeUnit>, StoreError> {
+        Ok(self
+            .try_sql_nonpersisted_workspace_declarations_vec_matching_limited(keep, || true)?
+            .rows)
+    }
+
+    fn try_sql_nonpersisted_workspace_declarations_vec_matching_limited(
+        &self,
+        mut keep: impl FnMut(&CodeUnit) -> bool,
+        mut continue_query: impl FnMut() -> bool,
+    ) -> std::result::Result<LimitedQueryRows<CodeUnit>, StoreError> {
         if !self.adapter.has_path_synthetic_module_units() {
-            return Ok(Vec::new());
+            return Ok(LimitedQueryRows::complete(Vec::new(), 0));
         }
         self.workspace_path_scan_count
             .fetch_add(1, Ordering::Relaxed);
         let snapshot = self.live_snapshot();
         let mut candidates = Vec::new();
         let mut candidate_files = Vec::new();
+        let mut inspected = 0usize;
         for file in snapshot.all_paths() {
+            if !continue_query() {
+                return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
+            }
+            inspected = inspected.saturating_add(1);
             let Some(project_file) = self.rebase_live_file_to_project_root(file) else {
                 continue;
             };
@@ -4197,25 +4225,32 @@ where
             candidates.push((file.clone(), oid, module));
         }
 
+        if !continue_query() {
+            return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
+        }
         let stale: HashSet<_> = snapshot
             .validate(candidate_files.iter())
             .into_iter()
             .collect();
-        candidates.retain(|(file, _, _)| !stale.contains(file));
+        if !continue_query() {
+            return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
+        }
 
-        if self.adapter.path_synthetic_module_requires_imports() {
-            let mut blob_keys: Vec<_> = candidates
-                .iter()
-                .map(|(file, oid, _)| {
-                    let project_file = self
-                        .rebase_live_file_to_project_root(file)
-                        .unwrap_or_else(|| file.clone());
-                    (
-                        *oid,
-                        self.adapter.storage_language_key_for_file(&project_file),
-                    )
-                })
-                .collect();
+        let import_oids = if self.adapter.path_synthetic_module_requires_imports() {
+            let mut blob_keys = Vec::with_capacity(candidates.len());
+            for (file, oid, _) in &candidates {
+                if !continue_query() {
+                    return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
+                }
+                inspected = inspected.saturating_add(1);
+                let project_file = self
+                    .rebase_live_file_to_project_root(file)
+                    .unwrap_or_else(|| file.clone());
+                blob_keys.push((
+                    *oid,
+                    self.adapter.storage_language_key_for_file(&project_file),
+                ));
+            }
             blob_keys.sort();
             blob_keys.dedup();
             let import_oids = self
@@ -4225,26 +4260,42 @@ where
                     &blob_keys,
                     self.store_context.generations.as_ref(),
                 )?;
-            candidates.retain(|(file, oid, _)| {
+            if !continue_query() {
+                return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
+            }
+            Some(import_oids)
+        } else {
+            None
+        };
+
+        let mut declarations = Vec::new();
+        for (file, oid, module) in candidates {
+            if !continue_query() {
+                return Ok(LimitedQueryRows::incomplete(declarations, inspected));
+            }
+            inspected = inspected.saturating_add(1);
+            if stale.contains(&file) || module.is_file_scope() {
+                continue;
+            }
+            if let Some(import_oids) = &import_oids {
                 let project_file = self
-                    .rebase_live_file_to_project_root(file)
+                    .rebase_live_file_to_project_root(&file)
                     .unwrap_or_else(|| file.clone());
-                self.adapter
+                if !self
+                    .adapter
                     .include_path_synthetic_module(import_oids.contains(&(
-                        *oid,
+                        oid,
                         self.adapter.storage_language_key_for_file(&project_file),
                     )))
-            });
+                {
+                    continue;
+                }
+            }
+            declarations.push(module);
         }
-
-        let mut declarations: Vec<_> = candidates
-            .into_iter()
-            .map(|(_, _, module)| module)
-            .filter(|unit| !unit.is_file_scope())
-            .collect();
         declarations.sort();
         declarations.dedup();
-        Ok(declarations)
+        Ok(LimitedQueryRows::complete(declarations, inspected))
     }
 
     fn dirty_file_states_for_queries(&self) -> Vec<FileState> {
@@ -5582,60 +5633,68 @@ where
     /// invisible when only the normalized fq is probed (#1127). Match the
     /// raw fq as well when it differs.
     fn fq_pattern_matches(&self, unit: &CodeUnit, compiled: &regex::Regex) -> bool {
+        self.fq_matches(unit, |name| compiled.is_match(name))
+    }
+
+    fn fq_matches(&self, unit: &CodeUnit, mut matches: impl FnMut(&str) -> bool) -> bool {
         let fq_name = self.adapter.normalize_full_name(&unit.fq_name());
         if self.adapter.is_anonymous_structure(&fq_name) {
             return false;
         }
-        if compiled.is_match(&fq_name) {
+        if matches(&fq_name) {
             return true;
         }
         let raw = unit.fq_name();
-        fq_name != raw && compiled.is_match(&raw)
+        fq_name != raw && matches(&raw)
     }
 
     fn sql_search_symbol_candidates(
         &self,
-        pattern: &str,
-        auto_quote: bool,
-    ) -> Option<Vec<SearchSymbolCandidate>> {
-        if pattern.is_empty() {
-            return Some(Vec::new());
+        patterns: &SearchSymbolPatternBatch,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<SearchSymbolCandidates> {
+        if patterns.patterns().is_empty() {
+            return Some(SearchSymbolCandidates::complete(Vec::new(), 0));
         }
-
-        let pattern = if auto_quote {
-            if pattern.contains(".*") {
-                pattern.to_string()
-            } else {
-                format!(".*?{}.*?", regex::escape(pattern))
-            }
-        } else {
-            escape_sigil_anchors(pattern)
-        };
-        let compiled = RegexBuilder::new(&pattern)
-            .case_insensitive(true)
-            .build()
-            .ok()?;
+        if !patterns.complete() || cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Some(SearchSymbolCandidates::incomplete(Vec::new(), 0));
+        }
+        self.full_declaration_scan_count
+            .fetch_add(1, Ordering::Relaxed);
         let rows = self.store_query_or_record(
-            self.store_context
-                .store
-                .search_candidate_rows_by_pattern_for_langs(
-                    &self.storage_language_keys_for_queries(),
-                    self.store_context.generations.as_ref(),
-                    &pattern,
-                ),
-            format!("searching symbol candidates for `{pattern}`"),
+            self.store_context.store.search_candidate_rows_for_langs(
+                &self.storage_language_keys_for_queries(),
+                self.store_context.generations.as_ref(),
+                cancellation,
+            ),
+            format!(
+                "searching symbol candidates for {} patterns",
+                patterns.patterns().len()
+            ),
         )?;
         let resolver = QueryResolver::from_snapshot(
             self.adapter.as_ref(),
             self.project.root(),
             self.live_snapshot(),
         );
-        let mut candidates = BTreeMap::new();
-        for (code_unit, (primary_range, in_test_region)) in resolver.resolve_rows_with_payload(
-            rows.into_iter()
+        let mut complete = rows.complete;
+        let mut inspected = rows.inspected;
+        let resolved = resolver.resolve_rows_with_payload_cancellable(
+            rows.rows
+                .into_iter()
                 .map(|row| (row.candidate, (row.primary_range, row.in_test_region))),
-        ) {
-            if self.fq_pattern_matches(&code_unit, &compiled) {
+            cancellation,
+        );
+        inspected = inspected.saturating_add(resolved.inspected);
+        complete &= resolved.complete;
+        let mut candidates = BTreeMap::new();
+        for (code_unit, (primary_range, in_test_region)) in resolved.rows {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                complete = false;
+                break;
+            }
+            inspected = inspected.saturating_add(1);
+            if self.fq_matches(&code_unit, |name| patterns.is_match(name)) {
                 candidates
                     .entry(code_unit.clone())
                     .or_insert(SearchSymbolCandidate {
@@ -5646,23 +5705,19 @@ where
             }
         }
 
-        for code_unit in
-            self.dirty_units_matching(false, |unit| self.fq_pattern_matches(unit, &compiled))
-        {
-            candidates
-                .entry(code_unit.clone())
-                .or_insert_with(|| SearchSymbolCandidate {
-                    primary_range: self
-                        .ranges(&code_unit)
-                        .into_iter()
-                        .min_by_key(|range| (range.start_line, range.start_byte)),
-                    in_test_region: self.in_test_region(&code_unit),
-                    code_unit,
-                });
-        }
-        for code_unit in self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
-            self.fq_pattern_matches(unit, &compiled)
-        })? {
+        let dirty = self.dirty_units_matching_limited(
+            false,
+            usize::MAX,
+            |unit| self.fq_matches(unit, |name| patterns.is_match(name)),
+            || !cancellation.is_some_and(CancellationToken::is_cancelled),
+        );
+        inspected = inspected.saturating_add(dirty.inspected);
+        complete &= dirty.complete;
+        for code_unit in dirty.rows {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                complete = false;
+                break;
+            }
             candidates
                 .entry(code_unit.clone())
                 .or_insert_with(|| SearchSymbolCandidate {
@@ -5675,7 +5730,36 @@ where
                 });
         }
 
-        Some(candidates.into_values().collect())
+        let synthetic = self.sql_nonpersisted_workspace_declarations_vec_matching_cancellable(
+            |unit| self.fq_matches(unit, |name| patterns.is_match(name)),
+            cancellation,
+        )?;
+        inspected = inspected.saturating_add(synthetic.inspected);
+        complete &= synthetic.complete;
+        for code_unit in synthetic.rows {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                complete = false;
+                break;
+            }
+            inspected = inspected.saturating_add(1);
+            candidates
+                .entry(code_unit.clone())
+                .or_insert_with(|| SearchSymbolCandidate {
+                    primary_range: self
+                        .ranges(&code_unit)
+                        .into_iter()
+                        .min_by_key(|range| (range.start_line, range.start_byte)),
+                    in_test_region: self.in_test_region(&code_unit),
+                    code_unit,
+                });
+        }
+
+        let candidates = candidates.into_values().collect();
+        if complete && !cancellation.is_some_and(CancellationToken::is_cancelled) {
+            Some(SearchSymbolCandidates::complete(candidates, inspected))
+        } else {
+            Some(SearchSymbolCandidates::incomplete(candidates, inspected))
+        }
     }
 
     pub(crate) fn package_name_of(&self, file: &ProjectFile) -> Option<String> {
@@ -7145,11 +7229,11 @@ where
 
     fn search_symbol_candidates(
         &self,
-        pattern: &str,
-        auto_quote: bool,
-    ) -> Vec<SearchSymbolCandidate> {
-        self.sql_search_symbol_candidates(pattern, auto_quote)
-            .unwrap_or_default()
+        patterns: &SearchSymbolPatternBatch,
+        cancellation: Option<&CancellationToken>,
+    ) -> SearchSymbolCandidates {
+        self.sql_search_symbol_candidates(patterns, cancellation)
+            .unwrap_or_else(|| SearchSymbolCandidates::complete(Vec::new(), 0))
     }
 
     fn metrics(&self) -> CodeBaseMetrics {
@@ -7188,38 +7272,6 @@ fn literal_ascii_search_substring(pattern: &str) -> Option<&str> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
     .then_some(pattern)
-}
-
-/// Escape anchor metacharacters only where they form part of an identifier
-/// token. A `$` directly followed by a word character or another `$`
-/// (JS/PHP/Ruby sigils: `$L`, `$utils`, `$$animate`) is unsatisfiable as an
-/// end-of-haystack anchor, so escaping it cannot change any pattern that
-/// matches today; likewise a `^` directly after a word character or `^` is
-/// unsatisfiable as a start anchor. A `$` directly *after* a word character
-/// gets the same treatment: java/scala identifiers legitimately end in `$`
-/// (twitter's `javaGlobalNoDefault$` classes, scala objects), and agents
-/// search those names literally (#1127). Intentional regex (groups, classes,
-/// real anchors) is left untouched.
-fn escape_sigil_anchors(pattern: &str) -> String {
-    let chars: Vec<char> = pattern.chars().collect();
-    let mut escaped = String::with_capacity(pattern.len());
-    for (index, ch) in chars.iter().enumerate() {
-        let prev_is_word = index > 0
-            && (chars[index - 1].is_alphanumeric() || matches!(chars[index - 1], '_' | '^'));
-        let next_is_word = chars
-            .get(index + 1)
-            .is_some_and(|next| next.is_alphanumeric() || matches!(next, '_' | '$'));
-        let unsatisfiable = match ch {
-            '$' => next_is_word || prev_is_word,
-            '^' => prev_is_word,
-            _ => false,
-        };
-        if unsatisfiable {
-            escaped.push('\\');
-        }
-        escaped.push(*ch);
-    }
-    escaped
 }
 
 fn enclosing_code_unit_rank(code_unit: &CodeUnit) -> usize {
@@ -9657,7 +9709,8 @@ mod tests {
         let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
 
         let matches = analyzer.search_definitions("Gson", false);
-        let candidates = analyzer.search_symbol_candidates("Gson", false);
+        let patterns = SearchSymbolPatternBatch::compile(vec!["Gson".to_string()], false, None);
+        let candidates = analyzer.search_symbol_candidates(&patterns, None).rows;
 
         assert!(matches.iter().any(|unit| unit.fq_name() == "demo.Gson"));
         assert!(
@@ -9672,18 +9725,48 @@ mod tests {
                 && !candidate.in_test_region
         }));
     }
+
+    #[test]
+    fn issue_1199_symbol_candidate_scan_honors_midstream_cancellation() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), "src/lib.rs");
+        file.write(
+            (0..32)
+                .map(|index| format!("pub fn diagnostic_{index}() {{}}\n"))
+                .collect::<String>(),
+        )
+        .expect("rust source");
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+        let cancellation = CancellationToken::cancel_after_checks_for_test(6);
+        let patterns =
+            SearchSymbolPatternBatch::compile(vec!["diagnostic_.*".to_string()], false, None);
+
+        let candidates = analyzer.search_symbol_candidates(&patterns, Some(&cancellation));
+
+        assert!(!candidates.complete, "{candidates:#?}");
+        assert!(candidates.inspected > 0, "{candidates:#?}");
+        assert!(cancellation.is_cancelled());
+    }
 }
 
 #[cfg(test)]
 mod sigil_anchor_tests {
+    use crate::analyzer::SearchSymbolPatternBatch;
+
     #[test]
     fn trailing_sigil_is_escaped_as_identifier_text() {
         // #1127: `Foo$` (java/scala sigil-suffixed identifiers) must not
         // compile as an end-of-haystack anchor.
-        assert_eq!(super::escape_sigil_anchors("Foo$"), "Foo\\$");
-        assert_eq!(super::escape_sigil_anchors("$L"), "\\$L");
-        assert_eq!(super::escape_sigil_anchors("$$animate"), "\\$\\$animate");
+        for pattern in ["Foo$", "$L", "$$animate"] {
+            let batch = SearchSymbolPatternBatch::compile(vec![pattern.to_string()], false, None);
+            assert!(batch.is_match(pattern), "{pattern}");
+        }
         // Word-free anchors stay anchors.
-        assert_eq!(super::escape_sigil_anchors("foo.$"), "foo.$");
+        let anchored = SearchSymbolPatternBatch::compile(vec!["foo.$".to_string()], false, None);
+        assert!(anchored.is_match("foo."));
+        assert!(!anchored.is_match("foo.$"));
     }
 }

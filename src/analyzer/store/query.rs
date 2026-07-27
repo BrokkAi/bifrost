@@ -3,8 +3,9 @@ use std::sync::Arc;
 
 use git2::Oid;
 
+use crate::CancellationToken;
 use crate::analyzer::store::liveness::{LiveSnapshot, Liveness};
-use crate::analyzer::store::{CandidateRow, Result, StoreError};
+use crate::analyzer::store::{CandidateRow, LimitedQueryRows, Result, StoreError};
 use crate::analyzer::tree_sitter_analyzer::LanguageAdapter;
 use crate::analyzer::{CodeUnit, ProjectFile};
 use crate::hash::HashSet;
@@ -51,27 +52,71 @@ impl<'a, A: LanguageAdapter> QueryResolver<'a, A> {
     where
         T: Clone,
     {
+        self.resolve_rows_with_payload_while(rows, || true).rows
+    }
+
+    pub(crate) fn resolve_rows_with_payload_cancellable<T>(
+        &self,
+        rows: impl IntoIterator<Item = (CandidateRow, T)>,
+        cancellation: Option<&CancellationToken>,
+    ) -> LimitedQueryRows<(CodeUnit, T)>
+    where
+        T: Clone,
+    {
+        match cancellation {
+            Some(cancellation) => {
+                self.resolve_rows_with_payload_while(rows, || !cancellation.is_cancelled())
+            }
+            None => self.resolve_rows_with_payload_while(rows, || true),
+        }
+    }
+
+    fn resolve_rows_with_payload_while<T>(
+        &self,
+        rows: impl IntoIterator<Item = (CandidateRow, T)>,
+        mut continue_query: impl FnMut() -> bool,
+    ) -> LimitedQueryRows<(CodeUnit, T)>
+    where
+        T: Clone,
+    {
         let rows: Vec<_> = rows.into_iter().collect();
-        let mut stale = HashSet::default();
+        let mut inspected = 0usize;
         let mut files = HashSet::default();
         for (row, _) in &rows {
-            if !self.snapshot.contains_oid(row.blob_oid) {
-                continue;
+            if !continue_query() {
+                return LimitedQueryRows::incomplete(Vec::new(), inspected);
             }
-            files.extend(self.paths_for_row(row));
+            inspected = inspected.saturating_add(1);
+            if self.snapshot.contains_oid(row.blob_oid) {
+                files.extend(self.paths_for_row(row));
+            }
         }
-        stale.extend(self.snapshot.validate(files.iter()));
+
+        if !continue_query() {
+            return LimitedQueryRows::incomplete(Vec::new(), inspected);
+        }
+        let stale: HashSet<_> = self.snapshot.validate(files.iter()).into_iter().collect();
+        if !continue_query() {
+            return LimitedQueryRows::incomplete(Vec::new(), inspected);
+        }
 
         let mut out = Vec::new();
         for (row, payload) in rows {
+            if !continue_query() {
+                return LimitedQueryRows::incomplete(out, inspected);
+            }
+            inspected = inspected.saturating_add(1);
             for file in self.paths_for_row(&row) {
-                if stale.contains(&file) {
-                    continue;
+                if !continue_query() {
+                    return LimitedQueryRows::incomplete(out, inspected);
                 }
-                out.push((self.code_unit_for_row(&row, &file), payload.clone()));
+                if !stale.contains(&file) {
+                    out.push((self.code_unit_for_row(&row, &file), payload.clone()));
+                }
             }
         }
-        out
+
+        LimitedQueryRows::complete(out, inspected)
     }
 
     fn paths_for_oid(&self, oid: Oid) -> Vec<ProjectFile> {

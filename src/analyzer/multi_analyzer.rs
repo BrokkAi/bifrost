@@ -4,9 +4,9 @@ use crate::analyzer::{
     DeclarationInfo, ExceptionHandlingSmell, ExceptionSmellWeights, GlobalUsageDefinitionIndex,
     GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer,
     Language, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer,
-    ScalaAnalyzer, SearchSymbolCandidate, SemanticDiagnostic, SignatureMetadata,
-    SummaryFileProjection, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
-    TypescriptAnalyzer,
+    ScalaAnalyzer, SearchSymbolCandidates, SearchSymbolPatternBatch, SemanticDiagnostic,
+    SignatureMetadata, SummaryFileProjection, TestDetectionProvider, TypeAliasProvider,
+    TypeHierarchyProvider, TypescriptAnalyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use rayon::prelude::*;
@@ -1039,9 +1039,9 @@ impl IAnalyzer for MultiAnalyzer {
 
     fn search_symbol_candidates(
         &self,
-        pattern: &str,
-        auto_quote: bool,
-    ) -> Vec<SearchSymbolCandidate> {
+        patterns: &SearchSymbolPatternBatch,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> SearchSymbolCandidates {
         self.delegates
             .values()
             .collect::<Vec<_>>()
@@ -1049,12 +1049,12 @@ impl IAnalyzer for MultiAnalyzer {
             .map(|delegate| {
                 delegate
                     .analyzer()
-                    .search_symbol_candidates(pattern, auto_quote)
+                    .search_symbol_candidates(patterns, cancellation)
             })
-            .reduce(Vec::new, |mut acc, candidates| {
-                acc.extend(candidates);
-                acc
-            })
+            .reduce(
+                || SearchSymbolCandidates::complete(Vec::new(), 0),
+                SearchSymbolCandidates::merge,
+            )
     }
 
     fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {

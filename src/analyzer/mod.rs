@@ -103,7 +103,10 @@ pub(crate) use go::{
     GO_MODULE_SCOPE_SEGMENT,
     packages::{GoModuleRoot, go_module_roots},
 };
-pub use i_analyzer::{AnalyzerQueryContext, AnalyzerSnapshotCaches, IAnalyzer};
+pub use i_analyzer::{
+    AnalyzerQueryContext, AnalyzerSnapshotCaches, IAnalyzer, QueryBatch, SearchSymbolCandidates,
+    SearchSymbolPatternBatch,
+};
 pub(crate) use i_analyzer::{AnalyzerQueryScope, default_parent_fq_name};
 pub use java::JavaAnalyzer;
 pub use javascript::JavascriptAnalyzer;
