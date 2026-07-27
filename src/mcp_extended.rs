@@ -29,7 +29,7 @@ pub fn run_extended_stdio_server(
     render_options: McpRenderOptions,
 ) -> Result<(), String> {
     let spec = crate::mcp_registry::resolve_server_spec("extended")?;
-    run_stdio_server(Some(root), render_options, &spec)
+    run_stdio_server(Some(root), render_options, &spec, None)
 }
 
 fn query_step_input_variants() -> Vec<Value> {

@@ -113,6 +113,7 @@ fn option_requires_value(argument: &str) -> bool {
             | "--server"
             | "--tool"
             | "--args"
+            | "--diff-snapshot-object-dir"
             | "--query-file"
             | "--sources"
             | "--policy-file"
@@ -145,6 +146,7 @@ fn run_inner(
     let mut tool_args = json!({});
     let mut tool_args_seen = false;
     let mut tool_sources = Vec::new();
+    let mut diff_snapshot_object_dir: Option<PathBuf> = None;
     let mut query_file: Option<String> = None;
     let mut render_options = McpRenderOptions::default();
     let mut no_line_numbers_seen = false;
@@ -250,6 +252,12 @@ fn run_inner(
                 tool_args = serde_json::from_str(&value)
                     .map_err(|err| format!("--args must be valid JSON: {err}"))?;
                 tool_args_seen = true;
+            }
+            "--diff-snapshot-object-dir" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--diff-snapshot-object-dir requires a path".to_string())?;
+                diff_snapshot_object_dir = Some(value.into());
             }
             "--query-file" => {
                 let value = args
@@ -364,9 +372,10 @@ fn run_inner(
             || mcp_mode.is_some()
             || no_line_numbers_seen
             || force_semantic_cpu_seen
+            || diff_snapshot_object_dir.is_some()
         {
             return Err(
-                "--policy-file and policy output options cannot be combined with --query-file, --tool, --args, --sources, --mcp, --lsp, --repl, skill-install options, --no-line-numbers, or --force-semantic-cpu"
+                "--policy-file and policy output options cannot be combined with --query-file, --tool, --args, --sources, --mcp, --lsp, --repl, skill-install options, --no-line-numbers, --force-semantic-cpu, or --diff-snapshot-object-dir"
                     .to_string(),
             );
         }
@@ -395,9 +404,10 @@ fn run_inner(
             || run_skill_install
             || install_option_seen
             || mcp_mode.is_some()
+            || diff_snapshot_object_dir.is_some()
         {
             return Err(
-                "--query-file cannot be combined with --tool, --args, --mcp, --lsp, --repl, or skill-install options"
+                "--query-file cannot be combined with --tool, --args, --mcp, --lsp, --repl, skill-install options, or --diff-snapshot-object-dir"
                     .to_string(),
             );
         }
@@ -410,6 +420,7 @@ fn run_inner(
             json!({ "query_file": query_file }),
             &[],
             render_options,
+            None,
         )
         .map(|()| CliRunResult::Complete);
     }
@@ -421,8 +432,18 @@ fn run_inner(
                     .to_string(),
             );
         }
-        return run_tool(root, &tool_name, tool_args, &tool_sources, render_options)
-            .map(|()| CliRunResult::Complete);
+        let diff_snapshot_object_dir = diff_snapshot_object_dir
+            .map(validate_diff_snapshot_object_dir)
+            .transpose()?;
+        return run_tool(
+            root,
+            &tool_name,
+            tool_args,
+            &tool_sources,
+            render_options,
+            diff_snapshot_object_dir,
+        )
+        .map(|()| CliRunResult::Complete);
     }
 
     if !tool_sources.is_empty() {
@@ -430,6 +451,9 @@ fn run_inner(
     }
 
     if run_skill_install {
+        if diff_snapshot_object_dir.is_some() {
+            return Err("--diff-snapshot-object-dir is only valid with --tool or MCP server mode; it cannot be combined with --install-skills".to_string());
+        }
         if run_lsp || run_repl || mcp_mode.is_some() {
             return Err(
                 "--install-skills cannot be combined with --mcp, --lsp, or --repl".to_string(),
@@ -470,10 +494,16 @@ fn run_inner(
     }
 
     if run_lsp {
+        if diff_snapshot_object_dir.is_some() {
+            return Err("--diff-snapshot-object-dir is only valid with --tool or MCP server mode; it cannot be combined with --lsp".to_string());
+        }
         return run_lsp_stdio_server(root).map(|()| CliRunResult::Complete);
     }
 
     if run_repl {
+        if diff_snapshot_object_dir.is_some() {
+            return Err("--diff-snapshot-object-dir is only valid with --tool or MCP server mode; it cannot be combined with --repl".to_string());
+        }
         return run_code_query_repl(root).map(|()| CliRunResult::Complete);
     }
 
@@ -493,7 +523,32 @@ fn run_inner(
         .as_deref()
         .is_none_or(brokk_bifrost::mcp_registry::workspace_is_git);
     let spec = resolve_server_spec_for_render_options(mode, render_options, git_repo)?;
-    run_stdio_server(initial_root, render_options, &spec).map(|()| CliRunResult::Complete)
+    let diff_snapshot_object_dir = diff_snapshot_object_dir
+        .map(validate_diff_snapshot_object_dir)
+        .transpose()?;
+    run_stdio_server(
+        initial_root,
+        render_options,
+        &spec,
+        diff_snapshot_object_dir,
+    )
+    .map(|()| CliRunResult::Complete)
+}
+
+fn validate_diff_snapshot_object_dir(path: PathBuf) -> Result<PathBuf, String> {
+    let path = path.canonicalize().map_err(|err| {
+        format!(
+            "Failed to resolve --diff-snapshot-object-dir {}: {err}",
+            path.display()
+        )
+    })?;
+    if !path.is_dir() {
+        return Err(format!(
+            "--diff-snapshot-object-dir must name a directory: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
 }
 
 fn parse_policy_format(value: &str) -> Result<PolicyOutputFormat, String> {
@@ -752,6 +807,7 @@ fn run_tool(
     tool_args: Value,
     tool_sources: &[String],
     render_options: McpRenderOptions,
+    diff_snapshot_object_dir: Option<PathBuf>,
 ) -> Result<(), String> {
     let canonical_root = root
         .canonicalize()
@@ -759,6 +815,10 @@ fn run_tool(
     let (arguments, overlays) =
         normalize_tool_arguments_for_cli(tool_name, tool_args, &canonical_root)?;
     let service = create_cli_tool_service(canonical_root, tool_sources, overlays)?;
+    let service = match diff_snapshot_object_dir {
+        Some(dir) => service.with_diff_snapshot_object_dir(dir),
+        None => service,
+    };
     let output = service
         .call_tool_output(
             tool_name,
@@ -825,6 +885,9 @@ USAGE:
 
 OPTIONS:
     --root DIR             Project root to analyze (default: current directory)
+    --diff-snapshot-object-dir DIR
+                           Trusted Git objects directory for immutable analyze_diff endpoints;
+                           valid only with --tool and MCP server modes.
     --args JSON            Inline JSON arguments for --tool, e.g. '{"patterns":["MyClass"]}'.
                            File path arguments may use <commit-ish>:<path> in --tool mode.
                            Required for tools that take arguments; omit for those that don't

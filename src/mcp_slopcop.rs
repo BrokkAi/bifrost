@@ -24,7 +24,7 @@ pub fn run_slopcop_stdio_server(
     render_options: McpRenderOptions,
 ) -> Result<(), String> {
     let spec = crate::mcp_registry::resolve_server_spec("slopcop")?;
-    run_stdio_server(Some(root), render_options, &spec)
+    run_stdio_server(Some(root), render_options, &spec, None)
 }
 
 pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
@@ -424,19 +424,19 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "analyze_diff",
-            "Diff two endpoints and return Bifrost-resolved semantic patch effects: changed files, introduced/edited/deleted/moved symbols, dependency symbols, signature/import/call-edge changes, changed test symbols, and large-callsite truncation notices. Three modes: omit both params to compare HEAD against the uncommitted working tree (`git diff HEAD`, staged plus unstaged plus new files); pass `target` alone to compare a single commit against its first parent; pass `base` and/or `target` to compare any two endpoints (`git diff <base> <target>`, or `<base>` against the working tree when `target` is omitted). Merge and root commits require an explicit `base`. The working-tree endpoint is a live snapshot with no locking: files may change between the diff and the analysis.",
+            "Diff two endpoints and return Bifrost-resolved semantic patch effects: changed files, introduced/edited/deleted/moved symbols, dependency symbols, signature/import/call-edge changes, changed test symbols, and large-callsite truncation notices. An explicit endpoint accepts a commit-ish or tree-ish; commit resolution wins when a spelling can resolve to either. Omit both parameters to compare HEAD against the live working tree. With `target` alone, a commit compares against its first parent; a tree-only target is rejected because a tree has no parent, so provide `base`. Endpoint labels report a full commit hash or `tree:<full-oid>`. When both endpoints are immutable commits or trees, comparison ignores the live working tree, index, and `.gitattributes`. Objects available only in a snapshot store require the host to launch Bifrost with `--diff-snapshot-object-dir`; this tool never accepts an object-store filesystem path argument.",
             json!({
                 "type": "object",
                 "properties": {
                     "base": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "Revspec of the \"before\" endpoint (commit hash, branch, or tag). Defaults to the first parent of `target`, or to HEAD when `target` is omitted."
+                        "description": "Commit-ish or tree-ish \"before\" endpoint. Commit resolution wins when both apply. Defaults to the first parent of a commit `target`, or HEAD when `target` is omitted. Snapshot-store objects require host launch configuration; no filesystem path is accepted here."
                     },
                     "target": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "Revspec of the \"after\" endpoint (commit hash, branch, or tag). Omit to use the uncommitted working tree."
+                        "description": "Commit-ish or tree-ish \"after\" endpoint. Commit resolution wins when both apply. Omit for the live working tree. A tree-only target requires explicit `base` because trees have no parents; immutable pairs ignore the live worktree, index, and .gitattributes. Snapshot-store objects require host launch configuration; no filesystem path is accepted here."
                     },
                     "include_tests": {
                         "type": "boolean",

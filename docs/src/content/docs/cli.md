@@ -13,6 +13,33 @@ bifrost --root /path/to/project --tool search_symbols --args '{"patterns":["MyCl
 
 `--args` is inline JSON matching the selected tool's MCP argument object. Omit it for tools that accept an empty object, such as `get_active_workspace`.
 
+## Immutable Git Snapshot Diffs
+
+`analyze_diff` can compare exact Git commits or tree objects. For snapshot trees
+that exist only in a separate Git object store, launch Bifrost with
+`--diff-snapshot-object-dir`. The value is a trusted path to a Git `objects`
+directory, given as either an absolute path or one relative to the launch working
+directory; Bifrost resolves it to an absolute path and rejects a missing or
+non-directory path before serving requests. It is launch
+configuration, never an `analyze_diff` argument, so callers cannot select an
+arbitrary filesystem object store.
+
+The flag is valid only with `--tool` and MCP server modes. For example, a review
+host that captured two private tree objects can compare them without consulting
+the current checkout, index, or `.gitattributes`:
+
+```bash
+bifrost --root /path/to/project \
+  --diff-snapshot-object-dir /path/to/turn-snapshot/objects \
+  --tool analyze_diff \
+  --args '{"base":"0123456789abcdef0123456789abcdef01234567","target":"89abcdef0123456789abcdef0123456789abcdef"}'
+```
+
+Each explicit endpoint may be a commit-ish or tree-ish (commit resolution wins
+when both apply). Results label tree endpoints as `tree:<oid>`. A tree supplied
+only as `target` is rejected because it has no parent; provide both `base` and
+`target` for a tree-to-tree comparison.
+
 ## Saved Code Queries
 
 Run a complete RQL or JSON `query_code` query from a workspace file without the generic tool wrapper:

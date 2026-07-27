@@ -33,6 +33,15 @@ pub struct AnalyzeDiffParams {
     pub include_tests: bool,
 }
 
+/// Trusted host configuration for immutable `analyze_diff` endpoints.
+///
+/// This deliberately is not deserializable from tool arguments: the directory
+/// is a Git object database selected by the process host, not by an MCP caller.
+#[derive(Debug, Clone, Default)]
+pub struct DiffAnalysisOptions {
+    pub snapshot_object_dir: Option<PathBuf>,
+}
+
 fn default_include_tests() -> bool {
     true
 }
@@ -51,8 +60,8 @@ pub struct DiffAnalysisResult {
     pub large_callsite_symbols: Vec<LargeCallsiteSymbol>,
 }
 
-/// Resolved diff endpoints. Each field is a full commit hash, or the literal
-/// [`WORKTREE_ENDPOINT`] when the endpoint is the uncommitted working tree.
+/// Resolved diff endpoints. Fields are a full commit hash, `tree:<full hash>`,
+/// or the literal [`WORKTREE_ENDPOINT`].
 #[derive(Debug, Clone, Serialize)]
 pub struct DiffEndpoints {
     pub base: String,
@@ -190,10 +199,11 @@ struct EdgeKey {
     language: String,
 }
 
-/// One end of a diff: either a committed tree, or the live working tree.
+/// One end of a diff: a commit, a bare tree, or the live working tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Snapshot {
     Commit(Oid),
+    Tree(Oid),
     Worktree,
 }
 
@@ -201,8 +211,13 @@ impl Snapshot {
     fn label(&self) -> String {
         match self {
             Self::Commit(oid) => oid.to_string(),
+            Self::Tree(oid) => format!("tree:{oid}"),
             Self::Worktree => WORKTREE_ENDPOINT.to_string(),
         }
+    }
+
+    fn is_immutable(self) -> bool {
+        !matches!(self, Self::Worktree)
     }
 }
 
@@ -215,33 +230,53 @@ impl Snapshot {
 /// | `{base: A, target: B}`     | `A`                 | `B`         |
 /// | `{base: A}`                | `A`                 | working tree|
 ///
-/// The base end is always a commit; only the target end can be the working
-/// tree.
 fn resolve_endpoints(
     repo: &Repository,
     params: &AnalyzeDiffParams,
-) -> Result<(Oid, Snapshot), String> {
+) -> Result<(Snapshot, Snapshot), String> {
     let target = match params.target.as_deref().map(str::trim) {
-        Some(revision) if !revision.is_empty() => Snapshot::Commit(resolve_commit(repo, revision)?),
+        Some(revision) if !revision.is_empty() => resolve_snapshot(repo, revision)?,
         _ => Snapshot::Worktree,
     };
 
     let base = match params.base.as_deref().map(str::trim) {
-        Some(revision) if !revision.is_empty() => resolve_commit(repo, revision)?,
+        Some(revision) if !revision.is_empty() => resolve_snapshot(repo, revision)?,
         _ => default_base(repo, target, params.target.as_deref())?,
     };
 
     Ok((base, target))
 }
 
-fn resolve_commit(repo: &Repository, revision: &str) -> Result<Oid, String> {
+fn resolve_snapshot(repo: &Repository, revision: &str) -> Result<Snapshot, String> {
     let object = repo
         .revparse_single(revision)
         .map_err(|err| format!("unable to resolve revision `{revision}`: {err}"))?;
-    let commit = object
-        .peel_to_commit()
-        .map_err(|err| format!("revision `{revision}` is not a commit: {err}"))?;
-    Ok(commit.id())
+    if let Ok(commit) = object.peel_to_commit() {
+        return Ok(Snapshot::Commit(commit.id()));
+    }
+    if let Ok(tree) = object.peel(ObjectType::Tree) {
+        return Ok(Snapshot::Tree(tree.id()));
+    }
+    Err(format!(
+        "revision `{revision}` resolves to {}, not a commit or tree",
+        object
+            .kind()
+            .map_or("an unknown object type", |kind| match kind {
+                ObjectType::Any => "an unspecified object",
+                ObjectType::Commit => "a commit",
+                ObjectType::Tree => "a tree",
+                ObjectType::Blob => "a blob",
+                ObjectType::Tag => "a tag",
+            })
+    ))
+}
+
+fn resolve_commit(repo: &Repository, revision: &str) -> Result<Oid, String> {
+    match resolve_snapshot(repo, revision)? {
+        Snapshot::Commit(oid) => Ok(oid),
+        Snapshot::Tree(_) => Err(format!("revision `{revision}` is a tree, not a commit")),
+        Snapshot::Worktree => unreachable!("explicit revisions never resolve to worktree"),
+    }
 }
 
 /// Pick the implicit base when the caller omitted `base`.
@@ -249,11 +284,13 @@ fn default_base(
     repo: &Repository,
     target: Snapshot,
     target_revision: Option<&str>,
-) -> Result<Oid, String> {
+) -> Result<Snapshot, String> {
     match target {
-        Snapshot::Worktree => resolve_commit(repo, "HEAD").map_err(|err| {
-            format!("unable to default `base` to HEAD for a working-tree diff: {err}")
-        }),
+        Snapshot::Worktree => resolve_commit(repo, "HEAD")
+            .map(Snapshot::Commit)
+            .map_err(|err| {
+                format!("unable to default `base` to HEAD for a working-tree diff: {err}")
+            }),
         Snapshot::Commit(oid) => {
             let commit = repo
                 .find_commit(oid)
@@ -271,6 +308,7 @@ fn default_base(
                 )),
                 1 => commit
                     .parent_id(0)
+                    .map(Snapshot::Commit)
                     .map_err(|err| format!("unable to read parent commit: {err}")),
                 n => Err(format!(
                     "analyze_diff cannot default `base` for merge commit `{spelling}` \
@@ -278,25 +316,36 @@ fn default_base(
                 )),
             }
         }
+        Snapshot::Tree(_) => Err(format!(
+            "analyze_diff cannot default `base` for tree endpoint `{}`; trees have no parent, so pass an explicit `base`",
+            target_revision.map(str::trim).unwrap_or_default()
+        )),
     }
 }
 
 pub fn analyze_diff(
     analyzer: &dyn IAnalyzer,
     params: AnalyzeDiffParams,
+    options: &DiffAnalysisOptions,
 ) -> Result<DiffAnalysisResult, String> {
-    analyze_diff_at_root(analyzer.project().root(), params)
+    analyze_diff_at_root(analyzer.project().root(), params, options)
 }
 
 pub fn analyze_diff_at_root(
     root: &Path,
     params: AnalyzeDiffParams,
+    options: &DiffAnalysisOptions,
 ) -> Result<DiffAnalysisResult, String> {
-    let repo = Repository::open(root)
-        .map_err(|err| format!("not a git repository at project root: {err}"))?;
-    let (base_oid, target) = resolve_endpoints(&repo, &params)?;
+    let resolution_repo = open_repository(root, options, false)?;
+    let (base, target) = resolve_endpoints(&resolution_repo.repo, &params)?;
+    let repository = if base.is_immutable() && target.is_immutable() {
+        open_repository(root, options, true)?
+    } else {
+        resolution_repo
+    };
+    let repo = &repository.repo;
 
-    let (file_changes, changed_lines) = diff_metadata(&repo, base_oid, target)?;
+    let (file_changes, changed_lines) = diff_metadata(repo, base, target)?;
     let changed_paths: Vec<String> = file_changes
         .iter()
         .flat_map(|change| [change.old_path.clone(), change.path.clone()])
@@ -319,8 +368,8 @@ pub fn analyze_diff_at_root(
         .into_iter()
         .collect();
 
-    let base_image = RevisionImage::materialize(&repo, Snapshot::Commit(base_oid), &base_paths)?;
-    let target_image = RevisionImage::materialize(&repo, target, &target_paths)?;
+    let base_image = RevisionImage::materialize(repo, base, &base_paths)?;
+    let target_image = RevisionImage::materialize(repo, target, &target_paths)?;
     let base_analyzer = build_analyzer(base_image.root(), base_image.files())?;
     let target_analyzer = build_analyzer(target_image.root(), target_image.files())?;
 
@@ -453,7 +502,7 @@ pub fn analyze_diff_at_root(
 
     Ok(DiffAnalysisResult {
         endpoints: DiffEndpoints {
-            base: base_oid.to_string(),
+            base: base.label(),
             target: target.label(),
         },
         file_changes,
@@ -468,22 +517,76 @@ pub fn analyze_diff_at_root(
     })
 }
 
+struct DiffRepository {
+    repo: Repository,
+    // Must outlive `repo`: it owns the private bare repository backing an
+    // immutable comparison.
+    _temp: Option<RevisionTempDir>,
+}
+
+fn open_repository(
+    root: &Path,
+    options: &DiffAnalysisOptions,
+    bare: bool,
+) -> Result<DiffRepository, String> {
+    let repo = if bare {
+        let discovered = Repository::open(root)
+            .map_err(|err| format!("not a git repository at project root: {err}"))?;
+        let source_objects = discovered.commondir().join("objects");
+        let temp = RevisionTempDir::new("immutable-odb")?;
+        let repo = Repository::init_bare(temp.path()).map_err(|err| {
+            format!(
+                "unable to create isolated immutable diff repository {}: {err}",
+                temp.path().display()
+            )
+        })?;
+        add_odb_alternate(&repo, &source_objects, "repository object directory")?;
+        return attach_snapshot_alternate(repo, options).map(|repo| DiffRepository {
+            repo,
+            _temp: Some(temp),
+        });
+    } else {
+        Repository::open(root)
+    }
+    .map_err(|err| format!("not a git repository at project root: {err}"))?;
+    attach_snapshot_alternate(repo, options).map(|repo| DiffRepository { repo, _temp: None })
+}
+
+fn attach_snapshot_alternate(
+    repo: Repository,
+    options: &DiffAnalysisOptions,
+) -> Result<Repository, String> {
+    if let Some(path) = options.snapshot_object_dir.as_deref() {
+        add_odb_alternate(&repo, path, "configured diff snapshot object directory")?;
+    }
+    Ok(repo)
+}
+
+fn add_odb_alternate(repo: &Repository, path: &Path, description: &str) -> Result<(), String> {
+    if !path.is_dir() {
+        return Err(format!(
+            "{description} {} does not exist or is not a directory",
+            path.display()
+        ));
+    }
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| format!("{description} {} is not valid UTF-8", path.display()))?;
+    repo.odb()
+        .and_then(|odb| odb.add_disk_alternate(path_str))
+        .map_err(|err| format!("unable to attach {description} {}: {err}", path.display()))
+}
+
 fn diff_metadata(
     repo: &Repository,
-    base_oid: Oid,
+    base: Snapshot,
     target: Snapshot,
 ) -> Result<(Vec<FileChange>, BTreeMap<String, ChangedLines>), String> {
-    let base_tree = repo
-        .find_commit(base_oid)
-        .and_then(|commit| commit.tree())
-        .map_err(|err| format!("unable to read base tree: {err}"))?;
+    let base_tree = snapshot_tree(repo, base)?;
     let mut opts = DiffOptions::new();
     let mut diff = match target {
-        Snapshot::Commit(target_oid) => {
-            let target_tree = repo
-                .find_commit(target_oid)
-                .and_then(|commit| commit.tree())
-                .map_err(|err| format!("unable to read target tree: {err}"))?;
+        Snapshot::Commit(_) | Snapshot::Tree(_) => {
+            let target_tree = snapshot_tree(repo, target)?;
             repo.diff_tree_to_tree(Some(&base_tree), Some(&target_tree), Some(&mut opts))
         }
         Snapshot::Worktree => {
@@ -578,14 +681,27 @@ fn diff_metadata(
     Ok((changes, changed_lines))
 }
 
+fn snapshot_tree(repo: &Repository, snapshot: Snapshot) -> Result<git2::Tree<'_>, String> {
+    match snapshot {
+        Snapshot::Commit(oid) => repo
+            .find_commit(oid)
+            .and_then(|commit| commit.tree())
+            .map_err(|err| format!("unable to read tree for commit {oid}: {err}")),
+        Snapshot::Tree(oid) => repo
+            .find_tree(oid)
+            .map_err(|err| format!("unable to read tree {oid}: {err}")),
+        Snapshot::Worktree => Err("working tree has no immutable Git tree".to_string()),
+    }
+}
+
 /// An analyzable image of one diff endpoint, restricted to the changed files.
 ///
-/// Commit endpoints are exported into a temp directory; the working-tree
-/// endpoint is analyzed in place from the real project root. Both sides stay
-/// restricted to the changed paths so the symbol and call-edge diffs compare
-/// like for like.
+/// Immutable endpoints — a commit or a bare tree — are exported into a private
+/// temp directory from their resolved tree; the working-tree endpoint is
+/// analyzed in place from the real project root. Both sides stay restricted to
+/// the changed paths so the symbol and call-edge diffs compare like for like.
 enum RevisionImage {
-    Commit {
+    Snapshot {
         temp: RevisionTempDir,
         files: Vec<PathBuf>,
     },
@@ -602,10 +718,10 @@ impl RevisionImage {
         paths: &[String],
     ) -> Result<Self, String> {
         match snapshot {
-            Snapshot::Commit(oid) => {
+            Snapshot::Commit(oid) | Snapshot::Tree(oid) => {
                 let temp = RevisionTempDir::new(&oid.to_string())?;
-                let files = export_commit_files(repo, oid, temp.path(), paths)?;
-                Ok(Self::Commit { temp, files })
+                let files = export_snapshot_files(repo, snapshot, temp.path(), paths)?;
+                Ok(Self::Snapshot { temp, files })
             }
             Snapshot::Worktree => {
                 let root = repo
@@ -623,14 +739,14 @@ impl RevisionImage {
 
     fn root(&self) -> &Path {
         match self {
-            Self::Commit { temp, .. } => temp.path(),
+            Self::Snapshot { temp, .. } => temp.path(),
             Self::Worktree { root, .. } => root,
         }
     }
 
     fn files(&self) -> &[PathBuf] {
         match self {
-            Self::Commit { files, .. } | Self::Worktree { files, .. } => files,
+            Self::Snapshot { files, .. } | Self::Worktree { files, .. } => files,
         }
     }
 }
@@ -671,8 +787,11 @@ impl RevisionTempDir {
                 "bifrost-analyze-{}-{nanos}-{attempt}-{label}",
                 std::process::id()
             ));
-            match fs::create_dir(&path) {
-                Ok(()) => return Ok(Self { path }),
+            match create_private_dir(&path) {
+                Ok(()) => {
+                    set_private_dir_permissions(&path)?;
+                    return Ok(Self { path });
+                }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(err) => {
                     return Err(format!(
@@ -696,16 +815,13 @@ impl Drop for RevisionTempDir {
     }
 }
 
-fn export_commit_files(
+fn export_snapshot_files(
     repo: &Repository,
-    oid: Oid,
+    snapshot: Snapshot,
     root: &Path,
     paths: &[String],
 ) -> Result<Vec<PathBuf>, String> {
-    let tree = repo
-        .find_commit(oid)
-        .and_then(|commit| commit.tree())
-        .map_err(|err| format!("unable to read tree for {oid}: {err}"))?;
+    let tree = snapshot_tree(repo, snapshot)?;
     let mut exported = Vec::new();
     for raw_path in paths {
         let rel = safe_tree_entry_path(raw_path)?;
@@ -720,14 +836,98 @@ fn export_commit_files(
             .map_err(|err| format!("unable to read blob `{}`: {err}", rel.display()))?;
         let path = root.join(&rel);
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| format!("unable to create {}: {err}", parent.display()))?;
+            create_private_dirs(root, parent)?;
         }
-        fs::write(&path, blob.content())
-            .map_err(|err| format!("unable to write {}: {err}", path.display()))?;
+        write_private_file(&path, blob.content())?;
+        set_private_file_permissions(&path)?;
         exported.push(rel);
     }
     Ok(exported)
+}
+
+fn create_private_dirs(root: &Path, parent: &Path) -> Result<(), String> {
+    let rel = parent.strip_prefix(root).map_err(|err| {
+        format!(
+            "unable to create directory outside revision root {}: {err}",
+            parent.display()
+        )
+    })?;
+    let mut current = root.to_path_buf();
+    for component in rel.components() {
+        current.push(component.as_os_str());
+        match create_private_dir(&current) {
+            Ok(()) => set_private_dir_permissions(&current)?,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                set_private_dir_permissions(&current)?
+            }
+            Err(err) => return Err(format!("unable to create {}: {err}", current.display())),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    fs::create_dir(path)
+}
+
+#[cfg(unix)]
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|err| format!("unable to write {}: {err}", path.display()))?;
+    file.write_all(contents)
+        .map_err(|err| format!("unable to write {}: {err}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), String> {
+    fs::write(path, contents).map_err(|err| format!("unable to write {}: {err}", path.display()))
+}
+
+#[cfg(unix)]
+fn set_private_dir_permissions(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|err| {
+        format!(
+            "unable to set private permissions on {}: {err}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn set_private_dir_permissions(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|err| {
+        format!(
+            "unable to set private permissions on {}: {err}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 fn safe_tree_entry_path(name: &str) -> Result<PathBuf, String> {
@@ -1079,4 +1279,33 @@ fn path_language(path: &Path) -> Language {
 
 fn kind_name(kind: CodeUnitType) -> &'static str {
     kind.display_lowercase()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{RevisionTempDir, create_private_dirs, write_private_file};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn snapshot_materialization_uses_private_permissions() {
+        let temp = RevisionTempDir::new("permissions").unwrap();
+        let nested = temp.path().join("nested").join("source");
+        create_private_dirs(temp.path(), &nested).unwrap();
+        let file = nested.join("lib.go");
+        write_private_file(&file, b"package sample\n").unwrap();
+
+        assert_eq!(
+            fs::metadata(temp.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(nested).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 }

@@ -1,9 +1,15 @@
 use brokk_bifrost::SearchToolsService;
 use serde_json::Value;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
+
+/// Comfortably above the usage-graph callsite cap
+/// (`analyzer::usages::inverted_edges::MAX_CALLSITES`, currently 1000), so a
+/// generated fixture reliably trips the large-callsite truncation notice.
+const CALLSITES_ABOVE_CAP: usize = 1_200;
 
 fn git(root: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -28,6 +34,17 @@ fn commit(root: &Path, message: &str) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
+fn git_output(root: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(output.status.success(), "git {args:?} failed");
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
 fn patch_array<'a>(result: &'a Value, pointer: &str) -> &'a Vec<Value> {
     result
         .pointer(pointer)
@@ -39,6 +56,88 @@ fn find_symbol<'a>(symbols: &'a [Value], name: &str) -> Option<&'a Value> {
     symbols
         .iter()
         .find(|symbol| symbol["name"].as_str() == Some(name))
+}
+
+fn alternate_tree(root: &Path, objects: &Path, path: &str, contents: &str) -> String {
+    fs::create_dir_all(objects).unwrap();
+    // `hash-object` reads its blob from stdin, so create it through a direct
+    // command rather than the generic output helper.
+    let mut hash = Command::new("git");
+    hash.arg("-C")
+        .arg(root)
+        .args(["hash-object", "-w", "--stdin"])
+        .env("GIT_OBJECT_DIRECTORY", objects)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let mut child = hash.spawn().expect("spawn hash-object");
+    use std::io::Write;
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(contents.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let blob = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    let tree_input = format!("100644 blob {blob}\t{path}\n");
+    let mut mktree = Command::new("git");
+    mktree
+        .arg("-C")
+        .arg(root)
+        .arg("mktree")
+        .env("GIT_OBJECT_DIRECTORY", objects)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let mut child = mktree.spawn().expect("spawn mktree");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(tree_input.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+fn alternate_tree_entries(root: &Path, objects: &Path, entries: &[(&str, &[u8])]) -> String {
+    fs::create_dir_all(objects).unwrap();
+    let mut tree_input = String::new();
+    for (path, contents) in entries {
+        let mut hash = Command::new("git");
+        hash.arg("-C")
+            .arg(root)
+            .args(["hash-object", "-w", "--stdin"])
+            .env("GIT_OBJECT_DIRECTORY", objects)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        let mut child = hash.spawn().unwrap();
+        use std::io::Write;
+        child.stdin.as_mut().unwrap().write_all(contents).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let blob = String::from_utf8(output.stdout).unwrap().trim().to_string();
+        tree_input.push_str(&format!("100644 blob {blob}\t{path}\n"));
+    }
+    let mut mktree = Command::new("git");
+    mktree
+        .arg("-C")
+        .arg(root)
+        .arg("mktree")
+        .env("GIT_OBJECT_DIRECTORY", objects)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let mut child = mktree.spawn().unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(tree_input.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
 #[test]
@@ -724,5 +823,539 @@ fn analyze_diff_worktree_mode_writes_no_workspace_cache() {
     assert!(
         !root.join(".bifrost").join("analyzer.db").exists(),
         "analyze_diff should not force the root workspace analyzer/cache"
+    );
+}
+
+#[test]
+fn analyze_diff_compares_unreachable_snapshot_trees_through_trusted_alternate() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    git(root, &["init"]);
+    git(root, &["config", "user.email", "tester@example.com"]);
+    git(root, &["config", "user.name", "Tester"]);
+    fs::write(root.join("lib.go"), "package sample\nfunc Head() {}\n").unwrap();
+    commit(root, "head");
+
+    let objects = temp.path().join("snapshot-objects");
+    let baseline = alternate_tree(
+        root,
+        &objects,
+        "lib.go",
+        "package sample\nfunc DirtyBeforeTurn() {}\n",
+    );
+    let after = alternate_tree(
+        root,
+        &objects,
+        "lib.go",
+        "package sample\nfunc Restored() {}\n",
+    );
+
+    let ordinary = SearchToolsService::new_without_semantic_index(root.to_path_buf()).unwrap();
+    let error = ordinary
+        .call_tool_json(
+            "analyze_diff",
+            &serde_json::json!({"base": baseline, "target": after}).to_string(),
+        )
+        .unwrap_err();
+    assert!(error.message.contains("unable to resolve revision"));
+
+    let service = SearchToolsService::new_without_semantic_index(root.to_path_buf())
+        .unwrap()
+        .with_diff_snapshot_object_dir(objects.clone());
+    let result: Value = serde_json::from_str(
+        &service
+            .call_tool_json(
+                "analyze_diff",
+                &serde_json::json!({"base": baseline, "target": after}).to_string(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["endpoints"]["base"], format!("tree:{baseline}"));
+    assert_eq!(result["endpoints"]["target"], format!("tree:{after}"));
+    assert!(
+        find_symbol(
+            patch_array(&result, "/patch_symbols/preimage/deleted"),
+            "DirtyBeforeTurn"
+        )
+        .is_some()
+    );
+    assert!(
+        find_symbol(
+            patch_array(&result, "/patch_symbols/postimage/introduced"),
+            "Restored"
+        )
+        .is_some()
+    );
+
+    let missing = temp.path().join("missing-objects");
+    let missing_service = SearchToolsService::new_without_semantic_index(root.to_path_buf())
+        .unwrap()
+        .with_diff_snapshot_object_dir(missing.clone());
+    let error = missing_service
+        .call_tool_json("analyze_diff", &serde_json::json!({}).to_string())
+        .unwrap_err();
+    assert!(error.message.contains(&missing.display().to_string()));
+}
+
+#[test]
+fn analyze_diff_tree_endpoints_are_immutable_and_require_an_explicit_base() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    git(root, &["init"]);
+    git(root, &["config", "user.email", "tester@example.com"]);
+    git(root, &["config", "user.name", "Tester"]);
+    fs::write(root.join("lib.go"), "package sample\nfunc Old() {}\n").unwrap();
+    let base_commit = commit(root, "base");
+    fs::write(root.join("lib.go"), "package sample\nfunc New() {}\n").unwrap();
+    let target_commit = commit(root, "target");
+    let base_tree = git_output(root, &["rev-parse", "HEAD~1^{tree}"]);
+    let target_tree = git_output(root, &["rev-parse", "HEAD^{tree}"]);
+    let service = SearchToolsService::new_without_semantic_index(root.to_path_buf()).unwrap();
+
+    let before: Value = serde_json::from_str(
+        &service
+            .call_tool_json(
+                "analyze_diff",
+                &serde_json::json!({"base": base_tree, "target": target_tree}).to_string(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    fs::write(root.join("lib.go"), "package sample\nfunc Corrupt() {}\n").unwrap();
+    fs::write(root.join(".gitattributes"), "*.go -diff\n").unwrap();
+    let worktree_attributes: Value = serde_json::from_str(
+        &service
+            .call_tool_json(
+                "analyze_diff",
+                &serde_json::json!({"base": base_tree, "target": target_tree}).to_string(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        before, worktree_attributes,
+        "immutable endpoints must ignore checkout attributes"
+    );
+    git(root, &["add", ".gitattributes"]);
+    let staged_attributes: Value = serde_json::from_str(
+        &service
+            .call_tool_json(
+                "analyze_diff",
+                &serde_json::json!({"base": base_tree, "target": target_tree}).to_string(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        before, staged_attributes,
+        "immutable endpoints must ignore checkout and index"
+    );
+
+    for (base, target, expected_base, expected_target) in [
+        (
+            &base_commit,
+            &target_commit,
+            base_commit.as_str(),
+            target_commit.as_str(),
+        ),
+        (&base_commit, &target_tree, base_commit.as_str(), "tree"),
+        (&base_tree, &target_commit, "tree", target_commit.as_str()),
+        (&base_tree, &target_tree, "tree", "tree"),
+    ] {
+        let result: Value = serde_json::from_str(
+            &service
+                .call_tool_json(
+                    "analyze_diff",
+                    &serde_json::json!({"base": base, "target": target}).to_string(),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            result["endpoints"]["base"]
+                .as_str()
+                .unwrap()
+                .contains(expected_base)
+        );
+        assert!(
+            result["endpoints"]["target"]
+                .as_str()
+                .unwrap()
+                .contains(expected_target)
+        );
+        assert!(
+            find_symbol(
+                patch_array(&result, "/patch_symbols/postimage/introduced"),
+                "New"
+            )
+            .is_some()
+        );
+    }
+
+    let error = service
+        .call_tool_json(
+            "analyze_diff",
+            &serde_json::json!({"target": target_tree}).to_string(),
+        )
+        .unwrap_err();
+    assert!(error.message.contains("trees have no parent"));
+    assert!(error.message.contains("explicit `base`"));
+}
+
+#[test]
+fn analyze_diff_snapshot_interval_survives_dirty_revert_to_head() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    git(root, &["init"]);
+    git(root, &["config", "user.email", "tester@example.com"]);
+    git(root, &["config", "user.name", "Tester"]);
+    let head_contents = "package sample\nfunc Head() {}\n";
+    fs::write(root.join("lib.go"), head_contents).unwrap();
+    commit(root, "head");
+    fs::write(
+        root.join("lib.go"),
+        "package sample\nfunc DirtyBeforeTurn() {}\n",
+    )
+    .unwrap();
+    let objects = temp.path().join("objects");
+    let baseline = alternate_tree(
+        root,
+        &objects,
+        "lib.go",
+        "package sample\nfunc DirtyBeforeTurn() {}\n",
+    );
+    fs::write(
+        root.join("lib.go"),
+        "package sample\nfunc DuringTurn() {}\n",
+    )
+    .unwrap();
+    fs::write(root.join("lib.go"), head_contents).unwrap();
+    let after = alternate_tree(root, &objects, "lib.go", head_contents);
+    let service = SearchToolsService::new_without_semantic_index(root.to_path_buf())
+        .unwrap()
+        .with_diff_snapshot_object_dir(objects);
+    let worktree: Value =
+        serde_json::from_str(&service.call_tool_json("analyze_diff", "{}").unwrap()).unwrap();
+    assert!(
+        worktree["file_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|change| change["path"] != "lib.go")
+    );
+    let snapshot: Value = serde_json::from_str(
+        &service
+            .call_tool_json(
+                "analyze_diff",
+                &serde_json::json!({"base": baseline, "target": after}).to_string(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(snapshot["endpoints"]["base"], format!("tree:{baseline}"));
+    assert_eq!(snapshot["endpoints"]["target"], format!("tree:{after}"));
+    assert!(
+        find_symbol(
+            patch_array(&snapshot, "/patch_symbols/preimage/deleted"),
+            "DirtyBeforeTurn"
+        )
+        .is_some()
+    );
+    assert!(
+        find_symbol(
+            patch_array(&snapshot, "/patch_symbols/postimage/introduced"),
+            "Head"
+        )
+        .is_some()
+    );
+}
+
+/// A tree base with no `target` must diff that immutable tree against the live
+/// working tree. This is the one endpoint combination that mixes a
+/// snapshot-only object with live state, so it exercises the non-isolated
+/// repository handle: the alternate must still resolve the tree, while the
+/// target side reads the real checkout.
+#[test]
+fn analyze_diff_tree_base_without_target_spans_snapshot_and_working_tree() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    git(root, &["init"]);
+    git(root, &["config", "user.email", "tester@example.com"]);
+    git(root, &["config", "user.name", "Tester"]);
+    fs::write(root.join("lib.go"), "package sample\nfunc Committed() {}\n").unwrap();
+    commit(root, "head");
+
+    let objects = temp.path().join("objects");
+    let base = alternate_tree(
+        root,
+        &objects,
+        "lib.go",
+        "package sample\nfunc SnapshotBase() {}\n",
+    );
+    fs::write(root.join("lib.go"), "package sample\nfunc LiveNow() {}\n").unwrap();
+
+    let service = SearchToolsService::new_without_semantic_index(root.to_path_buf())
+        .unwrap()
+        .with_diff_snapshot_object_dir(objects);
+    let result: Value = serde_json::from_str(
+        &service
+            .call_tool_json(
+                "analyze_diff",
+                &serde_json::json!({ "base": base }).to_string(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(result["endpoints"]["base"], format!("tree:{base}"));
+    assert_eq!(result["endpoints"]["target"], "worktree");
+    assert!(
+        find_symbol(
+            patch_array(&result, "/patch_symbols/preimage/deleted"),
+            "SnapshotBase"
+        )
+        .is_some(),
+        "{result}"
+    );
+    assert!(
+        find_symbol(
+            patch_array(&result, "/patch_symbols/postimage/introduced"),
+            "LiveNow"
+        )
+        .is_some(),
+        "{result}"
+    );
+}
+
+#[test]
+fn analyze_diff_snapshot_untracked_edit_delete_add_rename_and_binary() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    git(root, &["init"]);
+    git(root, &["config", "user.email", "tester@example.com"]);
+    git(root, &["config", "user.name", "Tester"]);
+    fs::write(
+        root.join("tracked.go"),
+        "package sample\nfunc Tracked() {}\n",
+    )
+    .unwrap();
+    commit(root, "head");
+    let objects = temp.path().join("objects");
+    // `old.go` and `new.go` share byte-identical content so rename detection
+    // fires on exactly that pair. The deleted and added files are deliberately
+    // dissimilar: with near-identical one-line bodies git's similarity
+    // heuristic pairs them as a rename too, which would hide the add/delete
+    // statuses this test exists to prove.
+    let base = alternate_tree_entries(
+        root,
+        &objects,
+        &[
+            ("edit.go", b"package sample\nfunc BeforeEdit() {}\n"),
+            (
+                "delete.go",
+                b"package sample\n\nfunc DeletedUntracked() string {\n\treturn \"gone after the turn\"\n}\n",
+            ),
+            ("old.go", b"package sample\nfunc Renamed() {}\n"),
+        ],
+    );
+    let target = alternate_tree_entries(
+        root,
+        &objects,
+        &[
+            ("edit.go", b"package sample\nfunc AfterEdit() {}\n"),
+            ("new.go", b"package sample\nfunc Renamed() {}\n"),
+            (
+                "added.go",
+                b"package sample\n\nimport \"strings\"\n\nfunc Added(parts []string) int {\n\tjoined := strings.Join(parts, \",\")\n\treturn len(joined)\n}\n",
+            ),
+            ("asset.bin", b"\0binary\0changed"),
+        ],
+    );
+    let service = SearchToolsService::new_without_semantic_index(root.to_path_buf())
+        .unwrap()
+        .with_diff_snapshot_object_dir(objects);
+    let result: Value = serde_json::from_str(
+        &service
+            .call_tool_json(
+                "analyze_diff",
+                &serde_json::json!({"base": base, "target": target}).to_string(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        find_symbol(
+            patch_array(&result, "/patch_symbols/preimage/deleted"),
+            "DeletedUntracked"
+        )
+        .is_some()
+    );
+    assert!(
+        find_symbol(
+            patch_array(&result, "/patch_symbols/preimage/deleted"),
+            "BeforeEdit"
+        )
+        .is_some()
+    );
+    assert!(
+        find_symbol(
+            patch_array(&result, "/patch_symbols/postimage/introduced"),
+            "AfterEdit"
+        )
+        .is_some()
+    );
+    assert!(
+        result["file_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["old_path"] == "old.go"
+                && c["path"] == "new.go"
+                && c["status"] == "renamed")
+    );
+    assert!(
+        result["moved_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|moved| {
+                moved["after"]["name"] == "Renamed" && moved["after"]["path"] == "new.go"
+            })
+    );
+    assert!(
+        result["file_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["path"] == "added.go" && c["status"] == "added"),
+        "{result}"
+    );
+    assert!(
+        find_symbol(
+            patch_array(&result, "/patch_symbols/postimage/introduced"),
+            "Added"
+        )
+        .is_some(),
+        "{result}"
+    );
+    assert!(
+        result["file_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["path"] == "asset.bin" && c["is_parseable"] == false)
+    );
+}
+
+#[test]
+fn analyze_diff_rejects_blob_endpoints_and_keeps_commits_available_with_alternate() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    git(root, &["init"]);
+    git(root, &["config", "user.email", "tester@example.com"]);
+    git(root, &["config", "user.name", "Tester"]);
+    fs::write(root.join("lib.go"), "package sample\nfunc Old() {}\n").unwrap();
+    let first = commit(root, "first");
+    fs::write(root.join("lib.go"), "package sample\nfunc New() {}\n").unwrap();
+    let second = commit(root, "second");
+    let blob = git_output(root, &["hash-object", "lib.go"]);
+    let objects = temp.path().join("objects");
+    fs::create_dir(&objects).unwrap();
+    let service = SearchToolsService::new_without_semantic_index(root.to_path_buf())
+        .unwrap()
+        .with_diff_snapshot_object_dir(objects);
+    for args in [
+        serde_json::json!({"base": blob, "target": second}),
+        serde_json::json!({"base": first, "target": blob}),
+    ] {
+        let error = service
+            .call_tool_json("analyze_diff", &args.to_string())
+            .unwrap_err();
+        assert!(error.message.contains("a blob"));
+        assert!(error.message.contains("commit or tree"));
+    }
+    for (base, target) in [
+        ("HEAD~1", "HEAD"),
+        ("HEAD~1", "master"),
+        (&first[..8], &second[..8]),
+    ] {
+        let result: Value = serde_json::from_str(
+            &service
+                .call_tool_json(
+                    "analyze_diff",
+                    &serde_json::json!({"base": base, "target": target}).to_string(),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["endpoints"]["base"], first);
+        assert_eq!(result["endpoints"]["target"], second);
+    }
+}
+
+#[test]
+fn analyze_diff_large_snapshot_interval_keeps_structured_result() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    git(root, &["init"]);
+    git(root, &["config", "user.email", "tester@example.com"]);
+    git(root, &["config", "user.name", "Tester"]);
+    fs::write(root.join("seed.go"), "package sample\nfunc Seed() {}\n").unwrap();
+    commit(root, "head");
+    let objects = temp.path().join("objects");
+    let before = "package sample\nfunc LargeBefore() {}\n";
+    // The postimage must both exceed prompt truncation limits (thousands of
+    // changed lines) and push a single callee past the usage-graph callsite
+    // cap, so the truncation notice is exercised rather than merely present.
+    let after = format!(
+        "package sample\n\
+         func Target() {{}}\n\
+         func Caller() {{\n{}}}\n\
+         {}func LargeAfter() {{}}\n",
+        "\tTarget()\n".repeat(CALLSITES_ABOVE_CAP),
+        "// deliberately large interval\n".repeat(4_000)
+    );
+    let base = alternate_tree(root, &objects, "large.go", before);
+    let target = alternate_tree(root, &objects, "large.go", &after);
+    let service = SearchToolsService::new_without_semantic_index(root.to_path_buf())
+        .unwrap()
+        .with_diff_snapshot_object_dir(objects);
+    let result: Value = serde_json::from_str(
+        &service
+            .call_tool_json(
+                "analyze_diff",
+                &serde_json::json!({"base": base, "target": target}).to_string(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        find_symbol(
+            patch_array(&result, "/patch_symbols/postimage/introduced"),
+            "LargeAfter"
+        )
+        .is_some()
+    );
+    let truncated = result["large_callsite_symbols"]
+        .as_array()
+        .expect("large_callsite_symbols array");
+    let target_notice = truncated
+        .iter()
+        .find(|symbol| {
+            symbol["fqn"]
+                .as_str()
+                .is_some_and(|fqn| fqn.contains("Target"))
+        })
+        .unwrap_or_else(|| panic!("expected a large-callsite notice for Target: {result}"));
+    let limit = target_notice["limit"].as_u64().expect("limit");
+    let total = target_notice["total_callsites"].as_u64().expect("total");
+    assert!(
+        total > limit,
+        "truncation notice must report more callsites than the limit: {target_notice}"
+    );
+    assert!(
+        total >= CALLSITES_ABOVE_CAP as u64,
+        "every generated callsite should be counted: {target_notice}"
     );
 }
