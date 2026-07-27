@@ -1,6 +1,7 @@
 mod adapter;
 mod clones;
-mod declarations;
+pub(crate) mod declarations;
+mod diagnostics;
 mod hierarchy;
 pub(crate) mod imports;
 pub(crate) mod language;
@@ -12,17 +13,20 @@ pub(crate) mod wildcard_imports;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
+use crate::analyzer::java::is_java_dependency_input;
 use crate::analyzer::js_ts::cache::{
     build_weighted_cache, weight_code_unit_set, weight_code_unit_vec_by_unit,
     weight_project_file_set,
 };
+use crate::analyzer::jvm::external::JavaExternalDeclarationIndex;
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BulkFileStateSource, CodeUnit, IAnalyzer,
-    ImportAnalysisProvider, Language, PoolSafeMemo, Project, ProjectFile, SignatureMetadata,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
-    TypeAliasProvider, TypeHierarchyProvider, UsageFactsIndex,
+    ImportAnalysisProvider, JavaAnalyzerConfig, Language, PoolSafeMemo, Project, ProjectFile,
+    SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
+    UsageFactsIndex,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -227,6 +231,8 @@ pub(crate) fn scala_parenthesized_arity(source: &str) -> Option<usize> {
 #[derive(Clone)]
 pub struct ScalaAnalyzer {
     inner: TreeSitterAnalyzer<ScalaAdapter>,
+    java_config: JavaAnalyzerConfig,
+    external_index: Arc<OnceLock<JavaExternalDeclarationIndex>>,
     memo_budget: u64,
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
@@ -247,6 +253,13 @@ pub struct ScalaAnalyzer {
     scala_query_walk_count: Arc<AtomicUsize>,
     #[allow(dead_code)]
     type_relations: Arc<OnceLock<Vec<TypeRelation>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScalaTypeKnownness {
+    Known,
+    Absent,
+    Uncertain,
 }
 
 crate::analyzer::impl_forward_query_provider!(ScalaAnalyzer);
@@ -428,6 +441,7 @@ impl ScalaAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
+        clone.external_index = Arc::new(OnceLock::new());
         clone.project_types = Arc::new(OnceLock::new());
         clone.full_usage_edges =
             build_weighted_cache(self.memo_budget / 8, weight_scala_usage_edges);
@@ -443,13 +457,20 @@ impl ScalaAnalyzer {
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
+        let java_config = config.java.clone();
         let inner = TreeSitterAnalyzer::new_with_config(project, ScalaAdapter, config);
-        Self::from_inner(inner, memo_budget)
+        Self::from_inner(inner, memo_budget, java_config)
     }
 
-    fn from_inner(inner: TreeSitterAnalyzer<ScalaAdapter>, memo_budget: u64) -> Self {
+    fn from_inner(
+        inner: TreeSitterAnalyzer<ScalaAdapter>,
+        memo_budget: u64,
+        java_config: JavaAnalyzerConfig,
+    ) -> Self {
         Self {
             inner,
+            java_config,
+            external_index: Arc::new(OnceLock::new()),
             memo_budget,
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
@@ -488,6 +509,70 @@ impl ScalaAnalyzer {
         self.initialize_project_types(|| {
             self.bulk_file_states(self.analyzed_files(), BulkFileStateSource::Omit)
         })
+    }
+
+    pub(crate) fn external_declaration_index(&self) -> &JavaExternalDeclarationIndex {
+        self.external_index.get_or_init(|| {
+            JavaExternalDeclarationIndex::build_for_project(&self.java_config, self.inner.project())
+        })
+    }
+
+    pub(crate) fn simple_type_knownness(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+    ) -> ScalaTypeKnownness {
+        if name.is_empty() || scala_default_type_name(name) {
+            return ScalaTypeKnownness::Known;
+        }
+
+        let package_name = self.inner.package_name_of(file).unwrap_or_default();
+        if self.inner.all_declarations().any(|declaration| {
+            declaration.is_class()
+                && declaration.short_name().trim_end_matches('$') == name
+                && (declaration.source() == file || declaration.package_name() == package_name)
+        }) {
+            return ScalaTypeKnownness::Known;
+        }
+
+        let imports = self.inner.import_info_of(file);
+        let imported = self.imported_code_units_of(file);
+        let external = self.external_declaration_index();
+        for import in &imports {
+            let Some(path) = scala_import_path(import) else {
+                return ScalaTypeKnownness::Uncertain;
+            };
+            if import.is_wildcard {
+                if imported.iter().any(|declaration| {
+                    declaration.is_class() && declaration.short_name().trim_end_matches('$') == name
+                }) || external
+                    .resolve_wildcard_import(&path, name, &package_name)
+                    .is_some()
+                {
+                    return ScalaTypeKnownness::Known;
+                }
+                return ScalaTypeKnownness::Uncertain;
+            }
+
+            if import.local_name() != Some(name) {
+                continue;
+            }
+            if imported.iter().any(|declaration| {
+                declaration.is_class() && declaration.short_name().trim_end_matches('$') == name
+            }) || external
+                .resolve_explicit_import(&path, &package_name)
+                .is_some()
+            {
+                return ScalaTypeKnownness::Known;
+            }
+            return ScalaTypeKnownness::Uncertain;
+        }
+
+        if external.resolve_same_package(&package_name, name).is_some() {
+            ScalaTypeKnownness::Known
+        } else {
+            ScalaTypeKnownness::Absent
+        }
     }
 
     pub(crate) fn full_usage_edges(
@@ -543,6 +628,7 @@ impl ScalaAnalyzer {
         progress: Option<BuildProgress>,
     ) -> Result<Self, crate::analyzer::store::StoreError> {
         let memo_budget = config.memo_cache_budget_bytes();
+        let java_config = config.java.clone();
         let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             project,
             ScalaAdapter,
@@ -550,7 +636,7 @@ impl ScalaAnalyzer {
             store_context,
             progress,
         )?;
-        Ok(Self::from_inner(inner, memo_budget))
+        Ok(Self::from_inner(inner, memo_budget, java_config))
     }
 
     pub fn from_project<P>(project: P) -> Self
@@ -635,6 +721,42 @@ impl ScalaAnalyzer {
             }
         }
     }
+}
+
+fn scala_default_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Any"
+            | "AnyRef"
+            | "AnyVal"
+            | "Nothing"
+            | "Null"
+            | "Unit"
+            | "Boolean"
+            | "Byte"
+            | "Short"
+            | "Int"
+            | "Long"
+            | "Float"
+            | "Double"
+            | "Char"
+            | "String"
+            | "Array"
+            | "Option"
+            | "Some"
+            | "None"
+            | "Either"
+            | "Left"
+            | "Right"
+            | "List"
+            | "Nil"
+            | "Seq"
+            | "Set"
+            | "Map"
+            | "Iterable"
+            | "Iterator"
+            | "Product"
+    )
 }
 
 fn weight_scala_usage_edges(
@@ -846,6 +968,13 @@ impl IAnalyzer for ScalaAnalyzer {
         self.inner.signature_metadata(code_unit)
     }
 
+    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
+        diagnostics::collect_scala_semantic_diagnostics(self, file, source)
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
     fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
         self.inner.get_analyzed_files()
     }
@@ -855,11 +984,26 @@ impl IAnalyzer for ScalaAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        Self::from_inner(self.inner.update(changed_files), self.memo_budget)
+        let external_index = if changed_files.iter().any(is_java_dependency_input) {
+            Arc::new(OnceLock::new())
+        } else {
+            self.external_index.clone()
+        };
+        let mut updated = Self::from_inner(
+            self.inner.update(changed_files),
+            self.memo_budget,
+            self.java_config.clone(),
+        );
+        updated.external_index = external_index;
+        updated
     }
 
     fn update_all(&self) -> Self {
-        Self::from_inner(self.inner.update_all(), self.memo_budget)
+        Self::from_inner(
+            self.inner.update_all(),
+            self.memo_budget,
+            self.java_config.clone(),
+        )
     }
 
     fn project(&self) -> &dyn Project {

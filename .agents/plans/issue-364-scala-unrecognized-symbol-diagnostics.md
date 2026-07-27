@@ -15,9 +15,9 @@ The observable outcome is a Scala file containing a truly unknown local value or
 - [x] (2026-07-27 07:35Z) Inspected the live issue, current issue branch, Java external-index implementation, Scala import and definition support, existing semantic diagnostic collectors, and LSP opt-in routing.
 - [x] (2026-07-27 07:35Z) Recorded the approved design and implementation milestones in this ExecPlan.
 - [x] (2026-07-27 07:38Z) Extracted the Java-owned external-index module into `src/analyzer/jvm/external.rs`, kept Java as its consumer, and preserved the focused Java archive/import tests.
-- [ ] Add a Scala source-JAR reader and prove source-JAR preference with classfile fallback.
-- [ ] Add the conservative Scala diagnostic collector and analyzer wiring.
-- [ ] Add focused collector, shared-index, and LSP behavior tests.
+- [x] (2026-07-27 07:47Z) Added structured Scala source-JAR declaration indexing, retaining classfile fallback and excluding private/protected source declarations.
+- [x] (2026-07-27 07:50Z) Gave Scala snapshots the shared JVM index and dependency-input invalidation, then added the conservative Scala collector and analyzer hook.
+- [x] (2026-07-27 07:53Z) Added focused collector, shared-index, and LSP opt-in behavior tests for unknown simple types, bare local references, known source/import/default boundaries, malformed input, and same-package source-JAR types.
 - [ ] Run formatting, focused tests, strict Clippy, the required feature test suite, whitespace validation, and an implementation review; update this plan with results.
 
 ## Surprises & Discoveries
@@ -32,6 +32,10 @@ The observable outcome is a Scala file containing a truly unknown local value or
   Evidence: `src/analyzer/scala/imports.rs` resolves explicit and wildcard imports and maintains same-package references; `IAnalyzer::semantic_diagnostics` defaults to empty and `ScalaAnalyzer` does not override it.
 - Observation: the extraction needs a small visibility widening for the Java declaration parser helpers used by the moved index.
   Evidence: the former child module could call `java::declarations` through `super`; `jvm::external` requires those helpers to be `pub(crate)` while their API remains internal to this crate.
+- Observation: Scala source-JAR declarations can reuse the normal structured Scala declaration collector without creating a dependency `ProjectFile` in the workspace.
+  Evidence: a synthetic absolute-root `ProjectFile` supplies identity only to `parse_scala_file`; the resulting `CodeUnit` names are converted to external records and never enter the analyzer's file/declaration indexes.
+- Observation: source-JAR declarations need an explicit visibility gate before they can override classfile evidence.
+  Evidence: Scala permits `private` and `protected` type declarations. The shared index locates the parser-recorded declaration range and uses its structured modifier child to exclude non-public entries; the `Hidden` source-JAR regression remains absent from the index.
 
 ## Decision Log
 
@@ -40,6 +44,9 @@ The observable outcome is a Scala file containing a truly unknown local value or
   Date/Author: 2026-07-27 / Codex and user.
 - Decision: retain the established `JavaExternal*` type names during the mechanical extraction, then rename only if Scala-facing APIs make the Java wording misleading.
   Rationale: the first checkpoint proves the ownership boundary without mixing a behavior-preserving file move with a broad mechanical identifier rewrite. The module path, not the private type spelling, establishes shared JVM ownership; the next milestone can rename types with Scala tests in place if that improves the resulting interface.
+  Date/Author: 2026-07-27 / Codex.
+- Decision: initially diagnose only simple type references and identifiers that appear directly as bare block expressions.
+  Rationale: those two forms have complete structural classification and do not require member dispatch, call overload selection, implicit/given search, or general type inference. Other value, call, member, interpolation, and qualified-path shapes remain silent until Bifrost can prove them without false positives.
   Date/Author: 2026-07-27 / Codex.
 - Decision: prefer parser-derived `.scala` source-JAR declarations, then use classfile declarations when no equivalent source declaration is available.
   Rationale: source has the clearest Scala spelling and package structure. Classfiles are the reliable fallback for generated code, dependencies without source artifacts, and sources the parser cannot trust.
@@ -53,7 +60,7 @@ The observable outcome is a Scala file containing a truly unknown local value or
 
 ## Outcomes & Retrospective
 
-The first implementation checkpoint is complete: `src/analyzer/jvm/external.rs` now owns the existing bounded artifact index and Java consumes it through the JVM module. The focused Java archive/index and import integration commands exited successfully. Scala source-JAR support and diagnostics remain outstanding. The branch is `364-add-high-confidence-scala-unrecognized-symbol-diagnostics`, is equal to `origin/master`, and has an unrelated untracked `.brokk/` directory that this work must preserve.
+The second implementation checkpoint adds Scala source-JAR extraction, a Scala-owned lazy shared index, and a conservative semantic diagnostic collector. Java remains an unchanged consumer of the shared archive index. The focused shared-index, Scala collector, Scala import, and LSP opt-in tests exited successfully. Full feature tests and strict linting remain outstanding. The branch is `364-add-high-confidence-scala-unrecognized-symbol-diagnostics` and has an unrelated untracked `.brokk/` directory that this work must preserve.
 
 ## Context and Orientation
 
@@ -184,3 +191,5 @@ At the end of Milestone 3, `src/analyzer/scala/diagnostics.rs` must export:
 Revision note, 2026-07-27: Initial approved ExecPlan created after live issue #364 diagnosis and planning. It records that the current source-JAR reader is Java-only and that Scala diagnostic confidence depends on extracting a single shared JVM external index.
 
 Revision note, 2026-07-27: Completed the first mechanical extraction checkpoint. The index now lives under `src/analyzer/jvm`; Java behavior remains covered by its pre-existing focused tests. Kept legacy private type names temporarily to isolate the ownership move from the later Scala-facing design work.
+
+Revision note, 2026-07-27: Added source-JAR parsing for parser-clean public Scala declarations, Scala lazy-index ownership and invalidation, the first conservative type/bare-local diagnostic shapes, and focused unit/integration/LSP tests. Left call, member, qualified, interpolation, and implicit/given-sensitive forms intentionally silent.

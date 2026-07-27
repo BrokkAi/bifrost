@@ -5,7 +5,7 @@ use crate::analyzer::java::declarations::{
 use crate::analyzer::java::dependency_discovery::{discover_build_tools, discover_metadata};
 use crate::analyzer::{
     JavaAnalyzerConfig, JavaDependencyDiscoveryMode, JavaExternalArtifact,
-    JavaExternalDependencies, JavaMavenCoordinate, Project,
+    JavaExternalDependencies, JavaMavenCoordinate, Project, ProjectFile,
 };
 use crate::hash::HashMap;
 use jclassfile::attributes::{Attribute, NestedClassFlags};
@@ -14,6 +14,7 @@ use jclassfile::constant_pool::ConstantPool;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use tree_sitter::Parser;
 use zip::ZipArchive;
 
 const MAX_ARCHIVE_ENTRIES: usize = 10_000;
@@ -212,9 +213,13 @@ impl JavaExternalDeclarationIndex {
             let Ok(entry) = archive.by_index(index) else {
                 continue;
             };
-            if !entry.name().ends_with(".java") {
+            let language = if entry.name().ends_with(".java") {
+                SourceJarLanguage::Java
+            } else if entry.name().ends_with(".scala") {
+                SourceJarLanguage::Scala
+            } else {
                 continue;
-            }
+            };
             if !can_read_entry(entry.size(), MAX_SOURCE_ENTRY_BYTES, &mut total_bytes) {
                 continue;
             }
@@ -228,7 +233,13 @@ impl JavaExternalDeclarationIndex {
             {
                 continue;
             }
-            for external_type in source_types(artifact_path, &source_path, &source) {
+            let external_types = match language {
+                SourceJarLanguage::Java => source_types(artifact_path, &source_path, &source),
+                SourceJarLanguage::Scala => {
+                    scala_source_types(artifact_path, &source_path, &source)
+                }
+            };
+            for external_type in external_types {
                 self.insert(external_type);
             }
         }
@@ -268,6 +279,12 @@ impl JavaExternalDeclarationIndex {
             }
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum SourceJarLanguage {
+    Java,
+    Scala,
 }
 
 #[allow(dead_code)]
@@ -651,6 +668,75 @@ fn source_types(artifact_path: &Path, source_path: &str, source: &str) -> Vec<Ja
     }
 
     result
+}
+
+fn scala_source_types(
+    artifact_path: &Path,
+    source_path: &str,
+    source: &str,
+) -> Vec<JavaExternalType> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
+        .expect("tree-sitter Scala language must load");
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    if tree.root_node().has_error() {
+        return Vec::new();
+    }
+
+    let synthetic_file = ProjectFile::new(std::env::temp_dir(), "external.scala");
+    let parsed =
+        crate::analyzer::scala::declarations::parse_scala_file(&synthetic_file, source, &tree);
+    parsed
+        .declarations()
+        .iter()
+        .filter(|declaration| declaration.is_class())
+        .filter(|declaration| {
+            scala_source_declaration_node(&tree, &parsed, declaration).is_some_and(|node| {
+                crate::analyzer::scala::declarations::scala_declaration_is_public(node, source)
+            })
+        })
+        .filter_map(|declaration| {
+            let fqn = crate::analyzer::scala_normalize_full_name(&declaration.fq_name());
+            let (package_name, short_name) = fqn.rsplit_once('.').map_or_else(
+                || (String::new(), fqn.clone()),
+                |(package_name, short_name)| (package_name.to_string(), short_name.to_string()),
+            );
+            (!short_name.is_empty()).then(|| JavaExternalType {
+                fqn,
+                package_name,
+                short_name,
+                kind: JavaExternalTypeKind::Class,
+                visibility: JavaVisibility::Public,
+                source: JavaExternalDeclarationSource::SourceJar {
+                    artifact_path: artifact_path.to_path_buf(),
+                    source_path: source_path.to_string(),
+                },
+            })
+        })
+        .collect()
+}
+
+fn scala_source_declaration_node<'tree>(
+    tree: &'tree tree_sitter::Tree,
+    parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    declaration: &crate::analyzer::CodeUnit,
+) -> Option<tree_sitter::Node<'tree>> {
+    let range = parsed.declaration_ranges(declaration).first()?;
+    let mut node = tree
+        .root_node()
+        .descendant_for_byte_range(range.start_byte, range.end_byte)?;
+    loop {
+        if matches!(
+            node.kind(),
+            "class_definition" | "object_definition" | "trait_definition" | "enum_definition"
+        ) {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
 }
 
 fn source_visibility(
@@ -1270,6 +1356,42 @@ mod tests {
             ),
             "{service:#?}"
         );
+    }
+
+    #[test]
+    fn jvm_external_declaration_indexes_scala_source_jar() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source_jar = root.join("scala-library-sources.jar");
+        write_zip_entry(
+            &source_jar,
+            "scala/example/Dependency.scala",
+            "package scala.example\nclass Dependency\ntrait Contract\nobject Defaults\nprivate class Hidden\n",
+        );
+
+        let index = JavaExternalDeclarationIndex::build(
+            &JavaExternalDependencies {
+                artifact_paths: vec![JavaExternalArtifact {
+                    artifact_path: source_jar,
+                    source_artifact_path: None,
+                }],
+                ..JavaExternalDependencies::default()
+            },
+            &root,
+        );
+
+        for name in [
+            "scala.example.Dependency",
+            "scala.example.Contract",
+            "scala.example.Defaults",
+        ] {
+            assert!(matches!(
+                index.get(name).map(JavaExternalType::source),
+                Some(JavaExternalDeclarationSource::SourceJar { source_path, .. })
+                    if source_path == "scala/example/Dependency.scala"
+            ));
+        }
+        assert!(index.get("scala.example.Hidden").is_none());
     }
 
     #[test]
