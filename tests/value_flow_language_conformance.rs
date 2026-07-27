@@ -1,13 +1,20 @@
 mod common;
+#[path = "common/value_flow_conformance.rs"]
+mod value_flow_conformance;
 
 use brokk_bifrost::Language;
-use brokk_bifrost::analyzer::semantic::{IcfgEdgeKind, ProcedureKind};
-use brokk_bifrost::analyzer::value_flow::ValueFlowPortKey;
+use brokk_bifrost::analyzer::dataflow::{PathQuality, SemanticInputStatus};
+use brokk_bifrost::analyzer::semantic::{
+    EvidenceCompleteness, IcfgEdgeKind, ProcedureKind, ProofStatus,
+};
+use brokk_bifrost::analyzer::value_flow::{
+    ValueFlowMayStatus, ValueFlowMustStatus, ValueFlowPortKey,
+};
 
-use common::value_flow_conformance::{
-    AbsentSinkExpectation, CallArgumentSink, CallSelector, CarrierMilestone, InlineSourceFile,
-    InterproceduralMilestone, ParameterSource, ProcedureSelector, ValueFlowConformanceCase,
-    assert_value_flow_conformance,
+use value_flow_conformance::{
+    CallArgumentSink, CallSelector, CarrierMilestone, ExpectedMeeting, ExpectedSinkOutcome,
+    ExpectedWitness, InlineSourceFile, InterproceduralMilestone, ParameterSource,
+    ProcedureSelector, ValueFlowConformanceCase, assert_value_flow_conformance,
 };
 
 const JAVA_SOURCE: &str = r#"
@@ -114,75 +121,111 @@ const SINKS: &[CallArgumentSink<'_>] = &[
         alias: "flowed",
         call: "sink_call",
         argument: 0,
-        reached: true,
-        absent_outcome: None,
+        outcome: ExpectedSinkOutcome::Reached,
     },
     CallArgumentSink {
         alias: "clean",
         call: "sink_call",
         argument: 1,
-        reached: false,
-        absent_outcome: Some(AbsentSinkExpectation::Inconclusive),
+        outcome: ExpectedSinkOutcome::Inconclusive,
     },
 ];
 
-const EXPECTED_CARRIERS: &[CarrierMilestone<'_>] = &[
-    CarrierMilestone::Port {
-        procedure: "run",
-        kind: ValueFlowPortKey::Parameter { ordinal: 0 },
-    },
-    CarrierMilestone::CallArgument {
-        caller: "run",
-        callee: "relay",
-        ordinal: 0,
-    },
-    CarrierMilestone::Port {
-        procedure: "relay",
-        kind: ValueFlowPortKey::Parameter { ordinal: 0 },
-    },
-    CarrierMilestone::Value {
-        procedure: "relay",
-        role: "local",
-        ordinal: None,
-    },
-    CarrierMilestone::Port {
-        procedure: "relay",
-        kind: ValueFlowPortKey::NormalReturn,
-    },
-    CarrierMilestone::CallResult {
-        caller: "run",
-        callee: "relay",
-        result: ValueFlowPortKey::NormalReturn,
-    },
-    CarrierMilestone::Value {
-        procedure: "run",
-        role: "local",
-        ordinal: None,
-    },
-    CarrierMilestone::SinkArgument {
-        caller: "run",
-        callee: "sink",
-        ordinal: 0,
-    },
-];
+fn expected_carriers(path: &str) -> Vec<CarrierMilestone> {
+    vec![
+        CarrierMilestone::Port {
+            path: path.into(),
+            procedure: "run".into(),
+            kind: ValueFlowPortKey::Parameter { ordinal: 0 },
+        },
+        CarrierMilestone::CallArgument {
+            path: path.into(),
+            caller: "run".into(),
+            callee: "relay".into(),
+            call: "relay(input)".into(),
+            ordinal: 0,
+        },
+        CarrierMilestone::Port {
+            path: path.into(),
+            procedure: "relay".into(),
+            kind: ValueFlowPortKey::Parameter { ordinal: 0 },
+        },
+        CarrierMilestone::Value {
+            path: path.into(),
+            procedure: "relay".into(),
+            role: "local".into(),
+            ordinal: None,
+            snippet: "relayed".into(),
+        },
+        CarrierMilestone::Port {
+            path: path.into(),
+            procedure: "relay".into(),
+            kind: ValueFlowPortKey::NormalReturn,
+        },
+        CarrierMilestone::CallResult {
+            path: path.into(),
+            caller: "run".into(),
+            callee: "relay".into(),
+            call: "relay(input)".into(),
+            result: ValueFlowPortKey::NormalReturn,
+        },
+        CarrierMilestone::Value {
+            path: path.into(),
+            procedure: "run".into(),
+            role: "local".into(),
+            ordinal: None,
+            snippet: "copy".into(),
+        },
+        CarrierMilestone::SinkArgument {
+            path: path.into(),
+            caller: "run".into(),
+            callee: "sink".into(),
+            call: "sink(copy, clean)".into(),
+            ordinal: 0,
+        },
+    ]
+}
 
 const EXPECTED_INTERPROCEDURAL: &[InterproceduralMilestone<'_>] = &[
     InterproceduralMilestone {
         kind: IcfgEdgeKind::Call,
         source_procedure: "run",
         target_procedure: "relay",
-        origin_procedure: "run",
+        origin_call: "relay_call",
     },
     InterproceduralMilestone {
         kind: IcfgEdgeKind::NormalReturn,
         source_procedure: "relay",
         target_procedure: "run",
-        origin_procedure: "run",
+        origin_call: "relay_call",
     },
 ];
 
+const EXPECTED_PATH_QUALITIES: &[PathQuality] = &[PathQuality::PROVEN_COMPLETE];
+const EXPECTED_STEP_PROOF: ProofStatus = ProofStatus::Proven;
+const EXPECTED_STEP_COMPLETENESS: EvidenceCompleteness = EvidenceCompleteness::Complete;
+
+fn expected_meetings<'case>(carriers: &'case [CarrierMilestone]) -> [ExpectedMeeting<'case>; 1] {
+    [ExpectedMeeting {
+        sink: "flowed",
+        may_status: ValueFlowMayStatus::Proven,
+        must_status: ValueFlowMustStatus::NotEstablished,
+        uncertain: false,
+        path_qualities: EXPECTED_PATH_QUALITIES,
+        witness: ExpectedWitness {
+            truncated: false,
+            step_proof: &EXPECTED_STEP_PROOF,
+            step_completeness: &EXPECTED_STEP_COMPLETENESS,
+            carriers,
+            interprocedural: EXPECTED_INTERPROCEDURAL,
+        },
+    }]
+}
+
 #[test]
 fn java_exact_helper_flow() {
+    let expected_carriers = expected_carriers("src/ExactFlowFixture.java");
+    let expected_meetings = expected_meetings(&expected_carriers);
     assert_value_flow_conformance(&ValueFlowConformanceCase {
         name: "java",
         language: Language::Java,
@@ -195,14 +238,17 @@ fn java_exact_helper_flow() {
             ordinal: 0,
         },
         sinks: SINKS,
-        expected_complete: false,
-        expected_carriers: EXPECTED_CARRIERS,
-        expected_interprocedural: EXPECTED_INTERPROCEDURAL,
+        expected_discovery_status: SemanticInputStatus::Unknown,
+        expected_discovery_complete: false,
+        expected_result_complete: false,
+        expected_meetings: &expected_meetings,
     });
 }
 
 #[test]
 fn typescript_exact_helper_flow() {
+    let expected_carriers = expected_carriers("src/exact_flow.ts");
+    let expected_meetings = expected_meetings(&expected_carriers);
     assert_value_flow_conformance(&ValueFlowConformanceCase {
         name: "typescript",
         language: Language::TypeScript,
@@ -215,8 +261,9 @@ fn typescript_exact_helper_flow() {
             ordinal: 0,
         },
         sinks: SINKS,
-        expected_complete: false,
-        expected_carriers: EXPECTED_CARRIERS,
-        expected_interprocedural: EXPECTED_INTERPROCEDURAL,
+        expected_discovery_status: SemanticInputStatus::Unknown,
+        expected_discovery_complete: false,
+        expected_result_complete: false,
+        expected_meetings: &expected_meetings,
     });
 }

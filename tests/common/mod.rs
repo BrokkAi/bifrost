@@ -7,7 +7,6 @@ pub mod lsp_client;
 pub mod search_tools;
 pub mod semantic_graph;
 pub mod usage_graph;
-pub mod value_flow_conformance;
 
 use brokk_bifrost::{
     CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, RubyAnalyzer, SearchToolsService,

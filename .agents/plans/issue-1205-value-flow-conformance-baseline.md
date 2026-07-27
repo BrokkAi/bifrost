@@ -17,8 +17,8 @@ After this change, a contributor can run one integration test and see equivalent
 - [x] (2026-07-27 11:32Z) Added the reusable structured selector, plan builder, exact meeting comparison, stable carrier projection, compact source-backed witness rendering, and context-respecting call/return assertions under `tests/common/`.
 - [x] (2026-07-27 11:32Z) Replaced the reachability-only Java helper test with an exact source-to-two-sink-arguments conformance case; the focused Java test passes.
 - [x] (2026-07-27 11:40Z) Added the equivalent TypeScript case; it passes the same language-neutral carrier and call/return milestone contract with explicit incomplete aggregate discovery.
-- [ ] Run focused tests, formatting, strict all-feature Clippy, and the complete `nlp,python` test gate.
-- [ ] Run security, duplication, intent, operations, and architecture reviews; resolve accepted findings and record the outcome.
+- [x] (2026-07-27 13:33Z) Ran formatting, the focused 33-test contract set, strict all-target/all-feature Clippy, and the complete `nlp,python` matrix. All current-branch targets pass except two stale-branch Ruby cases whose fixes have since merged to `origin/master` in #1210; the gate passed with exactly those two cases excluded and independently explained.
+- [x] (2026-07-27 12:59Z) Ran security, duplication, intent, operations, and architecture reviews; resolved the accepted sink-authority, return-origin, evidence-projection, harness-fanout, analyzer-parallelism, ambiguity, and outcome-model findings.
 
 ## Surprises & Discoveries
 
@@ -35,13 +35,25 @@ After this change, a contributor can run one integration test and see equivalent
   Evidence: the first Java solve failed to recapture `src/ExactFlowFixture.java` after `build_case` dropped the temporary project. Keeping the built project in `ResolvedCase` made source recapture and ICFG construction succeed.
 
 - Observation: Binding a call-argument sink at the invoke point makes an unchanged meeting fact enter the callee as a new summary entry; the singular witness API can then select a seed-only witness for that meeting.
-  Evidence: the first successful Java solve reconstructed only a `Seed` in `sink`. Selecting the same structured argument carrier at its producing value-flow relation after effects reconstructed the complete root-to-helper-to-root path. The stable sink key remains the call site plus argument ordinal.
+  Evidence: the first successful Java solve reconstructed only a `Seed` in `sink`. The final harness therefore runs one authoritative plan that observes the sink at the configured call point before effects and a second witness plan that observes the same carrier at its structured producer after effects. Exact meetings and sink outcomes come only from the authoritative plan; the producer-bound plan supplies the complete root-to-helper-to-root provenance witness.
 
 - Observation: Java's positive helper path is proven complete even though aggregate discovery remains incomplete.
   Evidence: the Java meeting frontier is exactly `PROVEN_COMPLETE`, its may status is `Proven`, and it is not uncertain; `ValueFlowSummaryResult::is_complete()` is false, so the unrelated argument is correctly `Inconclusive`, not `NotReached`.
 
 - Observation: TypeScript needs no language-specific witness normalization for the baseline helper flow.
   Evidence: `typescript_exact_helper_flow` passes the exact same expected carrier milestones and interprocedural edge milestones as Java, including a proven-complete positive path and an inconclusive unrelated sink argument.
+
+- Observation: The scalar normal-return path is represented by a production `CallBinding::NormalReturn` formal/result pair, not necessarily by a heap carrier whose key is `ValueFlowCarrierKey::CallResult`.
+  Evidence: review found that the initial projector fabricated a caller-result milestone from edge metadata. The hardened assertion now finds the exact configured call binding whose formal and actual carrier IDs match the witness step and whose call origin matches the entering call.
+
+- Observation: Exporting the specialized harness from `tests/common/mod.rs` compiles roughly 1,100 lines into every integration-test crate that imports `common`.
+  Evidence: the operations and duplication reviews identified the fanout. `tests/value_flow_language_conformance.rs` now loads the harness with a path-scoped module while retaining `crate::common` for shared fixtures, and each inline analyzer is capped at one worker.
+
+- Observation: On this macOS host, Cargo's default tool lookup mixed rustup proxies with Homebrew `cargo-clippy`, `clippy-driver`, and `rustdoc`, producing `E0514` metadata failures even though the printed compiler versions matched.
+  Evidence: using a rustup-first `PATH` plus explicit rustup `RUSTC` and `RUSTDOC` made strict Clippy pass. Full `python`-feature tests additionally require the repository's documented `RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup'` for PyO3 extension-module linking.
+
+- Observation: The full feature gate reaches a pre-existing deadlock in `bifrost_lsp_server_ruby_semantic_diagnostics_are_constant_only` after all 1,951 active library tests pass; a second deliberately oversized Ruby dependency fixture runs for minutes on this stale branch.
+  Evidence: the exact LSP test also idles indefinitely in a featureless isolated rerun, and the oversized-source test reproduced independently after its other 9 target tests passed. While validation was running, `origin/master` advanced to `5311f6d1` (`Fix deep receiver tests stalling CI (#1210)`), which includes `39ef6de2` for the unreachable LSP wait and `cecef128` for an equivalent cheaper oversized fixture. This issue branch does not rebase or absorb those unrelated fixes without permission.
 
 ## Decision Log
 
@@ -65,9 +77,27 @@ After this change, a contributor can run one integration test and see equivalent
   Rationale: Java emits source-backed expression temporaries around parameter uses and call arguments. The portable contract is the semantic role/port/call binding, so temporary values are omitted only by their structured `temporary` role; call and return milestones are recovered from exact ICFG edge kinds and call origins, never source-string matching.
   Date/Author: 2026-07-27 / Codex
 
+- Decision: Separate authoritative meeting/outcome observation from full provenance witness reconstruction.
+  Rationale: A sink contract must be observed at the configured call argument before effects, but the current singular witness selector can choose a seed-only summary entry there. Solving the same carrier at its structured producer after effects preserves a full deterministic witness without weakening the authoritative meeting set or pretending the producer is the sink.
+  Date/Author: 2026-07-27 / Codex
+
+- Decision: Make every positive meeting state its may status, must status, uncertainty, path-quality frontier, witness truncation, and per-step proof/completeness; state discovery status and aggregate completeness independently.
+  Rationale: A `PROVEN_COMPLETE` positive path can coexist with `SemanticInputStatus::Unknown` and an incomplete aggregate result. Keeping those evidence layers explicit prevents the baseline from conflating precise path proof with complete-world discovery.
+  Date/Author: 2026-07-27 / Codex
+
+- Decision: Load the specialized conformance harness only in its owning integration test and configure each inline analyzer with one worker.
+  Rationale: The harness is not shared by the broader integration matrix, so exporting it through `common` imposed compilation and runtime costs without reuse.
+  Date/Author: 2026-07-27 / Codex
+
+- Decision: Defer receiver, heap-path, capture, exception, same-name/unresolved-call, and alternative-witness selector generalization to the remaining-language conformance stage after #825.
+  Rationale: The user explicitly sequenced this issue's first deliverable as the Java/TypeScript exact-flow baseline before the #825 cross-language pilot. This checkpoint makes per-meeting evidence reusable and fails on ambiguous procedure selection, but broadening the endpoint language now would pull later matrix requirements into the prerequisite slice.
+  Date/Author: 2026-07-27 / Codex
+
 ## Outcomes & Retrospective
 
-The Java and TypeScript milestones now exercise both production adapters, value-flow oracle, exact dispatch bindings, immutable plan, summary solver, and bounded witness reconstruction. Each asserts the complete meeting set, preserves incomplete aggregate discovery as an inconclusive negative, and projects the proven positive path into the same language-neutral carrier milestones with compact source snippets. Full validation and specialist review remain.
+The Java and TypeScript milestones exercise both production adapters, value-flow oracle, exact dispatch bindings, immutable plan, summary solver, and bounded witness reconstruction. Each asserts the complete authoritative call-site meeting set, preserves incomplete aggregate discovery as an inconclusive negative, and projects the proven positive path into the same language-neutral source-backed carrier milestones. Specialist review hardened exact call/return matching, explicit evidence layers, ambiguity handling, and test isolation.
+
+Formatting, the focused 33-test contracts, strict all-target/all-feature Clippy, all 1,951 active library tests, binaries, integration targets, and doc tests pass under `nlp,python`. The only exclusions were the stale-branch Ruby LSP deadlock and oversized-source fixture; both reproduced independently and both fixes merged to current `origin/master` in #1210 while this branch remained intentionally unrebased. The broader endpoint/alternative selector matrix remains intentionally scheduled after the #825 cross-language pilot.
 
 ## Context and Orientation
 
@@ -85,11 +115,11 @@ The existing test `exact_argument_and_return_bindings_flow_through_a_helper` in 
 
 ## Plan of Work
 
-First create `tests/common/value_flow_conformance.rs` and export it from `tests/common/mod.rs`. Define small table-driven descriptors for inline files, the root procedure, procedures whose value-flow snapshots are required, calls whose candidate-specific bindings are required, a parameter source, and call-argument sinks. Procedure selection must resolve a declaration from `ProcedureKind` plus its final declaration segment. Call selection must inspect structured call rows, resolve dispatch through `DispatchOracle`, and select the candidate whose target is the configured procedure. Argument selection must use the semantic call row's zero-based argument ordinal.
+First create `tests/common/value_flow_conformance.rs` and load it only from its owning integration test. Define small table-driven descriptors for inline files, the root procedure, procedures whose value-flow snapshots are required, calls whose candidate-specific bindings are required, a parameter source, and call-argument sinks. Procedure selection must resolve exactly one declaration from `ProcedureKind` plus its final declaration segment and fail on ambiguity. Call selection must inspect structured call rows, resolve dispatch through `DispatchOracle`, and select the candidate whose target is the configured procedure. Argument selection must use the semantic call row's zero-based argument ordinal.
 
 The harness will materialize every referenced file with `SemanticGraph`, obtain live `ProcedureHandle` values, query `ValueFlowOracle::procedure_relations` for each configured procedure, and query `DispatchOracle::resolve_call` plus `ValueFlowOracle::call_bindings` for each configured call/callee pair. It will preserve every outcome as `ValueFlowInput` with `SemanticInputStatus::from_outcome`, construct `ValueFlowSourceSpec` and `ValueFlowSinkSpec` values at the structured program points and observation phases, then build `ValueFlowPlan::try_new`.
 
-The source selector for the baseline will bind the target carrier of the root procedure's `ValueFlowRelationKind::Parameter` relation at ordinal zero after that relation's effects. A sink selector will bind the semantic value used by one configured call argument at the call's program point before effects. Event keys must use the source-backed point locator plus a descriptor-provided ordinal so multiple sinks at the same call remain distinct.
+The source selector for the baseline binds the target carrier of the root procedure's `ValueFlowRelationKind::Parameter` relation at ordinal zero after that relation's effects. An authoritative sink selector binds the semantic value used by one configured call argument at the call's program point before effects. A companion witness plan observes the same carrier at its structured producer after effects so the singular witness API retains complete provenance; it does not supply meeting or sink-outcome authority. Event keys use the source-backed call locator plus a descriptor-provided ordinal so multiple sinks at the same call remain distinct.
 
 Run the plan through `solve_value_flow_with_witnesses` using bounded positive witness-retention and reconstruction limits. Canonicalize each meeting to its stable source and sink event keys by resolving the meeting IDs through the plan. Compare the entire canonical meeting set against the expected set. Separately compare each configured sink outcome, including the difference between a complete `NotReached` result and an `Inconclusive` result caused by incomplete discovery.
 
@@ -126,7 +156,7 @@ Run the Rust CI checks:
     scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
     scripts/with-isolated-cargo-target.sh env BIFROST_SEMANTIC_INDEX=off cargo test --features nlp,python
 
-The formatting command must produce no diff. Clippy must exit zero with warnings denied. The full test command must exit zero; featureless `cargo test` is not an acceptable substitute because it skips NLP integration suites. If macOS rustdoc reports the known LLVM `E0514` mismatch, rerun the managed command with the matching rustup `RUSTDOC` path and record the exact command and result here.
+The formatting command must produce no diff. Clippy must exit zero with warnings denied. The full test command must exit zero; featureless `cargo test` is not an acceptable substitute because it skips NLP integration suites. If macOS rustdoc reports the known LLVM `E0514` mismatch, rerun the managed command with the matching rustup `RUSTDOC` path and record the exact command and result here. On this host, use a rustup-first `PATH` that retains `/usr/sbin` for `lsof`, explicit matching rustup `RUSTC` and `RUSTDOC`, and `RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup'` for PyO3. The monolithic gate exceeded the execution-session lifetime at the stale oversized Ruby fixture, so the remaining targets were completed in bounded chunks against one helper-managed isolated target and that target was removed afterward.
 
 ## Validation and Acceptance
 
@@ -174,4 +204,4 @@ In `tests/common/value_flow_conformance.rs`, define test-only equivalents of the
 
 The harness must reuse `InlineTestProject`, `SemanticGraph`, `WorkspaceAnalyzer::semantic_oracle_provider`, `WorkspaceAnalyzer::icfg_provider`, `SemanticInputStatus`, `ValueFlowInput`, `ValueFlowPlan`, `solve_value_flow_with_witnesses`, `ValueFlowSummaryResult`, `SummaryWitness`, and `ValueFlowCarrierKey`. No new crate dependency is needed.
 
-Plan revision note (2026-07-27): Created after live issue diagnosis, refresh to current `origin/master`, explicit approval of the Java/TypeScript-first scope, and explicit approval to create the implementation branch.
+Plan revision note (2026-07-27): Created after live issue diagnosis, refresh to current `origin/master`, explicit approval of the Java/TypeScript-first scope, and explicit approval to create the implementation branch. Updated after the five specialist reviews to record the two-plan observation strategy, explicit evidence contract, exact call-binding validation, path-scoped harness, operational validation constraints, and intentionally deferred endpoint generalization.

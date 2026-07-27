@@ -4,8 +4,6 @@
 //! arguments. Source text is attached only after those structured selections
 //! have been made so this harness cannot turn into a second language parser.
 
-#![allow(dead_code)]
-
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 
@@ -14,11 +12,11 @@ use brokk_bifrost::analyzer::dataflow::{
     WitnessReconstructionLimits, WitnessRetentionLimits,
 };
 use brokk_bifrost::analyzer::semantic::{
-    CallSiteHandle, CancellationToken, DeclarationLocator, DispatchOracle, EvidenceCompleteness,
-    IcfgEdgeKind, OracleCallContext, ProcedureHandle, ProcedureKind, ProcedurePortKind,
-    ProgramPointHandle, ProofStatus, SemanticBudget, SemanticLanguage, SemanticLocator,
-    SemanticRequest, SemanticRole, SourceAnchor, ValueFlowOracle, ValueFlowRelationKind,
-    WorkspaceRelativePath,
+    CallBinding, CallBindings, CallSiteHandle, CancellationToken, DeclarationLocator,
+    DispatchOracle, EvidenceCompleteness, IcfgEdgeKind, OracleCallContext, ProcedureHandle,
+    ProcedureKind, ProcedurePortKind, ProgramPointHandle, ProofStatus, SemanticBudget,
+    SemanticLanguage, SemanticLocator, SemanticRequest, SemanticRole, SourceAnchor,
+    ValueFlowOracle, ValueFlowRelationKind, WorkspaceRelativePath,
 };
 use brokk_bifrost::analyzer::value_flow::{
     ValueFlowCarrier, ValueFlowCarrierKey, ValueFlowEventKey, ValueFlowEventKind, ValueFlowInput,
@@ -29,7 +27,7 @@ use brokk_bifrost::analyzer::value_flow::{
 use brokk_bifrost::{AnalyzerConfig, Language, WorkspaceAnalyzer};
 use pretty_assertions::assert_eq;
 
-use super::{BuiltInlineTestProject, InlineTestProject, semantic_graph::SemanticGraph};
+use crate::common::{BuiltInlineTestProject, InlineTestProject, semantic_graph::SemanticGraph};
 
 #[derive(Debug, Clone, Copy)]
 pub struct InlineSourceFile<'case> {
@@ -60,8 +58,8 @@ pub struct ParameterSource<'case> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AbsentSinkExpectation {
-    NotReached,
+pub enum ExpectedSinkOutcome {
+    Reached,
     Inconclusive,
 }
 
@@ -70,34 +68,42 @@ pub struct CallArgumentSink<'case> {
     pub alias: &'case str,
     pub call: &'case str,
     pub argument: usize,
-    pub reached: bool,
-    pub absent_outcome: Option<AbsentSinkExpectation>,
+    pub outcome: ExpectedSinkOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CarrierMilestone<'case> {
+pub enum CarrierMilestone {
     Value {
-        procedure: &'case str,
-        role: &'case str,
+        path: Box<str>,
+        procedure: Box<str>,
+        role: Box<str>,
         ordinal: Option<u32>,
+        snippet: Box<str>,
     },
     Port {
-        procedure: &'case str,
+        path: Box<str>,
+        procedure: Box<str>,
         kind: brokk_bifrost::analyzer::value_flow::ValueFlowPortKey,
     },
     CallResult {
-        caller: &'case str,
-        callee: &'case str,
+        path: Box<str>,
+        caller: Box<str>,
+        callee: Box<str>,
+        call: Box<str>,
         result: brokk_bifrost::analyzer::value_flow::ValueFlowPortKey,
     },
     CallArgument {
-        caller: &'case str,
-        callee: &'case str,
+        path: Box<str>,
+        caller: Box<str>,
+        callee: Box<str>,
+        call: Box<str>,
         ordinal: usize,
     },
     SinkArgument {
-        caller: &'case str,
-        callee: &'case str,
+        path: Box<str>,
+        caller: Box<str>,
+        callee: Box<str>,
+        call: Box<str>,
         ordinal: usize,
     },
 }
@@ -107,7 +113,26 @@ pub struct InterproceduralMilestone<'case> {
     pub kind: IcfgEdgeKind,
     pub source_procedure: &'case str,
     pub target_procedure: &'case str,
-    pub origin_procedure: &'case str,
+    pub origin_call: &'case str,
+}
+
+#[derive(Debug)]
+pub struct ExpectedWitness<'case> {
+    pub truncated: bool,
+    pub step_proof: &'case ProofStatus,
+    pub step_completeness: &'case EvidenceCompleteness,
+    pub carriers: &'case [CarrierMilestone],
+    pub interprocedural: &'case [InterproceduralMilestone<'case>],
+}
+
+#[derive(Debug)]
+pub struct ExpectedMeeting<'case> {
+    pub sink: &'case str,
+    pub may_status: ValueFlowMayStatus,
+    pub must_status: ValueFlowMustStatus,
+    pub uncertain: bool,
+    pub path_qualities: &'case [PathQuality],
+    pub witness: ExpectedWitness<'case>,
 }
 
 #[derive(Debug)]
@@ -120,9 +145,10 @@ pub struct ValueFlowConformanceCase<'case> {
     pub calls: &'case [CallSelector<'case>],
     pub source: ParameterSource<'case>,
     pub sinks: &'case [CallArgumentSink<'case>],
-    pub expected_complete: bool,
-    pub expected_carriers: &'case [CarrierMilestone<'case>],
-    pub expected_interprocedural: &'case [InterproceduralMilestone<'case>],
+    pub expected_discovery_status: SemanticInputStatus,
+    pub expected_discovery_complete: bool,
+    pub expected_result_complete: bool,
+    pub expected_meetings: &'case [ExpectedMeeting<'case>],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -276,8 +302,11 @@ struct ResolvedCase {
     analyzer: WorkspaceAnalyzer,
     procedures: HashMap<String, ProcedureHandle>,
     calls: HashMap<String, CallSiteHandle>,
+    call_bindings: HashMap<String, CallBindings>,
     plan: ValueFlowPlan,
+    witness_plan: ValueFlowPlan,
     sink_ids: HashMap<String, brokk_bifrost::analyzer::value_flow::ValueFlowSinkId>,
+    witness_sink_ids: HashMap<String, brokk_bifrost::analyzer::value_flow::ValueFlowSinkId>,
 }
 
 pub fn assert_value_flow_conformance(case: &ValueFlowConformanceCase<'_>) {
@@ -297,14 +326,26 @@ pub fn assert_value_flow_conformance(case: &ValueFlowConformanceCase<'_>) {
     .unwrap_or_else(|error| panic!("{} value-flow solve failed: {error}", case.name));
 
     assert_eq!(
+        resolved.plan.discovery_status(),
+        case.expected_discovery_status,
+        "{} plan discovery status",
+        case.name
+    );
+    assert_eq!(
+        resolved.plan.discovery_complete(),
+        case.expected_discovery_complete,
+        "{} plan discovery completeness",
+        case.name
+    );
+    assert_eq!(
         result.is_complete(),
-        case.expected_complete,
+        case.expected_result_complete,
         "{} aggregate completeness",
         case.name
     );
     assert_exact_meetings(case, &resolved, &result);
     assert_sink_outcomes(case, &resolved, &result);
-    assert_witness(case, &resolved, &result);
+    assert_witness(case, &resolved);
 }
 
 fn build_case(case: &ValueFlowConformanceCase<'_>) -> ResolvedCase {
@@ -313,7 +354,11 @@ fn build_case(case: &ValueFlowConformanceCase<'_>) -> ResolvedCase {
         builder = builder.file(file.path, file.source);
     }
     let project = builder.build();
-    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = project.workspace_analyzer(AnalyzerConfig {
+        parallelism: Some(1),
+        memo_cache_budget_bytes: Some(16 * 1024 * 1024),
+        ..AnalyzerConfig::default()
+    });
     let mut graphs = HashMap::new();
     let mut procedures = HashMap::new();
     for selector in case.procedures {
@@ -353,6 +398,7 @@ fn build_case(case: &ValueFlowConformanceCase<'_>) -> ResolvedCase {
     }
 
     let mut calls = HashMap::new();
+    let mut call_bindings = HashMap::new();
     let mut bindings = Vec::new();
     for selector in case.calls {
         let caller = procedure(&procedures, selector.caller);
@@ -368,6 +414,13 @@ fn build_case(case: &ValueFlowConformanceCase<'_>) -> ResolvedCase {
         assert!(
             calls.insert(selector.alias.to_owned(), call).is_none(),
             "duplicate call alias {}",
+            selector.alias
+        );
+        assert!(
+            call_bindings
+                .insert(selector.alias.to_owned(), binding.value().clone())
+                .is_none(),
+            "duplicate call-binding alias {}",
             selector.alias
         );
         bindings.push(binding);
@@ -417,6 +470,7 @@ fn build_case(case: &ValueFlowConformanceCase<'_>) -> ResolvedCase {
     );
 
     let mut sinks = Vec::new();
+    let mut witness_sinks = Vec::new();
     let mut sink_keys = Vec::new();
     for sink in case.sinks {
         let call = calls
@@ -465,6 +519,14 @@ fn build_case(case: &ValueFlowConformanceCase<'_>) -> ResolvedCase {
         .expect("stable sink event");
         sink_keys.push((sink.alias, key.clone()));
         sinks.push(ValueFlowSinkSpec::new(
+            key.clone(),
+            call_point,
+            ValueFlowObservationPhase::BeforeEffects,
+            carrier.clone(),
+            ProofStatus::Proven,
+            EvidenceCompleteness::Complete,
+        ));
+        witness_sinks.push(ValueFlowSinkSpec::new(
             key,
             producer.point().clone(),
             ValueFlowObservationPhase::AfterEffects,
@@ -474,49 +536,73 @@ fn build_case(case: &ValueFlowConformanceCase<'_>) -> ResolvedCase {
         ));
     }
 
-    let plan = ValueFlowPlan::try_new(root, snapshots, bindings, vec![source], sinks)
-        .unwrap_or_else(|error| panic!("{} plan failed: {error}", case.name));
-    let sink_ids = sink_keys
-        .into_iter()
-        .map(|(alias, key)| {
-            let id = plan
-                .sinks()
-                .find_map(|(id, sink)| (sink.key() == &key).then_some(id))
-                .expect("configured sink remains in plan");
-            (alias.to_owned(), id)
-        })
-        .collect();
+    let plan = ValueFlowPlan::try_new(
+        root.clone(),
+        snapshots.clone(),
+        bindings.clone(),
+        vec![source.clone()],
+        sinks,
+    )
+    .unwrap_or_else(|error| panic!("{} plan failed: {error}", case.name));
+    let witness_plan =
+        ValueFlowPlan::try_new(root, snapshots, bindings, vec![source], witness_sinks)
+            .unwrap_or_else(|error| panic!("{} witness plan failed: {error}", case.name));
+    let sink_ids = resolve_sink_ids(&plan, &sink_keys);
+    let witness_sink_ids = resolve_sink_ids(&witness_plan, &sink_keys);
     ResolvedCase {
         _project: project,
         analyzer,
         procedures,
         calls,
+        call_bindings,
         plan,
+        witness_plan,
         sink_ids,
+        witness_sink_ids,
     }
 }
 
-fn select_procedure(graph: &SemanticGraph, selector: &ProcedureSelector<'_>) -> ProcedureHandle {
-    let procedure = graph
-        .artifact()
-        .procedures()
+fn resolve_sink_ids(
+    plan: &ValueFlowPlan,
+    sink_keys: &[(&str, ValueFlowEventKey)],
+) -> HashMap<String, brokk_bifrost::analyzer::value_flow::ValueFlowSinkId> {
+    sink_keys
         .iter()
-        .find(|procedure| {
-            procedure.kind() == selector.kind
-                && procedure
-                    .locator()
-                    .declaration()
-                    .segments()
-                    .last()
-                    .and_then(|segment| segment.name())
-                    == Some(selector.name)
+        .map(|(alias, key)| {
+            let id = plan
+                .sinks()
+                .find_map(|(id, sink)| (sink.key() == key).then_some(id))
+                .expect("configured sink remains in plan");
+            ((*alias).to_owned(), id)
         })
-        .unwrap_or_else(|| {
-            panic!(
-                "missing {:?} procedure {} ({})",
-                selector.kind, selector.name, selector.alias
-            )
-        });
+        .collect()
+}
+
+fn select_procedure(graph: &SemanticGraph, selector: &ProcedureSelector<'_>) -> ProcedureHandle {
+    let mut matches = graph.artifact().procedures().iter().filter(|procedure| {
+        procedure.kind() == selector.kind
+            && procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some(selector.name)
+    });
+    let procedure = matches.next().unwrap_or_else(|| {
+        panic!(
+            "missing {:?} procedure {} ({})",
+            selector.kind, selector.name, selector.alias
+        )
+    });
+    assert!(
+        matches.next().is_none(),
+        "procedure selector {} ({:?} {}) is ambiguous in {}",
+        selector.alias,
+        selector.kind,
+        selector.name,
+        selector.path
+    );
     graph
         .artifact()
         .procedure_handle(procedure.id())
@@ -588,11 +674,10 @@ fn assert_exact_meetings(
 ) {
     let source = resolved.plan.sources().next().expect("configured source").1;
     let expected = case
-        .sinks
+        .expected_meetings
         .iter()
-        .filter(|sink| sink.reached)
-        .map(|sink| {
-            let sink_id = resolved.sink_ids[sink.alias];
+        .map(|meeting| {
+            let sink_id = resolved.sink_ids[meeting.sink];
             let sink = resolved.plan.sink(sink_id).expect("configured sink");
             (
                 StableEventKey::from(source.key()),
@@ -626,10 +711,28 @@ fn assert_sink_outcomes(
     resolved: &ResolvedCase,
     result: &ValueFlowSummaryResult,
 ) {
+    let meeting_sinks = case
+        .expected_meetings
+        .iter()
+        .map(|meeting| meeting.sink)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        meeting_sinks.len(),
+        case.expected_meetings.len(),
+        "{} meeting expectations use unique sinks",
+        case.name
+    );
     for expected in case.sinks {
         let sink = resolved.sink_ids[expected.alias];
-        match (expected.reached, result.sink_outcome(sink)) {
-            (true, ValueFlowSinkOutcome::Reached(meetings)) => {
+        match (expected.outcome, result.sink_outcome(sink)) {
+            (ExpectedSinkOutcome::Reached, ValueFlowSinkOutcome::Reached(meetings)) => {
+                let expectation = case
+                    .expected_meetings
+                    .iter()
+                    .find(|meeting| meeting.sink == expected.alias)
+                    .unwrap_or_else(|| {
+                        panic!("reached sink {} has no meeting expectation", expected.alias)
+                    });
                 assert_eq!(
                     meetings.len(),
                     1,
@@ -638,66 +741,127 @@ fn assert_sink_outcomes(
                     expected.alias
                 );
                 let meeting = meetings[0];
-                assert_eq!(meeting.may_status(), ValueFlowMayStatus::Proven);
-                assert_eq!(meeting.must_status(), ValueFlowMustStatus::NotEstablished);
-                assert!(
-                    !meeting.is_uncertain(),
-                    "{} {} is uncertain",
+                assert_eq!(meeting.may_status(), expectation.may_status);
+                assert_eq!(meeting.must_status(), expectation.must_status);
+                assert_eq!(
+                    meeting.is_uncertain(),
+                    expectation.uncertain,
+                    "{} {} uncertainty",
                     case.name,
                     expected.alias
                 );
                 assert_eq!(
                     meeting.path_qualities().iter().collect::<Vec<_>>(),
-                    vec![PathQuality::PROVEN_COMPLETE],
+                    expectation.path_qualities,
                     "{} {} path qualities",
                     case.name,
                     expected.alias
                 );
             }
-            (false, ValueFlowSinkOutcome::NotReached)
-                if expected.absent_outcome == Some(AbsentSinkExpectation::NotReached) => {}
-            (false, ValueFlowSinkOutcome::Inconclusive)
-                if expected.absent_outcome == Some(AbsentSinkExpectation::Inconclusive) => {}
+            (ExpectedSinkOutcome::Inconclusive, ValueFlowSinkOutcome::Inconclusive) => {}
             (_, actual) => panic!(
                 "{} sink {} had unexpected outcome {actual:?}",
                 case.name, expected.alias
             ),
         }
     }
+    assert_eq!(
+        case.sinks
+            .iter()
+            .filter(|sink| sink.outcome == ExpectedSinkOutcome::Reached)
+            .count(),
+        case.expected_meetings.len(),
+        "{} every positive sink has exactly one meeting expectation",
+        case.name
+    );
+    assert!(
+        case.expected_meetings.iter().all(|meeting| {
+            case.sinks.iter().any(|sink| {
+                sink.alias == meeting.sink && sink.outcome == ExpectedSinkOutcome::Reached
+            })
+        }),
+        "{} every meeting expectation names a reached sink",
+        case.name
+    );
 }
 
-fn assert_witness(
+fn assert_witness(case: &ValueFlowConformanceCase<'_>, resolved: &ResolvedCase) {
+    let root = procedure(&resolved.procedures, case.root);
+    let cancellation = CancellationToken::default();
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let result = solve_value_flow_with_witnesses(
+        root,
+        &resolved.analyzer.icfg_provider(),
+        &resolved.witness_plan,
+        WitnessRetentionLimits::new(8).expect("positive witness retention"),
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .unwrap_or_else(|error| panic!("{} witness solve failed: {error}", case.name));
+    for expectation in case.expected_meetings {
+        assert_meeting_witness(case, resolved, &result, expectation);
+    }
+}
+
+fn assert_meeting_witness(
     case: &ValueFlowConformanceCase<'_>,
     resolved: &ResolvedCase,
     result: &ValueFlowSummaryResult,
+    expectation: &ExpectedMeeting<'_>,
 ) {
     let positive_sink = case
         .sinks
         .iter()
-        .find(|sink| sink.reached)
-        .expect("positive sink");
-    let sink_id = resolved.sink_ids[positive_sink.alias];
+        .find(|sink| sink.alias == expectation.sink)
+        .expect("meeting sink");
+    let sink_id = resolved.witness_sink_ids[positive_sink.alias];
     let meeting = result
         .meetings()
         .iter()
         .find(|meeting| meeting.sink() == sink_id)
         .expect("positive meeting");
+    let quality = *expectation
+        .path_qualities
+        .first()
+        .expect("meeting has an expected path quality");
+    assert_eq!(
+        expectation.path_qualities.len(),
+        1,
+        "{} {} baseline witness expectation is singular",
+        case.name,
+        expectation.sink
+    );
     let witness = result
-        .witness_for_meeting(
-            meeting,
-            PathQuality::PROVEN_COMPLETE,
-            WitnessReconstructionLimits::default(),
-        )
+        .witness_for_meeting(meeting, quality, WitnessReconstructionLimits::default())
         .unwrap_or_else(|error| panic!("{} witness reconstruction failed: {error}", case.name));
-    assert!(!witness.truncated(), "{} witness was truncated", case.name);
+    assert_eq!(
+        witness.truncated(),
+        expectation.witness.truncated,
+        "{} {} witness truncation",
+        case.name,
+        expectation.sink
+    );
     let projected = witness
         .steps()
         .iter()
-        .map(|step| project_step(case, &resolved.plan, result, step))
+        .map(|step| project_step(case, &resolved.witness_plan, result, step))
         .collect::<Vec<_>>();
+    for step in &projected {
+        assert_eq!(
+            &step.proof, expectation.witness.step_proof,
+            "{} {} witness proof at {:?}",
+            case.name, expectation.sink, step.kind
+        );
+        assert_eq!(
+            &step.completeness, expectation.witness.step_completeness,
+            "{} {} witness completeness at {:?}",
+            case.name, expectation.sink, step.kind
+        );
+    }
 
     let source_carrier_key = resolved
-        .plan
+        .witness_plan
         .sources()
         .next()
         .expect("configured source")
@@ -707,38 +871,50 @@ fn assert_witness(
         .expect("source carrier has stable identity");
     let source_carrier = StableCarrier::from(&source_carrier_key);
     let mut actual_carriers = Vec::new();
-    append_carrier_milestone(&mut actual_carriers, &source_carrier);
+    append_carrier_milestone(case, &mut actual_carriers, &source_carrier);
+    let mut entered_calls = Vec::new();
     for step in &projected {
         if matches!(step.kind, SummaryWitnessStepKind::Edge(IcfgEdgeKind::Call)) {
-            let (call, callee) = call_for_origin(case, resolved, step);
+            let (selector, call) = configured_call_for_origin(case, resolved, step);
             let ordinal = call_argument_ordinal(call, step.input.as_ref().expect("call input"));
+            let origin = step.origin.as_ref().expect("call edge has origin");
+            entered_calls.push(origin.clone());
             actual_carriers.push(CarrierMilestone::CallArgument {
-                caller: procedure_name(&step.source),
-                callee,
+                path: origin.path.as_str().into(),
+                caller: procedure_name(&step.source).into(),
+                callee: selector.callee.into(),
+                call: source_snippet(case, origin),
                 ordinal,
             });
         }
         if let Some(carrier) = &step.input {
-            append_carrier_milestone(&mut actual_carriers, carrier);
+            append_carrier_milestone(case, &mut actual_carriers, carrier);
         }
         if matches!(
             step.kind,
             SummaryWitnessStepKind::Edge(IcfgEdgeKind::NormalReturn)
         ) {
-            actual_carriers.push(CarrierMilestone::CallResult {
-                caller: procedure_name(
-                    step.origin
-                        .as_ref()
-                        .expect("normal-return edge has call origin"),
-                ),
-                callee: procedure_name(&step.source),
-                result: brokk_bifrost::analyzer::value_flow::ValueFlowPortKey::NormalReturn,
-            });
+            let origin = step
+                .origin
+                .as_ref()
+                .expect("normal-return edge has call origin");
+            let entered = entered_calls.pop().expect("normal return follows a call");
+            assert_eq!(
+                origin, &entered,
+                "{} normal return must match its exact entering call",
+                case.name
+            );
+            append_return_binding_milestone(case, resolved, step, &mut actual_carriers);
         }
         if let Some(carrier) = &step.output {
-            append_carrier_milestone(&mut actual_carriers, carrier);
+            append_carrier_milestone(case, &mut actual_carriers, carrier);
         }
     }
+    assert!(
+        entered_calls.is_empty(),
+        "{} witness has unmatched call edges",
+        case.name
+    );
     let sink_call = resolved
         .calls
         .get(positive_sink.call)
@@ -750,13 +926,15 @@ fn assert_witness(
         .expect("positive sink call selector");
     let sink_call_locator = call_locator(sink_call);
     actual_carriers.push(CarrierMilestone::SinkArgument {
-        caller: procedure_name(&sink_call_locator),
-        callee: sink_selector.callee,
+        path: sink_call_locator.path.as_str().into(),
+        caller: procedure_name(&sink_call_locator).into(),
+        callee: sink_selector.callee.into(),
+        call: source_snippet(case, &sink_call_locator),
         ordinal: positive_sink.argument,
     });
     assert_eq!(
         actual_carriers,
-        case.expected_carriers,
+        expectation.witness.carriers,
         "{} canonical carrier milestones; projected witness:\n{}",
         case.name,
         render_witness(&projected)
@@ -777,11 +955,7 @@ fn assert_witness(
                             .as_ref()
                             .expect("interprocedural edge has target"),
                     ),
-                    origin_procedure: procedure_name(
-                        step.origin
-                            .as_ref()
-                            .expect("interprocedural edge has call origin"),
-                    ),
+                    origin_call: configured_call_for_origin(case, resolved, step).0.alias,
                 })
             }
             _ => None,
@@ -789,7 +963,7 @@ fn assert_witness(
         .collect::<Vec<_>>();
     assert_eq!(
         interprocedural,
-        case.expected_interprocedural,
+        expectation.witness.interprocedural,
         "{} context-respecting call/return milestones; projected witness:\n{}",
         case.name,
         render_witness(&projected)
@@ -931,9 +1105,10 @@ fn render_carrier(carrier: &StableCarrier) -> String {
     }
 }
 
-fn append_carrier_milestone<'carrier>(
-    milestones: &mut Vec<CarrierMilestone<'carrier>>,
-    carrier: &'carrier StableCarrier,
+fn append_carrier_milestone(
+    case: &ValueFlowConformanceCase<'_>,
+    milestones: &mut Vec<CarrierMilestone>,
+    carrier: &StableCarrier,
 ) {
     let milestone = match carrier {
         StableCarrier::Value { role, .. } if role.as_ref() == "temporary" => return,
@@ -942,26 +1117,34 @@ fn append_carrier_milestone<'carrier>(
             role,
             ordinal,
         } => CarrierMilestone::Value {
-            procedure: procedure_name(locator),
-            role,
+            path: locator.path.as_str().into(),
+            procedure: procedure_name(locator).into(),
+            role: role.clone(),
             ordinal: *ordinal,
+            snippet: source_snippet(case, locator),
         },
         StableCarrier::Port { procedure, kind } => CarrierMilestone::Port {
-            procedure: procedure_name(procedure),
+            path: procedure.path.as_str().into(),
+            procedure: procedure_name(procedure).into(),
             kind: *kind,
         },
         StableCarrier::CallResult {
             call,
             result,
             callee,
-        } => CarrierMilestone::CallResult {
-            caller: procedure_name(call),
-            callee: procedure_name(callee),
-            result: match carrier_milestone(result) {
-                Some(CarrierMilestone::Port { kind, .. }) => kind,
+        } => {
+            let result = match result.as_ref() {
+                StableCarrier::Port { kind, .. } => *kind,
                 other => panic!("baseline call result is not a return port: {other:?}"),
-            },
-        },
+            };
+            CarrierMilestone::CallResult {
+                path: call.path.as_str().into(),
+                caller: procedure_name(call).into(),
+                callee: procedure_name(callee).into(),
+                call: source_snippet(case, call),
+                result,
+            }
+        }
         other => panic!("baseline witness contains unexpected carrier {other:?}"),
     };
     if milestones.last() != Some(&milestone) {
@@ -969,25 +1152,71 @@ fn append_carrier_milestone<'carrier>(
     }
 }
 
-fn carrier_milestone(carrier: &StableCarrier) -> Option<CarrierMilestone<'_>> {
-    let mut milestones = Vec::new();
-    append_carrier_milestone(&mut milestones, carrier);
-    milestones.pop()
-}
-
-fn call_for_origin<'resolved, 'case>(
+fn configured_call_for_origin<'resolved, 'case>(
     case: &'resolved ValueFlowConformanceCase<'case>,
     resolved: &'resolved ResolvedCase,
     step: &ProjectedWitnessStep,
-) -> (&'resolved CallSiteHandle, &'case str) {
+) -> (&'resolved CallSelector<'case>, &'resolved CallSiteHandle) {
     let origin = step.origin.as_ref().expect("call edge has origin");
     case.calls
         .iter()
         .find_map(|selector| {
             let call = resolved.calls.get(selector.alias)?;
-            (call_locator(call) == *origin).then_some((call, selector.callee))
+            (call_locator(call) == *origin).then_some((selector, call))
         })
         .expect("witness call origin belongs to configured call")
+}
+
+fn append_return_binding_milestone(
+    case: &ValueFlowConformanceCase<'_>,
+    resolved: &ResolvedCase,
+    step: &ProjectedWitnessStep,
+    milestones: &mut Vec<CarrierMilestone>,
+) {
+    let (selector, _) = configured_call_for_origin(case, resolved, step);
+    let bindings = resolved
+        .call_bindings
+        .get(selector.alias)
+        .expect("configured call retains bindings");
+    let input = step
+        .input
+        .as_ref()
+        .expect("normal return has an input fact");
+    let output = step
+        .output
+        .as_ref()
+        .expect("normal return has an output fact");
+    let mut matches = bindings.bindings().iter().filter(|binding| match binding {
+        CallBinding::NormalReturn { formal, result, .. } => {
+            let formal = ValueFlowCarrier::Port(formal.clone())
+                .stable_key()
+                .map(|key| StableCarrier::from(&key));
+            let result = ValueFlowCarrier::Value(result.clone())
+                .stable_key()
+                .map(|key| StableCarrier::from(&key));
+            formal.as_ref().is_ok_and(|carrier| carrier == input)
+                && result.as_ref().is_ok_and(|carrier| carrier == output)
+        }
+        _ => false,
+    });
+    matches
+        .next()
+        .expect("normal-return witness follows one structured call binding");
+    assert!(
+        matches.next().is_none(),
+        "normal-return witness follows one unambiguous call binding"
+    );
+    let origin = step
+        .origin
+        .as_ref()
+        .expect("normal-return edge has call origin");
+    milestones.push(CarrierMilestone::CallResult {
+        path: origin.path.as_str().into(),
+        caller: procedure_name(origin).into(),
+        callee: selector.callee.into(),
+        call: source_snippet(case, origin),
+        result: brokk_bifrost::analyzer::value_flow::ValueFlowPortKey::NormalReturn,
+    });
 }
 
 fn call_argument_ordinal(call: &CallSiteHandle, carrier: &StableCarrier) -> usize {
