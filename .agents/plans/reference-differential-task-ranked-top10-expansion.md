@@ -223,6 +223,13 @@ comes through the local gate, but is not the focus.
   the sandbox at niceness 10 with the normal repository target; the full
   matrix included 1,937 library tests, all symbols MCP/CLI and LSP surfaces,
   every language usage graph, and doc tests.
+- [x] (2026-07-26) Fetched advanced `origin/master` at `5476da46` and merged
+  it as `70160699`; the concurrent changes touched C++ resolver and extractor
+  paths but merged without textual conflicts. On the integrated head,
+  formatting, `git diff --check`, all-target/all-feature Clippy, and the
+  complete `nlp,python` matrix are green at niceness 10 with the normal Cargo
+  target. The matrix now contains 1,943 library tests and again passed the
+  complete symbols MCP/CLI, LSP, definition, and language-usage surfaces.
 - [ ] Complete C++ and publish its evidence and user summary.
 - [ ] Complete C# and publish its evidence and user summary.
 - [ ] Complete Go and publish its evidence and user summary.
