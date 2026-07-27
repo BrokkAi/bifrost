@@ -4,9 +4,10 @@ use crate::analyzer::usages::ruby_graph::{
     RubySemanticIndex, is_declaration_constant, ruby_type_owner,
 };
 use crate::analyzer::{
-    IAnalyzer, Project, ProjectFile, Range, RubyAnalyzer, SemanticDiagnostic, resolve_analyzer,
+    IAnalyzer, ProjectFile, Range, RubyAnalyzer, SemanticDiagnostic, resolve_analyzer,
 };
 use crate::text_utils::compute_line_starts;
+use std::borrow::Cow;
 use tree_sitter::Node;
 
 pub(crate) const RUBY_UNRECOGNIZED_SYMBOL: &str = "ruby_unrecognized_symbol";
@@ -197,11 +198,11 @@ impl RubyDiagnosticCollector<'_> {
         let owner = owner.fq_name();
         facts
             .ancestors
-            .get(owner)
+            .get(&owner)
             .is_some_and(|ancestors| !ancestors.is_empty())
-            || facts.mixin_included_owners.contains_key(owner)
-            || facts.mixin_prepended_owners.contains_key(owner)
-            || facts.mixin_class_owners.contains_key(owner)
+            || facts.mixin_included_owners.contains_key(&owner)
+            || facts.mixin_prepended_owners.contains_key(&owner)
+            || facts.mixin_class_owners.contains_key(&owner)
     }
 
     fn push_unrecognized(&mut self, node: Node<'_>) {
@@ -217,7 +218,7 @@ impl RubyDiagnosticCollector<'_> {
     }
 }
 
-fn push_named_children(stack: &mut Vec<ScanFrame<'_>>, node: Node<'_>) {
+fn push_named_children<'tree>(stack: &mut Vec<ScanFrame<'tree>>, node: Node<'tree>) {
     let mut cursor = node.walk();
     let children: Vec<_> = node.named_children(&mut cursor).collect();
     for child in children.into_iter().rev() {
@@ -311,13 +312,14 @@ fn visible_files_have_open_runtime_boundary(
             return true;
         }
         let visible_source = if visible_file == file {
-            (source.len() <= remaining_bytes).then_some(source)
+            (source.len() <= remaining_bytes).then(|| Cow::Borrowed(source))
         } else {
             analyzer
                 .project()
                 .read_source_limited(visible_file, remaining_bytes)
                 .ok()
                 .flatten()
+                .map(Cow::Owned)
         };
         let Some(visible_source) = visible_source else {
             return true;
@@ -326,13 +328,13 @@ fn visible_files_have_open_runtime_boundary(
             return true;
         };
         remaining_bytes = next_remaining_bytes;
-        let Some(tree) = super::parse_ruby_tree(visible_source) else {
+        let Some(tree) = super::parse_ruby_tree(&visible_source) else {
             return true;
         };
         let mut parse_errors = Vec::new();
         collect_parse_errors(tree.root_node(), &mut parse_errors);
         if !parse_errors.is_empty()
-            || file_has_open_runtime_boundary(tree.root_node(), visible_source)
+            || file_has_open_runtime_boundary(tree.root_node(), &visible_source)
         {
             return true;
         }
