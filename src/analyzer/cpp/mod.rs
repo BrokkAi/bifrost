@@ -1,6 +1,7 @@
 mod adapter;
 mod cache;
 mod clones;
+mod compile_context;
 mod declarations;
 mod hierarchy;
 mod identity;
@@ -31,6 +32,7 @@ use std::sync::{Arc, OnceLock};
 pub(crate) use adapter::CppAdapter;
 use cache::{weight_code_unit_set_by_file, weight_code_unit_vec_by_file, weight_project_file_set};
 use clones::{build_clone_candidate_data, refine_cpp_clone_similarity};
+use compile_context::{CppCompileContext, CppCompileContexts};
 use tests::detect_cpp_test_assertion_smells;
 
 pub(crate) use declarations::{
@@ -63,6 +65,7 @@ pub struct CppAnalyzer {
     include_target_index: Arc<OnceLock<IncludeTargetIndex>>,
     reverse_include_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
+    compile_contexts: Arc<OnceLock<CppCompileContexts>>,
     #[cfg(test)]
     type_alias_classification_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
@@ -149,6 +152,7 @@ impl CppAnalyzer {
             include_target_index: Arc::new(OnceLock::new()),
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
             direct_descendant_index: Arc::new(OnceLock::new()),
+            compile_contexts: Arc::new(OnceLock::new()),
             #[cfg(test)]
             type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -348,6 +352,7 @@ impl CppAnalyzer {
             include_target_index: Arc::new(OnceLock::new()),
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
             direct_descendant_index: Arc::new(OnceLock::new()),
+            compile_contexts: Arc::new(OnceLock::new()),
             #[cfg(test)]
             type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -370,6 +375,12 @@ impl CppAnalyzer {
 }
 
 impl CppAnalyzer {
+    pub(crate) fn compile_context_for(&self, file: &ProjectFile) -> Option<&CppCompileContext> {
+        self.compile_contexts
+            .get_or_init(|| CppCompileContexts::load(self.inner.project()))
+            .for_file(file)
+    }
+
     pub(crate) fn prepared_syntax(
         &self,
         file: &ProjectFile,

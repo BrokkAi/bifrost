@@ -13,7 +13,7 @@ The feature must prefer silence to an incorrect editor error. Missing, malformed
 - [x] (2026-07-27) Read issue #366, fetched the current remote branch, and confirmed the worktree is clean and already tracks `origin/366-add-compile-context-gated-c-unrecognized-symbol-diagnostics`.
 - [x] (2026-07-27) Traced the existing LSP diagnostic gate, C++ analyzer, and project-only include resolver.
 - [x] (2026-07-27) Recorded the conservative first-slice decisions and implementation milestones.
-- [ ] Implement and unit-test compilation database loading and non-emitting context states.
+- [ ] (2026-07-27; completed: JSON loading, correct shell-token parsing, context ownership, and missing/malformed/duplicate tests; remaining: project-header closure and its non-emitting states) Implement and unit-test compilation database loading and non-emitting context states.
 - [ ] Implement and unit-test the conservative C++ collector and wire it to `CppAnalyzer`.
 - [ ] Prove the editor-facing pull and push diagnostic paths, update public documentation, and run the Rust validation gates.
 
@@ -31,6 +31,9 @@ The feature must prefer silence to an incorrect editor error. Missing, malformed
 - Observation: an analyzer-backed `search_symbols` request with four broad diagnostic patterns and `include_tests: true, limit: 100` did not return in 41 seconds and was cancelled; an earlier mixed batch ran for about 90 seconds.
   Evidence: the exact request was `search_symbols(["semantic_diagnostics", "collect_.*semantic_diagnostics", "DiagnosticPublisher", "publish.*diagnostic"], include_tests=true, limit=100)`.
 
+- Observation: compilation databases may use a relative `directory` in small fixtures even though production generators commonly use absolute directories.
+  Evidence: resolving entry paths from the workspace root is required before `directory`, `file`, and relative flag paths can identify the project source consistently.
+
 ## Decision Log
 
 - Decision: make compile context diagnostics-only and do not extend `src/analyzer/cpp/imports.rs`.
@@ -43,6 +46,10 @@ The feature must prefer silence to an incorrect editor error. Missing, malformed
 
 - Decision: any uncertainty in compilation-database loading or the transitive project-header closure makes that translation unit non-emitting.
   Rationale: an editor false positive is worse than a missed diagnostic for this opt-in feature.
+  Date/Author: 2026-07-27 / Codex.
+
+- Decision: retain compile contexts behind a fresh `OnceLock` for each analyzer snapshot rather than read `compile_commands.json` during every C++ analyzer construction.
+  Rationale: almost all C++ workspaces keep the global semantic diagnostic opt-in disabled. Lazy loading avoids an unrelated database read while snapshot replacement still invalidates stale context.
   Date/Author: 2026-07-27 / Codex.
 
 ## Outcomes & Retrospective
@@ -67,15 +74,15 @@ Create `src/analyzer/cpp/compile_context.rs` and expose it from `src/analyzer/cp
 
 Load only the workspace-root `compile_commands.json`. Deserialize the standard entry fields `directory`, `file`, `arguments`, and `command`; do not implement an ad hoc JSON or shell parser. Resolve every usable source and include path relative to the command directory. Parse accepted compiler flag spellings as structured command tokens, including separate and attached forms where the compiler permits them. Treat malformed JSON, absent entries, duplicate matching entries, unreadable paths, and unsupported command shapes as no context rather than an error visible to the editor.
 
-For a matching entry, calculate the transitive closure of directly and indirectly included project headers using the entry's ordered quote/project include roots. The closure must record uncertainty instead of guessing if an include is missing, uses an external or system root, is forced, appears macro-generated, or reaches a preprocessor form that cannot be evaluated. Do not change the existing `CppAnalyzer::import_statements` or `imports.rs` behavior. Write focused context tests beside the module using `InlineTestProject` where possible; fixture source and the JSON database belong in the temporary test project.
+For a matching entry, retain the ordered quote/project roots, system roots, forced-include paths, and macro names that the collector will need. Do not change the existing `CppAnalyzer::import_statements` or `imports.rs` behavior. The collector milestone calculates the transitive project-header closure from parsed include nodes, because interpreting source text with ad hoc string scanning would be incorrect. Write focused context tests beside the module; fixture source and the JSON database belong in the temporary test project.
 
-Milestone acceptance: a test can load a small database for `src/main.cpp`, see its project include root and `-D` macro name, and can distinguish a usable context from missing, malformed, unmatched, ambiguous, and unresolved-header contexts without running a compiler.
+Milestone acceptance: a test can load a small database for `src/main.cpp`, see its project include root and `-D` macro name, and can distinguish a usable context from missing, malformed, unmatched, and ambiguous contexts without running a compiler.
 
 ### Milestone 2: collect only proven unknown type references
 
 Create `src/analyzer/cpp/diagnostics.rs`. Follow the size limit, range conversion, source label, and diagnostic value conventions of the existing language collectors such as `src/analyzer/rust/diagnostics.rs`; define a C++ source label such as `bifrost-cpp` and a stable kind `cpp_unrecognized_symbol`.
 
-Implement an iterative tree-sitter traversal. If the source has a parse error, the source exceeds the collector budget, the file has no usable matching compile context, or the project-header closure is uncertain, return an empty vector. Otherwise identify only simple `type_identifier` nodes in true reference positions. Resolve against declarations in the source, declarations in every proven project header, locally declared aliases, and template parameters. Report an identifier only after all those sources reject it.
+Implement an iterative tree-sitter traversal. Use parsed preprocessor include nodes and the compile context's ordered roots to calculate the transitive project-header closure; if an include is missing, external or system, forced, macro-generated, or reaches a preprocessing form that cannot be evaluated, mark the translation unit non-emitting. If the source has a parse error, the source exceeds the collector budget, the file has no usable matching compile context, or the project-header closure is uncertain, return an empty vector. Otherwise identify only simple `type_identifier` nodes in true reference positions. Resolve against declarations in the source, declarations in every proven project header, locally declared aliases, and template parameters. Report an identifier only after all those sources reject it.
 
 Explicitly return no diagnostic for declarations, function calls, member/field accesses, qualified names, labels, keywords, macros and preprocessor directives, any node within a conditional-preprocessing uncertainty boundary, template parameter and dependent constructs, standard-library-looking names, system or forced headers, and sites requiring receiver or overload inference. This means a known macro and a template parameter are suppressions, not declarations that happen to resolve. Add collector tests for each boundary and keep assertions behavior-focused: diagnostic kind, exact location, and absence/presence rather than implementation-specific traversal order.
 
@@ -156,3 +163,5 @@ It was cancelled after 41 seconds in this Bifrost worktree, while an earlier mix
 Use `serde_json` for JSON already present in the crate. Add a maintained shell-word tokenizer dependency only if the existing dependency graph has no correct parser for the `command` form; never hand-roll tokenization with `split`, regexes, or delimiter scanning.
 
 Plan revision (2026-07-27): created from the issue #366 diagnosis and implementation planning so later work can resume without the earlier investigation.
+
+Plan revision (2026-07-27): Milestone 1 now has a tested fail-closed loader. Header-closure proof remains explicitly unfinished and will be added with the collector, where parsed include nodes can be interpreted structurally rather than with source-text scanning.
