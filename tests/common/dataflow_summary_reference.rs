@@ -328,7 +328,7 @@ where
 
 fn transfer_outputs<P>(
     problem: &P,
-    edge: DataflowEdge<'_>,
+    edge: DataflowEdge<'_, P::Fact>,
     fact: P::Fact,
     zero: P::Fact,
 ) -> Vec<P::Fact>
@@ -353,7 +353,7 @@ where
 
 fn apply_transfer<P>(
     problem: &P,
-    edge: DataflowEdge<'_>,
+    edge: DataflowEdge<'_, P::Fact>,
     kind: IcfgEdgeKind,
     fact: P::Fact,
     out: &mut dyn DataflowOutput<P::Fact>,
@@ -375,7 +375,7 @@ fn apply_transfer<P>(
     }
 }
 
-fn descriptor(edge: &ProcedureIcfgEdge) -> DataflowEdge<'_> {
+fn descriptor<Fact>(edge: &ProcedureIcfgEdge) -> DataflowEdge<'_, Fact> {
     DataflowEdge::new(
         edge.kind,
         edge.origin.as_ref(),

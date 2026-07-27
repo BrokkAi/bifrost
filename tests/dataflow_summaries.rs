@@ -1,17 +1,18 @@
 mod common;
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
 };
 
 use brokk_bifrost::analyzer::dataflow::{
     DataflowEdge, DataflowOutput, DataflowRequest, DirectFact, DirectFlowProblem,
-    DistributiveDataflowProblem, PathQuality, SolverBudget, SolverBudgetDimension,
-    SolverTermination, SummaryBoundaryKind, SummaryDataflowError, SummaryDataflowResult,
-    SummaryReachedFact, SummarySemanticStatus, SummarySolveInput, SummaryWitness,
-    SummaryWitnessError, SummaryWitnessStepKind, WitnessReconstructionLimits,
-    WitnessRetentionLimits, solve_with_summaries,
+    DistributiveDataflowProblem, PathQuality, ReusableEndSummary, ReusableProcedureSummary,
+    ReusableReachedFact, ReusableSummaryProvider, SolverBudget, SolverBudgetDimension,
+    SolverTermination, SolverWork, SummaryBoundaryKind, SummaryDataflowError,
+    SummaryDataflowResult, SummaryReachedFact, SummarySemanticStatus, SummarySolveInput,
+    SummaryWitness, SummaryWitnessError, SummaryWitnessStepKind, WitnessReconstructionLimits,
+    WitnessRetentionLimits, solve_with_reusable_end_summaries, solve_with_summaries,
 };
 use brokk_bifrost::analyzer::semantic::{
     CallBoundary, CallSiteHandle, CallSiteId, CallTransferSet, CancellationToken,
@@ -45,6 +46,61 @@ enum MarkerFact {
 
 struct MarkerProblem;
 
+struct FixedDirectSummaryProvider {
+    callee: ProcedureHandle,
+    observation: ProgramPointHandle,
+    exit_kinds: Box<[ReturnTransferKind]>,
+    cancellation: Option<CancellationToken>,
+    calls: Cell<usize>,
+}
+
+impl ReusableSummaryProvider<DirectFact> for FixedDirectSummaryProvider {
+    fn summary_for(
+        &mut self,
+        procedure: &ProcedureHandle,
+        _entry_fact: DirectFact,
+        request: &mut DataflowRequest<'_>,
+    ) -> Result<Option<ReusableProcedureSummary<DirectFact>>, SolverTermination> {
+        if procedure != &self.callee {
+            return Ok(None);
+        }
+        self.calls.set(self.calls.get().saturating_add(1));
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.cancel();
+        }
+        if request.cancellation.is_cancelled() {
+            return Err(SolverTermination::Cancelled);
+        }
+        let rows = self.exit_kinds.len().saturating_add(1);
+        if let Some(termination) = request.reserve(SolverWork {
+            callback_rows: rows,
+            propagated_outputs: rows,
+            ..SolverWork::default()
+        }) {
+            return Err(termination);
+        }
+        Ok(Some(ReusableProcedureSummary {
+            exits: self
+                .exit_kinds
+                .iter()
+                .copied()
+                .map(|exit_kind| ReusableEndSummary {
+                    exit_kind,
+                    exit_fact: DirectFact,
+                    qualities: vec![PathQuality::PROVEN_COMPLETE].into_boxed_slice(),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            reached: vec![ReusableReachedFact {
+                point: self.observation.clone(),
+                fact: DirectFact,
+                qualities: vec![PathQuality::PROVEN_COMPLETE].into_boxed_slice(),
+            }]
+            .into_boxed_slice(),
+        }))
+    }
+}
+
 impl MarkerProblem {
     fn emit(fact: MarkerFact, marker: MarkerFact, out: &mut dyn DataflowOutput<MarkerFact>) {
         if out.emit(fact) {
@@ -62,7 +118,7 @@ impl DistributiveDataflowProblem for MarkerProblem {
 
     fn normal_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -71,7 +127,7 @@ impl DistributiveDataflowProblem for MarkerProblem {
 
     fn call_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -80,7 +136,7 @@ impl DistributiveDataflowProblem for MarkerProblem {
 
     fn return_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -98,7 +154,7 @@ impl DistributiveDataflowProblem for MarkerProblem {
 
     fn call_to_return_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -116,7 +172,7 @@ impl DistributiveDataflowProblem for MarkerProblem {
 
     fn exceptional_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -152,7 +208,7 @@ impl DistributiveDataflowProblem for CallIdentityProblem {
 
     fn normal_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -161,7 +217,7 @@ impl DistributiveDataflowProblem for CallIdentityProblem {
 
     fn call_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -181,7 +237,7 @@ impl DistributiveDataflowProblem for CallIdentityProblem {
 
     fn return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -190,7 +246,7 @@ impl DistributiveDataflowProblem for CallIdentityProblem {
 
     fn call_to_return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -199,7 +255,7 @@ impl DistributiveDataflowProblem for CallIdentityProblem {
 
     fn exceptional_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -234,7 +290,7 @@ impl DistributiveDataflowProblem for CancelOnFlowProblem {
 
     fn normal_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -243,7 +299,7 @@ impl DistributiveDataflowProblem for CancelOnFlowProblem {
 
     fn call_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -252,7 +308,7 @@ impl DistributiveDataflowProblem for CancelOnFlowProblem {
 
     fn return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -261,7 +317,7 @@ impl DistributiveDataflowProblem for CancelOnFlowProblem {
 
     fn call_to_return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -270,7 +326,7 @@ impl DistributiveDataflowProblem for CancelOnFlowProblem {
 
     fn exceptional_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -291,7 +347,7 @@ impl DistributiveDataflowProblem for CancelOnReturnProblem {
 
     fn normal_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -300,7 +356,7 @@ impl DistributiveDataflowProblem for CancelOnReturnProblem {
 
     fn call_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -309,7 +365,7 @@ impl DistributiveDataflowProblem for CancelOnReturnProblem {
 
     fn return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -319,7 +375,7 @@ impl DistributiveDataflowProblem for CancelOnReturnProblem {
 
     fn call_to_return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -328,7 +384,7 @@ impl DistributiveDataflowProblem for CancelOnReturnProblem {
 
     fn exceptional_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -361,7 +417,7 @@ impl DistributiveDataflowProblem for ReplayWaveProblem {
 
     fn normal_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -370,7 +426,7 @@ impl DistributiveDataflowProblem for ReplayWaveProblem {
 
     fn call_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -379,7 +435,7 @@ impl DistributiveDataflowProblem for ReplayWaveProblem {
 
     fn return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -393,7 +449,7 @@ impl DistributiveDataflowProblem for ReplayWaveProblem {
 
     fn call_to_return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -402,7 +458,7 @@ impl DistributiveDataflowProblem for ReplayWaveProblem {
 
     fn exceptional_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -445,7 +501,7 @@ impl DistributiveDataflowProblem for PermutedProblem {
 
     fn normal_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -454,7 +510,7 @@ impl DistributiveDataflowProblem for PermutedProblem {
 
     fn call_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -463,7 +519,7 @@ impl DistributiveDataflowProblem for PermutedProblem {
 
     fn return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -472,7 +528,7 @@ impl DistributiveDataflowProblem for PermutedProblem {
 
     fn call_to_return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -481,7 +537,7 @@ impl DistributiveDataflowProblem for PermutedProblem {
 
     fn exceptional_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -1931,6 +1987,220 @@ fn shared_callee_reuses_entries_without_crossing_return_sites() {
     let snapshot = complete_snapshot(&root, &provider);
     assert_witness_matches_snapshot(&first_witness, &snapshot);
     assert_witness_matches_snapshot(&second_witness, &snapshot);
+}
+
+#[test]
+fn reusable_callee_rows_restore_query_state_and_observe_cancellation() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/Reusable.java",
+            r#"
+                class Reusable {
+                    static int leaf() { return 1; }
+                    static int root() { return leaf(); }
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let root = resolve_procedure_handle(
+        &project,
+        &analyzer,
+        "src/Reusable.java",
+        PointSelector::new("static int root")
+            .procedure("root")
+            .effect("entry"),
+    );
+    let leaf = resolve_procedure_handle(
+        &project,
+        &analyzer,
+        "src/Reusable.java",
+        PointSelector::new("static int leaf")
+            .procedure("leaf")
+            .effect("entry"),
+    );
+    let observation = leaf
+        .point_handle(leaf.semantics().normal_exit_point())
+        .expect("leaf normal exit");
+    let cancellation = CancellationToken::default();
+    let mut reusable = FixedDirectSummaryProvider {
+        callee: leaf.clone(),
+        observation: observation.clone(),
+        exit_kinds: vec![ReturnTransferKind::Normal].into_boxed_slice(),
+        cancellation: None,
+        calls: Cell::new(0),
+    };
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let result = solve_with_reusable_end_summaries(
+        SummarySolveInput::new(&root, &[]),
+        &analyzer.icfg_provider(),
+        &direct_problem(),
+        &mut reusable,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .expect("valid reusable direct-flow solve");
+
+    assert_eq!(result.termination(), SolverTermination::FixedPoint);
+    assert!(reusable.calls.get() > 0);
+    assert!(result.metrics().reusable_summary_hits > 0);
+    assert!(result.metrics().reusable_observations > 0);
+    assert!(result.reached_at(&observation).next().is_some());
+
+    let mut strict_witnesses = FixedDirectSummaryProvider {
+        callee: leaf.clone(),
+        observation: observation.clone(),
+        exit_kinds: vec![ReturnTransferKind::Normal].into_boxed_slice(),
+        cancellation: None,
+        calls: Cell::new(0),
+    };
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let strict_result = solve_with_reusable_end_summaries(
+        SummarySolveInput::new(&root, &[])
+            .with_witness_retention(WitnessRetentionLimits::new(2).unwrap()),
+        &analyzer.icfg_provider(),
+        &direct_problem(),
+        &mut strict_witnesses,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .expect("strict witnesses safely fall back to source-backed tabulation");
+    assert_eq!(strict_witnesses.calls.get(), 0);
+    assert_eq!(strict_result.metrics().reusable_summary_hits, 0);
+    assert!(!strict_result.witness_retention_truncated());
+    assert_all_retained_witnesses_reconstruct(&strict_result);
+
+    let mut limits = SolverBudget::default().limits();
+    limits.callback_rows = result.work().callback_rows.saturating_sub(1);
+    let mut bounded = FixedDirectSummaryProvider {
+        callee: leaf.clone(),
+        observation: observation.clone(),
+        exit_kinds: vec![ReturnTransferKind::Normal].into_boxed_slice(),
+        cancellation: None,
+        calls: Cell::new(0),
+    };
+    let mut solver_budget = SolverBudget::new(limits);
+    let mut semantic_budget = SemanticBudget::default();
+    let bounded_result = solve_with_reusable_end_summaries(
+        SummarySolveInput::new(&root, &[]),
+        &analyzer.icfg_provider(),
+        &direct_problem(),
+        &mut bounded,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .expect("budget exhaustion produces a typed partial result");
+    assert!(bounded.calls.get() > 0);
+    assert!(bounded_result.termination().budget_exceeded().is_some());
+    assert!(!bounded_result.is_complete());
+
+    let cancellation = CancellationToken::default();
+    let mut cancelling = FixedDirectSummaryProvider {
+        callee: leaf,
+        observation,
+        exit_kinds: vec![ReturnTransferKind::Normal].into_boxed_slice(),
+        cancellation: Some(cancellation.clone()),
+        calls: Cell::new(0),
+    };
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let cancelled = solve_with_reusable_end_summaries(
+        SummarySolveInput::new(&root, &[]),
+        &analyzer.icfg_provider(),
+        &direct_problem(),
+        &mut cancelling,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .expect("cancellation produces a typed partial result");
+
+    assert!(cancelling.calls.get() > 0);
+    assert_eq!(cancelled.termination(), SolverTermination::Cancelled);
+    assert_eq!(cancelled.metrics().reusable_summary_hits, 0);
+    assert_eq!(cancelled.metrics().reusable_observations, 0);
+}
+
+#[test]
+fn reusable_callee_rows_preserve_normal_and_exceptional_returns() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/ReusableReturns.java",
+            r#"
+                class ReusableReturns {
+                    static int leaf(boolean fail) {
+                        if (fail) throw new IllegalStateException();
+                        return 1;
+                    }
+
+                    static int root(boolean fail) {
+                        try {
+                            return leaf(fail);
+                        } catch (IllegalStateException ignored) {
+                            return -1;
+                        }
+                    }
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let root = resolve_procedure_handle(
+        &project,
+        &analyzer,
+        "src/ReusableReturns.java",
+        PointSelector::new("static int root")
+            .procedure("root")
+            .effect("entry"),
+    );
+    let leaf = resolve_procedure_handle(
+        &project,
+        &analyzer,
+        "src/ReusableReturns.java",
+        PointSelector::new("static int leaf")
+            .procedure("leaf")
+            .effect("entry"),
+    );
+    let observation = leaf
+        .point_handle(leaf.semantics().entry_point())
+        .expect("leaf entry");
+    let mut reusable = FixedDirectSummaryProvider {
+        callee: leaf,
+        observation,
+        exit_kinds: vec![ReturnTransferKind::Normal, ReturnTransferKind::Exceptional]
+            .into_boxed_slice(),
+        cancellation: None,
+        calls: Cell::new(0),
+    };
+    let cancellation = CancellationToken::default();
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let result = solve_with_reusable_end_summaries(
+        SummarySolveInput::new(&root, &[]),
+        &analyzer.icfg_provider(),
+        &direct_problem(),
+        &mut reusable,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .expect("dual-exit reusable solve");
+
+    assert_eq!(result.termination(), SolverTermination::FixedPoint);
+    assert!(result.metrics().reusable_summary_hits > 0);
+    let call = root
+        .semantics()
+        .call_sites()
+        .first()
+        .expect("root calls leaf");
+    let normal = root
+        .point_handle(call.normal_continuation.target().unwrap())
+        .unwrap();
+    let exceptional = root
+        .point_handle(call.exceptional_continuation.target().unwrap())
+        .unwrap();
+    assert!(result.reached_at(&normal).next().is_some());
+    assert!(result.reached_at(&exceptional).next().is_some());
 }
 
 #[test]

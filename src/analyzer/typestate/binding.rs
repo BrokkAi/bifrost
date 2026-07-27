@@ -8,7 +8,7 @@ use serde::Serialize;
 use crate::analyzer::dense_id::define_dense_id;
 use crate::analyzer::identifier::define_identifier;
 use crate::analyzer::semantic::{
-    AbstractObject, AccessPathRoot, CandidateCoverage, DeclarationSegmentKind,
+    AbstractObject, AccessPathRoot, CandidateCoverage, DeclarationLocator, DeclarationSegmentKind,
     EvidenceCompleteness, ObjectCardinality, OracleCallContext, ProcedureHandle, ProcedurePortKind,
     ProgramPointHandle, ProofStatus, SemanticArtifact, SemanticArtifactKey, SemanticLocator,
     SourceAnchor,
@@ -18,7 +18,8 @@ use super::{
     CompiledProtocol, ProtocolEventId, ProtocolEventKey, ProtocolEventOccurrence,
     ProtocolExpectationId, ProtocolExpectationKey, ProtocolObjectCardinality,
     ProtocolObservationPhase, ProtocolProcedureExitKind, ProtocolStateId, ProtocolStateKey,
-    ProtocolTerminalObservationSpec, TypestateBindingPlanHash, TypestateProtocolHash,
+    ProtocolTerminalObservationSpec, TypestateBindingPlanHash, TypestateBindingSummaryHash,
+    TypestateProtocolHash,
 };
 
 pub const BINDING_PLAN_SCHEMA_VERSION: u32 = 1;
@@ -702,6 +703,9 @@ pub struct TypestateBindingPlan {
     canonical_bytes: Box<[u8]>,
     canonical_rendering: Box<str>,
     hash: TypestateBindingPlanHash,
+    summary_hashes:
+        HashMap<SemanticArtifactKey, HashMap<DeclarationLocator, TypestateBindingSummaryHash>>,
+    empty_summary_hash: TypestateBindingSummaryHash,
 }
 
 impl TypestateBindingPlan {
@@ -895,6 +899,14 @@ impl TypestateBindingPlan {
         let canonical_rendering = serde_json::to_string_pretty(&canonical)
             .map_err(TypestateBindingPlanError::Canonicalization)?;
         let hash = TypestateBindingPlanHash::from_canonical_bytes(&canonical_bytes);
+        let (summary_hashes, empty_summary_hash) = procedure_summary_hashes(
+            protocol,
+            &subjects,
+            &initial_seeds,
+            &event_bindings,
+            &terminal_bindings,
+        )
+        .map_err(TypestateBindingPlanError::Canonicalization)?;
 
         let mut subject_by_object =
             HashMap::<_, HashMap<AbstractObject, TypestateSubjectId>>::new();
@@ -933,6 +945,8 @@ impl TypestateBindingPlan {
             canonical_bytes: canonical_bytes.into_boxed_slice(),
             canonical_rendering: canonical_rendering.into_boxed_str(),
             hash,
+            summary_hashes,
+            empty_summary_hash,
         })
     }
 
@@ -1135,6 +1149,18 @@ impl TypestateBindingPlan {
 
     pub const fn hash(&self) -> TypestateBindingPlanHash {
         self.hash
+    }
+
+    pub fn summary_hash_for(
+        &self,
+        artifact: &SemanticArtifactKey,
+        declaration: &DeclarationLocator,
+    ) -> TypestateBindingSummaryHash {
+        self.summary_hashes
+            .get(artifact)
+            .and_then(|declarations| declarations.get(declaration))
+            .copied()
+            .unwrap_or(self.empty_summary_hash)
     }
 }
 
@@ -1445,7 +1471,7 @@ fn value_locator(value: &crate::analyzer::semantic::ValueHandle) -> SemanticLoca
     source_locator(value.procedure(), row.source)
 }
 
-fn program_point_locator(point: &ProgramPointHandle) -> SemanticLocator {
+pub(super) fn program_point_locator(point: &ProgramPointHandle) -> SemanticLocator {
     let row = point
         .procedure()
         .semantics()
@@ -1816,6 +1842,159 @@ where
         .get(site)
         .into_iter()
         .flat_map(|indexes| indexes.iter().copied())
+}
+
+#[derive(Default)]
+struct ProcedureBindingIndexes {
+    seeds: Vec<usize>,
+    events: Vec<usize>,
+    terminals: Vec<usize>,
+}
+
+type ProcedureBindingSummaryHashes =
+    HashMap<SemanticArtifactKey, HashMap<DeclarationLocator, TypestateBindingSummaryHash>>;
+type ProcedureBindingSummaryHashResult =
+    Result<(ProcedureBindingSummaryHashes, TypestateBindingSummaryHash), serde_json::Error>;
+
+fn procedure_summary_hashes(
+    protocol: &CompiledProtocol,
+    subjects: &[BoundTypestateSubjectSpec],
+    initial_seeds: &[TypestateInitialSeedSpec],
+    event_bindings: &[TypestateEventBindingSpec],
+    terminal_bindings: &[TypestateTerminalBindingSpec],
+) -> ProcedureBindingSummaryHashResult {
+    type ProcedureKey = (SemanticArtifactKey, DeclarationLocator);
+    let mut indexes = HashMap::<ProcedureKey, ProcedureBindingIndexes>::new();
+    for (index, seed) in initial_seeds.iter().enumerate() {
+        indexes
+            .entry(summary_binding_procedure_key(&seed.site))
+            .or_default()
+            .seeds
+            .push(index);
+    }
+    for (index, event) in event_bindings.iter().enumerate() {
+        indexes
+            .entry(summary_binding_procedure_key(&event.site))
+            .or_default()
+            .events
+            .push(index);
+    }
+    for (index, terminal) in terminal_bindings.iter().enumerate() {
+        indexes
+            .entry(summary_binding_procedure_key(&terminal.site))
+            .or_default()
+            .terminals
+            .push(index);
+    }
+
+    let empty = CanonicalBindingPlan {
+        schema_version: BINDING_PLAN_SCHEMA_VERSION,
+        protocol_hash: protocol.hash(),
+        subjects: Vec::new(),
+        initial_seeds: Vec::new(),
+        event_bindings: Vec::new(),
+        terminal_bindings: Vec::new(),
+    };
+    let empty_summary_hash =
+        TypestateBindingSummaryHash::from_canonical_bytes(&serde_json::to_vec(&empty)?);
+    let mut summary_hashes = ProcedureBindingSummaryHashes::new();
+    for ((artifact, declaration), indexes) in indexes {
+        let mut subject_keys = indexes
+            .seeds
+            .iter()
+            .map(|index| &initial_seeds[*index].subject)
+            .chain(
+                indexes
+                    .events
+                    .iter()
+                    .map(|index| &event_bindings[*index].subject),
+            )
+            .chain(
+                indexes
+                    .terminals
+                    .iter()
+                    .map(|index| &terminal_bindings[*index].subject),
+            )
+            .collect::<Vec<_>>();
+        subject_keys.sort_unstable();
+        subject_keys.dedup();
+        let canonical = CanonicalBindingPlan {
+            schema_version: BINDING_PLAN_SCHEMA_VERSION,
+            protocol_hash: protocol.hash(),
+            subjects: subject_keys
+                .into_iter()
+                .map(|key| {
+                    let index = subjects
+                        .binary_search_by(|subject| subject.key.cmp(key))
+                        .expect("validated binding rows reference a declared subject");
+                    canonical_subject(&subjects[index])
+                })
+                .collect(),
+            initial_seeds: indexes
+                .seeds
+                .iter()
+                .map(|index| {
+                    let seed = &initial_seeds[*index];
+                    CanonicalSeed {
+                        subject: canonical_subject_key(&seed.subject),
+                        state: seed.state.as_str(),
+                        site: canonical_site(&seed.site),
+                        role: seed.role,
+                        quality: canonical_quality(&seed.quality),
+                    }
+                })
+                .collect(),
+            event_bindings: indexes
+                .events
+                .iter()
+                .map(|index| {
+                    let binding = &event_bindings[*index];
+                    CanonicalEventBinding {
+                        event: binding.event.as_str(),
+                        subject: canonical_subject_key(&binding.subject),
+                        site: canonical_site(&binding.site),
+                        order: binding.order,
+                        role: binding.role,
+                        quality: canonical_quality(&binding.quality),
+                    }
+                })
+                .collect(),
+            terminal_bindings: indexes
+                .terminals
+                .iter()
+                .map(|index| {
+                    let binding = &terminal_bindings[*index];
+                    CanonicalTerminalBinding {
+                        expectation: binding.expectation.as_str(),
+                        subject: canonical_subject_key(&binding.subject),
+                        site: canonical_site(&binding.site),
+                        role: binding.role,
+                        quality: canonical_quality(&binding.quality),
+                    }
+                })
+                .collect(),
+        };
+        let hash =
+            TypestateBindingSummaryHash::from_canonical_bytes(&serde_json::to_vec(&canonical)?);
+        summary_hashes
+            .entry(artifact)
+            .or_default()
+            .insert(declaration, hash);
+    }
+    Ok((summary_hashes, empty_summary_hash))
+}
+
+fn summary_binding_procedure_key(
+    site: &TypestateObservationSite,
+) -> (SemanticArtifactKey, DeclarationLocator) {
+    let procedure = match site {
+        TypestateObservationSite::ProgramPoint { point, .. } => point.procedure(),
+        TypestateObservationSite::CallSite { call, .. } => call.procedure(),
+    };
+    (
+        procedure.artifact().key().clone(),
+        procedure.semantics().locator().declaration().clone(),
+    )
 }
 
 #[derive(Serialize)]

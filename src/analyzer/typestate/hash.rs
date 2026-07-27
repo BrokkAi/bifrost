@@ -6,6 +6,7 @@ use crate::analyzer::canonical_hash::{hash_domain_bytes, write_lower_hex};
 
 const TYPESTATE_PROTOCOL_DOMAIN: &[u8] = b"bifrost-typestate-protocol/v1";
 const TYPESTATE_BINDING_PLAN_DOMAIN: &[u8] = b"bifrost-typestate-binding-plan/v1";
+const TYPESTATE_BINDING_SUMMARY_DOMAIN: &[u8] = b"bifrost-typestate-binding-summary/v1";
 
 macro_rules! define_typestate_hash {
     ($(#[$attribute:meta])* $name:ident, $domain:ident) => {
@@ -64,4 +65,14 @@ define_typestate_hash!(
     /// but excludes policy presentation and run-local dense IDs.
     TypestateBindingPlanHash,
     TYPESTATE_BINDING_PLAN_DOMAIN
+);
+
+define_typestate_hash!(
+    /// Procedure-scoped propagation identity for reusable protocol summaries.
+    ///
+    /// This excludes bindings owned exclusively by unrelated procedures while
+    /// retaining every local seed, event, terminal, subject, and quality that
+    /// can change the summarized procedure's transfer or observations.
+    TypestateBindingSummaryHash,
+    TYPESTATE_BINDING_SUMMARY_DOMAIN
 );

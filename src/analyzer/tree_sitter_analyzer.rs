@@ -866,6 +866,13 @@ struct QueryReadCache {
     file_states: HashMap<FileStateCacheKey, Arc<FileState>>,
     prepared_syntax:
         HashMap<PreparedSyntaxCacheKey, Arc<OnceLock<Option<Arc<PreparedSyntaxTree>>>>>,
+    /// Persisted top-level class declarations bucketed by package, hydrated at
+    /// most once per request. `class_declarations_in_package` answers a
+    /// *package-scoped* question with a *whole-workspace* declaration scan, so
+    /// asking it once per (file, using-directive) pair — which is exactly what
+    /// C# import-graph candidate discovery does — re-hydrates every declaration
+    /// in the workspace thousands of times per query (#1194).
+    top_level_class_units_by_package: Option<Arc<HashMap<String, Vec<CodeUnit>>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -888,6 +895,7 @@ impl QueryReadCache {
             self.prepared_sources.clear();
             self.file_states.clear();
             self.prepared_syntax.clear();
+            self.top_level_class_units_by_package = None;
         }
         if !self
             .contexts
@@ -906,6 +914,7 @@ impl QueryReadCache {
             self.prepared_sources.clear();
             self.file_states.clear();
             self.prepared_syntax.clear();
+            self.top_level_class_units_by_package = None;
         }
     }
 
@@ -950,6 +959,21 @@ impl QueryReadCache {
             || self.prepared_sources.len() < QUERY_PREPARED_SYNTAX_CACHE_CAPACITY
         {
             self.prepared_sources.insert(file, source);
+        }
+    }
+
+    fn top_level_class_units_by_package(&self) -> Option<Arc<HashMap<String, Vec<CodeUnit>>>> {
+        self.is_active()
+            .then(|| self.top_level_class_units_by_package.clone())
+            .flatten()
+    }
+
+    fn retain_top_level_class_units_by_package(
+        &mut self,
+        index: &Arc<HashMap<String, Vec<CodeUnit>>>,
+    ) {
+        if self.is_active() {
+            self.top_level_class_units_by_package = Some(Arc::clone(index));
         }
     }
 
@@ -1515,6 +1539,9 @@ pub struct TreeSitterAnalyzer<A> {
     definition_candidates_query_count: Arc<AtomicUsize>,
     enclosing_code_unit_query_count: Arc<AtomicUsize>,
     full_declaration_scan_count: Arc<AtomicUsize>,
+    /// Whole-workspace declaration scans issued to answer a *package-scoped*
+    /// class lookup (`class_declarations_in_package`). Pinned by #1194.
+    package_declaration_scan_count: Arc<AtomicUsize>,
     global_usage_definition_index_build_count: Arc<AtomicUsize>,
     workspace_path_scan_count: Arc<AtomicUsize>,
     _state: PhantomData<A>,
@@ -1553,6 +1580,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             definition_candidates_query_count: Arc::clone(&self.definition_candidates_query_count),
             enclosing_code_unit_query_count: Arc::clone(&self.enclosing_code_unit_query_count),
             full_declaration_scan_count: Arc::clone(&self.full_declaration_scan_count),
+            package_declaration_scan_count: Arc::clone(&self.package_declaration_scan_count),
             global_usage_definition_index_build_count: Arc::clone(
                 &self.global_usage_definition_index_build_count,
             ),
@@ -1735,6 +1763,7 @@ where
             definition_candidates_query_count: Arc::new(AtomicUsize::new(0)),
             enclosing_code_unit_query_count: Arc::new(AtomicUsize::new(0)),
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
+            package_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
             global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
             workspace_path_scan_count: Arc::new(AtomicUsize::new(0)),
             _state: PhantomData,
@@ -1920,6 +1949,7 @@ where
             definition_candidates_query_count: Arc::new(AtomicUsize::new(0)),
             enclosing_code_unit_query_count: Arc::new(AtomicUsize::new(0)),
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
+            package_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
             global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
             workspace_path_scan_count: Arc::new(AtomicUsize::new(0)),
             _state: PhantomData,
@@ -4443,6 +4473,17 @@ where
     }
 
     #[doc(hidden)]
+    pub fn reset_package_declaration_scan_count_for_test(&self) {
+        self.package_declaration_scan_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn package_declaration_scan_count_for_test(&self) -> usize {
+        self.package_declaration_scan_count.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
     pub fn reset_full_declaration_scan_count_for_test(&self) {
         self.full_declaration_scan_count.store(0, Ordering::Relaxed);
     }
@@ -6001,24 +6042,7 @@ where
     }
 
     pub(crate) fn class_declarations_in_package(&self, package_name: &str) -> Vec<CodeUnit> {
-        let rows = self
-            .store_query_or_record(
-                self.store_context
-                    .store
-                    .declaration_candidate_rows_for_langs(
-                        &self.storage_language_keys_for_queries(),
-                        self.store_context.generations.as_ref(),
-                    ),
-                format!("querying class declarations in package `{package_name}`"),
-            )
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|row| row.kind == CodeUnitType::Class && row.flags.is_top_level);
-        let mut matches: Vec<_> = self
-            .resolve_candidate_rows(rows.collect())
-            .into_iter()
-            .filter(|unit| unit.package_name() == package_name)
-            .collect();
+        let mut matches = self.persisted_top_level_classes_in_package(package_name);
         matches.extend(self.dirty_units_matching(false, |unit| {
             unit.is_class() && unit.package_name() == package_name
         }));
@@ -6032,6 +6056,80 @@ where
         matches.sort_by_cached_key(|code_unit| self.definition_sort_key_for_unit(code_unit));
         matches.dedup();
         matches
+    }
+
+    /// The persisted top-level class declarations whose hydrated package is
+    /// exactly `package_name`.
+    ///
+    /// The store has no package-scoped predicate that agrees with the hydrated
+    /// package identity (rows carry a persisted content qualifier; adapters may
+    /// derive the live package from the path), so answering this needs the
+    /// whole-workspace declaration scan followed by a hydrated filter. That is
+    /// affordable once — not once per caller. C# import-graph candidate
+    /// discovery asks it for every `using` directive of every workspace file,
+    /// which turned one `scan_usages_by_reference` probe on StockSharp into
+    /// tens of thousands of whole-workspace hydrations (#1194).
+    ///
+    /// So the scan is hoisted: one pass buckets *every* top-level class by its
+    /// hydrated package, and the bucket map is retained for the active request
+    /// through the same read cache that already holds hydrated file states. The
+    /// rows, the hydration, and the package equality test are unchanged, so the
+    /// returned set is identical either way; only the number of scans differs.
+    /// Without an active query scope there is nothing to retain the map against,
+    /// so the single-package path runs exactly as before.
+    fn persisted_top_level_classes_in_package(&self, package_name: &str) -> Vec<CodeUnit> {
+        if let Some(index) = self
+            .query_read_cache_lock()
+            .top_level_class_units_by_package()
+        {
+            return index.get(package_name).cloned().unwrap_or_default();
+        }
+
+        let units = self.hydrated_persisted_top_level_classes(package_name);
+        if !self.query_read_cache_lock().is_active() {
+            return units
+                .into_iter()
+                .filter(|unit| unit.package_name() == package_name)
+                .collect();
+        }
+
+        let mut index: HashMap<String, Vec<CodeUnit>> = HashMap::default();
+        for unit in units {
+            index
+                .entry(unit.package_name().to_string())
+                .or_default()
+                .push(unit);
+        }
+        let index = Arc::new(index);
+        self.query_read_cache_lock()
+            .retain_top_level_class_units_by_package(&index);
+        index.get(package_name).cloned().unwrap_or_default()
+    }
+
+    fn hydrated_persisted_top_level_classes(&self, package_name: &str) -> Vec<CodeUnit> {
+        self.package_declaration_scan_count
+            .fetch_add(1, Ordering::Relaxed);
+        let rows = self
+            .store_query_or_record(
+                self.store_context
+                    .store
+                    .declaration_candidate_rows_for_langs(
+                        &self.storage_language_keys_for_queries(),
+                        self.store_context.generations.as_ref(),
+                    ),
+                format!("querying class declarations in package `{package_name}`"),
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|row| row.kind == CodeUnitType::Class && row.flags.is_top_level)
+            .collect();
+        self.resolve_candidate_rows(rows)
+    }
+
+    fn query_read_cache_lock(&self) -> std::sync::MutexGuard<'_, QueryReadCache> {
+        self.query_read_cache
+            .lock()
+            .expect("query read cache mutex poisoned")
     }
 
     pub(crate) fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
@@ -6698,6 +6796,14 @@ where
 
     fn full_declaration_scan_count_for_test(&self) -> usize {
         TreeSitterAnalyzer::full_declaration_scan_count_for_test(self)
+    }
+
+    fn reset_package_declaration_scan_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_package_declaration_scan_count_for_test(self);
+    }
+
+    fn package_declaration_scan_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::package_declaration_scan_count_for_test(self)
     }
 
     fn reset_candidate_hydration_count_for_test(&self) {

@@ -2,8 +2,9 @@ use std::{error::Error, fmt, sync::Arc};
 
 use crate::analyzer::dataflow::{
     DataflowEdge, DataflowOutput, DataflowRequest, IdeDataflowError, IdeDataflowProblem,
-    IdeSummaryDataflowResult, IdeSummarySolveInput, IdeTransition, SummaryWitnessStep,
-    SummaryWitnessStepKind, WitnessRetentionLimits, solve_ide_with_summaries,
+    IdeSummaryDataflowResult, IdeSummarySolveInput, IdeTransition, ReusableIdeSummaryProvider,
+    SolverTermination, SolverWork, SummaryWitnessStep, SummaryWitnessStepKind,
+    WitnessRetentionLimits, solve_ide_with_reusable_summaries, solve_ide_with_summaries,
 };
 use crate::analyzer::semantic::{
     EvidenceCompleteness, IcfgEdgeKind, IcfgProvider, ProcedureHandle, ProofStatus, SemanticBudget,
@@ -89,6 +90,44 @@ impl TaintEdgeFunction {
 
     pub const fn universe(&self) -> super::TaintUniverseHash {
         self.generated.universe()
+    }
+
+    pub(crate) const fn generated(&self) -> &TaintClassSet {
+        &self.generated
+    }
+
+    pub(crate) const fn default_identity(&self) -> bool {
+        self.default_identity
+    }
+
+    pub(crate) fn overrides(&self) -> &[(TaintClassId, TaintClassSet)] {
+        &self.overrides
+    }
+
+    pub(crate) fn from_canonical_parts(
+        universe: &TaintUniverse,
+        generated: TaintClassSet,
+        default_identity: bool,
+        overrides: Vec<(TaintClassId, TaintClassSet)>,
+    ) -> Result<Self, TaintSolveError> {
+        universe
+            .validate_set(&generated)
+            .map_err(|_| TaintSolveError::UniverseMismatch)?;
+        let mut previous = None;
+        for (source, targets) in &overrides {
+            universe
+                .validate_set(targets)
+                .map_err(|_| TaintSolveError::UniverseMismatch)?;
+            if previous.is_some_and(|previous| previous >= *source) {
+                return Err(TaintSolveError::DuplicateTransformSource);
+            }
+            previous = Some(*source);
+        }
+        Ok(Self {
+            generated,
+            default_identity,
+            overrides: overrides.into_boxed_slice(),
+        })
     }
 
     pub fn apply(&self, value: &TaintClassSet) -> TaintClassSet {
@@ -264,7 +303,36 @@ enum TaintFactKind {
     Meeting {
         sink: ValueFlowSinkId,
         uncertain: bool,
+        entry: Option<TaintMeetingEntryFact>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum TaintMeetingEntryFact {
+    Zero,
+    Carrier {
+        carrier: ValueFlowCarrierId,
+        uncertain: bool,
+    },
+}
+
+impl TaintMeetingEntryFact {
+    fn from_fact(fact: TaintFact) -> Option<Self> {
+        match fact.0 {
+            TaintFactKind::Zero => Some(Self::Zero),
+            TaintFactKind::Carrier { carrier, uncertain } => {
+                Some(Self::Carrier { carrier, uncertain })
+            }
+            TaintFactKind::Meeting { .. } => None,
+        }
+    }
+
+    const fn fact(self) -> TaintFact {
+        match self {
+            Self::Zero => TaintFact::zero(),
+            Self::Carrier { carrier, uncertain } => TaintFact::for_carrier(carrier, uncertain),
+        }
+    }
 }
 
 /// Source-set-neutral fact topology; concrete classes live only in IDE values.
@@ -299,6 +367,43 @@ impl TaintFact {
 
     pub(crate) const fn is_zero(self) -> bool {
         matches!(self.0, TaintFactKind::Zero)
+    }
+
+    pub(crate) const fn zero() -> Self {
+        Self::ZERO
+    }
+
+    pub(crate) const fn for_carrier(carrier: ValueFlowCarrierId, uncertain: bool) -> Self {
+        Self(TaintFactKind::Carrier { carrier, uncertain })
+    }
+
+    pub(crate) const fn for_sink(sink: ValueFlowSinkId, uncertain: bool) -> Self {
+        Self(TaintFactKind::Meeting {
+            sink,
+            uncertain,
+            entry: None,
+        })
+    }
+
+    pub(crate) fn for_sink_with_entry(
+        sink: ValueFlowSinkId,
+        uncertain: bool,
+        entry: TaintFact,
+    ) -> Option<Self> {
+        Some(Self(TaintFactKind::Meeting {
+            sink,
+            uncertain,
+            entry: Some(TaintMeetingEntryFact::from_fact(entry)?),
+        }))
+    }
+
+    pub(crate) const fn meeting_entry_fact(self) -> Option<TaintFact> {
+        match self.0 {
+            TaintFactKind::Meeting {
+                entry: Some(entry), ..
+            } => Some(entry.fact()),
+            _ => None,
+        }
     }
 }
 
@@ -428,6 +533,7 @@ impl<'plan> TaintFlowProblem<'plan> {
         point: &crate::analyzer::semantic::ProgramPointHandle,
         phase: ValueFlowObservationPhase,
         active: &[ActiveTaint],
+        entry: Option<TaintFact>,
         output: &mut Vec<(TaintFact, TaintEdgeFunction)>,
     ) {
         for (sink, carrier) in self.plan.value_flow().sink_bindings_at(point, phase) {
@@ -440,15 +546,13 @@ impl<'plan> TaintFlowProblem<'plan> {
                     .value_flow()
                     .sink(sink)
                     .expect("bound sink remains live");
-                output.push((
-                    TaintFact(TaintFactKind::Meeting {
-                        sink,
-                        uncertain: flow.uncertain
-                            || !matches!(spec.proof(), ProofStatus::Proven)
-                            || !matches!(spec.completeness(), EvidenceCompleteness::Complete),
-                    }),
-                    flow.function.clone(),
-                ));
+                let uncertain = flow.uncertain
+                    || !matches!(spec.proof(), ProofStatus::Proven)
+                    || !matches!(spec.completeness(), EvidenceCompleteness::Complete);
+                let meeting = entry
+                    .and_then(|entry| TaintFact::for_sink_with_entry(sink, uncertain, entry))
+                    .unwrap_or_else(|| TaintFact::for_sink(sink, uncertain));
+                output.push((meeting, flow.function.clone()));
             }
         }
     }
@@ -457,6 +561,7 @@ impl<'plan> TaintFlowProblem<'plan> {
         &self,
         point: &crate::analyzer::semantic::ProgramPointHandle,
         fact: TaintFact,
+        entry: Option<TaintFact>,
         output: &mut Vec<(TaintFact, TaintEdgeFunction)>,
     ) -> Vec<ActiveTaint> {
         let mut active = self.initial_active(point, fact);
@@ -465,6 +570,7 @@ impl<'plan> TaintFlowProblem<'plan> {
             point,
             ValueFlowObservationPhase::BeforeEffects,
             &active,
+            entry,
             output,
         );
         self.apply_local_rules(point, &mut active);
@@ -474,11 +580,155 @@ impl<'plan> TaintFlowProblem<'plan> {
             point,
             ValueFlowObservationPhase::AfterEffects,
             &active,
+            entry,
             output,
         );
         active.sort_unstable();
         active.dedup();
         active
+    }
+
+    pub(crate) fn observer_candidates(
+        &self,
+        point: &crate::analyzer::semantic::ProgramPointHandle,
+        fact: TaintFact,
+        phase: ValueFlowObservationPhase,
+        max_candidates: usize,
+        request: &mut DataflowRequest<'_>,
+    ) -> Result<Option<Vec<(TaintFact, TaintEdgeFunction)>>, SolverTermination> {
+        if request.cancellation.is_cancelled() {
+            return Err(SolverTermination::Cancelled);
+        }
+        let mut active = match fact.0 {
+            TaintFactKind::Zero => {
+                let mut active = Vec::new();
+                for (source, carrier) in self
+                    .plan
+                    .value_flow()
+                    .source_bindings_at(point, ValueFlowObservationPhase::BeforeEffects)
+                {
+                    if request.cancellation.is_cancelled() {
+                        return Err(SolverTermination::Cancelled);
+                    }
+                    if let Some(termination) = request.reserve(SolverWork {
+                        callback_rows: 1,
+                        ..SolverWork::default()
+                    }) {
+                        return Err(termination);
+                    }
+                    let Some(binding) = self.plan.source(source) else {
+                        continue;
+                    };
+                    let Some(spec) = self.plan.value_flow().source(source) else {
+                        continue;
+                    };
+                    if active.len() == max_candidates {
+                        return Ok(None);
+                    }
+                    active.push(ActiveTaint {
+                        carrier,
+                        uncertain: !matches!(spec.proof(), ProofStatus::Proven)
+                            || !matches!(spec.completeness(), EvidenceCompleteness::Complete),
+                        function: TaintEdgeFunction::generate(binding.classes()),
+                    });
+                }
+                active
+            }
+            TaintFactKind::Carrier { carrier, uncertain } => vec![ActiveTaint {
+                carrier,
+                uncertain,
+                function: self.plan.identity().clone(),
+            }],
+            TaintFactKind::Meeting { .. } => Vec::new(),
+        };
+        if let Some(termination) = request.reserve(SolverWork {
+            edge_function_operations: active.len(),
+            ..SolverWork::default()
+        }) {
+            return Err(termination);
+        }
+        self.apply_phase(point, ValueFlowObservationPhase::BeforeEffects, &mut active);
+        if phase == ValueFlowObservationPhase::AfterEffects {
+            for (source, target, complete) in self.plan.value_flow().local_rule_views(point) {
+                if request.cancellation.is_cancelled() {
+                    return Err(SolverTermination::Cancelled);
+                }
+                if let Some(termination) = request.reserve(SolverWork {
+                    ide_propagations: active.len(),
+                    ..SolverWork::default()
+                }) {
+                    return Err(termination);
+                }
+                let remaining = max_candidates.saturating_sub(active.len());
+                let generated = active
+                    .iter()
+                    .filter(|flow| flow.carrier == source)
+                    .take(remaining.saturating_add(1))
+                    .cloned()
+                    .map(|flow| ActiveTaint {
+                        carrier: target,
+                        ..flow.through_semantics(complete)
+                    })
+                    .collect::<Vec<_>>();
+                if generated.len() > remaining {
+                    return Ok(None);
+                }
+                active.extend(generated);
+            }
+            if matches!(fact.0, TaintFactKind::Zero) {
+                let remaining = max_candidates.saturating_sub(active.len());
+                let generated = self
+                    .plan
+                    .value_flow()
+                    .source_bindings_at(point, ValueFlowObservationPhase::AfterEffects)
+                    .filter_map(|(source, carrier)| {
+                        let binding = self.plan.source(source)?;
+                        let spec = self.plan.value_flow().source(source)?;
+                        Some(ActiveTaint {
+                            carrier,
+                            uncertain: !matches!(spec.proof(), ProofStatus::Proven)
+                                || !matches!(spec.completeness(), EvidenceCompleteness::Complete),
+                            function: TaintEdgeFunction::generate(binding.classes()),
+                        })
+                    })
+                    .take(remaining.saturating_add(1))
+                    .collect::<Vec<_>>();
+                if let Some(termination) = request.reserve(SolverWork {
+                    callback_rows: generated.len(),
+                    ..SolverWork::default()
+                }) {
+                    return Err(termination);
+                }
+                if generated.len() > remaining {
+                    return Ok(None);
+                }
+                active.extend(generated);
+            }
+            if let Some(termination) = request.reserve(SolverWork {
+                edge_function_operations: active.len(),
+                ..SolverWork::default()
+            }) {
+                return Err(termination);
+            }
+            self.apply_phase(point, ValueFlowObservationPhase::AfterEffects, &mut active);
+        }
+        if request.cancellation.is_cancelled() {
+            return Err(SolverTermination::Cancelled);
+        }
+        if let Some(termination) = request.reserve(SolverWork {
+            ide_propagations: active.len(),
+            ..SolverWork::default()
+        }) {
+            return Err(termination);
+        }
+        active.sort_unstable();
+        active.dedup();
+        Ok((active.len() <= max_candidates).then(|| {
+            active
+                .into_iter()
+                .map(|flow| (flow.fact(), flow.function))
+                .collect()
+        }))
     }
 
     pub(crate) fn source_contribution(
@@ -525,6 +775,7 @@ impl<'plan> TaintFlowProblem<'plan> {
             spec.point(),
             ValueFlowObservationPhase::BeforeEffects,
             &active,
+            output_fact.meeting_entry_fact(),
             &mut output,
         );
         self.apply_local_rules(spec.point(), &mut active);
@@ -540,6 +791,7 @@ impl<'plan> TaintFlowProblem<'plan> {
             spec.point(),
             ValueFlowObservationPhase::AfterEffects,
             &active,
+            output_fact.meeting_entry_fact(),
             &mut output,
         );
 
@@ -675,12 +927,17 @@ impl<'plan> TaintFlowProblem<'plan> {
 
     fn call_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, TaintFact>,
         fact: TaintFact,
         out: &mut dyn DataflowOutput<IdeTransition<TaintFact, TaintEdgeFunction>>,
     ) {
         let mut output = Vec::new();
-        let active = self.apply_point(edge.source(), fact, &mut output);
+        let active = self.apply_point(
+            edge.source(),
+            fact,
+            edge.summary_entry_fact().copied(),
+            &mut output,
+        );
         let Some(transfer) = edge.call_transfer() else {
             self.emit(Vec::new(), output, out);
             return;
@@ -709,12 +966,17 @@ impl<'plan> TaintFlowProblem<'plan> {
 
     fn return_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, TaintFact>,
         fact: TaintFact,
         out: &mut dyn DataflowOutput<IdeTransition<TaintFact, TaintEdgeFunction>>,
     ) {
         let mut output = Vec::new();
-        let active = self.apply_point(edge.source(), fact, &mut output);
+        let active = self.apply_point(
+            edge.source(),
+            fact,
+            edge.summary_entry_fact().copied(),
+            &mut output,
+        );
         let Some(call) = edge.origin() else {
             self.emit(Vec::new(), output, out);
             return;
@@ -749,12 +1011,17 @@ impl<'plan> TaintFlowProblem<'plan> {
 
     fn boundary_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, TaintFact>,
         fact: TaintFact,
         out: &mut dyn DataflowOutput<IdeTransition<TaintFact, TaintEdgeFunction>>,
     ) {
         let mut output = Vec::new();
-        let active = self.apply_point(edge.source(), fact, &mut output);
+        let active = self.apply_point(
+            edge.source(),
+            fact,
+            edge.summary_entry_fact().copied(),
+            &mut output,
+        );
         let Some(call) = edge.origin() else {
             self.emit(active, output, out);
             return;
@@ -839,18 +1106,23 @@ impl IdeDataflowProblem for TaintFlowProblem<'_> {
 
     fn normal_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<IdeTransition<Self::Fact, Self::EdgeFunction>>,
     ) {
         let mut output = Vec::new();
-        let active = self.apply_point(edge.source(), fact, &mut output);
+        let active = self.apply_point(
+            edge.source(),
+            fact,
+            edge.summary_entry_fact().copied(),
+            &mut output,
+        );
         self.emit(active, output, out);
     }
 
     fn call_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<IdeTransition<Self::Fact, Self::EdgeFunction>>,
     ) {
@@ -859,7 +1131,7 @@ impl IdeDataflowProblem for TaintFlowProblem<'_> {
 
     fn return_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<IdeTransition<Self::Fact, Self::EdgeFunction>>,
     ) {
@@ -868,7 +1140,7 @@ impl IdeDataflowProblem for TaintFlowProblem<'_> {
 
     fn call_to_return_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<IdeTransition<Self::Fact, Self::EdgeFunction>>,
     ) {
@@ -877,12 +1149,17 @@ impl IdeDataflowProblem for TaintFlowProblem<'_> {
 
     fn exceptional_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<IdeTransition<Self::Fact, Self::EdgeFunction>>,
     ) {
         let mut output = Vec::new();
-        let active = self.apply_point(edge.source(), fact, &mut output);
+        let active = self.apply_point(
+            edge.source(),
+            fact,
+            edge.summary_entry_fact().copied(),
+            &mut output,
+        );
         self.emit(active, output, out);
     }
 }
@@ -983,6 +1260,34 @@ where
         IdeSummarySolveInput::new(root, &[]).with_witness_retention(witness_retention),
         provider,
         &TaintFlowProblem::new(plan),
+        semantic_budget,
+        request,
+    )?;
+    Ok(TaintSummaryResult::from_result(plan, result))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn solve_taint_with_reusable_provider<Provider, Reusable>(
+    root: &ProcedureHandle,
+    provider: &Provider,
+    reusable: &mut Reusable,
+    plan: &TaintAnalysisPlan,
+    witness_retention: WitnessRetentionLimits,
+    semantic_budget: &mut SemanticBudget,
+    request: &mut DataflowRequest<'_>,
+) -> Result<TaintSummaryResult, TaintSolveError>
+where
+    Provider: IcfgProvider + ?Sized,
+    Reusable: ReusableIdeSummaryProvider<TaintFact, TaintEdgeFunction>,
+{
+    if root != plan.value_flow().root() {
+        return Err(TaintSolveError::RootMismatch);
+    }
+    let result = solve_ide_with_reusable_summaries(
+        IdeSummarySolveInput::new(root, &[]).with_witness_retention(witness_retention),
+        provider,
+        &TaintFlowProblem::new(plan),
+        reusable,
         semantic_budget,
         request,
     )?;

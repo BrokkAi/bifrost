@@ -257,7 +257,7 @@ impl<'plan> ValueFlowProblem<'plan> {
 
     fn call_transfer(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, ValueFlowFact>,
         fact: ValueFlowFact,
         out: &mut dyn DataflowOutput<ValueFlowFact>,
     ) {
@@ -289,7 +289,7 @@ impl<'plan> ValueFlowProblem<'plan> {
 
     fn return_transfer(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, ValueFlowFact>,
         fact: ValueFlowFact,
         out: &mut dyn DataflowOutput<ValueFlowFact>,
     ) {
@@ -324,7 +324,7 @@ impl<'plan> ValueFlowProblem<'plan> {
 
     fn boundary_transfer(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, ValueFlowFact>,
         fact: ValueFlowFact,
         out: &mut dyn DataflowOutput<ValueFlowFact>,
     ) {
@@ -371,7 +371,7 @@ impl DistributiveDataflowProblem for ValueFlowProblem<'_> {
 
     fn normal_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -382,7 +382,7 @@ impl DistributiveDataflowProblem for ValueFlowProblem<'_> {
 
     fn call_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -391,7 +391,7 @@ impl DistributiveDataflowProblem for ValueFlowProblem<'_> {
 
     fn return_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -400,7 +400,7 @@ impl DistributiveDataflowProblem for ValueFlowProblem<'_> {
 
     fn call_to_return_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -409,7 +409,7 @@ impl DistributiveDataflowProblem for ValueFlowProblem<'_> {
 
     fn exceptional_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {

@@ -14,10 +14,11 @@ use crate::hash::{HashMap, HashSet};
 
 use super::{
     DataflowEdge, DataflowOutput, DataflowRequest, DistributiveDataflowProblem, FactId,
-    IdeDataflowError, IdeEdgeFunctionId, IdeMetrics, IdePointValue, IdeSummaryDataflowResult,
-    IdeValueId, PathQuality, PathQualityFrontier, SolverTermination, SolverWork,
-    SummaryDataflowError, SummaryDataflowResult, SummaryEntry, SummarySolveInput,
-    WitnessRetentionLimits, solve_with_summaries,
+    IdeDataflowError, IdeEdgeFunctionId, IdeEntryTransfer, IdeMetrics, IdePointValue,
+    IdeSummaryDataflowResult, IdeValueId, PathQuality, PathQualityFrontier, ReusableEndSummary,
+    ReusableProcedureSummary, ReusableReachedFact, ReusableSummaryProvider, SolverTermination,
+    SolverWork, SummaryDataflowError, SummaryDataflowResult, SummaryEntry, SummarySolveInput,
+    WitnessRetentionLimits, solve_with_reusable_end_summaries,
 };
 
 /// One fact transition coupled to its client-supplied edge function.
@@ -70,6 +71,59 @@ impl<Fact, Value> IdeDataflowSeed<Fact, Value> {
 
     pub fn into_parts(self) -> (Fact, Value) {
         (self.fact, self.value)
+    }
+}
+
+/// One reusable entry-to-exit fact relation and its relative IDE jump function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReusableIdeEndSummary<Fact, EdgeFunction> {
+    pub exit_kind: crate::analyzer::semantic::ReturnTransferKind,
+    pub exit_fact: Fact,
+    pub qualities: Box<[PathQuality]>,
+    pub edge_function: EdgeFunction,
+}
+
+/// One reusable internal observation and its relative IDE jump function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReusableIdeReachedFact<Fact, EdgeFunction> {
+    pub point: crate::analyzer::semantic::ProgramPointHandle,
+    pub fact: Fact,
+    pub qualities: Box<[PathQuality]>,
+    pub edge_function: EdgeFunction,
+}
+
+/// Complete reusable IDE relation for one exact procedure entry fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReusableIdeProcedureSummary<Fact, EdgeFunction> {
+    pub exits: Box<[ReusableIdeEndSummary<Fact, EdgeFunction>]>,
+    pub reached: Box<[ReusableIdeReachedFact<Fact, EdgeFunction>]>,
+}
+
+/// Optional context-independent cross-query IDE summary oracle.
+///
+/// The relation and every edge function must be relative to the exact
+/// procedure and entry fact supplied here. As with the fact-only provider,
+/// query-local tabulation deduplicates that identity and cannot accept a
+/// call-site-sensitive answer.
+pub trait ReusableIdeSummaryProvider<Fact, EdgeFunction> {
+    fn summary_for(
+        &mut self,
+        procedure: &ProcedureHandle,
+        entry_fact: Fact,
+        request: &mut DataflowRequest<'_>,
+    ) -> Result<Option<ReusableIdeProcedureSummary<Fact, EdgeFunction>>, SolverTermination>;
+}
+
+struct NoReusableIdeSummaries;
+
+impl<Fact, EdgeFunction> ReusableIdeSummaryProvider<Fact, EdgeFunction> for NoReusableIdeSummaries {
+    fn summary_for(
+        &mut self,
+        _procedure: &ProcedureHandle,
+        _entry_fact: Fact,
+        _request: &mut DataflowRequest<'_>,
+    ) -> Result<Option<ReusableIdeProcedureSummary<Fact, EdgeFunction>>, SolverTermination> {
+        Ok(None)
     }
 }
 
@@ -128,35 +182,35 @@ pub trait IdeDataflowProblem {
 
     fn normal_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<IdeTransition<Self::Fact, Self::EdgeFunction>>,
     );
 
     fn call_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<IdeTransition<Self::Fact, Self::EdgeFunction>>,
     );
 
     fn return_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<IdeTransition<Self::Fact, Self::EdgeFunction>>,
     );
 
     fn call_to_return_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<IdeTransition<Self::Fact, Self::EdgeFunction>>,
     );
 
     fn exceptional_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<IdeTransition<Self::Fact, Self::EdgeFunction>>,
     );
@@ -211,6 +265,7 @@ impl<'input, Fact, Value> IdeSummarySolveInput<'input, Fact, Value> {
 struct TransferKey<Fact> {
     edge: ProcedureIcfgEdge,
     call_transfer: Option<CallTransfer>,
+    entry: Fact,
     input: Fact,
 }
 
@@ -541,12 +596,12 @@ where
 
     fn project(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Problem::Fact>,
         fact: Problem::Fact,
         out: &mut dyn DataflowOutput<Problem::Fact>,
         callback: impl FnOnce(
             &Problem,
-            DataflowEdge<'_>,
+            DataflowEdge<'_, Problem::Fact>,
             Problem::Fact,
             &mut dyn DataflowOutput<IdeTransition<Problem::Fact, Problem::EdgeFunction>>,
         ),
@@ -554,6 +609,10 @@ where
         let key = TransferKey {
             edge: owned_edge(edge),
             call_transfer: edge.call_transfer().cloned(),
+            entry: edge
+                .summary_entry_fact()
+                .copied()
+                .expect("summary-backed IDE edges retain their exact entry fact"),
             input: fact,
         };
         let trace = self.trace.borrow();
@@ -657,7 +716,7 @@ where
 
     fn normal_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -666,7 +725,7 @@ where
 
     fn call_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -675,7 +734,7 @@ where
 
     fn return_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -684,7 +743,7 @@ where
 
     fn call_to_return_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -693,7 +752,7 @@ where
 
     fn exceptional_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -932,6 +991,7 @@ where
         self,
         reached: &mut [Option<IdeEdgeFunctionId>],
         summaries: &mut [Option<IdeEdgeFunctionId>],
+        entry_transfers: &mut [IdeEntryTransfer],
     ) -> Result<Vec<EdgeFunction>, IdeDataflowError> {
         let mut sorted = self.functions.clone();
         sorted.sort_unstable();
@@ -959,6 +1019,9 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         for id in reached.iter_mut().chain(summaries.iter_mut()).flatten() {
             *id = remap[id.index()];
+        }
+        for transfer in entry_transfers {
+            transfer.remap_edge_function(remap[transfer.edge_function_id().index()]);
         }
         Ok(sorted)
     }
@@ -1074,7 +1137,122 @@ struct CompleteIdePhase<Value, EdgeFunction> {
     values: Vec<Value>,
     reached_functions: Vec<Option<IdeEdgeFunctionId>>,
     summary_functions: Vec<Option<IdeEdgeFunctionId>>,
+    entry_transfers: Vec<IdeEntryTransfer>,
     point_values: Vec<IdePointValue>,
+}
+
+struct CapturedReusableIdeSummary<Fact, EdgeFunction> {
+    procedure: ProcedureHandle,
+    entry_fact: Fact,
+    summary: ReusableIdeProcedureSummary<Fact, EdgeFunction>,
+}
+
+struct IdeReusableProviderAdapter<'provider, Provider, Fact, EdgeFunction> {
+    provider: &'provider mut Provider,
+    captured: Vec<CapturedReusableIdeSummary<Fact, EdgeFunction>>,
+}
+
+impl<'provider, Provider, Fact, EdgeFunction>
+    IdeReusableProviderAdapter<'provider, Provider, Fact, EdgeFunction>
+{
+    fn new(provider: &'provider mut Provider) -> Self {
+        Self {
+            provider,
+            captured: Vec::new(),
+        }
+    }
+
+    fn into_captured(self) -> Vec<CapturedReusableIdeSummary<Fact, EdgeFunction>> {
+        self.captured
+    }
+}
+
+impl<Provider, Fact, EdgeFunction> ReusableSummaryProvider<Fact>
+    for IdeReusableProviderAdapter<'_, Provider, Fact, EdgeFunction>
+where
+    Provider: ReusableIdeSummaryProvider<Fact, EdgeFunction>,
+    Fact: Copy + Eq,
+    EdgeFunction: Clone,
+{
+    fn summary_for(
+        &mut self,
+        procedure: &ProcedureHandle,
+        entry_fact: Fact,
+        request: &mut DataflowRequest<'_>,
+    ) -> Result<Option<ReusableProcedureSummary<Fact>>, SolverTermination> {
+        let Some(mut summary) = self.provider.summary_for(procedure, entry_fact, request)? else {
+            return Ok(None);
+        };
+        if summary.exits.iter().any(|row| row.qualities.is_empty())
+            || summary
+                .reached
+                .iter()
+                .any(|row| row.qualities.is_empty() || row.point.procedure() != procedure)
+        {
+            return Ok(None);
+        }
+        let mut reached = summary.reached.into_vec();
+        for exit in &summary.exits {
+            let exit_point = match exit.exit_kind {
+                crate::analyzer::semantic::ReturnTransferKind::Normal => {
+                    procedure.semantics().normal_exit_point()
+                }
+                crate::analyzer::semantic::ReturnTransferKind::Exceptional => {
+                    procedure.semantics().exceptional_exit_point()
+                }
+            };
+            let Some(exit_point) = procedure.point_handle(exit_point) else {
+                return Ok(None);
+            };
+            if !reached
+                .iter()
+                .any(|row| row.point == exit_point && row.fact == exit.exit_fact)
+            {
+                reached.push(ReusableIdeReachedFact {
+                    point: exit_point,
+                    fact: exit.exit_fact,
+                    qualities: exit.qualities.clone(),
+                    edge_function: exit.edge_function.clone(),
+                });
+            }
+        }
+        summary.reached = reached.into_boxed_slice();
+        let relation_count = summary.exits.len().saturating_add(summary.reached.len());
+        if let Some(termination) = request.reserve(SolverWork {
+            ide_relations: relation_count,
+            ..SolverWork::default()
+        }) {
+            return Err(termination);
+        }
+        let fact_summary = ReusableProcedureSummary {
+            exits: summary
+                .exits
+                .iter()
+                .map(|row| ReusableEndSummary {
+                    exit_kind: row.exit_kind,
+                    exit_fact: row.exit_fact,
+                    qualities: row.qualities.clone(),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            reached: summary
+                .reached
+                .iter()
+                .map(|row| ReusableReachedFact {
+                    point: row.point.clone(),
+                    fact: row.fact,
+                    qualities: row.qualities.clone(),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        };
+        self.captured.push(CapturedReusableIdeSummary {
+            procedure: procedure.clone(),
+            entry_fact,
+            summary,
+        });
+        Ok(Some(fact_summary))
+    }
 }
 
 type IdeSolveOutcome<Problem> = Result<
@@ -1103,6 +1281,31 @@ where
     Problem: IdeDataflowProblem,
     Provider: crate::analyzer::semantic::IcfgProvider + ?Sized,
 {
+    let mut reusable = NoReusableIdeSummaries;
+    solve_ide_with_reusable_summaries(
+        input,
+        provider,
+        problem,
+        &mut reusable,
+        semantic_budget,
+        request,
+    )
+}
+
+/// Solve one finite IDE problem with an optional cross-query summary oracle.
+pub fn solve_ide_with_reusable_summaries<Problem, Provider, Reusable>(
+    input: IdeSummarySolveInput<'_, Problem::Fact, Problem::Value>,
+    provider: &Provider,
+    problem: &Problem,
+    reusable: &mut Reusable,
+    semantic_budget: &mut SemanticBudget,
+    request: &mut DataflowRequest<'_>,
+) -> IdeSolveOutcome<Problem>
+where
+    Problem: IdeDataflowProblem,
+    Provider: crate::analyzer::semantic::IcfgProvider + ?Sized,
+    Reusable: ReusableIdeSummaryProvider<Problem::Fact, Problem::EdgeFunction>,
+{
     let initial_work = request.budget.used();
     let initial_semantic_work = semantic_budget.used();
     let seed_facts = bounded_seed_facts::<Problem>(&input, problem.zero_fact(), request);
@@ -1113,14 +1316,17 @@ where
         remaining.edge_function_operations,
         remaining.edge_functions,
     );
-    let fact_result = solve_with_summaries(
+    let mut reusable_adapter = IdeReusableProviderAdapter::new(reusable);
+    let fact_result = solve_with_reusable_end_summaries(
         SummarySolveInput::new(input.root(), &seed_facts.facts)
             .with_witness_retention(input.witness_retention()),
         provider,
         &adapter,
+        &mut reusable_adapter,
         semantic_budget,
         request,
     )?;
+    let reusable_summaries = reusable_adapter.into_captured();
     let trace = adapter.into_trace();
     let mut metrics = IdeMetrics {
         captured_relations: trace.retained_relations,
@@ -1188,6 +1394,7 @@ where
         problem,
         &fact_result,
         &trace,
+        &reusable_summaries,
         request,
         &mut metrics,
     ) {
@@ -1213,6 +1420,7 @@ where
         phase.values,
         phase.reached_functions,
         phase.summary_functions,
+        phase.entry_transfers,
         phase.point_values,
         SolverTermination::FixedPoint,
         work,
@@ -1316,12 +1524,14 @@ where
     Ok(values)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_ide_phase<Problem>(
     root: &ProcedureHandle,
     seed_values: &HashMap<Problem::Fact, Problem::Value>,
     problem: &Problem,
     fact_result: &SummaryDataflowResult<Problem::Fact>,
     trace: &IdeTrace<Problem::Fact, Problem::EdgeFunction>,
+    reusable_summaries: &[CapturedReusableIdeSummary<Problem::Fact, Problem::EdgeFunction>],
     request: &mut DataflowRequest<'_>,
     metrics: &mut IdeMetrics,
 ) -> Result<CompleteIdePhase<Problem::Value, Problem::EdgeFunction>, IdeRunFailure>
@@ -1329,7 +1539,13 @@ where
     Problem: IdeDataflowProblem,
 {
     let mut functions = FunctionArena::new(problem, request)?;
-    let raw_graph = build_raw_graph(fact_result, trace, &mut functions, request)?;
+    let raw_graph = build_raw_graph(
+        fact_result,
+        trace,
+        reusable_summaries,
+        &mut functions,
+        request,
+    )?;
     let relation_count = raw_graph
         .direct
         .len()
@@ -1433,6 +1649,30 @@ where
         .iter()
         .map(|index| jumps[*index])
         .collect::<Vec<_>>();
+    let mut entry_transfers = Vec::new();
+    for (source_entry_row, relations) in graph.entry_values_by_entry.iter().enumerate() {
+        for relation in relations.iter().copied() {
+            let function = functions.compose(
+                jumps[relation.caller].ok_or(IdeDataflowError::Invariant(
+                    "IDE call source has no jump function",
+                ))?,
+                relation.function,
+                problem,
+                request,
+                metrics,
+            )?;
+            let path_qualities = conjoin_quality_frontiers(
+                fact_result.reached()[relation.caller].path_qualities(),
+                PathQualityFrontier::singleton(relation.edge_quality),
+            );
+            entry_transfers.push(IdeEntryTransfer::new(
+                fact_result.reached()[source_entry_row].entry().clone(),
+                fact_result.reached()[relation.target_entry].entry().clone(),
+                path_qualities,
+                function,
+            ));
+        }
+    }
     let (values, point_values) = materialize_values(
         root,
         seed_values,
@@ -1443,12 +1683,14 @@ where
         &functions.functions,
         request,
     )?;
-    let sorted_functions = functions.into_sorted_parts(&mut jumps, &mut summary_functions)?;
+    let sorted_functions =
+        functions.into_sorted_parts(&mut jumps, &mut summary_functions, &mut entry_transfers)?;
     Ok(CompleteIdePhase {
         functions: sorted_functions,
         values,
         reached_functions: jumps,
         summary_functions,
+        entry_transfers,
         point_values,
     })
 }
@@ -1561,6 +1803,7 @@ fn build_graph(
 fn build_raw_graph<Fact, EdgeFunction>(
     result: &SummaryDataflowResult<Fact>,
     trace: &IdeTrace<Fact, EdgeFunction>,
+    reusable_summaries: &[CapturedReusableIdeSummary<Fact, EdgeFunction>],
     functions: &mut FunctionArena<EdgeFunction>,
     request: &mut DataflowRequest<'_>,
 ) -> Result<RawIdeGraph, IdeRunFailure>
@@ -1596,8 +1839,11 @@ where
             .ok_or(IdeDataflowError::Invariant(
                 "reached IDE fact ID is absent from its result",
             ))?;
+        let entry_fact = result.fact(reached.entry().entry_fact()).copied().ok_or(
+            IdeDataflowError::Invariant("reached IDE entry fact ID is absent from its result"),
+        )?;
         by_point_fact
-            .entry((reached.point().clone(), fact))
+            .entry((reached.point().clone(), fact, entry_fact))
             .or_default()
             .push(index);
         by_state.insert(
@@ -1658,7 +1904,11 @@ where
     for record in &trace.records {
         reserve_ide_propagation(request)?;
         let sources = by_point_fact
-            .get(&(record.key.edge.source.clone(), record.key.input))
+            .get(&(
+                record.key.edge.source.clone(),
+                record.key.input,
+                record.key.entry,
+            ))
             .map(Vec::as_slice)
             .unwrap_or_default();
         match record.key.edge.kind {
@@ -1730,6 +1980,12 @@ where
                                     "captured summary exit fact was not interned",
                                 ),
                             )?;
+                            let entry_fact = result
+                                .fact(summary.entry().entry_fact())
+                                .copied()
+                                .ok_or(IdeDataflowError::Invariant(
+                                    "captured summary entry fact was not interned",
+                                ))?;
                             let projection = summary
                                 .exit()
                                 .project_matched_return(transfer)
@@ -1740,6 +1996,7 @@ where
                             let return_key = TransferKey {
                                 edge: return_edge,
                                 call_transfer: None,
+                                entry: entry_fact,
                                 input: exit_fact,
                             };
                             let Some(return_outputs) = trace.get(&return_key) else {
@@ -1815,6 +2072,94 @@ where
                         }
                     }
                 }
+            }
+        }
+    }
+    for cached in reusable_summaries {
+        reserve_ide_propagation(request)?;
+        let entry_point = cached
+            .procedure
+            .point_handle(cached.procedure.semantics().entry_point())
+            .ok_or(IdeDataflowError::Invariant(
+                "reusable IDE procedure entry point is stale",
+            ))?;
+        let entry_fact_id =
+            fact_ids
+                .get(&cached.entry_fact)
+                .copied()
+                .ok_or(IdeDataflowError::Invariant(
+                    "reusable IDE entry fact was not interned",
+                ))?;
+        let entry = SummaryEntry::new(cached.procedure.clone(), entry_point.clone(), entry_fact_id);
+        let source = by_state
+            .get(&(entry.clone(), entry_point, cached.entry_fact))
+            .copied()
+            .ok_or(IdeDataflowError::Invariant(
+                "reusable IDE summary has no entry row",
+            ))?;
+        for row in &cached.summary.reached {
+            reserve_ide_propagation(request)?;
+            let target = by_state
+                .get(&(entry.clone(), row.point.clone(), row.fact))
+                .copied()
+                .ok_or(IdeDataflowError::Invariant(
+                    "reusable IDE observation has no reached row",
+                ))?;
+            let function = functions.intern_ref(&row.edge_function, request)?;
+            let relation = RawDirectRelation {
+                source,
+                target,
+                function,
+            };
+            if !direct.contains(&relation) {
+                ensure_relation_capacity(
+                    direct
+                        .len()
+                        .saturating_add(summaries.len())
+                        .saturating_add(entry_values.len()),
+                    request,
+                )?;
+                direct.insert(relation);
+            }
+        }
+        for row in &cached.summary.exits {
+            reserve_ide_propagation(request)?;
+            let exit_point = match row.exit_kind {
+                crate::analyzer::semantic::ReturnTransferKind::Normal => {
+                    cached.procedure.semantics().normal_exit_point()
+                }
+                crate::analyzer::semantic::ReturnTransferKind::Exceptional => {
+                    cached.procedure.semantics().exceptional_exit_point()
+                }
+            };
+            let exit_point =
+                cached
+                    .procedure
+                    .point_handle(exit_point)
+                    .ok_or(IdeDataflowError::Invariant(
+                        "reusable IDE procedure exit point is stale",
+                    ))?;
+            let target = by_state
+                .get(&(entry.clone(), exit_point, row.exit_fact))
+                .copied()
+                .ok_or(IdeDataflowError::Invariant(
+                    "reusable IDE exit has no reached row",
+                ))?;
+            let function = functions.intern_ref(&row.edge_function, request)?;
+            let relation = RawDirectRelation {
+                source,
+                target,
+                function,
+            };
+            if !direct.contains(&relation) {
+                ensure_relation_capacity(
+                    direct
+                        .len()
+                        .saturating_add(summaries.len())
+                        .saturating_add(entry_values.len()),
+                    request,
+                )?;
+                direct.insert(relation);
             }
         }
     }
@@ -2105,6 +2450,7 @@ fn empty_ide_result<Fact, Value, EdgeFunction>(
         vec![None; reached_len],
         vec![None; summary_len],
         Vec::new(),
+        Vec::new(),
         termination,
         request.budget.used().saturating_sub(initial_work),
         semantic_budget.used().saturating_sub(initial_semantic_work),
@@ -2132,7 +2478,7 @@ fn reserve_ide_propagation(request: &mut DataflowRequest<'_>) -> Result<(), IdeR
     )
 }
 
-fn owned_edge(edge: DataflowEdge<'_>) -> ProcedureIcfgEdge {
+fn owned_edge<Fact>(edge: DataflowEdge<'_, Fact>) -> ProcedureIcfgEdge {
     ProcedureIcfgEdge {
         source: edge.source().clone(),
         target: edge.target().clone(),

@@ -1,4 +1,4 @@
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, mem::size_of_val};
 
 use crate::analyzer::dense_id::define_dense_id;
 use crate::analyzer::semantic::{
@@ -124,6 +124,61 @@ pub enum ValueFlowCarrierKey {
     },
 }
 
+impl ValueFlowCarrierKey {
+    /// Conservative retained size, including boxed nested access paths.
+    pub fn retained_bytes(&self) -> usize {
+        let mut total = std::mem::size_of::<Self>();
+        let mut stack = vec![self];
+        while let Some(key) = stack.pop() {
+            match key {
+                Self::Value { locator, role, .. } => {
+                    total = total
+                        .saturating_add(semantic_locator_heap_bytes(locator))
+                        .saturating_add(role.len());
+                }
+                Self::Port { procedure, .. } => {
+                    total = total.saturating_add(semantic_locator_heap_bytes(procedure));
+                }
+                Self::Allocation { locator } | Self::ScopedRoot { locator, .. } => {
+                    total = total.saturating_add(semantic_locator_heap_bytes(locator));
+                }
+                Self::CallResult {
+                    call,
+                    result,
+                    callee,
+                } => {
+                    total = total
+                        .saturating_add(semantic_locator_heap_bytes(call))
+                        .saturating_add(semantic_locator_heap_bytes(callee))
+                        .saturating_add(std::mem::size_of::<Self>());
+                    stack.push(result);
+                }
+                Self::Location {
+                    root, selectors, ..
+                } => {
+                    total = total
+                        .saturating_add(std::mem::size_of::<Self>())
+                        .saturating_add(size_of_val(selectors.as_ref()));
+                    stack.push(root);
+                    for selector in selectors {
+                        match selector {
+                            ValueFlowSelectorKey::Field(locator) => {
+                                total = total.saturating_add(semantic_locator_heap_bytes(locator));
+                            }
+                            ValueFlowSelectorKey::ExactIndex(key) => {
+                                total = total.saturating_add(std::mem::size_of::<Self>());
+                                stack.push(key);
+                            }
+                            ValueFlowSelectorKey::AnyIndex => {}
+                        }
+                    }
+                }
+            }
+        }
+        total
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ValueFlowPortKey {
     Receiver,
@@ -194,6 +249,10 @@ impl ValueFlowEventKey {
 
     pub const fn kind(&self) -> ValueFlowEventKind {
         self.kind
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(semantic_locator_heap_bytes(&self.site))
     }
 }
 
@@ -331,6 +390,22 @@ impl fmt::Display for ValueFlowModelError {
 }
 
 impl Error for ValueFlowModelError {}
+
+fn semantic_locator_heap_bytes(locator: &SemanticLocator) -> usize {
+    let segments = locator.declaration().segments();
+    locator
+        .path()
+        .as_str()
+        .len()
+        .saturating_add(size_of_val(segments))
+        .saturating_add(
+            segments
+                .iter()
+                .filter_map(|segment| segment.name())
+                .map(str::len)
+                .fold(0usize, usize::saturating_add),
+        )
+}
 
 fn source_locator(
     procedure: &ProcedureHandle,

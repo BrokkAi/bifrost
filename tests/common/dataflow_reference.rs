@@ -126,7 +126,7 @@ where
 
 fn apply_transfer<P: DistributiveDataflowProblem>(
     problem: &P,
-    edge: DataflowEdge<'_>,
+    edge: DataflowEdge<'_, P::Fact>,
     kind: IcfgEdgeKind,
     fact: P::Fact,
     out: &mut dyn DataflowOutput<P::Fact>,
