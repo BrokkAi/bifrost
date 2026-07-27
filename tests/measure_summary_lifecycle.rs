@@ -267,7 +267,7 @@ enum MeasuredArtifact {
     Protocol {
         repository: CompleteProtocolSummaryRepository,
         key: ProtocolSummaryKey,
-        invalid_key: ProtocolSummaryKey,
+        invalid_key: Box<ProtocolSummaryKey>,
     },
     Taint {
         repository: CompleteTaintTransferSummaryRepository,
@@ -457,7 +457,7 @@ impl MeasuredArtifact {
 
 #[test]
 fn summary_lifecycle_contract_blocks_non_equivalent_hydration() {
-    assert!(!EXACT_EQUIVALENCE);
+    assert!(!black_box(EXACT_EQUIVALENCE));
     let thresholds = ArtifactPromotionThresholds::default();
     let evaluation = evaluate_artifact_promotion(
         thresholds,
@@ -953,7 +953,7 @@ fn build_protocol_candidate() -> MeasuredArtifact {
     MeasuredArtifact::Protocol {
         repository,
         key,
-        invalid_key,
+        invalid_key: Box::new(invalid_key),
     }
 }
 

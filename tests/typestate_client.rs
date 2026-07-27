@@ -941,7 +941,7 @@ fn reusable_recursive_semantic_summaries_for(
                 .map(|((source, target), dependency)| {
                     SummaryEffect::new(
                         SummaryEffectKey::Call {
-                            event: SummaryEventKey::hash_bytes(&[
+                            event: SummaryEventKey::hash_bytes([
                                 u8::try_from(*source).unwrap(),
                                 u8::try_from(*target).unwrap(),
                             ]),
@@ -1293,8 +1293,8 @@ fn two_callers_reuse_one_helper_protocol_summary_inside_tabulation() {
             &[],
             &analyzer.icfg_provider(),
             &protocol,
-            &bindings,
-            &semantic_summaries,
+            bindings,
+            semantic_summaries,
             repository,
             &mut semantic_budget,
             &mut DataflowRequest::new(&mut solver_budget, &cancellation),
