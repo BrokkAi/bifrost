@@ -671,7 +671,15 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             }
             return;
         }
-        LexicalTypeResolution::Ambiguous => return,
+        LexicalTypeResolution::Ambiguous => {
+            if let Some(scopes) = static_qualifier_type_scopes(node, ctx) {
+                *ctx.raw_match_count += 1;
+                for scope in scopes {
+                    push_type_hit(scope, ctx);
+                }
+            }
+            return;
+        }
         LexicalTypeResolution::Missing => {
             let raw_resolution = resolve_type_node_lexically_for_target_without_visibility(
                 hit_node,
@@ -1334,7 +1342,10 @@ fn static_qualifier_type_scopes<'tree>(
     node: Node<'tree>,
     ctx: &ScanCtx<'_>,
 ) -> Option<Vec<Node<'tree>>> {
-    if node.kind() != "qualified_identifier" {
+    if !matches!(
+        node.kind(),
+        "qualified_identifier" | "scoped_type_identifier"
+    ) {
         return None;
     }
     // `maybe_record_type_hit` rejects nested type nodes before this helper, so
@@ -1371,9 +1382,14 @@ fn static_qualifier_type_scopes<'tree>(
                     matches.push(matched);
                 }
             }
-            // One ambiguous owner prefix makes the entire qualified occurrence
-            // unsafe to attribute, even if another prefix happened to match.
-            LexicalTypeResolution::Ambiguous => return None,
+            // The ordinary lexical resolver can remain ambiguous when the
+            // qualified terminal is an alias whose canonical target is not
+            // indexed (for example, `Hash::Digest` aliases an external
+            // `std::array`). The target-guided path below still requires one
+            // physically visible logical class for every emitted prefix.
+            LexicalTypeResolution::Ambiguous => {
+                return target_guided_qualifier_type_scopes(node, ctx);
+            }
             LexicalTypeResolution::Resolved { .. } | LexicalTypeResolution::Missing => {}
         }
     }
@@ -1388,10 +1404,12 @@ fn target_guided_qualifier_type_scopes<'tree>(
     node: Node<'tree>,
     ctx: &ScanCtx<'_>,
 ) -> Option<Vec<Node<'tree>>> {
-    if node.kind() != "qualified_identifier"
-        || !ctx
-            .visibility
-            .is_physically_visible(ctx.file, &ctx.spec.target)
+    if !matches!(
+        node.kind(),
+        "qualified_identifier" | "scoped_type_identifier"
+    ) || !ctx
+        .visibility
+        .is_physically_visible(ctx.file, &ctx.spec.target)
     {
         return None;
     }

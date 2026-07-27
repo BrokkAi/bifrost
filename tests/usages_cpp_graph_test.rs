@@ -9964,7 +9964,7 @@ fn authoritative_cpp_outer_type_qualifier_inverse_covers_alias_and_elaborated_ne
             r#"
 class Hash {
 public:
-    using Digest = int;
+    using Digest = std::array<unsigned char, 20>;
 };
 struct message {
     struct impl {};
