@@ -172,7 +172,6 @@ fn macro_name(definition: &str) -> Option<String> {
 mod tests {
     use super::CppCompileContexts;
     use crate::analyzer::{Language, ProjectFile, TestProject};
-    use std::path::Path;
 
     fn project_with_database(database: Option<&str>) -> (tempfile::TempDir, TestProject) {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -202,7 +201,7 @@ mod tests {
     #[test]
     fn arguments_entry_collects_include_paths_and_macro_names() {
         let (_temp, project) = project_with_database(Some(
-            r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-I","include","-iquotequotes","-isystem","/usr/include","-DDEBUG=1","-D","FEATURE","-c","src/main.cpp"]}]"#,
+            r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-I","include","-iquotequotes","-isystem","system-include","-DDEBUG=1","-D","FEATURE","-c","src/main.cpp"]}]"#,
         ));
         let file = ProjectFile::new(project.root_path().to_path_buf(), "src/main.cpp");
         let contexts = CppCompileContexts::load(&project);
@@ -216,7 +215,7 @@ mod tests {
             context.project_include_roots
         );
         assert_eq!(
-            vec![Path::new("/usr/include")],
+            vec![project.root_path().join("system-include")],
             context.system_include_roots
         );
         assert!(context.defined_macros.contains("DEBUG"));
