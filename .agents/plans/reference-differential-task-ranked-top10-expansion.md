@@ -347,7 +347,17 @@ comes through the local gate, but is not the focus.
   both anonymous-namespace constants; all 12 issue-linkage tests, formatting,
   all-feature Clippy, all 161 C++ usage tests, and the complete `nlp,python`
   matrix pass with normal Cargo storage at niceness 10.
-- [ ] Publish the six mapped C++ semantic issue families and run one final
+- [x] (2026-07-27) Resolved assigned #1186 by rejecting structured C++ type
+  declaration heads from forward definition lookup while preserving real tag
+  type references and owner qualifiers in out-of-line tagged definitions.
+  Focused regressions cover template-specialization heads, typedef targets,
+  qualified enum parameter types, and out-of-line nested owners. Formatting,
+  all-target/all-feature Clippy, all 646 definition-lookup tests, all 161 C++
+  usage tests, and the complete `nlp,python` matrix pass with normal Cargo
+  storage at niceness 10. This removes the 45 non-reference declaration
+  contexts from the differential's forward premise rather than manufacturing
+  inverse usages for them.
+- [ ] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [ ] Complete C++ and publish its evidence and user summary.
 - [x] Complete C# and publish its evidence and user summary.

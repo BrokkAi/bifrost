@@ -2158,11 +2158,12 @@ fn resolve_cpp_type(
     source: &str,
     node: Node<'_>,
 ) -> DefinitionLookupOutcome {
+    let node = cpp_expand_tagged_type_scope_reference(node).unwrap_or(node);
     let text = normalize_cpp_type_text(cpp_node_text(node, source));
     if text.is_empty() {
         return no_definition("no_reference_text", "C++ type reference is blank");
     }
-    if cpp_qualified_identifier_is_declaration_name(node)
+    if cpp_is_non_reference_type_declaration_site(node)
         || cpp_is_non_reference_preprocessor_token(node)
     {
         return no_definition(
@@ -3704,14 +3705,49 @@ fn cpp_unit_matches_kind(
     }
 }
 
-fn cpp_qualified_identifier_is_declaration_name(node: Node<'_>) -> bool {
-    node.kind() == "qualified_identifier"
-        && node.parent().is_some_and(|parent| {
-            matches!(
+fn cpp_is_non_reference_type_declaration_site(mut node: Node<'_>) -> bool {
+    loop {
+        if cpp_is_non_reference_declaration_name(node) {
+            return true;
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        if matches!(
+            parent.kind(),
+            "template_type" | "qualified_identifier" | "scoped_type_identifier"
+        ) && parent
+            .child_by_field_name("name")
+            .is_some_and(|name| cpp_same_node(name, node))
+        {
+            node = parent;
+            continue;
+        }
+        return parent
+            .child_by_field_name("name")
+            .is_some_and(|name| cpp_same_node(name, node))
+            && matches!(
                 parent.kind(),
-                "function_declarator" | "pointer_declarator" | "reference_declarator"
-            ) && parent.child_by_field_name("declarator") == Some(node)
-        })
+                "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
+            )
+            && cpp_tag_specifier_declares_name(parent);
+    }
+}
+
+fn cpp_expand_tagged_type_scope_reference(node: Node<'_>) -> Option<Node<'_>> {
+    let qualified = node.parent().filter(|parent| {
+        matches!(
+            parent.kind(),
+            "qualified_identifier" | "scoped_type_identifier"
+        ) && parent.child_by_field_name("scope") == Some(node)
+    })?;
+    let specifier = qualified.parent()?;
+    (matches!(
+        specifier.kind(),
+        "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
+    ) && specifier.child_by_field_name("name") == Some(qualified)
+        && !cpp_tag_specifier_declares_name(specifier))
+    .then_some(qualified)
 }
 
 fn cpp_is_non_reference_declaration_name(node: Node<'_>) -> bool {
@@ -3816,6 +3852,32 @@ fn cpp_same_node(left: Node<'_>, right: Node<'_>) -> bool {
     left.id() == right.id()
         && left.start_byte() == right.start_byte()
         && left.end_byte() == right.end_byte()
+}
+
+fn cpp_tag_specifier_declares_name(specifier: Node<'_>) -> bool {
+    if specifier.child_by_field_name("body").is_some() {
+        return true;
+    }
+    let mut current = specifier.parent();
+    while let Some(ancestor) = current {
+        match ancestor.kind() {
+            "type_descriptor"
+            | "parameter_declaration"
+            | "optional_parameter_declaration"
+            | "template_argument_list"
+            | "cast_expression" => return false,
+            "declaration" | "field_declaration" => {
+                let mut cursor = ancestor.walk();
+                return ancestor
+                    .children_by_field_name("declarator", &mut cursor)
+                    .next()
+                    .is_none();
+            }
+            "translation_unit" => return true,
+            _ => current = ancestor.parent(),
+        }
+    }
+    false
 }
 
 fn cpp_is_non_reference_preprocessor_token(node: Node<'_>) -> bool {
