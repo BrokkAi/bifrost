@@ -12,12 +12,12 @@ every candidate root before any target query can start. On ESPHome's 1,000-file
 reference differential this serial setup takes roughly 65–72 minutes, while
 the following 1,000 target queries finish in about 20 seconds.
 
-After this change, roots with semantically identical visible source sets share
-the immutable declaration and identifier projections. Root-specific
-internal-linkage filtering, include cycles, cancellation, exact declaration
-identity, and authoritative candidate isolation remain unchanged. Long
-authoritative visibility construction also reports bounded progress instead of
-appearing hung.
+After this change, the root-independent linkage classification for each
+declaration is reused across every root projection in the authoritative batch.
+Root-specific visible-source filtering, include cycles, cancellation, exact
+declaration identity, and authoritative candidate isolation remain unchanged.
+Long authoritative visibility construction also reports explicit
+start/completion progress instead of appearing hung.
 
 ## Progress
 
@@ -53,9 +53,13 @@ appearing hung.
   at 5,743.2 seconds, 4,341.8 seconds after forward completion, then the 1,000
   target queries completed rapidly. This independently confirms the diagnosed
   pre-target bottleneck.
-- [ ] Review correctness, run focused tests, and benchmark the production
-  ESPHome boundary outside the sandbox at niceness 10.
-- [ ] Pass formatting, all-feature Clippy, and the complete
+- [x] (2026-07-27) Benchmarked the same-limits persisted ESPHome production
+  boundary on clean runner `dc8d2765`: the 477-root / 1,000-target visibility
+  barrier fell from 4,341.8 seconds to 562.7 seconds (7.72x), total repository
+  time fell from 5,770.7 seconds to 2,231.8 seconds, and the complete report
+  remained byte-for-byte equivalent in summary counts with zero missing.
+- [x] (2026-07-27) Merged origin/master at `18346d74` without overlap and
+  passed formatting, diff checks, all-target/all-feature Clippy, and the complete
   `cargo test --features nlp,python` matrix before publication.
 
 ## Surprises & Discoveries
@@ -86,6 +90,13 @@ appearing hung.
   5,743.2 seconds, a 4,341.8-second barrier. The previous maximum was 4,322.8
   seconds.
 
+- Observation: sharing the classification cache removes most, but not all, of
+  the visibility cost.
+  Evidence: the clean corrected runner completed the same 477-root visibility
+  build in 562.7 seconds, then completed all 1,000 inverse queries in 17.3
+  seconds. The remaining setup time is no longer multiplied by the root count
+  and is separable from this issue's regression.
+
 ## Decision Log
 
 - Decision: let the already-running authoritative replay finish unchanged.
@@ -107,9 +118,26 @@ appearing hung.
   is unnecessary unless production evidence still shows material setup cost.
   Date/Author: 2026-07-27 / Codex
 
+- Decision: accept the narrow fix after the same-limits production replay
+  demonstrated a 7.72x visibility speedup with identical semantic output.
+  Track any further improvement to the now-exposed one-time classification
+  cost separately rather than broadening this ticket after its measured root
+  multiplier is removed.
+  Date/Author: 2026-07-27 / Codex
+
 ## Outcomes & Retrospective
 
-In progress.
+The fix changed no reference classifications on the same ESPHome commit and
+run fingerprint: both old and new reports audited 1,000 files / 10,000 sites,
+queried 1,000 targets, and produced 1,127 consistent, 80 editor-only, 153
+unproven, 8,640 inconclusive, and zero missing classifications with no file or
+candidate-limit errors.
+
+The measured visibility interval fell from 4,341.8 seconds to 562.7 seconds,
+removing 3,779.1 seconds (62.99 minutes) from the critical path. End-to-end
+repository time fell from 5,770.7 seconds to 2,231.8 seconds despite the new
+run sharing the machine with the all-feature Cargo gates. The explicit
+visibility progress events make any remaining setup cost observable.
 
 ## Context and Orientation
 
@@ -167,7 +195,9 @@ afterward. Existing progress events remain valid.
 The bounded ESPHome production proof must materially reduce the pre-inverse
 wall time without reducing files, sites, target groups, usage files, or
 candidate limits. All Cargo and Bifrost commands run outside the sandbox at
-niceness 10 with the normal repository target.
+niceness 10 with the normal repository target. The accepted proof reduced the
+477-root / 1,000-target visibility interval from 4,341.8 to 562.7 seconds while
+preserving the complete report summary.
 
 ## Idempotence and Recovery
 
@@ -187,3 +217,8 @@ Current authoritative log:
 The historical post-forward gaps were approximately 3,890.8, 4,056.9, and
 4,322.8 seconds. These are the production boundary the optimization must
 improve.
+
+Accepted production artifact:
+`/mnt/optane/tmp/bifrost-fird/cpp-esphome-issue1215-dc8d2765.jsonl`,
+SHA-256
+`0b26b435937a2d5ac3c2a0c29a7242d642d3be0f45afa2899563ef78ba055210`.
