@@ -12,7 +12,8 @@ use crate::analyzer::usages::cpp_graph::syntax::explicit_qualified_callable_valu
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::{
-    CodeUnit, CppAnalyzer, IAnalyzer, ProjectFile, Range, cpp_node_text as node_text,
+    CodeUnit, CppAnalyzer, IAnalyzer, ProjectFile, Range,
+    cpp_callable_definitions_share_identity_evidence, cpp_node_text as node_text,
 };
 use crate::hash::{HashMap, HashSet};
 #[cfg(test)]
@@ -95,8 +96,20 @@ pub(super) fn scan_prepared_file(
             .filter(|target| target.source() == file && same_logical_symbol(target, &spec.target))
             .flat_map(|target| analyzer.ranges(target))
             .collect()
-    } else if spec.target.source() == file {
-        analyzer.ranges(&spec.target)
+    } else if spec.target.is_callable() {
+        target_group
+            .iter()
+            .filter(|candidate| {
+                candidate.source() == file
+                    && candidate.is_callable()
+                    && cpp_callable_definitions_share_identity_evidence(
+                        analyzer,
+                        &spec.target,
+                        candidate,
+                    )
+            })
+            .flat_map(|candidate| analyzer.ranges(candidate))
+            .collect()
     } else {
         Vec::new()
     };

@@ -1,6 +1,7 @@
 use super::extractor::{ScanState, prepare_file, scan_prepared_file};
 use super::inverted;
 use super::resolver::{TargetSpec, TypeScanKey, VisibilityIndex};
+use crate::analyzer::usages::candidates::cpp_related_callable_peers;
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_file};
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitSurface};
@@ -162,7 +163,12 @@ impl CppQueryResolver<'_> {
                 specs.push(spec);
             }
         }
-        let target_group: HashSet<CodeUnit> = overloads.iter().cloned().collect();
+        // Declaration/body peers only provide the same callable's own source
+        // ranges.  Keep `specs` rooted in `overloads`: peers must not alter
+        // overload selection or make a different callable match.
+        let mut target_group: HashSet<CodeUnit> = overloads.iter().cloned().collect();
+        let peers = cpp_related_callable_peers(&target_group, analyzer, scan_scope.cancellation());
+        target_group.extend(peers);
         let files = self.scan_files(overloads, scan_scope);
 
         let mut hits: BTreeSet<UsageHit> = BTreeSet::new();

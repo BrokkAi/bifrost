@@ -22006,6 +22006,10 @@ void endpoint::touch() {}
             .map(|start| start + "endpoint::~".len())
             .expect("terminal destructor type name"),
         source.find("endpoint::touch").expect("method owner"),
+        source
+            .find("endpoint::touch")
+            .map(|start| start + "endpoint::".len())
+            .expect("method declaration terminal"),
     ];
     let value = lookup(
         project.root(),
@@ -22019,7 +22023,7 @@ void endpoint::touch() {}
     );
     let results = value["results"].as_array().expect("definition results");
     assert_eq!(results[0]["status"], "no_definition", "{value}");
-    for result in &results[1..] {
+    for result in &results[1..4] {
         assert_eq!(result["status"], "resolved", "{value}");
         assert_eq!(
             result["definitions"][0]["fqn"], "proton.endpoint",
@@ -22032,6 +22036,11 @@ void endpoint::touch() {}
             "{value}"
         );
     }
+    assert_eq!(results[4]["status"], "no_definition", "{value}");
+    assert_eq!(
+        results[4]["diagnostics"][0]["kind"], "declaration_or_import_site",
+        "{value}"
+    );
 }
 
 #[test]

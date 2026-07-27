@@ -193,6 +193,17 @@ pub(super) fn resolve_cpp<'a>(
             ),
         );
     };
+    // Preprocessor suppression is a property of the token selected by the
+    // caller, not of a broader recovery/application ancestor chosen while
+    // classifying its reference role.  In particular, an annotation macro
+    // can be represented as a declaration type after classification without
+    // becoming part of the preceding macro replacement body.
+    if cpp_is_non_reference_preprocessor_token(node) {
+        return no_definition(
+            "declaration_or_import_site",
+            format!("`{}` is not a C++ reference site", site.text),
+        );
+    }
     let reference = cpp_reference_node(node);
     if let Some(CppReferenceNode::Type(type_node)) = reference {
         if cpp_type_node_is_unqualified_name(type_node)
@@ -281,9 +292,7 @@ pub(super) fn resolve_cpp<'a>(
                     candidates_outcome(candidates)
                 };
             }
-            if cpp_is_non_reference_declaration_name(identifier)
-                || cpp_is_non_reference_preprocessor_token(identifier)
-            {
+            if cpp_is_non_reference_declaration_name(identifier) {
                 return no_definition(
                     "declaration_or_import_site",
                     format!("`{}` is not a C++ reference site", site.text),
@@ -2162,9 +2171,7 @@ fn resolve_cpp_type(
     if text.is_empty() {
         return no_definition("no_reference_text", "C++ type reference is blank");
     }
-    if cpp_qualified_identifier_is_declaration_name(node)
-        || cpp_is_non_reference_preprocessor_token(node)
-    {
+    if cpp_qualified_identifier_is_declaration_name(node) {
         return no_definition(
             "declaration_or_import_site",
             format!("`{text}` is not a C++ reference site"),
@@ -3715,10 +3722,43 @@ fn cpp_qualified_identifier_is_declaration_name(node: Node<'_>) -> bool {
 }
 
 fn cpp_is_non_reference_declaration_name(node: Node<'_>) -> bool {
-    if cpp_is_out_of_line_destructor_type_name(node) {
+    if cpp_is_out_of_line_destructor_type_name(node) || cpp_is_out_of_line_owner_type_name(node) {
         return false;
     }
     cpp_is_declaration_name(node) || cpp_is_terminal_declarator_name(node)
+}
+
+/// The scope of an out-of-line `Owner::member` declarator denotes the owner
+/// type.  The terminal `member` remains a declaration name, so only the
+/// structured `scope` role is exempt from the declaration-site guard.
+fn cpp_is_out_of_line_owner_type_name(node: Node<'_>) -> bool {
+    let Some(qualified) = node.parent().filter(|parent| {
+        parent.kind() == "qualified_identifier"
+            && parent.child_by_field_name("scope") == Some(node)
+            && parent.child_by_field_name("name").is_some()
+    }) else {
+        return false;
+    };
+
+    let mut current = qualified;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "function_definition" {
+            return parent
+                .child_by_field_name("declarator")
+                .is_some_and(|declarator| {
+                    declarator.start_byte() <= qualified.start_byte()
+                        && qualified.end_byte() <= declarator.end_byte()
+                });
+        }
+        if matches!(
+            parent.kind(),
+            "compound_statement" | "declaration" | "field_declaration" | "translation_unit"
+        ) {
+            return false;
+        }
+        current = parent;
+    }
+    false
 }
 
 fn cpp_is_out_of_line_destructor_type_name(node: Node<'_>) -> bool {

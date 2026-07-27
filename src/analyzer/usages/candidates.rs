@@ -67,11 +67,11 @@ fn find_import_graph_candidates(
     // (2) Defining files + directory siblings.
     let mut source_files: BTreeSet<ProjectFile> =
         all_targets.iter().map(|cu| cu.source().clone()).collect();
-    source_files.extend(cpp_related_callable_source_files(
-        &all_targets,
-        analyzer,
-        cancellation,
-    ));
+    source_files.extend(
+        cpp_related_callable_peers(&all_targets, analyzer, cancellation)
+            .into_iter()
+            .map(|peer| peer.source().clone()),
+    );
 
     for source_file in &source_files {
         if is_cancelled(cancellation) {
@@ -143,11 +143,15 @@ fn find_import_graph_candidates(
     candidates
 }
 
-fn cpp_related_callable_source_files(
+/// Returns only declaration/body units proven to represent the same C++
+/// callable.  These peers extend candidate-file discovery and mark the
+/// callable's own declaration ranges during usage scanning; they never expand
+/// overload selection or matching.
+pub(crate) fn cpp_related_callable_peers(
     targets: &HashSet<CodeUnit>,
     analyzer: &dyn IAnalyzer,
     cancellation: Option<&CancellationToken>,
-) -> BTreeSet<ProjectFile> {
+) -> BTreeSet<CodeUnit> {
     if !targets
         .iter()
         .any(|target| language_for_target(target) == Language::Cpp && target.is_callable())
@@ -177,7 +181,7 @@ fn cpp_related_callable_source_files(
                 continue;
             }
             if cpp_callable_definitions_share_identity_evidence(analyzer, target, candidate) {
-                related.insert(candidate.source().clone());
+                related.insert(candidate.clone());
             }
         }
     }
