@@ -408,6 +408,70 @@ struct Client {
 }
 
 #[test]
+fn cpp_qualified_temporary_with_inherited_constructor_is_a_type_usage() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "errors.hpp",
+            r#"
+namespace core {
+class ErrorBase {
+public:
+  explicit ErrorBase(const char* message);
+};
+class Error : public ErrorBase {
+  using ErrorBase::ErrorBase;
+};
+}
+namespace unrelated {
+class Error {
+public:
+  explicit Error(const char* message);
+};
+}
+namespace shadowed {
+class Error {};
+void Error(const char* format, int value);
+}
+"#,
+        )
+        .file(
+            "consumer.cpp",
+            r#"
+#include "errors.hpp"
+#define FMT(...) __VA_ARGS__
+void fail() {
+  throw core::Error(FMT("failure: {}", 1));
+  shadowed::Error(FMT("ignored: {}", 2));
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.cpp");
+    let source = consumer.read_to_string().expect("consumer source");
+    let target = definition_by(&analyzer, |unit| {
+        unit.is_class() && unit.fq_name() == "core.Error" && !unit.is_synthetic()
+    });
+    let shadowed = definition_by(&analyzer, |unit| {
+        unit.is_class() && unit.fq_name() == "shadowed.Error" && !unit.is_synthetic()
+    });
+    let expected_start = source
+        .find("Error(FMT(\"failure: {}\", 1))")
+        .expect("temporary type");
+
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &consumer),
+        BTreeSet::from([(expected_start, expected_start + "Error".len())]),
+        "the qualified temporary must retain the exact inherited-constructor class usage"
+    );
+    assert!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&shadowed), &consumer)
+            .is_empty(),
+        "a visible same-qualified free function must keep the class target conservative"
+    );
+}
+
+#[test]
 fn cpp_member_calls_match_visible_owner_peers_across_inheritance_and_body_definitions() {
     let (_project, analyzer) = cpp_analyzer_with_files(&[
         (
@@ -10716,11 +10780,19 @@ fn authoritative_cpp_exact_ranges_cover_qualified_static_and_temporary_member_ca
         .file(
             "calls.h",
             r#"#pragma once
+#define LOG4CXX_NS demo
 namespace demo {
 struct Target {
     static void stat();
     void run();
 };
+}
+namespace LOG4CXX_NS {
+namespace pattern {
+struct MacroTarget {
+    void run();
+};
+}
 }
 "#,
         )
@@ -10730,6 +10802,9 @@ struct Target {
 namespace demo {
 void Target::stat() {}
 void Target::run() {}
+}
+namespace demo::pattern {
+void MacroTarget::run() {}
 }
 "#,
         )
@@ -10742,6 +10817,10 @@ void consume() {
     Target::stat();
     Target().run();
 }
+}
+using namespace demo::pattern;
+void consume_macro_namespace() {
+    MacroTarget().run();
 }
 "#,
         )
@@ -10759,6 +10838,11 @@ void consume() {
             && unit.fq_name() == "demo.Target.run"
             && slash_path(unit.source()) == "calls.h"
     });
+    let macro_run = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name().contains("MacroTarget.run")
+            && slash_path(unit.source()) == "calls.h"
+    });
 
     assert_eq!(
         authoritative_exact_ranges(&analyzer, std::slice::from_ref(&stat), &site),
@@ -10769,6 +10853,113 @@ void consume() {
         authoritative_exact_ranges(&analyzer, std::slice::from_ref(&run), &site),
         BTreeSet::from([fixture_token_range(&source, "    Target().run();", "run")]),
         "temporary member calls must retain their exact terminal member range"
+    );
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&macro_run), &site),
+        BTreeSet::from([fixture_token_range(
+            &source,
+            "    MacroTarget().run();",
+            "run",
+        )]),
+        "temporary receivers must preserve macro-namespace owner identity"
+    );
+}
+
+#[test]
+fn authoritative_cpp_macro_decorated_temporary_receiver_resolves_own_override() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "base.h",
+            r#"#pragma once
+#define LOG4CXX_NS log4cxx
+namespace LOG4CXX_NS {
+namespace pattern {
+struct BaseConverter {
+    virtual void format(int event, int logger) const;
+};
+}
+}
+#if LOG4CXX_ABI_VERSION <= 15
+#define LOG4CXX_FORMAT_EVENT_FORMAL_PARAMETERS int event, int logger, int pool
+#else
+#define LOG4CXX_FORMAT_EVENT_FORMAL_PARAMETERS int event, int logger
+#endif
+"#,
+        )
+        .file(
+            "converter.h",
+            r#"#pragma once
+#include "base.h"
+#define LOG4CXX_EXPORT
+namespace LOG4CXX_NS {
+namespace pattern {
+class LOG4CXX_EXPORT FullLocationPatternConverter : public BaseConverter {
+public:
+    DECLARE_LOG4CXX_PATTERN(FullLocationPatternConverter)
+    BEGIN_LOG4CXX_CAST_MAP()
+    LOG4CXX_CAST_ENTRY(FullLocationPatternConverter)
+    END_LOG4CXX_CAST_MAP()
+
+    FullLocationPatternConverter();
+    using BaseConverter::format;
+    void format(LOG4CXX_FORMAT_EVENT_FORMAL_PARAMETERS) const override;
+};
+}
+}
+"#,
+        )
+        .file(
+            "consumer.cpp",
+            r#"#include "converter.h"
+using namespace log4cxx::pattern;
+void consume() {
+    FullLocationPatternConverter().format(1, 2, 3);
+    FullLocationPatternConverter().format(1, 2);
+}
+
+#undef LOG4CXX_FORMAT_EVENT_FORMAL_PARAMETERS
+#define LOG4CXX_FORMAT_EVENT_FORMAL_PARAMETERS int one, int two, int three, int four
+void consume_unrelated_macro_redefinition() {
+    FullLocationPatternConverter().format(1, 2, 3, 4);
+}
+
+namespace shadowed {
+struct OtherConverter {
+    void format(int event, int logger, int pool);
+};
+OtherConverter FullLocationPatternConverter();
+}
+
+void consume_shadowed() {
+    shadowed::FullLocationPatternConverter().format(1, 2, 3);
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let site = project.file("consumer.cpp");
+    let source = site.read_to_string().expect("consumer source");
+    let target = definition_by(&analyzer, |unit| {
+        unit.is_function()
+            && unit.fq_name() == "LOG4CXX_NS::pattern.FullLocationPatternConverter.format"
+            && unit.is_synthetic()
+    });
+
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &site),
+        BTreeSet::from([
+            fixture_token_range(
+                &source,
+                "    FullLocationPatternConverter().format(1, 2, 3);",
+                "format",
+            ),
+            fixture_token_range(
+                &source,
+                "    FullLocationPatternConverter().format(1, 2);",
+                "format",
+            ),
+        ]),
+        "a macro-decorated temporary receiver must retain its exact override method usage"
     );
 }
 

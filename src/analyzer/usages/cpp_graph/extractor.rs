@@ -904,13 +904,6 @@ fn resolve_qualified_call_target(
             file,
         );
     }
-    if visibility
-        .call_arity_evidence(file, call, source)
-        .exact()
-        .is_none()
-    {
-        return BareCallTargetResolution::Ambiguous;
-    }
     match resolve_type_node_lexically(
         function,
         analyzer,
