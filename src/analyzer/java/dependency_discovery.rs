@@ -55,20 +55,20 @@ gradle.projectsEvaluated {
 "#;
 
 #[derive(Debug, Default)]
-pub(super) struct DiscoveredJavaDependencies {
+pub(crate) struct DiscoveredJavaDependencies {
     pub(super) artifact_paths: Vec<JavaExternalArtifact>,
     pub(super) coordinates: Vec<JavaMavenCoordinate>,
 }
 
 impl DiscoveredJavaDependencies {
-    pub(super) fn merge_into(self, dependencies: &mut JavaExternalDependencies) {
+    pub(crate) fn merge_into(self, dependencies: &mut JavaExternalDependencies) {
         dependencies.artifact_paths.extend(self.artifact_paths);
         dependencies.coordinates.extend(self.coordinates);
         deduplicate_dependencies(dependencies);
     }
 }
 
-pub(super) fn discover_metadata(project: &dyn Project) -> DiscoveredJavaDependencies {
+pub(crate) fn discover_metadata(project: &dyn Project) -> DiscoveredJavaDependencies {
     let Ok(files) = project.all_files() else {
         return DiscoveredJavaDependencies::default();
     };
@@ -85,7 +85,7 @@ pub(super) fn discover_metadata(project: &dyn Project) -> DiscoveredJavaDependen
     discovered
 }
 
-pub(super) fn discover_build_tools(
+pub(crate) fn discover_build_tools(
     project: &dyn Project,
     config: &JavaDependencyDiscoveryConfig,
 ) -> DiscoveredJavaDependencies {

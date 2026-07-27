@@ -1362,6 +1362,13 @@ impl ParsedFile {
         &self.declarations
     }
 
+    pub(crate) fn declaration_ranges(&self, code_unit: &CodeUnit) -> &[Range] {
+        self.ranges
+            .get(code_unit)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
     pub(crate) fn contains_declaration(&self, code_unit: &CodeUnit) -> bool {
         self.declarations.contains(code_unit)
     }

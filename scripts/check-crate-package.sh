@@ -7,7 +7,8 @@ readonly max_crate_bytes="${MAX_CRATE_BYTES:-10000000}"
 cargo package --locked --allow-dirty
 
 shopt -s nullglob
-archives=(target/package/brokk-bifrost-*.crate)
+readonly package_target_dir="${CARGO_TARGET_DIR:-target}"
+archives=("$package_target_dir"/package/brokk-bifrost-*.crate)
 if (( ${#archives[@]} != 1 )); then
     echo "Expected one packaged crate, found ${#archives[@]}" >&2
     exit 1

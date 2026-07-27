@@ -59,7 +59,7 @@ use super::imports::{
 use super::supertypes::{extract_scala_supertypes, scala_full_enum_case_owner_supertype};
 use super::wildcard_imports::scala_package_prefixes_at;
 
-pub(super) fn parse_scala_file(
+pub(crate) fn parse_scala_file(
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
@@ -1492,6 +1492,25 @@ fn scala_modifier_prefix(node: Node<'_>, source: &str) -> String {
     } else {
         format!("{} ", modifiers.join(" "))
     }
+}
+
+pub(crate) fn scala_declaration_is_public(node: Node<'_>, source: &str) -> bool {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if !matches!(child.kind(), "modifiers" | "access_modifier") {
+            continue;
+        }
+        let modifier = scala_node_text(child, source).trim();
+        if modifier.split_whitespace().any(|word| {
+            matches!(
+                word.trim_matches(['[', ']', '(', ')', ',']),
+                "private" | "protected"
+            )
+        }) {
+            return false;
+        }
+    }
+    true
 }
 
 fn scala_pattern_names(node: Node<'_>, source: &str) -> Vec<String> {

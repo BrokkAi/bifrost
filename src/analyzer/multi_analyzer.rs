@@ -200,7 +200,7 @@ impl AnalyzerDelegate {
 
     fn needs_config_update_for(&self, file: &ProjectFile) -> bool {
         match self {
-            Self::Java(_) => crate::analyzer::java::is_java_dependency_input(file),
+            Self::Java(_) | Self::Scala(_) => crate::analyzer::java::is_java_dependency_input(file),
             Self::CSharp(_) => crate::analyzer::csharp::is_csharp_dependency_input(file),
             Self::JavaScript(_) | Self::TypeScript(_) => is_js_ts_config_file(file),
             _ => false,
