@@ -1271,7 +1271,18 @@ fn bifrost_lsp_server_validates_and_hovers_unsaved_rqlp_source() {
 fn bifrost_lsp_server_runs_unsaved_rqlp_source_with_workspace_identity() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canonical root");
-    fs::write(root.join("app.ts"), "export function target() {}\n").expect("write source fixture");
+    fs::write(
+        root.join("app.ts"),
+        r#"export function target() {}
+function open_resource(): object { return {}; }
+function close_resource(resource: object): void {}
+export function leak_resource(): object {
+  const resource = open_resource();
+  return resource;
+}
+"#,
+    )
+    .expect("write source fixture");
     fs::create_dir(root.join("policies")).expect("create policies directory");
     fs::create_dir(root.join("queries")).expect("create query directory");
     fs::write(
@@ -1462,8 +1473,10 @@ fn bifrost_lsp_server_runs_unsaved_rqlp_source_with_workspace_identity() {
       :events [
         (event :id close
           :calls (calls :selector (rql (call :callee (name "close_resource")))
-            :subject receiver :phase after-normal-return))]
-      :transitions [(transition :from open :on close :to closed)]
+            :subject (argument :index 0) :phase after-normal-return))]
+      :transitions [
+        (transition :from open :on close :to closed)
+        (transition :from closed :on close :to violated)]
       :terminal-expectations [
         (terminal-expectation :id normal-exit
           :on (normal-procedure-exit :scope analysis-root)
@@ -1472,12 +1485,19 @@ fn bifrost_lsp_server_runs_unsaved_rqlp_source_with_workspace_identity() {
     );
     assert!(typestate["error"].is_null(), "{typestate}");
     assert_eq!(
-        typestate["result"]["report"]["runs"][0]["completion"]["type"], "unsupported",
+        typestate["result"]["report"]["runs"][0]["completion"]["type"], "inconclusive",
         "{typestate}"
     );
     assert_eq!(
-        typestate["result"]["report"]["runs"][0]["completion"]["capability"]["type"],
-        "typestate_evaluation",
+        typestate["result"]["report"]["runs"][0]["completion"]["reasons"],
+        json!(["partial_discovery"]),
+        "{typestate}"
+    );
+    assert_eq!(
+        typestate["result"]["report"]["runs"][0]["findings"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
         "{typestate}"
     );
 

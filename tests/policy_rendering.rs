@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use brokk_bifrost::policy::{
     HumanRenderColor, HumanRenderDetail, HumanRenderOptions, PolicyFailOn, PolicyRenderError,
-    evaluate_policy_files, write_policy_human, write_policy_json,
+    PolicyRunCompletion, evaluate_policy_files, write_policy_human, write_policy_json,
 };
 use serde_json::Value;
 
@@ -135,7 +135,7 @@ fn concise_verbose_and_json_render_the_same_complete_finding_deterministically()
 }
 
 #[test]
-fn unsupported_typestate_run_names_the_policy_and_compilation_capability() {
+fn typestate_run_renders_findings_and_completion() {
     let fixture_root =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/policy-cli/project");
     let outcome = evaluate_policy_files(
@@ -145,6 +145,12 @@ fn unsupported_typestate_run_names_the_policy_and_compilation_capability() {
         PolicyFailOn::Never,
     )
     .expect("coordinated typestate policy evaluation");
+    assert_eq!(outcome.report().runs().len(), 1);
+    assert_eq!(outcome.report().runs()[0].findings().len(), 1);
+    assert!(matches!(
+        outcome.report().runs()[0].completion(),
+        PolicyRunCompletion::Inconclusive { .. }
+    ));
 
     let mut rendered = Vec::new();
     write_policy_human(
@@ -155,10 +161,13 @@ fn unsupported_typestate_run_names_the_policy_and_compilation_capability() {
     )
     .expect("human report");
     let rendered = String::from_utf8(rendered).unwrap();
-    assert!(rendered.contains(
-        "policy bifrost.test.resource-lifecycle (Resource lifecycle): unsupported: typestate policy compilation; non-clean"
-    ));
-    assert!(!rendered.contains("; clean"));
+    assert_eq!(
+        rendered
+            .matches("Resource can leave its analysis root without being closed")
+            .count(),
+        1
+    );
+    assert!(rendered.contains("summary: 1 finding; 1 inconclusive policy run; non-clean"));
 }
 
 #[test]

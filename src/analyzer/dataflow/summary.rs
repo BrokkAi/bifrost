@@ -87,7 +87,33 @@ impl<Fact> ReusableSummaryProvider<Fact> for NoReusableSummaries {
     }
 }
 
-/// One root procedure and its explicit entry facts for a summary solve.
+/// One explicit fact seed at a program point in the solve root.
+///
+/// Point seeds use the distinguished zero fact as their relative root-entry
+/// relation. This preserves the summary solver's entry-to-point relation while
+/// allowing clients to begin propagation at source observations that occur
+/// after procedure entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryPointSeed<Fact> {
+    point: ProgramPointHandle,
+    fact: Fact,
+}
+
+impl<Fact> SummaryPointSeed<Fact> {
+    pub const fn new(point: ProgramPointHandle, fact: Fact) -> Self {
+        Self { point, fact }
+    }
+
+    pub const fn point(&self) -> &ProgramPointHandle {
+        &self.point
+    }
+
+    pub const fn fact(&self) -> &Fact {
+        &self.fact
+    }
+}
+
+/// One root procedure and its explicit entry and point facts for a summary solve.
 ///
 /// The root's declared entry point is implicit. The distinguished zero fact is
 /// always added as its own relative entry relation.
@@ -95,6 +121,7 @@ impl<Fact> ReusableSummaryProvider<Fact> for NoReusableSummaries {
 pub struct SummarySolveInput<'input, Fact> {
     root: &'input ProcedureHandle,
     entry_facts: &'input [Fact],
+    point_seeds: &'input [SummaryPointSeed<Fact>],
     witness_retention: WitnessRetentionLimits,
 }
 
@@ -103,6 +130,7 @@ impl<'input, Fact> SummarySolveInput<'input, Fact> {
         Self {
             root,
             entry_facts,
+            point_seeds: &[],
             witness_retention: WitnessRetentionLimits::disabled(),
         }
     }
@@ -113,6 +141,15 @@ impl<'input, Fact> SummarySolveInput<'input, Fact> {
 
     pub const fn entry_facts(self) -> &'input [Fact] {
         self.entry_facts
+    }
+
+    pub const fn with_point_seeds(mut self, point_seeds: &'input [SummaryPointSeed<Fact>]) -> Self {
+        self.point_seeds = point_seeds;
+        self
+    }
+
+    pub const fn point_seeds(self) -> &'input [SummaryPointSeed<Fact>] {
+        self.point_seeds
     }
 
     pub const fn with_witness_retention(
@@ -202,6 +239,10 @@ struct StagedFacts<Fact> {
 }
 
 enum PathWitnessSource<'edge> {
+    PointSeed {
+        point: &'edge ProgramPointHandle,
+        quality: PathQuality,
+    },
     Edge {
         predecessor: WitnessEvidenceId,
         predecessor_quality: PathQuality,
@@ -228,6 +269,7 @@ enum PathWitnessSource<'edge> {
 impl PathWitnessSource<'_> {
     fn quality(&self) -> PathQuality {
         match self {
+            Self::PointSeed { quality, .. } => *quality,
             Self::Edge {
                 predecessor_quality,
                 edge,
@@ -252,6 +294,7 @@ impl PathWitnessSource<'_> {
 
     fn retained_bytes(&self) -> usize {
         match self {
+            Self::PointSeed { .. } => WitnessEvidenceNode::seed_retained_bytes(),
             Self::Edge { edge, .. } => WitnessEvidenceNode::edge_retained_bytes(edge),
             Self::SummaryApplication { return_edge, .. } => {
                 WitnessEvidenceNode::summary_application_retained_bytes(return_edge)
@@ -264,6 +307,9 @@ impl PathWitnessSource<'_> {
 
     fn evidence_for(&self, output_fact: FactId) -> WitnessEvidenceNode {
         match self {
+            Self::PointSeed { point, .. } => {
+                WitnessEvidenceNode::seed((*point).clone(), output_fact)
+            }
             Self::Edge {
                 predecessor,
                 predecessor_quality,
@@ -311,6 +357,7 @@ impl PathWitnessSource<'_> {
 
     fn matches_derivation(&self, output_fact: FactId, existing: &WitnessEvidenceNode) -> bool {
         match self {
+            Self::PointSeed { point, .. } => existing.matches_seed_derivation(point, output_fact),
             Self::Edge {
                 predecessor,
                 predecessor_quality,
@@ -383,6 +430,7 @@ struct SummaryState<Fact> {
     fact_ids: HashMap<Fact, FactId>,
     procedures: Vec<ProcedureHandle>,
     procedure_ids: HashMap<ProcedureHandle, usize>,
+    point_seeds: HashMap<(usize, ProgramPointId), Vec<Fact>>,
     reached: HashMap<PathEdgeKey, PathQualityFrontier>,
     path_witnesses: HashMap<PathEdgeKey, WitnessAlternatives>,
     worklist: VecDeque<QueuedPath>,
@@ -419,6 +467,7 @@ where
             fact_ids: HashMap::default(),
             procedures: Vec::new(),
             procedure_ids: HashMap::default(),
+            point_seeds: HashMap::default(),
             reached: HashMap::default(),
             path_witnesses: HashMap::default(),
             worklist: VecDeque::new(),
@@ -511,8 +560,10 @@ where
                 SemanticProviderError::internal("summary root procedure has no entry point")
             })?;
 
-        let mut unique_seeds = HashSet::default();
-        unique_seeds.insert(self.zero_fact);
+        let mut unique_facts = HashSet::default();
+        unique_facts.insert(self.zero_fact);
+        let mut initial_paths = HashSet::default();
+        initial_paths.insert((self.zero_fact, entry_point.id(), self.zero_fact));
         let mut callback_rows = 0usize;
         if let Err(exceeded) = request.budget.check(SolverWork {
             interned_facts: 1,
@@ -526,20 +577,51 @@ where
                 return Ok(Some(SolverTermination::Cancelled));
             }
             callback_rows = callback_rows.saturating_add(1);
-            let prospective_facts = unique_seeds.len() + usize::from(!unique_seeds.contains(&seed));
+            let prospective_facts = unique_facts.len() + usize::from(!unique_facts.contains(&seed));
+            let prospective_states = initial_paths.len()
+                + usize::from(!initial_paths.contains(&(seed, entry_point.id(), seed)));
             if let Err(exceeded) = request.budget.check(SolverWork {
                 interned_facts: prospective_facts,
-                reached_states: prospective_facts,
+                reached_states: prospective_states,
                 callback_rows,
                 ..SolverWork::default()
             }) {
                 return Ok(Some(SolverTermination::ExceededBudget(exceeded)));
             }
-            unique_seeds.insert(seed);
+            unique_facts.insert(seed);
+            initial_paths.insert((seed, entry_point.id(), seed));
         }
 
-        unique_seeds.remove(&self.zero_fact);
-        let mut explicit = unique_seeds.into_iter().collect::<Vec<_>>();
+        for seed in input.point_seeds() {
+            if request.cancellation.is_cancelled() {
+                return Ok(Some(SolverTermination::Cancelled));
+            }
+            if seed.point().procedure() != input.root() {
+                return Err(SummaryDataflowError::PointSeedOutsideRoot);
+            }
+            let fact = *seed.fact();
+            let prospective_facts = unique_facts.len() + usize::from(!unique_facts.contains(&fact));
+            if let Err(exceeded) = request.budget.check(SolverWork {
+                interned_facts: prospective_facts,
+                reached_states: initial_paths.len(),
+                callback_rows,
+                ..SolverWork::default()
+            }) {
+                return Ok(Some(SolverTermination::ExceededBudget(exceeded)));
+            }
+            unique_facts.insert(fact);
+            self.point_seeds
+                .entry((root, seed.point().id()))
+                .or_default()
+                .push(fact);
+        }
+        for facts in self.point_seeds.values_mut() {
+            facts.sort_unstable();
+            facts.dedup();
+        }
+
+        unique_facts.remove(&self.zero_fact);
+        let mut explicit = unique_facts.into_iter().collect::<Vec<_>>();
         explicit.sort_unstable();
 
         let mut staged_facts = Vec::with_capacity(explicit.len().saturating_add(1));
@@ -554,28 +636,36 @@ where
             staged_fact_ids.insert(seed, id);
         }
 
-        let staged_states = staged_facts
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                let fact = FactId::try_from_index(index)
-                    .expect("prevalidated root fact index remains representable");
-                PathEdgeKey {
-                    entry: EntryKey {
-                        procedure: root,
-                        entry_point: entry_point.id(),
-                        entry_fact: fact,
+        let mut initial_paths = initial_paths.into_iter().collect::<Vec<_>>();
+        initial_paths.sort_unstable();
+        let staged_states = initial_paths
+            .into_iter()
+            .map(|(relative_entry_fact, point, fact)| {
+                let relative_entry_fact = staged_fact_ids[&relative_entry_fact];
+                let fact = staged_fact_ids[&fact];
+                let point_handle = input
+                    .root()
+                    .point_handle(point)
+                    .expect("validated point seed remains in its root procedure");
+                (
+                    PathEdgeKey {
+                        entry: EntryKey {
+                            procedure: root,
+                            entry_point: entry_point.id(),
+                            entry_fact: relative_entry_fact,
+                        },
+                        point,
+                        fact,
                     },
-                    point: entry_point.id(),
-                    fact,
-                }
+                    point_handle,
+                )
             })
             .collect::<Vec<_>>();
         let mut staged_witness_nodes = Vec::new();
         let mut staged_witness_bytes = 0usize;
         let mut staged_witnesses = Vec::with_capacity(staged_states.len());
         let mut witness_exhausted = false;
-        for key in &staged_states {
+        for (key, seed_point) in &staged_states {
             if request.cancellation.is_cancelled() {
                 return Ok(Some(SolverTermination::Cancelled));
             }
@@ -590,8 +680,8 @@ where
                             WitnessEvidenceNode::seed_retained_bytes(),
                             self.request_witness_staging_capacity(request),
                         ),
-                        |existing| existing.matches_seed_derivation(&entry_point, key.fact),
-                        || WitnessEvidenceNode::seed(entry_point.clone(), key.fact),
+                        |existing| existing.matches_seed_derivation(seed_point, key.fact),
+                        || WitnessEvidenceNode::seed(seed_point.clone(), key.fact),
                         WitnessStaging::new(&mut staged_witness_nodes, &mut staged_witness_bytes),
                     )
                     .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow { index })?;
@@ -646,7 +736,7 @@ where
                 self.witness_arena.commit(id, node);
             }
         }
-        for (key, witnesses) in staged_states.into_iter().zip(staged_witnesses) {
+        for ((key, _), witnesses) in staged_states.into_iter().zip(staged_witnesses) {
             let quality = PathQuality::PROVEN_COMPLETE;
             self.reached
                 .insert(key, PathQualityFrontier::singleton(quality));
@@ -666,6 +756,35 @@ where
                 quality,
                 evidence,
             });
+        }
+        Ok(None)
+    }
+
+    fn activate_point_seeds(
+        &mut self,
+        point: &ProgramPointHandle,
+        entry: EntryKey,
+        quality: PathQuality,
+        request: &mut DataflowRequest<'_>,
+    ) -> Result<Option<SolverTermination>, SummaryDataflowError> {
+        let Some(seeds) = self
+            .point_seeds
+            .get(&(entry.procedure, point.id()))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        for fact in seeds {
+            if let Some(termination) = self.publish_path_outputs(
+                entry,
+                point.id(),
+                quality,
+                &[fact],
+                Some(PathWitnessSource::PointSeed { point, quality }),
+                request,
+            )? {
+                return Ok(Some(termination));
+            }
         }
         Ok(None)
     }
@@ -1111,6 +1230,14 @@ where
                 SemanticProviderError::internal("summary worklist point is stale")
             })?;
             let fact = self.facts[queued.key.fact.index()];
+
+            if queued.key.entry.entry_fact == ZERO_FACT_ID
+                && queued.key.fact == ZERO_FACT_ID
+                && let Some(termination) =
+                    self.activate_point_seeds(&point, queued.key.entry, queued.quality, request)?
+            {
+                return Ok(termination);
+            }
 
             if is_procedure_exit(&point) {
                 if let Some(termination) =

@@ -395,6 +395,7 @@ mod tests {
                 policy,
                 &PolicyEvaluationContext {
                     analyzer: &analyzer,
+                    workspace: None,
                     cancellation,
                     cvss_overlays: &[],
                     organizational_risk: &[],

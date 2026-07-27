@@ -9,6 +9,7 @@ use serde_json::Value;
 use common::{BuiltInlineTestProject, InlineTestProject};
 
 const APP: &str = include_str!("fixtures/policy-cli/project/src/app.py");
+const RESOURCE_SOURCE: &str = include_str!("fixtures/policy-cli/project/src/resource.ts");
 const DYNAMIC: &str = include_str!("fixtures/policy-cli/project/policies/dynamic-eval.rqlp");
 const INFERRED: &str =
     include_str!("fixtures/policy-cli/project/policies/inferred-dynamic-eval.rqlp");
@@ -24,10 +25,88 @@ const INFERRED_ACQUIRE_ENDPOINT: &str =
     include_str!("fixtures/policy-cli/overrides/resource-acquire-inferred.rqlp");
 const CLOSE_ENDPOINT: &str =
     include_str!("fixtures/policy-cli/project/policies/endpoints/resource-close.rqlp");
+const DOMINANT_CLOSE_ENDPOINT: &str = r#"(endpoint
+  :schema-version 1
+  :id "bifrost.resources.close-dominant"
+  :name "Dominant resource close"
+  :display-name "dominant resource close"
+  :role sink
+  :categories [resource.lifecycle resource.close]
+  :selector
+    (rql
+      :schema-version 2
+      (language typescript
+        (call :callee (name "closeResource"))))
+  :binding (argument :index 0)
+  :supersedes [bifrost.resources.close])"#;
+const DOMINANT_ACQUIRE_ENDPOINT: &str = r#"(endpoint
+  :schema-version 1
+  :id "bifrost.resources.acquire-dominant"
+  :name "Dominant resource acquisition"
+  :display-name "dominant acquired resource"
+  :role source
+  :categories [resource.lifecycle resource.acquire]
+  :selector
+    (rql
+      :schema-version 2
+      (language typescript
+        (call :callee (name "openResource"))))
+  :binding return-value
+  :supersedes [bifrost.resources.acquire])"#;
+const DOMINANCE_SOURCE: &str = r#"class Resource {}
+
+function openResource(): Resource {
+  return new Resource();
+}
+
+function closeResource(resource: Resource): void {}
+
+export function closesResource(): void {
+  const resource = openResource();
+  closeResource(resource);
+}
+"#;
+const EXIT_EVENT_POLICY: &str = r#"(policy
+  :schema-version 1
+  :id "bifrost.test.resource-exit-event"
+  :name "Resource exit event"
+  :message "Resource reached the analysis-root exit"
+  :severity error
+  :analysis
+    (analysis
+      :type typestate
+      :mode may
+      :subjects
+        (subject-set
+          :include-matches [
+            (match-directory
+              :path "policies/endpoints"
+              :scope recursive
+              :categories (all [resource.acquire]))]
+          :entries [])
+      :uncertainty
+        (uncertainty
+          :unknown-call inconclusive
+          :escape inconclusive)
+      :automaton
+        (automaton
+          :states [open violated]
+          :initial open
+          :accepting-states [open]
+          :error-states [violated]
+          :events [
+            (event
+              :id finish
+              :on (normal-procedure-exit :scope analysis-root)
+              :supersedes [])]
+          :transitions [
+            (transition :from open :on finish :to violated)]
+          :terminal-expectations [])))"#;
 
 fn policy_project(extra: &[(&str, String)]) -> BuiltInlineTestProject {
     let mut project = InlineTestProject::new()
         .file("src/app.py", APP)
+        .file("src/resource.ts", RESOURCE_SOURCE)
         .file("policies/dynamic-eval.rqlp", DYNAMIC)
         .file("policies/inferred-dynamic-eval.rqlp", INFERRED)
         .file("policies/no-exec.rqlp", NO_EXEC)
@@ -256,7 +335,7 @@ fn thresholds_cover_clean_rated_and_unrated_findings() {
 }
 
 #[test]
-fn strict_versions_endpoint_roots_and_unsupported_runs_are_status_two_reports() {
+fn strict_versions_endpoint_roots_and_typestate_execution_have_typed_statuses() {
     let project = policy_project(&[]);
 
     let inferred = run(
@@ -324,7 +403,18 @@ fn strict_versions_endpoint_roots_and_unsupported_runs_are_status_two_reports() 
             .len(),
         2
     );
-    assert_eq!(report["runs"][0]["completion"]["type"], "unsupported");
+    assert_eq!(report["runs"][0]["completion"]["type"], "inconclusive");
+    assert_eq!(
+        report["runs"][0]["completion"]["reasons"],
+        serde_json::json!(["partial_discovery"])
+    );
+    assert_eq!(report["runs"][0]["findings"].as_array().unwrap().len(), 1);
+    for finding in report["runs"][0]["findings"].as_array().unwrap() {
+        assert_eq!(finding["analysis_type"], "typestate");
+        assert_eq!(finding["identity_stability"], "strong");
+        assert!(!finding["related"].as_array().unwrap().is_empty());
+        assert!(!finding["witnesses"].as_array().unwrap().is_empty());
+    }
 
     let dependency_project = policy_project(&[(
         "policies/endpoints/resource-acquire.rqlp",
@@ -499,7 +589,7 @@ fn policy_id_order_is_stable_and_duplicate_roots_are_all_excluded() {
 }
 
 #[test]
-fn mixed_invalid_and_unsupported_batches_retain_valid_findings_with_status_two() {
+fn mixed_invalid_and_typestate_batches_retain_valid_findings_with_typed_statuses() {
     let project = policy_project(&[(
         "policies/invalid.rqlp",
         "(policy :id \"broken\"".to_string(),
@@ -526,7 +616,7 @@ fn mixed_invalid_and_unsupported_batches_retain_valid_findings_with_status_two()
     assert_eq!(report["runs"][0]["findings"].as_array().unwrap().len(), 1);
     assert_eq!(report["diagnostics"].as_array().unwrap().len(), 1);
 
-    let unsupported = run(
+    let typestate = run(
         project.root(),
         &[
             "--policy-file",
@@ -537,18 +627,267 @@ fn mixed_invalid_and_unsupported_batches_retain_valid_findings_with_status_two()
             "sarif",
         ],
     );
-    assert_status(&unsupported, 2);
-    let sarif = json_stdout(&unsupported);
-    assert_eq!(sarif["runs"][0]["results"].as_array().unwrap().len(), 1);
+    assert_status(&typestate, 2);
+    let sarif = json_stdout(&typestate);
+    assert_eq!(sarif["runs"][0]["results"].as_array().unwrap().len(), 2);
     assert_eq!(
         sarif["runs"][0]["invocations"][0]["executionSuccessful"],
         false
     );
     assert!(
-        !sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"]
+        sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"]
             .as_array()
             .unwrap()
-            .is_empty()
+            .iter()
+            .any(|notification| {
+                notification["descriptor"]["id"] == "BIFROST_POLICY_INCONCLUSIVE"
+            })
+    );
+}
+
+#[test]
+fn typestate_finding_identity_locations_and_witnesses_match_human_and_sarif() {
+    let project = policy_project(&[]);
+    let arguments = [
+        "--policy-file",
+        "policies/resource-lifecycle.rqlp",
+        "--fail-on",
+        "never",
+    ];
+    let json = run(
+        project.root(),
+        &[&arguments[..], &["--format", "json"]].concat(),
+    );
+    assert_status(&json, 2);
+    let json = json_stdout(&json);
+    let findings = json["runs"][0]["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    let finding_ids = findings
+        .iter()
+        .map(|finding| finding["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    for finding in findings {
+        assert!(!finding["related"].as_array().unwrap().is_empty());
+        assert!(!finding["witnesses"].as_array().unwrap().is_empty());
+        assert_eq!(finding["witnesses_truncated"], false);
+    }
+
+    let human = run(project.root(), &[&arguments[..], &["--verbose"]].concat());
+    assert_status(&human, 2);
+    let human = String::from_utf8(human.stdout).expect("UTF-8 typestate report");
+    for finding_id in &finding_ids {
+        assert!(
+            human.contains(finding_id),
+            "missing {finding_id} in:\n{human}"
+        );
+    }
+    assert!(human.contains("  related source: "), "{human}");
+    assert!(human.contains("  witness "), "{human}");
+    let finding = &findings[0];
+    assert!(
+        human.contains(finding["policy_id"].as_str().unwrap()),
+        "{human}"
+    );
+    assert!(
+        human.contains(&format!(
+            "analysis: typestate ({}, {})",
+            finding["certainty"]["type"].as_str().unwrap(),
+            finding["completeness"]["type"].as_str().unwrap(),
+        )),
+        "{human}"
+    );
+    for witness in finding["witnesses"].as_array().unwrap() {
+        assert!(human.contains(witness["id"].as_str().unwrap()), "{human}");
+        for step in witness["steps"].as_array().unwrap() {
+            assert!(human.contains(step["label"].as_str().unwrap()), "{human}");
+        }
+    }
+
+    let sarif = run(
+        project.root(),
+        &[&arguments[..], &["--format", "sarif"]].concat(),
+    );
+    assert_status(&sarif, 2);
+    let sarif = json_stdout(&sarif);
+    let results = sarif["runs"][0]["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    let sarif_ids = results
+        .iter()
+        .map(|result| result["properties"]["bifrost.findingId"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(sarif_ids, finding_ids);
+    for (finding, result) in findings.iter().zip(results) {
+        assert_eq!(result["ruleId"], finding["policy_id"]);
+        assert_eq!(
+            result["properties"]["bifrost.certainty"],
+            finding["certainty"]
+        );
+        assert_eq!(
+            result["properties"]["bifrost.findingCompleteness"],
+            finding["completeness"]
+        );
+        assert_eq!(
+            result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+            finding["primary"]["path"]
+        );
+        assert_eq!(
+            result["locations"][0]["physicalLocation"]["region"]["startLine"],
+            finding["primary"]["region"]["start_line"]
+        );
+        assert!(!result["relatedLocations"].as_array().unwrap().is_empty());
+        assert!(!result["codeFlows"].as_array().unwrap().is_empty());
+        let related = finding["related"].as_array().unwrap();
+        let sarif_related = result["relatedLocations"].as_array().unwrap();
+        assert_eq!(sarif_related.len(), related.len());
+        for (expected, actual) in related.iter().zip(sarif_related) {
+            assert_eq!(
+                actual["physicalLocation"]["artifactLocation"]["uri"],
+                expected["location"]["path"]
+            );
+            assert_eq!(
+                actual["properties"]["bifrost.relationship"],
+                expected["relationship"]
+            );
+        }
+        let witnesses = finding["witnesses"].as_array().unwrap();
+        let code_flows = result["codeFlows"].as_array().unwrap();
+        assert_eq!(code_flows.len(), witnesses.len());
+        for (expected, actual) in witnesses.iter().zip(code_flows) {
+            assert_eq!(actual["properties"]["bifrost.witnessId"], expected["id"]);
+            assert_eq!(
+                actual["properties"]["bifrost.truncated"],
+                expected["truncated"]
+            );
+            let actual_steps = actual["threadFlows"][0]["locations"].as_array().unwrap();
+            let expected_steps = expected["steps"].as_array().unwrap();
+            assert_eq!(actual_steps.len(), expected_steps.len());
+            for (expected_step, actual_step) in expected_steps.iter().zip(actual_steps) {
+                assert_eq!(
+                    actual_step["location"]["message"]["text"],
+                    expected_step["label"]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn typestate_same_site_endpoint_precedence_retains_only_the_dominant_binding() {
+    let project = policy_project(&[
+        (
+            "policies/endpoints/resource-acquire-dominant.rqlp",
+            DOMINANT_ACQUIRE_ENDPOINT.to_owned(),
+        ),
+        (
+            "policies/endpoints/resource-close-dominant.rqlp",
+            DOMINANT_CLOSE_ENDPOINT.to_owned(),
+        ),
+        ("src/dominance.ts", DOMINANCE_SOURCE.to_owned()),
+    ]);
+    let output = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/resource-lifecycle.rqlp",
+            "--format",
+            "json",
+            "--fail-on",
+            "never",
+        ],
+    );
+    assert_status(&output, 2);
+    let report = json_stdout(&output);
+    assert_eq!(
+        report["rules"][0]["precedence_manifest"]["edges"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    let metrics = report["runs"][0]["work"]["metrics"].as_array().unwrap();
+    let subjects = metrics
+        .iter()
+        .find(|metric| metric["name"] == "typestate.subjects")
+        .expect("typestate subject metric");
+    assert_eq!(subjects["value"], 2);
+    let initial_seeds = metrics
+        .iter()
+        .find(|metric| metric["name"] == "typestate.initial_seeds")
+        .expect("typestate initial-seed metric");
+    assert_eq!(initial_seeds["value"], 2);
+    let event_bindings = metrics
+        .iter()
+        .find(|metric| metric["name"] == "typestate.event_bindings")
+        .expect("typestate event binding metric");
+    assert_eq!(event_bindings["value"], 1);
+}
+
+#[test]
+fn typestate_analysis_root_exit_event_executes_its_transition() {
+    let project = policy_project(&[(
+        "policies/resource-exit-event.rqlp",
+        EXIT_EVENT_POLICY.to_owned(),
+    )]);
+    let output = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/resource-exit-event.rqlp",
+            "--format",
+            "json",
+            "--fail-on",
+            "never",
+        ],
+    );
+    assert_status(&output, 2);
+    let report = json_stdout(&output);
+    assert_eq!(
+        report["runs"][0]["findings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("semantic exit policy report: {report:#}"))
+            .len(),
+        1,
+        "semantic exit policy report: {report:#}"
+    );
+    let event_bindings = report["runs"][0]["work"]["metrics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|metric| metric["name"] == "typestate.event_bindings")
+        .expect("semantic exit event binding metric");
+    assert_eq!(event_bindings["value"], 1);
+}
+
+#[test]
+fn typestate_projection_honors_authored_report_caps_before_authority_validation() {
+    let capped = RESOURCE.replace(
+        ":severity error",
+        ":severity error\n  :report (report\n    :witness (witness :max-steps 1 :max-bytes 256)\n    :witnesses-per-finding 0\n    :origins-per-finding 0)",
+    );
+    let project = policy_project(&[("policies/resource-capped.rqlp", capped)]);
+    let output = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/resource-capped.rqlp",
+            "--format",
+            "json",
+            "--fail-on",
+            "never",
+        ],
+    );
+    assert_status(&output, 2);
+    let report = json_stdout(&output);
+    let finding = &report["runs"][0]["findings"][0];
+    assert!(finding["witnesses"].as_array().unwrap().is_empty());
+    assert_eq!(finding["witnesses_truncated"], true);
+    assert!(finding["omitted_witnesses_lower_bound"].as_u64().unwrap() >= 1);
+    assert!(finding["related"].as_array().unwrap().is_empty());
+    assert_eq!(finding["related_truncated"], true);
+    assert!(
+        finding["omitted_related_locations_lower_bound"]
+            .as_u64()
+            .unwrap()
+            >= 1
     );
 }
 

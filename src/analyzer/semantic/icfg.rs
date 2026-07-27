@@ -890,10 +890,8 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
             .ok_or_else(|| SemanticProviderError::internal("failed to scope semantic call site"))?;
         let call_evaluation_gaps = scoped_call_evaluation_gaps(caller, &semantic_call);
         let mut staged_budget = request.budget.clone();
-        let dispatch_outcome = self.resolve_call(
-            &origin,
-            &mut SemanticRequest::new(&mut staged_budget, request.cancellation),
-        )?;
+        let dispatch_outcome =
+            self.resolve_call(&origin, &mut request.staged(&mut staged_budget))?;
         let mapped = try_map_semantic_outcome(dispatch_outcome, |dispatch| {
             let mut transfers = Vec::new();
             let mut additional_work = SemanticWork::default();
@@ -1068,7 +1066,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                 work: root_work,
             });
         }
-        let mut staged_request = SemanticRequest::new(&mut staged_budget, request.cancellation);
+        let mut staged_request = request.staged(&mut staged_budget);
         let mut builder = SnapshotBuilder::new(limits);
         let mut transfer_cache: HashMap<CallSiteHandle, SemanticOutcome<CallTransferSet>> =
             HashMap::default();
@@ -1086,6 +1084,10 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         while let Some(node) = builder.queue.pop_front() {
             if request.cancellation.is_cancelled() {
                 builder.quality = SnapshotQuality::Cancelled;
+                break;
+            }
+            if !staged_request.charge_execution_traversal(1) {
+                builder.quality = merge_quality(builder.quality, SnapshotQuality::Truncated);
                 break;
             }
             let key = builder.traversal[node.index()].clone();
@@ -1643,6 +1645,16 @@ fn materialize_exit_profile(
     let point_count = semantics.points().len();
     let edge_count = semantics.control_edges().len();
     let gap_count = semantics.gaps().len();
+    let traversal_steps = point_count
+        .saturating_mul(2)
+        .saturating_add(edge_count.saturating_mul(2))
+        .saturating_add(gap_count);
+    if !request.charge_execution_traversal(traversal_steps) {
+        return Ok(SemanticOutcome::Unknown {
+            partial: None,
+            work: SemanticWork::default(),
+        });
+    }
     let scan_work = SemanticWork {
         program_points: point_count.saturating_mul(2),
         control_edges: edge_count.saturating_mul(2),

@@ -13,7 +13,6 @@ use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 use crate::CancellationToken;
-use crate::analyzer::IAnalyzer;
 use crate::analyzer::semantic::WorkspaceRelativePath;
 use crate::analyzer::structural::search::{
     CodeQueryStableOwnerDerivation, DetailedCodeQueryDomain, DetailedCodeQueryEvidence,
@@ -26,6 +25,7 @@ use crate::analyzer::structural::{
     CodeQueryExecutionWork, CodeQueryProvenance, CodeQueryRange, CodeQueryResultDetail,
     CodeQueryResultItem, CodeQueryResultRef, CodeQueryResultValue, QueryValueKind,
 };
+use crate::analyzer::{IAnalyzer, WorkspaceAnalyzer};
 
 use super::budget::PolicyBudget;
 use super::classification::{
@@ -75,6 +75,9 @@ const MAX_OVERLAY_ASSUMPTIONS: usize = 64;
 /// Host context supplied to one policy evaluation.
 pub struct PolicyEvaluationContext<'a> {
     pub analyzer: &'a dyn IAnalyzer,
+    /// Full workspace semantics for analyses that lower structural matches
+    /// into procedure, value, call-site, and heap identities.
+    pub workspace: Option<&'a WorkspaceAnalyzer>,
     pub cancellation: Option<&'a CancellationToken>,
     pub cvss_overlays: &'a [CvssEvaluationOverlay],
     pub organizational_risk: &'a [OrganizationalRiskOverlay],
@@ -420,7 +423,7 @@ pub(crate) trait TypestatePolicyEvaluator:
         spec: &ResolvedTypestatePolicySpec,
         context: &PolicyEvaluationContext<'_>,
         budget: &PolicyBudget,
-    ) -> Option<TypestateCompilationHashes>;
+    ) -> Result<TypestateCompilationHashes, TypestateCompilationFailure>;
 
     fn evaluate_typestate(
         &self,
@@ -430,6 +433,56 @@ pub(crate) trait TypestatePolicyEvaluator:
         context: &PolicyEvaluationContext<'_>,
         budget: &PolicyBudget,
     ) -> TypestateProjectionPayload;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TypestateCompilationFailure {
+    Incomplete {
+        reasons: Box<[PolicyIncompleteReason]>,
+        message: Box<str>,
+        work: PolicyWorkReport,
+    },
+    Failed {
+        reason: PolicyFailureReason,
+        message: Box<str>,
+        work: PolicyWorkReport,
+    },
+}
+
+impl TypestateCompilationFailure {
+    pub(crate) fn incomplete_many_with_work(
+        mut reasons: Vec<PolicyIncompleteReason>,
+        message: impl Into<Box<str>>,
+        work: PolicyWorkReport,
+    ) -> Self {
+        reasons.sort();
+        reasons.dedup();
+        Self::Incomplete {
+            reasons: reasons.into_boxed_slice(),
+            message: message.into(),
+            work,
+        }
+    }
+
+    pub(crate) fn failed(reason: PolicyFailureReason, message: impl Into<Box<str>>) -> Self {
+        Self::Failed {
+            reason,
+            message: message.into(),
+            work: PolicyWorkReport::default(),
+        }
+    }
+
+    pub(crate) fn failed_with_work(
+        reason: PolicyFailureReason,
+        message: impl Into<Box<str>>,
+        work: PolicyWorkReport,
+    ) -> Self {
+        Self::Failed {
+            reason,
+            message: message.into(),
+            work,
+        }
+    }
 }
 
 /// Built-in match evaluator with optional future-analysis adapters.
@@ -548,17 +601,41 @@ impl PolicyEvaluator for DefaultPolicyEvaluator<'_> {
                 };
                 match self.typestate {
                     Some(adapter) => {
-                        let Some(compilation) =
-                            adapter.compilation_hashes(policy, spec, context, &host_budget)
-                        else {
-                            *budget = host_budget;
-                            return failed_policy_run(
-                                policy,
-                                PolicyAnalysisType::Typestate,
-                                "typestate adapter could not produce compiled projection hashes",
-                                &host_budget,
-                            );
-                        };
+                        let compilation =
+                            match adapter.compilation_hashes(policy, spec, context, &host_budget) {
+                                Ok(compilation) => compilation,
+                                Err(TypestateCompilationFailure::Incomplete {
+                                    reasons,
+                                    message,
+                                    work,
+                                }) => {
+                                    *budget = host_budget;
+                                    return inconclusive_policy_run_many(
+                                        policy,
+                                        PolicyAnalysisType::Typestate,
+                                        reasons.into_vec(),
+                                        &message,
+                                        work,
+                                        &host_budget,
+                                    );
+                                }
+                                Err(TypestateCompilationFailure::Failed {
+                                    reason,
+                                    message,
+                                    work,
+                                }) => {
+                                    *budget = host_budget;
+                                    return failed_policy_run_with_reason(
+                                        policy,
+                                        PolicyAnalysisType::Typestate,
+                                        Vec::new(),
+                                        reason,
+                                        &message,
+                                        work,
+                                        &host_budget,
+                                    );
+                                }
+                            };
                         let authority = match TypestateProjectionAuthority::from_loaded_compilation(
                             policy,
                             compilation.protocol_hash(),
@@ -1215,6 +1292,43 @@ fn failed_policy_run(
         Vec::new(),
         message,
         work_report(CodeQueryExecutionWork::default(), 0, 0),
+        budget,
+    )
+}
+
+fn inconclusive_policy_run_many(
+    policy: &LoadedPolicy,
+    analysis_type: PolicyAnalysisType,
+    reasons: Vec<PolicyIncompleteReason>,
+    message: &str,
+    work: PolicyWorkReport,
+    budget: &PolicyBudget,
+) -> Result<PolicyRun, PolicyRunError> {
+    let diagnostic = PolicyDiagnostic::try_new(
+        PolicyDiagnosticCode::EvaluationFailure,
+        PolicyDiagnosticSeverity::Warning,
+        PolicyDiagnosticImpact::RunIncomplete,
+        message,
+        None,
+        Vec::new(),
+    )
+    .ok();
+    let retain_diagnostic = budget.max_diagnostics() > 0 && diagnostic.is_some();
+    let diagnostics = if retain_diagnostic {
+        diagnostic.into_iter().collect()
+    } else {
+        Vec::new()
+    };
+    PolicyRun::try_new(
+        policy.definition().metadata.id.clone(),
+        policy.semantic_hash(),
+        analysis_type,
+        PolicyRunCompletion::inconclusive(reasons)
+            .expect("typed compilation-incomplete reasons are canonical"),
+        Vec::new(),
+        diagnostics,
+        !retain_diagnostic,
+        work,
         budget,
     )
 }
@@ -3404,7 +3518,7 @@ fn certainty_reasons(
     reasons
 }
 
-fn incomplete_reasons(
+pub(super) fn incomplete_reasons(
     completion: &CodeQueryCompletion,
     truncated: bool,
 ) -> Vec<PolicyIncompleteReason> {
@@ -3431,7 +3545,7 @@ fn failure_reasons(completion: &CodeQueryCompletion) -> Vec<PolicyFailureReason>
     }
 }
 
-fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> PolicyIncompleteReason {
+pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> PolicyIncompleteReason {
     match code {
         CodeQueryDiagnosticCode::Cancelled => PolicyIncompleteReason::Cancelled,
         CodeQueryDiagnosticCode::UnsupportedStructuralFeature
@@ -3649,6 +3763,7 @@ mod tests {
         let policy = registry.policies().next().unwrap();
         let context = PolicyEvaluationContext {
             analyzer: &analyzer,
+            workspace: None,
             cancellation: None,
             cvss_overlays: &[],
             organizational_risk: &[],
@@ -3987,8 +4102,8 @@ mod tests {
             _spec: &ResolvedTypestatePolicySpec,
             _context: &PolicyEvaluationContext<'_>,
             _budget: &PolicyBudget,
-        ) -> Option<TypestateCompilationHashes> {
-            Some(TypestateCompilationHashes::new(
+        ) -> Result<TypestateCompilationHashes, TypestateCompilationFailure> {
+            Ok(TypestateCompilationHashes::new(
                 self.protocol_hash,
                 self.binding_plan_hash,
             ))
@@ -4016,11 +4131,90 @@ mod tests {
         }
     }
 
+    struct IncompleteTypestateAdapter;
+
+    impl crate::analyzer::policy::projection::sealed::TypestateAdapter for IncompleteTypestateAdapter {}
+
+    impl TypestatePolicyEvaluator for IncompleteTypestateAdapter {
+        fn compilation_hashes(
+            &self,
+            _policy: &LoadedPolicy,
+            _spec: &ResolvedTypestatePolicySpec,
+            _context: &PolicyEvaluationContext<'_>,
+            _budget: &PolicyBudget,
+        ) -> Result<TypestateCompilationHashes, TypestateCompilationFailure> {
+            Err(TypestateCompilationFailure::incomplete_many_with_work(
+                vec![
+                    PolicyIncompleteReason::PartialDiscovery,
+                    PolicyIncompleteReason::Cancelled,
+                    PolicyIncompleteReason::PartialDiscovery,
+                ],
+                "typestate selector execution was cancelled",
+                PolicyWorkReport::try_new(7, 11, 13, 17, 19, 0, 0, 0, Vec::new())
+                    .expect("valid compilation work report"),
+            ))
+        }
+
+        fn evaluate_typestate(
+            &self,
+            _authority: &TypestateProjectionAuthority,
+            _policy: &LoadedPolicy,
+            _spec: &ResolvedTypestatePolicySpec,
+            _context: &PolicyEvaluationContext<'_>,
+            _budget: &PolicyBudget,
+        ) -> TypestateProjectionPayload {
+            unreachable!("incomplete compilation must stop before evaluation")
+        }
+    }
+
+    #[test]
+    fn typestate_compilation_incompleteness_remains_typed_and_non_clean() {
+        let (_temp, analyzer) = assembly_analyzer();
+        let registry = policy_registry("test:typestate-incomplete", typestate_policy_source());
+        let policy = registry.policies().next().unwrap();
+        let adapter = IncompleteTypestateAdapter;
+        let run = DefaultPolicyEvaluator::new()
+            .with_typestate(&adapter)
+            .evaluate(
+                policy,
+                &PolicyEvaluationContext {
+                    analyzer: &analyzer,
+                    workspace: None,
+                    cancellation: None,
+                    cvss_overlays: &[],
+                    organizational_risk: &[],
+                },
+                &mut PolicyBudget::default(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            run.completion(),
+            &PolicyRunCompletion::Inconclusive {
+                reasons: vec![
+                    PolicyIncompleteReason::Cancelled,
+                    PolicyIncompleteReason::PartialDiscovery,
+                ],
+            }
+        );
+        assert_eq!(run.diagnostics().len(), 1);
+        assert_eq!(run.work().scanned_files(), 7);
+        assert_eq!(run.work().scanned_source_bytes(), 11);
+        assert_eq!(run.work().fact_nodes(), 13);
+        assert_eq!(run.work().pipeline_rows(), 17);
+        assert_eq!(run.work().examined_references(), 19);
+        assert_eq!(
+            run.diagnostics()[0].impact(),
+            PolicyDiagnosticImpact::RunIncomplete
+        );
+    }
+
     #[test]
     fn default_evaluator_dispatches_valid_taint_and_typestate_adapters() {
         let (_temp, analyzer) = assembly_analyzer();
         let context = PolicyEvaluationContext {
             analyzer: &analyzer,
+            workspace: None,
             cancellation: None,
             cvss_overlays: &[],
             organizational_risk: &[],
@@ -4112,6 +4306,7 @@ mod tests {
             batch,
             &PolicyEvaluationContext {
                 analyzer: &analyzer,
+                workspace: None,
                 cancellation: None,
                 cvss_overlays: &[],
                 organizational_risk: &[],
@@ -4147,6 +4342,7 @@ mod tests {
         let evaluator = DefaultPolicyEvaluator::new().with_taint(&adapter);
         let context = PolicyEvaluationContext {
             analyzer: &analyzer,
+            workspace: None,
             cancellation: None,
             cvss_overlays: &[],
             organizational_risk: &[],
@@ -4228,6 +4424,7 @@ mod tests {
             }),
             &PolicyEvaluationContext {
                 analyzer: &analyzer,
+                workspace: None,
                 cancellation: None,
                 cvss_overlays: &[],
                 organizational_risk: &overlays,

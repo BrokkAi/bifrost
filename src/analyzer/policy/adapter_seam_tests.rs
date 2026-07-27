@@ -3,7 +3,8 @@
 
 use super::budget::PolicyBudget;
 use super::evaluator::{
-    DefaultPolicyEvaluator, PolicyEvaluationContext, TaintPolicyEvaluator, TypestatePolicyEvaluator,
+    DefaultPolicyEvaluator, PolicyEvaluationContext, TaintPolicyEvaluator,
+    TypestateCompilationFailure, TypestatePolicyEvaluator,
 };
 use super::finding::{PolicyRunCompletion, PolicyWorkReport};
 use super::future_evidence::{TypestateBindingPlanHash, TypestateProtocolHash};
@@ -47,8 +48,8 @@ impl TypestatePolicyEvaluator for SiblingTypestateAdapter {
         _spec: &ResolvedTypestatePolicySpec,
         _context: &PolicyEvaluationContext<'_>,
         _budget: &PolicyBudget,
-    ) -> Option<TypestateCompilationHashes> {
-        Some(TypestateCompilationHashes::new(
+    ) -> Result<TypestateCompilationHashes, TypestateCompilationFailure> {
+        Ok(TypestateCompilationHashes::new(
             TypestateProtocolHash::from_canonical_bytes(b"sibling protocol"),
             TypestateBindingPlanHash::from_canonical_bytes(b"sibling bindings"),
         ))

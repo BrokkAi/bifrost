@@ -48,6 +48,7 @@ fn try_evaluate(
         policy,
         &PolicyEvaluationContext {
             analyzer,
+            workspace: None,
             cancellation,
             cvss_overlays: &[],
             organizational_risk: &[],
@@ -313,7 +314,9 @@ fn typestate_policy() -> &'static str {
             (event :id close
               :calls (calls :selector (rql (call :callee (name "close_resource")))
                 :subject receiver :phase after-normal-return))]
-          :transitions [(transition :from open :on close :to closed)]
+          :transitions [
+            (transition :from open :on close :to closed)
+            (transition :from closed :on close :to violated)]
           :terminal-expectations [
             (terminal-expectation :id normal-exit
               :on (normal-procedure-exit :scope analysis-root)
@@ -321,7 +324,7 @@ fn typestate_policy() -> &'static str {
 }
 
 #[test]
-fn zero_diagnostic_budget_preserves_unsupported_taint_and_typestate_completion() {
+fn zero_diagnostic_budget_preserves_uninstalled_future_adapter_statuses() {
     let (_project, analyzer) = typescript_analyzer("export function noop() {}\n");
     let mut budget = PolicyBudget::builder()
         .with_max_diagnostics(0)

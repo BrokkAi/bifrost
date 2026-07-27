@@ -314,49 +314,7 @@ impl QueryOperatorWorkProfile {
             import_edges_resolved: self
                 .import_edges_resolved
                 .saturating_add(other.import_edges_resolved),
-            semantic: CodeQuerySemanticWork {
-                materialization_attempts: self
-                    .semantic
-                    .materialization_attempts
-                    .saturating_add(other.semantic.materialization_attempts),
-                unique_materialized_files: self
-                    .semantic
-                    .unique_materialized_files
-                    .saturating_add(other.semantic.unique_materialized_files),
-                request_cache_hits: self
-                    .semantic
-                    .request_cache_hits
-                    .saturating_add(other.semantic.request_cache_hits),
-                source_bytes: self
-                    .semantic
-                    .source_bytes
-                    .saturating_add(other.semantic.source_bytes),
-                procedures: self
-                    .semantic
-                    .procedures
-                    .saturating_add(other.semantic.procedures),
-                program_points: self
-                    .semantic
-                    .program_points
-                    .saturating_add(other.semantic.program_points),
-                control_edges: self
-                    .semantic
-                    .control_edges
-                    .saturating_add(other.semantic.control_edges),
-                retained_bytes: self
-                    .semantic
-                    .retained_bytes
-                    .saturating_add(other.semantic.retained_bytes),
-                traversal_steps: self
-                    .semantic
-                    .traversal_steps
-                    .saturating_add(other.semantic.traversal_steps),
-                budget_exhausted: self.semantic.budget_exhausted || other.semantic.budget_exhausted,
-                typestate: self
-                    .semantic
-                    .typestate
-                    .saturating_add(other.semantic.typestate),
-            },
+            semantic: self.semantic.saturating_add(other.semantic),
         }
     }
 
@@ -380,52 +338,7 @@ impl QueryOperatorWorkProfile {
             import_edges_resolved: self
                 .import_edges_resolved
                 .saturating_sub(earlier.import_edges_resolved),
-            semantic: CodeQuerySemanticWork {
-                materialization_attempts: self
-                    .semantic
-                    .materialization_attempts
-                    .saturating_sub(earlier.semantic.materialization_attempts),
-                unique_materialized_files: self
-                    .semantic
-                    .unique_materialized_files
-                    .saturating_sub(earlier.semantic.unique_materialized_files),
-                request_cache_hits: self
-                    .semantic
-                    .request_cache_hits
-                    .saturating_sub(earlier.semantic.request_cache_hits),
-                source_bytes: self
-                    .semantic
-                    .source_bytes
-                    .saturating_sub(earlier.semantic.source_bytes),
-                procedures: self
-                    .semantic
-                    .procedures
-                    .saturating_sub(earlier.semantic.procedures),
-                program_points: self
-                    .semantic
-                    .program_points
-                    .saturating_sub(earlier.semantic.program_points),
-                control_edges: self
-                    .semantic
-                    .control_edges
-                    .saturating_sub(earlier.semantic.control_edges),
-                retained_bytes: self
-                    .semantic
-                    .retained_bytes
-                    .saturating_sub(earlier.semantic.retained_bytes),
-                traversal_steps: self
-                    .semantic
-                    .traversal_steps
-                    .saturating_sub(earlier.semantic.traversal_steps),
-                // A terminal state is not an arithmetic counter: retain it
-                // only when it first appeared in this interval.
-                budget_exhausted: self.semantic.budget_exhausted
-                    && !earlier.semantic.budget_exhausted,
-                typestate: self
-                    .semantic
-                    .typestate
-                    .saturating_sub(earlier.semantic.typestate),
-            },
+            semantic: self.semantic.saturating_sub(earlier.semantic),
         }
     }
 }
@@ -1514,8 +1427,19 @@ mod public_contract_tests {
                     "request_cache_hits": 0,
                     "source_bytes": 0,
                     "procedures": 0,
+                    "blocks": 0,
                     "program_points": 0,
+                    "values": 0,
+                    "allocations": 0,
+                    "call_sites": 0,
+                    "memory_locations": 0,
+                    "captures": 0,
+                    "source_mappings": 0,
+                    "evidence": 0,
+                    "gaps": 0,
+                    "events": 0,
                     "control_edges": 0,
+                    "nested_entries": 0,
                     "retained_bytes": 0,
                     "traversal_steps": 0,
                     "budget_exhausted": false
