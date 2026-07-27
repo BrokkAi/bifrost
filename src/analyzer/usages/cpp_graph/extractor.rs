@@ -37,7 +37,7 @@ pub(super) struct ScanState<'a> {
 
 pub(super) struct ScanCtx<'a> {
     pub(super) analyzer: &'a dyn IAnalyzer,
-    pub(super) visibility: &'a VisibilityIndex,
+    pub(super) visibility: &'a VisibilityIndex<'a>,
     pub(super) file: &'a ProjectFile,
     pub(super) source: &'a str,
     ordinary_type_imports: OrdinaryTypeImportCell,
@@ -78,7 +78,7 @@ pub(super) fn prepare_file(
 
 pub(super) fn scan_prepared_file(
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     prepared: &PreparedSyntaxTree,
     spec: &TargetSpec,
@@ -916,7 +916,7 @@ fn binding_free_function_candidates(
     binding: &OrdinaryTypeImport,
     active_bindings: &[&OrdinaryTypeImport],
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     name: &str,
     reference_byte: usize,
@@ -986,7 +986,7 @@ fn resolve_callable_candidates(
     call_arity: Option<usize>,
     reference_byte: usize,
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
 ) -> BareCallTargetResolution {
     let mut candidates = candidates;
@@ -1015,7 +1015,7 @@ fn resolve_callable_candidates(
 fn resolve_direct_type_candidates(
     candidates: Vec<(CodeUnit, Vec<String>)>,
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
 ) -> BareCallTargetResolution {
     let mut logical = Vec::<(CodeUnit, Vec<String>)>::new();
@@ -1048,7 +1048,7 @@ pub(in crate::analyzer::usages) fn resolve_bare_call_target(
     call: Node<'_>,
     function: Node<'_>,
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
     source: &str,
@@ -3157,7 +3157,7 @@ pub(super) fn enclosing_namespace_components(node: Node<'_>, source: &str) -> Ve
 pub(in crate::analyzer::usages) fn enclosing_lexical_scope_components(
     node: Node<'_>,
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
 ) -> LexicalScopeResolution {
@@ -3169,7 +3169,7 @@ pub(in crate::analyzer::usages) fn enclosing_lexical_scope_components(
 fn enclosing_lexical_scope_components_with_unresolved_owner(
     node: Node<'_>,
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
     allow_structured_unresolved_owner: bool,
@@ -3356,7 +3356,7 @@ fn indexed_enclosing_class_owner(
 pub(in crate::analyzer::usages) fn resolve_type_node_lexically(
     node: Node<'_>,
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
     source: &str,
@@ -3379,7 +3379,7 @@ pub(in crate::analyzer::usages) fn resolve_type_node_lexically(
 fn resolve_type_node_lexically_for_target(
     node: Node<'_>,
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
     source: &str,
@@ -3434,7 +3434,7 @@ fn resolve_type_node_lexically_for_target(
 fn resolve_type_node_lexically_for_target_without_visibility(
     node: Node<'_>,
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
     target: &CodeUnit,
@@ -3469,7 +3469,7 @@ fn resolve_type_node_lexically_for_target_without_visibility(
 fn type_node_has_exact_target_identity_without_visibility(
     node: Node<'_>,
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
     target: &CodeUnit,
@@ -3499,7 +3499,7 @@ fn type_node_has_exact_target_identity_without_visibility(
 pub(super) fn resolve_using_enum_declaration_owner(
     node: Node<'_>,
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
     source: &str,
@@ -3528,7 +3528,7 @@ pub(super) fn resolve_using_enum_declaration_owner(
 pub(super) fn resolve_ordinary_using_declaration_owner(
     node: Node<'_>,
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
 ) -> LexicalTypeResolution {
@@ -3708,7 +3708,7 @@ fn collect_source_using_index(
     index
 }
 
-fn build_project_using_index(visibility: &VisibilityIndex) -> ProjectUsingIndex {
+fn build_project_using_index(visibility: &VisibilityIndex<'_>) -> ProjectUsingIndex {
     let mut project = ProjectUsingIndex::default();
     for source_file in visibility.all_visible_source_files() {
         visibility.note_using_source_index_walk_for_test();
@@ -3750,7 +3750,7 @@ fn effective_using_target_tiers(binding: &OrdinaryTypeImport) -> Vec<Vec<String>
 fn using_binding_target_components_for_name(
     binding: &OrdinaryTypeImport,
     project: &ProjectUsingIndex,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     name: &str,
 ) -> Option<Vec<String>> {
@@ -3819,7 +3819,7 @@ fn include_node_for_activation(root: Node<'_>, activation: usize) -> Option<Node
 
 fn project_using_bindings(
     binding: OrdinaryTypeImport,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     root: Node<'_>,
     source: &str,
@@ -3898,7 +3898,7 @@ fn project_using_binding_at_activation(
 }
 
 fn effective_using_bindings_for_name(
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
     root: Node<'_>,
@@ -3939,7 +3939,7 @@ fn effective_using_bindings_for_name(
 pub(in crate::analyzer::usages) fn initialized_ordinary_type_imports(
     root: Node<'_>,
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
 ) -> OrdinaryTypeImportCell {
@@ -3960,7 +3960,7 @@ fn effective_using_binding_active(
     node: Node<'_>,
     lexical_scope: &[String],
     source: &str,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
 ) -> bool {
     binding.declaration_byte <= node.start_byte()
@@ -3981,7 +3981,7 @@ fn effective_using_binding_active(
 fn binding_type_candidates(
     binding: &OrdinaryTypeImport,
     active_bindings: &[&OrdinaryTypeImport],
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     name: &str,
 ) -> Vec<(CodeUnit, Vec<String>)> {
@@ -4058,7 +4058,7 @@ fn ordinary_type_import_resolution(
     components: &[String],
     global: bool,
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
     source: &str,
@@ -4163,7 +4163,7 @@ pub(super) fn resolve_type_components_lexically_at(
     components: &[String],
     global: bool,
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
     source: &str,
@@ -4190,7 +4190,7 @@ fn resolve_type_components_lexically_at_preserving_alias(
     components: &[String],
     global: bool,
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
     source: &str,
@@ -4217,7 +4217,7 @@ fn resolve_type_components_lexically_at_for_target(
     components: &[String],
     global: bool,
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
     source: &str,
@@ -4247,7 +4247,7 @@ fn resolve_type_components_lexically_at_inner(
     components: &[String],
     global: bool,
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
     source: &str,

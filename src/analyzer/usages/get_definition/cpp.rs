@@ -167,9 +167,9 @@ pub(super) fn select_navigation_targets(
     }
 }
 
-pub(super) fn resolve_cpp(
-    analyzer: &dyn IAnalyzer,
-    context: &mut DefinitionBatchContext<'_>,
+pub(super) fn resolve_cpp<'a>(
+    analyzer: &'a dyn IAnalyzer,
+    context: &mut DefinitionBatchContext<'a>,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -1865,7 +1865,7 @@ struct CppLookupCtx<'a, 'tree> {
     analyzer: &'a dyn IAnalyzer,
     support: &'a dyn BoundedDefinitionLookup,
     file: &'a ProjectFile,
-    visibility: &'a CppVisibilityIndex,
+    visibility: &'a CppVisibilityIndex<'a>,
     source: &'a str,
     root: Node<'tree>,
 }

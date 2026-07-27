@@ -439,9 +439,9 @@ pub(crate) fn resolve_navigation_batch(
     resolve_navigation_requests(analyzer, &mut context, requests, operation)
 }
 
-fn resolve_navigation_requests(
-    analyzer: &dyn IAnalyzer,
-    context: &mut DefinitionBatchContext<'_>,
+fn resolve_navigation_requests<'a>(
+    analyzer: &'a dyn IAnalyzer,
+    context: &mut DefinitionBatchContext<'a>,
     requests: Vec<DefinitionLookupRequest>,
     operation: NavigationOperation,
 ) -> Vec<NavigationLookupOutcome> {
@@ -463,9 +463,9 @@ fn resolve_navigation_requests(
         .collect()
 }
 
-fn resolve_definition_requests(
-    analyzer: &dyn IAnalyzer,
-    context: &mut DefinitionBatchContext<'_>,
+fn resolve_definition_requests<'a>(
+    analyzer: &'a dyn IAnalyzer,
+    context: &mut DefinitionBatchContext<'a>,
     requests: Vec<DefinitionLookupRequest>,
     cancellation: Option<&CancellationToken>,
     operation: Option<NavigationOperation>,
@@ -617,7 +617,7 @@ struct DefinitionBatchContext<'a> {
     sources: HashMap<ProjectFile, Result<Arc<str>, String>>,
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
     line_starts: HashMap<ProjectFile, Arc<Vec<usize>>>,
-    cpp_visibility: HashMap<ProjectFile, Arc<CppVisibilityIndex>>,
+    cpp_visibility: HashMap<ProjectFile, Arc<CppVisibilityIndex<'a>>>,
     // Candidate declaration ranges belong to the analyzer generation, so these
     // caches must use indexed source rather than the request's live disk source.
     cpp_indexed_sources: HashMap<ProjectFile, Option<Arc<String>>>,
@@ -751,10 +751,10 @@ impl<'a> DefinitionBatchContext<'a> {
 
     fn cpp_visibility(
         &mut self,
-        cpp: &crate::analyzer::CppAnalyzer,
+        cpp: &'a crate::analyzer::CppAnalyzer,
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
-    ) -> Arc<CppVisibilityIndex> {
+    ) -> Arc<CppVisibilityIndex<'a>> {
         self.cpp_visibility
             .entry(file.clone())
             .or_insert_with(|| {
@@ -884,9 +884,9 @@ impl<'a> DefinitionBatchContext<'a> {
     }
 }
 
-fn resolve_one(
-    analyzer: &dyn IAnalyzer,
-    context: &mut DefinitionBatchContext<'_>,
+fn resolve_one<'a>(
+    analyzer: &'a dyn IAnalyzer,
+    context: &mut DefinitionBatchContext<'a>,
     request: DefinitionLookupRequest,
     operation: Option<NavigationOperation>,
 ) -> DefinitionLookupOutcome {

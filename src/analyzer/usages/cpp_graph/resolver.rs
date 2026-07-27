@@ -71,7 +71,7 @@ pub(super) enum NamespaceValueResolution {
 
 pub(super) fn resolve_namespace_value(
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     namespace: &str,
     name: &str,
@@ -157,7 +157,7 @@ impl SemanticUsingEnumOwners {
 
     pub(super) fn resolve_member(
         &self,
-        visibility: &VisibilityIndex,
+        visibility: &VisibilityIndex<'_>,
         file: &ProjectFile,
         class: Option<&CodeUnit>,
         namespace: &[String],
@@ -194,7 +194,7 @@ impl SemanticUsingEnumOwners {
 }
 
 fn resolve_using_enum_member_for_owners<'a>(
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     owners: impl IntoIterator<Item = &'a CodeUnit>,
     name: &str,
@@ -255,7 +255,7 @@ impl ScopedUsingEnumOwners {
 
     pub(super) fn resolve_member(
         &self,
-        visibility: &VisibilityIndex,
+        visibility: &VisibilityIndex<'_>,
         file: &ProjectFile,
         name: &str,
     ) -> UsingEnumMemberResolution {
@@ -399,7 +399,7 @@ impl TargetSpec {
         &'a self,
         analyzer: &dyn IAnalyzer,
         cpp: &CppAnalyzer,
-        visibility: &VisibilityIndex,
+        visibility: &VisibilityIndex<'_>,
         file: &ProjectFile,
         prepared: &PreparedSyntaxTree,
     ) -> Cow<'a, Self> {
@@ -653,8 +653,18 @@ type ConditionalIncludeProjectionCache =
     HashMap<(ProjectFile, ProjectFile), Arc<[ConditionalIncludeProjection]>>;
 type VisibleParserAliasNameSetCell = Arc<OnceLock<HashSet<String>>>;
 
-pub(in crate::analyzer::usages) struct VisibilityIndex {
-    cpp: CppAnalyzer,
+/// Per-query C++ visibility facts.
+///
+/// The analyzer is *borrowed*, never cloned: `TreeSitterAnalyzer::clone` gives
+/// the clone a fresh, empty `QueryReadCache` on purpose (clones cross
+/// generations and overlays, where another generation's hydrated states would
+/// be wrong). An index that owned a clone would therefore see an inactive read
+/// cache for every `prepared_syntax` call it makes, re-reading and re-parsing
+/// the same source from the store once per candidate instead of once per query
+/// — the #1175 blow-up, where one scan re-parsed a 4.8 MB generated header
+/// tens of thousands of times.
+pub(in crate::analyzer::usages) struct VisibilityIndex<'a> {
+    cpp: &'a CppAnalyzer,
     pub(super) visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
     visible_by_identifier: HashMap<ProjectFile, HashMap<String, Vec<CodeUnit>>>,
     visible_source_files_by_root: HashMap<ProjectFile, HashSet<ProjectFile>>,
@@ -853,13 +863,13 @@ struct CppAlias {
 
 type ReceiverResolver<'a> = dyn for<'tree> Fn(Node<'tree>, &str) -> Vec<CodeUnit> + 'a;
 
-impl VisibilityIndex {
-    pub(super) fn cpp(&self) -> &CppAnalyzer {
-        &self.cpp
+impl<'a> VisibilityIndex<'a> {
+    pub(super) fn cpp(&self) -> &'a CppAnalyzer {
+        self.cpp
     }
 
     pub(in crate::analyzer::usages) fn build(
-        cpp: &CppAnalyzer,
+        cpp: &'a CppAnalyzer,
         analyzer: &dyn IAnalyzer,
         roots: &HashSet<ProjectFile>,
     ) -> Self {
@@ -867,7 +877,7 @@ impl VisibilityIndex {
     }
 
     pub(in crate::analyzer::usages) fn build_with_cancellation(
-        cpp: &CppAnalyzer,
+        cpp: &'a CppAnalyzer,
         analyzer: &dyn IAnalyzer,
         roots: &HashSet<ProjectFile>,
         cancellation: Option<&CancellationToken>,
@@ -912,7 +922,7 @@ impl VisibilityIndex {
                 .push(unit.clone());
         }
         Self {
-            cpp: cpp.clone(),
+            cpp,
             visible_by_file,
             visible_by_identifier,
             visible_source_files_by_root,
@@ -1692,7 +1702,7 @@ impl VisibilityIndex {
                                 .entry(visible_file.clone())
                                 .or_default() += 1;
                         }
-                        aliases_from_prepared_source(&self.cpp, &visible_file).into_boxed_slice()
+                        aliases_from_prepared_source(self.cpp, &visible_file).into_boxed_slice()
                     })
                     .iter()
                 {
@@ -1813,7 +1823,7 @@ impl VisibilityIndex {
             return cached;
         }
         let projections: Arc<[ConditionalIncludeProjection]> =
-            find_conditional_include_projections(&self.cpp, file, prepared, donor_source).into();
+            find_conditional_include_projections(self.cpp, file, prepared, donor_source).into();
         self.conditional_include_projection_cells
             .lock()
             .expect("C++ conditional include projection cache poisoned")
@@ -1900,7 +1910,7 @@ impl VisibilityIndex {
                 same_logical_symbol(candidate, declaration)
                     || flattened_macro_namespace_declaration_matches(
                         analyzer,
-                        &self.cpp,
+                        self.cpp,
                         file,
                         candidate,
                         declaration,
@@ -1931,7 +1941,7 @@ impl VisibilityIndex {
             let prepared = self.cpp.prepared_syntax(file)?;
             let spec = TargetSpec::from_target(analyzer, candidate)?;
             let spec = spec
-                .with_visible_callable_arities(analyzer, &self.cpp, self, file, prepared.as_ref())
+                .with_visible_callable_arities(analyzer, self.cpp, self, file, prepared.as_ref())
                 .into_owned();
             #[cfg(test)]
             self.callable_reference_spec_build_count
@@ -1967,7 +1977,7 @@ impl VisibilityIndex {
         {
             return false;
         }
-        self.include_activation_for_source(&self.cpp, file, prepared.as_ref(), declaration.source())
+        self.include_activation_for_source(self.cpp, file, prepared.as_ref(), declaration.source())
             .is_some_and(|activation| activation < reference_byte)
     }
 
@@ -1989,7 +1999,7 @@ impl VisibilityIndex {
                 peer.source() == file
                     || self
                         .include_activation_for_source(
-                            &self.cpp,
+                            self.cpp,
                             file,
                             prepared.as_ref(),
                             peer.source(),
@@ -2010,7 +2020,7 @@ impl VisibilityIndex {
         let Some(prepared) = self.cpp.prepared_syntax(file) else {
             return false;
         };
-        self.include_activation_for_source(&self.cpp, file, prepared.as_ref(), candidate.source())
+        self.include_activation_for_source(self.cpp, file, prepared.as_ref(), candidate.source())
             .is_some_and(|activation| activation <= reference_byte)
     }
 
@@ -2032,7 +2042,7 @@ impl VisibilityIndex {
         self.visible_identifier_candidates(file, candidate.identifier())
             .filter(|peer| same_logical_symbol(candidate, peer))
             .any(|peer| {
-                declaration_guard_requirements(analyzer, &self.cpp, peer)
+                declaration_guard_requirements(analyzer, self.cpp, peer)
                     .into_iter()
                     .any(|(declaration_byte, declaration_guards)| {
                         if peer.source() == file {
@@ -2047,7 +2057,7 @@ impl VisibilityIndex {
                         }
                         if self
                             .include_activation_for_source(
-                                &self.cpp,
+                                self.cpp,
                                 file,
                                 prepared.as_ref(),
                                 peer.source(),
@@ -3582,7 +3592,7 @@ pub(super) enum EnclosingMemberOwnerResolution {
 
 pub(super) fn resolve_declaring_member_owner(
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     receiver_owner: &CodeUnit,
     member_name: &str,
@@ -3776,7 +3786,7 @@ fn push_cpp_fqn_candidate(out: &mut Vec<String>, package: &str, short: &str) {
 
 pub(in crate::analyzer::usages) fn infer_cpp_initializer_type(
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -3787,7 +3797,7 @@ pub(in crate::analyzer::usages) fn infer_cpp_initializer_type(
 
 pub(super) fn infer_cpp_initializer_binding(
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -3843,7 +3853,7 @@ pub(super) fn infer_cpp_initializer_binding(
 
 fn resolve_static_method_call_return_binding(
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
     function: Node<'_>,
@@ -3888,7 +3898,7 @@ fn resolve_static_method_call_return_binding(
 
 fn resolve_field_method_call_return_binding(
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
     function: Node<'_>,
@@ -3922,7 +3932,7 @@ fn resolve_field_method_call_return_binding(
 
 fn unanimous_return_binding(
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     candidates: &[CodeUnit],
 ) -> Option<CppScanBinding> {
@@ -4810,7 +4820,7 @@ fn field_declares_type(unit: &CodeUnit, ctx: &ScanCtx<'_>, owner: &CodeUnit) -> 
 
 pub(super) fn field_declared_binding(
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     visible_from: &ProjectFile,
     field: &CodeUnit,
 ) -> Option<CppScanBinding> {
@@ -4891,7 +4901,7 @@ fn declared_type_alias(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
 
 pub(in crate::analyzer::usages) fn field_declared_type_binding(
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     visible_from: &ProjectFile,
     field: &CodeUnit,
 ) -> Option<(String, Option<CodeUnit>, i32)> {
@@ -5632,7 +5642,7 @@ pub(in crate::analyzer::usages) enum DesignatedInitializerOwner {
 /// node is not a designator at all; an unresolved designator remains classified so
 /// callers cannot fall through to unrelated global/member heuristics.
 pub(in crate::analyzer::usages) fn designated_initializer_owner(
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -5683,7 +5693,7 @@ fn classified_designated_owner(owner: Option<CodeUnit>) -> DesignatedInitializer
 }
 
 fn initializer_list_owner(
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
     initializer: Node<'_>,
@@ -5726,7 +5736,7 @@ fn initializer_list_owner(
 }
 
 fn declaration_owner(
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
     declaration: Node<'_>,
@@ -5741,7 +5751,7 @@ fn declaration_owner(
 }
 
 fn resolve_designated_owner_type(
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
     type_node: Node<'_>,
@@ -5784,7 +5794,7 @@ pub(in crate::analyzer::usages) fn first_type_child(node: Node<'_>) -> Option<No
 }
 
 pub(in crate::analyzer::usages) fn constructor_style_local_declaration<T: Clone + Eq + Hash>(
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
     declarator: Node<'_>,
@@ -6043,7 +6053,7 @@ pub(super) fn out_of_line_destructor_type_reference(node: Node<'_>) -> Option<No
 
 pub(super) fn out_of_line_member_definition_owner<'tree>(
     analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
+    visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     source: &str,
     node: Node<'tree>,
@@ -7743,7 +7753,8 @@ mod tests {
             |file| adjacency.get(file).cloned().unwrap_or_default(),
             |file| declarations.get(file).cloned().unwrap_or_default(),
         );
-        let visibility = visibility_index(visible_by_file);
+        let cpp = visibility_analyzer(&visible_by_file);
+        let visibility = visibility_index(&cpp, visible_by_file);
         let candidate_sources = |file: &ProjectFile| {
             visibility
                 .visible_identifier_candidates(file, "Collision")
@@ -7758,19 +7769,27 @@ mod tests {
         );
     }
 
-    fn visibility_index(
-        visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
-    ) -> VisibilityIndex {
+    /// Owns the analyzer the borrowed index points at; keep it alive for as
+    /// long as the returned index is used.
+    fn visibility_analyzer(
+        visible_by_file: &HashMap<ProjectFile, HashSet<CodeUnit>>,
+    ) -> CppAnalyzer {
         let root = visible_by_file
             .keys()
             .next()
             .expect("test visibility needs at least one file")
             .root()
             .to_path_buf();
-        let cpp = CppAnalyzer::new(Arc::new(crate::analyzer::TestProject::new(
+        CppAnalyzer::new(Arc::new(crate::analyzer::TestProject::new(
             root,
             crate::analyzer::Language::Cpp,
-        )));
+        )))
+    }
+
+    fn visibility_index<'a>(
+        cpp: &'a CppAnalyzer,
+        visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
+    ) -> VisibilityIndex<'a> {
         VisibilityIndex {
             cpp,
             visible_by_identifier: build_visible_identifier_index(&visible_by_file),
@@ -7818,10 +7837,10 @@ mod tests {
             "",
             "legacy",
         );
-        let visibility = visibility_index(HashMap::from_iter([(
-            consumer.clone(),
-            HashSet::from_iter([legacy.clone()]),
-        )]));
+        let visible_by_file =
+            HashMap::from_iter([(consumer.clone(), HashSet::from_iter([legacy.clone()]))]);
+        let cpp = visibility_analyzer(&visible_by_file);
+        let visibility = visibility_index(&cpp, visible_by_file);
         let source = "legacy<int> value;";
         let mut parser = Parser::new();
         parser
@@ -7943,7 +7962,8 @@ mod tests {
             (consumer.clone(), visible.clone()),
             (alias.source().clone(), visible),
         ]);
-        let visibility = visibility_index(visible_by_file);
+        let cpp = visibility_analyzer(&visible_by_file);
+        let visibility = visibility_index(&cpp, visible_by_file);
 
         visibility.reset_qualified_candidate_inspections();
         let candidates = visibility.type_candidates(&consumer, "perf::Exact");
@@ -8029,7 +8049,8 @@ mod tests {
                 destructor.clone(),
             ]),
         )]);
-        let visibility = visibility_index(visible_by_file);
+        let cpp = visibility_analyzer(&visible_by_file);
+        let visibility = visibility_index(&cpp, visible_by_file);
 
         assert_eq!(
             visibility.candidate_units(&consumer, "ns::Outer::Inner", TargetKind::Type),

@@ -1635,9 +1635,15 @@ func read(container Container) {
                 "{site:#?}"
             );
         }
+        // One parse for the forward phase (which samples and resolves sites
+        // before any outer query scope is opened) and one for the inverse
+        // phase, whose scope is what makes every target group share a single
+        // prepared consumer syntax. Two target groups, still one inverse
+        // parse; a count that tracked the group count would be the regression
+        // this pins against.
         assert_eq!(
             cpp.prepared_syntax_parse_count_for_test(&file),
-            1,
+            2,
             "both inverse target groups should reuse the same consumer syntax"
         );
         assert_eq!(
