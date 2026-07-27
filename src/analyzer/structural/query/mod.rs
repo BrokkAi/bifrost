@@ -24,7 +24,7 @@ pub use ir::{
     MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
     MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError, QueryStep, QueryValueKind,
     ReceiverTraversalFilter, ReferenceTraversalFilter, SCHEMA_VERSION, SetOperator,
-    StringPredicate,
+    StringPredicate, TypestateTraversal, WitnessTraversal,
 };
 pub use schema::{ALL_CODE_QUERY_EXECUTION_MODES, CodeQueryExecutionMode};
 pub use source::{

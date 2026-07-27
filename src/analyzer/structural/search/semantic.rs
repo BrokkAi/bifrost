@@ -1,6 +1,7 @@
 use std::mem::size_of;
 use std::sync::Arc;
 
+use super::typestate::{SemanticTypestateFindingValue, TypestateQueryState};
 use super::{
     CodeQueryControlEdge, CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact,
     CodeQueryProcedure, CodeQueryProgramPoint, CodeQueryProgramPointBoundary,
@@ -20,6 +21,7 @@ use crate::analyzer::semantic::{
     SemanticGap, SemanticLocator, SemanticOutcome, SemanticRequest, SemanticValue, SemanticWork,
     SourceMapping,
 };
+use crate::analyzer::structural::analysis_context::{ProtocolRef, QueryAnalysisContext};
 use crate::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -127,6 +129,9 @@ pub(super) struct SemanticQueryContext<'a> {
     cancellation: Option<&'a CancellationToken>,
     uncancelled: CancellationToken,
     limits: CodeQuerySemanticLimits,
+    typestate_limits: super::CodeQueryTypestateLimits,
+    workspace_generation: u64,
+    analysis_context: Option<&'a QueryAnalysisContext>,
     budget: SemanticBudget,
     cache: HashMap<ProjectFile, CachedSemanticMaterialization>,
     diagnostics: Vec<CodeQueryDiagnostic>,
@@ -138,13 +143,33 @@ pub(super) struct SemanticQueryContext<'a> {
     traversal_steps: usize,
     indexed_source_identities: HashMap<ProjectFile, Option<ContentIdentity>>,
     budget_exhausted: bool,
+    typestate: TypestateQueryState,
 }
 
 impl<'a> SemanticQueryContext<'a> {
+    #[cfg(test)]
     pub(super) fn new(
         workspace: &'a WorkspaceAnalyzer,
         cancellation: Option<&'a CancellationToken>,
         limits: CodeQuerySemanticLimits,
+    ) -> Self {
+        Self::new_with_analysis(
+            workspace,
+            cancellation,
+            limits,
+            super::CodeQueryTypestateLimits::default(),
+            0,
+            None,
+        )
+    }
+
+    pub(super) fn new_with_analysis(
+        workspace: &'a WorkspaceAnalyzer,
+        cancellation: Option<&'a CancellationToken>,
+        limits: CodeQuerySemanticLimits,
+        typestate_limits: super::CodeQueryTypestateLimits,
+        workspace_generation: u64,
+        analysis_context: Option<&'a QueryAnalysisContext>,
     ) -> Self {
         debug_assert!(limits.all_positive());
         Self {
@@ -152,6 +177,9 @@ impl<'a> SemanticQueryContext<'a> {
             cancellation,
             uncancelled: CancellationToken::default(),
             limits,
+            typestate_limits,
+            workspace_generation,
+            analysis_context,
             budget: SemanticBudget::new(semantic_budget_limits(limits))
                 .expect("CodeQuery semantic limits are positive"),
             cache: HashMap::default(),
@@ -164,6 +192,7 @@ impl<'a> SemanticQueryContext<'a> {
             traversal_steps: 0,
             indexed_source_identities: HashMap::default(),
             budget_exhausted: false,
+            typestate: TypestateQueryState::default(),
         }
     }
 
@@ -372,7 +401,9 @@ impl<'a> SemanticQueryContext<'a> {
 
     pub(super) fn take_diagnostics(&mut self) -> Vec<CodeQueryDiagnostic> {
         self.reported.clear();
-        std::mem::take(&mut self.diagnostics)
+        let mut diagnostics = std::mem::take(&mut self.diagnostics);
+        diagnostics.extend(self.typestate.take_diagnostics());
+        diagnostics
     }
 
     pub(super) fn work(&self) -> CodeQuerySemanticWork {
@@ -387,8 +418,31 @@ impl<'a> SemanticQueryContext<'a> {
             control_edges: saturating_u64(used.control_edges),
             retained_bytes: saturating_u64(self.retained_bytes),
             traversal_steps: saturating_u64(self.traversal_steps),
-            budget_exhausted: self.budget_exhausted,
+            budget_exhausted: self.budget_exhausted || self.typestate.semantic_budget_exhausted(),
+            typestate: self.typestate.work(),
         }
+    }
+
+    pub(super) fn typestate_findings(
+        &mut self,
+        procedure: &SemanticProcedureValue,
+        protocol_ref: &ProtocolRef,
+    ) -> Vec<SemanticTypestateFindingValue> {
+        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
+        self.typestate.findings(
+            self.workspace,
+            self.workspace_generation,
+            self.analysis_context,
+            procedure,
+            protocol_ref,
+            &mut self.budget,
+            self.typestate_limits,
+            cancellation,
+        )
+    }
+
+    pub(super) fn typestate_witness_truncated(&mut self, count: usize) {
+        self.typestate.witness_truncated(count);
     }
 
     fn finish_procedure_lookup(

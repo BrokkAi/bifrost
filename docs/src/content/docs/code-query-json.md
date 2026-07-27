@@ -5,7 +5,7 @@ description: Use the canonical JSON representation for Bifrost's query_code engi
 
 JSON `CodeQuery` is the canonical machine-facing representation accepted by Bifrost's `query_code` tool. MCP hosts and the Python client send this shape directly. The RQL REPL prints the same representation with `:json`.
 
-The compatible head is schema version 3. It retains version 2's normalized structural matching, declaration/reference/call/import/hierarchy steps, and bounded receiver provenance, then adds source-backed procedure-local CFG inspection. Explicit version-2 pins remain valid and reject version-3-only operations. Version 3 exposes control flow, but it is not an interprocedural CFG, data-flow, taint, or typestate analysis.
+The compatible head is schema version 4. It retains version 3's source-backed procedure-local CFG surface and version 2's structural/declaration/reference/call/import/hierarchy/receiver vocabulary, then adds host-registered diagnostic-neutral typestate findings and bounded witnesses. Explicit version-2 and version-3 pins keep their old meanings and reject later operations. Schema version 4 does not load protocol files from a query, compile policy findings, persist summaries, or expose the value-flow and taint clients.
 
 ## Minimal Query
 
@@ -28,7 +28,7 @@ The `match` object is the root pattern. It must constrain at least one of `kind`
 
 | Field | Shape | Meaning |
 | --- | --- | --- |
-| `schema_version` | integer | Optional. Omit it for compatible head version 3; pass `2` to pin the pre-CFG vocabulary or `3` explicitly. Other versions are rejected. |
+| `schema_version` | integer | Optional. Omit it for compatible head version 4; pass `2` to pin the pre-CFG vocabulary, `3` for CFG without typestate, or `4` explicitly. Other versions are rejected. |
 | `match` | pattern | Required root pattern. |
 | `where` | string array | Optional project-relative globs. Absolute paths or globs inside the active workspace are normalized by MCP and CLI entrypoints. |
 | `languages` | string array | Optional language labels such as `python`, `typescript`, `cpp`, or `csharp`. Empty means every structural adapter. |
@@ -183,6 +183,8 @@ Steps execute in array order and are validated before the workspace is searched:
 | `cfg_predecessor_edges` (v3) | program point | control edge | One-hop incoming control edges. |
 | `cfg_edge_source` (v3) | control edge | program point | Source endpoint of an edge. |
 | `cfg_edge_target` (v3) | control edge | program point | Target endpoint of an edge. |
+| `typestate` (v4) | procedure | typestate finding | Run the host-registered protocol/binding pair named by `protocol_ref` once for the exact procedure. |
+| `witness` (v4) | typestate finding | typestate witness | Project already-retained evidence, optionally reducing it with non-negative `max_steps` and `max_bytes`. |
 | `references_of` | declaration | reference site | Exact structured source sites targeting the declaration. |
 | `used_by` | declaration | declaration | Smallest exact declaration enclosing each matching site. |
 | `uses` | declaration | declaration | Exact indexed declarations referenced by this semantic owner. |
@@ -194,7 +196,7 @@ Steps execute in array order and are validated before the workspace is searched:
 | `receiver_targets` | structural match, reference site, call site, or expression site | receiver analysis | Receiver values extracted from a call/member site or supplied as an exact expression. |
 | `points_to` | structural match, reference site, or expression site | receiver analysis | Bounded value, allocation, type, module, current-receiver, and factory provenance. |
 | `member_targets` | structural match or reference site | receiver analysis | Exact indexed declarations selected by a receiver-qualified member access. |
-| `file_of` | structural match, declaration, procedure, program point, control edge, reference site, call site, expression site, or receiver analysis | file | Exact project file containing the analyzed input value. |
+| `file_of` | structural match, declaration, procedure, program point, control edge, typestate finding, typestate witness, reference site, call site, expression site, or receiver analysis | file | Exact project file containing the analyzed input value. |
 | `imports_of` | file | file | Direct project-local files imported by the input file. |
 | `importers_of` | file | file | Direct project-local files importing the input file. |
 | `supertypes` | declaration | declaration | Direct ancestors by default, or a bounded/full indexed ancestor closure. |
@@ -227,7 +229,28 @@ This query starts from a structural function match, resolves its executable proc
 
 Every semantic row carries `evidence.proof` (`proven` or `unproven`) and `evidence.completeness` (`complete` or `partial`), with a bounded reason when either status is degraded. Public IDs never expose dense semantic arena IDs and remain stable for identical indexed content mounted at different absolute checkout paths. Diagnostics distinguish unsupported/partial capability, provider failure, missing workspace services, no enclosing procedure, cancellation, and budget exhaustion. An incomplete diagnostic prevents a complete-negative conclusion even when the result array is empty.
 
-Each edge operation is exactly one hop. Compose more steps for a finite traversal; schema v3 does not provide an unbounded closure, ICFG, data-flow, taint, typestate, finding, or witness endpoint.
+Each edge operation is exactly one hop. Compose more steps for a finite traversal; schema v3 does not provide an unbounded closure, ICFG, data-flow, taint, typestate, finding, or witness endpoint. Schema v4 adds only the registered typestate adapter described next.
+
+### Registered typestate findings and witnesses (schema v4)
+
+An embedding first registers an in-memory compiled protocol and its pre-resolved binding plan under a namespaced reference. The JSON request supplies only that reference; it never supplies a protocol path, binding JSON, policy severity, or query-time mode override.
+
+<!-- code-query-test:json:typestate-witness -->
+```json
+{
+  "schema_version": 4,
+  "match": {"kind": "function", "name": "lifecycle"},
+  "steps": [
+    {"op": "procedure_of"},
+    {"op": "typestate", "protocol_ref": "embedding:resource-lifecycle"},
+    {"op": "witness", "max_steps": 32, "max_bytes": 16384}
+  ]
+}
+```
+
+`typestate_finding` rows carry stable protocol and binding-plan hashes, canonical subject identity, finding kind, certainty (`may`, `must`, or `inconclusive`), exact primary range, proof/completeness flags, uncertainty causes, abstention, and retained/omitted witness counts. They deliberately have no policy ID, severity, message, CWE, CVSS, or SARIF fields. `typestate_witness` rows retain the same identity plus ordered source-backed steps, semantic evidence, truncation flags, and omission lower bounds.
+
+One request solves each exact procedure/protocol/binding tuple at most once. `witness` only trims retained evidence and never reruns the solver. Solver, finding, witness, semantic, and ordinary pipeline work all remain finitely bounded; profile mode reports typestate solves, request-cache hits, reached rows, findings, witnesses, steps, bytes, termination, and exhaustion. Missing references, stale workspace generations or artifacts, wrong roots, cancellation, provider failure, and exhausted budgets are explicit incomplete diagnostics, never clean empty negatives.
 
 ```json
 {

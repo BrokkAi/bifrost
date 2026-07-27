@@ -247,6 +247,14 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryControlEdge>,
     },
+    TypestateFinding {
+        #[serde(flatten)]
+        value: Box<CodeQueryTypestateFinding>,
+    },
+    TypestateWitness {
+        #[serde(flatten)]
+        value: Box<CodeQueryTypestateWitness>,
+    },
     File {
         #[serde(flatten)]
         value: CodeQueryFile,
@@ -342,6 +350,143 @@ pub struct CodeQueryControlEdge {
     pub source: CodeQueryProgramPointRef,
     pub target: CodeQueryProgramPointRef,
     pub evidence: CodeQuerySemanticEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryTypestateSubject {
+    pub class: String,
+    pub identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CodeQueryTypestateFindingKind {
+    ErrorTransition {
+        event: String,
+        from_state: String,
+        to_state: String,
+    },
+    TerminalExpectation {
+        expectation: String,
+        actual_states: Vec<String>,
+    },
+}
+
+impl CodeQueryTypestateFindingKind {
+    fn presentation_label(&self) -> String {
+        match self {
+            Self::ErrorTransition {
+                event,
+                from_state,
+                to_state,
+            } => format!("{event}: {from_state} -> {to_state}"),
+            Self::TerminalExpectation {
+                expectation,
+                actual_states,
+            } => format!("{expectation}: actual {}", actual_states.join(", ")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeQueryTypestateCertainty {
+    May,
+    Must,
+    Inconclusive,
+}
+
+impl CodeQueryTypestateCertainty {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::May => "may",
+            Self::Must => "must",
+            Self::Inconclusive => "inconclusive",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeQueryTypestateUncertainty {
+    AmbiguousDispatch,
+    UnknownCall,
+    ExternalCall,
+    Escape,
+    IncompleteAnalysis,
+    UnmatchedEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryTypestateFinding {
+    pub id: String,
+    pub protocol_ref: String,
+    pub protocol_hash: String,
+    pub binding_plan_hash: String,
+    pub subject: CodeQueryTypestateSubject,
+    pub finding_kind: CodeQueryTypestateFindingKind,
+    pub certainty: CodeQueryTypestateCertainty,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub path_proven: bool,
+    pub path_complete: bool,
+    pub analysis_complete: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub uncertainty: Vec<CodeQueryTypestateUncertainty>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub abstained: bool,
+    pub retained_witnesses: usize,
+    pub omitted_witnesses: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CodeQueryTypestateWitnessStepKind {
+    Seed,
+    Edge { edge_kind: &'static str },
+    EndSummaryGap { return_kind: &'static str },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryTypestateWitnessStep {
+    pub kind: CodeQueryTypestateWitnessStepKind,
+    pub source: CodeQuerySourceSite,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<CodeQuerySourceSite>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<CodeQuerySourceSite>,
+    pub evidence: CodeQuerySemanticEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryTypestateWitness {
+    pub id: String,
+    pub finding_id: String,
+    pub protocol_ref: String,
+    pub protocol_hash: String,
+    pub binding_plan_hash: String,
+    pub subject: CodeQueryTypestateSubject,
+    pub witness_index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_state: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub quality: CodeQuerySemanticEvidence,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub uncertainty: Vec<CodeQueryTypestateUncertainty>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub abstained: bool,
+    pub steps: Vec<CodeQueryTypestateWitnessStep>,
+    pub retained_bytes: usize,
+    #[serde(skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    pub omitted_steps_lower_bound: usize,
+    #[serde(skip_serializing_if = "is_false")]
+    pub alternatives_truncated: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub retention_truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -589,7 +734,7 @@ impl CodeQueryReceiverAnalysis {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CodeQuerySourceSite {
     pub path: String,
     pub range: CodeQueryRange,
@@ -657,6 +802,18 @@ pub enum CodeQueryResultRef {
         edge_kind: &'static str,
         source_id: String,
         target_id: String,
+    },
+    TypestateFinding {
+        id: String,
+        path: String,
+        range: CodeQueryRange,
+        protocol_ref: String,
+    },
+    TypestateWitness {
+        id: String,
+        finding_id: String,
+        path: String,
+        range: CodeQueryRange,
     },
     File {
         path: String,
@@ -733,6 +890,16 @@ pub enum CodeQueryDiagnosticCode {
     SemanticAnalysisPartial,
     SemanticBudgetExhausted,
     SemanticProviderFailed,
+    UnresolvedProtocolReference,
+    TypestateRegistrationStale,
+    TypestateHandleStale,
+    TypestateRootMismatch,
+    TypestateCapabilityUnsupported,
+    TypestateAnalysisPartial,
+    TypestateProviderFailed,
+    TypestateSolverBudgetExhausted,
+    TypestateFindingBudgetExhausted,
+    TypestateWitnessTruncated,
     ReceiverAnalysisPartial,
     ReceiverAnalysisFailed,
     CallRelationBudgetExhausted,
@@ -773,6 +940,16 @@ impl CodeQueryDiagnosticCode {
             Self::SemanticAnalysisPartial => "semantic_analysis_partial",
             Self::SemanticBudgetExhausted => "semantic_budget_exhausted",
             Self::SemanticProviderFailed => "semantic_provider_failed",
+            Self::UnresolvedProtocolReference => "unresolved_protocol_reference",
+            Self::TypestateRegistrationStale => "typestate_registration_stale",
+            Self::TypestateHandleStale => "typestate_handle_stale",
+            Self::TypestateRootMismatch => "typestate_root_mismatch",
+            Self::TypestateCapabilityUnsupported => "typestate_capability_unsupported",
+            Self::TypestateAnalysisPartial => "typestate_analysis_partial",
+            Self::TypestateProviderFailed => "typestate_provider_failed",
+            Self::TypestateSolverBudgetExhausted => "typestate_solver_budget_exhausted",
+            Self::TypestateFindingBudgetExhausted => "typestate_finding_budget_exhausted",
+            Self::TypestateWitnessTruncated => "typestate_witness_truncated",
             Self::ReceiverAnalysisPartial => "receiver_analysis_partial",
             Self::ReceiverAnalysisFailed => "receiver_analysis_failed",
             Self::CallRelationBudgetExhausted => "call_relation_budget_exhausted",
@@ -848,6 +1025,47 @@ pub struct CodeQueryExecutionLimits {
     pub max_fact_nodes: usize,
     pub max_pipeline_rows: usize,
     pub semantic: CodeQuerySemanticLimits,
+    pub typestate: CodeQueryTypestateLimits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeQueryTypestateLimits {
+    pub solver_work: crate::analyzer::dataflow::SolverWork,
+    pub max_reached_rows: usize,
+    pub max_candidates: usize,
+    pub max_witness_steps: usize,
+    pub max_witness_expansions: usize,
+    pub max_total_witness_expansions: usize,
+    pub max_witness_bytes: usize,
+}
+
+impl CodeQueryTypestateLimits {
+    pub fn is_valid(self) -> bool {
+        let hard_solver = crate::analyzer::dataflow::SolverWork::default_limits();
+        let solver_valid = crate::analyzer::dataflow::SolverBudgetDimension::ALL
+            .into_iter()
+            .all(|dimension| {
+                let value = self.solver_work.get(dimension);
+                value > 0 && value <= hard_solver.get(dimension)
+            });
+        solver_valid
+            && self.max_reached_rows > 0
+            && self.max_reached_rows
+                <= crate::analyzer::typestate::MAX_TYPESTATE_FINDING_REACHED_ROWS
+            && self.max_candidates > 0
+            && self.max_candidates <= crate::analyzer::typestate::MAX_TYPESTATE_FINDING_CANDIDATES
+            && self.max_witness_steps > 0
+            && self.max_witness_steps <= crate::analyzer::typestate::MAX_TYPESTATE_WITNESS_STEPS
+            && self.max_witness_expansions > 0
+            && self.max_witness_expansions
+                <= crate::analyzer::typestate::MAX_TYPESTATE_WITNESS_EXPANSIONS
+            && self.max_total_witness_expansions > 0
+            && self.max_total_witness_expansions
+                <= crate::analyzer::typestate::MAX_TYPESTATE_FINDING_WITNESS_EXPANSIONS
+            && self.max_witness_bytes > 0
+            && self.max_witness_bytes
+                <= crate::analyzer::typestate::MAX_TYPESTATE_FINDING_WITNESS_BYTES
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -891,6 +1109,102 @@ pub struct CodeQuerySemanticWork {
     pub retained_bytes: u64,
     pub traversal_steps: u64,
     pub budget_exhausted: bool,
+    #[serde(skip_serializing_if = "CodeQueryTypestateWork::is_empty")]
+    pub typestate: CodeQueryTypestateWork,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct CodeQueryTypestateWork {
+    pub solves: u64,
+    pub cache_hits: u64,
+    pub reached_rows: u64,
+    pub findings: u64,
+    pub omitted_findings: u64,
+    pub witnesses: u64,
+    pub omitted_witnesses: u64,
+    pub witness_steps: u64,
+    pub witness_bytes: u64,
+    pub fixed_point_solves: u64,
+    pub cancelled_solves: u64,
+    pub budget_exhausted_solves: u64,
+    pub failed_solves: u64,
+    pub finding_budget_exhausted: bool,
+}
+
+impl CodeQueryTypestateWork {
+    pub const fn is_empty(&self) -> bool {
+        self.solves == 0
+            && self.cache_hits == 0
+            && self.reached_rows == 0
+            && self.findings == 0
+            && self.omitted_findings == 0
+            && self.witnesses == 0
+            && self.omitted_witnesses == 0
+            && self.witness_steps == 0
+            && self.witness_bytes == 0
+            && self.fixed_point_solves == 0
+            && self.cancelled_solves == 0
+            && self.budget_exhausted_solves == 0
+            && self.failed_solves == 0
+            && !self.finding_budget_exhausted
+    }
+
+    pub(crate) const fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            solves: self.solves.saturating_sub(earlier.solves),
+            cache_hits: self.cache_hits.saturating_sub(earlier.cache_hits),
+            reached_rows: self.reached_rows.saturating_sub(earlier.reached_rows),
+            findings: self.findings.saturating_sub(earlier.findings),
+            omitted_findings: self
+                .omitted_findings
+                .saturating_sub(earlier.omitted_findings),
+            witnesses: self.witnesses.saturating_sub(earlier.witnesses),
+            omitted_witnesses: self
+                .omitted_witnesses
+                .saturating_sub(earlier.omitted_witnesses),
+            witness_steps: self.witness_steps.saturating_sub(earlier.witness_steps),
+            witness_bytes: self.witness_bytes.saturating_sub(earlier.witness_bytes),
+            fixed_point_solves: self
+                .fixed_point_solves
+                .saturating_sub(earlier.fixed_point_solves),
+            cancelled_solves: self
+                .cancelled_solves
+                .saturating_sub(earlier.cancelled_solves),
+            budget_exhausted_solves: self
+                .budget_exhausted_solves
+                .saturating_sub(earlier.budget_exhausted_solves),
+            failed_solves: self.failed_solves.saturating_sub(earlier.failed_solves),
+            finding_budget_exhausted: self.finding_budget_exhausted
+                && !earlier.finding_budget_exhausted,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn saturating_add(self, other: Self) -> Self {
+        Self {
+            solves: self.solves.saturating_add(other.solves),
+            cache_hits: self.cache_hits.saturating_add(other.cache_hits),
+            reached_rows: self.reached_rows.saturating_add(other.reached_rows),
+            findings: self.findings.saturating_add(other.findings),
+            omitted_findings: self.omitted_findings.saturating_add(other.omitted_findings),
+            witnesses: self.witnesses.saturating_add(other.witnesses),
+            omitted_witnesses: self
+                .omitted_witnesses
+                .saturating_add(other.omitted_witnesses),
+            witness_steps: self.witness_steps.saturating_add(other.witness_steps),
+            witness_bytes: self.witness_bytes.saturating_add(other.witness_bytes),
+            fixed_point_solves: self
+                .fixed_point_solves
+                .saturating_add(other.fixed_point_solves),
+            cancelled_solves: self.cancelled_solves.saturating_add(other.cancelled_solves),
+            budget_exhausted_solves: self
+                .budget_exhausted_solves
+                .saturating_add(other.budget_exhausted_solves),
+            failed_solves: self.failed_solves.saturating_add(other.failed_solves),
+            finding_budget_exhausted: self.finding_budget_exhausted
+                || other.finding_budget_exhausted,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -977,6 +1291,8 @@ pub(crate) enum DetailedCodeQueryDomain {
     Procedure,
     ProgramPoint,
     ControlEdge,
+    TypestateFinding,
+    TypestateWitness,
     File,
     ReferenceSite,
     CallSite,
@@ -1005,6 +1321,13 @@ pub(crate) enum DetailedCodeQueryKey {
     ControlEdge {
         id: String,
         procedure_id: String,
+    },
+    TypestateFinding {
+        id: String,
+    },
+    TypestateWitness {
+        id: String,
+        finding_id: String,
     },
     File,
     ReferenceSite {
@@ -1035,6 +1358,7 @@ impl Default for CodeQueryExecutionLimits {
             max_fact_nodes: MAX_FACT_NODES,
             max_pipeline_rows: MAX_PIPELINE_ROWS,
             semantic: CodeQuerySemanticLimits::default(),
+            typestate: CodeQueryTypestateLimits::default(),
         }
     }
 }
@@ -1047,6 +1371,21 @@ impl Default for CodeQuerySemanticLimits {
             max_rows_per_dimension: MAX_SEMANTIC_ROWS_PER_DIMENSION,
             max_retained_bytes: MAX_SEMANTIC_RETAINED_BYTES,
             max_traversal_steps: MAX_SEMANTIC_TRAVERSAL_STEPS,
+        }
+    }
+}
+
+impl Default for CodeQueryTypestateLimits {
+    fn default() -> Self {
+        Self {
+            solver_work: crate::analyzer::dataflow::SolverWork::default_limits(),
+            max_reached_rows: crate::analyzer::typestate::MAX_TYPESTATE_FINDING_REACHED_ROWS,
+            max_candidates: crate::analyzer::typestate::MAX_TYPESTATE_FINDING_CANDIDATES,
+            max_witness_steps: crate::analyzer::typestate::MAX_TYPESTATE_WITNESS_STEPS,
+            max_witness_expansions: crate::analyzer::typestate::MAX_TYPESTATE_WITNESS_EXPANSIONS,
+            max_total_witness_expansions:
+                crate::analyzer::typestate::MAX_TYPESTATE_FINDING_WITNESS_EXPANSIONS,
+            max_witness_bytes: crate::analyzer::typestate::MAX_TYPESTATE_FINDING_WITNESS_BYTES,
         }
     }
 }
@@ -1103,6 +1442,12 @@ impl DetailedCodeQueryResult {
                     ) | (
                         DetailedCodeQueryDomain::ControlEdge,
                         DetailedCodeQueryKey::ControlEdge { .. }
+                    ) | (
+                        DetailedCodeQueryDomain::TypestateFinding,
+                        DetailedCodeQueryKey::TypestateFinding { .. }
+                    ) | (
+                        DetailedCodeQueryDomain::TypestateWitness,
+                        DetailedCodeQueryKey::TypestateWitness { .. }
                     ) | (DetailedCodeQueryDomain::File, DetailedCodeQueryKey::File)
                         | (
                             DetailedCodeQueryDomain::ReferenceSite,
@@ -1202,6 +1547,19 @@ fn detailed_semantic_identity(
                 procedure_id: value.procedure_id.clone(),
             },
         )),
+        CodeQueryResultValue::TypestateFinding { value } => Some((
+            DetailedCodeQueryDomain::TypestateFinding,
+            DetailedCodeQueryKey::TypestateFinding {
+                id: value.id.clone(),
+            },
+        )),
+        CodeQueryResultValue::TypestateWitness { value } => Some((
+            DetailedCodeQueryDomain::TypestateWitness,
+            DetailedCodeQueryKey::TypestateWitness {
+                id: value.id.clone(),
+                finding_id: value.finding_id.clone(),
+            },
+        )),
         CodeQueryResultValue::StructuralMatch { .. }
         | CodeQueryResultValue::Declaration { .. }
         | CodeQueryResultValue::File { .. }
@@ -1239,7 +1597,9 @@ fn assert_detailed_terminal_identities(
                 | DetailedCodeQueryDomain::Declaration
                 | DetailedCodeQueryDomain::Procedure
                 | DetailedCodeQueryDomain::ProgramPoint
-                | DetailedCodeQueryDomain::ControlEdge,
+                | DetailedCodeQueryDomain::ControlEdge
+                | DetailedCodeQueryDomain::TypestateFinding
+                | DetailedCodeQueryDomain::TypestateWitness,
             DetailedCodeQueryProvenanceIdentities::Primary(_),
         ) | (
             DetailedCodeQueryDomain::File
@@ -1260,7 +1620,9 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
     match key {
         DetailedCodeQueryKey::Procedure { id }
         | DetailedCodeQueryKey::ProgramPoint { id, .. }
-        | DetailedCodeQueryKey::ControlEdge { id, .. } => Some(id),
+        | DetailedCodeQueryKey::ControlEdge { id, .. }
+        | DetailedCodeQueryKey::TypestateFinding { id }
+        | DetailedCodeQueryKey::TypestateWitness { id, .. } => Some(id),
         DetailedCodeQueryKey::StructuralMatch { .. }
         | DetailedCodeQueryKey::Declaration { .. }
         | DetailedCodeQueryKey::File
@@ -1281,6 +1643,8 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::Procedure { .. }
                 | CodeQueryResultValue::ProgramPoint { .. }
                 | CodeQueryResultValue::ControlEdge { .. }
+                | CodeQueryResultValue::TypestateFinding { .. }
+                | CodeQueryResultValue::TypestateWitness { .. }
                 | CodeQueryResultValue::File { .. }
                 | CodeQueryResultValue::ReferenceSite { .. }
                 | CodeQueryResultValue::CallSite { .. }
@@ -1376,6 +1740,29 @@ impl CodeQueryResult {
                             value.evidence.status_label(),
                             value.source.id,
                             value.target.id,
+                        ));
+                    }
+                    CodeQueryResultValue::TypestateFinding { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [typestate finding; {}; {}] {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.certainty.label(),
+                            value.finding_kind.presentation_label(),
+                            value.id,
+                        ));
+                    }
+                    CodeQueryResultValue::TypestateWitness { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [typestate witness; {} step{}{}] {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.steps.len(),
+                            if value.steps.len() == 1 { "" } else { "s" },
+                            if value.truncated { "; truncated" } else { "" },
+                            value.id,
                         ));
                     }
                     CodeQueryResultValue::File { value } => {

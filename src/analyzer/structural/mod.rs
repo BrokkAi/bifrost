@@ -21,6 +21,7 @@
 //! and `.agents/plans/issue-449-query-code-reference.md` for the public rename.
 
 pub(crate) mod adapter_helpers;
+pub mod analysis_context;
 pub(crate) mod capabilities;
 pub(crate) mod execution;
 pub mod extract;
@@ -35,6 +36,17 @@ pub mod rune_ir;
 pub mod search;
 pub mod spec;
 
+pub use analysis_context::{
+    MAX_PROTOCOL_NAME_BYTES, MAX_PROTOCOL_NAMESPACE_BYTES, MAX_PROTOCOL_REF_BYTES,
+    MAX_PROTOCOL_REFS, MAX_PROTOCOL_REGISTRATIONS, MAX_QUERY_REGISTRATION_VALIDATION_ARTIFACTS,
+    MAX_QUERY_REGISTRATION_VALIDATION_SOURCE_BYTES, MAX_REGISTRATION_ARTIFACT_SOURCE_BYTES,
+    MAX_RETAINED_BINDING_PLAN_BYTES, MAX_RETAINED_PROTOCOL_BYTES,
+    MAX_RETAINED_REGISTRATION_ARTIFACT_BYTES, ProtocolHandle, ProtocolNameError,
+    ProtocolNamespaceError, ProtocolRef, ProtocolRefError, ProtocolRegistration,
+    ProtocolRegistrationError, ProtocolRegistrationLimits, ProtocolRegistrationOutcome,
+    ProtocolRegistrationSet, ProtocolRegistrationSetError, QueryAnalysisContext,
+    QueryAnalysisContextError, QueryAnalysisValidationLimits,
+};
 pub use execution::{
     CodeQueryAccessPathProfile, CodeQueryBoundedDispatchProfile, CodeQueryCacheMetricsKind,
     CodeQueryDerivedLayerCacheCounters, CodeQueryExplain, CodeQueryExplainScheduling,
@@ -72,9 +84,15 @@ pub use search::{
     CodeQueryReceiverValue, CodeQueryReferenceSite, CodeQueryResponse, CodeQueryResult,
     CodeQueryResultItem, CodeQueryResultRef, CodeQueryResultValue, CodeQuerySemanticCompleteness,
     CodeQuerySemanticEvidence, CodeQuerySemanticLimits, CodeQuerySemanticProof,
-    CodeQuerySemanticWork, CodeQuerySourceSite, execute, execute_request,
-    execute_request_with_cancellation, execute_request_with_limits, execute_with_limits,
-    execute_workspace, execute_workspace_request, execute_workspace_request_with_cancellation,
-    execute_workspace_request_with_limits, execute_workspace_with_limits,
+    CodeQuerySemanticWork, CodeQuerySourceSite, CodeQueryTypestateCertainty,
+    CodeQueryTypestateFinding, CodeQueryTypestateFindingKind, CodeQueryTypestateLimits,
+    CodeQueryTypestateSubject, CodeQueryTypestateUncertainty, CodeQueryTypestateWitness,
+    CodeQueryTypestateWitnessStep, CodeQueryTypestateWitnessStepKind, CodeQueryTypestateWork,
+    execute, execute_request, execute_request_with_cancellation, execute_request_with_limits,
+    execute_with_limits, execute_workspace, execute_workspace_request,
+    execute_workspace_request_with_cancellation, execute_workspace_request_with_limits,
+    execute_workspace_request_with_registration_cancellation,
+    execute_workspace_request_with_registration_limits,
+    execute_workspace_request_with_registrations, execute_workspace_with_limits,
 };
 pub use spec::{RoleSink, StructuralSpec};

@@ -892,6 +892,44 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.evidence.status_label(),
                     ));
                 }
+                CodeQueryResultValue::TypestateFinding { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let id = sanitize_terminal_text(&value.id);
+                    let protocol_ref = sanitize_terminal_text(&value.protocol_ref);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} {} ({:?})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "typestate finding:",
+                            use_color
+                        ),
+                        protocol_ref,
+                        paint(Style::new().bold(), &id, use_color),
+                        value.certainty,
+                    ));
+                }
+                CodeQueryResultValue::TypestateWitness { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let id = sanitize_terminal_text(&value.id);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} ({} step{}{})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "typestate witness:",
+                            use_color
+                        ),
+                        paint(Style::new().bold(), &id, use_color),
+                        value.steps.len(),
+                        if value.steps.len() == 1 { "" } else { "s" },
+                        if value.truncated { "; truncated" } else { "" },
+                    ));
+                }
                 CodeQueryResultValue::File { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     out.push_str(&format!(

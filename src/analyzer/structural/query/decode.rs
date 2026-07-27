@@ -6,6 +6,7 @@ use super::ir::{
     MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
     MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError, QueryStep,
     ReceiverTraversalFilter, ReferenceTraversalFilter, SetOperator, StringPredicate,
+    TypestateTraversal, WitnessTraversal,
 };
 use super::schema::{
     ALL_QUERY_STEP_OPS, CodeQueryExecutionMode, PatternField, QueryField, QueryStepField,
@@ -430,7 +431,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
             .ok_or_else(|| QueryError::new(&op_path, "required field is missing"))?
             .as_str()
             .ok_or_else(|| QueryError::new(&op_path, "expected a step name string"))?;
-        let mut step = QueryStep::from_label(label).ok_or_else(|| {
+        let op = super::schema::QueryStepOp::from_label(label).ok_or_else(|| {
             let expected = ALL_QUERY_STEP_OPS
                 .iter()
                 .map(|op| op.label())
@@ -441,6 +442,28 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 format!("unknown query step {label:?}; expected {expected}"),
             )
         })?;
+        let mut step = match op {
+            super::schema::QueryStepOp::Typestate => {
+                let protocol_ref_path = child_path(&entry_path, "protocol_ref");
+                let protocol_ref = object
+                    .get("protocol_ref")
+                    .ok_or_else(|| {
+                        QueryError::new(&protocol_ref_path, "required field is missing")
+                    })?
+                    .as_str()
+                    .ok_or_else(|| {
+                        QueryError::new(&protocol_ref_path, "expected a protocol reference string")
+                    })?
+                    .parse()
+                    .map_err(|error: super::super::analysis_context::ProtocolRefError| {
+                        QueryError::new(protocol_ref_path, error.to_string())
+                    })?;
+                QueryStep::Typestate(TypestateTraversal { protocol_ref })
+            }
+            super::schema::QueryStepOp::Witness => QueryStep::Witness(WitnessTraversal::default()),
+            _ => QueryStep::from_label(label)
+                .expect("option-free and defaultable query steps construct from their labels"),
+        };
         let hierarchy = matches!(step, QueryStep::Supertypes(_) | QueryStep::Subtypes(_));
         let reference = matches!(
             step,
@@ -456,6 +479,8 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
             step,
             QueryStep::ReceiverTargets(_) | QueryStep::PointsTo(_) | QueryStep::MemberTargets(_)
         );
+        let typestate = matches!(step, QueryStep::Typestate(_));
+        let witness = matches!(step, QueryStep::Witness(_));
         for key in object.keys() {
             match QueryStepField::from_label(key) {
                 Some(QueryStepField::Op) => {}
@@ -468,6 +493,8 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::ParameterName,
                 ) if call_input => {}
                 Some(QueryStepField::Capture) if receiver => {}
+                Some(QueryStepField::ProtocolRef) if typestate => {}
+                Some(QueryStepField::MaxSteps | QueryStepField::MaxBytes) if witness => {}
                 Some(
                     QueryStepField::ReferenceKinds
                     | QueryStepField::Proof
@@ -482,7 +509,10 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::Receiver
                     | QueryStepField::ParameterIndex
                     | QueryStepField::ParameterName
-                    | QueryStepField::Capture,
+                    | QueryStepField::Capture
+                    | QueryStepField::ProtocolRef
+                    | QueryStepField::MaxSteps
+                    | QueryStepField::MaxBytes,
                 )
                 | None => {
                     return Err(QueryError::new(
@@ -492,7 +522,24 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 }
             }
         }
-        if hierarchy {
+        if witness {
+            let decode_bound = |field: &str| -> Result<Option<usize>, QueryError> {
+                object
+                    .get(field)
+                    .map(|value| {
+                        let path = child_path(&entry_path, field);
+                        value
+                            .as_u64()
+                            .and_then(|raw| usize::try_from(raw).ok())
+                            .ok_or_else(|| QueryError::new(path, "expected a non-negative integer"))
+                    })
+                    .transpose()
+            };
+            step = QueryStep::Witness(WitnessTraversal {
+                max_steps: decode_bound("max_steps")?,
+                max_bytes: decode_bound("max_bytes")?,
+            });
+        } else if hierarchy {
             let depth = object.get("depth");
             let transitive = object.get("transitive");
             if depth.is_some() && transitive.is_some() {

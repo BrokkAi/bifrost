@@ -26,6 +26,7 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - [x] (2026-07-16 10:35+02:00) Made #709 the early public policy/API contract gate for #824 and #825 while keeping #814 through #823 free to build diagnostic-neutral internal analysis services.
 - [x] (2026-07-16 11:43+02:00) Defined and published set-oriented taint policies, compatible multi-policy batching, symbolic taint summaries, broad meeting-point findings, exact cache layers, and evidence-backed CVSS classification across #709, #813, #821, #823, and #824.
 - [x] (2026-07-25 17:24+02:00) Landed the first #824 public-query slice: schema-v3 procedure, program-point, and explicit control-edge domains over real procedure-local CFG services, with bounded execution and matching MCP/Python/LSP/VS Code/docs contracts. The remaining #824 flow, taint, typestate, policy-compiler, finding, and witness work stays open.
+- [x] (2026-07-26 21:43+02:00) Implemented the next #824 public-query checkpoint in rebased branch commit `b9d8c861`: schema v4 now exposes host-registered `procedure -> typestate_finding -> typestate_witness` execution with immutable registration snapshots, exact root/generation/artifact checks, one bounded solver run, retained witness projection, and matching MCP/Python/LSP/VS Code/docs contracts. Structural/call/expression binding forms, policy compilation, and flow/taint query domains remain later #824 work.
 - [x] (2026-07-16 12:39+02:00) Moved the publication thread to neutral branch `dave/composable-typestate-roadmap` and draft PR [#828](https://github.com/BrokkAi/bifrost/pull/828).
 - [x] (2026-07-16 14:39+02:00) Diagnosed #814 in detail and added the focused implementation plan `.agents/plans/issue-814-semantic-ir-contract.md`, including corrected artifact/ID scopes and explicit nested-callable, capture, method-reference, and source-position contracts.
 - [x] (2026-07-16 15:32+02:00) Implemented #814's identities, capabilities, outcomes/budgets, immutable artifact/procedure IR, invariant validation, scoped handles, bounded renderer, and TypeScript/Java contract fixtures.
@@ -699,7 +700,7 @@ Every persisted artifact uses a packed versioned DTO, generation/content validat
 
 #822 owns the versioned internal `ProtocolSpec`, automaton/terminal-expectation compilation, and diagnostic-neutral error-transition/terminal-expectation findings. #824 owns `TypestatePolicyCompiler`, typed query domains, endpoint binding classes, and adapters from analysis services to query rows and complete #709 projection facts. The compiler consumes #709's stored `ResolvedTypestatePolicySpec` without rescanning and lowers it into #822's internal `ProtocolSpec`; neither model embeds the other. #824 may build internal result domains before #709 closes, but it cannot declare the policy-facing wire shape stable until the #709 envelope and finding model are accepted. #825 requires both paths: diagnostic-neutral query exploration and `.rqlp` policy execution.
 
-The first #824 slice extends `QueryValueKind` and the declarative query schema with source-backed `procedure`, `program_point`, and `control_edge` domains. Later slices add `flow_endpoint`, `taint_finding`, `typestate_finding`, `taint_witness`, `typestate_witness`, and `flow_witness` only when their owning services exist. The operations are:
+The first #824 slice extended `QueryValueKind` and the declarative query schema with source-backed `procedure`, `program_point`, and `control_edge` domains. The next checkpoint adds `typestate_finding` and `typestate_witness` only for a host-registered compiled protocol and pre-resolved binding plan over an exact procedure root. Later compiler-backed slices add `flow_endpoint`, `taint_finding`, `taint_witness`, `flow_witness`, and richer typestate binding inputs when their owning services exist. The operations are:
 
 | Operation | Accepted input | Output | Required bound/behavior |
 | --- | --- | --- | --- |
@@ -709,9 +710,11 @@ The first #824 slice extends `QueryValueKind` and the declarative query schema w
 | `cfg_edge_source` / `cfg_edge_target` | control edge | program point | Exact endpoint projection through the owning procedure. |
 | future `cfg_successors` / `cfg_predecessors` convenience | program point | program point | Optional positive finite `depth`, default 1; lowers to repeated edge traversal plus source/target projection rather than defining another graph relation. |
 | `flows_to` / `flows_from` | expression site, program point, or flow endpoint | flow endpoint | Positive finite `depth` or explicit sink/source selector; valid-path semantics and work budget. |
-| `taint` | structural match, expression site, or flow endpoint | taint finding | Execution-scoped compiled taint plan, one finite multi-source/multi-sink run, solver budget. |
-| `typestate` | structural match, call site, expression site, or flow endpoint | typestate finding | Execution-scoped protocol reference, bind selector, may mode, solver budget. |
-| `witness` | taint finding, typestate finding, or flow endpoint | typed witness | Positive finite maximum steps and bytes. |
+| future `taint` | structural match, expression site, or flow endpoint | taint finding | Execution-scoped compiled taint plan, one finite multi-source/multi-sink run, solver budget. |
+| `typestate` | procedure | typestate finding | Required execution-scoped `protocol_ref` resolving to a compiled protocol and pre-resolved binding plan for that exact root; one finite solver run. |
+| `witness` | typestate finding | typestate witness | Pure projection from the retained finding; optional finite `max_steps` and `max_bytes` can only reduce the retained payload. |
+| future compiler-backed `typestate` inputs | structural match, call site, expression site, or flow endpoint | typestate finding | Resolve typed `bind` selectors and any authored analysis semantics before registration; never name-scan at execution time. |
+| future flow/taint `witness` inputs | taint finding or flow endpoint | typed witness | Reuse retained bounded derivations from the owning analysis without rerunning it. |
 
 Actual/formal/receiver/return bindings appear in flow provenance and solver transfers rather than as control edges. Each operation has a finite work budget, explicit capability diagnostics, deterministic endpoint identity and ordering, cancellation, and proof/completeness semantics. A witness is a bounded supporting derivation, not proof that all alternatives were enumerated. The planner evaluates cheap structural seeds before materializing expensive semantic facets.
 
@@ -782,21 +785,17 @@ The equivalent diagnostic-neutral RQL is:
 
 The result contains sink identity, reached source classes, bounded origins, proof/completeness, and a witness, but no policy message, CWE, severity, or CVSS. `PolicyEvaluator` supplies those only when projecting the same `TaintFinding` through its `PolicyDefinition`.
 
-The diagnostic-neutral JSON query increments `CodeQuery` to schema version 3 and introduces `typestate` followed by `witness`. Its `QueryAnalysisContext` must resolve the reference before validation/execution:
+The implemented diagnostic-neutral typestate query increments `CodeQuery` to schema version 4. The host first registers one compiled protocol and pre-resolved binding plan under a namespaced reference. Results/profile execution resolves that reference through a fresh `QueryAnalysisContext`; explain remains planning-only. The query accepts neither a protocol path nor `bind`/`mode` overrides:
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "languages": ["typescript"],
-  "match": {"kind": "call", "callee": {"name": "open"}},
+  "match": {"kind": "function", "name": "lifecycle"},
   "steps": [
-    {
-      "op": "typestate",
-      "protocol_ref": "policy:bifrost.test.resource-lifecycle",
-      "bind": "return_value",
-      "mode": "may"
-    },
-    {"op": "witness"}
+    {"op": "procedure_of"},
+    {"op": "typestate", "protocol_ref": "embedding:resource-lifecycle"},
+    {"op": "witness", "max_steps": 32, "max_bytes": 16384}
   ]
 }
 ```
@@ -804,12 +803,11 @@ The diagnostic-neutral JSON query increments `CodeQuery` to schema version 3 and
 The equivalent diagnostic-neutral RQL is:
 
 ```lisp
-(witness
-  (typestate :protocol-ref "policy:bifrost.test.resource-lifecycle"
-             :bind return-value
-             :mode may
-    (language typescript
-      (call :callee "open"))))
+(witness :max-steps 32 :max-bytes 16384
+  (typestate :protocol-ref "embedding:resource-lifecycle"
+    (procedure-of
+      (language typescript
+        (function :name "lifecycle")))))
 ```
 
 For a `use()` after `close()`, the typed analysis result has this minimum observable shape. It deliberately carries no severity or diagnostic message:
@@ -818,24 +816,24 @@ For a `use()` after `close()`, the typed analysis result has this minimum observ
 {
   "results": [{
     "result_type": "typestate_witness",
-    "protocol_ref": "policy:bifrost.test.resource-lifecycle",
+    "finding_id": "typestate-finding:<stable-content-identity>",
+    "protocol_ref": "embedding:resource-lifecycle",
     "protocol_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-    "outcome": "complete_finding",
-    "certainty": "may",
-    "error_state": "error",
-    "violation_event": "use",
+    "binding_plan_hash": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+    "subject": {"class": "resource", "identity": "<canonical-subject>"},
+    "witness_index": 0,
     "path": "resource.ts",
-    "range": {"start_line": 12, "end_line": 12},
-    "witness": {
-      "complete": true,
-      "steps": ["acquire", "close", "use"]
-    }
+    "range": {"start_line": 12, "start_column": 3, "end_line": 12, "end_column": 17},
+    "quality": {"proof": "proven", "completeness": "complete"},
+    "steps": ["<ordered source-backed seed/edge steps>"],
+    "retained_bytes": 512,
+    "omitted_steps_lower_bound": 0
   }],
   "truncated": false
 }
 ```
 
-`protocol_hash` is serialized as exactly 64 lowercase hexadecimal characters; the illustrative value above is replaced by the fixture's actual canonical hash in gold output.
+`protocol_hash` and `binding_plan_hash` are serialized as exactly 64 lowercase hexadecimal characters; integration fixtures use their real canonical values and assert their shape plus stable public identity behavior rather than freezing the entire response behind one opaque snapshot hash. The corresponding `typestate_finding` retains finding kind, `may`/`must`/`inconclusive` certainty, proof/completeness, uncertainty, abstention, and retained/omitted witness counts. Neither result carries policy presentation fields.
 
 Evaluating the `.rqlp` policy maps that result into a `PolicyFinding` with `policy_id`, severity/unrated state, message, primary/related locations, analysis type, classification, optional CVSS assessment, proof/completeness, and the bounded witness. The same `PolicyFinding` feeds human and SARIF renderers; renderers never reinterpret raw query matches or solver facts.
 
@@ -950,7 +948,7 @@ For #709 and #824:
 
     cargo test --test static_analysis_policy --test taint_policy_sets --test cvss_classification --test code_query_taint --test policy_taint_integration --test code_query_typestate --test policy_typestate_integration
 
-Expected: `test result: ok`; the policy envelope and `PolicyFinding` contract pass independently, `analysis.type` selects `match`, `taint`, or `typestate`, compatible omitted/pinned RQLP versions resolve exactly as specified, and #824's schema-version-3 JSON/RQL analysis examples lower to diagnostic-neutral queries. The taint fixture compiles to one plan, keeps a broad finding when no CWE refinement matches, rejects missing/conflicting catalog sides and ambiguous sink operands, maps incomplete Base evidence to `Unscored`, computes scores rather than accepting authored numbers, and preserves metric provenance and compatible assessment variants in matching human/SARIF findings.
+Expected: `test result: ok`; the policy envelope and `PolicyFinding` contract pass independently, `analysis.type` selects `match`, `taint`, or `typestate`, compatible omitted/pinned RQLP versions resolve exactly as specified, and #824's schema-version-4 JSON/RQL typestate examples lower to diagnostic-neutral queries. The taint fixture compiles to one plan, keeps a broad finding when no CWE refinement matches, rejects missing/conflicting catalog sides and ambiguous sink operands, maps incomplete Base evidence to `Unscored`, computes scores rather than accepting authored numbers, and preserves metric provenance and compatible assessment variants in matching human/SARIF findings.
 
 For #825:
 

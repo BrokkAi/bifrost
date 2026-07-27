@@ -22,9 +22,9 @@
         },
         "kind": "call"
       },
-      "schema_version": 3
+      "schema_version": 4
     },
-    "schema_version": 3,
+    "schema_version": 4,
     "type": "inline"
   },
   "supersedes": [],

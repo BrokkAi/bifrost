@@ -299,6 +299,10 @@ pub fn run_reference_differential_with_progress(
         eligible_files: summary.eligible_files,
         audited_files: summary.audited_files,
     });
+    // collect_sampled_sites and forward_resolve_sites walk the same sampled files, so
+    // one phase-wide scope (mirroring the inverse phase below) lets per-file syntax be
+    // prepared once across every candidate site instead of once per site.
+    let forward_query_scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
     let sampled = collect_sampled_sites(
         analyzer,
         &audited,
@@ -321,6 +325,8 @@ pub fn run_reference_differential_with_progress(
         &mut file_errors,
         progress,
     );
+    finish_forward_query(&forward_query_scope)?;
+    drop(forward_query_scope);
     let groups = resolved_groups(resolved);
     summary.distinct_targets = groups.len();
     progress(ReferenceDifferentialProgress::ForwardResolution {
@@ -1016,6 +1022,15 @@ fn finish_inverse_query(
     }
 }
 
+fn finish_forward_query(
+    query_scope: &crate::analyzer::AnalyzerQueryScope<'_>,
+) -> Result<(), String> {
+    match query_scope.store_error() {
+        Some(error) => Err(format!("forward analyzer query failed: {error}")),
+        None => Ok(()),
+    }
+}
+
 fn classify_group_result(
     records: &mut [ReferenceDifferentialSite],
     group: &ResolvedGroup,
@@ -1364,6 +1379,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn forward_query_scope_propagates_store_errors_after_the_batch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let project = Arc::new(TestProject::new(root, Language::Cpp));
+        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
+        scope.record_store_error_for_test(crate::analyzer::store::StoreError::new(
+            "injected forward read failure",
+        ));
+
+        assert_eq!(
+            scope.store_error().map(|error| error.to_string()),
+            Some("injected forward read failure".to_string())
+        );
+        assert_eq!(
+            finish_forward_query(&scope),
+            Err("forward analyzer query failed: injected forward read failure".to_string())
+        );
+    }
+
     struct RoundTripFixture {
         corpus_language: &'static str,
         analyzer_language: Language,
@@ -1650,6 +1686,101 @@ func read(container Container) {
             cpp.authoritative_visibility_build_count_for_test(),
             1,
             "both inverse target groups should reuse one union visibility index"
+        );
+    }
+
+    /// Issue #1181: the forward phase (`collect_sampled_sites` +
+    /// `forward_resolve_sites`) must share one phase-wide `AnalyzerQueryScope`,
+    /// exactly like the inverse phase above shares one across target groups.
+    ///
+    /// `Widget` is declared in `deep.h`; each consumer includes it only
+    /// indirectly, via its own `#include "relay.h"`, which itself
+    /// `#include`s `deep.h`. Resolving each consumer's `Widget` reference as
+    /// a C++ type calls `VisibilityIndex::external_type_candidate_visible_at` ->
+    /// `include_activation_for_source` -> `find_include_activation` ->
+    /// `unconditional_include_reaches`, which walks the include chain and
+    /// calls `prepared_syntax` on every *intermediate* file between the
+    /// consumer and `Widget`'s declaring file (it only short-circuits once it
+    /// reaches the donor itself). `relay.h` is that intermediate hop, shared
+    /// by every consumer. Each consumer file gets its own forward
+    /// `get_definition` resolution (a separate `DefinitionBatchContext`, hence
+    /// a separate `VisibilityIndex` with its own `include_activation_cells`),
+    /// so `relay.h` used to be re-parsed once per consumer, not once per
+    /// audit — the same detached-cache family #1175 fixed inside the
+    /// inverse-phase `VisibilityIndex`.
+    #[test]
+    fn forward_phase_shares_one_query_scope_across_consumer_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        fs::write(root.join("deep.h"), "#pragma once\nstruct Widget {};\n")
+            .expect("write deep header");
+        fs::write(root.join("relay.h"), "#pragma once\n#include \"deep.h\"\n")
+            .expect("write relay header");
+        const CONSUMERS: usize = 4;
+        for index in 0..CONSUMERS {
+            fs::write(
+                root.join(format!("consumer_{index}.cpp")),
+                format!("#include \"relay.h\"\n\nvoid use_{index}(Widget& w) {{}}\n"),
+            )
+            .expect("write consumer");
+        }
+
+        let project = Arc::new(TestProject::new(&root, Language::Cpp));
+        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
+        let relay = ProjectFile::new(&root, "relay.h");
+        let config = ReferenceDifferentialConfig {
+            corpus_language: "cpp".to_string(),
+            max_files: 10,
+            max_sites: 100,
+            max_candidates_per_file: 100,
+            max_source_bytes: 10_000,
+            max_targets: 100,
+            max_usage_files: 10,
+            max_usages: 1,
+            // Single-threaded on purpose: the per-file `resolve_definition_requests`
+            // batch already opens its own short-lived `AnalyzerQueryScope` (a
+            // separate #1175 fix), so with enough worker threads two files'
+            // batches can overlap in time and *accidentally* share a cache
+            // window even without the phase-wide scope this test pins. Forcing
+            // one worker makes each file's batch scope open and fully close
+            // before the next begins, so the phase-wide scope is what has to
+            // do the sharing, deterministically.
+            parallelism: 1,
+            ..ReferenceDifferentialConfig::default()
+        };
+
+        let report = run_reference_differential(workspace.analyzer(), &config).expect("run audit");
+        let mut resolved_sites = 0;
+        for index in 0..CONSUMERS {
+            let site = report
+                .sites
+                .iter()
+                .find(|site| site.path == format!("consumer_{index}.cpp") && site.text == "Widget")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "sampled Widget reference in consumer_{index}: {:#?}",
+                        report.sites
+                    )
+                });
+            assert_eq!(site.forward_status, "resolved", "{site:#?}");
+            resolved_sites += 1;
+        }
+        assert_eq!(resolved_sites, CONSUMERS, "{:#?}", report.sites);
+
+        // The pin: one parse for the forward phase (shared by every consumer
+        // routing through `relay.h`) and one for the inverse phase's own
+        // already-fixed #1175 scope, exactly like
+        // `cpp_inverse_target_groups_share_visibility_and_prepared_consumer_syntax`
+        // above. Before the fix (no phase-wide forward scope, single worker so
+        // per-file batches cannot accidentally overlap and share a cache
+        // window), each of the `CONSUMERS` consumers' own include-chain walk
+        // re-parsed `relay.h` from scratch: 5 parses, not 2.
+        assert_eq!(
+            cpp.prepared_syntax_parse_count_for_test(&relay),
+            2,
+            "the forward phase must parse a header shared by several consumer files once \
+             (plus the inverse phase's own one), not once per consumer"
         );
     }
 

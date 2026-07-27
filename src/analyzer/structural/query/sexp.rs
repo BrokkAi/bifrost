@@ -1,6 +1,7 @@
 use super::ir::{CodeQuery, CodeQueryResultDetail};
 use super::schema::{
-    CodeQueryExecutionMode, RqlForm, RqlFormClass, RqlProperty, resolve_rql_schema_version,
+    CodeQueryExecutionMode, QueryStepField, QueryStepOp, RqlForm, RqlFormClass, RqlProperty,
+    resolve_rql_schema_version,
 };
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{NormalizedKind, Role, RoleValueShape};
@@ -347,6 +348,84 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 .expect("typed pipeline wrapper has a declarative query-step association")
                 .label();
             steps.push(json!({ "op": op }));
+            Ok(Some(Value::Object(query)))
+        }
+        RqlForm::Typestate => {
+            let option = items
+                .get(1)
+                .and_then(Expr::as_symbol)
+                .and_then(|label| QueryStepOp::Typestate.option_for_rql_label(label));
+            if items.len() != 4
+                || option.is_none_or(|option| option.field() != QueryStepField::ProtocolRef)
+            {
+                return Err(lower_error(
+                    expr,
+                    "(typestate ...) expects :protocol-ref namespace:name followed by a query",
+                ));
+            }
+            let protocol_ref = symbol_or_string(&items[2])?;
+            let mut step = Map::new();
+            step.insert(
+                "op".to_string(),
+                Value::String(QueryStepOp::Typestate.label().to_string()),
+            );
+            step.insert(
+                option
+                    .expect("validated typestate option")
+                    .field()
+                    .label()
+                    .to_string(),
+                Value::String(protocol_ref),
+            );
+            let mut query = query_object(&items[3])?;
+            query
+                .entry("steps".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
+                .push(Value::Object(step));
+            Ok(Some(Value::Object(query)))
+        }
+        RqlForm::Witness => {
+            if items.len() < 2 || !(items.len() - 2).is_multiple_of(2) {
+                return Err(lower_error(
+                    expr,
+                    "(witness ...) expects option/value pairs followed by a query",
+                ));
+            }
+            let mut step = Map::new();
+            step.insert("op".to_string(), Value::String("witness".to_string()));
+            for pair in items[1..items.len() - 1].chunks_exact(2) {
+                let key = pair[0].as_symbol().ok_or_else(|| {
+                    lower_error(&pair[0], "(witness ...) option names must be symbols")
+                })?;
+                let field = QueryStepOp::Witness
+                    .option_for_rql_label(key)
+                    .ok_or_else(|| {
+                        lower_error(
+                            &pair[0],
+                            "(witness ...) accepts only :max-steps and :max-bytes",
+                        )
+                    })?
+                    .field()
+                    .label();
+                if step
+                    .insert(field.to_string(), number_value(&pair[1], "witness")?)
+                    .is_some()
+                {
+                    return Err(lower_error(
+                        &pair[0],
+                        format!("(witness ...) repeats option {key}"),
+                    ));
+                }
+            }
+            let mut query = query_object(items.last().expect("witness wrapper has a query"))?;
+            query
+                .entry("steps".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
+                .push(Value::Object(step));
             Ok(Some(Value::Object(query)))
         }
         RqlForm::ReferencesOf | RqlForm::UsedBy | RqlForm::Uses => {
@@ -729,6 +808,8 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::CfgPredecessorEdges
         | RqlForm::CfgEdgeSource
         | RqlForm::CfgEdgeTarget
+        | RqlForm::Typestate
+        | RqlForm::Witness
         | RqlForm::FileOf
         | RqlForm::ImportsOf
         | RqlForm::ImportersOf

@@ -28,9 +28,10 @@ pub use client::{
     solve_typestate_with_summaries,
 };
 pub use finding::{
-    MAX_TYPESTATE_FINDING_CANDIDATES, MAX_TYPESTATE_FINDING_REACHED_ROWS, MAX_TYPESTATE_FINDINGS,
-    MAX_TYPESTATE_WITNESS_EXPANSIONS, MAX_TYPESTATE_WITNESS_STEPS, TypestateFinding,
-    TypestateFindingCertainty, TypestateFindingEvidence, TypestateFindingKind,
+    MAX_TYPESTATE_FINDING_CANDIDATES, MAX_TYPESTATE_FINDING_REACHED_ROWS,
+    MAX_TYPESTATE_FINDING_WITNESS_BYTES, MAX_TYPESTATE_FINDING_WITNESS_EXPANSIONS,
+    MAX_TYPESTATE_FINDINGS, MAX_TYPESTATE_WITNESS_EXPANSIONS, MAX_TYPESTATE_WITNESS_STEPS,
+    TypestateFinding, TypestateFindingCertainty, TypestateFindingEvidence, TypestateFindingKind,
     TypestateFindingLimits, TypestateFindingReport, TypestateFindingWitness, TypestateWitness,
     TypestateWitnessStep, collect_summary_findings, collect_summary_findings_with_limits,
 };
