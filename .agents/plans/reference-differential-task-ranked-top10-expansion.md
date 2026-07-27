@@ -237,28 +237,39 @@ comes through the local gate, but is not the focus.
   The authoritative explicit C++ top-ten replay completed all ten envelopes
   in 233.6 seconds with one shared fingerprint, clean pinned heads, no file
   errors, and no candidate-limit escapes.
-- [ ] (2026-07-27) Exhaustively disposition the clean-head C++ replay's 444
-  residual missing rows: ESPHome 2, LMCache 11, Qpid 73, CIRCL 4, libzmq 7,
-  log4cxx 302, and CCache 45; Blosc, libcbor, and the selector-faithful
-  zero-eligible qs envelope are clean. The raw report and checksummed ledger
-  are `/mnt/optane/tmp/bifrost-fird/cpp-task-top10-af0968fa.jsonl` and
+- [x] (2026-07-27) Exhaustively dispositioned the clean-head C++ replay's 444
+  residual missing rows and reduced its remaining legitimate gap to recovered
+  typedef-base qualifier resolution, tracked as #1208. The raw report and
+  checksummed ledger remain historical reduction evidence at
+  `/mnt/optane/tmp/bifrost-fird/cpp-task-top10-af0968fa.jsonl` and
   `/mnt/optane/tmp/bifrost-fird/cpp-task-top10-af0968fa-missing.tsv`.
-- [ ] (2026-07-27) Assigned C++ follow-up #1208 to `jbellis` before changing
+- [x] (2026-07-27) Assigned C++ follow-up #1208 to `jbellis` before changing
   code. Its two exact log4cxx witnesses expose one root cause: tree-sitter
   recovers `typedef spi::Filter BASE_CLASS;` inside an export-macro class as a
   qualified declarator plus a displaced `ERROR` identifier, so declaration
   extraction published the false nested alias `LevelRangeFilter$Filter`.
-  The reviewed candidate now recovers `BASE_CLASS` structurally and resolves a
+  The reviewed fix recovers `BASE_CLASS` structurally and resolves a
   qualified inherited injected-class name through the nearest unambiguous base
   tier. A negative regression prevents that best-effort path from overriding a
-  nearer lexical type alias. Focused production witnesses are consistent, the
-  complete C++ and differential integration targets pass, formatting and
-  all-target/all-feature Clippy are clean, and the full `nlp,python` matrix is
-  running outside the sandbox at niceness 10 with the normal Cargo target. The
-  release runner rebuilt from the final candidate and reproduced both exact
-  witnesses with zero actionable discrepancy; the level-range and string-match
-  JSONL SHA-256 values are respectively `e4f5fe02673bfca0` and
-  `410637db4b26dfa3`.
+  nearer lexical type alias. Commit `c53d3b9c` passed formatting,
+  all-target/all-feature Clippy, all 161 C++ usage tests, the differential
+  target, and the complete `nlp,python` matrix; merge head `8d62804b` was
+  pushed directly to `origin/master` and #1208 closed. Clean-head exact
+  witnesses are consistent at both production sites. Their JSONL SHA-256
+  values are `cbe3c35d9a8854e9777fffc50374c07e937e9341b11617f423ca3954fd7943ff`
+  and `d3235279aa764e0a515ce9ec1cc74e0270ef61173b4f2596625478eb354ea60a`.
+- [ ] (2026-07-27) The authoritative post-#1208 C++ top-ten replay at clean
+  head `8d62804b` completed all ten task-selected envelopes in 1:49:05 at
+  niceness 10. All records have clean Bifrost and corpus heads, no file errors,
+  no candidate-limit escapes, and one shared fingerprint. Raw missing fell
+  from 444 to 152: LMCache 9, Qpid 32, CIRCL 4, libzmq 5, log4cxx 92, and
+  CCache 10; ESPHome, Blosc, libcbor, and the selector-faithful zero-eligible
+  qs envelope have zero. ESPHome and Qpid alone reached the deliberate
+  1,000-target ceiling. The raw report and generated ledger are
+  `/mnt/optane/tmp/bifrost-fird/cpp-task-top10-8d62804b.jsonl` and
+  `/mnt/optane/tmp/bifrost-fird/cpp-task-top10-8d62804b-missing.tsv`, with
+  SHA-256 values `a971c2bbdad85dd5c3228c1e4cda9d207a6349f9d05a93c4ff73ac274af6fe1b`
+  and `32f3a55dfa2a1b1427a3e7b26cd7da6ef54dafb82079da9c5020e18f37860c45`.
 - [ ] Complete C++ and publish its evidence and user summary.
 - [ ] Complete C# and publish its evidence and user summary.
 - [ ] Complete Go and publish its evidence and user summary.
