@@ -7776,6 +7776,88 @@ fn bifrost_lsp_server_unrecognized_symbol_diagnostics_are_runtime_opt_in() {
 }
 
 #[test]
+fn bifrost_lsp_server_cpp_semantic_diagnostics_require_context_and_opt_in() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::create_dir_all(temp_root.join("src")).expect("create source directory");
+    fs::write(temp_root.join("src/main.cpp"), "MissingType value;\n").expect("write C++ source");
+    fs::write(
+        temp_root.join("compile_commands.json"),
+        r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-c","src/main.cpp"]}]"#,
+    )
+    .expect("write compilation database");
+
+    let mut server = LspServer::start(&temp_root);
+    let source_uri = uri_for(&temp_root.join("src/main.cpp"));
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": source_uri}}
+    }));
+    let disabled_response = server.read_message();
+    assert!(
+        disabled_response["result"]["items"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "C++ semantic diagnostics must remain opt-in: {disabled_response}"
+    );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeConfiguration",
+        "params": {"settings": {"unrecognizedSymbolDiagnostics": true}}
+    }));
+    let enabled_publish = server.read_notification("textDocument/publishDiagnostics");
+    assert!(
+        enabled_publish["params"]["diagnostics"]
+            .as_array()
+            .is_some_and(|items| items
+                .iter()
+                .any(|item| item["code"] == "cpp_unrecognized_symbol")),
+        "enabling the opt-in must refresh C++ diagnostics: {enabled_publish}"
+    );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": source_uri}}
+    }));
+    let enabled_response = server.read_message();
+    assert!(
+        enabled_response["result"]["items"]
+            .as_array()
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item["source"] == "bifrost-cpp"
+                        && item["code"] == "cpp_unrecognized_symbol"
+                        && item["message"]
+                            .as_str()
+                            .is_some_and(|message| message.contains("MissingType"))
+                })
+            }),
+        "the opt-in must return the C++ semantic lint: {enabled_response}"
+    );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": source_uri}}
+    }));
+    let published = server.read_notification("textDocument/publishDiagnostics");
+    assert!(
+        published["params"]["diagnostics"]
+            .as_array()
+            .is_some_and(|items| items
+                .iter()
+                .any(|item| item["code"] == "cpp_unrecognized_symbol")),
+        "the opt-in must apply to C++ push diagnostics: {published}"
+    );
+}
+
+#[test]
 fn bifrost_lsp_server_go_malformed_file_reports_parse_not_semantic_diagnostics() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");

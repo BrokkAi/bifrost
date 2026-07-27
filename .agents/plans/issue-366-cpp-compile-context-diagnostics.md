@@ -13,9 +13,9 @@ The feature must prefer silence to an incorrect editor error. Missing, malformed
 - [x] (2026-07-27) Read issue #366, fetched the current remote branch, and confirmed the worktree is clean and already tracks `origin/366-add-compile-context-gated-c-unrecognized-symbol-diagnostics`.
 - [x] (2026-07-27) Traced the existing LSP diagnostic gate, C++ analyzer, and project-only include resolver.
 - [x] (2026-07-27) Recorded the conservative first-slice decisions and implementation milestones.
-- [ ] (2026-07-27; completed: JSON loading, correct shell-token parsing, context ownership, and missing/malformed/duplicate tests; remaining: project-header closure and its non-emitting states) Implement and unit-test compilation database loading and non-emitting context states.
-- [ ] Implement and unit-test the conservative C++ collector and wire it to `CppAnalyzer`.
-- [ ] Prove the editor-facing pull and push diagnostic paths, update public documentation, and run the Rust validation gates.
+- [x] (2026-07-27) Implemented and unit-tested compilation database loading and non-emitting context states, including JSON loading, correct shell-token parsing, lazy snapshot ownership, and missing/malformed/duplicate cases.
+- [x] (2026-07-27) Implemented and unit-tested the conservative C++ collector, structural project-header closure gate, and `CppAnalyzer` semantic-diagnostics hook.
+- [x] (2026-07-27) Proved the editor-facing pull and push paths, updated public documentation, and ran the Rust validation gates.
 
 ## Surprises & Discoveries
 
@@ -33,6 +33,9 @@ The feature must prefer silence to an incorrect editor error. Missing, malformed
 
 - Observation: compilation databases may use a relative `directory` in small fixtures even though production generators commonly use absolute directories.
   Evidence: resolving entry paths from the workspace root is required before `directory`, `file`, and relative flag paths can identify the project source consistently.
+
+- Observation: an unparsed system or forced header can supply arbitrary declarations, so it invalidates the proof needed to report even an apparently simple missing type.
+  Evidence: the collector returns no diagnostics when `-isystem` or `-include` context is present, and it accepts only a unique quoted project-header path through the configured roots.
 
 ## Decision Log
 
@@ -52,9 +55,13 @@ The feature must prefer silence to an incorrect editor error. Missing, malformed
   Rationale: almost all C++ workspaces keep the global semantic diagnostic opt-in disabled. Lazy loading avoids an unrelated database read while snapshot replacement still invalidates stale context.
   Date/Author: 2026-07-27 / Codex.
 
+- Decision: a macro defined through `-D` suppresses a same-named type-looking token, while in-source macro directives make the enclosing translation unit non-emitting.
+  Rationale: tree-sitter cannot expand macros. Both choices preserve the no-false-positive requirement without pretending a text token is a compiler-resolved type.
+  Date/Author: 2026-07-27 / Codex.
+
 ## Outcomes & Retrospective
 
-No implementation has been performed yet. At completion, update this section with the exact fixture behavior, validation commands and results, any compile-database shapes that were intentionally excluded, and remaining limits of the C++ diagnostic model.
+The implementation loads a root `compile_commands.json` lazily and invalidates it with each analyzer snapshot. It reports `cpp_unrecognized_symbol` only for a simple unknown type in a syntactically clean source file whose matching compilation entry, include closure, and preprocessing state are proven. The direct collector tests cover missing context, a true positive, project headers, command-line macros, and template suppression. The LSP test proves default-off pull behavior plus enabled pull and save/publish output. `cargo fmt`, focused feature-enabled tests, `cargo clippy --all-targets --all-features -- -D warnings`, and the full `cargo test --features nlp,python` passed on 2026-07-27.
 
 ## Context and Orientation
 
@@ -165,3 +172,7 @@ Use `serde_json` for JSON already present in the crate. Add a maintained shell-w
 Plan revision (2026-07-27): created from the issue #366 diagnosis and implementation planning so later work can resume without the earlier investigation.
 
 Plan revision (2026-07-27): Milestone 1 now has a tested fail-closed loader. Header-closure proof remains explicitly unfinished and will be added with the collector, where parsed include nodes can be interpreted structurally rather than with source-text scanning.
+
+Plan revision (2026-07-27): completed the loader and collector. The collector now calculates the header closure through tree-sitter `preproc_include` nodes, so the remaining work is the LSP integration proof and the full validation suite rather than a change to the diagnostic contract.
+
+Plan revision (2026-07-27): completed the LSP integration proof, documentation, clippy, and feature-enabled full test suite. The plan is complete; future work should begin from the intentionally conservative exclusions recorded here rather than widening the collector silently.

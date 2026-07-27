@@ -77,7 +77,7 @@ root is an error. See [RQL in VS Code](/rql-vscode/#rql-policy-documents) and
 | `bifrost.roots` | `[]` | Workspace-relative or absolute directories to index instead of the full VS Code workspace. Empty means use VS Code workspace folders. |
 | `bifrost.exclude` | `[]` | Workspace-relative or absolute files or directories to exclude from Bifrost indexing and LSP lookups. |
 | `bifrost.formatterCommands` | `[]` | Ordered formatter command rules passed to Bifrost from user settings only. Rules run without a shell, receive document text on stdin, and write the formatted document to stdout. |
-| `bifrost.unrecognizedSymbolDiagnostics` | `false` | Enable experimental unrecognized-symbol and member diagnostics. |
+| `bifrost.unrecognizedSymbolDiagnostics` | `false` | Enable experimental unrecognized-symbol and member diagnostics. C++ requires a matching valid `compile_commands.json` entry and reports only high-confidence unknown type references. |
 
 Changes to `bifrost.roots`, `bifrost.exclude`, `bifrost.formatterCommands`, and `bifrost.unrecognizedSymbolDiagnostics` apply to the running language server without a restart. Root and exclusion changes rebuild the workspace index; formatter changes affect subsequent formatting requests. Removing one of these settings sends its default value so the previous runtime setting is cleared.
 

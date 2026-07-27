@@ -3,6 +3,7 @@ mod cache;
 mod clones;
 mod compile_context;
 mod declarations;
+mod diagnostics;
 mod hierarchy;
 mod identity;
 mod imports;
@@ -803,6 +804,14 @@ impl IAnalyzer for CppAnalyzer {
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
         self.inner.parse_errors(file)
+    }
+
+    fn semantic_diagnostics(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> Vec<crate::analyzer::SemanticDiagnostic> {
+        diagnostics::collect_cpp_semantic_diagnostics(self, file, source)
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
