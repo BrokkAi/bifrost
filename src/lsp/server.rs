@@ -42,7 +42,8 @@ use lsp_types::{
 
 use crate::NavigationOperation;
 use crate::analyzer::policy::{
-    PolicyReportDocument, PolicySourceDiagnosticSeverity, PolicySourceIdentity,
+    PolicyEvaluationOptions, PolicyReportDocument, PolicySourceDiagnosticSeverity,
+    PolicySourceIdentity, PolicySuppressionOptions, PolicySuppressionSource,
     evaluate_policy_source, rqlp_source_completion_at, rqlp_source_help_at, validate_rqlp_source,
 };
 use crate::analyzer::semantic::WorkspaceRelativePath;
@@ -1205,6 +1206,24 @@ fn handle_run_rql_policy_request(
                     .map_err(|err| format!("Failed to send LSP response: {err}"));
             }
         };
+    let suppressions = match params.suppression_file {
+        Some(path) => match PolicySuppressionSource::explicit_portable(path) {
+            Ok(source) => PolicySuppressionOptions::new(source),
+            Err(error) => {
+                let response = Response::new_err(
+                    id,
+                    ErrorCode::InvalidParams as i32,
+                    format!("Invalid suppression file path: {error}"),
+                );
+                return connection
+                    .sender
+                    .send(Message::Response(response))
+                    .map_err(|err| format!("Failed to send LSP response: {err}"));
+            }
+        },
+        None => PolicySuppressionOptions::default(),
+    };
+    let options = PolicyEvaluationOptions::with_suppressions(params.evaluation_date, suppressions);
     let source = params.source;
     // Policy dependencies are confined to `workspace_root`, while analyzer
     // result paths are relative to the active project's report coordinate root.
@@ -1231,6 +1250,7 @@ fn handle_run_rql_policy_request(
                 source_identity,
                 &source,
                 workspace,
+                &options,
                 Some(cancellation),
             )
             .map_err(|error| {
@@ -2160,6 +2180,9 @@ impl lsp_types::request::Request for RunRqlPolicy {
 struct RunRqlPolicyParams {
     document_uri: Uri,
     source: String,
+    evaluation_date: crate::analyzer::policy::PolicyEvaluationDate,
+    #[serde(default)]
+    suppression_file: Option<String>,
 }
 
 #[derive(serde::Serialize)]

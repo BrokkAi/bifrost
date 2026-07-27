@@ -82,7 +82,7 @@ note: policy bifrost.security.dynamic-eval inferred policy schema 1 and RQL sche
 [warning]  app.py:2:12
     Dynamic evaluation is forbidden
 
-summary: 1 finding; 1 complete policy run
+summary: 1 active finding; 0 suppressed findings; 1 complete policy run
 ```
 
 </details>
@@ -462,6 +462,90 @@ the ordinal. A weak ID is labeled inconclusive and is deliberately omitted
 from SARIF `partialFingerprints`; it is not promoted into a fake stable
 fingerprint.
 
+## Review Findings With Exact Suppressions
+
+Keep project-owned analysis inputs together and keep generated cache data
+separate:
+
+```text
+.bifrost/
+├── queries/                 # saved exploratory .rql
+├── policies/                # recurring .rqlp roots
+├── suppressions.json        # exact review decisions
+└── cache/                   # generated; safe to ignore
+```
+
+The conventional suppression file is `.bifrost/suppressions.json`. Version 1
+contains accepted review decisions for exact strong findings:
+
+```json
+{
+  "schema_version": 1,
+  "suppressions": [
+    {
+      "policy_id": "bifrost.security.dynamic-eval",
+      "finding_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "This evaluator runs only a checked-in migration script",
+      "policy_hash_at_acceptance": "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+      "accepted_by": "security-review",
+      "accepted_at": "2026-07-27",
+      "expires_at": "2026-10-27"
+    }
+  ]
+}
+```
+
+`policy_id` and `finding_id` are the complete join key. Bifrost applies a
+record only to a current finding whose identity is strong and exactly equal.
+It never falls back to paths, lines, globs, regular expressions, messages,
+similar code, or weak identities. Unrelated line insertions and policy
+presentation changes can preserve the ID. Editing the selected source bytes,
+moving the file, changing its semantic owner, or changing the duplicate
+occurrence ordinal produces a different ID and leaves the old decision for
+review.
+
+Use an explicit date for a reproducible accept-and-rerun cycle:
+
+```bash
+bifrost --root . \
+  --policy-file .bifrost/policies/dynamic-eval.rqlp \
+  --evaluation-date 2026-07-27 \
+  --format json \
+  --fail-on warning
+```
+
+Copy the reported strong finding ID, policy ID, and optional policy hash into
+the suppression file, record a bounded reason and acceptance date, then run
+the same command again. The second canonical report still contains the
+finding and one suppression review, but an applied decision does not meet the
+failure threshold. SARIF retains the result, its `bifrostFinding/v1`
+fingerprint, and a standard external accepted suppression. Concise human
+output hides the result from the active-finding list while counting it;
+`--verbose` prints the reason and provenance.
+
+The audit keeps independent states instead of collapsing review outcomes:
+
+- A current exact strong match is `applied`. A changed `policy_hash` is also
+  marked `drifted`, but hash drift alone does not reactivate the same finding.
+- A record is `expired` only when the evaluation date is later than
+  `expires_at`; it remains active on the expiration date itself.
+- An unmatched record is `stale` only when the selected policy completed and
+  proved that the finding is absent.
+- An unselected, incomplete, failed, unsupported, or inconclusive policy
+  cannot prove staleness. A current weak finding also cannot prove the strong
+  match required for suppression.
+- A retention-limit failure is explicit as `result_omitted` and makes the
+  report unreliable rather than claiming a clean result.
+
+A missing conventional or explicit suppression file means no suppressions.
+Malformed, unsafe, oversized, escaping, duplicate, or conflicting input
+produces a report diagnostic, applies none of that document, and exits with
+status 2. Use `--suppressions-file PATH` for one workspace-relative override.
+The CLI uses today's UTC date if `--evaluation-date` is omitted; library, LSP,
+and MCP callers supply the date explicitly to the deterministic coordinator.
+
 ## Classification And CVSS v4.0
 
 A policy can declare one broad fallback taxonomy classification plus typed
@@ -507,9 +591,9 @@ from that set. The CLI does not guess paths or scan ambient directories.
 
 | Status | Meaning |
 | --- | --- |
-| `0` | Every requested policy completed and no finding met `--fail-on`, or the threshold was `never`. |
-| `1` | Every requested policy completed and at least one finding met the threshold. |
-| `2` | Loading, schema validation, composition, evaluation, completeness, serialization, or output was unreliable. This takes precedence over status 1. |
+| `0` | Every requested policy completed and no active unsuppressed finding met `--fail-on`, or the threshold was `never`. |
+| `1` | Every requested policy completed and at least one active unsuppressed finding met the threshold. |
+| `2` | Policy or suppression loading, schema validation, composition, evaluation, completeness, serialization, or output was unreliable. This takes precedence over status 1. |
 
 `--fail-on` accepts `never`, `finding`, `note`, `warning` (the default), or
 `error`; `finding` includes unrated findings. It changes only the complete-run
@@ -527,12 +611,15 @@ See [CLI](/cli/#static-analysis-policies) for option interactions and
 
 The Bifrost extension registers `.rqlp` as the distinct **Bifrost RQL Policy**
 language. It provides source-only validation, schema-resolution hover,
-optional-version completion, and 100-column formatting while preserving
-comments and omitted version fields. Nested RQL receives RQL highlighting only
-inside `(rql ...)`.
+optional-version completion, 100-column formatting, and a distinct **Run RQL
+Policy** action while preserving comments and omitted version fields. Nested
+RQL receives RQL highlighting only inside `(rql ...)`.
 
-Policy buffers are not executable RQL documents: `.rqlp` never enables the RQL
-Play action and never publishes policy findings into the **Bifrost Query
-Results** tree. Unsaved validation does not read an `rql-file`, endpoint
-directory, or catalog; those dependencies are resolved when a workspace-backed
-policy loader runs. See [RQL in VS Code](/rql-vscode/#rql-policy-documents).
+The policy action sends the current unsaved root to the workspace-backed
+loader, which resolves saved query and endpoint dependencies and reads the
+conventional suppression file. Active findings appear under **Bifrost Policy
+Results**; applied findings move into its suppression audit with stale,
+expired, drifted, and unproven review states. `.rqlp` remains separate from
+the ordinary RQL query action and never publishes policy findings into
+**Bifrost Query Results**. See [RQL in VS
+Code](/rql-vscode/#rql-policy-documents).

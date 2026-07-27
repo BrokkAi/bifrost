@@ -497,7 +497,7 @@ mod tests {
         );
         assert_eq!(first, second);
         assert_eq!(usize::try_from(exact).unwrap(), first.len());
-        assert!(first.starts_with(br#"{"schema_version":1,"rules":["#));
+        assert!(first.starts_with(br#"{"schema_version":2,"evaluation":{"#));
 
         let limit = first.len() - 1;
         let mut bounded = Vec::new();
@@ -578,7 +578,11 @@ mod tests {
         );
         assert!(!finding.contains("  evidence: structural_match function\n"));
         assert!(!finding.contains("policy rule: test.render (Render)\n"));
-        assert!(finding.contains("summary: 1 finding; 1 complete policy run\n"));
+        assert!(
+            finding.contains(
+                "summary: 1 active finding; 0 suppressed findings; 1 complete policy run\n"
+            )
+        );
         assert!(!finding.contains('\u{001B}'));
 
         let clean = evaluated_report(
@@ -596,7 +600,9 @@ mod tests {
         .unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(!output.contains("policy rule: test.render (Render)\n"));
-        assert!(output.ends_with("summary: 0 findings; 1 complete policy run; clean\n"));
+        assert!(output.ends_with(
+            "summary: 0 active findings; 0 suppressed findings; 1 complete policy run; clean\n"
+        ));
 
         let cancellation = CancellationToken::new();
         cancellation.cancel();
@@ -621,7 +627,9 @@ mod tests {
         assert!(
             output.contains("policy test.render (Render): inconclusive (cancelled); non-clean")
         );
-        assert!(output.ends_with("summary: 0 findings; 1 inconclusive policy run; non-clean\n"));
+        assert!(output.ends_with(
+            "summary: 0 active findings; 0 suppressed findings; 1 inconclusive policy run; non-clean\n"
+        ));
     }
 
     #[test]
@@ -649,7 +657,9 @@ mod tests {
         assert!(output.starts_with(note.as_str()));
         assert_eq!(output.matches(note.as_str()).count(), 1);
         assert!(!output.contains("policy rule: test.render (Render)\n"));
-        assert!(output.ends_with("summary: 0 findings; 1 complete policy run; clean\n"));
+        assert!(output.ends_with(
+            "summary: 0 active findings; 0 suppressed findings; 1 complete policy run; clean\n"
+        ));
 
         let mut verbose = Vec::new();
         write_policy_human(

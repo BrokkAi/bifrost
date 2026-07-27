@@ -1,6 +1,7 @@
 //! Stable, domain-separated public finding identity primitives.
 
 use std::fmt;
+use std::str::FromStr;
 
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
@@ -840,6 +841,8 @@ impl Serialize for MatchFindingAnchor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PolicyFindingId([u8; 32]);
 
+pub type PolicyFindingIdParseError = super::definition::Sha256ValueError;
+
 impl PolicyFindingId {
     pub fn from_match_anchor(policy_id: &PolicyId, anchor: &MatchFindingAnchor) -> Self {
         let mut hasher = Sha256::new();
@@ -898,6 +901,14 @@ impl PolicyFindingId {
 
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+}
+
+impl FromStr for PolicyFindingId {
+    type Err = PolicyFindingIdParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        super::definition::parse_lower_sha256(value).map(Self)
     }
 }
 
@@ -1186,6 +1197,28 @@ mod tests {
             PolicyFindingId::from_match_anchor(&policy_id, &file_anchor).to_string(),
             "ecc560daa8640be23c53c93ad906a27bf978dcf6e0b13948d0dbbace13a1e47b"
         );
+    }
+
+    #[test]
+    fn finding_id_parser_round_trips_only_exact_lowercase_sha256() {
+        let text = "ecc560daa8640be23c53c93ad906a27bf978dcf6e0b13948d0dbbace13a1e47b";
+        let parsed: PolicyFindingId = text.parse().unwrap();
+
+        assert_eq!(parsed.to_string(), text);
+        assert!(matches!(
+            text[..63].parse::<PolicyFindingId>(),
+            Err(super::super::definition::Sha256ValueError::InvalidLength)
+        ));
+        assert!(matches!(
+            text.to_uppercase().parse::<PolicyFindingId>(),
+            Err(super::super::definition::Sha256ValueError::Uppercase)
+        ));
+        let mut invalid = text.to_string();
+        invalid.replace_range(10..11, "g");
+        assert!(matches!(
+            invalid.parse::<PolicyFindingId>(),
+            Err(super::super::definition::Sha256ValueError::InvalidCharacter { index: 10 })
+        ));
     }
 
     #[test]

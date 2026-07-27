@@ -17,7 +17,9 @@ use super::super::{
     PolicyMessageSpec, PolicyOverlayScope, PolicyQueryProof, PolicyQueryProvenance,
     PolicyQueryResultRef, PolicyReportDocument, PolicyRuleDescriptor, PolicyRun,
     PolicyRunCompletion, PolicySemanticEvent, PolicySeveritySpec, PolicySourceLocation,
-    ProofMetadata, ProofReason, ProofState, ResolvedEndpointDependency, ResolvedEndpointIdentity,
+    PolicySuppressionDecision, PolicySuppressionMatchState, PolicySuppressionPolicyHashState,
+    PolicySuppressionReview, PolicySuppressionTemporalState, ProofMetadata, ProofReason,
+    ProofState, ResolvedEndpointDependency, ResolvedEndpointIdentity,
     ResolvedEndpointManifestEntry, ResolvedMatchDirectoryManifest, ResolvedPrecedenceEdge,
     ResolvedTypestateTerminal, SchemaVersionOrigin, SchemaVersionResolution,
     StableSemanticIdentity, TaintSourceEvidence, TaintSystemEntry, TaintTrustBoundary,
@@ -53,7 +55,7 @@ pub enum HumanRenderColor {
     Ansi,
 }
 
-/// Deterministic human output options for schema version 1.
+/// Deterministic human output options for schema version 2.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct HumanRenderOptions {
@@ -130,7 +132,9 @@ pub fn write_policy_human<W: Write>(
         for finding in run.findings() {
             match options.detail() {
                 HumanRenderDetail::Concise => {
-                    write_concise_finding(&mut output, finding, options.color())?
+                    if finding.suppression().is_none() {
+                        write_concise_finding(&mut output, finding, options.color())?;
+                    }
                 }
                 HumanRenderDetail::Verbose => write_finding(&mut output, finding, options.color())?,
             }
@@ -158,6 +162,13 @@ pub fn write_policy_human<W: Write>(
     if options.detail() == HumanRenderDetail::Verbose {
         for rule in report.rules() {
             write_rule_detail(&mut output, rule)?;
+        }
+        for review in report
+            .suppressions()
+            .iter()
+            .filter(|review| !review.applied() || review.result_omitted())
+        {
+            write_suppression_review(&mut output, review)?;
         }
     }
 
@@ -233,6 +244,13 @@ fn write_finding<W: Write>(
         identity_stability(finding.identity_stability()),
     )
     .map_err(map_io_error)?;
+    if let Some(suppression) = finding.suppression() {
+        write_applied_suppression(
+            output,
+            suppression.decision(),
+            suppression.policy_hash_state(),
+        )?;
+    }
     writeln!(
         output,
         "  analysis: {} ({}, {})",
@@ -395,6 +413,72 @@ fn write_finding<W: Write>(
         }
     }
     Ok(())
+}
+
+fn write_applied_suppression<W: Write>(
+    output: &mut BoundedWriter<W>,
+    decision: &PolicySuppressionDecision,
+    policy_hash_state: PolicySuppressionPolicyHashState,
+) -> Result<(), PolicyRenderError> {
+    writeln!(
+        output,
+        "  suppression: accepted (policy hash {})",
+        suppression_policy_hash_state(policy_hash_state),
+    )
+    .map_err(map_io_error)?;
+    write_suppression_decision(output, decision)
+}
+
+fn write_suppression_review<W: Write>(
+    output: &mut BoundedWriter<W>,
+    review: &PolicySuppressionReview,
+) -> Result<(), PolicyRenderError> {
+    writeln!(
+        output,
+        "suppression review: {} finding {}",
+        escape_terminal_text(review.policy_id().as_str()),
+        review.finding_id(),
+    )
+    .map_err(map_io_error)?;
+    writeln!(
+        output,
+        "  disposition: match {}; temporal {}; policy hash {}; applied {}; stale {}; result omitted {}",
+        suppression_match_state(review.match_state()),
+        suppression_temporal_state(review.temporal_state()),
+        suppression_policy_hash_state(review.policy_hash_state()),
+        yes_no(review.applied()),
+        yes_no(review.stale()),
+        yes_no(review.result_omitted()),
+    )
+    .map_err(map_io_error)?;
+    write_suppression_decision(output, review.decision())
+}
+
+fn write_suppression_decision<W: Write>(
+    output: &mut BoundedWriter<W>,
+    decision: &PolicySuppressionDecision,
+) -> Result<(), PolicyRenderError> {
+    writeln!(
+        output,
+        "  suppression reason: {}",
+        escape_terminal_text(decision.reason()),
+    )
+    .map_err(map_io_error)?;
+    write!(output, "  accepted: {}", decision.accepted_at()).map_err(map_io_error)?;
+    if let Some(accepted_by) = decision.accepted_by() {
+        write!(output, " by {}", escape_terminal_text(accepted_by)).map_err(map_io_error)?;
+    }
+    writeln!(output).map_err(map_io_error)?;
+    match decision.policy_hash_at_acceptance() {
+        Some(hash) => writeln!(output, "  accepted policy hash: {hash}"),
+        None => writeln!(output, "  accepted policy hash: unknown"),
+    }
+    .map_err(map_io_error)?;
+    match decision.expires_at() {
+        Some(expires_at) => writeln!(output, "  expires: {expires_at}"),
+        None => writeln!(output, "  expires: never"),
+    }
+    .map_err(map_io_error)
 }
 
 fn write_verbose_severity<W: Write>(
@@ -2132,9 +2216,53 @@ fn write_summary<W: Write>(
     output: &mut BoundedWriter<W>,
     report: &PolicyReportDocument,
 ) -> Result<(), PolicyRenderError> {
-    let finding_count = report.runs().iter().fold(0_usize, |total, run| {
+    let retained_suppressed_count = report
+        .runs()
+        .iter()
+        .flat_map(PolicyRun::findings)
+        .filter(|finding| finding.suppression().is_some())
+        .count();
+    let retained_finding_count = report.runs().iter().fold(0_usize, |total, run| {
         total.saturating_add(run.findings().len())
     });
+    let active_finding_count = retained_finding_count.saturating_sub(retained_suppressed_count);
+    let suppressed_finding_count = report
+        .suppressions()
+        .iter()
+        .filter(|review| review.applied())
+        .count();
+    let stale_count = report
+        .suppressions()
+        .iter()
+        .filter(|review| review.stale())
+        .count();
+    let expired_count = report
+        .suppressions()
+        .iter()
+        .filter(|review| review.temporal_state() == PolicySuppressionTemporalState::Expired)
+        .count();
+    let drifted_count = report
+        .suppressions()
+        .iter()
+        .filter(|review| review.policy_hash_state() == PolicySuppressionPolicyHashState::Drifted)
+        .count();
+    let unproven_count = report
+        .suppressions()
+        .iter()
+        .filter(|review| {
+            matches!(
+                review.match_state(),
+                PolicySuppressionMatchState::CurrentFindingNotStrong
+                    | PolicySuppressionMatchState::PolicyNotEvaluated
+                    | PolicySuppressionMatchState::PolicyIncomplete
+            )
+        })
+        .count();
+    let result_omitted_count = report
+        .suppressions()
+        .iter()
+        .filter(|review| review.result_omitted())
+        .count();
     let mut complete = 0_usize;
     let mut inconclusive = 0_usize;
     let mut unsupported = 0_usize;
@@ -2154,10 +2282,20 @@ fn write_summary<W: Write>(
 
     write!(
         output,
-        "summary: {finding_count} finding{}",
-        plural_suffix(finding_count)
+        "summary: {active_finding_count} active finding{}; {suppressed_finding_count} suppressed finding{}",
+        plural_suffix(active_finding_count),
+        plural_suffix(suppressed_finding_count),
     )
     .map_err(map_io_error)?;
+    write_summary_count(output, stale_count, "stale suppression review")?;
+    write_summary_count(output, expired_count, "expired suppression review")?;
+    write_summary_count(
+        output,
+        drifted_count,
+        "policy-hash-drifted suppression review",
+    )?;
+    write_summary_count(output, unproven_count, "unproven suppression review")?;
+    write_summary_count(output, result_omitted_count, "suppression result omitted")?;
     if report.runs().is_empty() {
         write!(output, "; 0 policy runs").map_err(map_io_error)?;
     } else {
@@ -2170,12 +2308,23 @@ fn write_summary<W: Write>(
     let all_complete = complete == report.runs().len()
         && report.diagnostics().is_empty()
         && !report.diagnostics_truncated();
-    if all_complete && finding_count == 0 {
+    if all_complete && active_finding_count == 0 {
         write!(output, "; clean").map_err(map_io_error)?;
     } else if !all_complete {
         write!(output, "; non-clean").map_err(map_io_error)?;
     }
     writeln!(output).map_err(map_io_error)
+}
+
+fn write_summary_count<W: Write>(
+    output: &mut BoundedWriter<W>,
+    count: usize,
+    label: &str,
+) -> Result<(), PolicyRenderError> {
+    if count > 0 {
+        write!(output, "; {count} {label}{}", plural_suffix(count)).map_err(map_io_error)?;
+    }
+    Ok(())
 }
 
 fn write_run_count<W: Write>(
@@ -2546,6 +2695,8 @@ const fn finding_incomplete_reason(value: FindingIncompleteReason) -> &'static s
 fn report_diagnostic_code(value: super::super::PolicyReportDiagnosticCode) -> &'static str {
     use super::super::PolicyReportDiagnosticCode as Code;
     match value {
+        Code::SuppressionLoadFailed => "suppression-load-failed",
+        Code::SuppressionAuditRetentionExceeded => "suppression-audit-retention-exceeded",
         Code::PolicyLoadFailed => "policy-load-failed",
         Code::PolicyParseFailed => "policy-parse-failed",
         Code::PolicyValidationFailed => "policy-validation-failed",
@@ -2592,6 +2743,35 @@ fn write_policy_diagnostic_code<W: Write>(
         Code::OrganizationalRiskOverlayBudget => "organizational_risk_overlay_budget",
     };
     write!(output, "{label}").map_err(map_io_error)
+}
+
+const fn suppression_match_state(value: PolicySuppressionMatchState) -> &'static str {
+    match value {
+        PolicySuppressionMatchState::StrongFinding => "strong finding",
+        PolicySuppressionMatchState::CurrentFindingNotStrong => "current finding not strong",
+        PolicySuppressionMatchState::FindingAbsent => "finding absent",
+        PolicySuppressionMatchState::PolicyNotEvaluated => "policy not evaluated",
+        PolicySuppressionMatchState::PolicyIncomplete => "policy incomplete",
+    }
+}
+
+const fn suppression_temporal_state(value: PolicySuppressionTemporalState) -> &'static str {
+    match value {
+        PolicySuppressionTemporalState::Current => "current",
+        PolicySuppressionTemporalState::Expired => "expired",
+    }
+}
+
+const fn suppression_policy_hash_state(value: PolicySuppressionPolicyHashState) -> &'static str {
+    match value {
+        PolicySuppressionPolicyHashState::Matching => "matching",
+        PolicySuppressionPolicyHashState::Drifted => "drifted",
+        PolicySuppressionPolicyHashState::Unknown => "unknown",
+    }
+}
+
+const fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
 }
 
 const fn plural_suffix(count: usize) -> &'static str {

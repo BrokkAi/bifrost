@@ -9,7 +9,9 @@ import {
   policyLocationRange,
   policyReportCompletedWithoutFindings,
   policyRunDiagnosticCodeLabel,
+  policySuppressionAuditSummary,
   runRqlPolicy,
+  utcEvaluationDate,
   type PolicyFinding,
   type RqlPolicyRunner
 } from "../src/rql_policy";
@@ -20,7 +22,12 @@ function response(completion: unknown = { type: "complete" }): unknown {
     policyRootUri: "file:///workspace/service-a",
     reportRootUri: "file:///workspace",
     report: {
-      schema_version: 1,
+      schema_version: 2,
+      evaluation: {
+        evaluation_date: "2026-07-27",
+        suppression_path: ".bifrost/suppressions.json",
+        suppression_document_state: "not_found"
+      },
       rules: [
         {
           policy_id: "test.policy",
@@ -40,6 +47,7 @@ function response(completion: unknown = { type: "complete" }): unknown {
           diagnostics_truncated: false
         }
       ],
+      suppressions: [],
       diagnostics: [],
       diagnostics_truncated: false,
       omitted_diagnostics_lower_bound: 0,
@@ -75,15 +83,24 @@ void test("runs unsaved policy text and lets the server derive workspace identit
   );
 
   assert.ok(result);
-  assert.deepEqual(requests, [
-    [
-      RUN_RQL_POLICY_METHOD,
-      {
-        documentUri: "file:///workspace/policies/live.rqlp",
-        source: '(policy :id "test.unsaved")'
-      }
-    ]
-  ]);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0][0], RUN_RQL_POLICY_METHOD);
+  assert.deepEqual(
+    {
+      ...(requests[0][1] as Record<string, unknown>),
+      evaluationDate: "<date>"
+    },
+    {
+      documentUri: "file:///workspace/policies/live.rqlp",
+      source: '(policy :id "test.unsaved")',
+      evaluationDate: "<date>"
+    }
+  );
+  assert.match(
+    (requests[0][1] as { evaluationDate: string }).evaluationDate,
+    /^\d{4}-\d{2}-\d{2}$/
+  );
+  assert.equal(utcEvaluationDate(new Date("2026-07-27T23:59:59.000Z")), "2026-07-27");
 });
 
 void test("keeps every policy completion state explicit", async () => {
@@ -164,6 +181,61 @@ void test("treats only complete diagnostic-free zero-finding reports as clean", 
 
   assert.equal(policyReportCompletedWithoutFindings(complete.report), true);
   assert.equal(policyReportCompletedWithoutFindings(unsupported.report), false);
+
+  complete.report.runs[0].findings.push({
+    id: "1".repeat(64),
+    policy_id: "test.policy",
+    severity: "warning",
+    message: "Accepted result",
+    primary: { path: "app.ts", region: null },
+    suppression: {
+      identity_stability: "strong",
+      status: "accepted",
+      reason: "Reviewed",
+      accepted_at: "2026-07-01",
+      policy_hash_state: "matching"
+    }
+  });
+  assert.equal(policyReportCompletedWithoutFindings(complete.report), true);
+});
+
+void test("summarizes orthogonal suppression audit states without hiding overlap", () => {
+  const decision = {
+    identity_stability: "strong" as const,
+    status: "accepted" as const,
+    reason: "Reviewed",
+    accepted_at: "2026-07-01",
+    policy_hash_state: "matching" as const,
+    policy_id: "test.policy",
+    finding_id: "1".repeat(64),
+    match_state: "strong_finding" as const,
+    temporal_state: "current" as const,
+    applied: true,
+    stale: false,
+    result_omitted: false
+  };
+  assert.equal(
+    policySuppressionAuditSummary([
+      decision,
+      {
+        ...decision,
+        finding_id: "2".repeat(64),
+        match_state: "finding_absent",
+        temporal_state: "expired",
+        policy_hash_state: "drifted",
+        applied: false,
+        stale: true,
+        result_omitted: true
+      },
+      {
+        ...decision,
+        finding_id: "3".repeat(64),
+        match_state: "policy_incomplete",
+        applied: false
+      }
+    ]),
+    "1 applied · 1 stale · 1 expired · 1 drifted · 1 unproven · 1 result omitted"
+  );
 });
 
 void test("extracts terminal symbols while keeping evidence structured", () => {
@@ -173,6 +245,7 @@ void test("extracts terminal symbols while keeping evidence structured", () => {
     severity: "warning",
     message: "Avoid target",
     primary: { path: "app.ts", region: null },
+    suppression: null,
     evidence: {
       type: "match",
       evidence: {
@@ -210,7 +283,7 @@ void test("rejects wrong documents and outdated report shapes", async () => {
   const testRunner = runner({
     sendRequest: () => {
       requests += 1;
-      return Promise.resolve({ report: { schema_version: 2 } });
+      return Promise.resolve({ report: { schema_version: 1 } });
     },
     showWarning: (message) => warnings.push(message),
     showError: (message) => errors.push(message)

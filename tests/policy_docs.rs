@@ -7,8 +7,8 @@ use std::process::{Command, Output};
 
 use brokk_bifrost::Language;
 use brokk_bifrost::policy::{
-    PolicyFailOn, PolicySourceIdentity, evaluate_policy_files, parse_rqlp_source,
-    validate_rqlp_source,
+    PolicyEvaluationDate, PolicyEvaluationOptions, PolicyFailOn, PolicySourceIdentity,
+    evaluate_policy_files, parse_rqlp_source, validate_rqlp_source,
 };
 use common::{InlineTestProject, normalize_line_endings};
 use serde_json::Value;
@@ -161,8 +161,10 @@ fn documented_match_policy_executes_and_future_analysis_boundary_is_explicit() {
     let outcome = evaluate_policy_files(
         workspace.root(),
         &[PathBuf::from("policies/dynamic-eval.rqlp")],
-        false,
-        PolicyFailOn::Warning,
+        &PolicyEvaluationOptions::new(
+            PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date"),
+        )
+        .with_fail_on(PolicyFailOn::Warning),
     )
     .expect("documented match policy evaluation");
     let report = serde_json::to_value(outcome.report()).expect("canonical policy report");

@@ -16,16 +16,11 @@ use growable_bloom_filter::GrowableBloom;
 
 pub type Result<T> = std::result::Result<T, String>;
 
-/// Workspace-local directory holding Bifrost's persistent cache.
-///
-/// Named for this tool, matching [`CACHE_DIR_ENV`], the `bifrost_cache.db` file
-/// inside it, and the `.bifrost/` entry this repository's own `.gitignore` has
-/// always carried. It was briefly `.brokk` -- the analyzer cache was `.bifrost`
-/// from the first persistence PR, the later semantic-search store used `.brokk`,
-/// and when #603 consolidated the two behind one constant the newer spelling
-/// won; nothing else moved with it, which is why the env var, the database
-/// filename, and the ignore rule all kept saying `bifrost`.
-pub const CACHE_DIR_NAME: &str = ".bifrost";
+/// Workspace-local directory holding Bifrost's tracked project configuration.
+pub const PROJECT_DIR_NAME: &str = ".bifrost";
+
+/// Generated state beneath [`PROJECT_DIR_NAME`].
+pub const CACHE_SUBDIR_NAME: &str = "cache";
 pub const CACHE_DIR_ENV: &str = "BIFROST_CACHE_DIR";
 
 /// Discover the repository containing `root`, if any.
@@ -52,8 +47,8 @@ pub fn primary_repo_root(repo: &Repository) -> Option<PathBuf> {
     repo.workdir().map(Path::to_path_buf)
 }
 
-/// Resolve the unified cache database path under `.bifrost` at the primary repo
-/// root. Non-git roots fall back to the provided workspace root.
+/// Resolve the unified cache database path under `.bifrost/cache` at the primary
+/// repo root. Non-git roots fall back to the provided workspace root.
 pub fn cache_db_path(workspace_root: &Path) -> PathBuf {
     if let Some(cache_dir) = std::env::var_os(CACHE_DIR_ENV).filter(|value| !value.is_empty()) {
         return PathBuf::from(cache_dir).join(crate::cache_db::CACHE_DB_FILE_NAME);
@@ -63,7 +58,8 @@ pub fn cache_db_path(workspace_root: &Path) -> PathBuf {
         .and_then(primary_repo_root)
         .unwrap_or_else(|| workspace_root.to_path_buf());
     primary_root
-        .join(CACHE_DIR_NAME)
+        .join(PROJECT_DIR_NAME)
+        .join(CACHE_SUBDIR_NAME)
         .join(crate::cache_db::CACHE_DB_FILE_NAME)
 }
 

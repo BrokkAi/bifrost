@@ -1,15 +1,18 @@
 mod common;
 
+use std::fs;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use brokk_bifrost::policy::{
     BoundedWitness, CatalogRegistryLimits, DefaultPolicyEvaluator, FindingIdentityStability,
-    PolicyBatchBudget, PolicyBudget, PolicyEvaluationContext, PolicyEvaluator,
-    PolicyIncompleteReason, PolicyRegistry, PolicyRegistryLimits, PolicyReportBuilder,
-    PolicyReportDocument, PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion,
-    PolicySourceIdentity, ReportValueError, SarifToolIdentity, TaintCatalogRegistry, WitnessId,
-    write_policy_sarif,
+    PolicyBatchBudget, PolicyBudget, PolicyEvaluationContext, PolicyEvaluationDate,
+    PolicyEvaluationOptions, PolicyEvaluator, PolicyIncompleteReason, PolicyRegistry,
+    PolicyRegistryLimits, PolicyReportBuilder, PolicyReportDocument, PolicyReportEvaluationContext,
+    PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicySourceIdentity,
+    PolicySuppressionDocumentState, ReportValueError, SarifToolIdentity, TaintCatalogRegistry,
+    WitnessId, evaluate_policy_files, write_policy_sarif,
 };
 use brokk_bifrost::{CancellationToken, Language, TypescriptAnalyzer};
 use jsonschema::Validator;
@@ -18,6 +21,23 @@ use sha2::{Digest, Sha256};
 
 const SCHEMA_BYTES: &[u8] = include_bytes!("fixtures/sarif/sarif-schema-2.1.0.json");
 const SCHEMA_SHA256: &str = "c3b4bb2d6093897483348925aaa73af03b3e3f4bd4ca38cef26dcb4212a2682e";
+
+fn report_builder(expected_inputs: usize) -> PolicyReportBuilder {
+    let options = PolicyEvaluationOptions::new(
+        PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date"),
+    );
+    PolicyReportBuilder::new_with_suppression_audit(
+        PolicyBatchBudget::default(),
+        expected_inputs,
+        PolicyReportEvaluationContext::new(
+            options.evaluation_date(),
+            options.suppressions(),
+            PolicySuppressionDocumentState::NotFound,
+        ),
+        Vec::new(),
+    )
+    .unwrap()
+}
 
 #[test]
 fn zero_step_witness_is_rejected_before_sarif_projection() {
@@ -81,7 +101,7 @@ fn assemble_report(
     clean_skeleton: PolicyRun,
     evaluated: PolicyRun,
 ) -> PolicyReportDocument {
-    let mut builder = PolicyReportBuilder::new(PolicyBatchBudget::default(), 1).unwrap();
+    let mut builder = report_builder(1);
     let findings = evaluated.findings().to_vec();
     let skeleton = if findings.is_empty() {
         evaluated
@@ -169,6 +189,45 @@ fn ordinary_report() -> PolicyReportDocument {
         None,
     );
     assemble_report(policy, skeleton, evaluated)
+}
+
+fn suppressed_report() -> PolicyReportDocument {
+    let policy_source = fixed_policy("test.sarif-suppressed", "warning", "app.ts", "target");
+    let project = common::InlineTestProject::with_language(Language::TypeScript)
+        .file("app.ts", "export function target() { return 1; }\n")
+        .file("policies/suppressed.rqlp", policy_source)
+        .build();
+    let options = PolicyEvaluationOptions::new(
+        PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date"),
+    );
+    let paths = [PathBuf::from("policies/suppressed.rqlp")];
+    let baseline = evaluate_policy_files(project.root(), &paths, &options).unwrap();
+    let rule = &baseline.report().rules()[0];
+    let finding = &baseline.report().runs()[0].findings()[0];
+    let suppression_path = project.root().join(".bifrost/suppressions.json");
+    fs::create_dir_all(suppression_path.parent().unwrap()).unwrap();
+    fs::write(
+        suppression_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "suppressions": [{
+                "policy_id": rule.policy_id().as_str(),
+                "finding_id": finding.id().to_string(),
+                "identity_stability": "strong",
+                "status": "accepted",
+                "reason": "Reviewed compatibility boundary",
+                "policy_hash_at_acceptance": rule.policy_hash().to_string(),
+                "accepted_by": "security-review",
+                "accepted_at": "2026-07-01",
+                "expires_at": "2026-08-01"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    evaluate_policy_files(project.root(), &paths, &options)
+        .unwrap()
+        .into_report()
 }
 
 fn incomplete_empty_report() -> PolicyReportDocument {
@@ -382,7 +441,7 @@ fn mixed_complete_and_unsupported_report() -> PolicyReportDocument {
     );
 
     let unsupported = unsupported_empty_report();
-    let mut builder = PolicyReportBuilder::new(PolicyBatchBudget::default(), 2).unwrap();
+    let mut builder = report_builder(2);
     builder
         .register_policy(
             PolicyRuleDescriptor::from_loaded(complete_policy),
@@ -491,6 +550,56 @@ fn complete_result_has_rule_parity_unicode_region_relative_uri_and_strong_finger
         report.runs()[0].findings()[0].id().to_string()
     );
     assert!(!String::from_utf8(first).unwrap().contains("baselineState"));
+}
+
+#[test]
+fn accepted_external_suppression_retains_result_fingerprint_and_run_audit() {
+    let report = suppressed_report();
+    let (_, value) = render(&report);
+    let run = &value["runs"][0];
+    let result = &run["results"][0];
+    assert_eq!(
+        result["partialFingerprints"]["bifrostFinding/v1"],
+        report.runs()[0].findings()[0].id().to_string()
+    );
+    let suppression = &result["suppressions"][0];
+    assert_eq!(suppression["kind"], "external");
+    assert_eq!(suppression["status"], "accepted");
+    assert_eq!(
+        suppression["justification"],
+        "Reviewed compatibility boundary"
+    );
+    assert_eq!(
+        suppression["properties"]["bifrost.acceptedBy"],
+        "security-review"
+    );
+    assert_eq!(
+        suppression["properties"]["bifrost.acceptedAt"],
+        "2026-07-01"
+    );
+    assert_eq!(
+        suppression["properties"]["bifrost.policyHashState"],
+        "matching"
+    );
+    assert_eq!(
+        run["properties"]["bifrost.policyEvaluation"]["evaluation_date"],
+        "2026-07-27"
+    );
+    assert_eq!(
+        run["properties"]["bifrost.suppressionReviews"][0]["applied"],
+        true
+    );
+
+    let schema: Value = serde_json::from_slice(SCHEMA_BYTES).unwrap();
+    let errors = schema_validator(&schema)
+        .iter_errors(&value)
+        .map(|error| format!("{} at {}", error, error.instance_path()))
+        .collect::<Vec<_>>();
+    assert!(
+        errors.is_empty(),
+        "SARIF validation errors:\n{}",
+        errors.join("\n")
+    );
 }
 
 #[test]

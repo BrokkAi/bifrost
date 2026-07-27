@@ -277,7 +277,12 @@ fn run_repo_writes_completed_jsonl_report_for_tiny_project() {
     assert!(record["bifrost_head"].is_string(), "{record}");
     assert!(record["report"]["summary"].is_object(), "{record}");
     assert_eq!(record["report"]["config"]["parallelism"], 2, "{record}");
-    assert!(fixture.root.join(".bifrost/bifrost_cache.db").is_file());
+    assert!(
+        fixture
+            .root
+            .join(".bifrost/cache/bifrost_cache.db")
+            .is_file()
+    );
 
     let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
     assert!(
@@ -339,7 +344,12 @@ fn run_repo_ephemeral_cache_does_not_create_persisted_database() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(fixture.output.is_file());
-    assert!(!fixture.root.join(".bifrost/bifrost_cache.db").exists());
+    assert!(
+        !fixture
+            .root
+            .join(".bifrost/cache/bifrost_cache.db")
+            .exists()
+    );
 }
 
 #[test]

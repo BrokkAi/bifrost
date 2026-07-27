@@ -42,6 +42,7 @@ canonical report:
 bifrost --root /path/to/project \
   --policy-file policies/security.rqlp \
   --policy-file policies/correctness.rqlp \
+  --evaluation-date 2026-07-27 \
   --format sarif \
   --fail-on warning \
   --output reports/bifrost.sarif
@@ -58,6 +59,18 @@ endpoint IDs; in a normal CLI run, the same policy can discover endpoints
 through a `match-directory` closure before selecting exact IDs. The CLI does
 not scan for policies, endpoints, or catalogs on its own.
 
+By default, policy evaluation reads `.bifrost/suppressions.json` beneath the
+workspace root. Pass `--suppressions-file reviews/accepted.json` to select one
+different workspace-relative JSON file. A missing file means no project
+suppressions; an invalid, unsafe, oversized, or escaping file produces a
+canonical diagnostic and status 2 instead of silently running unsuppressed.
+
+Suppression expiration uses `--evaluation-date YYYY-MM-DD`. Omit it for
+today's UTC date, resolved once by the CLI, or provide it explicitly for
+reproducible JSON/SARIF and stable expiry behavior. A decision remains current
+on its `expires_at` date and expires the following day. These options are valid
+only in policy mode.
+
 Policy mode cannot be combined with `--query-file`, `--tool`, `--args`,
 `--sources`, server/REPL modes, skill installation, `--no-line-numbers`, or
 `--force-semantic-cpu`.
@@ -72,8 +85,12 @@ uses Unicode-code-point columns and strong finding IDs as stable partial
 fingerprints; weak IDs are labeled inconclusive and are not emitted as stable
 fingerprints.
 
-Human output is concise by default. Add `--verbose` for the complete audit
-record. `--color auto|always|never` controls ANSI severity colors and Unicode
+Human output is concise by default: applied suppressed findings are counted
+but omitted from the active list. Add `--verbose` to retain every finding and
+print suppression reasons, acceptance provenance, and stale/expired/drifted
+review records. Canonical JSON always retains the complete finding and audit;
+SARIF retains the result as an external accepted suppression and preserves its
+strong partial fingerprint. `--color auto|always|never` controls ANSI severity colors and Unicode
 status symbols; `auto` uses them only for a terminal and respects `NO_COLOR`.
 Redirected and file output is plain and deterministic by default. These two
 options are rejected with JSON or SARIF output.
@@ -89,18 +106,18 @@ prepared before stdout is written.
 | Value | A complete batch exits 1 for |
 | --- | --- |
 | `never` | No finding threshold. |
-| `finding` | Any finding, including `unrated`. |
-| `note` | `note`, `warning`, or `error`. |
-| `warning` | `warning` or `error` (default). |
-| `error` | `error` only. |
+| `finding` | Any active unsuppressed finding, including `unrated`. |
+| `note` | An active unsuppressed `note`, `warning`, or `error`. |
+| `warning` | An active unsuppressed `warning` or `error` (default). |
+| `error` | An active unsuppressed `error` only. |
 
 The process status is:
 
 | Status | Meaning |
 | --- | --- |
-| `0` | Every requested policy completed and no finding met the threshold. |
-| `1` | Every requested policy completed and at least one finding met the threshold. |
-| `2` | A load, schema, composition, evaluation, completeness, serialization, or output failure made the batch unreliable. Status 2 takes precedence over status 1. |
+| `0` | Every requested policy completed and no active unsuppressed finding met the threshold. |
+| `1` | Every requested policy completed and at least one active unsuppressed finding met the threshold. |
+| `2` | A policy, suppression, schema, composition, evaluation, completeness, serialization, or output failure made the batch unreliable. Status 2 takes precedence over status 1. |
 
 `--fail-on never` disables only the finding threshold; it cannot turn an
 invalid, cancelled, incomplete, failed, or unsupported policy into a clean
