@@ -29,8 +29,9 @@ The first working milestone does not add a database table. It defines the stable
 - [x] (2026-07-27 00:47Z) Implemented Milestone 3: stable taint fact/function/source/propagation/observer keys, exact dependency closures, symbolic entry-to-exit transfers, transitive sink-neutral observation ports, live sink overlays, complete-only bounded repositories, and atomic SCC publication.
 - [x] (2026-07-27 01:17Z) Validated Milestone 3 with 15 reusable-summary, 24 IDE, 25 taint-client, 37 typestate-client, and 10 value-flow-client tests, plus 52 adjacent dataflow tests, formatting, diff, all-feature compilation, and strict pinned all-target/all-feature Clippy.
 - [x] (2026-07-27 01:17Z) Completed repeated Milestone 3 architecture, intent, and security reviews; fixed every Critical/High finding, including entry attribution across call/return edges and a quadratic replay scan, and received final clean delta reviews.
-- [ ] Checkpoint Milestone 3 and rebase it onto the fetched `origin/master` commit `105f2448` without touching `.brokk/`.
-- [ ] Run Milestone 4 lifecycle measurements and record the promotion decision; implement packed SQLite persistence only if the evidence passes #817's predeclared gates.
+- [x] (2026-07-27 01:31Z) Checkpointed Milestone 3 and rebased it onto fetched `origin/master` commit `105f2448`; the reviewed taint checkpoint is now `ab8b90f3`, and `.brokk/` remained untouched.
+- [x] (2026-07-27 02:10Z) Implemented the Milestone 4 fresh-process lifecycle runner, retained seven samples after two warmups for seven semantic/protocol/taint cases, ran the unchanged #817 gate, and recorded `insufficient_evidence` for every persistence candidate because no diagnostic hydration reconstructs an equivalent applicable summary.
+- [x] (2026-07-27 02:18Z) Completed Milestone 4 architecture, intent, and security reviews; fixed every Critical/High evidence-integrity finding, received final clean re-reviews, and passed the focused test, shell syntax, formatting/diff checks, and strict pinned all-target/all-feature Clippy.
 
 ## Surprises & Discoveries
 
@@ -84,6 +85,21 @@ The first working milestone does not add a database table. It defines the stable
 
 - Observation: making transfer capture entry-exact can turn replay quadratic if sources remain indexed only by point and input fact.
   Evidence: IDE replay now builds and queries a direct `(point, input fact, entry fact)` source index. Multi-entry records no longer filter a shared bucket, so rejected comparisons cannot bypass the work budget.
+
+- Observation: none of the three reusable summary families currently exposes a versioned portable representation from which a fresh process can reconstruct and apply the artifact.
+  Evidence: `SemanticProcedureSummary`, `ProtocolSummary`, and `TaintTransferSummary` retain private canonical Rust structures and nested stable identities without a production serialization/hydration contract. Milestone 4 therefore measures a deliberately non-equivalent diagnostic envelope and labels it as a lower bound rather than treating metadata parsing as summary hydration.
+
+- Observation: a benchmark checksum that includes inline-worktree artifact identity is not stable across fresh processes because the inline harness creates a new temporary workspace mount each time.
+  Evidence: the first aggregation rejected protocol/taint checksums across rounds. The final harness instead uses stable fixture roots and structurally hashes each complete validity key and every canonical row, effect/observation, function, and evidence value; no validity field is normalized away.
+
+- Observation: even a non-equivalent metadata lower bound passes every numeric gate for the pinned VS Code and Spring PetClinic semantic cases, which proves why exact equivalence must be an independent prerequisite.
+  Evidence: their median rebuilds were 126.733 ms and 64.056 ms while diagnostic hydration was 0.037 ms and 0.034 ms with acceptable RSS, size, and write overhead, but the 404-byte and 406-byte envelopes cannot reconstruct a transfer relation. Both final decisions remain `insufficient_evidence`.
+
+- Observation: the remaining semantic, protocol, and taint cases fail at least the predeclared 50 ms absolute saving gate before equivalence is considered.
+  Evidence: median rebuild savings range from 0.002 ms for one inline semantic entry through 11.0 ms for the two-procedure taint repository. The complete matrix is recorded in `.agents/docs/summary-lifecycle-benchmark-2026-07-27.md`.
+
+- Observation: benchmark integrity requires the same exactness as production cache validity.
+  Evidence: Milestone 4 review hardened the runner to hash complete protocol/taint validity keys and structural payloads under stable fixture roots, enumerate only pinned Git-tree source paths, revalidate external HEAD and tracked cleanliness around collection, exclude the taint invalidation solve from rebuild time/RSS, and reject missing, duplicate, or mixed-provenance sample matrices.
 
 ## Decision Log
 
@@ -139,6 +155,14 @@ The first working milestone does not add a database table. It defines the stable
   Rationale: exact dependency validity is required for every reusable member, but rebuilding and cloning closure rows per query or per member would make the validation path quadratic. Shared immutable contracts retain exact closure identity while keeping construction iterative, bounded, and stack-safe.
   Date/Author: 2026-07-27 / Codex
 
+- Decision: classify every Milestone 4 persistence candidate as `insufficient_evidence` and add no SQLite migration or store API.
+  Rationale: the benchmark proves complete in-memory hits, exact validity misses, stable counts/checksums, retained bytes, RSS, write cost, and a fresh-process diagnostic-envelope lower bound, but that envelope is not an equivalent artifact. Passing numeric gates without reconstructable application semantics cannot satisfy #817's promotion contract.
+  Date/Author: 2026-07-27 / Codex
+
+- Decision: retain the diagnostic envelope only in the ignored benchmark harness, not in production APIs.
+  Rationale: it is useful for measuring serialization and fresh-process process/RSS floors and for enforcing provenance and checksum repeatability. Exposing it as a product DTO would invite callers to mistake metadata validation for usable summary hydration.
+  Date/Author: 2026-07-27 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 now supplies the reusable semantic foundation without adding global state or persistence. Exact keys include semantic artifact validity, declaration, schema, execution semantics, context, behavior, origin, dependency closure, and the full recursive-group closure. Composition derives its own dependency identity, preserves effects from reachable non-returning callees, distinguishes alternative joins from sequential conjunction, and is deterministic across association for the complete semantic payload. The repository publishes only complete entries, validates exact dependencies, validates explicit recursive topology as a real SCC, preflights whole batches atomically, accounts retained bytes, and supports owner-driven generation rotation.
@@ -148,6 +172,8 @@ Focused `reusable_summaries` validation passes 15 behavior tests, including sour
 Milestone 2 now projects complete typestate results into stable protocol-branded entry-to-exit relations and observed effects, remaps them through validated live protocols and binding plans, and injects compatible cached callees into the existing tabulator without changing the no-repository path. Lookup uses exact entry manifests and procedure-scoped binding contracts; recursive groups share a validated member-closure contract and publish atomically. The current sound boundary is explicit: dependency-bearing nonrecursive procedures and effectful recursive SCCs remain live-solve-only until the semantic layer exposes an exact nested-effect-to-outer-entry map. Optional projection, capacity, and conflict failures preserve the completed analysis. Focused validation passes 125 tests across the six affected suites, strict all-target/all-feature Clippy passes, and final security, intent, and architecture reviews report no unresolved Critical or High finding.
 
 Milestone 3 now projects complete taint IDE results into stable carrier and edge-function relations, composes exact generic entry transfers across nested calls, and retains policy-neutral internal observations for later live sink evaluation. Stable taint universes survive dense-bit remapping; exact propagation, context, artifact, dependency, and recursive-group identities produce safe hits and misses; partial, cancelled, over-budget, oversized, conflicting, or incomplete work never publishes as complete. The dependency-bearing wrapper regression proves exact cached/uncached finding parity at the callee's formal entry, while dedicated call-site and callee-exit regressions prove that observations crossing interprocedural edges retain their owning entry. Focused isolated validation passes 111 tests across the five affected suites, 52 adjacent dataflow tests pass, strict pinned all-target/all-feature Clippy passes, and final security, intent, and architecture reviews report no unresolved Critical or High finding.
+
+Milestone 4 now supplies a reproducible release-mode lifecycle matrix for separate semantic, protocol, and taint candidates. The runner validates exact clean VS Code and Spring PetClinic revisions, uses nine fresh processes per mode/case, discards two warmups, measures real complete repositories and exact in-memory hits/misses, records counts/checksums/retained bytes/RSS, and invokes the unchanged shared promotion gate. A source checksum binds the result to the exact benchmark harness. The numeric all-gates passes are the pinned VS Code and Spring PetClinic semantic diagnostic lower bounds; both remain ineligible because the envelopes cannot reconstruct or apply a summary. Every candidate is therefore explicitly `insufficient_evidence`, no SQLite schema or `AnalyzerStore` API was added, and the bounded in-memory repositories are the final issue #823 lifecycle boundary.
 
 ## Context and Orientation
 
