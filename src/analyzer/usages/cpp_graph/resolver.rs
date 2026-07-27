@@ -1,3 +1,4 @@
+use crate::analyzer::declaration_range::node_for_exact_range;
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::cpp_call_match::{
@@ -2774,6 +2775,39 @@ impl VisibilityIndex {
         }
     }
 
+    pub(super) fn canonical_visible_full_type_unit(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        visible_from: &ProjectFile,
+        unit: &CodeUnit,
+    ) -> Option<CodeUnit> {
+        let canonical = self.canonical_type_unit(analyzer, visible_from, unit)?;
+        if cpp_class_declaration_strength(analyzer, &canonical)
+            != CppClassDeclarationStrength::Forward
+        {
+            return Some(canonical);
+        }
+        let mut full = Vec::new();
+        for candidate in self
+            .visible_identifier_candidates(visible_from, canonical.identifier())
+            .filter(|candidate| {
+                candidate.is_class()
+                    && candidate.fq_name() == canonical.fq_name()
+                    && cpp_class_declaration_strength(analyzer, candidate)
+                        == CppClassDeclarationStrength::Full
+            })
+        {
+            if !full.iter().any(|existing| same_symbol(existing, candidate)) {
+                full.push(candidate.clone());
+            }
+        }
+        match full.len() {
+            0 => Some(canonical),
+            1 => full.pop(),
+            _ => None,
+        }
+    }
+
     fn resolve_structured_alias_target(
         &self,
         visible_from: &ProjectFile,
@@ -3556,10 +3590,20 @@ pub(super) fn resolve_declaring_member_owner(
     let Some(hierarchy) = analyzer.type_hierarchy_provider() else {
         return EnclosingMemberOwnerResolution::Missing;
     };
+    let Some(receiver_owner) =
+        visibility.canonical_visible_full_type_unit(analyzer, file, receiver_owner)
+    else {
+        return EnclosingMemberOwnerResolution::Ambiguous;
+    };
     let resolve_level = |frontier: &[CodeUnit]| {
         let mut member_owners = Vec::new();
-        for owner in frontier {
-            for member in visibility.visible_members_for_owner_name(file, owner, member_name) {
+        for raw_owner in frontier {
+            let Some(owner) =
+                visibility.canonical_visible_full_type_unit(analyzer, file, raw_owner)
+            else {
+                return EnclosingMemberOwnerResolution::Ambiguous;
+            };
+            for member in visibility.visible_members_for_owner_name(file, &owner, member_name) {
                 let Some(member_owner) = type_owner_of(analyzer, member) else {
                     return EnclosingMemberOwnerResolution::Ambiguous;
                 };
@@ -3580,14 +3624,18 @@ pub(super) fn resolve_declaring_member_owner(
     // The first declaration on each structured base path hides deeper names,
     // regardless of whether its callable overload is applicable at a particular
     // call site. Applicability is checked only after this owner is established.
-    let direct = resolve_level(std::slice::from_ref(receiver_owner));
+    let direct = resolve_level(std::slice::from_ref(&receiver_owner));
     if !matches!(direct, EnclosingMemberOwnerResolution::Missing) {
         return direct;
     }
-    let mut stack = hierarchy.get_direct_ancestors(receiver_owner);
+    let mut stack = hierarchy.get_direct_ancestors(&receiver_owner);
     let mut propagated_counts: HashMap<CodeUnit, u8> = HashMap::default();
     let mut path_matches = Vec::new();
-    while let Some(owner) = stack.pop() {
+    while let Some(raw_owner) = stack.pop() {
+        let Some(owner) = visibility.canonical_visible_full_type_unit(analyzer, file, &raw_owner)
+        else {
+            return EnclosingMemberOwnerResolution::Ambiguous;
+        };
         // Persisted hierarchy edges do not encode virtual-base or base-subobject paths.
         // Propagate at most two occurrences of each owner: that preserves the distinction
         // between one and multiple resolving base paths without exponential diamond walks.
@@ -5794,21 +5842,25 @@ pub(in crate::analyzer::usages) fn is_declaration_name(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
-    if matches!(
-        parent.kind(),
-        "class_specifier"
-            | "struct_specifier"
-            | "union_specifier"
-            | "enum_specifier"
-            | "namespace_definition"
-            | "namespace_alias_definition"
-            | "alias_declaration"
-            | "enumerator"
-    ) && parent
+    if parent
         .child_by_field_name("name")
         .is_some_and(|name| same_node(name, node))
     {
-        return true;
+        if matches!(
+            parent.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
+        ) {
+            return cpp_tag_specifier_declares_name(parent);
+        }
+        if matches!(
+            parent.kind(),
+            "namespace_definition"
+                | "namespace_alias_definition"
+                | "alias_declaration"
+                | "enumerator"
+        ) {
+            return true;
+        }
     }
 
     let mut current = Some(parent);
@@ -5838,6 +5890,32 @@ pub(in crate::analyzer::usages) fn is_declaration_name(node: Node<'_>) -> bool {
             return false;
         }
         current = ancestor.parent();
+    }
+    false
+}
+
+fn cpp_tag_specifier_declares_name(specifier: Node<'_>) -> bool {
+    if specifier.child_by_field_name("body").is_some() {
+        return true;
+    }
+    let mut current = specifier.parent();
+    while let Some(ancestor) = current {
+        match ancestor.kind() {
+            "type_descriptor"
+            | "parameter_declaration"
+            | "optional_parameter_declaration"
+            | "template_argument_list"
+            | "cast_expression" => return false,
+            "declaration" | "field_declaration" => {
+                let mut cursor = ancestor.walk();
+                return ancestor
+                    .children_by_field_name("declarator", &mut cursor)
+                    .next()
+                    .is_none();
+            }
+            "translation_unit" => return true,
+            _ => current = ancestor.parent(),
+        }
     }
     false
 }
@@ -7088,7 +7166,7 @@ enum FullOwnerResolution {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum CppClassDeclarationStrength {
+pub(super) enum CppClassDeclarationStrength {
     Full,
     Forward,
     Unknown,
@@ -7163,7 +7241,7 @@ fn collapse_owner_candidates(
     }
 }
 
-fn cpp_class_declaration_strength(
+pub(super) fn cpp_class_declaration_strength(
     analyzer: &dyn IAnalyzer,
     candidate: &CodeUnit,
 ) -> CppClassDeclarationStrength {
@@ -7293,10 +7371,186 @@ pub(super) fn same_visible_symbol(left: &CodeUnit, right: &CodeUnit) -> bool {
     same_symbol(left, right) || same_logical_symbol(left, right)
 }
 
+pub(super) fn same_visible_global_field_symbol(
+    analyzer: &dyn IAnalyzer,
+    internal_linkage_cache: &mut HashMap<CodeUnit, bool>,
+    left: &CodeUnit,
+    right: &CodeUnit,
+) -> bool {
+    if same_symbol(left, right) {
+        return true;
+    }
+    if !same_logical_symbol(left, right) {
+        return false;
+    }
+    if cpp_global_field_has_internal_linkage_cached(analyzer, internal_linkage_cache, left)
+        || cpp_global_field_has_internal_linkage_cached(analyzer, internal_linkage_cache, right)
+    {
+        left.source() == right.source()
+    } else {
+        true
+    }
+}
+
+fn cpp_global_field_has_internal_linkage_cached(
+    analyzer: &dyn IAnalyzer,
+    cache: &mut HashMap<CodeUnit, bool>,
+    candidate: &CodeUnit,
+) -> bool {
+    if let Some(internal) = cache.get(candidate) {
+        return *internal;
+    }
+    let internal = cpp_global_field_has_internal_linkage(analyzer, candidate);
+    cache.insert(candidate.clone(), internal);
+    internal
+}
+
 pub(super) fn same_logical_symbol(left: &CodeUnit, right: &CodeUnit) -> bool {
     left.kind() == right.kind()
         && left.fq_name() == right.fq_name()
         && left.signature() == right.signature()
+}
+
+fn cpp_global_field_has_internal_linkage(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+    if !candidate.is_field() || candidate.short_name().contains('.') {
+        return false;
+    }
+    let Some(local_linkage) = cpp_global_field_declaration_linkage(analyzer, candidate) else {
+        return false;
+    };
+    match local_linkage {
+        CppFieldLinkage::Internal => true,
+        CppFieldLinkage::External => false,
+        CppFieldLinkage::InternalUnlessExternalPeer => !analyzer
+            .get_all_declarations()
+            .into_iter()
+            .filter(|peer| peer != candidate && same_logical_symbol(peer, candidate))
+            .filter_map(|peer| cpp_global_field_declaration_linkage(analyzer, &peer))
+            .any(CppFieldLinkage::is_explicit_external),
+    }
+}
+
+fn cpp_global_field_declaration_linkage(
+    analyzer: &dyn IAnalyzer,
+    candidate: &CodeUnit,
+) -> Option<CppFieldLinkage> {
+    let cpp = resolve_analyzer::<CppAnalyzer>(analyzer)?;
+    if let Some(prepared) = cpp.prepared_syntax(candidate.source()) {
+        return cpp_global_field_declaration_linkage_in_tree(
+            analyzer,
+            candidate,
+            prepared.source(),
+            prepared.tree().root_node(),
+        );
+    }
+    let source = analyzer.indexed_source(candidate.source())?;
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .is_err()
+    {
+        return None;
+    }
+    let tree = parser.parse(&source, None)?;
+    cpp_global_field_declaration_linkage_in_tree(analyzer, candidate, &source, tree.root_node())
+}
+
+fn cpp_global_field_declaration_linkage_in_tree(
+    analyzer: &dyn IAnalyzer,
+    candidate: &CodeUnit,
+    source: &str,
+    root: Node<'_>,
+) -> Option<CppFieldLinkage> {
+    analyzer.ranges(candidate).iter().find_map(|range| {
+        node_for_exact_range(root, range)
+            .and_then(enclosing_cpp_field_declaration)
+            .map(|declaration| cpp_field_declaration_linkage(source, declaration))
+    })
+}
+
+fn enclosing_cpp_field_declaration(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        if matches!(node.kind(), "declaration" | "field_declaration") {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CppFieldLinkage {
+    Internal,
+    External,
+    InternalUnlessExternalPeer,
+}
+
+impl CppFieldLinkage {
+    fn is_explicit_external(self) -> bool {
+        matches!(self, Self::External)
+    }
+}
+
+fn cpp_field_declaration_linkage(source: &str, declaration: Node<'_>) -> CppFieldLinkage {
+    let mut current = declaration.parent();
+    let mut enclosed_by_class = false;
+    while let Some(node) = current {
+        if node.kind() == "namespace_definition"
+            && node
+                .child_by_field_name("name")
+                .is_none_or(|name| normalize_cpp_whitespace(node_text(name, source)).is_empty())
+        {
+            return CppFieldLinkage::Internal;
+        }
+        if matches!(
+            node.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier"
+        ) && node
+            .child_by_field_name("name")
+            .is_none_or(|name| normalize_cpp_whitespace(node_text(name, source)).is_empty())
+        {
+            return CppFieldLinkage::Internal;
+        }
+        if matches!(
+            node.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier"
+        ) {
+            enclosed_by_class = true;
+        }
+        if matches!(node.kind(), "function_definition" | "lambda_expression") {
+            return CppFieldLinkage::Internal;
+        }
+        current = node.parent();
+    }
+    if enclosed_by_class {
+        return CppFieldLinkage::External;
+    }
+    let mut cursor = declaration.walk();
+    let mut has_static = false;
+    let mut has_extern = false;
+    let mut has_inline = false;
+    let mut has_const = false;
+    let mut has_constexpr = false;
+    for child in declaration.named_children(&mut cursor) {
+        let text = normalize_cpp_whitespace(node_text(child, source));
+        match (child.kind(), text.as_str()) {
+            ("storage_class_specifier", "static") => has_static = true,
+            ("storage_class_specifier", "extern") => has_extern = true,
+            ("storage_class_specifier", "inline") => has_inline = true,
+            ("storage_class_specifier", "constexpr") => has_constexpr = true,
+            ("type_qualifier", "const") => has_const = true,
+            ("type_qualifier", "constexpr") => has_constexpr = true,
+            _ => {}
+        }
+    }
+    if has_static {
+        CppFieldLinkage::Internal
+    } else if has_extern || has_inline {
+        CppFieldLinkage::External
+    } else if has_const || has_constexpr {
+        CppFieldLinkage::InternalUnlessExternalPeer
+    } else {
+        CppFieldLinkage::External
+    }
 }
 
 #[cfg(test)]

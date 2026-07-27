@@ -395,7 +395,9 @@ fn fragmented_export_body_region(
     // class keeps its own braces, so the first lone-`}` sibling is this class's.
     let mut sibling = node.next_named_sibling();
     let displaced_close = loop {
-        let current = sibling?;
+        let Some(current) = sibling else {
+            break displaced_fragment_close_at_namespace_boundary(node, body, source)?;
+        };
         if cpp_is_stray_close_brace(current, source) {
             break current;
         }
@@ -411,6 +413,38 @@ fn fragmented_export_body_region(
             end_line: displaced_close.end_position().row + 1,
         },
     })
+}
+
+fn displaced_fragment_close_at_namespace_boundary<'tree>(
+    declaration: Node<'tree>,
+    body: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let declaration_list = declaration.parent()?;
+    if declaration_list.kind() != "declaration_list" {
+        return None;
+    }
+    let namespace = declaration_list.parent()?;
+    if namespace.kind() != "namespace_definition"
+        || namespace.child_by_field_name("body") != Some(declaration_list)
+    {
+        return None;
+    }
+    let class_close = direct_close_brace(declaration_list)?;
+    let trailing_semicolon = namespace.next_named_sibling()?;
+    if trailing_semicolon.kind() != "expression_statement"
+        || trailing_semicolon.named_child_count() != 0
+    {
+        return None;
+    }
+    let displaced_namespace_close = trailing_semicolon.next_named_sibling()?;
+    if !cpp_is_stray_close_brace(displaced_namespace_close, source) {
+        return None;
+    }
+    let reparse_start = body.start_byte() + 1;
+    let (_padded, tree) =
+        cpp_reparse_region_items(source, reparse_start, class_close.start_byte())?;
+    cpp_reparsed_members_are_indexable(tree.root_node(), source).then_some(class_close)
 }
 
 /// The direct `}` child of a node, real or MISSING (a MISSING brace is zero-width).
@@ -531,7 +565,7 @@ fn malformed_qualified_prefix(node: Node<'_>, source: &str) -> Option<String> {
 fn recover_exported_class_function_definition<'tree>(
     node: Node<'tree>,
     source: &str,
-) -> Option<(Node<'tree>, String)> {
+) -> Option<(Node<'tree>, String, Option<Vec<String>>)> {
     if node.kind() != "function_definition" {
         return None;
     }
@@ -542,11 +576,13 @@ fn recover_exported_class_function_definition<'tree>(
         type_node.kind(),
         "class_specifier" | "struct_specifier" | "union_specifier"
     ) {
-        if type_node
+        let type_name = type_node
             .child_by_field_name("name")
-            .and_then(|name| direct_identifier_name(name, source))
-            .is_some_and(|name| cpp_export_macro_token(&name))
-        {
+            .and_then(|name| direct_identifier_name(name, source));
+        let exported_macro_type = type_name
+            .as_ref()
+            .is_some_and(|name| cpp_export_macro_token(name));
+        if exported_macro_type {
             let mut cursor = node.walk();
             let errors_before_declarator = node
                 .named_children(&mut cursor)
@@ -560,7 +596,13 @@ fn recover_exported_class_function_definition<'tree>(
                 .iter()
                 .find_map(|error| displaced_exported_class_name(*error, source))
             {
-                return Some((node, name));
+                let raw_supertypes = errors_before_declarator
+                    .iter()
+                    .any(|error| malformed_inheritance_syntax(*error))
+                    .then(|| recovered_malformed_base_name(declarator, source))
+                    .flatten()
+                    .map(|base| vec![base]);
+                return Some((node, name, raw_supertypes));
             }
             if errors_before_declarator
                 .iter()
@@ -569,10 +611,23 @@ fn recover_exported_class_function_definition<'tree>(
                 return None;
             }
         }
+        if !exported_macro_type
+            && let Some(name) = type_name
+            && !cpp_export_macro_token(&name)
+            && let Some(base) =
+                recovered_postfix_export_macro_base(node, type_node, declarator, source)
+        {
+            return Some((node, name, Some(vec![base])));
+        }
         if let Some(name) = direct_identifier_name(declarator, source)
+            && exported_macro_type
             && !cpp_export_macro_token(&name)
         {
-            return Some((node, name));
+            let raw_supertypes = exported_macro_type
+                .then(|| recovered_single_base_after_declarator(node, declarator, source))
+                .flatten()
+                .map(|base| vec![base]);
+            return Some((node, name, raw_supertypes));
         }
         if declarator.kind() == "parenthesized_declarator"
             && type_node
@@ -594,7 +649,7 @@ fn recover_exported_class_function_definition<'tree>(
                 })
                 .find_map(|error| declarator_name_from_node(error, source))
             {
-                return Some((node, name));
+                return Some((node, name, None));
             }
         }
     }
@@ -603,7 +658,73 @@ fn recover_exported_class_function_definition<'tree>(
     if !matches!(declarator_text.as_str(), "class" | "struct" | "union") {
         return None;
     }
-    class_identifier_before_body(node, source).map(|name| (node, name))
+    class_identifier_before_body(node, source).map(|name| (node, name, None))
+}
+
+fn recovered_postfix_export_macro_base(
+    node: Node<'_>,
+    type_node: Node<'_>,
+    declarator: Node<'_>,
+    source: &str,
+) -> Option<String> {
+    let mut cursor = node.walk();
+    let mut malformed_clauses = node.named_children(&mut cursor).filter(|child| {
+        child.kind() == "ERROR"
+            && child.start_byte() >= type_node.end_byte()
+            && child.end_byte() <= declarator.start_byte()
+            && postfix_export_macro_inheritance(*child, source)
+    });
+    malformed_clauses.next()?;
+    if malformed_clauses.next().is_some() {
+        return None;
+    }
+    recovered_malformed_base_name(declarator, source)
+}
+
+fn postfix_export_macro_inheritance(node: Node<'_>, source: &str) -> bool {
+    let mut macro_count = 0;
+    let mut colon_count = 0;
+    let mut access_count = 0;
+    for index in 0..node.child_count() {
+        let Some(child) = node.child(index) else {
+            return false;
+        };
+        match child.kind() {
+            "identifier" | "type_identifier" if child.is_named() => {
+                let candidate = normalize_cpp_whitespace(node_text(child, source));
+                if !cpp_export_macro_token(&candidate) {
+                    return false;
+                }
+                macro_count += 1;
+            }
+            ":" if !child.is_named() => colon_count += 1,
+            "public" | "protected" | "private" if !child.is_named() => access_count += 1,
+            _ => return false,
+        }
+    }
+    macro_count == 1 && colon_count == 1 && access_count == 1
+}
+
+fn recovered_single_base_after_declarator(
+    node: Node<'_>,
+    declarator: Node<'_>,
+    source: &str,
+) -> Option<String> {
+    let body_start = node
+        .child_by_field_name("body")
+        .map(|body| body.start_byte())
+        .unwrap_or(node.end_byte());
+    let mut cursor = node.walk();
+    let mut bases = node
+        .named_children(&mut cursor)
+        .filter(|child| {
+            child.kind() == "ERROR"
+                && child.start_byte() >= declarator.end_byte()
+                && child.end_byte() <= body_start
+        })
+        .filter_map(|error| displaced_exported_class_name(error, source));
+    let base = bases.next()?;
+    bases.next().is_none().then_some(base)
 }
 
 fn malformed_inheritance_syntax(node: Node<'_>) -> bool {
@@ -662,7 +783,7 @@ pub(crate) fn recovered_exported_class_has_body(
 ) -> Option<bool> {
     match node.kind() {
         "function_definition" => {
-            let (class_node, name) = recover_exported_class_function_definition(node, source)?;
+            let (class_node, name, _) = recover_exported_class_function_definition(node, source)?;
             (name == expected_name).then(|| cpp_body_node(class_node).is_some())
         }
         "declaration" | "field_declaration" => {
@@ -944,20 +1065,20 @@ impl<'a> CppVisitor<'a> {
         fragmented: &FragmentedExportBody,
         class_unit: CodeUnit,
         scope: &ScopeInfo,
-    ) {
+    ) -> bool {
         if fragmented.reparse_start >= fragmented.reparse_end {
-            return;
+            return false;
         }
         let Some((_padded, tree)) = cpp_reparse_region_items(
             self.source,
             fragmented.reparse_start,
             fragmented.reparse_end,
         ) else {
-            return;
+            return false;
         };
         let root = tree.root_node();
         if !cpp_reparsed_members_are_indexable(root, self.source) {
-            return;
+            return false;
         }
         let member_scope = ScopeInfo {
             package_name: scope.package_name.clone(),
@@ -970,6 +1091,7 @@ impl<'a> CppVisitor<'a> {
             visible_using_namespaces: scope.visible_using_namespaces.clone(),
         };
         self.run_container_work(root, member_scope);
+        true
     }
 
     fn visit_node<'tree>(
@@ -1413,11 +1535,21 @@ impl<'a> CppVisitor<'a> {
         if self.visit_sentinel_macro_region(node, scope) {
             return;
         }
-        if let Some((class_node, name)) =
+        if let Some((class_node, name, raw_supertypes)) =
             recover_exported_class_function_definition(node, self.source)
         {
             let mut stack = Vec::new();
-            self.visit_named_class_like(class_node, name, scope, &mut stack);
+            let body = cpp_body_node(class_node);
+            self.visit_named_class_like_shape(
+                class_node,
+                name,
+                body,
+                body.is_some(),
+                None,
+                raw_supertypes,
+                scope,
+                &mut stack,
+            );
             while let Some(work) = stack.pop() {
                 match work {
                     CppWork::Container(container) => {
@@ -1552,7 +1684,8 @@ impl<'a> CppVisitor<'a> {
                     recovered.declaration_node.end_byte(),
                     fragmented.class_range.end_byte,
                 );
-                self.visit_fragmented_export_class_members(&fragmented, code_unit, scope);
+                let recovered_members =
+                    self.visit_fragmented_export_class_members(&fragmented, code_unit, scope);
                 // Everything between the fragmented declaration and its displaced
                 // closing brace now belongs to the recovered class; keep the
                 // ordinary walk from re-indexing those scattered siblings at top
@@ -1561,7 +1694,9 @@ impl<'a> CppVisitor<'a> {
                 // offsets (inside this very region) and must not be suppressed;
                 // the outer tree's sibling work items are visited later, so the
                 // ordering still shields them.
-                self.consumed_fragment_regions.push(consumed_region);
+                if recovered_members {
+                    self.consumed_fragment_regions.push(consumed_region);
+                }
                 return;
             }
             let uses_initializer_body = recovered.uses_initializer_body;
@@ -4444,6 +4579,14 @@ class CORE_EXPORT QgsPoint : public AbstractGeometry
 class Ordinary : public Base { public: Ordinary(); };
 class API_EXPORT Plain { public: Plain(); };
 class API_EXPORT : public Base {};
+class
+PN_CPP_CLASS_EXTERN Sender : public Link {
+    Sender();
+};
+class thread_ctx_t {};
+class ctx_t ZMQ_FINAL : public thread_ctx_t {
+    bool start();
+};
 "#;
         let mut parser = tree_sitter::Parser::new();
         parser
@@ -4454,7 +4597,7 @@ class API_EXPORT : public Base {};
         let parsed = CppAdapter.parse_file(&file, source, &tree);
         let declarations = parsed.declarations();
 
-        for expected in ["QgsPoint", "Ordinary", "Plain"] {
+        for expected in ["QgsPoint", "Ordinary", "Plain", "Sender", "ctx_t"] {
             assert!(
                 declarations
                     .iter()
@@ -4462,6 +4605,33 @@ class API_EXPORT : public Base {};
                 "missing recovered class {expected}: {declarations:#?}"
             );
         }
+        let qgs_point = declarations
+            .iter()
+            .find(|unit| unit.is_class() && unit.fq_name() == "QgsPoint")
+            .expect("recovered QgsPoint class");
+        assert_eq!(
+            parsed.raw_supertypes.get(qgs_point),
+            Some(&vec!["AbstractGeometry".to_string()]),
+            "single-base export recovery must retain its displaced base"
+        );
+        let sender = declarations
+            .iter()
+            .find(|unit| unit.is_class() && unit.fq_name() == "Sender")
+            .expect("recovered Sender class");
+        assert_eq!(
+            parsed.raw_supertypes.get(sender),
+            Some(&vec!["Link".to_string()]),
+            "post-declarator export recovery must retain its displaced base"
+        );
+        let ctx = declarations
+            .iter()
+            .find(|unit| unit.is_class() && unit.fq_name() == "ctx_t")
+            .expect("recovered ctx_t class");
+        assert_eq!(
+            parsed.raw_supertypes.get(ctx),
+            Some(&vec!["thread_ctx_t".to_string()]),
+            "postfix export-macro recovery must retain its displaced base"
+        );
         assert!(
             declarations.iter().any(|unit| {
                 unit.is_function()

@@ -201,6 +201,21 @@ comes through the local gate, but is not the focus.
   contexts, nested owner references, and qualified constants. Delegated three
   disjoint first implementations to Oldskool while root retains review,
   integration, replay, publication, and issue closure.
+- [x] (2026-07-26) Integrated structured fixes for all seven C++ issue
+  families, then addressed three independent review findings: qualified
+  free-function calls now retain precedence over same-named construction
+  syntax, namespace-scope `const`/`constexpr` linkage honors `extern` and
+  `inline` peers, and malformed out-of-line ownership is recovered only through
+  a target-guided ambiguity-refusing lookup rather than rewriting declaration
+  identity.
+- [x] (2026-07-26) Passed all 154 C++ usage-graph tests, all 640
+  get-definition tests, all 11 file-local linkage tests, the reference
+  differential integration target, and the focused exported-class parser unit.
+  Rebuilt the release runner in the normal repository target and replayed the
+  Qpid `link.credit` and CCache `detail.mmap.close` production witnesses at
+  niceness 10; both completed with zero actionable discrepancy. A final
+  Oldskool read-only review found no actionable issue or leftover debug
+  scaffolding.
 - [ ] Complete C++ and publish its evidence and user summary.
 - [ ] Complete C# and publish its evidence and user summary.
 - [ ] Complete Go and publish its evidence and user summary.

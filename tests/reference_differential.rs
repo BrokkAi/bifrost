@@ -32,6 +32,71 @@ fn rust_differential(
     .expect("run inline Rust reference differential")
 }
 
+fn cpp_differential(
+    files: &[(&str, &str)],
+) -> brokk_bifrost::reference_differential::ReferenceDifferentialReport {
+    let mut project = InlineTestProject::with_language(Language::Cpp);
+    for (path, source) in files {
+        project = project.file(path, *source);
+    }
+    let project = project.build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    run_reference_differential(
+        workspace.analyzer(),
+        &ReferenceDifferentialConfig {
+            corpus_language: "cpp".to_string(),
+            max_files: 20,
+            max_sites: 1_000,
+            max_candidates_per_file: 1_000,
+            max_source_bytes: 100_000,
+            max_targets: 1_000,
+            max_usage_files: 20,
+            max_usages: 1_000,
+            ..ReferenceDifferentialConfig::default()
+        },
+    )
+    .expect("run inline C++ reference differential")
+}
+
+#[test]
+fn cpp_inherited_scoped_enum_qualifier_round_trips_to_lexical_owner() {
+    let source = r#"
+struct Client {
+    enum class Failure { error, timeout };
+};
+struct RemoteStorage {
+    struct Backend {
+        enum class Failure { error, timeout };
+    };
+};
+struct HelperBackend : RemoteStorage::Backend {
+    Failure choose(Client::Failure input) {
+        return input == Client::Failure::timeout ? Failure::timeout : Failure::error;
+    }
+};
+"#;
+    let report = cpp_differential(&[("failure.cpp", source)]);
+    let site = report
+        .sites
+        .iter()
+        .find(|site| {
+            site.text == "Failure::timeout" && site.source_evidence.contains("? Failure::timeout")
+        })
+        .expect("inherited scoped-enum differential site");
+
+    assert_eq!(site.forward_status, "resolved", "{site:#?}");
+    assert_eq!(
+        site.targets.first().map(|target| target.fq_name.as_str()),
+        Some("RemoteStorage$Backend$Failure"),
+        "{site:#?}"
+    );
+    assert_ne!(
+        site.classification,
+        ReferenceClassification::Missing,
+        "{site:#?}"
+    );
+}
+
 #[test]
 fn typescript_export_alias_is_excluded_as_a_declaration_site() {
     let source = r#"const createListItem = () => {};

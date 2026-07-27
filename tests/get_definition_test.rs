@@ -21156,6 +21156,179 @@ fn cpp_out_of_line_definition_name_is_not_reference() {
 }
 
 #[test]
+fn cpp_static_member_definition_name_is_not_reference() {
+    let source = r#"
+struct Counter {
+    static int value;
+};
+
+int Counter::value = 1;
+int read() { return Counter::value; }
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("counter.cpp", source)
+        .build();
+
+    let definition_name = source.find("value = 1;").expect("static member definition");
+    let use_name = source.rfind("Counter::value").expect("static member use") + "Counter::".len();
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("counter.cpp", source, definition_name),
+                location_query("counter.cpp", source, use_name),
+            ]
+        })
+        .to_string(),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "no_definition", "{value}");
+    assert_eq!(
+        results[0]["diagnostics"][0]["kind"], "declaration_or_import_site",
+        "{value}"
+    );
+    assert_eq!(results[1]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[1]["definitions"][0]["fqn"], "Counter.value",
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_preprocessor_replacement_body_token_is_not_reference_but_call_argument_stays_local() {
+    let source = r#"
+#define APPLY(slot) helper(slot)
+int helper(int value);
+
+int run(int value) {
+    return APPLY(value);
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("macro.cpp", source)
+        .build();
+
+    let replacement_token = source.rfind("slot)").expect("macro replacement token");
+    let call_argument = source.rfind("value);").expect("macro call argument");
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("macro.cpp", source, replacement_token),
+                location_query("macro.cpp", source, call_argument),
+            ]
+        })
+        .to_string(),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "no_definition", "{value}");
+    assert_eq!(
+        results[0]["diagnostics"][0]["kind"], "declaration_or_import_site",
+        "{value}"
+    );
+    assert_eq!(results[1]["status"], "resolved", "{value}");
+    assert_eq!(results[1]["definitions"][0]["kind"], "parameter", "{value}");
+}
+
+#[test]
+fn cpp_inherited_scoped_enum_qualifier_wins_over_visible_sibling_owner() {
+    let source = r#"
+struct Client {
+    enum class Failure { error, timeout };
+};
+struct RemoteStorage {
+    struct Backend {
+        enum class Failure { error, timeout };
+    };
+};
+struct HelperBackend : RemoteStorage::Backend {
+    Failure choose(Client::Failure input) {
+        return input == Client::Failure::timeout ? Failure::timeout : Failure::error;
+    }
+};
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("failure.cpp", source)
+        .build();
+
+    let client = source
+        .find("Client::Failure::timeout")
+        .expect("explicit client enum");
+    let backend = source
+        .find("? Failure::timeout")
+        .expect("inherited backend enum")
+        + 2
+        + "Failure::".len();
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("failure.cpp", source, client),
+                location_query("failure.cpp", source, backend),
+            ]
+        })
+        .to_string(),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "resolved", "{value}");
+    assert_eq!(results[0]["definitions"][0]["fqn"], "Client", "{value}");
+    assert_eq!(results[1]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[1]["definitions"][0]["fqn"], "RemoteStorage$Backend$Failure.timeout",
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_inherited_scoped_enum_qualifier_reports_multiple_base_owners_as_ambiguous() {
+    let source = r#"
+struct Left {
+    enum class Failure { timeout };
+};
+struct Right {
+    enum class Failure { timeout };
+};
+struct Derived : Left, Right {
+    auto choose() {
+        return Failure::timeout;
+    }
+};
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("ambiguous_failure.cpp", source)
+        .build();
+    let qualifier = source
+        .find("return Failure::timeout")
+        .expect("ambiguous inherited enum qualifier")
+        + "return ".len();
+    let enumerator = qualifier + "Failure::".len();
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("ambiguous_failure.cpp", source, qualifier),
+                location_query("ambiguous_failure.cpp", source, enumerator),
+            ]
+        })
+        .to_string(),
+    );
+
+    assert_eq!(value["results"][0]["status"], "ambiguous", "{value}");
+    assert_eq!(
+        value["results"][0]["diagnostics"][0]["kind"], "ambiguous_definition",
+        "{value}"
+    );
+    assert_eq!(value["results"][1]["status"], "ambiguous", "{value}");
+    assert_eq!(
+        value["results"][1]["diagnostics"][0]["kind"], "ambiguous_definition",
+        "{value}"
+    );
+}
+
+#[test]
 fn cpp_type_reference_does_not_resolve_to_same_named_function() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file("api.h", "namespace ns { void Service(); }\n")

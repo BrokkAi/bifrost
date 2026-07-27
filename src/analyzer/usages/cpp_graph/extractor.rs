@@ -59,6 +59,8 @@ pub(super) struct ScanCtx<'a> {
     pub(super) enclosing_owner_cache: RefCell<HashMap<CodeUnit, Option<CodeUnit>>>,
     lexical_free_function_cache: RefCell<HashMap<(String, String), bool>>,
     member_owner_cache: RefCell<HashMap<CodeUnit, EnclosingMemberOwnerResolution>>,
+    global_field_internal_linkage_cache: RefCell<HashMap<CodeUnit, bool>>,
+    receiver_canonical_type_cache: RefCell<HashMap<CodeUnit, Option<CodeUnit>>>,
 }
 
 #[derive(Clone, Default)]
@@ -129,6 +131,8 @@ pub(super) fn scan_prepared_file(
         enclosing_owner_cache: RefCell::new(HashMap::default()),
         lexical_free_function_cache: RefCell::new(HashMap::default()),
         member_owner_cache: RefCell::new(HashMap::default()),
+        global_field_internal_linkage_cache: RefCell::new(HashMap::default()),
+        receiver_canonical_type_cache: RefCell::new(HashMap::default()),
     };
     if needs_using_enum_member_resolution {
         collect_semantic_using_enums(prepared.tree().root_node(), &mut ctx);
@@ -564,30 +568,43 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if !recovered_type && is_nested_type_node(node) {
         return;
     }
-    if !recovered_type
-        && let Some(call) = call_for_function_node(node)
-        && let LexicalTypeResolution::Resolved {
-            unit, candidates, ..
-        } = resolve_type_node_lexically_for_target(
+    if !recovered_type && let Some(call) = call_for_function_node(node) {
+        let direct_target = resolve_qualified_call_target(
+            call,
             node,
             ctx.analyzer,
             ctx.visibility,
             &ctx.ordinary_type_imports,
             ctx.file,
             ctx.source,
-            &ctx.spec.target,
-        )
-        && (same_visible_symbol(&unit, &ctx.spec.target)
-            || candidates
-                .iter()
-                .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target)))
-    {
-        if !direct_temporary_resolves_to_explicit_constructor(call, &unit, ctx) {
+        );
+        if matches!(direct_target, BareCallTargetResolution::Type(_))
+            && let LexicalTypeResolution::Resolved {
+                unit, candidates, ..
+            } = resolve_type_node_lexically_for_target(
+                node,
+                ctx.analyzer,
+                ctx.visibility,
+                &ctx.ordinary_type_imports,
+                ctx.file,
+                ctx.source,
+                &ctx.spec.target,
+            )
+            && (same_visible_symbol(&unit, &ctx.spec.target)
+                || candidates
+                    .iter()
+                    .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target)))
+        {
             *ctx.raw_match_count += 1;
             push_type_hit(
                 type_reference_hit_node(node, ctx.file, ctx.source, &ctx.bindings),
                 ctx,
             );
+        } else if let Some(scopes) = static_qualifier_type_scopes(node, ctx) {
+            *ctx.raw_match_count += 1;
+            for scope in scopes {
+                push_type_hit(scope, ctx);
+            }
         }
         return;
     }
@@ -628,10 +645,16 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target)) =>
         {
             *ctx.raw_match_count += 1;
-            push_type_hit(
-                type_reference_hit_node(hit_node, ctx.file, ctx.source, &ctx.bindings),
-                ctx,
-            );
+            if let Some(scopes) = static_qualifier_type_scopes(node, ctx) {
+                for scope in scopes {
+                    push_type_hit(scope, ctx);
+                }
+            } else {
+                push_type_hit(
+                    type_reference_hit_node(hit_node, ctx.file, ctx.source, &ctx.bindings),
+                    ctx,
+                );
+            }
             return;
         }
         LexicalTypeResolution::Resolved { .. } => {
@@ -729,7 +752,10 @@ fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>)
     let Some(function) = call.child_by_field_name("function") else {
         return;
     };
-    if !matches!(function.kind(), "identifier" | "template_function") {
+    if !matches!(
+        function.kind(),
+        "identifier" | "type_identifier" | "template_function" | "template_type"
+    ) {
         return;
     }
     let terminal = function_terminal_node(function);
@@ -737,19 +763,26 @@ fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>)
     if name.is_empty() || ctx.local_shadows.is_shadowed(name) {
         return;
     }
-    if let Some(enclosing_owner) = structured_enclosing_owner(function, ctx)
-        && !matches!(
-            resolve_declaring_member_owner(
-                ctx.analyzer,
-                ctx.visibility,
-                ctx.file,
-                &enclosing_owner,
-                name,
-            ),
-            EnclosingMemberOwnerResolution::Missing
-        )
-    {
-        return;
+    if let Some(enclosing_owner) = structured_enclosing_owner(function, ctx) {
+        match resolve_declaring_member_owner(
+            ctx.analyzer,
+            ctx.visibility,
+            ctx.file,
+            &enclosing_owner,
+            name,
+        ) {
+            EnclosingMemberOwnerResolution::Owner(owner)
+                if matches!(
+                    ctx.visibility
+                        .visible_member_for_owner_name(ctx.file, &owner, name,),
+                    VisibleMemberResolution::Callable(_) | VisibleMemberResolution::AmbiguousKind
+                ) =>
+            {
+                return;
+            }
+            EnclosingMemberOwnerResolution::Ambiguous => return,
+            EnclosingMemberOwnerResolution::Owner(_) | EnclosingMemberOwnerResolution::Missing => {}
+        }
     }
     match resolve_bare_call_target(
         call,
@@ -786,9 +819,6 @@ fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>)
                 .iter()
                 .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target)) =>
         {
-            if direct_temporary_resolves_to_explicit_constructor(call, &unit, ctx) {
-                return;
-            }
             *ctx.raw_match_count += 1;
             push_type_hit(function, ctx);
         }
@@ -805,6 +835,81 @@ pub(in crate::analyzer::usages) enum BareCallTargetResolution {
     CallableShadow,
     Ambiguous,
     Missing,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_qualified_call_target(
+    call: Node<'_>,
+    function: Node<'_>,
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    ordinary_type_imports: &OrdinaryTypeImportCell,
+    file: &ProjectFile,
+    source: &str,
+) -> BareCallTargetResolution {
+    if matches!(function.kind(), "identifier" | "template_function") {
+        return resolve_bare_call_target(
+            call,
+            function,
+            analyzer,
+            visibility,
+            ordinary_type_imports,
+            file,
+            source,
+        );
+    }
+    if !matches!(
+        function.kind(),
+        "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+    ) {
+        return BareCallTargetResolution::Missing;
+    }
+    let terminal = function_terminal_node(function);
+    let name = node_text(terminal, source);
+    let Some((mut components, _)) = qualified_callable_owner_components(function, source) else {
+        return BareCallTargetResolution::Missing;
+    };
+    components.push(name.to_string());
+    let qualified_name = components.join("::");
+    let candidates = visibility
+        .visible_identifier_candidates(file, name)
+        .filter(|candidate| {
+            candidate.is_function()
+                && type_owner_of(analyzer, candidate).is_none()
+                && cpp_name_for(candidate) == qualified_name
+                && visibility.declaration_visible_at(analyzer, file, candidate, call.start_byte())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !candidates.is_empty() {
+        return resolve_callable_candidates(
+            candidates,
+            visibility.call_arity_evidence(file, call, source).exact(),
+            call.start_byte(),
+            analyzer,
+            visibility,
+            file,
+        );
+    }
+    if visibility
+        .call_arity_evidence(file, call, source)
+        .exact()
+        .is_none()
+    {
+        return BareCallTargetResolution::Ambiguous;
+    }
+    match resolve_type_node_lexically(
+        function,
+        analyzer,
+        visibility,
+        ordinary_type_imports,
+        file,
+        source,
+    ) {
+        LexicalTypeResolution::Resolved { unit, .. } => BareCallTargetResolution::Type(unit),
+        LexicalTypeResolution::Ambiguous => BareCallTargetResolution::Ambiguous,
+        LexicalTypeResolution::Missing => BareCallTargetResolution::Missing,
+    }
 }
 
 fn binding_free_function_candidates(
@@ -1218,28 +1323,6 @@ pub(in crate::analyzer::usages) fn resolve_bare_call_target(
         LexicalTypeResolution::Ambiguous => BareCallTargetResolution::Ambiguous,
         LexicalTypeResolution::Missing => BareCallTargetResolution::Missing,
     }
-}
-
-fn direct_temporary_resolves_to_explicit_constructor(
-    call: Node<'_>,
-    owner: &CodeUnit,
-    ctx: &ScanCtx<'_>,
-) -> bool {
-    let Some(call_arity) = ctx
-        .visibility
-        .call_arity_evidence(ctx.file, call, ctx.source)
-        .exact()
-    else {
-        return false;
-    };
-    matches!(
-        ctx.visibility
-            .visible_member_for_owner_name(ctx.file, owner, owner.identifier()),
-        VisibleMemberResolution::Callable(constructors)
-            if constructors.iter().any(|constructor| {
-                cpp_callable_arity(ctx.analyzer, constructor).accepts(call_arity)
-            })
-    )
 }
 
 fn static_qualifier_type_scopes<'tree>(
@@ -2211,7 +2294,12 @@ fn bare_global_field_uniquely_resolves_to_target(text: &str, ctx: &ScanCtx<'_>) 
         if !name_matches_terminal(cpp_name_for(unit).as_str(), text) {
             continue;
         }
-        if same_visible_symbol(unit, &ctx.spec.target) {
+        if same_visible_global_field_symbol(
+            ctx.analyzer,
+            &mut ctx.global_field_internal_linkage_cache.borrow_mut(),
+            unit,
+            &ctx.spec.target,
+        ) {
             matched_target = true;
         } else {
             return false;
@@ -2252,6 +2340,12 @@ fn global_field_is_known_non_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
                 has_persisted_global_field_identity(unit)
                     && unit.identifier() == ctx.spec.member_name
                     && cpp_namespace_for(unit).as_deref() == Some(namespace.as_str())
+                    && !same_visible_global_field_symbol(
+                        ctx.analyzer,
+                        &mut ctx.global_field_internal_linkage_cache.borrow_mut(),
+                        unit,
+                        &ctx.spec.target,
+                    )
             })
 }
 
@@ -2264,10 +2358,16 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             return;
         }
         *ctx.raw_match_count += 1;
-        if receiver_matches_target(node, ctx) {
-            push_hit(field, ctx);
-        } else if !receiver_has_known_non_target(node, ctx) {
-            push_unproven_hit(field, ctx);
+        let receiver = node
+            .child_by_field_name("argument")
+            .or_else(|| node.child_by_field_name("object"));
+        match receiver.map(|receiver| explicit_receiver_target_resolution(receiver, ctx)) {
+            Some(MethodReceiverTargetResolution::Target) => push_hit(field, ctx),
+            Some(MethodReceiverTargetResolution::Missing) | None => push_unproven_hit(field, ctx),
+            Some(
+                MethodReceiverTargetResolution::NonTarget
+                | MethodReceiverTargetResolution::Ambiguous,
+            ) => {}
         }
         return;
     }
@@ -2628,15 +2728,25 @@ fn receiver_type_units_with_budget(
 fn canonical_receiver_units(units: Vec<CodeUnit>, ctx: &ScanCtx<'_>) -> Vec<CodeUnit> {
     let mut canonical = Vec::with_capacity(units.len());
     for unit in units {
-        let Some(unit) = ctx
-            .visibility
-            .canonical_type_unit(ctx.analyzer, ctx.file, &unit)
-        else {
+        let Some(unit) = canonical_receiver_unit(&unit, ctx) else {
             return Vec::new();
         };
         canonical.push(unit);
     }
     unanimous_receiver_units(canonical)
+}
+
+fn canonical_receiver_unit(unit: &CodeUnit, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
+    if let Some(cached) = ctx.receiver_canonical_type_cache.borrow().get(unit) {
+        return cached.clone();
+    }
+    let canonical = ctx
+        .visibility
+        .canonical_visible_full_type_unit(ctx.analyzer, ctx.file, unit);
+    ctx.receiver_canonical_type_cache
+        .borrow_mut()
+        .insert(unit.clone(), canonical.clone());
+    canonical
 }
 
 fn receiver_units_from_declared_fields(fields: Vec<&CodeUnit>, ctx: &ScanCtx<'_>) -> Vec<CodeUnit> {
@@ -3213,6 +3323,22 @@ fn indexed_enclosing_owner_scope(
     file: &ProjectFile,
     node: Node<'_>,
 ) -> Option<Vec<String>> {
+    let owner = indexed_enclosing_class_owner(analyzer, file, node)?;
+    // `cpp_name_for` converts every `.`/`$` in the unit's name to `::` before
+    // this call, so it is already a pure `::`-joined string (same guarantee
+    // `namespace_prefixes` relies on); the shared structured splitter's
+    // segments are the `::`-delimited components exactly.
+    Some(crate::analyzer::symbol_lookup::parse_symbol_path(
+        crate::analyzer::Language::Cpp,
+        &cpp_name_for(&owner),
+    ))
+}
+
+fn indexed_enclosing_class_owner(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    node: Node<'_>,
+) -> Option<CodeUnit> {
     let range = Range {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
@@ -3224,14 +3350,7 @@ fn indexed_enclosing_owner_scope(
         analyzer.parent_of(unit)
     })
     .find(|unit| is_indexed_class_owner(analyzer, unit))?;
-    // `cpp_name_for` converts every `.`/`$` in the unit's name to `::` before
-    // this call, so it is already a pure `::`-joined string (same guarantee
-    // `namespace_prefixes` relies on); the shared structured splitter's
-    // segments are the `::`-delimited components exactly.
-    Some(crate::analyzer::symbol_lookup::parse_symbol_path(
-        crate::analyzer::Language::Cpp,
-        &cpp_name_for(&owner),
-    ))
+    Some(owner)
 }
 
 pub(in crate::analyzer::usages) fn resolve_type_node_lexically(
@@ -4644,6 +4763,12 @@ fn structured_enclosing_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeU
             {
                 return Some(owner.clone());
             }
+            if let Some(owner) = indexed_enclosing_class_owner(ctx.analyzer, ctx.file, function) {
+                return Some(owner);
+            }
+            if let Some(owner) = target_guided_out_of_line_owner(function, ctx) {
+                return Some(owner);
+            }
             break;
         }
         current = parent.parent();
@@ -4651,4 +4776,36 @@ fn structured_enclosing_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeU
     enclosing_context(node, ctx)
         .owner
         .filter(|owner| owner.is_class())
+}
+
+fn target_guided_out_of_line_owner(function: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
+    let target_owner = ctx.spec.owner.as_ref()?;
+    if !ctx.visibility.is_physically_visible(ctx.file, target_owner) {
+        return None;
+    }
+    let (owner_components, _) = qualified_callable_owner_components(function, ctx.source)?;
+    let owner_name = owner_components.last()?;
+    let mut candidates = Vec::new();
+    for candidate in ctx
+        .visibility
+        .visible_identifier_candidates(ctx.file, owner_name)
+        .filter(|candidate| candidate.is_class())
+    {
+        let components = crate::analyzer::symbol_lookup::parse_symbol_path(
+            crate::analyzer::Language::Cpp,
+            &cpp_name_for(candidate),
+        );
+        if !components.ends_with(&owner_components)
+            || candidates
+                .iter()
+                .any(|existing| same_logical_symbol(existing, candidate))
+        {
+            continue;
+        }
+        candidates.push(candidate.clone());
+    }
+    let [candidate] = candidates.as_slice() else {
+        return None;
+    };
+    same_visible_symbol(candidate, target_owner).then(|| target_owner.clone())
 }

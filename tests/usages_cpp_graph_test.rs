@@ -260,6 +260,246 @@ struct Foo {
 }
 
 #[test]
+fn cpp_member_calls_coalesce_header_and_body_owner_declarations() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "api.h",
+            r#"
+namespace model {
+struct Link {
+  PN_CPP_EXTERN int credit() const;
+};
+struct ContextBase {};
+class Context API_FINAL : public ContextBase {
+  bool start();
+  bool create();
+};
+}
+"#,
+        ),
+        (
+            "api.cpp",
+            r#"
+#include "api.h"
+#include "internal.hpp"
+int model::Link::credit() const { return 1; }
+bool model::Context::start() { return true; }
+bool model::Context::create() { return start(); }
+"#,
+        ),
+        (
+            "internal.hpp",
+            r#"
+namespace model {
+struct Link;
+struct Sender;
+struct Base;
+struct Derived;
+}
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"
+#include "api.h"
+int send(model::Link& link) { return link.credit(); }
+"#,
+        ),
+    ]);
+
+    let credit = member_function_definition_in_source(&analyzer, "Link", "credit", "api.cpp");
+    let credit_hits = usage_hits(&analyzer, &credit);
+    assert_hit_contains(&credit_hits, "consumer.cpp", "link.credit()");
+
+    let start = member_function_definition_in_source(&analyzer, "Context", "start", "api.cpp");
+    let start_hits = editor_usage_hits(&analyzer, &start);
+    assert_hit_contains(&start_hits, "api.cpp", "return start()");
+}
+
+#[test]
+fn cpp_destructor_bare_call_matches_synthetic_member_declaration() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[(
+        "mmap.hpp",
+        r#"
+namespace detail {
+class mmap {
+public:
+  ~mmap();
+  bool open();
+  void close();
+};
+inline mmap::~mmap() { close(); }
+inline bool mmap::open() {
+#if defined(USE_MMAP)
+  close();
+#endif
+  return true;
+}
+inline void mmap::close() {}
+}
+"#,
+    )]);
+
+    let close = definition_by(&analyzer, |unit| {
+        unit.is_function() && unit.fq_name() == "detail.mmap.close" && unit.is_synthetic()
+    });
+    let hits = editor_usage_hits(&analyzer, &close);
+    assert_hit_contains(&hits, "mmap.hpp", "~mmap() { close(); }");
+    assert_hit_contains(&hits, "mmap.hpp", "  close();");
+}
+
+#[test]
+fn cpp_malformed_out_of_line_owner_recovery_refuses_same_short_name_ambiguity() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[(
+        "ambiguous.cpp",
+        r#"
+namespace left {
+class mmap {
+public:
+  void close();
+};
+}
+namespace right {
+class mmap {
+public:
+  void close();
+};
+}
+inline bool mmap::open() {
+  close();
+  return true;
+}
+"#,
+    )]);
+
+    let close = definition_by(&analyzer, |unit| {
+        unit.is_function() && unit.fq_name() == "left.mmap.close" && unit.is_synthetic()
+    });
+    let hits = editor_usage_hits(&analyzer, &close);
+    assert!(
+        hits.iter().all(|hit| !hit.line.contains("close();")),
+        "a lost lexical namespace must not be guessed from one of several visible mmap owners: {hits:#?}"
+    );
+}
+
+#[test]
+fn cpp_nested_class_direct_temporary_is_a_type_usage() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[(
+        "client.cpp",
+        r#"
+namespace storage::remote {
+struct Client {
+  struct Error {
+    explicit Error(int code);
+  };
+  void fail() {
+    Error(1);
+  }
+};
+}
+"#,
+    )]);
+
+    let error = definition_by(&analyzer, |unit| {
+        unit.is_class() && unit.fq_name() == "storage::remote.Client$Error"
+    });
+    let hits = editor_usage_hits(&analyzer, &error);
+    assert_hit_contains(&hits, "client.cpp", "    Error(1);");
+}
+
+#[test]
+fn cpp_member_calls_match_visible_owner_peers_across_inheritance_and_body_definitions() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "api_fwd.h",
+            r#"
+namespace model {
+struct Link;
+struct Base;
+}
+"#,
+        ),
+        (
+            "api.h",
+            r#"
+#include "api_fwd.h"
+namespace model {
+struct Handle {};
+namespace internal {
+template <class T> struct Object {};
+}
+struct Endpoint {};
+class
+PN_CPP_CLASS_EXTERN Link : public internal::Object<Handle>, public Endpoint {
+  Link(Handle* value) : internal::Object<Handle>(value) {}
+  PN_CPP_EXTERN int credit() const;
+};
+class
+PN_CPP_CLASS_EXTERN Sender : public Link {
+  Sender();
+};
+struct Base {
+  int get_ctx() const;
+};
+struct Derived : Base {
+  int run() const;
+};
+}
+"#,
+        ),
+        (
+            "api.cpp",
+            r#"
+#include "api.h"
+namespace model {
+int Link::credit() const { return 1; }
+int Base::get_ctx() const { return 2; }
+int Derived::run() const { return this->get_ctx(); }
+}
+"#,
+        ),
+        (
+            "returned.h",
+            r#"
+#include "api.h"
+"#,
+        ),
+        (
+            "facade.h",
+            r#"
+#include "api_fwd.h"
+#include "returned.h"
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"
+#include "facade.h"
+int send(model::Sender& sender) { return sender.credit(); }
+"#,
+        ),
+    ]);
+
+    let sender = definition_by(&analyzer, |unit| {
+        unit.is_class() && unit.identifier() == "Sender" && slash_path(unit.source()) == "api.h"
+    });
+    let sender_bases =
+        brokk_bifrost::TypeHierarchyProvider::get_direct_ancestors(&analyzer, &sender);
+    assert!(
+        sender_bases.iter().any(|base| base.identifier() == "Link"),
+        "macro-decorated Sender lost its Link base: {sender_bases:#?}"
+    );
+
+    let credit = member_function_definition_in_source(&analyzer, "Link", "credit", "api.cpp");
+    let credit_hits = usage_hits(&analyzer, &credit);
+    assert_hit_contains(&credit_hits, "consumer.cpp", "sender.credit()");
+
+    let get_ctx = member_function_definition_in_source(&analyzer, "Base", "get_ctx", "api.cpp");
+    let get_ctx_hits = editor_usage_hits(&analyzer, &get_ctx);
+    assert_hit_contains(&get_ctx_hits, "api.cpp", "this->get_ctx()");
+}
+
+#[test]
 fn cpp_self_receiver_hits_do_not_trigger_external_usage_cap() {
     let (_project, analyzer) = cpp_analyzer_with_files(&[(
         "foo.cpp",
@@ -1497,6 +1737,34 @@ int read_wrong_qualified_value() {
             "nested Leaf.value terminal at {terminal_start} should be proven: {hits:#?}"
         );
     }
+}
+
+#[test]
+fn authoritative_cpp_usage_lifts_derived_receivers_to_base_declared_fields() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[(
+        "controller.cpp",
+        r#"
+struct Switch {
+    bool state;
+};
+struct DerivedSwitch : Switch {};
+struct Controller {
+    DerivedSwitch* standby;
+    bool read() const {
+        return this->standby->state;
+    }
+};
+"#,
+    )]);
+
+    let state = field_definition_with_owner(&analyzer, "Switch", "state");
+    let hits = usage_hits(&analyzer, &state);
+    assert_eq!(
+        1,
+        hits.len(),
+        "base field should have one derived-receiver usage"
+    );
+    assert_hit_contains(&hits, "controller.cpp", "standby->state");
 }
 
 #[test]
@@ -9601,6 +9869,57 @@ void consume() {
 }
 
 #[test]
+fn authoritative_cpp_outer_type_qualifier_inverse_covers_alias_and_elaborated_nested_type() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.hpp",
+            r#"
+class Hash {
+public:
+    using Digest = int;
+};
+struct message {
+    struct impl {};
+};
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"
+#include "types.hpp"
+void consume(const Hash::Digest& digest) {
+    sizeof(struct message::impl);
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let file = project.file("consumer.cc");
+    let source = file.read_to_string().expect("qualified type fixture");
+    let hash = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "Hash" && !unit.is_synthetic()
+    });
+    let message = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "message" && !unit.is_synthetic()
+    });
+    let hash_start = source.find("Hash::Digest").expect("qualified alias type");
+    let message_start = source
+        .find("message::impl")
+        .expect("elaborated nested type");
+
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&hash), &file),
+        BTreeSet::from([(hash_start, hash_start + "Hash".len())]),
+        "the alias owner qualifier must remain an exact inverse usage of Hash"
+    );
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&message), &file),
+        BTreeSet::from([(message_start, message_start + "message".len())]),
+        "the elaborated nested-type qualifier must remain an exact inverse usage of message"
+    );
+}
+
+#[test]
 fn authoritative_cpp_template_alias_resolves_to_canonical_type() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
@@ -14212,6 +14531,7 @@ struct Overloaded {};
 void Overloaded();
 void Overloaded(int value);
 struct Constructed { Constructed(); };
+struct Argful { explicit Argful(int value); };
 struct NamespaceName {};
 void NamespaceName();
 struct Base { void NamespaceName(); };
@@ -14286,6 +14606,7 @@ void shadowed() {
 
 void free_function_wins() {
     FunctionWins(); // negative-visible-free-function
+    model::FunctionWins(); // negative-qualified-visible-free-function
     ArityClash(); // negative-wrong-arity-function-shadow
     Overloaded(); // negative-applicable-overload
 }
@@ -14293,6 +14614,8 @@ void free_function_wins() {
 void explicit_constructor_wins() {
     Constructed(); // positive-constructor-function-only
     model::Constructed(); // positive-qualified-constructor-function-only
+    Argful(1); // positive-arg-constructor-type-and-function
+    model::Argful(2); // positive-qualified-arg-constructor-type-and-function
 }
 
 struct Late {};
@@ -14388,6 +14711,7 @@ void wrong_namespace() {
     let overloaded_class = class("model.Overloaded");
     let constructed = class("model.Constructed");
     let namespace_name = class("model.NamespaceName");
+    let argful = class("model.Argful");
     let late = class("model.Late");
     let include_early_class = class("model.IncludeEarly");
     let include_late_class = class("model.IncludeLate");
@@ -14398,6 +14722,7 @@ void wrong_namespace() {
         function_definition_in_package_with_arity(&analyzer, "model", "FunctionWins", 0);
     let overloaded = function_definition_in_package_with_arity(&analyzer, "model", "Overloaded", 0);
     let constructor = member_function_definition(&analyzer, "Constructed", "Constructed");
+    let argful_constructor = member_function_definition(&analyzer, "Argful", "Argful");
     let late_function = function_definition_in_package_with_arity(&analyzer, "model", "Late", 0);
     let inherited_member = member_function_definition(&analyzer, "Base", "NamespaceName");
     let include_early =
@@ -14494,6 +14819,11 @@ void wrong_namespace() {
             function_wins.fq_name(),
         ),
         (
+            "    model::FunctionWins(); // negative-qualified-visible-free-function",
+            "FunctionWins",
+            function_wins.fq_name(),
+        ),
+        (
             "    Overloaded(); // negative-applicable-overload",
             "Overloaded",
             overloaded.fq_name(),
@@ -14507,6 +14837,16 @@ void wrong_namespace() {
             "    model::Constructed(); // positive-qualified-constructor-function-only",
             "Constructed",
             constructed.fq_name(),
+        ),
+        (
+            "    Argful(1); // positive-arg-constructor-type-and-function",
+            "Argful",
+            argful.fq_name(),
+        ),
+        (
+            "    model::Argful(2); // positive-qualified-arg-constructor-type-and-function",
+            "Argful",
+            argful.fq_name(),
         ),
         (
             "    Late(); // positive-before-later-function",
@@ -14604,6 +14944,10 @@ void wrong_namespace() {
         "    FunctionWins(); // negative-visible-free-function",
         "FunctionWins",
     );
+    let qualified_function_call = range(
+        "    model::FunctionWins(); // negative-qualified-visible-free-function",
+        "FunctionWins",
+    );
     for hits in [
         inverse_ranges(&function_wins_class).0,
         inverse_ranges(&function_wins_class).1,
@@ -14612,10 +14956,16 @@ void wrong_namespace() {
             !hits.contains(&function_call),
             "visible free function must take precedence over the same-named class: {hits:#?}"
         );
+        assert!(
+            !hits.contains(&qualified_function_call),
+            "visible qualified free function must take precedence over the same-named class: {hits:#?}"
+        );
     }
     let (function_targeted, function_whole) = inverse_ranges(&function_wins);
     assert!(function_targeted.contains(&function_call));
     assert!(function_whole.contains(&function_call));
+    assert!(function_targeted.contains(&qualified_function_call));
+    assert!(function_whole.contains(&qualified_function_call));
     let arity_call = range(
         "    ArityClash(); // negative-wrong-arity-function-shadow",
         "ArityClash",
@@ -14646,16 +14996,35 @@ void wrong_namespace() {
         "    model::Constructed(); // positive-qualified-constructor-function-only",
         "Constructed",
     );
+    let argful_call = range(
+        "    Argful(1); // positive-arg-constructor-type-and-function",
+        "Argful",
+    );
+    let qualified_argful_call = range(
+        "    model::Argful(2); // positive-qualified-arg-constructor-type-and-function",
+        "Argful",
+    );
     let (constructed_targeted, constructed_whole) = inverse_ranges(&constructed);
-    assert!(!constructed_targeted.contains(&constructed_call));
-    assert!(!constructed_whole.contains(&constructed_call));
-    assert!(!constructed_targeted.contains(&qualified_constructed_call));
-    assert!(!constructed_whole.contains(&qualified_constructed_call));
+    assert!(constructed_targeted.contains(&constructed_call));
+    assert!(constructed_whole.contains(&constructed_call));
+    assert!(constructed_targeted.contains(&qualified_constructed_call));
+    assert!(constructed_whole.contains(&qualified_constructed_call));
     let (constructor_targeted, constructor_whole) = inverse_ranges(&constructor);
     assert!(constructor_targeted.contains(&constructed_call));
     assert!(constructor_whole.contains(&constructed_call));
     assert!(constructor_targeted.contains(&qualified_constructed_call));
     assert!(constructor_whole.contains(&qualified_constructed_call));
+    let (argful_targeted, argful_whole) = inverse_ranges(&argful);
+    assert!(argful_targeted.contains(&argful_call));
+    assert!(argful_whole.contains(&argful_call));
+    assert!(argful_targeted.contains(&qualified_argful_call));
+    assert!(argful_whole.contains(&qualified_argful_call));
+    let (argful_constructor_targeted, argful_constructor_whole) =
+        inverse_ranges(&argful_constructor);
+    assert!(argful_constructor_targeted.contains(&argful_call));
+    assert!(argful_constructor_whole.contains(&argful_call));
+    assert!(argful_constructor_targeted.contains(&qualified_argful_call));
+    assert!(argful_constructor_whole.contains(&qualified_argful_call));
 
     let before_late = range("    Late(); // positive-before-later-function", "Late");
     let after_late = range("    Late(); // negative-after-function-declaration", "Late");
