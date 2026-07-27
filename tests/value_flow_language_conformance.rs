@@ -32,6 +32,26 @@ const JAVA_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
     source: JAVA_SOURCE,
 }];
 
+const TYPESCRIPT_SOURCE: &str = r#"
+function relay(value: string): string {
+  const relayed = value;
+  return relayed;
+}
+
+function sink(flowed: string, clean: string): void {}
+
+function run(input: string): void {
+  const copy = relay(input);
+  const clean = "clean";
+  sink(copy, clean);
+}
+"#;
+
+const TYPESCRIPT_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
+    path: "src/exact_flow.ts",
+    source: TYPESCRIPT_SOURCE,
+}];
+
 const JAVA_PROCEDURES: &[ProcedureSelector<'_>] = &[
     ProcedureSelector {
         alias: "run",
@@ -50,6 +70,27 @@ const JAVA_PROCEDURES: &[ProcedureSelector<'_>] = &[
         path: "src/ExactFlowFixture.java",
         name: "sink",
         kind: ProcedureKind::Method,
+    },
+];
+
+const TYPESCRIPT_PROCEDURES: &[ProcedureSelector<'_>] = &[
+    ProcedureSelector {
+        alias: "run",
+        path: "src/exact_flow.ts",
+        name: "run",
+        kind: ProcedureKind::Function,
+    },
+    ProcedureSelector {
+        alias: "relay",
+        path: "src/exact_flow.ts",
+        name: "relay",
+        kind: ProcedureKind::Function,
+    },
+    ProcedureSelector {
+        alias: "sink",
+        path: "src/exact_flow.ts",
+        name: "sink",
+        kind: ProcedureKind::Function,
     },
 ];
 
@@ -85,7 +126,7 @@ const SINKS: &[CallArgumentSink<'_>] = &[
     },
 ];
 
-const JAVA_CARRIERS: &[CarrierMilestone<'_>] = &[
+const EXPECTED_CARRIERS: &[CarrierMilestone<'_>] = &[
     CarrierMilestone::Port {
         procedure: "run",
         kind: ValueFlowPortKey::Parameter { ordinal: 0 },
@@ -155,7 +196,27 @@ fn java_exact_helper_flow() {
         },
         sinks: SINKS,
         expected_complete: false,
-        expected_carriers: JAVA_CARRIERS,
+        expected_carriers: EXPECTED_CARRIERS,
+        expected_interprocedural: EXPECTED_INTERPROCEDURAL,
+    });
+}
+
+#[test]
+fn typescript_exact_helper_flow() {
+    assert_value_flow_conformance(&ValueFlowConformanceCase {
+        name: "typescript",
+        language: Language::TypeScript,
+        files: TYPESCRIPT_FILES,
+        procedures: TYPESCRIPT_PROCEDURES,
+        root: "run",
+        calls: CALLS,
+        source: ParameterSource {
+            procedure: "run",
+            ordinal: 0,
+        },
+        sinks: SINKS,
+        expected_complete: false,
+        expected_carriers: EXPECTED_CARRIERS,
         expected_interprocedural: EXPECTED_INTERPROCEDURAL,
     });
 }

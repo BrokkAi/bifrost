@@ -16,7 +16,7 @@ After this change, a contributor can run one integration test and see equivalent
 - [x] (2026-07-27 10:31Z) Diagnosed the missing seam between language adapter facts, the production value-flow client, and bounded witness reconstruction; confirmed that the first Java/TypeScript slice can use public APIs from test code.
 - [x] (2026-07-27 11:32Z) Added the reusable structured selector, plan builder, exact meeting comparison, stable carrier projection, compact source-backed witness rendering, and context-respecting call/return assertions under `tests/common/`.
 - [x] (2026-07-27 11:32Z) Replaced the reachability-only Java helper test with an exact source-to-two-sink-arguments conformance case; the focused Java test passes.
-- [ ] Add the equivalent TypeScript case with the same language-neutral milestone contract and explicit aggregate discovery expectations.
+- [x] (2026-07-27 11:40Z) Added the equivalent TypeScript case; it passes the same language-neutral carrier and call/return milestone contract with explicit incomplete aggregate discovery.
 - [ ] Run focused tests, formatting, strict all-feature Clippy, and the complete `nlp,python` test gate.
 - [ ] Run security, duplication, intent, operations, and architecture reviews; resolve accepted findings and record the outcome.
 
@@ -39,6 +39,9 @@ After this change, a contributor can run one integration test and see equivalent
 
 - Observation: Java's positive helper path is proven complete even though aggregate discovery remains incomplete.
   Evidence: the Java meeting frontier is exactly `PROVEN_COMPLETE`, its may status is `Proven`, and it is not uncertain; `ValueFlowSummaryResult::is_complete()` is false, so the unrelated argument is correctly `Inconclusive`, not `NotReached`.
+
+- Observation: TypeScript needs no language-specific witness normalization for the baseline helper flow.
+  Evidence: `typescript_exact_helper_flow` passes the exact same expected carrier milestones and interprocedural edge milestones as Java, including a proven-complete positive path and an inconclusive unrelated sink argument.
 
 ## Decision Log
 
@@ -64,7 +67,7 @@ After this change, a contributor can run one integration test and see equivalent
 
 ## Outcomes & Retrospective
 
-The Java milestone now exercises the production Java adapter, value-flow oracle, exact dispatch bindings, immutable plan, summary solver, and bounded witness reconstruction. It asserts the complete meeting set, preserves incomplete aggregate discovery as an inconclusive negative, and projects the proven positive path into language-neutral carrier milestones with compact source snippets. TypeScript parity, full validation, and specialist review remain.
+The Java and TypeScript milestones now exercise both production adapters, value-flow oracle, exact dispatch bindings, immutable plan, summary solver, and bounded witness reconstruction. Each asserts the complete meeting set, preserves incomplete aggregate discovery as an inconclusive negative, and projects the proven positive path into the same language-neutral carrier milestones with compact source snippets. Full validation and specialist review remain.
 
 ## Context and Orientation
 
