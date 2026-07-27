@@ -124,6 +124,7 @@ impl ScalaDiagnosticCollector<'_> {
         if name.is_empty()
             || self.declared_value_names.contains(name)
             || scala_default_term_name(name)
+            || self.scala.is_known_simple_term(self.file, name)
         {
             return;
         }

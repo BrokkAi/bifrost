@@ -18,10 +18,14 @@ use tree_sitter::Parser;
 use zip::ZipArchive;
 
 const MAX_ARCHIVE_ENTRIES: usize = 10_000;
+const MAX_INDEX_ARTIFACTS: usize = 128;
 const MAX_SOURCE_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_SCALA_SOURCE_ENTRY_BYTES: u64 = 1024 * 1024;
 const MAX_CLASS_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TOTAL_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_TOTAL_INDEX_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_SCALA_SOURCE_TYPES: usize = 4_096;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct JavaExternalDeclarationIndex {
@@ -95,15 +99,28 @@ impl JavaExternalDeclarationIndex {
 
     fn build_from_artifacts(artifacts: Vec<ResolvedJavaArtifact>) -> Self {
         let mut index = Self::default();
-        for artifact in artifacts {
+        let mut remaining_index_bytes = MAX_TOTAL_INDEX_BYTES;
+        for artifact in artifacts.into_iter().take(MAX_INDEX_ARTIFACTS) {
+            if remaining_index_bytes == 0 {
+                break;
+            }
             if is_source_jar(&artifact.artifact_path) {
-                index.index_source_jar(&artifact.artifact_path);
+                remaining_index_bytes = remaining_index_bytes.saturating_sub(
+                    index.index_source_jar(&artifact.artifact_path, remaining_index_bytes),
+                );
                 continue;
             }
             if let Some(source_artifact_path) = artifact.source_artifact_path.as_deref() {
-                index.index_source_jar(source_artifact_path);
+                remaining_index_bytes = remaining_index_bytes.saturating_sub(
+                    index.index_source_jar(source_artifact_path, remaining_index_bytes),
+                );
             }
-            index.index_class_jar(&artifact.artifact_path);
+            if remaining_index_bytes == 0 {
+                break;
+            }
+            remaining_index_bytes = remaining_index_bytes.saturating_sub(
+                index.index_class_jar(&artifact.artifact_path, remaining_index_bytes),
+            );
         }
         index.apply_enclosing_visibility();
         index
@@ -200,12 +217,12 @@ impl JavaExternalDeclarationIndex {
         }
     }
 
-    fn index_source_jar(&mut self, artifact_path: &Path) {
+    fn index_source_jar(&mut self, artifact_path: &Path, index_byte_budget: u64) -> u64 {
         let Some(file) = open_artifact_file(artifact_path) else {
-            return;
+            return 0;
         };
         let Ok(mut archive) = ZipArchive::new(file) else {
-            return;
+            return 0;
         };
         let entry_count = archive.len().min(MAX_ARCHIVE_ENTRIES);
         let mut total_bytes = 0u64;
@@ -220,16 +237,25 @@ impl JavaExternalDeclarationIndex {
             } else {
                 continue;
             };
-            if !can_read_entry(entry.size(), MAX_SOURCE_ENTRY_BYTES, &mut total_bytes) {
+            let max_entry_bytes = match language {
+                SourceJarLanguage::Java => MAX_SOURCE_ENTRY_BYTES,
+                SourceJarLanguage::Scala => MAX_SCALA_SOURCE_ENTRY_BYTES,
+            };
+            if !can_read_entry(
+                entry.size(),
+                max_entry_bytes,
+                MAX_TOTAL_ARCHIVE_BYTES.min(index_byte_budget),
+                &mut total_bytes,
+            ) {
                 continue;
             }
             let source_path = entry.name().to_string();
             let mut source = String::new();
             if entry
-                .take(MAX_SOURCE_ENTRY_BYTES + 1)
+                .take(max_entry_bytes + 1)
                 .read_to_string(&mut source)
                 .is_err()
-                || source.len() as u64 > MAX_SOURCE_ENTRY_BYTES
+                || source.len() as u64 > max_entry_bytes
             {
                 continue;
             }
@@ -243,14 +269,15 @@ impl JavaExternalDeclarationIndex {
                 self.insert(external_type);
             }
         }
+        total_bytes
     }
 
-    fn index_class_jar(&mut self, artifact_path: &Path) {
+    fn index_class_jar(&mut self, artifact_path: &Path, index_byte_budget: u64) -> u64 {
         let Some(file) = open_artifact_file(artifact_path) else {
-            return;
+            return 0;
         };
         let Ok(mut archive) = ZipArchive::new(file) else {
-            return;
+            return 0;
         };
         let entry_count = archive.len().min(MAX_ARCHIVE_ENTRIES);
         let mut total_bytes = 0u64;
@@ -261,7 +288,12 @@ impl JavaExternalDeclarationIndex {
             if !entry.name().ends_with(".class") || entry.name().ends_with("module-info.class") {
                 continue;
             }
-            if !can_read_entry(entry.size(), MAX_CLASS_ENTRY_BYTES, &mut total_bytes) {
+            if !can_read_entry(
+                entry.size(),
+                MAX_CLASS_ENTRY_BYTES,
+                MAX_TOTAL_ARCHIVE_BYTES.min(index_byte_budget),
+                &mut total_bytes,
+            ) {
                 continue;
             }
             let class_entry = entry.name().to_string();
@@ -278,6 +310,7 @@ impl JavaExternalDeclarationIndex {
                 self.insert(external_type);
             }
         }
+        total_bytes
     }
 }
 
@@ -330,14 +363,19 @@ fn open_artifact_file(path: &Path) -> Option<File> {
     File::open(path).ok()
 }
 
-fn can_read_entry(entry_size: u64, max_entry_bytes: u64, total_bytes: &mut u64) -> bool {
+fn can_read_entry(
+    entry_size: u64,
+    max_entry_bytes: u64,
+    max_total_bytes: u64,
+    total_bytes: &mut u64,
+) -> bool {
     if entry_size > max_entry_bytes {
         return false;
     }
     let Some(next_total) = total_bytes.checked_add(entry_size) else {
         return false;
     };
-    if next_total > MAX_TOTAL_ARCHIVE_BYTES {
+    if next_total > max_total_bytes {
         return false;
     }
     *total_bytes = next_total;
@@ -716,6 +754,10 @@ fn scala_source_types(
                 },
             })
         })
+        // Source JARs are untrusted input. The index is deliberately
+        // best-effort, so stopping at a bounded number of public Scala types
+        // is preferable to retaining an arbitrarily large declaration set.
+        .take(MAX_SCALA_SOURCE_TYPES)
         .collect()
 }
 

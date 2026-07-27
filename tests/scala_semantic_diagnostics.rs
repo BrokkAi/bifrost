@@ -68,9 +68,23 @@ import model.*
 import missing.DependencyType
 
 class Consumer[T](local: Local, widget: Widget, inferred: T, text: String, values: List[Int], dependency: DependencyType)
+class StandardLibraryDefaults(tuple: Tuple2[Int, String], callback: Function1[Int, String], partial: PartialFunction[Int, String], matching: Matchable, failure: RuntimeException)
 "#,
             ),
         ],
+        "app/Consumer.scala",
+    );
+
+    assert_eq!("[]", diagnostics, "{diagnostics}");
+}
+
+#[test]
+fn scala_semantic_diagnostics_suppress_same_package_singleton_term() {
+    let diagnostics = diagnostics(
+        &[(
+            "app/Consumer.scala",
+            "package app\nobject Service\ndef run(): Unit = { Service }\n",
+        )],
         "app/Consumer.scala",
     );
 

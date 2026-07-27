@@ -18,7 +18,8 @@ The observable outcome is a Scala file containing a truly unknown local value or
 - [x] (2026-07-27 07:47Z) Added structured Scala source-JAR declaration indexing, retaining classfile fallback and excluding private/protected source declarations.
 - [x] (2026-07-27 07:50Z) Gave Scala snapshots the shared JVM index and dependency-input invalidation, then added the conservative Scala collector and analyzer hook.
 - [x] (2026-07-27 07:53Z) Added focused collector, shared-index, and LSP opt-in behavior tests for unknown simple types, bare local references, known source/import/default boundaries, malformed input, and same-package source-JAR types.
-- [ ] Run formatting, focused tests, strict Clippy, the required feature test suite, whitespace validation, and an implementation review; update this plan with results.
+- [x] (2026-07-27 08:18Z) Ran formatting, focused Scala/index/LSP tests, strict Clippy, the feature-enabled test suite, whitespace validation, and three independent implementation reviews.
+- [x] (2026-07-27 08:23Z) Applied review follow-ups: bounded aggregate JVM archive work and Scala source expansion; modeled additional Scala/Java default types; resolved same-package singleton terms; and asserted the published Scala LSP diagnostic.
 
 ## Surprises & Discoveries
 
@@ -36,6 +37,8 @@ The observable outcome is a Scala file containing a truly unknown local value or
   Evidence: a synthetic absolute-root `ProjectFile` supplies identity only to `parse_scala_file`; the resulting `CodeUnit` names are converted to external records and never enter the analyzer's file/declaration indexes.
 - Observation: source-JAR declarations need an explicit visibility gate before they can override classfile evidence.
   Evidence: Scala permits `private` and `protected` type declarations. The shared index locates the parser-recorded declaration range and uses its structured modifier child to exclude non-public entries; the `Hidden` source-JAR regression remains absent from the index.
+- Observation: source-JAR parsing needs tighter Scala-specific resource limits than Java source parsing because the Scala declaration collector materializes a richer declaration model.
+  Evidence: review identified that an allowed 8 MiB Scala source entry could produce an excessive declaration set. The shared index now caps aggregate archive work, artifact count, Scala entry size, and retained Scala source types; exhausting a cap simply leaves diagnostics silent.
 
 ## Decision Log
 
@@ -57,10 +60,13 @@ The observable outcome is a Scala file containing a truly unknown local value or
 - Decision: diagnostics fail closed at every unresolved import, default-import, implicit/given, dynamic, or external-classpath boundary.
   Rationale: #364 explicitly values high confidence over broad compiler parity. A suppressed warning is preferable to a false positive in editor diagnostics.
   Date/Author: 2026-07-27 / Codex and user.
+- Decision: extend the intrinsic default-type set to the stable Scala and `java.lang` names that appear without explicit imports, including bounded `TupleN`/`FunctionN` families.
+  Rationale: these default scopes are part of ordinary Scala name resolution even when no Scala-library source artifact is configured. The collector must never call them unknown merely because its external index lacks that artifact.
+  Date/Author: 2026-07-27 / Codex.
 
 ## Outcomes & Retrospective
 
-The second implementation checkpoint adds Scala source-JAR extraction, a Scala-owned lazy shared index, and a conservative semantic diagnostic collector. Java remains an unchanged consumer of the shared archive index. The focused shared-index, Scala collector, Scala import, and LSP opt-in tests exited successfully. Full feature tests and strict linting remain outstanding. The branch is `364-add-high-confidence-scala-unrecognized-symbol-diagnostics` and has an unrelated untracked `.brokk/` directory that this work must preserve.
+The implementation adds Scala source-JAR extraction, a Scala-owned lazy shared index, and a conservative semantic diagnostic collector. Java remains a consumer of the shared archive index. Review follow-ups make archive indexing fail closed under aggregate resource limits, cover default scopes and same-package singleton terms, and verify the published LSP diagnostic payload. Formatter, focused index/Scala/LSP tests, strict Clippy, the feature-enabled test suite, and whitespace validation completed successfully. The branch is `364-add-high-confidence-scala-unrecognized-symbol-diagnostics` and has an unrelated untracked `.brokk/` directory that this work preserved.
 
 ## Context and Orientation
 
@@ -193,3 +199,5 @@ Revision note, 2026-07-27: Initial approved ExecPlan created after live issue #3
 Revision note, 2026-07-27: Completed the first mechanical extraction checkpoint. The index now lives under `src/analyzer/jvm`; Java behavior remains covered by its pre-existing focused tests. Kept legacy private type names temporarily to isolate the ownership move from the later Scala-facing design work.
 
 Revision note, 2026-07-27: Added source-JAR parsing for parser-clean public Scala declarations, Scala lazy-index ownership and invalidation, the first conservative type/bare-local diagnostic shapes, and focused unit/integration/LSP tests. Left call, member, qualified, interpolation, and implicit/given-sensitive forms intentionally silent.
+
+Revision note, 2026-07-27: Review follow-ups bound shared-index aggregate archive work and Scala source expansion, suppress default Scala/`java.lang` types and same-package singleton terms, and assert the Scala publish-diagnostics payload. Full required Rust gates passed after these changes.

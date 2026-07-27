@@ -7614,7 +7614,17 @@ fn bifrost_lsp_server_scala_semantic_diagnostics_are_runtime_opt_in() {
         "method": "workspace/didChangeConfiguration",
         "params": {"settings": {"unrecognizedSymbolDiagnostics": true}}
     }));
-    let _ = server.read_notification("textDocument/publishDiagnostics");
+    let published = server.read_notification("textDocument/publishDiagnostics");
+    assert!(
+        published["params"]["diagnostics"]
+            .as_array()
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item["source"] == "bifrost-scala" && item["code"] == "scala_unrecognized_symbol"
+                })
+            }),
+        "expected Scala unknown-type publish diagnostic: {published}"
+    );
 
     server.notify_value(json!({
         "jsonrpc": "2.0",

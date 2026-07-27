@@ -538,6 +538,9 @@ impl ScalaAnalyzer {
         let imports = self.inner.import_info_of(file);
         let imported = self.imported_code_units_of(file);
         let external = self.external_declaration_index();
+        if external.resolve_java_lang(name).is_some() {
+            return ScalaTypeKnownness::Known;
+        }
         for import in &imports {
             let Some(path) = scala_import_path(import) else {
                 return ScalaTypeKnownness::Uncertain;
@@ -573,6 +576,18 @@ impl ScalaAnalyzer {
         } else {
             ScalaTypeKnownness::Absent
         }
+    }
+
+    pub(crate) fn is_known_simple_term(&self, file: &ProjectFile, name: &str) -> bool {
+        let package_name = self.inner.package_name_of(file).unwrap_or_default();
+        self.inner.all_declarations().any(|declaration| {
+            declaration.is_class()
+                && declaration.short_name().trim_end_matches('$') == name
+                && (declaration.source() == file || declaration.package_name() == package_name)
+        }) || self
+            .external_declaration_index()
+            .resolve_same_package(&package_name, name)
+            .is_some()
     }
 
     pub(crate) fn full_usage_edges(
@@ -724,6 +739,9 @@ impl ScalaAnalyzer {
 }
 
 fn scala_default_type_name(name: &str) -> bool {
+    if scala_standard_arity_type_name(name) {
+        return true;
+    }
     matches!(
         name,
         "Any"
@@ -756,7 +774,39 @@ fn scala_default_type_name(name: &str) -> bool {
             | "Iterable"
             | "Iterator"
             | "Product"
+            | "PartialFunction"
+            | "Matchable"
+            | "Dynamic"
+            | "Singleton"
+            | "AnyKind"
+            | "CanEqual"
+            | "ValueOf"
+            | "DummyImplicit"
+            | "RuntimeException"
+            | "Exception"
+            | "Throwable"
+            | "Error"
+            | "Object"
+            | "Class"
+            | "Number"
+            | "Math"
+            | "System"
+            | "StringBuilder"
     )
+}
+
+fn scala_standard_arity_type_name(name: &str) -> bool {
+    for prefix in ["Tuple", "Function", "ContextFunction"] {
+        if let Some(arity) = name
+            .strip_prefix(prefix)
+            .and_then(|value| value.parse::<u8>().ok())
+        {
+            if arity <= 22 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn weight_scala_usage_edges(
