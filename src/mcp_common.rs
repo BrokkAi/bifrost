@@ -23,7 +23,7 @@ const INTERNAL_ERROR: i64 = -32603;
 const RESOURCE_NOT_FOUND: i64 = -32002;
 const SERVER_BUSY: i64 = -32000;
 const GET_SUMMARIES_RESPONSE_BUDGET_BYTES: usize = 4_096;
-const MAX_IN_FLIGHT_QUERY_CODE_REQUESTS: usize = 4;
+const MAX_IN_FLIGHT_CANCELLABLE_REQUESTS: usize = 4;
 const MAX_PENDING_MCP_RESPONSES: usize = 4;
 const AGENTS_GUIDANCE_URI: &str = "bifrost://agent-guidance/agents.md";
 const AGENTS_GUIDANCE_MIME_TYPE: &str = "text/markdown";
@@ -104,7 +104,7 @@ impl McpRequestCancellations {
         if active.contains_key(&key) {
             return Err(McpRequestRegistrationError::DuplicateId);
         }
-        if active.len() >= MAX_IN_FLIGHT_QUERY_CODE_REQUESTS {
+        if active.len() >= MAX_IN_FLIGHT_CANCELLABLE_REQUESTS {
             return Err(McpRequestRegistrationError::AtCapacity);
         }
         if workspace_generation != current_workspace_generation {
@@ -358,7 +358,7 @@ pub fn run_stdio_server(
 
         let response = match serde_json::from_str::<Value>(&line) {
             Ok(message) => {
-                if let Some((id, params)) = cancellable_query_request(&message, spec) {
+                if let Some((id, params)) = cancellable_tool_request(&message, spec) {
                     match prepare_tool_call(
                         service.as_ref(),
                         &mut connection,
@@ -370,9 +370,9 @@ pub fn run_stdio_server(
                             Some(success_response(id, result))
                         }
                         Ok(ToolCallPreparation::Ready(call)) => {
-                            let workspace_generation = call
-                                .workspace_generation()
-                                .expect("query_code preparation captures a workspace generation");
+                            let workspace_generation = call.workspace_generation().expect(
+                                "cancellable tool preparation captures a workspace generation",
+                            );
                             let cancellation = match cancellations.register(
                                 &id,
                                 workspace_generation,
@@ -388,12 +388,12 @@ pub fn run_stdio_server(
                                         McpRequestRegistrationError::AtCapacity => (
                                             SERVER_BUSY,
                                             format!(
-                                                "too many in-flight query_code requests; maximum is {MAX_IN_FLIGHT_QUERY_CODE_REQUESTS}"
+                                                "too many in-flight cancellable tool requests; maximum is {MAX_IN_FLIGHT_CANCELLABLE_REQUESTS}"
                                             ),
                                         ),
                                         McpRequestRegistrationError::StaleWorkspace => (
                                             RESOURCE_NOT_FOUND,
-                                            "workspace changed before query_code could start; retry the request"
+                                            "workspace changed before the tool call could start; retry the request"
                                                 .to_string(),
                                         ),
                                     };
@@ -493,12 +493,13 @@ fn file_watching_enabled(value: Option<&OsStr>) -> Result<bool, String> {
     }
 }
 
-fn cancellable_query_request(message: &Value, spec: &McpServerSpec) -> Option<(Value, Value)> {
+fn cancellable_tool_request(message: &Value, spec: &McpServerSpec) -> Option<(Value, Value)> {
     let object = message.as_object()?;
+    let tool_name = message.pointer("/params/name").and_then(Value::as_str)?;
     if object.get("jsonrpc").and_then(Value::as_str) != Some(JSONRPC_VERSION)
         || object.get("method").and_then(Value::as_str) != Some("tools/call")
-        || message.pointer("/params/name").and_then(Value::as_str) != Some("query_code")
-        || !spec.tool_names.contains("query_code")
+        || !matches!(tool_name, "query_code" | "search_symbols")
+        || !spec.tool_names.contains(tool_name)
     {
         return None;
     }
@@ -518,11 +519,11 @@ fn spawn_cancellable_tool_call(
 ) -> Result<(), String> {
     let workspace_generation = call
         .workspace_generation()
-        .expect("background tool calls are workspace-scoped query_code requests");
+        .expect("background tool calls are workspace-scoped cancellable requests");
     let cleanup_id = id.clone();
     let cleanup_cancellations = cancellations.clone();
     let spawn_result = thread::Builder::new()
-        .name("bifrost-mcp-query-code".to_string())
+        .name("bifrost-mcp-cancellable-tool".to_string())
         .spawn(move || {
             let response =
                 match execute_prepared_tool_call(service.as_ref(), call, Some(&cancellation)) {
@@ -958,6 +959,7 @@ enum PreparedToolCall {
         name: String,
         arguments: Value,
         render_options: RenderOptions,
+        workspace_generation: u64,
     },
 }
 
@@ -965,7 +967,10 @@ impl PreparedToolCall {
     fn workspace_generation(&self) -> Option<u64> {
         match self {
             Self::QueryCode(prepared) => Some(prepared.workspace_generation()),
-            Self::Standard { .. } => None,
+            Self::Standard {
+                workspace_generation,
+                ..
+            } => Some(*workspace_generation),
         }
     }
 }
@@ -1041,6 +1046,7 @@ fn prepare_tool_call(
         render_options: RenderOptions {
             render_line_numbers: render_options.render_line_numbers,
         },
+        workspace_generation: service.workspace_generation(),
     }))
 }
 
@@ -1059,6 +1065,7 @@ fn execute_prepared_tool_call(
             name,
             arguments,
             render_options,
+            workspace_generation: _,
         } => {
             let output = service.call_tool_output_with_cancellation(
                 &name,
@@ -2131,10 +2138,10 @@ mod uri_tests {
     }
 
     #[test]
-    fn query_code_admission_is_bounded() {
+    fn cancellable_tool_admission_is_bounded() {
         let cancellations = McpRequestCancellations::default();
         let generation = 7;
-        for request in 0..MAX_IN_FLIGHT_QUERY_CODE_REQUESTS {
+        for request in 0..MAX_IN_FLIGHT_CANCELLABLE_REQUESTS {
             cancellations
                 .register(&json!(request), generation, generation)
                 .expect("request within the fixed admission cap");
@@ -2285,6 +2292,103 @@ mod uri_tests {
         assert_eq!(
             response.value["result"]["structuredContent"]["truncated"],
             true
+        );
+    }
+
+    #[test]
+    fn issue_1199_search_symbols_cancellation_reaches_background_tool_response() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub fn semantic_diagnostics() {}\n",
+        )
+        .expect("write source");
+        let service = Arc::new(
+            SearchToolsService::new_deferred_manual(dir.path().to_path_buf()).expect("service"),
+        );
+        let spec = build_server_spec(
+            "test",
+            vec![json!({
+                "name": "search_symbols",
+                "description": "test",
+                "inputSchema": { "type": "object" }
+            })],
+        )
+        .expect("server spec");
+        let message = json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "id": 43,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": {
+                    "patterns": ["semantic_diagnostics"],
+                    "include_tests": true,
+                    "limit": 100
+                }
+            }
+        });
+        let (request_id, params) =
+            cancellable_tool_request(&message, &spec).expect("search_symbols is cancellable");
+        let mut connection = McpConnectionState::new(false);
+        let call = match prepare_tool_call(
+            service.as_ref(),
+            &mut connection,
+            params,
+            McpRenderOptions::default(),
+            &spec,
+        )
+        .expect("prepare search_symbols")
+        {
+            ToolCallPreparation::Ready(call) => call,
+            ToolCallPreparation::Reply(reply) => panic!("unexpected immediate reply: {reply}"),
+        };
+        let workspace_generation = call
+            .workspace_generation()
+            .expect("standard cancellable call is workspace scoped");
+        let cancellations = McpRequestCancellations::default();
+        let cancellation = cancellations
+            .register(
+                &request_id,
+                workspace_generation,
+                service.workspace_generation(),
+            )
+            .expect("unique request registers");
+        assert!(
+            handle_notification(
+                service.as_ref(),
+                &mut connection,
+                &cancellations,
+                "notifications/cancelled",
+                json!({ "requestId": request_id }),
+            )
+            .is_none()
+        );
+
+        let (response_sender, response_receiver) = mpsc::sync_channel(1);
+        spawn_cancellable_tool_call(
+            Arc::clone(&service),
+            call,
+            request_id,
+            cancellation,
+            cancellations,
+            response_sender,
+        )
+        .expect("background request starts");
+        let response = response_receiver
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("background request responds");
+
+        assert_eq!(
+            response.value["result"]["structuredContent"]["truncated"],
+            true
+        );
+        assert!(
+            response.value["result"]["structuredContent"]["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("cancelled")),
+            "{}",
+            response.value
         );
     }
 }
