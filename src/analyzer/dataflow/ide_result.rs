@@ -81,6 +81,56 @@ impl IdePointValue {
     }
 }
 
+/// One symbolic transfer from a caller-relative summary entry to a callee entry.
+///
+/// The edge function is relative to `source`: it includes the caller jump to the
+/// call state and the call-flow function entering `target`. Clients can compose
+/// these rows with callee-relative observations without materializing a concrete
+/// IDE value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdeEntryTransfer {
+    source: SummaryEntry,
+    target: SummaryEntry,
+    path_qualities: PathQualityFrontier,
+    edge_function: IdeEdgeFunctionId,
+}
+
+impl IdeEntryTransfer {
+    pub(crate) const fn new(
+        source: SummaryEntry,
+        target: SummaryEntry,
+        path_qualities: PathQualityFrontier,
+        edge_function: IdeEdgeFunctionId,
+    ) -> Self {
+        Self {
+            source,
+            target,
+            path_qualities,
+            edge_function,
+        }
+    }
+
+    pub const fn source(&self) -> &SummaryEntry {
+        &self.source
+    }
+
+    pub const fn target(&self) -> &SummaryEntry {
+        &self.target
+    }
+
+    pub const fn path_qualities(&self) -> PathQualityFrontier {
+        self.path_qualities
+    }
+
+    pub(crate) const fn edge_function_id(&self) -> IdeEdgeFunctionId {
+        self.edge_function
+    }
+
+    pub(crate) fn remap_edge_function(&mut self, id: IdeEdgeFunctionId) {
+        self.edge_function = id;
+    }
+}
+
 /// Deterministic IDE-only work and reuse counters.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IdeMetrics {
@@ -151,6 +201,7 @@ pub struct IdeSummaryDataflowResult<Fact, Value, EdgeFunction> {
     values: Box<[Value]>,
     reached_jump_functions: Box<[Option<IdeEdgeFunctionId>]>,
     end_summary_jump_functions: Box<[Option<IdeEdgeFunctionId>]>,
+    entry_transfers: Box<[IdeEntryTransfer]>,
     point_values: Box<[IdePointValue]>,
     termination: SolverTermination,
     work: SolverWork,
@@ -166,6 +217,7 @@ impl<Fact, Value, EdgeFunction> IdeSummaryDataflowResult<Fact, Value, EdgeFuncti
         values: Vec<Value>,
         reached_jump_functions: Vec<Option<IdeEdgeFunctionId>>,
         end_summary_jump_functions: Vec<Option<IdeEdgeFunctionId>>,
+        entry_transfers: Vec<IdeEntryTransfer>,
         point_values: Vec<IdePointValue>,
         termination: SolverTermination,
         work: SolverWork,
@@ -183,6 +235,7 @@ impl<Fact, Value, EdgeFunction> IdeSummaryDataflowResult<Fact, Value, EdgeFuncti
             values: values.into_boxed_slice(),
             reached_jump_functions: reached_jump_functions.into_boxed_slice(),
             end_summary_jump_functions: end_summary_jump_functions.into_boxed_slice(),
+            entry_transfers: entry_transfers.into_boxed_slice(),
             point_values: point_values.into_boxed_slice(),
             termination,
             work,
@@ -233,6 +286,13 @@ impl<Fact, Value, EdgeFunction> IdeSummaryDataflowResult<Fact, Value, EdgeFuncti
             .iter()
             .zip(self.end_summary_jump_functions.iter().copied())
             .filter_map(|(summary, function)| Some((summary, self.edge_function(function?)?)))
+    }
+
+    pub fn entry_transfers(&self) -> impl Iterator<Item = (&IdeEntryTransfer, &EdgeFunction)> {
+        self.entry_transfers.iter().filter_map(|transfer| {
+            self.edge_function(transfer.edge_function)
+                .map(|function| (transfer, function))
+        })
     }
 
     pub const fn coverage(&self) -> &SummaryCoverage {

@@ -1,9 +1,11 @@
 use std::{collections::BTreeSet, error::Error, fmt, sync::Arc};
 
 use crate::analyzer::dataflow::{
-    PathQualityFrontier, SummaryEntry, SummaryWitnessError, WitnessReconstructionLimits,
+    PathQualityFrontier, SummaryWitnessError, WitnessReconstructionLimits,
 };
-use crate::analyzer::semantic::{SemanticArtifactKey, SemanticLocator};
+use crate::analyzer::semantic::{
+    ProcedureHandle, ProgramPointHandle, SemanticArtifactKey, SemanticLocator,
+};
 use crate::analyzer::value_flow::{ValueFlowCarrierKey, ValueFlowEventKey, ValueFlowSinkId};
 
 use super::{
@@ -40,6 +42,32 @@ pub struct TaintOriginStatus {
     witness_unavailable: bool,
 }
 
+/// Stable semantic entry attached to one finding.
+///
+/// This retains the sink-owning procedure and its live entry fact rather than
+/// a query-local `FactId`, so cached transitive observations and uncached
+/// callee observations compare identically after actual-to-formal remapping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaintFindingEntry {
+    procedure: ProcedureHandle,
+    point: ProgramPointHandle,
+    fact: super::TaintFact,
+}
+
+impl TaintFindingEntry {
+    pub const fn procedure(&self) -> &ProcedureHandle {
+        &self.procedure
+    }
+
+    pub const fn point(&self) -> &ProgramPointHandle {
+        &self.point
+    }
+
+    pub const fn fact(&self) -> super::TaintFact {
+        self.fact
+    }
+}
+
 impl TaintOriginStatus {
     pub const fn origins(&self) -> &[SourceEventKey] {
         &self.origins
@@ -67,7 +95,7 @@ pub struct TaintFinding {
     key: TaintFindingKey,
     sink: ValueFlowSinkId,
     classes: TaintClassSet,
-    entry: SummaryEntry,
+    entry: TaintFindingEntry,
     path_qualities: PathQualityFrontier,
     proven: bool,
     complete: bool,
@@ -87,7 +115,7 @@ impl TaintFinding {
         &self.classes
     }
 
-    pub const fn entry(&self) -> &SummaryEntry {
+    pub const fn entry(&self) -> &TaintFindingEntry {
         &self.entry
     }
 
@@ -163,11 +191,21 @@ pub fn collect_taint_findings(
             .value_flow()
             .sink(sink)
             .ok_or(TaintFindingError::InvalidResult)?;
-        let entry = point_value.entry().clone();
-        let entry_fact = *result
+        let reached_entry = point_value.entry();
+        let reached_entry_fact = *result
             .fact_result()
-            .fact(entry.entry_fact())
+            .fact(reached_entry.entry_fact())
             .ok_or(TaintFindingError::InvalidResult)?;
+        let entry_fact = fact.meeting_entry_fact().unwrap_or(reached_entry_fact);
+        let entry_procedure = sink_spec.point().procedure().clone();
+        let entry_point = entry_procedure
+            .point_handle(entry_procedure.semantics().entry_point())
+            .ok_or(TaintFindingError::InvalidResult)?;
+        let entry = TaintFindingEntry {
+            procedure: entry_procedure,
+            point: entry_point,
+            fact: entry_fact,
+        };
         let entry_carrier = entry_fact
             .carrier()
             .map(|carrier| {
@@ -181,10 +219,13 @@ pub fn collect_taint_findings(
             universe: plan.universe().hash(),
             snapshot: plan.value_flow().root().artifact().key().clone(),
             sink: sink_spec.key().clone(),
-            entry: point_locator(entry.entry_point())?,
+            entry: point_locator(entry.point())?,
             entry_carrier,
             entry_uncertain: entry_fact.is_uncertain(),
-            meeting_site: point_locator(point_value.point())?,
+            // A meeting fact is materialized on the edge leaving the sink
+            // point, so its reached point is an implementation detail rather
+            // than the semantic observation site.
+            meeting_site: sink_spec.key().site().clone(),
             meeting_uncertain: fact.is_uncertain(),
         };
         let origins = reconstruct_origins(

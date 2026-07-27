@@ -26,7 +26,10 @@ The first working milestone does not add a database table. It defines the stable
 - [x] (2026-07-26 22:36Z) Implemented Milestone 2: stable protocol keys/facts/effects, exact entry-manifest lookup, bounded complete-result projection, reusable solver injection, caller-local witness continuity, and atomic protocol SCC publication.
 - [x] (2026-07-26 22:36Z) Completed repeated security, intent, and architecture reviews for Milestone 2; remediated every Critical/High finding and received final passes with no unresolved Critical or High issue.
 - [x] (2026-07-26 22:36Z) Validated Milestone 2 with 15 reusable-summary, 23 IDE, 29 query-local summary, 8 typestate-binding, 37 typestate-client, and 13 typestate-protocol tests plus formatting, diff, library all-feature compilation, and strict pinned all-target/all-feature Clippy.
-- [ ] Integrate Milestone 3 only after #821 lands: symbolic taint-transfer summaries and their split invalidation keys.
+- [x] (2026-07-27 00:47Z) Implemented Milestone 3: stable taint fact/function/source/propagation/observer keys, exact dependency closures, symbolic entry-to-exit transfers, transitive sink-neutral observation ports, live sink overlays, complete-only bounded repositories, and atomic SCC publication.
+- [x] (2026-07-27 01:17Z) Validated Milestone 3 with 15 reusable-summary, 24 IDE, 25 taint-client, 37 typestate-client, and 10 value-flow-client tests, plus 52 adjacent dataflow tests, formatting, diff, all-feature compilation, and strict pinned all-target/all-feature Clippy.
+- [x] (2026-07-27 01:17Z) Completed repeated Milestone 3 architecture, intent, and security reviews; fixed every Critical/High finding, including entry attribution across call/return edges and a quadratic replay scan, and received final clean delta reviews.
+- [ ] Checkpoint Milestone 3 and rebase it onto the fetched `origin/master` commit `105f2448` without touching `.brokk/`.
 - [ ] Run Milestone 4 lifecycle measurements and record the promotion decision; implement packed SQLite persistence only if the evidence passes #817's predeclared gates.
 
 ## Surprises & Discoveries
@@ -66,6 +69,21 @@ The first working milestone does not add a database table. It defines the stable
 
 - Observation: semantic summary context cannot be selected from a call site after query-local entry deduplication.
   Evidence: the tabulator keys reusable entries by procedure, entry point, and fact. The generic provider therefore promises a context-independent relation for that identity, while `ProtocolSemanticSummarySet` rejects more than one semantic context for the same artifact/declaration.
+
+- Observation: a transitive client observation cannot be flattened exactly from only the outer summary entry and the observed point.
+  Evidence: a wrapper actual carrier is remapped to a callee formal carrier at the call boundary. `TaintObservedPort` therefore retains both the outer reusable entry and the callee-local stable semantic entry fact, procedure, and point; cached and uncached findings then normalize to the same sink-owning procedure entry.
+
+- Observation: sink policy is independently mutable, but reusable transfer rows still need a stable semantic observation location.
+  Evidence: sink acceptance, message, CWE, CVSS, and report limits are absent from the transfer key. Cached observation ports retain a policy-neutral carrier/location/function and hydrate the current plan's sink overlay only during the current solve.
+
+- Observation: bounding only emitted live-overlay rows leaves adversarial candidate construction and observer products unbounded.
+  Evidence: cached observation hydration now caps retained rows, checks cancellation, and reserves work for every local-rule scan, observer/candidate comparison, edge-function operation, and emitted row before allocation or algebra.
+
+- Observation: side observations made while evaluating an interprocedural edge need the source summary's entry identity before the ordinary output crosses into another procedure.
+  Evidence: `DataflowEdge` now carries an optional fact-typed summary entry context. Every summary evaluation attaches it, taint meetings retain it, IDE trace capture keys it exactly, and matched-return replay uses the callee end-summary entry rather than the caller continuation entry.
+
+- Observation: making transfer capture entry-exact can turn replay quadratic if sources remain indexed only by point and input fact.
+  Evidence: IDE replay now builds and queries a direct `(point, input fact, entry fact)` source index. Multi-entry records no longer filter a shared bucket, so rejected comparisons cannot bypass the work budget.
 
 ## Decision Log
 
@@ -113,6 +131,14 @@ The first working milestone does not add a database table. It defines the stable
   Rationale: projection cancellation, projection size limits, repository capacity, and overlap conflicts return explicit cache statuses while preserving the computed result. Summaries with unavailable outer-entry effect mappings fail closed and are not published.
   Date/Author: 2026-07-26 / Codex
 
+- Decision: separate taint propagation identity from sink observation and presentation identity.
+  Rationale: sources, sanitizers, transforms, unknown-call semantics, access paths, execution context, and transitive dependency closures affect reusable transfer behavior. Sink acceptance and presentation affect only the live reporting overlay, so changing them must reuse the same transfer while re-evaluating the current sink policy.
+  Date/Author: 2026-07-27 / Codex
+
+- Decision: construct taint dependency contracts once as an SCC-collapsed graph with memoized transitive closures.
+  Rationale: exact dependency validity is required for every reusable member, but rebuilding and cloning closure rows per query or per member would make the validation path quadratic. Shared immutable contracts retain exact closure identity while keeping construction iterative, bounded, and stack-safe.
+  Date/Author: 2026-07-27 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 now supplies the reusable semantic foundation without adding global state or persistence. Exact keys include semantic artifact validity, declaration, schema, execution semantics, context, behavior, origin, dependency closure, and the full recursive-group closure. Composition derives its own dependency identity, preserves effects from reachable non-returning callees, distinguishes alternative joins from sequential conjunction, and is deterministic across association for the complete semantic payload. The repository publishes only complete entries, validates exact dependencies, validates explicit recursive topology as a real SCC, preflights whole batches atomically, accounts retained bytes, and supports owner-driven generation rotation.
@@ -120,6 +146,8 @@ Milestone 1 now supplies the reusable semantic foundation without adding global 
 Focused `reusable_summaries` validation passes 15 behavior tests, including source/external/dependency invalidation, keyed composition-root identity, full-summary associativity, maximum-size idempotence, bounded composition work, non-returning effect preservation, complete-only publication, recursive closure invalidation, non-SCC rejection, composed SCC publication, byte capacity, and atomicity. The adjacent `dataflow_summaries` (27 tests) and `dataflow_ide` (23 tests) suites also pass. Strict `--all-targets --all-features` Clippy passes through the pinned Rust 1.96 toolchain, and the final specialist delta reviews found no unresolved Critical or High issue. Commit `eb7370df` is the reviewed Milestone 1 checkpoint; Milestone 2 begins from that stable foundation.
 
 Milestone 2 now projects complete typestate results into stable protocol-branded entry-to-exit relations and observed effects, remaps them through validated live protocols and binding plans, and injects compatible cached callees into the existing tabulator without changing the no-repository path. Lookup uses exact entry manifests and procedure-scoped binding contracts; recursive groups share a validated member-closure contract and publish atomically. The current sound boundary is explicit: dependency-bearing nonrecursive procedures and effectful recursive SCCs remain live-solve-only until the semantic layer exposes an exact nested-effect-to-outer-entry map. Optional projection, capacity, and conflict failures preserve the completed analysis. Focused validation passes 125 tests across the six affected suites, strict all-target/all-feature Clippy passes, and final security, intent, and architecture reviews report no unresolved Critical or High finding.
+
+Milestone 3 now projects complete taint IDE results into stable carrier and edge-function relations, composes exact generic entry transfers across nested calls, and retains policy-neutral internal observations for later live sink evaluation. Stable taint universes survive dense-bit remapping; exact propagation, context, artifact, dependency, and recursive-group identities produce safe hits and misses; partial, cancelled, over-budget, oversized, conflicting, or incomplete work never publishes as complete. The dependency-bearing wrapper regression proves exact cached/uncached finding parity at the callee's formal entry, while dedicated call-site and callee-exit regressions prove that observations crossing interprocedural edges retain their owning entry. Focused isolated validation passes 111 tests across the five affected suites, 52 adjacent dataflow tests pass, strict pinned all-target/all-feature Clippy passes, and final security, intent, and architecture reviews report no unresolved Critical or High finding.
 
 ## Context and Orientation
 

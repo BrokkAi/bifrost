@@ -637,7 +637,7 @@ impl<'plan> TypestateFlowProblem<'plan> {
 
     fn transfer(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, TypestateFact>,
         fact: TypestateFact,
         family: TransferFamily,
         out: &mut dyn DataflowOutput<TypestateFact>,
@@ -673,7 +673,7 @@ impl<'plan> TypestateFlowProblem<'plan> {
 
     fn transfer_facts(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, TypestateFact>,
         family: TransferFamily,
         facts: Vec<TypestateFact>,
         out: &mut dyn DataflowOutput<TypestateFact>,
@@ -1372,7 +1372,7 @@ impl DistributiveDataflowProblem for TypestateFlowProblem<'_> {
 
     fn normal_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -1381,7 +1381,7 @@ impl DistributiveDataflowProblem for TypestateFlowProblem<'_> {
 
     fn call_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -1390,7 +1390,7 @@ impl DistributiveDataflowProblem for TypestateFlowProblem<'_> {
 
     fn return_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -1399,7 +1399,7 @@ impl DistributiveDataflowProblem for TypestateFlowProblem<'_> {
 
     fn call_to_return_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -1408,7 +1408,7 @@ impl DistributiveDataflowProblem for TypestateFlowProblem<'_> {
 
     fn exceptional_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {

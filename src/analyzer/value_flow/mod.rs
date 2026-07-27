@@ -15,6 +15,7 @@ pub use model::{
     ValueFlowScopedRootKind, ValueFlowSelectorKey, ValueFlowSinkId, ValueFlowSinkSpec,
     ValueFlowSourceId, ValueFlowSourceSpec,
 };
+pub(crate) use plan::ValueFlowCarrierSummaryIdentity;
 pub use plan::{ValueFlowInput, ValueFlowPlan, ValueFlowPlanError, ValueFlowPlanLimits};
 pub use result::{
     ValueFlowMayStatus, ValueFlowMeeting, ValueFlowMustStatus, ValueFlowSinkOutcome,

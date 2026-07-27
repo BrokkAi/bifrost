@@ -57,7 +57,7 @@ impl DistributiveDataflowProblem for MarkerProblem {
 
     fn normal_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -70,7 +70,7 @@ impl DistributiveDataflowProblem for MarkerProblem {
 
     fn call_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -79,7 +79,7 @@ impl DistributiveDataflowProblem for MarkerProblem {
 
     fn return_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -93,7 +93,7 @@ impl DistributiveDataflowProblem for MarkerProblem {
 
     fn call_to_return_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -107,7 +107,7 @@ impl DistributiveDataflowProblem for MarkerProblem {
 
     fn exceptional_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -146,7 +146,7 @@ impl DistributiveDataflowProblem for KillProblem {
 
     fn normal_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         _out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -154,7 +154,7 @@ impl DistributiveDataflowProblem for KillProblem {
 
     fn call_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         _out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -162,7 +162,7 @@ impl DistributiveDataflowProblem for KillProblem {
 
     fn return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         _out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -170,7 +170,7 @@ impl DistributiveDataflowProblem for KillProblem {
 
     fn call_to_return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         _out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -178,7 +178,7 @@ impl DistributiveDataflowProblem for KillProblem {
 
     fn exceptional_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         _out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -227,7 +227,7 @@ impl DistributiveDataflowProblem for PermutedProblem {
 
     fn normal_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -236,7 +236,7 @@ impl DistributiveDataflowProblem for PermutedProblem {
 
     fn call_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -245,7 +245,7 @@ impl DistributiveDataflowProblem for PermutedProblem {
 
     fn return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -254,7 +254,7 @@ impl DistributiveDataflowProblem for PermutedProblem {
 
     fn call_to_return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -263,7 +263,7 @@ impl DistributiveDataflowProblem for PermutedProblem {
 
     fn exceptional_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {

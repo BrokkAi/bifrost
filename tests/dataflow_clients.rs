@@ -56,7 +56,7 @@ impl DistributiveDataflowProblem for GeneratingProblem {
 
     fn normal_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -65,7 +65,7 @@ impl DistributiveDataflowProblem for GeneratingProblem {
 
     fn call_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -74,7 +74,7 @@ impl DistributiveDataflowProblem for GeneratingProblem {
 
     fn return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -83,7 +83,7 @@ impl DistributiveDataflowProblem for GeneratingProblem {
 
     fn call_to_return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -92,7 +92,7 @@ impl DistributiveDataflowProblem for GeneratingProblem {
 
     fn exceptional_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -127,7 +127,7 @@ impl DistributiveDataflowProblem for CancelOnTransferProblem {
 
     fn normal_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -136,7 +136,7 @@ impl DistributiveDataflowProblem for CancelOnTransferProblem {
 
     fn call_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -145,7 +145,7 @@ impl DistributiveDataflowProblem for CancelOnTransferProblem {
 
     fn return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -154,7 +154,7 @@ impl DistributiveDataflowProblem for CancelOnTransferProblem {
 
     fn call_to_return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -163,7 +163,7 @@ impl DistributiveDataflowProblem for CancelOnTransferProblem {
 
     fn exceptional_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -191,7 +191,7 @@ impl DistributiveDataflowProblem for SeedBurstProblem {
 
     fn normal_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         _out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -199,7 +199,7 @@ impl DistributiveDataflowProblem for SeedBurstProblem {
 
     fn call_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         _out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -207,7 +207,7 @@ impl DistributiveDataflowProblem for SeedBurstProblem {
 
     fn return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         _out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -215,7 +215,7 @@ impl DistributiveDataflowProblem for SeedBurstProblem {
 
     fn call_to_return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         _out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -223,7 +223,7 @@ impl DistributiveDataflowProblem for SeedBurstProblem {
 
     fn exceptional_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         _out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -267,7 +267,7 @@ impl DistributiveDataflowProblem for TransferBurstProblem {
 
     fn normal_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -276,7 +276,7 @@ impl DistributiveDataflowProblem for TransferBurstProblem {
 
     fn call_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -285,7 +285,7 @@ impl DistributiveDataflowProblem for TransferBurstProblem {
 
     fn return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -294,7 +294,7 @@ impl DistributiveDataflowProblem for TransferBurstProblem {
 
     fn call_to_return_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -303,7 +303,7 @@ impl DistributiveDataflowProblem for TransferBurstProblem {
 
     fn exceptional_flow(
         &self,
-        _edge: DataflowEdge<'_>,
+        _edge: DataflowEdge<'_, Self::Fact>,
         _fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {

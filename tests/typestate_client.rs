@@ -1055,7 +1055,7 @@ impl DataflowOutput<TypestateFact> for PollingOutput {
 
 fn transfer(
     problem: &TypestateFlowProblem<'_>,
-    edge: DataflowEdge<'_>,
+    edge: DataflowEdge<'_, TypestateFact>,
     fact: TypestateFact,
     family: TestTransfer,
 ) -> Vec<TypestateFact> {

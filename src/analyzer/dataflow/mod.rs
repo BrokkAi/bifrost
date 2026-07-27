@@ -28,11 +28,12 @@ pub use budget::{
 pub use direct::{DirectFact, DirectFlowProblem};
 pub use ide::{
     IdeDataflowProblem, IdeDataflowSeed, IdeSummarySolveInput, IdeTransition,
-    solve_ide_with_summaries,
+    ReusableIdeEndSummary, ReusableIdeProcedureSummary, ReusableIdeReachedFact,
+    ReusableIdeSummaryProvider, solve_ide_with_reusable_summaries, solve_ide_with_summaries,
 };
 pub use ide_result::{
-    IdeDataflowError, IdeEdgeFunctionId, IdeMetrics, IdePointValue, IdeSummaryDataflowResult,
-    IdeValueId,
+    IdeDataflowError, IdeEdgeFunctionId, IdeEntryTransfer, IdeMetrics, IdePointValue,
+    IdeSummaryDataflowResult, IdeValueId,
 };
 pub use input::{DataflowError, IcfgInputStatus, IcfgSolveInput, SemanticInputStatus};
 pub use problem::{

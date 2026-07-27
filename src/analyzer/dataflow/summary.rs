@@ -1329,7 +1329,9 @@ where
                 let incoming_quality = queued
                     .quality
                     .through_evidence(&edge.proof, &edge.completeness);
-                let descriptor = descriptor(&edge).with_call_transfer(transfer);
+                let descriptor = descriptor(&edge)
+                    .with_call_transfer(transfer)
+                    .with_summary_entry_fact(self.facts[queued.key.entry.entry_fact.index()]);
                 let outputs = match evaluate_transfer(
                     problem,
                     descriptor,
@@ -1451,7 +1453,7 @@ where
         }
         let output_quality = input_quality.through_evidence(&edge.proof, &edge.completeness);
         let target = edge.target.id();
-        let flow = descriptor(edge);
+        let flow = descriptor(edge).with_summary_entry_fact(self.facts[entry.entry_fact.index()]);
         let outputs = match evaluate_transfer(
             problem,
             flow,
@@ -2474,11 +2476,15 @@ where
         if let Some(termination) = reserve_summary_application(request) {
             return Ok(Some(termination));
         }
-        let (caller, exit_fact) = {
+        let (caller, summary_entry_fact, exit_fact) = {
             let incoming = &self.incoming[incoming_id];
             let summary = &self.summaries[summary_id];
             debug_assert_eq!(incoming.key.callee, summary.key.entry);
-            (incoming.key.caller, summary.key.exit_fact)
+            (
+                incoming.key.caller,
+                summary.key.entry.entry_fact,
+                summary.key.exit_fact,
+            )
         };
         let Some(projection) = self.matched_return_projection(incoming_id, summary_id, request)?
         else {
@@ -2512,7 +2518,8 @@ where
                     .conjoin(summary_quality)
                     .through_evidence(edge.proof(), edge.completeness());
                 let target = edge.target().id();
-                let flow = summary_descriptor(edge);
+                let flow = summary_descriptor(edge)
+                    .with_summary_entry_fact(self.facts[summary_entry_fact.index()]);
                 let outputs = match evaluate_transfer(
                     problem,
                     flow,
@@ -2771,7 +2778,7 @@ fn canonicalize_call_transfer_set(mut set: CallTransferSet) -> CallTransferSet {
     set
 }
 
-fn descriptor(edge: &ProcedureIcfgEdge) -> DataflowEdge<'_> {
+fn descriptor<Fact>(edge: &ProcedureIcfgEdge) -> DataflowEdge<'_, Fact> {
     let descriptor = DataflowEdge::new(
         edge.kind,
         edge.origin.as_ref(),
@@ -2786,7 +2793,7 @@ fn descriptor(edge: &ProcedureIcfgEdge) -> DataflowEdge<'_> {
     }
 }
 
-fn summary_descriptor(edge: &SummaryEdge) -> DataflowEdge<'_> {
+fn summary_descriptor<Fact>(edge: &SummaryEdge) -> DataflowEdge<'_, Fact> {
     DataflowEdge::new(
         edge.kind(),
         edge.origin(),
