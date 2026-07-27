@@ -249,7 +249,9 @@ fn ruby_semantic_diagnostics_bound_large_require_closures() {
 
 #[test]
 fn ruby_semantic_diagnostics_bound_required_source_bytes() {
-    let oversized_dependency = "# generated\n".repeat(200_000);
+    // Keep this source just over the 2 MiB visibility cap without creating
+    // hundreds of thousands of syntax nodes during project initialization.
+    let oversized_dependency = "#".repeat(2 * 1024 * 1024 + 1);
     assert_eq!(
         diagnostic_count(
             &[
