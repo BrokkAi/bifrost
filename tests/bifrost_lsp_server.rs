@@ -7806,6 +7806,19 @@ fn bifrost_lsp_server_cpp_semantic_diagnostics_require_context_and_opt_in() {
 
     server.notify_value(json!({
         "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": source_uri}}
+    }));
+    let initially_published = server.read_notification("textDocument/publishDiagnostics");
+    assert!(
+        initially_published["params"]["diagnostics"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "default-off C++ diagnostics must publish an empty report: {initially_published}"
+    );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
         "method": "workspace/didChangeConfiguration",
         "params": {"settings": {"unrecognizedSymbolDiagnostics": true}}
     }));
