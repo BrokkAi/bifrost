@@ -258,7 +258,7 @@ comes through the local gate, but is not the focus.
   witnesses are consistent at both production sites. Their JSONL SHA-256
   values are `cbe3c35d9a8854e9777fffc50374c07e937e9341b11617f423ca3954fd7943ff`
   and `d3235279aa764e0a515ce9ec1cc74e0270ef61173b4f2596625478eb354ea60a`.
-- [ ] (2026-07-27) The authoritative post-#1208 C++ top-ten replay at clean
+- [x] (2026-07-27) The post-#1208 C++ top-ten replay at clean
   head `8d62804b` completed all ten task-selected envelopes in 1:49:05 at
   niceness 10. All records have clean Bifrost and corpus heads, no file errors,
   no candidate-limit escapes, and one shared fingerprint. Raw missing fell
@@ -270,6 +270,23 @@ comes through the local gate, but is not the focus.
   `/mnt/optane/tmp/bifrost-fird/cpp-task-top10-8d62804b-missing.tsv`, with
   SHA-256 values `a971c2bbdad85dd5c3228c1e4cda9d207a6349f9d05a93c4ff73ac274af6fe1b`
   and `32f3a55dfa2a1b1427a3e7b26cd7da6ef54dafb82079da9c5020e18f37860c45`.
+  This is complete historical evidence but not an acceptance artifact: an
+  exact log4cxx range resolved correctly in same-head ephemeral mode while the
+  persisted envelope returned the pre-#1208 synthetic declaration identity.
+- [x] (2026-07-27) Reopened assigned issue #1208 after proving the persisted
+  C++ epoch still accepted pre-fix parsed blobs. Added a C++-scoped epoch salt
+  for the recovered typedef-base identity change and an exact store regression
+  that reconstructs the previously accepted corpus epoch
+  `098fd5644803843b42c6da3dea0ddea7f5036faf404414d146a9021ed6d265f9`,
+  writes a parsed blob under it, switches through the public current-epoch
+  path, and proves the stale blob is invisible. An independent Oldskool review
+  found no actionable issue. Formatting, all-target/all-feature Clippy, the
+  focused regression, and the complete `cargo test --features nlp,python`
+  matrix are green outside the sandbox at niceness 10 with the normal Cargo
+  target; the matrix skipped only the separately known hanging Ruby LSP test.
+- [ ] Publish the #1208 epoch correction, rebuild from the exact integrated
+  head, and rerun the complete persisted C++ top ten from the new epoch before
+  treating any of the 152 prior rows as current defects.
 - [ ] Complete C++ and publish its evidence and user summary.
 - [ ] Complete C# and publish its evidence and user summary.
 - [ ] Complete Go and publish its evidence and user summary.
@@ -396,6 +413,14 @@ comes through the local gate, but is not the focus.
   this at the admission boundary with one weakly retained mutex per canonical
   cache path; SQLite transactions still provide cross-process correctness.
 
+- A clean Bifrost Git head is not sufficient when a language-specific semantic
+  change fails to advance that language's analysis epoch. The post-#1208
+  persisted log4cxx envelope reused declaration rows whose accepted C++ epoch
+  was `098fd5644803843b42c6da3dea0ddea7f5036faf404414d146a9021ed6d265f9`;
+  an ephemeral run over the identical file and byte range produced the correct
+  `LOG4CXX_NS::spi.Filter` identity. Therefore all 152 residual rows from that
+  envelope are untrusted until a new C++ epoch forces a full persisted rebuild.
+
 ## Decision Log
 
 - Decision: Use the live `SFT_PREDICATES` selector and stable descending task
@@ -459,6 +484,15 @@ comes through the local gate, but is not the focus.
   target-specific resolution; and the decisive unfiltered libgit2 replay
   completed every target with exact accounting and zero missing rows.
   Date/Author: 2026-07-25 / Codex
+
+- Decision: Invalidate the persisted C++ analysis generation for #1208 and
+  discard the 152-row post-fix replay as acceptance evidence.
+  Rationale: Same-head persisted and ephemeral queries disagree at the exact
+  log4cxx witness because the cache still contains the old fabricated
+  `LevelRangeFilter$Filter` declaration. Auditing or fixing those rows before a
+  language-epoch cutover would turn stale cache artifacts into false product
+  work.
+  Date/Author: 2026-07-27 / Codex
 
 ## Outcomes & Retrospective
 
