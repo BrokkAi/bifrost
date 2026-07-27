@@ -37,6 +37,9 @@ The feature must prefer silence to an incorrect editor error. Missing, malformed
 - Observation: an unparsed system or forced header can supply arbitrary declarations, so it invalidates the proof needed to report even an apparently simple missing type.
   Evidence: the collector returns no diagnostics when `-isystem` or `-include` context is present, and it accepts only a unique quoted project-header path through the configured roots.
 
+- Observation: the local focused test command did not expose warnings promoted to errors by CI's target-specific clippy matrix.
+  Evidence: PR #1202's Linux clippy job reported two unused imports and an anonymous node-lifetime mismatch in `src/analyzer/cpp/diagnostics.rs`.
+
 ## Decision Log
 
 - Decision: make compile context diagnostics-only and do not extend `src/analyzer/cpp/imports.rs`.
@@ -176,3 +179,5 @@ Plan revision (2026-07-27): Milestone 1 now has a tested fail-closed loader. Hea
 Plan revision (2026-07-27): completed the loader and collector. The collector now calculates the header closure through tree-sitter `preproc_include` nodes, so the remaining work is the LSP integration proof and the full validation suite rather than a change to the diagnostic contract.
 
 Plan revision (2026-07-27): completed the LSP integration proof, documentation, clippy, and feature-enabled full test suite. The plan is complete; future work should begin from the intentionally conservative exclusions recorded here rather than widening the collector silently.
+
+Plan revision (2026-07-27): corrected the post-PR CI-only clippy failures by removing unused imports and tying the traversal helper's node and stack lifetimes explicitly. Re-run the full target-aware clippy gate before treating this plan as complete again.

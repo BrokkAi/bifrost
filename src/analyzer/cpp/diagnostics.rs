@@ -4,7 +4,6 @@ use crate::analyzer::tree_sitter_analyzer::collect_parse_errors;
 use crate::analyzer::{IAnalyzer, ProjectFile, SemanticDiagnostic};
 use crate::hash::HashSet;
 use crate::text_utils::compute_line_starts;
-use std::path::PathBuf;
 use tree_sitter::{Node, Parser, Tree};
 
 pub(crate) const CPP_UNRECOGNIZED_SYMBOL: &str = "cpp_unrecognized_symbol";
@@ -190,7 +189,7 @@ fn is_plain_type_reference(node: Node<'_>) -> bool {
     true
 }
 
-fn push_named_children(stack: &mut Vec<Node<'_>>, node: Node<'_>) {
+fn push_named_children<'tree>(stack: &mut Vec<Node<'tree>>, node: Node<'tree>) {
     let mut cursor = node.walk();
     let children: Vec<_> = node.named_children(&mut cursor).collect();
     stack.extend(children.into_iter().rev());
@@ -199,7 +198,7 @@ fn push_named_children(stack: &mut Vec<Node<'_>>, node: Node<'_>) {
 #[cfg(test)]
 mod tests {
     use super::{CPP_UNRECOGNIZED_SYMBOL, collect_cpp_semantic_diagnostics};
-    use crate::analyzer::{CppAnalyzer, IAnalyzer, Language, ProjectFile, TestProject};
+    use crate::analyzer::{CppAnalyzer, Language, ProjectFile, TestProject};
 
     fn analyzer_fixture(files: &[(&str, &str)]) -> (tempfile::TempDir, CppAnalyzer, ProjectFile) {
         let temp = tempfile::tempdir().expect("temp dir");
