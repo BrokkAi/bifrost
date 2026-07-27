@@ -315,8 +315,19 @@ pub trait LanguageAdapter: Send + Sync + 'static {
         crate::analyzer::parser_language_for_path(self.language(), file.rel_path())
             .expect("analyzable language must have a registered parser grammar")
     }
-    fn storage_language_key_for_file(&self, _file: &ProjectFile) -> String {
-        self.language().config_label().to_string()
+    /// The storage key this specific `file` was (or would be) persisted
+    /// under. Derived from the file's own detected language rather than
+    /// this adapter's language, so the cross-adapter row guard in
+    /// `paths_for_row`/`resolve_candidate_rows_limited` actually
+    /// discriminates: two adapters can share a live file (or a stale
+    /// candidate row's blob oid can resolve to a path analyzed by a
+    /// different language) and must not serve each other's rows.
+    /// Multi-key adapters (e.g. TypeScript, which splits `.ts`/`.tsx`
+    /// into distinct storage keys) override this.
+    fn storage_language_key_for_file(&self, file: &ProjectFile) -> String {
+        crate::analyzer::common::language_for_file(file)
+            .config_label()
+            .to_string()
     }
     fn storage_language_keys(&self) -> Vec<(String, TsLanguage)> {
         vec![(
@@ -2719,6 +2730,23 @@ where
             mut dirty_file_states,
             dirty_path_symbol_rows,
         } = input;
+        // This pipeline parses and persists file STATES, so it only concerns
+        // files this adapter's languages own. Change sets can legitimately
+        // carry other files — java dependency discovery routes build-manifest
+        // changes (pom.xml, build.gradle) through the analyzer update path for
+        // invalidation, which happens elsewhere — and with per-file storage
+        // keys (#1195) a foreign file would otherwise derive a key absent from
+        // this adapter's generation map. Filter at the single entry instead of
+        // guarding every downstream key derivation.
+        let served_keys: HashSet<String> = adapter
+            .storage_language_keys()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        let files: Vec<ProjectFile> = files
+            .into_iter()
+            .filter(|file| served_keys.contains(&adapter.storage_language_key_for_file(file)))
+            .collect();
         let mut fresh_parse_errors = HashMap::default();
         let mut seeded_file_states = Vec::new();
         let mut persistence_stats = PersistBatchStats::default();
@@ -3163,6 +3191,24 @@ where
         exact_source: Option<&str>,
     ) -> Option<Arc<FileState>> {
         let storage_key = self.adapter.storage_language_key_for_file(file);
+        // A file outside this adapter's own languages has no state here, and
+        // must not acquire one: multi-analyzer fan-outs (e.g.
+        // `ImportAnalysisProvider::referencing_files_of`) legitimately ask
+        // every provider about arbitrary files. Without this refusal the
+        // adapter would parse the foreign file as its own language — the
+        // #1189 panic chain, where a rust hierarchy probe parsed a C++
+        // header as rust and built a mixed-provenance `CodeUnit` — or, now
+        // that `storage_language_key_for_file` derives the key from the
+        // file itself (#1195), index a foreign key absent from
+        // `store_context.generations`. Answer honestly: no state.
+        if !self
+            .adapter
+            .storage_language_keys()
+            .iter()
+            .any(|(known, _)| known == &storage_key)
+        {
+            return None;
+        }
         if let Some(state) = self.retry_dirty_file_state(key, &storage_key) {
             return Some(state);
         }

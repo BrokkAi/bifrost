@@ -2028,3 +2028,148 @@ mod tests {
         "inline test fn tainted: {warm_taint:?}"
     );
 }
+
+/// Issue #1195: `LanguageAdapter::storage_language_key_for_file`'s default
+/// impl used to ignore its `file` argument and always answer with the
+/// *adapter's own* language key, so the cross-adapter guard in
+/// `paths_for_row`/`resolve_candidate_rows_limited` (which exists precisely
+/// to keep one language's persisted rows from being served for another
+/// language's files that share a git blob oid) never actually discriminated.
+///
+/// This fixture byte-for-byte mirrors the real exposure found in this very
+/// repo (`git ls-tree` shows `src/analyzer/python/cache.rs` and
+/// `src/analyzer/ruby/cache.rs` share a blob oid): a Python file and a Ruby
+/// file with identical content, so git dedups them to one blob. The `.rb`
+/// twin is not valid Ruby -- that's irrelevant; the only thing under test is
+/// whether Python's own persisted row for the shared blob also hydrates as
+/// the Ruby-named path when Python resolves candidates for that blob oid.
+/// Before the fix it did (the guard always matched), attaching Python's
+/// package/short_name conventions to a file Python's adapter never analyzed.
+#[test]
+fn cross_language_blob_sharing_does_not_leak_rows_across_adapters() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let shared_body = "class Widget:\n    def value(self):\n        return 1\n";
+    write_file(root, "pkg/widget.py", shared_body);
+    write_file(root, "pkg/widget.rb", shared_body);
+    let repo = init_git_repo(root);
+    commit_all(&repo, "shared blob across python and ruby");
+
+    // Confirm the fixture actually reproduces the exposure: both paths must
+    // resolve to the same git blob, or this test proves nothing.
+    let python_oid =
+        git2::Oid::hash_file(git2::ObjectType::Blob, root.join("pkg").join("widget.py")).unwrap();
+    let ruby_oid =
+        git2::Oid::hash_file(git2::ObjectType::Blob, root.join("pkg").join("widget.rb")).unwrap();
+    assert_eq!(
+        python_oid, ruby_oid,
+        "fixture must share a git blob oid across languages to exercise the guard"
+    );
+
+    let analyzer = build_persisted(
+        language_python_project(root, Language::Ruby),
+        AnalyzerConfig::default(),
+    );
+    let workspace = analyzer.analyzer();
+
+    let hits: Vec<_> = workspace.definitions("pkg.widget.Widget.value").collect();
+    let hit_paths: Vec<_> = hits
+        .iter()
+        .map(|unit| unit.source().rel_path().to_path_buf())
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "python's persisted row for the shared blob must not ALSO hydrate as \
+         the byte-identical ruby file: got paths {hit_paths:?}"
+    );
+    assert_eq!(hit_paths[0], Path::new("pkg/widget.py"));
+}
+
+/// Positive control for the #1195 fix: identical content shared across two
+/// paths WITHIN the same language is an intentional, pre-existing dedup path
+/// (git dedups identical blobs; `code_units.fq_segments` persists only the
+/// content-stable tail and rebuilds each path's package-qualified `fq` from
+/// its own `package_name` on load -- see `encode_unit_fq_segments`). The
+/// #1195 fix must not disturb this: both live paths sharing the one
+/// persisted row must still resolve, each under its own path-derived fqn.
+#[test]
+fn same_language_blob_sharing_still_serves_both_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let shared_body = "class Widget:\n    def value(self):\n        return 1\n";
+    write_file(root, "pkg_a/widget.py", shared_body);
+    write_file(root, "pkg_b/widget.py", shared_body);
+    let repo = init_git_repo(root);
+    commit_all(&repo, "shared blob within python");
+
+    let analyzer = build_persisted(python_project(root), AnalyzerConfig::default());
+    let workspace = analyzer.analyzer();
+
+    let a_hits: Vec<_> = workspace.definitions("pkg_a.widget.Widget.value").collect();
+    let b_hits: Vec<_> = workspace.definitions("pkg_b.widget.Widget.value").collect();
+
+    assert_eq!(
+        a_hits.len(),
+        1,
+        "pkg_a's path-qualified fqn must resolve from the shared blob's row"
+    );
+    assert_eq!(a_hits[0].source().rel_path(), Path::new("pkg_a/widget.py"));
+
+    assert_eq!(
+        b_hits.len(),
+        1,
+        "pkg_b's path-qualified fqn must resolve from the shared blob's row"
+    );
+    assert_eq!(b_hits[0].source().rel_path(), Path::new("pkg_b/widget.py"));
+}
+
+/// A language analyzer handed a file OUTSIDE its own language set must answer
+/// with no state — never parse the foreign file as its own language.
+/// Multi-analyzer fan-outs (`ImportAnalysisProvider::referencing_files_of`)
+/// legitimately ask every provider about arbitrary files; before the #1189
+/// fix the file-state funnel would tree-sitter-parse the foreign source with
+/// the adapter's own grammar (a rust probe parsed a C++ header, error-recovery
+/// produced a class-like, and the FqName round-trip assert killed the MCP
+/// process), and after #1195's per-file storage keys it would instead index a
+/// foreign key absent from the adapter's generation map and panic. The funnel
+/// now refuses: no panic, no declarations, for both never-seen and
+/// post-build-warm states.
+#[test]
+fn foreign_language_file_yields_no_state_instead_of_a_foreign_parse() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_file(
+        root,
+        "pkg/widget.py",
+        "class Widget:\n    def value(self):\n        return 1\n",
+    );
+    // The real #1189 shape: a C++ header whose `enum class` error-recovers
+    // into a declaration under a foreign grammar.
+    write_file(
+        root,
+        "native/advanced_features.h",
+        "enum class BlendMode {\n    Normal,\n    Multiply,\n};\n",
+    );
+    let repo = init_git_repo(root);
+    commit_all(&repo, "python beside a cpp header");
+
+    let project: Arc<dyn Project> = Arc::new(TestProject::new(
+        root.canonicalize().unwrap(),
+        Language::Python,
+    ));
+    let analyzer = PythonAnalyzer::new(Arc::clone(&project));
+    let header = ProjectFile::new(root.canonicalize().unwrap(), "native/advanced_features.h");
+
+    assert!(
+        analyzer.declarations(&header).is_empty(),
+        "a python analyzer must not produce declarations for a C++ header"
+    );
+    // Same answer once the workspace is fully built (warm caches, populated
+    // generation map) — the state the #1189 crash needed.
+    let workspace = build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    assert!(
+        workspace.analyzer().declarations(&header).is_empty(),
+        "a warm workspace must not serve foreign-language declarations either"
+    );
+}
