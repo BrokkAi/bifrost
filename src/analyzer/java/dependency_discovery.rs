@@ -61,7 +61,7 @@ pub(super) struct DiscoveredJavaDependencies {
 }
 
 impl DiscoveredJavaDependencies {
-    pub(super) fn merge_into(self, dependencies: &mut JavaExternalDependencies) {
+    pub(crate) fn merge_into(self, dependencies: &mut JavaExternalDependencies) {
         dependencies.artifact_paths.extend(self.artifact_paths);
         dependencies.coordinates.extend(self.coordinates);
         deduplicate_dependencies(dependencies);

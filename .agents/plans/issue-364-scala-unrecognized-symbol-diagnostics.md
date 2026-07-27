@@ -205,3 +205,5 @@ Revision note, 2026-07-27: Review follow-ups bound shared-index aggregate archiv
 Revision note, 2026-07-27: The first PR CI run exposed compile-only visibility fallout from relocating Java-owned tests into the sibling JVM module. Restored the narrow crate-private test seams, corrected the Scala archive fixture byte type, and imported the established Scala import-analysis capability before rerunning the strict local gate.
 
 Revision note, 2026-07-27: The CI rerun exposed the remaining production helper paths that had retained their former Java-child visibility. Made only the moved index's declaration and dependency-discovery helpers crate-private, and corrected its Scala module paths before a final CI rerun.
+
+Revision note, 2026-07-27: The final CI log isolated one remaining `pub(super)` method on the dependency discovery result. Widened that same internal merge seam to `pub(crate)`; no analyzer behavior changed.
