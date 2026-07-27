@@ -2408,6 +2408,11 @@ mod watcher_startup_tests {
     #[test]
     fn concurrent_lazy_first_use_publishes_one_session_outcome() {
         const CALLERS: usize = 8;
+        // Under the full library suite, persisted workspace construction can
+        // legitimately delay the first watcher-starter callback well beyond
+        // the single-test runtime. Keep a bounded hang watchdog here, but do
+        // not treat five seconds as a suite-wide performance contract.
+        const STARTUP_PUBLISH_TIMEOUT: Duration = Duration::from_secs(30);
         let (_temp, root) = workspace("Concurrent.java", "class Concurrent {}\n");
         let calls = Arc::new(AtomicUsize::new(0));
         let (startup_started_tx, startup_started_rx) = mpsc::channel();
@@ -2452,7 +2457,7 @@ mod watcher_startup_tests {
             .collect::<Vec<_>>();
         barrier.wait();
         startup_started_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(STARTUP_PUBLISH_TIMEOUT)
             .expect("one caller should begin watcher startup");
         for _ in 0..CALLERS {
             release_startup_tx

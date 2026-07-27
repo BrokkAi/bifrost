@@ -284,6 +284,18 @@ comes through the local gate, but is not the focus.
   focused regression, and the complete `cargo test --features nlp,python`
   matrix are green outside the sandbox at niceness 10 with the normal Cargo
   target; the matrix skipped only the separately known hanging Ruby LSP test.
+- [x] (2026-07-27) Merged current `origin/master` at `a913c29c` into the
+  epoch-correction checkpoint as `7591e788`. The post-merge full matrix then
+  reproduced the watcher single-flight regression's five-second callback
+  timeout twice under suite load even though the exact test passed in 0.07
+  seconds. After searching the complete issue tracker, created and assigned
+  `FIRD:` issue #1211 to `jbellis` before editing. An Oldskool diagnosis and
+  implementation review confirmed that the timeout covered synchronous
+  persisted-workspace construction, not just watcher publication, so the test
+  now uses an explicit 30-second bounded hang watchdog instead of an accidental
+  five-second performance contract. The exact regression and the complete
+  `cargo test --features nlp,python` matrix pass outside the sandbox at
+  niceness 10 with normal Cargo storage.
 - [ ] Publish the #1208 epoch correction, rebuild from the exact integrated
   head, and rerun the complete persisted C++ top ten from the new epoch before
   treating any of the 152 prior rows as current defects.
@@ -421,6 +433,13 @@ comes through the local gate, but is not the focus.
   `LOG4CXX_NS::spi.Filter` identity. Therefore all 152 residual rows from that
   envelope are untrusted until a new C++ epoch forces a full persisted rebuild.
 
+- The watcher single-flight regression's old five-second receive timeout
+  begins before persisted workspace construction, while its callback is
+  deliberately blocked to test publication. Under the complete library suite,
+  construction alone can exceed five seconds even though an isolated run takes
+  0.07 seconds. A longer named watchdog preserves deadlock detection without
+  asserting a performance guarantee that the test does not measure.
+
 ## Decision Log
 
 - Decision: Use the live `SFT_PREDICATES` selector and stable descending task
@@ -492,6 +511,14 @@ comes through the local gate, but is not the focus.
   `LevelRangeFilter$Filter` declaration. Auditing or fixing those rows before a
   language-epoch cutover would turn stale cache artifacts into false product
   work.
+  Date/Author: 2026-07-27 / Codex
+
+- Decision: Retain a bounded watcher-startup watchdog for #1211 but raise it
+  from five to thirty seconds and name its purpose in the test.
+  Rationale: The assertion still detects a failure to publish the one
+  single-flight startup outcome, while no longer conflating full-suite
+  persisted workspace construction time with the concurrency contract under
+  test.
   Date/Author: 2026-07-27 / Codex
 
 ## Outcomes & Retrospective
