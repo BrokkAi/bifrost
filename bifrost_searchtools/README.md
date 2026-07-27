@@ -126,22 +126,25 @@ cannot be proven. Byte offsets remain internal.
 ## `query_code` detail and ranges
 
 `query_code` is a versioned typed query surface. Omit `schema_version` for the
-compatible head, currently v3, or pass `schema_version=2` to pin the pre-CFG
-vocabulary. Pass exactly one of `pattern`, `union`,
+compatible head, currently v4, or pass `schema_version=2` to pin the pre-CFG
+vocabulary. Pass `schema_version=3` to pin CFG without typestate. Pass exactly
+one of `pattern`, `union`,
 `intersect`, or `except_`; set operands are complete query-plan dictionaries
 with compatible terminal domains. A structural `pattern` or composed set can be followed
 by ordered `steps` using `enclosing_decl`, `file_of`, `imports_of`,
 `importers_of`, `supertypes`, `subtypes`, `members`, `owner`, `procedure_of`,
 `cfg_entry`, `cfg_exits`, `cfg_successor_edges`, `cfg_predecessor_edges`,
-`cfg_edge_source`, and `cfg_edge_target`. Import
+`cfg_edge_source`, `cfg_edge_target`, `typestate`, and `witness`. Import
 operations traverse one direct project-local edge per step. Hierarchy operations
 are direct by default and accept a positive `depth` or `transitive: true`.
 Declaration results are limited to declarations indexed by the workspace
 analyzer, so references into an unindexed library do not manufacture library
 declarations. Results are tagged as structural matches, declarations, reference
 sites, call sites, expression sites, receiver analyses, procedures, program
-points, control edges, or files. The CFG operations are procedure-local and
-one-hop; they do not provide ICFG, data-flow, taint, or typestate analysis.
+points, control edges, typestate findings, typestate witnesses, or files. The CFG operations are procedure-local and
+one-hop; they do not provide ICFG, data-flow, or taint analysis. Schema v4 can
+consume a host-registered typestate protocol/binding pair and project its
+already-retained bounded witnesses; the Python call sends only `protocol_ref`.
 Compact output retains minimal pipeline provenance. Pass `result_detail="full"`
 when follow-up tooling needs deterministic IDs and precise ranges.
 
@@ -154,7 +157,8 @@ its `.result` is the ordinary typed result, while `.explain`, `.timings_ns`,
 `.work`, `.cache_layers`, `.scheduling`, and `.operators` expose structured
 observations. Explain physical nodes declare any `semantic_request`, while
 profile `.work.semantic` accounts materialization, cache reuse, CFG rows,
-retained bytes, traversal, and budget exhaustion. Profile timings are elapsed nanoseconds, and
+retained bytes, traversal, and budget exhaustion; `.work.semantic.typestate`
+accounts solver reuse, findings, retained witnesses, and termination. Profile timings are elapsed nanoseconds, and
 `temporary_capacity_bytes_lower_bound` is deliberately only a lower-bound
 container-capacity estimate. In the public v2 profile contract, top-level and
 per-operator `.cache_layers` are lists of `{layer, metrics}` records. The nested

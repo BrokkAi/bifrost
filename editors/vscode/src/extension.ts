@@ -38,8 +38,18 @@ import {
   releaseAssetFor,
   releaseTargetFor
 } from "./provisioning";
-import type { RqlQueryDocument, RqlQueryResponse, RqlQueryResultItem } from "./rql_query";
-import { formatRqlQueryOutput, queryResultRange, runRqlQuery } from "./rql_query";
+import type {
+  RqlQueryDocument,
+  RqlQueryNavigationTarget,
+  RqlQueryResponse,
+  RqlQueryResultItem
+} from "./rql_query";
+import {
+  codePointColumnToUtf16,
+  formatRqlQueryOutput,
+  queryResultRange,
+  runRqlQuery
+} from "./rql_query";
 import { RqlQueryResultsProvider } from "./rql_results";
 import type { RqlPolicyDocument, RqlPolicyResponse } from "./rql_policy";
 import {
@@ -116,8 +126,9 @@ export function activate(context: vscode.ExtensionContext): void {
       runRqlPolicyForEditor(resource)
     ),
     vscode.commands.registerCommand("bifrost.showRuneIr", () => showRuneIrForEditor()),
-    vscode.commands.registerCommand("bifrost.openRqlQueryResult", (result: RqlQueryResultItem) =>
-      openRqlQueryResult(result)
+    vscode.commands.registerCommand(
+      "bifrost.openRqlQueryResult",
+      (result: RqlQueryResultItem | RqlQueryNavigationTarget) => openRqlQueryResult(result)
     ),
     vscode.commands.registerCommand("bifrost.openRqlPolicyFinding", (target: PolicyFindingTarget) =>
       openRqlPolicyFinding(target)
@@ -359,21 +370,20 @@ function markPolicyResultsStale(reason: string): void {
   rqlPolicyResults?.markStale(reason);
 }
 
-async function openRqlQueryResult(result: RqlQueryResultItem): Promise<void> {
+async function openRqlQueryResult(
+  result: RqlQueryResultItem | RqlQueryNavigationTarget
+): Promise<void> {
   const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(result.uri));
   const editor = await vscode.window.showTextDocument(document, { preview: true });
-  const resultRange = queryResultRange(result);
+  const resultRange = "result_type" in result ? queryResultRange(result) : result.range;
   if (resultRange) {
     const startLine = Math.min(Math.max(0, resultRange.start_line - 1), document.lineCount - 1);
     const endLine = Math.min(Math.max(startLine, resultRange.end_line - 1), document.lineCount - 1);
-    const startColumn = Math.min(
-      Math.max(0, resultRange.start_column - 1),
-      document.lineAt(startLine).text.length
+    const startColumn = codePointColumnToUtf16(
+      document.lineAt(startLine).text,
+      resultRange.start_column
     );
-    const endColumn = Math.min(
-      Math.max(0, resultRange.end_column - 1),
-      document.lineAt(endLine).text.length
-    );
+    const endColumn = codePointColumnToUtf16(document.lineAt(endLine).text, resultRange.end_column);
     const start = new vscode.Position(startLine, startColumn);
     const end = new vscode.Position(endLine, endColumn);
     const range = new vscode.Range(start, end);

@@ -15,6 +15,7 @@ mod input;
 mod problem;
 mod quality;
 mod result;
+mod reusable_summary;
 mod summary;
 mod summary_result;
 mod tabulation;
@@ -27,11 +28,12 @@ pub use budget::{
 pub use direct::{DirectFact, DirectFlowProblem};
 pub use ide::{
     IdeDataflowProblem, IdeDataflowSeed, IdeSummarySolveInput, IdeTransition,
-    solve_ide_with_summaries,
+    ReusableIdeEndSummary, ReusableIdeProcedureSummary, ReusableIdeReachedFact,
+    ReusableIdeSummaryProvider, solve_ide_with_reusable_summaries, solve_ide_with_summaries,
 };
 pub use ide_result::{
-    IdeDataflowError, IdeEdgeFunctionId, IdeMetrics, IdePointValue, IdeSummaryDataflowResult,
-    IdeValueId,
+    IdeDataflowError, IdeEdgeFunctionId, IdeEntryTransfer, IdeMetrics, IdePointValue,
+    IdeSummaryDataflowResult, IdeValueId,
 };
 pub use input::{DataflowError, IcfgInputStatus, IcfgSolveInput, SemanticInputStatus};
 pub use problem::{
@@ -40,7 +42,28 @@ pub use problem::{
 };
 pub use quality::{PathQuality, PathQualityFrontier};
 pub use result::{DataflowCoverage, DataflowResult, ReachedFact, SolverTermination};
-pub use summary::{SummarySolveInput, solve_with_summaries};
+pub(crate) use reusable_summary::validate_recursive_summary_batch;
+pub use reusable_summary::{
+    CompleteSummaryRepository, DEFAULT_SUMMARY_REPOSITORY_BYTES,
+    DEFAULT_SUMMARY_REPOSITORY_ENTRIES, ExternalSummaryContentHash, ExternalSummaryModelId,
+    ExternalSummaryOrigin, MAX_AMBIGUOUS_SUMMARY_CALLEES, MAX_EXTERNAL_SUMMARY_MODEL_ID_BYTES,
+    MAX_SUMMARY_BOUNDARY_BINDINGS, MAX_SUMMARY_COMPOSITION_STEPS, MAX_SUMMARY_DEPENDENCIES,
+    MAX_SUMMARY_EFFECT_REFERENCES, MAX_SUMMARY_EFFECTS, MAX_SUMMARY_EVIDENCE_REASONS,
+    MAX_SUMMARY_REASON_BYTES, MAX_SUMMARY_RECURSIVE_MEMBERS, MAX_SUMMARY_TRANSFERS,
+    ProcedureSummaryIdentity, ProcedureSummaryKey, SUMMARY_SCHEMA_VERSION,
+    SemanticProcedureSummary, SummaryBehaviorKey, SummaryBoundaryBinding, SummaryBoundaryMap,
+    SummaryCompleteness, SummaryCompositionError, SummaryCompositionRootFingerprint,
+    SummaryContextKey, SummaryDependencyFingerprint, SummaryDependencyKey, SummaryEffect,
+    SummaryEffectKey, SummaryEventKey, SummaryEvidence, SummaryEvidenceAlternative, SummaryExit,
+    SummaryExitKind, SummaryIncompleteReason, SummaryLocationKey, SummaryOrigin, SummaryPort,
+    SummaryPublicationError, SummaryPublicationOutcome, SummaryRecursiveEdge,
+    SummaryRecursiveGroupFingerprint, SummaryRecursiveGroupKey, SummaryRepositoryLimits,
+    SummarySchemaVersion, SummarySemanticsVersion, SummaryTransfer, SummaryValidationError,
+};
+pub use summary::{
+    ReusableEndSummary, ReusableProcedureSummary, ReusableReachedFact, ReusableSummaryProvider,
+    SummarySolveInput, solve_with_reusable_end_summaries, solve_with_summaries,
+};
 pub use summary_result::{
     SummaryBoundary, SummaryBoundaryKind, SummaryCoverage, SummaryDataflowError,
     SummaryDataflowResult, SummaryEdge, SummaryEntry, SummaryMetrics, SummaryReachedFact,

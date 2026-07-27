@@ -85,7 +85,7 @@ where
 
 pub(crate) fn evaluate_transfer<P>(
     problem: &P,
-    edge: DataflowEdge<'_>,
+    edge: DataflowEdge<'_, P::Fact>,
     fact: P::Fact,
     zero_fact: P::Fact,
     preserve_zero: bool,
@@ -132,7 +132,7 @@ where
 
 fn apply_transfer<P>(
     problem: &P,
-    edge: DataflowEdge<'_>,
+    edge: DataflowEdge<'_, P::Fact>,
     fact: P::Fact,
     out: &mut dyn DataflowOutput<P::Fact>,
 ) where

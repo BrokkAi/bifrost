@@ -1,8 +1,7 @@
 //! Shared deterministic hashing primitives for analyzer-owned identities.
 
-use std::fmt;
-
 use sha2::{Digest, Sha256};
+use std::fmt;
 
 pub(crate) struct CanonicalHasher(Sha256);
 

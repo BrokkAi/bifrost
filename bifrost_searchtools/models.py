@@ -7,6 +7,35 @@ from typing import Any, ClassVar, Literal, cast, get_args
 
 CodeQueryExecutionMode = Literal["results", "explain", "profile"]
 _CODE_QUERY_EXECUTION_MODES = get_args(CodeQueryExecutionMode)
+_MISSING = object()
+
+
+def _strict_bool(data: dict, key: str, default: object = _MISSING) -> bool:
+    value = data[key] if default is _MISSING else data.get(key, default)
+    if type(value) is not bool:
+        raise TypeError(f"{key} must be a boolean")
+    return value
+
+
+def _strict_nonnegative_int(data: dict, key: str) -> int:
+    value = data[key]
+    if type(value) is not int or value < 0:
+        raise TypeError(f"{key} must be a non-negative integer")
+    return value
+
+
+def _strict_list(data: dict, key: str, default: object = _MISSING) -> list[Any]:
+    value = data[key] if default is _MISSING else data.get(key, default)
+    if not isinstance(value, list):
+        raise TypeError(f"{key} must be a list")
+    return value
+
+
+def _strict_string_list(data: dict, key: str) -> list[str]:
+    values = _strict_list(data, key)
+    if any(not isinstance(value, str) for value in values):
+        raise TypeError(f"{key} must contain only strings")
+    return values
 
 
 def _code_query_execution_mode(value: Any) -> CodeQueryExecutionMode | None:
@@ -232,6 +261,8 @@ class CodeQueryResultRef:
     analysis_kind: str | None = None
     outcome: str | None = None
     capture: str | None = None
+    protocol_ref: str | None = None
+    finding_id: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryResultRef:
@@ -268,6 +299,8 @@ class CodeQueryResultRef:
             analysis_kind=data.get("analysis_kind"),
             outcome=data.get("outcome"),
             capture=data.get("capture"),
+            protocol_ref=data.get("protocol_ref"),
+            finding_id=data.get("finding_id"),
         )
 
 
@@ -585,6 +618,243 @@ class CodeQueryControlEdge:
 
 
 @dataclass(frozen=True)
+class CodeQueryTypestateSubject:
+    class_name: str
+    identity: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryTypestateSubject:
+        return cls(class_name=data["class"], identity=data["identity"])
+
+
+class CodeQueryTypestateFindingKindType(StrEnum):
+    ERROR_TRANSITION = "error_transition"
+    TERMINAL_EXPECTATION = "terminal_expectation"
+
+
+@dataclass(frozen=True)
+class CodeQueryTypestateFindingKind:
+    type: CodeQueryTypestateFindingKindType
+    event: str | None = None
+    from_state: str | None = None
+    to_state: str | None = None
+    expectation: str | None = None
+    actual_states: tuple[str, ...] = ()
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryTypestateFindingKind:
+        kind = CodeQueryTypestateFindingKindType(data["type"])
+        if kind is CodeQueryTypestateFindingKindType.ERROR_TRANSITION:
+            return cls(
+                type=kind,
+                event=data["event"],
+                from_state=data["from_state"],
+                to_state=data["to_state"],
+            )
+        return cls(
+            type=kind,
+            expectation=data["expectation"],
+            actual_states=tuple(_strict_string_list(data, "actual_states")),
+        )
+
+    def render_text(self) -> str:
+        if self.type is CodeQueryTypestateFindingKindType.ERROR_TRANSITION:
+            return f"{self.event}: {self.from_state} -> {self.to_state}"
+        return f"{self.expectation}: actual {', '.join(self.actual_states)}"
+
+
+class CodeQueryTypestateCertainty(StrEnum):
+    MAY = "may"
+    MUST = "must"
+    INCONCLUSIVE = "inconclusive"
+
+
+class CodeQueryTypestateUncertainty(StrEnum):
+    AMBIGUOUS_DISPATCH = "ambiguous_dispatch"
+    UNKNOWN_CALL = "unknown_call"
+    EXTERNAL_CALL = "external_call"
+    ESCAPE = "escape"
+    INCOMPLETE_ANALYSIS = "incomplete_analysis"
+    UNMATCHED_EVENT = "unmatched_event"
+
+
+@dataclass(frozen=True)
+class CodeQueryTypestateFinding:
+    id: str
+    protocol_ref: str
+    protocol_hash: str
+    binding_plan_hash: str
+    subject: CodeQueryTypestateSubject
+    finding_kind: CodeQueryTypestateFindingKind
+    certainty: CodeQueryTypestateCertainty
+    path: str
+    language: str
+    range: CodeQueryRange
+    path_proven: bool
+    path_complete: bool
+    analysis_complete: bool
+    retained_witnesses: int
+    omitted_witnesses: int
+    uncertainty: tuple[CodeQueryTypestateUncertainty, ...] = ()
+    abstained: bool = False
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryTypestateFinding:
+        return cls(
+            id=data["id"],
+            protocol_ref=data["protocol_ref"],
+            protocol_hash=data["protocol_hash"],
+            binding_plan_hash=data["binding_plan_hash"],
+            subject=CodeQueryTypestateSubject.from_dict(data["subject"]),
+            finding_kind=CodeQueryTypestateFindingKind.from_dict(data["finding_kind"]),
+            certainty=CodeQueryTypestateCertainty(data["certainty"]),
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            path_proven=_strict_bool(data, "path_proven"),
+            path_complete=_strict_bool(data, "path_complete"),
+            analysis_complete=_strict_bool(data, "analysis_complete"),
+            retained_witnesses=_strict_nonnegative_int(data, "retained_witnesses"),
+            omitted_witnesses=_strict_nonnegative_int(data, "omitted_witnesses"),
+            uncertainty=tuple(
+                CodeQueryTypestateUncertainty(value)
+                for value in _strict_list(data, "uncertainty", [])
+            ),
+            abstained=_strict_bool(data, "abstained", False),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[typestate finding; {self.certainty}; {self.protocol_ref}] "
+            f"{self.finding_kind.render_text()}"
+        )
+
+
+class CodeQueryTypestateWitnessStepKindType(StrEnum):
+    SEED = "seed"
+    EDGE = "edge"
+    END_SUMMARY_GAP = "end_summary_gap"
+
+
+@dataclass(frozen=True)
+class CodeQueryTypestateWitnessStepKind:
+    type: CodeQueryTypestateWitnessStepKindType
+    edge_kind: str | None = None
+    return_kind: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryTypestateWitnessStepKind:
+        kind = CodeQueryTypestateWitnessStepKindType(data["type"])
+        if kind is CodeQueryTypestateWitnessStepKindType.EDGE:
+            return cls(type=kind, edge_kind=data["edge_kind"])
+        if kind is CodeQueryTypestateWitnessStepKindType.END_SUMMARY_GAP:
+            return cls(type=kind, return_kind=data["return_kind"])
+        return cls(type=kind)
+
+
+@dataclass(frozen=True)
+class CodeQueryTypestateWitnessStep:
+    kind: CodeQueryTypestateWitnessStepKind
+    source: CodeQuerySourceSite
+    evidence: CodeQuerySemanticEvidence
+    target: CodeQuerySourceSite | None = None
+    origin: CodeQuerySourceSite | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryTypestateWitnessStep:
+        return cls(
+            kind=CodeQueryTypestateWitnessStepKind.from_dict(data["kind"]),
+            source=CodeQuerySourceSite.from_dict(data["source"]),
+            evidence=CodeQuerySemanticEvidence.from_dict(data["evidence"]),
+            target=(
+                CodeQuerySourceSite.from_dict(data["target"])
+                if "target" in data
+                else None
+            ),
+            origin=(
+                CodeQuerySourceSite.from_dict(data["origin"])
+                if "origin" in data
+                else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryTypestateWitness:
+    id: str
+    finding_id: str
+    protocol_ref: str
+    protocol_hash: str
+    binding_plan_hash: str
+    subject: CodeQueryTypestateSubject
+    witness_index: int
+    path: str
+    language: str
+    range: CodeQueryRange
+    quality: CodeQuerySemanticEvidence
+    steps: tuple[CodeQueryTypestateWitnessStep, ...]
+    retained_bytes: int
+    omitted_steps_lower_bound: int
+    observed_state: str | None = None
+    uncertainty: tuple[CodeQueryTypestateUncertainty, ...] = ()
+    abstained: bool = False
+    truncated: bool = False
+    alternatives_truncated: bool = False
+    retention_truncated: bool = False
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryTypestateWitness:
+        return cls(
+            id=data["id"],
+            finding_id=data["finding_id"],
+            protocol_ref=data["protocol_ref"],
+            protocol_hash=data["protocol_hash"],
+            binding_plan_hash=data["binding_plan_hash"],
+            subject=CodeQueryTypestateSubject.from_dict(data["subject"]),
+            witness_index=_strict_nonnegative_int(data, "witness_index"),
+            observed_state=data.get("observed_state"),
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            quality=CodeQuerySemanticEvidence.from_dict(data["quality"]),
+            uncertainty=tuple(
+                CodeQueryTypestateUncertainty(value)
+                for value in _strict_list(data, "uncertainty", [])
+            ),
+            abstained=_strict_bool(data, "abstained", False),
+            steps=tuple(
+                CodeQueryTypestateWitnessStep.from_dict(step)
+                for step in _strict_list(data, "steps")
+            ),
+            retained_bytes=_strict_nonnegative_int(data, "retained_bytes"),
+            truncated=_strict_bool(data, "truncated", False),
+            omitted_steps_lower_bound=_strict_nonnegative_int(
+                data, "omitted_steps_lower_bound"
+            ),
+            alternatives_truncated=_strict_bool(
+                data, "alternatives_truncated", False
+            ),
+            retention_truncated=_strict_bool(data, "retention_truncated", False),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        suffix = "; truncated" if self.truncated else ""
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[typestate witness; {len(self.steps)} steps{suffix}; {self.protocol_ref}]"
+        )
+
+
+@dataclass(frozen=True)
 class CodeQueryFile:
     path: str
     language: str
@@ -896,6 +1166,8 @@ CodeQueryResultItem = (
     | CodeQueryProcedure
     | CodeQueryProgramPoint
     | CodeQueryControlEdge
+    | CodeQueryTypestateFinding
+    | CodeQueryTypestateWitness
     | CodeQueryFile
     | CodeQueryReferenceSite
     | CodeQueryCallSite
@@ -916,6 +1188,10 @@ def _code_query_result_item(data: dict) -> CodeQueryResultItem:
         return CodeQueryProgramPoint.from_dict(data)
     if result_type == "control_edge":
         return CodeQueryControlEdge.from_dict(data)
+    if result_type == "typestate_finding":
+        return CodeQueryTypestateFinding.from_dict(data)
+    if result_type == "typestate_witness":
+        return CodeQueryTypestateWitness.from_dict(data)
     if result_type == "file":
         return CodeQueryFile.from_dict(data)
     if result_type == "reference_site":
@@ -942,6 +1218,16 @@ class CodeQueryDiagnosticCode(StrEnum):
     SEMANTIC_ANALYSIS_PARTIAL = "semantic_analysis_partial"
     SEMANTIC_BUDGET_EXHAUSTED = "semantic_budget_exhausted"
     SEMANTIC_PROVIDER_FAILED = "semantic_provider_failed"
+    UNRESOLVED_PROTOCOL_REFERENCE = "unresolved_protocol_reference"
+    TYPESTATE_REGISTRATION_STALE = "typestate_registration_stale"
+    TYPESTATE_HANDLE_STALE = "typestate_handle_stale"
+    TYPESTATE_ROOT_MISMATCH = "typestate_root_mismatch"
+    TYPESTATE_CAPABILITY_UNSUPPORTED = "typestate_capability_unsupported"
+    TYPESTATE_ANALYSIS_PARTIAL = "typestate_analysis_partial"
+    TYPESTATE_PROVIDER_FAILED = "typestate_provider_failed"
+    TYPESTATE_SOLVER_BUDGET_EXHAUSTED = "typestate_solver_budget_exhausted"
+    TYPESTATE_FINDING_BUDGET_EXHAUSTED = "typestate_finding_budget_exhausted"
+    TYPESTATE_WITNESS_TRUNCATED = "typestate_witness_truncated"
     RECEIVER_ANALYSIS_PARTIAL = "receiver_analysis_partial"
     RECEIVER_ANALYSIS_FAILED = "receiver_analysis_failed"
     CALL_RELATION_BUDGET_EXHAUSTED = "call_relation_budget_exhausted"
@@ -1241,6 +1527,7 @@ class CodeQuerySemanticRequest:
     procedures: bool
     program_points: bool
     control_edges: bool
+    typestate: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CodeQuerySemanticRequest:
@@ -1248,6 +1535,7 @@ class CodeQuerySemanticRequest:
             procedures=bool(data["procedures"]),
             program_points=bool(data["program_points"]),
             control_edges=bool(data["control_edges"]),
+            typestate=bool(data.get("typestate", False)),
         )
 
 
@@ -1405,6 +1693,43 @@ class CodeQueryProfileTimings:
 
 
 @dataclass(frozen=True)
+class CodeQueryTypestateWork:
+    solves: int = 0
+    cache_hits: int = 0
+    reached_rows: int = 0
+    findings: int = 0
+    omitted_findings: int = 0
+    witnesses: int = 0
+    omitted_witnesses: int = 0
+    witness_steps: int = 0
+    witness_bytes: int = 0
+    fixed_point_solves: int = 0
+    cancelled_solves: int = 0
+    budget_exhausted_solves: int = 0
+    failed_solves: int = 0
+    finding_budget_exhausted: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodeQueryTypestateWork:
+        return cls(
+            solves=int(data.get("solves", 0)),
+            cache_hits=int(data.get("cache_hits", 0)),
+            reached_rows=int(data.get("reached_rows", 0)),
+            findings=int(data.get("findings", 0)),
+            omitted_findings=int(data.get("omitted_findings", 0)),
+            witnesses=int(data.get("witnesses", 0)),
+            omitted_witnesses=int(data.get("omitted_witnesses", 0)),
+            witness_steps=int(data.get("witness_steps", 0)),
+            witness_bytes=int(data.get("witness_bytes", 0)),
+            fixed_point_solves=int(data.get("fixed_point_solves", 0)),
+            cancelled_solves=int(data.get("cancelled_solves", 0)),
+            budget_exhausted_solves=int(data.get("budget_exhausted_solves", 0)),
+            failed_solves=int(data.get("failed_solves", 0)),
+            finding_budget_exhausted=bool(data.get("finding_budget_exhausted", False)),
+        )
+
+
+@dataclass(frozen=True)
 class CodeQuerySemanticWork:
     materialization_attempts: int = 0
     unique_materialized_files: int = 0
@@ -1416,6 +1741,7 @@ class CodeQuerySemanticWork:
     retained_bytes: int = 0
     traversal_steps: int = 0
     budget_exhausted: bool = False
+    typestate: CodeQueryTypestateWork = field(default_factory=CodeQueryTypestateWork)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CodeQuerySemanticWork:
@@ -1430,6 +1756,7 @@ class CodeQuerySemanticWork:
             retained_bytes=int(data.get("retained_bytes", 0)),
             traversal_steps=int(data.get("traversal_steps", 0)),
             budget_exhausted=bool(data.get("budget_exhausted", False)),
+            typestate=CodeQueryTypestateWork.from_dict(data.get("typestate", {})),
         )
 
 

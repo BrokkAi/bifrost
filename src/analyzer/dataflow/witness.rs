@@ -583,6 +583,11 @@ enum WitnessEvidenceKind {
         summary: WitnessEvidenceId,
         return_step: SummaryWitnessStep,
     },
+    ReusableSummaryApplication {
+        incoming: WitnessEvidenceId,
+        summary_quality: PathQuality,
+        return_step: SummaryWitnessStep,
+    },
 }
 
 impl WitnessEvidenceNode {
@@ -709,6 +714,44 @@ impl WitnessEvidenceNode {
         ))
     }
 
+    pub(crate) fn reusable_summary_application(
+        incoming: WitnessEvidenceId,
+        incoming_quality: PathQuality,
+        summary_quality: PathQuality,
+        return_edge: &SummaryEdge,
+        input_fact: FactId,
+        output_fact: FactId,
+    ) -> Self {
+        let quality = incoming_quality
+            .conjoin(summary_quality)
+            .through_evidence(return_edge.proof(), return_edge.completeness());
+        Self {
+            quality,
+            alternatives_truncated: false,
+            kind: WitnessEvidenceKind::ReusableSummaryApplication {
+                incoming,
+                summary_quality,
+                return_step: SummaryWitnessStep::new(
+                    SummaryWitnessStepKind::Edge(return_edge.kind()),
+                    return_edge.source().clone(),
+                    Some(return_edge.target().clone()),
+                    return_edge.origin().cloned(),
+                    return_edge.proof().clone(),
+                    return_edge.completeness().clone(),
+                    input_fact,
+                    output_fact,
+                ),
+            },
+        }
+    }
+
+    pub(crate) fn reusable_summary_application_retained_bytes(return_edge: &SummaryEdge) -> usize {
+        size_of::<Self>().saturating_add(retained_evidence_bytes(
+            return_edge.proof(),
+            return_edge.completeness(),
+        ))
+    }
+
     pub(crate) fn matches_seed_derivation(&self, point: &ProgramPointHandle, fact: FactId) -> bool {
         self.quality == PathQuality::PROVEN_COMPLETE
             && matches!(
@@ -794,6 +837,41 @@ impl WitnessEvidenceNode {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn matches_reusable_summary_application_derivation(
+        &self,
+        incoming: WitnessEvidenceId,
+        incoming_quality: PathQuality,
+        summary_quality: PathQuality,
+        return_edge: &SummaryEdge,
+        input_fact: FactId,
+        output_fact: FactId,
+    ) -> bool {
+        self.quality
+            == incoming_quality
+                .conjoin(summary_quality)
+                .through_evidence(return_edge.proof(), return_edge.completeness())
+            && matches!(
+                &self.kind,
+                WitnessEvidenceKind::ReusableSummaryApplication {
+                    incoming: retained_incoming,
+                    summary_quality: retained_summary_quality,
+                    return_step,
+                } if *retained_incoming == incoming
+                    && *retained_summary_quality == summary_quality
+                    && return_step.matches_derivation(
+                        SummaryWitnessStepKind::Edge(return_edge.kind()),
+                        return_edge.source(),
+                        Some(return_edge.target()),
+                        return_edge.origin(),
+                        return_edge.proof(),
+                        return_edge.completeness(),
+                        input_fact,
+                        output_fact,
+                    )
+            )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn matches_end_summary_derivation(
         &self,
         predecessor: WitnessEvidenceId,
@@ -832,6 +910,9 @@ impl WitnessEvidenceNode {
             WitnessEvidenceKind::SummaryApplication { return_step, .. } => {
                 return_step.retained_owned_bytes()
             }
+            WitnessEvidenceKind::ReusableSummaryApplication { return_step, .. } => {
+                return_step.retained_owned_bytes()
+            }
         })
     }
 
@@ -846,6 +927,9 @@ impl WitnessEvidenceNode {
             WitnessEvidenceKind::SummaryApplication { return_step, .. } => return_step
                 .target()
                 .expect("summary application return step has a target"),
+            WitnessEvidenceKind::ReusableSummaryApplication { return_step, .. } => return_step
+                .target()
+                .expect("reusable summary application return step has a target"),
         }
     }
 
@@ -854,6 +938,9 @@ impl WitnessEvidenceNode {
             WitnessEvidenceKind::Step { step, .. } => step.output_fact(),
             WitnessEvidenceKind::EndSummary { exit_fact, .. } => *exit_fact,
             WitnessEvidenceKind::SummaryApplication { return_step, .. } => {
+                return_step.output_fact()
+            }
+            WitnessEvidenceKind::ReusableSummaryApplication { return_step, .. } => {
                 return_step.output_fact()
             }
         }
@@ -866,6 +953,9 @@ impl WitnessEvidenceNode {
             WitnessEvidenceKind::SummaryApplication {
                 incoming, summary, ..
             } => [Some(*incoming), Some(*summary)],
+            WitnessEvidenceKind::ReusableSummaryApplication { incoming, .. } => {
+                [Some(*incoming), None]
+            }
         }
     }
 
@@ -916,6 +1006,9 @@ impl WitnessEvidenceNode {
             } => {
                 *incoming = mapped(*incoming);
                 *summary = mapped(*summary);
+            }
+            WitnessEvidenceKind::ReusableSummaryApplication { incoming, .. } => {
+                *incoming = mapped(*incoming);
             }
         }
     }
@@ -1194,6 +1287,7 @@ impl WitnessStore {
         enum Task {
             Expand(WitnessEvidenceId),
             Emit(SummaryWitnessStep),
+            OmittedReusableSummary,
         }
 
         let mut stack = vec![Task::Expand(evidence)];
@@ -1241,6 +1335,15 @@ impl WitnessStore {
                             stack.push(Task::Expand(*summary));
                             stack.push(Task::Expand(*incoming));
                         }
+                        WitnessEvidenceKind::ReusableSummaryApplication {
+                            incoming,
+                            return_step,
+                            ..
+                        } => {
+                            stack.push(Task::Emit(return_step.clone()));
+                            stack.push(Task::OmittedReusableSummary);
+                            stack.push(Task::Expand(*incoming));
+                        }
                     }
                 }
                 Task::Emit(step) => {
@@ -1263,6 +1366,10 @@ impl WitnessStore {
                         ));
                     }
                     steps.push(step);
+                }
+                Task::OmittedReusableSummary => {
+                    truncated = true;
+                    omitted_steps_lower_bound = omitted_steps_lower_bound.saturating_add(1);
                 }
             }
         }
@@ -1476,6 +1583,61 @@ impl WitnessStore {
                 if expected != node.quality || return_step.target().is_none() {
                     return Err(SummaryWitnessError::InvalidEvidence(
                         "summary application quality or return target is inconsistent",
+                    ));
+                }
+            }
+            WitnessEvidenceKind::ReusableSummaryApplication {
+                incoming,
+                summary_quality,
+                return_step,
+            } => {
+                let incoming = self
+                    .node(*incoming)
+                    .ok_or(SummaryWitnessError::InvalidEvidence(
+                        "reusable summary incoming evidence is absent",
+                    ))?;
+                let WitnessEvidenceKind::Step {
+                    step: incoming_step,
+                    ..
+                } = &incoming.kind
+                else {
+                    return Err(SummaryWitnessError::InvalidEvidence(
+                        "reusable summary incoming evidence is not a call edge",
+                    ));
+                };
+                let expected_return_kind = match return_step.kind() {
+                    SummaryWitnessStepKind::Edge(IcfgEdgeKind::NormalReturn) => {
+                        IcfgEdgeKind::NormalReturn
+                    }
+                    SummaryWitnessStepKind::Edge(IcfgEdgeKind::ExceptionalReturn) => {
+                        IcfgEdgeKind::ExceptionalReturn
+                    }
+                    _ => {
+                        return Err(SummaryWitnessError::InvalidEvidence(
+                            "reusable summary application is not a return edge",
+                        ));
+                    }
+                };
+                if incoming_step.kind() != SummaryWitnessStepKind::Edge(IcfgEdgeKind::Call)
+                    || incoming_step.origin().is_none()
+                    || incoming_step.origin() != return_step.origin()
+                    || return_step.kind() != SummaryWitnessStepKind::Edge(expected_return_kind)
+                    || incoming.output_point().procedure() != return_step.source().procedure()
+                    || return_step.target().is_none_or(|target| {
+                        target.procedure() != incoming_step.source().procedure()
+                    })
+                {
+                    return Err(SummaryWitnessError::InvalidEvidence(
+                        "reusable summary application call/return topology does not match",
+                    ));
+                }
+                let expected = incoming
+                    .quality
+                    .conjoin(*summary_quality)
+                    .through_evidence(return_step.proof(), return_step.completeness());
+                if expected != node.quality || return_step.target().is_none() {
+                    return Err(SummaryWitnessError::InvalidEvidence(
+                        "reusable summary application quality or return target is inconsistent",
                     ));
                 }
             }

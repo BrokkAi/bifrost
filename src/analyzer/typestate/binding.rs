@@ -1,22 +1,25 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use serde::Serialize;
 
 use crate::analyzer::dense_id::define_dense_id;
 use crate::analyzer::identifier::define_identifier;
 use crate::analyzer::semantic::{
-    AbstractObject, AccessPathRoot, CandidateCoverage, DeclarationSegmentKind,
+    AbstractObject, AccessPathRoot, CandidateCoverage, DeclarationLocator, DeclarationSegmentKind,
     EvidenceCompleteness, ObjectCardinality, OracleCallContext, ProcedureHandle, ProcedurePortKind,
-    ProgramPointHandle, ProofStatus, SemanticLocator, SourceAnchor,
+    ProgramPointHandle, ProofStatus, SemanticArtifact, SemanticArtifactKey, SemanticLocator,
+    SourceAnchor,
 };
 
 use super::{
     CompiledProtocol, ProtocolEventId, ProtocolEventKey, ProtocolEventOccurrence,
     ProtocolExpectationId, ProtocolExpectationKey, ProtocolObjectCardinality,
     ProtocolObservationPhase, ProtocolProcedureExitKind, ProtocolStateId, ProtocolStateKey,
-    ProtocolTerminalObservationSpec, TypestateBindingPlanHash, TypestateProtocolHash,
+    ProtocolTerminalObservationSpec, TypestateBindingPlanHash, TypestateBindingSummaryHash,
+    TypestateProtocolHash,
 };
 
 pub const BINDING_PLAN_SCHEMA_VERSION: u32 = 1;
@@ -145,6 +148,44 @@ impl TypestateSubjectKey {
 
     pub fn object(&self) -> &TypestateObjectKey {
         &self.object
+    }
+
+    /// Render the stable semantic subject identity used by public query rows.
+    ///
+    /// This is the same canonical representation that contributes to the
+    /// binding-plan hash; it never contains a run-local dense subject ID.
+    pub fn canonical_rendering(&self) -> String {
+        serde_json::to_string(&canonical_subject_key(self))
+            .expect("canonical typestate subject identities are serializable")
+    }
+
+    /// Render the source-facing identity without the absolute workspace mount.
+    ///
+    /// Registration and cache identities continue to use
+    /// [`Self::canonical_rendering`]. Public query rows use this form so the
+    /// same indexed content has the same identity in different checkouts.
+    pub fn public_canonical_rendering(&self) -> String {
+        let mut value = serde_json::to_value(canonical_subject_key(self))
+            .expect("canonical typestate subject identities are serializable");
+        remove_canonical_mounts(&mut value);
+        serde_json::to_string(&value).expect("public typestate subject identities are serializable")
+    }
+}
+
+fn remove_canonical_mounts(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            fields.remove("mount");
+            for value in fields.values_mut() {
+                remove_canonical_mounts(value);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                remove_canonical_mounts(value);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -662,6 +703,9 @@ pub struct TypestateBindingPlan {
     canonical_bytes: Box<[u8]>,
     canonical_rendering: Box<str>,
     hash: TypestateBindingPlanHash,
+    summary_hashes:
+        HashMap<SemanticArtifactKey, HashMap<DeclarationLocator, TypestateBindingSummaryHash>>,
+    empty_summary_hash: TypestateBindingSummaryHash,
 }
 
 impl TypestateBindingPlan {
@@ -855,6 +899,14 @@ impl TypestateBindingPlan {
         let canonical_rendering = serde_json::to_string_pretty(&canonical)
             .map_err(TypestateBindingPlanError::Canonicalization)?;
         let hash = TypestateBindingPlanHash::from_canonical_bytes(&canonical_bytes);
+        let (summary_hashes, empty_summary_hash) = procedure_summary_hashes(
+            protocol,
+            &subjects,
+            &initial_seeds,
+            &event_bindings,
+            &terminal_bindings,
+        )
+        .map_err(TypestateBindingPlanError::Canonicalization)?;
 
         let mut subject_by_object =
             HashMap::<_, HashMap<AbstractObject, TypestateSubjectId>>::new();
@@ -893,11 +945,59 @@ impl TypestateBindingPlan {
             canonical_bytes: canonical_bytes.into_boxed_slice(),
             canonical_rendering: canonical_rendering.into_boxed_str(),
             hash,
+            summary_hashes,
+            empty_summary_hash,
         })
     }
 
     pub fn subjects(&self) -> &[BoundTypestateSubject] {
         &self.subjects
+    }
+
+    /// Visit every semantic artifact identity retained by this plan.
+    ///
+    /// Registries use this to reject stale bindings before solver execution.
+    /// Duplicate keys are intentional here: callers that need a set can
+    /// deduplicate without this hot-path model retaining another index.
+    pub fn for_each_retained_artifact_key(&self, mut visit: impl FnMut(&SemanticArtifactKey)) {
+        for subject in &self.subjects {
+            visit_access_path_root_artifacts(subject.object().identity(), &mut visit);
+        }
+        for site in self
+            .initial_seeds
+            .iter()
+            .map(BoundTypestateInitialSeed::site)
+            .chain(self.event_bindings.iter().map(BoundTypestateEvent::site))
+            .chain(
+                self.terminal_bindings
+                    .iter()
+                    .map(BoundTypestateTerminal::site),
+            )
+        {
+            visit_observation_site_artifacts(site, &mut visit);
+        }
+    }
+
+    /// Visit every concrete semantic artifact allocation retained by handles
+    /// in this plan. Key-only scoped locators are intentionally excluded: they
+    /// retain identities but do not own semantic IR allocations.
+    pub(crate) fn for_each_retained_artifact(&self, mut visit: impl FnMut(&Arc<SemanticArtifact>)) {
+        for subject in &self.subjects {
+            visit_access_path_root_artifact_values(subject.object().identity(), &mut visit);
+        }
+        for site in self
+            .initial_seeds
+            .iter()
+            .map(BoundTypestateInitialSeed::site)
+            .chain(self.event_bindings.iter().map(BoundTypestateEvent::site))
+            .chain(
+                self.terminal_bindings
+                    .iter()
+                    .map(BoundTypestateTerminal::site),
+            )
+        {
+            visit_observation_site_artifact_values(site, &mut visit);
+        }
     }
 
     pub const fn protocol_hash(&self) -> TypestateProtocolHash {
@@ -1049,6 +1149,122 @@ impl TypestateBindingPlan {
 
     pub const fn hash(&self) -> TypestateBindingPlanHash {
         self.hash
+    }
+
+    pub fn summary_hash_for(
+        &self,
+        artifact: &SemanticArtifactKey,
+        declaration: &DeclarationLocator,
+    ) -> TypestateBindingSummaryHash {
+        self.summary_hashes
+            .get(artifact)
+            .and_then(|declarations| declarations.get(declaration))
+            .copied()
+            .unwrap_or(self.empty_summary_hash)
+    }
+}
+
+fn visit_access_path_root_artifacts(
+    root: &AccessPathRoot,
+    visit: &mut impl FnMut(&SemanticArtifactKey),
+) {
+    let mut visit_procedure = |procedure: &ProcedureHandle| visit(procedure.artifact().key());
+    match root {
+        AccessPathRoot::Value(value) => visit_procedure(value.procedure()),
+        AccessPathRoot::CallResult(result) => {
+            visit_procedure(result.call().procedure());
+            visit_procedure(result.result().procedure());
+            visit_procedure(result.callee());
+            for call in result
+                .caller_context()
+                .calls()
+                .iter()
+                .chain(result.callee_context().calls())
+            {
+                visit_procedure(call.procedure());
+            }
+        }
+        AccessPathRoot::ProcedurePort(port) | AccessPathRoot::CaptureSlot(port) => {
+            visit_procedure(port.procedure());
+        }
+        AccessPathRoot::Allocation(allocation) => visit_procedure(allocation.procedure()),
+        AccessPathRoot::LexicalCell(location) => visit_procedure(location.procedure()),
+        AccessPathRoot::Static(locator)
+        | AccessPathRoot::TypeSummary(locator)
+        | AccessPathRoot::ModuleObject(locator)
+        | AccessPathRoot::External(locator) => visit(locator.scope().key()),
+    }
+}
+
+fn visit_observation_site_artifacts(
+    site: &TypestateObservationSite,
+    visit: &mut impl FnMut(&SemanticArtifactKey),
+) {
+    match site {
+        TypestateObservationSite::ProgramPoint { point, context, .. } => {
+            visit(point.procedure().artifact().key());
+            for call in context.runtime().calls() {
+                visit(call.procedure().artifact().key());
+            }
+        }
+        TypestateObservationSite::CallSite { call, context, .. } => {
+            visit(call.procedure().artifact().key());
+            for context_call in context.runtime().calls() {
+                visit(context_call.procedure().artifact().key());
+            }
+        }
+    }
+}
+
+fn visit_access_path_root_artifact_values(
+    root: &AccessPathRoot,
+    visit: &mut impl FnMut(&Arc<SemanticArtifact>),
+) {
+    let mut visit_procedure = |procedure: &ProcedureHandle| visit(procedure.artifact());
+    match root {
+        AccessPathRoot::Value(value) => visit_procedure(value.procedure()),
+        AccessPathRoot::CallResult(result) => {
+            visit_procedure(result.call().procedure());
+            visit_procedure(result.result().procedure());
+            visit_procedure(result.callee());
+            for call in result
+                .caller_context()
+                .calls()
+                .iter()
+                .chain(result.callee_context().calls())
+            {
+                visit_procedure(call.procedure());
+            }
+        }
+        AccessPathRoot::ProcedurePort(port) | AccessPathRoot::CaptureSlot(port) => {
+            visit_procedure(port.procedure());
+        }
+        AccessPathRoot::Allocation(allocation) => visit_procedure(allocation.procedure()),
+        AccessPathRoot::LexicalCell(location) => visit_procedure(location.procedure()),
+        AccessPathRoot::Static(_)
+        | AccessPathRoot::TypeSummary(_)
+        | AccessPathRoot::ModuleObject(_)
+        | AccessPathRoot::External(_) => {}
+    }
+}
+
+fn visit_observation_site_artifact_values(
+    site: &TypestateObservationSite,
+    visit: &mut impl FnMut(&Arc<SemanticArtifact>),
+) {
+    match site {
+        TypestateObservationSite::ProgramPoint { point, context, .. } => {
+            visit(point.procedure().artifact());
+            for call in context.runtime().calls() {
+                visit(call.procedure().artifact());
+            }
+        }
+        TypestateObservationSite::CallSite { call, context, .. } => {
+            visit(call.procedure().artifact());
+            for context_call in context.runtime().calls() {
+                visit(context_call.procedure().artifact());
+            }
+        }
     }
 }
 
@@ -1255,7 +1471,7 @@ fn value_locator(value: &crate::analyzer::semantic::ValueHandle) -> SemanticLoca
     source_locator(value.procedure(), row.source)
 }
 
-fn program_point_locator(point: &ProgramPointHandle) -> SemanticLocator {
+pub(super) fn program_point_locator(point: &ProgramPointHandle) -> SemanticLocator {
     let row = point
         .procedure()
         .semantics()
@@ -1626,6 +1842,159 @@ where
         .get(site)
         .into_iter()
         .flat_map(|indexes| indexes.iter().copied())
+}
+
+#[derive(Default)]
+struct ProcedureBindingIndexes {
+    seeds: Vec<usize>,
+    events: Vec<usize>,
+    terminals: Vec<usize>,
+}
+
+type ProcedureBindingSummaryHashes =
+    HashMap<SemanticArtifactKey, HashMap<DeclarationLocator, TypestateBindingSummaryHash>>;
+type ProcedureBindingSummaryHashResult =
+    Result<(ProcedureBindingSummaryHashes, TypestateBindingSummaryHash), serde_json::Error>;
+
+fn procedure_summary_hashes(
+    protocol: &CompiledProtocol,
+    subjects: &[BoundTypestateSubjectSpec],
+    initial_seeds: &[TypestateInitialSeedSpec],
+    event_bindings: &[TypestateEventBindingSpec],
+    terminal_bindings: &[TypestateTerminalBindingSpec],
+) -> ProcedureBindingSummaryHashResult {
+    type ProcedureKey = (SemanticArtifactKey, DeclarationLocator);
+    let mut indexes = HashMap::<ProcedureKey, ProcedureBindingIndexes>::new();
+    for (index, seed) in initial_seeds.iter().enumerate() {
+        indexes
+            .entry(summary_binding_procedure_key(&seed.site))
+            .or_default()
+            .seeds
+            .push(index);
+    }
+    for (index, event) in event_bindings.iter().enumerate() {
+        indexes
+            .entry(summary_binding_procedure_key(&event.site))
+            .or_default()
+            .events
+            .push(index);
+    }
+    for (index, terminal) in terminal_bindings.iter().enumerate() {
+        indexes
+            .entry(summary_binding_procedure_key(&terminal.site))
+            .or_default()
+            .terminals
+            .push(index);
+    }
+
+    let empty = CanonicalBindingPlan {
+        schema_version: BINDING_PLAN_SCHEMA_VERSION,
+        protocol_hash: protocol.hash(),
+        subjects: Vec::new(),
+        initial_seeds: Vec::new(),
+        event_bindings: Vec::new(),
+        terminal_bindings: Vec::new(),
+    };
+    let empty_summary_hash =
+        TypestateBindingSummaryHash::from_canonical_bytes(&serde_json::to_vec(&empty)?);
+    let mut summary_hashes = ProcedureBindingSummaryHashes::new();
+    for ((artifact, declaration), indexes) in indexes {
+        let mut subject_keys = indexes
+            .seeds
+            .iter()
+            .map(|index| &initial_seeds[*index].subject)
+            .chain(
+                indexes
+                    .events
+                    .iter()
+                    .map(|index| &event_bindings[*index].subject),
+            )
+            .chain(
+                indexes
+                    .terminals
+                    .iter()
+                    .map(|index| &terminal_bindings[*index].subject),
+            )
+            .collect::<Vec<_>>();
+        subject_keys.sort_unstable();
+        subject_keys.dedup();
+        let canonical = CanonicalBindingPlan {
+            schema_version: BINDING_PLAN_SCHEMA_VERSION,
+            protocol_hash: protocol.hash(),
+            subjects: subject_keys
+                .into_iter()
+                .map(|key| {
+                    let index = subjects
+                        .binary_search_by(|subject| subject.key.cmp(key))
+                        .expect("validated binding rows reference a declared subject");
+                    canonical_subject(&subjects[index])
+                })
+                .collect(),
+            initial_seeds: indexes
+                .seeds
+                .iter()
+                .map(|index| {
+                    let seed = &initial_seeds[*index];
+                    CanonicalSeed {
+                        subject: canonical_subject_key(&seed.subject),
+                        state: seed.state.as_str(),
+                        site: canonical_site(&seed.site),
+                        role: seed.role,
+                        quality: canonical_quality(&seed.quality),
+                    }
+                })
+                .collect(),
+            event_bindings: indexes
+                .events
+                .iter()
+                .map(|index| {
+                    let binding = &event_bindings[*index];
+                    CanonicalEventBinding {
+                        event: binding.event.as_str(),
+                        subject: canonical_subject_key(&binding.subject),
+                        site: canonical_site(&binding.site),
+                        order: binding.order,
+                        role: binding.role,
+                        quality: canonical_quality(&binding.quality),
+                    }
+                })
+                .collect(),
+            terminal_bindings: indexes
+                .terminals
+                .iter()
+                .map(|index| {
+                    let binding = &terminal_bindings[*index];
+                    CanonicalTerminalBinding {
+                        expectation: binding.expectation.as_str(),
+                        subject: canonical_subject_key(&binding.subject),
+                        site: canonical_site(&binding.site),
+                        role: binding.role,
+                        quality: canonical_quality(&binding.quality),
+                    }
+                })
+                .collect(),
+        };
+        let hash =
+            TypestateBindingSummaryHash::from_canonical_bytes(&serde_json::to_vec(&canonical)?);
+        summary_hashes
+            .entry(artifact)
+            .or_default()
+            .insert(declaration, hash);
+    }
+    Ok((summary_hashes, empty_summary_hash))
+}
+
+fn summary_binding_procedure_key(
+    site: &TypestateObservationSite,
+) -> (SemanticArtifactKey, DeclarationLocator) {
+    let procedure = match site {
+        TypestateObservationSite::ProgramPoint { point, .. } => point.procedure(),
+        TypestateObservationSite::CallSite { call, .. } => call.procedure(),
+    };
+    (
+        procedure.artifact().key().clone(),
+        procedure.semantics().locator().declaration().clone(),
+    )
 }
 
 #[derive(Serialize)]

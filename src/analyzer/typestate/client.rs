@@ -3,8 +3,9 @@ use std::fmt;
 
 use crate::analyzer::dataflow::{
     DataflowEdge, DataflowOutput, DataflowRequest, DistributiveDataflowProblem,
-    SummaryDataflowError, SummaryDataflowResult, SummarySolveInput, SummaryWitnessError,
-    WitnessRetentionLimits, solve_with_summaries,
+    ReusableProcedureSummary, ReusableSummaryProvider, SolverTermination, SummaryDataflowError,
+    SummaryDataflowResult, SummarySolveInput, SummaryWitnessError, WitnessRetentionLimits,
+    solve_with_reusable_end_summaries,
 };
 use crate::analyzer::semantic::{
     EvidenceCompleteness, IcfgEdgeKind, IcfgProvider, ProcedureHandle, ProofStatus, SemanticBudget,
@@ -124,12 +125,78 @@ impl TypestateFact {
         subject: TypestateSubjectId,
         state: ProtocolStateId,
     ) -> Self {
+        Self::summary_state(plan, subject, state, TypestateUncertaintySet(0), false)
+    }
+
+    pub(super) const fn summary_state(
+        plan: TypestateBindingPlanHash,
+        subject: TypestateSubjectId,
+        state: ProtocolStateId,
+        uncertainty: TypestateUncertaintySet,
+        abstained: bool,
+    ) -> Self {
         Self(TypestateFactKind::State {
             plan,
             subject,
             state,
-            uncertainty: TypestateUncertaintySet(0),
-            abstained: false,
+            uncertainty,
+            abstained,
+        })
+    }
+
+    pub(super) const fn summary_violation(
+        plan: TypestateBindingPlanHash,
+        subject: TypestateSubjectId,
+        event_binding: TypestateEventBindingId,
+        from: ProtocolStateId,
+        to: ProtocolStateId,
+        uncertainty: TypestateUncertaintySet,
+        abstained: bool,
+    ) -> Self {
+        Self(TypestateFactKind::Violation {
+            plan,
+            subject,
+            violation: TypestateViolation {
+                event_binding,
+                from,
+                to,
+            },
+            uncertainty,
+            abstained,
+        })
+    }
+
+    pub(super) const fn summary_non_violation(
+        plan: TypestateBindingPlanHash,
+        subject: TypestateSubjectId,
+        event_binding: TypestateEventBindingId,
+        uncertainty: TypestateUncertaintySet,
+        abstained: bool,
+    ) -> Self {
+        Self(TypestateFactKind::NonViolation {
+            plan,
+            subject,
+            event_binding,
+            uncertainty,
+            abstained,
+        })
+    }
+
+    pub(super) const fn summary_terminal(
+        plan: TypestateBindingPlanHash,
+        subject: TypestateSubjectId,
+        terminal_binding: TypestateTerminalBindingId,
+        state: ProtocolStateId,
+        uncertainty: TypestateUncertaintySet,
+        abstained: bool,
+    ) -> Self {
+        Self(TypestateFactKind::Terminal {
+            plan,
+            subject,
+            terminal_binding,
+            state,
+            uncertainty,
+            abstained,
         })
     }
 
@@ -365,6 +432,7 @@ pub struct TypestateSummaryResult {
     protocol_hash: TypestateProtocolHash,
     binding_plan_hash: TypestateBindingPlanHash,
     bindings_complete: bool,
+    bindings_summary_complete: bool,
     execution_complete: bool,
     result: SummaryDataflowResult<TypestateFact>,
 }
@@ -382,12 +450,37 @@ impl TypestateSummaryResult {
         self.bindings_complete
     }
 
+    /// Whether binding discovery covered every candidate needed for reuse.
+    ///
+    /// Unlike [`Self::bindings_complete`], this permits exhaustive modeled
+    /// ambiguity because multiplicity and proof remain in the summary facts.
+    pub const fn bindings_summary_complete(&self) -> bool {
+        self.bindings_summary_complete
+    }
+
     pub const fn result(&self) -> &SummaryDataflowResult<TypestateFact> {
         &self.result
     }
 
     pub fn is_complete(&self) -> bool {
         self.bindings_complete && self.execution_complete && self.result.is_complete()
+    }
+
+    /// Whether this solve is safe to project into a reusable protocol artifact.
+    ///
+    /// Modeled ambiguity, unknown/external calls, escape, and unmatched events
+    /// remain sound summary effects. Cancellation, bounded truncation,
+    /// incomplete bindings, abstention, and explicit incomplete-analysis facts
+    /// do not.
+    pub fn is_summary_publication_complete(&self) -> bool {
+        self.bindings_summary_complete
+            && self.result.is_complete()
+            && self.result.facts().iter().all(|fact| {
+                !fact.abstained()
+                    && !fact
+                        .uncertainty()
+                        .contains(TypestateUncertainty::IncompleteAnalysis)
+            })
     }
 }
 
@@ -520,9 +613,31 @@ impl<'plan> TypestateFlowProblem<'plan> {
                 .all(|binding| binding.quality().is_definitive())
     }
 
+    fn bindings_summary_complete(&self) -> bool {
+        self.bindings
+            .subjects()
+            .iter()
+            .all(|binding| binding.quality().is_complete())
+            && self
+                .bindings
+                .initial_seeds()
+                .iter()
+                .all(|binding| binding.quality().is_complete())
+            && self
+                .bindings
+                .event_bindings()
+                .iter()
+                .all(|binding| binding.quality().is_complete())
+            && self
+                .bindings
+                .terminal_bindings()
+                .iter()
+                .all(|binding| binding.quality().is_complete())
+    }
+
     fn transfer(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, TypestateFact>,
         fact: TypestateFact,
         family: TransferFamily,
         out: &mut dyn DataflowOutput<TypestateFact>,
@@ -558,7 +673,7 @@ impl<'plan> TypestateFlowProblem<'plan> {
 
     fn transfer_facts(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, TypestateFact>,
         family: TransferFamily,
         facts: Vec<TypestateFact>,
         out: &mut dyn DataflowOutput<TypestateFact>,
@@ -1176,6 +1291,47 @@ pub fn solve_typestate_with_summaries<Provider>(
 where
     Provider: IcfgProvider + ?Sized,
 {
+    let mut reusable = NoReusableTypestateSummaries;
+    solve_typestate_with_reusable_provider(
+        root,
+        entry_facts,
+        provider,
+        &mut reusable,
+        protocol,
+        bindings,
+        semantic_budget,
+        request,
+    )
+}
+
+struct NoReusableTypestateSummaries;
+
+impl ReusableSummaryProvider<TypestateFact> for NoReusableTypestateSummaries {
+    fn summary_for(
+        &mut self,
+        _procedure: &ProcedureHandle,
+        _entry_fact: TypestateFact,
+        _request: &mut DataflowRequest<'_>,
+    ) -> Result<Option<ReusableProcedureSummary<TypestateFact>>, SolverTermination> {
+        Ok(None)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn solve_typestate_with_reusable_provider<Provider, Reusable>(
+    root: &ProcedureHandle,
+    entry_facts: &[TypestateFact],
+    provider: &Provider,
+    reusable: &mut Reusable,
+    protocol: &CompiledProtocol,
+    bindings: &TypestateBindingPlan,
+    semantic_budget: &mut SemanticBudget,
+    request: &mut DataflowRequest<'_>,
+) -> Result<TypestateSummaryResult, TypestateSolveError>
+where
+    Provider: IcfgProvider + ?Sized,
+    Reusable: ReusableSummaryProvider<TypestateFact> + ?Sized,
+{
     let problem = TypestateFlowProblem::try_new(protocol, bindings)?;
     problem.validate_analysis_root(root)?;
     problem.validate_entry_facts(entry_facts)?;
@@ -1185,10 +1341,11 @@ where
         MAX_TYPESTATE_RETAINED_WITNESS_BYTES,
     )
     .expect("typestate best-effort witness limits are valid");
-    let result = solve_with_summaries(
+    let result = solve_with_reusable_end_summaries(
         SummarySolveInput::new(root, entry_facts).with_witness_retention(witness_retention),
         provider,
         &problem,
+        reusable,
         semantic_budget,
         request,
     )?;
@@ -1200,6 +1357,7 @@ where
         protocol_hash: protocol.hash(),
         binding_plan_hash: bindings.hash(),
         bindings_complete: problem.bindings_complete(),
+        bindings_summary_complete: problem.bindings_summary_complete(),
         execution_complete,
         result,
     })
@@ -1214,7 +1372,7 @@ impl DistributiveDataflowProblem for TypestateFlowProblem<'_> {
 
     fn normal_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -1223,7 +1381,7 @@ impl DistributiveDataflowProblem for TypestateFlowProblem<'_> {
 
     fn call_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -1232,7 +1390,7 @@ impl DistributiveDataflowProblem for TypestateFlowProblem<'_> {
 
     fn return_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -1241,7 +1399,7 @@ impl DistributiveDataflowProblem for TypestateFlowProblem<'_> {
 
     fn call_to_return_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {
@@ -1250,7 +1408,7 @@ impl DistributiveDataflowProblem for TypestateFlowProblem<'_> {
 
     fn exceptional_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     ) {

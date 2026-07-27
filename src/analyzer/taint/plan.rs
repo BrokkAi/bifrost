@@ -393,6 +393,23 @@ impl TaintAnalysisPlan {
         &self.sinks
     }
 
+    pub(crate) const fn sanitizers(&self) -> &[TaintSanitizerBinding] {
+        &self.sanitizers
+    }
+
+    pub(crate) const fn transforms(&self) -> &[TaintTransformBinding] {
+        &self.transforms
+    }
+
+    pub(crate) fn summary_key_rows(&self) -> usize {
+        self.value_flow
+            .carrier_summary_identity_total_rows()
+            .saturating_add(self.sources.len())
+            .saturating_add(self.sinks.len())
+            .saturating_add(self.sanitizers.len())
+            .saturating_add(self.transforms.len())
+    }
+
     pub const fn discovery_complete(&self) -> bool {
         self.discovery_complete
     }

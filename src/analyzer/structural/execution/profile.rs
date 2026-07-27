@@ -352,6 +352,10 @@ impl QueryOperatorWorkProfile {
                     .traversal_steps
                     .saturating_add(other.semantic.traversal_steps),
                 budget_exhausted: self.semantic.budget_exhausted || other.semantic.budget_exhausted,
+                typestate: self
+                    .semantic
+                    .typestate
+                    .saturating_add(other.semantic.typestate),
             },
         }
     }
@@ -417,6 +421,10 @@ impl QueryOperatorWorkProfile {
                 // only when it first appeared in this interval.
                 budget_exhausted: self.semantic.budget_exhausted
                     && !earlier.semantic.budget_exhausted,
+                typestate: self
+                    .semantic
+                    .typestate
+                    .saturating_sub(earlier.semantic.typestate),
             },
         }
     }

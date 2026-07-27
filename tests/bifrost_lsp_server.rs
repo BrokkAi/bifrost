@@ -924,6 +924,21 @@ fn bifrost_lsp_server_returns_navigable_cfg_results() {
         }),
         "expected navigable source-backed control edges in {response}"
     );
+
+    let unresolved = server.request(
+        "bifrost/queryCode",
+        json!({
+            "query": "(typestate :protocol-ref \"embedding:resource-lifecycle\" (procedure-of (language typescript (function :name \"run\"))))"
+        }),
+    );
+    assert!(unresolved["error"].is_null(), "{unresolved}");
+    assert_eq!(unresolved["result"]["results"], json!([]));
+    assert!(
+        unresolved["result"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("unresolved_protocol_reference")),
+        "unconfigured LSP host must surface the typed unresolved-reference diagnostic: {unresolved}"
+    );
 }
 
 #[test]
@@ -1748,7 +1763,7 @@ fn bifrost_lsp_server_completes_optional_schema_versions_from_unsaved_rqlp_sourc
     );
     let completion = &response["result"]["items"][0];
     assert_eq!(
-        completion["textEdit"]["newText"], ":schema-version 3",
+        completion["textEdit"]["newText"], ":schema-version 4",
         "{response}"
     );
     assert_eq!(

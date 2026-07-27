@@ -1298,12 +1298,22 @@ fn run_rql_query_result(
             .results
             .into_iter()
             .map(|result| {
+                let witness_step_uris = match &result.value {
+                    CodeQueryResultValue::TypestateWitness { value } => value
+                        .steps
+                        .iter()
+                        .map(|step| path_to_uri_string(&workspace_root.join(&step.source.path)))
+                        .collect(),
+                    _ => Vec::new(),
+                };
                 let path = match &result.value {
                     CodeQueryResultValue::StructuralMatch { value } => &value.path,
                     CodeQueryResultValue::Declaration { value } => &value.path,
                     CodeQueryResultValue::Procedure { value } => &value.path,
                     CodeQueryResultValue::ProgramPoint { value } => &value.path,
                     CodeQueryResultValue::ControlEdge { value } => &value.path,
+                    CodeQueryResultValue::TypestateFinding { value } => &value.path,
+                    CodeQueryResultValue::TypestateWitness { value } => &value.path,
                     CodeQueryResultValue::File { value } => &value.path,
                     CodeQueryResultValue::ReferenceSite { value } => &value.path,
                     CodeQueryResultValue::CallSite { value } => &value.path,
@@ -1312,6 +1322,7 @@ fn run_rql_query_result(
                 };
                 RunRqlQueryResultItem {
                     uri: path_to_uri_string(&workspace_root.join(path)),
+                    witness_step_uris,
                     result,
                 }
             })
@@ -2126,6 +2137,8 @@ struct RunRqlQueryResult {
 #[derive(serde::Serialize)]
 struct RunRqlQueryResultItem {
     uri: String,
+    #[serde(rename = "witnessStepUris", skip_serializing_if = "Vec::is_empty")]
+    witness_step_uris: Vec<String>,
     #[serde(flatten)]
     result: CodeQueryResultItem,
 }
@@ -3963,6 +3976,114 @@ mod tests {
         assert_eq!(
             response.error.as_ref().map(|error| error.code),
             Some(ErrorCode::RequestCanceled as i32)
+        );
+    }
+
+    #[test]
+    fn rql_query_transport_attaches_navigation_uris_to_typestate_witness_steps() {
+        use crate::analyzer::structural::{
+            CodeQueryRange, CodeQueryResult, CodeQuerySemanticCompleteness,
+            CodeQuerySemanticEvidence, CodeQuerySemanticProof, CodeQuerySourceSite,
+            CodeQueryTypestateSubject, CodeQueryTypestateWitness, CodeQueryTypestateWitnessStep,
+            CodeQueryTypestateWitnessStepKind,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("main.ts"),
+            "export function lifecycle() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("helper.ts"),
+            "export function helper() {}\n",
+        )
+        .unwrap();
+        let project: Arc<dyn Project> = Arc::new(FilesystemProject::new(temp.path()).unwrap());
+        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let range = CodeQueryRange {
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 5,
+        };
+        let evidence = CodeQuerySemanticEvidence {
+            proof: CodeQuerySemanticProof::Proven,
+            proof_reason: None,
+            completeness: CodeQuerySemanticCompleteness::Complete,
+            completeness_reason: None,
+        };
+        let response = CodeQueryResponse::Results(CodeQueryResult {
+            results: vec![CodeQueryResultItem {
+                value: CodeQueryResultValue::TypestateWitness {
+                    value: Box::new(CodeQueryTypestateWitness {
+                        id: "witness".to_string(),
+                        finding_id: "finding".to_string(),
+                        protocol_ref: "test:lifecycle".to_string(),
+                        protocol_hash: "protocol".to_string(),
+                        binding_plan_hash: "bindings".to_string(),
+                        subject: CodeQueryTypestateSubject {
+                            class: "resource".to_string(),
+                            identity: "subject".to_string(),
+                        },
+                        witness_index: 0,
+                        observed_state: Some("closed".to_string()),
+                        path: "main.ts".to_string(),
+                        language: "typescript",
+                        range,
+                        quality: evidence.clone(),
+                        uncertainty: Vec::new(),
+                        abstained: false,
+                        steps: vec![
+                            CodeQueryTypestateWitnessStep {
+                                kind: CodeQueryTypestateWitnessStepKind::Seed,
+                                source: CodeQuerySourceSite {
+                                    path: "main.ts".to_string(),
+                                    range,
+                                },
+                                target: None,
+                                origin: None,
+                                evidence: evidence.clone(),
+                            },
+                            CodeQueryTypestateWitnessStep {
+                                kind: CodeQueryTypestateWitnessStepKind::Edge {
+                                    edge_kind: "normal",
+                                },
+                                source: CodeQuerySourceSite {
+                                    path: "helper.ts".to_string(),
+                                    range,
+                                },
+                                target: None,
+                                origin: None,
+                                evidence,
+                            },
+                        ],
+                        retained_bytes: 128,
+                        truncated: false,
+                        omitted_steps_lower_bound: 0,
+                        alternatives_truncated: false,
+                        retention_truncated: false,
+                    }),
+                },
+                provenance: Vec::new(),
+                provenance_truncated: false,
+            }],
+            truncated: false,
+            diagnostics: Vec::new(),
+        });
+
+        let value = serde_json::to_value(run_rql_query_result(&workspace, response)).unwrap();
+        let expected_root = workspace.analyzer().project().root();
+        assert_eq!(
+            value.pointer("/results/0/uri"),
+            Some(&json!(path_to_uri_string(&expected_root.join("main.ts"))))
+        );
+        assert_eq!(
+            value.pointer("/results/0/witnessStepUris"),
+            Some(&json!([
+                path_to_uri_string(&expected_root.join("main.ts")),
+                path_to_uri_string(&expected_root.join("helper.ts")),
+            ]))
         );
     }
 

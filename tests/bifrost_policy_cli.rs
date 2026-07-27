@@ -290,7 +290,7 @@ fn strict_versions_endpoint_roots_and_unsupported_runs_are_status_two_reports() 
     assert!(
         String::from_utf8_lossy(&accepted_inference.stdout)
             .contains(
-                "policy bifrost.security.inferred-dynamic-eval inferred policy schema 1 and RQL schema 3"
+                "policy bifrost.security.inferred-dynamic-eval inferred policy schema 1 and RQL schema 4"
             )
     );
 

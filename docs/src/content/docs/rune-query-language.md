@@ -17,7 +17,7 @@ RQL is only a query language. It is not a second matcher or query engine.
 
 Every RQL expression lowers into [JSON `CodeQuery`](/code-query-json/) before validation and execution. MCP hosts with `query_code` call the same engine using canonical JSON inline, or they can load a complete saved `.rql` file through the exclusive `query_file` argument. MCP does not accept raw inline RQL, and the `core` toolset does not expose `query_code`; use `symbol|extended` or `searchtools`. See [MCP query and RQL availability](/mcp/#query-and-rql-availability) for the complete surface matrix and [Code Querying](/code-querying/) for the schema and engine overview.
 
-RQL omits a schema version by default and therefore targets the compatible head, currently CodeQuery schema version 3. Use a root `:schema-version 2` option when a saved query must retain the pre-CFG vocabulary; version 2 rejects the CFG forms described below.
+RQL omits a schema version by default and therefore targets the compatible head, currently CodeQuery schema version 4. Use a root `:schema-version 2` option for the pre-CFG vocabulary or `:schema-version 3` for CFG without typestate; both reject later forms.
 
 Save a complete RQL expression in a workspace `.rql` file and run it without opening the REPL:
 
@@ -189,7 +189,23 @@ This returns `program_point` rows for targets of edges leaving `run`'s entry. Pr
 
 Semantic materialization is lazy and request-scoped. It has separate finite limits of 256 materialized files, 16 MiB of source, 1,000,000 rows per semantic dimension, 64 MiB retained semantic data, and 1,000,000 traversal steps. Repeating an edge form is how an authored query asks for another hop; no form silently computes an unbounded closure.
 
-This surface is a procedure-local CFG inspection API. It does not cross call boundaries and does not provide an ICFG, data-flow, taint, typestate, finding, or witness engine.
+This schema-v3 surface is a procedure-local CFG inspection API. It does not cross call boundaries and does not provide an ICFG, data-flow, taint, typestate, finding, or witness engine. Schema v4 adds only the registered typestate adapter below.
+
+## Registered Typestate Findings and Witnesses
+
+Schema version 4 adds `typestate`, which consumes an exact `procedure` and a namespaced `:protocol-ref`, plus `witness`, which consumes each resulting finding. The connected host must already have registered an in-memory compiled protocol and pre-resolved binding plan for that reference and current workspace generation.
+
+<!-- code-query-test:rql:typestate-witness -->
+```lisp
+(witness :max-steps 32 :max-bytes 16384
+  (typestate :protocol-ref "embedding:resource-lifecycle"
+    (procedure-of
+      (function :name "lifecycle"))))
+```
+
+This lowers to `procedure_of`, `typestate`, and `witness` JSON steps. The optional witness limits are non-negative reductions, so zero requests metadata without step payload. They cannot enlarge host limits, alter finding certainty, or rerun analysis. Findings are diagnostic-neutral: they carry protocol and binding hashes, canonical subject identity, kind, `may`/`must`/`inconclusive` certainty, proof/completeness, uncertainty, exact range, and witness counts—not severity, messages, classifications, or SARIF fields. Witnesses add ordered source-backed steps and truncation/omission metadata.
+
+The query never accepts protocol paths, query-time bindings, or may/must mode changes. Missing/stale registrations, wrong procedure roots, unsupported/partial semantics, cancellation, and solver/finding/witness budgets remain explicit incomplete diagnostics. Explain mode needs no registration; results and profile resolve the immutable host snapshot before execution.
 
 Only declarations indexed by the active workspace analyzer can appear. A visible usage of library code does not imply that the library declaration itself is indexed or queryable.
 

@@ -51,12 +51,22 @@ This Play action is a VS Code language-server feature. It does not start an MCP 
 
 The **Bifrost Query Results** Explorer view groups every tagged result by path,
 including structural matches, declarations, procedures, program points,
-control edges, and files. Select a source-backed result to open its file and
-highlight its range; control edges navigate to their source mapping and show
-both endpoint IDs and ranges in the tooltip. Selecting a file result opens the
+control edges, typestate findings/witnesses, and files. Select a source-backed
+result to open its file and highlight its range; control edges show both
+endpoint IDs and ranges. Typestate findings show certainty, protocol identity,
+proof/completeness, and witness counts without inventing severity. Expand a
+typestate witness to navigate each ordered source-backed step; tooltips retain
+evidence and truncation/omission metadata. Selecting a file result opens the
 file at its first line. Pipeline wrappers such as `enclosing-decl`,
-`cfg-successor-edges`, and `file-of` therefore remain navigable from the same
-view.
+`cfg-successor-edges`, `typestate`, `witness`, and `file-of` therefore remain
+navigable from the same view.
+
+The language server itself does not accept protocol or binding files over this
+private request. Results/profile typestate queries require the embedding host
+to pre-register the named protocol against the current workspace; otherwise
+the output shows the typed unresolved-reference diagnostic. Explain mode can
+still display the planned typestate operator without registration or solver
+work.
 
 ![An RQL query in VS Code, grouped query results in Explorer, and the selected Rust match.](../../assets/rql-vscode-query-results.png)
 
