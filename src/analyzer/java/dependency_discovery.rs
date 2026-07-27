@@ -68,7 +68,7 @@ impl DiscoveredJavaDependencies {
     }
 }
 
-pub(super) fn discover_metadata(project: &dyn Project) -> DiscoveredJavaDependencies {
+pub(crate) fn discover_metadata(project: &dyn Project) -> DiscoveredJavaDependencies {
     let Ok(files) = project.all_files() else {
         return DiscoveredJavaDependencies::default();
     };
@@ -85,7 +85,7 @@ pub(super) fn discover_metadata(project: &dyn Project) -> DiscoveredJavaDependen
     discovered
 }
 
-pub(super) fn discover_build_tools(
+pub(crate) fn discover_build_tools(
     project: &dyn Project,
     config: &JavaDependencyDiscoveryConfig,
 ) -> DiscoveredJavaDependencies {

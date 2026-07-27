@@ -2,7 +2,7 @@ mod adapter;
 mod cache;
 mod clones;
 mod comments;
-mod declarations;
+pub(crate) mod declarations;
 pub(crate) mod dependency_discovery;
 mod exceptions;
 mod hierarchy;
