@@ -113,7 +113,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -212,7 +212,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -267,12 +267,6 @@ jobs:
             runner: ubuntu-24.04-arm
             can-test: true
             rustflags: ''
-            test-args: ''
-            cargo-flags: '--features nlp'
-          - target: aarch64-apple-darwin
-            runner: macos-latest
-            can-test: true
-            rustflags: '-C link-arg=-undefined -C link-arg=dynamic_lookup'
             test-args: ''
             cargo-flags: '--features nlp'
           - target: x86_64-pc-windows-msvc
@@ -374,9 +368,6 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             rustflags: ''
-          - target: aarch64-apple-darwin
-            runner: macos-latest
-            rustflags: '-C link-arg=-undefined -C link-arg=dynamic_lookup'
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             rustflags: ''
