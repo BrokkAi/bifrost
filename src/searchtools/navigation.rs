@@ -6,11 +6,39 @@ use super::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchSymbolsParams {
+    #[serde(deserialize_with = "deserialize_search_symbol_patterns")]
     pub patterns: Vec<String>,
     #[serde(default)]
     pub include_tests: bool,
     #[serde(default = "default_limit")]
     pub limit: usize,
+}
+
+fn deserialize_search_symbol_patterns<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let patterns = Vec::<String>::deserialize(deserializer)?;
+    if patterns.len() > SEARCH_SYMBOL_MAX_PATTERNS {
+        return Err(serde::de::Error::custom(format!(
+            "patterns accepts at most {SEARCH_SYMBOL_MAX_PATTERNS} entries"
+        )));
+    }
+    let mut total_bytes = 0usize;
+    for pattern in &patterns {
+        if pattern.len() > SEARCH_SYMBOL_MAX_PATTERN_BYTES {
+            return Err(serde::de::Error::custom(format!(
+                "each search pattern must be at most {SEARCH_SYMBOL_MAX_PATTERN_BYTES} bytes"
+            )));
+        }
+        total_bytes = total_bytes.saturating_add(pattern.len());
+        if total_bytes > SEARCH_SYMBOL_MAX_TOTAL_PATTERN_BYTES {
+            return Err(serde::de::Error::custom(format!(
+                "search patterns must total at most {SEARCH_SYMBOL_MAX_TOTAL_PATTERN_BYTES} bytes"
+            )));
+        }
+    }
+    Ok(patterns)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,10 +296,11 @@ pub fn search_symbols_with_cancellation(
         .into_iter()
         .filter(|pattern| !pattern.trim().is_empty())
         .collect();
+    let pattern_batch = SearchSymbolPatternBatch::compile(patterns.clone(), false, cancellation);
 
     let definitions = {
         let _scope = profiling::scope("searchtools::search_symbols.resolve");
-        analyzer.search_symbol_candidates(&patterns, false, cancellation)
+        analyzer.search_symbol_candidates(&pattern_batch, cancellation)
     };
     let mut complete = definitions.complete;
 
@@ -279,7 +308,7 @@ pub fn search_symbols_with_cancellation(
         let _scope = profiling::scope("searchtools::search_symbols.filter_ranged");
         let mut seen = HashSet::default();
         let mut filtered = Vec::new();
-        for candidate in definitions.candidates {
+        for candidate in definitions.rows {
             if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
                 complete = false;
                 break;

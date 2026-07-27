@@ -4,9 +4,9 @@ use crate::analyzer::{
     DeclarationInfo, ExceptionHandlingSmell, ExceptionSmellWeights, GlobalUsageDefinitionIndex,
     GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer,
     Language, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer,
-    ScalaAnalyzer, SearchSymbolCandidates, SemanticDiagnostic, SignatureMetadata,
-    SummaryFileProjection, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
-    TypescriptAnalyzer,
+    ScalaAnalyzer, SearchSymbolCandidates, SearchSymbolPatternBatch, SemanticDiagnostic,
+    SignatureMetadata, SummaryFileProjection, TestDetectionProvider, TypeAliasProvider,
+    TypeHierarchyProvider, TypescriptAnalyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use rayon::prelude::*;
@@ -1039,8 +1039,7 @@ impl IAnalyzer for MultiAnalyzer {
 
     fn search_symbol_candidates(
         &self,
-        patterns: &[String],
-        auto_quote: bool,
+        patterns: &SearchSymbolPatternBatch,
         cancellation: Option<&crate::CancellationToken>,
     ) -> SearchSymbolCandidates {
         self.delegates
@@ -1050,7 +1049,7 @@ impl IAnalyzer for MultiAnalyzer {
             .map(|delegate| {
                 delegate
                     .analyzer()
-                    .search_symbol_candidates(patterns, auto_quote, cancellation)
+                    .search_symbol_candidates(patterns, cancellation)
             })
             .reduce(
                 || SearchSymbolCandidates::complete(Vec::new(), 0),

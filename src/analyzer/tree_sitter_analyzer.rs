@@ -10,7 +10,7 @@ use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, CodeUnitType, CppTemplateMetadata, DeclarationInfo,
     GlobalUsageDefinitionIndex, IAnalyzer, ImportInfo, Language, LanguageDialect, Project,
     ProjectFile, Range, RubyMethodDispatchMode, SearchSymbolCandidate, SearchSymbolCandidates,
-    SignatureMetadata, SummaryFileProjection, UsageFactsIndex,
+    SearchSymbolPatternBatch, SignatureMetadata, SummaryFileProjection, UsageFactsIndex,
 };
 use crate::cancellation::CancellationToken;
 use crate::gitblob;
@@ -5626,66 +5626,30 @@ where
     /// invisible when only the normalized fq is probed (#1127). Match the
     /// raw fq as well when it differs.
     fn fq_pattern_matches(&self, unit: &CodeUnit, compiled: &regex::Regex) -> bool {
-        let fq_name = self.adapter.normalize_full_name(&unit.fq_name());
-        if self.adapter.is_anonymous_structure(&fq_name) {
-            return false;
-        }
-        if compiled.is_match(&fq_name) {
-            return true;
-        }
-        let raw = unit.fq_name();
-        fq_name != raw && compiled.is_match(&raw)
+        self.fq_matches(unit, |name| compiled.is_match(name))
     }
 
-    fn fq_patterns_match(&self, unit: &CodeUnit, compiled: &regex::RegexSet) -> bool {
+    fn fq_matches(&self, unit: &CodeUnit, mut matches: impl FnMut(&str) -> bool) -> bool {
         let fq_name = self.adapter.normalize_full_name(&unit.fq_name());
         if self.adapter.is_anonymous_structure(&fq_name) {
             return false;
         }
-        if compiled.is_match(&fq_name) {
+        if matches(&fq_name) {
             return true;
         }
         let raw = unit.fq_name();
-        fq_name != raw && compiled.is_match(&raw)
+        fq_name != raw && matches(&raw)
     }
 
     fn sql_search_symbol_candidates(
         &self,
-        patterns: &[String],
-        auto_quote: bool,
+        patterns: &SearchSymbolPatternBatch,
         cancellation: Option<&CancellationToken>,
     ) -> Option<SearchSymbolCandidates> {
-        if patterns.is_empty() {
+        if patterns.patterns().is_empty() {
             return Some(SearchSymbolCandidates::complete(Vec::new(), 0));
         }
-
-        let compiled_patterns = patterns
-            .iter()
-            .filter_map(|pattern| {
-                let pattern = if auto_quote {
-                    if pattern.contains(".*") {
-                        pattern.to_string()
-                    } else {
-                        format!(".*?{}.*?", regex::escape(pattern))
-                    }
-                } else {
-                    escape_sigil_anchors(pattern)
-                };
-                RegexBuilder::new(&pattern)
-                    .case_insensitive(true)
-                    .build()
-                    .ok()
-            })
-            .collect::<Vec<_>>();
-        if compiled_patterns.is_empty() {
-            return Some(SearchSymbolCandidates::complete(Vec::new(), 0));
-        }
-        let compiled =
-            regex::RegexSetBuilder::new(compiled_patterns.iter().map(|pattern| pattern.as_str()))
-                .case_insensitive(true)
-                .build()
-                .ok()?;
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        if !patterns.complete() || cancellation.is_some_and(CancellationToken::is_cancelled) {
             return Some(SearchSymbolCandidates::incomplete(Vec::new(), 0));
         }
         self.full_declaration_scan_count
@@ -5698,7 +5662,7 @@ where
             ),
             format!(
                 "searching symbol candidates for {} patterns",
-                compiled_patterns.len()
+                patterns.patterns().len()
             ),
         )?;
         let resolver = QueryResolver::from_snapshot(
@@ -5723,7 +5687,7 @@ where
                 break;
             }
             inspected = inspected.saturating_add(1);
-            if self.fq_patterns_match(&code_unit, &compiled) {
+            if self.fq_matches(&code_unit, |name| patterns.is_match(name)) {
                 candidates
                     .entry(code_unit.clone())
                     .or_insert(SearchSymbolCandidate {
@@ -5737,7 +5701,7 @@ where
         let dirty = self.dirty_units_matching_limited(
             false,
             usize::MAX,
-            |unit| self.fq_patterns_match(unit, &compiled),
+            |unit| self.fq_matches(unit, |name| patterns.is_match(name)),
             || !cancellation.is_some_and(CancellationToken::is_cancelled),
         );
         inspected = inspected.saturating_add(dirty.inspected);
@@ -5760,7 +5724,7 @@ where
         }
 
         let synthetic = self.sql_nonpersisted_workspace_declarations_vec_matching_cancellable(
-            |unit| self.fq_patterns_match(unit, &compiled),
+            |unit| self.fq_matches(unit, |name| patterns.is_match(name)),
             cancellation,
         )?;
         inspected = inspected.saturating_add(synthetic.inspected);
@@ -7258,11 +7222,10 @@ where
 
     fn search_symbol_candidates(
         &self,
-        patterns: &[String],
-        auto_quote: bool,
+        patterns: &SearchSymbolPatternBatch,
         cancellation: Option<&CancellationToken>,
     ) -> SearchSymbolCandidates {
-        self.sql_search_symbol_candidates(patterns, auto_quote, cancellation)
+        self.sql_search_symbol_candidates(patterns, cancellation)
             .unwrap_or_else(|| SearchSymbolCandidates::complete(Vec::new(), 0))
     }
 
@@ -7302,38 +7265,6 @@ fn literal_ascii_search_substring(pattern: &str) -> Option<&str> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
     .then_some(pattern)
-}
-
-/// Escape anchor metacharacters only where they form part of an identifier
-/// token. A `$` directly followed by a word character or another `$`
-/// (JS/PHP/Ruby sigils: `$L`, `$utils`, `$$animate`) is unsatisfiable as an
-/// end-of-haystack anchor, so escaping it cannot change any pattern that
-/// matches today; likewise a `^` directly after a word character or `^` is
-/// unsatisfiable as a start anchor. A `$` directly *after* a word character
-/// gets the same treatment: java/scala identifiers legitimately end in `$`
-/// (twitter's `javaGlobalNoDefault$` classes, scala objects), and agents
-/// search those names literally (#1127). Intentional regex (groups, classes,
-/// real anchors) is left untouched.
-fn escape_sigil_anchors(pattern: &str) -> String {
-    let chars: Vec<char> = pattern.chars().collect();
-    let mut escaped = String::with_capacity(pattern.len());
-    for (index, ch) in chars.iter().enumerate() {
-        let prev_is_word = index > 0
-            && (chars[index - 1].is_alphanumeric() || matches!(chars[index - 1], '_' | '^'));
-        let next_is_word = chars
-            .get(index + 1)
-            .is_some_and(|next| next.is_alphanumeric() || matches!(next, '_' | '$'));
-        let unsatisfiable = match ch {
-            '$' => next_is_word || prev_is_word,
-            '^' => prev_is_word,
-            _ => false,
-        };
-        if unsatisfiable {
-            escaped.push('\\');
-        }
-        escaped.push(*ch);
-    }
-    escaped
 }
 
 fn enclosing_code_unit_rank(code_unit: &CodeUnit) -> usize {
@@ -9771,9 +9702,8 @@ mod tests {
         let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
 
         let matches = analyzer.search_definitions("Gson", false);
-        let candidates = analyzer
-            .search_symbol_candidates(&["Gson".to_string()], false, None)
-            .candidates;
+        let patterns = SearchSymbolPatternBatch::compile(vec!["Gson".to_string()], false, None);
+        let candidates = analyzer.search_symbol_candidates(&patterns, None).rows;
 
         assert!(matches.iter().any(|unit| unit.fq_name() == "demo.Gson"));
         assert!(
@@ -9804,12 +9734,10 @@ mod tests {
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
         let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
         let cancellation = CancellationToken::cancel_after_checks_for_test(6);
+        let patterns =
+            SearchSymbolPatternBatch::compile(vec!["diagnostic_.*".to_string()], false, None);
 
-        let candidates = analyzer.search_symbol_candidates(
-            &["diagnostic_.*".to_string()],
-            false,
-            Some(&cancellation),
-        );
+        let candidates = analyzer.search_symbol_candidates(&patterns, Some(&cancellation));
 
         assert!(!candidates.complete, "{candidates:#?}");
         assert!(candidates.inspected > 0, "{candidates:#?}");
@@ -9819,14 +9747,19 @@ mod tests {
 
 #[cfg(test)]
 mod sigil_anchor_tests {
+    use crate::analyzer::SearchSymbolPatternBatch;
+
     #[test]
     fn trailing_sigil_is_escaped_as_identifier_text() {
         // #1127: `Foo$` (java/scala sigil-suffixed identifiers) must not
         // compile as an end-of-haystack anchor.
-        assert_eq!(super::escape_sigil_anchors("Foo$"), "Foo\\$");
-        assert_eq!(super::escape_sigil_anchors("$L"), "\\$L");
-        assert_eq!(super::escape_sigil_anchors("$$animate"), "\\$\\$animate");
+        for pattern in ["Foo$", "$L", "$$animate"] {
+            let batch = SearchSymbolPatternBatch::compile(vec![pattern.to_string()], false, None);
+            assert!(batch.is_match(pattern), "{pattern}");
+        }
         // Word-free anchors stay anchors.
-        assert_eq!(super::escape_sigil_anchors("foo.$"), "foo.$");
+        let anchored = SearchSymbolPatternBatch::compile(vec!["foo.$".to_string()], false, None);
+        assert!(anchored.is_match("foo."));
+        assert!(!anchored.is_match("foo.$"));
     }
 }

@@ -961,12 +961,10 @@ impl IAnalyzer for ScalaAnalyzer {
 
     fn search_symbol_candidates(
         &self,
-        patterns: &[String],
-        auto_quote: bool,
+        patterns: &crate::analyzer::SearchSymbolPatternBatch,
         cancellation: Option<&crate::CancellationToken>,
     ) -> crate::analyzer::SearchSymbolCandidates {
-        self.inner
-            .search_symbol_candidates(patterns, auto_quote, cancellation)
+        self.inner.search_symbol_candidates(patterns, cancellation)
     }
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {

@@ -25,8 +25,8 @@ use crate::analyzer::fq_name::{FqName, package_prefix_fq, segment_interner};
 use crate::analyzer::model::MAX_SIGNATURE_METADATA_BLOB_BYTES;
 use crate::analyzer::tree_sitter_analyzer::{FileState, LanguageAdapter};
 use crate::analyzer::{
-    CodeUnit, CodeUnitType, CppTemplateMetadata, ImportInfo, Language, ProjectFile, Range,
-    RubyMethodDispatchMode, SignatureMetadata, SummaryFileProjection,
+    CodeUnit, CodeUnitType, CppTemplateMetadata, ImportInfo, Language, ProjectFile, QueryBatch,
+    Range, RubyMethodDispatchMode, SignatureMetadata, SummaryFileProjection,
 };
 use crate::gitblob;
 use crate::hash::{HashMap, HashSet, set_with_capacity};
@@ -388,30 +388,7 @@ pub struct CandidateRow {
 /// workspace paths. `complete` is false whenever the provider stopped at its
 /// supplied cap or observed cancellation, so bounded callers never mistake a
 /// partial batch for an authoritative miss.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LimitedQueryRows<T> {
-    pub(crate) rows: Vec<T>,
-    pub(crate) inspected: usize,
-    pub(crate) complete: bool,
-}
-
-impl<T> LimitedQueryRows<T> {
-    pub(crate) fn complete(rows: Vec<T>, inspected: usize) -> Self {
-        Self {
-            rows,
-            inspected,
-            complete: true,
-        }
-    }
-
-    pub(crate) fn incomplete(rows: Vec<T>, inspected: usize) -> Self {
-        Self {
-            rows,
-            inspected,
-            complete: false,
-        }
-    }
-}
+pub(crate) type LimitedQueryRows<T> = QueryBatch<T>;
 
 #[derive(Debug, Default)]
 struct LimitedQueryByteBudget {

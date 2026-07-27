@@ -103,7 +103,8 @@ pub(crate) use go::{
     packages::{GoModuleRoot, go_module_roots},
 };
 pub use i_analyzer::{
-    AnalyzerQueryContext, AnalyzerSnapshotCaches, IAnalyzer, SearchSymbolCandidates,
+    AnalyzerQueryContext, AnalyzerSnapshotCaches, IAnalyzer, QueryBatch, SearchSymbolCandidates,
+    SearchSymbolPatternBatch,
 };
 pub(crate) use i_analyzer::{AnalyzerQueryScope, default_parent_fq_name};
 pub use java::JavaAnalyzer;

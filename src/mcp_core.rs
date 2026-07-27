@@ -2,6 +2,7 @@ use crate::mcp_common::{
     McpRenderOptions, json_schema_object, mutating_tool_descriptor, run_stdio_server,
     summaries_schema, symbol_names_schema, tool_descriptor,
 };
+use crate::searchtools::{SEARCH_SYMBOL_MAX_PATTERN_BYTES, SEARCH_SYMBOL_MAX_PATTERNS};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
@@ -63,7 +64,11 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
                 "properties": {
                     "patterns": {
                         "type": "array",
-                        "items": { "type": "string" },
+                        "maxItems": SEARCH_SYMBOL_MAX_PATTERNS,
+                        "items": {
+                            "type": "string",
+                            "maxLength": SEARCH_SYMBOL_MAX_PATTERN_BYTES
+                        },
                         "description": "Search patterns to match against indexed symbol names."
                     },
                     "include_tests": {

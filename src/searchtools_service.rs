@@ -3083,6 +3083,49 @@ mod search_symbols_cancellation_tests {
             "{result:#}"
         );
     }
+
+    #[test]
+    fn issue_1199_search_symbols_rejects_unbounded_pattern_batches() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "pub fn target() {}\n").unwrap();
+        let service =
+            SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
+                .unwrap();
+
+        let oversized = [
+            (
+                vec!["target".to_string(); crate::searchtools::SEARCH_SYMBOL_MAX_PATTERNS + 1],
+                "at most",
+            ),
+            (
+                vec!["x".repeat(crate::searchtools::SEARCH_SYMBOL_MAX_PATTERN_BYTES + 1)],
+                "each search pattern",
+            ),
+            (
+                vec![
+                    "x".repeat(
+                        crate::searchtools::SEARCH_SYMBOL_MAX_TOTAL_PATTERN_BYTES
+                            / crate::searchtools::SEARCH_SYMBOL_MAX_PATTERNS
+                            + 1,
+                    );
+                    crate::searchtools::SEARCH_SYMBOL_MAX_PATTERNS
+                ],
+                "must total",
+            ),
+        ];
+        for (patterns, expected_message) in oversized {
+            let error = service
+                .call_tool_output(
+                    "search_symbols",
+                    json!({ "patterns": patterns }),
+                    RenderOptions::default(),
+                )
+                .expect_err("oversized pattern batches must be rejected before compilation");
+
+            assert_eq!(error.code, SearchToolsServiceErrorCode::InvalidParams);
+            assert!(error.message.contains(expected_message), "{error:#?}");
+        }
+    }
 }
 
 #[cfg(test)]

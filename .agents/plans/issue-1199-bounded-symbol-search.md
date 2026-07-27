@@ -13,6 +13,8 @@ This ExecPlan is a living document. The sections `Progress`, `Surprises & Discov
 - [x] (2026-07-27 09:12Z) Threaded the existing MCP request cancellation token through SQLite enumeration, qualified-name hydration, dirty state, path-synthetic modules, ranking, rendering, and the service boundary; interrupted responses use `truncated` plus an explicit partial-result note.
 - [x] (2026-07-27 09:18Z) Added work-count, pre-cancelled service/search, and deterministic mid-scan cancellation regressions; all four issue-focused tests pass.
 - [x] (2026-07-27 09:36Z) Ran `cargo fmt`, the four focused tests, the exact current-source timing twice, and the all-target/all-feature clippy gate successfully.
+- [x] (2026-07-27 12:02Z) Addressed guided-review findings after rebasing onto current `origin/master`: made `search_symbols` cancellable at the MCP transport, bounded request patterns, compiled one shared matcher per request, and consolidated duplicate batch/matching abstractions.
+- [x] (2026-07-27 12:39Z) Re-ran all six issue-focused regressions and the all-target/all-feature clippy gate successfully after the review fixes.
 
 ## Surprises & Discoveries
 
@@ -52,11 +54,19 @@ This ExecPlan is a living document. The sections `Progress`, `Surprises & Discov
   Rationale: The set shares automaton work across every target language without changing adapter normalization, raw-name handling, or invalid-pattern behavior.
   Date/Author: 2026-07-27 / Codex
 
+- Decision: Prepare the bounded matcher once before analyzer dispatch and fall back to individually compiled expressions if the combined `RegexSet` reaches its automaton-size limit.
+  Rationale: Sharing the matcher avoids multiplying compilation across language delegates. Fixed count, per-pattern, and aggregate-byte limits bound hostile MCP inputs, while the fallback preserves valid per-pattern results instead of silently returning an empty batch when only the combined set is too large.
+  Date/Author: 2026-07-27 / Codex
+
+- Decision: Run both `query_code` and `search_symbols` through the MCP request registry and background response path.
+  Rationale: Cooperative checkpoints are ineffective while a standard tool blocks the stdin reader: the server cannot receive `notifications/cancelled`, and the service otherwise receives no token. Workspace-scoped background dispatch makes cancellation reachable without weakening stale-workspace response suppression.
+  Date/Author: 2026-07-27 / Codex
+
 ## Outcomes & Retrospective
 
-The implementation now performs one persisted candidate scan per language for any number of request patterns, uses a shared regex set for the union, and preserves the language adapters' structured FQN hydration. Cancellation is cooperative through all large search loops, including JavaScript/TypeScript/Python path-synthetic module discovery, and callers receive explicit partial/truncated output.
+The implementation now performs one persisted candidate scan per language for any bounded request-pattern batch, uses one request-scoped matcher for the union, and preserves the language adapters' structured FQN hydration. Cancellation is registered at the MCP transport and cooperative through all large search loops, including JavaScript/TypeScript/Python path-synthetic module discovery, and callers receive explicit partial/truncated output.
 
-The exact issue request now completes in 5.29-7.25 seconds in two current-source runs and returns 18 files without truncation. Four focused regressions pass in under a tenth of a second once linked, and the repository's all-target/all-feature clippy gate passes with warnings denied.
+The exact issue request now completes in 5.29-7.25 seconds in two current-source runs and returns 18 files without truncation. All six issue-focused regressions pass once linked, including MCP-transport cancellation and count/per-pattern/aggregate request-bound coverage, and the all-target/all-feature clippy gate passes with warnings denied.
 
 ## Context and Orientation
 
@@ -110,7 +120,7 @@ The exact issue query must complete with current source and preserve ordinary se
 
 ## Idempotence and Recovery
 
-The code edits and tests are safe to repeat. Isolated cargo targets are created and removed by `scripts/with-isolated-cargo-target.sh`; do not create manually named temporary target directories. The persistent `.brokk` cache is rebuildable and should not be deleted as part of this work. If a compile or test is interrupted, rerun the same helper command. Stage and commit only the plan and source/test files changed for this issue.
+The code edits and tests are safe to repeat. Isolated cargo targets are created and removed by `scripts/with-isolated-cargo-target.sh`; do not create manually named temporary target directories. The persistent `.bifrost` cache is rebuildable and should not be deleted as part of this work. If a compile or test is interrupted, rerun the same helper command. Stage and commit only the plan and source/test files changed for this issue.
 
 ## Artifacts and Notes
 
@@ -120,7 +130,7 @@ Live MCP reproduction on commit `d2fdf88701c22e854d281edc08986b8713e25d41`:
     same request: still running at 91 seconds
     request terminated after reproduction was established
 
-Persisted declaration counts in the worktree's current analyzer cache total about 52,000 rows, led by about 47,000 Rust declarations. The problem is therefore repeated projection/hydration work and contention, not an infinite language parser loop.
+Persisted declaration counts in the worktree's analyzer cache at reproduction time totaled about 52,000 rows, led by about 47,000 Rust declarations. The problem was therefore repeated projection/hydration work and contention, not an infinite language parser loop.
 
 Focused milestone-1 validation:
 
@@ -129,11 +139,13 @@ Focused milestone-1 validation:
 
 Focused complete validation:
 
+    mcp_common::uri_tests::issue_1199_search_symbols_cancellation_reaches_background_tool_response ... ok
     searchtools_service::search_symbols_cancellation_tests::issue_1199_service_forwards_cancellation_to_search_symbols ... ok
+    searchtools_service::search_symbols_cancellation_tests::issue_1199_search_symbols_rejects_unbounded_pattern_batches ... ok
     analyzer::tree_sitter_analyzer::tests::issue_1199_symbol_candidate_scan_honors_midstream_cancellation ... ok
     issue_1199_cancelled_symbol_search_returns_explicit_partial_result ... ok
     issue_1199_multi_pattern_symbol_search_scans_persisted_candidates_once ... ok
-    test result: ok. 4 passed; 0 failed
+    test result: ok. 6 passed; 0 failed
 
 Current-source exact query timings:
 
@@ -155,3 +167,5 @@ Plan revision note (2026-07-27 08:39Z): Completed the shared-scan milestone, rec
 Plan revision note (2026-07-27 09:27Z): Completed cancellation and all focused regressions, added shared regex-set matching and cancellable synthetic-module enumeration, and recorded two successful exact-query timings. Final clippy and cleanup remain.
 
 Plan revision note (2026-07-27 09:36Z): Re-ran all four focused tests after the final hot-path specialization and completed the all-target/all-feature clippy gate. Implementation and validation are complete; only checkpoint commit and generated-artifact cleanup remain.
+
+Plan revision note (2026-07-27 12:39Z): Rebased onto current `origin/master`, addressed all guided-review findings, and completed revalidation. Pattern preparation is bounded and shared across languages, generic query-batch and FQN matching logic is consolidated, MCP cancellation reaches `search_symbols` through the background request registry, all six focused tests pass, and all-feature clippy is clean.
