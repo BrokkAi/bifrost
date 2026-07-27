@@ -111,7 +111,26 @@ static PROCESS_LOCAL_OPEN_GUARDS: Lazy<Mutex<std::collections::HashMap<PathBuf, 
 
 pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
     ensure_safe_cache_path(db_path)?;
-    let db_path = prepare_cache_db_path(db_path)?;
+    // Project-layout preparation can migrate the tracked `.bifrost/.gitignore`.
+    // Serialize it separately from the database open: the cache directory may
+    // not exist yet, so `prepare_cache_db_path` must run before we can derive
+    // the canonical database key used by the SQLite initialization lock below.
+    // Canonicalizing the existing project directory also makes equivalent
+    // spellings of the default cache path share the same preparation lock.
+    let preparation_key = default_project_dir_for_cache(db_path)
+        .and_then(|project_dir| project_dir.canonicalize().ok())
+        .unwrap_or_else(|| db_path.to_path_buf());
+    let process_local_preparation_lock = process_local_open_lock_cell(&preparation_key)?;
+    let db_path = {
+        let _process_local_preparation_guard =
+            process_local_preparation_lock.lock().map_err(|_| {
+                format!(
+                    "cache DB process-local preparation guard poisoned for {}",
+                    db_path.display()
+                )
+            })?;
+        prepare_cache_db_path(db_path)?
+    };
     ensure_safe_cache_path(&db_path)?;
     let process_local_open_lock = process_local_open_lock_cell(&db_path)?;
     let _process_local_open_guard = process_local_open_lock.lock().map_err(|_| {
