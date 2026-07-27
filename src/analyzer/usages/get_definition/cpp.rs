@@ -3715,7 +3715,29 @@ fn cpp_qualified_identifier_is_declaration_name(node: Node<'_>) -> bool {
 }
 
 fn cpp_is_non_reference_declaration_name(node: Node<'_>) -> bool {
+    if cpp_is_out_of_line_destructor_type_name(node) {
+        return false;
+    }
     cpp_is_declaration_name(node) || cpp_is_terminal_declarator_name(node)
+}
+
+fn cpp_is_out_of_line_destructor_type_name(node: Node<'_>) -> bool {
+    let destructor = if node.kind() == "destructor_name" {
+        node
+    } else {
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        if parent.kind() != "destructor_name" {
+            return false;
+        }
+        parent
+    };
+    destructor.parent().is_some_and(|qualified| {
+        qualified.kind() == "qualified_identifier"
+            && qualified.child_by_field_name("name") == Some(destructor)
+            && qualified.child_by_field_name("scope").is_some()
+    })
 }
 
 fn cpp_is_terminal_declarator_name(node: Node<'_>) -> bool {
@@ -3832,7 +3854,7 @@ fn cpp_is_non_reference_preprocessor_recovery_tail_token(node: Node<'_>) -> bool
     let Some(top_level) = cpp_translation_unit_child(node) else {
         return false;
     };
-    if !cpp_contains_recovery_error(top_level) {
+    if top_level.kind() != "ERROR" {
         return false;
     }
     let mut current = top_level.prev_named_sibling();
@@ -3840,7 +3862,7 @@ fn cpp_is_non_reference_preprocessor_recovery_tail_token(node: Node<'_>) -> bool
         if sibling.kind() == "preproc_function_def" {
             return sibling.child_by_field_name("value").is_some();
         }
-        if !cpp_contains_recovery_error(sibling) {
+        if sibling.kind() != "ERROR" {
             return false;
         }
         current = sibling.prev_named_sibling();
@@ -3856,10 +3878,6 @@ fn cpp_translation_unit_child(mut node: Node<'_>) -> Option<Node<'_>> {
         }
         node = parent;
     }
-}
-
-fn cpp_contains_recovery_error(node: Node<'_>) -> bool {
-    subtree_contains(node, |candidate| candidate.kind() == "ERROR")
 }
 
 fn cpp_parent_is_class(support: &dyn BoundedDefinitionLookup, unit: &CodeUnit) -> bool {
@@ -5275,6 +5293,11 @@ fn cpp_declaration_type_text_for_declarator(
 fn cpp_declarator_name_node(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
         "identifier" | "field_identifier" => Some(node),
+        "abstract_array_declarator"
+        | "abstract_function_declarator"
+        | "abstract_parenthesized_declarator"
+        | "abstract_pointer_declarator"
+        | "abstract_reference_declarator" => None,
         _ => node
             .child_by_field_name("declarator")
             .or_else(|| node.child_by_field_name("name"))

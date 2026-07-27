@@ -5682,17 +5682,28 @@ int use(example::Service& service) {
     let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
         .expect("service");
 
-    for (target, expected_total, definition_line, expected_column, token_len) in [
+    for (
+        target,
+        expected_total,
+        expected_definition_sites,
+        definition_line,
+        expected_column,
+        token_len,
+    ) in [
         (
             r#"{"path":"include/service.h","line":3,"column":5,"symbol":"example.compute"}"#,
             2,
+            1,
             3,
             33,
             7,
         ),
+        // Callable peer expansion scans the related header/body pair. Both
+        // declaration ranges are filtered from the external usage surface.
         (
             r#"{"path":"include/service.h","line":5,"column":9,"symbol":"example.Service.run"}"#,
             1,
+            2,
             4,
             20,
             3,
@@ -5709,7 +5720,10 @@ int use(example::Service& service) {
 
         assert_eq!("found", result["status"], "payload: {value}");
         assert_eq!(expected_total, result["total_hits"], "payload: {value}");
-        assert_eq!(1, result["definition_sites_excluded"], "payload: {value}");
+        assert_eq!(
+            expected_definition_sites, result["definition_sites_excluded"],
+            "payload: {value}"
+        );
         assert_eq!("src/main.cpp", result["files"][0]["path"], "{value}");
         assert_eq!(3, result["files"][0]["hits"][0]["line"], "{value}");
         assert_eq!(
