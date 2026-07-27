@@ -9,8 +9,8 @@ use crate::analyzer::store::{
 use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, CodeUnitType, CppTemplateMetadata, DeclarationInfo,
     GlobalUsageDefinitionIndex, IAnalyzer, ImportInfo, Language, LanguageDialect, Project,
-    ProjectFile, Range, RubyMethodDispatchMode, SearchSymbolCandidate, SignatureMetadata,
-    SummaryFileProjection, UsageFactsIndex,
+    ProjectFile, Range, RubyMethodDispatchMode, SearchSymbolCandidate, SearchSymbolCandidates,
+    SignatureMetadata, SummaryFileProjection, UsageFactsIndex,
 };
 use crate::cancellation::CancellationToken;
 use crate::gitblob;
@@ -4157,19 +4157,47 @@ where
         )
     }
 
+    fn sql_nonpersisted_workspace_declarations_vec_matching_cancellable(
+        &self,
+        keep: impl FnMut(&CodeUnit) -> bool,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<LimitedQueryRows<CodeUnit>> {
+        self.store_query_or_record(
+            self.try_sql_nonpersisted_workspace_declarations_vec_matching_limited(keep, || {
+                !cancellation.is_some_and(CancellationToken::is_cancelled)
+            }),
+            "querying non-persisted workspace declarations with cancellation",
+        )
+    }
+
     fn try_sql_nonpersisted_workspace_declarations_vec_matching(
         &self,
-        mut keep: impl FnMut(&CodeUnit) -> bool,
+        keep: impl FnMut(&CodeUnit) -> bool,
     ) -> std::result::Result<Vec<CodeUnit>, StoreError> {
+        Ok(self
+            .try_sql_nonpersisted_workspace_declarations_vec_matching_limited(keep, || true)?
+            .rows)
+    }
+
+    fn try_sql_nonpersisted_workspace_declarations_vec_matching_limited(
+        &self,
+        mut keep: impl FnMut(&CodeUnit) -> bool,
+        mut continue_query: impl FnMut() -> bool,
+    ) -> std::result::Result<LimitedQueryRows<CodeUnit>, StoreError> {
         if !self.adapter.has_path_synthetic_module_units() {
-            return Ok(Vec::new());
+            return Ok(LimitedQueryRows::complete(Vec::new(), 0));
         }
         self.workspace_path_scan_count
             .fetch_add(1, Ordering::Relaxed);
         let snapshot = self.live_snapshot();
         let mut candidates = Vec::new();
         let mut candidate_files = Vec::new();
+        let mut inspected = 0usize;
         for file in snapshot.all_paths() {
+            if !continue_query() {
+                return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
+            }
+            inspected = inspected.saturating_add(1);
             let Some(project_file) = self.rebase_live_file_to_project_root(file) else {
                 continue;
             };
@@ -4190,25 +4218,32 @@ where
             candidates.push((file.clone(), oid, module));
         }
 
+        if !continue_query() {
+            return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
+        }
         let stale: HashSet<_> = snapshot
             .validate(candidate_files.iter())
             .into_iter()
             .collect();
-        candidates.retain(|(file, _, _)| !stale.contains(file));
+        if !continue_query() {
+            return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
+        }
 
-        if self.adapter.path_synthetic_module_requires_imports() {
-            let mut blob_keys: Vec<_> = candidates
-                .iter()
-                .map(|(file, oid, _)| {
-                    let project_file = self
-                        .rebase_live_file_to_project_root(file)
-                        .unwrap_or_else(|| file.clone());
-                    (
-                        *oid,
-                        self.adapter.storage_language_key_for_file(&project_file),
-                    )
-                })
-                .collect();
+        let import_oids = if self.adapter.path_synthetic_module_requires_imports() {
+            let mut blob_keys = Vec::with_capacity(candidates.len());
+            for (file, oid, _) in &candidates {
+                if !continue_query() {
+                    return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
+                }
+                inspected = inspected.saturating_add(1);
+                let project_file = self
+                    .rebase_live_file_to_project_root(file)
+                    .unwrap_or_else(|| file.clone());
+                blob_keys.push((
+                    *oid,
+                    self.adapter.storage_language_key_for_file(&project_file),
+                ));
+            }
             blob_keys.sort();
             blob_keys.dedup();
             let import_oids = self
@@ -4218,26 +4253,42 @@ where
                     &blob_keys,
                     self.store_context.generations.as_ref(),
                 )?;
-            candidates.retain(|(file, oid, _)| {
+            if !continue_query() {
+                return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
+            }
+            Some(import_oids)
+        } else {
+            None
+        };
+
+        let mut declarations = Vec::new();
+        for (file, oid, module) in candidates {
+            if !continue_query() {
+                return Ok(LimitedQueryRows::incomplete(declarations, inspected));
+            }
+            inspected = inspected.saturating_add(1);
+            if stale.contains(&file) || module.is_file_scope() {
+                continue;
+            }
+            if let Some(import_oids) = &import_oids {
                 let project_file = self
-                    .rebase_live_file_to_project_root(file)
+                    .rebase_live_file_to_project_root(&file)
                     .unwrap_or_else(|| file.clone());
-                self.adapter
+                if !self
+                    .adapter
                     .include_path_synthetic_module(import_oids.contains(&(
-                        *oid,
+                        oid,
                         self.adapter.storage_language_key_for_file(&project_file),
                     )))
-            });
+                {
+                    continue;
+                }
+            }
+            declarations.push(module);
         }
-
-        let mut declarations: Vec<_> = candidates
-            .into_iter()
-            .map(|(_, _, module)| module)
-            .filter(|unit| !unit.is_file_scope())
-            .collect();
         declarations.sort();
         declarations.dedup();
-        Ok(declarations)
+        Ok(LimitedQueryRows::complete(declarations, inspected))
     }
 
     fn dirty_file_states_for_queries(&self) -> Vec<FileState> {
@@ -5586,16 +5637,29 @@ where
         fq_name != raw && compiled.is_match(&raw)
     }
 
+    fn fq_patterns_match(&self, unit: &CodeUnit, compiled: &regex::RegexSet) -> bool {
+        let fq_name = self.adapter.normalize_full_name(&unit.fq_name());
+        if self.adapter.is_anonymous_structure(&fq_name) {
+            return false;
+        }
+        if compiled.is_match(&fq_name) {
+            return true;
+        }
+        let raw = unit.fq_name();
+        fq_name != raw && compiled.is_match(&raw)
+    }
+
     fn sql_search_symbol_candidates(
         &self,
         patterns: &[String],
         auto_quote: bool,
-    ) -> Option<Vec<SearchSymbolCandidate>> {
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<SearchSymbolCandidates> {
         if patterns.is_empty() {
-            return Some(Vec::new());
+            return Some(SearchSymbolCandidates::complete(Vec::new(), 0));
         }
 
-        let compiled = patterns
+        let compiled_patterns = patterns
             .iter()
             .filter_map(|pattern| {
                 let pattern = if auto_quote {
@@ -5613,8 +5677,16 @@ where
                     .ok()
             })
             .collect::<Vec<_>>();
-        if compiled.is_empty() {
-            return Some(Vec::new());
+        if compiled_patterns.is_empty() {
+            return Some(SearchSymbolCandidates::complete(Vec::new(), 0));
+        }
+        let compiled =
+            regex::RegexSetBuilder::new(compiled_patterns.iter().map(|pattern| pattern.as_str()))
+                .case_insensitive(true)
+                .build()
+                .ok()?;
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Some(SearchSymbolCandidates::incomplete(Vec::new(), 0));
         }
         self.full_declaration_scan_count
             .fetch_add(1, Ordering::Relaxed);
@@ -5622,10 +5694,11 @@ where
             self.store_context.store.search_candidate_rows_for_langs(
                 &self.storage_language_keys_for_queries(),
                 self.store_context.generations.as_ref(),
+                cancellation,
             ),
             format!(
                 "searching symbol candidates for {} patterns",
-                compiled.len()
+                compiled_patterns.len()
             ),
         )?;
         let resolver = QueryResolver::from_snapshot(
@@ -5633,15 +5706,24 @@ where
             self.project.root(),
             self.live_snapshot(),
         );
-        let mut candidates = BTreeMap::new();
-        for (code_unit, (primary_range, in_test_region)) in resolver.resolve_rows_with_payload(
-            rows.into_iter()
+        let mut complete = rows.complete;
+        let mut inspected = rows.inspected;
+        let resolved = resolver.resolve_rows_with_payload_cancellable(
+            rows.rows
+                .into_iter()
                 .map(|row| (row.candidate, (row.primary_range, row.in_test_region))),
-        ) {
-            if compiled
-                .iter()
-                .any(|pattern| self.fq_pattern_matches(&code_unit, pattern))
-            {
+            cancellation,
+        );
+        inspected = inspected.saturating_add(resolved.inspected);
+        complete &= resolved.complete;
+        let mut candidates = BTreeMap::new();
+        for (code_unit, (primary_range, in_test_region)) in resolved.rows {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                complete = false;
+                break;
+            }
+            inspected = inspected.saturating_add(1);
+            if self.fq_patterns_match(&code_unit, &compiled) {
                 candidates
                     .entry(code_unit.clone())
                     .or_insert(SearchSymbolCandidate {
@@ -5652,27 +5734,19 @@ where
             }
         }
 
-        for code_unit in self.dirty_units_matching(false, |unit| {
-            compiled
-                .iter()
-                .any(|pattern| self.fq_pattern_matches(unit, pattern))
-        }) {
-            candidates
-                .entry(code_unit.clone())
-                .or_insert_with(|| SearchSymbolCandidate {
-                    primary_range: self
-                        .ranges(&code_unit)
-                        .into_iter()
-                        .min_by_key(|range| (range.start_line, range.start_byte)),
-                    in_test_region: self.in_test_region(&code_unit),
-                    code_unit,
-                });
-        }
-        for code_unit in self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
-            compiled
-                .iter()
-                .any(|pattern| self.fq_pattern_matches(unit, pattern))
-        })? {
+        let dirty = self.dirty_units_matching_limited(
+            false,
+            usize::MAX,
+            |unit| self.fq_patterns_match(unit, &compiled),
+            || !cancellation.is_some_and(CancellationToken::is_cancelled),
+        );
+        inspected = inspected.saturating_add(dirty.inspected);
+        complete &= dirty.complete;
+        for code_unit in dirty.rows {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                complete = false;
+                break;
+            }
             candidates
                 .entry(code_unit.clone())
                 .or_insert_with(|| SearchSymbolCandidate {
@@ -5685,7 +5759,36 @@ where
                 });
         }
 
-        Some(candidates.into_values().collect())
+        let synthetic = self.sql_nonpersisted_workspace_declarations_vec_matching_cancellable(
+            |unit| self.fq_patterns_match(unit, &compiled),
+            cancellation,
+        )?;
+        inspected = inspected.saturating_add(synthetic.inspected);
+        complete &= synthetic.complete;
+        for code_unit in synthetic.rows {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                complete = false;
+                break;
+            }
+            inspected = inspected.saturating_add(1);
+            candidates
+                .entry(code_unit.clone())
+                .or_insert_with(|| SearchSymbolCandidate {
+                    primary_range: self
+                        .ranges(&code_unit)
+                        .into_iter()
+                        .min_by_key(|range| (range.start_line, range.start_byte)),
+                    in_test_region: self.in_test_region(&code_unit),
+                    code_unit,
+                });
+        }
+
+        let candidates = candidates.into_values().collect();
+        if complete && !cancellation.is_some_and(CancellationToken::is_cancelled) {
+            Some(SearchSymbolCandidates::complete(candidates, inspected))
+        } else {
+            Some(SearchSymbolCandidates::incomplete(candidates, inspected))
+        }
     }
 
     pub(crate) fn package_name_of(&self, file: &ProjectFile) -> Option<String> {
@@ -7157,9 +7260,10 @@ where
         &self,
         patterns: &[String],
         auto_quote: bool,
-    ) -> Vec<SearchSymbolCandidate> {
-        self.sql_search_symbol_candidates(patterns, auto_quote)
-            .unwrap_or_default()
+        cancellation: Option<&CancellationToken>,
+    ) -> SearchSymbolCandidates {
+        self.sql_search_symbol_candidates(patterns, auto_quote, cancellation)
+            .unwrap_or_else(|| SearchSymbolCandidates::complete(Vec::new(), 0))
     }
 
     fn metrics(&self) -> CodeBaseMetrics {
@@ -9667,7 +9771,9 @@ mod tests {
         let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
 
         let matches = analyzer.search_definitions("Gson", false);
-        let candidates = analyzer.search_symbol_candidates(&["Gson".to_string()], false);
+        let candidates = analyzer
+            .search_symbol_candidates(&["Gson".to_string()], false, None)
+            .candidates;
 
         assert!(matches.iter().any(|unit| unit.fq_name() == "demo.Gson"));
         assert!(
@@ -9681,6 +9787,33 @@ mod tests {
                 && candidate.primary_range.is_some()
                 && !candidate.in_test_region
         }));
+    }
+
+    #[test]
+    fn issue_1199_symbol_candidate_scan_honors_midstream_cancellation() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), "src/lib.rs");
+        file.write(
+            &(0..32)
+                .map(|index| format!("pub fn diagnostic_{index}() {{}}\n"))
+                .collect::<String>(),
+        )
+        .expect("rust source");
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+        let cancellation = CancellationToken::cancel_after_checks_for_test(6);
+
+        let candidates = analyzer.search_symbol_candidates(
+            &["diagnostic_.*".to_string()],
+            false,
+            Some(&cancellation),
+        );
+
+        assert!(!candidates.complete, "{candidates:#?}");
+        assert!(candidates.inspected > 0, "{candidates:#?}");
+        assert!(cancellation.is_cancelled());
     }
 }
 

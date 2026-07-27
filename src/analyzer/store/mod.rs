@@ -20,6 +20,7 @@ use rusqlite::{
 use sha2::{Digest, Sha256};
 use tree_sitter::Language as TsLanguage;
 
+use crate::CancellationToken;
 use crate::analyzer::fq_name::{FqName, package_prefix_fq, segment_interner};
 use crate::analyzer::model::MAX_SIGNATURE_METADATA_BLOB_BYTES;
 use crate::analyzer::tree_sitter_analyzer::{FileState, LanguageAdapter};
@@ -2475,35 +2476,15 @@ impl AnalyzerStore {
     /// obtains by repeatedly hydrating complete file states.
     pub fn search_candidate_rows_by_lang(&self, lang: &str) -> Result<Vec<SearchCandidateRow>> {
         let conn = self.read_conn()?;
-        let sql = format!(
-            "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
-                    units.content_qualifier, units.signature, units.synthetic,
-                    units.is_type_alias, units.top_level_ordinal, units.in_declarations,
-                    units.in_definition_lookup, units.fq_segments, units.in_test_region,
-                    primary_range.start_byte, primary_range.end_byte,
-                    primary_range.start_line, primary_range.end_line
-             FROM code_units AS units
-             JOIN blob_meta AS meta
-               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
-             LEFT JOIN unit_ranges AS primary_range
-               ON primary_range.blob_oid = units.blob_oid
-              AND primary_range.lang = units.lang
-              AND primary_range.unit_key = units.unit_key
-              AND primary_range.ordinal = 0
-             WHERE units.lang = ?1 AND units.in_declarations = 1
-               AND {PARSED_BLOB_COMPLETE_CONDITION}
-             ORDER BY units.blob_oid, units.unit_key"
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map([lang], search_candidate_row_from_row)?;
-        collect_search_candidate_rows(rows)
+        search_candidate_rows_by_lang_conn(&conn, lang)
     }
 
-    pub fn search_candidate_rows_for_langs(
+    pub(crate) fn search_candidate_rows_for_langs(
         &self,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
-    ) -> Result<Vec<SearchCandidateRow>> {
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<LimitedQueryRows<SearchCandidateRow>> {
         // Pattern matching is performed after language-specific FQN hydration.
         // One request may carry several patterns, so the storage projection
         // intentionally supplies one complete declaration candidate set for
@@ -2512,11 +2493,27 @@ impl AnalyzerStore {
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let mut out = Vec::new();
+        let mut inspected = 0usize;
+        let mut complete = true;
         for lang in langs {
-            out.extend(search_candidate_rows_by_lang_conn(&tx, lang)?);
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                complete = false;
+                break;
+            }
+            let rows = search_candidate_rows_by_lang_conn_cancellable(&tx, lang, cancellation)?;
+            inspected = inspected.saturating_add(rows.inspected);
+            out.extend(rows.rows);
+            if !rows.complete {
+                complete = false;
+                break;
+            }
         }
         tx.commit()?;
-        Ok(out)
+        if complete && !cancellation.is_some_and(CancellationToken::is_cancelled) {
+            Ok(LimitedQueryRows::complete(out, inspected))
+        } else {
+            Ok(LimitedQueryRows::incomplete(out, inspected))
+        }
     }
 
     pub fn usage_fact_rows_by_lang(&self, lang: &str) -> Result<Vec<UsageFactRow>> {
@@ -5668,23 +5665,31 @@ where
     Ok(out)
 }
 
-fn collect_search_candidate_rows<F>(
-    rows: rusqlite::MappedRows<'_, F>,
-) -> Result<Vec<SearchCandidateRow>>
-where
-    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<SearchCandidateRow>,
-{
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
-}
-
 fn search_candidate_rows_by_lang_conn(
     conn: &Connection,
     lang: &str,
 ) -> Result<Vec<SearchCandidateRow>> {
+    Ok(search_candidate_rows_by_lang_conn_while(conn, lang, || true)?.rows)
+}
+
+fn search_candidate_rows_by_lang_conn_cancellable(
+    conn: &Connection,
+    lang: &str,
+    cancellation: Option<&CancellationToken>,
+) -> Result<LimitedQueryRows<SearchCandidateRow>> {
+    match cancellation {
+        Some(cancellation) => {
+            search_candidate_rows_by_lang_conn_while(conn, lang, || !cancellation.is_cancelled())
+        }
+        None => search_candidate_rows_by_lang_conn_while(conn, lang, || true),
+    }
+}
+
+fn search_candidate_rows_by_lang_conn_while(
+    conn: &Connection,
+    lang: &str,
+    mut continue_query: impl FnMut() -> bool,
+) -> Result<LimitedQueryRows<SearchCandidateRow>> {
     let sql = format!(
         "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
                 units.content_qualifier, units.signature, units.synthetic,
@@ -5705,8 +5710,21 @@ fn search_candidate_rows_by_lang_conn(
          ORDER BY units.blob_oid, units.unit_key"
     );
     let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map([lang], search_candidate_row_from_row)?;
-    collect_search_candidate_rows(rows)
+    let mut query = stmt.query([lang])?;
+    let mut rows = Vec::new();
+    let mut inspected = 0usize;
+    while let Some(row) = query.next()? {
+        if !continue_query() {
+            return Ok(LimitedQueryRows::incomplete(rows, inspected));
+        }
+        inspected = inspected.saturating_add(1);
+        rows.push(search_candidate_row_from_row(row)?);
+    }
+    if !continue_query() {
+        Ok(LimitedQueryRows::incomplete(rows, inspected))
+    } else {
+        Ok(LimitedQueryRows::complete(rows, inspected))
+    }
 }
 
 fn usage_fact_rows_by_lang_conn(conn: &Connection, lang: &str) -> Result<Vec<UsageFactRow>> {

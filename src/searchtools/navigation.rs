@@ -255,6 +255,14 @@ pub fn search_symbols(
     analyzer: &dyn IAnalyzer,
     params: SearchSymbolsParams,
 ) -> SearchSymbolsResult {
+    search_symbols_with_cancellation(analyzer, params, None)
+}
+
+pub fn search_symbols_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    params: SearchSymbolsParams,
+    cancellation: Option<&crate::CancellationToken>,
+) -> SearchSymbolsResult {
     let _scope = profiling::scope("searchtools::search_symbols");
     let patterns: Vec<String> = strip_params(params.patterns)
         .into_iter()
@@ -263,46 +271,60 @@ pub fn search_symbols(
 
     let definitions = {
         let _scope = profiling::scope("searchtools::search_symbols.resolve");
-        analyzer.search_symbol_candidates(&patterns, false)
+        analyzer.search_symbol_candidates(&patterns, false, cancellation)
     };
+    let mut complete = definitions.complete;
 
     let filtered: Vec<_> = {
         let _scope = profiling::scope("searchtools::search_symbols.filter_ranged");
         let mut seen = HashSet::default();
-        definitions
-            .into_iter()
-            .filter_map(|candidate| {
-                // A search result is an implicit selector offer for source/location tools. Internal
-                // graph identities without a unique range (for example replicated Go inline-struct
-                // members) must not be advertised even when they intentionally remain resolvable.
-                if !seen.insert(candidate.code_unit.clone()) {
-                    return None;
-                }
-                let range = candidate
-                    .primary_range
-                    .or_else(|| primary_range(analyzer, &candidate.code_unit))?;
-                // Symbol-level test filtering (#1102): a declaration is treated as
-                // a test symbol only when it is itself in a structurally-evidenced
-                // test region, or lives under a test-tree path. The old whole-file
-                // `contains_tests` gate hid the production API of any file carrying
-                // an inline `#[cfg(test)] mod tests`.
-                let is_test = candidate.in_test_region
-                    || test_paths::is_test_like_path(
-                        &rel_path_string(candidate.code_unit.source()),
-                        language_for_file(candidate.code_unit.source()),
-                    );
-                (params.include_tests || !is_test).then_some((candidate.code_unit, range, is_test))
-            })
-            .collect()
+        let mut filtered = Vec::new();
+        for candidate in definitions.candidates {
+            if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+                complete = false;
+                break;
+            }
+            // A search result is an implicit selector offer for source/location tools. Internal
+            // graph identities without a unique range (for example replicated Go inline-struct
+            // members) must not be advertised even when they intentionally remain resolvable.
+            if !seen.insert(candidate.code_unit.clone()) {
+                continue;
+            }
+            let Some(range) = candidate
+                .primary_range
+                .or_else(|| primary_range(analyzer, &candidate.code_unit))
+            else {
+                continue;
+            };
+            // Symbol-level test filtering (#1102): a declaration is treated as
+            // a test symbol only when it is itself in a structurally-evidenced
+            // test region, or lives under a test-tree path. The old whole-file
+            // `contains_tests` gate hid the production API of any file carrying
+            // an inline `#[cfg(test)] mod tests`.
+            let is_test = candidate.in_test_region
+                || test_paths::is_test_like_path(
+                    &rel_path_string(candidate.code_unit.source()),
+                    language_for_file(candidate.code_unit.source()),
+                );
+            if params.include_tests || !is_test {
+                filtered.push((candidate.code_unit, range, is_test));
+            }
+        }
+        filtered
     };
 
-    let ranked = {
+    let (ranked, ranking_complete) = {
         let _scope = profiling::scope("searchtools::search_symbols.rank");
-        rank_search_symbol_candidates(analyzer, &patterns, filtered)
+        rank_search_symbol_candidates(analyzer, &patterns, filtered, cancellation)
     };
+    complete &= ranking_complete;
 
     let mut grouped: HashMap<ProjectFile, Vec<RankedSearchCandidate>> = HashMap::default();
     for candidate in ranked {
+        if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+            complete = false;
+            break;
+        }
         grouped
             .entry(candidate.code_unit.source().clone())
             .or_default()
@@ -311,70 +333,86 @@ pub fn search_symbols(
 
     let effective_limit = params.limit.clamp(1, FILE_SEARCH_LIMIT);
     let total_files = grouped.len();
-    let truncated = total_files > effective_limit;
+    let limit_truncated = total_files > effective_limit;
     let mut file_entries: Vec<_> = grouped.into_iter().collect();
-    let git_tiers = search_symbol_git_tiers(
-        analyzer,
-        &file_entries
-            .iter()
-            .map(|(file, _)| file.clone())
-            .collect::<Vec<_>>(),
-    );
-    file_entries.sort_by(
-        |(left_file, left_candidates), (right_file, right_candidates)| {
-            compare_search_symbol_files(
-                left_file,
-                left_candidates,
-                right_file,
-                right_candidates,
-                &git_tiers,
-            )
-        },
-    );
+    let git_tiers = if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+        complete = false;
+        HashMap::default()
+    } else {
+        search_symbol_git_tiers(
+            analyzer,
+            &file_entries
+                .iter()
+                .map(|(file, _)| file.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+        complete = false;
+    } else {
+        file_entries.sort_by(
+            |(left_file, left_candidates), (right_file, right_candidates)| {
+                compare_search_symbol_files(
+                    left_file,
+                    left_candidates,
+                    right_file,
+                    right_candidates,
+                    &git_tiers,
+                )
+            },
+        );
+    }
     file_entries.truncate(effective_limit);
 
     let files: Vec<SearchSymbolsFile> = {
         let _scope = profiling::scope("searchtools::search_symbols.render");
-        file_entries
-            .into_iter()
-            .map(|(file, code_units)| {
-                let render_context = load_declaration_name_context(analyzer, &file);
-                let render_context = render_context.as_ref();
-                SearchSymbolsFile {
-                    path: rel_path_string(&file),
-                    loc: render_context
-                        .map(|context| line_count(context.content()))
-                        .unwrap_or(0),
-                    classes: collect_ranked_kind_names(
-                        analyzer,
-                        &code_units,
-                        CodeUnitType::Class,
-                        render_context,
-                    ),
-                    functions: collect_callable_kind_names(analyzer, &code_units, render_context),
-                    fields: collect_ranked_kind_names(
-                        analyzer,
-                        &code_units,
-                        CodeUnitType::Field,
-                        render_context,
-                    ),
-                    modules: collect_ranked_kind_names(
-                        analyzer,
-                        &code_units,
-                        CodeUnitType::Module,
-                        render_context,
-                    ),
-                    macros: collect_ranked_kind_names(
-                        analyzer,
-                        &code_units,
-                        CodeUnitType::Macro,
-                        render_context,
-                    ),
-                }
-            })
-            .collect()
+        let mut files = Vec::new();
+        for (file, code_units) in file_entries {
+            if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+                complete = false;
+                break;
+            }
+            let render_context = load_declaration_name_context(analyzer, &file);
+            let render_context = render_context.as_ref();
+            files.push(SearchSymbolsFile {
+                path: rel_path_string(&file),
+                loc: render_context
+                    .map(|context| line_count(context.content()))
+                    .unwrap_or(0),
+                classes: collect_ranked_kind_names(
+                    analyzer,
+                    &code_units,
+                    CodeUnitType::Class,
+                    render_context,
+                ),
+                functions: collect_callable_kind_names(analyzer, &code_units, render_context),
+                fields: collect_ranked_kind_names(
+                    analyzer,
+                    &code_units,
+                    CodeUnitType::Field,
+                    render_context,
+                ),
+                modules: collect_ranked_kind_names(
+                    analyzer,
+                    &code_units,
+                    CodeUnitType::Module,
+                    render_context,
+                ),
+                macros: collect_ranked_kind_names(
+                    analyzer,
+                    &code_units,
+                    CodeUnitType::Macro,
+                    render_context,
+                ),
+            });
+        }
+        files
     };
-    let note = search_symbols_note(truncated, files.len(), total_files);
+    if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+        complete = false;
+    }
+    let truncated = !complete || limit_truncated;
+    let note = search_symbols_note(!complete, limit_truncated, files.len(), total_files);
 
     SearchSymbolsResult {
         patterns,
@@ -385,8 +423,17 @@ pub fn search_symbols(
     }
 }
 
-pub(super) fn search_symbols_note(truncated: bool, shown: usize, total: usize) -> Option<String> {
-    if truncated {
+pub(super) fn search_symbols_note(
+    incomplete: bool,
+    limit_truncated: bool,
+    shown: usize,
+    total: usize,
+) -> Option<String> {
+    if incomplete {
+        Some(format!(
+            "Search was cancelled before all matching symbols could be examined. Results are partial; showing {shown} files observed before cancellation."
+        ))
+    } else if limit_truncated {
         Some(format!(
             "Showing {shown} of {total} matching files. Raise `limit` or use a more specific identifier, qualified, or regex-like pattern to see the rest."
         ))
@@ -1139,20 +1186,24 @@ pub(super) fn rank_search_symbol_candidates(
     analyzer: &dyn IAnalyzer,
     patterns: &[String],
     code_units: Vec<(CodeUnit, Range, bool)>,
-) -> Vec<RankedSearchCandidate> {
-    let mut ranked: Vec<_> = code_units
-        .into_iter()
-        .map(
-            |(code_unit, primary_range, is_test)| RankedSearchCandidate {
-                line: primary_range.start_line,
-                score: score_search_symbol_candidate(analyzer, patterns, &code_unit, is_test),
-                code_unit,
-                primary_range,
-            },
-        )
-        .collect();
+    cancellation: Option<&crate::CancellationToken>,
+) -> (Vec<RankedSearchCandidate>, bool) {
+    let mut ranked = Vec::new();
+    let mut complete = true;
+    for (code_unit, primary_range, is_test) in code_units {
+        if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+            complete = false;
+            break;
+        }
+        ranked.push(RankedSearchCandidate {
+            line: primary_range.start_line,
+            score: score_search_symbol_candidate(analyzer, patterns, &code_unit, is_test),
+            code_unit,
+            primary_range,
+        });
+    }
     ranked.sort_by(compare_ranked_search_candidates);
-    ranked
+    (ranked, complete)
 }
 
 pub(super) fn score_search_symbol_candidate(

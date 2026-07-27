@@ -14,6 +14,44 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// One analyzer's contribution to a batched symbol-search request.
+///
+/// `complete` is false when cooperative cancellation stopped enumeration.
+/// Callers may retain the candidates produced before that checkpoint, but
+/// must not present an incomplete batch as an authoritative search result.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct SearchSymbolCandidates {
+    pub candidates: Vec<SearchSymbolCandidate>,
+    pub inspected: usize,
+    pub complete: bool,
+}
+
+impl SearchSymbolCandidates {
+    pub fn complete(candidates: Vec<SearchSymbolCandidate>, inspected: usize) -> Self {
+        Self {
+            candidates,
+            inspected,
+            complete: true,
+        }
+    }
+
+    pub fn incomplete(candidates: Vec<SearchSymbolCandidate>, inspected: usize) -> Self {
+        Self {
+            candidates,
+            inspected,
+            complete: false,
+        }
+    }
+
+    pub fn merge(mut self, other: Self) -> Self {
+        self.candidates.extend(other.candidates);
+        self.inspected = self.inspected.saturating_add(other.inspected);
+        self.complete &= other.complete;
+        self
+    }
+}
+
 /// Failure state for one top-level analyzer request.
 ///
 /// The analyzer trait intentionally retains best-effort collection-returning APIs, so persisted
@@ -315,23 +353,38 @@ pub trait IAnalyzer: Send + Sync + Any {
         &self,
         patterns: &[String],
         auto_quote: bool,
-    ) -> Vec<SearchSymbolCandidate> {
-        patterns
-            .iter()
-            .flat_map(|pattern| self.search_definitions(pattern, auto_quote))
-            .map(|code_unit| SearchSymbolCandidate {
-                primary_range: self
-                    .ranges(&code_unit)
-                    .into_iter()
-                    .min_by_key(|range| (range.start_line, range.start_byte)),
-                // Structurally-evidenced suppression only: analyzers without a
-                // per-declaration taint surface default untainted here (path-based
-                // test filtering in `search_symbols` still applies), so production
-                // symbols in a file with inline tests are never hidden (#1102).
-                in_test_region: self.in_test_region(&code_unit),
-                code_unit,
-            })
-            .collect()
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> SearchSymbolCandidates {
+        let mut candidates = Vec::new();
+        let mut inspected = 0usize;
+        for pattern in patterns {
+            if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+                return SearchSymbolCandidates::incomplete(candidates, inspected);
+            }
+            for code_unit in self.search_definitions(pattern, auto_quote) {
+                if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+                    return SearchSymbolCandidates::incomplete(candidates, inspected);
+                }
+                inspected = inspected.saturating_add(1);
+                candidates.push(SearchSymbolCandidate {
+                    primary_range: self
+                        .ranges(&code_unit)
+                        .into_iter()
+                        .min_by_key(|range| (range.start_line, range.start_byte)),
+                    // Structurally-evidenced suppression only: analyzers without a
+                    // per-declaration taint surface default untainted here (path-based
+                    // test filtering in `search_symbols` still applies), so production
+                    // symbols in a file with inline tests are never hidden (#1102).
+                    in_test_region: self.in_test_region(&code_unit),
+                    code_unit,
+                });
+            }
+        }
+        if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+            SearchSymbolCandidates::incomplete(candidates, inspected)
+        } else {
+            SearchSymbolCandidates::complete(candidates, inspected)
+        }
     }
     /// Cold-start substring search that runs against the persisted FTS5
     /// symbol index, without requiring `AnalyzerState` to be fully built.

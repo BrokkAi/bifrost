@@ -1,12 +1,13 @@
 mod common;
 
 use brokk_bifrost::{
-    CSharpAnalyzer, CppAnalyzer, GoAnalyzer, IAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language,
-    PhpAnalyzer, RustAnalyzer, ScalaAnalyzer, TypescriptAnalyzer,
+    CSharpAnalyzer, CancellationToken, CppAnalyzer, GoAnalyzer, IAnalyzer, JavaAnalyzer,
+    JavascriptAnalyzer, Language, PhpAnalyzer, RustAnalyzer, ScalaAnalyzer, TypescriptAnalyzer,
     searchtools::{
         ScanUsagesByReferenceParams, ScanUsagesEntry, ScanUsagesResult, ScanUsagesStatus,
         SearchSymbolsParams, SymbolLookupParams, SymbolSourcesResult, get_symbol_ancestors,
         get_symbol_locations, get_symbol_sources, scan_usages_by_reference, search_symbols,
+        search_symbols_with_cancellation,
     },
 };
 use common::InlineTestProject;
@@ -86,6 +87,43 @@ impl DiagnosticPublisher {
             "missing {expected}: {search:#?}"
         );
     }
+}
+
+#[test]
+fn issue_1199_cancelled_symbol_search_returns_explicit_partial_result() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "pub fn semantic_diagnostics() {}\n")
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    analyzer.reset_full_declaration_scan_count_for_test();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    let search = search_symbols_with_cancellation(
+        &analyzer,
+        SearchSymbolsParams {
+            patterns: vec!["semantic_diagnostics".to_string()],
+            include_tests: true,
+            limit: 100,
+        },
+        Some(&cancellation),
+    );
+
+    assert!(search.truncated, "{search:#?}");
+    assert_eq!(search.total_files, 0, "{search:#?}");
+    assert!(search.files.is_empty(), "{search:#?}");
+    assert!(
+        search
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("cancelled") && note.contains("partial")),
+        "{search:#?}"
+    );
+    assert_eq!(
+        analyzer.full_declaration_scan_count_for_test(),
+        0,
+        "a request cancelled before dispatch must not start a persisted scan"
+    );
 }
 
 #[test]

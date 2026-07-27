@@ -22,7 +22,7 @@ use crate::{
         get_definitions_by_reference, get_summaries, get_symbol_ancestors, get_symbol_locations,
         get_symbol_sources, get_type_by_location, list_symbols, most_relevant_files,
         refresh_result, rename_symbol, scan_usages_by_location, scan_usages_by_reference,
-        search_symbols, symbol_source_candidate_files, usage_graph,
+        search_symbols_with_cancellation, symbol_source_candidate_files, usage_graph,
     },
     searchtools_render::{RenderOptions, RenderText},
     structured_data::{jq, xml_select, xml_skim},
@@ -661,7 +661,9 @@ impl SearchToolsService {
                 &snapshot,
                 arguments,
                 render_options,
-                |workspace, params| search_symbols(workspace.analyzer(), params),
+                |workspace, params| {
+                    search_symbols_with_cancellation(workspace.analyzer(), params, cancellation)
+                },
             ),
             "get_symbol_locations" => Self::decode_render_and_run(
                 &snapshot,
@@ -3034,6 +3036,51 @@ mod client_roots_tests {
                 .join(crate::cache_db::CACHE_DB_FILE_NAME)
                 .exists(),
             "client-root binding must not collapse cache writes to the primary checkout"
+        );
+    }
+}
+
+#[cfg(test)]
+mod search_symbols_cancellation_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn issue_1199_service_forwards_cancellation_to_search_symbols() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("lib.rs"),
+            "pub fn semantic_diagnostics() {}\n",
+        )
+        .unwrap();
+        let service =
+            SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
+                .unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let result = service
+            .call_tool_output_with_cancellation(
+                "search_symbols",
+                json!({
+                    "patterns": ["semantic_diagnostics"],
+                    "include_tests": true,
+                    "limit": 100
+                }),
+                RenderOptions::default(),
+                Some(&cancellation),
+            )
+            .unwrap()
+            .into_value();
+
+        assert_eq!(result["truncated"], true, "{result:#}");
+        assert_eq!(result["total_files"], 0, "{result:#}");
+        assert_eq!(result["files"], json!([]), "{result:#}");
+        assert!(
+            result["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("cancelled") && note.contains("partial")),
+            "{result:#}"
         );
     }
 }

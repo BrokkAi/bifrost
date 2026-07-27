@@ -125,6 +125,7 @@ pub use navigation::get_symbol_locations;
 pub use navigation::get_type_by_location;
 pub use navigation::rename_symbol;
 pub use navigation::search_symbols;
+pub use navigation::search_symbols_with_cancellation;
 pub use scan_usages::AmbiguousUsageCandidate;
 pub use scan_usages::AmbiguousUsageCandidateDetail;
 pub use scan_usages::AmbiguousUsageSymbol;

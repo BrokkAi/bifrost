@@ -668,8 +668,10 @@ impl IAnalyzer for TypescriptAnalyzer {
         &self,
         patterns: &[String],
         auto_quote: bool,
-    ) -> Vec<crate::analyzer::SearchSymbolCandidate> {
-        self.inner.search_symbol_candidates(patterns, auto_quote)
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> crate::analyzer::SearchSymbolCandidates {
+        self.inner
+            .search_symbol_candidates(patterns, auto_quote, cancellation)
     }
 
     fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {

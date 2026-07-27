@@ -10,9 +10,9 @@ This ExecPlan is a living document. The sections `Progress`, `Surprises & Discov
 
 - [x] (2026-07-27 08:16Z) Reproduced the live MCP request for more than 90 seconds on the current issue branch and traced the repeated scan through `searchtools::search_symbols`, `IAnalyzer::search_symbol_candidates`, `MultiAnalyzer`, `TreeSitterAnalyzer`, and `AnalyzerStore`.
 - [x] (2026-07-27 08:39Z) Refactored the analyzer search-candidate interface to accept the full pattern batch and enumerate persisted candidates once per language.
-- [ ] Thread the existing MCP request cancellation token through symbol candidate storage and hydration, and expose partial completion through the existing `truncated` and `note` response fields.
-- [ ] Add behavior and work-count regressions (completed: the issue-shaped four-pattern union passes and asserts one scan; remaining: cancellation coverage).
-- [ ] Run focused tests, `cargo fmt`, clippy with all features, and the exact current-source CLI query with timing; record measured evidence here.
+- [x] (2026-07-27 09:12Z) Threaded the existing MCP request cancellation token through SQLite enumeration, qualified-name hydration, dirty state, path-synthetic modules, ranking, rendering, and the service boundary; interrupted responses use `truncated` plus an explicit partial-result note.
+- [x] (2026-07-27 09:18Z) Added work-count, pre-cancelled service/search, and deterministic mid-scan cancellation regressions; all four issue-focused tests pass.
+- [x] (2026-07-27 09:36Z) Ran `cargo fmt`, the four focused tests, the exact current-source timing twice, and the all-target/all-feature clippy gate successfully.
 
 ## Surprises & Discoveries
 
@@ -28,6 +28,12 @@ This ExecPlan is a living document. The sections `Progress`, `Surprises & Discov
 - Observation: Featureless focused tests link and run, but an all-feature integration-test binary does not link in the current shell because PyO3 cannot resolve Python symbols.
   Evidence: the issue test passed featurelessly in 0.03 seconds; the preceding `--features nlp,python` build compiled Rust successfully, then failed at `cc` with undefined `_Py*` symbols. The shell resolves `python3` to Xcode Python 3.9 while `python3-config` reports Homebrew Python 3.14, so this is an environment/toolchain mismatch to keep separate from the symbol-search code.
 
+- Observation: The patched exact query completes well inside the prior cancellation window, while ranking is not the bottleneck.
+  Evidence: a reconciled current-source run completed `searchtools::search_symbols` in 5287.7 ms (2667.5 ms resolve, 22.4 ms rank); a warmed repeat completed in 7246.9 ms (4076.2 ms resolve, 23.1 ms rank). Both returned 18 files without truncation, versus the original request still running at 41 and 91 seconds.
+
+- Observation: This shell had two Rust 1.96 clippy installations with the same release number but incompatible compiler metadata.
+  Evidence: `cargo-clippy` on `PATH` came from Homebrew (LLVM 22.1.6), while `cargo`/`rustc` came from rustup (LLVM 22.1.2). Invoking the rustup toolchain's `cargo-clippy` directly made the required all-target/all-feature gate pass.
+
 ## Decision Log
 
 - Decision: Batch patterns at the `IAnalyzer` boundary instead of adding a timeout only in the MCP transport.
@@ -42,11 +48,15 @@ This ExecPlan is a living document. The sections `Progress`, `Surprises & Discov
   Rationale: The durable optimization is shared enumeration, not a narrower approximation. Some language qualified names depend on file paths, so an eager SQL substring filter could silently discard valid matches.
   Date/Author: 2026-07-27 / Codex
 
+- Decision: Compile a request's valid patterns into one case-insensitive `RegexSet` after retaining the existing per-pattern validation and sigil escaping.
+  Rationale: The set shares automaton work across every target language without changing adapter normalization, raw-name handling, or invalid-pattern behavior.
+  Date/Author: 2026-07-27 / Codex
+
 ## Outcomes & Retrospective
 
-Implementation is in progress. The intended outcome is one persisted candidate scan per language for any number of request patterns, cancellation-safe partial results, and measured interactive behavior for the issue query.
+The implementation now performs one persisted candidate scan per language for any number of request patterns, uses a shared regex set for the union, and preserves the language adapters' structured FQN hydration. Cancellation is cooperative through all large search loops, including JavaScript/TypeScript/Python path-synthetic module discovery, and callers receive explicit partial/truncated output.
 
-Milestone 1 is complete: the language-neutral interface now batches patterns, every built-in adapter forwards the batch, and the issue-shaped Rust test proves the four requested literal/regex forms return their union after one persisted scan.
+The exact issue request now completes in 5.29-7.25 seconds in two current-source runs and returns 18 files without truncation. Four focused regressions pass in under a tenth of a second once linked, and the repository's all-target/all-feature clippy gate passes with warnings denied.
 
 ## Context and Orientation
 
@@ -78,12 +88,11 @@ Implement and format:
 
 Run the focused regression suites through the managed isolated-target helper:
 
-    scripts/with-isolated-cargo-target.sh cargo test --test searchtools_fuzzy_symbol_lookup issue_1199 --features nlp,python -- --nocapture
-    scripts/with-isolated-cargo-target.sh cargo test --test searchtools_service search_symbols --features nlp,python -- --nocapture
+    scripts/with-isolated-cargo-target.sh cargo test --lib --test searchtools_fuzzy_symbol_lookup issue_1199 -- --nocapture
 
 Run the core Rust quality gate:
 
-    scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
+    PYO3_PYTHON=/opt/homebrew/bin/python3.14 scripts/with-isolated-cargo-target.sh /Users/dave/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin/cargo-clippy --all-targets --all-features -- -D warnings
 
 Run the exact dogfood query with current source and timing enabled:
 
@@ -118,8 +127,31 @@ Focused milestone-1 validation:
     test issue_1199_multi_pattern_symbol_search_scans_persisted_candidates_once ... ok
     test result: ok. 1 passed; 0 failed; 41 filtered out; finished in 0.03s
 
+Focused complete validation:
+
+    searchtools_service::search_symbols_cancellation_tests::issue_1199_service_forwards_cancellation_to_search_symbols ... ok
+    analyzer::tree_sitter_analyzer::tests::issue_1199_symbol_candidate_scan_honors_midstream_cancellation ... ok
+    issue_1199_cancelled_symbol_search_returns_explicit_partial_result ... ok
+    issue_1199_multi_pattern_symbol_search_scans_persisted_candidates_once ... ok
+    test result: ok. 4 passed; 0 failed
+
+Current-source exact query timings:
+
+    searchtools::search_symbols (5287.7 ms), resolve 2667.5 ms, rank 22.4 ms
+    warmed searchtools::search_symbols (7246.9 ms), resolve 4076.2 ms, rank 23.1 ms
+    both: total_files=18, truncated=false
+
+Final quality gate:
+
+    cargo clippy --all-targets --all-features -- -D warnings
+    Finished dev profile; exit 0
+
 ## Interfaces and Dependencies
 
 No new crate dependency is required. The implementation must use `crate::CancellationToken`, the existing Rayon fan-out across language delegates where useful, the persisted `AnalyzerStore`, and the current adapter-driven qualified-name hydration. The final internal interface will accept a pattern slice and optional cancellation token and return a candidate batch outcome with a completeness bit; `search_symbols` remains available as the non-cancellable public convenience function, with a cancellation-aware sibling used by `SearchToolsService`.
 
 Plan revision note (2026-07-27 08:39Z): Completed the shared-scan milestone, recorded its focused regression evidence, and separated the local all-feature PyO3 linker mismatch from product behavior. The next milestone threads cancellation through the new batch.
+
+Plan revision note (2026-07-27 09:27Z): Completed cancellation and all focused regressions, added shared regex-set matching and cancellable synthetic-module enumeration, and recorded two successful exact-query timings. Final clippy and cleanup remain.
+
+Plan revision note (2026-07-27 09:36Z): Re-ran all four focused tests after the final hot-path specialization and completed the all-target/all-feature clippy gate. Implementation and validation are complete; only checkpoint commit and generated-artifact cleanup remain.

@@ -608,8 +608,10 @@ impl IAnalyzer for PhpAnalyzer {
         &self,
         patterns: &[String],
         auto_quote: bool,
-    ) -> Vec<crate::analyzer::SearchSymbolCandidate> {
-        self.inner.search_symbol_candidates(patterns, auto_quote)
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> crate::analyzer::SearchSymbolCandidates {
+        self.inner
+            .search_symbol_candidates(patterns, auto_quote, cancellation)
     }
 
     fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
