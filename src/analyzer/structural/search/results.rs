@@ -1097,6 +1097,23 @@ pub struct CodeQueryExecutionWork {
     pub semantic: CodeQuerySemanticWork,
 }
 
+impl CodeQueryExecutionWork {
+    pub(crate) const fn saturating_add(self, other: Self) -> Self {
+        Self {
+            scanned_files: self.scanned_files.saturating_add(other.scanned_files),
+            scanned_source_bytes: self
+                .scanned_source_bytes
+                .saturating_add(other.scanned_source_bytes),
+            fact_nodes: self.fact_nodes.saturating_add(other.fact_nodes),
+            pipeline_rows: self.pipeline_rows.saturating_add(other.pipeline_rows),
+            examined_references: self
+                .examined_references
+                .saturating_add(other.examined_references),
+            semantic: self.semantic.saturating_add(other.semantic),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct CodeQuerySemanticWork {
     pub materialization_attempts: u64,
@@ -1104,13 +1121,94 @@ pub struct CodeQuerySemanticWork {
     pub request_cache_hits: u64,
     pub source_bytes: u64,
     pub procedures: u64,
+    pub blocks: u64,
     pub program_points: u64,
+    pub values: u64,
+    pub allocations: u64,
+    pub call_sites: u64,
+    pub memory_locations: u64,
+    pub captures: u64,
+    pub source_mappings: u64,
+    pub evidence: u64,
+    pub gaps: u64,
+    pub events: u64,
     pub control_edges: u64,
+    pub nested_entries: u64,
     pub retained_bytes: u64,
     pub traversal_steps: u64,
     pub budget_exhausted: bool,
     #[serde(skip_serializing_if = "CodeQueryTypestateWork::is_empty")]
     pub typestate: CodeQueryTypestateWork,
+}
+
+impl CodeQuerySemanticWork {
+    pub(crate) const fn saturating_add(self, other: Self) -> Self {
+        Self {
+            materialization_attempts: self
+                .materialization_attempts
+                .saturating_add(other.materialization_attempts),
+            unique_materialized_files: self
+                .unique_materialized_files
+                .saturating_add(other.unique_materialized_files),
+            request_cache_hits: self
+                .request_cache_hits
+                .saturating_add(other.request_cache_hits),
+            source_bytes: self.source_bytes.saturating_add(other.source_bytes),
+            procedures: self.procedures.saturating_add(other.procedures),
+            blocks: self.blocks.saturating_add(other.blocks),
+            program_points: self.program_points.saturating_add(other.program_points),
+            values: self.values.saturating_add(other.values),
+            allocations: self.allocations.saturating_add(other.allocations),
+            call_sites: self.call_sites.saturating_add(other.call_sites),
+            memory_locations: self.memory_locations.saturating_add(other.memory_locations),
+            captures: self.captures.saturating_add(other.captures),
+            source_mappings: self.source_mappings.saturating_add(other.source_mappings),
+            evidence: self.evidence.saturating_add(other.evidence),
+            gaps: self.gaps.saturating_add(other.gaps),
+            events: self.events.saturating_add(other.events),
+            control_edges: self.control_edges.saturating_add(other.control_edges),
+            nested_entries: self.nested_entries.saturating_add(other.nested_entries),
+            retained_bytes: self.retained_bytes.saturating_add(other.retained_bytes),
+            traversal_steps: self.traversal_steps.saturating_add(other.traversal_steps),
+            budget_exhausted: self.budget_exhausted || other.budget_exhausted,
+            typestate: self.typestate.saturating_add(other.typestate),
+        }
+    }
+
+    pub(crate) const fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            materialization_attempts: self
+                .materialization_attempts
+                .saturating_sub(earlier.materialization_attempts),
+            unique_materialized_files: self
+                .unique_materialized_files
+                .saturating_sub(earlier.unique_materialized_files),
+            request_cache_hits: self
+                .request_cache_hits
+                .saturating_sub(earlier.request_cache_hits),
+            source_bytes: self.source_bytes.saturating_sub(earlier.source_bytes),
+            procedures: self.procedures.saturating_sub(earlier.procedures),
+            blocks: self.blocks.saturating_sub(earlier.blocks),
+            program_points: self.program_points.saturating_sub(earlier.program_points),
+            values: self.values.saturating_sub(earlier.values),
+            allocations: self.allocations.saturating_sub(earlier.allocations),
+            call_sites: self.call_sites.saturating_sub(earlier.call_sites),
+            memory_locations: self
+                .memory_locations
+                .saturating_sub(earlier.memory_locations),
+            captures: self.captures.saturating_sub(earlier.captures),
+            source_mappings: self.source_mappings.saturating_sub(earlier.source_mappings),
+            evidence: self.evidence.saturating_sub(earlier.evidence),
+            gaps: self.gaps.saturating_sub(earlier.gaps),
+            events: self.events.saturating_sub(earlier.events),
+            control_edges: self.control_edges.saturating_sub(earlier.control_edges),
+            nested_entries: self.nested_entries.saturating_sub(earlier.nested_entries),
+            retained_bytes: self.retained_bytes.saturating_sub(earlier.retained_bytes),
+            traversal_steps: self.traversal_steps.saturating_sub(earlier.traversal_steps),
+            budget_exhausted: self.budget_exhausted && !earlier.budget_exhausted,
+            typestate: self.typestate.saturating_sub(earlier.typestate),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -1179,7 +1277,6 @@ impl CodeQueryTypestateWork {
         }
     }
 
-    #[cfg(test)]
     pub(crate) const fn saturating_add(self, other: Self) -> Self {
         Self {
             solves: self.solves.saturating_add(other.solves),

@@ -38,7 +38,8 @@
                   :categories (all [resource.close]))
               :supersedes [])]
           :transitions [
-            (transition :from open :on close :to closed)]
+            (transition :from open :on close :to closed)
+            (transition :from closed :on close :to violated)]
           :terminal-expectations [
             (terminal-expectation
               :id "normal-exit-closed"

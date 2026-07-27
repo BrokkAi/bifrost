@@ -290,6 +290,9 @@ impl PolicyBudgetField {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyBudgetError {
+    InvalidQueryLimits {
+        detail: &'static str,
+    },
     ExceedsHardCap {
         field: PolicyBudgetField,
         value: usize,
@@ -304,6 +307,9 @@ pub enum PolicyBudgetError {
 impl fmt::Display for PolicyBudgetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidQueryLimits { detail } => {
+                write!(formatter, "invalid policy query limits: {detail}")
+            }
             Self::ExceedsHardCap {
                 field,
                 value,
@@ -358,6 +364,16 @@ impl PolicyBudgetBuilder {
         mut self,
         limits: CodeQueryExecutionLimits,
     ) -> Result<Self, PolicyBudgetError> {
+        if !limits.semantic.all_positive() {
+            return Err(PolicyBudgetError::InvalidQueryLimits {
+                detail: "semantic limits must all be positive",
+            });
+        }
+        if !limits.typestate.is_valid() {
+            return Err(PolicyBudgetError::InvalidQueryLimits {
+                detail: "typestate limits must be positive and within their hard caps",
+            });
+        }
         ensure_at_most(
             PolicyBudgetField::ScannedFiles,
             limits.max_scanned_files,
@@ -658,6 +674,41 @@ mod tests {
             .unwrap();
         assert_eq!(budget.max_findings(), 0);
         assert_eq!(budget.max_retained_report_bytes(), 0);
+    }
+
+    #[test]
+    fn query_limits_reject_zero_semantic_and_typestate_dimensions() {
+        let semantic_error = PolicyBudget::builder()
+            .with_query_limits(CodeQueryExecutionLimits {
+                semantic: CodeQuerySemanticLimits {
+                    max_source_bytes: 0,
+                    ..CodeQuerySemanticLimits::default()
+                },
+                ..CodeQueryExecutionLimits::default()
+            })
+            .unwrap_err();
+        assert_eq!(
+            semantic_error,
+            PolicyBudgetError::InvalidQueryLimits {
+                detail: "semantic limits must all be positive",
+            }
+        );
+
+        let typestate_error = PolicyBudget::builder()
+            .with_query_limits(CodeQueryExecutionLimits {
+                typestate: CodeQueryTypestateLimits {
+                    max_candidates: 0,
+                    ..CodeQueryTypestateLimits::default()
+                },
+                ..CodeQueryExecutionLimits::default()
+            })
+            .unwrap_err();
+        assert_eq!(
+            typestate_error,
+            PolicyBudgetError::InvalidQueryLimits {
+                detail: "typestate limits must be positive and within their hard caps",
+            }
+        );
     }
 
     #[test]

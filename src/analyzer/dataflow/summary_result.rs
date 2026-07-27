@@ -698,6 +698,7 @@ pub enum SummaryDataflowError {
     FactIdOverflow { index: usize },
     WitnessEvidenceIdOverflow { index: usize },
     WitnessInvariant(&'static str),
+    PointSeedOutsideRoot,
     SemanticProvider(SemanticProviderError),
 }
 
@@ -713,6 +714,8 @@ impl fmt::Display for SummaryDataflowError {
             Self::WitnessInvariant(reason) => {
                 write!(formatter, "summary witness invariant failed: {reason}")
             }
+            Self::PointSeedOutsideRoot => formatter
+                .write_str("summary point seed belongs to a procedure outside the solve root"),
             Self::SemanticProvider(error) => error.fmt(formatter),
         }
     }
@@ -723,7 +726,8 @@ impl Error for SummaryDataflowError {
         match self {
             Self::FactIdOverflow { .. }
             | Self::WitnessEvidenceIdOverflow { .. }
-            | Self::WitnessInvariant(_) => None,
+            | Self::WitnessInvariant(_)
+            | Self::PointSeedOutsideRoot => None,
             Self::SemanticProvider(error) => Some(error),
         }
     }

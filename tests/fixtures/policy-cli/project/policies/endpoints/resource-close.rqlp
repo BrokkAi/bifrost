@@ -8,7 +8,7 @@
   :selector
     (rql
       :schema-version 2
-      (language python
-        (call :callee (name "close"))))
-  :binding receiver
+      (language typescript
+        (call :callee (name "closeResource"))))
+  :binding (argument :index 0)
   :supersedes [])

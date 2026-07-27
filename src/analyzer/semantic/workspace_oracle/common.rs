@@ -2,8 +2,8 @@
 
 use crate::analyzer::semantic::{
     EvidenceCompleteness, EvidenceHandle, EvidenceId, OracleContractError, ProcedureHandle,
-    ProofStatus, SemanticBudget, SemanticBudgetExceeded, SemanticProviderError, SemanticRequest,
-    SemanticWork, ValueHandle, ValueId,
+    ProofStatus, SemanticBudget, SemanticBudgetExceeded, SemanticExecutionBudget,
+    SemanticProviderError, SemanticRequest, SemanticWork, ValueHandle, ValueId,
 };
 
 #[derive(Debug)]
@@ -15,6 +15,7 @@ pub(super) enum Interruption {
 pub(super) struct WorkStager {
     pub(super) budget: SemanticBudget,
     pub(super) work: SemanticWork,
+    execution: Option<SemanticExecutionBudget>,
 }
 
 impl WorkStager {
@@ -22,6 +23,19 @@ impl WorkStager {
         Self {
             budget: request.budget.clone(),
             work: SemanticWork::default(),
+            execution: request.execution_budget().cloned(),
+        }
+    }
+
+    pub(super) fn request<'a>(
+        &'a mut self,
+        cancellation: &'a crate::CancellationToken,
+    ) -> SemanticRequest<'a> {
+        match &self.execution {
+            Some(execution) => {
+                SemanticRequest::with_execution_budget(&mut self.budget, cancellation, execution)
+            }
+            None => SemanticRequest::new(&mut self.budget, cancellation),
         }
     }
 

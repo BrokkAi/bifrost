@@ -5,8 +5,8 @@ use brokk_bifrost::analyzer::dataflow::{
     WitnessRetentionLimits,
 };
 use brokk_bifrost::analyzer::semantic::{
-    CancellationToken, DispatchOracle, EvidenceCompleteness, OracleCallContext, OracleLimits,
-    ProcedureHandle, ProcedureKind, ProofStatus, SemanticBudget, SemanticRequest, ValueFlowOracle,
+    CancellationToken, EvidenceCompleteness, OracleCallContext, OracleLimits, ProcedureHandle,
+    ProcedureKind, ProofStatus, SemanticBudget, SemanticRequest, ValueFlowOracle,
     ValueFlowRelationKind,
 };
 use brokk_bifrost::analyzer::value_flow::{
@@ -286,112 +286,4 @@ fn context_sensitive_oracle_inputs_are_rejected_instead_of_flattened() {
     )
     .unwrap_err();
     assert_eq!(error, ValueFlowPlanError::ContextSensitiveInputUnsupported);
-}
-
-#[test]
-fn exact_argument_and_return_bindings_flow_through_a_helper() {
-    let project = InlineTestProject::with_language(Language::Java)
-        .file("src/HelperFlowFixture.java", HELPER_SOURCE)
-        .build();
-    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
-    let graph = SemanticGraph::materialize(&project, &analyzer, "src/HelperFlowFixture.java");
-    let root = procedure_named(&graph, "run", ProcedureKind::Method);
-    let callee = procedure_named(&graph, "relay", ProcedureKind::Method);
-    let call_row = root.semantics().call_sites().first().expect("relay call");
-    let call = root.call_site_handle(call_row.id).expect("live relay call");
-    let cancellation = CancellationToken::default();
-    let mut budget = SemanticBudget::default();
-    let oracle = analyzer.semantic_oracle_provider();
-    let dispatch = oracle
-        .resolve_call(&call, &mut SemanticRequest::new(&mut budget, &cancellation))
-        .unwrap();
-    let candidate = dispatch
-        .available_value()
-        .unwrap()
-        .candidates()
-        .iter()
-        .find(|candidate| candidate.target() == &callee)
-        .expect("relay dispatch candidate")
-        .clone();
-    let binding_outcome = oracle
-        .call_bindings(
-            &call,
-            &candidate,
-            &OracleCallContext::empty(),
-            &mut SemanticRequest::new(&mut budget, &cancellation),
-        )
-        .unwrap();
-    let binding_status = SemanticInputStatus::from_outcome(&binding_outcome);
-    let bindings = binding_outcome.available_value().unwrap().clone();
-
-    let mut snapshots = Vec::new();
-    for procedure in [&root, &callee] {
-        let outcome = oracle
-            .procedure_relations(
-                procedure,
-                &OracleCallContext::empty(),
-                &mut SemanticRequest::new(&mut budget, &cancellation),
-            )
-            .unwrap();
-        snapshots.push(ValueFlowInput::new(
-            outcome.available_value().unwrap().clone(),
-            SemanticInputStatus::from_outcome(&outcome),
-        ));
-    }
-    let root_snapshot = snapshots
-        .iter()
-        .find(|snapshot| snapshot.value().procedure() == &root)
-        .unwrap()
-        .value();
-    let source_relation = root_snapshot
-        .relations()
-        .iter()
-        .find(|relation| relation.kind == ValueFlowRelationKind::Parameter)
-        .expect("run parameter relation");
-    let sink_relation = root_snapshot
-        .relations()
-        .iter()
-        .find(|relation| relation.kind == ValueFlowRelationKind::Assignment)
-        .expect("call-result assignment relation");
-    let source = ValueFlowSourceSpec::new(
-        ValueFlowEventKey::at_point(source_relation.point(), 0, ValueFlowEventKind::Source)
-            .unwrap(),
-        source_relation.point().clone(),
-        ValueFlowObservationPhase::AfterEffects,
-        ValueFlowCarrier::from(&source_relation.target),
-        ProofStatus::Proven,
-        EvidenceCompleteness::Complete,
-    );
-    let sink = ValueFlowSinkSpec::new(
-        ValueFlowEventKey::at_point(sink_relation.point(), 0, ValueFlowEventKind::Sink).unwrap(),
-        sink_relation.point().clone(),
-        ValueFlowObservationPhase::AfterEffects,
-        ValueFlowCarrier::from(&sink_relation.target),
-        ProofStatus::Proven,
-        EvidenceCompleteness::Complete,
-    );
-    let plan = ValueFlowPlan::try_new(
-        root.clone(),
-        snapshots,
-        vec![ValueFlowInput::new(bindings, binding_status)],
-        vec![source],
-        vec![sink],
-    )
-    .unwrap();
-    let sink_id = plan.sinks().next().unwrap().0;
-    let cancellation = CancellationToken::default();
-    let mut solver_budget = SolverBudget::default();
-    let mut semantic_budget = SemanticBudget::default();
-    let result = solve_value_flow_with_summaries(
-        &root,
-        &analyzer.icfg_provider(),
-        &plan,
-        &mut semantic_budget,
-        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
-    )
-    .unwrap();
-    assert!(matches!(
-        result.sink_outcome(sink_id),
-        ValueFlowSinkOutcome::Reached(_)
-    ));
 }

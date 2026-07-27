@@ -92,6 +92,7 @@ fn evaluate(source: &str, overlays: &[CvssEvaluationOverlay]) -> brokk_bifrost::
             policy,
             &PolicyEvaluationContext {
                 analyzer: &analyzer,
+                workspace: None,
                 cancellation: None,
                 cvss_overlays: overlays,
                 organizational_risk: &[],

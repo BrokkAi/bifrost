@@ -277,7 +277,7 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
         let mut materialization_exceeded = None;
         let mut materialized_files: HashMap<ProjectFile, SemanticOutcome<Arc<SemanticArtifact>>> =
             HashMap::default();
-        let mut staged_request = SemanticRequest::new(&mut staged_budget, request.cancellation);
+        let mut staged_request = request.staged(&mut staged_budget);
 
         while let Some(group) = target_groups.next() {
             if request.cancellation.is_cancelled() {
@@ -291,6 +291,19 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
                     procedure_call_gap,
                 )?;
                 materialization_quality = DispatchQuality::Cancelled;
+                break;
+            }
+            if !staged_request.charge_execution_traversal(1) {
+                append_execution_budget_target_boundaries(
+                    self.workspace.analyzer(),
+                    &candidates,
+                    &mut boundaries,
+                    std::iter::once(group).chain(target_groups.by_ref()),
+                    self.limits,
+                    call_dispatch_gap,
+                    procedure_call_gap,
+                )?;
+                materialization_quality = DispatchQuality::Truncated;
                 break;
             }
             // Exact dispatch already performed the structured, language-aware
@@ -1055,15 +1068,25 @@ fn cancelled_target_boundary(
     analyzer: &dyn IAnalyzer,
     target: &DispatchTargetGroup,
 ) -> Result<DispatchBoundary, SemanticProviderError> {
+    unmaterialized_target_boundary(
+        analyzer,
+        target,
+        "resolved target was not materialized because dispatch was cancelled",
+    )
+}
+
+fn unmaterialized_target_boundary(
+    analyzer: &dyn IAnalyzer,
+    target: &DispatchTargetGroup,
+    reason: &'static str,
+) -> Result<DispatchBoundary, SemanticProviderError> {
     Ok(DispatchBoundary {
         kind: DispatchBoundaryKind::Unmaterialized(locator_for_definition(
             analyzer,
             &target.representative,
         )?),
         proof: proof_from_usage(target.proof),
-        completeness: EvidenceCompleteness::Partial(
-            "resolved target was not materialized because dispatch was cancelled".into(),
-        ),
+        completeness: EvidenceCompleteness::Partial(reason.into()),
         provenance: Box::new([]),
     })
 }
@@ -1076,6 +1099,51 @@ fn append_cancelled_target_boundaries(
     limits: OracleLimits,
     call_dispatch_gap: Option<&SemanticGap>,
     procedure_call_gap: Option<&SemanticGap>,
+) -> Result<bool, SemanticProviderError> {
+    append_unmaterialized_target_boundaries(
+        analyzer,
+        candidates,
+        boundaries,
+        groups,
+        limits,
+        call_dispatch_gap,
+        procedure_call_gap,
+        "resolved target was not materialized because dispatch was cancelled",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_execution_budget_target_boundaries(
+    analyzer: &dyn IAnalyzer,
+    candidates: &[DispatchCandidate],
+    boundaries: &mut Vec<DispatchBoundary>,
+    groups: impl IntoIterator<Item = DispatchTargetGroup>,
+    limits: OracleLimits,
+    call_dispatch_gap: Option<&SemanticGap>,
+    procedure_call_gap: Option<&SemanticGap>,
+) -> Result<bool, SemanticProviderError> {
+    append_unmaterialized_target_boundaries(
+        analyzer,
+        candidates,
+        boundaries,
+        groups,
+        limits,
+        call_dispatch_gap,
+        procedure_call_gap,
+        "resolved target was not materialized because the request execution budget was exhausted",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_unmaterialized_target_boundaries(
+    analyzer: &dyn IAnalyzer,
+    candidates: &[DispatchCandidate],
+    boundaries: &mut Vec<DispatchBoundary>,
+    groups: impl IntoIterator<Item = DispatchTargetGroup>,
+    limits: OracleLimits,
+    call_dispatch_gap: Option<&SemanticGap>,
+    procedure_call_gap: Option<&SemanticGap>,
+    reason: &'static str,
 ) -> Result<bool, SemanticProviderError> {
     let retained_target_arms = candidates.len().saturating_add(
         boundaries
@@ -1108,7 +1176,7 @@ fn append_cancelled_target_boundaries(
         let Some(group) = groups.next() else {
             return Ok(false);
         };
-        let boundary = cancelled_target_boundary(analyzer, &group)?;
+        let boundary = unmaterialized_target_boundary(analyzer, &group, reason)?;
         let evidence =
             dispatch_boundary_evidence_count(&boundary, call_dispatch_gap, procedure_call_gap);
         if evidence > remaining_evidence {
