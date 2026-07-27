@@ -15,6 +15,8 @@ use crate::analyzer::{
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use std::borrow::Cow;
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::hash::Hash;
 #[cfg(test)]
@@ -3786,8 +3788,8 @@ fn build_visible_identifier_index(
     visible_source_files_by_root: &HashMap<ProjectFile, HashSet<ProjectFile>>,
 ) -> HashMap<ProjectFile, HashMap<String, Vec<CodeUnit>>> {
     let mut out = HashMap::default();
+    let mut internal_linkage_cache = HashMap::default();
     for (file, visible) in visible_by_file {
-        let mut internal_linkage_cache = HashMap::default();
         let mut by_identifier: HashMap<String, Vec<CodeUnit>> = HashMap::default();
         for unit in visible {
             if cpp_global_field_has_internal_linkage_cached(
@@ -7554,9 +7556,36 @@ fn cpp_global_field_has_internal_linkage_cached(
     if let Some(internal) = cache.get(candidate) {
         return *internal;
     }
+    #[cfg(test)]
+    note_cpp_global_field_internal_linkage_classification_for_test();
     let internal = cpp_global_field_has_internal_linkage(analyzer, candidate);
     cache.insert(candidate.clone(), internal);
     internal
+}
+
+#[cfg(test)]
+thread_local! {
+    static CPP_GLOBAL_FIELD_INTERNAL_LINKAGE_CLASSIFICATIONS_FOR_TEST: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_cpp_global_field_internal_linkage_classification_for_test() {
+    CPP_GLOBAL_FIELD_INTERNAL_LINKAGE_CLASSIFICATIONS_FOR_TEST.with(|count| {
+        count.set(count.get() + 1);
+    });
+}
+
+#[cfg(test)]
+fn with_cpp_global_field_internal_linkage_classification_counter_for_test<T>(
+    body: impl FnOnce() -> T,
+) -> (T, usize) {
+    CPP_GLOBAL_FIELD_INTERNAL_LINKAGE_CLASSIFICATIONS_FOR_TEST.with(|count| {
+        count.set(0);
+        let result = body();
+        let observed = count.get();
+        count.set(0);
+        (result, observed)
+    })
 }
 
 pub(super) fn same_logical_symbol(left: &CodeUnit, right: &CodeUnit) -> bool {
@@ -7911,6 +7940,67 @@ mod tests {
             candidate_sources(&right),
             HashSet::from_iter([right_header])
         );
+    }
+
+    #[test]
+    fn visible_identifier_index_reuses_internal_linkage_classification_across_roots() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let left = ProjectFile::new(root.clone(), "left.cpp");
+        let right = ProjectFile::new(root.clone(), "right.cpp");
+        let shared = ProjectFile::new(root.clone(), "shared.h");
+        let local = CodeUnit::new(shared.clone(), CodeUnitType::Field, "", "local_value");
+        let external = CodeUnit::new(shared.clone(), CodeUnitType::Field, "", "shared_value");
+        let visible = HashSet::from_iter([local.clone(), external.clone()]);
+        let visible_by_file =
+            HashMap::from_iter([(left.clone(), visible.clone()), (right.clone(), visible)]);
+        let visible_source_files_by_root = HashMap::from_iter([
+            (
+                left.clone(),
+                HashSet::from_iter([left.clone(), local.source().clone()]),
+            ),
+            (
+                right.clone(),
+                HashSet::from_iter([right.clone(), local.source().clone()]),
+            ),
+        ]);
+        let cpp = visibility_analyzer(&visible_by_file);
+        let (by_identifier, classification_count) =
+            with_cpp_global_field_internal_linkage_classification_counter_for_test(|| {
+                build_visible_identifier_index(
+                    &cpp,
+                    &visible_by_file,
+                    &visible_source_files_by_root,
+                )
+            });
+
+        assert_eq!(
+            classification_count, 2,
+            "one batch should classify each repeated global field once even when several roots share it"
+        );
+        // issue_1184 exercises the authoritative internal-linkage/root-isolation behavior.
+        // This fixture only guards that sharing the cache across roots preserves the buckets.
+        for root in [&left, &right] {
+            let bucket = by_identifier
+                .get(root)
+                .expect("visible identifier bucket for root");
+            assert_eq!(
+                bucket
+                    .get("local_value")
+                    .expect("shared field bucket")
+                    .len(),
+                1,
+                "sharing the classification cache must not change the per-root local_value bucket"
+            );
+            assert_eq!(
+                bucket
+                    .get("shared_value")
+                    .expect("shared field bucket")
+                    .len(),
+                1,
+                "sharing the classification cache must not change the per-root shared_value bucket"
+            );
+        }
     }
 
     /// Owns the analyzer the borrowed index points at; keep it alive for as
