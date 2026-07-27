@@ -22,6 +22,73 @@ fn single_found_usage(result: &ScanUsagesResult) -> &ScanUsagesEntry {
 }
 
 #[test]
+fn issue_1199_multi_pattern_symbol_search_scans_persisted_candidates_once() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/diagnostics.rs",
+            r#"
+pub fn semantic_diagnostics() {}
+pub fn collect_rust_semantic_diagnostics() {}
+
+pub struct DiagnosticPublisher;
+
+impl DiagnosticPublisher {
+    pub fn publish_workspace_diagnostic(&self) {}
+}
+"#,
+        )
+        .file("src/unrelated.rs", "pub fn unrelated() {}\n")
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    analyzer.reset_full_declaration_scan_count_for_test();
+
+    let search = search_symbols(
+        &analyzer,
+        SearchSymbolsParams {
+            patterns: vec![
+                "semantic_diagnostics".to_string(),
+                "collect_.*semantic_diagnostics".to_string(),
+                "DiagnosticPublisher".to_string(),
+                "publish.*diagnostic".to_string(),
+            ],
+            include_tests: true,
+            limit: 100,
+        },
+    );
+
+    assert_eq!(
+        analyzer.full_declaration_scan_count_for_test(),
+        1,
+        "one request must share one persisted candidate scan across every pattern"
+    );
+    assert_eq!(
+        search
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["src/diagnostics.rs"]
+    );
+    let symbols = search.files[0]
+        .classes
+        .iter()
+        .chain(search.files[0].functions.iter())
+        .map(|hit| hit.symbol.as_str())
+        .collect::<Vec<_>>();
+    for expected in [
+        "diagnostics.semantic_diagnostics",
+        "diagnostics.collect_rust_semantic_diagnostics",
+        "diagnostics.DiagnosticPublisher",
+        "diagnostics.DiagnosticPublisher.publish_workspace_diagnostic",
+    ] {
+        assert!(
+            symbols.contains(&expected),
+            "missing {expected}: {search:#?}"
+        );
+    }
+}
+
+#[test]
 fn javascript_constructor_assigned_field_is_searchable_by_property_name() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(

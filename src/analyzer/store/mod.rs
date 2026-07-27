@@ -2499,15 +2499,15 @@ impl AnalyzerStore {
         collect_search_candidate_rows(rows)
     }
 
-    pub fn search_candidate_rows_by_pattern_for_langs(
+    pub fn search_candidate_rows_for_langs(
         &self,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
-        _pattern: &str,
     ) -> Result<Vec<SearchCandidateRow>> {
-        // Regex matching is performed after language-specific FQN hydration.
-        // The storage projection intentionally supplies a complete declaration
-        // candidate set while avoiding per-candidate file-state hydration.
+        // Pattern matching is performed after language-specific FQN hydration.
+        // One request may carry several patterns, so the storage projection
+        // intentionally supplies one complete declaration candidate set for
+        // the batch while avoiding per-candidate file-state hydration.
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;

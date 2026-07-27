@@ -263,13 +263,7 @@ pub fn search_symbols(
 
     let definitions = {
         let _scope = profiling::scope("searchtools::search_symbols.resolve");
-        patterns
-            .par_iter()
-            .map(|pattern| analyzer.search_symbol_candidates(pattern, false))
-            .reduce(Vec::new, |mut acc, definitions| {
-                acc.extend(definitions);
-                acc
-            })
+        analyzer.search_symbol_candidates(&patterns, false)
     };
 
     let filtered: Vec<_> = {

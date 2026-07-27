@@ -1039,7 +1039,7 @@ impl IAnalyzer for MultiAnalyzer {
 
     fn search_symbol_candidates(
         &self,
-        pattern: &str,
+        patterns: &[String],
         auto_quote: bool,
     ) -> Vec<SearchSymbolCandidate> {
         self.delegates
@@ -1049,7 +1049,7 @@ impl IAnalyzer for MultiAnalyzer {
             .map(|delegate| {
                 delegate
                     .analyzer()
-                    .search_symbol_candidates(pattern, auto_quote)
+                    .search_symbol_candidates(patterns, auto_quote)
             })
             .reduce(Vec::new, |mut acc, candidates| {
                 acc.extend(candidates);

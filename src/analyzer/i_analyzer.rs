@@ -313,11 +313,12 @@ pub trait IAnalyzer: Send + Sync + Any {
     /// override it with a projection that avoids full file hydration.
     fn search_symbol_candidates(
         &self,
-        pattern: &str,
+        patterns: &[String],
         auto_quote: bool,
     ) -> Vec<SearchSymbolCandidate> {
-        self.search_definitions(pattern, auto_quote)
-            .into_iter()
+        patterns
+            .iter()
+            .flat_map(|pattern| self.search_definitions(pattern, auto_quote))
             .map(|code_unit| SearchSymbolCandidate {
                 primary_range: self
                     .ranges(&code_unit)

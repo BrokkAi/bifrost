@@ -5588,35 +5588,45 @@ where
 
     fn sql_search_symbol_candidates(
         &self,
-        pattern: &str,
+        patterns: &[String],
         auto_quote: bool,
     ) -> Option<Vec<SearchSymbolCandidate>> {
-        if pattern.is_empty() {
+        if patterns.is_empty() {
             return Some(Vec::new());
         }
 
-        let pattern = if auto_quote {
-            if pattern.contains(".*") {
-                pattern.to_string()
-            } else {
-                format!(".*?{}.*?", regex::escape(pattern))
-            }
-        } else {
-            escape_sigil_anchors(pattern)
-        };
-        let compiled = RegexBuilder::new(&pattern)
-            .case_insensitive(true)
-            .build()
-            .ok()?;
+        let compiled = patterns
+            .iter()
+            .filter_map(|pattern| {
+                let pattern = if auto_quote {
+                    if pattern.contains(".*") {
+                        pattern.to_string()
+                    } else {
+                        format!(".*?{}.*?", regex::escape(pattern))
+                    }
+                } else {
+                    escape_sigil_anchors(pattern)
+                };
+                RegexBuilder::new(&pattern)
+                    .case_insensitive(true)
+                    .build()
+                    .ok()
+            })
+            .collect::<Vec<_>>();
+        if compiled.is_empty() {
+            return Some(Vec::new());
+        }
+        self.full_declaration_scan_count
+            .fetch_add(1, Ordering::Relaxed);
         let rows = self.store_query_or_record(
-            self.store_context
-                .store
-                .search_candidate_rows_by_pattern_for_langs(
-                    &self.storage_language_keys_for_queries(),
-                    self.store_context.generations.as_ref(),
-                    &pattern,
-                ),
-            format!("searching symbol candidates for `{pattern}`"),
+            self.store_context.store.search_candidate_rows_for_langs(
+                &self.storage_language_keys_for_queries(),
+                self.store_context.generations.as_ref(),
+            ),
+            format!(
+                "searching symbol candidates for {} patterns",
+                compiled.len()
+            ),
         )?;
         let resolver = QueryResolver::from_snapshot(
             self.adapter.as_ref(),
@@ -5628,7 +5638,10 @@ where
             rows.into_iter()
                 .map(|row| (row.candidate, (row.primary_range, row.in_test_region))),
         ) {
-            if self.fq_pattern_matches(&code_unit, &compiled) {
+            if compiled
+                .iter()
+                .any(|pattern| self.fq_pattern_matches(&code_unit, pattern))
+            {
                 candidates
                     .entry(code_unit.clone())
                     .or_insert(SearchSymbolCandidate {
@@ -5639,9 +5652,11 @@ where
             }
         }
 
-        for code_unit in
-            self.dirty_units_matching(false, |unit| self.fq_pattern_matches(unit, &compiled))
-        {
+        for code_unit in self.dirty_units_matching(false, |unit| {
+            compiled
+                .iter()
+                .any(|pattern| self.fq_pattern_matches(unit, pattern))
+        }) {
             candidates
                 .entry(code_unit.clone())
                 .or_insert_with(|| SearchSymbolCandidate {
@@ -5654,7 +5669,9 @@ where
                 });
         }
         for code_unit in self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
-            self.fq_pattern_matches(unit, &compiled)
+            compiled
+                .iter()
+                .any(|pattern| self.fq_pattern_matches(unit, pattern))
         })? {
             candidates
                 .entry(code_unit.clone())
@@ -7138,10 +7155,10 @@ where
 
     fn search_symbol_candidates(
         &self,
-        pattern: &str,
+        patterns: &[String],
         auto_quote: bool,
     ) -> Vec<SearchSymbolCandidate> {
-        self.sql_search_symbol_candidates(pattern, auto_quote)
+        self.sql_search_symbol_candidates(patterns, auto_quote)
             .unwrap_or_default()
     }
 
@@ -9650,7 +9667,7 @@ mod tests {
         let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
 
         let matches = analyzer.search_definitions("Gson", false);
-        let candidates = analyzer.search_symbol_candidates("Gson", false);
+        let candidates = analyzer.search_symbol_candidates(&["Gson".to_string()], false);
 
         assert!(matches.iter().any(|unit| unit.fq_name() == "demo.Gson"));
         assert!(

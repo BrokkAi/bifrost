@@ -576,10 +576,10 @@ impl IAnalyzer for RustAnalyzer {
 
     fn search_symbol_candidates(
         &self,
-        pattern: &str,
+        patterns: &[String],
         auto_quote: bool,
     ) -> Vec<crate::analyzer::SearchSymbolCandidate> {
-        self.inner.search_symbol_candidates(pattern, auto_quote)
+        self.inner.search_symbol_candidates(patterns, auto_quote)
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
