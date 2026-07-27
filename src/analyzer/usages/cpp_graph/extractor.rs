@@ -3192,12 +3192,13 @@ fn receiver_owner_matches_target(
     ctx: &ScanCtx<'_>,
 ) -> bool {
     same_symbol(receiver_owner, target_owner)
-        || (ctx.visibility.is_physically_visible(ctx.file, target_owner)
-            || (ctx.spec.owner_is_forward_declaration
-                && ctx
-                    .visibility
-                    .is_physically_visible(ctx.file, receiver_owner)))
-            && same_logical_symbol(receiver_owner, target_owner)
+        || same_logical_symbol(receiver_owner, target_owner)
+            && (ctx.visibility.is_physically_visible(ctx.file, target_owner)
+                || (ctx.spec.owner_is_forward_declaration
+                    && ctx
+                        .visibility
+                        .is_physically_visible(ctx.file, receiver_owner))
+                || target_group_contains_owner_peer(receiver_owner, ctx))
 }
 
 fn receiver_owner_is_known_non_target(
@@ -3214,6 +3215,20 @@ fn receiver_owner_is_known_non_target(
     !ctx.target_group.iter().any(|target| {
         same_logical_symbol(target, &ctx.spec.target) && target.source() == target_owner.source()
     })
+}
+
+fn target_group_contains_owner_peer(owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
+    ctx.visibility
+        .external_type_declaration_visible_at(ctx.file, owner, usize::MAX)
+        && ctx.target_group.iter().any(|target| {
+            type_owner_of(ctx.analyzer, target)
+                .as_ref()
+                .is_some_and(|target_owner| {
+                    same_symbol(target_owner, owner)
+                        || (same_logical_symbol(target_owner, owner)
+                            && target_owner.source() == owner.source())
+                })
+        })
 }
 
 fn receiver_is_self_like(node: Node<'_>) -> bool {
@@ -5069,9 +5084,6 @@ fn structured_enclosing_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeU
 
 fn target_guided_out_of_line_owner(function: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
     let target_owner = ctx.spec.owner.as_ref()?;
-    if !ctx.visibility.is_physically_visible(ctx.file, target_owner) {
-        return None;
-    }
     let (owner_components, _) = qualified_callable_owner_components(function, ctx.source)?;
     let owner_name = owner_components.last()?;
     let mut candidates = Vec::new();
@@ -5096,5 +5108,7 @@ fn target_guided_out_of_line_owner(function: Node<'_>, ctx: &ScanCtx<'_>) -> Opt
     let [candidate] = candidates.as_slice() else {
         return None;
     };
-    same_visible_symbol(candidate, target_owner).then(|| target_owner.clone())
+    (same_logical_symbol(candidate, target_owner)
+        && target_group_contains_owner_peer(candidate, ctx))
+    .then(|| candidate.clone())
 }

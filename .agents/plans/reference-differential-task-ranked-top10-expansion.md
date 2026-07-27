@@ -379,6 +379,22 @@ comes through the local gate, but is not the focus.
   Focused metadata and end-to-end regressions, formatting, all-feature Clippy,
   and the complete `nlp,python` test matrix with eight test threads pass using
   normal Cargo storage at niceness 10.
+- [x] (2026-07-27) Resolved assigned #1185 by admitting a receiver or recovered
+  out-of-line owner only when the query target group contains its specific
+  physical declaration/body owner peer and that peer's declaration source is
+  visible from the scanned file. Same-FQN owners without that relationship
+  remain conservatively unproven. The behavior regression covers explicit
+  receivers, templated bare implicit-self calls, wrong owners, and free
+  functions; all 162 C++ usage tests, formatting, and all-target/all-feature
+  Clippy pass with eight jobs at niceness 10. Final-reviewed exact evidence:
+  Qpid `credit` is consistent with SHA-256
+  `02d825b29bb7c582c858256633f7538c028cf631c7a8204336e03c4004a6163c`;
+  Qpid `connection` is consistent with SHA-256
+  `41e39bafb213cefb31b6921a4901178c2edd9f135317d33eb89e011cb11c9267`;
+  libzmq `start` is an exact editor-only self-receiver with SHA-256
+  `b62447367a064ae84bc025c7bbdad48b5a135f565c37ad7f43bb404856943c16`;
+  and libzmq `get_tid` is consistent with SHA-256
+  `b4e85b9a6940bf93ff79f0d49a5d7d97a7d289dcffb33ff136f85607c750d1c5`.
 - [ ] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [ ] Complete C++ and publish its evidence and user summary.

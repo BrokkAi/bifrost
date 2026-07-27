@@ -13536,6 +13536,203 @@ void ::demo::Owner<T>::GlobalCheck() {
 }
 
 #[test]
+fn authoritative_cpp_body_peer_receivers_and_implicit_self_calls_use_logical_owner_groups() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "owners.h",
+            r#"#pragma once
+namespace demo {
+struct Worker {
+    bool clear();
+};
+struct WrongWorker {
+    bool clear();
+};
+template <typename T> struct Owner {
+    bool clear();
+    bool Reset();
+};
+template <typename T> struct WrongOwner {
+    bool clear();
+    bool Reset();
+};
+bool clear();
+bool call_free();
+}
+"#,
+        )
+        .file(
+            "impl.cc",
+            r#"#include "owners.h"
+namespace demo {
+bool Worker::clear() { return true; }
+bool WrongWorker::clear() { return false; }
+template <typename T>
+bool Owner<T>::clear() { return true; }
+template <typename T>
+bool WrongOwner<T>::clear() { return false; }
+template <typename T>
+bool Owner<T>::Reset() {
+    return clear(); // positive-implicit-self-template-owner
+}
+template <typename T>
+bool WrongOwner<T>::Reset() {
+    return clear(); // negative-wrong-owner-implicit-self
+}
+bool clear() { return false; }
+bool call_free() {
+    return clear(); // negative-free-function
+}
+template bool Owner<int>::clear();
+template bool Owner<int>::Reset();
+template bool WrongOwner<int>::clear();
+template bool WrongOwner<int>::Reset();
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "owners.h"
+bool consume(demo::Worker& worker, demo::WrongWorker& wrong) {
+    bool explicit_ok = worker.clear(); // positive-explicit-body-peer
+    bool explicit_wrong = wrong.clear(); // negative-wrong-owner-explicit
+    return explicit_ok || explicit_wrong;
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+
+    let explicit_target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Worker.clear"
+            && slash_path(unit.source()) == "impl.cc"
+    });
+    let implicit_target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Owner.clear"
+            && slash_path(unit.source()) == "impl.cc"
+    });
+
+    let consumer = project.file("consumer.cc");
+    let consumer_source = consumer.read_to_string().expect("consumer source");
+    let explicit_expected = BTreeSet::from([fixture_token_range(
+        &consumer_source,
+        "    bool explicit_ok = worker.clear(); // positive-explicit-body-peer",
+        "clear",
+    )]);
+    let explicit_negatives = [fixture_token_range(
+        &consumer_source,
+        "    bool explicit_wrong = wrong.clear(); // negative-wrong-owner-explicit",
+        "clear",
+    )];
+
+    let explicit_provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let explicit_query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&explicit_target),
+            Some(&explicit_provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = explicit_query.result
+    else {
+        panic!("expected authoritative explicit receiver success");
+    };
+    let explicit_targeted = hits_by_overload
+        .values()
+        .flatten()
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(explicit_targeted, explicit_expected);
+    assert!(
+        unproven_total_by_overload.values().all(|count| *count == 0),
+        "wrong-owner explicit receivers must be proven exclusions: {unproven_total_by_overload:#?}"
+    );
+    let explicit_whole =
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&explicit_target));
+    let explicit_whole_ranges = explicit_whole
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == consumer)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(explicit_whole_ranges, explicit_expected);
+    assert!(explicit_negatives.into_iter().all(|negative| {
+        !explicit_targeted.contains(&negative) && !explicit_whole_ranges.contains(&negative)
+    }));
+
+    let impl_file = project.file("impl.cc");
+    let impl_source = impl_file.read_to_string().expect("impl source");
+    let implicit_expected = BTreeSet::from([fixture_token_range(
+        &impl_source,
+        "    return clear(); // positive-implicit-self-template-owner",
+        "clear",
+    )]);
+    let implicit_negatives = [
+        fixture_token_range(
+            &impl_source,
+            "    return clear(); // negative-wrong-owner-implicit-self",
+            "clear",
+        ),
+        fixture_token_range(
+            &impl_source,
+            "    return clear(); // negative-free-function",
+            "clear",
+        ),
+    ];
+
+    let implicit_provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(impl_file.clone()).collect()));
+    let implicit_query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&implicit_target),
+            Some(&implicit_provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = implicit_query.result
+    else {
+        panic!("expected authoritative implicit-self success");
+    };
+    let implicit_targeted = hits_by_overload
+        .values()
+        .flatten()
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(implicit_targeted, implicit_expected);
+    assert!(
+        unproven_total_by_overload.values().all(|count| *count == 0),
+        "wrong-owner and free-function bare calls must be proven exclusions: {unproven_total_by_overload:#?}"
+    );
+    let implicit_whole =
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&implicit_target));
+    let implicit_whole_ranges = implicit_whole
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == impl_file)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(implicit_whole_ranges, implicit_expected);
+    assert!(implicit_negatives.into_iter().all(|negative| {
+        !implicit_targeted.contains(&negative) && !implicit_whole_ranges.contains(&negative)
+    }));
+}
+
+#[test]
 fn authoritative_cpp_macro_exported_class_declarations_keep_recovered_field_owner() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
