@@ -216,6 +216,13 @@ comes through the local gate, but is not the focus.
   niceness 10; both completed with zero actionable discrepancy. A final
   Oldskool read-only review found no actionable issue or leftover debug
   scaffolding.
+- [x] (2026-07-26) Checkpointed the reviewed C++ fixes at `cf607aee`, then
+  passed `cargo fmt --all -- --check`, `git diff --check`,
+  all-target/all-feature Clippy with warnings denied, and the complete
+  `cargo test --features nlp,python` matrix. Every Cargo process ran outside
+  the sandbox at niceness 10 with the normal repository target; the full
+  matrix included 1,937 library tests, all symbols MCP/CLI and LSP surfaces,
+  every language usage graph, and doc tests.
 - [ ] Complete C++ and publish its evidence and user summary.
 - [ ] Complete C# and publish its evidence and user summary.
 - [ ] Complete Go and publish its evidence and user summary.
