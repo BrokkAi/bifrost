@@ -117,7 +117,7 @@ fn non_git_workspace_uses_in_memory_store_for_queries() {
     let declarations = analyzer.analyzer().get_definitions("pkg.example.Example");
 
     assert_eq!(declarations.len(), 1);
-    assert!(!built.root().join(".brokk/bifrost_cache.db").exists());
+    assert!(!built.root().join(".bifrost/bifrost_cache.db").exists());
 }
 
 #[test]

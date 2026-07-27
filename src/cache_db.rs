@@ -199,6 +199,7 @@ fn unified_cache_initialized(conn: &Connection) -> Result<bool> {
 fn prepare_cache_db_path(db_path: &Path) -> Result<PathBuf> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| format!("cache DB I/O error: {err}"))?;
+        ensure_cache_dir_self_ignored(parent);
         if let Some(file_name) = db_path.file_name() {
             let parent = parent
                 .canonicalize()
@@ -207,6 +208,38 @@ fn prepare_cache_db_path(db_path: &Path) -> Result<PathBuf> {
         }
     }
     Ok(db_path.to_path_buf())
+}
+
+/// Make the cache directory ignore itself, the way `cargo` does for `target/`.
+///
+/// The unified SQLite cache lives *inside* the workspace (`<root>/.bifrost/`), so
+/// its database plus the WAL and shared-memory sidecars are live, continuously
+/// rewritten files sitting in the working tree. Anything that walks the tree
+/// through git therefore sees them, and anything that walks it while the cache
+/// is being written can observe a file mutating mid-read: `analyze_diff` asks
+/// libgit2 for untracked *content* (`show_untracked_content`), so it would try
+/// to read `bifrost_cache.db-wal` as if it were a source hunk and fail the whole
+/// request with `file changed before we could read it; class=Filesystem (30)`.
+///
+/// Writing `.gitignore` containing `*` into the cache directory removes the
+/// whole class of problem at its source rather than per-consumer: git and
+/// libgit2 then treat the directory as ignored, and every tree walk skips it
+/// (diff already excludes ignored entries), as does `git status` for users.
+/// `project_watcher` had to special-case this same directory for the same
+/// underlying reason; this keeps the next such surface from needing one.
+///
+/// Best-effort by design: a read-only or otherwise unwritable cache directory
+/// must not fail cache initialization, and an existing file is left untouched so
+/// repeated opens neither rewrite it nor churn its mtime.
+fn ensure_cache_dir_self_ignored(cache_dir: &Path) {
+    if cache_dir.file_name() != Some(std::ffi::OsStr::new(crate::gitblob::CACHE_DIR_NAME)) {
+        return;
+    }
+    let ignore_path = cache_dir.join(".gitignore");
+    if ignore_path.exists() {
+        return;
+    }
+    let _ = std::fs::write(&ignore_path, "*\n");
 }
 
 fn process_local_open_lock_cell(db_path: &Path) -> Result<Arc<Mutex<()>>> {
@@ -1599,7 +1632,7 @@ mod tests {
     #[test]
     fn first_unified_open_removes_only_idle_legacy_caches_after_migration() {
         let temp = tempfile::tempdir().unwrap();
-        let cache_dir = temp.path().join(".brokk");
+        let cache_dir = temp.path().join(".bifrost");
         std::fs::create_dir(&cache_dir).unwrap();
         for name in [LEGACY_SEMANTIC_DB_FILE_NAME, LEGACY_ANALYZER_DB_FILE_NAME] {
             create_legacy_cache(&cache_dir.join(name));
@@ -1617,7 +1650,7 @@ mod tests {
     #[test]
     fn baseline_adoption_does_not_remove_legacy_caches() {
         let temp = tempfile::tempdir().unwrap();
-        let cache_dir = temp.path().join(".brokk");
+        let cache_dir = temp.path().join(".bifrost");
         std::fs::create_dir(&cache_dir).unwrap();
         let legacy = cache_dir.join(LEGACY_SEMANTIC_DB_FILE_NAME);
         create_legacy_cache(&legacy);
@@ -1640,7 +1673,7 @@ mod tests {
     #[test]
     fn custom_database_open_does_not_remove_legacy_caches() {
         let temp = tempfile::tempdir().unwrap();
-        let cache_dir = temp.path().join(".brokk");
+        let cache_dir = temp.path().join(".bifrost");
         std::fs::create_dir(&cache_dir).unwrap();
         let legacy = cache_dir.join(LEGACY_SEMANTIC_DB_FILE_NAME);
         create_legacy_cache(&legacy);
@@ -1653,7 +1686,7 @@ mod tests {
     #[test]
     fn active_legacy_writer_survives_first_unified_open() {
         let temp = tempfile::tempdir().unwrap();
-        let cache_dir = temp.path().join(".brokk");
+        let cache_dir = temp.path().join(".bifrost");
         std::fs::create_dir(&cache_dir).unwrap();
         let legacy_path = cache_dir.join(LEGACY_ANALYZER_DB_FILE_NAME);
         let mut legacy = Connection::open(&legacy_path).unwrap();
@@ -1682,7 +1715,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let outside = temp.path().join("outside");
         std::fs::create_dir(&outside).unwrap();
-        let cache_dir = temp.path().join(".brokk");
+        let cache_dir = temp.path().join(".bifrost");
         symlink(&outside, &cache_dir).unwrap();
 
         let err = open_unified_connection(&cache_dir.join(CACHE_DB_FILE_NAME)).unwrap_err();
@@ -1699,7 +1732,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
-        let cache_dir = temp.path().join(".brokk");
+        let cache_dir = temp.path().join(".bifrost");
         std::fs::create_dir(&cache_dir).unwrap();
         let outside = temp.path().join("outside.db");
         symlink(&outside, cache_dir.join(CACHE_DB_FILE_NAME)).unwrap();
@@ -1710,5 +1743,92 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(!outside.exists());
+    }
+
+    /// Opening the cache inside a git working tree must leave the cache
+    /// directory *ignored*, so tree walks never see the live database. This is
+    /// the property that keeps `analyze_diff` from trying to read
+    /// `bifrost_cache.db-wal` as untracked content while SQLite is writing it
+    /// (`file changed before we could read it; class=Filesystem (30)`).
+    #[test]
+    fn cache_directory_is_ignored_by_git_after_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let repo = git2::Repository::init(root).unwrap();
+        std::fs::write(root.join("lib.go"), "package sample\n").unwrap();
+
+        let cache_dir = root.join(crate::gitblob::CACHE_DIR_NAME);
+        let _conn = open_unified_connection(&cache_dir.join(CACHE_DB_FILE_NAME)).unwrap();
+
+        // Workdir-relative: on macOS the temp root is a `/var` symlink to
+        // `/private/var`, so an absolute path would not be recognized as living
+        // inside the repository.
+        let relative_db = Path::new(crate::gitblob::CACHE_DIR_NAME).join(CACHE_DB_FILE_NAME);
+        assert!(
+            repo.is_path_ignored(&relative_db).unwrap(),
+            "the cache database must be ignored by git"
+        );
+        assert!(
+            repo.is_path_ignored(
+                Path::new(crate::gitblob::CACHE_DIR_NAME).join("bifrost_cache.db-wal")
+            )
+            .unwrap(),
+            "the write-ahead log -- the file `analyze_diff` raced with -- must be ignored"
+        );
+        // The untracked walk `analyze_diff` performs must surface real sources
+        // and nothing from the cache directory.
+        let mut options = git2::StatusOptions::new();
+        options.include_untracked(true).recurse_untracked_dirs(true);
+        let untracked: Vec<String> = repo
+            .statuses(Some(&mut options))
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry.path().map(str::to_string))
+            .collect();
+        assert!(
+            untracked.iter().any(|path| path == "lib.go"),
+            "real sources must still be visible: {untracked:?}"
+        );
+        assert!(
+            !untracked
+                .iter()
+                .any(|path| path.starts_with(crate::gitblob::CACHE_DIR_NAME)),
+            "cache directory leaked into the untracked walk: {untracked:?}"
+        );
+    }
+
+    /// The self-ignore is written once and then left alone: reopening must not
+    /// rewrite it (which would churn its mtime inside a watched tree), and a
+    /// user's own edit to it must survive.
+    #[test]
+    fn cache_directory_self_ignore_is_written_once_and_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join(crate::gitblob::CACHE_DIR_NAME);
+        let db_path = cache_dir.join(CACHE_DB_FILE_NAME);
+
+        let _conn = open_unified_connection(&db_path).unwrap();
+        let ignore_path = cache_dir.join(".gitignore");
+        assert_eq!(std::fs::read_to_string(&ignore_path).unwrap(), "*\n");
+
+        std::fs::write(&ignore_path, "*\n# edited by the user\n").unwrap();
+        drop(_conn);
+        let _reopened = open_unified_connection(&db_path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&ignore_path).unwrap(),
+            "*\n# edited by the user\n",
+            "reopening must not rewrite an existing self-ignore"
+        );
+    }
+
+    /// A cache database deliberately placed outside a `.bifrost` directory (the
+    /// `BIFROST_CACHE_DIR` escape hatch, and every temp-dir test above) must not
+    /// get a `.gitignore` dropped into it.
+    #[test]
+    fn non_cache_directories_do_not_get_a_self_ignore() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join(CACHE_DB_FILE_NAME);
+
+        let _conn = open_unified_connection(&db_path).unwrap();
+        assert!(!temp.path().join(".gitignore").exists());
     }
 }

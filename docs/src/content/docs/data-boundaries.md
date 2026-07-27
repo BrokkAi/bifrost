@@ -9,7 +9,7 @@ Bifrost analyzes source on the machine where its process runs. That local execut
 
 | Component | Reads or receives | Writes or sends |
 | --- | --- | --- |
-| Bifrost analyzer, CLI, and LSP | Files under the configured workspace root plus local Git metadata needed for indexing | Structured results to stdout, stdio MCP, LSP, or the embedding caller; persistent cache data under `.brokk/`. |
+| Bifrost analyzer, CLI, and LSP | Files under the configured workspace root plus local Git metadata needed for indexing | Structured results to stdout, stdio MCP, LSP, or the embedding caller; persistent cache data under `.bifrost/`. |
 | Agent MCP host | Bifrost tool schemas and returned results, which may include source excerpts | May include those results in model requests, logs, transcripts, or host caches according to host configuration. |
 | Agent-plugin launcher | Pinned release metadata and explicit environment or argument overrides | May download a checksum-verified Bifrost release from GitHub into a user cache. |
 | Optional semantic search | Workspace code chunks and a local embedding model | Downloads model files from Hugging Face on first use unless `BIFROST_EMBED_MODEL_DIR` points to local files; inference runs in a local Python sidecar and derived index data is cached. |
@@ -23,7 +23,7 @@ Workspace-relative query files cannot escape the configured root. Results can st
 
 ## Persistent Repository Cache
 
-For an explicit `--root` process, analyzer facts and optional semantic-index data use `.brokk/bifrost_cache.db` at the primary Git repository root, so linked worktrees share that content-addressed database. Set `BIFROST_CACHE_DIR` to use an explicit cache directory for such a process, for example when running isolated workers. A rootless MCP process bound through client roots or Codex sandbox metadata instead keeps its database under the exact approved root, including when that root is a linked worktree; it never broadens cache writes to the primary checkout. The cache is local persistent data derived from workspace source and Git objects; protect and retain it according to the same sensitivity policy as the repository.
+For an explicit `--root` process, analyzer facts and optional semantic-index data use `.bifrost/bifrost_cache.db` at the primary Git repository root, so linked worktrees share that content-addressed database. Set `BIFROST_CACHE_DIR` to use an explicit cache directory for such a process, for example when running isolated workers. A rootless MCP process bound through client roots or Codex sandbox metadata instead keeps its database under the exact approved root, including when that root is a linked worktree; it never broadens cache writes to the primary checkout. The cache is local persistent data derived from workspace source and Git objects; protect and retain it according to the same sensitivity policy as the repository.
 
 Removing the database while Bifrost is stopped forces later work to rebuild it. A running process may also hold in-memory source and analysis state. If a test requires a clean cache, stop Bifrost first and record that removal in the evaluation method.
 
@@ -56,7 +56,7 @@ The PyTorch sidecar receives code chunks for local embedding inference. It is a 
 
 - Pin and verify the effective Bifrost binary and workspace root.
 - Decide whether launcher and semantic-model downloads are allowed.
-- Treat `.brokk/bifrost_cache.db`, host transcripts, and model-provider logs as repository-sensitive artifacts.
+- Treat `.bifrost/bifrost_cache.db`, host transcripts, and model-provider logs as repository-sensitive artifacts.
 - Configure repository exclusions and request path filters, but do not mistake filters for process isolation.
 - Inspect representative tool output before granting an agent access; source excerpts can leave the local process through the host.
 - Start a fresh host session after MCP configuration changes and re-check the advertised tool surface.

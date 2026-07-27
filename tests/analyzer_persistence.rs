@@ -78,11 +78,11 @@ fn init_git_repo(root: &Path) -> Repository {
 
 fn commit_all(repo: &Repository, message: &str) {
     let mut index = repo.index().unwrap();
-    // Persisted analyzers keep their SQLite database under `.brokk`. A later
+    // Persisted analyzers keep their SQLite database under `.bifrost`. A later
     // fixture commit must not race those live database files into the Git
     // index; only the workspace sources are part of the test repository.
     let mut skip_analyzer_cache =
-        |path: &Path, _matched_pathspec: &[u8]| i32::from(path.starts_with(Path::new(".brokk")));
+        |path: &Path, _matched_pathspec: &[u8]| i32::from(path.starts_with(Path::new(".bifrost")));
     index
         .add_all(
             ["*"],
@@ -134,7 +134,7 @@ fn persisted_build_reports_cache_open_failure() {
     let root = temp.path();
     write_file(root, "example.py", "def example():\n    return 1\n");
     init_git_repo(root);
-    fs::write(root.join(".brokk"), "not a directory").unwrap();
+    fs::write(root.join(".bifrost"), "not a directory").unwrap();
     let project = python_project(root);
 
     let error = match WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default()) {
@@ -147,7 +147,7 @@ fn persisted_build_reports_cache_open_failure() {
         "missing persisted-store context: {message}"
     );
     assert!(
-        message.contains(".brokk") || message.contains("bifrost_cache.db"),
+        message.contains(".bifrost") || message.contains("bifrost_cache.db"),
         "missing failed cache path: {message}"
     );
 }
@@ -1702,7 +1702,7 @@ fn warm_python_path_module_query_does_not_scan_live_paths() {
 fn csharp_package_existence_ignores_stale_complete_blobs() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
-    write_file(root, ".gitignore", ".brokk/\n");
+    write_file(root, ".gitignore", ".bifrost/\n");
     write_file(
         root,
         "Types.cs",
