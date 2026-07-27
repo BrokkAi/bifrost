@@ -797,6 +797,29 @@ fn rerun_configs_target_summaries_listed_signatures_by_file_not_symbol() {
     }
 }
 
+#[test]
+fn rerun_configs_target_claims_not_indexed_signatures_by_file_not_symbol() {
+    // The exemplar symbol of an I4 honest-claim violation is drawn from the
+    // failure *message* (the disputed name / contradicting hit), not from
+    // the sampled reference sites driving the probe; filtering by it empties
+    // the probe set (observed on Monocle: `probe_calls=0`, signature MISSING
+    // while a direct path-scoped run reproduced the violation). The file is
+    // the reproduction scope, same as the summaries-listed family.
+    let record = rerun_record(serde_json::json!([rerun_violation(
+        "(I4, scala, get_definitions_by_reference, failure-message-claims-not-indexed-but-symbol-exists)",
+        "I4",
+        "monocle.Traversal.apply6"
+    )]));
+    let configs = rerun_configs(&record, None).expect("rerun configs");
+    assert_eq!(configs.len(), 1, "{configs:?}");
+    assert_eq!(configs[0].1.symbol_filter, None, "no symbol filter");
+    assert_eq!(
+        configs[0].1.path_filter.as_deref(),
+        Some("src/Foo.scala"),
+        "file-scoped rerun"
+    );
+}
+
 // Python function-local classes carry the enclosing path in their display
 // identifier (`test_deprecated_class$BadlyDeprecatedClass`); the name-token
 // check must look for the terminal segment, which is what the declaration's
