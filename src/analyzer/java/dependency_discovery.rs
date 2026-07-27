@@ -55,7 +55,7 @@ gradle.projectsEvaluated {
 "#;
 
 #[derive(Debug, Default)]
-pub(super) struct DiscoveredJavaDependencies {
+pub(crate) struct DiscoveredJavaDependencies {
     pub(super) artifact_paths: Vec<JavaExternalArtifact>,
     pub(super) coordinates: Vec<JavaMavenCoordinate>,
 }

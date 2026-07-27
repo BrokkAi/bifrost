@@ -800,10 +800,9 @@ fn scala_standard_arity_type_name(name: &str) -> bool {
         if let Some(arity) = name
             .strip_prefix(prefix)
             .and_then(|value| value.parse::<u8>().ok())
+            && arity <= 22
         {
-            if arity <= 22 {
-                return true;
-            }
+            return true;
         }
     }
     false
