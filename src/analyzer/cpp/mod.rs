@@ -12,6 +12,7 @@ mod tests;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
+use crate::analyzer::fq_name::{SegmentKind, segment_interner};
 use crate::analyzer::js_ts::{build_weighted_cache, weight_code_unit_vec_by_unit};
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::{
@@ -228,13 +229,21 @@ impl CppAnalyzer {
             // Re-key onto the canonical identity while keeping the definition's
             // real `.cpp` source and signature, so it resolves as a definition
             // alongside its header declaration under the canonical `fq_name`.
-            let rekeyed = CodeUnit::with_signature(
+            // The structured `FqName` is rebuilt from the *canonical* package and
+            // owner chain through the same emission helper extraction uses, so
+            // the re-keyed unit carries real segment boundaries: owner lookup
+            // (`default_parent_fq_name`) is a pure segment pop, where an empty
+            // `fq` would mean "no owner" rather than "not yet migrated".
+            let short_name = format!("{}.{}", reconciled.owner_chain, reconciled.member);
+            let fq = declarations::cpp_member_fq(&reconciled.package, &short_name);
+            let rekeyed = CodeUnit::with_signature_and_fq(
                 unit.source().clone(),
                 unit.kind(),
                 reconciled.package,
-                format!("{}.{}", reconciled.owner_chain, reconciled.member),
+                short_name,
                 unit.signature().map(str::to_string),
                 unit.is_synthetic(),
+                fq,
             );
             index.rekeyed.push(rekeyed.clone());
             index.provisional_of.insert(rekeyed, unit);
@@ -251,17 +260,37 @@ impl CppAnalyzer {
         unit: &CodeUnit,
         using_by_file: &mut HashMap<ProjectFile, Arc<Vec<String>>>,
     ) -> Option<reconcile::ReconciledIdentity> {
-        let (owner_chain, member) = unit.short_name().rsplit_once('.')?;
-        // Reconstruct the full source-order qualifier from the stored identity:
-        // the package (namespace path, `::`-joined) followed by the owner chain
-        // (class nesting, `$`-joined). The reconciler re-partitions this whole
-        // sequence against the class table, so extraction need not have decided
-        // where the namespace ends and the class chain begins.
+        // Read the full source-order qualifier off the definition's *structured*
+        // `FqName` -- the namespace (`Package`) segments followed by the
+        // class-nesting (`Type`/`Nested`) ones, with the terminal `Member` as the
+        // member name. The segment boundaries were recorded at extraction, so
+        // nothing here re-infers them by splitting the rendered name on a guessed
+        // delimiter (the shape `tests/no_stringly_name_parsing.rs` guards). The
+        // reconciler then re-partitions this whole sequence against the class
+        // table, so extraction need not have decided where the namespace ends and
+        // the class chain begins.
+        let interner = segment_interner();
         let mut owner_segments: Vec<&str> = Vec::new();
-        if !unit.package_name().is_empty() {
-            owner_segments.extend(unit.package_name().split("::").filter(|s| !s.is_empty()));
+        let mut member: Option<&str> = None;
+        for &segment in unit.fq().segments() {
+            let (text, kind) = interner.resolve(segment);
+            match kind {
+                SegmentKind::Package | SegmentKind::Type | SegmentKind::Nested => {
+                    // A `Member` is always terminal in a cpp callable's chain; a
+                    // qualifier segment after one would mean the identity is not
+                    // the plain `namespace... class... member` shape this handles.
+                    if member.is_some() {
+                        return None;
+                    }
+                    if !text.is_empty() {
+                        owner_segments.push(text);
+                    }
+                }
+                SegmentKind::Member => member = Some(text),
+                _ => return None,
+            }
         }
-        owner_segments.extend(owner_chain.split('$').filter(|s| !s.is_empty()));
+        let member = member?;
         if owner_segments.len() < 2 {
             return None;
         }

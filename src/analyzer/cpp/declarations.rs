@@ -75,7 +75,7 @@ fn cpp_class_fq(package_name: &str, short_name: &str) -> FqName {
 /// owner and no `.`, so the whole `short_name` is the terminal [`SegmentKind::Member`].
 /// C++ member names never contain a literal `.`, so the single `.` (if any)
 /// separates the owner chain from the member.
-fn cpp_member_fq(package_name: &str, short_name: &str) -> FqName {
+pub(super) fn cpp_member_fq(package_name: &str, short_name: &str) -> FqName {
     let mut fq = FqName::new();
     cpp_push_package(&mut fq, package_name);
     match short_name.rsplit_once('.') {
