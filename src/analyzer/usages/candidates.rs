@@ -165,10 +165,7 @@ fn cpp_related_callable_source_files(
         }
         let identifier = source_identifier_for_target(target);
         let target_fqn = target.fq_name();
-        for candidate in analyzer
-            .global_usage_definition_index()
-            .by_fqn(&target_fqn)
-        {
+        for candidate in analyzer.global_usage_definition_index().by_fqn(&target_fqn) {
             if is_cancelled(cancellation) {
                 break;
             }
