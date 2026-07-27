@@ -16,7 +16,16 @@ use growable_bloom_filter::GrowableBloom;
 
 pub type Result<T> = std::result::Result<T, String>;
 
-pub const CACHE_DIR_NAME: &str = ".brokk";
+/// Workspace-local directory holding Bifrost's persistent cache.
+///
+/// Named for this tool, matching [`CACHE_DIR_ENV`], the `bifrost_cache.db` file
+/// inside it, and the `.bifrost/` entry this repository's own `.gitignore` has
+/// always carried. It was briefly `.brokk` -- the analyzer cache was `.bifrost`
+/// from the first persistence PR, the later semantic-search store used `.brokk`,
+/// and when #603 consolidated the two behind one constant the newer spelling
+/// won; nothing else moved with it, which is why the env var, the database
+/// filename, and the ignore rule all kept saying `bifrost`.
+pub const CACHE_DIR_NAME: &str = ".bifrost";
 pub const CACHE_DIR_ENV: &str = "BIFROST_CACHE_DIR";
 
 /// Discover the repository containing `root`, if any.
@@ -43,7 +52,7 @@ pub fn primary_repo_root(repo: &Repository) -> Option<PathBuf> {
     repo.workdir().map(Path::to_path_buf)
 }
 
-/// Resolve the unified cache database path under `.brokk` at the primary repo
+/// Resolve the unified cache database path under `.bifrost` at the primary repo
 /// root. Non-git roots fall back to the provided workspace root.
 pub fn cache_db_path(workspace_root: &Path) -> PathBuf {
     if let Some(cache_dir) = std::env::var_os(CACHE_DIR_ENV).filter(|value| !value.is_empty()) {
