@@ -25,7 +25,7 @@ use crate::analyzer::usages::{
 use crate::analyzer::{
     AnalyzerDefinitionLookup, AnalyzerQueryScope, BoundedDefinitionLookup, CodeUnit, CodeUnitType,
     DeclarationKind, GO_MODULE_SCOPE_SEGMENT, GoModuleRoot, IAnalyzer, Language, ProjectFile,
-    Range, SummaryFileProjection, go_module_roots,
+    Range, SearchSymbolPatternBatch, SummaryFileProjection, go_module_roots,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::lsp::conversion::percent_decode;
@@ -125,6 +125,7 @@ pub use navigation::get_symbol_locations;
 pub use navigation::get_type_by_location;
 pub use navigation::rename_symbol;
 pub use navigation::search_symbols;
+pub use navigation::search_symbols_with_cancellation;
 pub use scan_usages::AmbiguousUsageCandidate;
 pub use scan_usages::AmbiguousUsageCandidateDetail;
 pub use scan_usages::AmbiguousUsageSymbol;
@@ -202,6 +203,10 @@ pub(crate) use summaries::summarize_files;
 pub(crate) use summaries::summary_block_for_code_unit;
 
 const FILE_SEARCH_LIMIT: usize = 100;
+
+pub(crate) const SEARCH_SYMBOL_MAX_PATTERNS: usize = 64;
+pub(crate) const SEARCH_SYMBOL_MAX_PATTERN_BYTES: usize = 4_096;
+pub(crate) const SEARCH_SYMBOL_MAX_TOTAL_PATTERN_BYTES: usize = 65_536;
 
 const FILE_SKIM_LIMIT: usize = 20;
 

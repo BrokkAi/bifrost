@@ -530,10 +530,10 @@ impl IAnalyzer for RubyAnalyzer {
 
     fn search_symbol_candidates(
         &self,
-        pattern: &str,
-        auto_quote: bool,
-    ) -> Vec<crate::analyzer::SearchSymbolCandidate> {
-        self.inner.search_symbol_candidates(pattern, auto_quote)
+        patterns: &crate::analyzer::SearchSymbolPatternBatch,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> crate::analyzer::SearchSymbolCandidates {
+        self.inner.search_symbol_candidates(patterns, cancellation)
     }
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {

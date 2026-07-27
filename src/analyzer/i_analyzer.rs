@@ -9,10 +9,177 @@ use crate::analyzer::{
     TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TypeAliasProvider,
     TypeHierarchyProvider, UsageFactsIndex, metrics_from_declarations,
 };
+use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use std::any::Any;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, OnceLock};
+
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryBatch<T> {
+    pub rows: Vec<T>,
+    pub inspected: usize,
+    pub complete: bool,
+}
+
+impl<T> QueryBatch<T> {
+    pub fn complete(rows: Vec<T>, inspected: usize) -> Self {
+        Self {
+            rows,
+            inspected,
+            complete: true,
+        }
+    }
+
+    pub fn incomplete(rows: Vec<T>, inspected: usize) -> Self {
+        Self {
+            rows,
+            inspected,
+            complete: false,
+        }
+    }
+
+    pub fn merge(mut self, other: Self) -> Self {
+        self.rows.extend(other.rows);
+        self.inspected = self.inspected.saturating_add(other.inspected);
+        self.complete &= other.complete;
+        self
+    }
+}
+
+/// One analyzer's contribution to a batched symbol-search request.
+///
+/// `complete` is false when cooperative cancellation stopped enumeration.
+/// Callers may retain the candidates produced before that checkpoint, but
+/// must not present an incomplete batch as an authoritative search result.
+#[doc(hidden)]
+pub type SearchSymbolCandidates = QueryBatch<SearchSymbolCandidate>;
+
+#[derive(Debug, Clone)]
+enum CompiledSymbolPatterns {
+    Set(RegexSet),
+    Individual(Vec<Regex>),
+}
+
+/// A request-scoped, language-neutral symbol matcher shared by every analyzer delegate.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct SearchSymbolPatternBatch {
+    patterns: Vec<String>,
+    auto_quote: bool,
+    compiled: Option<CompiledSymbolPatterns>,
+    complete: bool,
+}
+
+impl SearchSymbolPatternBatch {
+    pub fn compile(
+        patterns: Vec<String>,
+        auto_quote: bool,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> Self {
+        let mut compiled_patterns = Vec::new();
+        let mut compiled_regexes = Vec::new();
+        for pattern in &patterns {
+            if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+                return Self {
+                    patterns,
+                    auto_quote,
+                    compiled: None,
+                    complete: false,
+                };
+            }
+            let pattern = normalize_search_pattern(pattern, auto_quote);
+            if let Ok(compiled) = RegexBuilder::new(&pattern).case_insensitive(true).build() {
+                compiled_patterns.push(pattern);
+                compiled_regexes.push(compiled);
+            }
+        }
+
+        if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+            return Self {
+                patterns,
+                auto_quote,
+                compiled: None,
+                complete: false,
+            };
+        }
+        let compiled = if compiled_patterns.is_empty() {
+            None
+        } else {
+            match RegexSetBuilder::new(&compiled_patterns)
+                .case_insensitive(true)
+                .build()
+            {
+                Ok(set) => Some(CompiledSymbolPatterns::Set(set)),
+                Err(_) => Some(CompiledSymbolPatterns::Individual(compiled_regexes)),
+            }
+        };
+        Self {
+            patterns,
+            auto_quote,
+            compiled,
+            complete: true,
+        }
+    }
+
+    pub fn patterns(&self) -> &[String] {
+        &self.patterns
+    }
+
+    pub fn auto_quote(&self) -> bool {
+        self.auto_quote
+    }
+
+    pub fn complete(&self) -> bool {
+        self.complete
+    }
+
+    pub fn is_match(&self, value: &str) -> bool {
+        match &self.compiled {
+            Some(CompiledSymbolPatterns::Set(patterns)) => patterns.is_match(value),
+            Some(CompiledSymbolPatterns::Individual(patterns)) => {
+                patterns.iter().any(|pattern| pattern.is_match(value))
+            }
+            None => false,
+        }
+    }
+}
+
+fn normalize_search_pattern(pattern: &str, auto_quote: bool) -> String {
+    if auto_quote {
+        if pattern.contains(".*") {
+            pattern.to_string()
+        } else {
+            format!(".*?{}.*?", regex::escape(pattern))
+        }
+    } else {
+        escape_sigil_anchors(pattern)
+    }
+}
+
+/// Escape anchor metacharacters only where they form part of an identifier token.
+fn escape_sigil_anchors(pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut escaped = String::with_capacity(pattern.len());
+    for (index, ch) in chars.iter().enumerate() {
+        let prev_is_word = index > 0
+            && (chars[index - 1].is_alphanumeric() || matches!(chars[index - 1], '_' | '^'));
+        let next_is_word = chars
+            .get(index + 1)
+            .is_some_and(|next| next.is_alphanumeric() || matches!(next, '_' | '$'));
+        let unsatisfiable = match ch {
+            '$' => next_is_word || prev_is_word,
+            '^' => prev_is_word,
+            _ => false,
+        };
+        if unsatisfiable {
+            escaped.push('\\');
+        }
+        escaped.push(*ch);
+    }
+    escaped
+}
 
 /// Failure state for one top-level analyzer request.
 ///
@@ -313,24 +480,42 @@ pub trait IAnalyzer: Send + Sync + Any {
     /// override it with a projection that avoids full file hydration.
     fn search_symbol_candidates(
         &self,
-        pattern: &str,
-        auto_quote: bool,
-    ) -> Vec<SearchSymbolCandidate> {
-        self.search_definitions(pattern, auto_quote)
-            .into_iter()
-            .map(|code_unit| SearchSymbolCandidate {
-                primary_range: self
-                    .ranges(&code_unit)
-                    .into_iter()
-                    .min_by_key(|range| (range.start_line, range.start_byte)),
-                // Structurally-evidenced suppression only: analyzers without a
-                // per-declaration taint surface default untainted here (path-based
-                // test filtering in `search_symbols` still applies), so production
-                // symbols in a file with inline tests are never hidden (#1102).
-                in_test_region: self.in_test_region(&code_unit),
-                code_unit,
-            })
-            .collect()
+        patterns: &SearchSymbolPatternBatch,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> SearchSymbolCandidates {
+        let mut candidates = Vec::new();
+        let mut inspected = 0usize;
+        if !patterns.complete() {
+            return SearchSymbolCandidates::incomplete(candidates, inspected);
+        }
+        for pattern in patterns.patterns() {
+            if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+                return SearchSymbolCandidates::incomplete(candidates, inspected);
+            }
+            for code_unit in self.search_definitions(pattern, patterns.auto_quote()) {
+                if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+                    return SearchSymbolCandidates::incomplete(candidates, inspected);
+                }
+                inspected = inspected.saturating_add(1);
+                candidates.push(SearchSymbolCandidate {
+                    primary_range: self
+                        .ranges(&code_unit)
+                        .into_iter()
+                        .min_by_key(|range| (range.start_line, range.start_byte)),
+                    // Structurally-evidenced suppression only: analyzers without a
+                    // per-declaration taint surface default untainted here (path-based
+                    // test filtering in `search_symbols` still applies), so production
+                    // symbols in a file with inline tests are never hidden (#1102).
+                    in_test_region: self.in_test_region(&code_unit),
+                    code_unit,
+                });
+            }
+        }
+        if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+            SearchSymbolCandidates::incomplete(candidates, inspected)
+        } else {
+            SearchSymbolCandidates::complete(candidates, inspected)
+        }
     }
     /// Cold-start substring search that runs against the persisted FTS5
     /// symbol index, without requiring `AnalyzerState` to be fully built.
