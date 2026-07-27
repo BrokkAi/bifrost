@@ -329,9 +329,26 @@ comes through the local gate, but is not the focus.
   (7.72x). Formatting, all-feature Clippy, and the complete `nlp,python`
   matrix passed on the merged head; `1409d086` was pushed to `origin/master`
   and #1215 closed.
-- [ ] Resolve assigned #1220, which tracks the now-visible one-time linkage
-  peer scan, then publish the six mapped C++ semantic issue families and run
-  one final task-selected top-ten certification.
+- [x] (2026-07-27) Resolved assigned #1220 by replacing the per-global cloned
+  workspace declaration scan with an exact-FQN definition-bucket lookup while
+  preserving logical-symbol and explicit-external checks. A bounded regression
+  proves that one relevant peer is inspected despite 32 unrelated globals.
+  Formatting, all-feature Clippy, focused linkage regressions, and the complete
+  `nlp,python` test matrix passed at niceness 10 with normal Cargo storage.
+  Implementation commit `9ac8a4d9` was integrated and pushed at `123670bc`;
+  #1220 is closed.
+- [x] (2026-07-27) Resolved assigned #1184 at the shared authoritative-batch
+  boundary. `VisibilityIndex` now retains the field-only internal-linkage
+  classifications already produced for its identifier index, and internal
+  globals are visible only from roots that reach the target source rather than
+  through a same-name declaration in a sibling translation unit. Cache misses
+  remain correct for explicit scopes by classifying the target on demand. One
+  two-root `CppAuthoritativeUsageBatch` regression proves exact byte ranges for
+  both anonymous-namespace constants; all 12 issue-linkage tests, formatting,
+  all-feature Clippy, all 161 C++ usage tests, and the complete `nlp,python`
+  matrix pass with normal Cargo storage at niceness 10.
+- [ ] Publish the six mapped C++ semantic issue families and run one final
+  task-selected top-ten certification.
 - [ ] Complete C++ and publish its evidence and user summary.
 - [x] Complete C# and publish its evidence and user summary.
 - [x] Complete Go and publish its evidence and user summary.

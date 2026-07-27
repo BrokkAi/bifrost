@@ -674,6 +674,7 @@ pub(in crate::analyzer::usages) struct VisibilityIndex<'a> {
     cpp: &'a CppAnalyzer,
     pub(super) visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
     visible_by_identifier: HashMap<ProjectFile, HashMap<String, Vec<CodeUnit>>>,
+    global_field_internal_linkage: HashMap<CodeUnit, bool>,
     visible_source_files_by_root: HashMap<ProjectFile, HashSet<ProjectFile>>,
     alias_cells: Mutex<HashMap<ProjectFile, AliasCell>>,
     visible_parser_alias_name_sets: RwLock<HashMap<ProjectFile, VisibleParserAliasNameSetCell>>,
@@ -908,10 +909,12 @@ impl<'a> VisibilityIndex<'a> {
             },
             |file| analyzer.declarations(file),
         );
+        let mut global_field_internal_linkage = HashMap::default();
         let visible_by_identifier = build_visible_identifier_index(
             analyzer,
             &visible_by_file,
             &visible_source_files_by_root,
+            &mut global_field_internal_linkage,
         );
         let mut cpp_template_metadata = HashMap::default();
         for unit in visible_by_file
@@ -937,6 +940,7 @@ impl<'a> VisibilityIndex<'a> {
             cpp,
             visible_by_file,
             visible_by_identifier,
+            global_field_internal_linkage,
             visible_source_files_by_root,
             alias_cells: Mutex::new(HashMap::default()),
             visible_parser_alias_name_sets: RwLock::new(HashMap::default()),
@@ -988,11 +992,25 @@ impl<'a> VisibilityIndex<'a> {
         file: &ProjectFile,
         target: &CodeUnit,
     ) -> bool {
-        file == target.source()
-            || self
-                .visible_by_file
+        if file == target.source() {
+            return true;
+        }
+        if self.global_field_has_internal_linkage(target) {
+            return self
+                .visible_source_files_by_root
                 .get(file)
-                .is_some_and(|visible| visible.iter().any(|unit| same_visible_symbol(unit, target)))
+                .is_some_and(|sources| sources.contains(target.source()));
+        }
+        self.visible_by_file
+            .get(file)
+            .is_some_and(|visible| visible.iter().any(|unit| same_visible_symbol(unit, target)))
+    }
+
+    fn global_field_has_internal_linkage(&self, unit: &CodeUnit) -> bool {
+        self.global_field_internal_linkage
+            .get(unit)
+            .copied()
+            .unwrap_or_else(|| cpp_global_field_has_internal_linkage(self.cpp, unit))
     }
 
     pub(in crate::analyzer::usages) fn call_arity_evidence(
@@ -3786,19 +3804,21 @@ fn build_visible_identifier_index(
     analyzer: &dyn IAnalyzer,
     visible_by_file: &HashMap<ProjectFile, HashSet<CodeUnit>>,
     visible_source_files_by_root: &HashMap<ProjectFile, HashSet<ProjectFile>>,
+    global_field_internal_linkage: &mut HashMap<CodeUnit, bool>,
 ) -> HashMap<ProjectFile, HashMap<String, Vec<CodeUnit>>> {
     let mut out = HashMap::default();
-    let mut internal_linkage_cache = HashMap::default();
     for (file, visible) in visible_by_file {
         let mut by_identifier: HashMap<String, Vec<CodeUnit>> = HashMap::default();
         for unit in visible {
-            if cpp_global_field_has_internal_linkage_cached(
-                analyzer,
-                &mut internal_linkage_cache,
-                unit,
-            ) && !visible_source_files_by_root
-                .get(file)
-                .is_some_and(|sources| sources.contains(unit.source()))
+            if unit.is_field()
+                && cpp_global_field_has_internal_linkage_cached(
+                    analyzer,
+                    global_field_internal_linkage,
+                    unit,
+                )
+                && !visible_source_files_by_root
+                    .get(file)
+                    .is_some_and(|sources| sources.contains(unit.source()))
             {
                 continue;
             }
@@ -7781,6 +7801,8 @@ fn cpp_field_declaration_linkage(source: &str, declaration: Node<'_>) -> CppFiel
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::usages::cpp_graph::shared::CppAuthoritativeUsageBatch;
+    use crate::analyzer::usages::model::FuzzyResult;
     use std::fs;
 
     #[test]
@@ -8039,6 +8061,82 @@ mod tests {
     }
 
     #[test]
+    fn shared_authoritative_batch_keeps_same_named_anonymous_namespace_globals_root_local() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let left = ProjectFile::new(root.clone(), "left.cpp");
+        let right = ProjectFile::new(root.clone(), "right.cpp");
+        let left_source = "namespace {\nconstexpr int local_value = 1;\n}\nint read_left() { return local_value; }\n";
+        let right_source = "namespace {\nconstexpr int local_value = 2;\n}\nint read_right() { return local_value; }\n";
+        fs::write(root.join("left.cpp"), left_source).expect("write left fixture");
+        fs::write(root.join("right.cpp"), right_source).expect("write right fixture");
+        let cpp = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root.clone(),
+            crate::analyzer::Language::Cpp,
+        ));
+        let target_for = |source: &ProjectFile| {
+            cpp.get_all_declarations()
+                .into_iter()
+                .find(|unit| {
+                    unit.kind() == CodeUnitType::Field
+                        && unit.identifier() == "local_value"
+                        && unit.source() == source
+                })
+                .expect("fixture global field declaration")
+        };
+        let left_global = target_for(&left);
+        let right_global = target_for(&right);
+        let roots = HashSet::from_iter([left.clone(), right.clone()]);
+        let batch = CppAuthoritativeUsageBatch::new(&cpp, &roots).expect("shared cpp batch");
+        let candidate_files = HashSet::from_iter([left.clone(), right.clone()]);
+        let expected_hit = |file: &ProjectFile, source: &str| {
+            let start = source.rfind("local_value;").expect("usage marker");
+            (file.clone(), start, start + "local_value".len())
+        };
+        let hit_ranges = |result: FuzzyResult| match result {
+            FuzzyResult::Success {
+                hits_by_overload, ..
+            } => hits_by_overload
+                .into_values()
+                .flatten()
+                .map(|hit| (hit.file, hit.start_offset, hit.end_offset))
+                .collect::<HashSet<_>>(),
+            other => panic!("expected shared authoritative success, got {other:?}"),
+        };
+        let left_hits = hit_ranges(
+            batch
+                .find_usages(std::slice::from_ref(&left_global), &candidate_files, 1000)
+                .into_fuzzy_result(),
+        );
+        let right_hits = hit_ranges(
+            batch
+                .find_usages(std::slice::from_ref(&right_global), &candidate_files, 1000)
+                .into_fuzzy_result(),
+        );
+
+        assert_eq!(
+            left_hits,
+            HashSet::from_iter([expected_hit(&left, left_source)]),
+        );
+        assert_eq!(
+            right_hits,
+            HashSet::from_iter([expected_hit(&right, right_source)]),
+        );
+
+        let visibility = VisibilityIndex::build(&cpp, &cpp, &roots);
+        assert!(visibility.is_visible(&left, &left_global));
+        assert!(visibility.is_visible(&right, &right_global));
+        assert!(
+            !visibility.is_visible(&left, &right_global),
+            "shared authoritative visibility must not treat a sibling anonymous-namespace global as visible by logical name alone"
+        );
+        assert!(
+            !visibility.is_visible(&right, &left_global),
+            "shared authoritative visibility must not treat a sibling anonymous-namespace global as visible by logical name alone"
+        );
+    }
+
+    #[test]
     fn visible_identifier_index_reuses_internal_linkage_classification_across_roots() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
@@ -8067,6 +8165,7 @@ mod tests {
                     &cpp,
                     &visible_by_file,
                     &visible_source_files_by_root,
+                    &mut HashMap::default(),
                 )
             });
 
@@ -8133,13 +8232,16 @@ mod tests {
                 )
             })
             .collect();
+        let mut global_field_internal_linkage = HashMap::default();
         VisibilityIndex {
             cpp,
             visible_by_identifier: build_visible_identifier_index(
                 cpp,
                 &visible_by_file,
                 &visible_source_files_by_root,
+                &mut global_field_internal_linkage,
             ),
+            global_field_internal_linkage,
             visible_by_file,
             visible_source_files_by_root,
             alias_cells: Mutex::new(HashMap::default()),
