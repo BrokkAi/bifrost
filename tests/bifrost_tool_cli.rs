@@ -745,6 +745,86 @@ fn analyze_diff_cli_reads_immutable_trees_from_configured_snapshot_objects() {
 }
 
 #[test]
+fn diff_snapshot_object_dir_rejects_missing_path() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    let repo = Repository::init(root).expect("init repo");
+    fs::write(root.join("lib.rs"), "pub fn answer() -> i32 { 1 }\n").expect("write source");
+    commit_paths(&repo, &["lib.rs"], "base");
+    let missing_objects = root.join("missing-snapshot-objects");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(root)
+        .arg("--diff-snapshot-object-dir")
+        .arg(&missing_objects)
+        .arg("--tool")
+        .arg("analyze_diff")
+        .arg("--args")
+        .arg("{}")
+        .output()
+        .expect("run bifrost --tool analyze_diff with missing snapshot objects");
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("Failed to resolve --diff-snapshot-object-dir"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&missing_objects.display().to_string()),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("--diff-snapshot-object-dir must name a directory"),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty(), "stderr:\n{stderr}");
+}
+
+#[test]
+fn diff_snapshot_object_dir_rejects_regular_file() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    let repo = Repository::init(root).expect("init repo");
+    fs::write(root.join("lib.rs"), "pub fn answer() -> i32 { 1 }\n").expect("write source");
+    commit_paths(&repo, &["lib.rs"], "base");
+    let objects_file = root.join("snapshot-objects-file");
+    fs::write(&objects_file, "not a directory\n").expect("write snapshot objects file");
+    let canonical_objects_file = objects_file
+        .canonicalize()
+        .expect("canonical snapshot objects file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(root)
+        .arg("--diff-snapshot-object-dir")
+        .arg(&objects_file)
+        .arg("--tool")
+        .arg("analyze_diff")
+        .arg("--args")
+        .arg("{}")
+        .output()
+        .expect("run bifrost --tool analyze_diff with snapshot objects file");
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("--diff-snapshot-object-dir must name a directory"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&canonical_objects_file.display().to_string()),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Failed to resolve --diff-snapshot-object-dir"),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty(), "stderr:\n{stderr}");
+}
+
+#[test]
 fn diff_snapshot_object_dir_is_rejected_for_lsp() {
     let temp = TempDir::new().expect("tempdir");
     let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
