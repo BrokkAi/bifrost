@@ -64,7 +64,7 @@ pub trait DataflowOutput<T> {
 /// therefore invoke the same transfer relation without making client
 /// semantics depend on one materialized call stack.
 #[derive(Debug, Clone, Copy)]
-pub struct DataflowEdge<'graph> {
+pub struct DataflowEdge<'graph, Fact = ()> {
     kind: IcfgEdgeKind,
     origin: Option<&'graph CallSiteHandle>,
     source: &'graph ProgramPointHandle,
@@ -73,9 +73,10 @@ pub struct DataflowEdge<'graph> {
     completeness: &'graph EvidenceCompleteness,
     boundary: Option<&'graph DispatchBoundaryKind>,
     call_transfer: Option<&'graph CallTransfer>,
+    summary_entry_fact: Option<Fact>,
 }
 
-impl<'graph> DataflowEdge<'graph> {
+impl<'graph, Fact> DataflowEdge<'graph, Fact> {
     pub const fn new(
         kind: IcfgEdgeKind,
         origin: Option<&'graph CallSiteHandle>,
@@ -93,6 +94,7 @@ impl<'graph> DataflowEdge<'graph> {
             completeness,
             boundary: None,
             call_transfer: None,
+            summary_entry_fact: None,
         }
     }
 
@@ -106,6 +108,17 @@ impl<'graph> DataflowEdge<'graph> {
     /// summary context.
     pub(crate) const fn with_call_transfer(mut self, transfer: &'graph CallTransfer) -> Self {
         self.call_transfer = Some(transfer);
+        self
+    }
+
+    /// Attach the exact current procedure-summary entry fact.
+    ///
+    /// Bounded snapshot runs leave this absent. Summary-backed clients may use
+    /// it to retain semantic attribution for side observations emitted while
+    /// crossing a call or matched-return edge; it must not affect ordinary
+    /// flow facts whose transfer is entry independent.
+    pub(crate) fn with_summary_entry_fact(mut self, fact: Fact) -> Self {
+        self.summary_entry_fact = Some(fact);
         self
     }
 
@@ -132,37 +145,41 @@ impl<'graph> DataflowEdge<'graph> {
         })
     }
 
-    pub const fn kind(self) -> IcfgEdgeKind {
+    pub const fn kind(&self) -> IcfgEdgeKind {
         self.kind
     }
 
-    pub const fn origin(self) -> Option<&'graph CallSiteHandle> {
+    pub const fn origin(&self) -> Option<&'graph CallSiteHandle> {
         self.origin
     }
 
-    pub const fn source(self) -> &'graph ProgramPointHandle {
+    pub const fn source(&self) -> &'graph ProgramPointHandle {
         self.source
     }
 
-    pub const fn target(self) -> &'graph ProgramPointHandle {
+    pub const fn target(&self) -> &'graph ProgramPointHandle {
         self.target
     }
 
-    pub const fn proof(self) -> &'graph ProofStatus {
+    pub const fn proof(&self) -> &'graph ProofStatus {
         self.proof
     }
 
-    pub const fn completeness(self) -> &'graph EvidenceCompleteness {
+    pub const fn completeness(&self) -> &'graph EvidenceCompleteness {
         self.completeness
     }
 
     /// Structured dispatch boundary that produced this edge, when any.
-    pub const fn boundary(self) -> Option<&'graph DispatchBoundaryKind> {
+    pub const fn boundary(&self) -> Option<&'graph DispatchBoundaryKind> {
         self.boundary
     }
 
-    pub(crate) const fn call_transfer(self) -> Option<&'graph CallTransfer> {
+    pub(crate) const fn call_transfer(&self) -> Option<&'graph CallTransfer> {
         self.call_transfer
+    }
+
+    pub const fn summary_entry_fact(&self) -> Option<&Fact> {
+        self.summary_entry_fact.as_ref()
     }
 }
 
@@ -193,7 +210,7 @@ pub trait DistributiveDataflowProblem {
     /// remains visible through the original `IcfgEdgeKind`.
     fn normal_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     );
@@ -201,7 +218,7 @@ pub trait DistributiveDataflowProblem {
     /// Transfer from a call site to a materialized callee entry.
     fn call_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     );
@@ -211,7 +228,7 @@ pub trait DistributiveDataflowProblem {
     /// The original edge distinguishes normal from exceptional return.
     fn return_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     );
@@ -223,7 +240,7 @@ pub trait DistributiveDataflowProblem {
     /// every materialized call.
     fn call_to_return_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     );
@@ -231,7 +248,7 @@ pub trait DistributiveDataflowProblem {
     /// Transfer over local exceptional or async-exceptional control flow.
     fn exceptional_flow(
         &self,
-        edge: DataflowEdge<'_>,
+        edge: DataflowEdge<'_, Self::Fact>,
         fact: Self::Fact,
         out: &mut dyn DataflowOutput<Self::Fact>,
     );

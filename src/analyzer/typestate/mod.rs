@@ -9,6 +9,7 @@ mod client;
 mod finding;
 mod hash;
 mod protocol;
+mod summary;
 
 pub use binding::{
     BINDING_PLAN_SCHEMA_VERSION, BoundTypestateEvent, BoundTypestateInitialSeed,
@@ -35,7 +36,7 @@ pub use finding::{
     TypestateFindingLimits, TypestateFindingReport, TypestateFindingWitness, TypestateWitness,
     TypestateWitnessStep, collect_summary_findings, collect_summary_findings_with_limits,
 };
-pub use hash::{TypestateBindingPlanHash, TypestateProtocolHash};
+pub use hash::{TypestateBindingPlanHash, TypestateBindingSummaryHash, TypestateProtocolHash};
 pub use protocol::{
     CompiledProtocol, CompiledProtocolEvent, CompiledProtocolGuard, CompiledProtocolTransition,
     CompiledTerminalExpectation, MAX_PROTOCOL_EVENTS, MAX_PROTOCOL_EXPECTATIONS,
@@ -49,4 +50,16 @@ pub use protocol::{
     ProtocolTerminalObservationSpec, ProtocolTransitionSpec, ProtocolUncertaintyBehavior,
     ProtocolUncertaintyCause, ProtocolUncertaintyResolution, ProtocolUncertaintySemantics,
     ProtocolUncertaintyStateSet, ProtocolUncertaintyViolation, ProtocolUnmatchedEventBehavior,
+};
+pub use summary::{
+    CompleteProtocolSummaryRepository, DEFAULT_PROTOCOL_SUMMARY_REPOSITORY_BYTES,
+    DEFAULT_PROTOCOL_SUMMARY_REPOSITORY_ENTRIES, MAX_PROTOCOL_SUMMARY_EFFECTS,
+    MAX_PROTOCOL_SUMMARY_ROWS, PROTOCOL_SUMMARY_SCHEMA_VERSION, ProtocolAppliedEffect,
+    ProtocolEventBindingKey, ProtocolFactKey, ProtocolObservedEffect, ProtocolPathEvidence,
+    ProtocolSemanticSummarySet, ProtocolSummary, ProtocolSummaryApplication,
+    ProtocolSummaryCacheStatus, ProtocolSummaryError, ProtocolSummaryKey, ProtocolSummaryOutcome,
+    ProtocolSummaryPublicationError, ProtocolSummaryPublicationOutcome,
+    ProtocolSummaryRepositoryLimits, ProtocolSummaryRow, ProtocolSummarySolveError,
+    ProtocolSummarySolveResult, ProtocolTerminalBindingKey, ProtocolUncertaintyKey,
+    solve_typestate_with_reusable_summaries,
 };

@@ -991,7 +991,7 @@ fn rust_async_function_calls_are_deferred_icfg_boundaries() {
         )
     ));
     assert!(matches!(
-        DataflowEdge::from_snapshot(graph.snapshot(), continuation_edge_id)
+        DataflowEdge::<()>::from_snapshot(graph.snapshot(), continuation_edge_id)
             .expect("bounded dataflow descriptor")
             .boundary(),
         Some(

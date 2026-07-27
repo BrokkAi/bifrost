@@ -518,7 +518,7 @@ where
 
 fn apply_transfer<Problem>(
     problem: &Problem,
-    edge: DataflowEdge<'_>,
+    edge: DataflowEdge<'_, Problem::Fact>,
     kind: IcfgEdgeKind,
     fact: Problem::Fact,
     out: &mut dyn DataflowOutput<IdeTransition<Problem::Fact, Problem::EdgeFunction>>,
@@ -626,7 +626,7 @@ where
     }
 }
 
-fn descriptor(edge: &ProcedureIcfgEdge) -> DataflowEdge<'_> {
+fn descriptor<Fact>(edge: &ProcedureIcfgEdge) -> DataflowEdge<'_, Fact> {
     DataflowEdge::new(
         edge.kind,
         edge.origin.as_ref(),
