@@ -2,9 +2,11 @@ import * as vscode from "vscode";
 import type {
   PolicyFinding,
   PolicyReportDiagnostic,
+  PolicyReportEvaluation,
   PolicyRule,
   PolicyRun,
   PolicyRunDiagnostic,
+  PolicySuppressionReview,
   RqlPolicyResponse
 } from "./rql_policy";
 import {
@@ -12,7 +14,8 @@ import {
   policyCompletionLabel,
   policyFindingDetail,
   policyFindingTerminalSymbol,
-  policyRunDiagnosticCodeLabel
+  policyRunDiagnosticCodeLabel,
+  policySuppressionAuditSummary
 } from "./rql_policy";
 
 export interface PolicyFindingTarget {
@@ -24,6 +27,8 @@ type PolicyTreeItem =
   | PolicyStaleItem
   | PolicyRunItem
   | PolicyFindingItem
+  | PolicySuppressionSummaryItem
+  | PolicySuppressionReviewItem
   | PolicyDiagnosticItem
   | PolicyRunDiagnosticItem
   | PolicyTruncationItem;
@@ -62,11 +67,14 @@ export class RqlPolicyResultsProvider implements vscode.TreeDataProvider<PolicyT
         children.push(new PolicyTruncationItem("Additional run diagnostics were omitted."));
       }
       children.push(
-        ...element.run.findings.map(
+        ...activeFindings(element.run).map(
           (finding) => new PolicyFindingItem(element.reportRootUri, finding)
         )
       );
       return children;
+    }
+    if (element instanceof PolicySuppressionSummaryItem) {
+      return element.reviews.map((review) => new PolicySuppressionReviewItem(review));
     }
     if (element) {
       return [];
@@ -86,6 +94,14 @@ export class RqlPolicyResultsProvider implements vscode.TreeDataProvider<PolicyT
       items.push(
         new PolicyTruncationItem(
           `At least ${this.response.report.omitted_diagnostics_lower_bound} additional report diagnostics were omitted.`
+        )
+      );
+    }
+    if (this.response.report.suppressions.length > 0) {
+      items.push(
+        new PolicySuppressionSummaryItem(
+          this.response.report.evaluation,
+          this.response.report.suppressions
         )
       );
     }
@@ -122,13 +138,18 @@ class PolicyRunItem extends vscode.TreeItem {
   ) {
     super(
       rule ? `${rule.name} (${run.policy_id})` : run.policy_id,
-      run.findings.length > 0 || run.diagnostics.length > 0 || run.diagnostics_truncated
+      activeFindings(run).length > 0 || run.diagnostics.length > 0 || run.diagnostics_truncated
         ? vscode.TreeItemCollapsibleState.Expanded
         : vscode.TreeItemCollapsibleState.None
     );
+    const active = activeFindings(run);
     const completion = policyCompletionLabel(run.completion);
-    const findings = `${run.findings.length} ${run.findings.length === 1 ? "finding" : "findings"}`;
-    this.description = `${completion} · ${findings}`;
+    const findings = `${active.length} active ${active.length === 1 ? "finding" : "findings"}`;
+    const suppressed = run.findings.length - active.length;
+    this.description =
+      suppressed > 0
+        ? `${completion} · ${findings} · ${suppressed} suppressed`
+        : `${completion} · ${findings}`;
     const tooltip = new vscode.MarkdownString();
     tooltip.appendMarkdown("**Policy:** ");
     tooltip.appendText(rule?.name ?? run.policy_id);
@@ -140,6 +161,51 @@ class PolicyRunItem extends vscode.TreeItem {
     tooltip.appendText(policyCompletionDetail(run.completion));
     this.tooltip = tooltip;
     this.iconPath = new vscode.ThemeIcon(completionIcon(run));
+  }
+}
+
+class PolicySuppressionSummaryItem extends vscode.TreeItem {
+  constructor(
+    evaluation: PolicyReportEvaluation,
+    readonly reviews: PolicySuppressionReview[]
+  ) {
+    super("Suppression audit", vscode.TreeItemCollapsibleState.Expanded);
+    const omitted = reviews.filter((review) => review.result_omitted).length;
+    this.description = policySuppressionAuditSummary(reviews);
+    this.tooltip = `Evaluated ${evaluation.suppression_path} on ${evaluation.evaluation_date}; document ${evaluation.suppression_document_state.replaceAll("_", " ")}.`;
+    this.iconPath = new vscode.ThemeIcon(omitted > 0 ? "error" : "verified");
+  }
+}
+
+class PolicySuppressionReviewItem extends vscode.TreeItem {
+  constructor(review: PolicySuppressionReview) {
+    super(
+      `${review.policy_id} · ${review.finding_id.slice(0, 12)}`,
+      vscode.TreeItemCollapsibleState.None
+    );
+    const states = [
+      review.applied ? "applied" : review.match_state.replaceAll("_", " "),
+      review.temporal_state === "expired" ? "expired" : undefined,
+      review.policy_hash_state === "drifted" ? "policy hash drifted" : undefined,
+      review.stale ? "stale" : undefined,
+      review.result_omitted ? "result omitted" : undefined
+    ].filter((state): state is string => state !== undefined);
+    this.description = states.join(" · ");
+    const tooltip = new vscode.MarkdownString();
+    tooltip.appendMarkdown("**Policy:** ");
+    tooltip.appendText(review.policy_id);
+    tooltip.appendMarkdown("  \n**Finding:** ");
+    tooltip.appendText(review.finding_id);
+    tooltip.appendMarkdown("  \n**Reason:** ");
+    tooltip.appendText(review.reason);
+    tooltip.appendMarkdown("  \n**Accepted:** ");
+    tooltip.appendText(
+      review.accepted_by ? `${review.accepted_at} by ${review.accepted_by}` : review.accepted_at
+    );
+    tooltip.appendMarkdown("\n\n**Audit state**\n\n");
+    tooltip.appendCodeblock(JSON.stringify(review, null, 2), "json");
+    this.tooltip = tooltip;
+    this.iconPath = new vscode.ThemeIcon(suppressionReviewIcon(review));
   }
 }
 
@@ -210,7 +276,7 @@ class PolicyTruncationItem extends vscode.TreeItem {
 function completionIcon(run: PolicyRun): string {
   switch (run.completion.type) {
     case "complete":
-      return run.findings.length > 0 ? "issues" : "pass";
+      return activeFindings(run).length > 0 ? "issues" : "pass";
     case "inconclusive":
       return "question";
     case "unsupported":
@@ -218,6 +284,29 @@ function completionIcon(run: PolicyRun): string {
     case "failed":
       return "error";
   }
+}
+
+function activeFindings(run: PolicyRun): PolicyFinding[] {
+  return run.findings.filter((finding) => finding.suppression === null);
+}
+
+function suppressionReviewIcon(review: PolicySuppressionReview): string {
+  if (review.result_omitted) {
+    return "error";
+  }
+  if (review.stale) {
+    return "history";
+  }
+  if (review.temporal_state === "expired") {
+    return "watch";
+  }
+  if (review.policy_hash_state === "drifted") {
+    return "warning";
+  }
+  if (review.applied) {
+    return "verified";
+  }
+  return "question";
 }
 
 function severityIcon(severity: string): string {

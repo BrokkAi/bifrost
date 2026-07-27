@@ -33,11 +33,49 @@ export interface PolicyFinding {
   severity: string;
   message: string;
   primary: PolicySourceLocation;
+  suppression: PolicyFindingSuppression | null;
   evidence?: unknown;
   proof?: unknown;
   related?: unknown[];
   witnesses?: unknown[];
   [key: string]: unknown;
+}
+
+export interface PolicySuppressionDecision {
+  identity_stability: "strong";
+  status: "accepted";
+  reason: string;
+  policy_hash_at_acceptance?: string | null;
+  accepted_by?: string | null;
+  accepted_at: string;
+  expires_at?: string | null;
+  [key: string]: unknown;
+}
+
+export interface PolicyFindingSuppression extends PolicySuppressionDecision {
+  policy_hash_state: "matching" | "drifted" | "unknown";
+}
+
+export interface PolicySuppressionReview extends PolicySuppressionDecision {
+  policy_id: string;
+  finding_id: string;
+  match_state:
+    | "strong_finding"
+    | "current_finding_not_strong"
+    | "finding_absent"
+    | "policy_not_evaluated"
+    | "policy_incomplete";
+  temporal_state: "current" | "expired";
+  policy_hash_state: "matching" | "drifted" | "unknown";
+  applied: boolean;
+  stale: boolean;
+  result_omitted: boolean;
+}
+
+export interface PolicyReportEvaluation {
+  evaluation_date: string;
+  suppression_path: string;
+  suppression_document_state: "not_found" | "loaded" | "invalid";
 }
 
 export interface PolicyRun {
@@ -83,9 +121,11 @@ export interface PolicyReportDiagnostic {
 }
 
 export interface PolicyReport {
-  schema_version: 1;
+  schema_version: 2;
+  evaluation: PolicyReportEvaluation;
   rules: PolicyRule[];
   runs: PolicyRun[];
+  suppressions: PolicySuppressionReview[];
   diagnostics: PolicyReportDiagnostic[];
   diagnostics_truncated: boolean;
   omitted_diagnostics_lower_bound: number;
@@ -105,7 +145,15 @@ export interface PolicyEditorRange {
 
 export interface RqlPolicyRunner {
   isReady(): boolean;
-  sendRequest(method: string, params: { documentUri: string; source: string }): Promise<unknown>;
+  sendRequest(
+    method: string,
+    params: {
+      documentUri: string;
+      source: string;
+      evaluationDate: string;
+      suppressionFile?: string;
+    }
+  ): Promise<unknown>;
   showError(message: string): void;
   showWarning(message: string): void;
 }
@@ -127,7 +175,8 @@ export async function runRqlPolicy(
   try {
     const response = await runner.sendRequest(RUN_RQL_POLICY_METHOD, {
       documentUri: document.uri,
-      source: document.text
+      source: document.text,
+      evaluationDate: utcEvaluationDate()
     });
     if (!isRqlPolicyResponse(response)) {
       runner.showError(
@@ -141,6 +190,10 @@ export async function runRqlPolicy(
     runner.showError(`Bifrost RQL policy failed: ${message}`);
     return undefined;
   }
+}
+
+export function utcEvaluationDate(now: Date = new Date()): string {
+  return now.toISOString().slice(0, 10);
 }
 
 export interface PolicyRunSnapshot {
@@ -192,9 +245,11 @@ export function isRqlPolicyResponse(value: unknown): value is RqlPolicyResponse 
   const report = value.report;
   if (
     !isRecord(report) ||
-    report.schema_version !== 1 ||
+    report.schema_version !== 2 ||
+    !isPolicyReportEvaluation(report.evaluation) ||
     !Array.isArray(report.rules) ||
     !Array.isArray(report.runs) ||
+    !Array.isArray(report.suppressions) ||
     !Array.isArray(report.diagnostics) ||
     typeof report.diagnostics_truncated !== "boolean" ||
     typeof report.omitted_diagnostics_lower_bound !== "number"
@@ -204,6 +259,7 @@ export function isRqlPolicyResponse(value: unknown): value is RqlPolicyResponse 
   return (
     report.rules.every(isPolicyRule) &&
     report.runs.every(isPolicyRun) &&
+    report.suppressions.every(isPolicySuppressionReview) &&
     report.diagnostics.every(isPolicyDiagnostic)
   );
 }
@@ -244,11 +300,34 @@ export function policyReportCompletedWithoutFindings(report: PolicyReport): bool
     report.runs.every(
       (run) =>
         run.completion.type === "complete" &&
-        run.findings.length === 0 &&
+        run.findings.every((finding) => finding.suppression !== null) &&
         run.diagnostics.length === 0 &&
         !run.diagnostics_truncated
     )
   );
+}
+
+export function policySuppressionAuditSummary(reviews: readonly PolicySuppressionReview[]): string {
+  const applied = reviews.filter((review) => review.applied).length;
+  const stale = reviews.filter((review) => review.stale).length;
+  const expired = reviews.filter((review) => review.temporal_state === "expired").length;
+  const drifted = reviews.filter((review) => review.policy_hash_state === "drifted").length;
+  const unproven = reviews.filter((review) =>
+    ["current_finding_not_strong", "policy_not_evaluated", "policy_incomplete"].includes(
+      review.match_state
+    )
+  ).length;
+  const omitted = reviews.filter((review) => review.result_omitted).length;
+  return [
+    `${applied} applied`,
+    stale > 0 ? `${stale} stale` : undefined,
+    expired > 0 ? `${expired} expired` : undefined,
+    drifted > 0 ? `${drifted} drifted` : undefined,
+    unproven > 0 ? `${unproven} unproven` : undefined,
+    omitted > 0 ? `${omitted} result omitted` : undefined
+  ]
+    .filter((part): part is string => part !== undefined)
+    .join(" · ");
 }
 
 export function policyRunDiagnosticCodeLabel(code: PolicyRunDiagnosticCode): string {
@@ -280,6 +359,7 @@ export function policyFindingDetail(finding: PolicyFinding): string {
       severity: finding.severity,
       message: finding.message,
       location: finding.primary,
+      suppression: finding.suppression,
       terminal: policyFindingTerminalSymbol(finding),
       evidence: finding.evidence,
       proof: finding.proof,
@@ -367,7 +447,65 @@ function isPolicyFinding(value: unknown): value is PolicyFinding {
     typeof value.policy_id === "string" &&
     typeof value.severity === "string" &&
     typeof value.message === "string" &&
+    (value.suppression === null || isPolicyFindingSuppression(value.suppression)) &&
     isPolicyLocation(value.primary)
+  );
+}
+
+function isPolicyReportEvaluation(value: unknown): value is PolicyReportEvaluation {
+  return (
+    isRecord(value) &&
+    isPolicyDate(value.evaluation_date) &&
+    typeof value.suppression_path === "string" &&
+    (value.suppression_document_state === "not_found" ||
+      value.suppression_document_state === "loaded" ||
+      value.suppression_document_state === "invalid")
+  );
+}
+
+function isPolicySuppressionDecision(value: unknown): value is PolicySuppressionDecision {
+  return (
+    isRecord(value) &&
+    value.identity_stability === "strong" &&
+    value.status === "accepted" &&
+    typeof value.reason === "string" &&
+    isPolicyDate(value.accepted_at) &&
+    (value.policy_hash_at_acceptance === undefined ||
+      value.policy_hash_at_acceptance === null ||
+      typeof value.policy_hash_at_acceptance === "string") &&
+    (value.accepted_by === undefined ||
+      value.accepted_by === null ||
+      typeof value.accepted_by === "string") &&
+    (value.expires_at === undefined || value.expires_at === null || isPolicyDate(value.expires_at))
+  );
+}
+
+function isPolicyFindingSuppression(value: unknown): value is PolicyFindingSuppression {
+  return (
+    isPolicySuppressionDecision(value) &&
+    (value.policy_hash_state === "matching" ||
+      value.policy_hash_state === "drifted" ||
+      value.policy_hash_state === "unknown")
+  );
+}
+
+function isPolicySuppressionReview(value: unknown): value is PolicySuppressionReview {
+  return (
+    isPolicySuppressionDecision(value) &&
+    typeof value.policy_id === "string" &&
+    typeof value.finding_id === "string" &&
+    (value.match_state === "strong_finding" ||
+      value.match_state === "current_finding_not_strong" ||
+      value.match_state === "finding_absent" ||
+      value.match_state === "policy_not_evaluated" ||
+      value.match_state === "policy_incomplete") &&
+    (value.temporal_state === "current" || value.temporal_state === "expired") &&
+    (value.policy_hash_state === "matching" ||
+      value.policy_hash_state === "drifted" ||
+      value.policy_hash_state === "unknown") &&
+    typeof value.applied === "boolean" &&
+    typeof value.stale === "boolean" &&
+    typeof value.result_omitted === "boolean"
   );
 }
 
@@ -386,6 +524,10 @@ function isPolicyDiagnostic(value: unknown): value is PolicyReportDiagnostic {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function isPolicyDate(value: unknown): value is string {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value);
 }
 
 function formatUnknown(value: unknown): string {

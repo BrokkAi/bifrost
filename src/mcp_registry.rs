@@ -308,6 +308,7 @@ mod tests {
         expected.extend(
             [
                 "query_code",
+                "run_policy",
                 "get_symbol_locations",
                 "get_symbol_ancestors",
                 "find_filenames",

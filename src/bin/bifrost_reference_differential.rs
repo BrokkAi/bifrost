@@ -737,6 +737,20 @@ fn run_engine(
             "progress phase=inverse status=started total={total} target={target} repo={progress_repo} elapsed={:.1}s",
             started.elapsed().as_secs_f64()
         ),
+        ReferenceDifferentialProgress::InverseVisibilityBuildStarted {
+            root_files,
+            target_groups,
+        } => eprintln!(
+            "progress phase=inverse_visibility status=started root_files={root_files} target_groups={target_groups} repo={progress_repo} elapsed={:.1}s",
+            started.elapsed().as_secs_f64()
+        ),
+        ReferenceDifferentialProgress::InverseVisibilityBuildCompleted {
+            root_files,
+            target_groups,
+        } => eprintln!(
+            "progress phase=inverse_visibility status=completed root_files={root_files} target_groups={target_groups} repo={progress_repo} elapsed={:.1}s",
+            started.elapsed().as_secs_f64()
+        ),
     })
 }
 

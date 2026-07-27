@@ -308,18 +308,66 @@ comes through the local gate, but is not the focus.
   library tests, 194 LSP tests with the separately known Ruby hang filtered,
   28 MCP tests, all 161 C++ usage tests, the exact #1208 differential
   regression, and doc tests.
-- [ ] Publish the #1208 epoch correction, rebuild from the exact integrated
-  head, and rerun the complete persisted C++ top ten from the new epoch before
-  treating any of the 152 prior rows as current defects.
+- [x] (2026-07-27) Published the #1208 epoch correction and closed the issue
+  after exact persisted and ephemeral log4cxx witnesses agreed. The new-epoch
+  clean-head C++ replay at `003a2be4` completed all ten envelopes with no file
+  or candidate-limit errors and reduced the trustworthy residual set to 150
+  rows. Exhaustive disposition maps every row to already-assigned issues:
+  #1182 (2), #1184 (9), #1185 (11), #1186 (45), #1187 (65), and #1190 (18).
+  The accepted raw report and complete ledger are
+  `/mnt/optane/tmp/bifrost-fird/cpp-task-top10-003a2be4.jsonl` and
+  `/mnt/optane/tmp/bifrost-fird/cpp-task-top10-003a2be4-missing-v2.tsv`,
+  with SHA-256 values
+  `959cd6350db4194f9e14ce73d567206ddedc41bf6b4e0d37b21e71b5df4f64d7`
+  and
+  `f51583f2390d3df592c502d2d380a2ac638ee46d63c6e205a0afb7f1a8597683`.
+- [x] (2026-07-27) Diagnosed the replay's 72-minute ESPHome pre-inverse gap,
+  created and assigned #1215 before implementation, reused root-independent
+  linkage classification across the 477-root batch, and added explicit
+  visibility progress. The same-limits clean production replay preserved every
+  summary count while reducing visibility setup from 4,341.8 to 562.7 seconds
+  (7.72x). Formatting, all-feature Clippy, and the complete `nlp,python`
+  matrix passed on the merged head; `1409d086` was pushed to `origin/master`
+  and #1215 closed.
+- [x] (2026-07-27) Resolved assigned #1220 by replacing the per-global cloned
+  workspace declaration scan with an exact-FQN definition-bucket lookup while
+  preserving logical-symbol and explicit-external checks. A bounded regression
+  proves that one relevant peer is inspected despite 32 unrelated globals.
+  Formatting, all-feature Clippy, focused linkage regressions, and the complete
+  `nlp,python` test matrix passed at niceness 10 with normal Cargo storage.
+  Implementation commit `9ac8a4d9` was integrated and pushed at `123670bc`;
+  #1220 is closed.
+- [x] (2026-07-27) Resolved assigned #1184 at the shared authoritative-batch
+  boundary. `VisibilityIndex` now retains the field-only internal-linkage
+  classifications already produced for its identifier index, and internal
+  globals are visible only from roots that reach the target source rather than
+  through a same-name declaration in a sibling translation unit. Cache misses
+  remain correct for explicit scopes by classifying the target on demand. One
+  two-root `CppAuthoritativeUsageBatch` regression proves exact byte ranges for
+  both anonymous-namespace constants; all 12 issue-linkage tests, formatting,
+  all-feature Clippy, all 161 C++ usage tests, and the complete `nlp,python`
+  matrix pass with normal Cargo storage at niceness 10.
+- [x] (2026-07-27) Resolved assigned #1186 by rejecting structured C++ type
+  declaration heads from forward definition lookup while preserving real tag
+  type references and owner qualifiers in out-of-line tagged definitions.
+  Focused regressions cover template-specialization heads, typedef targets,
+  qualified enum parameter types, and out-of-line nested owners. Formatting,
+  all-target/all-feature Clippy, all 646 definition-lookup tests, all 161 C++
+  usage tests, and the complete `nlp,python` matrix pass with normal Cargo
+  storage at niceness 10. This removes the 45 non-reference declaration
+  contexts from the differential's forward premise rather than manufacturing
+  inverse usages for them.
+- [ ] Publish the remaining mapped C++ semantic issue families and run one final
+  task-selected top-ten certification.
 - [ ] Complete C++ and publish its evidence and user summary.
-- [ ] Complete C# and publish its evidence and user summary.
-- [ ] Complete Go and publish its evidence and user summary.
-- [ ] Complete Java and publish its evidence and user summary.
-- [ ] Complete JavaScript and publish its evidence and user summary.
-- [ ] Complete TypeScript and publish its evidence and user summary.
-- [ ] Complete PHP and publish its evidence and user summary.
-- [ ] Complete Rust and publish its evidence and user summary.
-- [ ] Complete Scala and publish its evidence and user summary.
+- [x] Complete C# and publish its evidence and user summary.
+- [x] Complete Go and publish its evidence and user summary.
+- [x] Complete Java and publish its evidence and user summary.
+- [x] Complete JavaScript and publish its evidence and user summary.
+- [x] Complete TypeScript and publish its evidence and user summary.
+- [x] Complete PHP and publish its evidence and user summary.
+- [x] Complete Rust and publish its evidence and user summary.
+- [x] Complete Scala and publish its evidence and user summary.
 - [ ] Complete Python and publish its evidence and user summary.
 - [ ] Prove all 110 accepted envelopes and every fixing head are present on
   final `origin/master`, run the final local gate, and remove temporary

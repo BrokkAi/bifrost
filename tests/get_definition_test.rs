@@ -20040,6 +20040,117 @@ Scope *identity(Scope *scope) {
 }
 
 #[test]
+fn cpp_template_specialization_name_is_not_reference_but_typedef_target_stays_resolvable() {
+    let source = r#"
+struct link_context {};
+struct link {};
+template <class T> struct context;
+template <> struct context<link> {
+    typedef link_context type;
+};
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", source)
+        .build();
+
+    let specialization_name = source
+        .find("context<link>")
+        .expect("specialization declaration head");
+    let typedef_target = source
+        .rfind("link_context type")
+        .expect("typedef target inside specialization");
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("app.cpp", source, specialization_name),
+                location_query("app.cpp", source, typedef_target),
+            ]
+        })
+        .to_string(),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "no_definition", "{value}");
+    assert_eq!(
+        results[0]["diagnostics"][0]["kind"], "declaration_or_import_site",
+        "{value}"
+    );
+    assert_eq!(results[1]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[1]["definitions"][0]["fqn"], "link_context",
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_tagged_enum_parameter_type_stays_resolvable() {
+    let source = r#"
+struct transfer { enum state { pending }; };
+int describe(const enum transfer::state s) { return s == transfer::pending; }
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", source)
+        .build();
+
+    let enum_type = source.find("transfer::state").expect("enum parameter type");
+    let terminal = source.find("state s)").expect("enum terminal");
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("app.cpp", source, enum_type),
+                location_query("app.cpp", source, terminal),
+            ]
+        })
+        .to_string(),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    for result in results {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["path"], "app.cpp", "{value}");
+        assert_eq!(result["definitions"][0]["kind"], "class", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], "transfer$state", "{value}");
+    }
+}
+
+#[test]
+fn cpp_out_of_line_tag_owner_qualifier_stays_resolvable_while_terminal_is_a_declaration() {
+    let source = r#"
+struct Owner {
+    struct Hidden;
+};
+struct Owner::Hidden {};
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", source)
+        .build();
+
+    let declaration = source.find("Owner::Hidden").expect("out-of-line tag name");
+    let terminal = declaration + "Owner::".len();
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("app.cpp", source, declaration),
+                location_query("app.cpp", source, terminal),
+            ]
+        })
+        .to_string(),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "resolved", "{value}");
+    assert_eq!(results[0]["definitions"][0]["fqn"], "Owner", "{value}");
+    assert_eq!(results[1]["status"], "no_definition", "{value}");
+    assert_eq!(
+        results[1]["diagnostics"][0]["kind"], "declaration_or_import_site",
+        "{value}"
+    );
+}
+
+#[test]
 fn cpp_export_macro_class_body_seeds_local_receiver_type() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

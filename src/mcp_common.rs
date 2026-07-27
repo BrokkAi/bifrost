@@ -1,4 +1,4 @@
-use crate::searchtools_service::PreparedQueryCode;
+use crate::searchtools_service::{PreparedQueryCode, PreparedRunPolicy};
 use crate::{
     CancellationToken, SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode,
     ToolOutput, analyzer::policy::escape_terminal_text, searchtools_render::RenderOptions,
@@ -498,7 +498,7 @@ fn cancellable_tool_request(message: &Value, spec: &McpServerSpec) -> Option<(Va
     let tool_name = message.pointer("/params/name").and_then(Value::as_str)?;
     if object.get("jsonrpc").and_then(Value::as_str) != Some(JSONRPC_VERSION)
         || object.get("method").and_then(Value::as_str) != Some("tools/call")
-        || !matches!(tool_name, "query_code" | "search_symbols")
+        || !matches!(tool_name, "query_code" | "search_symbols" | "run_policy")
         || !spec.tool_names.contains(tool_name)
     {
         return None;
@@ -955,6 +955,7 @@ fn handle_tool_call(
 
 enum PreparedToolCall {
     QueryCode(PreparedQueryCode),
+    RunPolicy(PreparedRunPolicy),
     Standard {
         name: String,
         arguments: Value,
@@ -967,6 +968,7 @@ impl PreparedToolCall {
     fn workspace_generation(&self) -> Option<u64> {
         match self {
             Self::QueryCode(prepared) => Some(prepared.workspace_generation()),
+            Self::RunPolicy(prepared) => Some(prepared.workspace_generation()),
             Self::Standard {
                 workspace_generation,
                 ..
@@ -1035,6 +1037,13 @@ fn prepare_tool_call(
             .map(ToolCallPreparation::Ready)
             .map_err(|error| map_service_error(error.code, error.message));
     }
+    if name == "run_policy" {
+        return service
+            .prepare_run_policy(arguments)
+            .map(PreparedToolCall::RunPolicy)
+            .map(ToolCallPreparation::Ready)
+            .map_err(|error| map_service_error(error.code, error.message));
+    }
     let arguments = match normalize_tool_arguments(name, arguments, &workspace_root) {
         Ok(arguments) => arguments,
         Err(message) => return Ok(ToolCallPreparation::Reply(tool_error_result(message))),
@@ -1060,6 +1069,11 @@ fn execute_prepared_tool_call(
             "query_code".to_string(),
             RenderOptions::default(),
             service.execute_prepared_query_code(prepared, cancellation),
+        ),
+        PreparedToolCall::RunPolicy(prepared) => (
+            "run_policy".to_string(),
+            RenderOptions::default(),
+            service.execute_prepared_run_policy(prepared, cancellation),
         ),
         PreparedToolCall::Standard {
             name,
@@ -2390,5 +2404,42 @@ mod uri_tests {
             "{}",
             response.value
         );
+    }
+
+    #[test]
+    fn cancelled_run_policy_stops_the_prepared_workspace_evaluation() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("source directory");
+        std::fs::create_dir_all(dir.path().join("policies")).expect("policy directory");
+        std::fs::write(
+            dir.path().join("src/app.py"),
+            include_str!("../tests/fixtures/policy-cli/project/src/app.py"),
+        )
+        .expect("write source");
+        std::fs::write(
+            dir.path().join("policies/dynamic-eval.rqlp"),
+            include_str!("../tests/fixtures/policy-cli/project/policies/dynamic-eval.rqlp"),
+        )
+        .expect("write policy");
+        let service =
+            SearchToolsService::new_manual_without_semantic_index(dir.path().to_path_buf())
+                .expect("service");
+        let prepared = service
+            .prepare_run_policy(json!({
+                "policy_files": ["policies/dynamic-eval.rqlp"],
+                "evaluation_date": "2026-07-27"
+            }))
+            .expect("prepare policy request");
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+
+        let error = execute_prepared_tool_call(
+            &service,
+            PreparedToolCall::RunPolicy(prepared),
+            Some(&cancellation),
+        )
+        .expect_err("pre-cancelled policy request must stop");
+        assert_eq!(error.0, INTERNAL_ERROR);
+        assert!(error.1.contains("policy evaluation cancelled"), "{error:?}");
     }
 }

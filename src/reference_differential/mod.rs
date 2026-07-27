@@ -214,6 +214,14 @@ pub enum ReferenceDifferentialProgress {
         total: usize,
         target: String,
     },
+    InverseVisibilityBuildStarted {
+        root_files: usize,
+        target_groups: usize,
+    },
+    InverseVisibilityBuildCompleted {
+        root_files: usize,
+        target_groups: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -940,11 +948,27 @@ fn compare_inverse(
         })
         .flat_map(|prepared| prepared.candidate_files.iter().cloned())
         .collect();
+    if !cpp_roots.is_empty() {
+        progress(
+            ReferenceDifferentialProgress::InverseVisibilityBuildStarted {
+                root_files: cpp_roots.len(),
+                target_groups: total,
+            },
+        );
+    }
     let cpp_batch = if cpp_roots.is_empty() {
         None
     } else {
         CppAuthoritativeUsageBatch::new(analyzer, &cpp_roots)
     };
+    if !cpp_roots.is_empty() {
+        progress(
+            ReferenceDifferentialProgress::InverseVisibilityBuildCompleted {
+                root_files: cpp_roots.len(),
+                target_groups: total,
+            },
+        );
+    }
     worker_pool.install(|| {
         prepared.par_iter().for_each(|prepared| {
             let target = prepared
@@ -1686,6 +1710,81 @@ func read(container Container) {
             cpp.authoritative_visibility_build_count_for_test(),
             1,
             "both inverse target groups should reuse one union visibility index"
+        );
+    }
+
+    #[test]
+    fn cpp_inverse_visibility_build_progress_brackets_target_progress() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        fs::write(
+            root.join("multi_target.cpp"),
+            "void first() {}\nvoid second() {}\nvoid consumer() { first(); second(); }\n",
+        )
+        .expect("write fixture");
+        let project = Arc::new(TestProject::new(&root, Language::Cpp));
+        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let config = ReferenceDifferentialConfig {
+            corpus_language: "cpp".to_string(),
+            max_files: 10,
+            max_sites: 100,
+            max_candidates_per_file: 100,
+            max_source_bytes: 10_000,
+            max_targets: 100,
+            max_usage_files: 10,
+            max_usages: 100,
+            ..ReferenceDifferentialConfig::default()
+        };
+        let progress = Mutex::new(Vec::new());
+
+        let report =
+            run_reference_differential_with_progress(workspace.analyzer(), &config, &|event| {
+                progress.lock().expect("progress lock poisoned").push(event);
+            })
+            .expect("run audit");
+
+        assert_eq!(report.summary.queried_targets, 2, "{report:#?}");
+        let progress = progress.into_inner().expect("extract progress");
+        let start_index = progress
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ReferenceDifferentialProgress::InverseVisibilityBuildStarted {
+                        root_files: 1,
+                        target_groups: 2,
+                    }
+                )
+            })
+            .expect("inverse visibility start");
+        let completed_index = progress
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ReferenceDifferentialProgress::InverseVisibilityBuildCompleted {
+                        root_files: 1,
+                        target_groups: 2,
+                    }
+                )
+            })
+            .expect("inverse visibility completion");
+        let first_target_index = progress
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ReferenceDifferentialProgress::InverseTargetStarted { total: 2, .. }
+                )
+            })
+            .expect("first inverse target");
+        assert!(
+            start_index < completed_index,
+            "start should precede completion: {progress:#?}"
+        );
+        assert!(
+            completed_index < first_target_index,
+            "visibility build should complete before target progress: {progress:#?}"
         );
     }
 

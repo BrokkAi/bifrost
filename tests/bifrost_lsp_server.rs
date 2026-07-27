@@ -1325,6 +1325,7 @@ export function leak_resource(): object {
         "bifrost/runPolicy",
         json!({
             "documentUri": uri_for(&policy_path),
+            "evaluationDate": "2026-07-27",
             "source": unsaved,
         }),
     );
@@ -1349,11 +1350,121 @@ export function leak_resource(): object {
         .unwrap_or_else(|| panic!("expected findings: {response}"));
     assert_eq!(findings.len(), 1, "{response}");
     assert_eq!(findings[0]["primary"]["path"], "app.ts");
+    assert_eq!(response["result"]["report"]["schema_version"], 2);
+    assert_eq!(
+        response["result"]["report"]["evaluation"]["evaluation_date"],
+        "2026-07-27"
+    );
+
+    let suppression_path = root.join("reviews/accepted.json");
+    fs::create_dir_all(suppression_path.parent().unwrap()).unwrap();
+    fs::write(
+        &suppression_path,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "suppressions": [{
+                "policy_id": response["result"]["report"]["rules"][0]["policy_id"],
+                "finding_id": findings[0]["id"],
+                "identity_stability": "strong",
+                "status": "accepted",
+                "reason": "Reviewed in the editor",
+                "policy_hash_at_acceptance": response["result"]["report"]["rules"][0]["policy_hash"],
+                "accepted_by": "editor-review",
+                "accepted_at": "2026-07-01",
+                "expires_at": "2026-07-27"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let suppressed = server.request(
+        "bifrost/runPolicy",
+        json!({
+            "documentUri": uri_for(&policy_path),
+            "evaluationDate": "2026-07-27",
+            "suppressionFile": "reviews/accepted.json",
+            "source": unsaved,
+        }),
+    );
+    assert!(suppressed["error"].is_null(), "{suppressed}");
+    assert_eq!(
+        suppressed["result"]["report"]["evaluation"]["suppression_path"],
+        "reviews/accepted.json"
+    );
+    assert_eq!(
+        suppressed["result"]["report"]["runs"][0]["findings"][0]["suppression"]["status"],
+        "accepted"
+    );
+    assert_eq!(
+        suppressed["result"]["report"]["suppressions"][0]["applied"],
+        true
+    );
+
+    let expired = server.request(
+        "bifrost/runPolicy",
+        json!({
+            "documentUri": uri_for(&policy_path),
+            "evaluationDate": "2026-07-28",
+            "suppressionFile": "reviews/accepted.json",
+            "source": unsaved,
+        }),
+    );
+    assert!(expired["error"].is_null(), "{expired}");
+    assert!(expired["result"]["report"]["runs"][0]["findings"][0]["suppression"].is_null());
+    assert_eq!(
+        expired["result"]["report"]["suppressions"][0]["temporal_state"],
+        "expired"
+    );
+
+    fs::write(&suppression_path, "{ invalid suppression json").unwrap();
+    let invalid_suppression = server.request(
+        "bifrost/runPolicy",
+        json!({
+            "documentUri": uri_for(&policy_path),
+            "evaluationDate": "2026-07-27",
+            "suppressionFile": "reviews/accepted.json",
+            "source": unsaved,
+        }),
+    );
+    assert!(
+        invalid_suppression["error"].is_null(),
+        "{invalid_suppression}"
+    );
+    assert_eq!(
+        invalid_suppression["result"]["report"]["evaluation"]["suppression_document_state"],
+        "invalid"
+    );
+    assert_eq!(
+        invalid_suppression["result"]["report"]["diagnostics"][0]["code"],
+        "suppression-load-failed"
+    );
+    assert!(
+        invalid_suppression["result"]["report"]["runs"][0]["findings"][0]["suppression"].is_null()
+    );
+
+    for invalid_params in [
+        json!({"documentUri": uri_for(&policy_path), "source": unsaved}),
+        json!({
+            "documentUri": uri_for(&policy_path),
+            "evaluationDate": "2026-02-30",
+            "source": unsaved
+        }),
+        json!({
+            "documentUri": uri_for(&policy_path),
+            "evaluationDate": "2026-07-27",
+            "suppressionFile": "../outside.json",
+            "source": unsaved
+        }),
+    ] {
+        let invalid_params = server.request("bifrost/runPolicy", invalid_params);
+        assert_eq!(invalid_params["error"]["code"], -32602, "{invalid_params}");
+    }
 
     let file_selector = server.request(
         "bifrost/runPolicy",
         json!({
             "documentUri": uri_for(&policy_path),
+            "evaluationDate": "2026-07-27",
             "source": r#"(policy
   :schema-version 1
   :id "test.file-selector"
@@ -1373,6 +1484,7 @@ export function leak_resource(): object {
         "bifrost/runPolicy",
         json!({
             "documentUri": uri_for(&policy_path),
+            "evaluationDate": "2026-07-27",
             "source": unsaved.replace("target", "missing_target"),
         }),
     );
@@ -1387,6 +1499,7 @@ export function leak_resource(): object {
         "bifrost/runPolicy",
         json!({
             "documentUri": uri_for(&policy_path),
+            "evaluationDate": "2026-07-27",
             "source": "(policy",
         }),
     );
@@ -1400,6 +1513,7 @@ export function leak_resource(): object {
         "bifrost/runPolicy",
         json!({
             "documentUri": uri_for(&policy_path),
+            "evaluationDate": "2026-07-27",
             "source": r#"(endpoint
   :id "endpoint.input"
   :name "Input"
@@ -1421,6 +1535,7 @@ export function leak_resource(): object {
         "bifrost/runPolicy",
         json!({
             "documentUri": uri_for(&policy_path),
+            "evaluationDate": "2026-07-27",
             "source": r#"(policy
   :id "test.taint"
   :name "Taint"
@@ -1453,6 +1568,7 @@ export function leak_resource(): object {
         "bifrost/runPolicy",
         json!({
             "documentUri": uri_for(&policy_path),
+            "evaluationDate": "2026-07-27",
             "source": r#"(policy
   :id "test.typestate"
   :name "Typestate"
@@ -1505,6 +1621,7 @@ export function leak_resource(): object {
         "bifrost/runPolicy",
         json!({
             "documentUri": uri_for(&root.join("app.ts")),
+            "evaluationDate": "2026-07-27",
             "source": unsaved,
         }),
     );
@@ -1526,6 +1643,7 @@ export function leak_resource(): object {
         "bifrost/runPolicy",
         json!({
             "documentUri": uri_for(&outside_policy),
+            "evaluationDate": "2026-07-27",
             "source": unsaved,
         }),
     );
@@ -1570,6 +1688,7 @@ fn bifrost_lsp_server_runs_policy_from_symlinked_workspace_uri() {
         "bifrost/runPolicy",
         json!({
             "documentUri": uri_for(&linked_root.join("policies/live.rqlp")),
+            "evaluationDate": "2026-07-27",
             "source": source,
         }),
     );
@@ -1620,7 +1739,11 @@ fn bifrost_lsp_server_derives_policy_identity_from_configured_root() {
 
     let response = server.request(
         "bifrost/runPolicy",
-        json!({"documentUri": uri_for(&policy_path), "source": source}),
+        json!({
+            "documentUri": uri_for(&policy_path),
+            "evaluationDate": "2026-07-27",
+            "source": source
+        }),
     );
 
     assert!(response["error"].is_null(), "{response}");
@@ -1673,7 +1796,11 @@ fn bifrost_lsp_server_returns_multi_root_finding_paths_in_report_coordinates() {
 
     let response = server.request(
         "bifrost/runPolicy",
-        json!({"documentUri": uri_for(&policy_path), "source": source}),
+        json!({
+            "documentUri": uri_for(&policy_path),
+            "evaluationDate": "2026-07-27",
+            "source": source
+        }),
     );
 
     assert!(response["error"].is_null(), "{response}");
@@ -1688,6 +1815,7 @@ fn bifrost_lsp_server_returns_multi_root_finding_paths_in_report_coordinates() {
         "bifrost/runPolicy",
         json!({
             "documentUri": uri_for(&policy_path),
+            "evaluationDate": "2026-07-27",
             "source": r#"(endpoint
   :id "endpoint.input"
   :name "Input"
@@ -7941,12 +8069,32 @@ fn bifrost_lsp_server_ruby_semantic_diagnostics_are_constant_only() {
 
     server.notify_value(json!({
         "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": app_uri}}
+    }));
+    let initially_published = server.read_notification("textDocument/publishDiagnostics");
+    assert!(
+        initially_published["params"]["diagnostics"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "default-off Ruby diagnostics must publish an empty report: {initially_published}"
+    );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
         "method": "workspace/didChangeConfiguration",
         "params": {"settings": {"unrecognizedSymbolDiagnostics": true}}
     }));
-    // This test has made only pull diagnostic requests. A configuration change
-    // republishes diagnostics only for documents that previously received a
-    // push diagnostic notification, so there is no notification to drain here.
+    let republished = server.read_notification("textDocument/publishDiagnostics");
+    let republished_items = republished["params"]["diagnostics"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected republished Ruby diagnostics, got {republished}"));
+    assert_eq!(
+        republished_items.len(),
+        1,
+        "expected one republished Ruby constant diagnostic: {republished_items:#?}"
+    );
+    assert_eq!(republished_items[0]["code"], "ruby_unrecognized_symbol");
 
     server.notify_value(json!({
         "jsonrpc": "2.0",

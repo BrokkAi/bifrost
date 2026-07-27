@@ -277,7 +277,12 @@ fn run_repo_writes_completed_jsonl_report_for_tiny_project() {
     assert!(record["bifrost_head"].is_string(), "{record}");
     assert!(record["report"]["summary"].is_object(), "{record}");
     assert_eq!(record["report"]["config"]["parallelism"], 2, "{record}");
-    assert!(fixture.root.join(".bifrost/bifrost_cache.db").is_file());
+    assert!(
+        fixture
+            .root
+            .join(".bifrost/cache/bifrost_cache.db")
+            .is_file()
+    );
 
     let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
     assert!(
@@ -339,7 +344,49 @@ fn run_repo_ephemeral_cache_does_not_create_persisted_database() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(fixture.output.is_file());
-    assert!(!fixture.root.join(".bifrost/bifrost_cache.db").exists());
+    assert!(
+        !fixture
+            .root
+            .join(".bifrost/cache/bifrost_cache.db")
+            .exists()
+    );
+}
+
+#[test]
+fn run_repo_cpp_reports_inverse_visibility_progress() {
+    let fixture = TinyCppRepoFixture::new("tiny__cpp");
+    let output = fixture.run(&["--cache-mode", "ephemeral"]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(
+        stderr.contains(
+            "progress phase=inverse_visibility status=started root_files=1 target_groups=2"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "progress phase=inverse_visibility status=completed root_files=1 target_groups=2"
+        ),
+        "{stderr}"
+    );
+    let started = stderr
+        .find("progress phase=inverse_visibility status=started")
+        .expect("visibility start");
+    let completed = stderr
+        .find("progress phase=inverse_visibility status=completed")
+        .expect("visibility completed");
+    let first_target = stderr
+        .find("progress phase=inverse status=started total=2 target=")
+        .expect("inverse target start");
+    assert!(started < completed, "{stderr}");
+    assert!(completed < first_target, "{stderr}");
 }
 
 #[test]
@@ -402,6 +449,56 @@ impl TinyRepoFixture {
             .arg(&self.root)
             .arg("--language")
             .arg("rust")
+            .arg("--output")
+            .arg(&self.output)
+            .args([
+                "--max-files",
+                "10",
+                "--max-sites",
+                "10",
+                "--max-targets",
+                "10",
+                "--jobs",
+                "2",
+            ])
+            .args(extra_args)
+            .output()
+            .expect("run repository differential")
+    }
+}
+
+struct TinyCppRepoFixture {
+    _temp: TempDir,
+    root: std::path::PathBuf,
+    output: std::path::PathBuf,
+}
+
+impl TinyCppRepoFixture {
+    fn new(slug: &str) -> Self {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().join(slug);
+        fs::create_dir_all(&root).expect("repo root");
+        fs::write(
+            root.join("main.cpp"),
+            "void first() {}\nvoid second() {}\nvoid consumer() { first(); second(); }\n",
+        )
+        .expect("cpp source");
+        init_repo(&root);
+        let output = temp.path().join("cpp-report.jsonl");
+        Self {
+            _temp: temp,
+            root,
+            output,
+        }
+    }
+
+    fn run(&self, extra_args: &[&str]) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_bifrost_reference_differential"))
+            .arg("run-repo")
+            .arg("--root")
+            .arg(&self.root)
+            .arg("--language")
+            .arg("cpp")
             .arg("--output")
             .arg(&self.output)
             .args([
