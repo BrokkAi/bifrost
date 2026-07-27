@@ -4,8 +4,8 @@ use std::fmt;
 use crate::analyzer::dataflow::{
     DataflowEdge, DataflowOutput, DataflowRequest, DistributiveDataflowProblem,
     ReusableProcedureSummary, ReusableSummaryProvider, SolverTermination, SummaryDataflowError,
-    SummaryDataflowResult, SummarySolveInput, SummaryWitnessError, WitnessRetentionLimits,
-    solve_with_reusable_end_summaries,
+    SummaryDataflowResult, SummaryPointSeed, SummarySolveInput, SummaryWitnessError,
+    WitnessRetentionLimits, solve_with_reusable_end_summaries,
 };
 use crate::analyzer::semantic::{
     EvidenceCompleteness, IcfgEdgeKind, IcfgProvider, ProcedureHandle, ProofStatus, SemanticBudget,
@@ -573,6 +573,16 @@ impl<'plan> TypestateFlowProblem<'plan> {
         &self,
         root: &ProcedureHandle,
     ) -> Result<(), TypestateFlowProblemError> {
+        let root_subjects = self
+            .bindings
+            .initial_seeds()
+            .iter()
+            .filter(|binding| {
+                observation_site_procedure(binding.site())
+                    .is_some_and(|procedure| procedure == root)
+            })
+            .map(|binding| binding.subject())
+            .collect::<BTreeSet<_>>();
         for binding in self.bindings.terminal_bindings() {
             let Some(terminal) = self.protocol.terminal_expectation(binding.expectation()) else {
                 return Err(TypestateFlowProblemError::InvalidFactIdentity);
@@ -580,10 +590,11 @@ impl<'plan> TypestateFlowProblem<'plan> {
             if matches!(
                 terminal.on(),
                 ProtocolTerminalObservationSpec::AnalysisRootExit { .. }
-            ) && binding
-                .site()
-                .program_point_handle()
-                .is_none_or(|point| point.procedure() != root)
+            ) && root_subjects.contains(&binding.subject())
+                && binding
+                    .site()
+                    .program_point_handle()
+                    .is_none_or(|point| point.procedure() != root)
             {
                 return Err(TypestateFlowProblemError::AnalysisRootMismatch);
             }
@@ -633,6 +644,53 @@ impl<'plan> TypestateFlowProblem<'plan> {
                 .terminal_bindings()
                 .iter()
                 .all(|binding| binding.quality().is_complete())
+    }
+
+    fn summary_point_seeds(&self, root: &ProcedureHandle) -> Vec<SummaryPointSeed<TypestateFact>> {
+        let mut seeds = Vec::new();
+        for seed in self.bindings.initial_seeds() {
+            let Some(point) = seed.site().program_point_handle() else {
+                continue;
+            };
+            if point.procedure() != root {
+                continue;
+            }
+            let fact = TypestateFact::state(self.bindings.hash(), seed.subject(), seed.state());
+            let mut facts =
+                TransferFactSet::new(self.apply_seed_quality(fact, seed.subject(), seed.quality()));
+            if point.id() == root.semantics().normal_exit_point()
+                || point.id() == root.semantics().exceptional_exit_point()
+            {
+                let output = ContinueOutput;
+                for binding in self
+                    .bindings
+                    .event_bindings_at_program_point_all_contexts(point)
+                {
+                    if exit_point_occurrence(self.protocol, binding.event(), point)
+                        && !self.apply_binding(&mut facts, binding, &output)
+                    {
+                        break;
+                    }
+                }
+                for binding in self
+                    .bindings
+                    .terminal_bindings_at_program_point_all_contexts(point)
+                {
+                    if terminal_exit_point_occurrence(self.protocol, binding, point)
+                        && !self.append_terminal_observations(&mut facts, binding, &output)
+                    {
+                        break;
+                    }
+                }
+            }
+            seeds.extend(
+                facts
+                    .into_facts()
+                    .into_iter()
+                    .map(|fact| SummaryPointSeed::new(point.clone(), fact)),
+            );
+        }
+        seeds
     }
 
     fn transfer(
@@ -867,7 +925,12 @@ impl<'plan> TypestateFlowProblem<'plan> {
         out: &dyn DataflowOutput<TypestateFact>,
     ) -> bool {
         let quality = binding.quality();
-        if self.effective_quality_is_definitive(binding.subject(), quality) {
+        // Subject uncertainty says whether the selected object is really in
+        // the policy population; it does not make an authored semantic event
+        // optional for that candidate. Initial-seed processing already marks
+        // the candidate state incomplete. Only uncertainty in the event row
+        // itself should branch or abstain instead of applying the transition.
+        if quality.is_definitive() {
             if matches!(
                 self.protocol
                     .event(binding.event())
@@ -1278,6 +1341,12 @@ impl<'plan> TypestateFlowProblem<'plan> {
     }
 }
 
+fn observation_site_procedure(site: &super::TypestateObservationSite) -> Option<&ProcedureHandle> {
+    site.program_point_handle()
+        .map(|point| point.procedure())
+        .or_else(|| site.call_site_handle().map(|call| call.procedure()))
+}
+
 /// Solve a pre-resolved typestate plan while retaining its durable identity.
 pub fn solve_typestate_with_summaries<Provider>(
     root: &ProcedureHandle,
@@ -1341,8 +1410,11 @@ where
         MAX_TYPESTATE_RETAINED_WITNESS_BYTES,
     )
     .expect("typestate best-effort witness limits are valid");
+    let point_seeds = problem.summary_point_seeds(root);
     let result = solve_with_reusable_end_summaries(
-        SummarySolveInput::new(root, entry_facts).with_witness_retention(witness_retention),
+        SummarySolveInput::new(root, entry_facts)
+            .with_point_seeds(&point_seeds)
+            .with_witness_retention(witness_retention),
         provider,
         &problem,
         reusable,
@@ -1463,6 +1535,10 @@ impl TransferFactSet {
 
     fn facts(&self) -> &BTreeSet<TypestateFact> {
         &self.facts
+    }
+
+    fn into_facts(self) -> BTreeSet<TypestateFact> {
+        self.facts
     }
 
     fn map(
@@ -1600,6 +1676,14 @@ impl TransferFactSet {
                 return false;
             }
         }
+        true
+    }
+}
+
+struct ContinueOutput;
+
+impl DataflowOutput<TypestateFact> for ContinueOutput {
+    fn emit(&mut self, _fact: TypestateFact) -> bool {
         true
     }
 }

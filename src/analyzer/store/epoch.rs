@@ -60,35 +60,37 @@ trait LanguageEpoch {
 }
 
 fn epoch_cell<L: LanguageEpoch>(ts_language: &TsLanguage) -> &'static str {
-    L::cell().get_or_init(|| {
-        let mut hasher = Sha256::new();
-        hasher.update(b"bifrost-analyzer-epoch-v2\n");
-        hasher.update(ANALYZER_VERSION.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(STORE_EPOCH_SALT.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(L::NAME.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(L::SALT.as_bytes());
-        hasher.update(b"\n");
-        hash_grammar(&mut hasher, ts_language);
-        hasher.update(b"\n");
-        for (path, contents) in EMBEDDED_QUERIES {
-            if path.starts_with(L::QUERY_DIR) {
-                hasher.update(path.as_bytes());
-                hasher.update(b"\0");
-                hasher.update(contents.as_bytes());
-                hasher.update(b"\0");
-            }
+    L::cell().get_or_init(|| compute_epoch::<L>(ts_language, L::SALT))
+}
+
+fn compute_epoch<L: LanguageEpoch>(ts_language: &TsLanguage, language_salt: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"bifrost-analyzer-epoch-v2\n");
+    hasher.update(ANALYZER_VERSION.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(STORE_EPOCH_SALT.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(L::NAME.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(language_salt.as_bytes());
+    hasher.update(b"\n");
+    hash_grammar(&mut hasher, ts_language);
+    hasher.update(b"\n");
+    for (path, contents) in EMBEDDED_QUERIES {
+        if path.starts_with(L::QUERY_DIR) {
+            hasher.update(path.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(contents.as_bytes());
+            hasher.update(b"\0");
         }
-        let digest = hasher.finalize();
-        let mut hex = String::with_capacity(digest.len() * 2);
-        for byte in digest {
-            use std::fmt::Write;
-            let _ = write!(hex, "{byte:02x}");
-        }
-        hex
-    })
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// Fingerprint a `tree_sitter::Language` so the epoch follows the
@@ -305,12 +307,24 @@ lang_epoch!(
 // `namespace {}` block now index their owner as the class-nesting chain
 // (`Outer$Inner`) instead of dropping all but the last owner segment, changing
 // persisted identities for those definitions.
+// Salt bumped again (#1208): recovered export-macro class bodies now publish
+// the declarator name of a displaced `typedef` (`BASE_CLASS`) instead of the
+// qualified aliased type's terminal (`Filter`). This changes persisted C++
+// declaration identities and must hide pre-fix parsed blobs.
 lang_epoch!(
     Cpp,
     "cpp",
     "treesitter/cpp/",
-    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07"
+    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07"
 );
+
+#[cfg(test)]
+pub(super) fn cpp_epoch_before_recovered_typedef_base() -> String {
+    compute_epoch::<Cpp>(
+        &tree_sitter_cpp::LANGUAGE.into(),
+        "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07",
+    )
+}
 // JS/TS salts bumped: anonymous `export default` expressions/declarations now
 // emit a synthetic `default` code unit, changing each file's persisted unit set.
 // JS salt bumped again (#1167): a `<ns>.object({...})` schema-builder call

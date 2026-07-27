@@ -179,9 +179,12 @@ fn documented_match_policy_executes_and_future_analysis_boundary_is_explicit() {
     let unsupported_sentence = "evaluation reports `unsupported` until [#824](https://github.com/BrokkAi/bifrost/issues/824)";
     assert_eq!(
         docs.matches(unsupported_sentence).count(),
-        2,
-        "taint and typestate rows must both state the #824 execution boundary"
+        1,
+        "only the taint row should retain the #824 unsupported boundary"
     );
+    assert!(docs.contains(
+        "Executes query-local semantic bindings and emits production findings with stable identity"
+    ));
     const REACHABILITY_WARNING: &str = "> **Important:** An RQL selector returns analysis candidates. An endpoint\n\
 > selector match is diagnostic-neutral. Neither an endpoint match nor the\n\
 > co-presence of a source and sink proves reachability, and neither creates a\n\

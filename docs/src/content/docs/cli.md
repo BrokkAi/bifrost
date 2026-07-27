@@ -30,11 +30,10 @@ A saved query may select planning-only explain or measured profile mode with `(e
 
 ## Static-Analysis Policies
 
-> **Warning — only code matching is implemented:** Policy execution currently
-> supports only analyses with `:type match`. Taint-analysis and
-> typestate-analysis policies can be parsed, validated, and composed, but their
-> analyzers are not implemented yet. Running either type reports `unsupported`
-> and exits with status 2.
+> **Current execution boundary:** Policy execution supports analyses with
+> `:type match` and `:type typestate`. Taint-analysis policies can be parsed,
+> validated, and composed, but taint evaluation is not implemented yet.
+> Running taint reports `unsupported` and exits with status 2.
 
 Run one or more workspace-relative `.rqlp` policy roots and emit one combined
 canonical report:
@@ -109,10 +108,12 @@ run. `--require-explicit-schema-versions` rejects compatible inference for the
 root and every loaded endpoint or RQL dependency. Omitted versions otherwise
 select only the newest compiled-in compatible lineage.
 
-Only `match` evaluation is available now. `taint` and `typestate` policies
-parse, validate, and compose, but running them emits an `unsupported` policy
-completion and exits 2 until [#824](https://github.com/BrokkAi/bifrost/issues/824)
-provides the semantic compiler/adapter. See [Static-Analysis
+`match` and query-local `typestate` evaluation are available now. Typestate
+compiles resolved subject/event selectors into the semantic protocol engine and
+preserves finding identity, locations, witnesses, and completeness across all
+three report formats. `taint` policies still emit an `unsupported` completion
+and exit 2 until the remaining [#824](https://github.com/BrokkAi/bifrost/issues/824)
+flow adapter lands. See [Static-Analysis
 Policies](/static-analysis-policies/) for syntax, endpoint composition,
 completeness, finding identity, and CVSS rules.
 

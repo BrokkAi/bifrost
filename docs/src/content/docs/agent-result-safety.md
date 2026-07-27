@@ -20,7 +20,7 @@ Never claim **all** or **none** unless every relevant check below passes:
 | Proof tier | The claim distinguishes `proven` from `unproven` graph edges | Describe unproven rows as possible candidates or exclude them explicitly. |
 | Provenance | Every result used for a path claim has `provenance_truncated != true` | Cite the retained paths only; do not claim every derivation is present. |
 | Receiver outcome | Every `receiver_analysis` row used by the claim has the required `outcome`; unsupported/budget rows and candidate truncation are absent | Preserve unknown/unsupported/ambiguous states, narrow the query, or avoid the claim. |
-| Analysis boundary | The claim does not require unsupported path-sensitive control flow, whole-program points-to, general alias sets, or taint/typestate evaluation (unsupported until #824) | Restate the narrower structural/graph/receiver fact or use another analyzer. |
+| Analysis boundary | The claim stays within supported structural/graph analysis or a configured query-local typestate policy; it does not require unsupported whole-program points-to, general alias sets, taint evaluation, or unmodeled flow semantics | Restate the narrower fact, inspect typestate completeness/uncertainty, or use another analyzer. |
 
 An empty `results` array is only a zero-result inside the query's actual workspace, language/path filters, supported capabilities, and execution budgets. It is never proof about files outside the index, unindexed external declarations, unsupported syntax roles, or possible runtime behavior that static resolution does not model.
 

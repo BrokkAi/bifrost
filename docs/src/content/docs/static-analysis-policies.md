@@ -9,12 +9,10 @@ and completeness semantics around native [Rune Query Language
 (RQL)](/rune-query-language/) selectors. JSON is available as a normalized or
 reporting form, but it is not an alternate RQLP authoring syntax.
 
-> **Warning — only code matching is implemented:** Bifrost currently executes
-> only policies whose analysis has `:type match`. Taint-analysis and
-> typestate-analysis policies can be authored, parsed, validated, and composed,
-> but their analyzers are not implemented yet. Running either type reports an
-> `unsupported` completion and exits with status 2; accepted syntax must not be
-> interpreted as an enforced taint or typestate result.
+> **Current execution boundary:** Bifrost executes match- and
+> typestate-analysis policies. Taint-analysis policies can be authored, parsed,
+> validated, and composed, but their evaluator is not implemented yet. Running
+> taint reports an `unsupported` completion and exits with status 2.
 
 > **Important:** An RQL selector returns analysis candidates. An endpoint
 > selector match is diagnostic-neutral. Neither an endpoint match nor the
@@ -203,7 +201,7 @@ source/sink leaves should normally use endpoint documents.
 | --- | --- | --- |
 | `match` | One inline or file-backed RQL selector returning supported, location-bearing terminal results. | Executable. |
 | `taint` | Set-oriented sources, sinks, sanitizers, transforms, external models, and optional finding combinations. | Parses, validates, and composes; evaluation reports `unsupported` until [#824](https://github.com/BrokkAi/bifrost/issues/824). |
-| `typestate` | Tracked subjects, typed events, deterministic transitions, uncertainty rules, and terminal expectations. | Parses, validates, and composes; evaluation reports `unsupported` until [#824](https://github.com/BrokkAi/bifrost/issues/824). |
+| `typestate` | Tracked subjects, typed events, deterministic transitions, uncertainty rules, and terminal expectations. | Executes query-local semantic bindings and emits production findings with stable identity, primary/related locations, bounded witnesses, and completeness metadata. |
 
 ### Taint: broad libraries, specific findings
 
@@ -516,9 +514,11 @@ from that set. The CLI does not guess paths or scan ambient directories.
 `--fail-on` accepts `never`, `finding`, `note`, `warning` (the default), or
 `error`; `finding` includes unrated findings. It changes only the complete-run
 finding threshold. It cannot turn an invalid, incomplete, cancelled, or
-unsupported run into status 0. Today, running a taint or typestate policy emits
-a retained report with an `unsupported` completion and exits 2 until #824
-provides the semantic compiler/adapter.
+unsupported run into status 0. Today, running a taint policy emits a retained
+report with an `unsupported` completion and exits 2 until #824 completes the
+flow adapter. Typestate policies execute; cancellation, budgets, incomplete
+selector discovery, semantic uncertainty, and witness truncation remain visible
+in run/finding completeness instead of becoming clean zero-results.
 
 See [CLI](/cli/#static-analysis-policies) for option interactions and
 [Reproduce an Analysis](/reproduce-analysis/) for the artifacts to preserve.

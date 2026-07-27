@@ -237,28 +237,80 @@ comes through the local gate, but is not the focus.
   The authoritative explicit C++ top-ten replay completed all ten envelopes
   in 233.6 seconds with one shared fingerprint, clean pinned heads, no file
   errors, and no candidate-limit escapes.
-- [ ] (2026-07-27) Exhaustively disposition the clean-head C++ replay's 444
-  residual missing rows: ESPHome 2, LMCache 11, Qpid 73, CIRCL 4, libzmq 7,
-  log4cxx 302, and CCache 45; Blosc, libcbor, and the selector-faithful
-  zero-eligible qs envelope are clean. The raw report and checksummed ledger
-  are `/mnt/optane/tmp/bifrost-fird/cpp-task-top10-af0968fa.jsonl` and
+- [x] (2026-07-27) Exhaustively dispositioned the clean-head C++ replay's 444
+  residual missing rows and reduced its remaining legitimate gap to recovered
+  typedef-base qualifier resolution, tracked as #1208. The raw report and
+  checksummed ledger remain historical reduction evidence at
+  `/mnt/optane/tmp/bifrost-fird/cpp-task-top10-af0968fa.jsonl` and
   `/mnt/optane/tmp/bifrost-fird/cpp-task-top10-af0968fa-missing.tsv`.
-- [ ] (2026-07-27) Assigned C++ follow-up #1208 to `jbellis` before changing
+- [x] (2026-07-27) Assigned C++ follow-up #1208 to `jbellis` before changing
   code. Its two exact log4cxx witnesses expose one root cause: tree-sitter
   recovers `typedef spi::Filter BASE_CLASS;` inside an export-macro class as a
   qualified declarator plus a displaced `ERROR` identifier, so declaration
   extraction published the false nested alias `LevelRangeFilter$Filter`.
-  The reviewed candidate now recovers `BASE_CLASS` structurally and resolves a
+  The reviewed fix recovers `BASE_CLASS` structurally and resolves a
   qualified inherited injected-class name through the nearest unambiguous base
   tier. A negative regression prevents that best-effort path from overriding a
-  nearer lexical type alias. Focused production witnesses are consistent, the
-  complete C++ and differential integration targets pass, formatting and
-  all-target/all-feature Clippy are clean, and the full `nlp,python` matrix is
-  running outside the sandbox at niceness 10 with the normal Cargo target. The
-  release runner rebuilt from the final candidate and reproduced both exact
-  witnesses with zero actionable discrepancy; the level-range and string-match
-  JSONL SHA-256 values are respectively `e4f5fe02673bfca0` and
-  `410637db4b26dfa3`.
+  nearer lexical type alias. Commit `c53d3b9c` passed formatting,
+  all-target/all-feature Clippy, all 161 C++ usage tests, the differential
+  target, and the complete `nlp,python` matrix; merge head `8d62804b` was
+  pushed directly to `origin/master` and #1208 closed. Clean-head exact
+  witnesses are consistent at both production sites. Their JSONL SHA-256
+  values are `cbe3c35d9a8854e9777fffc50374c07e937e9341b11617f423ca3954fd7943ff`
+  and `d3235279aa764e0a515ce9ec1cc74e0270ef61173b4f2596625478eb354ea60a`.
+- [x] (2026-07-27) The post-#1208 C++ top-ten replay at clean
+  head `8d62804b` completed all ten task-selected envelopes in 1:49:05 at
+  niceness 10. All records have clean Bifrost and corpus heads, no file errors,
+  no candidate-limit escapes, and one shared fingerprint. Raw missing fell
+  from 444 to 152: LMCache 9, Qpid 32, CIRCL 4, libzmq 5, log4cxx 92, and
+  CCache 10; ESPHome, Blosc, libcbor, and the selector-faithful zero-eligible
+  qs envelope have zero. ESPHome and Qpid alone reached the deliberate
+  1,000-target ceiling. The raw report and generated ledger are
+  `/mnt/optane/tmp/bifrost-fird/cpp-task-top10-8d62804b.jsonl` and
+  `/mnt/optane/tmp/bifrost-fird/cpp-task-top10-8d62804b-missing.tsv`, with
+  SHA-256 values `a971c2bbdad85dd5c3228c1e4cda9d207a6349f9d05a93c4ff73ac274af6fe1b`
+  and `32f3a55dfa2a1b1427a3e7b26cd7da6ef54dafb82079da9c5020e18f37860c45`.
+  This is complete historical evidence but not an acceptance artifact: an
+  exact log4cxx range resolved correctly in same-head ephemeral mode while the
+  persisted envelope returned the pre-#1208 synthetic declaration identity.
+- [x] (2026-07-27) Reopened assigned issue #1208 after proving the persisted
+  C++ epoch still accepted pre-fix parsed blobs. Added a C++-scoped epoch salt
+  for the recovered typedef-base identity change and an exact store regression
+  that reconstructs the previously accepted corpus epoch
+  `098fd5644803843b42c6da3dea0ddea7f5036faf404414d146a9021ed6d265f9`,
+  writes a parsed blob under it, switches through the public current-epoch
+  path, and proves the stale blob is invisible. An independent Oldskool review
+  found no actionable issue. Formatting, all-target/all-feature Clippy, the
+  focused regression, and the complete `cargo test --features nlp,python`
+  matrix are green outside the sandbox at niceness 10 with the normal Cargo
+  target; the matrix skipped only the separately known hanging Ruby LSP test.
+- [x] (2026-07-27) Merged current `origin/master` at `a913c29c` into the
+  epoch-correction checkpoint as `7591e788`. The post-merge full matrix then
+  reproduced the watcher single-flight regression's five-second callback
+  timeout twice under suite load even though the exact test passed in 0.07
+  seconds. After searching the complete issue tracker, created and assigned
+  `FIRD:` issue #1211 to `jbellis` before editing. An Oldskool diagnosis and
+  implementation review confirmed that the timeout covered synchronous
+  persisted-workspace construction, not just watcher publication, so the test
+  now uses an explicit 30-second bounded hang watchdog instead of an accidental
+  five-second performance contract. The exact regression and the complete
+  `cargo test --features nlp,python` matrix pass outside the sandbox at
+  niceness 10 with normal Cargo storage.
+- [x] (2026-07-27) Committed #1211 as `4b43b528`, fetched the concurrently
+  advanced `origin/master` at `85771d08`, and merged its C++ reconciliation
+  and symbols-search changes as `c4d871a4`. A delegated Oldskool overlap audit
+  confirmed that the new C++ reconciliation is a separate resolution-time
+  overlay: the #1208 parser identity fix, C++ epoch salt, reconstructed prior
+  epoch, and exact log4cxx regression all remain intact. On that integrated
+  head, formatting, `git diff --check`, all-target/all-feature Clippy, and the
+  complete `cargo test --features nlp,python` matrix pass outside the sandbox
+  with normal Cargo storage at niceness 10. The matrix passed 1,964 substantive
+  library tests, 194 LSP tests with the separately known Ruby hang filtered,
+  28 MCP tests, all 161 C++ usage tests, the exact #1208 differential
+  regression, and doc tests.
+- [ ] Publish the #1208 epoch correction, rebuild from the exact integrated
+  head, and rerun the complete persisted C++ top ten from the new epoch before
+  treating any of the 152 prior rows as current defects.
 - [ ] Complete C++ and publish its evidence and user summary.
 - [ ] Complete C# and publish its evidence and user summary.
 - [ ] Complete Go and publish its evidence and user summary.
@@ -385,6 +437,21 @@ comes through the local gate, but is not the focus.
   this at the admission boundary with one weakly retained mutex per canonical
   cache path; SQLite transactions still provide cross-process correctness.
 
+- A clean Bifrost Git head is not sufficient when a language-specific semantic
+  change fails to advance that language's analysis epoch. The post-#1208
+  persisted log4cxx envelope reused declaration rows whose accepted C++ epoch
+  was `098fd5644803843b42c6da3dea0ddea7f5036faf404414d146a9021ed6d265f9`;
+  an ephemeral run over the identical file and byte range produced the correct
+  `LOG4CXX_NS::spi.Filter` identity. Therefore all 152 residual rows from that
+  envelope are untrusted until a new C++ epoch forces a full persisted rebuild.
+
+- The watcher single-flight regression's old five-second receive timeout
+  begins before persisted workspace construction, while its callback is
+  deliberately blocked to test publication. Under the complete library suite,
+  construction alone can exceed five seconds even though an isolated run takes
+  0.07 seconds. A longer named watchdog preserves deadlock detection without
+  asserting a performance guarantee that the test does not measure.
+
 ## Decision Log
 
 - Decision: Use the live `SFT_PREDICATES` selector and stable descending task
@@ -448,6 +515,23 @@ comes through the local gate, but is not the focus.
   target-specific resolution; and the decisive unfiltered libgit2 replay
   completed every target with exact accounting and zero missing rows.
   Date/Author: 2026-07-25 / Codex
+
+- Decision: Invalidate the persisted C++ analysis generation for #1208 and
+  discard the 152-row post-fix replay as acceptance evidence.
+  Rationale: Same-head persisted and ephemeral queries disagree at the exact
+  log4cxx witness because the cache still contains the old fabricated
+  `LevelRangeFilter$Filter` declaration. Auditing or fixing those rows before a
+  language-epoch cutover would turn stale cache artifacts into false product
+  work.
+  Date/Author: 2026-07-27 / Codex
+
+- Decision: Retain a bounded watcher-startup watchdog for #1211 but raise it
+  from five to thirty seconds and name its purpose in the test.
+  Rationale: The assertion still detects a failure to publish the one
+  single-flight startup outcome, while no longer conflating full-suite
+  persisted workspace construction time with the concurrency contract under
+  test.
+  Date/Author: 2026-07-27 / Codex
 
 ## Outcomes & Retrospective
 

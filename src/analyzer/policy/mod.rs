@@ -24,6 +24,7 @@ mod resolved;
 mod retained;
 pub mod schema;
 mod source;
+mod typestate_policy;
 
 #[cfg(test)]
 mod adapter_seam_tests;

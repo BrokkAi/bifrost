@@ -12,7 +12,7 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 
 use crate::CancellationToken;
-use crate::analyzer::{AnalyzerConfig, FilesystemProject, IAnalyzer, Project, WorkspaceAnalyzer};
+use crate::analyzer::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
 use crate::schema_version::SchemaVersionOrigin;
 use crate::workspace_document::WorkspaceRoot;
 
@@ -37,6 +37,7 @@ use super::source::{
     PolicySourceDiagnostic, PolicySourceIdentity, PolicySourceIdentityError,
     PolicySourceRelatedDiagnostic, parse_rqlp_source, validate_policy_source_identity,
 };
+use super::typestate_policy::ProductionTypestatePolicyEvaluator;
 use super::{PolicyBatchBudget, PolicyBudget};
 
 pub const POLICY_EXIT_CLEAN: u8 = 0;
@@ -164,7 +165,7 @@ pub fn evaluate_policy_source(
     root: impl AsRef<Path>,
     source_identity: PolicySourceIdentity,
     source: &str,
-    analyzer: &dyn IAnalyzer,
+    workspace: &WorkspaceAnalyzer,
     cancellation: Option<&CancellationToken>,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
     let (root, _) = open_policy_workspace_root(root.as_ref())?;
@@ -177,7 +178,7 @@ pub fn evaluate_policy_source(
         PolicyFailOn::Never,
         PolicyBatchBudget::default(),
         PolicyRegistryLimits::default(),
-        Some(analyzer),
+        Some(workspace),
         cancellation,
     )
 }
@@ -230,7 +231,7 @@ fn evaluate_policy_inputs(
     fail_on: PolicyFailOn,
     batch_budget: PolicyBatchBudget,
     registry_limits: PolicyRegistryLimits,
-    supplied_analyzer: Option<&dyn IAnalyzer>,
+    supplied_workspace: Option<&WorkspaceAnalyzer>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
     check_policy_cancellation(cancellation)?;
@@ -319,7 +320,7 @@ fn evaluate_policy_inputs(
         })
         .collect::<HashSet<_>>();
 
-    let owned_analyzer = if runnable_ids.is_empty() || supplied_analyzer.is_some() {
+    let owned_analyzer = if runnable_ids.is_empty() || supplied_workspace.is_some() {
         None
     } else {
         let project = FilesystemProject::new(root).map_err(|error| {
@@ -333,10 +334,10 @@ fn evaluate_policy_inputs(
     };
     check_policy_cancellation(cancellation)?;
 
-    let evaluator = DefaultPolicyEvaluator::new();
+    let typestate = ProductionTypestatePolicyEvaluator::default();
+    let evaluator = DefaultPolicyEvaluator::new().with_typestate(&typestate);
     let mut runs = HashMap::with_capacity(runnable_ids.len());
-    let analyzer =
-        supplied_analyzer.or_else(|| owned_analyzer.as_ref().map(WorkspaceAnalyzer::analyzer));
+    let workspace = supplied_workspace.or(owned_analyzer.as_ref());
     for policy in registry
         .policies()
         .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id))
@@ -344,12 +345,13 @@ fn evaluate_policy_inputs(
         check_policy_cancellation(cancellation)?;
         let mut evaluation_budget = *batch_budget.per_policy();
         let context = PolicyEvaluationContext {
-            analyzer: analyzer.ok_or_else(|| {
+            analyzer: workspace.map(WorkspaceAnalyzer::analyzer).ok_or_else(|| {
                 PolicyCoordinatorError::new(format!(
                     "runnable policy `{}` has no analyzer snapshot",
                     policy.definition().metadata.id
                 ))
             })?,
+            workspace,
             cancellation,
             cvss_overlays: &[],
             organizational_risk: &[],
@@ -1063,7 +1065,7 @@ mod tests {
             workspace.path(),
             PolicySourceIdentity::new("policies/live.rqlp"),
             &live_source,
-            analyzer.analyzer(),
+            &analyzer,
             None,
         )
         .expect("live policy report");
@@ -1109,7 +1111,7 @@ mod tests {
             workspace.path(),
             PolicySourceIdentity::new("policies/input.rqlp"),
             endpoint,
-            analyzer.analyzer(),
+            &analyzer,
             None,
         )
         .expect("endpoint diagnostic report");
@@ -1145,7 +1147,7 @@ mod tests {
             workspace.path(),
             PolicySourceIdentity::new("policies/live.rqlp"),
             &match_policy("test.cancelled", "Cancelled"),
-            analyzer.analyzer(),
+            &analyzer,
             Some(&cancellation),
         );
         let Err(error) = result else {

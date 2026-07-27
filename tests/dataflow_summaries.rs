@@ -10,9 +10,10 @@ use brokk_bifrost::analyzer::dataflow::{
     DistributiveDataflowProblem, PathQuality, ReusableEndSummary, ReusableProcedureSummary,
     ReusableReachedFact, ReusableSummaryProvider, SolverBudget, SolverBudgetDimension,
     SolverTermination, SolverWork, SummaryBoundaryKind, SummaryDataflowError,
-    SummaryDataflowResult, SummaryReachedFact, SummarySemanticStatus, SummarySolveInput,
-    SummaryWitness, SummaryWitnessError, SummaryWitnessStepKind, WitnessReconstructionLimits,
-    WitnessRetentionLimits, solve_with_reusable_end_summaries, solve_with_summaries,
+    SummaryDataflowResult, SummaryPointSeed, SummaryReachedFact, SummarySemanticStatus,
+    SummarySolveInput, SummaryWitness, SummaryWitnessError, SummaryWitnessStepKind,
+    WitnessReconstructionLimits, WitnessRetentionLimits, solve_with_reusable_end_summaries,
+    solve_with_summaries,
 };
 use brokk_bifrost::analyzer::semantic::{
     CallBoundary, CallSiteHandle, CallSiteId, CallTransferSet, CancellationToken,
@@ -2948,6 +2949,156 @@ fn duplicate_root_inputs_are_bounded_before_seed_scratch_can_grow() {
         result.facts().is_empty(),
         "failed root admission must remain atomic",
     );
+}
+
+#[test]
+fn point_seed_starts_at_its_observation_and_reconstructs_from_that_site() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", "pub fn root() -> i32 { let value = 1; value }\n")
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let root = resolve_procedure_handle(
+        &project,
+        &analyzer,
+        "lib.rs",
+        PointSelector::new("pub fn root")
+            .procedure("root")
+            .effect("entry"),
+    );
+    let point = root
+        .semantics()
+        .points()
+        .iter()
+        .find(|point| {
+            point.id != root.semantics().entry_point()
+                && point.id != root.semantics().normal_exit_point()
+                && point.id != root.semantics().exceptional_exit_point()
+        })
+        .and_then(|point| root.point_handle(point.id))
+        .expect("fixture has one local observation point");
+    let seeds = [SummaryPointSeed::new(point.clone(), MarkerFact::Seed)];
+    let cancellation = CancellationToken::default();
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let result = solve_with_summaries(
+        SummarySolveInput::new(&root, &[])
+            .with_point_seeds(&seeds)
+            .with_witness_retention(WitnessRetentionLimits::new(2).unwrap()),
+        &analyzer.icfg_provider(),
+        &MarkerProblem,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .expect("valid point-seeded summary solve");
+
+    let reached = reached_fact(&result, &point, MarkerFact::Seed);
+    let witness = result
+        .witness_for_reached(
+            reached,
+            PathQuality::PROVEN_COMPLETE,
+            WitnessReconstructionLimits::default(),
+        )
+        .expect("point seed retains a reconstructable witness");
+    let first = witness.steps().first().expect("seed witness has one step");
+    assert_eq!(first.kind(), SummaryWitnessStepKind::Seed);
+    assert_eq!(first.source(), &point);
+    assert_all_retained_witnesses_reconstruct(&result);
+}
+
+#[test]
+fn point_seed_does_not_activate_at_an_unreachable_observation() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            "pub fn root() -> i32 { return 1; let unreachable = 2; unreachable }\n",
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let root = resolve_procedure_handle(
+        &project,
+        &analyzer,
+        "lib.rs",
+        PointSelector::new("pub fn root")
+            .procedure("root")
+            .effect("entry"),
+    );
+    let point = root
+        .semantics()
+        .points()
+        .iter()
+        .filter(|point| {
+            point.id != root.semantics().entry_point()
+                && point.id != root.semantics().normal_exit_point()
+                && point.id != root.semantics().exceptional_exit_point()
+        })
+        .filter_map(|point| root.point_handle(point.id))
+        .find(|point| {
+            root.semantics()
+                .point(point.id())
+                .and_then(|semantic_point| root.semantics().source_mapping(semantic_point.source))
+                .is_some_and(|mapping| mapping.locator.anchor().span().start_byte() >= 33)
+        })
+        .expect("fixture retains an unreachable local observation point");
+    let seeds = [SummaryPointSeed::new(point.clone(), MarkerFact::Seed)];
+    let cancellation = CancellationToken::default();
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let result = solve_with_summaries(
+        SummarySolveInput::new(&root, &[]).with_point_seeds(&seeds),
+        &analyzer.icfg_provider(),
+        &MarkerProblem,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .expect("valid point-seeded summary solve");
+
+    assert!(
+        result
+            .reached_at(&point)
+            .all(|reached| result.fact(reached.fact()).copied() != Some(MarkerFact::Seed)),
+        "a point seed must not manufacture reachability to a disconnected observation",
+    );
+}
+
+#[test]
+fn point_seed_outside_the_root_fails_closed() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", "pub fn root() {}\npub fn foreign() {}\n")
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let root = resolve_procedure_handle(
+        &project,
+        &analyzer,
+        "lib.rs",
+        PointSelector::new("pub fn root")
+            .procedure("root")
+            .effect("entry"),
+    );
+    let foreign = resolve_procedure_handle(
+        &project,
+        &analyzer,
+        "lib.rs",
+        PointSelector::new("pub fn foreign")
+            .procedure("foreign")
+            .effect("entry"),
+    );
+    let foreign_point = foreign
+        .point_handle(foreign.semantics().entry_point())
+        .expect("foreign entry point");
+    let seeds = [SummaryPointSeed::new(foreign_point, MarkerFact::Seed)];
+    let cancellation = CancellationToken::default();
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let error = solve_with_summaries(
+        SummarySolveInput::new(&root, &[]).with_point_seeds(&seeds),
+        &analyzer.icfg_provider(),
+        &MarkerProblem,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .expect_err("foreign point seed must fail closed");
+
+    assert_eq!(error, SummaryDataflowError::PointSeedOutsideRoot);
 }
 
 #[test]

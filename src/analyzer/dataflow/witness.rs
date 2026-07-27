@@ -1355,15 +1355,20 @@ impl WitnessStore {
                             .count();
                         break;
                     }
-                    if steps.is_empty()
-                        && (!matches!(step.kind(), SummaryWitnessStepKind::Seed)
-                            || step.source() != target.entry_point()
-                            || step.input_fact() != target.entry_fact()
-                            || step.output_fact() != target.entry_fact())
-                    {
-                        return Err(SummaryWitnessError::InvalidEvidence(
-                            "witness does not begin at the requested entry and fact",
-                        ));
+                    if steps.is_empty() {
+                        let fact_is_stable = step.input_fact() == step.output_fact();
+                        let root_entry_seed = step.source() == target.entry_point()
+                            && step.input_fact() == target.entry_fact();
+                        let explicit_point_seed = target.entry_fact().get() == 0
+                            && step.source().procedure() == target.entry_point().procedure();
+                        if !matches!(step.kind(), SummaryWitnessStepKind::Seed)
+                            || !fact_is_stable
+                            || (!root_entry_seed && !explicit_point_seed)
+                        {
+                            return Err(SummaryWitnessError::InvalidEvidence(
+                                "witness does not begin at the requested entry relation",
+                            ));
+                        }
                     }
                     steps.push(step);
                 }

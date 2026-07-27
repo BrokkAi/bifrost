@@ -617,20 +617,21 @@ fn public_finding_kind(
     kind: &TypestateFindingKind,
 ) -> CodeQueryTypestateFindingKind {
     match kind {
-        TypestateFindingKind::ErrorTransition { event, from, to } => {
-            CodeQueryTypestateFindingKind::ErrorTransition {
-                event: protocol
-                    .event(*event)
-                    .expect("validated finding event resolves")
-                    .key()
-                    .to_string(),
-                from_state: state_key(protocol, *from),
-                to_state: state_key(protocol, *to),
-            }
-        }
+        TypestateFindingKind::ErrorTransition {
+            event, from, to, ..
+        } => CodeQueryTypestateFindingKind::ErrorTransition {
+            event: protocol
+                .event(*event)
+                .expect("validated finding event resolves")
+                .key()
+                .to_string(),
+            from_state: state_key(protocol, *from),
+            to_state: state_key(protocol, *to),
+        },
         TypestateFindingKind::TerminalExpectation {
             expectation,
             actual_states,
+            ..
         } => CodeQueryTypestateFindingKind::TerminalExpectation {
             expectation: protocol
                 .terminal_expectation(*expectation)
