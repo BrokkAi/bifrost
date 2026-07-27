@@ -1453,6 +1453,33 @@ mod tests {
         run_reference_differential(workspace.analyzer(), &config).expect("run audit")
     }
 
+    fn exact_cpp_site_report(
+        root: &Path,
+        path: &str,
+        start_byte: usize,
+    ) -> ReferenceDifferentialReport {
+        let project = Arc::new(TestProject::new(root, Language::Cpp));
+        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let config = ReferenceDifferentialConfig {
+            corpus_language: "cpp".to_string(),
+            max_files: 10,
+            max_sites: 100,
+            max_candidates_per_file: 100,
+            max_source_bytes: 10_000,
+            max_targets: 100,
+            max_usage_files: 10,
+            max_usages: 100,
+            exact_site: Some(ExactReferenceSite {
+                path: path.to_string(),
+                start_byte,
+                end_byte: None,
+            }),
+            ..ReferenceDifferentialConfig::default()
+        };
+
+        run_reference_differential(workspace.analyzer(), &config).expect("run audit")
+    }
+
     #[test]
     fn corpus_language_references_round_trip_through_forward_and_inverse_resolution() {
         let fixtures = [
@@ -2755,5 +2782,222 @@ public sealed class Model {
             "{report:#?}"
         );
         assert!(report.sites.iter().all(|site| site.text != "payload"));
+    }
+
+    #[test]
+    fn cpp_exact_site_matches_qualified_direct_temporary_type_with_multi_physical_targets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        fs::create_dir_all(root.join("proton/codec")).expect("codec dir");
+        fs::create_dir_all(root.join("proton/internal")).expect("internal dir");
+        fs::write(
+            root.join("proton/types_fwd.hpp"),
+            "namespace proton {\nclass value;\n}\n",
+        )
+        .expect("types fwd");
+        fs::write(
+            root.join("proton/internal/data.hpp"),
+            "#include \"../types_fwd.hpp\"\nnamespace proton {\nclass value;\n}\n",
+        )
+        .expect("data header");
+        fs::write(
+            root.join("proton/codec/decoder.hpp"),
+            "#include \"../types_fwd.hpp\"\nnamespace proton {\nclass value;\n}\n",
+        )
+        .expect("decoder header");
+        fs::write(
+            root.join("proton/value.hpp"),
+            concat!(
+                "#ifndef PROTON_VALUE_HPP\n",
+                "#define PROTON_VALUE_HPP\n",
+                "#include \"types_fwd.hpp\"\n",
+                "namespace proton {\n",
+                "namespace internal {\n",
+                "class value_base {};\n",
+                "template <class T> class comparable {};\n",
+                "}\n",
+                "namespace codec { template <class T> struct is_encodable {}; }\n",
+                "class value : public internal::value_base, private internal::comparable<value> {\n",
+                "private:\n",
+                "    template <class T, class U = void> struct assignable :\n",
+                "        public std::enable_if<codec::is_encodable<T>::value, U> {};\n",
+                "    template <class U> struct assignable<value, U> {};\n",
+                "public:\n",
+                "    PN_CPP_EXTERN value();\n",
+                "    PN_CPP_EXTERN value(const value&);\n",
+                "    PN_CPP_EXTERN value& operator=(const value&);\n",
+                "    PN_CPP_EXTERN value(value&&);\n",
+                "    PN_CPP_EXTERN value& operator=(value&&);\n",
+                "    template <class T> value(const T& x, typename assignable<T>::type* = 0) { *this = x; }\n",
+                "    template <class T> typename assignable<T, value&>::type operator=(const T& x) {\n",
+                "        return *this;\n",
+                "    }\n",
+                "    PN_CPP_EXTERN type_id type() const;\n",
+                "    PN_CPP_EXTERN bool empty() const;\n",
+                "    PN_CPP_EXTERN void clear();\n",
+                "    template <class T> PN_CPP_DEPRECATED(\"Use proton::get\") void get(T&) const;\n",
+                "    template <class T> PN_CPP_DEPRECATED(\"Use proton::get\") T get() const;\n",
+                "    friend PN_CPP_EXTERN void swap(value&, value&);\n",
+                "    friend PN_CPP_EXTERN bool operator==(const value&, const value&);\n",
+                "    friend PN_CPP_EXTERN bool operator<(const value&, const value&);\n",
+                "    friend PN_CPP_EXTERN std::ostream& operator<<(std::ostream&, const value&);\n",
+                "    value(pn_data_t* d);\n",
+                "    void reset(pn_data_t* d = 0);\n",
+                "};\n",
+                "}\n",
+                "#endif\n",
+            ),
+        )
+        .expect("macro-decorated value definition");
+        fs::write(
+            root.join("proton/types.hpp"),
+            "#include \"types_fwd.hpp\"\n#include \"value.hpp\"\n",
+        )
+        .expect("types header");
+        let consumer = concat!(
+            "#include <vector>\n",
+            "#include \"proton/types.hpp\"\n",
+            "#include \"proton/codec/decoder.hpp\"\n",
+            "#include \"proton/internal/data.hpp\"\n",
+            "\n",
+            "namespace other {\n",
+            "class value {\n",
+            "public:\n",
+            "    explicit value(char c) {}\n",
+            "};\n",
+            "}\n",
+            "\n",
+            "void encode_decode() {\n",
+            "    std::vector<proton::value> vv;\n",
+            "    vv.push_back(proton::value(\"c\"));\n",
+            "}\n",
+            "void negative_wrong_namespace() {\n",
+            "    other::value wrong('x');\n",
+            "    (void)wrong;\n",
+            "}\n",
+        );
+        fs::write(root.join("encode_decode.cpp"), consumer).expect("consumer");
+        let exact_site = consumer
+            .find("proton::value(\"c\")")
+            .expect("qualified temporary")
+            + "proton::".len();
+
+        let report = exact_cpp_site_report(&root, "encode_decode.cpp", exact_site);
+
+        assert_eq!(report.summary.sampled_sites, 1, "{report:#?}");
+        let site = &report.sites[0];
+        assert_eq!(site.path, "encode_decode.cpp");
+        assert_eq!(site.forward_status, "resolved", "{site:#?}");
+        assert_eq!(
+            site.classification,
+            ReferenceClassification::Consistent,
+            "{site:#?}"
+        );
+        assert!(
+            site.targets
+                .iter()
+                .all(|target| target.fq_name == "proton.value" && target.kind == "class"),
+            "{site:#?}"
+        );
+        assert!(
+            site.targets
+                .iter()
+                .any(|target| target.path == "proton/types_fwd.hpp"),
+            "{site:#?}"
+        );
+        assert!(
+            site.targets
+                .iter()
+                .any(|target| target.path == "proton/internal/data.hpp"),
+            "{site:#?}"
+        );
+        assert!(
+            site.targets
+                .iter()
+                .any(|target| target.path == "proton/codec/decoder.hpp"),
+            "{site:#?}"
+        );
+        assert_eq!(
+            site.inverse_hit.as_ref().map(|hit| hit.path.as_str()),
+            Some("encode_decode.cpp"),
+            "{site:#?}"
+        );
+        assert_eq!(
+            site.inverse_hit.as_ref().map(|hit| hit.exact_range),
+            Some(true),
+            "{site:#?}"
+        );
+        assert_eq!(report.summary.classifications.missing, 0, "{report:#?}");
+        assert!(!report.has_actionable_findings(), "{report:#?}");
+    }
+
+    #[test]
+    fn cpp_exact_site_matches_macro_namespace_constructor_imported_via_using_namespace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        fs::write(
+            root.join("layout.h"),
+            concat!(
+                "#define LOG4CXX_NS log4cxx\n",
+                "namespace LOG4CXX_NS {\n",
+                "class PatternLayout {\n",
+                "public:\n",
+                "    PatternLayout(const char* pattern);\n",
+                "};\n",
+                "}\n",
+            ),
+        )
+        .expect("layout header");
+        fs::write(
+            root.join("other.h"),
+            "namespace other { class PatternLayout {}; }\n",
+        )
+        .expect("non-visible same-name control");
+        let consumer = concat!(
+            "#include \"layout.h\"\n",
+            "#define ARG \"%m\"\n",
+            "\n",
+            "using namespace log4cxx;\n",
+            "\n",
+            "void make_layout() {\n",
+            "    auto* layout = new PatternLayout(ARG);\n",
+            "    (void)layout;\n",
+            "}\n",
+        );
+        fs::write(root.join("consumer.cpp"), consumer).expect("consumer");
+        let exact_site = consumer
+            .find("new PatternLayout(ARG)")
+            .expect("constructor use")
+            + "new ".len();
+
+        let report = exact_cpp_site_report(&root, "consumer.cpp", exact_site);
+
+        assert_eq!(report.summary.sampled_sites, 1, "{report:#?}");
+        let site = &report.sites[0];
+        assert_eq!(site.path, "consumer.cpp");
+        assert_eq!(site.forward_status, "resolved", "{site:#?}");
+        assert_eq!(
+            site.classification,
+            ReferenceClassification::Consistent,
+            "{site:#?}"
+        );
+        assert!(
+            site.targets
+                .iter()
+                .any(|target| target.fq_name == "LOG4CXX_NS.PatternLayout"),
+            "{site:#?}"
+        );
+        assert_eq!(
+            site.inverse_hit.as_ref().map(|hit| hit.path.as_str()),
+            Some("consumer.cpp"),
+            "{site:#?}"
+        );
+        assert_eq!(
+            site.inverse_hit.as_ref().map(|hit| hit.exact_range),
+            Some(true),
+            "{site:#?}"
+        );
+        assert_eq!(report.summary.classifications.missing, 0, "{report:#?}");
+        assert!(!report.has_actionable_findings(), "{report:#?}");
     }
 }

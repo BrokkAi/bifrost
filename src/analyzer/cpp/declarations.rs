@@ -3571,10 +3571,67 @@ fn cpp_signature_metadata(
     )
 }
 
+fn cpp_callable_is_structural_constructor(function_declarator: Node<'_>, source: &str) -> bool {
+    let Some(name_node) = function_declarator
+        .child_by_field_name("declarator")
+        .or_else(|| function_declarator.child_by_field_name("name"))
+        .or_else(|| last_named_child(function_declarator))
+    else {
+        return false;
+    };
+    let Some(callable_name) = direct_identifier_name(name_node, source) else {
+        return false;
+    };
+
+    let mut current = function_declarator.parent();
+    while let Some(ancestor) = current {
+        let owner_name = match ancestor.kind() {
+            "class_specifier" | "struct_specifier" | "union_specifier" => {
+                class_like_name(ancestor, source)
+            }
+            "ERROR" => malformed_class_error_owner_name(ancestor, source),
+            _ => None,
+        };
+        if owner_name.is_some_and(|owner_name| owner_name == callable_name) {
+            return true;
+        }
+        current = ancestor.parent();
+    }
+    false
+}
+
+/// Recover the owner name from the direct grammar shape retained when a later
+/// member macro makes tree-sitter reduce an otherwise ordinary class body to an
+/// `ERROR` node:
+///
+/// `ERROR(class, type_identifier, base_class_clause?, "{", members...)`
+///
+/// Direct-child checks keep this distinct from an unrelated nested class inside
+/// a broader error region. The closing brace may be displaced past the error
+/// node, so the opening body token is the available structural boundary.
+fn malformed_class_error_owner_name(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "ERROR" {
+        return None;
+    }
+    let keyword = node.child(0)?;
+    if !matches!(keyword.kind(), "class" | "struct" | "union") {
+        return None;
+    }
+    let name_node = node.child(1)?;
+    let name = direct_identifier_name(name_node, source)?;
+    let has_body = (2..node.child_count())
+        .filter_map(|index| node.child(index))
+        .any(|child| child.kind() == "{");
+    has_body.then_some(name)
+}
+
 fn cpp_callable_return_type_identity(
     function_declarator: Node<'_>,
     source: &str,
 ) -> Option<StructuredTypeIdentity> {
+    if cpp_callable_is_structural_constructor(function_declarator, source) {
+        return None;
+    }
     let lexical_scope = cpp_callable_lexical_scope(function_declarator, source);
     let mut cursor = function_declarator.walk();
     if let Some(trailing) = function_declarator
@@ -3959,6 +4016,9 @@ fn cpp_callable_linkage(declaration: Node<'_>, source: &str) -> CallableLinkage 
 }
 
 fn cpp_callable_return_type_text(function_declarator: Node<'_>, source: &str) -> Option<String> {
+    if cpp_callable_is_structural_constructor(function_declarator, source) {
+        return None;
+    }
     let mut cursor = function_declarator.walk();
     if let Some(trailing) = function_declarator
         .named_children(&mut cursor)
@@ -4559,6 +4619,82 @@ mod tests {
         assert_eq!(
             member_function_linkage("struct { int method() { return 1; } } instance;"),
             CallableLinkage::Internal
+        );
+    }
+
+    #[test]
+    fn malformed_class_macro_constructors_have_no_decorator_return_type() {
+        let source = r#"
+#ifndef PROTON_VALUE_HPP
+#define PROTON_VALUE_HPP
+namespace proton {
+namespace internal {
+class value_base {
+  protected:
+    internal::data& data();
+    internal::data data_;
+  friend class codec::encoder;
+  friend class codec::decoder;
+};
+}
+class value : public internal::value_base, private internal::comparable<value> {
+  private:
+    template<class T, class U=void> struct assignable :
+        public std::enable_if<codec::is_encodable<T>::value, U> {};
+    template<class U> struct assignable<value, U> {};
+  public:
+    PN_CPP_EXTERN value();
+    PN_CPP_EXTERN value(const value&);
+    PN_CPP_EXTERN value& operator=(const value&);
+    PN_CPP_EXTERN value(value&&);
+    PN_CPP_EXTERN value& operator=(value&&);
+    template <class T> value(const T& x, typename assignable<T>::type* = 0) { *this = x; }
+    template <class T> typename assignable<T, value&>::type operator=(const T& x) {
+        codec::encoder e(*this);
+        e << x;
+        return *this;
+    }
+    PN_CPP_EXTERN type_id type() const;
+    PN_CPP_EXTERN bool empty() const;
+    PN_CPP_EXTERN void clear();
+    template<class T> PN_CPP_DEPRECATED("Use 'proton::get'") void get(T &t) const;
+    template<class T> PN_CPP_DEPRECATED("Use 'proton::get'") T get() const;
+  friend PN_CPP_EXTERN void swap(value&, value&);
+  friend PN_CPP_EXTERN bool operator==(const value& x, const value& y);
+  friend PN_CPP_EXTERN bool operator<(const value& x, const value& y);
+  friend PN_CPP_EXTERN std::ostream& operator<<(std::ostream&, const value&);
+    value(pn_data_t* d);
+    void reset(pn_data_t* d = 0);
+};
+}
+#endif
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let file = ProjectFile::new(std::env::temp_dir(), "qpid-value.hpp");
+        let parsed = CppAdapter.parse_file(&file, source, &tree);
+        let macro_constructors = parsed
+            .signature_metadata
+            .iter()
+            .filter(|(unit, _)| unit.is_function() && unit.fq_name() == "proton.value")
+            .flat_map(|(_, metadata)| metadata)
+            .filter(|metadata| metadata.label().starts_with("PN_CPP_EXTERN value("))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            macro_constructors.len(),
+            3,
+            "fixture must retain the three macro-decorated constructor declarations: {:#?}",
+            parsed.declarations()
+        );
+        assert!(
+            macro_constructors.iter().all(|metadata| {
+                metadata.return_type_text().is_none() && metadata.return_type_identity().is_none()
+            }),
+            "the export decorator is not a semantic constructor return type or identity: {macro_constructors:#?}"
         );
     }
 

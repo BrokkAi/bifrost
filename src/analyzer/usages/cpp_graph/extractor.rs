@@ -767,7 +767,13 @@ fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>)
     };
     if !matches!(
         function.kind(),
-        "identifier" | "type_identifier" | "template_function" | "template_type"
+        "identifier"
+            | "type_identifier"
+            | "template_function"
+            | "template_type"
+            | "qualified_identifier"
+            | "scoped_identifier"
+            | "scoped_type_identifier"
     ) {
         return;
     }
@@ -797,7 +803,7 @@ fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>)
             EnclosingMemberOwnerResolution::Owner(_) | EnclosingMemberOwnerResolution::Missing => {}
         }
     }
-    match resolve_bare_call_target(
+    match resolve_qualified_call_target(
         call,
         function,
         ctx.analyzer,
@@ -807,6 +813,13 @@ fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>)
         ctx.source,
     ) {
         BareCallTargetResolution::Type(_) => {}
+        BareCallTargetResolution::FreeFunctions(units)
+            if units.iter().all(|unit| {
+                unit.fq_name() == ctx.spec.target.fq_name()
+                    && ctx
+                        .visibility
+                        .callable_is_constructor_declaration(ctx.analyzer, unit)
+            }) => {}
         BareCallTargetResolution::Ambiguous => {
             push_unproven_hit(function, ctx);
             return;
@@ -833,7 +846,15 @@ fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>)
                 .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target)) =>
         {
             *ctx.raw_match_count += 1;
-            push_type_hit(function, ctx);
+            let hit_node = if matches!(
+                function.kind(),
+                "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+            ) {
+                function_terminal_node(function)
+            } else {
+                function
+            };
+            push_type_hit(hit_node, ctx);
         }
         LexicalTypeResolution::Resolved { .. }
         | LexicalTypeResolution::Ambiguous
@@ -884,11 +905,32 @@ fn resolve_qualified_call_target(
     };
     components.push(name.to_string());
     let qualified_name = components.join("::");
+    let type_resolution = resolve_type_node_lexically(
+        function,
+        analyzer,
+        visibility,
+        ordinary_type_imports,
+        file,
+        source,
+    );
+    let same_name_resolves_to_type = matches!(
+        &type_resolution,
+        LexicalTypeResolution::Resolved {
+            unit,
+            candidates,
+            ..
+        } if cpp_name_for(unit) == qualified_name
+            || candidates
+                .iter()
+                .any(|candidate| cpp_name_for(candidate) == qualified_name)
+    );
     let candidates = visibility
         .visible_identifier_candidates(file, name)
         .filter(|candidate| {
             candidate.is_function()
                 && type_owner_of(analyzer, candidate).is_none()
+                && !(same_name_resolves_to_type
+                    && visibility.callable_is_constructor_declaration(analyzer, candidate))
                 && cpp_name_for(candidate) == qualified_name
                 && visibility.declaration_visible_at(analyzer, file, candidate, call.start_byte())
         })
@@ -904,14 +946,7 @@ fn resolve_qualified_call_target(
             file,
         );
     }
-    match resolve_type_node_lexically(
-        function,
-        analyzer,
-        visibility,
-        ordinary_type_imports,
-        file,
-        source,
-    ) {
+    match type_resolution {
         LexicalTypeResolution::Resolved { unit, .. } => BareCallTargetResolution::Type(unit),
         LexicalTypeResolution::Ambiguous => BareCallTargetResolution::Ambiguous,
         LexicalTypeResolution::Missing => BareCallTargetResolution::Missing,
@@ -1178,7 +1213,7 @@ pub(in crate::analyzer::usages) fn resolve_bare_call_target(
             .clone()
             .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Ordinary { .. }))
             .flat_map(|binding| {
-                binding_type_candidates(binding, &transitive_bindings, visibility, file, name)
+                binding_type_candidates(binding, &transitive_bindings, visibility, file, name, None)
             })
             .collect::<Vec<_>>();
         if !direct_types.is_empty() {
@@ -1268,7 +1303,7 @@ pub(in crate::analyzer::usages) fn resolve_bare_call_target(
             .clone()
             .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Ordinary { .. }))
             .flat_map(|binding| {
-                binding_type_candidates(binding, &transitive_bindings, visibility, file, name)
+                binding_type_candidates(binding, &transitive_bindings, visibility, file, name, None)
             })
             .collect::<Vec<_>>();
         if direct_type_components.is_some_and(|components| components == qualified.as_slice())
@@ -3999,8 +4034,9 @@ fn using_binding_target_components_for_name(
         }
         EffectiveUsingTarget::Namespace { .. } => {
             visibility.note_using_namespace_lookup_for_test();
-            effective_using_target_tiers(binding)
-                .into_iter()
+            let target_tiers = effective_using_target_tiers(binding);
+            let resolved = target_tiers
+                .iter()
                 .find(|namespace_components| {
                     let namespace = namespace_components.join("::");
                     visible_candidates.iter().any(|candidate| {
@@ -4021,6 +4057,19 @@ fn using_binding_target_components_for_name(
                                 == Some(namespace_components.as_slice())
                         })
                 })
+                .cloned();
+            resolved.or_else(|| {
+                let first = visible_candidates
+                    .iter()
+                    .find(|candidate| candidate.is_class() || is_type_alias(candidate))?;
+                let uniquely_named_type = visible_candidates.iter().all(|candidate| {
+                    (candidate.is_class() || is_type_alias(candidate))
+                        && same_logical_symbol(candidate, first)
+                });
+                (uniquely_named_type && target_tiers.len() == 1)
+                    .then(|| target_tiers.into_iter().next())
+                    .flatten()
+            })
         }
         EffectiveUsingTarget::Ordinary { .. } => None,
     }
@@ -4202,6 +4251,7 @@ fn binding_type_candidates(
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
     name: &str,
+    direct_target: Option<&CodeUnit>,
 ) -> Vec<(CodeUnit, Vec<String>)> {
     let Some(qualified) = binding.resolved_target_components.clone() else {
         return Vec::new();
@@ -4232,13 +4282,32 @@ fn binding_type_candidates(
         .into_iter()
         .flat_map(|target| {
             let qualified_name = target.join("::");
-            visibility
+            let mut candidates = visibility
                 .visible_identifier_candidates(file, name)
                 .filter(move |candidate| {
                     (candidate.is_class() || is_type_alias(candidate))
                         && cpp_name_for(candidate) == qualified_name
                 })
                 .cloned()
+                .collect::<Vec<_>>();
+            if candidates.is_empty()
+                && matches!(binding.target, EffectiveUsingTarget::Namespace { .. })
+                && let Some(target_unit) = direct_target
+            {
+                let visible_types = visibility
+                    .visible_identifier_candidates(file, name)
+                    .filter(|candidate| candidate.is_class() || is_type_alias(candidate))
+                    .collect::<Vec<_>>();
+                let uniquely_names_target = !visible_types.is_empty()
+                    && visible_types
+                        .iter()
+                        .all(|candidate| same_visible_symbol(candidate, target_unit));
+                if uniquely_names_target {
+                    candidates.extend(visible_types.into_iter().cloned());
+                }
+            }
+            candidates
+                .into_iter()
                 .map(move |candidate| (candidate, target.clone()))
         })
         .collect()
@@ -4281,6 +4350,7 @@ fn ordinary_type_import_resolution(
     file: &ProjectFile,
     source: &str,
     lexical_scope: &[String],
+    direct_target: Option<&CodeUnit>,
 ) -> OrdinaryTypeImportResolution {
     if global || components.len() != 1 {
         return OrdinaryTypeImportResolution::Missing;
@@ -4330,7 +4400,7 @@ fn ordinary_type_import_resolution(
             .clone()
             .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Ordinary { .. }))
             .flat_map(|binding| {
-                binding_type_candidates(binding, &transitive, visibility, file, name)
+                binding_type_candidates(binding, &transitive, visibility, file, name, direct_target)
             })
             .collect::<Vec<_>>();
         if !direct.is_empty() {
@@ -4339,7 +4409,7 @@ fn ordinary_type_import_resolution(
         let directives = at_tier
             .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Namespace { .. }))
             .flat_map(|binding| {
-                binding_type_candidates(binding, &transitive, visibility, file, name)
+                binding_type_candidates(binding, &transitive, visibility, file, name, direct_target)
             })
             .collect::<Vec<_>>();
         if !directives.is_empty() {
@@ -4356,7 +4426,7 @@ fn ordinary_type_import_resolution(
             .clone()
             .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Ordinary { .. }))
             .flat_map(|binding| {
-                binding_type_candidates(binding, &transitive, visibility, file, name)
+                binding_type_candidates(binding, &transitive, visibility, file, name, direct_target)
             })
             .collect::<Vec<_>>();
         if !direct.is_empty() {
@@ -4365,7 +4435,7 @@ fn ordinary_type_import_resolution(
         let directives = at_tier
             .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Namespace { .. }))
             .flat_map(|binding| {
-                binding_type_candidates(binding, &transitive, visibility, file, name)
+                binding_type_candidates(binding, &transitive, visibility, file, name, direct_target)
             })
             .collect::<Vec<_>>();
         if !directives.is_empty() {
@@ -4581,6 +4651,7 @@ fn resolve_type_components_lexically_at_inner(
         file,
         source,
         &lexical_scope,
+        direct_target,
     ) {
         OrdinaryTypeImportResolution::Missing => normal,
         OrdinaryTypeImportResolution::Resolved {

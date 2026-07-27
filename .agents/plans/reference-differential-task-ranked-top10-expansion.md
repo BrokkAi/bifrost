@@ -312,8 +312,11 @@ comes through the local gate, but is not the focus.
   after exact persisted and ephemeral log4cxx witnesses agreed. The new-epoch
   clean-head C++ replay at `003a2be4` completed all ten envelopes with no file
   or candidate-limit errors and reduced the trustworthy residual set to 150
-  rows. Exhaustive disposition maps every row to already-assigned issues:
-  #1182 (2), #1184 (9), #1185 (11), #1186 (45), #1187 (65), and #1190 (18).
+  rows. The corrected exhaustive disposition maps every row to assigned
+  issues: #1182 (2), #1184 (9), #1185 (11), #1186 (47), #1187 (64),
+  #1190 (16), and #1221 (1). The correction moves two template-specialization
+  declaration heads from #1190 to #1186 and separates one implicit-self field
+  read from #1187 into #1221.
   The accepted raw report and complete ledger are
   `/mnt/optane/tmp/bifrost-fird/cpp-task-top10-003a2be4.jsonl` and
   `/mnt/optane/tmp/bifrost-fird/cpp-task-top10-003a2be4-missing-v2.tsv`,
@@ -354,9 +357,28 @@ comes through the local gate, but is not the focus.
   qualified enum parameter types, and out-of-line nested owners. Formatting,
   all-target/all-feature Clippy, all 646 definition-lookup tests, all 161 C++
   usage tests, and the complete `nlp,python` matrix pass with normal Cargo
-  storage at niceness 10. This removes the 45 non-reference declaration
+  storage at niceness 10. This removes the 47 non-reference declaration
   contexts from the differential's forward premise rather than manufacturing
   inverse usages for them.
+- [x] (2026-07-27) Isolated the remaining `syslogEquivalent` implicit-self
+  field read from the outer-owner qualifier family, created #1221 with the
+  required `FIRD:` prefix, and assigned it to `jbellis` before implementation.
+  A current-head exact replay confirms that forward resolves
+  `LOG4CXX_NS.Level.syslogEquivalent` while authoritative inverse returns no
+  hit; the issue remains queued behind the already-started #1182 publication.
+- [x] (2026-07-27) Resolved assigned #1182 at its two exact corpus sites.
+  Qualified direct temporaries now preserve the terminal type-token range,
+  constructor declarations misindexed as free functions are recognized from
+  their structured class ancestry, and target-guided namespace imports
+  conservatively reconcile macro-spelled declaration namespaces. The exact
+  Qpid and log4cxx artifacts report one consistent site and zero missing sites
+  each: `issue-1182-qpid-exact-6e0ce028-final.jsonl` has SHA-256
+  `6b7dac12941f5a7ede572647527cdb96e03c9a12be3e90e8f2af9b8acdc94553`;
+  `issue-1182-log4cxx-exact-6e0ce028-final.jsonl` has SHA-256
+  `14f61f675f217fdcbe161f7f8d2582571f287a776023976728d5f1748befca7f`.
+  Focused metadata and end-to-end regressions, formatting, all-feature Clippy,
+  and the complete `nlp,python` test matrix with eight test threads pass using
+  normal Cargo storage at niceness 10.
 - [ ] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [ ] Complete C++ and publish its evidence and user summary.
