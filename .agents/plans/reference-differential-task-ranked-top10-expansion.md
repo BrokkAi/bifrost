@@ -230,6 +230,19 @@ comes through the local gate, but is not the focus.
   complete `nlp,python` matrix are green at niceness 10 with the normal Cargo
   target. The matrix now contains 1,943 library tests and again passed the
   complete symbols MCP/CLI, LSP, definition, and language-usage surfaces.
+- [x] (2026-07-27) Integrated two later `origin/master` evidence-only commits,
+  published clean head `af0968fa`, and rebuilt the release differential runner
+  at niceness 10 with SHA-256
+  `880157807974ca0b25c6ae575d19df6c08e35ad998435cc1cbd4978dec48121d`.
+  The authoritative explicit C++ top-ten replay completed all ten envelopes
+  in 233.6 seconds with one shared fingerprint, clean pinned heads, no file
+  errors, and no candidate-limit escapes.
+- [ ] (2026-07-27) Exhaustively disposition the clean-head C++ replay's 444
+  residual missing rows: ESPHome 2, LMCache 11, Qpid 73, CIRCL 4, libzmq 7,
+  log4cxx 302, and CCache 45; Blosc, libcbor, and the selector-faithful
+  zero-eligible qs envelope are clean. The raw report and checksummed ledger
+  are `/mnt/optane/tmp/bifrost-fird/cpp-task-top10-af0968fa.jsonl` and
+  `/mnt/optane/tmp/bifrost-fird/cpp-task-top10-af0968fa-missing.tsv`.
 - [ ] Complete C++ and publish its evidence and user summary.
 - [ ] Complete C# and publish its evidence and user summary.
 - [ ] Complete Go and publish its evidence and user summary.
