@@ -1971,7 +1971,7 @@ fn maybe_record_using_member_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     };
     *ctx.raw_match_count += 1;
     let owner_resolution = qualified_owner_components(imported, ctx.source)
-        .and_then(|qualified| {
+        .map(|qualified| {
             let lexical_scope = match enclosing_lexical_scope_components(
                 imported,
                 ctx.analyzer,
@@ -1980,16 +1980,16 @@ fn maybe_record_using_member_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 ctx.source,
             ) {
                 LexicalScopeResolution::Resolved(scope) => scope,
-                LexicalScopeResolution::Ambiguous => return Some(LexicalTypeResolution::Ambiguous),
-                LexicalScopeResolution::Missing => return Some(LexicalTypeResolution::Missing),
+                LexicalScopeResolution::Ambiguous => return LexicalTypeResolution::Ambiguous,
+                LexicalScopeResolution::Missing => return LexicalTypeResolution::Missing,
             };
-            Some(ctx.visibility.resolve_type_components_lexically(
+            ctx.visibility.resolve_type_components_lexically(
                 ctx.analyzer,
                 ctx.file,
                 &qualified.names,
                 qualified.global,
                 &lexical_scope,
-            ))
+            )
         })
         .unwrap_or(LexicalTypeResolution::Missing);
     let matches_target_owner = matches!(
