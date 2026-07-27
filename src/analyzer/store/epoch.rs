@@ -20,6 +20,7 @@
 
 use crate::analyzer::Language;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::sync::OnceLock;
 use tree_sitter::Language as TsLanguage;
 
@@ -80,7 +81,7 @@ fn compute_epoch<L: LanguageEpoch>(ts_language: &TsLanguage, language_salt: &str
         if path.starts_with(L::QUERY_DIR) {
             hasher.update(path.as_bytes());
             hasher.update(b"\0");
-            hasher.update(contents.as_bytes());
+            hasher.update(normalized_query_contents(contents).as_bytes());
             hasher.update(b"\0");
         }
     }
@@ -91,6 +92,19 @@ fn compute_epoch<L: LanguageEpoch>(ts_language: &TsLanguage, language_salt: &str
         let _ = write!(hex, "{byte:02x}");
     }
     hex
+}
+
+/// Uses the repository's canonical LF representation for embedded query text.
+///
+/// Git commonly checks out text as CRLF on Windows. Query contents are part of
+/// the persisted-cache compatibility key, so hashing those checkout-specific
+/// bytes would create different cache epochs for the same revision.
+fn normalized_query_contents(contents: &str) -> Cow<'_, str> {
+    if contents.contains("\r\n") {
+        Cow::Owned(contents.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(contents)
+    }
 }
 
 /// Fingerprint a `tree_sitter::Language` so the epoch follows the
@@ -324,6 +338,19 @@ pub(super) fn cpp_epoch_before_recovered_typedef_base() -> String {
         &tree_sitter_cpp::LANGUAGE.into(),
         "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07",
     )
+}
+
+#[cfg(test)]
+mod query_content_tests {
+    use super::normalized_query_contents;
+
+    #[test]
+    fn normalizes_embedded_query_crlf_for_cross_platform_epochs() {
+        assert_eq!(
+            normalized_query_contents("(node) @capture\r\n(comment) @comment\r\n"),
+            "(node) @capture\n(comment) @comment\n"
+        );
+    }
 }
 // JS/TS salts bumped: anonymous `export default` expressions/declarations now
 // emit a synthetic `default` code unit, changing each file's persisted unit set.
