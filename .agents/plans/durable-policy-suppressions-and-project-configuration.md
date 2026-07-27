@@ -19,7 +19,7 @@ The behavior is observable by running one fixture policy, accepting its strong f
 - [x] (2026-07-27 10:40Z) Reconciled issue #1207 with current `origin/master`, parent issue #1204, closed policy foundation #709, and the existing CLI, library, LSP, MCP, report, and cache surfaces.
 - [x] (2026-07-27 10:40Z) Chose the canonical suppression, evaluation-date, cache-migration, and narrow MCP contracts recorded below.
 - [x] (2026-07-27 11:47Z) Milestone 1: split tracked `.bifrost` project state from generated cache state; validated exact legacy migration, ignore safety, watcher behavior, linked-worktree sharing, extension provisioning, and affected persistence integrations.
-- [ ] Milestone 2: implement the bounded suppression schema, typed parser, capability-confined loader, and identity/date types.
+- [x] (2026-07-27 12:35Z) Milestone 2: implemented the bounded suppression schema, typed parser, capability-confined loader, and identity/date types.
 - [ ] Milestone 3: apply suppressions in the shared coordinator and extend the canonical report model without changing analyzer evidence or work.
 - [ ] Milestone 4: make human, JSON, SARIF, CLI, and failure-threshold behavior suppression-aware.
 - [ ] Milestone 5: thread the same request through LSP/VS Code and add a narrow read-only MCP `run_policy` tool for explicit workspace policies.
@@ -47,6 +47,9 @@ The behavior is observable by running one fixture policy, accepting its strong f
 
 - Observation: four existing subprocess-based MCP stderr tests fail with `Operation not permitted` under the restricted filesystem/process sandbox, while the same complete library suite passes outside that restriction.
   Evidence: the restricted run passed 1,907 tests and failed only three `benchmark::mcp_session` subprocess tests plus the then-unfixed milestone tests. After the milestone fixes, the approved unrestricted run passed 1,914 tests with six intentional ignores.
+
+- Observation: this shell resolved Cargo and Rustc through rustup but resolved `clippy-driver` through Homebrew; both identify as Rust 1.96.0 but use different LLVM patch builds and therefore reject each other's crate metadata.
+  Evidence: Clippy failed on a freshly isolated target with `E0514` for `cc`; rustup Rustc/Clippy report LLVM 22.1.2 while Homebrew Clippy reports LLVM 22.1.6. Prepending `/Users/dave/.cargo/bin` for the command selected the already-installed matching rustup Clippy component and the denied-warning run passed.
 
 ## Decision Log
 
@@ -112,7 +115,11 @@ Milestone 1 is complete. Generated state now defaults to `.bifrost/cache/bifrost
 
 The legacy upgrade removes only an exact generated `.bifrost/.gitignore` and the known old unified database/sidecars after proving the database is idle. User-authored narrow ignore files survive byte-for-byte; modified whole-directory rules, symlinked ignore state, live/unsafe legacy files, or cache rules that expose generated files fail actionably. VS Code now offers an explicit replacement for an exact root `.bifrost` ignore and otherwise adds only `.bifrost/cache/`, preserving comments, negations, line endings, and non-exact patterns.
 
-Validation for this checkpoint: `cargo fmt --all`; all 39 `cache_db` tests; all six `project_watcher` tests; linked-worktree path tests; the complete library suite outside the subprocess restriction (1,914 passed, 6 ignored); 45 analyzer persistence tests, 8 store-reconcile tests, and 3 structural-facts persistence tests; VS Code Prettier, both TypeScript type checks, ESLint, and all 74 extension unit tests. The `unified_cache` integration target correctly compiled but contains zero default-feature tests because its cases are gated by `nlp`; it remains part of the final `--features nlp,python` gate. Suppression semantics and host/report integration remain for milestones 2 through 5. The slow broad-navigation observation has not yet been filed.
+Validation for this checkpoint: `cargo fmt --all`; all 39 `cache_db` tests; all six `project_watcher` tests; linked-worktree path tests; the complete library suite outside the subprocess restriction (1,914 passed, 6 ignored); 45 analyzer persistence tests, 8 store-reconcile tests, and 3 structural-facts persistence tests; VS Code Prettier, both TypeScript type checks, ESLint, and all 74 extension unit tests. The `unified_cache` integration target correctly compiled but contains zero default-feature tests because its cases are gated by `nlp`; it remains part of the final `--features nlp,python` gate. Suppression coordinator, report, and host integration remain for milestones 3 through 5. The slow broad-navigation observation has not yet been filed.
+
+Milestone 2 is complete. The public suppression model now accepts only schema version 1, exact strong finding IDs, accepted status, bounded terminal-safe audit text, strict lower-hex hashes, and exact `YYYY-MM-DD` dates. It canonicalizes record order and optional provenance, rejects duplicate or conflicting normalized keys, accounts for retained storage, and exposes a capability-confined loader whose only empty case is an actual missing file. Explicit sources are workspace-relative JSON paths; symlink escapes, FIFOs, directories, invalid UTF-8, oversized documents, and malformed content remain typed failures.
+
+Validation for this checkpoint: `cargo fmt --all -- --check`; `cargo check --lib`; the finding-ID parser unit test; all 15 tests in `policy_suppression_loading`, including shared-harness tests; matching-toolchain `cargo clippy --lib -- -D warnings`; and `git diff --check`. The ordinary and isolated Clippy attempts that resolved the mismatched Homebrew driver failed before source checking and are recorded above; selecting the already-installed rustup driver passed. The shared coordinator/report join remains for milestone 3.
 
 ## Context and Orientation
 

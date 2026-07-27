@@ -845,6 +845,8 @@ impl fmt::Display for TextValidationError {
     }
 }
 
+impl std::error::Error for TextValidationError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvidenceReferenceError {
     Empty,
