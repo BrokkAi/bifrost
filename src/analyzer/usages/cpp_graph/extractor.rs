@@ -622,6 +622,11 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     push_hit(owner_node, ctx);
                 }
             }
+        } else if let Some(scopes) = target_guided_qualifier_type_scopes(node, ctx) {
+            *ctx.raw_match_count += 1;
+            for scope in scopes {
+                push_hit(scope, ctx);
+            }
         }
         return;
     }
@@ -1372,6 +1377,55 @@ fn static_qualifier_type_scopes<'tree>(
             LexicalTypeResolution::Resolved { .. } | LexicalTypeResolution::Missing => {}
         }
     }
+    if matches.is_empty() {
+        target_guided_qualifier_type_scopes(node, ctx)
+    } else {
+        Some(matches)
+    }
+}
+
+fn target_guided_qualifier_type_scopes<'tree>(
+    node: Node<'tree>,
+    ctx: &ScanCtx<'_>,
+) -> Option<Vec<Node<'tree>>> {
+    if node.kind() != "qualified_identifier"
+        || !ctx
+            .visibility
+            .is_physically_visible(ctx.file, &ctx.spec.target)
+    {
+        return None;
+    }
+    let qualified = qualified_owner_components(node, ctx.source)?;
+    let mut matches = Vec::new();
+    for component_count in 1..=qualified.names.len() {
+        let components = &qualified.names[..component_count];
+        let name = components.last()?;
+        let mut candidates = Vec::new();
+        for candidate in ctx
+            .visibility
+            .visible_identifier_candidates(ctx.file, name)
+            .filter(|candidate| candidate.is_class())
+        {
+            let candidate_components = crate::analyzer::symbol_lookup::parse_symbol_path(
+                crate::analyzer::Language::Cpp,
+                &cpp_name_for(candidate),
+            );
+            if !candidate_components.ends_with(components)
+                || candidates
+                    .iter()
+                    .any(|existing| same_logical_symbol(existing, candidate))
+            {
+                continue;
+            }
+            candidates.push(candidate.clone());
+        }
+        let [candidate] = candidates.as_slice() else {
+            continue;
+        };
+        if same_visible_symbol(candidate, &ctx.spec.target) {
+            matches.push(qualified.nodes[component_count - 1]);
+        }
+    }
     (!matches.is_empty()).then_some(matches)
 }
 
@@ -1773,6 +1827,10 @@ fn maybe_record_free_function_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'
 }
 
 fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if node.kind() == "using_declaration" {
+        maybe_record_using_member_hit(node, ctx);
+        return;
+    }
     if let Some(value) = explicit_qualified_callable_value(node) {
         maybe_record_qualified_method_value_hit(value.qualified, value.member, ctx);
         return;
@@ -1898,6 +1956,84 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             push_unproven_hit(function_terminal_node(function), ctx);
         }
         MethodReceiverTargetResolution::Missing => {}
+    }
+}
+
+fn maybe_record_using_member_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(imported) = ordinary_using_declaration_type_node(node) else {
+        return;
+    };
+    if !callable_node_matches(imported, &ctx.spec.member_name, ctx.source) {
+        return;
+    }
+    let Some(target_owner) = ctx.spec.owner.as_ref() else {
+        return;
+    };
+    *ctx.raw_match_count += 1;
+    let owner_resolution = qualified_owner_components(imported, ctx.source)
+        .and_then(|qualified| {
+            let lexical_scope = match enclosing_lexical_scope_components(
+                imported,
+                ctx.analyzer,
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
+            ) {
+                LexicalScopeResolution::Resolved(scope) => scope,
+                LexicalScopeResolution::Ambiguous => return Some(LexicalTypeResolution::Ambiguous),
+                LexicalScopeResolution::Missing => return Some(LexicalTypeResolution::Missing),
+            };
+            Some(ctx.visibility.resolve_type_components_lexically(
+                ctx.analyzer,
+                ctx.file,
+                &qualified.names,
+                qualified.global,
+                &lexical_scope,
+            ))
+        })
+        .unwrap_or(LexicalTypeResolution::Missing);
+    let matches_target_owner = matches!(
+        owner_resolution,
+        LexicalTypeResolution::Resolved {
+            ref unit,
+            ref candidates,
+            ..
+        } if same_visible_symbol(unit, target_owner)
+            || candidates
+                .iter()
+                .any(|candidate| same_visible_symbol(candidate, target_owner))
+    );
+    if !matches_target_owner {
+        match owner_resolution {
+            LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => {
+                push_unproven_hit(imported, ctx);
+            }
+            LexicalTypeResolution::Resolved { .. } => {}
+        }
+        return;
+    }
+    match ctx.visibility.visible_member_for_owner_name(
+        ctx.file,
+        target_owner,
+        &ctx.spec.member_name,
+    ) {
+        VisibleMemberResolution::Callable(candidates)
+            if candidates.iter().all(|candidate| {
+                ctx.target_group.contains(candidate)
+                    || ctx
+                        .target_group
+                        .iter()
+                        .any(|target| same_visible_symbol(candidate, target))
+            }) =>
+        {
+            push_hit(imported, ctx);
+        }
+        VisibleMemberResolution::NonCallable => {}
+        VisibleMemberResolution::Callable(_)
+        | VisibleMemberResolution::AmbiguousKind
+        | VisibleMemberResolution::Missing => {
+            push_unproven_hit(imported, ctx);
+        }
     }
 }
 
