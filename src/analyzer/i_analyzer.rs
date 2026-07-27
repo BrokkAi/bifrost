@@ -175,6 +175,12 @@ pub trait IAnalyzer: Send + Sync + Any {
         0
     }
     #[doc(hidden)]
+    fn reset_package_declaration_scan_count_for_test(&self) {}
+    #[doc(hidden)]
+    fn package_declaration_scan_count_for_test(&self) -> usize {
+        0
+    }
+    #[doc(hidden)]
     fn reset_candidate_hydration_count_for_test(&self) {}
     #[doc(hidden)]
     fn candidate_hydration_count_for_test(&self) -> usize {

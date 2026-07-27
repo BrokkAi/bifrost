@@ -260,6 +260,16 @@ impl CSharpAnalyzer {
     }
 
     #[doc(hidden)]
+    pub fn reset_package_declaration_scan_count_for_test(&self) {
+        self.inner.reset_package_declaration_scan_count_for_test();
+    }
+
+    #[doc(hidden)]
+    pub fn package_declaration_scan_count_for_test(&self) -> usize {
+        self.inner.package_declaration_scan_count_for_test()
+    }
+
+    #[doc(hidden)]
     pub fn reset_full_hydration_count_for_test(&self) {
         self.inner.reset_full_hydration_count_for_test();
     }
@@ -1865,6 +1875,14 @@ impl IAnalyzer for CSharpAnalyzer {
 
     fn full_declaration_scan_count_for_test(&self) -> usize {
         self.inner.full_declaration_scan_count_for_test()
+    }
+
+    fn reset_package_declaration_scan_count_for_test(&self) {
+        self.inner.reset_package_declaration_scan_count_for_test();
+    }
+
+    fn package_declaration_scan_count_for_test(&self) -> usize {
+        self.inner.package_declaration_scan_count_for_test()
     }
 
     fn reset_candidate_hydration_count_for_test(&self) {
