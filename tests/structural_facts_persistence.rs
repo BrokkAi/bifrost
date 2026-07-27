@@ -35,8 +35,9 @@ fn init_git_repo(root: &Path) -> Repository {
 
 fn commit_all(repository: &Repository, message: &str) {
     let mut index = repository.index().unwrap();
-    let mut skip_cache =
-        |path: &Path, _matched: &[u8]| -> i32 { i32::from(path.starts_with(Path::new(".brokk"))) };
+    let mut skip_cache = |path: &Path, _matched: &[u8]| -> i32 {
+        i32::from(path.starts_with(Path::new(".bifrost")))
+    };
     index
         .add_all(["*"], IndexAddOption::DEFAULT, Some(&mut skip_cache))
         .unwrap();
@@ -121,12 +122,12 @@ fn limited_materialization_keeps_durable_snapshot_work_outside_the_query() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let source = "export const value = service.run();\n";
-    write_file(root, ".gitignore", ".brokk/\n");
+    write_file(root, ".gitignore", ".bifrost/\n");
     write_file(root, "app.ts", source);
     let repository = init_git_repo(root);
     commit_all(&repository, "limited structural fixture");
     let project = typescript_project(root);
-    let database = root.join(".brokk/bifrost_cache.db");
+    let database = root.join(".bifrost/bifrost_cache.db");
 
     let limited =
         WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
@@ -188,7 +189,7 @@ fn limited_materialization_keeps_durable_snapshot_work_outside_the_query() {
 fn persisted_structural_facts_hydrate_by_exact_language_and_recover_corruption() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
-    write_file(root, ".gitignore", ".brokk/\n");
+    write_file(root, ".gitignore", ".bifrost/\n");
     write_file(root, "plain.ts", "export const value = call(1);\n");
     write_file(
         root,
@@ -198,7 +199,7 @@ fn persisted_structural_facts_hydrate_by_exact_language_and_recover_corruption()
     let repository = init_git_repo(root);
     commit_all(&repository, "initial TypeScript fixtures");
     let project = typescript_project(root);
-    let database = root.join(".brokk/bifrost_cache.db");
+    let database = root.join(".bifrost/bifrost_cache.db");
 
     let cold = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
         .expect("persisted analyzer should build");
@@ -269,7 +270,7 @@ fn persisted_structural_facts_hydrate_by_exact_language_and_recover_corruption()
 fn changed_content_extracts_once_then_hydrates_its_new_blob() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
-    write_file(root, ".gitignore", ".brokk/\n");
+    write_file(root, ".gitignore", ".bifrost/\n");
     write_file(root, "app.ts", "export const first = call(1);\n");
     let repository = init_git_repo(root);
     commit_all(&repository, "initial source");

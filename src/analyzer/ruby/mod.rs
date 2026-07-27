@@ -1,6 +1,7 @@
 mod adapter;
 mod cache;
 mod declarations;
+mod diagnostics;
 mod hierarchy;
 mod imports;
 mod mixins;
@@ -14,8 +15,8 @@ use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, CodeUnitType,
     DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo, Project,
-    ProjectFile, Range, RubyMethodDispatchMode, SignatureMetadata, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeHierarchyProvider,
+    ProjectFile, Range, RubyMethodDispatchMode, SemanticDiagnostic, SignatureMetadata,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -453,6 +454,13 @@ impl IAnalyzer for RubyAnalyzer {
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
         self.inner.parse_errors(file)
+    }
+
+    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
+        diagnostics::collect_ruby_semantic_diagnostics(self, file, source)
+            .into_iter()
+            .map(Into::into)
+            .collect()
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {

@@ -160,7 +160,7 @@ fn gc_trigger_math_uses_combined_registry_growth() {
 #[test]
 fn first_unified_open_deletes_legacy_cache_files() {
     let temp = tempfile::tempdir().unwrap();
-    let brokk = temp.path().join(".brokk");
+    let brokk = temp.path().join(".bifrost");
     std::fs::create_dir(&brokk).unwrap();
     for name in [
         cache_db::LEGACY_SEMANTIC_DB_FILE_NAME,
