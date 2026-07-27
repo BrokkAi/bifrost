@@ -61,7 +61,10 @@ export interface BifrostMcpHostCommands {
   claudeCode: string;
 }
 
-const BIFROST_GITIGNORE_ENTRY = ".bifrost";
+const BIFROST_CACHE_GITIGNORE_ENTRY = ".bifrost/cache";
+const BIFROST_CACHE_GITIGNORE_LINE = `${BIFROST_CACHE_GITIGNORE_ENTRY}/`;
+
+export type BifrostGitignoreState = "configured" | "missing" | "legacy-whole-directory";
 
 export function resolveLaunchMode(
   mode: LaunchMode,
@@ -216,13 +219,22 @@ export function supportedWorkspaceRoot(): string | null {
 }
 
 export async function workspaceGitignoreNeedsBifrostEntry(workspaceRoot: string): Promise<boolean> {
+  return (await inspectWorkspaceBifrostGitignore(workspaceRoot)) !== "configured";
+}
+
+export async function inspectWorkspaceBifrostGitignore(
+  workspaceRoot: string
+): Promise<BifrostGitignoreState> {
   const gitignorePath = path.join(workspaceRoot, ".gitignore");
   try {
     const content = await fs.readFile(gitignorePath, "utf8");
-    return !gitignoreIncludesBifrostEntry(content);
+    if (gitignoreIncludesLegacyBifrostEntry(content)) {
+      return "legacy-whole-directory";
+    }
+    return gitignoreIncludesBifrostEntry(content) ? "configured" : "missing";
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return true;
+      return "missing";
     }
     throw error;
   }
@@ -244,18 +256,46 @@ export async function appendBifrostGitignoreEntry(workspaceRoot: string): Promis
   }
 
   const prefix = content && !content.endsWith("\n") ? "\n" : "";
-  await fs.writeFile(gitignorePath, `${content}${prefix}${BIFROST_GITIGNORE_ENTRY}\n`);
+  await fs.writeFile(gitignorePath, `${content}${prefix}${BIFROST_CACHE_GITIGNORE_LINE}\n`);
 }
 
 export function gitignoreIncludesBifrostEntry(content: string): boolean {
-  return content.split(/\r?\n/).some((line) => {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) {
-      return false;
+  return content
+    .split(/\r?\n/)
+    .some((line) => normalizedGitignoreEntry(line) === BIFROST_CACHE_GITIGNORE_ENTRY);
+}
+
+export function gitignoreIncludesLegacyBifrostEntry(content: string): boolean {
+  return content.split(/\r?\n/).some((line) => normalizedGitignoreEntry(line) === ".bifrost");
+}
+
+export async function replaceLegacyBifrostGitignoreEntry(workspaceRoot: string): Promise<void> {
+  const gitignorePath = path.join(workspaceRoot, ".gitignore");
+  const content = await fs.readFile(gitignorePath, "utf8");
+  let replaced = false;
+  const parts = content.split(/(\r?\n)/).map((part, index) => {
+    if (index % 2 !== 0 || normalizedGitignoreEntry(part) !== ".bifrost") {
+      return part;
     }
-    const normalized = trimmed.replace(/^\/+/, "").replace(/\/+$/, "");
-    return normalized === BIFROST_GITIGNORE_ENTRY;
+    const match = /^(\s*)\/?\.bifrost\/?(\s*)$/.exec(part);
+    if (!match) {
+      return part;
+    }
+    replaced = true;
+    return `${match[1]}${BIFROST_CACHE_GITIGNORE_LINE}${match[2]}`;
   });
+  if (!replaced) {
+    throw new Error("No exact legacy .bifrost ignore entry was found.");
+  }
+  await fs.writeFile(gitignorePath, parts.join(""));
+}
+
+function normalizedGitignoreEntry(line: string): string | null {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith("!")) {
+    return null;
+  }
+  return trimmed.replace(/^\/+/, "").replace(/\/+$/, "");
 }
 
 export function sourceFileWatchers(): vscode.FileSystemWatcher[] {

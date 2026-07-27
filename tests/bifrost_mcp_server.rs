@@ -2612,7 +2612,10 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
         "{revoked_search}"
     );
     assert!(
-        !plugin_dir.path().join(".bifrost/bifrost_cache.db").exists(),
+        !plugin_dir
+            .path()
+            .join(".bifrost/cache/bifrost_cache.db")
+            .exists(),
         "plugin cwd must not become analyzer storage"
     );
 
@@ -2863,7 +2866,10 @@ fn rootless_mcp_binds_from_codex_sandbox_state_and_revokes_per_call_scope() {
         "{missing}"
     );
     assert!(
-        !plugin_dir.path().join(".bifrost/bifrost_cache.db").exists(),
+        !plugin_dir
+            .path()
+            .join(".bifrost/cache/bifrost_cache.db")
+            .exists(),
         "plugin cwd must not become analyzer storage"
     );
 
@@ -2950,7 +2956,10 @@ fn rootless_mcp_rejects_first_codex_workspace_activation_outside_sandbox() {
         .expect("active workspace path");
     assert_same_canonical_path(active_path, workspace.root());
     assert!(
-        !plugin_dir.path().join(".bifrost/bifrost_cache.db").exists(),
+        !plugin_dir
+            .path()
+            .join(".bifrost/cache/bifrost_cache.db")
+            .exists(),
         "rejected activation must not create analyzer state in the escaped root"
     );
 
@@ -3064,7 +3073,10 @@ fn rootless_mcp_accepts_codex_sandbox_metadata_from_a_compatible_client() {
         "{search}"
     );
     assert!(
-        !plugin_dir.path().join(".bifrost/bifrost_cache.db").exists(),
+        !plugin_dir
+            .path()
+            .join(".bifrost/cache/bifrost_cache.db")
+            .exists(),
         "plugin cwd must not become analyzer storage"
     );
 

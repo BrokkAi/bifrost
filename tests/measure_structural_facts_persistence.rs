@@ -125,7 +125,7 @@ fn git_commit(root: &Path) -> Option<String> {
 }
 
 fn generate_workspace(root: &Path, file_count: usize, calls_per_file: usize) {
-    fs::write(root.join(".gitignore"), ".bifrost/\n").expect("write benchmark .gitignore");
+    fs::write(root.join(".gitignore"), ".bifrost/cache/\n").expect("write benchmark .gitignore");
     for file in 0..file_count {
         let mut source = String::with_capacity(calls_per_file.saturating_mul(180));
         source.push_str(
@@ -353,7 +353,7 @@ fn structural_facts_cold_extraction_and_warm_persisted_hydration() {
         .expect("canonicalize structural persistence benchmark root");
     generate_workspace(&root, file_count, calls_per_file);
     initialize_git_workspace(&root);
-    let database = root.join(".bifrost/bifrost_cache.db");
+    let database = root.join(".bifrost/cache/bifrost_cache.db");
     let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::TypeScript));
     let config = AnalyzerConfig {
         parallelism: Some(parallelism),

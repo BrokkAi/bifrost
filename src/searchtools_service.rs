@@ -2224,7 +2224,8 @@ fn build_persisted_workspace(
 }
 
 fn client_cache_db_path(root: &Path) -> PathBuf {
-    root.join(crate::gitblob::CACHE_DIR_NAME)
+    root.join(crate::gitblob::PROJECT_DIR_NAME)
+        .join(crate::gitblob::CACHE_SUBDIR_NAME)
         .join(crate::cache_db::CACHE_DB_FILE_NAME)
 }
 
@@ -3037,7 +3038,8 @@ mod client_roots_tests {
         assert!(client_cache_db_path(&canonical_linked).exists());
         assert!(
             !primary_root
-                .join(crate::gitblob::CACHE_DIR_NAME)
+                .join(crate::gitblob::PROJECT_DIR_NAME)
+                .join(crate::gitblob::CACHE_SUBDIR_NAME)
                 .join(crate::cache_db::CACHE_DB_FILE_NAME)
                 .exists(),
             "client-root binding must not collapse cache writes to the primary checkout"

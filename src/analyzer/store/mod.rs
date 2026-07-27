@@ -10027,10 +10027,14 @@ mod tests {
                     .unwrap()
                     .parent()
                     .unwrap()
+                    .parent()
+                    .unwrap()
             )
             .unwrap(),
             std::fs::canonicalize(
                 analyzer_db_path(&linked_root)
+                    .parent()
+                    .unwrap()
                     .parent()
                     .unwrap()
                     .parent()
@@ -10043,6 +10047,14 @@ mod tests {
                 .file_name()
                 .and_then(|n| n.to_str()),
             Some(crate::cache_db::CACHE_DB_FILE_NAME)
+        );
+        assert_eq!(
+            analyzer_db_path(&repo_root),
+            repo.workdir()
+                .unwrap()
+                .join(crate::gitblob::PROJECT_DIR_NAME)
+                .join(crate::gitblob::CACHE_SUBDIR_NAME)
+                .join(crate::cache_db::CACHE_DB_FILE_NAME)
         );
         assert_eq!(analyzer_db_path(&repo_root), analyzer_db_path(&linked_root));
     }

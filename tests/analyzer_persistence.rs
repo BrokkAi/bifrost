@@ -78,11 +78,12 @@ fn init_git_repo(root: &Path) -> Repository {
 
 fn commit_all(repo: &Repository, message: &str) {
     let mut index = repo.index().unwrap();
-    // Persisted analyzers keep their SQLite database under `.bifrost`. A later
+    // Persisted analyzers keep their SQLite database under `.bifrost/cache`. A later
     // fixture commit must not race those live database files into the Git
     // index; only the workspace sources are part of the test repository.
-    let mut skip_analyzer_cache =
-        |path: &Path, _matched_pathspec: &[u8]| i32::from(path.starts_with(Path::new(".bifrost")));
+    let mut skip_analyzer_cache = |path: &Path, _matched_pathspec: &[u8]| {
+        i32::from(path.starts_with(Path::new(".bifrost/cache")))
+    };
     index
         .add_all(
             ["*"],
@@ -1702,7 +1703,7 @@ fn warm_python_path_module_query_does_not_scan_live_paths() {
 fn csharp_package_existence_ignores_stale_complete_blobs() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
-    write_file(root, ".gitignore", ".bifrost/\n");
+    write_file(root, ".gitignore", ".bifrost/cache/\n");
     write_file(
         root,
         "Types.cs",
