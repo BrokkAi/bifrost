@@ -5,11 +5,12 @@ use std::sync::Arc;
 
 use brokk_bifrost::policy::{
     BoundedWitness, CatalogRegistryLimits, DefaultPolicyEvaluator, FindingIdentityStability,
-    PolicyBatchBudget, PolicyBudget, PolicyEvaluationContext, PolicyEvaluator,
-    PolicyIncompleteReason, PolicyRegistry, PolicyRegistryLimits, PolicyReportBuilder,
-    PolicyReportDocument, PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion,
-    PolicySourceIdentity, ReportValueError, SarifToolIdentity, TaintCatalogRegistry, WitnessId,
-    write_policy_sarif,
+    PolicyBatchBudget, PolicyBudget, PolicyEvaluationContext, PolicyEvaluationDate,
+    PolicyEvaluationOptions, PolicyEvaluator, PolicyIncompleteReason, PolicyRegistry,
+    PolicyRegistryLimits, PolicyReportBuilder, PolicyReportDocument, PolicyReportEvaluationContext,
+    PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicySourceIdentity,
+    PolicySuppressionDocumentState, ReportValueError, SarifToolIdentity, TaintCatalogRegistry,
+    WitnessId, write_policy_sarif,
 };
 use brokk_bifrost::{CancellationToken, Language, TypescriptAnalyzer};
 use jsonschema::Validator;
@@ -18,6 +19,19 @@ use sha2::{Digest, Sha256};
 
 const SCHEMA_BYTES: &[u8] = include_bytes!("fixtures/sarif/sarif-schema-2.1.0.json");
 const SCHEMA_SHA256: &str = "c3b4bb2d6093897483348925aaa73af03b3e3f4bd4ca38cef26dcb4212a2682e";
+
+fn report_builder(expected_inputs: usize) -> PolicyReportBuilder {
+    let options = PolicyEvaluationOptions::new(
+        PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date"),
+    );
+    PolicyReportBuilder::new_with_suppression_audit(
+        PolicyBatchBudget::default(),
+        expected_inputs,
+        PolicyReportEvaluationContext::new(&options, PolicySuppressionDocumentState::NotFound),
+        Vec::new(),
+    )
+    .unwrap()
+}
 
 #[test]
 fn zero_step_witness_is_rejected_before_sarif_projection() {
@@ -81,7 +95,7 @@ fn assemble_report(
     clean_skeleton: PolicyRun,
     evaluated: PolicyRun,
 ) -> PolicyReportDocument {
-    let mut builder = PolicyReportBuilder::new(PolicyBatchBudget::default(), 1).unwrap();
+    let mut builder = report_builder(1);
     let findings = evaluated.findings().to_vec();
     let skeleton = if findings.is_empty() {
         evaluated
@@ -382,7 +396,7 @@ fn mixed_complete_and_unsupported_report() -> PolicyReportDocument {
     );
 
     let unsupported = unsupported_empty_report();
-    let mut builder = PolicyReportBuilder::new(PolicyBatchBudget::default(), 2).unwrap();
+    let mut builder = report_builder(2);
     builder
         .register_policy(
             PolicyRuleDescriptor::from_loaded(complete_policy),

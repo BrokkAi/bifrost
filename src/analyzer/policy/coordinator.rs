@@ -23,11 +23,13 @@ use super::finding::{
     PolicyDiagnostic, PolicyDiagnosticCode, PolicyDiagnosticImpact, PolicyDiagnosticSeverity,
     PolicyFailureReason, PolicyRun, PolicyRunCompletion, PolicyWorkReport,
 };
+use super::finding_identity::FindingIdentityStability;
 use super::loading::{PolicyDocumentLoadError, read_rqlp_document};
 use super::registry::{PolicyRegistry, PolicyRegistryError, PolicyRegistryLimits};
 use super::report::{
-    PolicyReportBuilder, PolicyReportDiagnostic, PolicyReportDiagnosticCode, PolicyReportDocument,
-    PolicyRuleDescriptor, PolicySourceRange,
+    PolicyReportBuilder, PolicyReportBuilderError, PolicyReportDiagnostic,
+    PolicyReportDiagnosticCode, PolicyReportDocument, PolicyRetentionOutcome, PolicyRuleDescriptor,
+    PolicySourceRange,
 };
 use super::resolved::{
     EndpointDefinitionSchemaResolution, EndpointOrigin, LoadedPolicy, ResolvedEndpointIdentity,
@@ -36,6 +38,12 @@ use super::resolved::{
 use super::source::{
     PolicySourceDiagnostic, PolicySourceIdentity, PolicySourceIdentityError,
     PolicySourceRelatedDiagnostic, parse_rqlp_source, validate_policy_source_identity,
+};
+use super::suppression::{
+    PolicyEvaluationDate, PolicyEvaluationOptions, PolicyReportEvaluationContext,
+    PolicySuppressionDocument, PolicySuppressionDocumentState, PolicySuppressionMatchState,
+    PolicySuppressionPolicyHashState, PolicySuppressionReview, PolicySuppressionTemporalState,
+    load_policy_suppressions_from_root,
 };
 use super::typestate_policy::ProductionTypestatePolicyEvaluator;
 use super::{PolicyBatchBudget, PolicyBudget};
@@ -144,12 +152,14 @@ pub fn evaluate_policy_files(
     root: impl AsRef<Path>,
     policy_files: &[PathBuf],
     require_explicit_schema_versions: bool,
+    options: &PolicyEvaluationOptions,
     fail_on: PolicyFailOn,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
     evaluate_policy_files_with_limits(
         root.as_ref(),
         policy_files,
         require_explicit_schema_versions,
+        options,
         fail_on,
         PolicyBatchBudget::default(),
         PolicyRegistryLimits::default(),
@@ -166,15 +176,18 @@ pub fn evaluate_policy_source(
     source_identity: PolicySourceIdentity,
     source: &str,
     workspace: &WorkspaceAnalyzer,
+    options: &PolicyEvaluationOptions,
     cancellation: Option<&CancellationToken>,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
-    let (root, _) = open_policy_workspace_root(root.as_ref())?;
+    let (root, read_root) = open_policy_workspace_root(root.as_ref())?;
 
     let input = prepare_source_input(source_identity, source)?;
     evaluate_policy_inputs(
         &root,
+        &read_root,
         vec![input],
         false,
+        options,
         PolicyFailOn::Never,
         PolicyBatchBudget::default(),
         PolicyRegistryLimits::default(),
@@ -187,6 +200,7 @@ fn evaluate_policy_files_with_limits(
     root: &Path,
     policy_files: &[PathBuf],
     require_explicit_schema_versions: bool,
+    options: &PolicyEvaluationOptions,
     fail_on: PolicyFailOn,
     batch_budget: PolicyBatchBudget,
     registry_limits: PolicyRegistryLimits,
@@ -213,8 +227,10 @@ fn evaluate_policy_files_with_limits(
 
     evaluate_policy_inputs(
         &root,
+        &read_root,
         inputs,
         require_explicit_schema_versions,
+        options,
         fail_on,
         batch_budget,
         registry_limits,
@@ -226,8 +242,10 @@ fn evaluate_policy_files_with_limits(
 #[allow(clippy::too_many_arguments)]
 fn evaluate_policy_inputs(
     root: &Path,
+    read_root: &WorkspaceRoot,
     mut inputs: Vec<InputOutcome>,
     require_explicit_schema_versions: bool,
+    options: &PolicyEvaluationOptions,
     fail_on: PolicyFailOn,
     batch_budget: PolicyBatchBudget,
     registry_limits: PolicyRegistryLimits,
@@ -235,6 +253,24 @@ fn evaluate_policy_inputs(
     cancellation: Option<&CancellationToken>,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
     check_policy_cancellation(cancellation)?;
+    let mut secondary_diagnostics = Vec::new();
+    let (suppression_document, suppression_document_state) =
+        match load_policy_suppressions_from_root(read_root, options.suppressions()) {
+            Ok(Some(document)) => (Some(document), PolicySuppressionDocumentState::Loaded),
+            Ok(None) => (None, PolicySuppressionDocumentState::NotFound),
+            Err(error) => {
+                secondary_diagnostics.push(report_diagnostic(
+                    PolicyReportDiagnosticCode::SuppressionLoadFailed,
+                    format!("failed to load policy suppressions: {error}"),
+                    Some(PolicySourceIdentity::new(
+                        options.suppressions().source().relative_path(),
+                    )),
+                    None,
+                    Vec::new(),
+                )?);
+                (None, PolicySuppressionDocumentState::Invalid)
+            }
+        };
     let catalogs = Arc::new(
         TaintCatalogRegistry::new_for_workspace(
             root.to_path_buf(),
@@ -292,7 +328,6 @@ fn evaluate_policy_inputs(
         }
     }
 
-    let mut secondary_diagnostics = Vec::new();
     if require_explicit_schema_versions {
         for policy in registry.policies() {
             let diagnostics = explicit_version_diagnostics(policy)?;
@@ -363,9 +398,55 @@ fn evaluate_policy_inputs(
         runs.insert(policy.definition().metadata.id.clone(), run);
     }
 
-    let mut builder = PolicyReportBuilder::new(batch_budget, inputs.len()).map_err(|error| {
-        PolicyCoordinatorError::new(format!("policy report preflight failed: {error}"))
-    })?;
+    let suppression_reviews = match suppression_document.as_ref() {
+        Some(document) => {
+            apply_policy_suppressions(document, options.evaluation_date(), &registry, &mut runs)?
+        }
+        None => Vec::new(),
+    };
+    let evaluation = PolicyReportEvaluationContext::new(options, suppression_document_state);
+    let mut builder = match PolicyReportBuilder::new_with_suppression_audit(
+        batch_budget,
+        inputs.len(),
+        evaluation.clone(),
+        suppression_reviews,
+    ) {
+        Ok(builder) => builder,
+        Err(PolicyReportBuilderError::SuppressionAuditPreflightExceeded { .. }) => {
+            for finding in runs.values_mut().flat_map(|run| run.findings_mut()) {
+                finding.clear_suppression();
+            }
+            secondary_diagnostics.push(report_diagnostic(
+                PolicyReportDiagnosticCode::SuppressionAuditRetentionExceeded,
+                "suppression audit exceeds the report retention budget; no suppressions were applied",
+                Some(PolicySourceIdentity::new(
+                    options.suppressions().source().relative_path(),
+                )),
+                None,
+                Vec::new(),
+            )?);
+            PolicyReportBuilder::new_with_suppression_audit(
+                batch_budget,
+                inputs.len(),
+                evaluation,
+                Vec::new(),
+            )
+            .map_err(|error| {
+                PolicyCoordinatorError::new(format!(
+                    "policy report preflight failed after disabling suppressions: {error}"
+                ))
+            })?
+        }
+        Err(error) => {
+            return Err(PolicyCoordinatorError::new(format!(
+                "policy report preflight failed: {error}"
+            )));
+        }
+    };
+    let threshold_exceeded = runs
+        .values()
+        .flat_map(PolicyRun::findings)
+        .any(|finding| finding.suppression().is_none() && fail_on.matches(finding.severity()));
     let mut retained_findings = Vec::new();
     for input in inputs {
         check_policy_cancellation(cancellation)?;
@@ -408,11 +489,36 @@ fn evaluate_policy_inputs(
         }
     }
 
-    retained_findings.sort_by_key(|finding| finding.id());
+    retained_findings.sort_by_key(|finding| (finding.suppression().is_none(), finding.id()));
+    let mut suppression_result_omitted = false;
     for finding in retained_findings {
-        builder.retain_finding(finding).map_err(|error| {
+        let policy_id = finding.policy_id().clone();
+        let finding_id = finding.id();
+        let suppressed = finding.suppression().is_some();
+        let outcome = builder.retain_finding(finding).map_err(|error| {
             PolicyCoordinatorError::new(format!("failed to retain a policy finding: {error}"))
         })?;
+        if suppressed && matches!(outcome, PolicyRetentionOutcome::Omitted { .. }) {
+            builder
+                .mark_suppression_result_omitted(&policy_id, finding_id)
+                .map_err(|error| {
+                    PolicyCoordinatorError::new(format!(
+                        "failed to record an omitted suppressed finding: {error}"
+                    ))
+                })?;
+            suppression_result_omitted = true;
+        }
+    }
+    if suppression_result_omitted {
+        secondary_diagnostics.push(report_diagnostic(
+            PolicyReportDiagnosticCode::SuppressionAuditRetentionExceeded,
+            "one or more applied suppression results exceeded the report retention budget",
+            Some(PolicySourceIdentity::new(
+                options.suppressions().source().relative_path(),
+            )),
+            None,
+            Vec::new(),
+        )?);
     }
     for diagnostic in secondary_diagnostics {
         builder
@@ -427,12 +533,82 @@ fn evaluate_policy_inputs(
     let report = builder.finish().map_err(|error| {
         PolicyCoordinatorError::new(format!("failed to finish policy report: {error}"))
     })?;
-    let exit_status = report_exit_status(&report, fail_on);
+    let exit_status = report_exit_status(&report, threshold_exceeded);
     Ok(PolicyBatchOutcome {
         report,
         exit_status,
         max_serialized_report_bytes: batch_budget.max_serialized_report_bytes(),
     })
+}
+
+fn apply_policy_suppressions(
+    document: &PolicySuppressionDocument,
+    evaluation_date: PolicyEvaluationDate,
+    registry: &PolicyRegistry,
+    runs: &mut HashMap<PolicyId, PolicyRun>,
+) -> Result<Vec<PolicySuppressionReview>, PolicyCoordinatorError> {
+    let policy_hashes = registry
+        .policies()
+        .map(|policy| {
+            (
+                policy.definition().metadata.id.clone(),
+                policy.semantic_hash(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut reviews = Vec::with_capacity(document.suppressions().len());
+    for record in document.suppressions() {
+        let policy_hash_state = PolicySuppressionPolicyHashState::compare(
+            record.policy_hash_at_acceptance(),
+            policy_hashes.get(record.policy_id()).copied(),
+        );
+        let temporal_state = PolicySuppressionTemporalState::for_record(record, evaluation_date);
+        let (match_state, finding_index) = match runs.get(record.policy_id()) {
+            Some(run) => {
+                let finding_index = run
+                    .findings()
+                    .iter()
+                    .position(|finding| finding.id() == record.finding_id());
+                let match_state = match finding_index.map(|index| &run.findings()[index]) {
+                    Some(finding)
+                        if finding.identity_stability() == FindingIdentityStability::Strong =>
+                    {
+                        PolicySuppressionMatchState::StrongFinding
+                    }
+                    Some(_) => PolicySuppressionMatchState::CurrentFindingNotStrong,
+                    None if run.completion().is_complete() => {
+                        PolicySuppressionMatchState::FindingAbsent
+                    }
+                    None => PolicySuppressionMatchState::PolicyIncomplete,
+                };
+                (match_state, finding_index)
+            }
+            None => (PolicySuppressionMatchState::PolicyNotEvaluated, None),
+        };
+        let review =
+            PolicySuppressionReview::new(record, match_state, temporal_state, policy_hash_state);
+        if let (Some(finding_index), Some(suppression)) =
+            (finding_index, review.finding_suppression())
+        {
+            let run = runs.get_mut(record.policy_id()).ok_or_else(|| {
+                PolicyCoordinatorError::new(format!(
+                    "suppression join lost policy run {}",
+                    record.policy_id()
+                ))
+            })?;
+            run.findings_mut()[finding_index]
+                .attach_suppression(suppression)
+                .map_err(|error| {
+                    PolicyCoordinatorError::new(format!(
+                        "failed to attach suppression for policy {} finding {}: {error}",
+                        record.policy_id(),
+                        record.finding_id()
+                    ))
+                })?;
+        }
+        reviews.push(review);
+    }
+    Ok(reviews)
 }
 
 fn open_policy_workspace_root(
@@ -848,7 +1024,7 @@ fn failed_evaluation_run(
     })
 }
 
-fn report_exit_status(report: &PolicyReportDocument, fail_on: PolicyFailOn) -> u8 {
+fn report_exit_status(report: &PolicyReportDocument, threshold_exceeded: bool) -> u8 {
     let unreliable = !report.diagnostics().is_empty()
         || report.diagnostics_truncated()
         || report
@@ -858,12 +1034,7 @@ fn report_exit_status(report: &PolicyReportDocument, fail_on: PolicyFailOn) -> u
     if unreliable {
         return POLICY_EXIT_UNRELIABLE;
     }
-    if report
-        .runs()
-        .iter()
-        .flat_map(PolicyRun::findings)
-        .any(|finding| fail_on.matches(finding.severity()))
-    {
+    if threshold_exceeded {
         POLICY_EXIT_FINDING
     } else {
         POLICY_EXIT_CLEAN
@@ -937,10 +1108,17 @@ mod tests {
 
     use cap_std::ambient_authority;
     use cap_std::fs::Dir;
+    use serde_json::json;
 
     use super::*;
     use crate::analyzer::policy::source::MAX_POLICY_SOURCE_IDENTITY_BYTES;
     use crate::policy::write_policy_json;
+
+    fn evaluation_options() -> PolicyEvaluationOptions {
+        PolicyEvaluationOptions::new(
+            PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date"),
+        )
+    }
 
     fn match_policy(policy_id: &str, name: &str) -> String {
         format!(
@@ -1042,6 +1220,30 @@ mod tests {
         output
     }
 
+    fn write_test_suppression(root: &Path, policy_id: &str, policy_hash: &str, finding_id: &str) {
+        let path = root.join(".bifrost/suppressions.json");
+        fs::create_dir_all(path.parent().expect("suppression parent"))
+            .expect("create suppression directory");
+        fs::write(
+            path,
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "suppressions": [{
+                    "policy_id": policy_id,
+                    "finding_id": finding_id,
+                    "identity_stability": "strong",
+                    "status": "accepted",
+                    "reason": "Reviewed exact finding",
+                    "policy_hash_at_acceptance": policy_hash,
+                    "accepted_at": "2026-07-01",
+                    "expires_at": null
+                }]
+            }))
+            .expect("suppression JSON"),
+        )
+        .expect("write suppression document");
+    }
+
     #[test]
     fn live_policy_source_uses_supplied_analyzer_and_unsaved_bytes() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -1066,6 +1268,7 @@ mod tests {
             PolicySourceIdentity::new("policies/live.rqlp"),
             &live_source,
             &analyzer,
+            &evaluation_options(),
             None,
         )
         .expect("live policy report");
@@ -1112,6 +1315,7 @@ mod tests {
             PolicySourceIdentity::new("policies/input.rqlp"),
             endpoint,
             &analyzer,
+            &evaluation_options(),
             None,
         )
         .expect("endpoint diagnostic report");
@@ -1148,6 +1352,7 @@ mod tests {
             PolicySourceIdentity::new("policies/live.rqlp"),
             &match_policy("test.cancelled", "Cancelled"),
             &analyzer,
+            &evaluation_options(),
             Some(&cancellation),
         );
         let Err(error) = result else {
@@ -1176,11 +1381,23 @@ mod tests {
             paths.push(PathBuf::from(relative));
         }
 
-        let forward = evaluate_policy_files(workspace.path(), &paths, false, PolicyFailOn::Never)
-            .expect("forward duplicate report");
+        let forward = evaluate_policy_files(
+            workspace.path(),
+            &paths,
+            false,
+            &evaluation_options(),
+            PolicyFailOn::Never,
+        )
+        .expect("forward duplicate report");
         paths.reverse();
-        let reversed = evaluate_policy_files(workspace.path(), &paths, false, PolicyFailOn::Never)
-            .expect("reversed duplicate report");
+        let reversed = evaluate_policy_files(
+            workspace.path(),
+            &paths,
+            false,
+            &evaluation_options(),
+            PolicyFailOn::Never,
+        )
+        .expect("reversed duplicate report");
 
         assert_eq!(forward.exit_status(), POLICY_EXIT_UNRELIABLE);
         assert_eq!(reversed.exit_status(), POLICY_EXIT_UNRELIABLE);
@@ -1237,11 +1454,23 @@ mod tests {
             paths.push(PathBuf::from(relative));
         }
 
-        let forward = evaluate_policy_files(workspace.path(), &paths, false, PolicyFailOn::Never)
-            .expect("oversized duplicate report");
+        let forward = evaluate_policy_files(
+            workspace.path(),
+            &paths,
+            false,
+            &evaluation_options(),
+            PolicyFailOn::Never,
+        )
+        .expect("oversized duplicate report");
         paths.reverse();
-        let reversed = evaluate_policy_files(workspace.path(), &paths, false, PolicyFailOn::Never)
-            .expect("reversed oversized duplicate report");
+        let reversed = evaluate_policy_files(
+            workspace.path(),
+            &paths,
+            false,
+            &evaluation_options(),
+            PolicyFailOn::Never,
+        )
+        .expect("reversed oversized duplicate report");
 
         assert_invalid_source_diagnostics(&forward, &[source_len, source_len]);
         assert!(forward.report().diagnostics().iter().all(|diagnostic| {
@@ -1267,11 +1496,23 @@ mod tests {
         let control_len = control.to_string_lossy().len();
         let mut paths = vec![missing.clone(), control.clone()];
 
-        let forward = evaluate_policy_files(workspace.path(), &paths, false, PolicyFailOn::Never)
-            .expect("invalid requested-source report");
+        let forward = evaluate_policy_files(
+            workspace.path(),
+            &paths,
+            false,
+            &evaluation_options(),
+            PolicyFailOn::Never,
+        )
+        .expect("invalid requested-source report");
         paths.reverse();
-        let reversed = evaluate_policy_files(workspace.path(), &paths, false, PolicyFailOn::Never)
-            .expect("reversed invalid requested-source report");
+        let reversed = evaluate_policy_files(
+            workspace.path(),
+            &paths,
+            false,
+            &evaluation_options(),
+            PolicyFailOn::Never,
+        )
+        .expect("reversed invalid requested-source report");
 
         assert_invalid_source_diagnostics(&forward, &[missing_len, control_len]);
         assert!(forward.report().diagnostics().iter().any(|diagnostic| {
@@ -1325,6 +1566,7 @@ mod tests {
                 workspace.path(),
                 paths,
                 false,
+                &evaluation_options(),
                 PolicyFailOn::Never,
                 PolicyBatchBudget::default(),
                 limits,
@@ -1394,6 +1636,7 @@ mod tests {
             workspace.path(),
             &[PathBuf::from("policies/limit.rqlp")],
             false,
+            &evaluation_options(),
             PolicyFailOn::Never,
             PolicyBatchBudget::default(),
             limits,
@@ -1413,5 +1656,113 @@ mod tests {
                 .message()
                 .contains("more than 2 total entries")
         );
+    }
+
+    #[test]
+    fn applied_suppressions_are_retained_first_and_omission_is_explicitly_unreliable() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(
+            workspace.path().join("app.ts"),
+            "export function target() {}\n",
+        )
+        .expect("source fixture");
+        write_policy(
+            workspace.path(),
+            "policies/a.rqlp",
+            &match_policy("test.a", "A"),
+        );
+        write_policy(
+            workspace.path(),
+            "policies/z.rqlp",
+            &match_policy("test.z", "Z"),
+        );
+        let paths = [
+            PathBuf::from("policies/a.rqlp"),
+            PathBuf::from("policies/z.rqlp"),
+        ];
+        let baseline = evaluate_policy_files(
+            workspace.path(),
+            &paths,
+            false,
+            &evaluation_options(),
+            PolicyFailOn::Never,
+        )
+        .expect("baseline report");
+        let rule = baseline
+            .report()
+            .rules()
+            .iter()
+            .find(|rule| rule.policy_id().as_str() == "test.z")
+            .expect("test.z rule");
+        let finding = baseline
+            .report()
+            .runs()
+            .iter()
+            .find(|run| run.policy_id().as_str() == "test.z")
+            .expect("test.z run")
+            .findings()[0]
+            .id();
+        write_test_suppression(
+            workspace.path(),
+            "test.z",
+            &rule.policy_hash().to_string(),
+            &finding.to_string(),
+        );
+
+        let one_result_budget = PolicyBatchBudget::builder()
+            .with_max_total_findings(1)
+            .unwrap()
+            .build()
+            .unwrap();
+        let retained = evaluate_policy_files_with_limits(
+            workspace.path(),
+            &paths,
+            false,
+            &evaluation_options(),
+            PolicyFailOn::Never,
+            one_result_budget,
+            PolicyRegistryLimits::default(),
+        )
+        .expect("one-result report");
+        let retained_findings = retained
+            .report()
+            .runs()
+            .iter()
+            .flat_map(PolicyRun::findings)
+            .collect::<Vec<_>>();
+        assert_eq!(retained_findings.len(), 1);
+        assert_eq!(retained_findings[0].policy_id().as_str(), "test.z");
+        assert!(retained_findings[0].suppression().is_some());
+        assert!(retained.report().suppressions()[0].applied());
+        assert!(!retained.report().suppressions()[0].result_omitted());
+
+        let zero_result_budget = PolicyBatchBudget::builder()
+            .with_max_total_findings(0)
+            .unwrap()
+            .build()
+            .unwrap();
+        let omitted = evaluate_policy_files_with_limits(
+            workspace.path(),
+            &paths,
+            false,
+            &evaluation_options(),
+            PolicyFailOn::Never,
+            zero_result_budget,
+            PolicyRegistryLimits::default(),
+        )
+        .expect("zero-result report");
+        assert_eq!(omitted.exit_status(), POLICY_EXIT_UNRELIABLE);
+        assert!(
+            omitted
+                .report()
+                .runs()
+                .iter()
+                .all(|run| run.findings().is_empty())
+        );
+        assert!(omitted.report().suppressions()[0].applied());
+        assert!(omitted.report().suppressions()[0].result_omitted());
+        assert!(omitted.report().diagnostics().iter().any(|diagnostic| {
+            diagnostic.code() == PolicyReportDiagnosticCode::SuppressionAuditRetentionExceeded
+        }));
     }
 }

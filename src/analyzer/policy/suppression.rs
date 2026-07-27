@@ -14,6 +14,7 @@ use crate::workspace_document::{WorkspaceDocumentError, WorkspaceRoot, read_work
 use super::classification::{TextValidationError, validate_required_text};
 use super::definition::{PolicyId, PolicyIdentifierError, Sha256ValueError, parse_lower_sha256};
 use super::finding_identity::{FindingIdentityStability, PolicyFindingId};
+use super::identity::PolicySemanticHash;
 use super::retained::{RetainedSize, retained_extra};
 
 pub const DEFAULT_POLICY_SUPPRESSION_PATH: &str = ".bifrost/suppressions.json";
@@ -21,6 +22,7 @@ pub const MAX_POLICY_SUPPRESSION_DOCUMENT_BYTES: u64 = 256 * 1024;
 pub const MAX_POLICY_SUPPRESSIONS: usize = 512;
 pub const MAX_POLICY_SUPPRESSION_REASON_BYTES: usize = 4_096;
 pub const MAX_POLICY_SUPPRESSION_ACCEPTED_BY_BYTES: usize = 256;
+pub const MAX_POLICY_SUPPRESSION_PATH_BYTES: usize = 1_024;
 
 const POLICY_SUPPRESSION_SCHEMA_VERSION: u32 = 1;
 const MAX_JSON_ERROR_BYTES: usize = 512;
@@ -233,12 +235,12 @@ pub enum PolicySuppressionSource {
 }
 
 impl PolicySuppressionSource {
-    pub fn explicit(path: impl AsRef<Path>) -> Result<Self, WorkspaceRelativePathError> {
-        WorkspaceRelativePath::try_from_path(path.as_ref()).map(Self::Explicit)
+    pub fn explicit(path: impl AsRef<Path>) -> Result<Self, PolicySuppressionSourceError> {
+        Self::from_workspace_path(WorkspaceRelativePath::try_from_path(path.as_ref())?)
     }
 
-    pub fn explicit_portable(path: impl AsRef<str>) -> Result<Self, WorkspaceRelativePathError> {
-        WorkspaceRelativePath::new(path).map(Self::Explicit)
+    pub fn explicit_portable(path: impl AsRef<str>) -> Result<Self, PolicySuppressionSourceError> {
+        Self::from_workspace_path(WorkspaceRelativePath::new(path)?)
     }
 
     pub fn relative_path(&self) -> &str {
@@ -246,6 +248,17 @@ impl PolicySuppressionSource {
             Self::Conventional => DEFAULT_POLICY_SUPPRESSION_PATH,
             Self::Explicit(path) => path.as_str(),
         }
+    }
+
+    fn from_workspace_path(
+        path: WorkspaceRelativePath,
+    ) -> Result<Self, PolicySuppressionSourceError> {
+        if path.as_str().len() > MAX_POLICY_SUPPRESSION_PATH_BYTES {
+            return Err(PolicySuppressionSourceError::TooLong {
+                max_bytes: MAX_POLICY_SUPPRESSION_PATH_BYTES,
+            });
+        }
+        Ok(Self::Explicit(path))
     }
 }
 
@@ -261,6 +274,325 @@ impl PolicySuppressionOptions {
 
     pub const fn source(&self) -> &PolicySuppressionSource {
         &self.source
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicySuppressionSourceError {
+    Path(WorkspaceRelativePathError),
+    TooLong { max_bytes: usize },
+}
+
+impl From<WorkspaceRelativePathError> for PolicySuppressionSourceError {
+    fn from(error: WorkspaceRelativePathError) -> Self {
+        Self::Path(error)
+    }
+}
+
+impl fmt::Display for PolicySuppressionSourceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Path(error) => error.fmt(formatter),
+            Self::TooLong { max_bytes } => write!(
+                formatter,
+                "suppression path must be at most {max_bytes} bytes"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PolicySuppressionSourceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Path(error) => Some(error),
+            Self::TooLong { .. } => None,
+        }
+    }
+}
+
+/// Host-supplied deterministic inputs that govern suppression evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyEvaluationOptions {
+    evaluation_date: PolicyEvaluationDate,
+    suppressions: PolicySuppressionOptions,
+}
+
+impl PolicyEvaluationOptions {
+    pub fn new(evaluation_date: PolicyEvaluationDate) -> Self {
+        Self {
+            evaluation_date,
+            suppressions: PolicySuppressionOptions::default(),
+        }
+    }
+
+    pub const fn with_suppressions(
+        evaluation_date: PolicyEvaluationDate,
+        suppressions: PolicySuppressionOptions,
+    ) -> Self {
+        Self {
+            evaluation_date,
+            suppressions,
+        }
+    }
+
+    pub const fn evaluation_date(&self) -> PolicyEvaluationDate {
+        self.evaluation_date
+    }
+
+    pub const fn suppressions(&self) -> &PolicySuppressionOptions {
+        &self.suppressions
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicySuppressionDocumentState {
+    NotFound,
+    Loaded,
+    Invalid,
+}
+
+/// Deterministic report context for one suppression-aware policy batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicyReportEvaluationContext {
+    evaluation_date: PolicyEvaluationDate,
+    suppression_path: Box<str>,
+    suppression_document_state: PolicySuppressionDocumentState,
+}
+
+impl PolicyReportEvaluationContext {
+    pub fn new(
+        options: &PolicyEvaluationOptions,
+        suppression_document_state: PolicySuppressionDocumentState,
+    ) -> Self {
+        Self {
+            evaluation_date: options.evaluation_date,
+            suppression_path: options.suppressions.source.relative_path().into(),
+            suppression_document_state,
+        }
+    }
+
+    pub const fn evaluation_date(&self) -> PolicyEvaluationDate {
+        self.evaluation_date
+    }
+
+    pub fn suppression_path(&self) -> &str {
+        &self.suppression_path
+    }
+
+    pub const fn suppression_document_state(&self) -> PolicySuppressionDocumentState {
+        self.suppression_document_state
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicySuppressionDecision {
+    identity_stability: FindingIdentityStability,
+    status: PolicySuppressionStatus,
+    reason: Box<str>,
+    policy_hash_at_acceptance: Option<AcceptedPolicyHash>,
+    accepted_by: Option<Box<str>>,
+    accepted_at: PolicyEvaluationDate,
+    expires_at: Option<PolicyEvaluationDate>,
+}
+
+impl PolicySuppressionDecision {
+    fn from_record(record: &PolicySuppressionRecord) -> Self {
+        Self {
+            identity_stability: record.identity_stability,
+            status: record.status,
+            reason: record.reason.clone(),
+            policy_hash_at_acceptance: record.policy_hash_at_acceptance,
+            accepted_by: record.accepted_by.clone(),
+            accepted_at: record.accepted_at,
+            expires_at: record.expires_at,
+        }
+    }
+
+    pub const fn identity_stability(&self) -> FindingIdentityStability {
+        self.identity_stability
+    }
+
+    pub const fn status(&self) -> PolicySuppressionStatus {
+        self.status
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    pub const fn policy_hash_at_acceptance(&self) -> Option<AcceptedPolicyHash> {
+        self.policy_hash_at_acceptance
+    }
+
+    pub fn accepted_by(&self) -> Option<&str> {
+        self.accepted_by.as_deref()
+    }
+
+    pub const fn accepted_at(&self) -> PolicyEvaluationDate {
+        self.accepted_at
+    }
+
+    pub const fn expires_at(&self) -> Option<PolicyEvaluationDate> {
+        self.expires_at
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicySuppressionMatchState {
+    StrongFinding,
+    CurrentFindingNotStrong,
+    FindingAbsent,
+    PolicyNotEvaluated,
+    PolicyIncomplete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicySuppressionTemporalState {
+    Current,
+    Expired,
+}
+
+impl PolicySuppressionTemporalState {
+    pub(crate) fn for_record(
+        record: &PolicySuppressionRecord,
+        evaluation_date: PolicyEvaluationDate,
+    ) -> Self {
+        if record
+            .expires_at
+            .is_some_and(|expires_at| expires_at < evaluation_date)
+        {
+            Self::Expired
+        } else {
+            Self::Current
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicySuppressionPolicyHashState {
+    Matching,
+    Drifted,
+    Unknown,
+}
+
+impl PolicySuppressionPolicyHashState {
+    pub(crate) fn compare(
+        accepted: Option<AcceptedPolicyHash>,
+        current: Option<PolicySemanticHash>,
+    ) -> Self {
+        match (accepted, current) {
+            (Some(accepted), Some(current)) if accepted.as_bytes() == current.as_bytes() => {
+                Self::Matching
+            }
+            (Some(_), Some(_)) => Self::Drifted,
+            (None, _) | (_, None) => Self::Unknown,
+        }
+    }
+}
+
+/// Active accepted-decision metadata attached to a retained finding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicyFindingSuppression {
+    #[serde(flatten)]
+    decision: PolicySuppressionDecision,
+    policy_hash_state: PolicySuppressionPolicyHashState,
+}
+
+impl PolicyFindingSuppression {
+    pub const fn decision(&self) -> &PolicySuppressionDecision {
+        &self.decision
+    }
+
+    pub const fn policy_hash_state(&self) -> PolicySuppressionPolicyHashState {
+        self.policy_hash_state
+    }
+}
+
+/// Canonical audit disposition for one loaded suppression record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicySuppressionReview {
+    policy_id: PolicyId,
+    finding_id: PolicyFindingId,
+    #[serde(flatten)]
+    decision: PolicySuppressionDecision,
+    match_state: PolicySuppressionMatchState,
+    temporal_state: PolicySuppressionTemporalState,
+    policy_hash_state: PolicySuppressionPolicyHashState,
+    applied: bool,
+    stale: bool,
+    result_omitted: bool,
+}
+
+impl PolicySuppressionReview {
+    pub(crate) fn new(
+        record: &PolicySuppressionRecord,
+        match_state: PolicySuppressionMatchState,
+        temporal_state: PolicySuppressionTemporalState,
+        policy_hash_state: PolicySuppressionPolicyHashState,
+    ) -> Self {
+        Self {
+            policy_id: record.policy_id.clone(),
+            finding_id: record.finding_id,
+            decision: PolicySuppressionDecision::from_record(record),
+            match_state,
+            temporal_state,
+            policy_hash_state,
+            applied: match_state == PolicySuppressionMatchState::StrongFinding
+                && temporal_state == PolicySuppressionTemporalState::Current,
+            stale: match_state == PolicySuppressionMatchState::FindingAbsent,
+            result_omitted: false,
+        }
+    }
+
+    pub const fn policy_id(&self) -> &PolicyId {
+        &self.policy_id
+    }
+
+    pub const fn finding_id(&self) -> PolicyFindingId {
+        self.finding_id
+    }
+
+    pub const fn decision(&self) -> &PolicySuppressionDecision {
+        &self.decision
+    }
+
+    pub const fn match_state(&self) -> PolicySuppressionMatchState {
+        self.match_state
+    }
+
+    pub const fn temporal_state(&self) -> PolicySuppressionTemporalState {
+        self.temporal_state
+    }
+
+    pub const fn policy_hash_state(&self) -> PolicySuppressionPolicyHashState {
+        self.policy_hash_state
+    }
+
+    pub const fn applied(&self) -> bool {
+        self.applied
+    }
+
+    pub const fn stale(&self) -> bool {
+        self.stale
+    }
+
+    pub const fn result_omitted(&self) -> bool {
+        self.result_omitted
+    }
+
+    pub(crate) fn finding_suppression(&self) -> Option<PolicyFindingSuppression> {
+        self.applied.then(|| PolicyFindingSuppression {
+            decision: self.decision.clone(),
+            policy_hash_state: self.policy_hash_state,
+        })
+    }
+
+    pub(crate) fn mark_result_omitted(&mut self) {
+        self.result_omitted = true;
     }
 }
 
@@ -504,6 +836,40 @@ impl RetainedSize for PolicySuppressionSource {
 impl RetainedSize for PolicySuppressionOptions {
     fn retained_size(&self) -> usize {
         std::mem::size_of::<Self>().saturating_add(retained_extra(&self.source))
+    }
+}
+
+impl RetainedSize for PolicyEvaluationOptions {
+    fn retained_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(retained_extra(&self.suppressions))
+    }
+}
+
+impl RetainedSize for PolicyReportEvaluationContext {
+    fn retained_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(self.suppression_path.len())
+    }
+}
+
+impl RetainedSize for PolicySuppressionDecision {
+    fn retained_size(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(retained_extra(&self.reason))
+            .saturating_add(retained_extra(&self.accepted_by))
+    }
+}
+
+impl RetainedSize for PolicyFindingSuppression {
+    fn retained_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(retained_extra(&self.decision))
+    }
+}
+
+impl RetainedSize for PolicySuppressionReview {
+    fn retained_size(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(retained_extra(&self.policy_id))
+            .saturating_add(retained_extra(&self.decision))
     }
 }
 

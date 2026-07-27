@@ -2546,6 +2546,8 @@ const fn finding_incomplete_reason(value: FindingIncompleteReason) -> &'static s
 fn report_diagnostic_code(value: super::super::PolicyReportDiagnosticCode) -> &'static str {
     use super::super::PolicyReportDiagnosticCode as Code;
     match value {
+        Code::SuppressionLoadFailed => "suppression-load-failed",
+        Code::SuppressionAuditRetentionExceeded => "suppression-audit-retention-exceeded",
         Code::PolicyLoadFailed => "policy-load-failed",
         Code::PolicyParseFailed => "policy-parse-failed",
         Code::PolicyValidationFailed => "policy-validation-failed",

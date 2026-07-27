@@ -1067,7 +1067,15 @@ mod tests {
 
     use super::*;
     use crate::analyzer::semantic::WorkspaceRelativePath;
-    use crate::policy::{PolicyFailOn, evaluate_policy_files};
+    use crate::policy::{
+        PolicyEvaluationDate, PolicyEvaluationOptions, PolicyFailOn, evaluate_policy_files,
+    };
+
+    fn evaluation_options() -> PolicyEvaluationOptions {
+        PolicyEvaluationOptions::new(
+            PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date"),
+        )
+    }
 
     #[test]
     fn artifact_uri_preserves_only_segment_separators_and_unreserved_bytes() {
@@ -1086,6 +1094,7 @@ mod tests {
             &fixture_root,
             &[PathBuf::from("policies/dynamic-eval.rqlp")],
             false,
+            &evaluation_options(),
             PolicyFailOn::Never,
         )
         .expect("fixture policy evaluation");
@@ -1170,6 +1179,7 @@ mod tests {
             &fixture_root,
             &[PathBuf::from("policies/resource-lifecycle.rqlp")],
             false,
+            &evaluation_options(),
             PolicyFailOn::Never,
         )
         .expect("fixture policy evaluation");

@@ -294,6 +294,13 @@ fn explicit_json_path_is_confined_and_wrong_extensions_are_rejected() {
 
     assert!(PolicySuppressionSource::explicit_portable("../escape.json").is_err());
     assert!(PolicySuppressionSource::explicit(Path::new("/tmp/escape.json")).is_err());
+    assert!(
+        PolicySuppressionSource::explicit_portable(format!(
+            "{}.json",
+            "x".repeat(brokk_bifrost::policy::MAX_POLICY_SUPPRESSION_PATH_BYTES)
+        ))
+        .is_err()
+    );
     let wrong_extension = PolicySuppressionOptions::new(
         PolicySuppressionSource::explicit(Path::new("review/suppressions.txt")).unwrap(),
     );

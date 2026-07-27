@@ -497,7 +497,7 @@ mod tests {
         );
         assert_eq!(first, second);
         assert_eq!(usize::try_from(exact).unwrap(), first.len());
-        assert!(first.starts_with(br#"{"schema_version":1,"rules":["#));
+        assert!(first.starts_with(br#"{"schema_version":2,"evaluation":{"#));
 
         let limit = first.len() - 1;
         let mut bounded = Vec::new();

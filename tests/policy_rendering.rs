@@ -2,8 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use brokk_bifrost::policy::{
-    HumanRenderColor, HumanRenderDetail, HumanRenderOptions, PolicyFailOn, PolicyRenderError,
-    PolicyRunCompletion, evaluate_policy_files, write_policy_human, write_policy_json,
+    HumanRenderColor, HumanRenderDetail, HumanRenderOptions, PolicyEvaluationDate,
+    PolicyEvaluationOptions, PolicyFailOn, PolicyRenderError, PolicyRunCompletion,
+    evaluate_policy_files, write_policy_human, write_policy_json,
 };
 use serde_json::Value;
 
@@ -19,6 +20,12 @@ const MATCH_POLICY: &str = r#"(policy
       :selector
         (rql :schema-version 2
           (language typescript (function :name "target")))))"#;
+
+fn evaluation_options() -> PolicyEvaluationOptions {
+    PolicyEvaluationOptions::new(
+        PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date"),
+    )
+}
 
 fn workspace(source: &str, policy_name: &str, policy: &str) -> tempfile::TempDir {
     let workspace = tempfile::tempdir().expect("temporary workspace");
@@ -36,6 +43,7 @@ fn evaluate(
         workspace.path(),
         &[PathBuf::from("policies").join(policy_name)],
         false,
+        &evaluation_options(),
         PolicyFailOn::Never,
     )
     .expect("coordinated policy evaluation")
@@ -120,7 +128,7 @@ fn concise_verbose_and_json_render_the_same_complete_finding_deterministically()
     assert_eq!(json_first, json_second);
     assert_eq!(usize::try_from(json_bytes).unwrap(), json_first.len());
     let json: Value = serde_json::from_slice(&json_first).expect("valid JSON");
-    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["schema_version"], 2);
     assert_eq!(json["rules"][0]["policy_id"], "test.render");
     assert_eq!(json["runs"][0]["findings"][0]["id"], finding_id);
     assert_eq!(
@@ -142,6 +150,7 @@ fn typestate_run_renders_findings_and_completion() {
         &fixture_root,
         &[PathBuf::from("policies/resource-lifecycle.rqlp")],
         false,
+        &evaluation_options(),
         PolicyFailOn::Never,
     )
     .expect("coordinated typestate policy evaluation");
@@ -225,6 +234,7 @@ fn encoded_bounds_apply_after_terminal_and_json_escaping() {
         workspace.path(),
         &[PathBuf::from("policies").join(unsafe_name)],
         false,
+        &evaluation_options(),
         PolicyFailOn::Never,
     )
     .expect("missing unsafe requested path becomes a report diagnostic");

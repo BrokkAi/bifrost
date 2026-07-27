@@ -3,6 +3,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use chrono::{Datelike, Utc};
 #[path = "bifrost/code_query_repl.rs"]
 mod code_query_repl;
 
@@ -14,9 +15,9 @@ use brokk_bifrost::mcp_registry::{
 };
 use brokk_bifrost::policy::{
     HumanRenderColor, HumanRenderDetail, HumanRenderOptions, POLICY_EXIT_UNRELIABLE,
-    PolicyBatchOutcome, PolicyFailOn, PolicyRenderError, PolicyReportDocument, SarifToolIdentity,
-    escape_terminal_text, evaluate_policy_files, write_policy_human, write_policy_json,
-    write_policy_sarif,
+    PolicyBatchOutcome, PolicyEvaluationDate, PolicyEvaluationOptions, PolicyFailOn,
+    PolicyRenderError, PolicyReportDocument, SarifToolIdentity, escape_terminal_text,
+    evaluate_policy_files, write_policy_human, write_policy_json, write_policy_sarif,
 };
 use brokk_bifrost::scoped_project::create_cli_tool_service;
 use brokk_bifrost::searchtools_render::RenderOptions;
@@ -542,10 +543,22 @@ fn run_policy_mode(
     color_mode: PolicyColorMode,
     require_explicit_schema_versions: bool,
 ) -> u8 {
+    let today = Utc::now().date_naive();
+    let options = match PolicyEvaluationDate::from_ymd(today.year(), today.month(), today.day()) {
+        Ok(date) => PolicyEvaluationOptions::new(date),
+        Err(error) => {
+            eprintln!(
+                "bifrost: failed to determine the policy evaluation date: {}",
+                escape_terminal_text(&error.to_string())
+            );
+            return POLICY_EXIT_UNRELIABLE;
+        }
+    };
     let outcome = match evaluate_policy_files(
         root,
         policy_files,
         require_explicit_schema_versions,
+        &options,
         fail_on,
     ) {
         Ok(outcome) => outcome,

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use chrono::{Datelike, Utc};
 use lsp_server::{
     Connection, ErrorCode, ExtractError, IoThreads, Message, Notification, Request, RequestId,
     Response,
@@ -42,8 +43,9 @@ use lsp_types::{
 
 use crate::NavigationOperation;
 use crate::analyzer::policy::{
-    PolicyReportDocument, PolicySourceDiagnosticSeverity, PolicySourceIdentity,
-    evaluate_policy_source, rqlp_source_completion_at, rqlp_source_help_at, validate_rqlp_source,
+    PolicyEvaluationDate, PolicyEvaluationOptions, PolicyReportDocument,
+    PolicySourceDiagnosticSeverity, PolicySourceIdentity, evaluate_policy_source,
+    rqlp_source_completion_at, rqlp_source_help_at, validate_rqlp_source,
 };
 use crate::analyzer::semantic::WorkspaceRelativePath;
 use crate::analyzer::structural::query::{
@@ -1226,11 +1228,22 @@ fn handle_run_rql_policy_request(
         },
         move |workspace, _project, context, cancellation| {
             context.report("Evaluating policy");
+            let today = Utc::now().date_naive();
+            let options = PolicyEvaluationOptions::new(
+                PolicyEvaluationDate::from_ymd(today.year(), today.month(), today.day()).map_err(
+                    |error| {
+                        CancellableWorkerError::Failed(format!(
+                            "Failed to determine the policy evaluation date: {error}"
+                        ))
+                    },
+                )?,
+            );
             let outcome = evaluate_policy_source(
                 &workspace_root,
                 source_identity,
                 &source,
                 workspace,
+                &options,
                 Some(cancellation),
             )
             .map_err(|error| {
