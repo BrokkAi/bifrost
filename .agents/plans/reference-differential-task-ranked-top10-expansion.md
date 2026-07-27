@@ -296,6 +296,18 @@ comes through the local gate, but is not the focus.
   five-second performance contract. The exact regression and the complete
   `cargo test --features nlp,python` matrix pass outside the sandbox at
   niceness 10 with normal Cargo storage.
+- [x] (2026-07-27) Committed #1211 as `4b43b528`, fetched the concurrently
+  advanced `origin/master` at `85771d08`, and merged its C++ reconciliation
+  and symbols-search changes as `c4d871a4`. A delegated Oldskool overlap audit
+  confirmed that the new C++ reconciliation is a separate resolution-time
+  overlay: the #1208 parser identity fix, C++ epoch salt, reconstructed prior
+  epoch, and exact log4cxx regression all remain intact. On that integrated
+  head, formatting, `git diff --check`, all-target/all-feature Clippy, and the
+  complete `cargo test --features nlp,python` matrix pass outside the sandbox
+  with normal Cargo storage at niceness 10. The matrix passed 1,964 substantive
+  library tests, 194 LSP tests with the separately known Ruby hang filtered,
+  28 MCP tests, all 161 C++ usage tests, the exact #1208 differential
+  regression, and doc tests.
 - [ ] Publish the #1208 epoch correction, rebuild from the exact integrated
   head, and rerun the complete persisted C++ top ten from the new epoch before
   treating any of the 152 prior rows as current defects.
