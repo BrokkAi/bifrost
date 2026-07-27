@@ -1572,7 +1572,7 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
         assert!(analyzer.export_indexes.get(&file).is_some());
 
-        let unrelated_watcher_noise = ProjectFile::new(fixture.project_root(), ".brokk/cache.db");
+        let unrelated_watcher_noise = ProjectFile::new(fixture.project_root(), ".bifrost/cache.db");
         let updated = analyzer.update(&BTreeSet::from([file.clone(), unrelated_watcher_noise]));
         let after_noop_update = updated.forward_reference_context_of(&file);
 

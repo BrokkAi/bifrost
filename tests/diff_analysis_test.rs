@@ -262,7 +262,7 @@ fn analyze_diff_from_python_service_does_not_build_root_workspace_cache() {
         "analyze_diff should not force the root workspace analyzer/cache"
     );
     assert!(
-        !root.join(".brokk").join("bifrost_cache.db").exists(),
+        !root.join(".bifrost").join("bifrost_cache.db").exists(),
         "analyze_diff should honor FileSetProject's persistence opt-out"
     );
 }
@@ -718,7 +718,7 @@ fn analyze_diff_worktree_mode_writes_no_workspace_cache() {
 
     assert_eq!(result["endpoints"]["target"].as_str().unwrap(), "worktree");
     assert!(
-        !root.join(".brokk").join("bifrost_cache.db").exists(),
+        !root.join(".bifrost").join("bifrost_cache.db").exists(),
         "worktree-endpoint analyzer must stay ephemeral over the live project root"
     );
     assert!(

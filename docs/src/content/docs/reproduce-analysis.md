@@ -125,7 +125,7 @@ For MCP, record the configured workspace root and the exact `query_code` argumen
 
 ## Cold and Warm Runs
 
-Label cache state precisely. Bifrost's persistent repository cache is `.brokk/bifrost_cache.db` at the primary Git repository root, and linked worktrees share it. A new process using that database is not a fully cold run. Record whether you removed the cache while Bifrost was stopped, reused it, warmed the same process, or changed branches between samples.
+Label cache state precisely. Bifrost's persistent repository cache is `.bifrost/bifrost_cache.db` at the primary Git repository root, and linked worktrees share it. A new process using that database is not a fully cold run. Record whether you removed the cache while Bifrost was stopped, reused it, warmed the same process, or changed branches between samples.
 
 Use the [evaluation protocol](/evaluation-evidence/) when publishing timing, memory, precision, or recall. Keep installation downloads and optional semantic-model downloads separate unless they are intentionally part of the measurement.
 
