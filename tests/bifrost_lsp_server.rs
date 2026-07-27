@@ -7862,7 +7862,9 @@ fn bifrost_lsp_server_ruby_semantic_diagnostics_are_constant_only() {
         "method": "workspace/didChangeConfiguration",
         "params": {"settings": {"unrecognizedSymbolDiagnostics": true}}
     }));
-    let _ = server.read_notification("textDocument/publishDiagnostics");
+    // This test has made only pull diagnostic requests. A configuration change
+    // republishes diagnostics only for documents that previously received a
+    // push diagnostic notification, so there is no notification to drain here.
 
     server.notify_value(json!({
         "jsonrpc": "2.0",
