@@ -1,11 +1,11 @@
-use super::declarations::{
+use crate::analyzer::java::declarations::{
     class_like_body_children_rev, determine_package_name, is_class_like_declaration_kind,
     node_text, normalize_java_full_name, parse_tree,
 };
-use super::dependency_discovery::{discover_build_tools, discover_metadata};
+use crate::analyzer::java::dependency_discovery::{discover_build_tools, discover_metadata};
 use crate::analyzer::{
     JavaAnalyzerConfig, JavaDependencyDiscoveryMode, JavaExternalArtifact,
-    JavaExternalDependencies, JavaMavenCoordinate, Project,
+    JavaExternalDependencies, JavaMavenCoordinate, Project, ProjectFile,
 };
 use crate::hash::HashMap;
 use jclassfile::attributes::{Attribute, NestedClassFlags};
@@ -14,13 +14,18 @@ use jclassfile::constant_pool::ConstantPool;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use tree_sitter::Parser;
 use zip::ZipArchive;
 
 const MAX_ARCHIVE_ENTRIES: usize = 10_000;
+const MAX_INDEX_ARTIFACTS: usize = 128;
 const MAX_SOURCE_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_SCALA_SOURCE_ENTRY_BYTES: u64 = 1024 * 1024;
 const MAX_CLASS_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TOTAL_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_TOTAL_INDEX_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_SCALA_SOURCE_TYPES: usize = 4_096;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct JavaExternalDeclarationIndex {
@@ -94,15 +99,28 @@ impl JavaExternalDeclarationIndex {
 
     fn build_from_artifacts(artifacts: Vec<ResolvedJavaArtifact>) -> Self {
         let mut index = Self::default();
-        for artifact in artifacts {
+        let mut remaining_index_bytes = MAX_TOTAL_INDEX_BYTES;
+        for artifact in artifacts.into_iter().take(MAX_INDEX_ARTIFACTS) {
+            if remaining_index_bytes == 0 {
+                break;
+            }
             if is_source_jar(&artifact.artifact_path) {
-                index.index_source_jar(&artifact.artifact_path);
+                remaining_index_bytes = remaining_index_bytes.saturating_sub(
+                    index.index_source_jar(&artifact.artifact_path, remaining_index_bytes),
+                );
                 continue;
             }
             if let Some(source_artifact_path) = artifact.source_artifact_path.as_deref() {
-                index.index_source_jar(source_artifact_path);
+                remaining_index_bytes = remaining_index_bytes.saturating_sub(
+                    index.index_source_jar(source_artifact_path, remaining_index_bytes),
+                );
             }
-            index.index_class_jar(&artifact.artifact_path);
+            if remaining_index_bytes == 0 {
+                break;
+            }
+            remaining_index_bytes = remaining_index_bytes.saturating_sub(
+                index.index_class_jar(&artifact.artifact_path, remaining_index_bytes),
+            );
         }
         index.apply_enclosing_visibility();
         index
@@ -199,12 +217,12 @@ impl JavaExternalDeclarationIndex {
         }
     }
 
-    fn index_source_jar(&mut self, artifact_path: &Path) {
+    fn index_source_jar(&mut self, artifact_path: &Path, index_byte_budget: u64) -> u64 {
         let Some(file) = open_artifact_file(artifact_path) else {
-            return;
+            return 0;
         };
         let Ok(mut archive) = ZipArchive::new(file) else {
-            return;
+            return 0;
         };
         let entry_count = archive.len().min(MAX_ARCHIVE_ENTRIES);
         let mut total_bytes = 0u64;
@@ -212,34 +230,54 @@ impl JavaExternalDeclarationIndex {
             let Ok(entry) = archive.by_index(index) else {
                 continue;
             };
-            if !entry.name().ends_with(".java") {
+            let language = if entry.name().ends_with(".java") {
+                SourceJarLanguage::Java
+            } else if entry.name().ends_with(".scala") {
+                SourceJarLanguage::Scala
+            } else {
                 continue;
-            }
-            if !can_read_entry(entry.size(), MAX_SOURCE_ENTRY_BYTES, &mut total_bytes) {
+            };
+            let max_entry_bytes = match language {
+                SourceJarLanguage::Java => MAX_SOURCE_ENTRY_BYTES,
+                SourceJarLanguage::Scala => MAX_SCALA_SOURCE_ENTRY_BYTES,
+            };
+            if !can_read_entry(
+                entry.size(),
+                max_entry_bytes,
+                MAX_TOTAL_ARCHIVE_BYTES.min(index_byte_budget),
+                &mut total_bytes,
+            ) {
                 continue;
             }
             let source_path = entry.name().to_string();
             let mut source = String::new();
             if entry
-                .take(MAX_SOURCE_ENTRY_BYTES + 1)
+                .take(max_entry_bytes + 1)
                 .read_to_string(&mut source)
                 .is_err()
-                || source.len() as u64 > MAX_SOURCE_ENTRY_BYTES
+                || source.len() as u64 > max_entry_bytes
             {
                 continue;
             }
-            for external_type in source_types(artifact_path, &source_path, &source) {
+            let external_types = match language {
+                SourceJarLanguage::Java => source_types(artifact_path, &source_path, &source),
+                SourceJarLanguage::Scala => {
+                    scala_source_types(artifact_path, &source_path, &source)
+                }
+            };
+            for external_type in external_types {
                 self.insert(external_type);
             }
         }
+        total_bytes
     }
 
-    fn index_class_jar(&mut self, artifact_path: &Path) {
+    fn index_class_jar(&mut self, artifact_path: &Path, index_byte_budget: u64) -> u64 {
         let Some(file) = open_artifact_file(artifact_path) else {
-            return;
+            return 0;
         };
         let Ok(mut archive) = ZipArchive::new(file) else {
-            return;
+            return 0;
         };
         let entry_count = archive.len().min(MAX_ARCHIVE_ENTRIES);
         let mut total_bytes = 0u64;
@@ -250,7 +288,12 @@ impl JavaExternalDeclarationIndex {
             if !entry.name().ends_with(".class") || entry.name().ends_with("module-info.class") {
                 continue;
             }
-            if !can_read_entry(entry.size(), MAX_CLASS_ENTRY_BYTES, &mut total_bytes) {
+            if !can_read_entry(
+                entry.size(),
+                MAX_CLASS_ENTRY_BYTES,
+                MAX_TOTAL_ARCHIVE_BYTES.min(index_byte_budget),
+                &mut total_bytes,
+            ) {
                 continue;
             }
             let class_entry = entry.name().to_string();
@@ -267,7 +310,14 @@ impl JavaExternalDeclarationIndex {
                 self.insert(external_type);
             }
         }
+        total_bytes
     }
+}
+
+#[derive(Clone, Copy)]
+enum SourceJarLanguage {
+    Java,
+    Scala,
 }
 
 #[allow(dead_code)]
@@ -313,14 +363,19 @@ fn open_artifact_file(path: &Path) -> Option<File> {
     File::open(path).ok()
 }
 
-fn can_read_entry(entry_size: u64, max_entry_bytes: u64, total_bytes: &mut u64) -> bool {
+fn can_read_entry(
+    entry_size: u64,
+    max_entry_bytes: u64,
+    max_total_bytes: u64,
+    total_bytes: &mut u64,
+) -> bool {
     if entry_size > max_entry_bytes {
         return false;
     }
     let Some(next_total) = total_bytes.checked_add(entry_size) else {
         return false;
     };
-    if next_total > MAX_TOTAL_ARCHIVE_BYTES {
+    if next_total > max_total_bytes {
         return false;
     }
     *total_bytes = next_total;
@@ -651,6 +706,79 @@ fn source_types(artifact_path: &Path, source_path: &str, source: &str) -> Vec<Ja
     }
 
     result
+}
+
+fn scala_source_types(
+    artifact_path: &Path,
+    source_path: &str,
+    source: &str,
+) -> Vec<JavaExternalType> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
+        .expect("tree-sitter Scala language must load");
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    if tree.root_node().has_error() {
+        return Vec::new();
+    }
+
+    let synthetic_file = ProjectFile::new(std::env::temp_dir(), "external.scala");
+    let parsed =
+        crate::analyzer::scala::declarations::parse_scala_file(&synthetic_file, source, &tree);
+    parsed
+        .declarations()
+        .iter()
+        .filter(|declaration| declaration.is_class())
+        .filter(|declaration| {
+            scala_source_declaration_node(&tree, &parsed, declaration).is_some_and(|node| {
+                crate::analyzer::scala::declarations::scala_declaration_is_public(node, source)
+            })
+        })
+        .filter_map(|declaration| {
+            let fqn = crate::analyzer::scala::scala_normalize_full_name(&declaration.fq_name());
+            let (package_name, short_name) = fqn.rsplit_once('.').map_or_else(
+                || (String::new(), fqn.clone()),
+                |(package_name, short_name)| (package_name.to_string(), short_name.to_string()),
+            );
+            (!short_name.is_empty()).then(|| JavaExternalType {
+                fqn,
+                package_name,
+                short_name,
+                kind: JavaExternalTypeKind::Class,
+                visibility: JavaVisibility::Public,
+                source: JavaExternalDeclarationSource::SourceJar {
+                    artifact_path: artifact_path.to_path_buf(),
+                    source_path: source_path.to_string(),
+                },
+            })
+        })
+        // Source JARs are untrusted input. The index is deliberately
+        // best-effort, so stopping at a bounded number of public Scala types
+        // is preferable to retaining an arbitrarily large declaration set.
+        .take(MAX_SCALA_SOURCE_TYPES)
+        .collect()
+}
+
+fn scala_source_declaration_node<'tree>(
+    tree: &'tree tree_sitter::Tree,
+    parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    declaration: &crate::analyzer::CodeUnit,
+) -> Option<tree_sitter::Node<'tree>> {
+    let range = parsed.declaration_ranges(declaration).first()?;
+    let mut node = tree
+        .root_node()
+        .descendant_for_byte_range(range.start_byte, range.end_byte)?;
+    loop {
+        if matches!(
+            node.kind(),
+            "class_definition" | "object_definition" | "trait_definition" | "enum_definition"
+        ) {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
 }
 
 fn source_visibility(
@@ -1270,6 +1398,42 @@ mod tests {
             ),
             "{service:#?}"
         );
+    }
+
+    #[test]
+    fn jvm_external_declaration_indexes_scala_source_jar() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source_jar = root.join("scala-library-sources.jar");
+        write_zip_entry(
+            &source_jar,
+            "scala/example/Dependency.scala",
+            b"package scala.example\nclass Dependency\ntrait Contract\nobject Defaults\nprivate class Hidden\n",
+        );
+
+        let index = JavaExternalDeclarationIndex::build(
+            &JavaExternalDependencies {
+                artifact_paths: vec![JavaExternalArtifact {
+                    artifact_path: source_jar,
+                    source_artifact_path: None,
+                }],
+                ..JavaExternalDependencies::default()
+            },
+            &root,
+        );
+
+        for name in [
+            "scala.example.Dependency",
+            "scala.example.Contract",
+            "scala.example.Defaults",
+        ] {
+            assert!(matches!(
+                index.get(name).map(JavaExternalType::source),
+                Some(JavaExternalDeclarationSource::SourceJar { source_path, .. })
+                    if source_path == "scala/example/Dependency.scala"
+            ));
+        }
+        assert!(index.get("scala.example.Hidden").is_none());
     }
 
     #[test]

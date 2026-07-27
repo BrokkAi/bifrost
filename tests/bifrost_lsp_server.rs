@@ -7731,6 +7731,68 @@ func Run() {
 }
 
 #[test]
+fn bifrost_lsp_server_scala_semantic_diagnostics_are_runtime_opt_in() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(
+        temp_root.join("Consumer.scala"),
+        "class Consumer(value: MissingType)\n",
+    )
+    .expect("write Scala fixture");
+
+    let mut server = LspServer::start(&temp_root);
+    let uri = uri_for(&temp_root.join("Consumer.scala"));
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": uri}}
+    }));
+    let disabled = server.read_message();
+    assert!(
+        disabled["result"]["items"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "Scala semantic diagnostics must be disabled by default: {disabled}"
+    );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeConfiguration",
+        "params": {"settings": {"unrecognizedSymbolDiagnostics": true}}
+    }));
+    let published = server.read_notification("textDocument/publishDiagnostics");
+    assert!(
+        published["params"]["diagnostics"]
+            .as_array()
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item["source"] == "bifrost-scala" && item["code"] == "scala_unrecognized_symbol"
+                })
+            }),
+        "expected Scala unknown-type publish diagnostic: {published}"
+    );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": uri}}
+    }));
+    let enabled = server.read_message();
+    let items = enabled["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected diagnostics after enabling Scala linting: {enabled}"));
+    assert!(
+        items.iter().any(|item| {
+            item["source"] == "bifrost-scala" && item["code"] == "scala_unrecognized_symbol"
+        }),
+        "expected Scala unknown-type diagnostic: {enabled}"
+    );
+}
+
+#[test]
 fn bifrost_lsp_server_unrecognized_symbol_diagnostics_are_runtime_opt_in() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");

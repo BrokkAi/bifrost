@@ -1,5 +1,5 @@
-use super::external::JavaExternalType;
 use super::*;
+use crate::analyzer::jvm::external::JavaExternalType;
 use crate::analyzer::{ImportInfo, build_reverse_file_index};
 use std::sync::Arc;
 
