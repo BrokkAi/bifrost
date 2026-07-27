@@ -559,21 +559,24 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         tracker: &mut ReceiverAnalysisBudgetTracker,
     ) -> ReceiverAnalysisOutcome<ReceiverValue> {
         let before_byte = receiver_node.start_byte();
-        let scopes = lexical_scopes_for_node(receiver_node);
-        if scopes.is_empty() {
-            return ReceiverAnalysisOutcome::Unknown;
-        };
-        for scope in scopes {
-            if let Some(outcome) = self.latest_identifier_binding_in_scope(
-                scope,
-                receiver,
-                before_byte,
-                depth,
-                budget,
-                tracker,
-            ) {
+        let mut current = receiver_node;
+        loop {
+            if is_scope_boundary(current.kind())
+                && let Some(outcome) = self.latest_identifier_binding_in_scope(
+                    current,
+                    receiver,
+                    before_byte,
+                    depth,
+                    budget,
+                    tracker,
+                )
+            {
                 return outcome;
             }
+            let Some(parent) = current.parent() else {
+                break;
+            };
+            current = parent;
         }
         ReceiverAnalysisOutcome::Unknown
     }
