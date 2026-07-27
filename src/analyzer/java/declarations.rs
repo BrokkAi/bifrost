@@ -26,7 +26,7 @@ fn java_package_fq(package_name: &str) -> FqName {
     fq
 }
 
-pub(super) fn determine_package_name(root: Node<'_>, source: &str) -> String {
+pub(crate) fn determine_package_name(root: Node<'_>, source: &str) -> String {
     for index in 0..root.named_child_count() {
         let Some(child) = root.named_child(index) else {
             continue;
@@ -67,7 +67,7 @@ fn strip_generic_type_arguments(input: &str) -> String {
     out
 }
 
-pub(super) fn normalize_java_full_name(fq_name: &str) -> String {
+pub(crate) fn normalize_java_full_name(fq_name: &str) -> String {
     let mut normalized = strip_generic_type_arguments(fq_name);
 
     if normalized.contains("$anon$") {
@@ -202,7 +202,7 @@ pub(super) fn is_java_anonymous_structure(fq_name: &str) -> bool {
             .unwrap_or(false)
 }
 
-pub(super) fn collect_type_identifiers(
+pub(crate) fn collect_type_identifiers(
     node: Node<'_>,
     source: &str,
     identifiers: &mut HashSet<String>,
@@ -725,7 +725,7 @@ fn lambda_code_unit(
     )
 }
 
-pub(super) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     crate::analyzer::common::node_source_text(node, source)
 }
 
@@ -733,7 +733,7 @@ pub(super) fn normalize_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub(super) fn parse_tree(source: &str) -> Option<Tree> {
+pub(crate) fn parse_tree(source: &str) -> Option<Tree> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_java::LANGUAGE.into())
@@ -762,7 +762,7 @@ pub(super) fn is_declaration_parent(kind: &str) -> bool {
     )
 }
 
-pub(super) fn is_class_like_declaration_kind(kind: &str) -> bool {
+pub(crate) fn is_class_like_declaration_kind(kind: &str) -> bool {
     matches!(
         kind,
         "class_declaration"
@@ -773,7 +773,7 @@ pub(super) fn is_class_like_declaration_kind(kind: &str) -> bool {
     )
 }
 
-pub(super) fn class_like_body_children_rev<'tree>(body: Node<'tree>) -> Vec<Node<'tree>> {
+pub(crate) fn class_like_body_children_rev<'tree>(body: Node<'tree>) -> Vec<Node<'tree>> {
     let mut children = Vec::new();
     for index in (0..body.named_child_count()).rev() {
         let Some(child) = body.named_child(index) else {

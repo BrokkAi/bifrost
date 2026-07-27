@@ -23,6 +23,7 @@ pub(crate) mod identifier;
 mod java;
 mod javascript;
 mod js_ts;
+pub(crate) mod jvm;
 pub(crate) mod lexical_definitions;
 mod model;
 mod multi_analyzer;

@@ -3,9 +3,8 @@ mod cache;
 mod clones;
 mod comments;
 mod declarations;
-mod dependency_discovery;
+pub(crate) mod dependency_discovery;
 mod exceptions;
-mod external;
 mod hierarchy;
 mod imports;
 mod semantic;
@@ -27,6 +26,7 @@ use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use crate::analyzer::jvm::external::JavaExternalDeclarationIndex;
 pub(crate) use adapter::JavaAdapter;
 use cache::JavaMemoCaches;
 use clones::{build_clone_candidate_data, refine_java_clone_similarity};
@@ -38,7 +38,6 @@ use declarations::{
 };
 pub(crate) use dependency_discovery::is_java_dependency_input;
 use exceptions::detect_exception_handling_smells_java;
-use external::JavaExternalDeclarationIndex;
 use tests::detect_test_assertion_smells_java;
 
 #[derive(Clone)]
