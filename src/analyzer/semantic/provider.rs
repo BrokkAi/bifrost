@@ -1,7 +1,8 @@
 //! Provider outcomes, finite budgets, and the language-neutral adapter boundary.
 
+use std::collections::HashSet;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::analyzer::ProjectFile;
 use crate::cancellation::CancellationToken;
@@ -186,6 +187,129 @@ impl Default for SemanticBudget {
     }
 }
 
+/// Cross-provider limits for semantic work that is not represented by
+/// [`SemanticWork`]: distinct workspace files entered and bounded traversal
+/// steps performed while resolving them.
+///
+/// The shared ledger is deliberately request-scoped. Nested oracle requests
+/// clone the handle, not the allowance, so dispatch cannot reset the caller's
+/// file or traversal cap when it materializes candidate targets.
+#[derive(Debug, Clone)]
+pub struct SemanticExecutionBudget {
+    state: Arc<Mutex<SemanticExecutionBudgetState>>,
+}
+
+#[derive(Debug)]
+struct SemanticExecutionBudgetState {
+    max_materialized_files: usize,
+    max_traversal_steps: usize,
+    materialized_files: HashSet<ProjectFile>,
+    externally_materialized_files: usize,
+    traversal_steps: usize,
+    exhausted: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SemanticExecutionWork {
+    pub materialized_files: usize,
+    pub traversal_steps: usize,
+    pub exhausted: bool,
+}
+
+impl SemanticExecutionBudget {
+    pub fn new(max_materialized_files: usize, max_traversal_steps: usize) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(SemanticExecutionBudgetState {
+                max_materialized_files,
+                max_traversal_steps,
+                materialized_files: HashSet::new(),
+                externally_materialized_files: 0,
+                traversal_steps: 0,
+                exhausted: max_materialized_files == 0 || max_traversal_steps == 0,
+            })),
+        }
+    }
+
+    pub fn work(&self) -> SemanticExecutionWork {
+        let state = self.state.lock().expect("semantic execution budget lock");
+        SemanticExecutionWork {
+            materialized_files: state
+                .externally_materialized_files
+                .saturating_add(state.materialized_files.len()),
+            traversal_steps: state.traversal_steps,
+            exhausted: state.exhausted,
+        }
+    }
+
+    pub fn remaining_materialized_files(&self) -> usize {
+        let state = self.state.lock().expect("semantic execution budget lock");
+        state.max_materialized_files.saturating_sub(
+            state
+                .externally_materialized_files
+                .saturating_add(state.materialized_files.len()),
+        )
+    }
+
+    pub fn remaining_traversal_steps(&self) -> usize {
+        let state = self.state.lock().expect("semantic execution budget lock");
+        state
+            .max_traversal_steps
+            .saturating_sub(state.traversal_steps)
+    }
+
+    pub(crate) fn admit_materialization(&self, file: &ProjectFile) -> bool {
+        let mut state = self.state.lock().expect("semantic execution budget lock");
+        if state.materialized_files.contains(file) {
+            return true;
+        }
+        let used = state
+            .externally_materialized_files
+            .saturating_add(state.materialized_files.len());
+        if used >= state.max_materialized_files {
+            state.exhausted = true;
+            return false;
+        }
+        state.materialized_files.insert(file.clone());
+        true
+    }
+
+    pub(crate) fn charge_external_query_work(
+        &self,
+        materialized_files: usize,
+        traversal_steps: usize,
+    ) -> bool {
+        // CodeQuery currently reports only a count, not the identities, of
+        // semantic materializations. Keep those slots anonymous: associating
+        // them with final result paths would be unsound for branches that
+        // materialize one file while producing evidence from another.
+        self.charge_external_work(materialized_files, traversal_steps)
+    }
+
+    fn charge_external_work(&self, materialized_files: usize, traversal_steps: usize) -> bool {
+        let mut state = self.state.lock().expect("semantic execution budget lock");
+        let attempted_files = state
+            .externally_materialized_files
+            .saturating_add(state.materialized_files.len())
+            .saturating_add(materialized_files);
+        let attempted_traversal = state.traversal_steps.saturating_add(traversal_steps);
+        if attempted_files > state.max_materialized_files
+            || attempted_traversal > state.max_traversal_steps
+        {
+            state.exhausted = true;
+            return false;
+        }
+        state.externally_materialized_files = state
+            .externally_materialized_files
+            .saturating_add(materialized_files);
+        state.traversal_steps = attempted_traversal;
+        true
+    }
+
+    pub(crate) fn charge_traversal(&self, steps: usize) -> bool {
+        self.charge_external_work(0, steps)
+    }
+}
+
 /// A semantic result whose uncertainty, partial value, and work remain explicit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticOutcome<T> {
@@ -313,6 +437,7 @@ impl<T> SemanticOutcome<T> {
 pub struct SemanticRequest<'a> {
     pub budget: &'a mut SemanticBudget,
     pub cancellation: &'a CancellationToken,
+    execution: Option<SemanticExecutionBudget>,
 }
 
 impl<'a> SemanticRequest<'a> {
@@ -320,7 +445,47 @@ impl<'a> SemanticRequest<'a> {
         Self {
             budget,
             cancellation,
+            execution: None,
         }
+    }
+
+    pub fn with_execution_budget(
+        budget: &'a mut SemanticBudget,
+        cancellation: &'a CancellationToken,
+        execution: &SemanticExecutionBudget,
+    ) -> Self {
+        Self {
+            budget,
+            cancellation,
+            execution: Some(execution.clone()),
+        }
+    }
+
+    pub(crate) fn staged<'b>(&self, budget: &'b mut SemanticBudget) -> SemanticRequest<'b>
+    where
+        'a: 'b,
+    {
+        SemanticRequest {
+            budget,
+            cancellation: self.cancellation,
+            execution: self.execution.clone(),
+        }
+    }
+
+    pub(crate) fn execution_budget(&self) -> Option<&SemanticExecutionBudget> {
+        self.execution.as_ref()
+    }
+
+    pub(crate) fn admit_materialization(&self, file: &ProjectFile) -> bool {
+        self.execution
+            .as_ref()
+            .is_none_or(|execution| execution.admit_materialization(file))
+    }
+
+    pub(crate) fn charge_execution_traversal(&self, steps: usize) -> bool {
+        self.execution
+            .as_ref()
+            .is_none_or(|execution| execution.charge_traversal(steps))
     }
 }
 
@@ -489,6 +654,35 @@ mod tests {
             })
         );
         assert!(SemanticBudget::uniform(1).is_ok());
+    }
+
+    #[test]
+    fn execution_budget_unifies_external_and_nested_provider_work() {
+        let first = mock_file();
+        let second = ProjectFile::new(std::env::temp_dir(), "src/second.ts");
+        let third = ProjectFile::new(std::env::temp_dir(), "src/third.ts");
+        let execution = SemanticExecutionBudget::new(3, 3);
+        assert!(execution.charge_external_query_work(1, 1));
+        assert!(execution.admit_materialization(&first));
+        assert!(execution.admit_materialization(&second));
+
+        let mut budget = SemanticBudget::uniform(10).unwrap();
+        let mut staged_budget = budget.clone();
+        let cancellation = CancellationToken::default();
+        let request =
+            SemanticRequest::with_execution_budget(&mut budget, &cancellation, &execution);
+        let staged = request.staged(&mut staged_budget);
+        assert!(staged.charge_execution_traversal(2));
+        assert!(!staged.admit_materialization(&third));
+
+        assert_eq!(
+            execution.work(),
+            SemanticExecutionWork {
+                materialized_files: 3,
+                traversal_steps: 3,
+                exhausted: true,
+            }
+        );
     }
 
     #[test]

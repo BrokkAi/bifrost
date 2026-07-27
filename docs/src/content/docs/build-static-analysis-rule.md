@@ -5,11 +5,10 @@ description: Take a query from RQL exploration to a native RQLP policy or tested
 
 A Bifrost rule begins as a versioned `CodeQuery`. It can remain an application-owned query integration, or it can become a native `.rqlp` policy with stable rule identity, severity, completeness, and human/JSON/SARIF reporting. This guide builds a small “direct calls to Python `eval`” query, then shows both production paths.
 
-> **Warning — only code matching is implemented:** Bifrost currently executes
-> only `.rqlp` policies whose analysis has `:type match`. Taint-analysis and
-> typestate-analysis policy syntax is available for authoring and validation,
-> but those analyzers are not implemented yet. Running either type reports
-> `unsupported` and exits with status 2.
+> **Execution boundary:** Bifrost executes `.rqlp` policies whose analysis has
+> `:type match` or `:type typestate`. Taint-analysis syntax is available for
+> authoring and validation, but taint evaluation is not implemented yet;
+> running it reports `unsupported` and exits with status 2.
 
 This example becomes a structural policy: it finds parsed call expressions whose callee is named `eval`. It does not prove runtime dispatch, taint, reachability, or data flow. Choose a graph step and proof filter when declaration identity matters, and choose another analysis engine when the policy requires an unsupported guarantee.
 
@@ -78,8 +77,8 @@ Save it as one `.rqlp` file and run it with `bifrost --policy-file`. The policy
 owns finding identity and presentation while the nested RQL remains the same
 typed selector explored above. See [Static-Analysis
 Policies](/static-analysis-policies/) for endpoint libraries, taint and
-typestate syntax, schema inference, composition, report parity, and the current
-execution boundary.
+typestate syntax, schema inference, composition, typestate execution and report
+parity, and the current taint execution boundary.
 
 If an application needs the raw query result or custom domain logic rather than
 a Bifrost policy report, keep the checked-in CodeQuery and use one of the

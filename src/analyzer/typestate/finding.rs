@@ -110,11 +110,13 @@ pub enum TypestateFindingCertainty {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TypestateFindingKind {
     ErrorTransition {
+        binding: TypestateEventBindingId,
         event: ProtocolEventId,
         from: ProtocolStateId,
         to: ProtocolStateId,
     },
     TerminalExpectation {
+        binding: TypestateTerminalBindingId,
         expectation: ProtocolExpectationId,
         actual_states: Box<[ProtocolStateId]>,
     },
@@ -320,6 +322,33 @@ pub struct TypestateFindingReport {
     findings: Box<[TypestateFinding]>,
     omitted: usize,
     analysis_complete: bool,
+    work: TypestateFindingWork,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TypestateFindingWork {
+    reached_rows: usize,
+    candidates: usize,
+    witness_expansions: usize,
+    witness_bytes: usize,
+}
+
+impl TypestateFindingWork {
+    pub const fn reached_rows(self) -> usize {
+        self.reached_rows
+    }
+
+    pub const fn candidates(self) -> usize {
+        self.candidates
+    }
+
+    pub const fn witness_expansions(self) -> usize {
+        self.witness_expansions
+    }
+
+    pub const fn witness_bytes(self) -> usize {
+        self.witness_bytes
+    }
 }
 
 impl TypestateFindingReport {
@@ -333,6 +362,10 @@ impl TypestateFindingReport {
 
     pub const fn analysis_complete(&self) -> bool {
         self.analysis_complete
+    }
+
+    pub const fn work(&self) -> TypestateFindingWork {
+        self.work
     }
 }
 
@@ -580,6 +613,7 @@ pub fn collect_summary_findings_with_limits(
             subject: key.subject,
             site: binding.site().identity().clone(),
             kind: TypestateFindingKind::ErrorTransition {
+                binding: binding.id(),
                 event: binding.event(),
                 from: key.from,
                 to: key.to,
@@ -794,6 +828,7 @@ pub fn collect_summary_findings_with_limits(
             subject: binding.subject(),
             site: binding.site().identity().clone(),
             kind: TypestateFindingKind::TerminalExpectation {
+                binding: binding.id(),
                 expectation: binding.expectation(),
                 actual_states: actual_states.into_boxed_slice(),
             },
@@ -820,11 +855,18 @@ pub fn collect_summary_findings_with_limits(
     findings = merge_pending_findings(findings, cancellation)?;
     let omitted = findings.len().saturating_sub(MAX_TYPESTATE_FINDINGS);
     findings.truncate(MAX_TYPESTATE_FINDINGS);
-    let findings = materialize_findings(findings, result, limits, cancellation)?;
+    let (findings, witness_expansions, witness_bytes) =
+        materialize_findings(findings, result, limits, cancellation)?;
     Ok(TypestateFindingReport {
         findings: findings.into_boxed_slice(),
         omitted,
         analysis_complete,
+        work: TypestateFindingWork {
+            reached_rows: result.reached().len(),
+            candidates: retained_candidates,
+            witness_expansions,
+            witness_bytes,
+        },
     })
 }
 
@@ -1215,7 +1257,7 @@ fn materialize_findings(
     result: &crate::analyzer::dataflow::SummaryDataflowResult<TypestateFact>,
     limits: TypestateFindingLimits,
     cancellation: &CancellationToken,
-) -> Result<Vec<TypestateFinding>, TypestateFlowProblemError> {
+) -> Result<(Vec<TypestateFinding>, usize, usize), TypestateFlowProblemError> {
     let mut retained_expansions = 0usize;
     let mut retained_bytes = 0usize;
     let mut materialized = Vec::with_capacity(findings.len());
@@ -1275,7 +1317,7 @@ fn materialize_findings(
             omitted_witnesses: finding.omitted_witnesses,
         });
     }
-    Ok(materialized)
+    Ok((materialized, retained_expansions, retained_bytes))
 }
 
 #[cfg(test)]

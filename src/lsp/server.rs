@@ -1230,7 +1230,7 @@ fn handle_run_rql_policy_request(
                 &workspace_root,
                 source_identity,
                 &source,
-                workspace.analyzer(),
+                workspace,
                 Some(cancellation),
             )
             .map_err(|error| {

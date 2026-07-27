@@ -650,7 +650,7 @@ fn materialize_one_call_result(
     let mut resolution = CallResultResolution::default();
 
     let dispatch_outcome = {
-        let mut request = SemanticRequest::new(&mut staged.budget, cancellation);
+        let mut request = staged.request(cancellation);
         oracle
             .resolve_call(&call, &mut request)
             .map_err(InterruptionOrProvider::Provider)?
@@ -678,7 +678,7 @@ fn materialize_one_call_result(
             ));
         }
         let bindings_outcome = {
-            let mut request = SemanticRequest::new(&mut staged.budget, cancellation);
+            let mut request = staged.request(cancellation);
             oracle
                 .call_bindings(&call, candidate, query.context(), &mut request)
                 .map_err(InterruptionOrProvider::Provider)?
@@ -698,7 +698,7 @@ fn materialize_one_call_result(
         let callee_context = query.context().extended(call.clone(), limits);
         resolution.open |= callee_context.was_truncated();
         let flow_outcome = {
-            let mut request = SemanticRequest::new(&mut staged.budget, cancellation);
+            let mut request = staged.request(cancellation);
             oracle
                 .procedure_relations(candidate.target(), &callee_context, &mut request)
                 .map_err(InterruptionOrProvider::Provider)?

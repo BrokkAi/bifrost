@@ -2173,6 +2173,146 @@ fn procedure_exit_events_execute_when_control_enters_the_exit() {
 }
 
 #[test]
+fn proven_exit_event_transitions_a_partially_discovered_subject() {
+    let fixture = fixture(TypestateBindingQuality::proven_unique());
+    let protocol = exit_protocol();
+    let partial_subject = TypestateBindingQuality::new(
+        ProofStatus::Proven,
+        EvidenceCompleteness::Partial("selector provenance was truncated".into()),
+        TypestateBindingMultiplicity::new(CandidateCoverage::Exhaustive, 1).unwrap(),
+    );
+    let bindings = TypestateBindingPlan::try_new(
+        &protocol,
+        vec![BoundTypestateSubjectSpec::new(
+            fixture.subject_class.clone(),
+            fixture.subject_object.clone(),
+            partial_subject,
+        )],
+        Vec::new(),
+        vec![TypestateEventBindingSpec::new(
+            ProtocolEventKey::new("finish").unwrap(),
+            fixture.subject_key.clone(),
+            TypestateObservationSite::program_point(
+                fixture.exit.clone(),
+                TypestateBindingContext::root(),
+            ),
+            0,
+            TypestateObjectRole::CurrentObject,
+            TypestateBindingQuality::proven_unique(),
+        )],
+        Vec::new(),
+    )
+    .unwrap();
+    let problem = TypestateFlowProblem::try_new(&protocol, &bindings).unwrap();
+    let proven = ProofStatus::Proven;
+    let complete = EvidenceCompleteness::Complete;
+    let open = problem
+        .state_fact(
+            &fixture.subject_key,
+            &ProtocolStateKey::new("open").unwrap(),
+        )
+        .unwrap();
+
+    let result = transfer(
+        &problem,
+        DataflowEdge::new(
+            IcfgEdgeKind::Intraprocedural(
+                brokk_bifrost::analyzer::semantic::ControlEdgeKind::Normal,
+            ),
+            None,
+            &fixture.entry,
+            &fixture.exit,
+            &proven,
+            &complete,
+        ),
+        open,
+        TestTransfer::Normal,
+    );
+
+    assert!(
+        result.contains(
+            &problem
+                .state_fact(
+                    &fixture.subject_key,
+                    &ProtocolStateKey::new("closed").unwrap(),
+                )
+                .unwrap()
+        ),
+        "subject discovery uncertainty must not suppress a proven authored event"
+    );
+}
+
+#[test]
+fn point_seed_at_exit_observes_the_exit_event_once() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("src/main.ts", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let fixture = fixture_from(
+        &project,
+        &analyzer,
+        TypestateBindingQuality::proven_unique(),
+        TypestateBindingQuality::proven_unique(),
+        false,
+        false,
+    );
+    let protocol = exit_protocol();
+    let exact = TypestateBindingQuality::proven_unique();
+    let exit_site = TypestateObservationSite::program_point(
+        fixture.exit.clone(),
+        TypestateBindingContext::root(),
+    );
+    let bindings = TypestateBindingPlan::try_new(
+        &protocol,
+        vec![BoundTypestateSubjectSpec::new(
+            fixture.subject_class.clone(),
+            fixture.subject_object.clone(),
+            exact.clone(),
+        )],
+        vec![TypestateInitialSeedSpec::new(
+            fixture.subject_key.clone(),
+            ProtocolStateKey::new("open").unwrap(),
+            exit_site.clone(),
+            TypestateObjectRole::MatchedValue,
+            exact.clone(),
+        )],
+        vec![TypestateEventBindingSpec::new(
+            ProtocolEventKey::new("finish").unwrap(),
+            fixture.subject_key.clone(),
+            exit_site,
+            0,
+            TypestateObjectRole::CurrentObject,
+            exact,
+        )],
+        Vec::new(),
+    )
+    .unwrap();
+    let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let summary = solve_typestate_with_summaries(
+        &fixture.root,
+        &[],
+        &analyzer.icfg_provider(),
+        &protocol,
+        &bindings,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .unwrap();
+    let closed = protocol
+        .state_id(&ProtocolStateKey::new("closed").unwrap())
+        .unwrap();
+
+    assert!(summary.result().reached_at(&fixture.exit).any(|reached| {
+        summary
+            .result()
+            .fact(reached.fact())
+            .is_some_and(|fact| fact.protocol_state() == Some(closed))
+    }));
+}
+
+#[test]
 fn exit_terminal_observes_the_post_return_state() {
     let fixture = fixture(TypestateBindingQuality::proven_unique());
     let mut spec = ProtocolSpec::from_json(RESOURCE_LIFECYCLE).unwrap();

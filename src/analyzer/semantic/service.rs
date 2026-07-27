@@ -247,6 +247,16 @@ pub(crate) fn materialize_with_lowerer<A: LanguageAdapter>(
         });
     }
 
+    // Admit the file and its top-level traversal before preparing source or
+    // consulting the artifact cache. A cache hit is still a materialized file
+    // in this request, and a rejected file must perform no hidden work.
+    if !request.charge_execution_traversal(1) || !request.admit_materialization(file) {
+        return Ok(SemanticOutcome::Unknown {
+            partial: None,
+            work: SemanticWork::default(),
+        });
+    }
+
     validate_semantic_file(analyzer, file)?;
 
     let max_source_bytes = request.budget.remaining().source_bytes;
