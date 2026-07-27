@@ -6,7 +6,7 @@ use brokk_bifrost::policy::{
     PolicyEvaluationOptions, PolicyFailOn, PolicyRenderError, PolicyRunCompletion,
     evaluate_policy_files, write_policy_human, write_policy_json,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
 const MATCH_POLICY: &str = r#"(policy
   :schema-version 1
@@ -49,6 +49,141 @@ fn evaluate(
     .expect("coordinated policy evaluation")
 }
 
+fn write_suppression(
+    workspace: &tempfile::TempDir,
+    policy_id: &str,
+    policy_hash: &str,
+    finding_id: &str,
+) {
+    let path = workspace.path().join(".bifrost/suppressions.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "suppressions": [{
+                "policy_id": policy_id,
+                "finding_id": finding_id,
+                "identity_stability": "strong",
+                "status": "accepted",
+                "reason": "Reviewed compatibility boundary",
+                "policy_hash_at_acceptance": policy_hash,
+                "accepted_by": "security-review",
+                "accepted_at": "2026-07-01",
+                "expires_at": "2026-07-27"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn suppressions_hide_only_concise_results_and_keep_verbose_json_audit() {
+    let workspace = workspace(
+        "export function target() { return 1; }\n",
+        "render.rqlp",
+        MATCH_POLICY,
+    );
+    let baseline = evaluate(&workspace, "render.rqlp");
+    let rule = &baseline.report().rules()[0];
+    let finding = &baseline.report().runs()[0].findings()[0];
+    write_suppression(
+        &workspace,
+        rule.policy_id().as_str(),
+        &rule.policy_hash().to_string(),
+        &finding.id().to_string(),
+    );
+
+    let suppressed = evaluate(&workspace, "render.rqlp");
+    let mut concise = Vec::new();
+    write_policy_human(
+        suppressed.report(),
+        &HumanRenderOptions::default(),
+        &mut concise,
+        usize::MAX,
+    )
+    .unwrap();
+    let concise = String::from_utf8(concise).unwrap();
+    assert!(!concise.contains("Avoid target"));
+    assert_eq!(
+        concise,
+        "summary: 0 active findings; 1 suppressed finding; 1 complete policy run; clean\n"
+    );
+
+    let mut verbose = Vec::new();
+    write_policy_human(
+        suppressed.report(),
+        &HumanRenderOptions::new(HumanRenderDetail::Verbose, HumanRenderColor::Plain),
+        &mut verbose,
+        usize::MAX,
+    )
+    .unwrap();
+    let verbose = String::from_utf8(verbose).unwrap();
+    assert!(verbose.contains("test.render: Avoid target"));
+    assert!(verbose.contains("  suppression: accepted (policy hash matching)\n"));
+    assert!(verbose.contains("  suppression reason: Reviewed compatibility boundary\n"));
+    assert!(verbose.contains("  accepted: 2026-07-01 by security-review\n"));
+    assert!(verbose.contains("  expires: 2026-07-27\n"));
+    assert!(!verbose.contains("suppression review:"));
+
+    let mut json_bytes = Vec::new();
+    write_policy_json(suppressed.report(), &mut json_bytes, usize::MAX).unwrap();
+    let json: Value = serde_json::from_slice(&json_bytes).unwrap();
+    assert_eq!(
+        json["runs"][0]["findings"][0]["suppression"]["status"],
+        "accepted"
+    );
+    assert_eq!(json["suppressions"][0]["applied"], true);
+    assert_eq!(json["suppressions"][0]["result_omitted"], false);
+
+    fs::write(
+        workspace.path().join("app.ts"),
+        "export function other() { return 1; }\n",
+    )
+    .unwrap();
+    let stale = evaluate(&workspace, "render.rqlp");
+    let mut verbose = Vec::new();
+    write_policy_human(
+        stale.report(),
+        &HumanRenderOptions::new(HumanRenderDetail::Verbose, HumanRenderColor::Plain),
+        &mut verbose,
+        usize::MAX,
+    )
+    .unwrap();
+    let verbose = String::from_utf8(verbose).unwrap();
+    assert!(verbose.contains("suppression review: test.render finding "));
+    assert!(verbose.contains("disposition: match finding absent; temporal current; policy hash matching; applied no; stale yes; result omitted no"));
+    assert!(verbose.ends_with("; 1 stale suppression review; 1 complete policy run; clean\n"));
+
+    fs::write(
+        workspace.path().join("app.ts"),
+        "export function target() { return 1; }\n",
+    )
+    .unwrap();
+    let expired = evaluate_policy_files(
+        workspace.path(),
+        &[PathBuf::from("policies/render.rqlp")],
+        false,
+        &PolicyEvaluationOptions::new("2026-07-28".parse().unwrap()),
+        PolicyFailOn::Never,
+    )
+    .unwrap();
+    let mut concise = Vec::new();
+    write_policy_human(
+        expired.report(),
+        &HumanRenderOptions::default(),
+        &mut concise,
+        usize::MAX,
+    )
+    .unwrap();
+    let concise = String::from_utf8(concise).unwrap();
+    assert!(concise.contains("Avoid target"));
+    assert!(concise.ends_with(
+        "summary: 1 active finding; 0 suppressed findings; 1 expired suppression review; 1 complete policy run\n"
+    ));
+}
+
 #[test]
 fn concise_verbose_and_json_render_the_same_complete_finding_deterministically() {
     let workspace = workspace(
@@ -84,7 +219,10 @@ fn concise_verbose_and_json_render_the_same_complete_finding_deterministically()
     assert!(!human.contains(&finding_id));
     assert!(!human.contains("  evidence:"));
     assert!(!human.contains("policy rule:"));
-    assert!(human.ends_with("summary: 1 finding; 1 complete policy run\n"));
+    assert!(
+        human
+            .ends_with("summary: 1 active finding; 0 suppressed findings; 1 complete policy run\n")
+    );
     assert!(!human.contains('\u{001B}'));
 
     let verbose_options =
@@ -110,7 +248,10 @@ fn concise_verbose_and_json_render_the_same_complete_finding_deterministically()
     assert!(verbose.contains("  severity: fixed warning\n"));
     assert!(!verbose.contains(" detail: {"));
     assert!(verbose.lines().all(|line| line.len() <= 240));
-    assert!(verbose.ends_with("summary: 1 finding; 1 complete policy run\n"));
+    assert!(
+        verbose
+            .ends_with("summary: 1 active finding; 0 suppressed findings; 1 complete policy run\n")
+    );
 
     let ansi_options = HumanRenderOptions::new(HumanRenderDetail::Concise, HumanRenderColor::Ansi);
     let mut ansi = Vec::new();
@@ -198,7 +339,9 @@ fn human_complete_empty_and_invalid_reports_are_explicitly_clean_and_non_clean()
     let human = String::from_utf8(human).unwrap();
     assert!(!human.contains("policy rule: test.render (Render test)\n"));
     assert!(!human.contains(" detail: {"));
-    assert!(human.ends_with("summary: 0 findings; 1 complete policy run; clean\n"));
+    assert!(human.ends_with(
+        "summary: 0 active findings; 0 suppressed findings; 1 complete policy run; clean\n"
+    ));
 
     let invalid_workspace = workspace(
         "export function other() { return 1; }\n",
@@ -219,7 +362,9 @@ fn human_complete_empty_and_invalid_reports_are_explicitly_clean_and_non_clean()
     // `(policy :id)` is valid S-expression syntax but violates the policy
     // schema, so it must remain distinguishable from a source parse failure.
     assert!(human.contains("report diagnostic: [error] policy-validation-failed:"));
-    assert!(human.ends_with("summary: 0 findings; 0 policy runs; non-clean\n"));
+    assert!(human.ends_with(
+        "summary: 0 active findings; 0 suppressed findings; 0 policy runs; non-clean\n"
+    ));
 }
 
 #[test]

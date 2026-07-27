@@ -262,7 +262,9 @@ fn thresholds_cover_clean_rated_and_unrated_findings() {
         "{stdout}"
     );
     assert!(!stdout.contains("  evidence:"), "{stdout}");
-    assert!(stdout.contains("summary: 1 finding; 1 complete policy run"));
+    assert!(
+        stdout.contains("summary: 1 active finding; 0 suppressed findings; 1 complete policy run")
+    );
 
     let verbose = run(
         project.root(),
@@ -332,6 +334,197 @@ fn thresholds_cover_clean_rated_and_unrated_findings() {
             .windows(5)
             .any(|window| window == b"\x1b[33m")
     );
+}
+
+#[test]
+fn policy_suppressions_are_deterministic_auditable_and_threshold_aware_across_formats() {
+    let project = policy_project(&[]);
+    let baseline = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--evaluation-date",
+            "2026-07-27",
+            "--format",
+            "json",
+            "--fail-on",
+            "warning",
+        ],
+    );
+    assert_status(&baseline, 1);
+    let baseline = json_stdout(&baseline);
+    let policy_id = baseline["rules"][0]["policy_id"].as_str().unwrap();
+    let policy_hash = baseline["rules"][0]["policy_hash"].as_str().unwrap();
+    let finding_id = baseline["runs"][0]["findings"][0]["id"].as_str().unwrap();
+    let suppression = serde_json::json!({
+        "schema_version": 1,
+        "suppressions": [{
+            "policy_id": policy_id,
+            "finding_id": finding_id,
+            "identity_stability": "strong",
+            "status": "accepted",
+            "reason": "Reviewed compatibility boundary",
+            "policy_hash_at_acceptance": policy_hash,
+            "accepted_by": "security-review",
+            "accepted_at": "2026-07-01",
+            "expires_at": "2026-07-27"
+        }]
+    });
+    let default_path = project.root().join(".bifrost/suppressions.json");
+    fs::create_dir_all(default_path.parent().unwrap()).unwrap();
+    fs::write(
+        &default_path,
+        serde_json::to_vec_pretty(&suppression).unwrap(),
+    )
+    .unwrap();
+    let custom_path = project.root().join("reviews/accepted.json");
+    fs::create_dir_all(custom_path.parent().unwrap()).unwrap();
+    fs::write(
+        &custom_path,
+        serde_json::to_vec_pretty(&suppression).unwrap(),
+    )
+    .unwrap();
+
+    let concise = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--evaluation-date",
+            "2026-07-27",
+            "--fail-on",
+            "warning",
+        ],
+    );
+    assert_status(&concise, 0);
+    let concise = String::from_utf8(concise.stdout).unwrap();
+    assert!(!concise.contains("Dynamic evaluation is forbidden"));
+    assert_eq!(
+        concise,
+        "summary: 0 active findings; 1 suppressed finding; 1 complete policy run; clean\n"
+    );
+
+    let json_args = [
+        "--policy-file",
+        "policies/dynamic-eval.rqlp",
+        "--suppressions-file",
+        "reviews/accepted.json",
+        "--evaluation-date",
+        "2026-07-27",
+        "--format",
+        "json",
+        "--fail-on",
+        "warning",
+    ];
+    let first = run(project.root(), &json_args);
+    let second = run(project.root(), &json_args);
+    assert_status(&first, 0);
+    assert_status(&second, 0);
+    assert_eq!(first.stdout, second.stdout);
+    let json = json_stdout(&first);
+    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["evaluation"]["evaluation_date"], "2026-07-27");
+    assert_eq!(
+        json["evaluation"]["suppression_path"],
+        "reviews/accepted.json"
+    );
+    assert_eq!(json["runs"][0]["findings"][0]["id"], finding_id);
+    assert_eq!(
+        json["runs"][0]["findings"][0]["suppression"]["status"],
+        "accepted"
+    );
+    assert_eq!(json["suppressions"][0]["applied"], true);
+
+    let verbose = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--evaluation-date",
+            "2026-07-27",
+            "--verbose",
+            "--fail-on",
+            "warning",
+        ],
+    );
+    assert_status(&verbose, 0);
+    let verbose = String::from_utf8(verbose.stdout).unwrap();
+    assert!(verbose.contains("Dynamic evaluation is forbidden"));
+    assert!(verbose.contains("  suppression: accepted (policy hash matching)\n"));
+    assert!(verbose.contains("  accepted: 2026-07-01 by security-review\n"));
+
+    let sarif = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--evaluation-date",
+            "2026-07-27",
+            "--format",
+            "sarif",
+            "--fail-on",
+            "warning",
+        ],
+    );
+    assert_status(&sarif, 0);
+    let sarif = json_stdout(&sarif);
+    assert_eq!(
+        sarif["runs"][0]["results"][0]["suppressions"][0]["kind"],
+        "external"
+    );
+    assert_eq!(
+        sarif["runs"][0]["results"][0]["partialFingerprints"]["bifrostFinding/v1"],
+        finding_id
+    );
+
+    let expired = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--evaluation-date",
+            "2026-07-28",
+            "--fail-on",
+            "warning",
+        ],
+    );
+    assert_status(&expired, 1);
+    let expired = String::from_utf8(expired.stdout).unwrap();
+    assert!(expired.contains("Dynamic evaluation is forbidden"));
+    assert!(expired.contains("1 expired suppression review"));
+
+    fs::write(project.root().join("reviews/invalid.json"), b"not JSON\n").unwrap();
+    let invalid = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--suppressions-file",
+            "reviews/invalid.json",
+            "--evaluation-date",
+            "2026-07-27",
+            "--format",
+            "json",
+            "--fail-on",
+            "warning",
+        ],
+    );
+    assert_status(&invalid, 2);
+    let invalid = json_stdout(&invalid);
+    assert_eq!(invalid["runs"][0]["findings"].as_array().unwrap().len(), 1);
+    assert_eq!(invalid["diagnostics"][0]["code"], "suppression-load-failed");
+}
+
+#[test]
+fn policy_help_names_suppression_controls() {
+    let project = policy_project(&[]);
+    let help = run(project.root(), &["--help"]);
+    assert_status(&help, 0);
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.contains("--suppressions-file PATH"));
+    assert!(help.contains("--evaluation-date YYYY-MM-DD"));
+    assert!(help.contains("default: .bifrost/suppressions.json"));
 }
 
 #[test]
@@ -923,6 +1116,34 @@ fn policy_mode_is_exclusive_and_output_failures_use_status_two_without_clobberin
         vec!["--policy-file"],
         vec!["--policy-file", "policies/dynamic-eval.rqlp", "--unknown"],
         vec!["--unknown", "--policy-file", "policies/dynamic-eval.rqlp"],
+        vec![
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--evaluation-date",
+            "2026-02-30",
+        ],
+        vec![
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--suppressions-file",
+            "/outside/reviews.json",
+        ],
+        vec![
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--evaluation-date",
+            "2026-07-27",
+            "--evaluation-date",
+            "2026-07-28",
+        ],
+        vec![
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--suppressions-file",
+            "reviews/one.json",
+            "--suppressions-file",
+            "reviews/two.json",
+        ],
         vec![
             "--policy-file",
             "policies/dynamic-eval.rqlp",
