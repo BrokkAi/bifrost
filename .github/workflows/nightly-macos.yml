@@ -143,3 +143,73 @@ jobs:
 
       - name: Run python tests
         run: bash scripts/test_python.sh
+
+  nightly-incident:
+    name: nightly incident
+    if: always()
+    needs: [agent-plugin, pi-package, rust, python]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ISSUE_TITLE: Nightly macOS CI is failing
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      AGENT_PLUGIN_RESULT: ${{ needs.agent-plugin.result }}
+      PI_PACKAGE_RESULT: ${{ needs.pi-package.result }}
+      RUST_RESULT: ${{ needs.rust.result }}
+      PYTHON_RESULT: ${{ needs.python.result }}
+    steps:
+      - name: Open, update, or close nightly incident
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          issue_number="$({
+            gh issue list \
+              --repo "$GITHUB_REPOSITORY" \
+              --state all \
+              --search "\"${ISSUE_TITLE}\" in:title" \
+              --limit 100 \
+              --json number,title \
+              --jq ".[] | select(.title == \"${ISSUE_TITLE}\") | .number"
+          } | head -n 1)"
+
+          failed_jobs=()
+          [ "$AGENT_PLUGIN_RESULT" = "success" ] || failed_jobs+=("agent plugin: $AGENT_PLUGIN_RESULT")
+          [ "$PI_PACKAGE_RESULT" = "success" ] || failed_jobs+=("Pi package: $PI_PACKAGE_RESULT")
+          [ "$RUST_RESULT" = "success" ] || failed_jobs+=("Rust: $RUST_RESULT")
+          [ "$PYTHON_RESULT" = "success" ] || failed_jobs+=("Python: $PYTHON_RESULT")
+
+          if [ "${#failed_jobs[@]}" -eq 0 ]; then
+            if [ -n "$issue_number" ]; then
+              issue_state="$(gh issue view "$issue_number" --repo "$GITHUB_REPOSITORY" --json state --jq .state)"
+              if [ "$issue_state" = "OPEN" ]; then
+                gh issue comment "$issue_number" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --body "Nightly macOS CI recovered in [this run](${RUN_URL})."
+                gh issue close "$issue_number" --repo "$GITHUB_REPOSITORY"
+              fi
+            fi
+            exit 0
+          fi
+
+          failure_list="$(printf -- '- %s\n' "${failed_jobs[@]}")"
+          failure_body="The nightly macOS workflow failed in [this run](${RUN_URL}).
+
+          ${failure_list}"
+
+          if [ -z "$issue_number" ]; then
+            gh issue create \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$ISSUE_TITLE" \
+              --body "$failure_body"
+            exit 0
+          fi
+
+          issue_state="$(gh issue view "$issue_number" --repo "$GITHUB_REPOSITORY" --json state --jq .state)"
+          if [ "$issue_state" = "CLOSED" ]; then
+            gh issue reopen "$issue_number" --repo "$GITHUB_REPOSITORY"
+          fi
+          gh issue comment "$issue_number" --repo "$GITHUB_REPOSITORY" --body "$failure_body"
