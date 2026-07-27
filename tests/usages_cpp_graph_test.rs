@@ -14016,6 +14016,142 @@ void exercise(demo::Metrics& metrics, demo::Ordinary& ordinary, wrong::Metrics& 
 }
 
 #[test]
+fn authoritative_cpp_log4cxx_macro_class_keeps_bare_implicit_self_field_owner() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[(
+        "level.h",
+        r#"#define LOG4CXX_NS log4cxx
+#define LOG4CXX_STR(x) x
+namespace std {
+template <class T> class shared_ptr {};
+class string {};
+}
+using LogString = std::string;
+namespace helpers {
+class Object {};
+class Class {};
+}
+namespace LOG4CXX_NS {
+class Level;
+typedef std::shared_ptr<Level> LevelPtr;
+class LOG4CXX_EXPORT Level : public helpers::Object
+{
+public:
+    class LOG4CXX_EXPORT LevelClass : public helpers::Class
+    {
+    public:
+        LevelClass() : helpers::Class() {}
+
+        LogString getName() const override
+        {
+            return LOG4CXX_STR("Level");
+        }
+
+        virtual LevelPtr toLevel(const LogString& sArg) const
+        {
+            return Level::toLevelLS(sArg);
+        }
+
+        virtual LevelPtr toLevel(int val) const
+        {
+            return Level::toLevel(val);
+        }
+    };
+
+    DECLARE_LOG4CXX_OBJECT_WITH_CUSTOM_CLASS(Level, LevelClass)
+    BEGIN_LOG4CXX_CAST_MAP()
+    LOG4CXX_CAST_ENTRY(Level)
+    END_LOG4CXX_CAST_MAP()
+
+    Level(int level, const LogString& name, int syslogEquivalent);
+    static LevelPtr toLevelLS(const LogString& sArg);
+    static LevelPtr toLevel(int val);
+
+    struct Data
+    {
+        LevelPtr Off;
+        LevelPtr Fatal;
+        LevelPtr Error;
+    };
+    using DataPtr = std::shared_ptr<Data>;
+
+    static const DataPtr& getData();
+    static LevelPtr getOff();
+
+    inline int getSyslogEquivalent() const
+    {
+        return syslogEquivalent; // positive-bare-implicit-self
+    }
+
+    inline int getSyslogEquivalentExplicit() const
+    {
+        return this->syslogEquivalent; // positive-explicit-this
+    }
+
+    inline int getShadowedValue() const
+    {
+        int syslogEquivalent = 0;
+        return syslogEquivalent; // negative-local-shadow
+    }
+
+private:
+    int level;
+    int syslogEquivalent;
+};
+
+class OtherLevel
+{
+public:
+    inline int getSyslogEquivalent() const
+    {
+        return syslogEquivalent; // negative-wrong-owner
+    }
+
+private:
+    int syslogEquivalent;
+};
+}
+"#,
+    )]);
+
+    let log4cxx_file = project.file("level.h");
+    let log4cxx_source = log4cxx_file.read_to_string().expect("read level.h");
+    let log4cxx_target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Field && unit.fq_name() == "LOG4CXX_NS.Level.syslogEquivalent"
+    });
+    let log4cxx_expected = BTreeSet::from([
+        fixture_token_range(
+            &log4cxx_source,
+            "        return syslogEquivalent; // positive-bare-implicit-self",
+            "syslogEquivalent",
+        ),
+        fixture_token_range(
+            &log4cxx_source,
+            "        return this->syslogEquivalent; // positive-explicit-this",
+            "syslogEquivalent",
+        ),
+    ]);
+
+    assert_eq!(
+        authoritative_exact_ranges(
+            &analyzer,
+            std::slice::from_ref(&log4cxx_target),
+            &log4cxx_file
+        ),
+        log4cxx_expected,
+        "the reduced log4cxx macro-decorated class must retain both bare and explicit-this field reads"
+    );
+    let log4cxx_whole =
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&log4cxx_target));
+    let log4cxx_whole_ranges = log4cxx_whole
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == log4cxx_file)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(log4cxx_whole_ranges, log4cxx_expected);
+}
+
+#[test]
 fn authoritative_cpp_partial_specialization_owner_and_receiver_dispatch_are_structural() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

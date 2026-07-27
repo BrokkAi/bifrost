@@ -6070,6 +6070,34 @@ pub(in crate::analyzer::usages) fn is_declaration_name(node: Node<'_>) -> bool {
     false
 }
 
+/// Whether a parameter declaration belongs to the callable scope whose body can
+/// contain references to it.
+///
+/// Error recovery can wrap a macro-decorated class body in a synthetic outer
+/// `function_definition`. Merely finding any callable ancestor would then leak
+/// parameters from member prototypes into later member bodies. Require the
+/// parameter to be inside that definition's own declarator instead.
+pub(in crate::analyzer::usages) fn parameter_belongs_to_callable_scope(
+    parameter: Node<'_>,
+) -> bool {
+    let mut current = parameter.parent();
+    while let Some(ancestor) = current {
+        if ancestor.kind() == "lambda_expression" {
+            return true;
+        }
+        if ancestor.kind() == "function_definition" {
+            return ancestor
+                .child_by_field_name("declarator")
+                .is_some_and(|declarator| {
+                    declarator.start_byte() <= parameter.start_byte()
+                        && parameter.end_byte() <= declarator.end_byte()
+                });
+        }
+        current = ancestor.parent();
+    }
+    false
+}
+
 fn cpp_tag_specifier_declares_name(specifier: Node<'_>) -> bool {
     if specifier.child_by_field_name("body").is_some() {
         return true;

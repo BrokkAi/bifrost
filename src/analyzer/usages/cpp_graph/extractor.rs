@@ -354,6 +354,9 @@ fn seed_variable_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn seed_typed_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if !parameter_belongs_to_callable_scope(node) {
+        return;
+    }
     let Some(declarator) = node.child_by_field_name("declarator") else {
         return;
     };

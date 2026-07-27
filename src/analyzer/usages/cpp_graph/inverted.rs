@@ -37,8 +37,8 @@ use super::resolver::{
     function_terminal_node, infer_cpp_initializer_binding, infer_cpp_initializer_type,
     is_declaration_name, is_declarator_node, is_nested_type_node, normalize_type_text,
     out_of_line_destructor_type_reference, out_of_line_member_definition_owner,
-    recovered_macro_decorated_declarator_type, resolve_declaring_member_owner, same_visible_symbol,
-    type_reference_hit_node,
+    parameter_belongs_to_callable_scope, recovered_macro_decorated_declarator_type,
+    resolve_declaring_member_owner, same_visible_symbol, type_reference_hit_node,
 };
 use super::syntax::explicit_qualified_callable_value;
 use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
@@ -779,6 +779,9 @@ fn seed_typed_binding(
     ctx: &CppScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<CodeUnit>,
 ) {
+    if !parameter_belongs_to_callable_scope(node) {
+        return;
+    }
     let Some(declarator) = node.child_by_field_name("declarator") else {
         return;
     };
