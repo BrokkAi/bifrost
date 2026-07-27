@@ -320,40 +320,6 @@ impl std::error::Error for PolicySuppressionSourceError {
     }
 }
 
-/// Host-supplied deterministic inputs that govern suppression evaluation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PolicyEvaluationOptions {
-    evaluation_date: PolicyEvaluationDate,
-    suppressions: PolicySuppressionOptions,
-}
-
-impl PolicyEvaluationOptions {
-    pub fn new(evaluation_date: PolicyEvaluationDate) -> Self {
-        Self {
-            evaluation_date,
-            suppressions: PolicySuppressionOptions::default(),
-        }
-    }
-
-    pub const fn with_suppressions(
-        evaluation_date: PolicyEvaluationDate,
-        suppressions: PolicySuppressionOptions,
-    ) -> Self {
-        Self {
-            evaluation_date,
-            suppressions,
-        }
-    }
-
-    pub const fn evaluation_date(&self) -> PolicyEvaluationDate {
-        self.evaluation_date
-    }
-
-    pub const fn suppressions(&self) -> &PolicySuppressionOptions {
-        &self.suppressions
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicySuppressionDocumentState {
@@ -372,12 +338,13 @@ pub struct PolicyReportEvaluationContext {
 
 impl PolicyReportEvaluationContext {
     pub fn new(
-        options: &PolicyEvaluationOptions,
+        evaluation_date: PolicyEvaluationDate,
+        suppressions: &PolicySuppressionOptions,
         suppression_document_state: PolicySuppressionDocumentState,
     ) -> Self {
         Self {
-            evaluation_date: options.evaluation_date,
-            suppression_path: options.suppressions.source.relative_path().into(),
+            evaluation_date,
+            suppression_path: suppressions.source.relative_path().into(),
             suppression_document_state,
         }
     }
@@ -846,12 +813,6 @@ impl RetainedSize for PolicySuppressionSource {
 impl RetainedSize for PolicySuppressionOptions {
     fn retained_size(&self) -> usize {
         std::mem::size_of::<Self>().saturating_add(retained_extra(&self.source))
-    }
-}
-
-impl RetainedSize for PolicyEvaluationOptions {
-    fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>().saturating_add(retained_extra(&self.suppressions))
     }
 }
 

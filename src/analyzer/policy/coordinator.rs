@@ -35,13 +35,14 @@ use super::resolved::{
     EndpointDefinitionSchemaResolution, EndpointOrigin, LoadedPolicy, ResolvedEndpointIdentity,
     SelectorOrigin,
 };
+use super::retained::{RetainedSize, retained_extra};
 use super::source::{
     PolicySourceDiagnostic, PolicySourceIdentity, PolicySourceIdentityError,
     PolicySourceRelatedDiagnostic, parse_rqlp_source, validate_policy_source_identity,
 };
 use super::suppression::{
-    PolicyEvaluationDate, PolicyEvaluationOptions, PolicyReportEvaluationContext,
-    PolicySuppressionDocument, PolicySuppressionDocumentState, PolicySuppressionMatchState,
+    PolicyEvaluationDate, PolicyReportEvaluationContext, PolicySuppressionDocument,
+    PolicySuppressionDocumentState, PolicySuppressionMatchState, PolicySuppressionOptions,
     PolicySuppressionPolicyHashState, PolicySuppressionReview, PolicySuppressionTemporalState,
     load_policy_suppressions_from_root,
 };
@@ -76,6 +77,70 @@ impl PolicyFailOn {
             }
             Self::Error => severity == FindingSeverity::Error,
         }
+    }
+}
+
+/// Complete deterministic host contract for one policy-evaluation batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyEvaluationOptions {
+    evaluation_date: PolicyEvaluationDate,
+    suppressions: PolicySuppressionOptions,
+    require_explicit_schema_versions: bool,
+    fail_on: PolicyFailOn,
+}
+
+impl PolicyEvaluationOptions {
+    pub fn new(evaluation_date: PolicyEvaluationDate) -> Self {
+        Self {
+            evaluation_date,
+            suppressions: PolicySuppressionOptions::default(),
+            require_explicit_schema_versions: false,
+            fail_on: PolicyFailOn::Never,
+        }
+    }
+
+    pub const fn with_suppressions(
+        evaluation_date: PolicyEvaluationDate,
+        suppressions: PolicySuppressionOptions,
+    ) -> Self {
+        Self {
+            evaluation_date,
+            suppressions,
+            require_explicit_schema_versions: false,
+            fail_on: PolicyFailOn::Never,
+        }
+    }
+
+    pub const fn with_required_schema_versions(mut self, required: bool) -> Self {
+        self.require_explicit_schema_versions = required;
+        self
+    }
+
+    pub const fn with_fail_on(mut self, fail_on: PolicyFailOn) -> Self {
+        self.fail_on = fail_on;
+        self
+    }
+
+    pub const fn evaluation_date(&self) -> PolicyEvaluationDate {
+        self.evaluation_date
+    }
+
+    pub const fn suppressions(&self) -> &PolicySuppressionOptions {
+        &self.suppressions
+    }
+
+    pub const fn require_explicit_schema_versions(&self) -> bool {
+        self.require_explicit_schema_versions
+    }
+
+    pub const fn fail_on(&self) -> PolicyFailOn {
+        self.fail_on
+    }
+}
+
+impl RetainedSize for PolicyEvaluationOptions {
+    fn retained_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(retained_extra(&self.suppressions))
     }
 }
 
@@ -151,16 +216,12 @@ const MAX_DUPLICATE_RELATED_DIAGNOSTICS: usize = 2;
 pub fn evaluate_policy_files(
     root: impl AsRef<Path>,
     policy_files: &[PathBuf],
-    require_explicit_schema_versions: bool,
     options: &PolicyEvaluationOptions,
-    fail_on: PolicyFailOn,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
     evaluate_policy_files_with_limits(
         root.as_ref(),
         policy_files,
-        require_explicit_schema_versions,
         options,
-        fail_on,
         PolicyBatchBudget::default(),
         PolicyRegistryLimits::default(),
     )
@@ -173,10 +234,8 @@ pub fn evaluate_policy_files(
 pub fn evaluate_policy_files_with_analyzer(
     root: impl AsRef<Path>,
     policy_files: &[PathBuf],
-    require_explicit_schema_versions: bool,
     analyzer: &dyn IAnalyzer,
     options: &PolicyEvaluationOptions,
-    fail_on: PolicyFailOn,
     cancellation: Option<&CancellationToken>,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
     let batch_budget = PolicyBatchBudget::default();
@@ -203,9 +262,7 @@ pub fn evaluate_policy_files_with_analyzer(
         &root,
         &read_root,
         inputs,
-        require_explicit_schema_versions,
         options,
-        fail_on,
         batch_budget,
         PolicyRegistryLimits::default(),
         Some(analyzer),
@@ -233,9 +290,7 @@ pub fn evaluate_policy_source(
         &root,
         &read_root,
         vec![input],
-        false,
         options,
-        PolicyFailOn::Never,
         PolicyBatchBudget::default(),
         PolicyRegistryLimits::default(),
         Some(workspace),
@@ -246,9 +301,7 @@ pub fn evaluate_policy_source(
 fn evaluate_policy_files_with_limits(
     root: &Path,
     policy_files: &[PathBuf],
-    require_explicit_schema_versions: bool,
     options: &PolicyEvaluationOptions,
-    fail_on: PolicyFailOn,
     batch_budget: PolicyBatchBudget,
     registry_limits: PolicyRegistryLimits,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
@@ -276,9 +329,7 @@ fn evaluate_policy_files_with_limits(
         &root,
         &read_root,
         inputs,
-        require_explicit_schema_versions,
         options,
-        fail_on,
         batch_budget,
         registry_limits,
         None,
@@ -291,9 +342,7 @@ fn evaluate_policy_inputs(
     root: &Path,
     read_root: &WorkspaceRoot,
     mut inputs: Vec<InputOutcome>,
-    require_explicit_schema_versions: bool,
     options: &PolicyEvaluationOptions,
-    fail_on: PolicyFailOn,
     batch_budget: PolicyBatchBudget,
     registry_limits: PolicyRegistryLimits,
     supplied_workspace: Option<&WorkspaceAnalyzer>,
@@ -375,7 +424,7 @@ fn evaluate_policy_inputs(
         }
     }
 
-    if require_explicit_schema_versions {
+    if options.require_explicit_schema_versions() {
         for policy in registry.policies() {
             let diagnostics = explicit_version_diagnostics(policy)?;
             let Some((primary, secondary)) = diagnostics.split_first() else {
@@ -451,7 +500,11 @@ fn evaluate_policy_inputs(
         }
         None => Vec::new(),
     };
-    let evaluation = PolicyReportEvaluationContext::new(options, suppression_document_state);
+    let evaluation = PolicyReportEvaluationContext::new(
+        options.evaluation_date(),
+        options.suppressions(),
+        suppression_document_state,
+    );
     let mut builder = match PolicyReportBuilder::new_with_suppression_audit(
         batch_budget,
         inputs.len(),
@@ -490,10 +543,9 @@ fn evaluate_policy_inputs(
             )));
         }
     };
-    let threshold_exceeded = runs
-        .values()
-        .flat_map(PolicyRun::findings)
-        .any(|finding| finding.suppression().is_none() && fail_on.matches(finding.severity()));
+    let threshold_exceeded = runs.values().flat_map(PolicyRun::findings).any(|finding| {
+        finding.suppression().is_none() && options.fail_on().matches(finding.severity())
+    });
     let mut retained_findings = Vec::new();
     for input in inputs {
         check_policy_cancellation(cancellation)?;
@@ -1428,23 +1480,11 @@ mod tests {
             paths.push(PathBuf::from(relative));
         }
 
-        let forward = evaluate_policy_files(
-            workspace.path(),
-            &paths,
-            false,
-            &evaluation_options(),
-            PolicyFailOn::Never,
-        )
-        .expect("forward duplicate report");
+        let forward = evaluate_policy_files(workspace.path(), &paths, &evaluation_options())
+            .expect("forward duplicate report");
         paths.reverse();
-        let reversed = evaluate_policy_files(
-            workspace.path(),
-            &paths,
-            false,
-            &evaluation_options(),
-            PolicyFailOn::Never,
-        )
-        .expect("reversed duplicate report");
+        let reversed = evaluate_policy_files(workspace.path(), &paths, &evaluation_options())
+            .expect("reversed duplicate report");
 
         assert_eq!(forward.exit_status(), POLICY_EXIT_UNRELIABLE);
         assert_eq!(reversed.exit_status(), POLICY_EXIT_UNRELIABLE);
@@ -1501,23 +1541,11 @@ mod tests {
             paths.push(PathBuf::from(relative));
         }
 
-        let forward = evaluate_policy_files(
-            workspace.path(),
-            &paths,
-            false,
-            &evaluation_options(),
-            PolicyFailOn::Never,
-        )
-        .expect("oversized duplicate report");
+        let forward = evaluate_policy_files(workspace.path(), &paths, &evaluation_options())
+            .expect("oversized duplicate report");
         paths.reverse();
-        let reversed = evaluate_policy_files(
-            workspace.path(),
-            &paths,
-            false,
-            &evaluation_options(),
-            PolicyFailOn::Never,
-        )
-        .expect("reversed oversized duplicate report");
+        let reversed = evaluate_policy_files(workspace.path(), &paths, &evaluation_options())
+            .expect("reversed oversized duplicate report");
 
         assert_invalid_source_diagnostics(&forward, &[source_len, source_len]);
         assert!(forward.report().diagnostics().iter().all(|diagnostic| {
@@ -1543,23 +1571,11 @@ mod tests {
         let control_len = control.to_string_lossy().len();
         let mut paths = vec![missing.clone(), control.clone()];
 
-        let forward = evaluate_policy_files(
-            workspace.path(),
-            &paths,
-            false,
-            &evaluation_options(),
-            PolicyFailOn::Never,
-        )
-        .expect("invalid requested-source report");
+        let forward = evaluate_policy_files(workspace.path(), &paths, &evaluation_options())
+            .expect("invalid requested-source report");
         paths.reverse();
-        let reversed = evaluate_policy_files(
-            workspace.path(),
-            &paths,
-            false,
-            &evaluation_options(),
-            PolicyFailOn::Never,
-        )
-        .expect("reversed invalid requested-source report");
+        let reversed = evaluate_policy_files(workspace.path(), &paths, &evaluation_options())
+            .expect("reversed invalid requested-source report");
 
         assert_invalid_source_diagnostics(&forward, &[missing_len, control_len]);
         assert!(forward.report().diagnostics().iter().any(|diagnostic| {
@@ -1612,9 +1628,7 @@ mod tests {
             evaluate_policy_files_with_limits(
                 workspace.path(),
                 paths,
-                false,
                 &evaluation_options(),
-                PolicyFailOn::Never,
                 PolicyBatchBudget::default(),
                 limits,
             )
@@ -1682,9 +1696,7 @@ mod tests {
         let outcome = evaluate_policy_files_with_limits(
             workspace.path(),
             &[PathBuf::from("policies/limit.rqlp")],
-            false,
             &evaluation_options(),
-            PolicyFailOn::Never,
             PolicyBatchBudget::default(),
             limits,
         )
@@ -1727,14 +1739,8 @@ mod tests {
             PathBuf::from("policies/a.rqlp"),
             PathBuf::from("policies/z.rqlp"),
         ];
-        let baseline = evaluate_policy_files(
-            workspace.path(),
-            &paths,
-            false,
-            &evaluation_options(),
-            PolicyFailOn::Never,
-        )
-        .expect("baseline report");
+        let baseline = evaluate_policy_files(workspace.path(), &paths, &evaluation_options())
+            .expect("baseline report");
         let rule = baseline
             .report()
             .rules()
@@ -1764,9 +1770,7 @@ mod tests {
         let retained = evaluate_policy_files_with_limits(
             workspace.path(),
             &paths,
-            false,
             &evaluation_options(),
-            PolicyFailOn::Never,
             one_result_budget,
             PolicyRegistryLimits::default(),
         )
@@ -1791,9 +1795,7 @@ mod tests {
         let omitted = evaluate_policy_files_with_limits(
             workspace.path(),
             &paths,
-            false,
             &evaluation_options(),
-            PolicyFailOn::Never,
             zero_result_budget,
             PolicyRegistryLimits::default(),
         )

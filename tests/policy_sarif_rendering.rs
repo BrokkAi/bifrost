@@ -8,7 +8,7 @@ use std::sync::Arc;
 use brokk_bifrost::policy::{
     BoundedWitness, CatalogRegistryLimits, DefaultPolicyEvaluator, FindingIdentityStability,
     PolicyBatchBudget, PolicyBudget, PolicyEvaluationContext, PolicyEvaluationDate,
-    PolicyEvaluationOptions, PolicyEvaluator, PolicyFailOn, PolicyIncompleteReason, PolicyRegistry,
+    PolicyEvaluationOptions, PolicyEvaluator, PolicyIncompleteReason, PolicyRegistry,
     PolicyRegistryLimits, PolicyReportBuilder, PolicyReportDocument, PolicyReportEvaluationContext,
     PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicySourceIdentity,
     PolicySuppressionDocumentState, ReportValueError, SarifToolIdentity, TaintCatalogRegistry,
@@ -29,7 +29,11 @@ fn report_builder(expected_inputs: usize) -> PolicyReportBuilder {
     PolicyReportBuilder::new_with_suppression_audit(
         PolicyBatchBudget::default(),
         expected_inputs,
-        PolicyReportEvaluationContext::new(&options, PolicySuppressionDocumentState::NotFound),
+        PolicyReportEvaluationContext::new(
+            options.evaluation_date(),
+            options.suppressions(),
+            PolicySuppressionDocumentState::NotFound,
+        ),
         Vec::new(),
     )
     .unwrap()
@@ -197,9 +201,7 @@ fn suppressed_report() -> PolicyReportDocument {
         PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date"),
     );
     let paths = [PathBuf::from("policies/suppressed.rqlp")];
-    let baseline =
-        evaluate_policy_files(project.root(), &paths, false, &options, PolicyFailOn::Never)
-            .unwrap();
+    let baseline = evaluate_policy_files(project.root(), &paths, &options).unwrap();
     let rule = &baseline.report().rules()[0];
     let finding = &baseline.report().runs()[0].findings()[0];
     let suppression_path = project.root().join(".bifrost/suppressions.json");
@@ -223,7 +225,7 @@ fn suppressed_report() -> PolicyReportDocument {
         .unwrap(),
     )
     .unwrap();
-    evaluate_policy_files(project.root(), &paths, false, &options, PolicyFailOn::Never)
+    evaluate_policy_files(project.root(), &paths, &options)
         .unwrap()
         .into_report()
 }

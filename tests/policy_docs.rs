@@ -161,11 +161,10 @@ fn documented_match_policy_executes_and_future_analysis_boundary_is_explicit() {
     let outcome = evaluate_policy_files(
         workspace.root(),
         &[PathBuf::from("policies/dynamic-eval.rqlp")],
-        false,
         &PolicyEvaluationOptions::new(
             PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date"),
-        ),
-        PolicyFailOn::Warning,
+        )
+        .with_fail_on(PolicyFailOn::Warning),
     )
     .expect("documented match policy evaluation");
     let report = serde_json::to_value(outcome.report()).expect("canonical policy report");

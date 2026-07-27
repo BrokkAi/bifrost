@@ -103,6 +103,7 @@ const INITIALIZATION_RETRY_DEADLINE: Duration = BUSY_TIMEOUT;
 const INITIALIZATION_RETRY_BACKOFF: Duration = Duration::from_millis(5);
 const INITIALIZATION_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(100);
 const GENERATED_CACHE_GITIGNORE: &[u8] = b"*\n";
+const GENERATED_LEGACY_PROJECT_GITIGNORE: &[u8] = b"/.gitignore\n/bifrost_cache.db\n/bifrost_cache.db-wal\n/bifrost_cache.db-shm\n/bifrost_cache.db-journal\n";
 // Persistent pragma setup and migration are serialized only among same-process
 // openers for one canonical cache path. SQLite remains the cross-process lock.
 static PROCESS_LOCAL_OPEN_GUARDS: Lazy<Mutex<std::collections::HashMap<PathBuf, Weak<Mutex<()>>>>> =
@@ -248,10 +249,17 @@ fn migrate_legacy_project_cache(project_dir: &Path) -> Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(format!("cache DB I/O error: {err}")),
     };
+    let has_legacy_state = validate_legacy_project_cache_state(&project_dir)?;
     let ignore_path = project_dir.join(".gitignore");
     let metadata = match std::fs::symlink_metadata(&ignore_path) {
         Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return if has_legacy_state {
+                create_legacy_project_cache_ignore(&ignore_path)
+            } else {
+                Ok(())
+            };
+        }
         Err(err) => return Err(format!("cache DB I/O error: {err}")),
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -262,23 +270,102 @@ fn migrate_legacy_project_cache(project_dir: &Path) -> Result<()> {
     }
     let content =
         std::fs::read(&ignore_path).map_err(|err| format!("cache DB I/O error: {err}"))?;
-    if content != GENERATED_CACHE_GITIGNORE {
+    if content == GENERATED_CACHE_GITIGNORE {
+        // Never unlink the old database automatically. An older Bifrost process
+        // can reopen the legacy path after any SQLite idleness check, so deleting
+        // it and its sidecars would race a live writer. Narrow the exact generated
+        // whole-directory ignore to the exact legacy filenames instead. The
+        // compatibility ignore also ignores itself, leaving project-owned
+        // `.bifrost` configuration visible without creating untracked noise.
+        return replace_generated_legacy_project_ignore(&ignore_path);
+    }
+    if content != GENERATED_LEGACY_PROJECT_GITIGNORE {
         if gitignore_ignores_entire_directory(&content) {
             return Err(format!(
                 "legacy {} still ignores all tracked .bifrost configuration; replace the whole-directory rule with cache/",
                 ignore_path.display()
             ));
         }
+        if has_legacy_state {
+            return Err(format!(
+                "legacy cache state beside tracked .bifrost configuration is not covered by the user-authored {}; stop older Bifrost processes, remove the legacy bifrost_cache.db files, or add exact ignore rules",
+                ignore_path.display()
+            ));
+        }
         return Ok(());
     }
+    Ok(())
+}
 
-    remove_legacy_unified_cache_if_idle(&project_dir)?;
-    std::fs::remove_file(&ignore_path).map_err(|err| {
+fn create_legacy_project_cache_ignore(ignore_path: &Path) -> Result<()> {
+    let parent = ignore_path.parent().ok_or_else(|| {
         format!(
-            "failed to remove generated legacy cache ignore {}: {err}",
+            "legacy cache ignore has no parent directory: {}",
             ignore_path.display()
         )
-    })
+    })?;
+    let mut replacement = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|err| format!("failed to stage legacy cache ignore: {err}"))?;
+    replacement
+        .write_all(GENERATED_LEGACY_PROJECT_GITIGNORE)
+        .and_then(|()| replacement.as_file().sync_all())
+        .map_err(|err| format!("failed to stage legacy cache ignore: {err}"))?;
+    match replacement.persist_noclobber(ignore_path) {
+        Ok(_) => Ok(()),
+        Err(err) if err.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            validate_concurrent_legacy_project_ignore(ignore_path)
+        }
+        Err(err) => Err(format!(
+            "failed to atomically publish legacy cache ignore {}: {}",
+            ignore_path.display(),
+            err.error
+        )),
+    }
+}
+
+fn replace_generated_legacy_project_ignore(ignore_path: &Path) -> Result<()> {
+    let parent = ignore_path.parent().ok_or_else(|| {
+        format!(
+            "legacy cache ignore has no parent directory: {}",
+            ignore_path.display()
+        )
+    })?;
+    let mut replacement = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|err| format!("failed to stage narrowed legacy cache ignore: {err}"))?;
+    replacement
+        .write_all(GENERATED_LEGACY_PROJECT_GITIGNORE)
+        .and_then(|()| replacement.as_file().sync_all())
+        .map_err(|err| format!("failed to stage narrowed legacy cache ignore: {err}"))?;
+    replacement.persist(ignore_path).map_err(|err| {
+        format!(
+            "failed to atomically narrow generated legacy cache ignore {}: {}",
+            ignore_path.display(),
+            err.error
+        )
+    })?;
+    Ok(())
+}
+
+fn validate_concurrent_legacy_project_ignore(ignore_path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(ignore_path)
+        .map_err(|err| format!("cache DB I/O error: {err}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "legacy cache ignore created concurrently is not a regular file: {}",
+            ignore_path.display()
+        ));
+    }
+    let content = std::fs::read(ignore_path).map_err(|err| format!("cache DB I/O error: {err}"))?;
+    if content == GENERATED_LEGACY_PROJECT_GITIGNORE {
+        Ok(())
+    } else if content == GENERATED_CACHE_GITIGNORE {
+        replace_generated_legacy_project_ignore(ignore_path)
+    } else {
+        Err(format!(
+            "legacy cache ignore changed while it was being migrated: {}",
+            ignore_path.display()
+        ))
+    }
 }
 
 fn gitignore_ignores_entire_directory(content: &[u8]) -> bool {
@@ -302,69 +389,34 @@ fn cache_gitignore_ignores_all_generated_state(content: &[u8]) -> bool {
     ignores_all
 }
 
-fn remove_legacy_unified_cache_if_idle(project_dir: &Path) -> Result<()> {
-    let legacy_db = project_dir.join(CACHE_DB_FILE_NAME);
-    match std::fs::symlink_metadata(&legacy_db) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err(format!(
-                "refusing to remove legacy cache that is not a regular file: {}",
-                legacy_db.display()
-            ));
-        }
-        Ok(_) => {
-            let mut connection = Connection::open_with_flags(
-                &legacy_db,
-                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-            )
-            .map_err(|err| format!("failed to inspect legacy cache DB: {err}"))?;
-            connection
-                .busy_timeout(Duration::ZERO)
-                .map_err(|err| format!("failed to inspect legacy cache DB: {err}"))?;
-            connection
-                .pragma_update(None, "locking_mode", "EXCLUSIVE")
-                .map_err(|err| format!("failed to lock legacy cache DB: {err}"))?;
-            let checkpoint_busy = connection
-                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .map_err(|err| format!("failed to checkpoint legacy cache DB: {err}"))?;
-            if checkpoint_busy != 0 {
-                return Err(format!(
-                    "legacy cache DB is still active: {}",
-                    legacy_db.display()
-                ));
-            }
-            let exclusive = connection
-                .transaction_with_behavior(TransactionBehavior::Exclusive)
-                .map_err(|err| format!("legacy cache DB is still active: {err}"))?;
-            drop(exclusive);
-            drop(connection);
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(format!("cache DB I/O error: {err}")),
-    }
-
-    let Some(file_name) = legacy_db.file_name() else {
-        return Ok(());
-    };
+fn validate_legacy_project_cache_state(project_dir: &Path) -> Result<bool> {
+    let mut found = false;
     for suffix in ["", "-wal", "-shm", "-journal"] {
-        let mut legacy_name = file_name.to_os_string();
-        legacy_name.push(suffix);
-        let path = legacy_db.with_file_name(legacy_name);
+        let path = project_dir.join(format!("{CACHE_DB_FILE_NAME}{suffix}"));
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
                 return Err(format!(
-                    "refusing to remove legacy cache state that is not a regular file: {}",
+                    "refusing legacy cache state that is not a regular file: {}",
                     path.display()
                 ));
             }
-            Ok(_) => std::fs::remove_file(&path)
-                .map_err(|err| format!("failed to remove legacy cache state: {err}"))?,
+            Ok(_) => found = true,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(format!("cache DB I/O error: {err}")),
         }
     }
-    Ok(())
+    Ok(found)
+}
+
+pub(crate) fn is_legacy_project_cache_file_name(name: &std::ffi::OsStr) -> bool {
+    [
+        CACHE_DB_FILE_NAME,
+        "bifrost_cache.db-wal",
+        "bifrost_cache.db-shm",
+        "bifrost_cache.db-journal",
+    ]
+    .iter()
+    .any(|candidate| name == std::ffi::OsStr::new(candidate))
 }
 
 /// Make the generated cache directory ignore itself, the way `cargo` does for `target/`.
@@ -404,18 +456,22 @@ fn ensure_cache_dir_self_ignored(cache_dir: &Path) -> Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(format!("cache DB I/O error: {err}")),
     }
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&ignore_path)
-    {
-        Ok(mut file) => file
-            .write_all(GENERATED_CACHE_GITIGNORE)
-            .map_err(|err| format!("cache DB I/O error: {err}")),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+    let mut replacement = tempfile::NamedTempFile::new_in(cache_dir)
+        .map_err(|err| format!("failed to stage cache directory ignore: {err}"))?;
+    replacement
+        .write_all(GENERATED_CACHE_GITIGNORE)
+        .and_then(|()| replacement.as_file().sync_all())
+        .map_err(|err| format!("failed to stage cache directory ignore: {err}"))?;
+    match replacement.persist_noclobber(&ignore_path) {
+        Ok(_) => Ok(()),
+        Err(err) if err.error.kind() == std::io::ErrorKind::AlreadyExists => {
             validate_cache_gitignore(&ignore_path)
         }
-        Err(err) => Err(format!("cache DB I/O error: {err}")),
+        Err(err) => Err(format!(
+            "failed to atomically publish cache directory ignore {}: {}",
+            ignore_path.display(),
+            err.error
+        )),
     }
 }
 
@@ -1996,7 +2052,7 @@ mod tests {
     }
 
     #[test]
-    fn default_cache_open_migrates_exact_generated_legacy_layout() {
+    fn default_cache_open_narrows_exact_generated_legacy_layout_without_deleting_it() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let repo = git2::Repository::init(root).unwrap();
@@ -2019,8 +2075,11 @@ mod tests {
         let db_path = cache_dir.join(CACHE_DB_FILE_NAME);
         let _connection = open_unified_connection(&db_path).unwrap();
 
-        assert!(!project_dir.join(".gitignore").exists());
-        assert!(!legacy_db.exists());
+        assert_eq!(
+            std::fs::read(project_dir.join(".gitignore")).unwrap(),
+            GENERATED_LEGACY_PROJECT_GITIGNORE
+        );
+        assert!(legacy_db.exists());
         assert_eq!(
             std::fs::read(cache_dir.join(".gitignore")).unwrap(),
             GENERATED_CACHE_GITIGNORE
@@ -2031,9 +2090,159 @@ mod tests {
                 .unwrap()
         );
         assert!(
+            repo.is_path_ignored(Path::new(".bifrost/bifrost_cache.db"))
+                .unwrap()
+        );
+        assert!(
             repo.is_path_ignored(Path::new(".bifrost/cache/bifrost_cache.db"))
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn default_cache_open_protects_legacy_state_when_project_ignore_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let repo = git2::Repository::init(root).unwrap();
+        let project_dir = root.join(crate::gitblob::PROJECT_DIR_NAME);
+        std::fs::create_dir(&project_dir).unwrap();
+        let legacy_db = project_dir.join(CACHE_DB_FILE_NAME);
+        create_legacy_cache(&legacy_db);
+        let db_path = project_dir
+            .join(crate::gitblob::CACHE_SUBDIR_NAME)
+            .join(CACHE_DB_FILE_NAME);
+
+        let _connection = open_unified_connection(&db_path).unwrap();
+
+        assert!(legacy_db.exists());
+        assert_eq!(
+            std::fs::read(project_dir.join(".gitignore")).unwrap(),
+            GENERATED_LEGACY_PROJECT_GITIGNORE
+        );
+        assert!(
+            repo.is_path_ignored(Path::new(".bifrost/.gitignore"))
+                .unwrap()
+        );
+        assert!(
+            repo.is_path_ignored(Path::new(".bifrost/bifrost_cache.db"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn active_legacy_writer_survives_default_layout_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().join(crate::gitblob::PROJECT_DIR_NAME);
+        std::fs::create_dir(&project_dir).unwrap();
+        std::fs::write(project_dir.join(".gitignore"), GENERATED_CACHE_GITIGNORE).unwrap();
+        let legacy_db = project_dir.join(CACHE_DB_FILE_NAME);
+        let mut legacy = Connection::open(&legacy_db).unwrap();
+        legacy.pragma_update(None, "journal_mode", "WAL").unwrap();
+        legacy
+            .execute_batch("CREATE TABLE legacy(value TEXT) STRICT;")
+            .unwrap();
+        let writer = legacy
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        writer
+            .execute("INSERT INTO legacy(value) VALUES('active')", [])
+            .unwrap();
+        let db_path = project_dir
+            .join(crate::gitblob::CACHE_SUBDIR_NAME)
+            .join(CACHE_DB_FILE_NAME);
+
+        let _connection = open_unified_connection(&db_path).unwrap();
+        writer.commit().unwrap();
+
+        assert!(legacy_db.exists());
+        assert_eq!(
+            std::fs::read(project_dir.join(".gitignore")).unwrap(),
+            GENERATED_LEGACY_PROJECT_GITIGNORE
+        );
+        assert_eq!(
+            legacy
+                .query_row("SELECT value FROM legacy", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "active"
+        );
+    }
+
+    #[test]
+    fn concurrent_default_layout_upgrades_publish_one_complete_narrow_ignore() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().join(crate::gitblob::PROJECT_DIR_NAME);
+        std::fs::create_dir(&project_dir).unwrap();
+        std::fs::write(project_dir.join(".gitignore"), GENERATED_CACHE_GITIGNORE).unwrap();
+        create_legacy_cache(&project_dir.join(CACHE_DB_FILE_NAME));
+        let db_path = Arc::new(
+            project_dir
+                .join(crate::gitblob::CACHE_SUBDIR_NAME)
+                .join(CACHE_DB_FILE_NAME),
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+
+        let handles = (0..4)
+            .map(|_| {
+                let db_path = Arc::clone(&db_path);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    open_unified_connection(db_path.as_ref())
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for handle in handles {
+            handle
+                .join()
+                .expect("upgrade thread")
+                .expect("concurrent upgrade");
+        }
+
+        assert_eq!(
+            std::fs::read(project_dir.join(".gitignore")).unwrap(),
+            GENERATED_LEGACY_PROJECT_GITIGNORE
+        );
+        assert!(project_dir.join(CACHE_DB_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn concurrent_upgrades_publish_a_complete_ignore_when_it_was_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().join(crate::gitblob::PROJECT_DIR_NAME);
+        std::fs::create_dir(&project_dir).unwrap();
+        create_legacy_cache(&project_dir.join(CACHE_DB_FILE_NAME));
+        let db_path = Arc::new(
+            project_dir
+                .join(crate::gitblob::CACHE_SUBDIR_NAME)
+                .join(CACHE_DB_FILE_NAME),
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+
+        let handles = (0..4)
+            .map(|_| {
+                let db_path = Arc::clone(&db_path);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    open_unified_connection(db_path.as_ref())
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for handle in handles {
+            handle
+                .join()
+                .expect("upgrade thread")
+                .expect("concurrent missing-ignore upgrade");
+        }
+
+        assert_eq!(
+            std::fs::read(project_dir.join(".gitignore")).unwrap(),
+            GENERATED_LEGACY_PROJECT_GITIGNORE
+        );
+        assert!(project_dir.join(CACHE_DB_FILE_NAME).exists());
     }
 
     #[test]
@@ -2048,7 +2257,7 @@ mod tests {
     }
 
     #[test]
-    fn default_cache_open_removes_orphaned_exact_legacy_sidecars() {
+    fn default_cache_open_keeps_orphaned_legacy_sidecars_ignored() {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = temp.path().join(crate::gitblob::PROJECT_DIR_NAME);
         std::fs::create_dir(&project_dir).unwrap();
@@ -2061,8 +2270,11 @@ mod tests {
 
         let _connection = open_unified_connection(&db_path).unwrap();
 
-        assert!(!orphaned_journal.exists());
-        assert!(!project_dir.join(".gitignore").exists());
+        assert!(orphaned_journal.exists());
+        assert_eq!(
+            std::fs::read(project_dir.join(".gitignore")).unwrap(),
+            GENERATED_LEGACY_PROJECT_GITIGNORE
+        );
     }
 
     #[test]

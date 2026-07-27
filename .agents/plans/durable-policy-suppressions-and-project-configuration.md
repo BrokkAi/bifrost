@@ -23,7 +23,7 @@ The behavior is observable by running one fixture policy, accepting its strong f
 - [x] (2026-07-27 13:30Z) Milestone 3: applied suppressions in the shared coordinator and extended the canonical report model without changing analyzer evidence or work.
 - [x] (2026-07-27 13:44Z) Milestone 4: made human, JSON, SARIF, CLI, and failure-threshold behavior suppression-aware.
 - [x] (2026-07-27 14:20Z) Milestone 5: threaded deterministic suppression-aware evaluation through LSP/VS Code and added a narrow cancellable MCP `run_policy` tool over the active immutable workspace snapshot.
-- [ ] Milestone 6: update public documentation, run the complete Rust/docs validation gates, perform specialist review, and record final outcomes.
+- [x] (2026-07-27 16:11Z) Milestone 6: documented the complete lifecycle and cache boundary, validated the final implementation, resolved specialist review findings, and recorded the one unrelated pathological test-cost exception.
 
 ## Surprises & Discoveries
 
@@ -56,6 +56,21 @@ The behavior is observable by running one fixture policy, accepting its strong f
 
 - Observation: the complete MCP integration target cannot open the primary checkout's shared persisted cache inside the restricted worktree sandbox.
   Evidence: six existing tests failed there with SQLite `disk I/O error`; the same serial 28-test target passed after granting access to the shared cache boundary, including the new `run_policy` stdio test.
+
+- Observation: PyO3's macOS `extension-module` feature intentionally suppresses libpython linkage, so an all-feature test binary needs an explicit Homebrew Python library only at the test-link boundary.
+  Evidence: the first `--features nlp,python` run failed to link unresolved Python symbols; setting `PYO3_PYTHON=/opt/homebrew/bin/python3` and test-only `RUSTFLAGS` for `-lpython3.14` allowed the suite to build and run without changing product linkage.
+
+- Observation: the all-feature gate exposed three stale existing tests outside the feature implementation.
+  Evidence: the MCP registry gold omitted the newly callable `run_policy`, the linked-worktree NLP cache assertion still walked only to the old `.bifrost` parent, and one Ruby LSP diagnostic test waited forever because it never sent the `didSave` that seeds diagnostics. The registry/path expectations and the LSP synchronization were corrected and their focused targets pass.
+
+- Observation: executable policy documentation still expected the schema-one human summary wording.
+  Evidence: `policy_docs` expected `1 finding`; schema two correctly renders `1 active finding; 0 suppressed findings`. Both checked golds were updated and all eight executable documentation tests pass.
+
+- Observation: `ruby_semantic_diagnostics_bound_required_source_bytes` is pathologically slow for reasons unrelated to #1207.
+  Evidence: after more than thirteen minutes at one full CPU core with stable memory, a process sample showed `walk_named_tree_preorder` repeatedly calling Tree-sitter `named_child` on a root with 200,000 comment children, producing quadratic indexed-child traversal. The target was stopped, every preceding target and every remaining integration target passed separately, and this performance defect is left for its own analyzer/test-cost work.
+
+- Observation: specialist review found that destructive legacy-cache cleanup could race an older Bifrost process and that both generated ignore files had partial-publication windows under concurrent startup.
+  Evidence: the final migration never deletes `.bifrost/bifrost_cache.db*`; it atomically narrows the exact generated whole-directory ignore to exact legacy filenames, atomically publishes missing compatibility and cache-directory ignores with staged synced no-clobber writes, accepts identical publish races, filters exact legacy watcher events, and has concurrent-start and live-writer regression tests.
 
 ## Decision Log
 
@@ -111,8 +126,8 @@ The behavior is observable by running one fixture policy, accepting its strong f
   Rationale: changing the environment-variable meaning would break its safety boundary and create a surprising extra nested directory. Client-root MCP sessions must continue using the exact approved root rather than the primary checkout.
   Date/Author: 2026-07-27 / Codex
 
-- Decision: On a default-layout open, migrate only the exact generated legacy state: `.bifrost/.gitignore` whose bytes are exactly `*\n` and the known old `bifrost_cache.db`, `-wal`, `-shm`, and journal files. Never alter a user-modified `.bifrost/.gitignore`. If a legacy generated file cannot be safely removed, return an actionable cache-initialization error rather than leaving tracked project configuration hidden.
-  Rationale: the cache is explicitly disposable, but user-authored ignore rules are not. Exact-name, exact-content migration avoids broad deletion and handles Windows live-file failures honestly.
+- Decision: On a default-layout open, never delete `.bifrost/bifrost_cache.db` or its exact SQLite sidecars automatically. Atomically replace only an exact generated `*\n` project ignore with a self-ignoring compatibility file that names those exact legacy files, or atomically create that file when legacy state exists without an ignore. Preserve user-authored narrow ignores and fail actionably when they expose retained legacy state.
+  Rationale: no SQLite idleness check can prevent an older process from reopening the legacy path immediately afterward. Retaining and narrowly ignoring exact legacy files makes mixed-version concurrency safe while exposing project-owned configuration; users can remove the old rebuildable cache after every older process stops.
   Date/Author: 2026-07-27 / Codex
 
 ## Outcomes & Retrospective
@@ -140,6 +155,12 @@ Milestone 5 is complete. LSP policy execution now requires one explicit evaluati
 The `extended` and combined MCP toolsets now advertise read-only `run_policy` for bounded explicit `.rqlp` paths only. Requests are decoded strictly, pinned to the active workspace snapshot and generation, cancellable through the existing asynchronous MCP request registry, capability-confined for policy and suppression reads, and returned as structured canonical schema-2 reports with clean, finding, or unreliable status plus the equivalent exit projection. Built-in policy discovery remains outside this tool for #1204. The stdio integration test compares the full MCP report to direct library evaluation, switches to a distinct active workspace, applies and expires an exact suppression, rejects escaping paths and invalid dates, and preserves invalid-suppression unreliability. A live current-worktree stdio call found the expected Python `exec` fixture result through `run_policy` with schema 2 and the fixed date.
 
 Validation for this checkpoint: `cargo fmt --all -- --check`; `cargo check --all-targets`; matching-toolchain `cargo clippy --all-targets --all-features -- -D warnings`; all 11 MCP cancellation/URI unit tests; the full 28-test MCP stdio target with shared-cache access; the focused LSP policy execution, symlink, configured-root, expiration, invalid-suppression, date, and confinement cases; and the complete VS Code format, type-check, lint, bundle, license, and 75-test unit suite. The restricted MCP run's shared-cache failure is recorded above; its unrestricted rerun passed.
+
+Milestone 6 is complete. Public docs now describe the `.rql` exploration to `.rqlp` recurring-policy to exact suppression-review lifecycle, schema-one suppression input, schema-two report/audit output, strong-identity boundaries, deterministic evaluation dates, cleanup states, thresholds, VS Code presentation, and the read-only MCP tool. All cache-path docs now distinguish `.bifrost/cache/bifrost_cache.db`, explicit `BIFROST_CACHE_DIR`, primary-checkout sharing, exact client roots, and safely retained legacy files. The rendered preview was inspected in the in-app browser; shortening the policy-tree example removed horizontal overflow, and the checked pages had no console errors.
+
+Specialist security, intent, architecture/duplication, and operational reviews found one high-risk legacy SQLite deletion race plus lower-severity migration, watcher, and API-fragmentation issues. The final code keeps legacy files rather than unlinking beneath mixed-version processes, publishes generated ignore state atomically under concurrent startup, watches existing tracked `.bifrost` configuration while filtering only generated paths, and makes `PolicyEvaluationOptions` the single coordinator-owned host contract for date, suppression source, schema mode, and threshold. Post-fix security and architecture reviews reported no remaining findings; the operational recheck's final missing-ignore publication finding was fixed and covered by the concurrent-start test.
+
+Final validation: formatting and diff hygiene; all 43 cache migration tests and all nine watcher tests; policy suppression, rendering, offline SARIF-schema, executable-doc, CLI, and real stdio MCP regressions; default all-target compilation; all-target/all-feature denied-warning Clippy in a removed isolated target; documentation type/content checks plus a 57-page build and 5,401 internal links. The feature-enabled Rust suite passed as a composite run: 1,964 library tests with six intentional ignores, all integration targets before and after `policy_docs`, the corrected eight-test `policy_docs` target, and every explicit tail target from `policy_loading` through `workspace_analyzer_test`. The sole exception is the unrelated quadratic Ruby oversized-source test recorded above; no #1207 test failed.
 
 ## Context and Orientation
 
@@ -283,7 +304,7 @@ Staleness is reported only after a complete selected policy produced no matching
 
 Library, CLI JSON, LSP, and MCP evaluations over identical inputs and a fixed date agree on rule, run, finding, suppression, completion, and work values. MCP exposes a callable read-only explicit-policy tool against the active root, but it does not discover or execute every project policy automatically.
 
-The path migration retains existing primary-checkout sharing for explicit roots, exact worktree confinement for client-root sessions, and the existing explicit `BIFROST_CACHE_DIR` boundary. Exact generated legacy state can be rebuilt, user-authored ignore files are not overwritten, VS Code no longer creates broad ignore rules, and both a live generated ignore failure and a user-owned legacy root rule are visible and actionable.
+The path migration retains existing primary-checkout sharing for explicit roots, exact worktree confinement for client-root sessions, and the existing explicit `BIFROST_CACHE_DIR` boundary. Exact generated legacy state remains narrowly ignored until users remove it after stopping older processes, user-authored ignore files are not overwritten, VS Code no longer creates broad ignore rules, and user-owned legacy root rules remain visible and actionable.
 
 All focused tests, the full `--features nlp,python` suite, Clippy with all targets/features and denied warnings, docs checks/build, rendered docs inspection, and final specialist review pass.
 
@@ -291,7 +312,7 @@ All focused tests, the full `--features nlp,python` suite, Clippy with all targe
 
 All source edits and test commands are repeatable. Isolated Cargo targets are created and removed by `scripts/with-isolated-cargo-target.sh`; do not create manually named `/tmp/bifrost-*` targets. Suppression tests use temporary projects and fixed dates, so they do not depend on the wall clock or write `.bifrost` state into the repository.
 
-Cache migration is intentionally narrow. It may remove only exact generated legacy cache filenames and the exact generated `*\n` ignore file. It must be safe to retry after partial completion: missing old files are success, an already-created new cache directory is reused, and a user-modified ignore file is left unchanged. If Windows reports a live handle, stop the old Bifrost process and retry; do not broaden deletion or overwrite the file.
+Cache migration is intentionally narrow and non-destructive. It retains exact legacy cache filenames, atomically narrows only the exact generated `*\n` ignore, atomically publishes missing generated ignores without clobbering a concurrent winner, reuses an existing new cache directory, and leaves user-modified ignore files unchanged. After every older Bifrost process stops, users may remove the exact legacy database and sidecars manually; retries never broaden deletion or overwrite user content.
 
 If a milestone fails, leave its changes unstaged, record the failure and evidence in `Surprises & Discoveries`, and resume from the last committed checkpoint. Do not reset, delete unrelated files, or alter user-owned `.bifrost` configuration. If a schema or host-contract decision changes during implementation, update every affected section of this plan and append a revision note before proceeding.
 
@@ -403,14 +424,14 @@ In `src/analyzer/policy/coordinator.rs`, converge public evaluation around:
     pub fn evaluate_policy_files(
         root: impl AsRef<Path>,
         policy_files: &[PathBuf],
-        options: PolicyEvaluationOptions,
+        options: &PolicyEvaluationOptions,
     ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError>;
 
     pub fn evaluate_policy_files_with_analyzer(
         root: impl AsRef<Path>,
         policy_files: &[PathBuf],
         analyzer: &dyn IAnalyzer,
-        options: PolicyEvaluationOptions,
+        options: &PolicyEvaluationOptions,
         cancellation: Option<&CancellationToken>,
     ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError>;
 
@@ -430,3 +451,5 @@ In `src/mcp_extended.rs`, advertise `run_policy` as a read-only tool with bounde
 Revision note, 2026-07-27 / Codex: Initial plan created after live issue reconciliation and repository diagnosis. It resolves the previously open evaluation-date and MCP ownership decisions, adds conservative legacy-ignore migration, and makes canonical report schema 2 the shared host contract.
 
 Revision note, 2026-07-27 / Codex: Post-planning specialist review added the overlooked VS Code provisioning seam, made suppression failures explicitly batch-level, defined pre-retention threshold and mandatory applied-result retention behavior, and replaced an ambiguous mutually-exclusive review disposition with orthogonal match, temporal, and policy-hash states.
+
+Revision note, 2026-07-27 / Codex: Final specialist review replaced destructive legacy-cache cleanup with atomic narrow compatibility ignores, added real `.bifrost` watcher coverage, consolidated the complete host evaluation contract, documented retained upgrade state, and recorded the unrelated quadratic Ruby validation exception.

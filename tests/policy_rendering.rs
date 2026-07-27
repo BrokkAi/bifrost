@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 use brokk_bifrost::policy::{
     HumanRenderColor, HumanRenderDetail, HumanRenderOptions, PolicyEvaluationDate,
-    PolicyEvaluationOptions, PolicyFailOn, PolicyRenderError, PolicyRunCompletion,
-    evaluate_policy_files, write_policy_human, write_policy_json,
+    PolicyEvaluationOptions, PolicyRenderError, PolicyRunCompletion, evaluate_policy_files,
+    write_policy_human, write_policy_json,
 };
 use serde_json::{Value, json};
 
@@ -42,9 +42,7 @@ fn evaluate(
     evaluate_policy_files(
         workspace.path(),
         &[PathBuf::from("policies").join(policy_name)],
-        false,
         &evaluation_options(),
-        PolicyFailOn::Never,
     )
     .expect("coordinated policy evaluation")
 }
@@ -164,9 +162,7 @@ fn suppressions_hide_only_concise_results_and_keep_verbose_json_audit() {
     let expired = evaluate_policy_files(
         workspace.path(),
         &[PathBuf::from("policies/render.rqlp")],
-        false,
         &PolicyEvaluationOptions::new("2026-07-28".parse().unwrap()),
-        PolicyFailOn::Never,
     )
     .unwrap();
     let mut concise = Vec::new();
@@ -290,9 +286,7 @@ fn typestate_run_renders_findings_and_completion() {
     let outcome = evaluate_policy_files(
         &fixture_root,
         &[PathBuf::from("policies/resource-lifecycle.rqlp")],
-        false,
         &evaluation_options(),
-        PolicyFailOn::Never,
     )
     .expect("coordinated typestate policy evaluation");
     assert_eq!(outcome.report().runs().len(), 1);
@@ -378,9 +372,7 @@ fn encoded_bounds_apply_after_terminal_and_json_escaping() {
     let outcome = evaluate_policy_files(
         workspace.path(),
         &[PathBuf::from("policies").join(unsafe_name)],
-        false,
         &evaluation_options(),
-        PolicyFailOn::Never,
     )
     .expect("missing unsafe requested path becomes a report diagnostic");
 

@@ -33,15 +33,30 @@ load endpoint directories, catalogs, or referenced query files. Formatting
 preserves comments and omitted `:schema-version` fields and returns no edit for
 an incomplete S-expression.
 
-An `.rqlp` buffer is not an RQL query document. It never enables the Play
-action, cannot publish findings into **Bifrost Query Results**, and cannot be
-passed to `--query-file`. Execute a saved `(policy ...)` root with
-`bifrost --policy-file`; an `(endpoint ...)` is a diagnostic-neutral dependency,
-not an executable root. See [Static-Analysis
-Policies](/static-analysis-policies/) for the complete authoring and reporting
-contract.
+An `.rqlp` buffer is not an ordinary RQL query document. Its editor-title Play
+button invokes **Run RQL Policy**, sends the current unsaved policy root to the
+language server, and resolves saved `rql-file`, endpoint, and directory
+dependencies beneath that policy's workspace root. An `(endpoint ...)` root
+remains diagnostic-neutral and non-executable. Policy buffers cannot publish
+findings into **Bifrost Query Results** and cannot be passed to `--query-file`.
 
-This Play action is a VS Code language-server feature. It does not start an MCP server, expose `query_code` to an agent, or prove that an agent can run RQL. For agent access, configure a query-capable MCP toolset and use a saved workspace `.rql` file through `query_file`; MCP does not accept unsaved editor text or raw inline RQL. See [MCP query and RQL availability](/mcp/#query-and-rql-availability).
+The extension supplies today's UTC evaluation date and uses the conventional
+`.bifrost/suppressions.json` project file. Active findings appear under
+**Bifrost Policy Results**. Applied findings are hidden from each policy's
+active list but remain under **Suppression audit**, which also shows stale,
+expired, policy-hash-drifted, unproven, and omitted-result decisions. Editing
+the policy or workspace while a run is in flight marks retained results stale;
+starting a new run cancels the earlier request. Use the CLI with an explicit
+`--evaluation-date` and optional `--suppressions-file` when the date or file
+must be pinned independently of the editor.
+
+These Play actions are VS Code language-server features. They do not start an
+MCP server or prove that an agent can run a query or policy. For agent query
+access, configure a query-capable MCP toolset and use a saved workspace `.rql`
+file through `query_file`; MCP does not accept unsaved editor text or raw
+inline RQL. For agent policy access, call the distinct `run_policy` MCP tool
+with explicit workspace `.rqlp` paths and an evaluation date. See [MCP query
+and RQL availability](/mcp/#query-and-rql-availability).
 
 ```lisp
 (result-detail full

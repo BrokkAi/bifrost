@@ -834,7 +834,11 @@ mod tests {
             actual.file_name().and_then(|n| n.to_str()),
             Some(crate::cache_db::CACHE_DB_FILE_NAME)
         );
-        let actual_root = actual.parent().and_then(Path::parent).unwrap();
+        let actual_root = actual
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .unwrap();
         assert_eq!(
             std::fs::canonicalize(actual_root).unwrap(),
             std::fs::canonicalize(&repo_root).unwrap()

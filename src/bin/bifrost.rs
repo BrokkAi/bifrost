@@ -595,14 +595,10 @@ fn run_policy_mode(
             }
         }
     };
-    let options = PolicyEvaluationOptions::with_suppressions(evaluation_date, suppressions);
-    let outcome = match evaluate_policy_files(
-        root,
-        policy_files,
-        require_explicit_schema_versions,
-        &options,
-        fail_on,
-    ) {
+    let options = PolicyEvaluationOptions::with_suppressions(evaluation_date, suppressions)
+        .with_required_schema_versions(require_explicit_schema_versions)
+        .with_fail_on(fail_on);
+    let outcome = match evaluate_policy_files(root, policy_files, &options) {
         Ok(outcome) => outcome,
         Err(error) => {
             eprintln!(

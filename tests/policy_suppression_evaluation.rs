@@ -44,9 +44,7 @@ fn evaluate(
     evaluate_policy_files(
         root,
         &[PathBuf::from(POLICY_PATH)],
-        false,
-        &evaluation_options(date),
-        fail_on,
+        &evaluation_options(date).with_fail_on(fail_on),
     )
     .expect("policy evaluation")
 }

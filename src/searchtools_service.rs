@@ -249,7 +249,6 @@ pub(crate) struct PreparedRunPolicy {
     root: PathBuf,
     policy_files: Vec<PathBuf>,
     options: PolicyEvaluationOptions,
-    fail_on: PolicyFailOn,
     workspace_generation: u64,
 }
 
@@ -2242,9 +2241,10 @@ impl SearchToolsService {
                 PolicySuppressionOptions::default,
                 PolicySuppressionOptions::new,
             );
-        let options =
-            PolicyEvaluationOptions::with_suppressions(params.evaluation_date, suppressions);
         let fail_on = PolicyFailOn::from(params.fail_on);
+        let options =
+            PolicyEvaluationOptions::with_suppressions(params.evaluation_date, suppressions)
+                .with_fail_on(fail_on);
 
         loop {
             let workspace_generation = self.workspace_generation();
@@ -2258,7 +2258,6 @@ impl SearchToolsService {
                 root,
                 policy_files,
                 options,
-                fail_on,
                 workspace_generation,
             });
         }
@@ -2274,17 +2273,14 @@ impl SearchToolsService {
             root,
             policy_files,
             options,
-            fail_on,
             workspace_generation: _,
         } = prepared;
         let result = (|| {
             let outcome = evaluate_policy_files_with_analyzer(
                 &root,
                 &policy_files,
-                false,
                 snapshot.analyzer(),
                 &options,
-                fail_on,
                 cancellation,
             )
             .map_err(|error| {

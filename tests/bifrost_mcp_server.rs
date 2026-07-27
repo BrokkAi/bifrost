@@ -933,9 +933,8 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     let expected = evaluate_policy_files(
         switched.root(),
         &[PathBuf::from("policies/dynamic-eval.rqlp")],
-        false,
-        &PolicyEvaluationOptions::new(evaluation_date.parse().expect("fixed evaluation date")),
-        PolicyFailOn::Warning,
+        &PolicyEvaluationOptions::new(evaluation_date.parse().expect("fixed evaluation date"))
+            .with_fail_on(PolicyFailOn::Warning),
     )
     .expect("direct policy evaluation");
     assert_eq!(expected.exit_status(), 1);

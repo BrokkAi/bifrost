@@ -1126,9 +1126,7 @@ mod tests {
 
     use super::*;
     use crate::analyzer::semantic::WorkspaceRelativePath;
-    use crate::policy::{
-        PolicyEvaluationDate, PolicyEvaluationOptions, PolicyFailOn, evaluate_policy_files,
-    };
+    use crate::policy::{PolicyEvaluationDate, PolicyEvaluationOptions, evaluate_policy_files};
 
     fn evaluation_options() -> PolicyEvaluationOptions {
         PolicyEvaluationOptions::new(
@@ -1152,9 +1150,7 @@ mod tests {
         let outcome = evaluate_policy_files(
             &fixture_root,
             &[PathBuf::from("policies/dynamic-eval.rqlp")],
-            false,
             &evaluation_options(),
-            PolicyFailOn::Never,
         )
         .expect("fixture policy evaluation");
         assert_eq!(outcome.report().runs()[0].findings().len(), 1);
@@ -1237,9 +1233,7 @@ mod tests {
         let outcome = evaluate_policy_files(
             &fixture_root,
             &[PathBuf::from("policies/resource-lifecycle.rqlp")],
-            false,
             &evaluation_options(),
-            PolicyFailOn::Never,
         )
         .expect("fixture policy evaluation");
         let mut run = outcome.report().runs()[0].clone();

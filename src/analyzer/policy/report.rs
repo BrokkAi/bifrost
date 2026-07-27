@@ -1390,13 +1390,14 @@ impl PolicyReportDocument {
         omitted_diagnostics_lower_bound: u64,
         worst_omitted_diagnostic_severity: Option<PolicyDiagnosticSeverity>,
     ) -> Result<Self, PolicyReportDocumentError> {
-        let options = super::suppression::PolicyEvaluationOptions::new(
+        let options = super::coordinator::PolicyEvaluationOptions::new(
             super::suppression::PolicyEvaluationDate::from_ymd(2026, 7, 27)
                 .expect("fixed test date is valid"),
         );
         Self::try_new_with_suppression_audit(
             PolicyReportEvaluationContext::new(
-                &options,
+                options.evaluation_date(),
+                options.suppressions(),
                 super::suppression::PolicySuppressionDocumentState::NotFound,
             ),
             rules,
@@ -1665,7 +1666,7 @@ impl PolicyReportBuilder {
         budget: PolicyBatchBudget,
         expected_inputs: usize,
     ) -> Result<Self, PolicyReportBuilderError> {
-        let options = super::suppression::PolicyEvaluationOptions::new(
+        let options = super::coordinator::PolicyEvaluationOptions::new(
             super::suppression::PolicyEvaluationDate::from_ymd(2026, 7, 27)
                 .expect("fixed test date is valid"),
         );
@@ -1673,7 +1674,8 @@ impl PolicyReportBuilder {
             budget,
             expected_inputs,
             PolicyReportEvaluationContext::new(
-                &options,
+                options.evaluation_date(),
+                options.suppressions(),
                 super::suppression::PolicySuppressionDocumentState::NotFound,
             ),
             Vec::new(),
@@ -2666,6 +2668,7 @@ fn completion_allows_diagnostic_impact(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::policy::coordinator::PolicyEvaluationOptions;
     use crate::analyzer::policy::definition::{PolicyAnalysis, PolicySelector, RqlpDocument};
     use crate::analyzer::policy::finding::{
         FindingCertainty, FindingCompleteness, FindingIncompleteReason, MatchFindingEvidence,
@@ -2680,9 +2683,9 @@ mod tests {
     use crate::analyzer::policy::resolved::{ResolvedPolicySelector, SelectorOrigin};
     use crate::analyzer::policy::source::parse_rqlp_source;
     use crate::analyzer::policy::suppression::{
-        PolicyEvaluationDate, PolicyEvaluationOptions, PolicySuppressionDocumentState,
-        PolicySuppressionMatchState, PolicySuppressionPolicyHashState,
-        PolicySuppressionTemporalState, parse_policy_suppression_document,
+        PolicyEvaluationDate, PolicySuppressionDocumentState, PolicySuppressionMatchState,
+        PolicySuppressionPolicyHashState, PolicySuppressionTemporalState,
+        parse_policy_suppression_document,
     };
     use crate::analyzer::semantic::WorkspaceRelativePath;
     use serde_json::json;
@@ -3084,8 +3087,11 @@ mod tests {
         let options = PolicyEvaluationOptions::new(
             PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date"),
         );
-        let evaluation =
-            PolicyReportEvaluationContext::new(&options, PolicySuppressionDocumentState::Loaded);
+        let evaluation = PolicyReportEvaluationContext::new(
+            options.evaluation_date(),
+            options.suppressions(),
+            PolicySuppressionDocumentState::Loaded,
+        );
         let rules = Vec::new();
         let runs = Vec::new();
         let suppressions = vec![review.clone()];
