@@ -1,8 +1,8 @@
 use crate::analyzer::semantic_diagnostics::{node_range, node_text};
 use crate::analyzer::tree_sitter_analyzer::collect_parse_errors;
 use crate::analyzer::{
-    IAnalyzer, ProjectFile, Range, ScalaAnalyzer, ScalaTypeKnownness, SemanticDiagnostic,
-    resolve_analyzer,
+    IAnalyzer, ImportAnalysisProvider, ProjectFile, Range, ScalaAnalyzer, ScalaTypeKnownness,
+    SemanticDiagnostic, resolve_analyzer,
 };
 use crate::hash::HashSet;
 use crate::text_utils::compute_line_starts;

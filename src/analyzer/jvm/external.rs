@@ -1408,7 +1408,7 @@ mod tests {
         write_zip_entry(
             &source_jar,
             "scala/example/Dependency.scala",
-            "package scala.example\nclass Dependency\ntrait Contract\nobject Defaults\nprivate class Hidden\n",
+            b"package scala.example\nclass Dependency\ntrait Contract\nobject Defaults\nprivate class Hidden\n",
         );
 
         let index = JavaExternalDeclarationIndex::build(

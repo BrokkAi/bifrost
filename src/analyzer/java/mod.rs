@@ -6,7 +6,7 @@ mod declarations;
 pub(crate) mod dependency_discovery;
 mod exceptions;
 mod hierarchy;
-mod imports;
+pub(crate) mod imports;
 mod semantic;
 pub(crate) mod structural;
 mod tests;
@@ -45,7 +45,7 @@ pub struct JavaAnalyzer {
     inner: TreeSitterAnalyzer<JavaAdapter>,
     memo_caches: Arc<JavaMemoCaches>,
     java_config: crate::analyzer::JavaAnalyzerConfig,
-    external_index: Arc<std::sync::OnceLock<JavaExternalDeclarationIndex>>,
+    pub(crate) external_index: Arc<std::sync::OnceLock<JavaExternalDeclarationIndex>>,
 }
 
 crate::analyzer::impl_forward_query_provider!(JavaAnalyzer);

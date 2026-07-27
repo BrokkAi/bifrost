@@ -201,3 +201,5 @@ Revision note, 2026-07-27: Completed the first mechanical extraction checkpoint.
 Revision note, 2026-07-27: Added source-JAR parsing for parser-clean public Scala declarations, Scala lazy-index ownership and invalidation, the first conservative type/bare-local diagnostic shapes, and focused unit/integration/LSP tests. Left call, member, qualified, interpolation, and implicit/given-sensitive forms intentionally silent.
 
 Revision note, 2026-07-27: Review follow-ups bound shared-index aggregate archive work and Scala source expansion, suppress default Scala/`java.lang` types and same-package singleton terms, and assert the Scala publish-diagnostics payload. Full required Rust gates passed after these changes.
+
+Revision note, 2026-07-27: The first PR CI run exposed compile-only visibility fallout from relocating Java-owned tests into the sibling JVM module. Restored the narrow crate-private test seams, corrected the Scala archive fixture byte type, and imported the established Scala import-analysis capability before rerunning the strict local gate.
