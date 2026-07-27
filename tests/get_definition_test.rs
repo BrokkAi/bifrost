@@ -19960,6 +19960,48 @@ int read(Record *record) {
 }
 
 #[test]
+fn cpp_parameter_declaration_name_stays_non_reference_while_type_stays_resolvable() {
+    let source = r#"
+namespace util {
+struct Bytes {};
+}
+struct Header {};
+struct CacheEntryType {
+    static int result;
+};
+void take(std::function<void(util::Bytes& result, const Header& hdr)> serialize_payload);
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", source)
+        .build();
+
+    let parameter_name = source.find("& result").expect("parameter name") + 2;
+    let parameter_type = source
+        .find("util::Bytes")
+        .expect("declaration-context type reference")
+        + "util::".len();
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("app.cpp", source, parameter_name),
+                location_query("app.cpp", source, parameter_type),
+            ]
+        })
+        .to_string(),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "no_definition", "{value}");
+    assert_eq!(
+        results[0]["diagnostics"][0]["kind"], "declaration_or_import_site",
+        "{value}"
+    );
+    assert_eq!(results[1]["status"], "resolved", "{value}");
+    assert_eq!(results[1]["definitions"][0]["fqn"], "util.Bytes", "{value}");
+}
+
+#[test]
 fn cpp_typedef_alias_declarator_is_not_a_type_reference() {
     let source = r#"
 typedef struct Scope Scope;
@@ -21230,6 +21272,84 @@ int run(int value) {
     );
     assert_eq!(results[1]["status"], "resolved", "{value}");
     assert_eq!(results[1]["definitions"][0]["kind"], "parameter", "{value}");
+}
+
+#[test]
+fn cpp_recovered_preprocessor_tail_tokens_do_not_resolve_workspace_symbols() {
+    let source = r#"
+int R15();
+int DX();
+int R12();
+int MULXQ();
+
+#define _fqMulBmi2(c, a, b) \
+    MOVL $0, R15 \
+    \ // T0 = a0 * b0, R11:R10:R9:R8 <- 0+ra:8+ra * 0+rb:8+rb
+    MOVQ 0+b, DX \
+    MULXQ 0+a, R12, R13 \
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("macro.h", source)
+        .build();
+
+    let tail_start = source.find("#define _fqMulBmi2").expect("macro start");
+    let r15 = source[tail_start..].find("R15").expect("recovered R15") + tail_start;
+    let dx = source[tail_start..].find("DX").expect("recovered DX") + tail_start;
+    let mulxq = source[tail_start..].find("MULXQ").expect("recovered MULXQ") + tail_start;
+    let r12 = source[tail_start..].rfind("R12").expect("recovered R12") + tail_start;
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("macro.h", source, r15),
+                location_query("macro.h", source, dx),
+                location_query("macro.h", source, mulxq),
+                location_query("macro.h", source, r12),
+            ]
+        })
+        .to_string(),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    for result in results {
+        assert_eq!(result["status"], "no_definition", "{value}");
+        assert_eq!(
+            result["diagnostics"][0]["kind"], "declaration_or_import_site",
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn cpp_recovered_preprocessor_tail_stops_before_later_clean_reference() {
+    let source = r#"
+int keep() { return 1; }
+
+#define _fqMulBmi2(c, a, b) \
+    MOVL $0, R15 \
+    \ // T0 = a0 * b0, R11:R10:R9:R8 <- 0+ra:8+ra * 0+rb:8+rb
+    MOVQ 0+b, DX \
+    MULXQ 0+a, R12, R13 \
+
+#define AFTER_RECOVERY 1
+int use() { return keep(); }
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("macro.h", source)
+        .build();
+
+    let keep_call = source.rfind("keep()").expect("later clean keep call");
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [location_query("macro.h", source, keep_call)]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "keep", "{value}");
 }
 
 #[test]

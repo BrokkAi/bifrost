@@ -367,6 +367,63 @@ int read_b() {
 }
 
 #[test]
+fn inverse_lookup_keeps_same_named_anonymous_namespace_constexpr_globals_file_local() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "a.cpp",
+            r#"
+namespace {
+constexpr int local_value = 0;
+}
+int read_a() {
+    return local_value; // target-a
+}
+"#,
+        ),
+        (
+            "b.cpp",
+            r#"
+namespace {
+constexpr int local_value = 0;
+}
+int read_b() {
+    return local_value; // sibling-b
+}
+"#,
+        ),
+    ]);
+
+    let target = field_definition_in_source(&analyzer, "a.cpp", "local_value");
+    let a = project.file("a.cpp");
+    let b = project.file("b.cpp");
+    let a_source = a.read_to_string().expect("read a.cpp");
+    let b_source = b.read_to_string().expect("read b.cpp");
+    let expected = BTreeSet::from([fixture_token_range(
+        &a_source,
+        "    return local_value; // target-a",
+        "local_value",
+    )]);
+    let wrong = fixture_token_range(
+        &b_source,
+        "    return local_value; // sibling-b",
+        "local_value",
+    );
+
+    assert_eq!(authoritative_exact_ranges(&analyzer, &target, &a), expected);
+    assert!(
+        authoritative_exact_ranges(&analyzer, &target, &b).is_empty(),
+        "authoritative inverse lookup must not leak to the sibling anonymous-namespace constexpr global"
+    );
+
+    let public = whole_workspace_ranges(&analyzer, &target, &a);
+    assert_eq!(public, expected);
+    assert!(
+        !whole_workspace_ranges(&analyzer, &target, &b).contains(&wrong),
+        "whole-workspace inverse lookup must not leak to the sibling anonymous-namespace constexpr global"
+    );
+}
+
+#[test]
 fn inverse_lookup_still_coalesces_extern_const_globals_across_files() {
     let (project, analyzer) = cpp_analyzer_with_files(&[
         (

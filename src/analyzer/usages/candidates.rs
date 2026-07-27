@@ -3,7 +3,10 @@ use crate::analyzer::usages::common::{
     analyzed_files_for_language, language_for_file, language_for_target,
 };
 use crate::analyzer::usages::traits::CandidateFileProvider;
-use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile};
+use crate::analyzer::{
+    CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile,
+    cpp_callable_definitions_share_identity_evidence,
+};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet, set_with_capacity};
 use rayon::prelude::*;
@@ -62,8 +65,13 @@ fn find_import_graph_candidates(
     }
 
     // (2) Defining files + directory siblings.
-    let source_files: BTreeSet<ProjectFile> =
+    let mut source_files: BTreeSet<ProjectFile> =
         all_targets.iter().map(|cu| cu.source().clone()).collect();
+    source_files.extend(cpp_related_callable_source_files(
+        &all_targets,
+        analyzer,
+        cancellation,
+    ));
 
     for source_file in &source_files {
         if is_cancelled(cancellation) {
@@ -133,6 +141,47 @@ fn find_import_graph_candidates(
     add_scala_candidates_for_java_type(target, analyzer, &mut candidates, cancellation);
 
     candidates
+}
+
+fn cpp_related_callable_source_files(
+    targets: &HashSet<CodeUnit>,
+    analyzer: &dyn IAnalyzer,
+    cancellation: Option<&CancellationToken>,
+) -> BTreeSet<ProjectFile> {
+    if !targets
+        .iter()
+        .any(|target| language_for_target(target) == Language::Cpp && target.is_callable())
+    {
+        return BTreeSet::new();
+    }
+
+    let mut related = BTreeSet::new();
+    for target in targets {
+        if is_cancelled(cancellation) {
+            break;
+        }
+        if language_for_target(target) != Language::Cpp || !target.is_callable() {
+            continue;
+        }
+        let identifier = source_identifier_for_target(target);
+        let target_fqn = target.fq_name();
+        for candidate in analyzer.global_usage_definition_index().by_fqn(&target_fqn) {
+            if is_cancelled(cancellation) {
+                break;
+            }
+            if !candidate.is_callable()
+                || source_identifier_for_target(candidate) != identifier
+                || candidate.fq_name() != target_fqn
+                || candidate.signature() != target.signature()
+            {
+                continue;
+            }
+            if cpp_callable_definitions_share_identity_evidence(analyzer, target, candidate) {
+                related.insert(candidate.source().clone());
+            }
+        }
+    }
+    related
 }
 
 fn find_direct_importers_with_cancellation(

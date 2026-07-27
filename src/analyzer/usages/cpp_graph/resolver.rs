@@ -900,7 +900,11 @@ impl<'a> VisibilityIndex<'a> {
             },
             |file| analyzer.declarations(file),
         );
-        let visible_by_identifier = build_visible_identifier_index(&visible_by_file);
+        let visible_by_identifier = build_visible_identifier_index(
+            analyzer,
+            &visible_by_file,
+            &visible_source_files_by_root,
+        );
         let mut cpp_template_metadata = HashMap::default();
         for unit in visible_by_file
             .values()
@@ -3691,12 +3695,25 @@ pub(super) fn lexical_component_tiers<'a>(
 }
 
 fn build_visible_identifier_index(
+    analyzer: &dyn IAnalyzer,
     visible_by_file: &HashMap<ProjectFile, HashSet<CodeUnit>>,
+    visible_source_files_by_root: &HashMap<ProjectFile, HashSet<ProjectFile>>,
 ) -> HashMap<ProjectFile, HashMap<String, Vec<CodeUnit>>> {
     let mut out = HashMap::default();
     for (file, visible) in visible_by_file {
+        let mut internal_linkage_cache = HashMap::default();
         let mut by_identifier: HashMap<String, Vec<CodeUnit>> = HashMap::default();
         for unit in visible {
+            if cpp_global_field_has_internal_linkage_cached(
+                analyzer,
+                &mut internal_linkage_cache,
+                unit,
+            ) && !visible_source_files_by_root
+                .get(file)
+                .is_some_and(|sources| sources.contains(unit.source()))
+            {
+                continue;
+            }
             by_identifier
                 .entry(unit.identifier().to_string())
                 .or_default()
@@ -7790,11 +7807,28 @@ mod tests {
         cpp: &'a CppAnalyzer,
         visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
     ) -> VisibilityIndex<'a> {
+        let visible_source_files_by_root = visible_by_file
+            .iter()
+            .map(|(file, visible)| {
+                (
+                    file.clone(),
+                    visible
+                        .iter()
+                        .map(|unit| unit.source().clone())
+                        .chain(std::iter::once(file.clone()))
+                        .collect(),
+                )
+            })
+            .collect();
         VisibilityIndex {
             cpp,
-            visible_by_identifier: build_visible_identifier_index(&visible_by_file),
+            visible_by_identifier: build_visible_identifier_index(
+                cpp,
+                &visible_by_file,
+                &visible_source_files_by_root,
+            ),
             visible_by_file,
-            visible_source_files_by_root: HashMap::default(),
+            visible_source_files_by_root,
             alias_cells: Mutex::new(HashMap::default()),
             visible_parser_alias_name_sets: RwLock::new(HashMap::default()),
             ordinary_type_import_cells: Mutex::new(HashMap::default()),

@@ -225,7 +225,7 @@ pub(super) fn resolve_cpp<'a>(
                 );
             }
         }
-        if cpp_is_declaration_name(node) {
+        if cpp_is_non_reference_declaration_name(node) {
             return no_definition(
                 "declaration_or_import_site",
                 format!("`{}` is not a C++ reference site", site.text),
@@ -281,8 +281,8 @@ pub(super) fn resolve_cpp<'a>(
                     candidates_outcome(candidates)
                 };
             }
-            if cpp_is_declaration_name(node)
-                || cpp_is_non_reference_preprocessor_body_token(identifier)
+            if cpp_is_non_reference_declaration_name(identifier)
+                || cpp_is_non_reference_preprocessor_token(identifier)
             {
                 return no_definition(
                     "declaration_or_import_site",
@@ -2163,7 +2163,7 @@ fn resolve_cpp_type(
         return no_definition("no_reference_text", "C++ type reference is blank");
     }
     if cpp_qualified_identifier_is_declaration_name(node)
-        || cpp_is_non_reference_preprocessor_body_token(node)
+        || cpp_is_non_reference_preprocessor_token(node)
     {
         return no_definition(
             "declaration_or_import_site",
@@ -3714,6 +3714,93 @@ fn cpp_qualified_identifier_is_declaration_name(node: Node<'_>) -> bool {
         })
 }
 
+fn cpp_is_non_reference_declaration_name(node: Node<'_>) -> bool {
+    cpp_is_declaration_name(node) || cpp_is_terminal_declarator_name(node)
+}
+
+fn cpp_is_terminal_declarator_name(node: Node<'_>) -> bool {
+    if !matches!(
+        node.kind(),
+        "identifier" | "field_identifier" | "qualified_identifier"
+    ) {
+        return false;
+    }
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        let Some(parent) = candidate.parent() else {
+            break;
+        };
+        if matches!(
+            parent.kind(),
+            "init_declarator"
+                | "function_declarator"
+                | "pointer_declarator"
+                | "array_declarator"
+                | "attributed_declarator"
+                | "reference_declarator"
+                | "parenthesized_declarator"
+                | "parameter_declaration"
+                | "optional_parameter_declaration"
+                | "declaration"
+                | "field_declaration"
+                | "function_definition"
+                | "type_definition"
+                | "alias_declaration"
+        ) && cpp_declares_terminal_name(parent, node)
+        {
+            return true;
+        }
+        if matches!(
+            parent.kind(),
+            "parameter_declaration"
+                | "optional_parameter_declaration"
+                | "declaration"
+                | "field_declaration"
+                | "function_definition"
+                | "type_definition"
+                | "alias_declaration"
+                | "translation_unit"
+        ) {
+            return false;
+        }
+        current = Some(parent);
+    }
+    false
+}
+
+fn cpp_declares_terminal_name(container: Node<'_>, target: Node<'_>) -> bool {
+    let target = cpp_terminal_declarator_name_target(target);
+    let mut cursor = container.walk();
+    for declarator in container.children_by_field_name("declarator", &mut cursor) {
+        if cpp_declarator_name_node(declarator).is_some_and(|name| cpp_same_node(name, target)) {
+            return true;
+        }
+    }
+    container
+        .child_by_field_name("name")
+        .and_then(cpp_declarator_name_node)
+        .is_some_and(|name| cpp_same_node(name, target))
+}
+
+fn cpp_terminal_declarator_name_target(node: Node<'_>) -> Node<'_> {
+    if node.kind() == "qualified_identifier" {
+        node.child_by_field_name("name").unwrap_or(node)
+    } else {
+        node
+    }
+}
+
+fn cpp_same_node(left: Node<'_>, right: Node<'_>) -> bool {
+    left.id() == right.id()
+        && left.start_byte() == right.start_byte()
+        && left.end_byte() == right.end_byte()
+}
+
+fn cpp_is_non_reference_preprocessor_token(node: Node<'_>) -> bool {
+    cpp_is_non_reference_preprocessor_body_token(node)
+        || cpp_is_non_reference_preprocessor_recovery_tail_token(node)
+}
+
 fn cpp_is_non_reference_preprocessor_body_token(node: Node<'_>) -> bool {
     let mut current = Some(node);
     while let Some(candidate) = current {
@@ -3739,6 +3826,40 @@ fn cpp_is_non_reference_preprocessor_body_token(node: Node<'_>) -> bool {
         current = Some(parent);
     }
     false
+}
+
+fn cpp_is_non_reference_preprocessor_recovery_tail_token(node: Node<'_>) -> bool {
+    let Some(top_level) = cpp_translation_unit_child(node) else {
+        return false;
+    };
+    if !cpp_contains_recovery_error(top_level) {
+        return false;
+    }
+    let mut current = top_level.prev_named_sibling();
+    while let Some(sibling) = current {
+        if sibling.kind() == "preproc_function_def" {
+            return sibling.child_by_field_name("value").is_some();
+        }
+        if !cpp_contains_recovery_error(sibling) {
+            return false;
+        }
+        current = sibling.prev_named_sibling();
+    }
+    false
+}
+
+fn cpp_translation_unit_child(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        let parent = node.parent()?;
+        if parent.kind() == "translation_unit" {
+            return Some(node);
+        }
+        node = parent;
+    }
+}
+
+fn cpp_contains_recovery_error(node: Node<'_>) -> bool {
+    subtree_contains(node, |candidate| candidate.kind() == "ERROR")
 }
 
 fn cpp_parent_is_class(support: &dyn BoundedDefinitionLookup, unit: &CodeUnit) -> bool {

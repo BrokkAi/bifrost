@@ -764,6 +764,27 @@ fn editor_usage_hits(analyzer: &CppAnalyzer, target: &CodeUnit) -> Vec<HitSummar
         .collect()
 }
 
+fn default_editor_usage_hits(analyzer: &CppAnalyzer, targets: &[CodeUnit]) -> Vec<HitSummary> {
+    UsageFinder::new()
+        .find_usages_default(analyzer, targets)
+        .all_hits_including_imports()
+        .into_iter()
+        .map(hit_summary)
+        .collect()
+}
+
+fn default_usage_hit_locations(
+    analyzer: &CppAnalyzer,
+    targets: &[CodeUnit],
+) -> BTreeSet<(String, usize, usize)> {
+    UsageFinder::new()
+        .find_usages_default(analyzer, targets)
+        .all_hits_including_imports()
+        .into_iter()
+        .map(|hit| (slash_path(&hit.file), hit.start_offset, hit.end_offset))
+        .collect()
+}
+
 fn hit_summary(hit: brokk_bifrost::usages::UsageHit) -> HitSummary {
     let line = hit
         .file
@@ -6659,6 +6680,73 @@ std::string Service::execute(const std::string& name) {
 }
 
 #[test]
+fn cpp_default_candidates_expand_callable_body_to_header_peers() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "include/link.h",
+            r#"#pragma once
+namespace proton {
+class Link {
+public:
+    int credit() const;
+};
+}
+"#,
+        ),
+        (
+            "src/link.cpp",
+            r#"#include "link.h"
+namespace proton {
+int Link::credit() const { return 7; }
+}
+"#,
+        ),
+        (
+            "src/consumer.cpp",
+            r#"#include "link.h"
+int use_credit(const proton::Link& link) {
+    return link.credit();
+}
+"#,
+        ),
+        (
+            "src/unrelated.cpp",
+            r#"#include "link.h"
+namespace other {
+class Link {
+public:
+    int credit() const { return 0; }
+};
+int use_credit(const Link& link) {
+    return link.credit();
+}
+}
+"#,
+        ),
+    ]);
+
+    let credit_header = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.short_name() == "Link.credit"
+            && slash_path(unit.source()) == "include/link.h"
+    });
+    let credit_body =
+        member_function_definition_in_source(&analyzer, "Link", "credit", "src/link.cpp");
+
+    let body_hits = default_editor_usage_hits(&analyzer, std::slice::from_ref(&credit_body));
+    assert_hit_contains(&body_hits, "src/consumer.cpp", "return link.credit();");
+    assert_no_hit_contains(&body_hits, "src/unrelated.cpp");
+
+    let body_only = default_usage_hit_locations(&analyzer, std::slice::from_ref(&credit_body));
+    let body_and_header =
+        default_usage_hit_locations(&analyzer, &[credit_header.clone(), credit_body.clone()]);
+    assert_eq!(
+        body_and_header, body_only,
+        "body-only/default lookup diverged"
+    );
+}
+
+#[test]
 fn cpp_graph_definition_sites_respect_overload_signatures_and_void_arity() {
     let (_project, analyzer) = cpp_analyzer_with_files(&[
         (
@@ -10429,6 +10517,258 @@ void consume(n::Outer::Inner* value) {} // positive-ordinary-type-control
     assert!(
         g_hits.is_empty(),
         "a missing terminal owner must not attribute its function body to the last resolved prefix: {g_hits:#?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_macro_decorated_owner_inverse_keeps_out_of_line_qualifiers_exact() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "widget.h",
+            r#"#pragma once
+#define LOG4CXX_NS demo
+#define LOG4CXX_EXPORT
+
+namespace LOG4CXX_NS {
+class LOG4CXX_EXPORT Widget {
+public:
+    Widget();
+    ~Widget();
+    void operator()();
+    void run();
+    struct Inner;
+};
+}
+"#,
+        )
+        .file(
+            "widget.cpp",
+            r#"#include "widget.h"
+namespace demo {
+struct Widget::Inner {
+    void touch();
+};
+
+Widget::Widget() {}
+Widget::~Widget() {}
+void Widget::operator()() {}
+void Widget::run() {}
+void Widget::Inner::touch() {}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "LOG4CXX_NS.Widget"
+            && slash_path(unit.source()) == "widget.h"
+            && !unit.is_synthetic()
+    });
+    let site = project.file("widget.cpp");
+    let source = site.read_to_string().expect("widget source");
+    let range = |line: &str, token: &str| fixture_token_range(&source, line, token);
+    let positive = [
+        range("struct Widget::Inner {", "Widget"),
+        range("Widget::Widget() {}", "Widget"),
+        range("Widget::~Widget() {}", "Widget"),
+        range("void Widget::operator()() {}", "Widget"),
+        range("void Widget::run() {}", "Widget"),
+        range("void Widget::Inner::touch() {}", "Widget"),
+    ];
+    let controls = [
+        range("struct Widget::Inner {", "Inner"),
+        range("Widget::Widget() {}", "Widget()"),
+        range("Widget::~Widget() {}", "~Widget"),
+        range("void Widget::operator()() {}", "operator"),
+        range("void Widget::run() {}", "run"),
+        range("void Widget::Inner::touch() {}", "touch"),
+    ];
+    let covers = |hits: &BTreeSet<(usize, usize)>, needle: (usize, usize)| {
+        hits.iter()
+            .any(|hit| hit.0 <= needle.0 && needle.1 <= hit.1)
+    };
+
+    let authoritative = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &site);
+    let whole = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&target))
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == site)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+
+    for hits in [&authoritative, &whole] {
+        assert!(
+            positive.iter().copied().all(|needle| covers(hits, needle)),
+            "every out-of-line owner qualifier must be covered: hits={hits:#?}, positive={positive:#?}"
+        );
+        assert!(
+            controls.iter().copied().all(|needle| !covers(hits, needle)),
+            "terminal declaration names must stay excluded even when the owner qualifier is retained: hits={hits:#?}, controls={controls:#?}"
+        );
+    }
+}
+
+#[test]
+fn authoritative_cpp_declaration_context_type_refs_and_using_member_ranges_stay_exact() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "decls.h",
+            r#"#pragma once
+namespace demo {
+class Owner {};
+namespace other { class Owner {}; }
+
+template <typename T> struct Box { using Item = T; };
+
+struct Usage {
+    Owner field;
+    static Owner make();
+    void take(Owner value);
+    Box<Owner> templated;
+    Box<Owner>::Item nested;
+    other::Owner other_field;
+};
+
+struct Base {
+    void member();
+};
+
+struct Sibling {
+    void member();
+};
+
+struct Derived : Base, Sibling {
+    using Base::member;
+    using Sibling::member;
+};
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let site = project.file("decls.h");
+    let source = site.read_to_string().expect("declaration fixture");
+    let owner = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "demo.Owner" && !unit.is_synthetic()
+    });
+    let member = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Base.member"
+            && slash_path(unit.source()) == "decls.h"
+    });
+    let range = |line: &str, token: &str| fixture_token_range(&source, line, token);
+
+    let owner_expected = BTreeSet::from([
+        range("    Owner field;", "Owner"),
+        range("    static Owner make();", "Owner"),
+        range("    void take(Owner value);", "Owner"),
+        range("    Box<Owner> templated;", "Owner"),
+        range("    Box<Owner>::Item nested;", "Owner"),
+    ]);
+    let owner_control = range("    other::Owner other_field;", "other::Owner");
+    let owner_authoritative =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&owner), &site);
+    let owner_whole = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&owner))
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == site)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        (&owner_authoritative, &owner_whole),
+        (&owner_expected, &owner_expected),
+        "field, return, parameter, and template/nested declaration-context type identifiers must stay exact"
+    );
+    assert!(
+        !owner_authoritative.contains(&owner_control) && !owner_whole.contains(&owner_control),
+        "an unrelated same-name owner must stay excluded"
+    );
+
+    let using_expected = BTreeSet::from([range("    using Base::member;", "Base::member")]);
+    let sibling_control = range("    using Sibling::member;", "Sibling::member");
+    let member_authoritative =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&member), &site);
+    let member_whole = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&member))
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == site)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        (&member_authoritative, &member_whole),
+        (&using_expected, &using_expected),
+        "`using Base::member` must contribute the exact imported member range"
+    );
+    assert!(
+        !member_authoritative.contains(&sibling_control)
+            && !member_whole.contains(&sibling_control),
+        "same-short-name sibling imports must stay attributed to their own owner"
+    );
+}
+
+#[test]
+fn authoritative_cpp_exact_ranges_cover_qualified_static_and_temporary_member_calls() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "calls.h",
+            r#"#pragma once
+namespace demo {
+struct Target {
+    static void stat();
+    void run();
+};
+}
+"#,
+        )
+        .file(
+            "impl.cpp",
+            r#"#include "calls.h"
+namespace demo {
+void Target::stat() {}
+void Target::run() {}
+}
+"#,
+        )
+        .file(
+            "calls.cpp",
+            r#"#include "calls.h"
+namespace demo {
+
+void consume() {
+    Target::stat();
+    Target().run();
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let site = project.file("calls.cpp");
+    let source = site.read_to_string().expect("calls source");
+    let stat = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Target.stat"
+            && slash_path(unit.source()) == "calls.h"
+    });
+    let run = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Target.run"
+            && slash_path(unit.source()) == "calls.h"
+    });
+
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&stat), &site),
+        BTreeSet::from([fixture_token_range(&source, "    Target::stat();", "stat",)]),
+        "qualified static member calls must retain their exact terminal member range"
+    );
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&run), &site),
+        BTreeSet::from([fixture_token_range(&source, "    Target().run();", "run")]),
+        "temporary member calls must retain their exact terminal member range"
     );
 }
 
