@@ -27,6 +27,13 @@ use crate::mcp_property_fuzzer::FuzzerConfig;
 ///   empty the probe set (observed on chisel: `probe_calls=0`, signature
 ///   MISSING). These rerun via `path_filter` on the violation's file, which
 ///   regenerates the file's summaries probe and its element follow-ups.
+/// - file-scoped violations (`failure-message-claims-not-indexed-but-symbol-exists`,
+///   the I4 honest-claim check): the exemplar symbol is drawn from the
+///   failure *message* (the disputed name / contradicting hit), not from the
+///   sampled reference sites that drive the probe — the same empty-probe-set
+///   trap (observed on Monocle: `probe_calls=0`, signature MISSING while a
+///   direct path-scoped run reproduced the violation). These likewise rerun
+///   via `path_filter` on the violation's file.
 /// - I5 and symbol-less violations keep the base config: I5 negatives derive
 ///   from the whole service sample, so filtering would empty the probe set.
 ///
@@ -69,9 +76,11 @@ pub fn rerun_configs(
             .unwrap_or("");
         let path = violation.get("path").and_then(Value::as_str).unwrap_or("");
         let mut config = base.clone();
-        if signature.contains("summaries-listed") {
-            // File-scoped (I3a): reproduce through the file's summaries
-            // probe, not the response-side element name.
+        let file_scoped = signature.contains("summaries-listed")
+            || signature.contains("failure-message-claims-not-indexed-but-symbol-exists");
+        if file_scoped {
+            // Reproduce through the violation's file, not the response-side
+            // or message-side exemplar name (see the module docs).
             config.symbol_filter = None;
             if !path.is_empty() {
                 config.path_filter = Some(path.to_string());
