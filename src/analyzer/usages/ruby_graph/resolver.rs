@@ -281,9 +281,11 @@ impl<'a> RubySemanticIndex<'a> {
         let candidates = constant_lookup_candidates(lexical_stack, segments, absolute)?;
 
         candidates.into_iter().find_map(|candidate| {
-            let autoload_files = include_autoload
-                .then(|| self.ruby.autoload_visible_files_for_constant(&candidate))
-                .unwrap_or_default();
+            let autoload_files = if include_autoload {
+                self.ruby.autoload_visible_files_for_constant(&candidate)
+            } else {
+                HashSet::default()
+            };
             self.analyzer.definitions(&candidate).find(|unit| {
                 visible_files.contains(unit.source())
                     || unit.source() == file

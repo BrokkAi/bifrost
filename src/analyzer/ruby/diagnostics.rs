@@ -248,17 +248,17 @@ fn file_has_open_runtime_boundary(root: Node<'_>, source: &str) -> bool {
         if defines_const_missing_dynamically(node, source) {
             return true;
         }
-        if node.kind() == "call" {
-            if let Some(method) = node.child_by_field_name("method") {
-                match node_text(method, source) {
-                    "autoload" => return true,
-                    "require" | "require_relative" | "load"
-                        if super::imports::parse_ruby_require_call(node, source).is_none() =>
-                    {
-                        return true;
-                    }
-                    _ => {}
+        if node.kind() == "call"
+            && let Some(method) = node.child_by_field_name("method")
+        {
+            match node_text(method, source) {
+                "autoload" => return true,
+                "require" | "require_relative" | "load"
+                    if super::imports::parse_ruby_require_call(node, source).is_none() =>
+                {
+                    return true;
                 }
+                _ => {}
             }
         }
         if matches!(node.kind(), "method" | "singleton_method")
@@ -312,7 +312,7 @@ fn visible_files_have_open_runtime_boundary(
             return true;
         }
         let visible_source = if visible_file == file {
-            (source.len() <= remaining_bytes).then(|| Cow::Borrowed(source))
+            (source.len() <= remaining_bytes).then_some(Cow::Borrowed(source))
         } else {
             analyzer
                 .project()
