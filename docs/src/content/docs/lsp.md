@@ -48,7 +48,7 @@ Each accepted runtime value is a full snapshot. It replaces the startup `initial
 
 Changing only `formatterCommands` affects later formatting requests without rebuilding the analyzer. Changing `roots` or `exclude` rebuilds the workspace, preserves open editor buffers, cancels active formatter processes before swapping state, and clears published diagnostics for files that leave the workspace. Clearing `roots` restores the latest workspace folders reported by the editor.
 
-`unrecognizedSymbolDiagnostics` is an experimental opt-in lint. It is `false` by default because Bifrost's symbol resolver is not yet accurate enough to make those editor errors trustworthy. Set it to `true` to publish unrecognized symbol and member diagnostics; syntax diagnostics are always enabled.
+`unrecognizedSymbolDiagnostics` is an experimental opt-in lint. It is `false` by default because Bifrost's symbol resolver is not yet accurate enough to make those editor errors trustworthy. Set it to `true` to publish unrecognized symbol and member diagnostics; syntax diagnostics are always enabled. Ruby currently contributes only high-confidence project-local constant-path diagnostics. It intentionally does not diagnose unknown Ruby methods or members: `method_missing`, runtime patching, gems, autoloading, and framework conventions make their absence unsafe to claim.
 
 ## Protocol Surface
 

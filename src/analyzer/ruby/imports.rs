@@ -135,6 +135,19 @@ impl RubyAnalyzer {
             .collect()
     }
 
+    /// Whether a supported load directive cannot be closed over project files.
+    ///
+    /// A bare `require` can load a gem or a caller-provided load-path entry at
+    /// runtime. Navigation can still offer best-effort indexed results, but a
+    /// diagnostic must not claim that a constant is absent while that boundary
+    /// remains open.
+    pub(crate) fn has_unresolved_load_directive(&self, file: &ProjectFile) -> bool {
+        self.inner
+            .import_info_of(file)
+            .iter()
+            .any(|import| resolve_required_file(file, import).is_none())
+    }
+
     pub(crate) fn autoload_visible_files_for_constant(
         &self,
         constant: &str,
