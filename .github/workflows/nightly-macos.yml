@@ -1,0 +1,145 @@
+name: Nightly macOS
+
+on:
+  schedule:
+    - cron: '23 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  agent-plugin:
+    name: agent plugin
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+
+      - name: Test launcher
+        run: node --test plugins/bifrost-agent/test/launcher.test.mjs
+
+      - name: Validate manifests
+        run: node scripts/check-codex-plugin-manifest.mjs
+
+  pi-package:
+    name: Pi package
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: plugins/bifrost-agent/package-lock.json
+
+      - name: Install package dependencies
+        run: npm ci
+        working-directory: plugins/bifrost-agent
+
+      - name: Check package
+        run: npm run check
+        working-directory: plugins/bifrost-agent
+
+      - name: Test package
+        run: npm test
+        working-directory: plugins/bifrost-agent
+
+      - name: Test packed package install
+        run: npm run test:packed
+        working-directory: plugins/bifrost-agent
+
+      - name: Validate shared plugin manifests
+        run: node scripts/check-codex-plugin-manifest.mjs
+
+  rust:
+    name: rust (aarch64-apple-darwin)
+    runs-on: macos-latest
+    env:
+      RUSTFLAGS: '-C link-arg=-undefined -C link-arg=dynamic_lookup'
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Set up Java
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.0
+          components: clippy
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: aarch64-apple-darwin
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --features nlp --target aarch64-apple-darwin -- -D warnings
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          version: 0.11.31
+          python-version: '3.12'
+          enable-cache: false
+
+      - name: cargo test
+        run: cargo test --target aarch64-apple-darwin --features nlp
+
+  python:
+    name: python (aarch64-apple-darwin)
+    runs-on: macos-latest
+    env:
+      RUSTFLAGS: '-C link-arg=-undefined -C link-arg=dynamic_lookup'
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.0
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: python-aarch64-apple-darwin
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          version: 0.11.31
+          python-version: '3.12'
+
+      - name: Run python tests
+        run: bash scripts/test_python.sh
