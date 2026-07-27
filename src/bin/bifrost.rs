@@ -3,6 +3,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use chrono::{Datelike, Utc};
 #[path = "bifrost/code_query_repl.rs"]
 mod code_query_repl;
 
@@ -14,9 +15,10 @@ use brokk_bifrost::mcp_registry::{
 };
 use brokk_bifrost::policy::{
     HumanRenderColor, HumanRenderDetail, HumanRenderOptions, POLICY_EXIT_UNRELIABLE,
-    PolicyBatchOutcome, PolicyFailOn, PolicyRenderError, PolicyReportDocument, SarifToolIdentity,
-    escape_terminal_text, evaluate_policy_files, write_policy_human, write_policy_json,
-    write_policy_sarif,
+    PolicyBatchOutcome, PolicyEvaluationDate, PolicyEvaluationOptions, PolicyFailOn,
+    PolicyRenderError, PolicyReportDocument, PolicySuppressionOptions, PolicySuppressionSource,
+    SarifToolIdentity, escape_terminal_text, evaluate_policy_files, write_policy_human,
+    write_policy_json, write_policy_sarif,
 };
 use brokk_bifrost::scoped_project::create_cli_tool_service;
 use brokk_bifrost::searchtools_render::RenderOptions;
@@ -85,6 +87,8 @@ fn has_policy_syntax(args: &[String]) -> bool {
             "--policy-file"
                 | "--format"
                 | "--fail-on"
+                | "--suppressions-file"
+                | "--evaluation-date"
                 | "--output"
                 | "--color"
                 | "--verbose"
@@ -118,6 +122,8 @@ fn option_requires_value(argument: &str) -> bool {
             | "--policy-file"
             | "--format"
             | "--fail-on"
+            | "--suppressions-file"
+            | "--evaluation-date"
             | "--output"
             | "--color"
     )
@@ -154,6 +160,9 @@ fn run_inner(
     let mut policy_format_seen = false;
     let mut policy_fail_on = PolicyFailOn::Warning;
     let mut policy_fail_on_seen = false;
+    let mut policy_suppressions = PolicySuppressionOptions::default();
+    let mut policy_suppressions_seen = false;
+    let mut policy_evaluation_date = None;
     let mut policy_output: Option<PathBuf> = None;
     let mut policy_verbose = false;
     let mut policy_verbose_seen = false;
@@ -291,6 +300,30 @@ fn run_inner(
                 policy_fail_on = parse_policy_fail_on(&value)?;
                 policy_fail_on_seen = true;
             }
+            "--suppressions-file" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--suppressions-file requires a path".to_string())?;
+                if policy_suppressions_seen {
+                    return Err("--suppressions-file may only be provided once".to_string());
+                }
+                let source = PolicySuppressionSource::explicit_portable(&value)
+                    .map_err(|error| format!("Invalid --suppressions-file path: {error}"))?;
+                policy_suppressions = PolicySuppressionOptions::new(source);
+                policy_suppressions_seen = true;
+            }
+            "--evaluation-date" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--evaluation-date requires YYYY-MM-DD".to_string())?;
+                if policy_evaluation_date.is_some() {
+                    return Err("--evaluation-date may only be provided once".to_string());
+                }
+                policy_evaluation_date =
+                    Some(value.parse::<PolicyEvaluationDate>().map_err(|error| {
+                        format!("Invalid --evaluation-date value: {value}. {error}.")
+                    })?);
+            }
             "--output" => {
                 let value = args
                     .next()
@@ -379,6 +412,8 @@ fn run_inner(
             &policy_files,
             policy_format,
             policy_fail_on,
+            policy_evaluation_date,
+            policy_suppressions,
             policy_output.as_deref(),
             policy_verbose,
             policy_color,
@@ -537,17 +572,33 @@ fn run_policy_mode(
     policy_files: &[PathBuf],
     format: PolicyOutputFormat,
     fail_on: PolicyFailOn,
+    evaluation_date: Option<PolicyEvaluationDate>,
+    suppressions: PolicySuppressionOptions,
     output_path: Option<&Path>,
     verbose: bool,
     color_mode: PolicyColorMode,
     require_explicit_schema_versions: bool,
 ) -> u8 {
-    let outcome = match evaluate_policy_files(
-        root,
-        policy_files,
-        require_explicit_schema_versions,
-        fail_on,
-    ) {
+    let evaluation_date = match evaluation_date {
+        Some(date) => date,
+        None => {
+            let today = Utc::now().date_naive();
+            match PolicyEvaluationDate::from_ymd(today.year(), today.month(), today.day()) {
+                Ok(date) => date,
+                Err(error) => {
+                    eprintln!(
+                        "bifrost: failed to determine the policy evaluation date: {}",
+                        escape_terminal_text(&error.to_string())
+                    );
+                    return POLICY_EXIT_UNRELIABLE;
+                }
+            }
+        }
+    };
+    let options = PolicyEvaluationOptions::with_suppressions(evaluation_date, suppressions)
+        .with_required_schema_versions(require_explicit_schema_versions)
+        .with_fail_on(fail_on);
+    let outcome = match evaluate_policy_files(root, policy_files, &options) {
         Ok(outcome) => outcome,
         Err(error) => {
             eprintln!(
@@ -838,6 +889,11 @@ OPTIONS:
     --color MODE           Human output color: auto, always, or never (default: auto)
     --fail-on THRESHOLD    Policy finding threshold: never, finding, note, warning, or error
                            (default: warning; finding includes unrated findings)
+    --suppressions-file PATH
+                           Load accepted findings from this workspace-relative JSON file
+                           (default: .bifrost/suppressions.json)
+    --evaluation-date YYYY-MM-DD
+                           Evaluate suppression expiration on this UTC date (default: today)
     --require-explicit-schema-versions
                            Reject inferred policy and RQL schema versions
     --output PATH          Atomically write policy output to PATH instead of stdout
@@ -893,7 +949,7 @@ EXAMPLES:
     bifrost --query-file queries/audit.rql
 
     # Evaluate two policy roots together and emit one canonical JSON report:
-    bifrost --root /path/to/project --policy-file policies/security.rqlp --policy-file policies/correctness.rqlp --format json
+    bifrost --root /path/to/project --policy-file policies/security.rqlp --policy-file policies/correctness.rqlp --evaluation-date 2026-07-27 --format json
 
     # Human code-query exploration with S-expressions, completion, docs, and history:
     bifrost --root /path/to/project --repl

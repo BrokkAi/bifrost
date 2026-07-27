@@ -13,10 +13,12 @@ use super::{
 use crate::analyzer::policy::{
     BoundedWitness, FindingCertainty, FindingCompleteness, FindingIdentityStability,
     FindingSeverity, OrganizationalRiskAssessment, PolicyAnalysisType, PolicyDiagnostic,
-    PolicyDiagnosticSeverity, PolicyDisplayRegion, PolicyFinding, PolicyFindingEvidence,
-    PolicyLevel, PolicyReportDiagnostic, PolicyReportDocument, PolicyRuleDescriptor, PolicyRun,
+    PolicyDiagnosticSeverity, PolicyDisplayRegion, PolicyEvaluationDate, PolicyFinding,
+    PolicyFindingEvidence, PolicyFindingSuppression, PolicyLevel, PolicyReportDiagnostic,
+    PolicyReportDocument, PolicyReportEvaluationContext, PolicyRuleDescriptor, PolicyRun,
     PolicyRunCompletion, PolicySemanticHash, PolicySeveritySpec, PolicySourceLocation,
-    PolicyWorkReport, ProofMetadata, RelatedPolicyLocation, WitnessStep, WitnessStepKind,
+    PolicySuppressionPolicyHashState, PolicySuppressionReview, PolicyWorkReport, ProofMetadata,
+    RelatedPolicyLocation, WitnessStep, WitnessStepKind,
 };
 
 const SARIF_SCHEMA_URI: &str =
@@ -333,6 +335,8 @@ struct SarifResult<'a> {
     code_flows: SarifCodeFlows<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     partial_fingerprints: Option<SarifPartialFingerprints>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suppressions: Option<[SarifSuppression<'a>; 1]>,
     properties: SarifResultProperties<'a>,
 }
 
@@ -356,6 +360,9 @@ impl<'a> SarifResult<'a> {
                 .then(|| SarifPartialFingerprints {
                     finding_id: finding.id(),
                 }),
+            suppressions: finding
+                .suppression()
+                .map(|suppression| [SarifSuppression::from_suppression(suppression)]),
             properties: SarifResultProperties {
                 finding_id: finding.id(),
                 policy_hash: finding.policy_hash(),
@@ -381,6 +388,52 @@ impl<'a> SarifResult<'a> {
             },
         }
     }
+}
+
+#[derive(Serialize)]
+struct SarifSuppression<'a> {
+    kind: &'static str,
+    status: &'static str,
+    justification: &'a str,
+    properties: SarifSuppressionProperties<'a>,
+}
+
+impl<'a> SarifSuppression<'a> {
+    fn from_suppression(suppression: &'a PolicyFindingSuppression) -> Self {
+        let decision = suppression.decision();
+        Self {
+            kind: "external",
+            status: "accepted",
+            justification: decision.reason(),
+            properties: SarifSuppressionProperties {
+                identity_stability: decision.identity_stability(),
+                accepted_by: decision.accepted_by(),
+                accepted_at: decision.accepted_at(),
+                expires_at: decision.expires_at(),
+                policy_hash_at_acceptance: decision.policy_hash_at_acceptance(),
+                policy_hash_state: suppression.policy_hash_state(),
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SarifSuppressionProperties<'a> {
+    #[serde(rename = "bifrost.identityStability")]
+    identity_stability: FindingIdentityStability,
+    #[serde(rename = "bifrost.acceptedBy", skip_serializing_if = "Option::is_none")]
+    accepted_by: Option<&'a str>,
+    #[serde(rename = "bifrost.acceptedAt")]
+    accepted_at: PolicyEvaluationDate,
+    #[serde(rename = "bifrost.expiresAt", skip_serializing_if = "Option::is_none")]
+    expires_at: Option<PolicyEvaluationDate>,
+    #[serde(
+        rename = "bifrost.policyHashAtAcceptance",
+        skip_serializing_if = "Option::is_none"
+    )]
+    policy_hash_at_acceptance: Option<crate::analyzer::policy::AcceptedPolicyHash>,
+    #[serde(rename = "bifrost.policyHashState")]
+    policy_hash_state: PolicySuppressionPolicyHashState,
 }
 
 struct SarifRelatedLocations<'a>(&'a [RelatedPolicyLocation]);
@@ -858,8 +911,12 @@ struct SarifNotificationProperties<'a> {
 struct SarifRunProperties<'a> {
     #[serde(rename = "bifrost.policyReportSchemaVersion")]
     schema_version: u32,
+    #[serde(rename = "bifrost.policyEvaluation")]
+    evaluation: &'a PolicyReportEvaluationContext,
     #[serde(rename = "bifrost.policyRuns")]
     policy_runs: SarifPolicyRuns<'a>,
+    #[serde(rename = "bifrost.suppressionReviews")]
+    suppressions: &'a [PolicySuppressionReview],
     #[serde(rename = "bifrost.reportDiagnostics")]
     report_diagnostics: &'a [PolicyReportDiagnostic],
     #[serde(rename = "bifrost.reportDiagnosticsTruncated")]
@@ -877,7 +934,9 @@ impl<'a> SarifRunProperties<'a> {
     fn from_report(report: &'a PolicyReportDocument) -> Self {
         Self {
             schema_version: report.schema_version(),
+            evaluation: report.evaluation(),
             policy_runs: SarifPolicyRuns(report.runs()),
+            suppressions: report.suppressions(),
             report_diagnostics: report.diagnostics(),
             diagnostics_truncated: report.diagnostics_truncated(),
             omitted_diagnostics_lower_bound: report.omitted_diagnostics_lower_bound(),
@@ -1067,7 +1126,13 @@ mod tests {
 
     use super::*;
     use crate::analyzer::semantic::WorkspaceRelativePath;
-    use crate::policy::{PolicyFailOn, evaluate_policy_files};
+    use crate::policy::{PolicyEvaluationDate, PolicyEvaluationOptions, evaluate_policy_files};
+
+    fn evaluation_options() -> PolicyEvaluationOptions {
+        PolicyEvaluationOptions::new(
+            PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date"),
+        )
+    }
 
     #[test]
     fn artifact_uri_preserves_only_segment_separators_and_unreserved_bytes() {
@@ -1085,8 +1150,7 @@ mod tests {
         let outcome = evaluate_policy_files(
             &fixture_root,
             &[PathBuf::from("policies/dynamic-eval.rqlp")],
-            false,
-            PolicyFailOn::Never,
+            &evaluation_options(),
         )
         .expect("fixture policy evaluation");
         assert_eq!(outcome.report().runs()[0].findings().len(), 1);
@@ -1169,8 +1233,7 @@ mod tests {
         let outcome = evaluate_policy_files(
             &fixture_root,
             &[PathBuf::from("policies/resource-lifecycle.rqlp")],
-            false,
-            PolicyFailOn::Never,
+            &evaluation_options(),
         )
         .expect("fixture policy evaluation");
         let mut run = outcome.report().runs()[0].clone();

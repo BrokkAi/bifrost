@@ -8899,14 +8899,12 @@ mod tests {
         let state = Arc::new(parse_state(&CppAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
         let store = AnalyzerStore::open_in_memory().unwrap();
-        // Recompute the real immediately preceding C++ epoch from the complete
-        // pre-#1208 language salt, rather than passing an arbitrary old label
-        // through the store's generic epoch API.
+        // Recompute the immediately preceding C++ epoch for this target from
+        // the complete pre-#1208 language salt, rather than passing an
+        // arbitrary old label through the store's generic epoch API. The live
+        // grammar fingerprint is target-specific, so the durable contract is
+        // the generation cutover below, not one target's full epoch digest.
         let prior_epoch = epoch::cpp_epoch_before_recovered_typedef_base();
-        assert_eq!(
-            prior_epoch, "098fd5644803843b42c6da3dea0ddea7f5036faf404414d146a9021ed6d265f9",
-            "the reconstructed pre-#1208 epoch must match the persisted corpus cache"
-        );
         let prior_generation = store
             .ensure_language_epoch_value("cpp", &prior_epoch)
             .unwrap();
@@ -10027,10 +10025,14 @@ mod tests {
                     .unwrap()
                     .parent()
                     .unwrap()
+                    .parent()
+                    .unwrap()
             )
             .unwrap(),
             std::fs::canonicalize(
                 analyzer_db_path(&linked_root)
+                    .parent()
+                    .unwrap()
                     .parent()
                     .unwrap()
                     .parent()
@@ -10043,6 +10045,14 @@ mod tests {
                 .file_name()
                 .and_then(|n| n.to_str()),
             Some(crate::cache_db::CACHE_DB_FILE_NAME)
+        );
+        assert_eq!(
+            analyzer_db_path(&repo_root),
+            repo.workdir()
+                .unwrap()
+                .join(crate::gitblob::PROJECT_DIR_NAME)
+                .join(crate::gitblob::CACHE_SUBDIR_NAME)
+                .join(crate::cache_db::CACHE_DB_FILE_NAME)
         );
         assert_eq!(analyzer_db_path(&repo_root), analyzer_db_path(&linked_root));
     }

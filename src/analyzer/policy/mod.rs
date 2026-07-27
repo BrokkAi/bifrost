@@ -24,6 +24,7 @@ mod resolved;
 mod retained;
 pub mod schema;
 mod source;
+mod suppression;
 mod typestate_policy;
 
 #[cfg(test)]
@@ -50,3 +51,4 @@ pub use report::*;
 pub use resolved::*;
 pub(crate) use source::rqlp_source_completion_at;
 pub use source::*;
+pub use suppression::*;

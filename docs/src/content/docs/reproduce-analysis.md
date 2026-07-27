@@ -18,6 +18,7 @@ bifrost-analysis/
 │   └── endpoints/
 │       ├── source.rqlp
 │       └── sink.rqlp
+├── suppressions.json
 ├── results/
 │   ├── query-result.json
 │   └── policy-report.json
@@ -88,12 +89,15 @@ Add fields such as:
     "semantic_hash": "<loaded policy semantic hash>",
     "resolved_rql_schemas": [{"version": 2, "origin": "explicit"}],
     "endpoint_manifests": ["<selected endpoint manifest hash>"],
-    "catalogs": []
+    "catalogs": [],
+    "suppression_path": "suppressions.json",
+    "suppression_sha256": "<suppression file hash>"
   },
   "execution": {
-    "command": "bifrost --root . --policy-file policies/rule.rqlp --format json --fail-on never --require-explicit-schema-versions",
+    "command": "bifrost --root . --policy-file policies/rule.rqlp --suppressions-file suppressions.json --evaluation-date 2026-07-27 --format json --fail-on never --require-explicit-schema-versions",
     "format": "json",
-    "fail_on": "never"
+    "fail_on": "never",
+    "evaluation_date": "2026-07-27"
   },
   "result": {
     "path": "results/policy-report.json",
@@ -116,16 +120,22 @@ part of the policy meaning; the directory path and unselected leaves are not.
 - **Engine:** binary version, full source commit when known, build features/profile, and plugin or package version.
 - **Source:** repository and full commit, dirty-tree status or patch, workspace root, submodules, generated/vendor policy, and relevant file filters.
 - **Query:** both RQL and canonical JSON when applicable, `schema_version`, file hash, result detail, limits, languages, and path filters.
-- **Policy:** every root and dependency source, source hashes, resolved policy/endpoint and nested RQL schema versions plus origins, loaded semantic hash, selected endpoint and catalog manifests, precedence manifest, report limits, output format, `--fail-on`, and strict-version mode.
+- **Policy:** every root and dependency source, source hashes, resolved policy/endpoint and nested RQL schema versions plus origins, loaded semantic hash, selected endpoint and catalog manifests, precedence manifest, suppression source and hash, evaluation date, report limits, output format, `--fail-on`, and strict-version mode.
 - **Interface:** exact CLI command, MCP toolset and arguments, Python package version and call, or Rust dependency revision.
 - **Environment:** operating system and hardware when timing matters; semantic model ID/directory and accelerator settings when semantic search is involved.
 - **Response:** every typed result variant, diagnostics, `truncated`, proof tiers, provenance, and `provenance_truncated` before downstream filtering.
 
-For MCP, record the configured workspace root and the exact `query_code` arguments. A saved `query_file` path is workspace-relative and exclusive with inline query fields. For VS Code, record the extension and server versions and whether the RQL buffer was unsaved; unsaved text is an input that must be preserved separately.
+For MCP, record the configured workspace root and the exact `query_code` or
+`run_policy` arguments. A saved `query_file` path is workspace-relative and
+exclusive with inline query fields; policy files, suppression override, fixed
+evaluation date, and threshold are independent `run_policy` fields. For VS
+Code, record the extension and server versions, whether the RQL or policy
+buffer was unsaved, and the UTC evaluation date reported by the policy run;
+unsaved text is an input that must be preserved separately.
 
 ## Cold and Warm Runs
 
-Label cache state precisely. Bifrost's persistent repository cache is `.bifrost/bifrost_cache.db` at the primary Git repository root, and linked worktrees share it. A new process using that database is not a fully cold run. Record whether you removed the cache while Bifrost was stopped, reused it, warmed the same process, or changed branches between samples.
+Label cache state precisely. Bifrost's persistent repository cache is `.bifrost/cache/bifrost_cache.db` at the primary Git repository root, and linked worktrees share it. Client-root MCP sessions keep that relative path under the exact approved root; an explicit `BIFROST_CACHE_DIR` instead uses `$BIFROST_CACHE_DIR/bifrost_cache.db`. A new process using any of those databases is not a fully cold run. Record whether you removed the cache while Bifrost was stopped, reused it, warmed the same process, or changed branches between samples.
 
 Use the [evaluation protocol](/evaluation-evidence/) when publishing timing, memory, precision, or recall. Keep installation downloads and optional semantic-model downloads separate unless they are intentionally part of the measurement.
 

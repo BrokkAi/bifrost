@@ -80,7 +80,7 @@ managed-target marker. Historical manually named `bifrost-*` directories remain 
 `--include-unmanaged` after reviewing them.
 
 For `bifrost_reference_differential`, use `--cache-mode ephemeral` for one-off smoke runs that should not write
-`.bifrost/bifrost_cache.db`. Keep the default `--cache-mode persisted` for deliberately warmed or resumable corpus
+`.bifrost/cache/bifrost_cache.db`. Keep the default `--cache-mode persisted` for deliberately warmed or resumable corpus
 campaigns.
 
 # RQL syntax maintenance

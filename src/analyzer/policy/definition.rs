@@ -1538,7 +1538,7 @@ impl fmt::Display for Sha256ValueError {
 
 impl std::error::Error for Sha256ValueError {}
 
-fn parse_lower_sha256(value: &str) -> Result<[u8; 32], Sha256ValueError> {
+pub(crate) fn parse_lower_sha256(value: &str) -> Result<[u8; 32], Sha256ValueError> {
     if value.len() != 64 {
         return Err(Sha256ValueError::InvalidLength);
     }

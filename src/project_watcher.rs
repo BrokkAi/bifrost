@@ -150,14 +150,22 @@ fn classify_project_path(project: &dyn Project, path: &Path) -> PathDisposition 
     if rel_path.as_os_str().is_empty() {
         return PathDisposition::RefreshFallback;
     }
-    // The unified SQLite cache writes inside the watched workspace. Treating
-    // those writes as source changes repeatedly invalidates analyzer snapshots.
-    if rel_path
-        .components()
+    // Generated SQLite state writes inside the watched workspace. Treating
+    // those writes as source changes repeatedly invalidates analyzer snapshots,
+    // but the rest of `.bifrost` is tracked project input and must remain live.
+    let mut components = rel_path.components();
+    if components
         .next()
-        .is_some_and(|component| component.as_os_str() == crate::gitblob::CACHE_DIR_NAME)
+        .is_some_and(|component| component.as_os_str() == crate::gitblob::PROJECT_DIR_NAME)
     {
-        return PathDisposition::IgnoredInternal;
+        let child = components.next();
+        if child.is_some_and(|component| {
+            component.as_os_str() == crate::gitblob::CACHE_SUBDIR_NAME
+                || (components.next().is_none()
+                    && crate::cache_db::is_legacy_project_cache_file_name(component.as_os_str()))
+        }) {
+            return PathDisposition::IgnoredInternal;
+        }
     }
 
     let file = ProjectFile::new(project.root().to_path_buf(), rel_path.to_path_buf());
@@ -200,6 +208,11 @@ fn watch_roots(project: &dyn Project) -> Result<Vec<PathBuf>, String> {
         }
     }
 
+    let project_configuration = project.root().join(crate::gitblob::PROJECT_DIR_NAME);
+    if project_configuration.is_dir() {
+        directories.push(project_configuration);
+    }
+
     if directories.is_empty() {
         return Ok(vec![project.root().to_path_buf()]);
     }
@@ -222,7 +235,7 @@ fn watch_roots(project: &dyn Project) -> Result<Vec<PathBuf>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PendingChanges, handle_event, watch_roots};
+    use super::{PendingChanges, ProjectChangeWatcher, handle_event, watch_roots};
     use crate::ProjectFile;
     use crate::path_normalization::NormalizePath;
     use crate::{FilesystemProject, Project};
@@ -230,6 +243,7 @@ mod tests {
     use notify::{Event, EventKind};
     use std::fs;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn project_with_files(paths: &[&str]) -> (TempDir, Arc<dyn Project>) {
@@ -264,6 +278,52 @@ mod tests {
     }
 
     #[test]
+    fn watch_roots_include_existing_bifrost_project_configuration() {
+        let (_temp, project) = project_with_files(&[
+            "src/main.rs",
+            ".bifrost/policies/example.rqlp",
+            ".bifrost/suppressions.json",
+        ]);
+        let roots = watch_roots(project.as_ref()).unwrap();
+        let rels: Vec<_> = roots
+            .iter()
+            .map(|path| {
+                path.strip_prefix(project.root())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+
+        assert_eq!(rels, vec![".bifrost", "src"]);
+    }
+
+    #[test]
+    fn polling_watcher_delivers_bifrost_configuration_edits() {
+        let (_temp, project) = project_with_files(&["src/main.rs", ".bifrost/suppressions.json"]);
+        let suppression_path = project.root().join(".bifrost/suppressions.json");
+        let watcher = ProjectChangeWatcher::start_polling_for_tests(Arc::clone(&project)).unwrap();
+
+        fs::write(&suppression_path, "updated configuration").unwrap();
+        for _ in 0..100 {
+            if watcher.has_pending() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let delta = watcher.take_changed_files();
+        assert!(!delta.requires_full_refresh);
+        assert!(
+            delta
+                .files
+                .iter()
+                .any(|file| file.abs_path() == suppression_path),
+            "the live watcher must deliver tracked suppression edits"
+        );
+    }
+
+    #[test]
     fn watch_roots_fall_back_to_project_root_when_no_analyzable_files_exist() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -277,7 +337,10 @@ mod tests {
     #[test]
     fn internal_cache_events_do_not_trigger_project_updates() {
         let (_temp, project) = project_with_files(&["src/main.rs"]);
-        let cache_dir = project.root().join(crate::gitblob::CACHE_DIR_NAME);
+        let cache_dir = project
+            .root()
+            .join(crate::gitblob::PROJECT_DIR_NAME)
+            .join(crate::gitblob::CACHE_SUBDIR_NAME);
         fs::create_dir_all(&cache_dir).unwrap();
         let cache_db = cache_dir.join(crate::cache_db::CACHE_DB_FILE_NAME);
         fs::write(&cache_db, "cache state").unwrap();
@@ -295,6 +358,62 @@ mod tests {
 
             let state = pending.lock().unwrap();
             assert!(state.files.is_empty());
+            assert!(!state.requires_full_refresh);
+        }
+    }
+
+    #[test]
+    fn legacy_root_cache_events_do_not_trigger_project_updates() {
+        let (_temp, project) = project_with_files(&["src/main.rs"]);
+        let project_dir = project.root().join(crate::gitblob::PROJECT_DIR_NAME);
+        fs::create_dir_all(&project_dir).unwrap();
+
+        for name in [
+            crate::cache_db::CACHE_DB_FILE_NAME,
+            "bifrost_cache.db-wal",
+            "bifrost_cache.db-shm",
+            "bifrost_cache.db-journal",
+        ] {
+            let path = project_dir.join(name);
+            fs::write(&path, "legacy cache state").unwrap();
+            let pending = Arc::new(Mutex::new(PendingChanges::default()));
+            handle_event(
+                &project,
+                &pending,
+                Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path),
+            );
+
+            let state = pending.lock().unwrap();
+            assert!(state.files.is_empty(), "{name} must remain internal");
+            assert!(!state.requires_full_refresh);
+        }
+    }
+
+    #[test]
+    fn tracked_bifrost_configuration_events_are_project_updates() {
+        let (_temp, project) = project_with_files(&["src/main.rs"]);
+        for relative in [
+            ".bifrost/policies/example.rqlp",
+            ".bifrost/suppressions.json",
+        ] {
+            let path = project.root().join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "configuration").unwrap();
+            let pending = Arc::new(Mutex::new(PendingChanges::default()));
+
+            handle_event(
+                &project,
+                &pending,
+                Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path.clone()),
+            );
+
+            let state = pending.lock().unwrap();
+            assert_eq!(state.files.len(), 1, "{relative} must remain watched");
+            assert!(
+                state
+                    .files
+                    .contains(&ProjectFile::new(project.root().to_path_buf(), relative))
+            );
             assert!(!state.requires_full_refresh);
         }
     }

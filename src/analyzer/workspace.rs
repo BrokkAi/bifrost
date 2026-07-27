@@ -565,7 +565,7 @@ mod tests {
         let root = temp.path().canonicalize().unwrap();
         let disk_source = "export const disk = call(1);\n";
         let overlay_source = "export const overlay = call(1, 2);\nexport const extra = call(3);\n";
-        std::fs::write(root.join(".gitignore"), ".bifrost/\n").unwrap();
+        std::fs::write(root.join(".gitignore"), ".bifrost/cache/\n").unwrap();
         std::fs::write(root.join("app.ts"), disk_source).unwrap();
         let repository = init_repo(&root);
         commit_all(&repository, "disk source");
@@ -614,15 +614,16 @@ mod tests {
 
         let disk_oid = git2::Oid::hash_object(git2::ObjectType::Blob, disk_source.as_bytes())
             .expect("hash committed source");
-        let committed_snapshot_rows = Connection::open(root.join(".bifrost/bifrost_cache.db"))
-            .unwrap()
-            .query_row(
-                "SELECT COUNT(*) FROM structural_facts_snapshots
+        let committed_snapshot_rows =
+            Connection::open(root.join(".bifrost/cache/bifrost_cache.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM structural_facts_snapshots
                  WHERE blob_oid = ?1 AND lang = 'typescript:ts'",
-                [disk_oid.to_string()],
-                |row| row.get::<_, usize>(0),
-            )
-            .unwrap();
+                    [disk_oid.to_string()],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap();
         assert_eq!(
             committed_snapshot_rows, 1,
             "overlay analysis must not replace the committed source snapshot"

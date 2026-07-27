@@ -14,6 +14,7 @@ use std::path::PathBuf;
 
 pub const EXTENDED_TOOL_NAMES: &[&str] = &[
     "query_code",
+    "run_policy",
     "get_symbol_locations",
     "get_symbol_ancestors",
     "find_filenames",
@@ -23,6 +24,8 @@ pub const EXTENDED_TOOL_NAMES: &[&str] = &[
     "xml_skim",
     "xml_select",
 ];
+
+pub(crate) const MAX_RUN_POLICY_PATH_BYTES: usize = 1_024;
 
 pub fn run_extended_stdio_server(
     root: PathBuf,
@@ -350,6 +353,7 @@ fn query_plan_schema(pattern_schema_description: &str, query_step_variants: &[Va
 }
 
 pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
+    let max_policy_files = crate::analyzer::policy::PolicyBatchBudget::default().max_policies();
     let kind_vocabulary = ALL_KINDS
         .iter()
         .map(|kind| kind.label())
@@ -451,6 +455,47 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                     }
                 ],
                 "$defs": { "queryPlan": query_plan_schema }
+            }),
+        ),
+        tool_descriptor(
+            "run_policy",
+            "Evaluate one or more explicit workspace-relative .rqlp policy files against the active immutable workspace snapshot. Returns the canonical schema-2 report and computed policy status. Built-in policy-pack discovery is intentionally outside this tool.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "policy_files": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_RUN_POLICY_PATH_BYTES,
+                            "description": "One workspace-relative .rqlp policy path."
+                        },
+                        "minItems": 1,
+                        "maxItems": max_policy_files,
+                        "uniqueItems": true,
+                        "description": "Explicit workspace policy roots to evaluate together."
+                    },
+                    "suppression_file": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": crate::analyzer::policy::MAX_POLICY_SUPPRESSION_PATH_BYTES,
+                        "description": "Optional workspace-relative suppression JSON path. Defaults to .bifrost/suppressions.json."
+                    },
+                    "evaluation_date": {
+                        "type": "string",
+                        "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+                        "description": "Explicit UTC calendar date used for suppression expiration."
+                    },
+                    "fail_on": {
+                        "type": "string",
+                        "enum": ["never", "finding", "note", "warning", "error"],
+                        "default": "warning",
+                        "description": "Finding threshold used to compute the returned policy status."
+                    }
+                },
+                "required": ["policy_files", "evaluation_date"],
+                "additionalProperties": false
             }),
         ),
         tool_descriptor(
@@ -818,5 +863,43 @@ mod tests {
         let mode = &descriptor["inputSchema"]["properties"]["ranking_mode"];
         assert_eq!(mode["enum"], json!(["history_imports", "usage_graph"]));
         assert_eq!(mode["default"], "history_imports");
+    }
+
+    #[test]
+    fn run_policy_schema_requires_bounded_explicit_inputs() {
+        let descriptor = extended_tool_descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor["name"] == "run_policy")
+            .expect("run_policy descriptor");
+        let schema = &descriptor["inputSchema"];
+        let policy_files = &schema["properties"]["policy_files"];
+        assert_eq!(
+            schema["required"],
+            json!(["policy_files", "evaluation_date"])
+        );
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(policy_files["minItems"], 1);
+        assert_eq!(
+            policy_files["maxItems"],
+            crate::analyzer::policy::PolicyBatchBudget::default().max_policies()
+        );
+        assert_eq!(policy_files["uniqueItems"], true);
+        assert_eq!(
+            policy_files["items"]["maxLength"],
+            MAX_RUN_POLICY_PATH_BYTES
+        );
+        assert_eq!(
+            schema["properties"]["evaluation_date"]["pattern"],
+            "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+        );
+        assert_eq!(
+            schema["properties"]["suppression_file"]["maxLength"],
+            crate::analyzer::policy::MAX_POLICY_SUPPRESSION_PATH_BYTES
+        );
+        assert_eq!(
+            schema["properties"]["fail_on"]["enum"],
+            json!(["never", "finding", "note", "warning", "error"])
+        );
+        assert_eq!(schema["properties"]["fail_on"]["default"], "warning");
     }
 }

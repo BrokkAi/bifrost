@@ -1,4 +1,4 @@
-//! Stable schema-version-1 policy evaluation and match-evidence domain types.
+//! Stable policy evaluation and schema-version-2 match-evidence report types.
 //!
 //! This module deliberately contains no query-to-finding conversion.  The
 //! evaluator must combine a loaded policy, detailed analyzer evidence, and a
@@ -25,6 +25,7 @@ use super::finding_identity::{
 use super::future_evidence::{TaintFindingEvidence, TypestateFindingEvidence};
 use super::identity::PolicySemanticHash;
 use super::retained::{RetainedSize, retained_extra};
+use super::suppression::PolicyFindingSuppression;
 
 const MAX_REPORT_PROSE_BYTES: usize = 4_096;
 const MAX_REPORT_IDENTIFIER_BYTES: usize = 128;
@@ -1696,7 +1697,7 @@ pub enum PolicyWorkUnit {
     Rows,
 }
 
-/// One normalized finding in the canonical schema-version-1 report model.
+/// One normalized finding in the canonical schema-version-2 report model.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PolicyFinding {
     id: PolicyFindingId,
@@ -1722,6 +1723,7 @@ pub struct PolicyFinding {
     witnesses: Vec<BoundedWitness>,
     witnesses_truncated: bool,
     omitted_witnesses_lower_bound: u64,
+    suppression: Option<PolicyFindingSuppression>,
 }
 
 impl PolicyFinding {
@@ -1867,6 +1869,7 @@ impl PolicyFinding {
             witnesses,
             witnesses_truncated,
             omitted_witnesses_lower_bound,
+            suppression: None,
         };
         finding.validate_against_budget(budget)?;
         Ok(finding)
@@ -1941,11 +1944,36 @@ impl PolicyFinding {
     pub const fn omitted_witnesses_lower_bound(&self) -> u64 {
         self.omitted_witnesses_lower_bound
     }
+    pub const fn suppression(&self) -> Option<&PolicyFindingSuppression> {
+        self.suppression.as_ref()
+    }
+
+    pub(crate) fn attach_suppression(
+        &mut self,
+        suppression: PolicyFindingSuppression,
+    ) -> Result<(), PolicyFindingError> {
+        if self.identity_stability != FindingIdentityStability::Strong {
+            return Err(PolicyFindingError::SuppressionRequiresStrongIdentity);
+        }
+        if self.suppression.is_some() {
+            return Err(PolicyFindingError::DuplicateSuppressionAttachment);
+        }
+        self.suppression = Some(suppression);
+        Ok(())
+    }
+
+    pub(crate) fn clear_suppression(&mut self) {
+        self.suppression = None;
+    }
 
     pub(crate) fn validate_against_budget(
         &self,
         budget: &PolicyBudget,
     ) -> Result<(), PolicyFindingError> {
+        if self.suppression.is_some() && self.identity_stability != FindingIdentityStability::Strong
+        {
+            return Err(PolicyFindingError::SuppressionRequiresStrongIdentity);
+        }
         if self.related.len() > budget.max_related_locations_per_finding() {
             return Err(ReportValueError::TooManyItems {
                 field: "finding_related_locations",
@@ -2073,6 +2101,7 @@ impl RetainedSize for PolicyFinding {
             .saturating_add(retained_extra(&self.organizational_risk))
             .saturating_add(retained_extra(&self.proof))
             .saturating_add(retained_extra(&self.witnesses))
+            .saturating_add(retained_extra(&self.suppression))
     }
 }
 
@@ -2088,6 +2117,8 @@ pub enum PolicyFindingError {
     DanglingWitnessReference { witness_id: WitnessId },
     CvssVulnerabilityIdentityMismatch,
     CvssSourceScenarioJoinMismatch,
+    SuppressionRequiresStrongIdentity,
+    DuplicateSuppressionAttachment,
 }
 
 impl PolicyFindingError {
@@ -2137,6 +2168,12 @@ impl fmt::Display for PolicyFindingError {
                 .write_str("CVSS variant vulnerability identity does not match the finding anchor"),
             Self::CvssSourceScenarioJoinMismatch => formatter
                 .write_str("CVSS variant source scenarios do not resolve to the finding evidence"),
+            Self::SuppressionRequiresStrongIdentity => {
+                formatter.write_str("only a strong finding identity can carry a suppression")
+            }
+            Self::DuplicateSuppressionAttachment => {
+                formatter.write_str("finding already carries a suppression")
+            }
         }
     }
 }
@@ -2260,6 +2297,10 @@ impl PolicyRun {
     }
     pub fn findings(&self) -> &[PolicyFinding] {
         &self.findings
+    }
+
+    pub(crate) fn findings_mut(&mut self) -> &mut [PolicyFinding] {
+        &mut self.findings
     }
 
     pub(crate) fn take_findings(&mut self) -> Vec<PolicyFinding> {
