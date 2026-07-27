@@ -7604,13 +7604,55 @@ fn cpp_global_field_has_internal_linkage(analyzer: &dyn IAnalyzer, candidate: &C
     match local_linkage {
         CppFieldLinkage::Internal => true,
         CppFieldLinkage::External => false,
-        CppFieldLinkage::InternalUnlessExternalPeer => !analyzer
-            .get_all_declarations()
-            .into_iter()
-            .filter(|peer| peer != candidate && same_logical_symbol(peer, candidate))
-            .filter_map(|peer| cpp_global_field_declaration_linkage(analyzer, &peer))
-            .any(CppFieldLinkage::is_explicit_external),
+        CppFieldLinkage::InternalUnlessExternalPeer => {
+            !cpp_global_field_linkage_peers(analyzer, candidate)
+                .filter_map(|peer| cpp_global_field_declaration_linkage(analyzer, peer))
+                .any(CppFieldLinkage::is_explicit_external)
+        }
     }
+}
+
+fn cpp_global_field_linkage_peers<'a>(
+    analyzer: &'a dyn IAnalyzer,
+    candidate: &'a CodeUnit,
+) -> impl Iterator<Item = &'a CodeUnit> + 'a {
+    analyzer
+        .global_usage_definition_index()
+        .by_fqn(&candidate.fq_name())
+        .iter()
+        .filter(move |peer| {
+            if *peer == candidate {
+                return false;
+            }
+            #[cfg(test)]
+            note_cpp_global_field_linkage_peer_inspection_for_test();
+            same_logical_symbol(peer, candidate)
+        })
+}
+
+#[cfg(test)]
+thread_local! {
+    static CPP_GLOBAL_FIELD_LINKAGE_PEER_INSPECTIONS_FOR_TEST: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_cpp_global_field_linkage_peer_inspection_for_test() {
+    CPP_GLOBAL_FIELD_LINKAGE_PEER_INSPECTIONS_FOR_TEST.with(|count| {
+        count.set(count.get() + 1);
+    });
+}
+
+#[cfg(test)]
+fn with_cpp_global_field_linkage_peer_inspection_counter_for_test<T>(
+    body: impl FnOnce() -> T,
+) -> (T, usize) {
+    CPP_GLOBAL_FIELD_LINKAGE_PEER_INSPECTIONS_FOR_TEST.with(|count| {
+        count.set(0);
+        let result = body();
+        let observed = count.get();
+        count.set(0);
+        (result, observed)
+    })
 }
 
 fn cpp_global_field_declaration_linkage(
@@ -7739,6 +7781,7 @@ fn cpp_field_declaration_linkage(source: &str, declaration: Node<'_>) -> CppFiel
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn type_target_spec_scan_keys_collapse_logical_redeclarations() {
@@ -7819,6 +7862,59 @@ mod tests {
             first_type_spec.type_scan_key(),
             other_namespace_spec.type_scan_key(),
             "same-short-name Types with distinct FQNs must retain separate scans"
+        );
+    }
+
+    #[test]
+    fn const_global_with_extern_peer_remains_external_with_exact_fqn_peer_bound() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let write = |path: &str, contents: &str| {
+            let full = root.join(path);
+            if let Some(parent) = full.parent() {
+                fs::create_dir_all(parent).expect("create parent directories");
+            }
+            fs::write(&full, contents).expect("write fixture");
+            ProjectFile::new(root.clone(), path)
+        };
+        let _header = write(
+            "shared.hpp",
+            "#pragma once\nextern const int shared_value;\n",
+        );
+        let definition = write(
+            "definition.cpp",
+            "#include \"shared.hpp\"\nconst int shared_value = 0;\n",
+        );
+        for index in 0..32 {
+            let path = format!("noise_{index}.cpp");
+            let source = format!("const int unrelated_{index} = {index};\n");
+            let _ = write(&path, &source);
+        }
+        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let target = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| {
+                unit.kind() == CodeUnitType::Field
+                    && unit.identifier() == "shared_value"
+                    && unit.source() == &definition
+            })
+            .expect("definition global field");
+        let (internal, inspected_peers) =
+            with_cpp_global_field_linkage_peer_inspection_counter_for_test(|| {
+                cpp_global_field_has_internal_linkage(&analyzer, &target)
+            });
+
+        assert!(
+            !internal,
+            "an extern peer in the exact-fqn bucket must keep the const definition externally visible"
+        );
+        assert_eq!(
+            inspected_peers, 1,
+            "exact-fqn peer lookup should inspect only the matching extern peer, not unrelated globals from the rest of the workspace"
         );
     }
 
