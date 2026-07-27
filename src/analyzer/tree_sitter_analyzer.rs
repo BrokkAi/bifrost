@@ -9725,7 +9725,7 @@ mod tests {
         let root = temp.path().canonicalize().expect("canonical temp dir");
         let file = ProjectFile::new(root.clone(), "src/lib.rs");
         file.write(
-            &(0..32)
+            (0..32)
                 .map(|index| format!("pub fn diagnostic_{index}() {{}}\n"))
                 .collect::<String>(),
         )
