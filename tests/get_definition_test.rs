@@ -23575,6 +23575,67 @@ fn scala_companion_method_call_resolves_from_type_receiver() {
 }
 
 #[test]
+fn scala_term_call_beats_same_named_type_alias_in_same_scope() {
+    let source = r#"package app
+
+object Dual {
+  type Factory = Int
+  val Factory: Int => Int = value => value + 1
+  val made = Factory(0)
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Dual.scala", source)
+        .build();
+
+    let factory_start = source.find("made = Factory").expect("dual term call") + "made = ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Dual.scala", source, factory_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.Dual$.Factory", "{value}");
+}
+
+#[test]
+fn scala_qualified_term_apply_beats_same_named_type_member() {
+    let source = r#"package app
+
+object Result {
+  opaque type Success[+A] = A
+  object Success {
+    def apply[A](value: A): Success[A] = value
+  }
+}
+
+object Consumer {
+  val success = Result.Success(1)
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Result.scala", source)
+        .build();
+
+    let success_start = source
+        .find("Result.Success(1)")
+        .expect("qualified stable apply")
+        + "Result.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Result.scala", source, success_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Result$.Success$.apply",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_object_apply_call_resolves_from_constructor_like_reference() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
