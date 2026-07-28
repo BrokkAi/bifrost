@@ -506,7 +506,7 @@ local gate, but is not the focus.
   envelopes report the later dynamic checkout head and dirty flag and are not
   acceptance evidence. Exhaustive triage subsequently reduced the rows to six
   assigned roots: #1261, #1263, #1264, #1265, #1266, and #1267.
-- [ ] (2026-07-28 20:48Z) Go ranks six through ten completed as a fast
+- [x] (2026-07-28 20:48Z) Go ranks six through ten completed as a fast
   triage baseline in 24s: `gobl` and `helm` have zero raw missing, while
   `rclone`, `opa`, and `mdsmith` contribute 38 rows now under exhaustive
   review. Because the progress plan was modified during this overlapping run,
@@ -515,9 +515,11 @@ local gate, but is not the focus.
 - [x] (2026-07-28 21:07Z) Exhaustive Go triage reduced all 38 rows to four
   assigned roots: promoted methods through embedded interfaces (#1269), keyed
   composite labels bypassing exact owner resolution (#1270), package/import
-  declaration sampling (#1271), and a field access misresolved as a promoted
-  interface method (#1272). The focused #1269 embedded-interface regression
-  passes with all features at niceness 10.
+  declaration sampling (#1271), and an initially suspected field access
+  (#1272). Exact source review showed the last sampled span was the legitimate
+  call `o.Fs()` through an embedded interface, making it another #1269 witness;
+  #1272 was closed as a duplicate without product edits. The focused #1269
+  embedded-interface regression passes with all features at niceness 10.
 - [x] (2026-07-28 21:07Z) Java, TypeScript, and PHP each completed five-repo
   triage baselines with 50,000 accepted sampled sites and zero raw missing
   rows. Java took 6m08s, TypeScript 19s, and PHP 31s. These overlapping
@@ -542,6 +544,27 @@ local gate, but is not the focus.
   repositories reached the deliberate 1,000-target cap, so their sampled-site
   partitions and all 92 raw rows require exhaustive disposition before the
   clean acceptance replay.
+- [x] (2026-07-28) Independent source review dispositioned all 92 Rust rows:
+  61 genuine inverse gaps and 31 forward/candidate/qualifier artifacts. No
+  existing `FIRD: Rust` issue matched. Created and assigned #1278 (call edges),
+  #1279 (namespace/import/re-export edges), #1280 (type/associated qualifiers),
+  #1281 (`self` receiver mapped to its owner type), #1282 (associated-type
+  declaration heads), and #1283 (wrong qualified namespace) to `jbellis`
+  before implementation.
+- [x] (2026-07-28) Scala completed all five ranks-six-through-ten triage
+  envelopes in 26m53s with zero file errors or truncation and 293 raw missing
+  rows: stream-reactor 26, http4s 134, Guardian Grid 18, scalachess 47, and
+  zio-http 68. Independent exhaustive review accounted for every row and
+  separated deliberate same-owner/unproven evidence from genuine inverse gaps
+  and wrong-forward artifacts. No existing `FIRD: Scala` issue matched.
+  Created and assigned #1284 (qualified/import terminal selection), #1285
+  (companion application and type-term forward namespaces), #1286 (bare stable
+  fields), #1287 (wildcard/local imported members), #1288 (wildcard import
+  owner hits), #1289 (companion application inverse edges), #1290 (anonymous
+  template parent types), #1291 (singleton types and qualified stable case
+  objects), and #1292 (members inherited by extending objects) to `jbellis`
+  before implementation. These dirty/dynamic-head envelopes remain triage
+  evidence and require clean acceptance replay.
 - [x] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [x] Complete C++ and publish its evidence and user summary.
