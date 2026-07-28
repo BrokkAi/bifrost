@@ -7791,6 +7791,19 @@ fn bifrost_lsp_server_scala_semantic_diagnostics_are_runtime_opt_in() {
 
     server.notify_value(json!({
         "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": uri}}
+    }));
+    let initially_published = server.read_notification("textDocument/publishDiagnostics");
+    assert!(
+        initially_published["params"]["diagnostics"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "default-off Scala diagnostics must publish an empty report: {initially_published}"
+    );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
         "method": "workspace/didChangeConfiguration",
         "params": {"settings": {"unrecognizedSymbolDiagnostics": true}}
     }));
