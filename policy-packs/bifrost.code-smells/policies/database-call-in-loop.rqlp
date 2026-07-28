@@ -12,13 +12,13 @@
       :type match
       :selector
         (rql
-          :schema-version 2
+          :schema-version 5
           (union
             (language python
-              (inside (loop) (call :receiver (name "cursor") :callee (name "execute"))))
+              (inside-decl (loop) (call :receiver (name "cursor") :callee (name "execute"))))
             (language java
-              (inside (loop) (call :receiver (name "statement") :callee (name "executeQuery"))))
+              (inside-decl (loop) (call :receiver (name "statement") :callee (name "executeQuery"))))
             (language javascript
-              (inside (loop) (call :receiver (name "db") :callee (name "query"))))
+              (inside-decl (loop) (call :receiver (name "db") :callee (name "query"))))
             (language typescript
-              (inside (loop) (call :receiver (name "db") :callee (name "query"))))))))
+              (inside-decl (loop) (call :receiver (name "db") :callee (name "query"))))))))

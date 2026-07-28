@@ -12,21 +12,21 @@
       :type match
       :selector
         (rql
-          :schema-version 2
+          :schema-version 5
           (union
             (language python
-              (inside (loop) (call :receiver (name "json") :callee (name "dumps"))))
+              (inside-decl (loop) (call :receiver (name "json") :callee (name "dumps"))))
             (language java
-              (inside (loop) (call :callee (name "writeValueAsString"))))
+              (inside-decl (loop) (call :callee (name "writeValueAsString"))))
             (language javascript
-              (inside (loop) (call :receiver (name "JSON") :callee (name "stringify"))))
+              (inside-decl (loop) (call :receiver (name "JSON") :callee (name "stringify"))))
             (language typescript
-              (inside (loop) (call :receiver (name "JSON") :callee (name "stringify"))))
+              (inside-decl (loop) (call :receiver (name "JSON") :callee (name "stringify"))))
             (language rust
-              (inside
+              (inside-decl
                 (loop)
                 (call
                   :receiver (name "serde_json")
                   :callee (name/regex "^(to_string|to_vec)$"))))
             (language rust
-              (inside (loop) (call :receiver (name "bincode") :callee (name "serialize"))))))))
+              (inside-decl (loop) (call :receiver (name "bincode") :callee (name "serialize"))))))))

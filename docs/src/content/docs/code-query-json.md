@@ -5,7 +5,7 @@ description: Use the canonical JSON representation for Bifrost's query_code engi
 
 JSON `CodeQuery` is the canonical machine-facing representation accepted by Bifrost's `query_code` tool. MCP hosts and the Python client send this shape directly. The RQL REPL prints the same representation with `:json`.
 
-The compatible head is schema version 4. It retains version 3's source-backed procedure-local CFG surface and version 2's structural/declaration/reference/call/import/hierarchy/receiver vocabulary, then adds host-registered diagnostic-neutral typestate findings and bounded witnesses. Explicit version-2 and version-3 pins keep their old meanings and reject later operations. Schema version 4 does not load protocol files from a query, compile policy findings, persist summaries, or expose the value-flow and taint clients.
+The compatible head is schema version 5. It retains version 3's source-backed procedure-local CFG surface and version 2's structural/declaration/reference/call/import/hierarchy/receiver vocabulary, adds host-registered diagnostic-neutral typestate findings and bounded witnesses, then adds declaration-bounded containment. Explicit version pins keep their old meanings and reject later operations. Schema version 5 does not load protocol files from a query, compile policy findings, persist summaries, or expose the value-flow and taint clients.
 
 ## Minimal Query
 
@@ -28,11 +28,12 @@ The `match` object is the root pattern. It must constrain at least one of `kind`
 
 | Field | Shape | Meaning |
 | --- | --- | --- |
-| `schema_version` | integer | Optional. Omit it for compatible head version 4; pass `2` to pin the pre-CFG vocabulary, `3` for CFG without typestate, or `4` explicitly. Other versions are rejected. |
+| `schema_version` | integer | Optional. Omit it for compatible head version 5; pass `2` to pin the pre-CFG vocabulary, `3` for CFG without typestate, `4` for typestate, or `5` explicitly. Other versions are rejected. |
 | `match` | pattern | Required root pattern. |
 | `where` | string array | Optional project-relative globs. Absolute paths or globs inside the active workspace are normalized by MCP and CLI entrypoints. |
 | `languages` | string array | Optional language labels such as `python`, `typescript`, `cpp`, or `csharp`. Empty means every structural adapter. |
 | `inside` | pattern | Require the root match to be lexically inside a matching ancestor. |
+| `inside_decl` | pattern | Require containment in a matching ancestor without crossing a nested callable declaration. |
 | `not_inside` | pattern | Reject the root match when a matching ancestor exists. |
 | `steps` | step array | Ordered typed transformations applied after structural matching. At most `16`. |
 | `limit` | integer | Maximum terminal results after pipeline deduplication. Defaults to `100`; valid range is `1` through `1000`. |

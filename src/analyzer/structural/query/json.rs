@@ -93,6 +93,9 @@ pub(super) fn seed_to_json(seed: &CodeQuerySeed) -> Map<String, Value> {
     if let Some(pattern) = &seed.inside {
         object.insert("inside".to_string(), pattern_to_json(pattern));
     }
+    if let Some(pattern) = &seed.inside_decl {
+        object.insert("inside_decl".to_string(), pattern_to_json(pattern));
+    }
     if let Some(pattern) = &seed.not_inside {
         object.insert("not_inside".to_string(), pattern_to_json(pattern));
     }

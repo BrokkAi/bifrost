@@ -47,6 +47,45 @@ fn parses_the_issue_example_query() {
 }
 
 #[test]
+fn declaration_bounded_containment_round_trips_and_requires_schema_version_five() {
+    let json = json!({
+        "schema_version": 5,
+        "match": { "kind": "call", "callee": { "name": "open" } },
+        "inside_decl": { "kind": "loop", "capture": "loop" }
+    });
+    let query = parse_ok(json.clone());
+    let seed = query.seed().expect("structural seed");
+    assert_eq!(
+        seed.inside_decl
+            .as_ref()
+            .expect("inside_decl pattern")
+            .kinds,
+        vec![NormalizedKind::Loop]
+    );
+    assert_eq!(query.to_canonical_json(), json);
+
+    parse_ok(json!({
+        "schema_version": 5,
+        "match": { "kind": "call" },
+        "inside_decl": { "kind": "loop", "capture": "loop" },
+        "steps": [{ "op": "points_to", "capture": "loop" }]
+    }));
+
+    let rql =
+        CodeQuery::from_sexp("(inside-decl (loop :capture loop) (call :callee (name \"open\")))")
+            .expect("declaration-bounded RQL should lower");
+    assert_eq!(rql.to_canonical_json(), query.to_canonical_json());
+
+    let error = error_of(json!({
+        "schema_version": 4,
+        "match": { "kind": "call" },
+        "inside_decl": { "kind": "loop" }
+    }));
+    assert_eq!(error.path, "inside_decl");
+    assert!(error.message.contains("requires schema version 5"));
+}
+
+#[test]
 fn parses_and_canonicalizes_reference_traversal_filters() {
     let query = parse_ok(json!({
         "match": { "kind": "class", "name": "Target" },

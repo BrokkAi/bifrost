@@ -17,6 +17,7 @@ use super::ir::{MAX_CAPTURE_LENGTH, MAX_KWARG_NAME_LENGTH, SCHEMA_VERSION};
 
 const RQL_INITIAL_SCHEMA_VERSION: u32 = 2;
 const RQL_CFG_SCHEMA_VERSION: u32 = 3;
+const RQL_TYPESTATE_SCHEMA_VERSION: u32 = 4;
 const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
     SchemaVersionDescriptor::new(RQL_INITIAL_SCHEMA_VERSION, None, true),
     SchemaVersionDescriptor::new(
@@ -24,7 +25,16 @@ const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
         Some(RQL_INITIAL_SCHEMA_VERSION),
         true,
     ),
-    SchemaVersionDescriptor::new(SCHEMA_VERSION as u32, Some(RQL_CFG_SCHEMA_VERSION), true),
+    SchemaVersionDescriptor::new(
+        RQL_TYPESTATE_SCHEMA_VERSION,
+        Some(RQL_CFG_SCHEMA_VERSION),
+        true,
+    ),
+    SchemaVersionDescriptor::new(
+        SCHEMA_VERSION as u32,
+        Some(RQL_TYPESTATE_SCHEMA_VERSION),
+        true,
+    ),
 ];
 
 static RQL_SCHEMA_VERSION_REGISTRY: OnceLock<SchemaVersionRegistry> = OnceLock::new();
@@ -456,6 +466,7 @@ macro_rules! rql_forms {
                     | Self::Explain
                     | Self::Profile
                     | Self::Inside
+                    | Self::InsideDecl
                     | Self::NotInside
                     | Self::Union
                     | Self::Intersect
@@ -550,6 +561,14 @@ rql_forms! {
         shape: Pattern,
         signature: "(inside container-pattern query)",
         description: "Require the root match to be lexically inside a matching container.",
+    }
+    InsideDecl {
+        labels: ["inside-decl", "inside_decl"],
+        class: Wrapper,
+        shape: Pattern,
+        signature: "(inside-decl container-pattern query)",
+        description: "Require the root match to be inside a matching container without crossing a callable declaration.",
+        since: 5,
     }
     NotInside {
         labels: ["not-inside"],
@@ -1017,6 +1036,7 @@ json_fields! {
     Intersect { label: "intersect", shape: QueryList, signature: "\"intersect\": [{ query }, { query }, ...]", description: "Keep compatible typed endpoints reached by every branch." }
     Except { label: "except", shape: QueryList, signature: "\"except\": [{ query }, { query }, ...]", description: "Keep first-branch endpoints absent from every later branch." }
     Inside { label: "inside", shape: Pattern, signature: "\"inside\": { pattern }", description: "Require the root match to be inside a matching container." }
+    InsideDecl { label: "inside_decl", shape: Pattern, signature: "\"inside_decl\": { pattern }", description: "Require the root match to be inside a matching container without crossing a callable declaration." }
     NotInside { label: "not_inside", shape: Pattern, signature: "\"not_inside\": { pattern }", description: "Exclude root matches inside a matching container." }
     Steps { label: "steps", shape: QuerySteps, signature: "\"steps\": [{ \"op\": \"file_of\" }, ...]", description: "Apply ordered typed transformations to structural matches." }
     Limit { label: "limit", shape: PositiveInteger, signature: "\"limit\": positive integer", description: "Set the maximum number of matches returned." }
@@ -1209,11 +1229,11 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn rql_schema_lineage_defaults_to_version_four_and_accepts_exact_pins() {
+    fn rql_schema_lineage_defaults_to_version_five_and_accepts_exact_pins() {
         assert_eq!(
             resolve_rql_schema_version(None).unwrap(),
             SchemaVersionResolution {
-                version: 4,
+                version: 5,
                 origin: SchemaVersionOrigin::ImplicitCompatible,
             }
         );
@@ -1238,10 +1258,17 @@ mod tests {
                 origin: SchemaVersionOrigin::Explicit,
             }
         );
+        assert_eq!(
+            resolve_rql_schema_version(Some(5)).unwrap(),
+            SchemaVersionResolution {
+                version: 5,
+                origin: SchemaVersionOrigin::Explicit,
+            }
+        );
 
         let error = resolve_rql_schema_version(Some(1)).unwrap_err();
         assert_eq!(error.requested, 1);
-        assert_eq!(error.supported, vec![2, 3, 4]);
+        assert_eq!(error.supported, vec![2, 3, 4, 5]);
     }
 
     #[test]

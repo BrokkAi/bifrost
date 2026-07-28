@@ -174,6 +174,11 @@ void test("highlights explain and profile execution controls", async () => {
   assertScoped(tokens, "profile", "support.function.wrapper.bifrost-rql");
 });
 
+void test("highlights declaration-bounded containment", async () => {
+  const tokens = tokenizeGrammar(await grammar(), "(inside-decl (loop) (call))");
+  assertScoped(tokens, "inside-decl", "support.function.wrapper.bifrost-rql");
+});
+
 void test("highlights semantic traversal forms and options", async () => {
   const tokens = tokenizeGrammar(
     await grammar(),

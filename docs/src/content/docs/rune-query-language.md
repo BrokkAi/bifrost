@@ -17,7 +17,7 @@ RQL is only a query language. It is not a second matcher or query engine.
 
 Every RQL expression lowers into [JSON `CodeQuery`](/code-query-json/) before validation and execution. MCP hosts with `query_code` call the same engine using canonical JSON inline, or they can load a complete saved `.rql` file through the exclusive `query_file` argument. MCP does not accept raw inline RQL, and the `core` toolset does not expose `query_code`; use `symbol|extended` or `searchtools`. See [MCP query and RQL availability](/mcp/#query-and-rql-availability) for the complete surface matrix and [Code Querying](/code-querying/) for the schema and engine overview.
 
-RQL omits a schema version by default and therefore targets the compatible head, currently CodeQuery schema version 4. Use a root `:schema-version 2` option for the pre-CFG vocabulary or `:schema-version 3` for CFG without typestate; both reject later forms.
+RQL omits a schema version by default and therefore targets the compatible head, currently CodeQuery schema version 5. Use a root `:schema-version 2` option for the pre-CFG vocabulary or `:schema-version 3` for CFG without typestate; explicit older versions reject later forms.
 
 Save a complete RQL expression in a workspace `.rql` file and run it without opening the REPL:
 
@@ -79,6 +79,7 @@ RQL uses compact S-expressions. The following are independent forms, not one mul
 (explain (call :callee (name "eval")))
 (profile (call :callee (name "eval")))
 (inside (function :name "handler") (call :callee (name "eval")))
+(inside-decl (loop) (call :callee (name "open")))
 ```
 
 ## Comments
@@ -191,6 +192,8 @@ This returns `program_point` rows for targets of edges leaving `run`'s entry. Pr
 Semantic materialization is lazy and request-scoped. It has separate finite limits of 256 materialized files, 16 MiB of source, 1,000,000 rows per semantic dimension, 64 MiB retained semantic data, and 1,000,000 traversal steps. Repeating an edge form is how an authored query asks for another hop; no form silently computes an unbounded closure.
 
 This schema-v3 surface is a procedure-local CFG inspection API. It does not cross call boundaries and does not provide an ICFG, data-flow, taint, typestate, finding, or witness engine. Schema v4 adds only the registered typestate adapter below.
+
+Schema v5 adds `inside-decl`: containment that can match an enclosing callable itself, but stops before searching beyond a non-matching nested function, method, constructor, or lambda. Ordinary `inside` remains lexical and can cross those boundaries.
 
 ## Registered Typestate Findings and Witnesses
 

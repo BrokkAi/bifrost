@@ -1111,7 +1111,10 @@ impl QueryCodeTraits {
         if seed.root.name.is_none() && seed.root.text.is_none() {
             self.workloads.insert(QueryCodeWorkload::Broad);
         }
-        if seed.inside.is_some() || positive_patterns(seed).any(|pattern| pattern.has.is_some()) {
+        if seed.inside.is_some()
+            || seed.inside_decl.is_some()
+            || positive_patterns(seed).any(|pattern| pattern.has.is_some())
+        {
             self.workloads.insert(QueryCodeWorkload::Containment);
         }
         if positive_patterns(seed).any(pattern_has_regex) {
@@ -1124,6 +1127,9 @@ fn positive_patterns(seed: &CodeQuerySeed) -> impl Iterator<Item = &Pattern> {
     let mut stack = vec![&seed.root];
     if let Some(inside) = seed.inside.as_ref() {
         stack.push(inside);
+    }
+    if let Some(inside_decl) = seed.inside_decl.as_ref() {
+        stack.push(inside_decl);
     }
     std::iter::from_fn(move || {
         let pattern = stack.pop()?;

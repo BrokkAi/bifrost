@@ -768,6 +768,7 @@ mod tests {
                 ..Pattern::default()
             },
             inside: None,
+            inside_decl: None,
             not_inside: None,
         }
     }

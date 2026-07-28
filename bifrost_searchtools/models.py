@@ -1386,6 +1386,7 @@ class CodeQueryParsedQuery:
     where: list[str] = field(default_factory=list)
     languages: list[str] = field(default_factory=list)
     inside: dict[str, Any] | None = None
+    inside_decl: dict[str, Any] | None = None
     not_inside: dict[str, Any] | None = None
     limit: int | None = None
     result_detail: str | None = None
@@ -1415,6 +1416,7 @@ class CodeQueryParsedQuery:
             "where",
             "languages",
             "inside",
+            "inside_decl",
             "not_inside",
             "limit",
             "result_detail",
@@ -1428,6 +1430,11 @@ class CodeQueryParsedQuery:
             where=[str(path) for path in data.get("where", [])],
             languages=[str(language) for language in data.get("languages", [])],
             inside=dict(data["inside"]) if data.get("inside") is not None else None,
+            inside_decl=(
+                dict(data["inside_decl"])
+                if data.get("inside_decl") is not None
+                else None
+            ),
             not_inside=(
                 dict(data["not_inside"])
                 if data.get("not_inside") is not None
