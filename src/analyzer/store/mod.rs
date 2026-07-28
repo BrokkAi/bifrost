@@ -450,6 +450,8 @@ pub(crate) struct PathSymbolRow {
     pub(crate) normalized_fqn: String,
 }
 
+type PathSymbolRowsResult = Result<Vec<(String, PathSymbolRow)>>;
+
 fn decode_path_symbol_row(
     row: &rusqlite::Row<'_>,
     offset: usize,
@@ -687,24 +689,25 @@ impl AnalyzerStore {
     /// Batched sibling of `path_symbol_rows_by_fqn_for_langs`: resolves many (exact_fqn,
     /// normalized_fqn) pairs in one transaction instead of one transaction per pair. Used by the
     /// Python import resolver so a file with many imports doesn't open one transaction per import.
+    ///
+    /// The outer `Result` covers setup failures (can't open the transaction at all); each item's own
+    /// `Result` is independent, so one FQN's query/decode error doesn't discard the rest of the
+    /// batch's already-successful results the way propagating a single `?` through the loop would.
     pub(crate) fn path_symbol_rows_by_fqns_for_langs_batch(
         &self,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
         fqns: &[(String, String)],
-    ) -> Result<Vec<Vec<(String, PathSymbolRow)>>> {
+    ) -> Result<Vec<PathSymbolRowsResult>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        let mut results = Vec::with_capacity(fqns.len());
-        for (exact_fqn, normalized_fqn) in fqns {
-            results.push(path_symbol_rows_by_fqn_in_tx(
-                &tx,
-                langs,
-                exact_fqn,
-                normalized_fqn,
-            )?);
-        }
+        let results = fqns
+            .iter()
+            .map(|(exact_fqn, normalized_fqn)| {
+                path_symbol_rows_by_fqn_in_tx(&tx, langs, exact_fqn, normalized_fqn)
+            })
+            .collect();
         tx.commit()?;
         Ok(results)
     }

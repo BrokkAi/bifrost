@@ -4110,6 +4110,11 @@ where
     /// path-symbol rows in one store transaction instead of one per FQN. Row decoding (live-snapshot
     /// filtering, dirty-row merge, sort+dedup) is unchanged, just run once per FQN against a shared
     /// snapshot instead of re-fetching it per call.
+    ///
+    /// A whole-batch error (can't open the transaction) still returns `None` for every FQN, matching
+    /// `forward_path_module_fqn`'s single-item error behavior. A per-FQN error (caught once inside the
+    /// shared transaction) returns `None` for only that FQN -- the sibling FQNs in the same batch that
+    /// resolved successfully keep their results instead of being discarded by a shared failure.
     pub(crate) fn forward_path_module_fqns_batch(
         &self,
         fq_names: &[String],
@@ -4134,8 +4139,16 @@ where
                 pairs
                     .iter()
                     .zip(rows_per_fqn)
-                    .map(|((fq_name, normalized), rows)| {
-                        Some(self.decode_path_symbol_rows(fq_name, normalized, rows, &snapshot))
+                    .map(|((fq_name, normalized), rows)| match rows {
+                        Ok(rows) => {
+                            Some(self.decode_path_symbol_rows(fq_name, normalized, rows, &snapshot))
+                        }
+                        Err(error) => {
+                            self.record_store_error(
+                                error.context("querying path-backed definition candidates"),
+                            );
+                            None
+                        }
                     })
                     .collect()
             }

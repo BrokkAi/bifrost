@@ -768,6 +768,50 @@ mod tests {
         assert!(importers.is_empty());
     }
 
+    /// The single-file test above can't exercise real concurrency. This runs enough files through
+    /// the now-parallel `par_iter().try_for_each(..)` that many are genuinely in flight at once, and
+    /// checks the same cancellation invariant still holds when multiple worker threads can observe
+    /// (and race on) the same cancellation flag and the same shared `importers` sink.
+    #[test]
+    fn cancellable_importer_scan_stops_early_without_recording_partial_work_under_concurrency() {
+        let root = std::env::temp_dir();
+        let target_file = ProjectFile::new(root.clone(), "Target.java");
+        let file_count = 200;
+        let importers_input: Vec<ProjectFile> = (0..file_count)
+            .map(|i| ProjectFile::new(root.clone(), format!("Importer{i}.java")))
+            .collect();
+        let cancellation = CancellationToken::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = CancellingImportProvider {
+            cancellation: cancellation.clone(),
+            calls: Arc::clone(&calls),
+            imported: CodeUnit::new(target_file.clone(), CodeUnitType::Class, "pkg", "Target"),
+        };
+
+        let importers = find_direct_importers_with_cancellation(
+            importers_input,
+            &provider,
+            &[target_file].into_iter().collect(),
+            &cancellation,
+        );
+
+        assert!(
+            importers.is_empty(),
+            "a cancelled scan must not record partial matches, even with many files racing \
+             concurrently on the same cancellation flag and the same shared sink"
+        );
+        let observed_calls = calls.load(Ordering::Acquire);
+        assert!(
+            observed_calls >= 1,
+            "at least the file that triggered cancellation should have run"
+        );
+        assert!(
+            observed_calls < file_count,
+            "cancellation should stop the scan short of visiting every one of the {file_count} \
+             files, got {observed_calls}"
+        );
+    }
+
     #[test]
     fn cancellable_importer_scan_uses_batched_import_facts_when_available() {
         let root = std::env::temp_dir();

@@ -216,29 +216,34 @@ pub(crate) fn could_import_file<T: JsTsAnalyzerHost>(
 /// file. Without this, `could_import_file` re-ran `resolve_js_ts_import_paths` for every
 /// (candidate, target) pair the shared usages candidate walker checks -- unbounded per-call cost on a
 /// large workspace, never cached before this.
+///
+/// `get_with` (not get-then-insert): `could_import_file` runs unconditionally for every candidate in
+/// the parallelized workspace-wide import-graph walk, so two worker threads can miss the cache for
+/// the same file at once. `get_with` guarantees only one thread ever runs the resolution closure per
+/// key, matching `PythonAnalyzer::resolve_import_target_files`'s equivalent fix.
 fn resolved_import_target_files<T: JsTsAnalyzerHost>(
     host: &T,
     file: &ProjectFile,
 ) -> Arc<HashSet<ProjectFile>> {
     let caches = host.memo_caches();
-    if let Some(cached) = caches.imported_target_files.get(file) {
-        return cached;
-    }
-    let language = host.js_ts_language();
-    let alias_resolver = host.alias_resolver();
-    let targets: HashSet<ProjectFile> = host
-        .ts_inner()
-        .import_info_of(file)
-        .iter()
-        .flat_map(|import| {
-            resolve_js_ts_import_paths(file, &import.raw_snippet, language, Some(alias_resolver))
-        })
-        .collect();
-    let targets = Arc::new(targets);
-    caches
-        .imported_target_files
-        .insert(file.clone(), targets.clone());
-    targets
+    caches.imported_target_files.get_with(file.clone(), || {
+        let language = host.js_ts_language();
+        let alias_resolver = host.alias_resolver();
+        let targets: HashSet<ProjectFile> = host
+            .ts_inner()
+            .import_info_of(file)
+            .iter()
+            .flat_map(|import| {
+                resolve_js_ts_import_paths(
+                    file,
+                    &import.raw_snippet,
+                    language,
+                    Some(alias_resolver),
+                )
+            })
+            .collect();
+        Arc::new(targets)
+    })
 }
 
 // --- TypeHierarchyProvider -------------------------------------------------
