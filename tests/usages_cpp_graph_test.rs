@@ -10937,6 +10937,125 @@ struct Derived : Base, Sibling {
 }
 
 #[test]
+fn authoritative_cpp_missing_declaration_and_alias_type_refs_stay_exact() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "missing.hpp",
+            r#"#ifndef MISSING_HPP
+#define MISSING_HPP
+
+namespace proton {
+namespace internal {
+template <class T> class factory;
+}
+
+class session;
+class session_iterator {
+public:
+    explicit session_iterator(session s = nullptr);
+    friend class internal::factory<session>;
+};
+}
+
+typedef struct pn_endpoint_t pn_endpoint_t;
+struct pn_endpoint_t {
+    pn_endpoint_t* transport_next;
+};
+
+namespace tl::detail {
+template <class F, class, class... Us> struct invoke_result_impl;
+template <class F, class... Us>
+using invoke_result = invoke_result_impl<F, void, Us...>;
+template <class F, class... Us>
+using invoke_result_t = typename invoke_result<F, Us...>::type;
+}
+
+#endif
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let site = project.file("missing.hpp");
+    let source = site.read_to_string().expect("missing source");
+    let range = |line: &str, token: &str| fixture_token_range(&source, line, token);
+
+    let session = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "proton.session"
+            && !unit.is_synthetic()
+    });
+    let endpoint = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "pn_endpoint_t"
+            && !unit.is_synthetic()
+    });
+    let invoke_result_impl = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "tl::detail.invoke_result_impl"
+            && unit
+                .signature()
+                .is_some_and(|signature| signature.contains("class... Us"))
+    });
+
+    let session_param_marker = "session s = nullptr";
+    let session_param_start = source
+        .find(session_param_marker)
+        .expect("session parameter marker");
+    let session_param = (session_param_start, session_param_start + "session".len());
+    let session_friend = range("    friend class internal::factory<session>;", "session");
+    let endpoint_field = range("    pn_endpoint_t* transport_next;", "pn_endpoint_t");
+    let marker = "typename invoke_result<F, Us...>::type";
+    let marker_start = source.find(marker).expect("invoke alias RHS");
+    let leaf_start = marker_start + "typename ".len();
+    let leaf = (leaf_start, leaf_start + "invoke_result".len());
+    for (label, target, expected, control) in [
+        (
+            "default parameter",
+            session,
+            BTreeSet::from([session_param, session_friend]),
+            Some(session_param),
+        ),
+        (
+            "self field",
+            endpoint,
+            BTreeSet::from([endpoint_field]),
+            Some(endpoint_field),
+        ),
+        (
+            "alias leaf",
+            invoke_result_impl,
+            BTreeSet::from([leaf]),
+            Some(leaf),
+        ),
+    ] {
+        let authoritative =
+            authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &site);
+        let whole = UsageFinder::new()
+            .find_usages_default(&analyzer, std::slice::from_ref(&target))
+            .all_hits_including_imports()
+            .into_iter()
+            .filter(|hit| hit.file == site)
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            (&authoritative, &whole),
+            (&expected, &expected),
+            "{label} missing-resolution hits must stay exact",
+        );
+        if let Some(leaf) = control {
+            for hits in [&authoritative, &whole] {
+                assert!(
+                    !hits
+                        .iter()
+                        .any(|hit| hit.0 <= leaf.0 && leaf.1 <= hit.1 && *hit != leaf),
+                    "{label} hit must not widen beyond its exact leaf: hits={hits:#?}",
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn authoritative_cpp_exact_ranges_cover_qualified_static_and_temporary_member_calls() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

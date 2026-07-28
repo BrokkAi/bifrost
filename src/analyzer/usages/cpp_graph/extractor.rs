@@ -681,6 +681,9 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 for scope in scopes {
                     push_type_hit(scope, ctx);
                 }
+            } else if let Some(leaf) = target_guided_missing_alias_rhs_type_leaf(node, ctx) {
+                *ctx.raw_match_count += 1;
+                push_type_hit(leaf, ctx);
             }
             return;
         }
@@ -690,10 +693,18 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 for scope in scopes {
                     push_type_hit(scope, ctx);
                 }
+            } else if let Some(leaf) = target_guided_missing_alias_rhs_type_leaf(node, ctx) {
+                *ctx.raw_match_count += 1;
+                push_type_hit(leaf, ctx);
             }
             return;
         }
         LexicalTypeResolution::Missing => {
+            if let Some(leaf) = target_guided_missing_type_leaf(node, ctx) {
+                *ctx.raw_match_count += 1;
+                push_type_hit(leaf, ctx);
+                return;
+            }
             let raw_resolution = resolve_type_node_lexically_for_target_without_visibility(
                 hit_node,
                 ctx.analyzer,
@@ -1565,6 +1576,207 @@ fn target_guided_qualifier_type_scopes<'tree>(
         }
     }
     (!matches.is_empty()).then_some(matches)
+}
+
+fn target_guided_missing_type_leaf<'tree>(
+    node: Node<'tree>,
+    ctx: &ScanCtx<'_>,
+) -> Option<Node<'tree>> {
+    if !ctx
+        .visibility
+        .is_physically_visible(ctx.file, &ctx.spec.target)
+    {
+        return None;
+    }
+    target_guided_missing_declaration_type_leaf(node, ctx)
+        .or_else(|| target_guided_missing_alias_rhs_type_leaf(node, ctx))
+}
+
+fn target_guided_missing_declaration_type_leaf<'tree>(
+    node: Node<'tree>,
+    ctx: &ScanCtx<'_>,
+) -> Option<Node<'tree>> {
+    if node.kind() != "type_identifier" || is_declaration_name(node) {
+        return None;
+    }
+    let name = node_text(node, ctx.source);
+    if name != ctx.spec.target.identifier() {
+        return None;
+    }
+    let indexed_scope = indexed_enclosing_lexical_scope(ctx.analyzer, ctx.file, node)?;
+    let components = [name.to_string()];
+    let declaration = nearest_declaration_type_context(node)?;
+    let exact_scope_match =
+        indexed_scope_matches_target_name(&indexed_scope, &components, &ctx.spec.target);
+    if declaration.kind() == "field_declaration" {
+        return exact_scope_match.then_some(node);
+    }
+    let candidates = visible_type_identifier_candidates(ctx, name);
+    let unique_visible_target = !candidates.is_empty()
+        && candidates
+            .iter()
+            .all(|candidate| same_visible_symbol(candidate, &ctx.spec.target));
+    let lost_namespace_parameter_context =
+        matches!(
+            declaration.kind(),
+            "parameter_declaration" | "optional_parameter_declaration"
+        ) && target_guided_parameter_scope_lost_namespace(&indexed_scope, &ctx.spec.target);
+    if exact_scope_match || (lost_namespace_parameter_context && unique_visible_target) {
+        return Some(node);
+    }
+    None
+}
+
+fn target_guided_missing_alias_rhs_type_leaf<'tree>(
+    node: Node<'tree>,
+    ctx: &ScanCtx<'_>,
+) -> Option<Node<'tree>> {
+    let mut stack = vec![node];
+    while let Some(candidate) = stack.pop() {
+        if candidate.kind() == "type_identifier"
+            && !is_declaration_name(candidate)
+            && matches!(
+                candidate.parent().map(|parent| parent.kind()),
+                Some("template_type")
+            )
+        {
+            let mut current = candidate.parent();
+            let mut saw_qualified = false;
+            let mut saw_dependent = false;
+            let mut saw_type_descriptor = false;
+            let mut saw_alias_declaration = false;
+            while let Some(ancestor) = current {
+                match ancestor.kind() {
+                    "qualified_identifier" | "scoped_type_identifier" => saw_qualified = true,
+                    "dependent_type" => saw_dependent = true,
+                    "type_descriptor" => saw_type_descriptor = true,
+                    "alias_declaration" => {
+                        saw_alias_declaration = true;
+                        break;
+                    }
+                    "template_type"
+                    | "template_argument_list"
+                    | "typename"
+                    | "template_declaration" => {}
+                    _ => {}
+                }
+                current = ancestor.parent();
+            }
+            let name = node_text(candidate, ctx.source);
+            let visible_candidates = visible_type_identifier_candidates(ctx, name);
+            let canonical_alias_target = visible_candidates
+                .iter()
+                .filter_map(|alias| ctx.visibility.alias_target(alias))
+                .any(|target| same_visible_symbol(&target, &ctx.spec.target));
+            let alias_resolves = ctx.visibility.parser_alias_resolves_to_type(
+                ctx.analyzer,
+                ctx.file,
+                name,
+                &ctx.spec.target,
+            ) || canonical_alias_target;
+            if saw_qualified
+                && saw_dependent
+                && saw_type_descriptor
+                && saw_alias_declaration
+                && alias_resolves
+            {
+                return Some(candidate);
+            }
+        }
+        for index in (0..candidate.named_child_count()).rev() {
+            if let Some(child) = candidate.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    None
+}
+
+fn nearest_declaration_type_context(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = Some(node);
+    while let Some(ancestor) = current {
+        if matches!(
+            ancestor.kind(),
+            "field_declaration" | "parameter_declaration" | "optional_parameter_declaration"
+        ) {
+            return Some(ancestor);
+        }
+        if matches!(
+            ancestor.kind(),
+            "compound_statement"
+                | "translation_unit"
+                | "namespace_definition"
+                | "alias_declaration"
+                | "type_definition"
+                | "base_class_clause"
+        ) {
+            return None;
+        }
+        current = ancestor.parent();
+    }
+    None
+}
+
+fn visible_type_identifier_candidates(ctx: &ScanCtx<'_>, name: &str) -> Vec<CodeUnit> {
+    let mut candidates = Vec::new();
+    for candidate in ctx
+        .visibility
+        .visible_identifier_candidates(ctx.file, name)
+        .filter(|candidate| {
+            candidate.is_class()
+                || ctx
+                    .analyzer
+                    .type_alias_provider()
+                    .is_some_and(|provider| provider.is_type_alias(candidate))
+        })
+    {
+        if !candidates
+            .iter()
+            .any(|existing| same_logical_symbol(existing, candidate))
+        {
+            candidates.push(candidate.clone());
+        }
+    }
+    candidates
+}
+
+fn indexed_scope_matches_target_name(
+    indexed_scope: &[String],
+    components: &[String],
+    target: &CodeUnit,
+) -> bool {
+    let target_name = cpp_name_for(target);
+    lexical_component_tiers(components, false, indexed_scope)
+        .any(|qualified| qualified.join("::") == target_name)
+}
+
+fn target_guided_parameter_scope_lost_namespace(
+    indexed_scope: &[String],
+    target: &CodeUnit,
+) -> bool {
+    !target.package_name().is_empty() && indexed_scope.len() <= 1
+}
+
+fn indexed_enclosing_lexical_scope(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    node: Node<'_>,
+) -> Option<Vec<String>> {
+    let range = Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
+    };
+    let enclosing = analyzer.enclosing_code_unit(file, &range)?;
+    let mut components = crate::analyzer::symbol_lookup::parse_symbol_path(
+        crate::analyzer::Language::Cpp,
+        &cpp_name_for(&enclosing),
+    );
+    if !enclosing.is_class() && !enclosing.is_module() {
+        components.pop();
+    }
+    Some(components)
 }
 
 fn static_qualifier_name_scope<'tree>(node: Node<'tree>, ctx: &ScanCtx<'_>) -> Option<Node<'tree>> {
