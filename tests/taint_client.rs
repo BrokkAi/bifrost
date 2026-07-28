@@ -5,8 +5,8 @@ use brokk_bifrost::analyzer::dataflow::{
     SemanticProcedureSummary, SolverBudget, SummaryBehaviorKey, SummaryCompleteness,
     SummaryContextKey, SummaryDependencyKey, SummaryEffect, SummaryEffectKey, SummaryEventKey,
     SummaryEvidence, SummaryOrigin, SummaryRecursiveEdge, SummaryRecursiveGroupKey,
-    SummarySchemaVersion, SummarySemanticsVersion, WitnessReconstructionLimits,
-    WitnessRetentionLimits,
+    SummarySchemaVersion, SummarySemanticsVersion, UnmodeledCallBehavior,
+    WitnessReconstructionLimits, WitnessRetentionLimits,
 };
 use brokk_bifrost::analyzer::semantic::{
     CallBinding, CallBindings, CancellationToken, CandidateCoverage, DispatchOracle,
@@ -116,6 +116,14 @@ fn fixture(sanitizer: Option<bool>) -> Fixture {
 }
 
 fn fixture_with_transfers(sanitizer: Option<(bool, u32)>, transform_index: Option<u32>) -> Fixture {
+    fixture_with_behavior(sanitizer, transform_index, UnmodeledCallBehavior::default())
+}
+
+fn fixture_with_behavior(
+    sanitizer: Option<(bool, u32)>,
+    transform_index: Option<u32>,
+    unmodeled_call_behavior: UnmodeledCallBehavior,
+) -> Fixture {
     let project = InlineTestProject::with_language(Language::Java)
         .file("src/TaintFixture.java", SOURCE)
         .build();
@@ -167,12 +175,13 @@ fn fixture_with_transfers(sanitizer: Option<(bool, u32)>, transform_index: Optio
             )
         })
         .collect::<Vec<_>>();
-    let value_flow = ValueFlowPlan::try_new(
+    let value_flow = ValueFlowPlan::with_call_behavior(
         root.clone(),
         vec![ValueFlowInput::new(snapshot, status)],
         Vec::new(),
         source_specs,
         sink_specs,
+        unmodeled_call_behavior,
     )
     .unwrap();
     let universe = TaintUniverse::new(vec![class("sql"), class("path"), class("html")]).unwrap();
@@ -1787,4 +1796,40 @@ fn batch_planner_groups_only_identical_propagation_semantics() {
             .collect::<Vec<_>>(),
         vec!["p1", "p2"]
     );
+}
+
+#[test]
+fn batch_compatibility_partitions_unmodeled_call_behavior_explicitly() {
+    let paranoid = fixture(None).plan;
+    let optimistic = fixture_with_behavior(None, None, UnmodeledCallBehavior::Optimistic).plan;
+    let paranoid_key = TaintBatchCompatibilityKey::new(
+        "snapshot",
+        "context=2;heap=alloc-site",
+        paranoid.universe().hash(),
+    )
+    .unwrap();
+    let optimistic_key = TaintBatchCompatibilityKey::with_call_behavior(
+        "snapshot",
+        "context=2;heap=alloc-site",
+        UnmodeledCallBehavior::Optimistic,
+        optimistic.universe().hash(),
+    )
+    .unwrap();
+
+    assert!(
+        TaintPolicyPlan::new("mismatched", paranoid_key.clone(), optimistic.clone()).is_err(),
+        "a compatibility key must describe the analysis plan's call behavior"
+    );
+    let batches = TaintBatchPlanner::partition(vec![
+        TaintPolicyPlan::new("paranoid", paranoid_key, paranoid).unwrap(),
+        TaintPolicyPlan::new("optimistic", optimistic_key, optimistic).unwrap(),
+    ])
+    .unwrap();
+    assert_eq!(batches.len(), 2);
+    assert!(batches.iter().any(|batch| {
+        batch.compatibility().unmodeled_call_behavior() == UnmodeledCallBehavior::Paranoid
+    }));
+    assert!(batches.iter().any(|batch| {
+        batch.compatibility().unmodeled_call_behavior() == UnmodeledCallBehavior::Optimistic
+    }));
 }

@@ -16,10 +16,10 @@ use brokk_bifrost::analyzer::dataflow::{
     DataflowEdge, DataflowOutput, DistributiveDataflowProblem,
 };
 use brokk_bifrost::analyzer::semantic::{
-    CallTransfer, ControlContinuation, ControlEdgeKind, IcfgEdgeKind, IcfgExitProfile,
-    IcfgProvider, MatchedReturnProjection, ProcedureHandle, ProcedureIcfgEdge, ProgramPointHandle,
-    ProgramPointId, ProofStatus, SemanticBudget, SemanticEffect, SemanticProviderError,
-    SemanticRequest,
+    CallBoundary, CallToReturnModel, CallTransfer, ControlContinuation, ControlEdgeKind,
+    IcfgEdgeKind, IcfgExitProfile, IcfgProvider, MatchedReturnProjection, ProcedureHandle,
+    ProcedureIcfgEdge, ProgramPointHandle, ProgramPointId, ProofStatus, SemanticBudget,
+    SemanticCallSite, SemanticEffect, SemanticProviderError, SemanticRequest,
 };
 
 /// Canonical, context-free rows from the repeated-scan reference.
@@ -110,8 +110,7 @@ impl<Value> DataflowOutput<Value> for VecOutput<'_, Value> {
 /// Compute a context-free may fixed point by repeated provider-backed scans.
 ///
 /// The reference consumes materialized call transfers and matched exit
-/// projections. Dispatch boundaries with call-to-return models are outside
-/// this small differential oracle and have dedicated behavior tests.
+/// projections, including residual call-boundary continuations.
 pub fn reference_summary_projection<P, Provider>(
     root: &ProcedureHandle,
     entry_facts: &[P::Fact],
@@ -230,6 +229,17 @@ where
                             });
                         }
                     }
+                    for boundary in transfers.boundaries.iter() {
+                        propagate_call_boundary(
+                            &mut reached,
+                            problem,
+                            &point,
+                            &path,
+                            &semantic_call,
+                            boundary,
+                            zero,
+                        )?;
+                    }
                 }
 
                 propagate_local_edges(
@@ -285,6 +295,66 @@ where
             return Ok(ReferenceSummaryProjection { reached });
         }
     }
+}
+
+fn propagate_call_boundary<P>(
+    reached: &mut HashSet<Path<P::Fact>>,
+    problem: &P,
+    point: &ProgramPointHandle,
+    path: &Path<P::Fact>,
+    call: &SemanticCallSite,
+    boundary: &CallBoundary,
+    zero: P::Fact,
+) -> Result<(), ReferenceSummaryError>
+where
+    P: DistributiveDataflowProblem,
+{
+    for (enabled, continuation, kind) in [
+        (
+            matches!(
+                boundary.model,
+                CallToReturnModel::Normal | CallToReturnModel::NormalAndExceptional
+            ),
+            call.normal_continuation,
+            IcfgEdgeKind::CallToNormalContinuation,
+        ),
+        (
+            matches!(
+                boundary.model,
+                CallToReturnModel::Exceptional | CallToReturnModel::NormalAndExceptional
+            ),
+            call.exceptional_continuation,
+            IcfgEdgeKind::CallToExceptionalContinuation,
+        ),
+    ] {
+        let (true, ControlContinuation::Target(target)) = (enabled, continuation) else {
+            continue;
+        };
+        let target =
+            point
+                .procedure()
+                .point_handle(target)
+                .ok_or(ReferenceSummaryError::MissingPoint(
+                    "call-boundary continuation",
+                ))?;
+        let edge = ProcedureIcfgEdge {
+            source: point.clone(),
+            target,
+            kind,
+            origin: Some(boundary.origin.clone()),
+            proof: boundary.dispatch.proof.clone(),
+            completeness: boundary.dispatch.completeness.clone(),
+            boundary: Some(boundary.dispatch.kind.clone()),
+        };
+        for output in transfer_outputs(problem, descriptor(&edge), path.fact, zero) {
+            reached.insert(Path {
+                entry: path.entry.clone(),
+                point: edge.target.id(),
+                fact: output,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn propagate_local_edges<P>(
@@ -376,14 +446,18 @@ fn apply_transfer<P>(
 }
 
 fn descriptor<Fact>(edge: &ProcedureIcfgEdge) -> DataflowEdge<'_, Fact> {
-    DataflowEdge::new(
+    let descriptor = DataflowEdge::new(
         edge.kind,
         edge.origin.as_ref(),
         &edge.source,
         &edge.target,
         &edge.proof,
         &edge.completeness,
-    )
+    );
+    match &edge.boundary {
+        Some(boundary) => descriptor.with_boundary(boundary),
+        None => descriptor,
+    }
 }
 
 fn invoked_call_at(

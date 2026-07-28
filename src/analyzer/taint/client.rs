@@ -4,7 +4,8 @@ use crate::analyzer::dataflow::{
     DataflowEdge, DataflowOutput, DataflowRequest, IdeDataflowError, IdeDataflowProblem,
     IdeSummaryDataflowResult, IdeSummarySolveInput, IdeTransition, ReusableIdeSummaryProvider,
     SolverTermination, SolverWork, SummaryWitnessStep, SummaryWitnessStepKind,
-    WitnessRetentionLimits, solve_ide_with_reusable_summaries, solve_ide_with_summaries,
+    UnmodeledCallBehavior, WitnessRetentionLimits, solve_ide_with_reusable_summaries,
+    solve_ide_with_summaries,
 };
 use crate::analyzer::semantic::{
     EvidenceCompleteness, IcfgEdgeKind, IcfgProvider, ProcedureHandle, ProofStatus, SemanticBudget,
@@ -1042,8 +1043,26 @@ impl<'plan> TaintFlowProblem<'plan> {
                 .value_flow()
                 .carrier_id(&ValueFlowCarrier::Value(value))
         });
-        let mut propagated = active.clone();
-        if let Some(result) = result {
+        let mut propagated = match self.plan.value_flow().unmodeled_call_behavior() {
+            UnmodeledCallBehavior::Paranoid | UnmodeledCallBehavior::Optimistic => active.clone(),
+            UnmodeledCallBehavior::RequireModel => active
+                .iter()
+                .cloned()
+                .map(|flow| {
+                    if self.plan.value_flow().is_call_input(call, flow.carrier) {
+                        ActiveTaint {
+                            uncertain: true,
+                            ..flow
+                        }
+                    } else {
+                        flow
+                    }
+                })
+                .collect(),
+        };
+        if self.plan.value_flow().unmodeled_call_behavior() == UnmodeledCallBehavior::Paranoid
+            && let Some(result) = result
+        {
             propagated.extend(active.into_iter().filter_map(|flow| {
                 self.plan
                     .value_flow()

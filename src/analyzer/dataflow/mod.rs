@@ -8,6 +8,7 @@
 //! domain-specific clients remain separate follow-up work.
 
 mod budget;
+mod call_model;
 mod direct;
 mod ide;
 mod ide_result;
@@ -25,6 +26,7 @@ mod witness;
 pub use budget::{
     DataflowRequest, SolverBudget, SolverBudgetDimension, SolverBudgetExceeded, SolverWork,
 };
+pub use call_model::UnmodeledCallBehavior;
 pub use direct::{DirectFact, DirectFlowProblem};
 pub use ide::{
     IdeDataflowProblem, IdeDataflowSeed, IdeSummarySolveInput, IdeTransition,

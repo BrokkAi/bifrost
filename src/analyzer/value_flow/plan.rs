@@ -1,6 +1,8 @@
 use std::{cmp::Ordering, error::Error, fmt, mem::size_of_val, sync::Arc};
 
-use crate::analyzer::dataflow::{SemanticInputStatus, SummaryDataflowResult};
+use crate::analyzer::dataflow::{
+    SemanticInputStatus, SummaryDataflowResult, UnmodeledCallBehavior,
+};
 use crate::analyzer::semantic::{
     AbstractLocation, AbstractObject, AccessPathRoot, CallArgumentEndpoint, CallBinding,
     CallBindings, CallSiteHandle, CallSiteId, CandidateCoverage, DeclarationLocator,
@@ -138,6 +140,7 @@ pub(crate) struct ValueFlowCallSummaryRule {
 /// clients add those independently according to their invalidation contract.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ValueFlowCarrierSummaryIdentity {
+    unmodeled_call_behavior: UnmodeledCallBehavior,
     has_snapshot: bool,
     local_rules: Box<[ValueFlowLocalSummaryRule]>,
     call_rules: Box<[ValueFlowCallSummaryRule]>,
@@ -225,6 +228,7 @@ pub(crate) struct BoundValueFlowSink {
 #[derive(Debug, Clone)]
 pub struct ValueFlowPlan {
     root: ProcedureHandle,
+    unmodeled_call_behavior: UnmodeledCallBehavior,
     carriers: Box<[ValueFlowCarrier]>,
     carrier_keys: Box<[ValueFlowCarrierKey]>,
     carrier_ids: HashMap<ValueFlowCarrier, ValueFlowCarrierId>,
@@ -242,6 +246,7 @@ pub struct ValueFlowPlan {
 impl PartialEq for ValueFlowPlan {
     fn eq(&self, other: &Self) -> bool {
         self.root == other.root
+            && self.unmodeled_call_behavior == other.unmodeled_call_behavior
             && self.carriers == other.carriers
             && self.carrier_keys == other.carrier_keys
             && self.carrier_ids == other.carrier_ids
@@ -266,23 +271,62 @@ impl ValueFlowPlan {
         sources: Vec<ValueFlowSourceSpec>,
         sinks: Vec<ValueFlowSinkSpec>,
     ) -> Result<Self, ValueFlowPlanError> {
-        Self::with_limits(
+        Self::with_call_behavior(
+            root,
+            snapshots,
+            bindings,
+            sources,
+            sinks,
+            UnmodeledCallBehavior::default(),
+        )
+    }
+
+    pub fn with_call_behavior(
+        root: ProcedureHandle,
+        snapshots: Vec<ValueFlowInput<ValueFlowSnapshot>>,
+        bindings: Vec<ValueFlowInput<CallBindings>>,
+        sources: Vec<ValueFlowSourceSpec>,
+        sinks: Vec<ValueFlowSinkSpec>,
+        unmodeled_call_behavior: UnmodeledCallBehavior,
+    ) -> Result<Self, ValueFlowPlanError> {
+        Self::with_limits_and_call_behavior(
             root,
             snapshots,
             bindings,
             sources,
             sinks,
             ValueFlowPlanLimits::default(),
+            unmodeled_call_behavior,
         )
     }
 
     pub fn with_limits(
+        root: ProcedureHandle,
+        snapshots: Vec<ValueFlowInput<ValueFlowSnapshot>>,
+        bindings: Vec<ValueFlowInput<CallBindings>>,
+        sources: Vec<ValueFlowSourceSpec>,
+        sinks: Vec<ValueFlowSinkSpec>,
+        limits: ValueFlowPlanLimits,
+    ) -> Result<Self, ValueFlowPlanError> {
+        Self::with_limits_and_call_behavior(
+            root,
+            snapshots,
+            bindings,
+            sources,
+            sinks,
+            limits,
+            UnmodeledCallBehavior::default(),
+        )
+    }
+
+    pub fn with_limits_and_call_behavior(
         root: ProcedureHandle,
         mut snapshots: Vec<ValueFlowInput<ValueFlowSnapshot>>,
         mut bindings: Vec<ValueFlowInput<CallBindings>>,
         mut sources: Vec<ValueFlowSourceSpec>,
         mut sinks: Vec<ValueFlowSinkSpec>,
         limits: ValueFlowPlanLimits,
+        unmodeled_call_behavior: UnmodeledCallBehavior,
     ) -> Result<Self, ValueFlowPlanError> {
         if sources.len() > limits.max_sources || sinks.len() > limits.max_sinks {
             return Err(ValueFlowPlanError::LimitExceeded);
@@ -443,6 +487,7 @@ impl ValueFlowPlan {
 
         Ok(Self {
             root,
+            unmodeled_call_behavior,
             carriers: carriers.into_boxed_slice(),
             carrier_keys: carrier_keys.into_boxed_slice(),
             carrier_ids,
@@ -460,6 +505,10 @@ impl ValueFlowPlan {
 
     pub fn root(&self) -> &ProcedureHandle {
         &self.root
+    }
+
+    pub const fn unmodeled_call_behavior(&self) -> UnmodeledCallBehavior {
+        self.unmodeled_call_behavior
     }
 
     pub fn carriers(&self) -> &[ValueFlowCarrier] {
@@ -600,6 +649,7 @@ impl ValueFlowPlan {
                 (
                     procedure,
                     ValueFlowCarrierSummaryIdentity {
+                        unmodeled_call_behavior: self.unmodeled_call_behavior,
                         has_snapshot: builder.has_snapshot,
                         local_rules: builder.local_rules.into_boxed_slice(),
                         call_rules: builder.call_rules.into_boxed_slice(),
@@ -614,9 +664,25 @@ impl ValueFlowPlan {
     }
 
     pub(crate) fn is_call_input(&self, call: &CallSiteHandle, carrier: ValueFlowCarrierId) -> bool {
-        self.call_rules.iter().any(|rule| {
+        if self.call_rules.iter().any(|rule| {
             &rule.call == call && rule.kind == CallFlowRuleKind::Call && rule.source == carrier
-        })
+        }) {
+            return true;
+        }
+        let Some(ValueFlowCarrier::Value(value)) = self.carrier(carrier) else {
+            return false;
+        };
+        if value.procedure() != call.procedure() {
+            return false;
+        }
+        let Some(call_row) = call.procedure().semantics().call_site(call.id()) else {
+            return false;
+        };
+        call_row.receiver == Some(value.id())
+            || call_row
+                .arguments
+                .iter()
+                .any(|argument| argument.value == value.id())
     }
 
     pub(crate) fn is_callee_port(

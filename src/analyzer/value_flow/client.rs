@@ -2,7 +2,8 @@ use std::{error::Error, fmt};
 
 use crate::analyzer::dataflow::{
     DataflowEdge, DataflowOutput, DataflowRequest, DistributiveDataflowProblem,
-    SummaryDataflowError, SummarySolveInput, WitnessRetentionLimits, solve_with_summaries,
+    SummaryDataflowError, SummarySolveInput, UnmodeledCallBehavior, WitnessRetentionLimits,
+    solve_with_summaries,
 };
 use crate::analyzer::semantic::{
     EvidenceCompleteness, IcfgEdgeKind, IcfgProvider, ProcedureHandle, ProofStatus, SemanticBudget,
@@ -334,7 +335,23 @@ impl<'plan> ValueFlowProblem<'plan> {
             self.emit_all(active, meetings, out);
             return;
         };
-        let mut propagated = active.clone();
+        let mut propagated = match self.plan.unmodeled_call_behavior() {
+            UnmodeledCallBehavior::Paranoid | UnmodeledCallBehavior::Optimistic => active.clone(),
+            UnmodeledCallBehavior::RequireModel => active
+                .iter()
+                .copied()
+                .map(|flow| {
+                    if self.plan.is_call_input(call, flow.carrier) {
+                        ActiveFlow {
+                            uncertainty: flow.uncertainty.with_semantic(),
+                            ..flow
+                        }
+                    } else {
+                        flow
+                    }
+                })
+                .collect(),
+        };
         let call_row = call
             .procedure()
             .semantics()
@@ -347,7 +364,9 @@ impl<'plan> ValueFlowProblem<'plan> {
         }
         .and_then(|value| call.procedure().value_handle(value))
         .and_then(|value| self.plan.carrier_id(&ValueFlowCarrier::Value(value)));
-        if let Some(result) = result {
+        if self.plan.unmodeled_call_behavior() == UnmodeledCallBehavior::Paranoid
+            && let Some(result) = result
+        {
             for flow in active {
                 if self.plan.is_call_input(call, flow.carrier) {
                     propagated.push(ActiveFlow {

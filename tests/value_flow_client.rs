@@ -1,12 +1,12 @@
 mod common;
 
 use brokk_bifrost::analyzer::dataflow::{
-    DataflowRequest, PathQuality, SemanticInputStatus, SolverBudget, WitnessReconstructionLimits,
-    WitnessRetentionLimits,
+    DataflowRequest, PathQuality, SemanticInputStatus, SolverBudget, UnmodeledCallBehavior,
+    WitnessReconstructionLimits, WitnessRetentionLimits,
 };
 use brokk_bifrost::analyzer::semantic::{
-    CancellationToken, EvidenceCompleteness, OracleCallContext, OracleLimits, ProcedureHandle,
-    ProcedureKind, ProofStatus, SemanticBudget, SemanticRequest, ValueFlowOracle,
+    CancellationToken, ControlContinuation, EvidenceCompleteness, OracleCallContext, OracleLimits,
+    ProcedureHandle, ProcedureKind, ProofStatus, SemanticBudget, SemanticRequest, ValueFlowOracle,
     ValueFlowRelationKind,
 };
 use brokk_bifrost::analyzer::value_flow::{
@@ -38,6 +38,18 @@ final class HelperFlowFixture {
   static String run(String input) {
     String copy = relay(input);
     return copy;
+  }
+}
+"#;
+
+const UNMODELED_CALL_SOURCE: &str = r#"
+interface ExternalWork {
+  String run(String value);
+}
+
+final class UnmodeledCallFixture {
+  static String caller(ExternalWork work, String input) {
+    return work.run(input);
   }
 }
 "#;
@@ -150,6 +162,97 @@ fn solve(fixture: &Fixture) -> brokk_bifrost::analyzer::value_flow::ValueFlowSum
     .expect("value-flow solve")
 }
 
+fn solve_unmodeled_call(
+    behavior: UnmodeledCallBehavior,
+) -> (
+    brokk_bifrost::analyzer::value_flow::ValueFlowSummaryResult,
+    brokk_bifrost::analyzer::value_flow::ValueFlowSinkId,
+    brokk_bifrost::analyzer::value_flow::ValueFlowSinkId,
+) {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/UnmodeledCallFixture.java", UNMODELED_CALL_SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "src/UnmodeledCallFixture.java");
+    let root = procedure_named(&graph, "caller", ProcedureKind::Method);
+    let call = root
+        .semantics()
+        .call_sites()
+        .first()
+        .expect("unmodeled call")
+        .clone();
+    let invoke = root.point_handle(call.point).expect("call point");
+    let normal_continuation = match call.normal_continuation {
+        ControlContinuation::Target(point) => {
+            root.point_handle(point).expect("normal continuation")
+        }
+        continuation => panic!("expected normal continuation, got {continuation:?}"),
+    };
+    let input = root
+        .value_handle(call.arguments[0].value)
+        .expect("argument value");
+    let result = root
+        .value_handle(call.result.expect("call result"))
+        .expect("result value");
+    let input_carrier = ValueFlowCarrier::Value(input);
+    let result_carrier = ValueFlowCarrier::Value(result);
+    let source = ValueFlowSourceSpec::new(
+        ValueFlowEventKey::at_point(&invoke, 0, ValueFlowEventKind::Source).expect("source key"),
+        invoke,
+        ValueFlowObservationPhase::BeforeEffects,
+        input_carrier.clone(),
+        ProofStatus::Proven,
+        EvidenceCompleteness::Complete,
+    );
+    let result_sink_spec = ValueFlowSinkSpec::new(
+        ValueFlowEventKey::at_point(&normal_continuation, 0, ValueFlowEventKind::Sink)
+            .expect("result sink key"),
+        normal_continuation.clone(),
+        ValueFlowObservationPhase::BeforeEffects,
+        result_carrier.clone(),
+        ProofStatus::Proven,
+        EvidenceCompleteness::Complete,
+    );
+    let preserved_sink_spec = ValueFlowSinkSpec::new(
+        ValueFlowEventKey::at_point(&normal_continuation, 1, ValueFlowEventKind::Sink)
+            .expect("preserved sink key"),
+        normal_continuation,
+        ValueFlowObservationPhase::BeforeEffects,
+        input_carrier.clone(),
+        ProofStatus::Proven,
+        EvidenceCompleteness::Complete,
+    );
+    let plan = ValueFlowPlan::with_call_behavior(
+        root.clone(),
+        Vec::new(),
+        Vec::new(),
+        vec![source],
+        vec![result_sink_spec, preserved_sink_spec],
+        behavior,
+    )
+    .expect("unmodeled-call plan");
+    let result_sink = plan
+        .sinks()
+        .find_map(|(id, spec)| (spec.carrier() == &result_carrier).then_some(id))
+        .expect("bound result sink");
+    let preserved_sink = plan
+        .sinks()
+        .find_map(|(id, spec)| (spec.carrier() == &input_carrier).then_some(id))
+        .expect("bound preserved sink");
+    let cancellation = CancellationToken::default();
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let result = solve_value_flow_with_summaries(
+        &root,
+        &analyzer.icfg_provider(),
+        &plan,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .expect("unmodeled-call solve");
+    (result, result_sink, preserved_sink)
+}
+
 #[test]
 fn local_assignment_produces_a_policy_neutral_may_meeting() {
     let fixture = fixture(true, (ProofStatus::Proven, EvidenceCompleteness::Complete));
@@ -250,6 +353,58 @@ fn omitted_snapshot_closure_keeps_results_incomplete() {
         ValueFlowSinkOutcome::Reached(_)
     ));
     assert!(!result.is_complete());
+}
+
+#[test]
+fn unmodeled_call_profiles_are_distinct_and_paranoid_is_conservative() {
+    let (paranoid, paranoid_result, paranoid_preserved) =
+        solve_unmodeled_call(UnmodeledCallBehavior::Paranoid);
+    let ValueFlowSinkOutcome::Reached(result_meetings) = paranoid.sink_outcome(paranoid_result)
+    else {
+        panic!("paranoid fallback must propagate the argument to the call result");
+    };
+    assert!(result_meetings.iter().all(|meeting| meeting.is_uncertain()));
+    assert!(matches!(
+        paranoid.sink_outcome(paranoid_preserved),
+        ValueFlowSinkOutcome::Reached(_)
+    ));
+    assert!(!paranoid.is_complete());
+
+    let (optimistic, optimistic_result, optimistic_preserved) =
+        solve_unmodeled_call(UnmodeledCallBehavior::Optimistic);
+    assert!(matches!(
+        optimistic.sink_outcome(optimistic_result),
+        ValueFlowSinkOutcome::Inconclusive
+    ));
+    let ValueFlowSinkOutcome::Reached(preserved_meetings) =
+        optimistic.sink_outcome(optimistic_preserved)
+    else {
+        panic!("optimistic fallback must preserve the existing argument fact");
+    };
+    assert!(
+        preserved_meetings
+            .iter()
+            .all(|meeting| !meeting.is_uncertain())
+    );
+    assert!(!optimistic.is_complete());
+
+    let (require_model, require_result, require_preserved) =
+        solve_unmodeled_call(UnmodeledCallBehavior::RequireModel);
+    assert!(matches!(
+        require_model.sink_outcome(require_result),
+        ValueFlowSinkOutcome::Inconclusive
+    ));
+    let ValueFlowSinkOutcome::Reached(abstained_meetings) =
+        require_model.sink_outcome(require_preserved)
+    else {
+        panic!("require-model fallback must retain an abstained argument fact");
+    };
+    assert!(
+        abstained_meetings
+            .iter()
+            .all(|meeting| meeting.is_uncertain())
+    );
+    assert!(!require_model.is_complete());
 }
 
 #[test]

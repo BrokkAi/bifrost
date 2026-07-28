@@ -6,6 +6,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::analyzer::dataflow::UnmodeledCallBehavior;
 use crate::analyzer::dense_id::define_dense_id;
 use crate::analyzer::identifier::define_identifier;
 
@@ -325,6 +326,16 @@ pub enum ProtocolUncertaintyBehavior {
     Abstain,
 }
 
+impl From<UnmodeledCallBehavior> for ProtocolUncertaintyBehavior {
+    fn from(behavior: UnmodeledCallBehavior) -> Self {
+        match behavior {
+            UnmodeledCallBehavior::Paranoid => Self::ConservativeTransition,
+            UnmodeledCallBehavior::Optimistic => Self::PreserveUncertainty,
+            UnmodeledCallBehavior::RequireModel => Self::Abstain,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ProtocolUncertaintyCause {
     AmbiguousDispatch,
@@ -335,6 +346,13 @@ pub enum ProtocolUncertaintyCause {
 }
 
 impl ProtocolUncertaintySemantics {
+    pub fn with_unmodeled_call_behavior(mut self, behavior: UnmodeledCallBehavior) -> Self {
+        let behavior = ProtocolUncertaintyBehavior::from(behavior);
+        self.unknown_call = behavior;
+        self.external_call = behavior;
+        self
+    }
+
     pub const fn behavior(self, cause: ProtocolUncertaintyCause) -> ProtocolUncertaintyBehavior {
         match cause {
             ProtocolUncertaintyCause::AmbiguousDispatch => self.ambiguous_dispatch,
