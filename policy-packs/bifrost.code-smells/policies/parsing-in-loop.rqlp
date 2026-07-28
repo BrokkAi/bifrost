@@ -21,4 +21,14 @@
             (language javascript
               (inside (loop) (call :receiver (name "JSON") :callee (name "parse"))))
             (language typescript
-              (inside (loop) (call :receiver (name "JSON") :callee (name "parse"))))))))
+              (inside (loop) (call :receiver (name "JSON") :callee (name "parse"))))
+            (language rust
+              (inside
+                (loop)
+                (call
+                  :receiver (name "serde_json")
+                  :callee (name/regex "^(from_str|from_slice)$"))))
+            (language rust
+              (inside (loop) (call :receiver (name "bincode") :callee (name "deserialize"))))
+            (language rust
+              (inside (loop) (call :receiver (name "toml") :callee (name "from_str"))))))))

@@ -13,9 +13,16 @@
       :selector
         (rql
           :schema-version 2
-          (where
-            "*.py" "**/*.py"
-            "*.java" "**/*.java"
-            "*.ts" "**/*.ts"
-            "*.tsx" "**/*.tsx"
-            (inside (loop) (call :callee (name "sort")))))))
+          (union
+            (where
+              "*.py" "**/*.py"
+              "*.java" "**/*.java"
+              "*.ts" "**/*.ts"
+              "*.tsx" "**/*.tsx"
+              (inside (loop) (call :callee (name "sort"))))
+            (language rust
+              (inside
+                (loop)
+                (call
+                  :callee
+                    (name/regex "^(sort|sort_by|sort_by_key|sort_by_cached_key|sort_unstable|sort_unstable_by|sort_unstable_by_key)$"))))))))

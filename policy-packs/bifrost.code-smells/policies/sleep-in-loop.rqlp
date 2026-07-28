@@ -17,4 +17,6 @@
             (language python
               (inside (loop) (call :receiver (name "time") :callee (name "sleep"))))
             (language java
-              (inside (loop) (call :receiver (name "Thread") :callee (name "sleep"))))))))
+              (inside (loop) (call :receiver (name "Thread") :callee (name "sleep"))))
+            (language rust
+              (inside (loop) (call :receiver (name "thread") :callee (name "sleep"))))))))

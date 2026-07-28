@@ -42,6 +42,18 @@ checked-in `.rqlp` source with a stable ID and semantic hash; the manifest also
 records its category, claimed languages, required capabilities, severity
 rationale, and remediation.
 
+Pack version 1.1 adds Rust coverage to eight performance policies. The Rust
+selectors recognize the standard slice `sort*` family, `Regex::new`,
+`fs::read` / `fs::read_to_string`, `serde_json::{to_string, to_vec, from_str,
+from_slice}`, `bincode::{serialize, deserialize}`, `toml::from_str`, direct
+`reqwest::get` and `ureq::{get, post}` requests, and `thread::sleep`. These are
+language- and API-specific normalized call shapes, not source-text matches. The
+pack does not claim Rust database or
+subprocess coverage yet: common APIs expose generic instance methods whose
+resolved receiver type is not available to structural match policies, so a
+name-only rule would be too broad. Dynamic evaluation and unsafe object
+deserialization also remain scoped to languages with a defensible equivalent.
+
 Use `bifrost --list-policies` or MCP `list_policies` to inspect the exact catalog
 in the running build. Select it with `--policy-pack bifrost.code-smells`, a
 `--policy-category`, or a stable `--policy-id`; MCP `run_policy` exposes the same

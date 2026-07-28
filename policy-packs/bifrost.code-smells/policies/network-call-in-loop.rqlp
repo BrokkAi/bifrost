@@ -21,4 +21,12 @@
             (language java
               (inside (loop) (call :receiver (name "client") :callee (name "send"))))
             (language javascript (inside (loop) (call :callee (name "fetch"))))
-            (language typescript (inside (loop) (call :callee (name "fetch"))))))))
+            (language typescript (inside (loop) (call :callee (name "fetch"))))
+            (language rust
+              (inside (loop) (call :receiver (name "reqwest") :callee (name "get"))))
+            (language rust
+              (inside
+                (loop)
+                (call
+                  :receiver (name "ureq")
+                  :callee (name/regex "^(get|post)$"))))))))

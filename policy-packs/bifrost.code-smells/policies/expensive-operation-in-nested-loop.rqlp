@@ -37,4 +37,12 @@
                 (has
                   (loop
                     (has
-                      (call :callee (name "parse")))))))))))
+                      (call :callee (name "parse")))))))
+            (language rust
+              (loop
+                (has
+                  (loop
+                    (has
+                      (call
+                        :receiver (name "fs")
+                        :callee (name/regex "^(read|read_to_string)$")))))))))))

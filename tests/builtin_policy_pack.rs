@@ -378,6 +378,109 @@ export function nestedDeferred(rows: string[][]): void {
 }
 "#;
 
+const RUST_POSITIVES: &str = r#"fn local_smells(items: &mut [String]) {
+    for item in items.iter() {
+        items.sort();
+        items.sort_by(|left, right| left.cmp(right));
+        items.sort_by_key(|value| value.len());
+        items.sort_by_cached_key(|value| value.len());
+        items.sort_unstable();
+        items.sort_unstable_by(|left, right| left.cmp(right));
+        items.sort_unstable_by_key(|value| value.len());
+        Regex::new("x");
+        fs::read(item);
+        std::fs::read_to_string(item);
+        serde_json::to_string(item);
+        serde_json::to_vec(item);
+        bincode::serialize(item);
+        serde_json::from_str::<Value>(item);
+        serde_json::from_slice::<Value>(item.as_bytes());
+        bincode::deserialize::<Value>(item.as_bytes());
+        toml::from_str::<Value>(item);
+        reqwest::get(item);
+        ureq::get(item);
+        ureq::post(item);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn nested_smell(rows: &[Vec<String>]) {
+    for row in rows {
+        for item in row {
+            fs::read(item);
+            std::fs::read_to_string(item);
+        }
+    }
+}
+"#;
+
+const RUST_NEAR_MISSES: &str = r#"fn outside(items: &mut [String], item: &str) {
+    items.sort();
+    items.sort_by(|left, right| left.cmp(right));
+    items.sort_by_key(|value| value.len());
+    items.sort_by_cached_key(|value| value.len());
+    items.sort_unstable();
+    items.sort_unstable_by(|left, right| left.cmp(right));
+    items.sort_unstable_by_key(|value| value.len());
+    Regex::new("x");
+    fs::read(item);
+    std::fs::read_to_string(item);
+    serde_json::to_string(item);
+    serde_json::to_vec(item);
+    bincode::serialize(item);
+    serde_json::from_str::<Value>(item);
+    serde_json::from_slice::<Value>(item.as_bytes());
+    bincode::deserialize::<Value>(item.as_bytes());
+    toml::from_str::<Value>(item);
+    reqwest::get(item);
+    ureq::get(item);
+    ureq::post(item);
+    std::thread::sleep(Duration::from_millis(1));
+
+    for value in items.iter() {
+        items.binary_search(value);
+        regex.is_match(value);
+        fs::metadata(value);
+        serde_json::Value::get(&json, value);
+        bincode::serialized_size(value);
+        reqwest::Client::new();
+        ureq::Agent::new();
+        std::thread::yield_now();
+    }
+    for row in [items] {
+        for value in row {
+            cache.lookup(value);
+        }
+    }
+}
+"#;
+
+const RUST_DEFERRED_LEXICAL_POSITIVES: &str = r#"fn deferred(items: &[String]) {
+    for _item in items {
+        fn later() {
+            let mut values = vec!["b", "a"];
+            values.sort_unstable_by_key(|value| value.len());
+            Regex::new("x");
+            std::fs::read_to_string("input.txt");
+            serde_json::to_vec("value");
+            toml::from_str::<Value>("key = 'value'");
+            ureq::get("https://example.invalid");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+fn nested_deferred(rows: &[Vec<String>]) {
+    for row in rows {
+        for _item in row {
+            fn later() {
+                fs::read("input.txt");
+            }
+        }
+    }
+}
+"#;
+
 const TSX_SORT_POSITIVE: &str = r#"export function SortedRows({ rows }: { rows: string[][] }) {
   for (const row of rows) {
     row.sort();
@@ -410,6 +513,8 @@ fn expected_finding_lines(policy_id: &str) -> BTreeMap<&'static str, Vec<u64>> {
             ("Deferred.java", &[6]),
             ("positive.ts", &[20]),
             ("deferred.ts", &[4]),
+            ("positive.rs", &[3, 4, 5, 6, 7, 8, 9]),
+            ("deferred.rs", &[5]),
             ("positive.tsx", &[3]),
             ("tsx/positive.tsx", &[3]),
         ],
@@ -422,6 +527,8 @@ fn expected_finding_lines(policy_id: &str) -> BTreeMap<&'static str, Vec<u64>> {
             ("deferred.js", &[4]),
             ("positive.ts", &[21]),
             ("deferred.ts", &[5]),
+            ("positive.rs", &[10]),
+            ("deferred.rs", &[6]),
         ],
         "bifrost.performance.file-read-in-loop" => &[
             ("positive.py", &[20, 32]),
@@ -432,6 +539,8 @@ fn expected_finding_lines(policy_id: &str) -> BTreeMap<&'static str, Vec<u64>> {
             ("deferred.js", &[5]),
             ("positive.ts", &[22]),
             ("deferred.ts", &[6]),
+            ("positive.rs", &[11, 12, 30, 31]),
+            ("deferred.rs", &[7, 20]),
         ],
         "bifrost.performance.serialization-in-loop" => &[
             ("positive.py", &[21]),
@@ -442,6 +551,8 @@ fn expected_finding_lines(policy_id: &str) -> BTreeMap<&'static str, Vec<u64>> {
             ("deferred.js", &[6]),
             ("positive.ts", &[23]),
             ("deferred.ts", &[7]),
+            ("positive.rs", &[13, 14, 15]),
+            ("deferred.rs", &[8]),
         ],
         "bifrost.performance.parsing-in-loop" => &[
             ("positive.py", &[22]),
@@ -452,6 +563,8 @@ fn expected_finding_lines(policy_id: &str) -> BTreeMap<&'static str, Vec<u64>> {
             ("deferred.js", &[7]),
             ("positive.ts", &[24, 34]),
             ("deferred.ts", &[8, 20]),
+            ("positive.rs", &[16, 17, 18, 19]),
+            ("deferred.rs", &[9]),
         ],
         "bifrost.performance.database-call-in-loop" => &[
             ("positive.py", &[23]),
@@ -472,6 +585,8 @@ fn expected_finding_lines(policy_id: &str) -> BTreeMap<&'static str, Vec<u64>> {
             ("deferred.js", &[9, 19]),
             ("positive.ts", &[26]),
             ("deferred.ts", &[10]),
+            ("positive.rs", &[20, 21, 22]),
+            ("deferred.rs", &[10]),
         ],
         "bifrost.performance.subprocess-in-loop" => &[
             ("positive.py", &[26]),
@@ -488,6 +603,8 @@ fn expected_finding_lines(policy_id: &str) -> BTreeMap<&'static str, Vec<u64>> {
             ("deferred.py", &[18]),
             ("Positive.java", &[12]),
             ("Deferred.java", &[14]),
+            ("positive.rs", &[23]),
+            ("deferred.rs", &[11]),
         ],
         "bifrost.performance.expensive-operation-in-nested-loop" => &[
             ("positive.py", &[30]),
@@ -498,6 +615,8 @@ fn expected_finding_lines(policy_id: &str) -> BTreeMap<&'static str, Vec<u64>> {
             ("deferred.js", &[16]),
             ("positive.ts", &[32]),
             ("deferred.ts", &[17]),
+            ("positive.rs", &[28]),
+            ("deferred.rs", &[17]),
         ],
         other => panic!("unexpected built-in policy {other}"),
     };
@@ -522,6 +641,9 @@ fn code_smell_pack_matches_every_selector_alternative_and_excludes_near_misses()
         .file("positive.ts", TYPESCRIPT_POSITIVES)
         .file("safe.ts", TYPESCRIPT_NEAR_MISSES)
         .file("deferred.ts", TYPESCRIPT_DEFERRED_LEXICAL_POSITIVES)
+        .file("positive.rs", RUST_POSITIVES)
+        .file("safe.rs", RUST_NEAR_MISSES)
+        .file("deferred.rs", RUST_DEFERRED_LEXICAL_POSITIVES)
         .file("positive.tsx", TSX_SORT_POSITIVE)
         .file("safe.tsx", TSX_SORT_NEAR_MISS)
         .file("tsx/positive.tsx", TSX_SORT_POSITIVE)

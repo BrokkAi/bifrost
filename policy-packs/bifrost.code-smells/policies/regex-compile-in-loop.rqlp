@@ -21,4 +21,6 @@
             (language javascript
               (inside (loop) (call :callee (name "RegExp"))))
             (language typescript
-              (inside (loop) (call :callee (name "RegExp"))))))))
+              (inside (loop) (call :callee (name "RegExp"))))
+            (language rust
+              (inside (loop) (call :receiver (name "Regex") :callee (name "new"))))))))

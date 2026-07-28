@@ -6,11 +6,12 @@ record covers the subsequent review fixes on the same branch as well.
 
 ## Shipped surface
 
-- Embedded pack ID: `bifrost.code-smells`, manifest schema 1, pack version 1.0.0.
+- Embedded pack ID: `bifrost.code-smells`, manifest schema 1, pack version 1.1.0.
 - Twelve canonical `.rqlp` sources with checked semantic hashes: two correctness
   rules and ten structural performance review rules.
-- The sort rule uses one language-neutral selector unchanged across Python,
-  Java, TypeScript, and TSX source paths.
+- The sort rule retains one language-neutral selector unchanged across Python,
+  Java, TypeScript, and TSX source paths and adds the seven exact Rust slice
+  `sort*` variants as one anchored normalized-name family.
 - Deterministic selection by pack, category, or stable policy ID.
 - One mixed coordinator for embedded and workspace-file inputs.
 - CLI discovery and selection through `--list-policies`, `--policy-pack`,
@@ -22,7 +23,7 @@ record covers the subsequent review fixes on the same branch as well.
 ## Focused evidence
 
 The shared inferred-language fixture uses one analyzer snapshot for Python,
-Java, JavaScript, and TypeScript. Every claimed policy/language pair has a
+Java, JavaScript, TypeScript, and Rust. Every claimed policy/language pair has a
 positive source file and a structurally similar outside-loop or safe-API near
 miss. The corpus exercises every selector alternative (including root and
 nested TSX positives and near misses for the language-neutral sort rule) and
@@ -31,6 +32,16 @@ hide a broken or broadened branch. It also locks the current declaration-crossin
 explicit lexical positive and proves that `yaml.safe_load` plus
 `yaml.load(..., Loader=yaml.SafeLoader)` are not reported. All twelve runs
 complete and the near-miss files produce no findings.
+
+Rust coverage is deliberately API-specific. Eight policies now cover slice
+sorting, `Regex::new`, whole-file `fs` reads, the exact `serde_json` and
+`bincode` entry points listed in the public policy docs, `toml::from_str`,
+direct `reqwest` / `ureq` requests, `thread::sleep`, and nested-loop file reads.
+Database and subprocess
+rules remain unclaimed for Rust because the current structural facts cannot
+prove the receiver type of generic instance methods such as `execute`,
+`spawn`, `status`, or `output`. Dynamic evaluation and unsafe deserialization
+also have no defensible Rust equivalent in this catalog.
 
 Passing commands during implementation:
 
@@ -62,9 +73,10 @@ locations, completion, and diagnostics.
 
 The strict Clippy run used rustup's Cargo and `cargo-clippy` from one toolchain;
 the default shell otherwise paired rustup Cargo with Homebrew `cargo-clippy`
-artifacts built by a different LLVM patch level. Package validation archived
-all 1,498 expected files, verified the packaged crate, and produced a 9,342,428
-byte archive under the 10 MB compressed-size budget. The staged plugin smoke passed launcher
+artifacts built by a different LLVM patch level. The Rust-increment rerun pinned
+both tools to rustup and passed strict all-target/all-feature Clippy. Package
+validation archived all 1,500 expected files, verified the packaged crate, and
+produced an 8.9 MiB archive under the 10 MB compressed-size budget. The staged plugin smoke passed launcher
 resolution, the recorded Codex handshake, MCP roots, and built-in policy
 listing/execution from an empty plugin cache.
 
@@ -81,6 +93,24 @@ compile failure.
 The full twelve-policy fixture evaluation completed in 0.12 seconds after the
 small analyzer snapshot was built. This number describes the synthetic policy
 corpus, not self-repository startup or production p95 latency.
+
+The Rust expansion reran the exact selector corpus after replacing repeated
+same-receiver union branches with finite anchored normalized-name predicates.
+Every individual Rust API alternative still has an exact expected source line,
+and all outside-loop and near-miss Rust calls remain clean.
+
+The final task-level policy check could not use the checked-in
+`bifrost-policy-checking` MCP workflow because this Codex task exposed neither
+`list_policies` nor `run_policy`. The user-requested CLI dogfood fallback ran
+the complete `bifrost.code-smells` pack with evaluation date 2026-07-28 and
+`fail-on warning`; there are no canonical repository-defined policy roots
+outside fixtures and the embedded pack. The report retained 134 review
+findings, had no suppression document, completed seven policies, and marked
+five performance policies inconclusive with `execution_budget_exhausted`
+(two also reported `stable_anchor_unavailable`). No finding points at a file
+changed by this Rust-policy increment. Per the skill contract, this is an
+unreliable policy result rather than a green check; #1246 owns the repeated
+union seed work.
 
 ## Performance observations
 
@@ -121,6 +151,12 @@ already-running MCP process.
 - #824 owns source-backed CFG/data-flow/query-policy exposure, and #1205 owns
   the cross-language exact value-flow readiness gate. No file-level projection
   was used to simulate a semantic finding.
+- #1246, <https://github.com/BrokkAi/bifrost/issues/1246>, owns structural seed
+  sharing across RQL union branches. A fresh Bifrost self-scan proved that the
+  multi-language performance category can exceed the fixed two-million-fact
+  per-policy budget even after Rust alternatives with the same receiver were
+  collapsed. Exact findings are retained, but five runs become inconclusive;
+  global hard caps were not raised to hide the repeated work.
 
 These blockers mean the branch delivers #1204's release-bundled structural
 wave, CLI/MCP surface, and rule-authoring protocol, but not the epic's required

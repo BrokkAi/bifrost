@@ -22,4 +22,10 @@
             (language javascript
               (inside (loop) (call :receiver (name "fs") :callee (name "readFileSync"))))
             (language typescript
-              (inside (loop) (call :receiver (name "fs") :callee (name "readFileSync"))))))))
+              (inside (loop) (call :receiver (name "fs") :callee (name "readFileSync"))))
+            (language rust
+              (inside
+                (loop)
+                (call
+                  :receiver (name "fs")
+                  :callee (name/regex "^(read|read_to_string)$"))))))))

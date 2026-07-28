@@ -24,6 +24,10 @@ The work also turns policy dogfooding into a durable maintenance practice. `AGEN
 - [x] (2026-07-28 10:05Z) Recorded focused corpus timing and cancelled debug self-repository attempts honestly; linked declaration-bounded containment to new #1232, proven-only call-policy semantics to new #1233, CFG/value-flow to #824/#1205, and the exact 6.883-second plugin read to #1228.
 - [x] (2026-07-28 09:37Z) Ran formatting, the six-test exact selector corpus, all 23 policy CLI tests, all 29 MCP server tests, the rootless listing unit test, strict all-target/all-feature Clippy, clean-room crate packaging, and staged-plugin smoke. The host-side full gate passed all 2,011 enabled library tests (seven ignored) and every integration target before an unchanged Scala LSP diagnostics test blocked indefinitely; the exact test reproduced the same unbounded wait standalone. Security and DevOps review found no issues; senior and architecture re-review found no remaining critical, high, or medium findings after selector, host-contract, inventory, deferred-body, and TSX fixes.
 - [x] (2026-07-28 10:56Z) Shipped and validated the generic `bifrost-policy-checking` skill, Pi policy capability, Amp tool allowlist, embedded CLI installation, and staged fresh-host skill/tool contract.
+- [x] (2026-07-28 12:22Z) Extended eight performance policies to Rust with exact normalized stdlib/crate API families, added positive/outside/deferred fixtures for every selector alternative, bumped the pack to 1.1.0, dogfooded the category on Bifrost, and filed union seed-sharing follow-up #1246 after the real mixed workspace exceeded per-policy fact budgets.
+- [x] (2026-07-28 12:22Z) Ran the checked-in policy-checking completion protocol as far as this task allows: MCP policy tools remain absent, while the explicitly requested CLI fallback selected the complete built-in pack, found no canonical repository policy roots, retained 134 review findings, and honestly returned five inconclusive runs with no suppressions. No finding targeted a file changed by the Rust increment.
+- [x] (2026-07-28 12:45Z) Passed the final seven-variant Rust selector corpus, all 6 pack tests, 23 CLI tests, 29 MCP tests, 8 policy-doc tests, catalog consistency, formatting/diff hygiene, coherent-rustup strict all-target/all-feature Clippy, and clean-room packaging of 1,500 files into an 8.9 MiB archive under the 10 MB budget.
+- [x] (2026-07-28 12:45Z) Completed final diff review; it found the omitted standard `sort_by_cached_key` alternative, which was added with its exact positive/outside-loop oracle and regenerated semantic hash. No critical or high defect remains in the Rust increment.
 
 ## Surprises & Discoveries
 
@@ -62,6 +66,12 @@ The work also turns policy dogfooding into a durable maintenance practice. `AGEN
 
 - Observation: explicit-root MCP against this linked worktree cannot write the primary checkout's shared analyzer cache under the current sandbox.
   Evidence: the first active-workspace call failed with SQLite `attempt to write a readonly database`; setting `BIFROST_CACHE_DIR` to a fresh private temporary directory preserved the same active source root and made the policy run complete. No tracked or shared cache file was modified to bypass the boundary.
+
+- Observation: Rust scoped calls retain enough normalized identity for exact module/type receiver families, but common database and subprocess instance methods do not.
+  Evidence: `std::fs::read_to_string` normalizes to receiver `fs` and callee `read_to_string`; `Regex::new`, `serde_json::from_str`, and `std::thread::sleep` similarly retain `Regex`, `serde_json`, and `thread`. Calls such as `connection.execute()` retain only the syntactic variable name, while chained `Command::new(...).output()` does not retain resolved `Command` identity at the launch call.
+
+- Observation: a multi-language policy union can exhaust its per-policy structural fact budget by replaying compatible seed scans.
+  Evidence: the optimized Rust dogfood run retained exact findings but reported `execution_budget_exhausted` for nested operations, file reads, parsing, serialization, and sorting on the mixed Bifrost workspace. Same-receiver Rust alternatives were already collapsed into finite anchored name predicates, so #1246 now owns shared seed/fact accounting instead of raising the two-million-fact hard cap.
 
 ## Decision Log
 
@@ -109,9 +119,13 @@ The work also turns policy dogfooding into a durable maintenance practice. `AGEN
   Rationale: the cached package passes launcher readiness and a real MCP initialize, tools/list, and `search_symbols` call. A brand-new Codex task is the remaining host-level reproduction boundary; changing the working launcher or MCP config without that failure would be speculative.
   Date/Author: 2026-07-28 / Codex
 
+- Decision: Extend the existing cross-language performance policy identities to Rust only where normalized calls preserve a defensible API family.
+  Rationale: slice sorting, `Regex::new`, whole-file `fs` reads, `serde_json` / `bincode` / `toml` conversion, direct `reqwest` / `ureq` requests, and `thread::sleep` are structurally distinguishable. Rust database and subprocess instance methods are not type-resolved in match policies, and dynamic evaluation or unsafe object deserialization has no equivalent worth inventing. Omitting those claims is more durable than broad callee-name matches.
+  Date/Author: 2026-07-28 / Codex
+
 ## Outcomes & Retrospective
 
-The branch ships the first offline `bifrost.code-smells` structural wave: twelve human-reviewable policies, deterministic manifest and hashes, mixed built-in/workspace evaluation, CLI/MCP discovery and selection, exact canonical host parity, package/staged-plugin proof, and a durable review-to-policy maintenance protocol. It now also ships a generic policy-checking skill across plugin, Pi, Amp, Codex-generated, and embedded CLI distributions. The skill discovers categories from `list_policies`, selects all built-ins by pack or a subset by category/ID, combines repository roots explicitly, and treats missing tools or unreliable reports as validation failures. Review tightened selector-alternative coverage, exact source-line assertions, TypeScript/TSX scope, language neutrality, safe-loader behavior, rootless discovery, and directory-to-manifest inventory validation. Final senior and architecture re-review found no remaining critical, high, or medium defect in this structural slice.
+The branch ships the first offline `bifrost.code-smells` structural wave: twelve human-reviewable policies, deterministic manifest and hashes, mixed built-in/workspace evaluation, CLI/MCP discovery and selection, exact canonical host parity, package/staged-plugin proof, and a durable review-to-policy maintenance protocol. Pack 1.1 now gives Rust eight API-specific performance-policy branches and an exact fixture oracle, allowing Bifrost and the other internal Rust tools to dogfood the same installed pack. It also ships a generic policy-checking skill across plugin, Pi, Amp, Codex-generated, and embedded CLI distributions. The skill discovers categories from `list_policies`, selects all built-ins by pack or a subset by category/ID, combines repository roots explicitly, and treats missing tools or unreliable reports as validation failures. Review tightened selector-alternative coverage, exact source-line assertions, TypeScript/TSX/Rust scope, language neutrality, safe-loader behavior, rootless discovery, and directory-to-manifest inventory validation. Final senior and architecture re-review found no remaining critical, high, or medium defect in the original structural slice; local final review of the Rust increment found and fixed the missing `sort_by_cached_key` standard-library alternative and found no remaining critical or high defect.
 
 The result is releasable but does not close the entire epic. The attempted bounded caller-chain policy produced honest partial discovery, current match-policy projection cannot turn CFG/data-flow terminal evidence into precise findings, and public general value flow is not ready. #1233 and #824/#1205 retain those acceptance items. #1232 owns declaration-bounded containment; until then loop rules are deliberately worded and tested as lexical prompts. The full repository gate is green through 2,011 enabled library tests and all preceding integrations, with the unrelated standalone Scala LSP notification hang recorded as the exact remaining environment/runtime blocker.
 
@@ -214,6 +228,7 @@ Relevant open issues:
     #1228 sub-five-second common code-intelligence latency and cancellation
     #1232 declaration-bounded RQL containment
     #1233 non-exhaustive proven-only call-graph match-policy semantics
+    #1246 shared structural seed/fact work across RQL union branches
 
 Related completed foundation:
 
@@ -243,3 +258,5 @@ The implementation uses existing `serde`, `serde_json`, policy registries, analy
 Revision note (2026-07-28): Initial plan created after reconciling live issue, repository, related-issue, and plugin-latency state. The plan deliberately ships a structural first pack and links semantic-rule gaps to #824/#1205 instead of manufacturing file-level CFG/data-flow findings.
 
 Revision note (2026-07-28): Updated after the first executable milestone. Catalog, coordinator, twelve rules, CLI/MCP parity, package smoke, docs, and durable `AGENTS.md` guidance are implemented. A bounded call-graph candidate was rejected because honest partial-discovery diagnostics made the run unreliable, and lexical containment across nested callable declarations was minimized for focused follow-up issues.
+
+Revision note (2026-07-28): Added the Rust dogfood increment. Eight existing performance policies now recognize finite Rust API families with exact positive, near-miss, and deferred lexical fixtures. A real self-scan exposed repeated union seed work and produced follow-up #1246; the policy implementation keeps honest inconclusive completion instead of increasing global budgets.
