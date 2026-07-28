@@ -170,3 +170,27 @@ fn benchmark_workflow_enforces_actionable_regressions_by_default() {
         "the final gate must enforce a failed strict comparison"
     );
 }
+
+#[test]
+fn issue_1228_workflow_enforces_release_interactive_latency_with_profiles() {
+    let workflow = checked_in_workflow();
+    let job = workflow
+        .split_once("  interactive-latency:\n")
+        .map(|(_, job)| job)
+        .expect("workflow should define the interactive latency job");
+
+    assert!(job.contains("    timeout-minutes: 90\n"));
+    assert!(job.contains("scripts/run-interactive-latency.sh --profile"));
+    assert!(job.contains("if-no-files-found: error"));
+    assert!(job.contains("| Bounded incomplete | Status |"));
+    assert!(job.contains("Light p95 | Cancel p95 | Dominant phase"));
+    assert!(job.contains(".bounded_incomplete_iterations // 0"));
+    assert!(
+        job.contains("      - name: Upload interactive latency artifacts\n        if: always()")
+    );
+    assert!(
+        job.contains(
+            "if [ \"${{ steps.run_interactive_latency.outcome }}\" != \"success\" ]; then"
+        )
+    );
+}

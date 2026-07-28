@@ -14,6 +14,9 @@ use tree_sitter::Node;
 pub(super) fn record_module_qualified_hits(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
+        if ctx.cancellation_requested() {
+            return;
+        }
         match node.kind() {
             "scoped_identifier" | "scoped_type_identifier" => {
                 record_scoped_identifier_hit(node, ctx)

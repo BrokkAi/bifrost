@@ -1,0 +1,34 @@
+(policy
+  :schema-version 1
+  :id "bifrost.performance.parsing-in-loop"
+  :name "Parsing inside a loop"
+  :message "Review whether this lexically nested parse repeats invariant work"
+  :severity warning
+  :description "A parse call lexically nested under a loop may repeat tokenization, validation, and allocation. This structural prompt also includes deferred nested bodies; verify execution and invariance before hoisting it."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["performance" "parsing" "loop" "code-smell"]
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql
+          :schema-version 2
+          (union
+            (language python
+              (inside (loop) (call :receiver (name "json") :callee (name "loads"))))
+            (language java
+              (inside (loop) (call :callee (name "parse"))))
+            (language javascript
+              (inside (loop) (call :receiver (name "JSON") :callee (name "parse"))))
+            (language typescript
+              (inside (loop) (call :receiver (name "JSON") :callee (name "parse"))))
+            (language rust
+              (inside
+                (loop)
+                (call
+                  :receiver (name "serde_json")
+                  :callee (name/regex "^(from_str|from_slice)$"))))
+            (language rust
+              (inside (loop) (call :receiver (name "bincode") :callee (name "deserialize"))))
+            (language rust
+              (inside (loop) (call :receiver (name "toml") :callee (name "from_str"))))))))

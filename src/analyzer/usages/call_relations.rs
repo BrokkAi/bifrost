@@ -18,7 +18,7 @@ use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 
-use super::{FuzzyResult, UsageFinder, UsageHit, UsageHitKind, UsageProof};
+use super::{FuzzyResult, UsageFinder, UsageHit, UsageHitKind, UsageProof, UsageQueryCompletion};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CallArgument {
@@ -524,6 +524,7 @@ impl CallRelationService {
             scanned_source_bytes: query.scanned_source_bytes,
             examined_candidates: 0,
         };
+        let query_cancelled = query.completion == UsageQueryCompletion::Cancelled;
         let (hits, mut truncated, mut diagnostics) = call_hits(query.result, target);
         if query.source_bytes_truncated {
             diagnostics.push(CallRelationDiagnostic::new(
@@ -548,7 +549,8 @@ impl CallRelationService {
         truncated |= query.candidate_files_truncated || query.source_bytes_truncated;
         let mut syntax_cache = CallSyntaxCache::default();
         let mut sites = Vec::new();
-        let mut cancelled = false;
+        let mut cancelled = query_cancelled;
+        truncated |= query_cancelled;
         let mut omitted = 0usize;
         for (hit, proof) in hits.into_iter().take(limits.max_candidates) {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {

@@ -48,6 +48,27 @@ bifrost --root /path/to/project \
   --output reports/bifrost.sarif
 ```
 
+List the policies embedded in the installed binary, then select the whole
+pack, one category, or one stable policy ID:
+
+```bash
+bifrost --list-policies
+bifrost --root /path/to/project \
+  --policy-pack bifrost.code-smells \
+  --evaluation-date 2026-07-28 \
+  --format json
+bifrost --root /path/to/project \
+  --policy-category performance \
+  --policy-id bifrost.correctness.dynamic-evaluation
+```
+
+`--policy-pack`, `--policy-category`, and `--policy-id` are repeatable and form
+one deduplicated union in manifest order. They can be combined with
+`--policy-file`; built-in and workspace policies share one analyzer snapshot,
+budget, suppression audit, report, and exit status. `--list-policies` prints the
+deterministic manifest without constructing an analyzer and cannot be combined
+with evaluation options.
+
 `--policy-file` is repeatable. Every root must be a `(policy ...)` document;
 passing a diagnostic-neutral `(endpoint ...)` as a root is a status-2 report.
 Policies may still load endpoints and saved `.rql` selectors as explicit
@@ -57,7 +78,8 @@ explicitly populated `TaintCatalogRegistry`. A policy that uses only
 `(match-endpoints :ids [...])` also requires an embedding to pre-register those
 endpoint IDs; in a normal CLI run, the same policy can discover endpoints
 through a `match-directory` closure before selecting exact IDs. The CLI does
-not scan for policies, endpoints, or catalogs on its own.
+not scan for workspace policies, endpoints, or catalogs on its own. Built-in
+policies are selected only through the explicit selectors above.
 
 By default, policy evaluation reads `.bifrost/suppressions.json` beneath the
 workspace root. Pass `--suppressions-file reviews/accepted.json` to select one
@@ -196,11 +218,12 @@ The built-in destinations are:
 - `--target global`: install to `~/.agents/skills`
 - `--skills-root /path/to/skills`: install to an explicit skill root
 
-The default skill set installs the three Bifrost code-intelligence skills:
+The default skill set installs four generic Bifrost agent skills:
 
 - `bifrost-code-navigation`
 - `bifrost-code-reading`
 - `bifrost-codebase-search`
+- `bifrost-policy-checking`
 
 Use `--skill-set all` to also install the Brokk workflow and review skills. Use
 `--mode copy` for self-contained copies, `--mode symlink` for checkout-local

@@ -17,6 +17,7 @@ const canonicalSkills = [
   "./skills/bifrost-code-navigation",
   "./skills/bifrost-code-reading",
   "./skills/bifrost-codebase-search",
+  "./skills/bifrost-policy-checking",
 ];
 
 const repoRoot = path.resolve(packageDir, "..", "..");
@@ -66,6 +67,7 @@ const requiredFiles = [
   "skills/bifrost-code-navigation/SKILL.md",
   "skills/bifrost-code-reading/SKILL.md",
   "skills/bifrost-codebase-search/SKILL.md",
+  "skills/bifrost-policy-checking/SKILL.md",
   "LICENSE.md",
   "GPL-3.0.md",
   "SOURCE.md",

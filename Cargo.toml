@@ -12,16 +12,69 @@ homepage = "https://github.com/BrokkAi/bifrost"
 readme = "README.md"
 keywords = ["analyzer", "tree-sitter", "lsp", "mcp", "code-analysis"]
 categories = ["development-tools", "parser-implementations", "command-line-utilities"]
+# Order matters: gitignore semantics, last match wins. A "!" negation only
+# re-includes a file if it appears AFTER the broad pattern it carves out
+# of. Do not sort this list. scripts/check-crate-package.sh guards both
+# directions (excluded content staying out, negated files staying in).
 exclude = [
     ".agents/**",
+    # Repository/process metadata that Cargo includes by default but crate
+    # consumers never need.
+    ".cargo/config.toml",
+    ".claude-plugin/**",
+    ".cursor-plugin/**",
+    ".gitattributes",
+    ".github/**",
+    ".gitignore",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
     # Repository test targets run from source checkouts and CI, not from the
     # published crate. Retain non-Rust fixtures used by inline library tests.
     "/tests/**/*.rs",
     "/tests/common/**",
     "/python_tests/**",
-    # The documentation site owns these large demos; Rust consumers do not
-    # need duplicate animated media in the crate archive.
-    "docs/src/assets/*.gif",
+    # Fixtures consumed only by the excluded integration-test targets. Inline
+    # #[cfg(test)] modules keep csharp-external (with its source provenance),
+    # two policies/*.rqlp files, policy-cli/project, typestate, and the
+    # testcode-java sources below.
+    "tests/fixtures/mcp/**",
+    "tests/fixtures/policies/**",
+    "!tests/fixtures/policies/dynamic-eval.rqlp",
+    "!tests/fixtures/policies/endpoints/http-request-parameter.rqlp",
+    "tests/fixtures/policy-cli/overrides/**",
+    "tests/fixtures/proxygroup_test_regression.go",
+    "tests/fixtures/sarif/**",
+    "tests/fixtures/scala-issue-1016/**",
+    "tests/fixtures/scala-issue-1068/**",
+    "tests/fixtures/testcode-cpp/**",
+    "tests/fixtures/testcode-cs/**",
+    "tests/fixtures/testcode-git-rank-java/**",
+    "tests/fixtures/testcode-go/**",
+    "tests/fixtures/testcode-java/bin/**",
+    # The documentation site is published separately; none of it is a crate
+    # build or runtime input.
+    "docs/**",
+    # Benchmark baselines and runner tooling are development-only.
+    "benchmark/**",
+    # Editor extension sources ship through the VS Code marketplace. The
+    # Rune IR TextMate grammar stays: an inline test include_str!'s it.
+    "editors/**",
+    "!editors/vscode/syntaxes/bifrost-rune-ir.tmLanguage.json",
+    # Agent plugin manifests/tests ship through plugin marketplaces. Only
+    # the SKILL.md files embedded into the binary via include_str! stay;
+    # anything else placed under skills/ must not ship.
+    "plugins/**",
+    "!plugins/bifrost-agent/skills/*/SKILL.md",
+    # Development tooling. The voyage sidecar script is a runtime input for
+    # the nlp feature and stays. The mcp property fuzzer's repo-rank helper
+    # (scripts/mcp-fuzzer-repo-rank.py) is deliberately dropped: the fuzzer
+    # binary is a development tool that already needs a source checkout.
+    "scripts/**",
+    "!scripts/voyage_sidecar.py",
+    "examples/**",
     "vendor/tree-sitter-scala/README.md",
     "vendor/tree-sitter-scala/queries/**",
     "vendor/tree-sitter-scala/src/grammar.json",

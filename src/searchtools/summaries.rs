@@ -1,3 +1,4 @@
+use super::navigation::deserialize_symbol_lookup_names;
 use super::selectors::*;
 use super::*;
 
@@ -8,6 +9,7 @@ pub struct FilePatternsParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummariesParams {
+    #[serde(deserialize_with = "deserialize_symbol_lookup_names")]
     pub targets: Vec<String>,
 }
 
@@ -146,9 +148,18 @@ pub(super) struct SummaryTargets {
     pub(super) ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
+#[cfg(test)]
 pub(super) fn route_summary_targets(
     analyzer: &dyn IAnalyzer,
     targets: &[String],
+) -> SummaryTargets {
+    route_summary_targets_with_cancellation(analyzer, targets, None)
+}
+
+fn route_summary_targets_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    targets: &[String],
+    cancellation: Option<&crate::CancellationToken>,
 ) -> SummaryTargets {
     let _scope = profiling::scope("searchtools::route_summary_targets");
     let resolver = WorkspaceFileResolver::new(analyzer.project());
@@ -165,6 +176,9 @@ pub(super) fn route_summary_targets(
         .map(|target| target.trim())
         .filter(|target| !target.is_empty())
     {
+        if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+            break;
+        }
         if matches!(
             split_definition_selector(target),
             DefinitionSelector::FileAnchored { .. }
@@ -398,15 +412,19 @@ pub(super) fn container_entry_sort_key(entry: &ContainerListingEntry) -> (u8, &s
     }
 }
 
-pub(super) fn summarize_symbol_targets(
+fn summarize_symbol_targets_with_cancellation(
     analyzer: &dyn IAnalyzer,
     targets: Vec<String>,
+    cancellation: Option<&crate::CancellationToken>,
 ) -> SummaryResult {
     let mut summaries = Vec::new();
     let mut not_found = Vec::new();
     let mut ambiguous = Vec::new();
 
     for target in targets {
+        if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+            break;
+        }
         match resolve_selectable_definitions(analyzer, &target, resolve_codeunit_fuzzy) {
             SelectableDefinitionResolution::Resolved(code_units) => {
                 let start_len = summaries.len();
@@ -434,9 +452,17 @@ pub(super) fn summarize_symbol_targets(
 }
 
 pub fn get_summaries(analyzer: &dyn IAnalyzer, params: SummariesParams) -> SummaryResult {
+    get_summaries_with_cancellation(analyzer, params, None)
+}
+
+pub(crate) fn get_summaries_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    params: SummariesParams,
+    cancellation: Option<&crate::CancellationToken>,
+) -> SummaryResult {
     let _scope = profiling::scope("searchtools::get_summaries");
-    let targets = route_summary_targets(analyzer, &params.targets);
-    summarize_routed_targets(analyzer, &targets)
+    let targets = route_summary_targets_with_cancellation(analyzer, &params.targets, cancellation);
+    summarize_routed_targets_with_cancellation(analyzer, &targets, cancellation)
 }
 
 pub(super) fn skim_files_for_files(
@@ -485,11 +511,23 @@ pub(super) fn skim_files_note(truncated: bool, shown: usize, total: usize) -> Op
     })
 }
 
+#[cfg(any(test, feature = "nlp"))]
 pub(crate) fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> SummaryResult {
+    summarize_files_with_cancellation(analyzer, files, None)
+}
+
+fn summarize_files_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    files: Vec<ProjectFile>,
+    cancellation: Option<&crate::CancellationToken>,
+) -> SummaryResult {
     let _scope = profiling::scope("searchtools::summarize_files");
     let mut summaries: Vec<_> = files
         .into_par_iter()
         .filter_map(|file| {
+            if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+                return None;
+            }
             let mut elements = analyzer
                 .summary_file_projection(&file)
                 .map(|projection| summary_elements_from_file_projection(&projection, &file))
@@ -674,12 +712,21 @@ pub(super) fn extract_include_target(statement: &str) -> String {
     rest.to_string()
 }
 
-pub(super) fn summarize_routed_targets(
+fn summarize_routed_targets_with_cancellation(
     analyzer: &dyn IAnalyzer,
     summary_targets: &SummaryTargets,
+    cancellation: Option<&crate::CancellationToken>,
 ) -> SummaryResult {
-    let mut file_output = summarize_files(analyzer, summary_targets.file_targets.clone());
-    let symbol_output = summarize_symbol_targets(analyzer, summary_targets.symbol_targets.clone());
+    let mut file_output = summarize_files_with_cancellation(
+        analyzer,
+        summary_targets.file_targets.clone(),
+        cancellation,
+    );
+    let symbol_output = summarize_symbol_targets_with_cancellation(
+        analyzer,
+        summary_targets.symbol_targets.clone(),
+        cancellation,
+    );
 
     file_output.summaries.extend(symbol_output.summaries);
     file_output.listings = summary_targets.listings.clone();

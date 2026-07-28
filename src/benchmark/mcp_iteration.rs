@@ -1,7 +1,8 @@
 use crate::benchmark::artifact_path::{sanitize_component, unique_component};
 use crate::benchmark::mcp_session::{CapturedStderr, McpSession};
 use crate::benchmark::runner::BenchmarkProfile;
-use crate::benchmark::{BenchmarkRepoTarget, BenchmarkScenario};
+use crate::benchmark::{BenchmarkRepoTarget, BenchmarkScenario, McpTransportPhaseReport};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -71,6 +72,10 @@ pub(super) fn run_profiled_iteration<T>(
     });
 
     if profile.is_some() {
+        outcome = preserve_outcome_on_boundary_failure(outcome, session.profile_boundary());
+        // The first boundary response is delivered by the same writer as the
+        // tool response, proving the tool's writer-delivery scope has closed.
+        // A second boundary then seals stderr after that final timing line.
         outcome = preserve_outcome_on_boundary_failure(outcome, session.profile_boundary());
     } else if outcome.is_err() {
         // Flush stderr written before a normal JSON-RPC error response so the
@@ -176,6 +181,84 @@ pub(super) fn error_with_stderr_tail(error: String, tail: CapturedStderr) -> Str
     )
 }
 
+pub(super) fn transport_phase_report(
+    profile: Option<&BenchmarkProfile>,
+    artifacts: &[PathBuf],
+) -> Result<Vec<McpTransportPhaseReport>, String> {
+    let Some(profile) = profile else {
+        return Ok(Vec::new());
+    };
+    let measured = artifacts.iter().filter(|artifact| {
+        artifact
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("-measured-"))
+    });
+    let mut timings = BTreeMap::<(String, String), Vec<f64>>::new();
+    let mut phases = HashSet::new();
+    for artifact in measured {
+        let filename = artifact
+            .file_name()
+            .ok_or_else(|| format!("profile artifact `{}` has no filename", artifact.display()))?;
+        let path = profile.output_dir.join(filename);
+        let contents = std::fs::read_to_string(&path).map_err(|error| {
+            format!(
+                "failed to read profile artifact `{}`: {error}",
+                path.display()
+            )
+        })?;
+        for (phase, tool, duration_ms) in parse_transport_phase_timings(&contents) {
+            phases.insert(phase.clone());
+            timings.entry((phase, tool)).or_default().push(duration_ms);
+        }
+    }
+    for required in [
+        "queue_wait",
+        "execution",
+        "response_queue_wait",
+        "writer_delivery",
+    ] {
+        if !phases.contains(required) {
+            return Err(format!(
+                "profile artifacts omitted required MCP transport phase `{required}`"
+            ));
+        }
+    }
+    Ok(timings
+        .into_iter()
+        .map(|((phase, tool), durations)| {
+            McpTransportPhaseReport::from_timings(phase, tool, durations)
+        })
+        .collect())
+}
+
+fn parse_transport_phase_timings(contents: &str) -> Vec<(String, String, f64)> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let marker = line.find("mcp_request.")?;
+            let timing = &line[marker + "mcp_request.".len()..];
+            let phase_end = timing.find('[')?;
+            let tool_end = timing[phase_end + 1..].find(']')? + phase_end + 1;
+            let phase = &timing[..phase_end];
+            if !matches!(
+                phase,
+                "queue_wait" | "execution" | "response_queue_wait" | "writer_delivery"
+            ) {
+                return None;
+            }
+            let duration_start = timing[tool_end + 1..].rfind('(')? + tool_end + 2;
+            let duration_end = timing[duration_start..].find(" ms)")? + duration_start;
+            let duration_ms = timing[duration_start..duration_end].parse().ok()?;
+            Some((
+                phase.to_string(),
+                timing[phase_end + 1..tool_end].to_string(),
+                duration_ms,
+            ))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +273,23 @@ mod tests {
 
         assert!(error.starts_with("MCP child closed early"), "{error}");
         assert!(error.contains("stderr boundary unavailable"), "{error}");
+    }
+
+    #[test]
+    fn issue_1228_transport_phase_parser_separates_queue_and_execution() {
+        let timings = parse_transport_phase_timings(
+            "[bifrost-timing] DURATION mcp_request.queue_wait[scan_usages_by_location] (1.2 ms)\n\
+             [bifrost-timing] END mcp_request.execution[scan_usages_by_location] (3456.7 ms)\n\
+             [bifrost-timing] DURATION mcp_request.response_queue_wait[scan_usages_by_location] (0.4 ms)\n\
+             [bifrost-timing] END mcp_request.writer_delivery[scan_usages_by_location] (0.2 ms)\n",
+        );
+
+        assert_eq!(timings.len(), 4);
+        assert_eq!(
+            timings[0],
+            ("queue_wait".into(), "scan_usages_by_location".into(), 1.2)
+        );
+        assert_eq!(timings[1].0, "execution");
+        assert_eq!(timings[1].2, 3456.7);
     }
 }

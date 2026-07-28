@@ -14,6 +14,7 @@ use std::path::PathBuf;
 
 pub const EXTENDED_TOOL_NAMES: &[&str] = &[
     "query_code",
+    "list_policies",
     "run_policy",
     "get_symbol_locations",
     "get_symbol_ancestors",
@@ -26,6 +27,7 @@ pub const EXTENDED_TOOL_NAMES: &[&str] = &[
 ];
 
 pub(crate) const MAX_RUN_POLICY_PATH_BYTES: usize = 1_024;
+pub(crate) const MAX_RUN_POLICY_SELECTOR_BYTES: usize = 256;
 
 pub fn run_extended_stdio_server(
     root: PathBuf,
@@ -458,8 +460,17 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
             }),
         ),
         tool_descriptor(
+            "list_policies",
+            "List the deterministic built-in policy-pack manifest, including stable policy ids, categories, supported languages, capabilities, and semantic hashes. Does not construct or query a workspace analyzer.",
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        ),
+        tool_descriptor(
             "run_policy",
-            "Evaluate one or more explicit workspace-relative .rqlp policy files against the active immutable workspace snapshot. Returns the canonical schema-2 report and computed policy status. Built-in policy-pack discovery is intentionally outside this tool.",
+            "Evaluate built-in policy selections and/or explicit workspace-relative .rqlp files against the active immutable workspace snapshot. Returns the canonical schema-2 report and computed policy status.",
             json!({
                 "type": "object",
                 "properties": {
@@ -474,7 +485,43 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "minItems": 1,
                         "maxItems": max_policy_files,
                         "uniqueItems": true,
-                        "description": "Explicit workspace policy roots to evaluate together."
+                        "description": "Optional explicit workspace policy roots to evaluate together."
+                    },
+                    "policy_packs": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_RUN_POLICY_SELECTOR_BYTES
+                        },
+                        "minItems": 1,
+                        "maxItems": max_policy_files,
+                        "uniqueItems": true,
+                        "description": "Optional built-in pack ids."
+                    },
+                    "policy_categories": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_RUN_POLICY_SELECTOR_BYTES
+                        },
+                        "minItems": 1,
+                        "maxItems": max_policy_files,
+                        "uniqueItems": true,
+                        "description": "Optional built-in policy categories."
+                    },
+                    "policy_ids": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_RUN_POLICY_SELECTOR_BYTES
+                        },
+                        "minItems": 1,
+                        "maxItems": max_policy_files,
+                        "uniqueItems": true,
+                        "description": "Optional stable built-in policy ids."
                     },
                     "suppression_file": {
                         "type": "string",
@@ -494,7 +541,13 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "description": "Finding threshold used to compute the returned policy status."
                     }
                 },
-                "required": ["policy_files", "evaluation_date"],
+                "required": ["evaluation_date"],
+                "anyOf": [
+                    { "required": ["policy_files"] },
+                    { "required": ["policy_packs"] },
+                    { "required": ["policy_categories"] },
+                    { "required": ["policy_ids"] }
+                ],
                 "additionalProperties": false
             }),
         ),
@@ -866,17 +919,15 @@ mod tests {
     }
 
     #[test]
-    fn run_policy_schema_requires_bounded_explicit_inputs() {
+    fn run_policy_schema_requires_bounded_mixed_inputs() {
         let descriptor = extended_tool_descriptors()
             .into_iter()
             .find(|descriptor| descriptor["name"] == "run_policy")
             .expect("run_policy descriptor");
         let schema = &descriptor["inputSchema"];
         let policy_files = &schema["properties"]["policy_files"];
-        assert_eq!(
-            schema["required"],
-            json!(["policy_files", "evaluation_date"])
-        );
+        assert_eq!(schema["required"], json!(["evaluation_date"]));
+        assert_eq!(schema["anyOf"].as_array().map(Vec::len), Some(4));
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(policy_files["minItems"], 1);
         assert_eq!(
@@ -888,6 +939,19 @@ mod tests {
             policy_files["items"]["maxLength"],
             MAX_RUN_POLICY_PATH_BYTES
         );
+        for selector in ["policy_packs", "policy_categories", "policy_ids"] {
+            let property = &schema["properties"][selector];
+            assert_eq!(property["minItems"], 1);
+            assert_eq!(
+                property["maxItems"],
+                crate::analyzer::policy::PolicyBatchBudget::default().max_policies()
+            );
+            assert_eq!(property["uniqueItems"], true);
+            assert_eq!(
+                property["items"]["maxLength"],
+                MAX_RUN_POLICY_SELECTOR_BYTES
+            );
+        }
         assert_eq!(
             schema["properties"]["evaluation_date"]["pattern"],
             "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"

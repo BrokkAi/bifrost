@@ -19,6 +19,8 @@ pub(crate) enum TreeWalkAction {
     DescendWithExit,
     /// Do not descend into this node's children.
     Skip,
+    /// Stop the entire traversal immediately without firing pending exits.
+    Stop,
 }
 
 enum TreeWalkFrame<'tree> {
@@ -49,6 +51,7 @@ pub(crate) fn walk_tree_iterative<State>(
                     push_named_children(node, &mut stack);
                 }
                 TreeWalkAction::Skip => {}
+                TreeWalkAction::Stop => break,
             },
             TreeWalkFrame::Exit => exit(state),
         }
@@ -173,6 +176,30 @@ mod tests {
         );
         assert!(visited.iter().any(|k| k == "block"));
         assert!(!visited.iter().any(|k| k == "let_declaration"));
+    }
+
+    #[test]
+    fn issue_1228_walk_tree_iterative_can_stop_cooperatively() {
+        let source = "fn first() {} fn stop() {} fn never() {}";
+        let tree = parse(source);
+        let root = tree.root_node();
+        let mut visited: Vec<String> = Vec::new();
+        walk_tree_iterative(
+            root,
+            &mut visited,
+            |node, visited| {
+                let text = node.utf8_text(source.as_bytes()).unwrap_or_default();
+                visited.push(text.to_string());
+                if text.starts_with("fn stop") {
+                    TreeWalkAction::Stop
+                } else {
+                    TreeWalkAction::Descend
+                }
+            },
+            |_| {},
+        );
+        assert!(visited.iter().any(|text| text.starts_with("fn stop")));
+        assert!(!visited.iter().any(|text| text.starts_with("fn never")));
     }
 
     #[test]

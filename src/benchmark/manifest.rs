@@ -3,6 +3,7 @@ use crate::analyzer::structural::{
     CodeQuery, CodeQueryPlanSource, CodeQuerySeed, Pattern, StringPredicate,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
@@ -185,6 +186,10 @@ pub enum BenchmarkScenario {
     TypeHierarchy,
     #[serde(rename = "query_code")]
     QueryCode,
+    #[serde(rename = "interactive_code_intelligence")]
+    InteractiveCodeIntelligence,
+    #[serde(rename = "mcp_fairness")]
+    McpFairness,
 }
 
 impl BenchmarkScenario {
@@ -217,6 +222,8 @@ impl BenchmarkScenario {
             Self::CallHierarchy => "call_hierarchy",
             Self::TypeHierarchy => "type_hierarchy",
             Self::QueryCode => "query_code",
+            Self::InteractiveCodeIntelligence => "interactive_code_intelligence",
+            Self::McpFairness => "mcp_fairness",
         }
     }
 
@@ -226,6 +233,7 @@ impl BenchmarkScenario {
             Self::DeadCodeSmells => "report_dead_code_and_unused_abstraction_smells",
             Self::GetDefinition => "get_definitions_by_location",
             Self::CallHierarchy | Self::TypeHierarchy => self.label(),
+            Self::InteractiveCodeIntelligence | Self::McpFairness => self.label(),
             _ => self.label(),
         }
     }
@@ -264,7 +272,7 @@ impl QueryCodeWorkload {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkManifest {
     #[serde(default = "default_warmup_iterations")]
     pub warmup_iterations: usize,
@@ -406,7 +414,7 @@ impl BenchmarkManifest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkRepoTarget {
     pub name: String,
     pub url: String,
@@ -445,6 +453,10 @@ pub struct BenchmarkRepoTarget {
     pub type_hierarchy_queries: Vec<HierarchyQueryTarget>,
     #[serde(default)]
     pub query_code_queries: Vec<QueryCodeBenchmarkCase>,
+    #[serde(default)]
+    pub interactive_queries: Vec<InteractiveQueryBenchmarkCase>,
+    #[serde(default)]
+    pub mcp_fairness: Option<McpFairnessBenchmarkCase>,
 }
 
 pub type ScanUsageQueryTarget = BenchmarkLocationSelector;
@@ -456,6 +468,54 @@ pub struct BenchmarkLocationSelector {
     pub line: Option<usize>,
     #[serde(default)]
     pub column: Option<usize>,
+    #[serde(default)]
+    pub symbol: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractiveQueryTool {
+    SearchSymbols,
+    GetSymbolSources,
+    GetDefinitionsByLocation,
+    GetSummaries,
+    ScanUsagesByLocation,
+}
+
+impl InteractiveQueryTool {
+    pub fn tool_name(self) -> &'static str {
+        match self {
+            Self::SearchSymbols => "search_symbols",
+            Self::GetSymbolSources => "get_symbol_sources",
+            Self::GetDefinitionsByLocation => "get_definitions_by_location",
+            Self::GetSummaries => "get_summaries",
+            Self::ScanUsagesByLocation => "scan_usages_by_location",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InteractiveQueryBenchmarkCase {
+    pub id: String,
+    pub tool: InteractiveQueryTool,
+    pub arguments_json: String,
+    pub expected_json_pointer: String,
+    #[serde(default)]
+    pub expected_json_value: Option<Value>,
+    /// Accept a truthful bounded scan result when the exact witness cannot be
+    /// produced inside the interactive latency budget.
+    #[serde(default)]
+    pub allow_bounded_incomplete: bool,
+    pub max_p95_ms: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpFairnessBenchmarkCase {
+    pub id: String,
+    pub scan_arguments_json: String,
+    pub source_arguments_json: String,
+    pub expected_source_path: String,
+    pub max_p95_ms: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -712,6 +772,105 @@ impl BenchmarkRepoTarget {
                 ));
             }
         }
+
+        if scenarios.contains(&BenchmarkScenario::InteractiveCodeIntelligence) {
+            if self.interactive_queries.is_empty() {
+                errors.push(format!(
+                    "repo `{name}` enables `interactive_code_intelligence` but does not define interactive_queries"
+                ));
+            }
+        } else if !self.interactive_queries.is_empty() {
+            errors.push(format!(
+                "repo `{name}` defines interactive_queries but does not enable `interactive_code_intelligence`"
+            ));
+        }
+        let mut interactive_ids = BTreeSet::new();
+        for (index, query) in self.interactive_queries.iter().enumerate() {
+            query.validate(name, index, errors);
+            let id = query.id.trim();
+            if !id.is_empty() && !interactive_ids.insert(id) {
+                errors.push(format!(
+                    "repo `{name}` defines duplicate interactive query id `{id}`"
+                ));
+            }
+        }
+
+        match (
+            scenarios.contains(&BenchmarkScenario::McpFairness),
+            self.mcp_fairness.as_ref(),
+        ) {
+            (true, Some(case)) => case.validate(name, errors),
+            (true, None) => errors.push(format!(
+                "repo `{name}` enables `mcp_fairness` but does not define mcp_fairness"
+            )),
+            (false, Some(_)) => errors.push(format!(
+                "repo `{name}` defines mcp_fairness but does not enable `mcp_fairness`"
+            )),
+            (false, None) => {}
+        }
+    }
+}
+
+impl InteractiveQueryBenchmarkCase {
+    fn validate(&self, repo_name: &str, index: usize, errors: &mut Vec<String>) {
+        let label = format!("repo `{repo_name}` interactive_queries[{index}]");
+        validate_benchmark_case_id(&self.id, &label, errors);
+        validate_arguments_json(&self.arguments_json, &label, errors);
+        if !self.expected_json_pointer.starts_with('/') {
+            errors.push(format!(
+                "{label} expected_json_pointer must be a non-empty JSON pointer"
+            ));
+        }
+        if self.allow_bounded_incomplete && self.tool != InteractiveQueryTool::ScanUsagesByLocation
+        {
+            errors.push(format!(
+                "{label} allow_bounded_incomplete is only valid for scan_usages_by_location"
+            ));
+        }
+        validate_latency_budget(self.max_p95_ms, &label, errors);
+    }
+}
+
+impl McpFairnessBenchmarkCase {
+    fn validate(&self, repo_name: &str, errors: &mut Vec<String>) {
+        let label = format!("repo `{repo_name}` mcp_fairness");
+        validate_benchmark_case_id(&self.id, &label, errors);
+        validate_arguments_json(&self.scan_arguments_json, &label, errors);
+        validate_arguments_json(&self.source_arguments_json, &label, errors);
+        if self.expected_source_path.trim().is_empty() {
+            errors.push(format!("{label} expected_source_path must not be blank"));
+        }
+        validate_latency_budget(self.max_p95_ms, &label, errors);
+    }
+}
+
+fn validate_benchmark_case_id(id: &str, label: &str, errors: &mut Vec<String>) {
+    let id = id.trim();
+    if id.is_empty() {
+        errors.push(format!("{label} must define a non-empty id"));
+    } else if id.len() > MAX_QUERY_CODE_CASE_ID_LENGTH
+        || !id.is_ascii()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        errors.push(format!(
+            "{label} id must be at most {MAX_QUERY_CODE_CASE_ID_LENGTH} ASCII letters, digits, '-' or '_'"
+        ));
+    }
+}
+
+fn validate_arguments_json(arguments_json: &str, label: &str, errors: &mut Vec<String>) {
+    match serde_json::from_str::<Value>(arguments_json) {
+        Ok(Value::Object(_)) => {}
+        Ok(_) => errors.push(format!("{label} arguments JSON must be an object")),
+        Err(error) => errors.push(format!("{label} has invalid arguments JSON: {error}")),
+    }
+}
+
+fn validate_latency_budget(max_p95_ms: f64, label: &str, errors: &mut Vec<String>) {
+    if !max_p95_ms.is_finite() || max_p95_ms <= 0.0 {
+        errors.push(format!("{label} max_p95_ms must be finite and positive"));
     }
 }
 
@@ -1032,6 +1191,13 @@ impl BenchmarkLocationSelector {
         }
         if self.line == Some(0) {
             errors.push(format!("{label} line must be 1-based"));
+        }
+        if self
+            .symbol
+            .as_ref()
+            .is_some_and(|symbol| symbol.trim().is_empty())
+        {
+            errors.push(format!("{label} symbol must not be blank"));
         }
     }
 }

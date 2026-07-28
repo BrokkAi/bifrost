@@ -82,7 +82,7 @@ version, reinstall the skills into `~/.gemini/config/skills`; leaving only the
 old copies does not make them available to Antigravity 2.3.1. See
 [CLI](/cli/#install-agent-skills) for the full option list.
 
-Then restart Antigravity. Open the project-specific settings page, not only global **Customizations**. The project **Customizations** section should list `bifrost-code-navigation`, `bifrost-code-reading`, and `bifrost-codebase-search` alongside any global skills.
+Then restart Antigravity. Open the project-specific settings page, not only global **Customizations**. The project **Customizations** section should list `bifrost-code-navigation`, `bifrost-code-reading`, `bifrost-codebase-search`, and `bifrost-policy-checking` alongside any global skills.
 
 ## Use It for Guided Review
 

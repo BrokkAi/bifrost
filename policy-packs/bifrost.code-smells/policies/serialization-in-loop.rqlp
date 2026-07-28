@@ -1,0 +1,32 @@
+(policy
+  :schema-version 1
+  :id "bifrost.performance.serialization-in-loop"
+  :name "Serialization inside a loop"
+  :message "Review whether this lexically nested serialization repeats per iteration"
+  :severity warning
+  :description "Serialization lexically nested under a loop may repeat traversal, encoding, and allocation. This structural prompt also includes deferred nested bodies; verify execution before hoisting or batching."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["performance" "serialization" "loop" "code-smell"]
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql
+          :schema-version 2
+          (union
+            (language python
+              (inside (loop) (call :receiver (name "json") :callee (name "dumps"))))
+            (language java
+              (inside (loop) (call :callee (name "writeValueAsString"))))
+            (language javascript
+              (inside (loop) (call :receiver (name "JSON") :callee (name "stringify"))))
+            (language typescript
+              (inside (loop) (call :receiver (name "JSON") :callee (name "stringify"))))
+            (language rust
+              (inside
+                (loop)
+                (call
+                  :receiver (name "serde_json")
+                  :callee (name/regex "^(to_string|to_vec)$"))))
+            (language rust
+              (inside (loop) (call :receiver (name "bincode") :callee (name "serialize"))))))))

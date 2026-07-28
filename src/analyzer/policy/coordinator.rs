@@ -190,6 +190,28 @@ impl fmt::Display for PolicyCoordinatorError {
 
 impl std::error::Error for PolicyCoordinatorError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyEvaluationInput {
+    WorkspaceFile(PathBuf),
+    Embedded {
+        identity: PolicySourceIdentity,
+        source: String,
+    },
+}
+
+impl PolicyEvaluationInput {
+    pub fn workspace_file(path: impl Into<PathBuf>) -> Self {
+        Self::WorkspaceFile(path.into())
+    }
+
+    pub fn embedded(identity: PolicySourceIdentity, source: impl Into<String>) -> Self {
+        Self::Embedded {
+            identity,
+            source: source.into(),
+        }
+    }
+}
+
 struct PreparedPolicy {
     source: PolicySourceIdentity,
     bytes: String,
@@ -251,19 +273,44 @@ pub fn evaluate_policy_files_with_analyzer(
         )));
     }
 
-    let (root, read_root) = open_policy_workspace_root(root.as_ref())?;
-    let mut inputs = Vec::with_capacity(policy_files.len());
-    for path in policy_files {
-        check_policy_cancellation(cancellation)?;
-        inputs.push(prepare_input(&read_root, path)?);
-    }
-    exclude_duplicate_policy_ids(&mut inputs)?;
-    evaluate_policy_inputs(
-        &root,
-        &read_root,
-        inputs,
+    let inputs = policy_files
+        .iter()
+        .cloned()
+        .map(PolicyEvaluationInput::WorkspaceFile)
+        .collect::<Vec<_>>();
+    evaluate_policy_inputs_with_analyzer(root, &inputs, workspace, options, cancellation)
+}
+
+/// Evaluate a deterministic mixture of workspace files and caller-owned policy sources.
+pub fn evaluate_policy_inputs(
+    root: impl AsRef<Path>,
+    policy_inputs: &[PolicyEvaluationInput],
+    options: &PolicyEvaluationOptions,
+) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
+    evaluate_policy_inputs_with_limits(
+        root.as_ref(),
+        policy_inputs,
         options,
-        batch_budget,
+        PolicyBatchBudget::default(),
+        PolicyRegistryLimits::default(),
+        None,
+        None,
+    )
+}
+
+/// Evaluate mixed policy inputs against a caller-owned immutable analyzer snapshot.
+pub fn evaluate_policy_inputs_with_analyzer(
+    root: impl AsRef<Path>,
+    policy_inputs: &[PolicyEvaluationInput],
+    workspace: &WorkspaceAnalyzer,
+    options: &PolicyEvaluationOptions,
+    cancellation: Option<&CancellationToken>,
+) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
+    evaluate_policy_inputs_with_limits(
+        root.as_ref(),
+        policy_inputs,
+        options,
+        PolicyBatchBudget::default(),
         PolicyRegistryLimits::default(),
         Some(workspace),
         cancellation,
@@ -283,17 +330,11 @@ pub fn evaluate_policy_source(
     options: &PolicyEvaluationOptions,
     cancellation: Option<&CancellationToken>,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
-    let (root, read_root) = open_policy_workspace_root(root.as_ref())?;
-
-    let input = prepare_source_input(source_identity, source)?;
-    evaluate_policy_inputs(
-        &root,
-        &read_root,
-        vec![input],
+    evaluate_policy_inputs_with_analyzer(
+        root,
+        &[PolicyEvaluationInput::embedded(source_identity, source)],
+        workspace,
         options,
-        PolicyBatchBudget::default(),
-        PolicyRegistryLimits::default(),
-        Some(workspace),
         cancellation,
     )
 }
@@ -325,7 +366,7 @@ fn evaluate_policy_files_with_limits(
     }
     exclude_duplicate_policy_ids(&mut inputs)?;
 
-    evaluate_policy_inputs(
+    evaluate_prepared_policy_inputs(
         &root,
         &read_root,
         inputs,
@@ -338,7 +379,53 @@ fn evaluate_policy_files_with_limits(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn evaluate_policy_inputs(
+fn evaluate_policy_inputs_with_limits(
+    root: &Path,
+    policy_inputs: &[PolicyEvaluationInput],
+    options: &PolicyEvaluationOptions,
+    batch_budget: PolicyBatchBudget,
+    registry_limits: PolicyRegistryLimits,
+    supplied_workspace: Option<&WorkspaceAnalyzer>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
+    if policy_inputs.is_empty() {
+        return Err(PolicyCoordinatorError::new(
+            "policy evaluation requires at least one policy input",
+        ));
+    }
+    if policy_inputs.len() > batch_budget.max_policies() {
+        return Err(PolicyCoordinatorError::new(format!(
+            "policy evaluation accepts at most {} policy inputs",
+            batch_budget.max_policies()
+        )));
+    }
+
+    let (root, read_root) = open_policy_workspace_root(root)?;
+    let mut inputs = Vec::with_capacity(policy_inputs.len());
+    for input in policy_inputs {
+        check_policy_cancellation(cancellation)?;
+        inputs.push(match input {
+            PolicyEvaluationInput::WorkspaceFile(path) => prepare_input(&read_root, path)?,
+            PolicyEvaluationInput::Embedded { identity, source } => {
+                prepare_source_input(identity.clone(), source)?
+            }
+        });
+    }
+    exclude_duplicate_policy_ids(&mut inputs)?;
+    evaluate_prepared_policy_inputs(
+        &root,
+        &read_root,
+        inputs,
+        options,
+        batch_budget,
+        registry_limits,
+        supplied_workspace,
+        cancellation,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_prepared_policy_inputs(
     root: &Path,
     read_root: &WorkspaceRoot,
     mut inputs: Vec<InputOutcome>,

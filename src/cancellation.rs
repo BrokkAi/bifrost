@@ -2,6 +2,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 /// Cloneable cooperative-cancellation flag for bounded in-process work.
 ///
@@ -11,6 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[derive(Clone, Debug, Default)]
 pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
+    timed_out: Arc<AtomicBool>,
+    deadline: Option<Instant>,
     #[cfg(test)]
     cancel_after_checks: Option<Arc<AtomicUsize>>,
 }
@@ -22,6 +25,30 @@ impl CancellationToken {
 
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Return a child token that cancels itself after `duration` while still
+    /// sharing explicit cancellation with the original token and its clones.
+    pub(crate) fn with_timeout(mut self, duration: Duration) -> Self {
+        let deadline = Instant::now() + duration;
+        self.deadline = Some(
+            self.deadline
+                .map_or(deadline, |current| current.min(deadline)),
+        );
+        self
+    }
+
+    pub(crate) fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(
+            self.deadline
+                .map_or(deadline, |current| current.min(deadline)),
+        );
+        self
+    }
+
+    /// Whether cancellation was triggered by this token's wall-clock deadline.
+    pub(crate) fn is_timed_out(&self) -> bool {
+        self.timed_out.load(Ordering::Acquire)
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -36,13 +63,28 @@ impl CancellationToken {
                 self.cancel();
             }
         }
-        self.cancelled.load(Ordering::Acquire)
+        // An explicit caller cancellation that arrived before the deadline
+        // remains distinguishable from a timeout in the public response.
+        if self.cancelled.load(Ordering::Acquire) {
+            return true;
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.timed_out.store(true, Ordering::Release);
+            self.cancelled.store(true, Ordering::Release);
+            return true;
+        }
+        false
     }
 
     #[cfg(test)]
     pub(crate) fn cancel_after_checks_for_test(checks: usize) -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
+            timed_out: Arc::new(AtomicBool::new(false)),
+            deadline: None,
             cancel_after_checks: Some(Arc::new(AtomicUsize::new(checks))),
         }
     }
@@ -60,5 +102,34 @@ mod tests {
         assert!(!clone.is_cancelled());
         token.cancel();
         assert!(clone.is_cancelled());
+    }
+
+    #[test]
+    fn issue_1228_timeout_cancels_clones_and_records_its_cause() {
+        let token = CancellationToken::default().with_timeout(Duration::ZERO);
+        let clone = token.clone();
+
+        assert!(clone.is_cancelled());
+        assert!(token.is_timed_out());
+    }
+
+    #[test]
+    fn issue_1228_explicit_cancellation_is_not_reported_as_timeout() {
+        let token = CancellationToken::default().with_timeout(Duration::from_secs(60));
+
+        token.cancel();
+
+        assert!(token.is_cancelled());
+        assert!(!token.is_timed_out());
+    }
+
+    #[test]
+    fn issue_1228_nested_timeouts_preserve_the_earliest_deadline() {
+        let token = CancellationToken::default()
+            .with_timeout(Duration::ZERO)
+            .with_timeout(Duration::from_secs(60));
+
+        assert!(token.is_cancelled());
+        assert!(token.is_timed_out());
     }
 }

@@ -1,6 +1,7 @@
 //! Versioned static-analysis policy authoring, loading, evaluation, and reporting.
 
 mod budget;
+mod builtin;
 mod canonical;
 mod canonical_loaded;
 mod catalog;
@@ -33,6 +34,7 @@ mod adapter_seam_tests;
 pub use crate::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
 pub use crate::workspace_document::{WorkspaceDocumentError, WorkspacePathError};
 pub use budget::*;
+pub use builtin::*;
 pub use canonical::InlineLocalSemanticProjectionError;
 pub use catalog::*;
 pub use classification::*;
