@@ -32,6 +32,19 @@ if grep -Eq '^(tests/.*[.]rs|tests/common/|python_tests/)' "$package_files"; the
     exit 1
 fi
 
+# Non-runtime repository content stays out of the archive. The kept
+# exceptions are compile-time or runtime inputs of the published crate:
+# embedded agent skills, the Rune IR grammar an inline test include_str!'s,
+# and the nlp voyage sidecar script.
+readonly forbidden_pattern='^(docs/|benchmark/|examples/|[.]github/|[.]claude-plugin/|[.]cursor-plugin/|[.]cargo/config[.]toml|AGENTS[.]md|CLAUDE[.]md|CODE_OF_CONDUCT[.]md|CONTRIBUTING[.]md|SECURITY[.]md|editors/|plugins/|scripts/|tests/fixtures/(mcp/|sarif/|policy-cli/overrides/|proxygroup|scala-issue|testcode-(cpp|cs|go|git-rank-java)/|testcode-java/bin/))'
+readonly allowed_exceptions='^(editors/vscode/syntaxes/bifrost-rune-ir[.]tmLanguage[.]json|plugins/bifrost-agent/skills/|scripts/voyage_sidecar[.]py)'
+
+if grep -E "$forbidden_pattern" "$package_files" | grep -Evq "$allowed_exceptions"; then
+    echo "Packaged crate contains non-runtime repository content:" >&2
+    grep -E "$forbidden_pattern" "$package_files" | grep -Ev "$allowed_exceptions" >&2
+    exit 1
+fi
+
 required_vendor_files=(
     vendor/tree-sitter-scala/LICENSE
     vendor/tree-sitter-scala/BIFROST_PATCH.md
@@ -54,6 +67,31 @@ required_vendor_files=(
 for required_file in "${required_vendor_files[@]}"; do
     if ! grep -Fqx "$required_file" "$package_files"; then
         echo "Packaged crate is missing required vendored file: ${required_file}" >&2
+        exit 1
+    fi
+done
+
+# Compile-time and runtime inputs deliberately negated back in from excluded
+# directories; a future exclude edit must not drop them.
+required_kept_exceptions=(
+    editors/vscode/syntaxes/bifrost-rune-ir.tmLanguage.json
+    scripts/voyage_sidecar.py
+    plugins/bifrost-agent/skills/adversarial-test-sweep/SKILL.md
+    plugins/bifrost-agent/skills/bifrost-code-navigation/SKILL.md
+    plugins/bifrost-agent/skills/bifrost-code-reading/SKILL.md
+    plugins/bifrost-agent/skills/bifrost-codebase-search/SKILL.md
+    plugins/bifrost-agent/skills/git-exploration/SKILL.md
+    plugins/bifrost-agent/skills/guided-issue/SKILL.md
+    plugins/bifrost-agent/skills/guided-review/SKILL.md
+    plugins/bifrost-agent/skills/review/SKILL.md
+    plugins/bifrost-agent/skills/review-pr/SKILL.md
+    plugins/bifrost-agent/skills/today/SKILL.md
+    plugins/bifrost-agent/skills/write-issue/SKILL.md
+)
+
+for required_file in "${required_kept_exceptions[@]}"; do
+    if ! grep -Fqx "$required_file" "$package_files"; then
+        echo "Packaged crate is missing required kept exception: ${required_file}" >&2
         exit 1
     fi
 done
