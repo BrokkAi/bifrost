@@ -32,16 +32,83 @@ if grep -Eq '^(tests/.*[.]rs|tests/common/|python_tests/)' "$package_files"; the
     exit 1
 fi
 
-# Non-runtime repository content stays out of the archive. The kept
-# exceptions are compile-time or runtime inputs of the published crate:
-# embedded agent skills, the Rune IR grammar an inline test include_str!'s,
-# and the nlp voyage sidecar script.
-readonly forbidden_pattern='^(docs/|benchmark/|examples/|[.]github/|[.]claude-plugin/|[.]cursor-plugin/|[.]cargo/config[.]toml|AGENTS[.]md|CLAUDE[.]md|CODE_OF_CONDUCT[.]md|CONTRIBUTING[.]md|SECURITY[.]md|editors/|plugins/|scripts/|tests/fixtures/(mcp/|sarif/|policy-cli/overrides/|proxygroup|scala-issue|testcode-(cpp|cs|go|git-rank-java)/|testcode-java/bin/))'
-readonly allowed_exceptions='^(editors/vscode/syntaxes/bifrost-rune-ir[.]tmLanguage[.]json|plugins/bifrost-agent/skills/|scripts/voyage_sidecar[.]py)'
+# Non-runtime repository content stays out of the archive. One prefix per
+# line, ordered to match the [package].exclude list in Cargo.toml so the
+# two lists can be compared side by side when either changes.
+forbidden_patterns=(
+    '[.]agents/'
+    '[.]cargo/config[.]toml'
+    '[.]claude-plugin/'
+    '[.]cursor-plugin/'
+    '[.]gitattributes'
+    '[.]github/'
+    '[.]gitignore'
+    'AGENTS[.]md'
+    'CLAUDE[.]md'
+    'CODE_OF_CONDUCT[.]md'
+    'CONTRIBUTING[.]md'
+    'SECURITY[.]md'
+    'tests/fixtures/mcp/'
+    'tests/fixtures/policies/'
+    'tests/fixtures/policy-cli/overrides/'
+    'tests/fixtures/proxygroup_test_regression[.]go'
+    'tests/fixtures/sarif/'
+    'tests/fixtures/scala-issue-'
+    'tests/fixtures/testcode-cpp/'
+    'tests/fixtures/testcode-cs/'
+    'tests/fixtures/testcode-git-rank-java/'
+    'tests/fixtures/testcode-go/'
+    'tests/fixtures/testcode-java/bin/'
+    'docs/'
+    'benchmark/'
+    'editors/'
+    'plugins/'
+    'scripts/'
+    'examples/'
+)
+forbidden_pattern="^($(IFS='|'; printf '%s' "${forbidden_patterns[*]}"))"
+readonly forbidden_pattern
 
-if grep -E "$forbidden_pattern" "$package_files" | grep -Evq "$allowed_exceptions"; then
+# Files deliberately negated back in from excluded directories via "!"
+# entries in Cargo.toml's exclude list. This one list drives both the
+# violation allow-filter and the required-presence check below, so the two
+# cannot diverge. The embedded-skill roster is derived from its owner,
+# src/skill_install.rs, so a newly embedded skill is guarded without
+# editing this script. The two policies/*.rqlp entries are also asserted
+# in required_inline_test_fixtures; listing them here keeps every "!"
+# negation covered by exactly this list.
+kept_exception_files=(
+    editors/vscode/syntaxes/bifrost-rune-ir.tmLanguage.json
+    scripts/voyage_sidecar.py
+    tests/fixtures/policies/dynamic-eval.rqlp
+    tests/fixtures/policies/endpoints/http-request-parameter.rqlp
+)
+
+embedded_skill_count=0
+while IFS= read -r skill_file; do
+    kept_exception_files+=("$skill_file")
+    embedded_skill_count=$((embedded_skill_count + 1))
+done < <(grep -oE 'plugins/bifrost-agent/skills/[^"]+/SKILL[.]md' src/skill_install.rs | sort -u)
+
+if (( embedded_skill_count == 0 )); then
+    echo "Failed to derive the embedded skill roster from src/skill_install.rs" >&2
+    exit 1
+fi
+
+allowed_exceptions=''
+for kept_file in "${kept_exception_files[@]}"; do
+    allowed_exceptions+="${allowed_exceptions:+|}$(printf '%s' "$kept_file" | sed 's/[.]/[.]/g')"'$'
+done
+allowed_exceptions="^(${allowed_exceptions})"
+readonly allowed_exceptions
+
+# The trailing grep reads to EOF (no -q), so the leading grep cannot die
+# from SIGPIPE and vanish under pipefail; "|| true" absorbs the benign
+# no-match exit status.
+violations="$(grep -E "$forbidden_pattern" "$package_files" | grep -Ev "$allowed_exceptions" || true)"
+if [[ -n "$violations" ]]; then
     echo "Packaged crate contains non-runtime repository content:" >&2
-    grep -E "$forbidden_pattern" "$package_files" | grep -Ev "$allowed_exceptions" >&2
+    printf '%s\n' "$violations" >&2
     exit 1
 fi
 
@@ -71,25 +138,9 @@ for required_file in "${required_vendor_files[@]}"; do
     fi
 done
 
-# Compile-time and runtime inputs deliberately negated back in from excluded
-# directories; a future exclude edit must not drop them.
-required_kept_exceptions=(
-    editors/vscode/syntaxes/bifrost-rune-ir.tmLanguage.json
-    scripts/voyage_sidecar.py
-    plugins/bifrost-agent/skills/adversarial-test-sweep/SKILL.md
-    plugins/bifrost-agent/skills/bifrost-code-navigation/SKILL.md
-    plugins/bifrost-agent/skills/bifrost-code-reading/SKILL.md
-    plugins/bifrost-agent/skills/bifrost-codebase-search/SKILL.md
-    plugins/bifrost-agent/skills/git-exploration/SKILL.md
-    plugins/bifrost-agent/skills/guided-issue/SKILL.md
-    plugins/bifrost-agent/skills/guided-review/SKILL.md
-    plugins/bifrost-agent/skills/review/SKILL.md
-    plugins/bifrost-agent/skills/review-pr/SKILL.md
-    plugins/bifrost-agent/skills/today/SKILL.md
-    plugins/bifrost-agent/skills/write-issue/SKILL.md
-)
-
-for required_file in "${required_kept_exceptions[@]}"; do
+# Every kept exception (including the derived skill roster) must actually
+# be present in the archive; a future exclude edit must not drop them.
+for required_file in "${kept_exception_files[@]}"; do
     if ! grep -Fqx "$required_file" "$package_files"; then
         echo "Packaged crate is missing required kept exception: ${required_file}" >&2
         exit 1

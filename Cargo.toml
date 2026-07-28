@@ -12,6 +12,10 @@ homepage = "https://github.com/BrokkAi/bifrost"
 readme = "README.md"
 keywords = ["analyzer", "tree-sitter", "lsp", "mcp", "code-analysis"]
 categories = ["development-tools", "parser-implementations", "command-line-utilities"]
+# Order matters: gitignore semantics, last match wins. A "!" negation only
+# re-includes a file if it appears AFTER the broad pattern it carves out
+# of. Do not sort this list. scripts/check-crate-package.sh guards both
+# directions (excluded content staying out, negated files staying in).
 exclude = [
     ".agents/**",
     # Repository/process metadata that Cargo includes by default but crate
@@ -59,12 +63,15 @@ exclude = [
     # Rune IR TextMate grammar stays: an inline test include_str!'s it.
     "editors/**",
     "!editors/vscode/syntaxes/bifrost-rune-ir.tmLanguage.json",
-    # Agent plugin manifests/tests ship through plugin marketplaces. The
-    # skills are embedded into the binary via include_str! and stay.
+    # Agent plugin manifests/tests ship through plugin marketplaces. Only
+    # the SKILL.md files embedded into the binary via include_str! stay;
+    # anything else placed under skills/ must not ship.
     "plugins/**",
-    "!plugins/bifrost-agent/skills/**",
+    "!plugins/bifrost-agent/skills/*/SKILL.md",
     # Development tooling. The voyage sidecar script is a runtime input for
-    # the nlp feature and stays.
+    # the nlp feature and stays. The mcp property fuzzer's repo-rank helper
+    # (scripts/mcp-fuzzer-repo-rank.py) is deliberately dropped: the fuzzer
+    # binary is a development tool that already needs a source checkout.
     "scripts/**",
     "!scripts/voyage_sidecar.py",
     "examples/**",
