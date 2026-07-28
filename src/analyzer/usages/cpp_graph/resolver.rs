@@ -6760,7 +6760,7 @@ fn cpp_template_terms_equal(left: &CppTemplateTerm, right: &CppTemplateTerm) -> 
     true
 }
 
-fn cpp_name_component_nodes(node: Node<'_>) -> Option<Vec<Node<'_>>> {
+pub(super) fn cpp_name_component_nodes(node: Node<'_>) -> Option<Vec<Node<'_>>> {
     let mut components = Vec::new();
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {

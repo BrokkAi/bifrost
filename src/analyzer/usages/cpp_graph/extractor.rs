@@ -827,7 +827,7 @@ fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>)
             EnclosingMemberOwnerResolution::Owner(_) | EnclosingMemberOwnerResolution::Missing => {}
         }
     }
-    match resolve_qualified_call_target(
+    let call_resolution = resolve_qualified_call_target(
         call,
         function,
         ctx.analyzer,
@@ -835,8 +835,23 @@ fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>)
         &ctx.ordinary_type_imports,
         ctx.file,
         ctx.source,
-    ) {
-        BareCallTargetResolution::Type(_) => {}
+    );
+    match call_resolution {
+        BareCallTargetResolution::Type(unit) => {
+            if same_visible_symbol(&unit, &ctx.spec.target) {
+                *ctx.raw_match_count += 1;
+                let hit_node = if matches!(
+                    function.kind(),
+                    "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+                ) {
+                    function_terminal_node(function)
+                } else {
+                    function
+                };
+                push_type_hit(hit_node, ctx);
+                return;
+            }
+        }
         BareCallTargetResolution::FreeFunctions(units)
             if units.iter().all(|unit| {
                 unit.fq_name() == ctx.spec.target.fq_name()
@@ -1612,31 +1627,57 @@ fn target_guided_missing_declaration_type_leaf<'tree>(
     node: Node<'tree>,
     ctx: &ScanCtx<'_>,
 ) -> Option<Node<'tree>> {
-    if node.kind() != "type_identifier" || is_declaration_name(node) {
+    if is_declaration_name(node) {
         return None;
     }
-    let name = node_text(node, ctx.source);
+    let component_nodes = cpp_name_component_nodes(node)?;
+    let name_node = component_nodes.last().copied()?;
+    let name = node_text(name_node, ctx.source);
     if name != ctx.spec.target.identifier() {
         return None;
     }
-    let indexed_scope = indexed_enclosing_lexical_scope(ctx.analyzer, ctx.file, node)?;
-    let components = [name.to_string()];
-    let declaration = nearest_declaration_type_context(node)?;
-    let exact_scope_match =
-        indexed_scope_matches_target_name(&indexed_scope, &components, &ctx.spec.target);
-    if declaration.kind() == "field_declaration" {
-        return exact_scope_match.then_some(node);
+    let inside_target_declaration = ctx
+        .target_declaration_ranges
+        .iter()
+        .any(|range| range.start_byte <= node.start_byte() && node.end_byte() <= range.end_byte);
+    if !inside_target_declaration
+        && !ctx.visibility.external_type_candidate_visible_in_context(
+            ctx.analyzer,
+            ctx.file,
+            &ctx.spec.target,
+            node,
+        )
+    {
+        return None;
     }
+    let components = component_nodes
+        .iter()
+        .map(|component| node_text(*component, ctx.source).to_string())
+        .collect::<Vec<_>>();
+    let indexed_scope = indexed_enclosing_lexical_scope(ctx.analyzer, ctx.file, node)?;
+    let declaration = nearest_declaration_type_context(node)?;
+    let exact_scope_match = indexed_scope_matches_target_name(
+        &indexed_scope,
+        &components,
+        is_globally_qualified_cpp_name(node),
+        &ctx.spec.target,
+    );
     let candidates = visible_type_identifier_candidates(ctx, name);
     let unique_visible_target = !candidates.is_empty()
         && candidates
             .iter()
             .all(|candidate| same_visible_symbol(candidate, &ctx.spec.target));
+    if matches!(declaration.kind(), "field_declaration" | "declaration") {
+        let parser_lost_declaration_scope =
+            target_guided_scope_lost_namespace(&indexed_scope, &ctx.spec.target)
+                && unique_visible_target;
+        return (exact_scope_match || parser_lost_declaration_scope).then_some(node);
+    }
     let lost_namespace_parameter_context =
         matches!(
             declaration.kind(),
             "parameter_declaration" | "optional_parameter_declaration"
-        ) && target_guided_parameter_scope_lost_namespace(&indexed_scope, &ctx.spec.target);
+        ) && target_guided_scope_lost_namespace(&indexed_scope, &ctx.spec.target);
     if exact_scope_match || (lost_namespace_parameter_context && unique_visible_target) {
         return Some(node);
     }
@@ -1713,9 +1754,33 @@ fn nearest_declaration_type_context(node: Node<'_>) -> Option<Node<'_>> {
     while let Some(ancestor) = current {
         if matches!(
             ancestor.kind(),
-            "field_declaration" | "parameter_declaration" | "optional_parameter_declaration"
+            "field_declaration"
+                | "parameter_declaration"
+                | "optional_parameter_declaration"
+                | "declaration"
+                | "type_descriptor"
         ) {
-            return Some(ancestor);
+            let contains_type = ancestor
+                .child_by_field_name("type")
+                .is_some_and(|type_node| {
+                    type_node.start_byte() <= node.start_byte()
+                        && node.end_byte() <= type_node.end_byte()
+                });
+            if contains_type
+                || ancestor.kind() == "type_descriptor"
+                    && ancestor.parent().is_some_and(|parent| {
+                        matches!(
+                            parent.kind(),
+                            "cast_expression"
+                                | "new_expression"
+                                | "sizeof_expression"
+                                | "alignof_expression"
+                                | "typeid_expression"
+                        )
+                    })
+            {
+                return Some(ancestor);
+            }
         }
         if matches!(
             ancestor.kind(),
@@ -1759,18 +1824,29 @@ fn visible_type_identifier_candidates(ctx: &ScanCtx<'_>, name: &str) -> Vec<Code
 fn indexed_scope_matches_target_name(
     indexed_scope: &[String],
     components: &[String],
+    global: bool,
     target: &CodeUnit,
 ) -> bool {
     let target_name = cpp_name_for(target);
-    lexical_component_tiers(components, false, indexed_scope)
+    lexical_component_tiers(components, global, indexed_scope)
         .any(|qualified| qualified.join("::") == target_name)
 }
 
-fn target_guided_parameter_scope_lost_namespace(
-    indexed_scope: &[String],
-    target: &CodeUnit,
-) -> bool {
-    !target.package_name().is_empty() && indexed_scope.len() <= 1
+fn target_guided_scope_lost_namespace(indexed_scope: &[String], target: &CodeUnit) -> bool {
+    if target.package_name().is_empty() {
+        return false;
+    }
+    if indexed_scope.len() <= 1 {
+        return true;
+    }
+    let mut target_scope = crate::analyzer::symbol_lookup::parse_symbol_path(
+        crate::analyzer::Language::Cpp,
+        &cpp_name_for(target),
+    );
+    target_scope.pop();
+    (1..indexed_scope.len())
+        .rev()
+        .any(|prefix_len| target_scope.ends_with(&indexed_scope[..prefix_len]))
 }
 
 fn indexed_enclosing_lexical_scope(

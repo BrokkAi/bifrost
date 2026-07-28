@@ -11056,6 +11056,216 @@ using invoke_result_t = typename invoke_result<F, Us...>::type;
 }
 
 #[test]
+fn issue_1190_production_declaration_type_wrappers_stay_exact() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.hpp",
+            r#"#pragma once
+#define LOG4CXX_NS log4cxx
+
+namespace zmq {
+class dist_t {};
+template <typename T> class atomic_ptr_t {};
+class chunk_t {};
+}
+
+namespace LOG4CXX_NS {
+namespace spi {
+class LoggingEvent {};
+using LoggingEventPtr = LoggingEvent*;
+}
+namespace net {
+class SMTPSession {};
+}
+namespace helpers {
+class Class {};
+}
+}
+
+typedef enum { VERIFY_NONE, VERIFY_PEER } pn_ssl_verify_mode_t;
+"#,
+        )
+        .file(
+            "consumer.cpp",
+            r#"#include "types.hpp"
+
+namespace zmq {
+struct dish_t {
+    dist_t _dist;
+    atomic_ptr_t<chunk_t> _spare_chunk;
+};
+}
+
+namespace LOG4CXX_NS {
+class CyclicBuffer {
+public:
+    void add(const spi::LoggingEventPtr& event);
+};
+
+void CyclicBuffer::add(const spi::LoggingEventPtr& event) {
+    (void) event;
+}
+
+void authenticate(int mode) {
+    pn_ssl_verify_mode_t(mode);
+}
+
+namespace callable_shadow {
+void pn_ssl_verify_mode_t(int mode);
+void authenticate(int mode) {
+    pn_ssl_verify_mode_t(mode);
+}
+}
+
+void cast_session(void* arg) {
+    net::SMTPSession* session = (net::SMTPSession*) arg;
+    (void) session;
+}
+
+class LocalSession {
+    static void callback(void* arg) {
+        LocalSession* session = (LocalSession*) arg;
+        (void) session;
+    }
+};
+
+class LOG4CXX_EXPORT Object {
+public:
+    virtual bool instance_of(const helpers::Class& clazz) const = 0;
+};
+
+class PropertyFilter {
+    using PropertyMap = int;
+    PropertyMap* properties;
+};
+
+class Level {
+    using DataPtr = int*;
+    static const DataPtr& getData();
+};
+}
+
+namespace unrelated {
+class dist_t {};
+using PropertyMap = int;
+using DataPtr = int*;
+struct holder {
+    dist_t _dist;
+    PropertyMap* properties;
+    static const DataPtr& getData();
+};
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.cpp");
+    let source = consumer
+        .read_to_string()
+        .expect("production declaration source");
+    let target = |identifier: &str, source_path: &str| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Class
+                && unit.identifier() == identifier
+                && slash_path(unit.source()) == source_path
+                && !unit.is_synthetic()
+        })
+    };
+    let range = |line: &str, token: &str| fixture_token_range(&source, line, token);
+    let repeated_ranges = |line: &str, token: &str| {
+        let line_start = source
+            .find(line)
+            .unwrap_or_else(|| panic!("missing fixture line {line}"));
+        line.match_indices(token)
+            .map(|(offset, matched)| (line_start + offset, line_start + offset + matched.len()))
+            .collect::<BTreeSet<_>>()
+    };
+    let smtp_session_ranges = {
+        let mut ranges = repeated_ranges(
+            "    net::SMTPSession* session = (net::SMTPSession*) arg;",
+            "net::SMTPSession",
+        );
+        let first = *ranges.iter().next().expect("first SMTP session type");
+        ranges.remove(&first);
+        ranges.insert((first.0 + "net::".len(), first.1));
+        ranges
+    };
+    let local_session_ranges = repeated_ranges(
+        "        LocalSession* session = (LocalSession*) arg;",
+        "LocalSession",
+    );
+
+    let cases = [
+        (
+            target("dist_t", "types.hpp"),
+            BTreeSet::from([range("    dist_t _dist;", "dist_t")]),
+        ),
+        (
+            target("atomic_ptr_t", "types.hpp"),
+            BTreeSet::from([range(
+                "    atomic_ptr_t<chunk_t> _spare_chunk;",
+                "atomic_ptr_t<chunk_t>",
+            )]),
+        ),
+        (
+            target("LoggingEventPtr", "types.hpp"),
+            BTreeSet::from([
+                range(
+                    "    void add(const spi::LoggingEventPtr& event);",
+                    "spi::LoggingEventPtr",
+                ),
+                range(
+                    "void CyclicBuffer::add(const spi::LoggingEventPtr& event) {",
+                    "spi::LoggingEventPtr",
+                ),
+            ]),
+        ),
+        (
+            target("pn_ssl_verify_mode_t", "types.hpp"),
+            BTreeSet::from([range(
+                "    pn_ssl_verify_mode_t(mode);",
+                "pn_ssl_verify_mode_t",
+            )]),
+        ),
+        (target("SMTPSession", "types.hpp"), smtp_session_ranges),
+        (target("LocalSession", "consumer.cpp"), local_session_ranges),
+        (
+            target("Class", "types.hpp"),
+            BTreeSet::from([range(
+                "    virtual bool instance_of(const helpers::Class& clazz) const = 0;",
+                "helpers::Class",
+            )]),
+        ),
+        (
+            target("PropertyMap", "consumer.cpp"),
+            BTreeSet::from([range("    PropertyMap* properties;", "PropertyMap")]),
+        ),
+        (
+            target("DataPtr", "consumer.cpp"),
+            BTreeSet::from([range("    static const DataPtr& getData();", "DataPtr")]),
+        ),
+    ];
+
+    for (target, expected) in cases {
+        let authoritative =
+            authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &consumer);
+        let whole = UsageFinder::new()
+            .find_usages_default(&analyzer, std::slice::from_ref(&target))
+            .all_hits_including_imports()
+            .into_iter()
+            .filter(|hit| hit.file == consumer)
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            (&authoritative, &whole),
+            (&expected, &expected),
+            "production declaration wrappers must retain exact identity for {}",
+            target.fq_name(),
+        );
+    }
+}
+
+#[test]
 fn cpp_anonymous_namespace_global_exact_ranges_survive_sycl_style_nested_lambda_initializers() {
     let (project, analyzer) = cpp_analyzer_with_files(&[
         (
