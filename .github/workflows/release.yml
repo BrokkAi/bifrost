@@ -10,6 +10,10 @@ on:
         description: 'Tag to build and release (e.g. v0.1.0)'
         required: true
         type: string
+      validation_ref:
+        description: 'Optional ref containing corrected release smoke validation'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -243,7 +247,7 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-          ref: ${{ needs.release-context.outputs.tag }}
+          ref: ${{ inputs.validation_ref || needs.release-context.outputs.tag }}
 
       - name: Set up Node
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
@@ -460,7 +464,7 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-          ref: ${{ needs.release-context.outputs.tag }}
+          ref: ${{ inputs.validation_ref || needs.release-context.outputs.tag }}
 
       - name: Set up Node
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
