@@ -11653,6 +11653,24 @@ type Options struct {
     ResolvedRegion string
 }
 
+type Value struct{}
+
+type NestedLabel struct {
+    Value string
+}
+
+type NestedHolder struct {
+    Label NestedLabel
+}
+
+type NestedSliceHolder struct {
+    Items []NestedLabel
+}
+
+type NestedMapHolder struct {
+    Items map[string]NestedLabel
+}
+
 type Outside struct {
     Field string
 }
@@ -11666,6 +11684,9 @@ var arrayValues = [1]model.Imported{{ImportedOnly: "array"}}
 var nestedArrays = [1][1]model.Imported{{{ImportedOnly: "nested-array"}}}
 var mapValues = map[string]model.Imported{"value": {ImportedOnly: "map"}}
 var vendoredAliasCollision = main.Options{ResolvedRegion: "imported-vendor"}
+var nestedStructValue = NestedHolder{Label: {Value: "nested"}}
+var nestedSliceFieldValue = NestedSliceHolder{Items: {{Value: "nested-slice"}}}
+var nestedMapFieldValue = NestedMapHolder{Items: {"nested": {Value: "nested-map"}}}
 var unresolvedQualifiedOwner = main.Outside{Field: "must not fall back to local Outside.Field"}
 var invalidOwner = MissingFieldOwner{Shared: "must not guess Distractor.Shared"}
 var keyedMap = map[string]int{LocalMapKey: 1}
@@ -11737,6 +11758,24 @@ type Options struct {
             "ResolvedRegion",
             "example.com/app/vendor/example.com/dependency/endpoints.Options.ResolvedRegion",
             "vendor/example.com/dependency/endpoints/endpoints.go",
+        ),
+        (
+            "NestedHolder{Label: {Value: \"nested\"}}",
+            "Value",
+            "example.com/app.NestedLabel.Value",
+            "main.go",
+        ),
+        (
+            "NestedSliceHolder{Items: {{Value: \"nested-slice\"}}}",
+            "Value",
+            "example.com/app.NestedLabel.Value",
+            "main.go",
+        ),
+        (
+            "NestedMapHolder{Items: {\"nested\": {Value: \"nested-map\"}}}",
+            "Value",
+            "example.com/app.NestedLabel.Value",
+            "main.go",
         ),
     ] {
         let marker_start = source.find(marker).expect("composite marker");
