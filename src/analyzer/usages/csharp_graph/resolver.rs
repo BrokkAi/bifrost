@@ -1926,7 +1926,9 @@ pub(super) fn type_identity_matches(left: &str, right: &str) -> bool {
         })
 }
 
-fn canonical_builtin_type_identity(reference: &str) -> Option<&'static str> {
+pub(in crate::analyzer::usages) fn canonical_builtin_type_identity(
+    reference: &str,
+) -> Option<&'static str> {
     match reference.strip_prefix("global::").unwrap_or(reference) {
         "bool" | "System.Boolean" => Some("System.Boolean"),
         "byte" | "System.Byte" => Some("System.Byte"),
@@ -2164,24 +2166,6 @@ fn visible_extension_method_candidates_inner(
     let compatible_receiver_types =
         compatible_receiver_type_names(csharp, analyzer, receiver_type_names, usage, session);
     if !usage && compatible_receiver_types.is_empty() {
-        return Vec::new();
-    }
-    if !usage
-        && !receiver_type_names.iter().any(|receiver| {
-            if let Some(session) = session {
-                !forward_type_declarations_for_fq_name_in_session(csharp, receiver, session)
-                    .is_empty()
-            } else {
-                !forward_type_declarations_for_fq_name(csharp, receiver).is_empty()
-            }
-        })
-    {
-        // Extension syntax loses to an applicable instance member. When the
-        // receiver type is outside the indexed workspace, Bifrost cannot prove
-        // that no such member exists, so a local extension is not a confident
-        // forward definition. Usage mode remains best-effort: direct inverse
-        // queries still retain these sites as unproven rather than dropping
-        // them (#1261).
         return Vec::new();
     }
     let scopes = extension_visibility_scopes(csharp, source, site, usage, session);

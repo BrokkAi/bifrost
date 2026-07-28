@@ -8,7 +8,7 @@ pub(in crate::analyzer::usages) use extractor::{
     is_declaration_name as csharp_is_declaration_name, member_access_name, member_access_receiver,
 };
 pub(in crate::analyzer::usages) use resolver::{
-    argument_count as csharp_argument_count,
+    argument_count as csharp_argument_count, canonical_builtin_type_identity,
     extension_invocation_return_type_fq_name as csharp_extension_invocation_return_type_fq_name,
     extension_invocation_return_type_fq_name_in_session as csharp_extension_invocation_return_type_fq_name_in_session,
     first_type_child as csharp_first_type_child,

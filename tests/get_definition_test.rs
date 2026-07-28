@@ -16823,10 +16823,9 @@ public static class Extensions {
         project.root(),
         &location_reference("Model.Json.cs", source, format_start),
     );
-    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
     assert_eq!(
-        value["results"][0]["definitions"][0]["fqn"], "Example.Extensions.Format",
-        "the explicit object cast should retain the matching builtin extension receiver: {value}"
+        value["results"][0]["status"], "no_definition",
+        "an unindexed builtin receiver cannot prove that an external instance member does not take precedence over the workspace extension: {value}"
     );
 }
 
@@ -17533,9 +17532,7 @@ fn csharp_unindexed_receiver_extensions_do_not_overclaim_external_instance_membe
     ] {
         assert_eq!(result["status"], "no_definition", "{label}: {value}");
         assert!(
-            result["definitions"]
-                .as_array()
-                .is_none_or(Vec::is_empty),
+            result["definitions"].as_array().is_none_or(Vec::is_empty),
             "{label}: {value}"
         );
     }
@@ -17826,21 +17823,21 @@ fn csharp_extension_lookup_uses_visibility_indexes_without_unrelated_hydration()
     let mut project = InlineTestProject::with_language(Language::CSharp)
         .file(
             "Visible/Extensions.cs",
-            "namespace Visible { public static class Extensions { public static int Convert(this string value) => 0; public static int Convert(this string value, int radix) => 0; public static int Convert(string value, int radix, bool ordinary) => 0; } }\n",
+            "using System.Data;\nnamespace Visible { public static class Extensions { public static int Convert(this IDbConnection value) => 0; public static int Convert(this IDbConnection value, int radix) => 0; public static int Convert(IDbConnection value, int radix, bool ordinary) => 0; } }\n",
         )
         .file(
             "Hidden/Extensions.cs",
-            "namespace Hidden { public static class Extensions { public static int Convert(this string value, int radix) => 1; } }\n",
+            "using System.Data;\nnamespace Hidden { public static class Extensions { public static int Convert(this IDbConnection value, int radix) => 1; } }\n",
         )
         .file(
             "App/Runner.cs",
-            "using static Visible.Extensions;\nnamespace App { public class Runner { public int Run(string value) { return value.Convert(10); } } }\n",
+            "using System.Data;\nusing static Visible.Extensions;\nnamespace App { public class Runner { public int Run(IDbConnection value) { return value.Convert(10); } } }\n",
         );
     for index in 0..256 {
         project = project.file(
             format!("Noise{index}/Extensions.cs"),
             format!(
-                "namespace Noise{index} {{ public static class Extensions {{ public static int Convert(this string value, int radix) => {index}; }} }}\n"
+                "using System.Data;\nnamespace Noise{index} {{ public static class Extensions {{ public static int Convert(this IDbConnection value, int radix) => {index}; }} }}\n"
             ),
         );
     }
@@ -17856,14 +17853,14 @@ fn csharp_extension_lookup_uses_visibility_indexes_without_unrelated_hydration()
     assert_eq!(owner.fq_name(), "Visible.Extensions");
     analyzer.reset_full_declaration_scan_count_for_test();
     analyzer.reset_full_hydration_count_for_test();
-    let line = "namespace App { public class Runner { public int Run(string value) { return value.Convert(10); } } }";
+    let line = "namespace App { public class Runner { public int Run(IDbConnection value) { return value.Convert(10); } } }";
 
     let value = brokk_bifrost::searchtools::get_definitions_by_location(
         &analyzer,
         brokk_bifrost::searchtools::GetDefinitionParams {
             references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
                 path: "App/Runner.cs".to_string(),
-                line: Some(2),
+                line: Some(3),
                 column: Some(column_of(line, "Convert")),
             }],
         },
@@ -17882,7 +17879,7 @@ fn csharp_extension_lookup_uses_visibility_indexes_without_unrelated_hydration()
     );
     assert_eq!(
         result.definitions[0].signature.as_deref(),
-        Some("(string, int)")
+        Some("(IDbConnection, int)")
     );
     assert_eq!(
         analyzer.full_declaration_scan_count_for_test(),

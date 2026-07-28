@@ -2,7 +2,7 @@ use super::*;
 use crate::analyzer::declaration_range::node_for_exact_range;
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::csharp_graph::{
-    csharp_extension_invocation_return_type_fq_name_in_session,
+    canonical_builtin_type_identity, csharp_extension_invocation_return_type_fq_name_in_session,
     csharp_member_declared_type_fq_name_in_session,
     csharp_method_return_type_fq_name_for_arity_in_session, csharp_resolve_type_fq_name,
     csharp_usage_direct_base, csharp_visible_extension_method_candidates_in_session,
@@ -551,16 +551,27 @@ fn resolve_csharp_in_session(
             );
             let owners = receiver_types.units;
             let mut receiver_type_names = receiver_types.fq_names;
+            let structured_receiver_type_names = csharp_structured_receiver_type_names(
+                csharp,
+                definitions,
+                file,
+                source,
+                tree.root_node(),
+                receiver,
+            );
             if receiver_type_names.is_empty() {
-                receiver_type_names = csharp_structured_receiver_type_names(
-                    csharp,
-                    definitions,
-                    file,
-                    source,
-                    tree.root_node(),
-                    receiver,
-                );
+                receiver_type_names = structured_receiver_type_names.clone();
+            } else if !structured_receiver_type_names.is_empty() {
+                receiver_type_names.extend(structured_receiver_type_names.iter().cloned());
+                receiver_type_names.sort();
+                receiver_type_names.dedup();
             }
+            let unindexed_builtin_receiver = owners.is_empty()
+                && structured_receiver_type_names
+                    .iter()
+                    .any(|name| canonical_builtin_type_identity(name).is_some());
+            let should_try_extensions = !owners.is_empty()
+                || (!structured_receiver_type_names.is_empty() && !unindexed_builtin_receiver);
             let arity = csharp_invocation_arity(name, source, definitions);
             let outcome = csharp_member_outcome(
                 analyzer,
@@ -571,7 +582,7 @@ fn resolve_csharp_in_session(
                 explicit_generic_arity,
                 false,
             );
-            if outcome.status == DefinitionLookupStatus::NoDefinition {
+            if outcome.status == DefinitionLookupStatus::NoDefinition && should_try_extensions {
                 let extensions = match definitions.session() {
                     Some(session) => csharp_visible_extension_method_candidates_in_session(
                         csharp,
@@ -811,6 +822,23 @@ fn csharp_structured_receiver_type_names(
     }
     if receiver.kind() == "identifier" {
         let name = csharp_node_text(receiver, source);
+        let typed_bindings = csharp_type_bindings_before_scoped(
+            csharp,
+            definitions,
+            file,
+            source,
+            root,
+            receiver.start_byte(),
+        );
+        if let Some(types) = typed_bindings.resolve_symbol(name).as_precise() {
+            let mut names = types.iter().map(CodeUnit::fq_name).collect::<Vec<_>>();
+            names.sort();
+            names.dedup();
+            if !names.is_empty() {
+                return names;
+            }
+        }
+
         let bindings = csharp_legacy_bindings_before_scoped(
             csharp,
             definitions,
@@ -819,11 +847,20 @@ fn csharp_structured_receiver_type_names(
             root,
             receiver.start_byte(),
         );
-        return bindings
-            .resolve_symbol(name)
-            .as_precise()
-            .map(|types| types.iter().cloned().collect())
-            .unwrap_or_default();
+        let mut names = Vec::new();
+        if let Some(types) = bindings.resolve_symbol(name).as_precise() {
+            for reference in types {
+                names.extend(csharp_structured_receiver_reference_type_names(
+                    csharp,
+                    definitions,
+                    file,
+                    reference,
+                ));
+            }
+        }
+        names.sort();
+        names.dedup();
+        return names;
     }
     let type_node = match receiver.kind() {
         "cast_expression" => receiver.child_by_field_name("type"),
@@ -833,7 +870,21 @@ fn csharp_structured_receiver_type_names(
     let Some(type_node) = type_node else {
         return Vec::new();
     };
-    let reference = csharp_normalize_full_name(&csharp_reference_type_text(type_node, source));
+    csharp_structured_receiver_reference_type_names(
+        csharp,
+        definitions,
+        file,
+        &csharp_reference_type_text(type_node, source),
+    )
+}
+
+fn csharp_structured_receiver_reference_type_names(
+    csharp: &CSharpAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    reference: &str,
+) -> Vec<String> {
+    let reference = csharp_normalize_full_name(reference);
     if reference.is_empty() {
         return Vec::new();
     }
