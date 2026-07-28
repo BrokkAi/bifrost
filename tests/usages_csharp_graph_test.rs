@@ -3798,8 +3798,7 @@ namespace App {
         relative_default_query.candidate_files.contains(&consumer),
         "shared declaration routing should retain relative nested receiver candidates"
     );
-    let generic_default_query =
-        UsageFinder::new().query(&analyzer, &[generic_pattern], 1000, 1000);
+    let generic_default_query = UsageFinder::new().query(&analyzer, &[generic_pattern], 1000, 1000);
     assert!(
         generic_default_query.candidate_files.contains(&consumer),
         "generic is-pattern type roles should route the consumer by default"
@@ -7657,7 +7656,8 @@ public static class Consumer {
 }
 
 #[test]
-fn csharp_graph_reports_unproven_unresolved_task_like_extension_receivers_without_ordinary_leakage() {
+fn csharp_graph_reports_unproven_unresolved_task_like_extension_receivers_without_ordinary_leakage()
+{
     let (project, analyzer) = csharp_analyzer_with_files(&[
         (
             "src/Extensions.cs",
@@ -7720,13 +7720,14 @@ public static class Consumer {
                 .expect("the unresolved extension hit should be rendered");
             assert!(
                 unproven.iter().any(|hit| {
-                    hit.file == consumer
-                        && hit.snippet.contains("resultTask.DefaultAwait()")
+                    hit.file == consumer && hit.snippet.contains("resultTask.DefaultAwait()")
                 }),
                 "unresolved Task<T>-style receiver should remain visible as unproven: {unproven:#?}"
             );
         }
-        other => panic!("expected success with one unproven Task-like extension hit, got {other:#?}"),
+        other => {
+            panic!("expected success with one unproven Task-like extension hit, got {other:#?}")
+        }
     }
 }
 

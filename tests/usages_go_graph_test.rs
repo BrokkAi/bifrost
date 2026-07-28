@@ -1613,7 +1613,11 @@ func ReadRemote(m cfg.Mapper) string {
         .into_either()
         .expect("promoted embedded interface calls should resolve");
 
-    assert_eq!(2, hits.len(), "expected both Mapper.Get call sites: {hits:?}");
+    assert_eq!(
+        2,
+        hits.len(),
+        "expected both Mapper.Get call sites: {hits:?}"
+    );
     assert_eq!(
         std::collections::BTreeSet::from([
             (project.file("pkg/config/config.go"), 13),
@@ -1625,11 +1629,13 @@ func ReadRemote(m cfg.Mapper) string {
         "only embedded-interface promoted calls should count: {hits:?}",
     );
     assert!(
-        hits.iter().any(|hit| hit.snippet.contains("m.Get(\"token\")")),
+        hits.iter()
+            .any(|hit| hit.snippet.contains("m.Get(\"token\")")),
         "same-package embedded-interface call missing: {hits:?}",
     );
     assert!(
-        hits.iter().any(|hit| hit.snippet.contains("m.Get(\"remote\")")),
+        hits.iter()
+            .any(|hit| hit.snippet.contains("m.Get(\"remote\")")),
         "imported embedded-interface call missing: {hits:?}",
     );
 }

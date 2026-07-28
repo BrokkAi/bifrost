@@ -18638,9 +18638,7 @@ public partial class App : Application
     let result = &value["results"][0];
     assert_eq!(result["status"], "no_definition", "{value}");
     assert!(
-        result["definitions"]
-            .as_array()
-            .is_none_or(Vec::is_empty),
+        result["definitions"].as_array().is_none_or(Vec::is_empty),
         "an external inherited value member must not resolve to a same-named workspace type: {value}"
     );
 }
@@ -23596,7 +23594,10 @@ object Dual {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "app.Dual$.Factory", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Dual$.Factory",
+        "{value}"
+    );
 }
 
 #[test]

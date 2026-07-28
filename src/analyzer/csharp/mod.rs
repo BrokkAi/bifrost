@@ -184,9 +184,11 @@ pub(crate) fn csharp_is_expression_type_operand(parent: Node<'_>, node: Node<'_>
         "is_expression" => parent.child_by_field_name("right").is_some_and(|right| {
             right.start_byte() == node.start_byte() && right.end_byte() == node.end_byte()
         }),
-        "is_pattern_expression" => parent.child_by_field_name("pattern").is_some_and(|pattern| {
-            pattern.start_byte() == node.start_byte() && pattern.end_byte() == node.end_byte()
-        }),
+        "is_pattern_expression" => parent
+            .child_by_field_name("pattern")
+            .is_some_and(|pattern| {
+                pattern.start_byte() == node.start_byte() && pattern.end_byte() == node.end_byte()
+            }),
         _ => false,
     }
 }

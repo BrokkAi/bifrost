@@ -1,5 +1,5 @@
-use crate::analyzer::go::{go_embedded_type_nodes, go_field_declaration_is_embedded};
 use crate::analyzer::go::packages::{GoWorkspacePathIndex, canonical_go_package_name};
+use crate::analyzer::go::{go_embedded_type_nodes, go_field_declaration_is_embedded};
 use crate::analyzer::usages::common::language_for_file;
 pub(super) use crate::analyzer::usages::common::node_text;
 use crate::analyzer::usages::go_graph::extractor::{
@@ -621,12 +621,7 @@ fn collect_go_embedded_field_type_fqns(
         if !package_names.contains_key(file) {
             continue;
         }
-        collect_go_embedded_interface_type_fqns(
-            file,
-            parsed,
-            &resolver,
-            &mut embedded_by_owner,
-        );
+        collect_go_embedded_interface_type_fqns(file, parsed, &resolver, &mut embedded_by_owner);
         for field in analyzer
             .declarations(file)
             .into_iter()

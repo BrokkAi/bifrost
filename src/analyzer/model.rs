@@ -2012,9 +2012,7 @@ impl CodeUnit {
         if self.0.kind == CodeUnitType::Field
             && let Some(last) = self.0.fq.last()
         {
-            return crate::analyzer::fq_name::segment_interner()
-                .resolve(last)
-                .0;
+            return crate::analyzer::fq_name::segment_interner().resolve(last).0;
         }
         let member_name = self
             .0
