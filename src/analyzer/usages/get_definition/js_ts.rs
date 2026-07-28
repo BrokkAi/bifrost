@@ -2236,7 +2236,7 @@ fn ts_expression_property_owners(
                     depth + 1,
                     resolution,
                 );
-                ts_expand_property_owners(analyzer, support, callees, depth + 1)
+                ts_expand_call_return_property_owners(analyzer, support, callees, depth + 1)
             })
             .unwrap_or_default(),
         "await_expression" => {
@@ -2487,7 +2487,7 @@ fn jsts_local_receiver_value_owner_candidates(
                 let callees = jsts_call_expression_callees(
                     analyzer, support, file, language, source, imports, aliases, function,
                 );
-                ts_expand_property_owners(analyzer, support, callees, depth + 1)
+                ts_expand_call_return_property_owners(analyzer, support, callees, depth + 1)
             })
             .unwrap_or_default(),
         "identifier" | "type_identifier" => source
@@ -2914,6 +2914,115 @@ fn ts_expand_property_owners(
     sort_units(&mut owners);
     owners.dedup();
     owners
+}
+
+fn ts_expand_call_return_property_owners(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    callees: Vec<CodeUnit>,
+    depth: usize,
+) -> Vec<CodeUnit> {
+    if depth > 8 {
+        return Vec::new();
+    }
+    let mut owners = Vec::new();
+    for callee in callees.into_iter().filter(|callee| callee.is_function()) {
+        if jsts_function_returns_direct_object_literal(analyzer, &callee) {
+            owners.push(callee.clone());
+        }
+        owners.extend(ts_function_return_property_owners(
+            analyzer,
+            support,
+            &callee,
+            depth + 1,
+        ));
+    }
+    sort_units(&mut owners);
+    owners.dedup();
+    owners
+}
+
+fn jsts_function_returns_direct_object_literal(
+    analyzer: &dyn IAnalyzer,
+    function: &CodeUnit,
+) -> bool {
+    let Ok(source) = function.source().read_to_string() else {
+        return false;
+    };
+    let language = crate::analyzer::common::language_for_file(function.source());
+    let Some(tree) = parse_js_ts_tree(function.source(), &source, language) else {
+        return false;
+    };
+    for indexed_node in ts_nodes_for_code_unit(analyzer, function, tree.root_node()) {
+        let function_node = jsts_indexed_callable_node(indexed_node).unwrap_or(indexed_node);
+        if function_node.kind() == "arrow_function"
+            && function_node
+                .child_by_field_name("body")
+                .and_then(ts_direct_object_literal_value)
+                .is_some()
+        {
+            return true;
+        }
+        let mut stack = vec![function_node];
+        while let Some(node) = stack.pop() {
+            if node.id() != function_node.id()
+                && matches!(
+                    node.kind(),
+                    "function_declaration"
+                        | "function_expression"
+                        | "arrow_function"
+                        | "method_definition"
+                        | "class_declaration"
+                        | "abstract_class_declaration"
+                        | "interface_declaration"
+                )
+            {
+                continue;
+            }
+            if node.kind() == "return_statement" {
+                let mut cursor = node.walk();
+                if node
+                    .named_children(&mut cursor)
+                    .next()
+                    .and_then(ts_direct_object_literal_value)
+                    .is_some()
+                {
+                    return true;
+                }
+                continue;
+            }
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+    false
+}
+
+fn jsts_indexed_callable_node(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        if matches!(
+            node.kind(),
+            "function_declaration"
+                | "function_expression"
+                | "arrow_function"
+                | "method_definition"
+        ) {
+            return Some(node);
+        }
+        node = match node.kind() {
+            "export_statement" => node.child_by_field_name("declaration")?,
+            "lexical_declaration" | "variable_declaration" => {
+                let mut cursor = node.walk();
+                node.named_children(&mut cursor)
+                    .find(|child| child.kind() == "variable_declarator")?
+            }
+            "variable_declarator" => node.child_by_field_name("value")?,
+            _ => return None,
+        };
+    }
 }
 
 fn ts_resolve_type_from_unit_context(

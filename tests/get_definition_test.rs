@@ -10700,6 +10700,45 @@ function render(query) {
 }
 
 #[test]
+fn javascript_local_receiver_member_does_not_resolve_unrelated_file_scoped_property() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "defs.js",
+            r#"
+const el = {};
+el.textContent = "indexed";
+"#,
+        )
+        .file(
+            "app.js",
+            r#"
+function el(id) {
+  return document.getElementById(id);
+}
+
+function render() {
+  const msg = el("status");
+  return msg.textContent;
+}
+"#,
+        )
+        .build();
+
+    let line = "  return msg.textContent;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":8,"column":{}}}]}}"#,
+            column_of(line, "textContent")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"].is_null(), "{value}");
+}
+
+#[test]
 fn javascript_unparenthesized_arrow_parameter_blocks_project_wide_member_fallback() {
     let consumer = r#"
 const inspect = data => data.originalPlacement;
