@@ -197,6 +197,7 @@ class SearchToolsClient:
         intersect: list[dict[str, Any]] | None = None,
         except_: list[dict[str, Any]] | None = None,
         inside: dict[str, Any] | None = None,
+        inside_decl: dict[str, Any] | None = None,
         not_inside: dict[str, Any] | None = None,
         where: list[str] | None = None,
         languages: list[str] | None = None,
@@ -208,7 +209,7 @@ class SearchToolsClient:
     ) -> CodeQueryResponse:
         """Query normalized code structure across supported languages.
 
-        The compatible head is schema version 4; pass ``schema_version=2`` to
+        The compatible head is schema version 5; pass ``schema_version=2`` to
         pin the pre-CFG vocabulary or ``schema_version=3`` for CFG without
         typestate. A query starts with normalized syntactic
         structure or a typed set of complete query branches, then optionally
@@ -220,6 +221,8 @@ class SearchToolsClient:
         procedure-local control-flow inspection. Version 4 adds a
         host-registered ``typestate`` step and pure retained ``witness``
         projection; callers send only ``protocol_ref`` and finite reductions.
+        Version 5 adds ``inside_decl`` for containment that stops at nested
+        callable declarations.
         Hierarchy steps are direct by default and accept a positive ``depth`` or
         ``transitive=True``. Declaration results are limited to declarations
         indexed by the workspace analyzer. Pass exactly one of ``pattern``,
@@ -253,15 +256,18 @@ class SearchToolsClient:
             )
         source_name, source_value = selected[0]
         if source_name != "match" and any(
-            value is not None for value in (inside, not_inside, where, languages)
+            value is not None
+            for value in (inside, inside_decl, not_inside, where, languages)
         ):
             raise ValueError(
-                "inside, not_inside, where, and languages apply only to a pattern query; "
+                "inside, inside_decl, not_inside, where, and languages apply only to a pattern query; "
                 "put structural scope fields inside each set branch"
             )
         arguments: dict[str, Any] = {source_name: source_value}
         if inside is not None:
             arguments["inside"] = inside
+        if inside_decl is not None:
+            arguments["inside_decl"] = inside_decl
         if not_inside is not None:
             arguments["not_inside"] = not_inside
         if where is not None:

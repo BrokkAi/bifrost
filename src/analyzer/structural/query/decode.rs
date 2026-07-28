@@ -107,6 +107,7 @@ struct QueryFields<'a> {
     intersect: Option<&'a Value>,
     except: Option<&'a Value>,
     inside: Option<&'a Value>,
+    inside_decl: Option<&'a Value>,
     not_inside: Option<&'a Value>,
     steps: Option<&'a Value>,
     limit: Option<&'a Value>,
@@ -135,6 +136,7 @@ fn collect_query_fields<'a>(
             QueryField::Intersect => fields.intersect = Some(value),
             QueryField::Except => fields.except = Some(value),
             QueryField::Inside => fields.inside = Some(value),
+            QueryField::InsideDecl => fields.inside_decl = Some(value),
             QueryField::NotInside => fields.not_inside = Some(value),
             QueryField::Steps => fields.steps = Some(value),
             QueryField::Limit => fields.limit = Some(value),
@@ -230,6 +232,19 @@ fn decode_plan(
         {
             return Err(QueryError::new(inside_path, "pattern must not be empty"));
         }
+        let inside_decl_path = child_path(path, "inside_decl");
+        let inside_decl = fields
+            .inside_decl
+            .map(|value| decode_pattern(value, &inside_decl_path, budget, 0))
+            .transpose()?;
+        if let Some(pattern) = &inside_decl
+            && pattern.is_empty()
+        {
+            return Err(QueryError::new(
+                inside_decl_path,
+                "pattern must not be empty",
+            ));
+        }
         let not_inside_path = child_path(path, "not_inside");
         let not_inside = fields
             .not_inside
@@ -256,6 +271,7 @@ fn decode_plan(
                 .unwrap_or_default(),
             root: root_pattern,
             inside,
+            inside_decl,
             not_inside,
         }))
     } else {
@@ -263,6 +279,7 @@ fn decode_plan(
             ("where", fields.where_globs),
             ("languages", fields.languages),
             ("inside", fields.inside),
+            ("inside_decl", fields.inside_decl),
             ("not_inside", fields.not_inside),
         ] {
             if value.is_some() {

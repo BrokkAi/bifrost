@@ -297,13 +297,14 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             .at(&items[0])?;
             Ok(Some(Value::Object(query)))
         }
-        RqlForm::Inside | RqlForm::NotInside => {
+        RqlForm::Inside | RqlForm::InsideDecl | RqlForm::NotInside => {
             expect_len(expr, items, 3, head)?;
             let mut query = query_object(&items[2])?;
-            let field = if form == RqlForm::Inside {
-                "inside"
-            } else {
-                "not_inside"
+            let field = match form {
+                RqlForm::Inside => "inside",
+                RqlForm::InsideDecl => "inside_decl",
+                RqlForm::NotInside => "not_inside",
+                _ => unreachable!("containment forms were filtered above"),
             };
             insert_unique(&mut query, field, pattern_to_json(&items[1])?).at(expr)?;
             Ok(Some(Value::Object(query)))
@@ -806,6 +807,7 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::Explain
         | RqlForm::Profile
         | RqlForm::Inside
+        | RqlForm::InsideDecl
         | RqlForm::NotInside
         | RqlForm::Union
         | RqlForm::Intersect

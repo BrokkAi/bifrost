@@ -361,7 +361,7 @@ fn omitted_versions_select_latest_compatible_but_explicit_versions_are_exact() {
         error
             .diagnostic
             .message
-            .contains("supported exact versions: 2, 3")
+            .contains("supported exact versions: 2, 3, 4, 5")
     );
 }
 
@@ -613,6 +613,36 @@ fn formatter_preserves_crlf_without_creating_mixed_line_endings() {
         once,
         "CRLF formatting must be idempotent",
     );
+}
+
+#[test]
+fn formatter_preserves_declaration_bounded_containment() {
+    let source = r#"(policy :id "test.loop" :name "Loop" :message "Move it" :severity warning :analysis (analysis :type match :selector (rql :schema-version 5 (inside-decl (loop) (call :callee (name "open"))))))"#;
+    let formatted = format_rqlp_source(source).expect("complete policy formats");
+    assert!(formatted.contains("(inside-decl (loop)"), "{formatted}");
+    assert_eq!(format_rqlp_source(&formatted).unwrap(), formatted);
+}
+
+#[test]
+fn declaration_bounded_containment_rejects_legacy_rqlp_schema_pins_at_the_wrapper() {
+    for schema_version in [2, 3, 4] {
+        let source = format!(
+            r#"(policy :id "test.loop" :name "Loop" :message "Move it" :severity warning :analysis (analysis :type match :selector (rql :schema-version {schema_version} (inside-decl (loop) (call :callee (name "open"))))))"#
+        );
+        let error = parse_rqlp_source(
+            &source,
+            PolicySourceIdentity::new(format!("legacy-{schema_version}.rqlp")),
+        )
+        .expect_err("legacy schema pin must reject inside-decl");
+        assert_eq!(error.diagnostic.code, "invalid-inline-rql");
+        assert_eq!(&source[error.diagnostic.range], "inside-decl");
+        assert!(
+            error
+                .diagnostic
+                .message
+                .contains("requires schema version 5")
+        );
+    }
 }
 
 #[test]

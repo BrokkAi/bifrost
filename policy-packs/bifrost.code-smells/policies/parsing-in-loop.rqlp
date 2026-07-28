@@ -12,23 +12,23 @@
       :type match
       :selector
         (rql
-          :schema-version 2
+          :schema-version 5
           (union
             (language python
-              (inside (loop) (call :receiver (name "json") :callee (name "loads"))))
+              (inside-decl (loop) (call :receiver (name "json") :callee (name "loads"))))
             (language java
-              (inside (loop) (call :callee (name "parse"))))
+              (inside-decl (loop) (call :callee (name "parse"))))
             (language javascript
-              (inside (loop) (call :receiver (name "JSON") :callee (name "parse"))))
+              (inside-decl (loop) (call :receiver (name "JSON") :callee (name "parse"))))
             (language typescript
-              (inside (loop) (call :receiver (name "JSON") :callee (name "parse"))))
+              (inside-decl (loop) (call :receiver (name "JSON") :callee (name "parse"))))
             (language rust
-              (inside
+              (inside-decl
                 (loop)
                 (call
                   :receiver (name "serde_json")
                   :callee (name/regex "^(from_str|from_slice)$"))))
             (language rust
-              (inside (loop) (call :receiver (name "bincode") :callee (name "deserialize"))))
+              (inside-decl (loop) (call :receiver (name "bincode") :callee (name "deserialize"))))
             (language rust
-              (inside (loop) (call :receiver (name "toml") :callee (name "from_str"))))))))
+              (inside-decl (loop) (call :receiver (name "toml") :callee (name "from_str"))))))))

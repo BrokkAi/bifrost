@@ -712,7 +712,7 @@ fn validate_wrapper(
             }
         }
         RqlForm::Explain | RqlForm::Profile => {}
-        RqlForm::Inside | RqlForm::NotInside => {
+        RqlForm::Inside | RqlForm::InsideDecl | RqlForm::NotInside => {
             if args.len() != 2 {
                 analysis.error(
                     query.range.clone(),
@@ -720,13 +720,17 @@ fn validate_wrapper(
                     "containment wrapper expects a pattern and query",
                 );
             } else {
-                let field = if form == RqlForm::Inside {
-                    "inside"
-                } else {
-                    "not_inside"
+                let field = match form {
+                    RqlForm::Inside => "inside",
+                    RqlForm::InsideDecl => "inside_decl",
+                    RqlForm::NotInside => "not_inside",
+                    _ => unreachable!("containment forms were filtered above"),
                 };
                 let field_path = rql_query_child_path(path, field);
                 validate_rql_pattern(&args[0], &field_path, analysis);
+                if form == RqlForm::InsideDecl {
+                    analysis.path(&field_path, head_range.clone());
+                }
             }
         }
         RqlForm::Union | RqlForm::Intersect | RqlForm::Except => {
@@ -1976,8 +1980,14 @@ fn validate_json_query(
         match field {
             QueryField::Where => validate_json_globs(child, &child_path, analysis),
             QueryField::Languages => validate_json_languages(child, &child_path, analysis),
-            QueryField::Match | QueryField::Inside | QueryField::NotInside => {
+            QueryField::Match
+            | QueryField::Inside
+            | QueryField::InsideDecl
+            | QueryField::NotInside => {
                 validate_json_pattern(child, &child_path, analysis);
+                if field == QueryField::InsideDecl {
+                    analysis.path(&child_path, key.range());
+                }
                 if field == QueryField::Match && json_pattern_anchors_root(child) == Some(false) {
                     analysis.error(
                         child.range(),
@@ -3441,6 +3451,23 @@ mod tests {
         let json_help = query_source_help_at(json, value_offset).unwrap();
         assert_eq!(&json[json_help.range], r#""profile""#);
         assert!(json_help.description.contains("operator-level"));
+    }
+
+    #[test]
+    fn declaration_bounded_containment_has_shared_help_and_version_ranges() {
+        let rql = "(inside-decl (loop) (call :callee (name \"open\")))";
+        assert!(validate_query_source(rql).is_empty());
+        let help =
+            query_source_help_at(rql, rql.find("inside-decl").unwrap()).expect("inside-decl help");
+        assert_eq!(&rql[help.range], "inside-decl");
+        assert!(help.description.contains("callable declaration"));
+
+        let json = r#"{"schema_version":4,"match":{"kind":"call"},"inside_decl":{"kind":"loop"}}"#;
+        let diagnostic = validate_query_source(json)
+            .into_iter()
+            .find(|diagnostic| diagnostic.message.contains("requires schema version 5"))
+            .expect("version diagnostic");
+        assert_eq!(&json[diagnostic.range], r#""inside_decl""#);
     }
 
     #[test]

@@ -184,9 +184,11 @@ fn query_documentation_tracks_public_contracts() {
     let python_client = fs::read_to_string(root.join("docs/src/content/docs/python-client.md"))
         .expect("read Python client documentation");
     for required in [
-        "compatible-head version-4",
+        "compatible-head version-5",
         "schema_version=2",
         "schema_version=3",
+        "schema_version=4",
+        "inside_decl",
         "twelve possible classes",
         "CodeQueryProcedure",
         "CodeQueryProgramPoint",
@@ -197,14 +199,14 @@ fn query_documentation_tracks_public_contracts() {
     ] {
         assert!(
             python_client.contains(required),
-            "Python client documentation must track the schema-v4 result contract: missing {required:?}"
+            "Python client documentation must track the schema-v5 result contract: missing {required:?}"
         );
     }
 
     let python_client_source = fs::read_to_string(root.join("bifrost_searchtools/client.py"))
         .expect("read Python client source");
     for required in [
-        "schema version 4",
+        "schema version 5",
         "cfg_successor_edges",
         "cfg_edge_target",
         "typestate",
@@ -212,7 +214,7 @@ fn query_documentation_tracks_public_contracts() {
     ] {
         assert!(
             python_client_source.contains(required),
-            "Python query_code docstring must track the schema-v4 operation contract: missing {required:?}"
+            "Python query_code docstring must track the schema-v5 operation contract: missing {required:?}"
         );
     }
 }
