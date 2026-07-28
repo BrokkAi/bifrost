@@ -148,11 +148,20 @@ fn resolve_bare_annotation_symbol(
     analyzer: &dyn IAnalyzer,
     py: &PythonAnalyzer,
     file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
     raw_symbol: &str,
 ) -> Vec<CodeUnit> {
     let raw_symbol = raw_symbol.trim();
     if raw_symbol.is_empty() {
         return Vec::new();
+    }
+
+    if let Some(owner) = annotation_scope_owner_class(analyzer, file, source, node) {
+        let owner_candidates = exact_owner_annotation_members(analyzer, &owner, raw_symbol);
+        if !owner_candidates.is_empty() {
+            return owner_candidates;
+        }
     }
 
     let mut candidates = Vec::new();
@@ -197,8 +206,14 @@ pub(in crate::analyzer::usages) fn annotation_reference_candidates(
 
     let mut candidates = match node.kind() {
         "identifier" | "string_content" => {
-            let mut candidates =
-                resolve_bare_annotation_symbol(analyzer, py, file, node_text(node, source));
+            let mut candidates = resolve_bare_annotation_symbol(
+                analyzer,
+                py,
+                file,
+                source,
+                node,
+                node_text(node, source),
+            );
             if candidates.is_empty() {
                 candidates.extend(resolve_receiver_type(
                     analyzer,
@@ -234,10 +249,11 @@ fn resolve_annotation_attribute_types(
         return candidates;
     };
     let root_text = node_text(root, source);
-    let owners: Vec<_> = resolve_bare_annotation_symbol(analyzer, py, file, root_text)
-        .into_iter()
-        .filter(CodeUnit::is_class)
-        .collect();
+    let owners: Vec<_> =
+        resolve_bare_annotation_symbol(analyzer, py, file, source, root, root_text)
+            .into_iter()
+            .filter(CodeUnit::is_class)
+            .collect();
     let [owner] = owners.as_slice() else {
         return candidates;
     };
@@ -275,12 +291,25 @@ fn exact_nested_annotation_class(
     owner: &CodeUnit,
     segment: &str,
 ) -> Vec<CodeUnit> {
+    let mut candidates: Vec<_> = exact_owner_annotation_members(analyzer, owner, segment)
+        .into_iter()
+        .filter(CodeUnit::is_class)
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn exact_owner_annotation_members(
+    analyzer: &dyn IAnalyzer,
+    owner: &CodeUnit,
+    segment: &str,
+) -> Vec<CodeUnit> {
     let mut candidates: Vec<_> = analyzer
         .declarations(owner.source())
         .into_iter()
         .filter(|unit| {
-            unit.is_class()
-                && unit.identifier() == segment
+            unit.identifier() == segment
                 && analyzer
                     .parent_of(unit)
                     .is_some_and(|parent| parent.fq_name() == owner.fq_name())
@@ -289,6 +318,94 @@ fn exact_nested_annotation_class(
     candidates.sort();
     candidates.dedup();
     candidates
+}
+
+fn annotation_scope_owner_class(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> Option<CodeUnit> {
+    if !annotation_expression_is_class_scoped(node) {
+        return None;
+    }
+    let range = crate::analyzer::Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: 0,
+        end_line: 0,
+    };
+    if let Some(enclosing) = analyzer.enclosing_code_unit(file, &range) {
+        if enclosing.is_class() {
+            return Some(enclosing);
+        }
+        if let Some(owner) = target_owner_code_unit(analyzer, &enclosing) {
+            return Some(owner);
+        }
+    }
+    structural_annotation_owner_class(analyzer, file, source, node)
+}
+
+fn annotation_expression_is_class_scoped(node: Node<'_>) -> bool {
+    let site_start = node.start_byte();
+    let site_end = node.end_byte();
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if matches!(parent.kind(), "function_definition" | "lambda")
+            && parent
+                .child_by_field_name("body")
+                .is_some_and(|body| body.start_byte() <= site_start && site_end <= body.end_byte())
+        {
+            return false;
+        }
+        if parent.kind() == "class_definition" {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+fn structural_annotation_owner_class(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> Option<CodeUnit> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "class_definition" {
+            let name = node_text(parent.child_by_field_name("name")?, source).trim();
+            if name.is_empty() {
+                return None;
+            }
+            let class_range = crate::analyzer::Range {
+                start_byte: parent.start_byte(),
+                end_byte: parent.end_byte(),
+                start_line: 0,
+                end_line: 0,
+            };
+            let mut matches: Vec<_> = analyzer
+                .declarations(file)
+                .into_iter()
+                .filter(|unit| unit.is_class() && unit.identifier() == name)
+                .filter(|unit| {
+                    analyzer
+                        .ranges(unit)
+                        .into_iter()
+                        .any(|range| range.contains(&class_range))
+                })
+                .collect();
+            matches.sort();
+            matches.dedup();
+            let [owner] = matches.as_slice() else {
+                return None;
+            };
+            return Some(owner.clone());
+        }
+        current = parent;
+    }
+    None
 }
 
 fn is_annotation_reference_node(node: Node<'_>) -> bool {

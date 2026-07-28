@@ -396,6 +396,14 @@ impl ScanCtx<'_> {
             return true;
         }
 
+        match enclosing_runtime_parameter_type(expr, node, self.source) {
+            EnclosingParameterType::Typed(raw_type) => {
+                return self.receiver_type_matches_target(&raw_type);
+            }
+            EnclosingParameterType::Untyped => return false,
+            EnclosingParameterType::NotDeclared => {}
+        }
+
         let Some(scope_facts) = self.scope_facts_for_node(node) else {
             return false;
         };
@@ -442,6 +450,11 @@ impl ScanCtx<'_> {
     /// unseeded receiver such as an unannotated parameter), as opposed to a
     /// receiver we resolved to some specific — possibly different — type.
     fn receiver_type_is_unknown(&self, expr: &str, node: Node<'_>) -> bool {
+        match enclosing_runtime_parameter_type(expr, node, self.source) {
+            EnclosingParameterType::Typed(_) => return false,
+            EnclosingParameterType::Untyped => return true,
+            EnclosingParameterType::NotDeclared => {}
+        }
         match self.scope_facts_for_node(node) {
             Some(facts) => facts.resolution_for(expr).is_unknown(),
             None => true,
@@ -624,10 +637,9 @@ fn handle_annotation_reference_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) 
         return false;
     };
 
-    if (ctx.target.is_class() || ctx.target_member.is_none())
-        && candidates
-            .into_iter()
-            .any(|candidate| candidate == *ctx.target)
+    if (ctx.target.is_class() || ctx.target.is_field() || ctx.target_member.is_none())
+        && candidates.iter().all(|candidate| *candidate == *ctx.target)
+        && candidates.iter().any(|candidate| *candidate == *ctx.target)
     {
         let site = if node.kind() == "attribute" {
             node.child_by_field_name("attribute").unwrap_or(node)
@@ -636,6 +648,11 @@ fn handle_annotation_reference_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) 
         };
         record_hit(site, ctx);
     }
+
+    if ctx.target_member.is_some() && node.kind() == "attribute" && candidates.is_empty() {
+        return false;
+    }
+
     true
 }
 
@@ -1241,6 +1258,45 @@ fn enclosing_parameters_shadow(root_text: &str, reference: Node<'_>, source: &st
         current = parent;
     }
     false
+}
+
+enum EnclosingParameterType {
+    NotDeclared,
+    Untyped,
+    Typed(String),
+}
+
+fn enclosing_runtime_parameter_type(
+    name: &str,
+    reference: Node<'_>,
+    source: &str,
+) -> EnclosingParameterType {
+    let site_start = reference.start_byte();
+    let site_end = reference.end_byte();
+    let mut current = reference;
+    while let Some(parent) = current.parent() {
+        if matches!(parent.kind(), "function_definition" | "lambda")
+            && parent
+                .child_by_field_name("body")
+                .is_some_and(|body| body.start_byte() <= site_start && site_end <= body.end_byte())
+            && let Some(parameters) = parent.child_by_field_name("parameters")
+        {
+            let mut cursor = parameters.walk();
+            for parameter in parameters.named_children(&mut cursor) {
+                if parameter_symbol(parameter, source).as_deref() != Some(name) {
+                    continue;
+                }
+                return parameter
+                    .child_by_field_name("type")
+                    .and_then(|annotation| normalized_receiver_type(slice(annotation, source)))
+                    .map_or(EnclosingParameterType::Untyped, |raw_type| {
+                        EnclosingParameterType::Typed(raw_type)
+                    });
+            }
+        }
+        current = parent;
+    }
+    EnclosingParameterType::NotDeclared
 }
 
 fn member_receiver_match_is_unproven(
@@ -1870,8 +1926,42 @@ fn collect_scope_facts_from_source(
     factory_return_types: &HashMap<String, String>,
 ) -> LocalBindingsSnapshot<String> {
     let events = collect_scope_fact_events(source, traversal);
+    collect_scope_facts_from_events(
+        &events,
+        allow_self_receivers,
+        current_class,
+        factory_return_types,
+    )
+}
+
+pub(in crate::analyzer::usages) fn collect_function_scope_facts_from_node(
+    function: Node<'_>,
+    source: &str,
+) -> LocalBindingsSnapshot<String> {
+    let mut events = Vec::new();
+    if function.kind() == "lambda" {
+        if let Some(parameters) = function.child_by_field_name("parameters") {
+            collect_parameter_events(parameters, source, &mut events);
+        }
+    } else {
+        collect_scope_fact_events_from_node(
+            function,
+            source,
+            ScopeFactTraversal::Function,
+            &mut events,
+        );
+    }
+    collect_scope_facts_from_events(&events, false, None, &HashMap::default())
+}
+
+fn collect_scope_facts_from_events(
+    events: &[ScopeFactEvent],
+    allow_self_receivers: bool,
+    current_class: Option<&str>,
+    factory_return_types: &HashMap<String, String>,
+) -> LocalBindingsSnapshot<String> {
     let mut engine = LocalInferenceEngine::new(LocalInferenceConfig::default());
-    for event in &events {
+    for event in events {
         if let ScopeFactEvent::Parameter { symbol, .. } = event
             && !engine.is_shadowed(symbol)
         {
@@ -1883,7 +1973,7 @@ fn collect_scope_facts_from_source(
     while changed {
         changed = false;
         let mut aliases = Vec::new();
-        for event in &events {
+        for event in events {
             match event {
                 ScopeFactEvent::Parameter {
                     symbol,
@@ -2080,7 +2170,7 @@ fn collect_scope_fact_events_from_node(
             continue;
         }
         match node.kind() {
-            "parameters" => collect_parameter_events(node, source, events),
+            "parameters" | "lambda_parameters" => collect_parameter_events(node, source, events),
             "assignment" => collect_assignment_events(node, source, events),
             _ => {}
         }
@@ -2283,6 +2373,30 @@ fn returned_receiver_type(node: Node<'_>, source: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn lambda_scope_facts_preserve_untyped_parameter_shadowing() {
+        let source = "shadowed = lambda method: method.signature\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut nodes = vec![tree.root_node()];
+        let lambda = loop {
+            let node = nodes.pop().unwrap();
+            if node.kind() == "lambda" {
+                break node;
+            }
+            let mut cursor = node.walk();
+            nodes.extend(node.named_children(&mut cursor));
+        };
+
+        let facts = collect_function_scope_facts_from_node(lambda, source);
+
+        assert!(facts.is_shadowed("method"));
+        assert!(facts.resolution_for("method").is_unknown());
+    }
 
     #[test]
     fn pre_cancelled_graph_build_skips_python_file_parsing() {

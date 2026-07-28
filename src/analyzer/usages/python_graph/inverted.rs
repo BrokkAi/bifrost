@@ -17,8 +17,9 @@
 //! typing ([`collect_scope_facts`] + [`resolve_receiver_type`]).
 
 use super::extractor::{
-    call_result_types, collect_assigned_identifiers, collect_scope_facts_from_parsed_source,
-    enclosing_scope_facts, is_declaration_identifier, slice,
+    call_result_types, collect_assigned_identifiers, collect_function_scope_facts_from_node,
+    collect_scope_facts_from_parsed_source, enclosing_scope_facts, is_declaration_identifier,
+    slice,
 };
 use super::resolver::{
     annotation_reference_candidates, resolve_constructor_types, resolve_receiver_type,
@@ -260,12 +261,13 @@ fn scan_tree(root: Node<'_>, ctx: &mut PyScan<'_, '_>) {
     walk(root, ctx, &mut scopes, None);
 }
 
-fn walk<'a>(
+fn walk(
     node: Node<'_>,
-    ctx: &mut PyScan<'a, '_>,
+    ctx: &mut PyScan<'_, '_>,
     scopes: &mut Vec<FunctionScope>,
-    facts: Option<&'a LocalBindingsSnapshot<String>>,
+    facts: Option<usize>,
 ) {
+    let mut merged_facts = Vec::new();
     let mut stack = vec![WalkFrame::Enter { node, facts }];
     while let Some(frame) = stack.pop() {
         match frame {
@@ -276,11 +278,17 @@ fn walk<'a>(
                 // scope's receiver-type facts once here and thread them down.
                 "function_definition" | "lambda" => {
                     scopes.push(collect_function_scope(node, ctx.source));
-                    let scope_facts =
-                        enclosing_scope_facts(ctx.analyzer, ctx.file, ctx.scope_facts, node)
-                            .or(facts);
+                    let scope_facts = merged_enclosing_scope_facts(
+                        ctx.analyzer,
+                        ctx.file,
+                        ctx.scope_facts,
+                        &mut merged_facts,
+                        node,
+                        ctx.source,
+                        facts,
+                    );
                     stack.push(WalkFrame::ExitScope);
-                    push_children(node, scope_facts, &mut stack);
+                    push_function_children(node, facts, scope_facts, &mut stack);
                 }
                 // A class body is not a function scope: code at the class-body level has
                 // no enclosing-function facts. Methods inside re-resolve their own facts.
@@ -295,7 +303,8 @@ fn walk<'a>(
                     if handle_annotation_reference(node, ctx) {
                         continue;
                     }
-                    handle_attribute(node, ctx, scopes, facts);
+                    let scope_facts = facts.and_then(|id| merged_facts.get(id));
+                    handle_attribute(node, ctx, scopes, scope_facts);
                     push_children(node, facts, &mut stack);
                 }
                 "string_content" => {
@@ -316,22 +325,73 @@ fn walk<'a>(
     }
 }
 
-enum WalkFrame<'tree, 'facts> {
+enum WalkFrame<'tree> {
     Enter {
         node: Node<'tree>,
-        facts: Option<&'facts LocalBindingsSnapshot<String>>,
+        facts: Option<usize>,
     },
     ExitScope,
 }
 
-fn push_children<'tree, 'facts>(
+fn push_children<'tree>(
     node: Node<'tree>,
-    facts: Option<&'facts LocalBindingsSnapshot<String>>,
-    stack: &mut Vec<WalkFrame<'tree, 'facts>>,
+    facts: Option<usize>,
+    stack: &mut Vec<WalkFrame<'tree>>,
 ) {
     for index in (0..node.named_child_count()).rev() {
         if let Some(child) = node.named_child(index) {
             stack.push(WalkFrame::Enter { node: child, facts });
+        }
+    }
+}
+
+fn push_function_children<'tree>(
+    function: Node<'tree>,
+    enclosing_facts: Option<usize>,
+    body_facts: Option<usize>,
+    stack: &mut Vec<WalkFrame<'tree>>,
+) {
+    let body = function.child_by_field_name("body");
+    for index in (0..function.named_child_count()).rev() {
+        if let Some(child) = function.named_child(index) {
+            // Defaults and annotations are evaluated while defining the
+            // function, before its parameters and locals exist. Only the body
+            // executes in the new lexical scope.
+            let facts = if body == Some(child) {
+                body_facts
+            } else {
+                enclosing_facts
+            };
+            stack.push(WalkFrame::Enter { node: child, facts });
+        }
+    }
+}
+
+fn merged_enclosing_scope_facts(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    scope_facts: &HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
+    merged_facts: &mut Vec<LocalBindingsSnapshot<String>>,
+    node: Node<'_>,
+    source: &str,
+    inherited: Option<usize>,
+) -> Option<usize> {
+    let structural_local = collect_function_scope_facts_from_node(node, source);
+    let local = enclosing_scope_facts(analyzer, file, scope_facts, node)
+        .map(|indexed| indexed.merged_with_shadowing(&structural_local))
+        .unwrap_or(structural_local);
+    match (local, inherited) {
+        (local, Some(inherited_id)) => {
+            let inherited = merged_facts.get(inherited_id)?;
+            let merged = inherited.merged_with_shadowing(&local);
+            let next_id = merged_facts.len();
+            merged_facts.push(merged);
+            Some(next_id)
+        }
+        (local, None) => {
+            let next_id = merged_facts.len();
+            merged_facts.push(local);
+            Some(next_id)
         }
     }
 }
@@ -379,23 +439,24 @@ fn handle_annotation_reference(node: Node<'_>, ctx: &mut PyScan<'_, '_>) -> bool
     else {
         return false;
     };
+    let [candidate] = candidates.as_slice() else {
+        return !(node.kind() == "attribute" && candidates.is_empty());
+    };
 
     let site = if node.kind() == "attribute" {
         node.child_by_field_name("attribute").unwrap_or(node)
     } else {
         node
     };
-    for candidate in candidates {
-        ctx.record(candidate.fq_name(), site);
-    }
+    ctx.record(candidate.fq_name(), site);
     true
 }
 
-fn handle_attribute<'a>(
+fn handle_attribute(
     node: Node<'_>,
-    ctx: &mut PyScan<'a, '_>,
+    ctx: &mut PyScan<'_, '_>,
     scopes: &[FunctionScope],
-    facts: Option<&'a LocalBindingsSnapshot<String>>,
+    facts: Option<&LocalBindingsSnapshot<String>>,
 ) {
     let (Some(object), Some(attribute)) = (
         node.child_by_field_name("object"),

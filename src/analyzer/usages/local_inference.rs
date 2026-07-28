@@ -114,6 +114,35 @@ where
         }
     }
 
+    /// Merge an enclosing snapshot with an inner lexical scope.
+    ///
+    /// Every declaration in `inner` shadows the outer binding, including
+    /// declarations whose type is unknown and therefore have no binding entry.
+    pub fn merged_with_shadowing(&self, inner: &Self) -> Self
+    where
+        T: Clone,
+    {
+        let mut bindings = self.bindings.clone();
+        for symbol in &inner.declared {
+            bindings.remove(symbol);
+        }
+        bindings.extend(
+            inner
+                .bindings
+                .iter()
+                .map(|(symbol, resolution)| (symbol.clone(), resolution.clone())),
+        );
+        Self {
+            declared: self
+                .declared
+                .iter()
+                .cloned()
+                .chain(inner.declared.iter().cloned())
+                .collect(),
+            bindings,
+        }
+    }
+
     pub fn resolution_for(&self, symbol: &str) -> SymbolResolution<T>
     where
         T: Clone,
