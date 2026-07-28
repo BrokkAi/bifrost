@@ -4,7 +4,7 @@ This directory is the shared source for Bifrost integrations in Pi, Codex,
 Claude Code, Cursor, and Amp. Every host reuses the same launcher and pinned
 release metadata, but each distribution includes only the resources its host
 supports. The npm package `@brokk/bifrost-agent` contains the Pi extension and
-three generic code-intelligence skills. The Claude, Codex, and Cursor plugin
+four generic Bifrost agent skills. The Claude, Codex, and Cursor plugin
 manifests expose their host-specific MCP configuration, broader workflow skills,
 and specialist agents, while Amp uses its generated skill bundle.
 
@@ -88,9 +88,10 @@ pinned, checksum-verified Bifrost binary as the other hosts, starts one stdio
 MCP child for the session's workspace, and closes the child on session shutdown
 or reload. Pi-visible tools use a `bifrost_` namespace, so Bifrost's canonical
 MCP `query_code` tool appears as `bifrost_query_code`. The extension adds a
-short system-prompt note that explains this host-specific rendering; the three
-canonical `bifrost-code-navigation`, `bifrost-code-reading`, and
-`bifrost-codebase-search` skills remain shared without Pi-specific copies.
+short system-prompt note that explains this host-specific rendering. The four
+canonical `bifrost-code-navigation`, `bifrost-code-reading`,
+`bifrost-codebase-search`, and `bifrost-policy-checking` skills remain shared
+without Pi-specific copies.
 
 Install a local checkout after installing its package dependencies:
 
@@ -265,6 +266,9 @@ tools:
   `get_summaries` and `get_symbol_sources`.
 - `bifrost-codebase-search`: symbol, usage, file, and related-file discovery
   with shell grep reserved for arbitrary text.
+- `bifrost-policy-checking`: built-in policy-pack and category discovery plus
+  combined built-in/repository RQL policy evaluation with `list_policies` and
+  `run_policy`.
 - `brokk-adversarial-test-sweep`: comprehensive test-suite hardening across
   edge cases, malformed inputs, concurrency, resource pressure, corrupted
   state, invalid assumptions, and weak or redundant coverage.
@@ -304,7 +308,7 @@ with the Bifrost CLI instead of copying directories by hand:
 bifrost --root /absolute/path/to/workspace --install-skills --target project
 ```
 
-The default command installs the three Bifrost code-intelligence skills. Use
+The default command installs the four generic Bifrost agent skills. Use
 `--target global` for `~/.agents/skills`, `--skills-root /path/to/skills` for an
 explicit skills root, `--mode copy` for self-contained copies, or
 `--skill-set all` to opt into the Brokk workflow/review skills as well. This
@@ -450,7 +454,7 @@ Use the bifrost-code-reading skill. Use the Bifrost MCP get_summaries tool on sr
 
 Amp uses a generated skill collection at
 `plugins/bifrost-agent/amp-skills`. Do not edit files under that directory
-directly; update the canonical code-intelligence skills in
+directly; update the canonical Bifrost agent skills in
 `plugins/bifrost-agent/skills`, then regenerate the Amp bundle:
 
 ```bash

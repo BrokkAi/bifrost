@@ -95,6 +95,38 @@ appropriate, and update the conservative TextMate grammar in `editors/vscode/syn
 Keep ordinary JSON documents outside the RQL editor integration: JSON-shaped CodeQuery source is recognized only after
 the host has identified the document as `bifrost-rql`.
 
+# Review findings as RQL regressions
+
+When code review exposes a recurring, mechanically detectable smell, first minimize it into a structured RQL query.
+If the query is useful across repositories, add or extend a checked-in `.rqlp` rule under `policy-packs/` with a stable
+policy ID, explicit policy/RQL schema versions, inventory metadata, and a semantic hash in the pack manifest. A shippable
+rule needs behavior-focused positive and realistic near-miss coverage for every language it claims, including similarly
+named APIs, the same operation outside the relevant structural context, and nested/deferred bodies where containment is
+part of the rule. If current containment cannot distinguish a deferred body, either keep the rule out or make the deferred
+case an explicit tested lexical positive and state that boundary in the message and description. Phrase name-based
+performance matches as review prompts rather than proof of execution, runtime cost, or invariance.
+
+Do not replace a missing RQL/analyzer relation with regexes, source-text matching, or a coarse `file_of` projection. When
+the minimized query cannot express the review condition or produces an incomplete/misleading result, search open issues
+first, then link the existing owner or file a focused follow-up. Record the smallest fixture and query, expected versus
+actual result, diagnostics/completion, language, and exact Bifrost commit. Keep the candidate out of the built-in pack
+until it can pass positive and near-miss tests reliably.
+
+Treat Bifrost plugin latency as a product regression. Time code-intelligence calls during normal agent work; any call
+longer than five seconds warrants an open-issue search. If an issue already owns the slow path, add materially new timing
+evidence there; otherwise file one. Include the exact tool and arguments, workspace/revision and scope, wall-clock time,
+cold/warm state when known, result or cancellation state, and a profile or minimized reproducer when practical.
+
+During active development, leave each day's policy work release-ready: keep increments small, update the embedded
+manifest and package checks, and run the staged-binary policy smoke. This cadence does not authorize version bumps,
+tags, publishing, or deployment without an explicit request.
+
+Before completing a code-changing task, use the `bifrost-policy-checking` skill when it is installed. Run the
+`bifrost.code-smells` pack together with every executable repository policy root explicitly named by the project, using
+one MCP `run_policy` request against the active workspace. Treat `finding` as work to review or fix and `unreliable` as a
+failed validation result; rerun the same selection after changes. Never infer success merely because the skill is visible
+when its `list_policies` or `run_policy` MCP tools are absent.
+
 # Design philosophy
 
 We build for correctness and generality. Adding narrow "fallbacks" is a smell. Always follow problems

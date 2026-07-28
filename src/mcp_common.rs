@@ -1006,12 +1006,28 @@ fn prepare_tool_call(
         ))));
     }
 
-    reconcile_codex_sandbox_workspace(service, connection, object)?;
-
     let arguments = object
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    if name == "list_policies" {
+        if !arguments
+            .as_object()
+            .is_some_and(|object| object.is_empty())
+        {
+            return Err((
+                INVALID_PARAMS,
+                "list_policies arguments must be an empty object".to_string(),
+            ));
+        }
+        let output = service
+            .call_tool_output_with_cancellation(name, arguments, RenderOptions::default(), None)
+            .map_err(|error| map_service_error(error.code, error.message))?;
+        return Ok(ToolCallPreparation::Reply(tool_success_result(output)));
+    }
+
+    reconcile_codex_sandbox_workspace(service, connection, object)?;
+
     if connection.workspace_binding_source == WorkspaceBindingSource::None {
         return Err(unbound_workspace_error());
     }
@@ -2089,6 +2105,44 @@ mod uri_tests {
     fn relative_native_workspace_root_is_rejected() {
         let error = client_root_to_path("workspace").unwrap_err();
         assert!(error.contains("invalid root URI `workspace`"), "{error}");
+    }
+
+    #[test]
+    fn list_policies_is_rootless_and_rejects_nonempty_arguments() {
+        let service = SearchToolsService::new_unbound_manual();
+        let mut connection = McpConnectionState::new(true);
+        let spec = McpServerSpec {
+            instructions: "test",
+            tool_names: HashSet::from(["list_policies".to_string()]),
+            tool_descriptors: Vec::new(),
+        };
+
+        let prepared = prepare_tool_call(
+            &service,
+            &mut connection,
+            json!({ "name": "list_policies", "arguments": {} }),
+            McpRenderOptions::default(),
+            &spec,
+        )
+        .expect("rootless policy listing");
+        let ToolCallPreparation::Reply(result) = prepared else {
+            panic!("list_policies should reply without workspace preparation");
+        };
+        assert_eq!(result["isError"], false, "{result}");
+        assert_eq!(result["structuredContent"]["id"], "bifrost.code-smells");
+        assert!(service.active_workspace_root().is_none());
+
+        let error = prepare_tool_call(
+            &service,
+            &mut connection,
+            json!({ "name": "list_policies", "arguments": { "unexpected": true } }),
+            McpRenderOptions::default(),
+            &spec,
+        )
+        .err()
+        .expect("nonempty arguments must be rejected");
+        assert_eq!(error.0, INVALID_PARAMS);
+        assert!(error.1.contains("empty object"), "{}", error.1);
     }
 
     #[test]

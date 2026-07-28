@@ -14,11 +14,12 @@ use brokk_bifrost::mcp_registry::{
     resolve_server_spec, resolve_server_spec_for_render_options, searchtools_toolset_order,
 };
 use brokk_bifrost::policy::{
-    HumanRenderColor, HumanRenderDetail, HumanRenderOptions, POLICY_EXIT_UNRELIABLE,
-    PolicyBatchOutcome, PolicyEvaluationDate, PolicyEvaluationOptions, PolicyFailOn,
-    PolicyRenderError, PolicyReportDocument, PolicySuppressionOptions, PolicySuppressionSource,
-    SarifToolIdentity, escape_terminal_text, evaluate_policy_files, write_policy_human,
-    write_policy_json, write_policy_sarif,
+    BuiltInPolicySelection, HumanRenderColor, HumanRenderDetail, HumanRenderOptions,
+    POLICY_EXIT_UNRELIABLE, PolicyBatchOutcome, PolicyEvaluationDate, PolicyEvaluationInput,
+    PolicyEvaluationOptions, PolicyFailOn, PolicyRenderError, PolicyReportDocument,
+    PolicySuppressionOptions, PolicySuppressionSource, SarifToolIdentity, built_in_policy_catalog,
+    escape_terminal_text, evaluate_policy_inputs, write_policy_human, write_policy_json,
+    write_policy_sarif,
 };
 use brokk_bifrost::scoped_project::create_cli_tool_service;
 use brokk_bifrost::searchtools_render::RenderOptions;
@@ -85,6 +86,10 @@ fn has_policy_syntax(args: &[String]) -> bool {
         if matches!(
             argument,
             "--policy-file"
+                | "--policy-pack"
+                | "--policy-category"
+                | "--policy-id"
+                | "--list-policies"
                 | "--format"
                 | "--fail-on"
                 | "--suppressions-file"
@@ -120,6 +125,9 @@ fn option_requires_value(argument: &str) -> bool {
             | "--query-file"
             | "--sources"
             | "--policy-file"
+            | "--policy-pack"
+            | "--policy-category"
+            | "--policy-id"
             | "--format"
             | "--fail-on"
             | "--suppressions-file"
@@ -156,6 +164,8 @@ fn run_inner(
     let mut no_line_numbers_seen = false;
     let mut force_semantic_cpu_seen = false;
     let mut policy_files = Vec::new();
+    let mut policy_selection = BuiltInPolicySelection::default();
+    let mut list_policies = false;
     let mut policy_format = PolicyOutputFormat::Human;
     let mut policy_format_seen = false;
     let mut policy_fail_on = PolicyFailOn::Warning;
@@ -280,6 +290,30 @@ fn run_inner(
                     .ok_or_else(|| "--policy-file requires a path".to_string())?;
                 policy_files.push(PathBuf::from(value));
             }
+            "--policy-pack" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--policy-pack requires an id".to_string())?;
+                policy_selection.packs.push(value);
+            }
+            "--policy-category" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--policy-category requires a category".to_string())?;
+                policy_selection.categories.push(value);
+            }
+            "--policy-id" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--policy-id requires an id".to_string())?;
+                policy_selection.policy_ids.push(value);
+            }
+            "--list-policies" => {
+                if list_policies {
+                    return Err("--list-policies may only be provided once".to_string());
+                }
+                list_policies = true;
+            }
             "--format" => {
                 let value = args
                     .next()
@@ -383,9 +417,6 @@ fn run_inner(
     }
 
     if policy_invocation {
-        if policy_files.is_empty() {
-            return Err("policy mode requires at least one --policy-file".to_string());
-        }
         if query_file.is_some()
             || tool_name.is_some()
             || tool_args_seen
@@ -399,7 +430,36 @@ fn run_inner(
             || force_semantic_cpu_seen
         {
             return Err(
-                "--policy-file and policy output options cannot be combined with --query-file, --tool, --args, --sources, --mcp, --lsp, --repl, skill-install options, --no-line-numbers, or --force-semantic-cpu"
+                "policy options cannot be combined with --query-file, --tool, --args, --sources, --mcp, --lsp, --repl, skill-install options, --no-line-numbers, or --force-semantic-cpu"
+                    .to_string(),
+            );
+        }
+        if list_policies {
+            if !policy_files.is_empty()
+                || !policy_selection.is_empty()
+                || policy_format_seen
+                || policy_fail_on_seen
+                || policy_suppressions_seen
+                || policy_evaluation_date.is_some()
+                || policy_output.is_some()
+                || policy_verbose_seen
+                || policy_color_seen
+                || require_explicit_schema_versions
+            {
+                return Err(
+                    "--list-policies cannot be combined with policy selection or evaluation options"
+                        .to_string(),
+                );
+            }
+            let catalog = built_in_policy_catalog().map_err(|error| error.to_string())?;
+            let encoded = serde_json::to_string_pretty(catalog.manifest())
+                .map_err(|error| format!("failed to serialize built-in policy catalog: {error}"))?;
+            println!("{encoded}");
+            return Ok(CliRunResult::Complete);
+        }
+        if policy_files.is_empty() && policy_selection.is_empty() {
+            return Err(
+                "policy mode requires at least one --policy-file or built-in policy selector"
                     .to_string(),
             );
         }
@@ -407,9 +467,23 @@ fn run_inner(
         {
             return Err("--verbose and --color are only valid with --format human".to_string());
         }
+        let mut policy_inputs = built_in_policy_catalog()
+            .map_err(|error| error.to_string())?
+            .select(&policy_selection)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|policy| {
+                PolicyEvaluationInput::embedded(policy.source_identity(), policy.source())
+            })
+            .collect::<Vec<_>>();
+        policy_inputs.extend(
+            policy_files
+                .into_iter()
+                .map(PolicyEvaluationInput::workspace_file),
+        );
         let status = run_policy_mode(
             root,
-            &policy_files,
+            &policy_inputs,
             policy_format,
             policy_fail_on,
             policy_evaluation_date,
@@ -569,7 +643,7 @@ fn parse_policy_color(value: &str) -> Result<PolicyColorMode, String> {
 #[allow(clippy::too_many_arguments)]
 fn run_policy_mode(
     root: PathBuf,
-    policy_files: &[PathBuf],
+    policy_inputs: &[PolicyEvaluationInput],
     format: PolicyOutputFormat,
     fail_on: PolicyFailOn,
     evaluation_date: Option<PolicyEvaluationDate>,
@@ -598,7 +672,7 @@ fn run_policy_mode(
     let options = PolicyEvaluationOptions::with_suppressions(evaluation_date, suppressions)
         .with_required_schema_versions(require_explicit_schema_versions)
         .with_fail_on(fail_on);
-    let outcome = match evaluate_policy_files(root, policy_files, &options) {
+    let outcome = match evaluate_policy_inputs(root, policy_inputs, &options) {
         Ok(outcome) => outcome,
         Err(error) => {
             eprintln!(
@@ -870,7 +944,8 @@ USAGE:
     bifrost --repl             Run the interactive code-query REPL
     bifrost --tool NAME        Run a single tool once, print JSON result, and exit
     bifrost --query-file PATH  Run a .rql or .json code query once, print JSON result, and exit
-    bifrost --policy-file PATH Evaluate one or more static-analysis policy files and exit
+    bifrost --policy-file PATH Evaluate workspace or built-in static-analysis policies and exit
+    bifrost --list-policies    Print the built-in policy-pack manifest and exit
     bifrost --install-skills   Install Bifrost Agent Skills into a .agents/skills root
     bifrost --version | --help [TOOL]
 
@@ -884,6 +959,10 @@ OPTIONS:
     --sources PATH         Restrict one-shot --tool workspace construction to selected files,
                            directories, or globs. Repeatable; valid only with --tool.
     --policy-file PATH     Evaluate a workspace-relative .rqlp policy. Repeatable.
+    --policy-pack ID       Evaluate every built-in policy in a pack. Repeatable.
+    --policy-category NAME Evaluate built-in policies in a category. Repeatable.
+    --policy-id ID         Evaluate one built-in policy by stable id. Repeatable.
+    --list-policies        Print the deterministic built-in policy catalog as JSON
     --format FORMAT        Policy output: human, json, or sarif (default: human)
     --verbose              Include complete evidence, provenance, and rule details in human output
     --color MODE           Human output color: auto, always, or never (default: auto)
@@ -950,6 +1029,10 @@ EXAMPLES:
 
     # Evaluate two policy roots together and emit one canonical JSON report:
     bifrost --root /path/to/project --policy-file policies/security.rqlp --policy-file policies/correctness.rqlp --evaluation-date 2026-07-27 --format json
+
+    # Discover and run the built-in code-smell pack:
+    bifrost --list-policies
+    bifrost --root /path/to/project --policy-pack bifrost.code-smells --evaluation-date 2026-07-28 --format json
 
     # Human code-query exploration with S-expressions, completion, docs, and history:
     bifrost --root /path/to/project --repl

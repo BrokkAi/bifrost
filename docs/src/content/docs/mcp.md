@@ -48,7 +48,7 @@ When standard roots or sandbox-state metadata controls a rootless connection, `a
 | `symbol` | `search_symbols`, `get_symbol_sources`, `get_summaries`, mode-specific usage and definition lookup tools, `get_type_by_location`, `rename_symbol`, `usage_graph` |
 | `nlp` | `semantic_search` when Bifrost is built with `--features nlp`, the active root is a git repository, and semantic search is available for the session. `semantic_search_status` is accepted for diagnostics but hidden from the advertised tool list. |
 | `workspace` | `refresh`, `activate_workspace`, `get_active_workspace` |
-| `extended` | `query_code`, `run_policy`, `get_symbol_locations`, `get_symbol_ancestors`, `find_filenames`, `list_files`, `most_relevant_files`, `jq`, `xml_skim`, `xml_select` |
+| `extended` | `query_code`, `list_policies`, `run_policy`, `get_symbol_locations`, `get_symbol_ancestors`, `find_filenames`, `list_files`, `most_relevant_files`, `jq`, `xml_skim`, `xml_select` |
 | `text` | `get_file_contents`, `search_file_contents`, `find_files_containing` |
 | `slopcop` | `compute_cyclomatic_complexity`, `compute_cognitive_complexity`, `report_comment_density_for_code_unit`, `report_exception_handling_smells`, `report_comment_density_for_files`, `analyze_git_hotspots`, `report_test_assertion_smells`, `report_structural_clone_smells`, `report_long_method_and_god_object_smells`, `report_dead_code_and_unused_abstraction_smells`, `report_secret_like_code`, `analyze_diff` |
 | `cli` | `classify_test_files` |
@@ -65,21 +65,27 @@ Exact MCP source positions use 1-based lines and 1-based Unicode code-point colu
 
 Pass `--no-line-numbers` to remove rendered line and line-range prefixes from MCP text previews while keeping `structuredContent` unchanged.
 
-## Run Explicit Policies
+## Discover and Run Policies
 
-The `extended` toolset's read-only `run_policy` tool evaluates only the
-workspace-relative `.rqlp` files named by the caller:
+The `extended` toolset's read-only `list_policies` tool returns the deterministic
+built-in manifest without constructing an analyzer. `run_policy` evaluates any
+non-empty union of built-in selectors and workspace-relative `.rqlp` files:
 
 ```json
 {
+  "policy_packs": ["bifrost.code-smells"],
+  "policy_categories": ["performance"],
+  "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
   "policy_files": [".bifrost/policies/security.rqlp"],
   "evaluation_date": "2026-07-27",
   "fail_on": "warning"
 }
 ```
 
-`policy_files` contains one or more explicit roots. The tool does not discover
-built-in packs or run every file under `.bifrost/policies/`. Add
+The selector arrays form a deduplicated union in manifest order, and
+`policy_files` adds explicit workspace roots to the same batch. All arrays are
+bounded and reject duplicate entries; unknown selectors are invalid parameters.
+The tool never discovers or runs every file under `.bifrost/policies/`. Add
 `"suppression_file":"reviews/accepted.json"` for one workspace-relative
 override; otherwise it uses `.bifrost/suppressions.json`. The date is required
 because the shared policy coordinator does not read the clock.
@@ -179,8 +185,8 @@ Before asking an agent to claim “all callers” or “no matches,” teach it 
 
 MCP setup makes Bifrost tools available to an agent host. Agent Skills are
 separate instructions that teach the host when and how to use those tools. For
-hosts that load generic filesystem skills, install Bifrost's default
-code-intelligence skills with:
+hosts that load generic filesystem skills, install Bifrost's default code
+intelligence and policy-checking skills with:
 
 ```bash
 bifrost --root /path/to/project --install-skills --target project

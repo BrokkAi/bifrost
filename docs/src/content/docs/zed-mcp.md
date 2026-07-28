@@ -125,6 +125,7 @@ The recommended first set is:
 - `bifrost-code-navigation`
 - `bifrost-code-reading`
 - `bifrost-codebase-search`
+- `bifrost-policy-checking`
 
 Workflow skills such as guided review or PR review may depend on host-specific
 tools and should be installed only after validating that the host provides the

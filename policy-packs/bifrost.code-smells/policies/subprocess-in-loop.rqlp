@@ -1,0 +1,24 @@
+(policy
+  :schema-version 1
+  :id "bifrost.performance.subprocess-in-loop"
+  :name "Subprocess creation inside a loop"
+  :message "Review whether this lexically nested subprocess launch repeats per iteration"
+  :severity warning
+  :description "A subprocess call lexically nested under a loop may repeat expensive process creation. This structural prompt also includes deferred nested bodies; verify execution before reusing a process or batching input."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["performance" "subprocess" "loop" "code-smell"]
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql
+          :schema-version 2
+          (union
+            (language python
+              (inside (loop) (call :receiver (name "subprocess") :callee (name "run"))))
+            (language java
+              (inside (loop) (call :receiver (name "runtime") :callee (name "exec"))))
+            (language javascript
+              (inside (loop) (call :receiver (name "child_process") :callee (name "execSync"))))
+            (language typescript
+              (inside (loop) (call :receiver (name "child_process") :callee (name "execSync"))))))))

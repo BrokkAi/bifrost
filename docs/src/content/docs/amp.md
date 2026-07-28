@@ -48,6 +48,11 @@ Use the bifrost-code-intelligence skill. Call the Bifrost get_summaries tool on 
 
 Use a source directory or source file for validation. Avoid a prompt that only asks about `README.md`, because that can pass through ordinary file reading without proving the MCP server ran.
 
+The same skill includes `list_policies` and `run_policy`. Ask it to call
+`list_policies` with `{}` to discover the installed pack and its distinct
+categories, then select the whole `bifrost.code-smells` pack or pass exact
+category names through `policy_categories`.
+
 Apply the shared
 [host-integration evidence contract](/mcp/#validate-host-integration): retain
 the Bifrost tool event and structured result for a known workspace declaration,

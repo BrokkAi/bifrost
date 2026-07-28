@@ -34,6 +34,7 @@ const SYMBOL_TOOL_NAMES = toolNamesFor("symbols");
 const QUALITY_TOOL_NAMES = toolNamesFor("quality");
 const QUERY_TOOL_NAMES = toolNamesFor("query");
 const FILE_TOOL_NAMES = toolNamesFor("files");
+const POLICY_TOOL_NAMES = toolNamesFor("policies");
 const TEXT_TOOL_NAMES = toolNamesFor("text");
 const TRANSFORMS_TOOL_NAMES = toolNamesFor("transforms");
 
@@ -71,6 +72,8 @@ const EXTENDED_SERVER_TOOL_NAMES = [
   "find_filenames",
   "list_files",
   "most_relevant_files",
+  "list_policies",
+  "run_policy",
   "search_git_commit_messages",
   "get_git_log",
   "get_commit_diff",
@@ -272,6 +275,7 @@ test("default capabilities match the real MCP toolset boundaries", async () => {
       ...piNames(SYMBOL_TOOL_NAMES),
       ...piNames(QUERY_TOOL_NAMES),
       ...piNames(FILE_TOOL_NAMES),
+      ...piNames(POLICY_TOOL_NAMES),
     ]),
   );
   await assert.rejects(
