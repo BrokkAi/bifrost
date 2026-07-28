@@ -216,6 +216,14 @@ impl RustAnalyzer {
             .candidates_in_library_route(file, route, candidates)
     }
 
+    pub(crate) fn resolve_cargo_crate_root_file(
+        &self,
+        file: &ProjectFile,
+        route: &str,
+    ) -> Option<ProjectFile> {
+        self.cargo_routes().resolve_crate_root_file(file, route)
+    }
+
     pub fn new(project: Arc<dyn Project>) -> Self {
         Self::new_with_config(project, AnalyzerConfig::default())
     }

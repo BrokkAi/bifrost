@@ -308,7 +308,7 @@ fn resolve_rust_bounded_in_session(
         return outcome;
     }
 
-    if focused_rust_field_receiver(node, site.focus_start_byte) {
+    if node.kind() == "self" && focused_rust_field_receiver(node, site.focus_start_byte) {
         return no_definition(
             "local_receiver",
             "the focused Rust receiver is a local expression, which is not indexed",
@@ -1348,7 +1348,7 @@ fn rust_exact_reference_role_outcome(
             "Rust lifetime parameters are lexical bindings and are not indexed definitions",
         ));
     }
-    if focused_rust_field_receiver(focused, site.focus_start_byte) {
+    if focused.kind() == "self" && focused_rust_field_receiver(focused, site.focus_start_byte) {
         return Some(no_definition(
             "local_receiver",
             "the focused Rust receiver is a local expression, which is not indexed",
@@ -2476,6 +2476,10 @@ fn rust_local_scoped_owner_member_candidates(
         .flat_map(|owner| support.members_for_owner_name(&owner.fq_name(), member))
         .filter(|candidate| rust_role_accepts_scoped(rust, role, candidate))
         .collect::<Vec<_>>();
+    candidates.extend(rust_cargo_root_member_candidates(
+        rust, support, file, source, path, member,
+    ));
+    candidates.retain(|candidate| rust_role_accepts_scoped(rust, role, candidate));
     sort_units(&mut candidates);
     candidates.dedup();
     (!candidates.is_empty()).then_some(candidates)
@@ -2517,9 +2521,39 @@ fn rust_focused_terminal_scoped_type_candidates(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+    candidates.extend(
+        rust_cargo_root_member_candidates(rust, support, file, source, path, member)
+            .into_iter()
+            .filter(|candidate| rust_is_type_definition(analyzer, candidate)),
+    );
     sort_units(&mut candidates);
     candidates.dedup();
     (!candidates.is_empty()).then_some(candidates)
+}
+
+fn rust_cargo_root_member_candidates(
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    path: Node<'_>,
+    member: &str,
+) -> Vec<CodeUnit> {
+    if !matches!(path.kind(), "identifier" | "type_identifier") {
+        return Vec::new();
+    }
+    let route = rust_node_text(path, source).trim();
+    if route.is_empty() {
+        return Vec::new();
+    }
+    let Some(root_file) = rust.resolve_cargo_crate_root_file(file, route) else {
+        return Vec::new();
+    };
+    support
+        .file_identifier(&root_file, member)
+        .into_iter()
+        .filter(|candidate| candidate.source() == &root_file)
+        .collect()
 }
 
 fn rust_scoped_owner_candidates_from_path(
@@ -2562,6 +2596,24 @@ fn rust_scoped_owner_candidates_from_path(
                 owner_text,
                 RustBareReferenceRole::Owner,
             ));
+        }
+        let rust_2015 = rust.file_uses_rust_2015_edition(file);
+        let explicit_extern_route = rust_2015
+            .then(|| rust_visible_extern_crate_binding(path, source, owner_text))
+            .flatten();
+        let cargo_root_in_scope = !rust_2015 || explicit_extern_route.is_some();
+        let cargo_route = explicit_extern_route.as_deref().unwrap_or(owner_text);
+        let external = cargo_root_in_scope
+            .then(|| rust.resolve_module_package(file, cargo_route))
+            .flatten()
+            .into_iter()
+            .flat_map(|package| support.fqn(&package))
+            .filter(|candidate| {
+                rust_role_accepts_imported(rust, RustBareReferenceRole::Owner, candidate)
+            })
+            .collect::<Vec<_>>();
+        if let Some(routed) = rust.candidates_in_cargo_library_route(file, cargo_route, external) {
+            candidates.extend(routed);
         }
         if let Some(fqn) = rust.resolve_module_package(file, owner_text) {
             candidates.extend(support.fqn(&fqn));
@@ -3257,10 +3309,12 @@ fn resolve_rust_field(
         if receiver.start_byte() <= site.focus_start_byte
             && site.focus_start_byte < receiver.end_byte()
         {
-            return Some(no_definition(
-                "local_receiver",
-                "the focused Rust receiver is a local expression, which is not indexed",
-            ));
+            return (receiver.kind() == "self").then(|| {
+                no_definition(
+                    "local_receiver",
+                    "the focused Rust receiver is a local expression, which is not indexed",
+                )
+            });
         }
         if !(field.start_byte() <= site.focus_start_byte
             && site.focus_start_byte < field.end_byte())
@@ -3546,8 +3600,9 @@ fn focused_rust_field_receiver(node: Node<'_>, focus_start: usize) -> bool {
 }
 
 pub(super) fn focused_site_is_field_receiver(root: Node<'_>, site: &ResolvedReferenceSite) -> bool {
-    smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)
-        .is_some_and(|node| focused_rust_field_receiver(node, site.focus_start_byte))
+    smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte).is_some_and(
+        |node| node.kind() == "self" && focused_rust_field_receiver(node, site.focus_start_byte),
+    )
 }
 
 fn rust_enclosing_field_expression_bounded<'tree>(
