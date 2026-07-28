@@ -11056,6 +11056,177 @@ using invoke_result_t = typename invoke_result<F, Us...>::type;
 }
 
 #[test]
+fn cpp_anonymous_namespace_global_exact_ranges_survive_sycl_style_nested_lambda_initializers() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "left.cpp",
+            r#"namespace {
+constexpr int OUTPUT_BUFFER_LENGTH_PER_THREAD = 256;
+constexpr int OTHER_BUFFER_LENGTH_PER_THREAD = 128;
+constexpr int MAX_LP = 64;
+constexpr int INTEL_SUB_GROUP_SIZE = 16;
+}
+
+template <int BLOCK_SIZE>
+void launch_decode_per_channel(sycl::queue& queue, int nlayers,
+                               int nchannels, int lp) {
+    const int channel_blocks = nchannels / BLOCK_SIZE;
+    sycl::range<2> global_range(static_cast<size_t>(nlayers),
+                                static_cast<size_t>(channel_blocks) * BLOCK_SIZE);
+    sycl::range<2> local_range(1, BLOCK_SIZE);
+    queue.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<uint16_t, 1> cdf_shared(
+            sycl::range<1>(MAX_LP * BLOCK_SIZE), cgh);
+        sycl::local_accessor<uint8_t, 1> bs_shared(
+            sycl::range<1>(BLOCK_SIZE * OUTPUT_BUFFER_LENGTH_PER_THREAD), cgh);
+        sycl::local_accessor<int32_t, 1> len_shared(sycl::range<1>(BLOCK_SIZE),
+                                                    cgh);
+        cgh.parallel_for(
+            sycl::nd_range<2>(global_range, local_range),
+            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(
+                INTEL_SUB_GROUP_SIZE)]] {
+                const int block_y = static_cast<int>(item.get_group(1));
+                const int tx = item.get_local_id(1);
+                const int global_channel_offset = block_y * BLOCK_SIZE;
+                const int total_bytes =
+                    BLOCK_SIZE * OUTPUT_BUFFER_LENGTH_PER_THREAD;
+                for (int k = tx; k < total_bytes; k += BLOCK_SIZE) {
+                    const int i = k / OUTPUT_BUFFER_LENGTH_PER_THREAD;
+                    const int j = k - i * OUTPUT_BUFFER_LENGTH_PER_THREAD;
+                    const int channel_id = global_channel_offset + i;
+                    const int length = len_shared[i];
+                    if (j < length) {
+                        bs_shared[k] = static_cast<uint8_t>(channel_id);
+                    }
+                }
+            });
+    });
+}
+"#,
+        ),
+        (
+            "right.cpp",
+            r#"namespace {
+constexpr int OUTPUT_BUFFER_LENGTH_PER_THREAD = 512;
+constexpr int INTEL_SUB_GROUP_SIZE = 16;
+}
+
+template <int BLOCK_SIZE>
+void launch_decode_per_channel(sycl::queue& queue) {
+    sycl::range<2> global_range(1, BLOCK_SIZE);
+    sycl::range<2> local_range(1, BLOCK_SIZE);
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<2>(global_range, local_range),
+            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(
+                INTEL_SUB_GROUP_SIZE)]] {
+                const int total_bytes =
+                    BLOCK_SIZE * OUTPUT_BUFFER_LENGTH_PER_THREAD;
+                const int OUTPUT_BUFFER_LENGTH_PER_THREAD = total_bytes;
+                (void) OUTPUT_BUFFER_LENGTH_PER_THREAD;
+                (void) total_bytes;
+            });
+    });
+}
+"#,
+        ),
+    ]);
+    let left = project.file("left.cpp");
+    let right = project.file("right.cpp");
+    let left_source = left.read_to_string().expect("left source");
+    let right_source = right.read_to_string().expect("right source");
+
+    let left_target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Field
+            && unit.identifier() == "OUTPUT_BUFFER_LENGTH_PER_THREAD"
+            && slash_path(unit.source()) == "left.cpp"
+    });
+    let right_target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Field
+            && unit.identifier() == "OUTPUT_BUFFER_LENGTH_PER_THREAD"
+            && slash_path(unit.source()) == "right.cpp"
+    });
+    let other_target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Field
+            && unit.identifier() == "OTHER_BUFFER_LENGTH_PER_THREAD"
+            && slash_path(unit.source()) == "left.cpp"
+    });
+
+    let left_expected = fixture_token_range(
+        &left_source,
+        "                    BLOCK_SIZE * OUTPUT_BUFFER_LENGTH_PER_THREAD;",
+        "OUTPUT_BUFFER_LENGTH_PER_THREAD",
+    );
+    let left_secondary = fixture_token_range(
+        &left_source,
+        "                    const int i = k / OUTPUT_BUFFER_LENGTH_PER_THREAD;",
+        "OUTPUT_BUFFER_LENGTH_PER_THREAD",
+    );
+    let left_tertiary = fixture_token_range(
+        &left_source,
+        "                    const int j = k - i * OUTPUT_BUFFER_LENGTH_PER_THREAD;",
+        "OUTPUT_BUFFER_LENGTH_PER_THREAD",
+    );
+    let right_expected = fixture_token_range(
+        &right_source,
+        "                    BLOCK_SIZE * OUTPUT_BUFFER_LENGTH_PER_THREAD;",
+        "OUTPUT_BUFFER_LENGTH_PER_THREAD",
+    );
+    let left_authoritative =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&left_target), &left);
+    let right_authoritative =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&right_target), &right);
+    let right_shadowed = fixture_token_range(
+        &right_source,
+        "                (void) OUTPUT_BUFFER_LENGTH_PER_THREAD;",
+        "OUTPUT_BUFFER_LENGTH_PER_THREAD",
+    );
+    let left_whole = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&left_target))
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == left || hit.file == right)
+        .map(|hit| (slash_path(&hit.file), hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    let right_whole = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&right_target))
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == left || hit.file == right)
+        .map(|hit| (slash_path(&hit.file), hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(
+        left_authoritative,
+        BTreeSet::from([left_expected, left_secondary, left_tertiary])
+    );
+    assert_eq!(right_authoritative, BTreeSet::from([right_expected]));
+    assert_eq!(
+        left_whole,
+        BTreeSet::from([
+            ("left.cpp".to_string(), left_expected.0, left_expected.1),
+            ("left.cpp".to_string(), left_secondary.0, left_secondary.1),
+            ("left.cpp".to_string(), left_tertiary.0, left_tertiary.1),
+        ]),
+        "whole-workspace inverse lookup must keep anonymous-namespace globals file-local in nested SYCL-style lambdas",
+    );
+    assert_eq!(
+        right_whole,
+        BTreeSet::from([("right.cpp".to_string(), right_expected.0, right_expected.1)]),
+        "whole-workspace inverse lookup must keep anonymous-namespace globals file-local in nested SYCL-style lambdas",
+    );
+    assert!(
+        !authoritative_exact_ranges(&analyzer, std::slice::from_ref(&other_target), &left)
+            .contains(&left_expected),
+        "same-file sibling anonymous-namespace constants must stay distinct in SYCL-style nested lambdas",
+    );
+    assert!(
+        !right_authoritative.contains(&right_shadowed),
+        "a true lambda-local declaration must shadow later same-name reads",
+    );
+}
+
+#[test]
 fn authoritative_cpp_exact_ranges_cover_qualified_static_and_temporary_member_calls() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

@@ -5660,6 +5660,10 @@ pub(in crate::analyzer::usages) fn extract_variable_name(
         | "abstract_parenthesized_declarator"
         | "abstract_pointer_declarator"
         | "abstract_reference_declarator" => None,
+        "function_declarator" => node
+            .child_by_field_name("declarator")
+            .or_else(|| node.child_by_field_name("name"))
+            .and_then(|child| extract_variable_name(child, source)),
         _ => node
             .child_by_field_name("declarator")
             .or_else(|| node.child_by_field_name("name"))
@@ -6084,7 +6088,12 @@ pub(in crate::analyzer::usages) fn parameter_belongs_to_callable_scope(
     let mut current = parameter.parent();
     while let Some(ancestor) = current {
         if ancestor.kind() == "lambda_expression" {
-            return true;
+            return ancestor
+                .child_by_field_name("declarator")
+                .is_some_and(|declarator| {
+                    declarator.start_byte() <= parameter.start_byte()
+                        && parameter.end_byte() <= declarator.end_byte()
+                });
         }
         if ancestor.kind() == "function_definition" {
             return ancestor
