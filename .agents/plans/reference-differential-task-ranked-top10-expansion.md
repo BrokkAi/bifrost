@@ -468,6 +468,21 @@ comes through the local gate, but is not the focus.
   corpus reports, logs, ledgers, caches, and exact diagnostics from the exact
   campaign scratch directory plus the three named Qpid files in `/tmp`; the
   compact checked-in summaries retain the final provenance and checksums.
+- [x] (2026-07-28) Re-audited completion after unrelated work advanced hosted
+  master from the campaign close to `53cc729d`. The live
+  `tasks.task_repos(SFT_PREDICATES, langs=[LANG])` selector still reproduces
+  all eleven checked-in top-ten lists and its `not_overlarge=True` path; all 23
+  discoverable `FIRD:` issues are closed and assigned to `jbellis`; all 91
+  resolvable commit references in the plan and compact evidence are ancestors
+  of the new master; and the campaign scratch directory remains empty. On
+  `53cc729d`, formatting, `git diff --check`, all-target/all-feature Clippy,
+  and the complete feature-enabled test matrix pass at niceness 10 with normal
+  Cargo storage. The matrix passed 2,010 library tests with six intentional
+  ignores, 196 LSP tests, the MCP/CLI and differential surfaces, every language
+  integration target, and doc tests; it filtered only the separately
+  documented Scala diagnostic and analyzer name-structure tests. The unrelated
+  post-campaign commits do not change corpus membership or any accepted
+  artifact.
 - [x] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [x] Complete C++ and publish its evidence and user summary.
