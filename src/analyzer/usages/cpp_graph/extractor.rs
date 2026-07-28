@@ -2386,7 +2386,10 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         {
             push_hit(function_terminal_node(function), ctx);
         }
-        MethodReceiverTargetResolution::Missing if same_owner_context(function, ctx) => {
+        MethodReceiverTargetResolution::Missing
+            if same_owner_context(function, ctx)
+                || out_of_line_target_owner_context(function, ctx) =>
+        {
             push_self_receiver_hit(function_terminal_node(function), ctx);
         }
         MethodReceiverTargetResolution::Missing
@@ -2777,6 +2780,16 @@ fn function_definition_name_node(node: Node<'_>) -> Option<Node<'_>> {
     }
     node.child_by_field_name("declarator")
         .and_then(declarator_name_node)
+}
+
+fn function_definition_owner_lookup_node(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "function_definition" {
+        return None;
+    }
+    let declarator = node.child_by_field_name("declarator")?;
+    first_descendant_of_kind(declarator, "qualified_identifier")
+        .or_else(|| first_descendant_of_kind(declarator, "scoped_identifier"))
+        .or_else(|| function_definition_name_node(node))
 }
 
 fn function_definition_signature_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -3476,6 +3489,18 @@ fn declaring_owner_for_explicit_receiver(
     let receiver_units = receiver_type_units(receiver, ctx.source, ctx);
     let mut declaring_owner = None;
     for receiver_owner in receiver_units {
+        if ctx.spec.owner.as_ref().is_some_and(|target_owner| {
+            receiver_owner_matches_target(&receiver_owner, target_owner, receiver.start_byte(), ctx)
+        }) {
+            if declaring_owner
+                .as_ref()
+                .is_some_and(|existing| !same_visible_symbol(existing, &receiver_owner))
+            {
+                return EnclosingMemberOwnerResolution::Ambiguous;
+            }
+            declaring_owner = Some(receiver_owner);
+            continue;
+        }
         match cached_declaring_member_owner(&receiver_owner, ctx) {
             EnclosingMemberOwnerResolution::Owner(owner) => {
                 if declaring_owner
@@ -5235,6 +5260,36 @@ fn known_non_target_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     )
 }
 
+fn out_of_line_target_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let Some(target_owner) = ctx.spec.owner.as_ref() else {
+        return false;
+    };
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "function_definition" {
+            let Some(owner_lookup) = function_definition_owner_lookup_node(parent) else {
+                return false;
+            };
+            if let Some(owners) = out_of_line_member_definition_owner(
+                ctx.analyzer,
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
+                owner_lookup,
+            ) && let Some((_, owner)) = owners.innermost()
+            {
+                return receiver_owner_matches_target(owner, target_owner, node.start_byte(), ctx);
+            }
+            if let Some(owner) = target_guided_out_of_line_owner(owner_lookup, ctx) {
+                return receiver_owner_matches_target(&owner, target_owner, node.start_byte(), ctx);
+            }
+            return false;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
 #[cfg(test)]
 mod effective_using_scale_tests {
     use super::*;
@@ -5566,20 +5621,27 @@ fn structured_enclosing_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeU
     while let Some(parent) = current {
         if parent.kind() == "function_definition" {
             let function = function_definition_name_node(parent)?;
+            let owner_lookup = function_definition_owner_lookup_node(parent).unwrap_or(function);
             if let Some(owners) = out_of_line_member_definition_owner(
                 ctx.analyzer,
                 ctx.visibility,
                 ctx.file,
                 ctx.source,
-                function,
+                owner_lookup,
             ) && let Some((_, owner)) = owners.innermost()
             {
                 return Some(owner.clone());
             }
-            if let Some(owner) = indexed_enclosing_class_owner(ctx.analyzer, ctx.file, function) {
+            if let Some(owner) = indexed_enclosing_class_owner(ctx.analyzer, ctx.file, parent) {
                 return Some(owner);
             }
-            if let Some(owner) = target_guided_out_of_line_owner(function, ctx) {
+            if let Some(owner) = enclosing_context(parent, ctx)
+                .owner
+                .filter(|owner| owner.is_class())
+            {
+                return Some(owner);
+            }
+            if let Some(owner) = target_guided_out_of_line_owner(owner_lookup, ctx) {
                 return Some(owner);
             }
             break;

@@ -825,3 +825,265 @@ void consume(proton::value& v, int& x) {
         );
     }
 }
+
+#[test]
+fn qpid_production_shaped_session_overrides_and_value_operator_body_stay_exact() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "cpp/include/proton/error_condition.hpp",
+            r#"
+#pragma once
+namespace proton {
+class error_condition {};
+}
+"#,
+        ),
+        (
+            "cpp/include/proton/endpoint.hpp",
+            r#"
+#pragma once
+#include "error_condition.hpp"
+namespace proton {
+class endpoint {
+  public:
+    virtual ~endpoint() {}
+    virtual bool uninitialized() const = 0;
+    virtual class error_condition error() const = 0;
+};
+}
+"#,
+        ),
+        (
+            "cpp/include/proton/session.hpp",
+            r#"
+#pragma once
+#include "endpoint.hpp"
+namespace proton {
+class session : public endpoint {
+  public:
+    bool uninitialized() const override;
+    class error_condition error() const override;
+};
+class wrong_endpoint : public endpoint {
+  public:
+    bool uninitialized() const override;
+    class error_condition error() const override;
+};
+}
+"#,
+        ),
+        (
+            "cpp/include/proton/value.hpp",
+            r#"
+#pragma once
+namespace proton {
+namespace internal {
+class data {
+  public:
+    void clear();
+    void copy(const data&);
+};
+class value_base {
+  protected:
+    internal::data& data();
+    internal::data data_;
+};
+}
+class value : public internal::value_base {
+  public:
+    value& operator=(const value&);
+    bool empty() const;
+    void clear();
+};
+void clear();
+}
+"#,
+        ),
+        (
+            "cpp/src/endpoint.cpp",
+            r#"
+#include "proton/session.hpp"
+namespace proton {
+bool session::uninitialized() const { return false; }
+bool wrong_endpoint::uninitialized() const { return true; }
+}
+"#,
+        ),
+        (
+            "cpp/src/session.cpp",
+            r#"
+#include "proton/session.hpp"
+namespace proton {
+error_condition session::error() const { return error_condition(); }
+error_condition wrong_endpoint::error() const { return error_condition(); }
+}
+"#,
+        ),
+        (
+            "cpp/src/session_options.cpp",
+            r#"
+#include "proton/session.hpp"
+namespace proton {
+void apply(session& s, wrong_endpoint& wrong) {
+    if (s.uninitialized()) { } // positive-session-uninitialized-body
+    if (wrong.uninitialized()) { } // negative-wrong-owner-uninitialized
+}
+}
+"#,
+        ),
+        (
+            "cpp/examples/tx_recv.cpp",
+            r#"
+#include "proton/session.hpp"
+namespace proton {
+void on_session_error(session& s, wrong_endpoint& wrong) {
+    s.error(); // positive-session-error-body
+    wrong.error(); // negative-wrong-owner-error
+}
+}
+"#,
+        ),
+        (
+            "cpp/src/value.cpp",
+            r#"
+#include "proton/value.hpp"
+namespace proton {
+value& value::operator=(const value& x) {
+    if (this != &x) {
+        if (x.empty())
+            clear(); // positive-value-clear-operator
+        else
+            data().copy(x.data_);
+    }
+    return *this;
+}
+bool value::empty() const { return false; }
+void value::clear() {}
+void clear() {}
+namespace internal {
+data& value_base::data() { return data_; }
+void data::clear() {}
+void data::copy(const data&) {}
+}
+void consume(value& value_ref) {
+    value_ref.data().clear(); // negative-other-owner-clear
+    clear(); // negative-free-clear
+}
+}
+"#,
+        ),
+    ]);
+
+    let tx_recv = project.file("cpp/examples/tx_recv.cpp");
+    let tx_recv_source = tx_recv.read_to_string().expect("tx_recv source");
+    let session_options = project.file("cpp/src/session_options.cpp");
+    let session_options_source = session_options
+        .read_to_string()
+        .expect("session_options source");
+    let value_source_file = project.file("cpp/src/value.cpp");
+    let value_source = value_source_file.read_to_string().expect("value source");
+
+    let session_error_definition = function_target_with_signature(
+        &analyzer,
+        "cpp/src/session.cpp",
+        "session",
+        "error",
+        "() const",
+    );
+    let session_uninitialized_definition = function_target_with_signature(
+        &analyzer,
+        "cpp/src/endpoint.cpp",
+        "session",
+        "uninitialized",
+        "() const",
+    );
+    let clear_definition =
+        function_target_with_signature(&analyzer, "cpp/src/value.cpp", "value", "clear", "()");
+
+    let error_positive = fixture_token_range(
+        &tx_recv_source,
+        "    s.error(); // positive-session-error-body",
+        "error",
+    );
+    let error_negative = fixture_token_range(
+        &tx_recv_source,
+        "    wrong.error(); // negative-wrong-owner-error",
+        "error",
+    );
+    let (error_targeted, error_unproven) =
+        authoritative_result(&analyzer, &session_error_definition, &tx_recv);
+    assert!(
+        error_targeted.contains(&error_positive),
+        "session body target must recover explicit receiver override call: {error_targeted:?}"
+    );
+    assert!(
+        !error_targeted.contains(&error_negative),
+        "wrong owner explicit receiver must stay excluded: {error_targeted:?}"
+    );
+    assert_eq!(error_unproven, 0, "session error negatives must be proven");
+
+    let uninitialized_positive = fixture_token_range(
+        &session_options_source,
+        "    if (s.uninitialized()) { } // positive-session-uninitialized-body",
+        "uninitialized",
+    );
+    let uninitialized_negative = fixture_token_range(
+        &session_options_source,
+        "    if (wrong.uninitialized()) { } // negative-wrong-owner-uninitialized",
+        "uninitialized",
+    );
+    let (uninitialized_targeted, uninitialized_unproven) = authoritative_result(
+        &analyzer,
+        &session_uninitialized_definition,
+        &session_options,
+    );
+    assert!(
+        uninitialized_targeted.contains(&uninitialized_positive),
+        "session body target must recover explicit receiver override call from endpoint.cpp: {uninitialized_targeted:?}"
+    );
+    assert!(
+        !uninitialized_targeted.contains(&uninitialized_negative),
+        "wrong owner explicit receiver must stay excluded: {uninitialized_targeted:?}"
+    );
+    assert_eq!(
+        uninitialized_unproven, 0,
+        "session uninitialized negatives must be proven"
+    );
+
+    let clear_positive = fixture_token_range(
+        &value_source,
+        "            clear(); // positive-value-clear-operator",
+        "clear",
+    );
+    let clear_other_owner_negative = fixture_token_range(
+        &value_source,
+        "    value_ref.data().clear(); // negative-other-owner-clear",
+        "clear",
+    );
+    let clear_free_negative = fixture_token_range(
+        &value_source,
+        "    clear(); // negative-free-clear",
+        "clear",
+    );
+    let (clear_targeted, clear_unproven) =
+        authoritative_result(&analyzer, &clear_definition, &value_source_file);
+    assert!(
+        clear_targeted.contains(&clear_positive),
+        "value::operator= must recover bare clear() as an implicit self call: {clear_targeted:?}"
+    );
+    assert!(
+        !clear_targeted.contains(&clear_other_owner_negative)
+            && !clear_targeted.contains(&clear_free_negative),
+        "non-target clear calls must stay excluded: {clear_targeted:?}"
+    );
+    let clear_editor = editor_ranges(&analyzer, &clear_definition, &value_source_file);
+    assert!(
+        !clear_editor.contains(&clear_other_owner_negative)
+            && !clear_editor.contains(&clear_free_negative),
+        "editor surface must not misclassify non-target clear calls: {clear_editor:?}"
+    );
+    assert!(
+        clear_unproven <= 1,
+        "at most one control call may remain unproven while the operator-body target stays exact"
+    );
+}
