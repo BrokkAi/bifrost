@@ -4043,6 +4043,7 @@ where
                 let fq = crate::analyzer::store::hydrate_unit_fq(
                     row.fq_segments.as_deref(),
                     &package_name,
+                    &file,
                     crate::analyzer::common::language_for_file(&file),
                 )
                 .unwrap_or_default();
@@ -4711,6 +4712,7 @@ where
                 let fq = crate::analyzer::store::hydrate_unit_fq(
                     row.fq_segments.as_deref(),
                     &package_name,
+                    file,
                     crate::analyzer::common::language_for_file(file),
                 )
                 .unwrap_or_default();

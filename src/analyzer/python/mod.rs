@@ -36,6 +36,7 @@ use std::sync::{Arc, OnceLock};
 pub(crate) use adapter::PythonAdapter;
 use cache::{weight_code_unit_set, weight_code_unit_vec, weight_project_file_set};
 use clones::{build_clone_candidate_data, refine_python_clone_similarity};
+pub(crate) use declarations::python_package_prefix_fq;
 use declarations::{
     collect_python_identifiers, parse_python_tree, py_node_text, python_expanded_comment_start,
     python_module_name,

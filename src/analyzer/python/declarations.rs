@@ -2,7 +2,9 @@ use super::imports::python_import_infos_from_node;
 use super::syntax::{PythonOverloadDecoratorBindings, expression_name_node};
 use super::*;
 use crate::analyzer::ParameterMetadata;
-use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
+use crate::analyzer::fq_name::{
+    FqName, SegmentId, SegmentKind, package_prefix_fq, segment_interner,
+};
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use std::path::Path;
@@ -15,21 +17,98 @@ fn py_segment(text: &str, kind: SegmentKind) -> SegmentId {
 
 /// Build the structured module-path prefix for a Python declaration.
 ///
-/// The `package_name` threaded through [`PythonVisitor`] (and the `package_name`
-/// param of [`module_code_unit`]) is actually the file's full dotted module path
-/// — directory components plus the module's own file-stem, e.g.
-/// `mypkg.subpkg.mymodule` — built by joining `Path::components()` with `.`
-/// (see `python_package_name_for_file` / `python_module_info` below). Python
-/// identifiers can never contain a literal `.`, so splitting on `.` is lossless,
-/// and each component becomes one [`SegmentKind::Package`] segment: `Package`-
-/// `Package` renders with `.` by default (unlike Go's `/`-joined import path,
-/// which needs the `Path` kind), which is exactly this convention.
-fn python_module_fq(module_fq: &str) -> FqName {
+/// Ordinary modules render as a dotted path such as `mypkg.subpkg.mymodule`,
+/// with each original path component represented by one
+/// [`SegmentKind::Package`] segment. Hidden directories such as `.agent` and
+/// `.github` are also legal components in the analyzer's path-derived Python
+/// convention, but their leading dot is ambiguous after a rendered name has
+/// been joined.
+///
+/// Build the structured name from the file path's original components so
+/// hidden-directory segments stay intact in cold extraction, synthesized module
+/// units, and persisted reconstruction.
+pub(crate) fn python_module_fq(file: &ProjectFile) -> FqName {
     let mut fq = FqName::new();
-    for component in module_fq.split('.').filter(|c| !c.is_empty()) {
-        fq.push(py_segment(component, SegmentKind::Package));
+    for component in python_module_components(file) {
+        fq.push(py_segment(&component, SegmentKind::Package));
     }
     fq
+}
+
+pub(crate) fn python_package_prefix_fq(file: &ProjectFile, package_name: &str) -> FqName {
+    if package_name.is_empty() {
+        return FqName::new();
+    }
+
+    let mut fq = FqName::new();
+    let mut rendered = String::new();
+    for component in python_module_components(file) {
+        if !rendered.is_empty() {
+            rendered.push('.');
+        }
+        rendered.push_str(&component);
+        fq.push(py_segment(&component, SegmentKind::Package));
+        if rendered == package_name {
+            return fq;
+        }
+    }
+
+    debug_assert!(
+        false,
+        "python package_name should match a path-derived module-prefix boundary \
+         (file={}, package_name={package_name:?}, module_name={:?})",
+        file.rel_path().display(),
+        python_module_name(file),
+    );
+
+    package_prefix_fq(Language::Python, package_name, segment_interner())
+}
+
+fn python_module_components(file: &ProjectFile) -> Vec<String> {
+    let mut components = python_package_components_for_file(file);
+    let module_name = file
+        .rel_path()
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    if module_name != "__init__" || components.is_empty() {
+        components.push(module_name.to_string());
+    }
+    components
+}
+
+fn python_package_components_for_file(file: &ProjectFile) -> Vec<String> {
+    let Some(parent_rel) = file.rel_path().parent() else {
+        return Vec::new();
+    };
+    if parent_rel.as_os_str().is_empty() {
+        return Vec::new();
+    }
+
+    let mut effective_package_root_rel: Option<&Path> = None;
+    let mut current_rel = Some(parent_rel);
+    while let Some(path) = current_rel {
+        if file.root().join(path).join("__init__.py").exists() {
+            effective_package_root_rel = Some(path);
+        }
+        current_rel = path.parent();
+    }
+
+    let relative_package = match effective_package_root_rel {
+        Some(package_root_rel) => package_root_rel
+            .parent()
+            .and_then(|import_root_rel| parent_rel.strip_prefix(import_root_rel).ok())
+            .unwrap_or(parent_rel),
+        None => parent_rel,
+    };
+    path_components(relative_package)
+}
+
+fn path_components(path: &Path) -> Vec<String> {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .filter(|component| !component.is_empty())
+        .collect()
 }
 
 pub(super) fn python_is_decorated_function_boundary(node: Node<'_>) -> bool {
@@ -237,9 +316,7 @@ impl<'a> PythonVisitor<'a> {
                 .fq
                 .clone()
                 .with_pushed(py_segment(name, SegmentKind::Nested)),
-            None => {
-                python_module_fq(self.package_name).with_pushed(py_segment(name, SegmentKind::Type))
-            }
+            None => python_module_fq(self.file).with_pushed(py_segment(name, SegmentKind::Type)),
         };
         let code_unit = CodeUnit::new_fq(
             self.file.clone(),
@@ -335,7 +412,7 @@ impl<'a> PythonVisitor<'a> {
                     .with_pushed(py_segment(name, SegmentKind::Nested)),
             }
         } else {
-            python_module_fq(self.package_name).with_pushed(py_segment(name, SegmentKind::Member))
+            python_module_fq(self.file).with_pushed(py_segment(name, SegmentKind::Member))
         };
 
         if capture {
@@ -449,8 +526,7 @@ impl<'a> PythonVisitor<'a> {
             } else if module_control_depth <= 1 {
                 (
                     name.clone(),
-                    python_module_fq(self.package_name)
-                        .with_pushed(py_segment(&name, SegmentKind::Member)),
+                    python_module_fq(self.file).with_pushed(py_segment(&name, SegmentKind::Member)),
                 )
             } else {
                 continue;
@@ -540,108 +616,28 @@ pub(super) fn py_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     crate::analyzer::common::node_source_text(node, source)
 }
 
-struct PythonModuleInfo {
-    package_name: String,
-    module_name: String,
-}
-
-impl PythonModuleInfo {
-    fn module_qualified_package(&self) -> String {
-        if self.package_name.is_empty() {
-            self.module_name.clone()
-        } else {
-            format!("{}.{}", self.package_name, self.module_name)
-        }
-    }
-}
-
 pub(super) fn python_module_name(file: &ProjectFile) -> String {
-    python_module_info(file).module_qualified_package()
-}
-
-fn python_module_info(file: &ProjectFile) -> PythonModuleInfo {
-    let raw_package = python_package_name_for_file(file);
-    let module_name = file
-        .rel_path()
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or_default()
-        .to_string();
-
-    if module_name == "__init__" && !raw_package.is_empty() {
-        if let Some((package_name, last_segment)) = raw_package.rsplit_once('.') {
-            return PythonModuleInfo {
-                package_name: package_name.to_string(),
-                module_name: last_segment.to_string(),
-            };
-        }
-        return PythonModuleInfo {
-            package_name: String::new(),
-            module_name: raw_package,
-        };
-    }
-
-    PythonModuleInfo {
-        package_name: raw_package,
-        module_name,
-    }
-}
-
-fn python_package_name_for_file(file: &ProjectFile) -> String {
-    let Some(parent_rel) = file.rel_path().parent() else {
-        return String::new();
-    };
-    if parent_rel.as_os_str().is_empty() {
-        return String::new();
-    }
-
-    let mut effective_package_root_rel: Option<&Path> = None;
-    let mut current_rel = Some(parent_rel);
-    while let Some(path) = current_rel {
-        if file.root().join(path).join("__init__.py").exists() {
-            effective_package_root_rel = Some(path);
-        }
-        current_rel = path.parent();
-    }
-
-    let Some(package_root_rel) = effective_package_root_rel else {
-        return dotted_path(parent_rel);
-    };
-
-    let Some(import_root_rel) = package_root_rel.parent() else {
-        return dotted_path(parent_rel);
-    };
-
-    dotted_path(
-        import_root_rel
-            .strip_prefix("")
-            .ok()
-            .and_then(|_| parent_rel.strip_prefix(import_root_rel).ok())
-            .unwrap_or(parent_rel),
-    )
-}
-
-fn dotted_path(path: &Path) -> String {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy().to_string())
-        .filter(|component| !component.is_empty())
-        .collect::<Vec<_>>()
-        .join(".")
+    python_module_components(file).join(".")
 }
 
 pub(super) fn module_code_unit(file: &ProjectFile, module_fq: &str) -> Option<CodeUnit> {
     if module_fq.is_empty() {
         return None;
     }
-    let mut parts = module_fq.rsplitn(2, '.');
-    let short_name = parts.next().unwrap_or(module_fq);
-    let package_name = parts.next().unwrap_or_default();
+    let mut components = python_module_components(file);
+    debug_assert_eq!(
+        module_fq,
+        components.join("."),
+        "module_code_unit must be built from the file's path-derived Python module name"
+    );
+    let short_name = components.pop()?;
+    let package_name = components.join(".");
     Some(CodeUnit::new_fq(
         file.clone(),
         CodeUnitType::Module,
-        package_name.to_string(),
-        short_name.to_string(),
-        python_module_fq(module_fq),
+        package_name,
+        short_name,
+        python_module_fq(file),
     ))
 }
 

@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Mutex, Once};
 
 /// Keep this process's opportunistic analyzer-store GC permanently out of the
 /// picture (see `AnalyzerGcCoordinator::schedule`).
@@ -2172,5 +2172,49 @@ fn foreign_language_file_yields_no_state_instead_of_a_foreign_parse() {
     assert!(
         workspace.analyzer().declarations(&header).is_empty(),
         "a warm workspace must not serve foreign-language declarations either"
+    );
+}
+
+#[test]
+fn hidden_python_path_module_fq_reopens_warm_without_reparse() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_file(
+        root,
+        ".github/download-models-weights.py",
+        "def fetch():\n    return 1\n",
+    );
+    let repo = init_git_repo(root);
+    commit_all(&repo, "hidden python path module");
+    let project = python_project(root);
+
+    let _cold = build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    let warm_events = Arc::new(Mutex::new(Vec::new()));
+    let warm = build_persisted_with_progress(project, AnalyzerConfig::default(), {
+        let events = Arc::clone(&warm_events);
+        move |event| events.lock().unwrap().push(event)
+    });
+    assert_eq!(parsed_file_count(&warm_events.lock().unwrap()), 0);
+
+    let analyzer = warm.analyzer();
+    let module_hits: Vec<_> = analyzer
+        .definitions(".github.download-models-weights")
+        .collect();
+    assert!(
+        module_hits.iter().any(|unit| unit.is_module()),
+        "warm reopen must synthesize the hidden-path module unit: {module_hits:#?}"
+    );
+
+    let function_hits: Vec<_> = analyzer
+        .definitions(".github.download-models-weights.fetch")
+        .collect();
+    assert_eq!(
+        function_hits.len(),
+        1,
+        "warm reopen must preserve the hidden-path function fq: {function_hits:#?}"
+    );
+    assert_eq!(
+        function_hits[0].source().rel_path(),
+        Path::new(".github/download-models-weights.py")
     );
 }

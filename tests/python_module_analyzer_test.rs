@@ -146,6 +146,71 @@ fn module_code_units_use_python_src_layout_import_root() {
 }
 
 #[test]
+fn module_code_units_preserve_hidden_directory_module_prefixes() {
+    let project = inline_project(&[
+        (
+            ".github/download-models-weights.py",
+            r#"
+        def fetch():
+            pass
+        "#,
+        ),
+        (
+            ".agent/__init__.py",
+            r#"
+        def initialize():
+            pass
+        "#,
+        ),
+        (
+            ".hidden.py",
+            r#"
+        def root_hidden():
+            pass
+        "#,
+        ),
+    ]);
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+
+    let module = analyzer
+        .get_definitions(".github.download-models-weights")
+        .into_iter()
+        .find(|code_unit| code_unit.is_module())
+        .unwrap();
+    let children: Vec<_> = analyzer
+        .direct_children(&module)
+        .into_iter()
+        .map(|code_unit| code_unit.fq_name())
+        .collect();
+
+    assert_eq!(vec![".github.download-models-weights.fetch"], children);
+
+    let hidden_package = analyzer
+        .get_definitions(".agent")
+        .into_iter()
+        .find(|code_unit| code_unit.is_module())
+        .unwrap();
+    let hidden_package_children: Vec<_> = analyzer
+        .direct_children(&hidden_package)
+        .into_iter()
+        .map(|code_unit| code_unit.fq_name())
+        .collect();
+    assert_eq!(vec![".agent.initialize"], hidden_package_children);
+
+    let hidden_root_module = analyzer
+        .get_definitions(".hidden")
+        .into_iter()
+        .find(|code_unit| code_unit.is_module())
+        .unwrap();
+    let hidden_root_children: Vec<_> = analyzer
+        .direct_children(&hidden_root_module)
+        .into_iter()
+        .map(|code_unit| code_unit.fq_name())
+        .collect();
+    assert_eq!(vec![".hidden.root_hidden"], hidden_root_children);
+}
+
+#[test]
 fn referencing_files_resolve_python_src_layout_modules() {
     let project = inline_project(&[
         ("src/pkg/__init__.py", ""),

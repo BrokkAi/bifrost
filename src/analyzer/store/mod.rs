@@ -23,6 +23,7 @@ use tree_sitter::Language as TsLanguage;
 use crate::CancellationToken;
 use crate::analyzer::fq_name::{FqName, package_prefix_fq, segment_interner};
 use crate::analyzer::model::MAX_SIGNATURE_METADATA_BLOB_BYTES;
+use crate::analyzer::python::python_package_prefix_fq;
 use crate::analyzer::tree_sitter_analyzer::{FileState, LanguageAdapter};
 use crate::analyzer::{
     CodeUnit, CodeUnitType, CppTemplateMetadata, ImportInfo, Language, ProjectFile, QueryBatch,
@@ -4530,7 +4531,7 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
         let file_lang = crate::analyzer::common::language_for_file(file);
         for raw in raw_units {
             let package_name = adapter.hydrate_content_qualifier(&raw.content_qualifier, file);
-            let fq = hydrate_unit_fq(raw.fq_segments.as_deref(), &package_name, file_lang)?;
+            let fq = hydrate_unit_fq(raw.fq_segments.as_deref(), &package_name, file, file_lang)?;
             let unit = CodeUnit::with_signature_and_fq(
                 file.clone(),
                 raw.kind,
@@ -5940,6 +5941,7 @@ fn read_unit_rows<A: LanguageAdapter>(
         let fq = hydrate_unit_fq(
             fq_segments.as_deref(),
             &package_name,
+            file,
             crate::analyzer::common::language_for_file(file),
         )?;
         let unit = CodeUnit::with_signature_and_fq(
@@ -7119,7 +7121,11 @@ fn encode_unit_fq_segments(unit: &CodeUnit) -> Option<Vec<u8>> {
     }
     let interner = segment_interner();
     let lang = crate::analyzer::common::language_for_file(unit.source());
-    let prefix = package_prefix_fq(lang, unit.package_name(), interner);
+    let prefix = if lang == Language::Python {
+        python_package_prefix_fq(unit.source(), unit.package_name())
+    } else {
+        package_prefix_fq(lang, unit.package_name(), interner)
+    };
     debug_assert!(
         fq.starts_with(&prefix),
         "package_prefix_fq did not reproduce the extractor's leading fq segments \
@@ -7140,6 +7146,7 @@ fn encode_unit_fq_segments(unit: &CodeUnit) -> Option<Vec<u8>> {
 pub(crate) fn hydrate_unit_fq(
     persisted: Option<&[u8]>,
     package_name: &str,
+    file: &ProjectFile,
     lang: Language,
 ) -> Result<FqName> {
     let interner = segment_interner();
@@ -7151,7 +7158,11 @@ pub(crate) fn hydrate_unit_fq(
         }
         _ => return Ok(FqName::new()),
     };
-    let mut fq = package_prefix_fq(lang, package_name, interner);
+    let mut fq = if lang == Language::Python {
+        python_package_prefix_fq(file, package_name)
+    } else {
+        package_prefix_fq(lang, package_name, interner)
+    };
     fq.extend_from(&tail);
     Ok(fq)
 }
