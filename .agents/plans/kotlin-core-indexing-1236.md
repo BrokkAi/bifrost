@@ -19,7 +19,9 @@ After this change, Kotlin is a real analyzer language: a workspace containing `.
 - [x] (2026-07-28 16:30Z) M1: `Language::Kotlin` variant added; compiler-driven sweep of 23 exhaustive-match sites complete; parser + epoch registered; crate compiles with `cargo check --all-targets --all-features`.
 - [x] (2026-07-28 17:10Z) M2+M3 (interleaved): `src/analyzer/kotlin/{declarations,adapter,mod}.rs` extraction + analyzer, wired through delegate/workspace/multi-analyzer with the explicit-unsupported semantics provider; 10 module tests pass.
 - [x] (2026-07-28 17:50Z) M4: 18 behavior tests in `tests/kotlin_analyzer_test.rs` (declaration forms, duplicate-name owners, constructors, `.kts` limits, skeletons, incremental updates, mixed-language via InlineTestProject); 3 persistence tests (warm hydration without reparse, dirty-file delta, Kotlin-scoped epoch bump leaving Java warm); capability-parity expectations updated.
-- [ ] Validation: `cargo fmt` done; isolated clippy `-D warnings` and full `--features nlp` gate running (completed: targeted kotlin/persistence/parity suites green; remaining: full-suite result).
+- [x] (2026-07-28 19:20Z) Synced with `origin/master` (`22af2f57`) by merge; clean, no conflicts.
+- [x] (2026-07-28 20:40Z) Guided multi-agent review (security, duplication, intent-verification, devops, architecture) over the three commits; 19 findings triaged and all fixed. Details in `Outcomes & Retrospective`.
+- [ ] Validation: `cargo fmt` and clippy `-D warnings` clean; targeted suites green (24 Kotlin behavior, 12 module, 56 persistence, 29 Scala analyzer, 8 Scala skeleton, 2 parity); full `--features nlp` gate running.
 
 ## Surprises & Discoveries
 
@@ -79,11 +81,25 @@ After this change, Kotlin is a real analyzer language: a workspace containing `.
   Date/Author: 2026-07-28 / Claude.
 - Decision (enum entry bodies): members declared inside an `enum_entry`'s `class_body` are indexed with the *enum class* as parent, not the entry.
   Rationale: The entry is a Field; Fields do not own children anywhere else in the model, and skeleton/summary rendering assumes class-like owners. The entry-body member remains reachable and correctly ranged; per-entry override semantics are dispatch concerns owned by later tiers.
+  Consequence (recorded after review): an entry-body member that *overrides* a base member collides with it — `REFERENCE { override fun lendable() }` and the enum's own `open fun lendable()` share the FQ `Genre.lendable`, producing one CodeUnit with both ranges and both signatures, so `get_source`/`get_skeleton` return both bodies. This is accepted for the core tier and pinned by `enum_entry_override_shares_the_base_member_identity` so an *unintended* merge cannot hide behind the intended one. Distinguishing per-entry overrides requires entry-qualified identities (`Genre.REFERENCE.lendable`), which needs a Field to own children; deferred to the dispatch tiers (#1239).
   Date/Author: 2026-07-28 / Claude.
 
 ## Outcomes & Retrospective
 
-(To be written at milestone completions and at the end.)
+(2026-07-28, post-review) A five-specialist adversarial review over the three implementation commits produced 19 findings; all were fixed. Two were real defects the test suite had missed, and both are worth recording because they share a cause — *untested code that compiled and looked right*:
+
+1. **Primary-constructor defaults were counted as required** (HIGH). `kotlin_parameter_facts` took a `parameter_kind: &str` and pretended `function_value_parameters` and `primary_constructor` were the same shape. They are not: `_function_value_parameter` is a *hidden* grammar rule, so a function default's `=` inlines as a direct child of the list, whereas `class_parameter` is a *visible* rule that keeps its own `=`. Scanning the list's children therefore found every function default and no constructor default, so `data class Book(val title: String, val copies: Int = 1)` reported `required == 2` and rejected the legal `Book("x")`. The fixture that triggers it was already in the suite; only the assertion was missing. Fixed by splitting the helper per node shape — the string-keyed parameter was what let the divergence hide.
+2. **The `lexical_definitions.rs` Kotlin arms did not work at all.** Adding a test (as the review demanded) showed formal-parameter resolution returning zero slots. Two registries were missing Kotlin entries that no compiler error could surface: `is_binding_leaf` fell through to `kind == "identifier"` (Kotlin spells names `simple_identifier`), and `binding_container` fell through to `false`, so the walk never descended from a `parameter` into its name. Root discovery also needed a Kotlin branch, since the shared code finds parameter lists by *field* and the Kotlin grammar exposes no `parameters` field.
+
+The lesson is the same in both: a language registry that compiles proves nothing, because every arm is a string-keyed lookup against grammar node kinds. Behavior tests are the only check. The review's most valuable output was not a bug report but the demand that ~40 lines of registry code have at least one end-to-end assertion.
+
+Also fixed: object/companion signatures were synthesized keyword-by-keyword instead of sliced from source, dropping supertypes (`object Catalog : Shelver` → `object Catalog {`) and emitting a synthetic `Companion` name that appears nowhere in the file; backtick-quoted identifiers (`` fun `serves the request`() ``) interned their backticks and were unreachable by their real spelling; `callable_return_type_text` lost function-typed returns to `rfind(')')`; and `kotlin_binding_keyword` guessed `val` on a broken parse rather than skipping.
+
+On duplication, the review caught that `render_skeleton_recursive` had been copied verbatim (45 lines) from `scala/mod.rs` — and that eight of eleven analyzers simply forward to the engine, so the copy was following the *rarer* precedent. It is now one shared iterative helper in `common.rs` used by both, which also closes the stack-depth concern security raised. Three small helpers (`node_text`, `named_children_of`, `first_named_child`) had re-opened consolidations the codebase had explicitly completed — `tree_walk.rs`'s own module doc describes absorbing ~25 copies of `named_children`, and `common.rs` documents `node_source_text` as replacing exactly the panicking `&source[range]` form the new code reintroduced.
+
+Security found no exploitable vulnerability: no injection sinks, no cross-language cache leakage, and the byte-slicing concern proved non-triggerable given tree-sitter's char-boundary and parent-contains-child guarantees (fixed anyway, as hardening). DevOps confirmed the epoch's empty query-prefix is intentional and that appending `Kotlin` last in the `Language` enum was load-bearing — inserting it mid-enum would have silently remapped every persisted row's bincode language tag.
+
+What the review did *not* change: the module boundary, the delegation shape, the deferral discipline, and the adapter's string-handling (that boundary receives rendered signatures, not an AST — Scala, Java and C# are identical). Three reviewers independently confirmed the sibling-issue deferrals are genuinely inert rather than half-wired.
 
 ## Context and Orientation
 
@@ -167,5 +183,7 @@ No new crate dependencies: the grammar is already vendored and compiled by `buil
 ---
 
 Revision note (2026-07-28, plan authoring): initial version, written after architecture exploration and before M1, capturing scope boundaries against sibling issues and the identity/`.kts` decisions up front, because those drive both the extractor design and the acceptance tests.
+
+Revision note (2026-07-28, post-review): recorded the enum-entry override-collision consequence in the Decision Log (it was understated as pure ownership relocation), and wrote the review outcomes up in `Outcomes & Retrospective`. The two real defects both lived in code that compiled cleanly and was never asserted on, which is now the plan's stated reason why every language-registry arm needs an end-to-end behavior test rather than only a compiler check.
 
 Revision note (2026-07-28, M1–M4): recorded the three mid-implementation decision revisions (companion segment kind, typealias unit kind, unified synthetic constructor identity) with their triggers, plus the parse-error-collection, toolchain-shadowing, and macOS `python`-feature discoveries. Milestone plan held otherwise; M2 and M3 landed together (as one commit) because the delegate wiring was needed for the extractor's integration harness to compile.

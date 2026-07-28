@@ -96,7 +96,9 @@ impl AnalyzerDelegate {
             Self::Rust(analyzer) => analyzer,
             Self::Scala(analyzer) => analyzer,
             Self::Ruby(analyzer) => analyzer,
-            Self::Kotlin(analyzer) => analyzer,
+            // Kotlin lowering is issue #1241; until then every capability is
+            // explicitly unsupported rather than absent.
+            Self::Kotlin(_) => &crate::analyzer::semantic::UNSUPPORTED_PROGRAM_SEMANTICS,
         }
     }
 

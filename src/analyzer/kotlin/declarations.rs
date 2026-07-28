@@ -16,8 +16,16 @@
 //! CFG (#1241). Local functions, lambdas, and anonymous objects inside bodies
 //! are deliberately not indexed as declarations in this tier.
 
+use crate::analyzer::common::{
+    collapse_whitespace, node_source_text as node_text,
+    node_source_text_trimmed as node_text_trimmed,
+};
 use crate::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use crate::analyzer::tree_sitter_analyzer::ParsedFile;
+use crate::analyzer::tree_walk::{
+    first_named_child_of_kind as first_named_child, has_token_child,
+    named_children as named_children_of,
+};
 use crate::analyzer::{
     CallableArity, CodeUnit, CodeUnitType, ParameterMetadata, ProjectFile, SignatureMetadata,
 };
@@ -25,6 +33,20 @@ use tree_sitter::{Node, Tree};
 
 fn kotlin_segment(text: &str, kind: SegmentKind) -> SegmentId {
     segment_interner().intern(text, kind)
+}
+
+/// The declared name of an identifier node, with Kotlin's backtick quoting
+/// removed.
+///
+/// Kotlin lets any identifier be written `` `like this` `` (routinely used for
+/// test method names). The backticks are quoting syntax, not part of the name,
+/// so they must not reach an interned segment — otherwise the declaration is
+/// unreachable by its real spelling.
+fn kotlin_identifier_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    let text = node_text_trimmed(node, source);
+    text.strip_prefix('`')
+        .and_then(|text| text.strip_suffix('`'))
+        .unwrap_or(text)
 }
 
 /// Build the structured package prefix for a Kotlin declaration: each dotted
@@ -47,39 +69,6 @@ fn kotlin_child_fq_base(parent: Option<&CodeUnit>, package_name: &str) -> FqName
         Some(parent) => parent.fq().clone(),
         None => kotlin_package_fq(package_name),
     }
-}
-
-fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    &source[node.byte_range()]
-}
-
-/// Collapse a header slice to a single-line signature.
-fn collapse_whitespace(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for token in text.split_whitespace() {
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(token);
-    }
-    out
-}
-
-fn named_children_of(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).collect()
-}
-
-fn first_named_child<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| child.kind() == kind)
-}
-
-fn has_token_child(node: Node<'_>, token: &str) -> bool {
-    let mut cursor = node.walk();
-    node.children(&mut cursor)
-        .any(|child| !child.is_named() && child.kind() == token)
 }
 
 pub(crate) fn parse_kotlin_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
@@ -218,28 +207,10 @@ impl<'a> KotlinVisitor<'a> {
         let Some(name_node) = first_named_child(node, "type_identifier") else {
             return;
         };
-        let name = node_text(name_node, self.source).trim();
+        let name = kotlin_identifier_text(name_node, self.source);
         if name.is_empty() {
             return;
         }
-        let already_declared = {
-            let probe = CodeUnit::new_fq(
-                self.file.clone(),
-                CodeUnitType::Class,
-                self.package_name.to_string(),
-                match parent {
-                    Some(parent) => format!("{}.{name}", parent.short_name()),
-                    None => name.to_string(),
-                },
-                kotlin_child_fq_base(parent, self.package_name)
-                    .with_pushed(kotlin_segment(name, SegmentKind::Type)),
-            );
-            self.parsed.contains_declaration(&probe)
-        };
-        if already_declared {
-            return;
-        }
-
         let code_unit = self.declare(CodeUnitType::Class, SegmentKind::Type, name, node, parent);
         self.parsed
             .add_signature(code_unit.clone(), kotlin_class_signature(node, self.source));
@@ -266,7 +237,7 @@ impl<'a> KotlinVisitor<'a> {
         stack: &mut Vec<KotlinWork<'tree>>,
     ) {
         let declared_name = first_named_child(node, "type_identifier")
-            .map(|name_node| node_text(name_node, self.source).trim().to_string());
+            .map(|name_node| kotlin_identifier_text(name_node, self.source).to_string());
         let name = match declared_name {
             Some(name) if !name.is_empty() => name,
             // An unnamed companion object is spelled `Companion` in source
@@ -277,14 +248,12 @@ impl<'a> KotlinVisitor<'a> {
         };
 
         let code_unit = self.declare(CodeUnitType::Class, SegmentKind::Type, &name, node, parent);
-        let keyword = if companion {
-            "companion object"
-        } else {
-            "object"
-        };
-        let prefix = kotlin_modifier_prefix(node, self.source);
+        // Sliced from source like a class header, so a declared supertype
+        // (`object Catalog : Shelver`) survives and an anonymous companion
+        // renders as written. The `Companion` identity default above is a
+        // name-resolution rule and must not leak into rendered source text.
         self.parsed
-            .add_signature(code_unit.clone(), format!("{prefix}{keyword} {name} {{"));
+            .add_signature(code_unit.clone(), kotlin_class_signature(node, self.source));
 
         if let Some(body) = first_named_child(node, "class_body") {
             stack.push(KotlinWork {
@@ -298,7 +267,7 @@ impl<'a> KotlinVisitor<'a> {
         let Some(name_node) = first_named_child(node, "simple_identifier") else {
             return;
         };
-        let name = node_text(name_node, self.source).trim();
+        let name = kotlin_identifier_text(name_node, self.source);
         if name.is_empty() {
             return;
         }
@@ -345,8 +314,10 @@ impl<'a> KotlinVisitor<'a> {
             } else {
                 format!("{class_name} {params_text}")
             };
-            let metadata =
-                kotlin_parameters_signature_metadata(signature, &parameters, self.source);
+            let metadata = kotlin_signature_metadata(
+                signature,
+                kotlin_class_parameter_facts(&parameters, self.source),
+            );
             self.parsed
                 .add_signature_with_metadata(constructor, metadata);
         }
@@ -359,7 +330,7 @@ impl<'a> KotlinVisitor<'a> {
             let Some(name_node) = first_named_child(parameter, "simple_identifier") else {
                 continue;
             };
-            let name = node_text(name_node, self.source).trim();
+            let name = kotlin_identifier_text(name_node, self.source);
             if name.is_empty() {
                 continue;
             }
@@ -387,12 +358,7 @@ impl<'a> KotlinVisitor<'a> {
         let Some(owner) = parent else {
             return;
         };
-        let class_name = owner
-            .short_name()
-            .rsplit('.')
-            .next()
-            .unwrap_or(owner.short_name())
-            .to_string();
+        let class_name = owner.identifier().to_string();
         let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Function,
@@ -406,27 +372,33 @@ impl<'a> KotlinVisitor<'a> {
         .with_synthetic(true);
         self.parsed
             .add_code_unit(code_unit.clone(), node, self.source, parent.cloned(), None);
-        let header_end = first_named_child(node, "function_value_parameters")
+        let parameter_list = first_named_child(node, "function_value_parameters");
+        let header_end = parameter_list
             .map(|parameters| parameters.end_byte())
             .unwrap_or(node.end_byte());
-        let signature = collapse_whitespace(&self.source[node.start_byte()..header_end]);
-        let parameters: Vec<Node<'_>> = first_named_child(node, "function_value_parameters")
-            .map(|list| {
-                named_children_of(list)
-                    .into_iter()
-                    .filter(|child| child.kind() == "parameter")
-                    .collect()
-            })
-            .unwrap_or_default();
-        let metadata = kotlin_parameters_signature_metadata(signature, &parameters, self.source);
-        self.parsed.add_signature_with_metadata(code_unit, metadata);
+        let signature = collapse_whitespace(
+            self.source
+                .get(node.start_byte()..header_end)
+                .unwrap_or_default(),
+        );
+        let facts = parameter_list
+            .map(|list| kotlin_function_parameter_facts(list, self.source))
+            .unwrap_or_else(|| kotlin_parameter_facts_from(Vec::new(), 0, false));
+        self.parsed
+            .add_signature_with_metadata(code_unit, kotlin_signature_metadata(signature, facts));
     }
 
     fn visit_property(&mut self, node: Node<'_>, parent: Option<&CodeUnit>) {
-        let binding = kotlin_binding_keyword(node, self.source).unwrap_or("val");
+        // `binding_pattern_kind` is mandatory on a well-formed
+        // `property_declaration`; its absence means recovery produced
+        // something that is not actually a property, so skip rather than
+        // guessing a keyword and publishing a wrong signature.
+        let Some(binding) = kotlin_binding_keyword(node, self.source) else {
+            return;
+        };
         let receiver = node
             .child_by_field_name("receiver")
-            .map(|receiver| node_text(receiver, self.source).trim().to_string());
+            .map(|receiver| node_text_trimmed(receiver, self.source).to_string());
 
         let mut variables = Vec::new();
         if let Some(variable) = first_named_child(node, "variable_declaration") {
@@ -443,7 +415,7 @@ impl<'a> KotlinVisitor<'a> {
             let Some(name_node) = first_named_child(variable, "simple_identifier") else {
                 continue;
             };
-            let name = node_text(name_node, self.source).trim();
+            let name = kotlin_identifier_text(name_node, self.source);
             if name.is_empty() {
                 continue;
             }
@@ -468,7 +440,7 @@ impl<'a> KotlinVisitor<'a> {
         let Some(name_node) = first_named_child(node, "type_identifier") else {
             return;
         };
-        let name = node_text(name_node, self.source).trim();
+        let name = kotlin_identifier_text(name_node, self.source);
         if name.is_empty() {
             return;
         }
@@ -492,7 +464,7 @@ impl<'a> KotlinVisitor<'a> {
         let Some(name_node) = first_named_child(node, "simple_identifier") else {
             return;
         };
-        let name = node_text(name_node, self.source).trim();
+        let name = kotlin_identifier_text(name_node, self.source);
         if name.is_empty() {
             return;
         }
@@ -515,18 +487,15 @@ impl<'a> KotlinVisitor<'a> {
     }
 }
 
-/// The `val`/`var` binding keyword of a property-like node, when present.
+/// The `val`/`var` binding keyword of a property-like node.
+///
+/// `binding_pattern_kind` is mandatory on `property_declaration` and optional
+/// on `class_parameter` (a plain constructor parameter has none, and is not a
+/// property). Absence is therefore meaningful, never a parse artifact to guess
+/// around.
 fn kotlin_binding_keyword<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
-    if let Some(binding) = first_named_child(node, "binding_pattern_kind") {
-        return Some(node_text(binding, source).trim());
-    }
-    if has_token_child(node, "val") {
-        return Some("val");
-    }
-    if has_token_child(node, "var") {
-        return Some("var");
-    }
-    None
+    first_named_child(node, "binding_pattern_kind")
+        .map(|binding| node_text_trimmed(binding, source))
 }
 
 const KOTLIN_TYPE_NODE_KINDS: &[&str] = &[
@@ -552,7 +521,7 @@ fn kotlin_declared_type_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a 
             continue;
         }
         if seen_colon && KOTLIN_TYPE_NODE_KINDS.contains(&child.kind()) {
-            return Some(node_text(child, source).trim());
+            return Some(node_text_trimmed(child, source));
         }
     }
     None
@@ -570,7 +539,7 @@ fn kotlin_modifier_prefix(node: Node<'_>, source: &str) -> String {
         if modifier.kind() == "annotation" {
             continue;
         }
-        let text = node_text(modifier, source).trim();
+        let text = node_text_trimmed(modifier, source);
         if text.is_empty() {
             continue;
         }
@@ -588,7 +557,11 @@ fn kotlin_class_signature(node: Node<'_>, source: &str) -> String {
         .or_else(|| first_named_child(node, "enum_class_body"))
         .map(|body| body.start_byte())
         .unwrap_or(node.end_byte());
-    let header = collapse_whitespace(&source[node.start_byte()..body_start]);
+    let header = collapse_whitespace(
+        source
+            .get(node.start_byte()..body_start)
+            .unwrap_or_default(),
+    );
     format!("{header} {{")
 }
 
@@ -598,7 +571,11 @@ fn kotlin_callable_header(node: Node<'_>, source: &str) -> String {
     let body_start = first_named_child(node, "function_body")
         .map(|body| body.start_byte())
         .unwrap_or(node.end_byte());
-    collapse_whitespace(&source[node.start_byte()..body_start])
+    collapse_whitespace(
+        source
+            .get(node.start_byte()..body_start)
+            .unwrap_or_default(),
+    )
 }
 
 struct KotlinParameterFacts {
@@ -607,64 +584,96 @@ struct KotlinParameterFacts {
     repeated: bool,
 }
 
-/// Parameter labels, arity, and variadic facts for a parameter list.
-///
-/// Defaults (`= expr`) and `vararg` modifiers are siblings of the parameter
-/// node inside the list, so this scans the list's token stream in order.
-fn kotlin_parameter_facts(
-    list: Node<'_>,
-    parameter_kind: &str,
-    source: &str,
+/// Whether a parameter's modifier list marks it `vararg`.
+fn kotlin_modifiers_mark_vararg(modifiers: Node<'_>, source: &str) -> bool {
+    has_token_child(modifiers, "vararg")
+        || named_children_of(modifiers)
+            .into_iter()
+            .any(|modifier| node_text_trimmed(modifier, source) == "vararg")
+}
+
+fn kotlin_parameter_metadata(parameter: Node<'_>, source: &str) -> ParameterMetadata {
+    ParameterMetadata::new(
+        collapse_whitespace(node_text(parameter, source)),
+        parameter.start_byte(),
+        parameter.end_byte(),
+    )
+}
+
+fn kotlin_parameter_facts_from(
+    metadata: Vec<ParameterMetadata>,
+    optional: usize,
+    repeated: bool,
 ) -> KotlinParameterFacts {
+    KotlinParameterFacts {
+        required: metadata.len().saturating_sub(optional),
+        metadata,
+        repeated,
+    }
+}
+
+/// Parameter facts for a `function_value_parameters` list.
+///
+/// The grammar's `_function_value_parameter` is a *hidden* rule
+/// (`parameter_modifiers? parameter ('=' expression)?`), so tree-sitter inlines
+/// its parts: both the modifiers and the `=` of a default are direct children
+/// of the list, as siblings of the `parameter` they belong to. This therefore
+/// walks the list's children in order, attributing each modifier run to the
+/// parameter that follows it.
+fn kotlin_function_parameter_facts(list: Node<'_>, source: &str) -> KotlinParameterFacts {
     let mut metadata = Vec::new();
     let mut optional = 0usize;
     let mut repeated = false;
-    // A parameter's `vararg` modifier and `= default` are siblings of the
-    // parameter node inside the list (`parameter_modifiers? parameter
-    // ('=' expression)?`), so this scans the list's children in order.
     let mut pending_vararg = false;
     let mut cursor = list.walk();
     for child in list.children(&mut cursor) {
         if child.is_named() && child.kind() == "parameter_modifiers" {
-            pending_vararg = has_token_child(child, "vararg")
-                || named_children_of(child).into_iter().any(|modifier| {
-                    modifier.kind() == "parameter_modifier"
-                        && node_text(modifier, source).trim() == "vararg"
-                });
-        } else if child.is_named() && child.kind() == parameter_kind {
-            // `class_parameter` keeps its modifiers inline rather than as a
-            // preceding sibling.
-            if pending_vararg
-                || first_named_child(child, "parameter_modifiers")
-                    .or_else(|| first_named_child(child, "modifiers"))
-                    .is_some_and(|modifiers| {
-                        named_children_of(modifiers)
-                            .into_iter()
-                            .any(|modifier| node_text(modifier, source).trim() == "vararg")
-                            || has_token_child(modifiers, "vararg")
-                    })
-            {
+            pending_vararg = kotlin_modifiers_mark_vararg(child, source);
+        } else if child.is_named() && child.kind() == "parameter" {
+            if pending_vararg {
                 repeated = true;
                 // A `vararg` parameter accepts zero arguments, so it is not
                 // required.
                 optional += 1;
             }
             pending_vararg = false;
-            metadata.push(ParameterMetadata::new(
-                collapse_whitespace(node_text(child, source)),
-                child.start_byte(),
-                child.end_byte(),
-            ));
+            metadata.push(kotlin_parameter_metadata(child, source));
         } else if !child.is_named() && child.kind() == "=" {
             optional += 1;
         }
     }
-    let required = metadata.len().saturating_sub(optional);
-    KotlinParameterFacts {
-        metadata,
-        required,
-        repeated,
+    kotlin_parameter_facts_from(metadata, optional, repeated)
+}
+
+/// Parameter facts for a `primary_constructor`'s `class_parameter` list.
+///
+/// Unlike a function parameter list, `class_parameter` is a *visible* rule that
+/// owns its own modifiers and its own `("=" expression)?` default. Nothing
+/// belonging to a parameter appears as a sibling, so each parameter must be
+/// inspected individually — scanning the list's own children for `=` (as the
+/// function form does) would never find a default and would report every
+/// defaulted constructor parameter as required.
+fn kotlin_class_parameter_facts(parameters: &[Node<'_>], source: &str) -> KotlinParameterFacts {
+    let mut metadata = Vec::new();
+    let mut optional = 0usize;
+    let mut repeated = false;
+    for parameter in parameters {
+        let vararg = first_named_child(*parameter, "modifiers")
+            .or_else(|| first_named_child(*parameter, "parameter_modifiers"))
+            .is_some_and(|modifiers| kotlin_modifiers_mark_vararg(modifiers, source));
+        // The default's `=` is a token child of the parameter itself.
+        if vararg || has_token_child(*parameter, "=") {
+            optional += 1;
+            repeated |= vararg;
+        }
+        metadata.push(kotlin_parameter_metadata(*parameter, source));
     }
+    kotlin_parameter_facts_from(metadata, optional, repeated)
+}
+
+fn kotlin_signature_metadata(signature: String, facts: KotlinParameterFacts) -> SignatureMetadata {
+    let arity = CallableArity::new(facts.required, facts.metadata.len(), facts.repeated);
+    SignatureMetadata::new(signature, facts.metadata).with_callable_arity(arity)
 }
 
 fn kotlin_callable_signature_metadata(
@@ -672,44 +681,10 @@ fn kotlin_callable_signature_metadata(
     node: Node<'_>,
     source: &str,
 ) -> SignatureMetadata {
-    let parameters = first_named_child(node, "function_value_parameters");
-    let facts = parameters
-        .map(|list| kotlin_parameter_facts(list, "parameter", source))
-        .unwrap_or(KotlinParameterFacts {
-            metadata: Vec::new(),
-            required: 0,
-            repeated: false,
-        });
-    SignatureMetadata::new(signature, facts.metadata.clone()).with_callable_arity(
-        CallableArity::new(facts.required, facts.metadata.len(), facts.repeated),
-    )
-}
-
-fn kotlin_parameters_signature_metadata(
-    signature: String,
-    parameters: &[Node<'_>],
-    source: &str,
-) -> SignatureMetadata {
-    let list = parameters.first().and_then(Node::parent);
-    let facts = list
-        .map(|list| {
-            kotlin_parameter_facts(
-                list,
-                parameters
-                    .first()
-                    .map(|parameter| parameter.kind())
-                    .unwrap_or("parameter"),
-                source,
-            )
-        })
-        .unwrap_or(KotlinParameterFacts {
-            metadata: Vec::new(),
-            required: 0,
-            repeated: false,
-        });
-    SignatureMetadata::new(signature, facts.metadata.clone()).with_callable_arity(
-        CallableArity::new(facts.required, facts.metadata.len(), facts.repeated),
-    )
+    let facts = first_named_child(node, "function_value_parameters")
+        .map(|list| kotlin_function_parameter_facts(list, source))
+        .unwrap_or_else(|| kotlin_parameter_facts_from(Vec::new(), 0, false));
+    kotlin_signature_metadata(signature, facts)
 }
 
 #[cfg(test)]

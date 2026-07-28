@@ -176,6 +176,15 @@ fn cpp_function_like_macro_invocation_matches_call_callee_query() {
     assert_eq!("TEST_DECLARE(value)", output.structural_matches()[0].text);
 }
 
+/// Languages that are analyzable but whose structural (CodeQuery/RQL) adapter
+/// is not implemented yet. Kotlin's is issue #1240.
+///
+/// Every analyzable language must still appear in `cases` below, so adding a
+/// language without an adapter fails this test until it is listed here — and
+/// the assertions below require each listed language to match *nothing*, so
+/// this list cannot outlive the gap it documents.
+const STRUCTURAL_ADAPTER_PENDING: &[&str] = &["kotlin"];
+
 #[test]
 fn shared_call_query_matches_every_analyzable_language_without_adapter_diagnostics() {
     let cases = [
@@ -245,6 +254,12 @@ fn shared_call_query_matches_every_analyzable_language_without_adapter_diagnosti
             "def audit; end\ndef run; audit(); end\n",
             "audit()",
         ),
+        (
+            "kotlin",
+            "kotlin/App.kt",
+            "fun audit() {}\nfun run() { audit() }\n",
+            "audit()",
+        ),
     ];
     let files: Vec<_> = cases
         .iter()
@@ -255,32 +270,59 @@ fn shared_call_query_matches_every_analyzable_language_without_adapter_diagnosti
         json!({ "match": { "kind": "call", "callee": { "name": "audit" } } }),
     );
 
-    assert!(
-        output.diagnostics.is_empty(),
-        "all analyzable languages should have structural adapters: {:?}",
+    // A language without an adapter must say so explicitly rather than
+    // silently returning nothing, and no other diagnostic is acceptable.
+    let diagnostic_languages: BTreeSet<_> = output
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.language)
+        .collect();
+    assert_eq!(
+        diagnostic_languages,
+        STRUCTURAL_ADAPTER_PENDING.iter().copied().collect(),
+        "every analyzable language except the pending ones must have a \
+         structural adapter, and each pending one must report its gap: {:?}",
         output.diagnostics
     );
-    assert_eq!(
-        output.structural_matches().len(),
-        Language::ANALYZABLE.len()
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::MissingStructuralAdapter),
+        "pending languages must report a missing adapter, not another failure: {:?}",
+        output.diagnostics
     );
 
-    let expected_languages: BTreeSet<_> = Language::ANALYZABLE
+    // Every analyzable language must be represented in the corpus, so a newly
+    // registered language cannot silently skip this invariant.
+    let all_languages: BTreeSet<_> = Language::ANALYZABLE
         .iter()
         .map(|language| language.config_label())
         .collect();
     let case_languages: BTreeSet<_> = cases.iter().map(|(language, _, _, _)| *language).collect();
-    assert_eq!(case_languages, expected_languages);
+    assert_eq!(case_languages, all_languages);
+
+    let pending: BTreeSet<_> = STRUCTURAL_ADAPTER_PENDING.iter().copied().collect();
+    assert!(
+        pending.is_subset(&all_languages),
+        "STRUCTURAL_ADAPTER_PENDING names a language that is not analyzable: {pending:?}"
+    );
+    let expected_languages: BTreeSet<_> = all_languages.difference(&pending).copied().collect();
+
+    assert_eq!(output.structural_matches().len(), expected_languages.len());
 
     let actual_languages: BTreeSet<_> = output
         .structural_matches()
         .iter()
         .map(|mat| mat.language)
         .collect();
+    // A pending language matching anything means its adapter landed; remove it
+    // from STRUCTURAL_ADAPTER_PENDING rather than relaxing this.
     assert_eq!(actual_languages, expected_languages);
 
     let expected_rows: BTreeSet<_> = cases
         .iter()
+        .filter(|(language, _, _, _)| !pending.contains(language))
         .map(|(language, path, _, text)| (*language, *path, *text))
         .collect();
     let rows: BTreeSet<_> = output

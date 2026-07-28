@@ -10,17 +10,13 @@
 //! Capabilities owned by sibling issues stay explicitly unsupported here:
 //! structured imports and type hierarchy (#1237), definition navigation
 //! (#1238), usage graphs (#1239), structural RQL (#1240), and CFG/semantic
-//! lowering (#1241 — see the manual [`ProgramSemanticsProvider`] impl that
-//! reports `Unsupported` instead of lowering).
+//! lowering (#1241 — the analyzer delegate hands out the shared
+//! `UnsupportedProgramSemantics` provider instead of lowering).
 
 mod adapter;
 pub(crate) mod declarations;
 pub(crate) mod language;
 
-use crate::analyzer::semantic::{
-    ProgramSemanticsProvider, SemanticArtifact, SemanticArtifactSourceSnapshot, SemanticCapability,
-    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticWork,
-};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer, Language, Project,
     ProjectFile, SemanticDiagnostic, SignatureMetadata, TreeSitterAnalyzer, TypeAliasProvider,
@@ -78,81 +74,11 @@ impl KotlinAnalyzer {
             inner: self.inner.clone_with_project(project),
         }
     }
-
-    fn render_skeleton_recursive(
-        &self,
-        code_unit: &CodeUnit,
-        indent: &str,
-        header_only: bool,
-        out: &mut String,
-    ) {
-        for signature in self.signatures(code_unit) {
-            if signature.is_empty() {
-                continue;
-            }
-            for line in signature.lines() {
-                out.push_str(indent);
-                out.push_str(line);
-                out.push('\n');
-            }
-        }
-
-        let all_children = self.direct_children(code_unit);
-        let field_children: Vec<_> = all_children
-            .iter()
-            .filter(|child| child.is_field())
-            .cloned()
-            .collect();
-        let children = if header_only {
-            field_children.clone()
-        } else {
-            all_children.clone()
-        };
-
-        if !children.is_empty() || code_unit.is_class() {
-            let child_indent = format!("{indent}  ");
-            for child in children {
-                self.render_skeleton_recursive(&child, &child_indent, header_only, out);
-            }
-            if header_only && all_children.len() > field_children.len() {
-                out.push_str(&child_indent);
-                out.push_str("[...]\n");
-            }
-            if code_unit.is_class() {
-                out.push_str(indent);
-                out.push_str("}\n");
-            }
-        }
-    }
 }
 
 impl TypeAliasProvider for KotlinAnalyzer {
     fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
         self.inner.is_type_alias(code_unit)
-    }
-}
-
-/// Kotlin CFG/semantic lowering is issue #1241; until it lands, semantic
-/// materialization is explicitly unsupported rather than absent or partial.
-impl ProgramSemanticsProvider for KotlinAnalyzer {
-    fn current_artifact_source(
-        &self,
-        _file: &ProjectFile,
-        _max_source_bytes: usize,
-    ) -> Result<Option<SemanticArtifactSourceSnapshot>, SemanticProviderError> {
-        Ok(None)
-    }
-
-    fn materialize(
-        &self,
-        _file: &ProjectFile,
-        _request: &mut SemanticRequest<'_>,
-    ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError> {
-        Ok(SemanticOutcome::Unsupported {
-            capability: SemanticCapability::Procedures,
-            partial: None,
-            work: SemanticWork::default(),
-        })
     }
 }
 
@@ -380,14 +306,12 @@ impl IAnalyzer for KotlinAnalyzer {
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
-        let mut rendered = String::new();
-        self.render_skeleton_recursive(code_unit, "", false, &mut rendered);
+        let rendered = crate::analyzer::common::render_skeleton(self, code_unit, false);
         (!rendered.is_empty()).then(|| rendered.trim_end().to_string())
     }
 
     fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
-        let mut rendered = String::new();
-        self.render_skeleton_recursive(code_unit, "", true, &mut rendered);
+        let rendered = crate::analyzer::common::render_skeleton(self, code_unit, true);
         (!rendered.is_empty()).then(|| rendered.trim_end().to_string())
     }
 

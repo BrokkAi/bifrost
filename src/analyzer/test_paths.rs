@@ -219,4 +219,26 @@ mod tests {
             Language::Scala
         ));
     }
+
+    #[test]
+    fn kotlin_pascal_case_suffixes_are_recognized() {
+        for path in ["SampleTest.kt", "SampleTests.kt", "SampleSpec.kt"] {
+            assert!(
+                has_test_filename_convention(path, Language::Kotlin),
+                "{path}"
+            );
+        }
+        assert!(!has_test_filename_convention("Sample.kt", Language::Kotlin));
+        // Suffix-anchored, not substring: a production file merely containing
+        // "Test" is not a test file.
+        assert!(!has_test_filename_convention(
+            "Testament.kt",
+            Language::Kotlin
+        ));
+        // Case-sensitive, matching the other PascalCase JVM languages.
+        assert!(!has_test_filename_convention(
+            "sampletest.kt",
+            Language::Kotlin
+        ));
+    }
 }

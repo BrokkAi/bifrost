@@ -690,52 +690,6 @@ impl ScalaAnalyzer {
     pub fn bulk_hydration_count_for_test(&self) -> usize {
         self.inner.bulk_hydration_count_for_test()
     }
-
-    fn render_skeleton_recursive(
-        &self,
-        code_unit: &CodeUnit,
-        indent: &str,
-        header_only: bool,
-        out: &mut String,
-    ) {
-        for signature in self.signatures(code_unit) {
-            if signature.is_empty() {
-                continue;
-            }
-            for line in signature.lines() {
-                out.push_str(indent);
-                out.push_str(line);
-                out.push('\n');
-            }
-        }
-
-        let all_children = self.direct_children(code_unit);
-        let field_children: Vec<_> = all_children
-            .iter()
-            .filter(|child| child.is_field())
-            .cloned()
-            .collect();
-        let children = if header_only {
-            field_children.clone()
-        } else {
-            all_children.clone()
-        };
-
-        if !children.is_empty() || code_unit.is_class() {
-            let child_indent = format!("{indent}  ");
-            for child in children {
-                self.render_skeleton_recursive(&child, &child_indent, header_only, out);
-            }
-            if header_only && all_children.len() > field_children.len() {
-                out.push_str(&child_indent);
-                out.push_str("[...]\n");
-            }
-            if code_unit.is_class() {
-                out.push_str(indent);
-                out.push_str("}\n");
-            }
-        }
-    }
 }
 
 fn scala_default_type_name(name: &str) -> bool {
@@ -1121,14 +1075,12 @@ impl IAnalyzer for ScalaAnalyzer {
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
-        let mut rendered = String::new();
-        self.render_skeleton_recursive(code_unit, "", false, &mut rendered);
+        let rendered = crate::analyzer::common::render_skeleton(self, code_unit, false);
         (!rendered.is_empty()).then(|| rendered.trim_end().to_string())
     }
 
     fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
-        let mut rendered = String::new();
-        self.render_skeleton_recursive(code_unit, "", true, &mut rendered);
+        let rendered = crate::analyzer::common::render_skeleton(self, code_unit, true);
         (!rendered.is_empty()).then(|| rendered.trim_end().to_string())
     }
 

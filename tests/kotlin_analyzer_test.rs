@@ -131,7 +131,10 @@ fn principal_declaration_forms_have_stable_source_identities() {
     for name in &names {
         assert!(!name.contains('$'), "JVM-encoded identity leaked: {name}");
         assert!(!name.contains("LibraryKt"), "file facade leaked: {name}");
-        assert!(!name.contains('/'), "path-shaped identity: {name}");
+        assert!(
+            !name.contains('/') && !name.contains('\\'),
+            "path-shaped identity: {name}"
+        );
     }
 }
 
@@ -255,7 +258,10 @@ class Circle(val radius: Double) {
     let skeleton = analyzer.get_skeleton(&circle).expect("skeleton");
     assert_eq!(
         skeleton,
-        "class Circle(val radius: Double) {\n  val radius: Double\n  val area: Double\n  fun scaled(factor: Double): Circle\n  companion object Companion {\n    val UNIT: Circle\n  }\n}"
+        // The companion renders as written in source. Its `Companion`
+        // identity default is a name-resolution rule and must not leak into
+        // rendered text.
+        "class Circle(val radius: Double) {\n  val radius: Double\n  val area: Double\n  fun scaled(factor: Double): Circle\n  companion object {\n    val UNIT: Circle\n  }\n}"
     );
 
     let header = analyzer.get_skeleton_header(&circle).expect("header");
@@ -506,13 +512,42 @@ fn mixed_language_workspace_routes_kotlin_and_java() {
     assert!(analyzer.is_analyzed(&kotlin_file));
     assert!(analyzer.is_analyzed(&java_file));
 
-    // Semantic materialization stays explicitly unsupported for Kotlin
-    // until issue #1241, while Java resolves through its provider.
+    // Semantic materialization stays explicitly unsupported for Kotlin until
+    // issue #1241 — asserted by materializing, not merely by the provider
+    // being present, so wiring Kotlin to a working lowerer would fail here.
+    let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+    let mut budget = brokk_bifrost::analyzer::semantic::SemanticBudget::default();
+    let outcome = workspace
+        .materialize_program_semantics(
+            &kotlin_file,
+            &mut brokk_bifrost::analyzer::semantic::SemanticRequest::new(
+                &mut budget,
+                &cancellation,
+            ),
+        )
+        .expect("Kotlin semantics must resolve to an outcome, not an error");
     assert!(
-        workspace
-            .program_semantics_provider_for_file(&kotlin_file)
-            .is_some(),
-        "Kotlin routes to a provider that reports Unsupported"
+        matches!(
+            outcome,
+            brokk_bifrost::analyzer::semantic::SemanticOutcome::Unsupported { .. }
+        ),
+        "Kotlin program semantics must be explicitly Unsupported until #1241: {outcome:?}"
+    );
+
+    // Structural CodeQuery/RQL likewise stays absent until issue #1240.
+    let kotlin_only = InlineTestProject::with_language(Language::Kotlin)
+        .file(
+            "src/Only.kt",
+            "package only
+
+class Only
+",
+        )
+        .build();
+    let kotlin_analyzer = KotlinAnalyzer::new(kotlin_only.project_dyn());
+    assert!(
+        kotlin_analyzer.structural_search_providers().is_empty(),
+        "Kotlin must expose no structural search provider yet"
     );
 }
 
@@ -530,4 +565,234 @@ class Tool {
     let unit = analyzer.get_definitions("snip.Tool.use").remove(0);
     let source = analyzer.get_source(&unit, false).expect("source");
     assert_eq!(source, "fun use(): String = \"in use\"");
+}
+
+#[test]
+fn primary_constructor_defaults_are_optional_arguments() {
+    // Regression: `class_parameter` owns its own `= default`, unlike a
+    // function parameter whose `=` is a sibling in the list. Scanning the
+    // list's children (the function rule's shape) found no defaults here and
+    // reported every constructor parameter as required.
+    let (_built, analyzer) = kotlin_analyzer(&[(
+        "src/Defaults.kt",
+        r#"package defaults
+
+class Book(val title: String, val copies: Int = 1, val tag: String = "none")
+
+class Exact(val only: Int)
+
+class Spread(vararg val parts: String)
+
+fun freeform(title: String, copies: Int = 1): Int = copies
+"#,
+    )]);
+    let arity_of = |fq: &str| {
+        analyzer
+            .signature_metadata(&analyzer.get_definitions(fq).remove(0))
+            .first()
+            .and_then(|metadata| metadata.callable_arity())
+            .unwrap_or_else(|| panic!("{fq} must carry callable arity"))
+    };
+
+    let book = arity_of("defaults.Book.Book");
+    assert!(book.accepts(1), "Book(title) is legal Kotlin");
+    assert!(book.accepts(2) && book.accepts(3));
+    assert!(!book.accepts(0) && !book.accepts(4));
+
+    let exact = arity_of("defaults.Exact.Exact");
+    assert!(exact.accepts(1) && !exact.accepts(0) && !exact.accepts(2));
+
+    let spread = arity_of("defaults.Spread.Spread");
+    assert!(
+        spread.accepts(0) && spread.accepts(5),
+        "vararg accepts any count"
+    );
+
+    // The function form must keep working — it takes the other code path.
+    let freeform = arity_of("defaults.freeform");
+    assert!(freeform.accepts(1) && freeform.accepts(2) && !freeform.accepts(3));
+}
+
+#[test]
+fn object_signatures_keep_supertypes_and_source_spelling() {
+    let (_built, analyzer) = kotlin_analyzer(&[(
+        "src/Objects.kt",
+        r#"package objects
+
+interface Shelver
+
+object Catalog : Shelver
+
+class Owner {
+    companion object Named : Shelver
+
+    class Inner {
+        companion object
+    }
+}
+"#,
+    )]);
+    assert_eq!(
+        analyzer.signatures(&analyzer.get_definitions("objects.Catalog").remove(0)),
+        vec!["object Catalog : Shelver {"],
+        "an object's declared supertype must survive into its signature"
+    );
+    assert_eq!(
+        analyzer.signatures(&analyzer.get_definitions("objects.Owner.Named").remove(0)),
+        vec!["companion object Named : Shelver {"]
+    );
+    assert_eq!(
+        analyzer.signatures(
+            &analyzer
+                .get_definitions("objects.Owner.Inner.Companion")
+                .remove(0)
+        ),
+        vec!["companion object {"],
+        "an anonymous companion renders as written, not with its synthetic identity"
+    );
+}
+
+#[test]
+fn enum_entry_override_shares_the_base_member_identity() {
+    // Entry-body members are owned by the enum class (Field units own no
+    // children), so an override collides with the base member: one CodeUnit
+    // carrying both ranges and both signatures. Deliberate, and asserted here
+    // so an unintended merge cannot hide behind it.
+    let (_built, analyzer) = kotlin_analyzer(&[(
+        "src/Genre.kt",
+        r#"package shapes
+
+enum class Genre {
+    FICTION,
+    REFERENCE {
+        override fun lendable(): Boolean = false
+    };
+
+    open fun lendable(): Boolean = true
+}
+"#,
+    )]);
+    let lendable = analyzer.get_definitions("shapes.Genre.lendable");
+    assert_eq!(lendable.len(), 1, "base and override share one identity");
+    assert_eq!(
+        analyzer.ranges(&lendable[0]).len(),
+        2,
+        "both declaration sites are retained as ranges"
+    );
+    let signatures = analyzer.signatures(&lendable[0]);
+    assert!(
+        signatures
+            .iter()
+            .any(|s| s.starts_with("open fun lendable"))
+    );
+    assert!(
+        signatures
+            .iter()
+            .any(|s| s.starts_with("override fun lendable"))
+    );
+}
+
+#[test]
+fn generics_sealed_nested_and_init_forms_are_indexed() {
+    let (_built, analyzer) = kotlin_analyzer(&[(
+        "src/Forms.kt",
+        r#"package forms
+
+sealed class Result<out T> {
+    class Ok<T>(val value: T) : Result<T>()
+    class Err(val reason: String) : Result<Nothing>()
+}
+
+class Container<K : Comparable<K>, V>(val key: K) {
+    val entries: MutableMap<K, V> = mutableMapOf()
+
+    init {
+        entries.clear()
+    }
+
+    inner class Cursor {
+        fun advance(): Int = 1
+    }
+}
+
+fun <T : Any> T.describeAll(others: List<T>): String = others.toString()
+
+typealias Handlers<T> = Map<String, (T) -> Unit>
+"#,
+    )]);
+    let names = declaration_names(&analyzer);
+    for expected in [
+        "forms.Result",
+        "forms.Result.Ok",
+        "forms.Result.Ok.value",
+        "forms.Result.Err",
+        "forms.Result.Err.reason",
+        "forms.Container",
+        "forms.Container.key",
+        "forms.Container.entries",
+        "forms.Container.Cursor",
+        "forms.Container.Cursor.advance",
+        "forms.describeAll",
+        "forms.Handlers",
+    ] {
+        assert!(names.contains(expected), "missing {expected} in {names:#?}");
+    }
+
+    // Type parameters must not bleed into identities.
+    for name in &names {
+        assert!(!name.contains('<'), "type parameter leaked into {name}");
+    }
+
+    assert_eq!(
+        analyzer.signatures(&analyzer.get_definitions("forms.Result.Ok").remove(0)),
+        vec!["class Ok<T>(val value: T) : Result<T>() {"]
+    );
+    assert!(analyzer.is_type_alias(&analyzer.get_definitions("forms.Handlers").remove(0)));
+}
+
+#[test]
+fn destructuring_property_declares_every_bound_name() {
+    let (_built, analyzer) = kotlin_analyzer(&[(
+        "src/Destructure.kt",
+        r#"package destructure
+
+class Holder {
+    val (first, second) = Pair(1, 2)
+}
+"#,
+    )]);
+    let names = declaration_names(&analyzer);
+    assert!(names.contains("destructure.Holder.first"), "{names:#?}");
+    assert!(names.contains("destructure.Holder.second"), "{names:#?}");
+}
+
+#[test]
+fn backtick_quoted_identifiers_index_under_their_real_name() {
+    // Kotlin's backticks are quoting syntax, not part of the name. Keeping
+    // them would make the declaration unreachable by its real spelling — and
+    // backticked test-method names are idiomatic.
+    let (_built, analyzer) = kotlin_analyzer(&[(
+        "src/QuotedTest.kt",
+        r#"package quoted
+
+class SampleTest {
+    fun `serves the request`(): Int = 1
+}
+"#,
+    )]);
+    let names = declaration_names(&analyzer);
+    assert!(
+        names.contains("quoted.SampleTest.serves the request"),
+        "backticks must be stripped from the identity: {names:#?}"
+    );
+    for name in &names {
+        assert!(!name.contains('`'), "backtick leaked into identity: {name}");
+    }
+    assert_eq!(
+        analyzer
+            .get_definitions("quoted.SampleTest.serves the request")
+            .len(),
+        1,
+        "the declaration must be reachable by its real spelling"
+    );
 }

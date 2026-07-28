@@ -31,10 +31,11 @@ impl LanguageAdapter for KotlinAdapter {
     }
 
     fn callable_return_type_text<'a>(&self, signature: &'a str) -> Option<&'a str> {
-        // The return type is everything after the last top-level `:` that
-        // follows the parameter list (`fun f(x: Int): List<Int>`).
-        let close = signature.rfind(')')?;
-        let after_parameters = &signature[close + 1..];
+        // The return type follows the `:` after the *parameter list's* closing
+        // paren. `rfind(')')` would land inside the return type itself for a
+        // function type (`fun f(): (Int) -> String`), so the list is located by
+        // a balanced forward scan.
+        let after_parameters = &signature[kotlin_parameter_list_end(signature)?..];
         let (_, return_type) = after_parameters.split_once(':')?;
         let return_type = return_type.trim();
         (!return_type.is_empty()).then_some(return_type)
@@ -61,15 +62,31 @@ impl LanguageAdapter for KotlinAdapter {
     }
 }
 
-/// Best-effort arity from a rendered signature when metadata is absent:
-/// the number of top-level commas in the first balanced parameter list.
+/// The byte offset just past the callable's parameter list in a rendered
+/// signature, or `None` when there is no balanced list.
+///
+/// The scan starts at the parameter list rather than the first `(` in the
+/// string: a signature may open with annotation arguments
+/// (`@Suppress("A", "B") fun f(x: Int)`), whose commas belong to the
+/// annotation, not the callable.
+fn kotlin_parameter_list_end(signature: &str) -> Option<usize> {
+    kotlin_scan_parameter_list(signature).map(|(_, end)| end)
+}
+
+/// Best-effort arity from a rendered signature when structured metadata is
+/// absent: the number of top-level commas in the callable's parameter list.
 fn kotlin_signature_arity(signature: &str) -> Option<usize> {
-    let open = signature.find('(')?;
+    kotlin_scan_parameter_list(signature).map(|(arity, _)| arity)
+}
+
+/// Scan the callable's parameter list, returning `(arity, end_offset)`.
+fn kotlin_scan_parameter_list(signature: &str) -> Option<(usize, usize)> {
+    let open = kotlin_parameter_list_start(signature)?;
     let mut depth = 0usize;
     let mut arguments = 0usize;
     let mut saw_content = false;
     let mut previous = ' ';
-    for character in signature[open..].chars() {
+    for (offset, character) in signature[open..].char_indices() {
         match character {
             '(' | '[' | '<' => depth += 1,
             // `->` in a function-type parameter is not a closing bracket.
@@ -77,7 +94,8 @@ fn kotlin_signature_arity(signature: &str) -> Option<usize> {
             ')' | ']' | '>' => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    return Some(arguments + usize::from(saw_content));
+                    let arity = arguments + usize::from(saw_content);
+                    return Some((arity, open + offset + character.len_utf8()));
                 }
             }
             ',' if depth == 1 => arguments += 1,
@@ -85,6 +103,47 @@ fn kotlin_signature_arity(signature: &str) -> Option<usize> {
             _ => {}
         }
         previous = character;
+    }
+    None
+}
+
+/// The offset of the `(` that opens the callable's own parameter list,
+/// skipping any leading annotation argument lists.
+fn kotlin_parameter_list_start(signature: &str) -> Option<usize> {
+    let mut search_from = 0usize;
+    loop {
+        let open = signature[search_from..].find('(')? + search_from;
+        // An annotation's arguments are attached directly to an `@name`; the
+        // callable's list is the first one that is not.
+        let head = signature[..open].trim_end();
+        let attached_to_annotation = head
+            .rsplit(|character: char| character.is_whitespace())
+            .next()
+            .is_some_and(|token| token.starts_with('@'));
+        if !attached_to_annotation {
+            return Some(open);
+        }
+        let Some(close) = kotlin_balanced_close(signature, open) else {
+            return Some(open);
+        };
+        search_from = close;
+    }
+}
+
+/// The offset just past the `)` matching the `(` at `open`.
+fn kotlin_balanced_close(signature: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (offset, character) in signature[open..].char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(open + offset + character.len_utf8());
+                }
+            }
+            _ => {}
+        }
     }
     None
 }
