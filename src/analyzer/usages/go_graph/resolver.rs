@@ -1,4 +1,4 @@
-use crate::analyzer::go::go_field_declaration_is_embedded;
+use crate::analyzer::go::{go_embedded_type_nodes, go_field_declaration_is_embedded};
 use crate::analyzer::go::packages::{GoWorkspacePathIndex, canonical_go_package_name};
 use crate::analyzer::usages::common::language_for_file;
 pub(super) use crate::analyzer::usages::common::node_text;
@@ -621,6 +621,12 @@ fn collect_go_embedded_field_type_fqns(
         if !package_names.contains_key(file) {
             continue;
         }
+        collect_go_embedded_interface_type_fqns(
+            file,
+            parsed,
+            &resolver,
+            &mut embedded_by_owner,
+        );
         for field in analyzer
             .declarations(file)
             .into_iter()
@@ -646,7 +652,52 @@ fn collect_go_embedded_field_type_fqns(
                 .push(embedded_fqn);
         }
     }
+    for embedded in embedded_by_owner.values_mut() {
+        embedded.sort();
+        embedded.dedup();
+    }
     embedded_by_owner
+}
+
+fn collect_go_embedded_interface_type_fqns(
+    file: &ProjectFile,
+    parsed: &ParsedFile,
+    resolver: &GoEdgeTypeResolver<'_>,
+    embedded_by_owner: &mut HashMap<String, Vec<String>>,
+) {
+    let Some(package_name) = resolver.package_names.get(file) else {
+        return;
+    };
+    let package_fqn = canonical_go_package_name(file, package_name);
+    let mut stack = vec![parsed.tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "type_spec"
+            && let (Some(name_node), Some(type_node)) = (
+                node.child_by_field_name("name"),
+                node.child_by_field_name("type"),
+            )
+            && type_node.kind() == "interface_type"
+        {
+            let owner_name = node_text(name_node, &parsed.source);
+            if !owner_name.is_empty() {
+                let owner_fqn = format!("{package_fqn}.{owner_name}");
+                for embedded in go_embedded_type_nodes(type_node) {
+                    let type_text = node_text(embedded, &parsed.source).trim();
+                    let Some(embedded_fqn) =
+                        resolver.resolve_field_type_fqn(file, &owner_fqn, type_text)
+                    else {
+                        continue;
+                    };
+                    embedded_by_owner
+                        .entry(owner_fqn.clone())
+                        .or_default()
+                        .push(embedded_fqn);
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
 }
 
 pub(crate) fn go_embedded_field_unit_type_text(

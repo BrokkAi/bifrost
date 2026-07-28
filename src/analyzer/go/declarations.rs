@@ -1099,7 +1099,7 @@ fn go_embedded_type_identity(type_node: Node<'_>, source: &str) -> Option<Struct
     Some(identity)
 }
 
-fn go_embedded_type_nodes(node: Node<'_>) -> Vec<Node<'_>> {
+pub(crate) fn go_embedded_type_nodes(node: Node<'_>) -> Vec<Node<'_>> {
     match node.kind() {
         "struct_type" => {
             let Some(fields) = named_children_of_kind(node, "field_declaration_list")
