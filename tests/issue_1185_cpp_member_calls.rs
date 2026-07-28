@@ -268,11 +268,25 @@ void call_free_clear() {
 
     let session_error =
         function_target(&analyzer, "proactor_container_impl.hpp", "session", "error");
+    let session_error_definition = function_target_with_signature(
+        &analyzer,
+        "proactor_container_impl.cpp",
+        "session",
+        "error",
+        "() const",
+    );
     let session_uninitialized = function_target(
         &analyzer,
         "proactor_container_impl.hpp",
         "session",
         "uninitialized",
+    );
+    let session_uninitialized_definition = function_target_with_signature(
+        &analyzer,
+        "proactor_container_impl.cpp",
+        "session",
+        "uninitialized",
+        "() const",
     );
     let make_connection = function_target(
         &analyzer,
@@ -293,6 +307,13 @@ void call_free_clear() {
         "setup_reconnect",
     );
     let clear = function_target(&analyzer, "proactor_container_impl.hpp", "impl", "clear");
+    let clear_definition = function_target_with_signature(
+        &analyzer,
+        "proactor_container_impl.cpp",
+        "impl",
+        "clear",
+        "()",
+    );
 
     let explicit_cases = [
         (
@@ -311,7 +332,37 @@ void call_free_clear() {
             .collect::<Vec<_>>(),
         ),
         (
+            session_error_definition,
+            BTreeSet::from([fixture_token_range(
+                &source,
+                "    int ec = s.error(); // positive-session-error",
+                "error",
+            )]),
+            [fixture_token_range(
+                &source,
+                "    int wrong_ec = wrong.error(); // negative-wrong-owner-explicit",
+                "error",
+            )]
+            .into_iter()
+            .collect::<Vec<_>>(),
+        ),
+        (
             session_uninitialized,
+            BTreeSet::from([fixture_token_range(
+                &source,
+                "    bool pending = s.uninitialized(); // positive-session-uninitialized",
+                "uninitialized",
+            )]),
+            [fixture_token_range(
+                &source,
+                "    bool wrong_pending = wrong.uninitialized(); // negative-wrong-owner-explicit",
+                "uninitialized",
+            )]
+            .into_iter()
+            .collect::<Vec<_>>(),
+        ),
+        (
+            session_uninitialized_definition,
             BTreeSet::from([fixture_token_range(
                 &source,
                 "    bool pending = s.uninitialized(); // positive-session-uninitialized",
@@ -406,6 +457,22 @@ void call_free_clear() {
         ),
         (
             clear,
+            BTreeSet::from([fixture_token_range(
+                &source,
+                "    clear(); // positive-implicit-self-clear",
+                "clear",
+            )]),
+            vec![
+                fixture_token_range(
+                    &source,
+                    "    clear(); // negative-wrong-owner-implicit-self",
+                    "clear",
+                ),
+                fixture_token_range(&source, "    clear(); // negative-free-function", "clear"),
+            ],
+        ),
+        (
+            clear_definition,
             BTreeSet::from([fixture_token_range(
                 &source,
                 "    clear(); // positive-implicit-self-clear",

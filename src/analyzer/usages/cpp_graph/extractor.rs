@@ -12,7 +12,8 @@ use crate::analyzer::usages::cpp_graph::syntax::explicit_qualified_callable_valu
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::{
-    CodeUnit, CppAnalyzer, IAnalyzer, ProjectFile, Range, cpp_node_text as node_text,
+    CodeUnit, CppAnalyzer, IAnalyzer, ProjectFile, Range,
+    cpp_callable_definitions_share_identity_evidence, cpp_node_text as node_text,
 };
 use crate::hash::{HashMap, HashSet};
 #[cfg(test)]
@@ -2559,7 +2560,7 @@ fn maybe_record_qualified_method_value_hit(
                 push_unproven_hit(member, ctx);
                 return;
             };
-            if !receiver_owner_matches_target(&resolved_owner, owner, ctx) {
+            if !receiver_owner_matches_target(&resolved_owner, owner, member.start_byte(), ctx) {
                 if same_visible_symbol(&resolved_owner, owner) {
                     push_unproven_hit(member, ctx);
                 }
@@ -3437,7 +3438,9 @@ fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
                 receiver_is_self_like(receiver) && same_owner_context(receiver, ctx)
                     || receiver_type_units(receiver, ctx.source, ctx)
                         .iter()
-                        .any(|target| receiver_owner_matches_target(target, owner, ctx))
+                        .any(|target| {
+                            receiver_owner_matches_target(target, owner, node.start_byte(), ctx)
+                        })
             }),
         "call_expression" => node
             .child_by_field_name("function")
@@ -3454,7 +3457,9 @@ fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
                 targets
                     .iter()
                     .filter_map(|target| target.unit.as_ref())
-                    .any(|target| receiver_owner_matches_target(target, owner, ctx))
+                    .any(|target| {
+                        receiver_owner_matches_target(target, owner, node.start_byte(), ctx)
+                    })
             }),
         "this" => same_owner_context(node, ctx),
         _ => qualified_owner_matches(node, ctx),
@@ -3526,12 +3531,12 @@ fn method_receiver_target_resolution(
     };
     match declaring_owner {
         EnclosingMemberOwnerResolution::Owner(owner)
-            if receiver_owner_matches_target(&owner, target_owner, ctx) =>
+            if receiver_owner_matches_target(&owner, target_owner, node.start_byte(), ctx) =>
         {
             MethodReceiverTargetResolution::Target
         }
         EnclosingMemberOwnerResolution::Owner(owner)
-            if receiver_owner_is_known_non_target(&owner, target_owner, ctx) =>
+            if receiver_owner_is_known_non_target(&owner, target_owner, node.start_byte(), ctx) =>
         {
             MethodReceiverTargetResolution::NonTarget
         }
@@ -3574,6 +3579,7 @@ fn call_function_target_resolution(
 fn receiver_owner_matches_target(
     receiver_owner: &CodeUnit,
     target_owner: &CodeUnit,
+    reference_byte: usize,
     ctx: &ScanCtx<'_>,
 ) -> bool {
     same_symbol(receiver_owner, target_owner)
@@ -3583,15 +3589,17 @@ fn receiver_owner_matches_target(
                     && ctx
                         .visibility
                         .is_physically_visible(ctx.file, receiver_owner))
+                || visible_target_peer_matches_owner(receiver_owner, reference_byte, ctx)
                 || target_group_contains_owner_peer(receiver_owner, ctx))
 }
 
 fn receiver_owner_is_known_non_target(
     receiver_owner: &CodeUnit,
     target_owner: &CodeUnit,
+    reference_byte: usize,
     ctx: &ScanCtx<'_>,
 ) -> bool {
-    if receiver_owner_matches_target(receiver_owner, target_owner, ctx) {
+    if receiver_owner_matches_target(receiver_owner, target_owner, reference_byte, ctx) {
         return false;
     }
     if !same_logical_symbol(receiver_owner, target_owner) {
@@ -3614,6 +3622,36 @@ fn target_group_contains_owner_peer(owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool
                             && target_owner.source() == owner.source())
                 })
         })
+}
+
+fn visible_target_peer_matches_owner(
+    owner: &CodeUnit,
+    reference_byte: usize,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    ctx.visibility
+        .external_type_declaration_visible_at(ctx.file, owner, reference_byte)
+        && ctx
+            .visibility
+            .visible_identifier_candidates(ctx.file, &ctx.spec.member_name)
+            .any(|candidate| {
+                cpp_callable_definitions_share_identity_evidence(
+                    ctx.analyzer,
+                    candidate,
+                    &ctx.spec.target,
+                ) && ctx.visibility.declaration_visible_at(
+                    ctx.analyzer,
+                    ctx.file,
+                    candidate,
+                    reference_byte,
+                ) && type_owner_of(ctx.analyzer, candidate).as_ref().is_some_and(
+                    |candidate_owner| {
+                        same_symbol(candidate_owner, owner)
+                            || (same_logical_symbol(candidate_owner, owner)
+                                && candidate_owner.source() == owner.source())
+                    },
+                )
+            })
 }
 
 fn receiver_is_self_like(node: Node<'_>) -> bool {
@@ -3648,9 +3686,9 @@ fn receiver_has_known_non_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             .is_some_and(|receiver| {
                 let units = receiver_type_units(receiver, ctx.source, ctx);
                 !units.is_empty()
-                    && units
-                        .iter()
-                        .all(|target| receiver_owner_is_known_non_target(target, owner, ctx))
+                    && units.iter().all(|target| {
+                        receiver_owner_is_known_non_target(target, owner, node.start_byte(), ctx)
+                    })
             }),
         "call_expression" => node
             .child_by_field_name("function")
@@ -3669,9 +3707,9 @@ fn receiver_has_known_non_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
                     .filter_map(|target| target.unit.as_ref())
                     .collect::<Vec<_>>();
                 !units.is_empty()
-                    && units
-                        .iter()
-                        .all(|target| receiver_owner_is_known_non_target(target, owner, ctx))
+                    && units.iter().all(|target| {
+                        receiver_owner_is_known_non_target(target, owner, node.start_byte(), ctx)
+                    })
             }),
         "this" => known_non_target_owner_context(node, ctx),
         "qualified_identifier" | "scoped_identifier" | "field_identifier" => {
@@ -3741,7 +3779,7 @@ fn qualified_owner_resolution(node: Node<'_>, ctx: &ScanCtx<'_>) -> QualifiedOwn
         false,
     ) {
         LexicalTypeResolution::Resolved { unit: owner, .. }
-            if receiver_owner_matches_target(&owner, target_owner, ctx) =>
+            if receiver_owner_matches_target(&owner, target_owner, node.start_byte(), ctx) =>
         {
             QualifiedOwnerResolution::Target
         }
@@ -5485,7 +5523,7 @@ fn structured_owner_context_resolution(
     let Some(enclosing_owner) = structured_enclosing_owner(node, ctx) else {
         return StructuredOwnerContextResolution::Missing;
     };
-    if receiver_owner_matches_target(&enclosing_owner, target_owner, ctx) {
+    if receiver_owner_matches_target(&enclosing_owner, target_owner, node.start_byte(), ctx) {
         return StructuredOwnerContextResolution::SelfTarget;
     }
     // The enclosing class is not the target owner, so any match reached by walking its
@@ -5493,7 +5531,7 @@ fn structured_owner_context_resolution(
     let member_owner = cached_declaring_member_owner(&enclosing_owner, ctx);
     match member_owner {
         EnclosingMemberOwnerResolution::Owner(owner)
-            if receiver_owner_matches_target(&owner, target_owner, ctx) =>
+            if receiver_owner_matches_target(&owner, target_owner, node.start_byte(), ctx) =>
         {
             StructuredOwnerContextResolution::InheritedTarget
         }
