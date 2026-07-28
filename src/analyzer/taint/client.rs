@@ -4,15 +4,12 @@ use crate::analyzer::dataflow::{
     DataflowEdge, DataflowOutput, DataflowRequest, IdeDataflowError, IdeDataflowProblem,
     IdeSummaryDataflowResult, IdeSummarySolveInput, IdeTransition, ReusableIdeSummaryProvider,
     SolverTermination, SolverWork, SummaryWitnessStep, SummaryWitnessStepKind,
-    UnmodeledCallBehavior, WitnessRetentionLimits, solve_ide_with_reusable_summaries,
-    solve_ide_with_summaries,
+    WitnessRetentionLimits, solve_ide_with_reusable_summaries, solve_ide_with_summaries,
 };
 use crate::analyzer::semantic::{
     EvidenceCompleteness, IcfgEdgeKind, IcfgProvider, ProcedureHandle, ProofStatus, SemanticBudget,
 };
-use crate::analyzer::value_flow::{
-    ValueFlowCarrier, ValueFlowCarrierId, ValueFlowObservationPhase, ValueFlowSinkId,
-};
+use crate::analyzer::value_flow::{ValueFlowCarrierId, ValueFlowObservationPhase, ValueFlowSinkId};
 
 use super::model::TaintClassId;
 use super::{SourceClassId, TaintAnalysisPlan, TaintClassSet, TaintUniverse};
@@ -864,35 +861,30 @@ impl<'plan> TaintFlowProblem<'plan> {
                 let Some(call) = step.origin() else {
                     return self.plan.universe().empty_set();
                 };
-                let row = call
-                    .procedure()
-                    .semantics()
-                    .call_site(call.id())
-                    .expect("witness call handles are validated");
-                let result = match step.kind() {
-                    SummaryWitnessStepKind::Edge(IcfgEdgeKind::CallToNormalContinuation) => {
-                        row.result
-                    }
-                    _ => row.thrown,
-                }
-                .and_then(|value| call.procedure().value_handle(value))
-                .and_then(|value| {
-                    self.plan
-                        .value_flow()
-                        .carrier_id(&ValueFlowCarrier::Value(value))
-                });
-                let mut propagated = active.clone();
-                if let Some(result) = result {
-                    propagated.extend(active.into_iter().filter_map(|flow| {
-                        self.plan
-                            .value_flow()
-                            .is_call_input(call, flow.carrier)
-                            .then_some(ActiveTaint {
-                                carrier: result,
-                                uncertain: true,
-                                ..flow
-                            })
-                    }));
+                let kind = match step.kind() {
+                    SummaryWitnessStepKind::Edge(kind) => kind,
+                    _ => unreachable!(),
+                };
+                let mut propagated = Vec::new();
+                for flow in active {
+                    let application = self.plan.value_flow().visit_boundary_transfers(
+                        call,
+                        step.boundary(),
+                        kind,
+                        flow.carrier,
+                        |transfer| {
+                            propagated.push(ActiveTaint {
+                                carrier: transfer.target,
+                                uncertain: flow.uncertain || !transfer.proven_complete,
+                                function: flow.function.clone(),
+                            });
+                            true
+                        },
+                    );
+                    propagated.push(ActiveTaint {
+                        uncertain: flow.uncertain || application.abstained,
+                        ..flow
+                    });
                 }
                 propagated
             }
@@ -1027,54 +1019,42 @@ impl<'plan> TaintFlowProblem<'plan> {
             self.emit(active, output, out);
             return;
         };
-        let row = call
-            .procedure()
-            .semantics()
-            .call_site(call.id())
-            .expect("call handles are validated");
-        let result = match edge.kind() {
-            IcfgEdgeKind::CallToNormalContinuation => row.result,
-            IcfgEdgeKind::CallToExceptionalContinuation => row.thrown,
-            _ => None,
+        output.sort_unstable();
+        output.dedup();
+        for (fact, function) in output {
+            if !out.emit(IdeTransition::new(fact, function)) {
+                return;
+            }
         }
-        .and_then(|value| call.procedure().value_handle(value))
-        .and_then(|value| {
-            self.plan
-                .value_flow()
-                .carrier_id(&ValueFlowCarrier::Value(value))
-        });
-        let mut propagated = match self.plan.value_flow().unmodeled_call_behavior() {
-            UnmodeledCallBehavior::Paranoid | UnmodeledCallBehavior::Optimistic => active.clone(),
-            UnmodeledCallBehavior::RequireModel => active
-                .iter()
-                .cloned()
-                .map(|flow| {
-                    if self.plan.value_flow().is_call_input(call, flow.carrier) {
-                        ActiveTaint {
-                            uncertain: true,
-                            ..flow
-                        }
-                    } else {
-                        flow
-                    }
-                })
-                .collect(),
-        };
-        if self.plan.value_flow().unmodeled_call_behavior() == UnmodeledCallBehavior::Paranoid
-            && let Some(result) = result
-        {
-            propagated.extend(active.into_iter().filter_map(|flow| {
-                self.plan
-                    .value_flow()
-                    .is_call_input(call, flow.carrier)
-                    .then_some(ActiveTaint {
-                        carrier: result,
-                        uncertain: true,
-                        ..flow
-                    })
-            }));
+        for flow in active {
+            let mut emitting = true;
+            let application = self.plan.value_flow().visit_boundary_transfers(
+                call,
+                edge.boundary(),
+                edge.kind(),
+                flow.carrier,
+                |transfer| {
+                    let transferred = ActiveTaint {
+                        carrier: transfer.target,
+                        uncertain: flow.uncertain || !transfer.proven_complete,
+                        function: flow.function.clone(),
+                    };
+                    emitting =
+                        out.emit(IdeTransition::new(transferred.fact(), transferred.function));
+                    emitting
+                },
+            );
+            if !emitting {
+                return;
+            }
+            let preserved = ActiveTaint {
+                uncertain: flow.uncertain || application.abstained,
+                ..flow
+            };
+            if !out.emit(IdeTransition::new(preserved.fact(), preserved.function)) {
+                return;
+            }
         }
-        self.emit(propagated, output, out);
     }
 }
 
@@ -1197,7 +1177,7 @@ impl TaintSummaryResult {
     fn from_result(plan: &TaintAnalysisPlan, result: RawTaintSummaryResult) -> Self {
         let discovery_complete = plan
             .value_flow()
-            .execution_discovery_complete(result.fact_result())
+            .execution_result_complete(result.fact_result())
             && plan.discovery_complete();
         Self {
             result,
@@ -1233,7 +1213,7 @@ impl TaintSummaryResult {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.discovery_complete && self.result.is_complete()
+        self.discovery_complete
     }
 
     pub(crate) fn owner(&self) -> &Arc<()> {

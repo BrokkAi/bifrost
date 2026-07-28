@@ -989,19 +989,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 }
                 let children = runtime_expression_children(node);
                 let terminal = self.point(builder, node, Vec::new())?;
-                for child in &children {
-                    let source =
-                        self.expression_value(builder, *child, expression_value_kind(*child))?;
-                    self.append_effect(
-                        builder,
-                        terminal,
-                        SemanticEffect::ValueFlow {
-                            kind: ValueFlowKind::LanguageDefined,
-                            source,
-                            target: result,
-                        },
-                    )?;
-                }
+                let operands = children
+                    .iter()
+                    .map(|child| {
+                        self.expression_value(builder, *child, expression_value_kind(*child))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.session
+                    .append_language_defined_value_flows(builder, terminal, operands, result)?;
                 self.edge(builder, terminal, next)?;
                 self.schedule_expressions(
                     builder,

@@ -44,25 +44,29 @@ pub use problem::{
 };
 pub use quality::{PathQuality, PathQualityFrontier};
 pub use result::{DataflowCoverage, DataflowResult, ReachedFact, SolverTermination};
-pub(crate) use reusable_summary::validate_recursive_summary_batch;
 pub use reusable_summary::{
     CompleteSummaryRepository, CuratedCallModel, CuratedCallModelFingerprint,
     DEFAULT_SUMMARY_REPOSITORY_BYTES, DEFAULT_SUMMARY_REPOSITORY_ENTRIES,
-    ExternalSemanticSummarySet, ExternalSummaryContentHash, ExternalSummaryModelId,
-    ExternalSummaryOrigin, ExternalSummarySetError, ExternalSummarySetFingerprint,
-    ExternalSummaryTarget, MAX_AMBIGUOUS_SUMMARY_CALLEES, MAX_EXTERNAL_SUMMARY_MODEL_ID_BYTES,
-    MAX_SUMMARY_BOUNDARY_BINDINGS, MAX_SUMMARY_COMPOSITION_STEPS, MAX_SUMMARY_DEPENDENCIES,
-    MAX_SUMMARY_EFFECT_REFERENCES, MAX_SUMMARY_EFFECTS, MAX_SUMMARY_EVIDENCE_REASONS,
-    MAX_SUMMARY_REASON_BYTES, MAX_SUMMARY_RECURSIVE_MEMBERS, MAX_SUMMARY_TRANSFERS,
-    ProcedureSummaryIdentity, ProcedureSummaryKey, SUMMARY_SCHEMA_VERSION,
-    SemanticProcedureSummary, SummaryBehaviorKey, SummaryBoundaryBinding, SummaryBoundaryMap,
-    SummaryCompleteness, SummaryCompositionError, SummaryCompositionRootFingerprint,
-    SummaryContextKey, SummaryDependencyFingerprint, SummaryDependencyKey, SummaryEffect,
-    SummaryEffectKey, SummaryEventKey, SummaryEvidence, SummaryEvidenceAlternative, SummaryExit,
-    SummaryExitKind, SummaryIncompleteReason, SummaryLocationKey, SummaryOrigin, SummaryPort,
-    SummaryPublicationError, SummaryPublicationOutcome, SummaryRecursiveEdge,
-    SummaryRecursiveGroupFingerprint, SummaryRecursiveGroupKey, SummaryRepositoryLimits,
-    SummarySchemaVersion, SummarySemanticsVersion, SummaryTransfer, SummaryValidationError,
+    ExternalSemanticSummarySet, ExternalSummaryCompatibilityKey, ExternalSummaryContentHash,
+    ExternalSummaryModelId, ExternalSummaryOrigin, ExternalSummarySetError,
+    ExternalSummarySetFingerprint, ExternalSummaryTarget, MAX_AMBIGUOUS_SUMMARY_CALLEES,
+    MAX_EXTERNAL_SUMMARY_MODEL_ID_BYTES, MAX_SUMMARY_BOUNDARY_BINDINGS,
+    MAX_SUMMARY_COMPOSITION_STEPS, MAX_SUMMARY_DEPENDENCIES, MAX_SUMMARY_EFFECT_REFERENCES,
+    MAX_SUMMARY_EFFECTS, MAX_SUMMARY_EVIDENCE_REASONS, MAX_SUMMARY_REASON_BYTES,
+    MAX_SUMMARY_RECURSIVE_MEMBERS, MAX_SUMMARY_TRANSFERS, ProcedureSummaryIdentity,
+    ProcedureSummaryKey, SUMMARY_SCHEMA_VERSION, SemanticProcedureSummary, SummaryBehaviorKey,
+    SummaryBoundaryBinding, SummaryBoundaryMap, SummaryCompleteness, SummaryCompositionError,
+    SummaryCompositionRootFingerprint, SummaryContextKey, SummaryDependencyFingerprint,
+    SummaryDependencyKey, SummaryEffect, SummaryEffectKey, SummaryEventKey, SummaryEvidence,
+    SummaryEvidenceAlternative, SummaryExit, SummaryExitKind, SummaryIncompleteReason,
+    SummaryLocationKey, SummaryOrigin, SummaryPort, SummaryPublicationError,
+    SummaryPublicationOutcome, SummaryRecursiveEdge, SummaryRecursiveGroupFingerprint,
+    SummaryRecursiveGroupKey, SummaryRepositoryLimits, SummarySchemaVersion,
+    SummarySemanticsVersion, SummaryTransfer, SummaryValidationError,
+};
+pub(crate) use reusable_summary::{
+    SemanticSummarySetValidationError, canonicalize_semantic_summary_items,
+    validate_recursive_summary_batch,
 };
 pub use summary::{
     ReusableEndSummary, ReusableProcedureSummary, ReusableReachedFact, ReusableSummaryProvider,

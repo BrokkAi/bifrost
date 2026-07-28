@@ -121,7 +121,7 @@ impl ValueFlowSummaryResult {
                 owner: Arc::clone(plan.owner()),
             });
         }
-        let discovery_complete = plan.execution_discovery_complete(&result);
+        let discovery_complete = plan.execution_result_complete(&result);
         Ok(Self {
             result,
             meetings: meetings.into_boxed_slice(),
@@ -139,7 +139,7 @@ impl ValueFlowSummaryResult {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.discovery_complete && self.result.is_complete()
+        self.discovery_complete
     }
 
     pub fn sink_outcome(&self, sink: ValueFlowSinkId) -> ValueFlowSinkOutcome<'_> {

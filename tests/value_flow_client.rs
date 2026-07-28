@@ -3,13 +3,13 @@ mod common;
 use std::sync::Arc;
 
 use brokk_bifrost::analyzer::dataflow::{
-    CuratedCallModel, DataflowRequest, ExternalSemanticSummarySet, ExternalSummaryContentHash,
-    ExternalSummaryModelId, ExternalSummaryOrigin, PathQuality, ProcedureSummaryIdentity,
-    ProcedureSummaryKey, SemanticInputStatus, SemanticProcedureSummary, SolverBudget,
-    SummaryBehaviorKey, SummaryCompleteness, SummaryContextKey, SummaryEvidence, SummaryExit,
-    SummaryExitKind, SummaryLocationKey, SummaryOrigin, SummaryPort, SummarySchemaVersion,
-    SummarySemanticsVersion, SummaryTransfer, UnmodeledCallBehavior, WitnessReconstructionLimits,
-    WitnessRetentionLimits,
+    CuratedCallModel, DataflowRequest, ExternalSemanticSummarySet, ExternalSummaryCompatibilityKey,
+    ExternalSummaryContentHash, ExternalSummaryModelId, ExternalSummaryOrigin, PathQuality,
+    ProcedureSummaryIdentity, ProcedureSummaryKey, SemanticInputStatus, SemanticProcedureSummary,
+    SolverBudget, SummaryBehaviorKey, SummaryCompleteness, SummaryContextKey, SummaryEvidence,
+    SummaryExit, SummaryExitKind, SummaryLocationKey, SummaryOrigin, SummaryPort,
+    SummarySchemaVersion, SummarySemanticsVersion, SummaryTransfer, UnmodeledCallBehavior,
+    WitnessReconstructionLimits, WitnessRetentionLimits,
 };
 use brokk_bifrost::analyzer::semantic::{
     AbstractLocation, AbstractObject, AbstractObjectIdentity, AccessPath, AccessPathRoot,
@@ -60,6 +60,16 @@ interface ExternalWork {
 final class UnmodeledCallFixture {
   static String caller(ExternalWork work, String input) {
     return work.run(input);
+  }
+}
+"#;
+
+const EXACT_STATIC_CALL_SOURCE: &str = r#"
+final class ExactStaticCallFixture {
+  static native String external(String value);
+
+  static String caller(String input) {
+    return external(input);
   }
 }
 "#;
@@ -268,14 +278,32 @@ fn solve(fixture: &Fixture) -> brokk_bifrost::analyzer::value_flow::ValueFlowSum
 fn solve_unmodeled_call(
     behavior: UnmodeledCallBehavior,
     exact_external_summary: bool,
-    curated_transfer: Option<(SummaryPort, SummaryEvidence)>,
+    curated_transfers: Option<Vec<SummaryTransfer>>,
+) -> (
+    brokk_bifrost::analyzer::value_flow::ValueFlowSummaryResult,
+    brokk_bifrost::analyzer::value_flow::ValueFlowSinkId,
+    brokk_bifrost::analyzer::value_flow::ValueFlowSinkId,
+) {
+    solve_call_source(
+        UNMODELED_CALL_SOURCE,
+        behavior,
+        exact_external_summary,
+        curated_transfers,
+    )
+}
+
+fn solve_call_source(
+    source_text: &str,
+    behavior: UnmodeledCallBehavior,
+    exact_external_summary: bool,
+    curated_transfers: Option<Vec<SummaryTransfer>>,
 ) -> (
     brokk_bifrost::analyzer::value_flow::ValueFlowSummaryResult,
     brokk_bifrost::analyzer::value_flow::ValueFlowSinkId,
     brokk_bifrost::analyzer::value_flow::ValueFlowSinkId,
 ) {
     let project = InlineTestProject::with_language(Language::Java)
-        .file("src/UnmodeledCallFixture.java", UNMODELED_CALL_SOURCE)
+        .file("src/UnmodeledCallFixture.java", source_text)
         .build();
     let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
     let graph = SemanticGraph::materialize(&project, &analyzer, "src/UnmodeledCallFixture.java");
@@ -309,6 +337,21 @@ fn solve_unmodeled_call(
         ProofStatus::Proven,
         EvidenceCompleteness::Complete,
     );
+    let cancellation = CancellationToken::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let relations = analyzer
+        .semantic_oracle_provider()
+        .procedure_relations(
+            &root,
+            &OracleCallContext::empty(),
+            &mut SemanticRequest::new(&mut semantic_budget, &cancellation),
+        )
+        .expect("caller value-flow snapshot");
+    let relation_status = SemanticInputStatus::from_outcome(&relations);
+    let relation_snapshot = relations
+        .available_value()
+        .expect("caller snapshot remains available")
+        .clone();
     let result_sink_spec = ValueFlowSinkSpec::new(
         ValueFlowEventKey::at_point(&normal_continuation, 0, ValueFlowEventKind::Sink)
             .expect("result sink key"),
@@ -329,24 +372,18 @@ fn solve_unmodeled_call(
     );
     let mut plan = ValueFlowPlan::with_call_behavior(
         root.clone(),
-        Vec::new(),
+        vec![ValueFlowInput::new(relation_snapshot, relation_status)],
         Vec::new(),
         vec![source],
         vec![result_sink_spec, preserved_sink_spec],
         behavior,
     )
     .expect("unmodeled-call plan");
-    if let Some((curated_input, evidence)) = curated_transfer {
-        let transfer = SummaryTransfer::try_new(
-            curated_input,
-            SummaryExit::try_new(SummaryExitKind::Normal, SummaryPort::NormalReturn).unwrap(),
-            evidence,
-        )
-        .unwrap();
+    if let Some(transfers) = curated_transfers {
         let model = CuratedCallModel::try_new(
             ExternalSummaryModelId::new("test.curated-external-work").unwrap(),
             ExternalSummaryContentHash::hash_bytes(b"curated-external-work-v1"),
-            vec![transfer],
+            transfers,
         )
         .unwrap();
         plan = plan
@@ -407,8 +444,30 @@ fn solve_unmodeled_call(
             SummaryCompleteness::Complete,
         )
         .unwrap();
+        let incompatible_behavior = match behavior {
+            UnmodeledCallBehavior::Paranoid => UnmodeledCallBehavior::Optimistic,
+            UnmodeledCallBehavior::Optimistic | UnmodeledCallBehavior::RequireModel => {
+                UnmodeledCallBehavior::Paranoid
+            }
+        };
+        let incompatible = ExternalSemanticSummarySet::try_new(
+            vec![summary.clone()],
+            external_compatibility(&summary, incompatible_behavior),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.clone().with_external_summaries(incompatible),
+            Err(ValueFlowPlanError::IncompatibleExternalSummary)
+        );
         plan = plan
-            .with_external_summaries(ExternalSemanticSummarySet::try_new(vec![summary]).unwrap());
+            .with_external_summaries(
+                ExternalSemanticSummarySet::try_new(
+                    vec![summary.clone()],
+                    external_compatibility(&summary, behavior),
+                )
+                .unwrap(),
+            )
+            .unwrap();
     }
     let result_sink = plan
         .sinks()
@@ -430,6 +489,29 @@ fn solve_unmodeled_call(
     )
     .expect("unmodeled-call solve");
     (result, result_sink, preserved_sink)
+}
+
+fn modeled_return_transfer(input: SummaryPort, evidence: SummaryEvidence) -> SummaryTransfer {
+    SummaryTransfer::try_new(
+        input,
+        SummaryExit::try_new(SummaryExitKind::Normal, SummaryPort::NormalReturn).unwrap(),
+        evidence,
+    )
+    .unwrap()
+}
+
+fn external_compatibility(
+    summary: &SemanticProcedureSummary,
+    behavior: UnmodeledCallBehavior,
+) -> ExternalSummaryCompatibilityKey {
+    ExternalSummaryCompatibilityKey::new(
+        summary.key().schema(),
+        summary.key().semantics(),
+        summary.key().context(),
+        summary.key().behavior(),
+        summary.key().artifact().dependencies(),
+        behavior,
+    )
 }
 
 fn unmodeled_exceptional_call_reaches_result(behavior: UnmodeledCallBehavior) -> bool {
@@ -688,7 +770,14 @@ fn structured_side_effect_reaches_location(
         .unwrap();
         let heap_port = summary.transfers()[0].exit().port().clone();
         plan = plan
-            .with_external_summaries(ExternalSemanticSummarySet::try_new(vec![summary]).unwrap())
+            .with_external_summaries(
+                ExternalSemanticSummarySet::try_new(
+                    vec![summary.clone()],
+                    external_compatibility(&summary, behavior),
+                )
+                .unwrap(),
+            )
+            .unwrap()
             .with_summary_location_bindings(vec![ValueFlowSummaryLocationBinding::new(
                 root.call_site_handle(call.id).unwrap(),
                 heap_port,
@@ -1090,11 +1179,8 @@ fn java_and_typescript_unary_and_binary_operations_emit_structured_flows() {
 
 #[test]
 fn exact_external_summary_precedes_require_model_fallback() {
-    let (result, result_sink, preserved_sink) = solve_unmodeled_call(
-        UnmodeledCallBehavior::RequireModel,
-        true,
-        Some((SummaryPort::Receiver, SummaryEvidence::proven_complete())),
-    );
+    let (result, result_sink, preserved_sink) =
+        solve_unmodeled_call(UnmodeledCallBehavior::RequireModel, true, None);
     let ValueFlowSinkOutcome::Reached(meetings) = result.sink_outcome(result_sink) else {
         panic!("the exact external summary must propagate parameter zero to the return value");
     };
@@ -1105,7 +1191,29 @@ fn exact_external_summary_precedes_require_model_fallback() {
     ));
     assert!(
         !result.is_complete(),
-        "the structured dispatch boundary remains visible as incompleteness"
+        "the exact interface target must not erase the independent unresolved override arm"
+    );
+}
+
+#[test]
+fn complete_exact_static_model_discharges_only_the_missing_body_boundary() {
+    let (result, result_sink, _) = solve_call_source(
+        EXACT_STATIC_CALL_SOURCE,
+        UnmodeledCallBehavior::RequireModel,
+        true,
+        Some(vec![modeled_return_transfer(
+            SummaryPort::Parameter(0),
+            SummaryEvidence::proven_complete(),
+        )]),
+    );
+    assert!(matches!(
+        result.sink_outcome(result_sink),
+        ValueFlowSinkOutcome::Reached(_)
+    ));
+    assert!(
+        result.is_complete(),
+        "a compatible complete static model should make the missing body conclusive: {:#?}",
+        result.result().coverage()
     );
 }
 
@@ -1127,16 +1235,42 @@ fn curated_call_model_precedes_require_model_fallback() {
     let (result, result_sink, _) = solve_unmodeled_call(
         UnmodeledCallBehavior::RequireModel,
         false,
-        Some((
+        Some(vec![modeled_return_transfer(
             SummaryPort::Parameter(0),
             SummaryEvidence::proven_complete(),
-        )),
+        )]),
     );
     let ValueFlowSinkOutcome::Reached(meetings) = result.sink_outcome(result_sink) else {
         panic!("the selector-bound curated model must propagate parameter zero to the return");
     };
     assert!(meetings.iter().all(|meeting| !meeting.is_uncertain()));
-    assert!(!result.is_complete());
+    assert!(result.is_complete());
+}
+
+#[test]
+fn curated_model_keeps_bindable_rows_when_another_port_is_unbound() {
+    let (result, result_sink, _) = solve_unmodeled_call(
+        UnmodeledCallBehavior::RequireModel,
+        false,
+        Some(vec![
+            modeled_return_transfer(
+                SummaryPort::Parameter(0),
+                SummaryEvidence::proven_complete(),
+            ),
+            modeled_return_transfer(
+                SummaryPort::Heap(SummaryLocationKey::hash_bytes(b"unbound-test-heap")),
+                SummaryEvidence::proven_complete(),
+            ),
+        ]),
+    );
+    assert!(matches!(
+        result.sink_outcome(result_sink),
+        ValueFlowSinkOutcome::Reached(_)
+    ));
+    assert!(
+        !result.is_complete(),
+        "an unbound row remains an explicit completeness gap"
+    );
 }
 
 #[test]
@@ -1149,7 +1283,10 @@ fn modeled_transfer_quality_requires_one_proven_complete_alternative() {
     let (result, result_sink, _) = solve_unmodeled_call(
         UnmodeledCallBehavior::RequireModel,
         false,
-        Some((SummaryPort::Parameter(0), incomparable)),
+        Some(vec![modeled_return_transfer(
+            SummaryPort::Parameter(0),
+            incomparable,
+        )]),
     );
     let ValueFlowSinkOutcome::Reached(meetings) = result.sink_outcome(result_sink) else {
         panic!("the modeled transfer must remain reachable");

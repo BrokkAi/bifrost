@@ -34,6 +34,8 @@ This is intentionally staged. The control-flow invariant and shared fallback pro
   - [x] (2026-07-28 12:16 SAST) Manual correctness/performance review fixed undercounted nested fallback/location rows in retained-size and solver-work accounting, required one proven-and-complete summary evidence alternative rather than joining independent axes across alternatives, and removed the remaining call-times-carrier profile-construction scan.
   - [x] (2026-07-28 12:16 SAST) Broad no-feature library run executed 1,970 tests: 1,967 passed in the managed sandbox and the three blocked MCP subprocess tests passed when rerun outside it (five matching tests passed). The issue-focused matrix then passed: CLI 19, summaries 32, ICFG 25, docs 8, loading 16, match evaluation 13, reusable summaries 17, semantic IR 11, taint 26, typestate 40, and value-flow 17.
   - [x] (2026-07-28 12:19 SAST) Repeated fresh-target strict all-target/all-feature clippy after the post-review accounting and indexing fixes; it passed in 2m20s. Formatting and diff validation are clean.
+  - [x] (2026-07-28) Applied all eleven findings from the guided-review mode 3 pass on `1227-add-configurable-fallback-semantics-for-unresolved-and-external-calls`. Value-flow and taint now share one streaming exact/curated/fallback boundary engine and witness replay retains the dispatch arm; external sets validate their analysis family and may contain explicitly partial summaries; deferred calls cannot consume ordinary procedure summaries; fallback globals/components are indexed once; model fanout stops at solver budgets; complete compatible models discharge only attributed call gaps; bindable rows survive adjacent unbound rows; curated transfer counts are bounded before canonicalization; cache identities use applicable per-procedure external fingerprints; Java/TypeScript operator effects share one lowering helper; and taint/typestate/external sets share one summary canonicalizer.
+  - [x] (2026-07-28) Added regression coverage for external compatibility rejection, partial external-set acceptance, transfer-count limits, complete modeled-call coverage, partial row binding, and taint/witness traversal through a curated unresolved call. Final focused runs passed (`reusable_summaries`: 18, `taint_client`: 27, `value_flow_client`: 19), `cargo fmt --all -- --check` and `git diff --check` are clean, and the final strict isolated all-target/all-feature clippy run passed in 2m06s with the matching rustup toolchain.
 
 ## Surprises & Discoveries
 
@@ -81,6 +83,12 @@ This is intentionally staged. The control-flow invariant and shared fallback pro
 - Observation: review found two validity/accounting pitfalls after semantics were passing. Retained-size and solver-work estimates counted fallback records but not their nested carrier keys, and summary evidence checked proven and complete axes independently across alternatives.
   Evidence: final accounting includes nested input/output/location keys and model-row work; modeled transfer quality now requires one alternative whose `PathQuality` is both proven and complete, with a regression test using incomparable alternatives.
 
+- Observation: the guided review found that value-flow, taint, and taint witness replay had evolved separate boundary-transfer implementations. The taint paths therefore skipped exact summaries, curated models, heap/capture outputs, and structured paranoid side effects even when value-flow handled them correctly.
+  Evidence: `ValueFlowPlan::visit_boundary_transfers` is now the single streaming precedence and binding path used by `src/analyzer/value_flow/client.rs` and both forward/replay paths in `src/analyzer/taint/client.rs`; `curated_external_call_flow_is_shared_with_taint_and_witness_replay` fails on the prior implementation and passes now.
+
+- Observation: a complete external model cannot make an independently unresolved dynamic-dispatch arm conclusive. Java currently retains both a proven unmaterialized target and an unproven possible-override arm even for the static native fixture, so the test needs an exact target model plus a call-site curated model for the residual target set.
+  Evidence: summary coverage retained `Dispatch(Unmaterialized(...))` and `Dispatch(Unresolved)` separately. Exact-only coverage remains incomplete, while exact plus selector-bound complete coverage discharges the missing-body semantic boundary and call-to-continuation edge.
+
 ## Decision Log
 
 - Decision: Separate continuation from transfer semantics. An unmaterialized call arm projects every semantically available normal and exceptional continuation regardless of the client-selected fallback profile.
@@ -127,13 +135,29 @@ This is intentionally staged. The control-flow invariant and shared fallback pro
   Rationale: conservative alias/reachability needs structured transitive connectivity, but repeated graph searches in the plan-construction hot path would undermine the sub-five-second responsiveness goal tracked by #1228.
   Date/Author: 2026-07-28 / Codex
 
+- Decision: Centralize boundary transfer precedence, port binding, evidence quality, fallback semantics, and budget-aware output enumeration in `ValueFlowPlan::visit_boundary_transfers`.
+  Rationale: value-flow, taint propagation, and taint witness replay must consume exactly the same semantics. A visitor keeps potentially broad paranoid output sets lazy so solver budgets stop work before a fanout allocation is materialized.
+  Date/Author: 2026-07-28 / Codex
+
+- Decision: Treat exact external summaries as target-specific and curated call-site models as coverage of the selected call boundary. Exact summaries require proven dispatch and complete, fully bindable rows before discharging completeness; curated models may explicitly model an otherwise unproven residual target set.
+  Rationale: an exact summary describes one target and cannot prove there are no other dynamic targets, while a selector-bound curated model is deliberately attached to the whole live call site. This preserves dynamic-dispatch uncertainty unless the residual arm is also modeled.
+  Date/Author: 2026-07-28 / Codex
+
+- Decision: Accept partial external summaries but retain their completeness, and reject incompatible summary families or active call-profile/dependency identities before installation.
+  Rationale: partial indexed knowledge is still useful for positive flow discovery, but it must never claim a complete negative result or cross an incompatible analysis/cache boundary.
+  Date/Author: 2026-07-28 / Codex
+
+- Decision: Continue on the user-selected `1227-add-configurable-fallback-semantics-for-unresolved-and-external-calls` branch after moving the three implementation commits onto it.
+  Rationale: the user explicitly requested that branch and commit move after the earlier detached-worktree implementation. No new branch or rebase was created.
+  Date/Author: 2026-07-28 / Codex
+
 ## Outcomes & Retrospective
 
 Milestones 1 through 4 now cover the issue's runtime and authoring contract. Residual call arms reach normal and exceptional continuations while retaining incomplete boundary evidence. Value-flow and taint apply one shared paranoid-default profile without requiring resolved formal bindings, while typestate maps the same profile into its existing uncertainty transitions. `.rqlp` can override that profile with a typed `call-modeling` record, and the selected mode participates in canonical policy, semantic, summary, and batch identities.
 
 Exact external procedure summaries and selector-bound curated models use the existing reusable-summary ports, transfers, evidence, completeness, origins, and content identities. Exact summaries precede curated models, which precede fallback. Paranoid fallback includes structured mutable receiver/argument state and bounded globals without treating Java primitives as out parameters. Java and TypeScript unary/binary expressions emit neutral `LanguageDefined` facts that flow through the same value-flow and reusable-summary machinery.
 
-Final validation is green: the broad library surface passed apart from three sandbox-blocked subprocess tests that passed immediately outside the sandbox, the complete issue-focused matrix passed, and a fresh strict all-feature clippy run passed after review fixes. The implementation is ready for its Milestones 3-5 checkpoint on the current detached worktree. Production evaluation of authored taint external-model selectors remains the pre-existing future adapter gap; this issue does not claim that absent adapter.
+Final validation is green: the broad library surface passed apart from three sandbox-blocked subprocess tests that passed immediately outside the sandbox, the complete issue-focused matrix passed, and the post-guided-review focused matrix passed 18 reusable-summary, 27 taint-client, and 19 value-flow-client tests. A fresh isolated strict all-feature clippy run passed after aligning `cargo`, `rustc`, and `clippy-driver` to the rustup toolchain. All eleven guided-review findings are resolved on `1227-add-configurable-fallback-semantics-for-unresolved-and-external-calls`. Production evaluation of authored taint external-model selectors remains the pre-existing future adapter gap; this issue does not claim that absent adapter.
 
 ## Context and Orientation
 
@@ -278,3 +302,5 @@ Revision note (2026-07-28): Initial plan created after live issue inspection and
 Revision note (2026-07-28): Milestone 2 completed the public RQLP surface and removed the conflicting legacy unknown-call knob. The default change uncovered and fixed terminal typestate reporting for sets containing both expected and violating states.
 
 Revision note (2026-07-28): Milestones 3 and 4 completed exact external-summary selection, neutral curated-model binding, structured side-effect fallback, and Java/TypeScript operator flows. The plan records the absent production taint-policy adapter explicitly and replaces a repeated reachability scan with one iterative connectivity pass for performance.
+
+Revision note (2026-07-28): The guided-review mode 3 follow-up resolved all eleven findings by unifying boundary semantics across value-flow, taint, and witness replay; validating and narrowing external-summary compatibility/cache identity; bounding and streaming model work; correcting completeness and partial binding; consolidating summary canonicalization and operator lowering; and adding focused regressions. The revision also records the user-selected branch and the rustup/Homebrew clippy-driver mismatch discovered during validation.

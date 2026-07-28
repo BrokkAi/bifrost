@@ -1,18 +1,19 @@
 mod common;
 
 use brokk_bifrost::analyzer::dataflow::{
-    DataflowRequest, ProcedureSummaryIdentity, ProcedureSummaryKey, SemanticInputStatus,
-    SemanticProcedureSummary, SolverBudget, SummaryBehaviorKey, SummaryCompleteness,
-    SummaryContextKey, SummaryDependencyKey, SummaryEffect, SummaryEffectKey, SummaryEventKey,
-    SummaryEvidence, SummaryOrigin, SummaryRecursiveEdge, SummaryRecursiveGroupKey,
-    SummarySchemaVersion, SummarySemanticsVersion, UnmodeledCallBehavior,
+    CuratedCallModel, DataflowRequest, ExternalSummaryContentHash, ExternalSummaryModelId,
+    ProcedureSummaryIdentity, ProcedureSummaryKey, SemanticInputStatus, SemanticProcedureSummary,
+    SolverBudget, SummaryBehaviorKey, SummaryCompleteness, SummaryContextKey, SummaryDependencyKey,
+    SummaryEffect, SummaryEffectKey, SummaryEventKey, SummaryEvidence, SummaryExit,
+    SummaryExitKind, SummaryOrigin, SummaryPort, SummaryRecursiveEdge, SummaryRecursiveGroupKey,
+    SummarySchemaVersion, SummarySemanticsVersion, SummaryTransfer, UnmodeledCallBehavior,
     WitnessReconstructionLimits, WitnessRetentionLimits,
 };
 use brokk_bifrost::analyzer::semantic::{
-    CallBinding, CallBindings, CancellationToken, CandidateCoverage, DispatchOracle,
-    EvidenceCompleteness, OracleCallContext, OracleLimits, ProcedureHandle, ProcedureKind,
-    ProofStatus, SemanticBudget, SemanticRequest, ValueFlowOracle, ValueFlowRelationKind,
-    ValueFlowSnapshot,
+    CallBinding, CallBindings, CancellationToken, CandidateCoverage, ControlContinuation,
+    DispatchOracle, EvidenceCompleteness, OracleCallContext, OracleLimits, ProcedureHandle,
+    ProcedureKind, ProofStatus, SemanticBudget, SemanticRequest, ValueFlowOracle,
+    ValueFlowRelationKind, ValueFlowSnapshot,
 };
 use brokk_bifrost::analyzer::taint::{
     CompleteTaintTransferSummaryRepository, SourceClassId, SourceEventKey, TaintAnalysisPlan,
@@ -23,8 +24,9 @@ use brokk_bifrost::analyzer::taint::{
     solve_taint_with_reusable_summaries,
 };
 use brokk_bifrost::analyzer::value_flow::{
-    ValueFlowCarrier, ValueFlowEventKey, ValueFlowEventKind, ValueFlowInput,
-    ValueFlowObservationPhase, ValueFlowPlan, ValueFlowSinkSpec, ValueFlowSourceSpec,
+    ValueFlowCarrier, ValueFlowCuratedCallModel, ValueFlowEventKey, ValueFlowEventKind,
+    ValueFlowInput, ValueFlowObservationPhase, ValueFlowPlan, ValueFlowSinkSpec,
+    ValueFlowSourceSpec,
 };
 use brokk_bifrost::{AnalyzerConfig, Language};
 
@@ -35,6 +37,18 @@ final class TaintFixture {
   static String run(String input) {
     String copy = input;
     return copy;
+  }
+}
+"#;
+
+const UNMODELED_TAINT_SOURCE: &str = r#"
+interface ExternalTaintWork {
+  String run(String value);
+}
+
+final class UnmodeledTaintFixture {
+  static String caller(ExternalTaintWork work, String input) {
+    return work.run(input);
   }
 }
 "#;
@@ -281,6 +295,107 @@ fn solve(
         &mut DataflowRequest::new(&mut solver_budget, &cancellation),
     )
     .unwrap()
+}
+
+#[test]
+fn curated_external_call_flow_is_shared_with_taint_and_witness_replay() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/UnmodeledTaintFixture.java", UNMODELED_TAINT_SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "src/UnmodeledTaintFixture.java");
+    let root = procedure_named(&graph, "caller", ProcedureKind::Method);
+    let call = root.semantics().call_sites().first().unwrap().clone();
+    let invoke = root.point_handle(call.point).unwrap();
+    let continuation = match call.normal_continuation {
+        ControlContinuation::Target(point) => root.point_handle(point).unwrap(),
+        ref other => panic!("expected normal continuation, got {other:?}"),
+    };
+    let input = root.value_handle(call.arguments[0].value).unwrap();
+    let output = root.value_handle(call.result.unwrap()).unwrap();
+    let source = ValueFlowSourceSpec::new(
+        ValueFlowEventKey::at_point(&invoke, 0, ValueFlowEventKind::Source).unwrap(),
+        invoke,
+        ValueFlowObservationPhase::BeforeEffects,
+        ValueFlowCarrier::Value(input),
+        ProofStatus::Proven,
+        EvidenceCompleteness::Complete,
+    );
+    let sink = ValueFlowSinkSpec::new(
+        ValueFlowEventKey::at_point(&continuation, 0, ValueFlowEventKind::Sink).unwrap(),
+        continuation,
+        ValueFlowObservationPhase::BeforeEffects,
+        ValueFlowCarrier::Value(output),
+        ProofStatus::Proven,
+        EvidenceCompleteness::Complete,
+    );
+    let cancellation = CancellationToken::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let outcome = analyzer
+        .semantic_oracle_provider()
+        .procedure_relations(
+            &root,
+            &OracleCallContext::empty(),
+            &mut SemanticRequest::new(&mut semantic_budget, &cancellation),
+        )
+        .unwrap();
+    let status = SemanticInputStatus::from_outcome(&outcome);
+    let snapshot = outcome.available_value().unwrap().clone();
+    let transfer = SummaryTransfer::try_new(
+        SummaryPort::Parameter(0),
+        SummaryExit::try_new(SummaryExitKind::Normal, SummaryPort::NormalReturn).unwrap(),
+        SummaryEvidence::proven_complete(),
+    )
+    .unwrap();
+    let model = CuratedCallModel::try_new(
+        ExternalSummaryModelId::new("test.taint-external-work").unwrap(),
+        ExternalSummaryContentHash::hash_bytes(b"taint-parameter-0-to-return-v1"),
+        vec![transfer],
+    )
+    .unwrap();
+    let value_flow = ValueFlowPlan::with_call_behavior(
+        root.clone(),
+        vec![ValueFlowInput::new(snapshot, status)],
+        Vec::new(),
+        vec![source],
+        vec![sink],
+        UnmodeledCallBehavior::RequireModel,
+    )
+    .unwrap()
+    .with_curated_call_models(vec![ValueFlowCuratedCallModel::new(
+        root.call_site_handle(call.id).unwrap(),
+        model,
+    )])
+    .unwrap();
+    let universe = TaintUniverse::new(vec![class("sql")]).unwrap();
+    let tainted = universe.class_set(universe.classes()).unwrap();
+    let sources = value_flow
+        .sources()
+        .map(|(id, spec)| {
+            TaintSourceBinding::new(id, tainted.clone(), SourceEventKey::new(spec.key().clone()))
+        })
+        .collect();
+    let sinks = value_flow
+        .sinks()
+        .map(|(id, _)| TaintSinkBinding::new(id, tainted.clone()))
+        .collect();
+    let plan = TaintAnalysisPlan::new(value_flow, universe, sources, sinks, Vec::new(), Vec::new())
+        .unwrap();
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let result = solve_taint_batch_with_witnesses(
+        &root,
+        &analyzer.icfg_provider(),
+        &plan,
+        WitnessRetentionLimits::new(2).unwrap(),
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .unwrap();
+    let report =
+        collect_taint_findings(&plan, result, 2, WitnessReconstructionLimits::default()).unwrap();
+    assert_eq!(report.findings().len(), 1);
+    assert!(report.findings()[0].origins().is_complete());
 }
 
 fn reusable_semantic_identity(root: &ProcedureHandle) -> ProcedureSummaryIdentity {

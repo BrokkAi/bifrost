@@ -10,8 +10,9 @@ use std::fmt;
 use std::mem::{size_of, size_of_val};
 
 use crate::analyzer::semantic::{
-    DeclarationLocator, EvidenceCompleteness, ProofStatus, SemanticArtifactKey, SemanticLocator,
-    SemanticRole, StableDigest, WorkspaceMountId, WorkspaceRelativePath,
+    DeclarationLocator, DependencyFingerprint, EvidenceCompleteness, ProofStatus,
+    SemanticArtifactKey, SemanticLocator, SemanticRole, StableDigest, WorkspaceMountId,
+    WorkspaceRelativePath,
 };
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 
@@ -109,6 +110,54 @@ define_summary_digest!(
     /// Content-addressed identity of one curated call-site model.
     CuratedCallModelFingerprint
 );
+
+/// Summary-family contract that must agree with the active analysis before an
+/// external summary may replace configured fallback behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExternalSummaryCompatibilityKey {
+    schema: SummarySchemaVersion,
+    semantics: SummarySemanticsVersion,
+    context: SummaryContextKey,
+    behavior: SummaryBehaviorKey,
+    dependencies: DependencyFingerprint,
+    unmodeled_call_behavior: UnmodeledCallBehavior,
+}
+
+impl ExternalSummaryCompatibilityKey {
+    pub const fn new(
+        schema: SummarySchemaVersion,
+        semantics: SummarySemanticsVersion,
+        context: SummaryContextKey,
+        behavior: SummaryBehaviorKey,
+        dependencies: DependencyFingerprint,
+        unmodeled_call_behavior: UnmodeledCallBehavior,
+    ) -> Self {
+        Self {
+            schema,
+            semantics,
+            context,
+            behavior,
+            dependencies,
+            unmodeled_call_behavior,
+        }
+    }
+
+    fn matches(self, summary: &SemanticProcedureSummary) -> bool {
+        self.schema == summary.key().schema()
+            && self.semantics == summary.key().semantics()
+            && self.context == summary.key().context()
+            && self.behavior == summary.key().behavior()
+            && self.dependencies == summary.key().artifact().dependencies()
+    }
+
+    pub const fn unmodeled_call_behavior(self) -> UnmodeledCallBehavior {
+        self.unmodeled_call_behavior
+    }
+
+    pub const fn dependencies(self) -> DependencyFingerprint {
+        self.dependencies
+    }
+}
 define_summary_digest!(
     /// Canonical identity of one recursive publication group.
     SummaryRecursiveGroupFingerprint
@@ -1277,13 +1326,42 @@ impl ExternalSummaryTarget {
     }
 }
 
-/// Canonical query-scoped index for complete externally supplied procedure
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticSummarySetValidationError {
+    Incomplete,
+    AmbiguousKey,
+}
+
+pub(crate) fn canonicalize_semantic_summary_items<T>(
+    mut items: Vec<T>,
+    summary: impl Fn(&T) -> &SemanticProcedureSummary,
+    require_complete: bool,
+) -> Result<Box<[T]>, SemanticSummarySetValidationError> {
+    if require_complete
+        && items
+            .iter()
+            .any(|item| !summary(item).completeness().is_complete())
+    {
+        return Err(SemanticSummarySetValidationError::Incomplete);
+    }
+    items.sort_unstable_by(|left, right| summary(left).key().cmp(summary(right).key()));
+    if items
+        .windows(2)
+        .any(|pair| summary(&pair[0]).key() == summary(&pair[1]).key())
+    {
+        return Err(SemanticSummarySetValidationError::AmbiguousKey);
+    }
+    Ok(items.into_boxed_slice())
+}
+
+/// Canonical query-scoped index for compatible externally supplied procedure
 /// summaries. It resolves boundary locators without fabricating a live
 /// [`crate::analyzer::semantic::ProcedureHandle`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalSemanticSummarySet {
     entries: Box<[(ExternalSummaryTarget, SemanticProcedureSummary)]>,
     fingerprint: ExternalSummarySetFingerprint,
+    compatibility: Option<ExternalSummaryCompatibilityKey>,
 }
 
 impl Default for ExternalSemanticSummarySet {
@@ -1293,6 +1371,7 @@ impl Default for ExternalSemanticSummarySet {
             fingerprint: ExternalSummarySetFingerprint::hash_bytes(
                 b"bifrost-external-summary-set/v1\0",
             ),
+            compatibility: None,
         }
     }
 }
@@ -1300,14 +1379,17 @@ impl Default for ExternalSemanticSummarySet {
 impl ExternalSemanticSummarySet {
     pub fn try_new(
         summaries: Vec<SemanticProcedureSummary>,
+        compatibility: ExternalSummaryCompatibilityKey,
     ) -> Result<Self, ExternalSummarySetError> {
+        let summaries = canonicalize_semantic_summary_items(summaries, |summary| summary, false)
+            .map_err(|_| ExternalSummarySetError::AmbiguousTarget)?;
         let mut entries = Vec::with_capacity(summaries.len());
-        for summary in summaries {
+        for summary in summaries.into_vec() {
             if !matches!(summary.origin(), SummaryOrigin::External(_)) {
                 return Err(ExternalSummarySetError::InferredSummary);
             }
-            if !summary.completeness().is_complete() {
-                return Err(ExternalSummarySetError::IncompleteSummary);
+            if !compatibility.matches(&summary) {
+                return Err(ExternalSummarySetError::IncompatibleSummary);
             }
             entries.push((ExternalSummaryTarget::from_summary(&summary), summary));
         }
@@ -1328,6 +1410,7 @@ impl ExternalSemanticSummarySet {
         Ok(Self {
             entries: entries.into_boxed_slice(),
             fingerprint: ExternalSummarySetFingerprint::hash_bytes(bytes),
+            compatibility: Some(compatibility),
         })
     }
 
@@ -1351,6 +1434,19 @@ impl ExternalSemanticSummarySet {
 
     pub const fn fingerprint(&self) -> ExternalSummarySetFingerprint {
         self.fingerprint
+    }
+
+    pub const fn compatibility(&self) -> Option<ExternalSummaryCompatibilityKey> {
+        self.compatibility
+    }
+
+    pub fn fingerprint_for(
+        &self,
+        locator: &SemanticLocator,
+    ) -> Option<ExternalSummarySetFingerprint> {
+        self.summary_for(locator).map(|summary| {
+            ExternalSummarySetFingerprint::hash_bytes(summary.key().fingerprint().as_bytes())
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1379,6 +1475,12 @@ impl CuratedCallModel {
         content: ExternalSummaryContentHash,
         transfers: Vec<SummaryTransfer>,
     ) -> Result<Self, SummaryValidationError> {
+        if transfers.len() > MAX_SUMMARY_TRANSFERS {
+            return Err(SummaryValidationError::TooManyTransfers {
+                actual: transfers.len(),
+                limit: MAX_SUMMARY_TRANSFERS,
+            });
+        }
         let transfers = canonicalize_transfers(transfers)?;
         let mut bytes = Vec::with_capacity(96usize.saturating_add(model.as_str().len()));
         bytes.extend_from_slice(b"bifrost-curated-call-model/v1\0");
@@ -1412,7 +1514,7 @@ impl CuratedCallModel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExternalSummarySetError {
     InferredSummary,
-    IncompleteSummary,
+    IncompatibleSummary,
     AmbiguousTarget,
 }
 
@@ -1420,7 +1522,9 @@ impl fmt::Display for ExternalSummarySetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::InferredSummary => "external summary sets cannot contain inferred summaries",
-            Self::IncompleteSummary => "external summary sets require complete summaries",
+            Self::IncompatibleSummary => {
+                "external summary sets require one compatible summary family"
+            }
             Self::AmbiguousTarget => {
                 "external summary sets require exactly one summary per structured target"
             }

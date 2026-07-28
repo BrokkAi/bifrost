@@ -3,14 +3,16 @@ use std::{cmp::Ordering, error::Error, fmt, mem::size_of_val, sync::Arc};
 use crate::analyzer::dataflow::{
     CuratedCallModel, CuratedCallModelFingerprint, ExternalSemanticSummarySet,
     ExternalSummarySetFingerprint, MAX_SUMMARY_BOUNDARY_BINDINGS, SemanticInputStatus,
-    SemanticProcedureSummary, SummaryDataflowResult, SummaryPort, UnmodeledCallBehavior,
+    SemanticProcedureSummary, SummaryBoundary, SummaryBoundaryKind, SummaryDataflowResult,
+    SummaryEvidence, SummaryExitKind, SummaryPort, SummaryTransfer, UnmodeledCallBehavior,
 };
 use crate::analyzer::semantic::{
     AbstractLocation, AbstractObject, AccessPathRoot, CallArgumentEndpoint, CallBinding,
-    CallBindings, CallSiteHandle, CallSiteId, CandidateCoverage, DeclarationLocator,
-    EvidenceCompleteness, MemoryLocationKind, ObjectCardinality, ProcedureHandle,
-    ProgramPointHandle, ProgramPointId, ProofStatus, SemanticArtifactKey, SemanticEffect,
-    ValueFlowRelationKind, ValueFlowSnapshot,
+    CallBindings, CallSiteHandle, CallSiteId, CallableTarget, CallableTargetResolution,
+    CandidateCoverage, DeclarationLocator, DispatchBoundaryKind, EvidenceCompleteness,
+    IcfgEdgeKind, MemoryLocationKind, ObjectCardinality, ProcedureHandle, ProgramPointHandle,
+    ProgramPointId, ProofStatus, SemanticArtifactKey, SemanticEffect, ValueFlowRelationKind,
+    ValueFlowSnapshot,
 };
 use crate::hash::HashMap;
 
@@ -147,7 +149,7 @@ pub(crate) struct ValueFlowCuratedModelSummaryRule {
 pub(crate) struct ValueFlowFallbackSummaryRule {
     call: CallSiteId,
     inputs: Box<[ValueFlowCarrierKey]>,
-    side_effect_outputs: Box<[ValueFlowCarrierKey]>,
+    reachable_components: Box<[usize]>,
     normal_output: Option<ValueFlowCarrierKey>,
     exceptional_output: Option<ValueFlowCarrierKey>,
 }
@@ -166,7 +168,8 @@ pub(crate) struct ValueFlowLocationBindingSummaryRule {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ValueFlowCarrierSummaryIdentity {
     unmodeled_call_behavior: UnmodeledCallBehavior,
-    external_summaries: ExternalSummarySetFingerprint,
+    external_summaries: Box<[ExternalSummarySetFingerprint]>,
+    fallback_globals: Box<[ValueFlowCarrierKey]>,
     has_snapshot: bool,
     local_rules: Box<[ValueFlowLocalSummaryRule]>,
     call_rules: Box<[ValueFlowCallSummaryRule]>,
@@ -207,13 +210,7 @@ impl ValueFlowCarrierSummaryIdentity {
                             .map(ValueFlowCarrierKey::retained_bytes)
                             .fold(0usize, usize::saturating_add),
                     )
-                    .saturating_add(size_of_val(rule.side_effect_outputs.as_ref()))
-                    .saturating_add(
-                        rule.side_effect_outputs
-                            .iter()
-                            .map(ValueFlowCarrierKey::retained_bytes)
-                            .fold(0usize, usize::saturating_add),
-                    )
+                    .saturating_add(size_of_val(rule.reachable_components.as_ref()))
                     .saturating_add(
                         rule.normal_output
                             .as_ref()
@@ -236,6 +233,14 @@ impl ValueFlowCarrierSummaryIdentity {
             .saturating_add(local)
             .saturating_add(calls)
             .saturating_add(size_of_val(self.curated_models.as_ref()))
+            .saturating_add(size_of_val(self.external_summaries.as_ref()))
+            .saturating_add(size_of_val(self.fallback_globals.as_ref()))
+            .saturating_add(
+                self.fallback_globals
+                    .iter()
+                    .map(ValueFlowCarrierKey::retained_bytes)
+                    .fold(0usize, usize::saturating_add),
+            )
             .saturating_add(fallbacks)
             .saturating_add(location_bindings)
     }
@@ -266,6 +271,13 @@ fn completeness_heap_bytes(completeness: &EvidenceCompleteness) -> usize {
     }
 }
 
+fn summary_evidence_is_proven_complete(evidence: &SummaryEvidence) -> bool {
+    evidence
+        .alternatives()
+        .iter()
+        .any(|alternative| alternative.quality().is_proven() && alternative.quality().is_complete())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CallFlowRule {
     pub call: CallSiteHandle,
@@ -281,9 +293,22 @@ pub(crate) struct CallFlowRule {
 pub(crate) struct CallFallbackProfile {
     call: CallSiteHandle,
     inputs: Box<[ValueFlowCarrierId]>,
-    side_effect_outputs: Box<[ValueFlowCarrierId]>,
+    reachable_components: Box<[usize]>,
     normal_output: Option<ValueFlowCarrierId>,
     exceptional_output: Option<ValueFlowCarrierId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BoundaryTransferApplication {
+    pub modeled: bool,
+    pub complete: bool,
+    pub abstained: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BoundBoundaryTransfer {
+    pub target: ValueFlowCarrierId,
+    pub proven_complete: bool,
 }
 
 /// One curated transfer model after its selector has been bound to a live
@@ -361,6 +386,7 @@ pub struct ValueFlowPlan {
     local_rules: Box<[LocalFlowRule]>,
     call_rules: Box<[CallFlowRule]>,
     fallback_profiles: Box<[CallFallbackProfile]>,
+    fallback_locations: FallbackLocationIndex,
     summary_location_bindings: Box<[BoundSummaryLocationBinding]>,
     sources: Box<[BoundValueFlowSource]>,
     sinks: Box<[BoundValueFlowSink]>,
@@ -368,6 +394,7 @@ pub struct ValueFlowPlan {
     binding_pairs: Box<[(CallSiteHandle, ProcedureHandle)]>,
     discovery_status: SemanticInputStatus,
     discovery_complete: bool,
+    structural_discovery_complete: bool,
     owner: Arc<()>,
 }
 
@@ -383,6 +410,7 @@ impl PartialEq for ValueFlowPlan {
             && self.local_rules == other.local_rules
             && self.call_rules == other.call_rules
             && self.fallback_profiles == other.fallback_profiles
+            && self.fallback_locations == other.fallback_locations
             && self.summary_location_bindings == other.summary_location_bindings
             && self.sources == other.sources
             && self.sinks == other.sinks
@@ -390,6 +418,7 @@ impl PartialEq for ValueFlowPlan {
             && self.binding_pairs == other.binding_pairs
             && self.discovery_status == other.discovery_status
             && self.discovery_complete == other.discovery_complete
+            && self.structural_discovery_complete == other.structural_discovery_complete
     }
 }
 
@@ -483,6 +512,7 @@ impl ValueFlowPlan {
         let mount = root.artifact().key().mount();
         let mut discovery_status = SemanticInputStatus::Complete;
         let mut discovery_complete = true;
+        let mut structural_discovery_complete = true;
         let mut carrier_candidates = Vec::new();
         let mut relation_count = 0usize;
         let snapshot_procedures = snapshots
@@ -511,6 +541,7 @@ impl ValueFlowPlan {
             discovery_complete &= input.status().is_complete()
                 && input.value().coverage() == CandidateCoverage::Exhaustive
                 && !input.value().context().was_truncated();
+            structural_discovery_complete &= !input.value().context().was_truncated();
             for binding in input.value().bindings() {
                 relation_count = relation_count.saturating_add(call_binding_rule_count(binding));
                 append_binding_carriers(binding, &mut carrier_candidates)?;
@@ -520,11 +551,15 @@ impl ValueFlowPlan {
             validate_event(source.point(), source.carrier(), mount)?;
             discovery_complete &= matches!(source.proof(), ProofStatus::Proven)
                 && matches!(source.completeness(), EvidenceCompleteness::Complete);
+            structural_discovery_complete &= matches!(source.proof(), ProofStatus::Proven)
+                && matches!(source.completeness(), EvidenceCompleteness::Complete);
             carrier_candidates.push(source.carrier().clone());
         }
         for sink in &sinks {
             validate_event(sink.point(), sink.carrier(), mount)?;
             discovery_complete &= matches!(sink.proof(), ProofStatus::Proven)
+                && matches!(sink.completeness(), EvidenceCompleteness::Complete);
+            structural_discovery_complete &= matches!(sink.proof(), ProofStatus::Proven)
                 && matches!(sink.completeness(), EvidenceCompleteness::Complete);
             carrier_candidates.push(sink.carrier().clone());
         }
@@ -597,7 +632,6 @@ impl ValueFlowPlan {
                 .collect::<Vec<_>>(),
             &carrier_ids,
             &carrier_components,
-            &fallback_locations,
         );
 
         let bound_sources = sources
@@ -640,6 +674,7 @@ impl ValueFlowPlan {
             local_rules: local_rules.into_boxed_slice(),
             call_rules: call_rules.into_boxed_slice(),
             fallback_profiles: fallback_profiles.into_boxed_slice(),
+            fallback_locations,
             summary_location_bindings: Box::default(),
             sources: bound_sources.into_boxed_slice(),
             sinks: bound_sinks.into_boxed_slice(),
@@ -647,6 +682,7 @@ impl ValueFlowPlan {
             binding_pairs: binding_pairs.into_boxed_slice(),
             discovery_status,
             discovery_complete,
+            structural_discovery_complete,
             owner: Arc::new(()),
         })
     }
@@ -662,9 +698,18 @@ impl ValueFlowPlan {
     /// Install complete external semantic summaries used before the configured
     /// fallback profile. The set owns its content-addressed validity identity,
     /// so changing a model partitions value-flow and downstream taint caches.
-    pub fn with_external_summaries(mut self, summaries: ExternalSemanticSummarySet) -> Self {
+    pub fn with_external_summaries(
+        mut self,
+        summaries: ExternalSemanticSummarySet,
+    ) -> Result<Self, ValueFlowPlanError> {
+        if summaries.compatibility().is_some_and(|compatibility| {
+            compatibility.unmodeled_call_behavior() != self.unmodeled_call_behavior
+                || compatibility.dependencies() != self.root.artifact().key().dependencies()
+        }) {
+            return Err(ValueFlowPlanError::IncompatibleExternalSummary);
+        }
         self.external_summaries = summaries;
-        self
+        Ok(self)
     }
 
     pub const fn external_summaries(&self) -> &ExternalSemanticSummarySet {
@@ -791,7 +836,7 @@ impl ValueFlowPlan {
         &self,
         result: &SummaryDataflowResult<Fact>,
     ) -> bool {
-        self.discovery_complete
+        self.structural_discovery_complete
             && result.reached().iter().all(|reached| {
                 let procedure = reached.point().procedure();
                 self.has_snapshot(procedure)
@@ -800,13 +845,127 @@ impl ValueFlowPlan {
                         .point(reached.point().id())
                         .is_some_and(|point| {
                             point.events.iter().all(|event| match event.effect {
-                                SemanticEffect::Invoke { call_site } => procedure
-                                    .call_site_handle(call_site)
-                                    .is_some_and(|call| self.has_binding_for_call(&call)),
+                                SemanticEffect::Invoke { call_site } => {
+                                    procedure.call_site_handle(call_site).is_some_and(|call| {
+                                        self.has_binding_for_call(&call)
+                                            || self.call_boundaries_are_fully_modeled(result, &call)
+                                    })
+                                }
                                 _ => true,
                             })
                         })
             })
+    }
+
+    pub(crate) fn execution_result_complete<Fact>(
+        &self,
+        result: &SummaryDataflowResult<Fact>,
+    ) -> bool {
+        if !result.termination().is_fixed_point() || !self.execution_discovery_complete(result) {
+            return false;
+        }
+        let fully_modeled_calls = result
+            .coverage()
+            .boundaries()
+            .iter()
+            .filter_map(SummaryBoundary::origin)
+            .filter(|call| self.call_boundaries_are_fully_modeled(result, call))
+            .collect::<Vec<_>>();
+        let edge_is_discharged = |edge: &crate::analyzer::dataflow::SummaryEdge| {
+            matches!(
+                edge.kind(),
+                IcfgEdgeKind::CallToNormalContinuation
+                    | IcfgEdgeKind::CallToExceptionalContinuation
+            ) && edge
+                .origin()
+                .is_some_and(|origin| fully_modeled_calls.contains(&origin))
+        };
+        result
+            .coverage()
+            .unproven_edges()
+            .iter()
+            .all(edge_is_discharged)
+            && result
+                .coverage()
+                .partial_edges()
+                .iter()
+                .all(edge_is_discharged)
+            && result
+                .coverage()
+                .boundaries()
+                .iter()
+                .all(|boundary| self.boundary_is_fully_modeled(result, boundary))
+    }
+
+    fn call_boundaries_are_fully_modeled<Fact>(
+        &self,
+        result: &SummaryDataflowResult<Fact>,
+        call: &CallSiteHandle,
+    ) -> bool {
+        let mut saw_dispatch = false;
+        for boundary in result
+            .coverage()
+            .boundaries()
+            .iter()
+            .filter(|boundary| boundary.origin() == Some(call))
+        {
+            match boundary.kind() {
+                SummaryBoundaryKind::Dispatch(_) => {
+                    saw_dispatch = true;
+                    if !self.dispatch_boundary_is_fully_modeled(boundary) {
+                        return false;
+                    }
+                }
+                SummaryBoundaryKind::Semantic(_) => {}
+                SummaryBoundaryKind::Limit(_) | SummaryBoundaryKind::Continuation { .. } => {
+                    return false;
+                }
+            }
+        }
+        saw_dispatch
+    }
+
+    fn boundary_is_fully_modeled<Fact>(
+        &self,
+        result: &SummaryDataflowResult<Fact>,
+        boundary: &SummaryBoundary,
+    ) -> bool {
+        if matches!(boundary.kind(), SummaryBoundaryKind::Semantic(_)) {
+            return boundary
+                .origin()
+                .is_some_and(|call| self.call_boundaries_are_fully_modeled(result, call));
+        }
+        self.dispatch_boundary_is_fully_modeled(boundary)
+    }
+
+    fn dispatch_boundary_is_fully_modeled(&self, boundary: &SummaryBoundary) -> bool {
+        let Some(call) = boundary.origin() else {
+            return false;
+        };
+        let SummaryBoundaryKind::Dispatch(kind) = boundary.kind() else {
+            return false;
+        };
+        if let Some(summary) = self.external_summary_for_boundary(kind) {
+            return matches!(boundary.proof(), Some(ProofStatus::Proven))
+                && summary.completeness().is_complete()
+                && self.model_is_fully_bindable(call, summary.transfers());
+        }
+        self.curated_model_for_call(call)
+            .is_some_and(|model| self.model_is_fully_bindable(call, model.transfers()))
+    }
+
+    fn model_is_fully_bindable(
+        &self,
+        call: &CallSiteHandle,
+        transfers: &[SummaryTransfer],
+    ) -> bool {
+        transfers.iter().all(|transfer| {
+            summary_evidence_is_proven_complete(transfer.evidence())
+                && self.summary_port_carrier(call, transfer.input()).is_some()
+                && self
+                    .summary_port_carrier(call, transfer.exit().port())
+                    .is_some()
+        })
     }
 
     pub(crate) fn has_snapshot(&self, procedure: &ProcedureHandle) -> bool {
@@ -896,11 +1055,7 @@ impl ValueFlowPlan {
                         .iter()
                         .map(|carrier| self.carrier_keys[carrier.index()].clone())
                         .collect(),
-                    side_effect_outputs: profile
-                        .side_effect_outputs
-                        .iter()
-                        .map(|carrier| self.carrier_keys[carrier.index()].clone())
-                        .collect(),
+                    reachable_components: profile.reachable_components.clone(),
                     normal_output: profile
                         .normal_output
                         .map(|carrier| self.carrier_keys[carrier.index()].clone()),
@@ -923,11 +1078,22 @@ impl ValueFlowPlan {
         builders
             .into_iter()
             .map(|(procedure, builder)| {
+                let external_summaries = self.external_summary_fingerprints_for(&procedure);
+                let fallback_globals = if builder.fallback_rules.is_empty() {
+                    Box::default()
+                } else {
+                    self.fallback_locations
+                        .bounded_globals
+                        .iter()
+                        .map(|carrier| self.carrier_keys[carrier.index()].clone())
+                        .collect()
+                };
                 (
                     procedure,
                     ValueFlowCarrierSummaryIdentity {
                         unmodeled_call_behavior: self.unmodeled_call_behavior,
-                        external_summaries: self.external_summaries.fingerprint(),
+                        external_summaries,
+                        fallback_globals,
                         has_snapshot: builder.has_snapshot,
                         local_rules: builder.local_rules.into_boxed_slice(),
                         call_rules: builder.call_rules.into_boxed_slice(),
@@ -953,22 +1119,70 @@ impl ValueFlowPlan {
                         total
                             .saturating_add(1)
                             .saturating_add(profile.inputs.len())
-                            .saturating_add(profile.side_effect_outputs.len())
+                            .saturating_add(profile.reachable_components.len())
                             .saturating_add(usize::from(profile.normal_output.is_some()))
                             .saturating_add(usize::from(profile.exceptional_output.is_some()))
                     }),
             )
+            .saturating_add(self.fallback_locations.bounded_globals.len())
+    }
+
+    fn external_summary_fingerprints_for(
+        &self,
+        procedure: &ProcedureHandle,
+    ) -> Box<[ExternalSummarySetFingerprint]> {
+        let mut fingerprints = Vec::new();
+        for call in procedure.semantics().call_sites() {
+            let targets: &[CallableTarget] = match &call.declared_targets {
+                CallableTargetResolution::Proven(target) => std::slice::from_ref(target),
+                CallableTargetResolution::Ambiguous(targets)
+                | CallableTargetResolution::Unproven(targets)
+                | CallableTargetResolution::ExceededBudget(targets) => targets,
+                CallableTargetResolution::Unknown | CallableTargetResolution::Unsupported => {
+                    return vec![self.external_summaries.fingerprint()].into_boxed_slice();
+                }
+            };
+            fingerprints.extend(targets.iter().filter_map(|target| match target {
+                CallableTarget::Local(_) => None,
+                CallableTarget::Unmaterialized(locator) | CallableTarget::External(locator) => {
+                    self.external_summaries.fingerprint_for(locator)
+                }
+            }));
+        }
+        fingerprints.sort_unstable();
+        fingerprints.dedup();
+        fingerprints.into_boxed_slice()
     }
 
     pub(crate) fn is_call_input(&self, call: &CallSiteHandle, carrier: ValueFlowCarrierId) -> bool {
-        self.fallback_profile(call)
-            .is_some_and(|profile| profile.inputs.contains(&carrier))
+        let Some(profile) = self.fallback_profile(call) else {
+            return false;
+        };
+        profile.inputs.binary_search(&carrier).is_ok()
+            || self
+                .fallback_locations
+                .bounded_globals
+                .binary_search(&carrier)
+                .is_ok()
+            || self
+                .fallback_locations
+                .location_components
+                .get(&carrier)
+                .is_some_and(|component| {
+                    profile
+                        .reachable_components
+                        .binary_search(component)
+                        .is_ok()
+                })
     }
 
     pub(crate) fn external_summary_for_boundary(
         &self,
-        boundary: &crate::analyzer::semantic::DispatchBoundaryKind,
+        boundary: &DispatchBoundaryKind,
     ) -> Option<&SemanticProcedureSummary> {
+        if matches!(boundary, DispatchBoundaryKind::Deferred { .. }) {
+            return None;
+        }
         self.external_summaries
             .summary_for(boundary.target_locator()?)
     }
@@ -983,7 +1197,7 @@ impl ValueFlowPlan {
             .map(|index| &self.curated_call_models[index].model)
     }
 
-    pub(crate) fn summary_port_carrier(
+    fn summary_port_carrier(
         &self,
         call: &CallSiteHandle,
         port: &SummaryPort,
@@ -1009,25 +1223,147 @@ impl ValueFlowPlan {
         self.carrier_id(&ValueFlowCarrier::Value(value))
     }
 
-    pub(crate) fn fallback_outputs(
+    pub(crate) fn visit_boundary_transfers(
         &self,
         call: &CallSiteHandle,
-        kind: crate::analyzer::semantic::IcfgEdgeKind,
-    ) -> impl Iterator<Item = ValueFlowCarrierId> + '_ {
-        let profile = self.fallback_profile(call);
-        let result = profile.and_then(|profile| match kind {
-            crate::analyzer::semantic::IcfgEdgeKind::CallToNormalContinuation => {
-                profile.normal_output
+        boundary: Option<&DispatchBoundaryKind>,
+        kind: IcfgEdgeKind,
+        input: ValueFlowCarrierId,
+        mut visitor: impl FnMut(BoundBoundaryTransfer) -> bool,
+    ) -> BoundaryTransferApplication {
+        if let Some(summary) =
+            boundary.and_then(|boundary| self.external_summary_for_boundary(boundary))
+        {
+            return self.visit_modeled_transfers(
+                call,
+                kind,
+                input,
+                summary.transfers(),
+                summary.completeness().is_complete(),
+                visitor,
+            );
+        }
+        if let Some(model) = self.curated_model_for_call(call) {
+            return self.visit_modeled_transfers(
+                call,
+                kind,
+                input,
+                model.transfers(),
+                true,
+                visitor,
+            );
+        }
+
+        let is_input = self.is_call_input(call, input);
+        if self.unmodeled_call_behavior == UnmodeledCallBehavior::Paranoid && is_input {
+            self.visit_fallback_outputs(call, kind, |target| {
+                visitor(BoundBoundaryTransfer {
+                    target,
+                    proven_complete: false,
+                })
+            });
+        }
+        BoundaryTransferApplication {
+            modeled: false,
+            complete: false,
+            abstained: self.unmodeled_call_behavior == UnmodeledCallBehavior::RequireModel
+                && is_input,
+        }
+    }
+
+    fn visit_modeled_transfers(
+        &self,
+        call: &CallSiteHandle,
+        kind: IcfgEdgeKind,
+        input: ValueFlowCarrierId,
+        transfers: &[SummaryTransfer],
+        mut complete: bool,
+        mut visitor: impl FnMut(BoundBoundaryTransfer) -> bool,
+    ) -> BoundaryTransferApplication {
+        let exit = match kind {
+            IcfgEdgeKind::CallToNormalContinuation => SummaryExitKind::Normal,
+            IcfgEdgeKind::CallToExceptionalContinuation => SummaryExitKind::Exceptional,
+            _ => {
+                return BoundaryTransferApplication {
+                    modeled: false,
+                    complete: false,
+                    abstained: false,
+                };
             }
-            crate::analyzer::semantic::IcfgEdgeKind::CallToExceptionalContinuation => {
-                profile.exceptional_output
+        };
+        for transfer in transfers
+            .iter()
+            .filter(|transfer| transfer.exit().kind() == exit)
+        {
+            let Some(source) = self.summary_port_carrier(call, transfer.input()) else {
+                complete = false;
+                continue;
+            };
+            let Some(target) = self.summary_port_carrier(call, transfer.exit().port()) else {
+                complete = false;
+                continue;
+            };
+            if source == input
+                && !visitor(BoundBoundaryTransfer {
+                    target,
+                    proven_complete: summary_evidence_is_proven_complete(transfer.evidence()),
+                })
+            {
+                break;
             }
+            complete &= summary_evidence_is_proven_complete(transfer.evidence());
+        }
+        BoundaryTransferApplication {
+            modeled: true,
+            complete,
+            abstained: false,
+        }
+    }
+
+    fn visit_fallback_outputs(
+        &self,
+        call: &CallSiteHandle,
+        kind: IcfgEdgeKind,
+        mut visitor: impl FnMut(ValueFlowCarrierId) -> bool,
+    ) {
+        let Some(profile) = self.fallback_profile(call) else {
+            return;
+        };
+        for target in self.fallback_locations.bounded_globals.iter().copied() {
+            if !visitor(target) {
+                return;
+            }
+        }
+        for component in &profile.reachable_components {
+            if let Some(targets) = self.fallback_locations.by_component.get(component) {
+                for target in targets.iter().copied() {
+                    if !visitor(target) {
+                        return;
+                    }
+                }
+            }
+        }
+        let result = match kind {
+            IcfgEdgeKind::CallToNormalContinuation => profile.normal_output,
+            IcfgEdgeKind::CallToExceptionalContinuation => profile.exceptional_output,
             _ => None,
-        });
-        profile
-            .into_iter()
-            .flat_map(|profile| profile.side_effect_outputs.iter().copied())
-            .chain(result)
+        };
+        if let Some(result) = result {
+            let already_emitted = self
+                .fallback_locations
+                .bounded_globals
+                .binary_search(&result)
+                .is_ok()
+                || profile.reachable_components.iter().any(|component| {
+                    self.fallback_locations
+                        .by_component
+                        .get(component)
+                        .is_some_and(|targets| targets.binary_search(&result).is_ok())
+                });
+            if !already_emitted {
+                let _ = visitor(result);
+            }
+        }
     }
 
     fn fallback_profile(&self, call: &CallSiteHandle) -> Option<&CallFallbackProfile> {
@@ -1190,6 +1526,7 @@ pub enum ValueFlowPlanError {
     StaleCallModel,
     InvalidSummaryLocationPort,
     DuplicateSummaryLocationBinding,
+    IncompatibleExternalSummary,
     StableCarrierCollision,
     CarrierIdOverflow,
     SourceIdOverflow,
@@ -1225,6 +1562,8 @@ impl fmt::Display for ValueFlowPlanError {
             }
             Self::DuplicateSummaryLocationBinding => formatter
                 .write_str("multiple summary location bindings target the same call and port"),
+            Self::IncompatibleExternalSummary => formatter
+                .write_str("external summaries are incompatible with the active analysis contract"),
             Self::StableCarrierCollision => {
                 formatter.write_str("distinct value-flow carriers share one stable key")
             }
@@ -1410,7 +1749,6 @@ fn build_call_fallback_profiles(
     mut procedures: Vec<&ProcedureHandle>,
     carrier_ids: &HashMap<ValueFlowCarrier, ValueFlowCarrierId>,
     carrier_components: &[usize],
-    fallback_locations: &FallbackLocationIndex,
 ) -> Vec<CallFallbackProfile> {
     procedures.sort_by(|left, right| compare_procedures(left, right));
     procedures.dedup_by(|left, right| *left == *right);
@@ -1444,15 +1782,6 @@ fn build_call_fallback_profiles(
                 .collect::<Vec<_>>();
             input_components.sort_unstable();
             input_components.dedup();
-            let mut side_effect_outputs = fallback_locations.bounded_globals.clone();
-            for component in input_components {
-                if let Some(locations) = fallback_locations.by_component.get(&component) {
-                    side_effect_outputs.extend_from_slice(locations);
-                }
-            }
-            side_effect_outputs.sort_unstable();
-            side_effect_outputs.dedup();
-            inputs.extend_from_slice(&side_effect_outputs);
             inputs.sort_unstable();
             inputs.dedup();
             let result_carrier = |value| {
@@ -1463,7 +1792,7 @@ fn build_call_fallback_profiles(
             profiles.push(CallFallbackProfile {
                 call,
                 inputs: inputs.into_boxed_slice(),
-                side_effect_outputs: side_effect_outputs.into_boxed_slice(),
+                reachable_components: input_components.into_boxed_slice(),
                 normal_output: row.result.and_then(result_carrier),
                 exceptional_output: row.thrown.and_then(result_carrier),
             });
@@ -1473,10 +1802,11 @@ fn build_call_fallback_profiles(
     profiles
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct FallbackLocationIndex {
     by_component: HashMap<usize, Vec<ValueFlowCarrierId>>,
     bounded_globals: Vec<ValueFlowCarrierId>,
+    location_components: HashMap<ValueFlowCarrierId, usize>,
 }
 
 fn build_fallback_location_index(
@@ -1504,8 +1834,13 @@ fn build_fallback_location_index(
             .and_then(|carrier| carrier_ids.get(&carrier).copied())
             .map(|carrier| carrier_components[carrier.index()])
         {
+            index.location_components.insert(id, component);
             index.by_component.entry(component).or_default().push(id);
         }
+    }
+    index.bounded_globals.sort_unstable();
+    for locations in index.by_component.values_mut() {
+        locations.sort_unstable();
     }
     index
 }
