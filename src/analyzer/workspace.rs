@@ -1,8 +1,9 @@
 use crate::analyzer::store::StoreError;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerDelegate, BuildProgress, CSharpAnalyzer, CppAnalyzer, GoAnalyzer,
-    IAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language, MultiAnalyzer, PhpAnalyzer, Project,
-    PythonAnalyzer, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, TypescriptAnalyzer,
+    IAnalyzer, JavaAnalyzer, JavascriptAnalyzer, KotlinAnalyzer, Language, MultiAnalyzer,
+    PhpAnalyzer, Project, PythonAnalyzer, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer,
+    TypescriptAnalyzer,
 };
 use crate::profiling;
 use std::collections::{BTreeMap, BTreeSet};
@@ -304,6 +305,7 @@ impl WorkspaceAnalyzer {
                     Language::Scala => build_delegate!(Scala, ScalaAnalyzer),
                     Language::CSharp => build_delegate!(CSharp, CSharpAnalyzer),
                     Language::Ruby => build_delegate!(Ruby, RubyAnalyzer),
+                    Language::Kotlin => build_delegate!(Kotlin, KotlinAnalyzer),
                     Language::None => continue,
                 }
             };
@@ -337,6 +339,7 @@ impl WorkspaceAnalyzer {
                 AnalyzerDelegate::Rust(analyzer) => analyzer,
                 AnalyzerDelegate::Scala(analyzer) => analyzer,
                 AnalyzerDelegate::Ruby(analyzer) => analyzer,
+                AnalyzerDelegate::Kotlin(analyzer) => analyzer,
             },
             Self::Multi(analyzer) => analyzer.as_ref(),
         }

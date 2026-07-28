@@ -90,6 +90,7 @@ fn language_for_path(rel_path: &Path) -> &'static str {
         Language::Scala => "scala",
         Language::CSharp => "csharp",
         Language::Ruby => "ruby",
+        Language::Kotlin => "kotlin",
         Language::None => "",
     }
 }

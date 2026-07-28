@@ -360,6 +360,7 @@ fn is_call_expression_node(node: Node<'_>, language: Language) -> bool {
             "invocation_expression" | "object_creation_expression"
         ),
         Language::Ruby => node.kind() == "call",
+        Language::Kotlin => matches!(node.kind(), "call_expression" | "constructor_invocation"),
         Language::None => false,
     }
 }
@@ -771,6 +772,8 @@ fn is_call_reference_candidate(node: Node<'_>, language: Language) -> bool {
         Language::Scala => scala_call_reference_candidate(node),
         Language::CSharp => csharp_call_reference_candidate(node),
         Language::Ruby => ruby_call_reference_candidate(node),
+        // Kotlin call-site reference resolution is issue #1238.
+        Language::Kotlin => false,
         Language::None => false,
     }
 }

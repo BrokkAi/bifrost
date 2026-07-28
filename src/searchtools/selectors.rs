@@ -1510,6 +1510,7 @@ pub(super) fn language_name(language: Language) -> String {
         Language::Scala => "scala",
         Language::CSharp => "csharp",
         Language::Ruby => "ruby",
+        Language::Kotlin => "kotlin",
     }
     .to_string()
 }

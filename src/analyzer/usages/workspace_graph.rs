@@ -34,6 +34,8 @@ impl UsageEcosystem {
             Language::Php => Self::Php,
             Language::Ruby => Self::Ruby,
             Language::Scala => Self::Scala,
+            // Kotlin usage-graph ecosystem membership is issue #1239.
+            Language::Kotlin => Self::Unknown,
             Language::None => Self::Unknown,
         }
     }

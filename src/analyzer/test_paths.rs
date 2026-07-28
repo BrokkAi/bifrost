@@ -59,6 +59,11 @@ pub fn has_test_filename_convention(path: &str, language: Language) -> bool {
                 || file_name.ends_with("Spec.scala")
                 || file_name.ends_with("Suite.scala")
         }
+        Language::Kotlin => {
+            file_name.ends_with("Test.kt")
+                || file_name.ends_with("Tests.kt")
+                || file_name.ends_with("Spec.kt")
+        }
         Language::Ruby => {
             lower == "spec_helper.rb"
                 || lower == "test_helper.rb"
@@ -89,6 +94,9 @@ pub fn has_test_filename_convention(path: &str, language: Language) -> bool {
                 || file_name.ends_with("Test.scala")
                 || file_name.ends_with("Spec.scala")
                 || file_name.ends_with("Suite.scala")
+                || file_name.ends_with("Test.kt")
+                || file_name.ends_with("Tests.kt")
+                || file_name.ends_with("Spec.kt")
                 || file_name.ends_with("Test.cs")
                 || file_name.ends_with("Tests.cs")
                 || file_name.ends_with("Test.php")

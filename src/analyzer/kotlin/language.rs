@@ -4,11 +4,10 @@ unsafe extern "C" {
     fn brokk_bifrost_tree_sitter_kotlin() -> *const ();
 }
 
-/// The pinned, vendored Tree-sitter Kotlin grammar.
-///
-/// Kotlin is not registered as an analyzer language yet. This raw grammar
-/// boundary exists so its native build and parser contract can be validated
-/// independently of the language integration tracked by issue #1236.
+/// The pinned, vendored Tree-sitter Kotlin grammar, registered as the parser
+/// for [`crate::analyzer::Language::Kotlin`] (issue #1236). The tests below
+/// validate the native build and parser contract independently of the
+/// analyzer integration.
 pub(crate) const LANGUAGE: LanguageFn =
     unsafe { LanguageFn::from_raw(brokk_bifrost_tree_sitter_kotlin) };
 

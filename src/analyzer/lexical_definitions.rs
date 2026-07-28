@@ -464,7 +464,11 @@ fn is_variadic_parameter(language: Language, parameter: Node<'_>) -> Option<Form
             "hash_splat_parameter" => Some(Keyword),
             _ => None,
         },
-        Language::Cpp | Language::Scala | Language::CSharp | Language::None => None,
+        // Kotlin spells varargs as a `vararg` parameter modifier rather than a
+        // distinct parameter node kind, so no kind maps to a variadic slot.
+        Language::Cpp | Language::Scala | Language::CSharp | Language::Kotlin | Language::None => {
+            None
+        }
     }
 }
 
@@ -892,6 +896,15 @@ fn is_parameter_owner(language: Language, kind: &str) -> bool {
                 | "record_struct_declaration"
         ),
         Language::Ruby => matches!(kind, "method" | "singleton_method" | "lambda" | "block"),
+        Language::Kotlin => matches!(
+            kind,
+            "function_declaration"
+                | "secondary_constructor"
+                | "primary_constructor"
+                | "anonymous_function"
+                | "lambda_literal"
+                | "setter"
+        ),
         Language::None => false,
     }
 }
@@ -910,6 +923,7 @@ fn is_lambda_owner(language: Language, kind: &str) -> bool {
         Language::Scala => kind == "lambda_expression",
         Language::CSharp => matches!(kind, "lambda_expression" | "anonymous_method_expression"),
         Language::Ruby => matches!(kind, "lambda" | "block"),
+        Language::Kotlin => matches!(kind, "lambda_literal" | "anonymous_function"),
         Language::None => false,
     }
 }
@@ -957,6 +971,10 @@ fn is_parameter_declaration(language: Language, kind: &str) -> bool {
                 | "block_parameter"
                 | "destructured_parameter"
         ),
+        Language::Kotlin => matches!(
+            kind,
+            "parameter" | "class_parameter" | "parameter_with_optional_type"
+        ),
         Language::None => false,
     }
 }
@@ -976,6 +994,10 @@ fn is_parameter_container(language: Language, kind: &str) -> bool {
             kind,
             "method_parameters" | "lambda_parameters" | "block_parameters"
         ),
+        Language::Kotlin => matches!(
+            kind,
+            "function_value_parameters" | "lambda_parameters" | "primary_constructor"
+        ),
         Language::None => false,
     }
 }
@@ -991,6 +1013,7 @@ fn is_direct_parameter_binding(language: Language, kind: &str) -> bool {
         | Language::Ruby => {
             matches!(kind, "identifier" | "operator_identifier")
         }
+        Language::Kotlin => kind == "simple_identifier",
         Language::JavaScript | Language::TypeScript => {
             is_binding_leaf(language, kind) || binding_container(language, kind)
         }
@@ -1073,6 +1096,10 @@ fn is_lexical_scope(language: Language, kind: &str) -> bool {
         Language::Scala => matches!(kind, "block" | "indented_block"),
         Language::CSharp => matches!(kind, "block" | "switch_body"),
         Language::Ruby => matches!(kind, "body_statement" | "do_block" | "block"),
+        Language::Kotlin => matches!(
+            kind,
+            "function_body" | "statements" | "control_structure_body"
+        ),
         Language::None => false,
     }
 }
@@ -1088,6 +1115,7 @@ fn is_nested_scope(language: Language, kind: &str) -> bool {
             Language::Scala => matches!(kind, "template_body" | "case_block"),
             Language::CSharp => matches!(kind, "declaration_list"),
             Language::Ruby => matches!(kind, "class" | "module"),
+            Language::Kotlin => matches!(kind, "class_body" | "enum_class_body"),
             _ => false,
         }
 }
@@ -1123,6 +1151,17 @@ fn is_local_declaration(language: Language, kind: &str) -> bool {
                 | "for_each_statement"
                 | "catch_declaration"
                 | "declaration_expression"
+        ),
+        // A local `val`/`var` in Kotlin reuses `property_declaration`; its
+        // bound name lives in the nested `variable_declaration` node, and
+        // `catch_block`/`for_statement` introduce their own bindings.
+        Language::Kotlin => matches!(
+            kind,
+            "property_declaration"
+                | "variable_declaration"
+                | "multi_variable_declaration"
+                | "catch_block"
+                | "for_statement"
         ),
         Language::None => false,
     }
