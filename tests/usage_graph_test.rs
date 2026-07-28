@@ -316,6 +316,34 @@ class Consumer:
 }
 
 #[test]
+fn top_level_lambda_parameter_shadows_module_receiver_fact() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "app.py",
+            r#"
+class Service:
+    def run(self):
+        pass
+
+svc = Service()
+shadowed = lambda svc: svc.run()
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        value["edges"]
+            .as_array()
+            .expect("edges array")
+            .iter()
+            .all(|edge| edge["to"] != "app.Service.run"),
+        "a lambda parameter must shadow the module receiver fact: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn hidden_nested_factory_does_not_type_unrelated_call() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(
