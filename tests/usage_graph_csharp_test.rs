@@ -266,6 +266,68 @@ public sealed class Command {
 }
 
 #[test]
+fn inverted_graph_resolves_switch_arm_method_group_values_only() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Demo.cs",
+            r#"
+namespace Demo;
+
+public enum KernelKind {
+    Uniform,
+    Gaussian,
+}
+
+public delegate double Kernel(double x);
+
+public sealed class Density {
+    private double Uniform(double x) => x;
+    private double Gaussian(double x) => x + 1;
+    private double Fallback(double x) => -x;
+
+    public Kernel Select(KernelKind kind) => kind switch {
+        KernelKind.Uniform => Uniform,
+        KernelKind.Gaussian => Fallback,
+        _ => Gaussian,
+    };
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "Demo.Density.Select", "Demo.Density.Uniform"),
+        "a switch arm value should resolve as a method-group edge: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "Demo.Density.Select", "Demo.Density.Fallback"),
+        "a switch arm method-group value should remain visible through another label: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "Demo.Density.Select", "Demo.Density.Gaussian"),
+        "a discard arm value should also resolve as a method-group edge: {}",
+        value["edges"]
+    );
+    let uniform_method_edge = value["edges"]
+        .as_array()
+        .expect("edges array")
+        .iter()
+        .find(|edge| {
+            edge["from"].as_str() == Some("Demo.Density.Select")
+                && edge["to"].as_str() == Some("Demo.Density.Uniform")
+        })
+        .expect("uniform method-group edge");
+    assert_eq!(
+        uniform_method_edge["weight"], 1,
+        "the same-named switch arm label must not add method-group weight: {}",
+        value["edges"],
+    );
+}
+
+#[test]
 fn inverted_graph_resolves_inherited_members_at_the_nearest_declaring_type() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(

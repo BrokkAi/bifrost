@@ -745,6 +745,10 @@ fn containing_method_group_value_context(node: Node<'_>) -> bool {
                         .child_by_field_name("operator")
                         .is_some_and(|operator| matches!(operator.kind(), "=" | "+=" | "-="));
             }
+            "switch_expression_arm" => {
+                return parent.named_child(parent.named_child_count().saturating_sub(1))
+                    == Some(current);
+            }
             "variable_declarator" => {
                 return parent.child_by_field_name("name") != Some(current)
                     && parent.named_child(parent.named_child_count().saturating_sub(1))
