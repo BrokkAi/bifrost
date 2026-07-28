@@ -1,8 +1,8 @@
 use crate::searchtools_service::{PreparedQueryCode, PreparedRunPolicy};
 use crate::{
     CancellationToken, SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode,
-    ToolOutput, analyzer::policy::escape_terminal_text, searchtools_render::RenderOptions,
-    tool_arguments::normalize_tool_arguments,
+    ToolOutput, analyzer::policy::escape_terminal_text, profiling,
+    searchtools_render::RenderOptions, tool_arguments::normalize_tool_arguments,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -12,6 +12,7 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::Instant;
 
 const JSONRPC_VERSION: &str = "2.0";
 const PROTOCOL_VERSION: &str = "2025-11-25";
@@ -168,6 +169,12 @@ struct OutboundMcpResponse {
     value: Value,
     workspace_generation: Option<u64>,
     completion_id: Option<Value>,
+    timing: Option<OutboundMcpResponseTiming>,
+}
+
+struct OutboundMcpResponseTiming {
+    tool_name: String,
+    ready_at: Instant,
 }
 
 impl OutboundMcpResponse {
@@ -176,6 +183,7 @@ impl OutboundMcpResponse {
             value,
             workspace_generation: None,
             completion_id: None,
+            timing: None,
         }
     }
 
@@ -185,14 +193,24 @@ impl OutboundMcpResponse {
             value,
             workspace_generation: Some(workspace_generation),
             completion_id: None,
+            timing: None,
         }
     }
 
-    fn scoped_request(value: Value, workspace_generation: u64, completion_id: Value) -> Self {
+    fn scoped_request(
+        value: Value,
+        workspace_generation: u64,
+        completion_id: Value,
+        tool_name: String,
+    ) -> Self {
         Self {
             value,
             workspace_generation: Some(workspace_generation),
             completion_id: Some(completion_id),
+            timing: Some(OutboundMcpResponseTiming {
+                tool_name,
+                ready_at: Instant::now(),
+            }),
         }
     }
 
@@ -320,6 +338,15 @@ pub fn run_stdio_server(
         .spawn(move || -> Result<(), String> {
             let mut stdout = io::stdout();
             for response in response_receiver {
+                if let Some(timing) = &response.timing {
+                    profiling::duration(
+                        format!("mcp_request.response_queue_wait[{}]", timing.tool_name),
+                        timing.ready_at.elapsed(),
+                    );
+                }
+                let _delivery_scope = response.timing.as_ref().map(|timing| {
+                    profiling::scope(format!("mcp_request.writer_delivery[{}]", timing.tool_name))
+                });
                 let write_result = if response.is_current(writer_service.as_ref()) {
                     serde_json::to_string(&response.value)
                         .map_err(|err| format!("Failed to serialize MCP response: {err}"))
@@ -358,7 +385,8 @@ pub fn run_stdio_server(
 
         let response = match serde_json::from_str::<Value>(&line) {
             Ok(message) => {
-                if let Some((id, params)) = cancellable_tool_request(&message, spec) {
+                if let Some((id, params)) = background_tool_request(&message, spec) {
+                    let accepted_at = Instant::now();
                     match prepare_tool_call(
                         service.as_ref(),
                         &mut connection,
@@ -413,13 +441,14 @@ pub fn run_stdio_server(
                             };
                             let service = Arc::clone(&service);
                             let response_sender = response_sender.clone();
-                            spawn_cancellable_tool_call(
+                            spawn_cancellable_tool_call_at(
                                 service,
                                 *call,
                                 id,
                                 cancellation,
                                 cancellations.clone(),
                                 response_sender,
+                                accepted_at,
                             )?;
                             None
                         }
@@ -493,12 +522,12 @@ fn file_watching_enabled(value: Option<&OsStr>) -> Result<bool, String> {
     }
 }
 
-fn cancellable_tool_request(message: &Value, spec: &McpServerSpec) -> Option<(Value, Value)> {
+fn background_tool_request(message: &Value, spec: &McpServerSpec) -> Option<(Value, Value)> {
     let object = message.as_object()?;
     let tool_name = message.pointer("/params/name").and_then(Value::as_str)?;
     if object.get("jsonrpc").and_then(Value::as_str) != Some(JSONRPC_VERSION)
         || object.get("method").and_then(Value::as_str) != Some("tools/call")
-        || !matches!(tool_name, "query_code" | "search_symbols" | "run_policy")
+        || serial_tool_request(tool_name)
         || !spec.tool_names.contains(tool_name)
     {
         return None;
@@ -509,6 +538,13 @@ fn cancellable_tool_request(message: &Value, spec: &McpServerSpec) -> Option<(Va
     ))
 }
 
+fn serial_tool_request(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "activate_workspace" | "refresh" | "update_paths" | "get_active_workspace"
+    )
+}
+
 fn spawn_cancellable_tool_call(
     service: Arc<SearchToolsService>,
     call: PreparedToolCall,
@@ -517,24 +553,81 @@ fn spawn_cancellable_tool_call(
     cancellations: McpRequestCancellations,
     response_sender: mpsc::SyncSender<OutboundMcpResponse>,
 ) -> Result<(), String> {
+    spawn_cancellable_tool_call_at(
+        service,
+        call,
+        id,
+        cancellation,
+        cancellations,
+        response_sender,
+        Instant::now(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_cancellable_tool_call_at(
+    service: Arc<SearchToolsService>,
+    call: PreparedToolCall,
+    id: Value,
+    cancellation: CancellationToken,
+    cancellations: McpRequestCancellations,
+    response_sender: mpsc::SyncSender<OutboundMcpResponse>,
+    accepted_at: Instant,
+) -> Result<(), String> {
+    spawn_cancellable_tool_call_with_start_hook(
+        service,
+        call,
+        id,
+        cancellation,
+        cancellations,
+        response_sender,
+        accepted_at,
+        || {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_cancellable_tool_call_with_start_hook<F>(
+    service: Arc<SearchToolsService>,
+    call: PreparedToolCall,
+    id: Value,
+    cancellation: CancellationToken,
+    cancellations: McpRequestCancellations,
+    response_sender: mpsc::SyncSender<OutboundMcpResponse>,
+    accepted_at: Instant,
+    on_worker_start: F,
+) -> Result<(), String>
+where
+    F: FnOnce() + Send + 'static,
+{
     let workspace_generation = call
         .workspace_generation()
         .expect("background tool calls are workspace-scoped cancellable requests");
+    let tool_name = call.tool_name().to_string();
     let cleanup_id = id.clone();
     let cleanup_cancellations = cancellations.clone();
     let spawn_result = thread::Builder::new()
-        .name("bifrost-mcp-cancellable-tool".to_string())
+        .name("bifrost-mcp-tool".to_string())
         .spawn(move || {
-            let response =
+            profiling::duration(
+                format!("mcp_request.queue_wait[{tool_name}]"),
+                accepted_at.elapsed(),
+            );
+            on_worker_start();
+            let response = {
+                let _execution_scope =
+                    profiling::scope(format!("mcp_request.execution[{tool_name}]"));
                 match execute_prepared_tool_call(service.as_ref(), call, Some(&cancellation)) {
                     Ok(result) => success_response(id.clone(), result),
                     Err((code, message)) => error_response(id.clone(), code, message),
-                };
+                }
+            };
             if response_sender
                 .send(OutboundMcpResponse::scoped_request(
                     response,
                     workspace_generation,
                     id.clone(),
+                    tool_name,
                 ))
                 .is_err()
             {
@@ -965,6 +1058,14 @@ enum PreparedToolCall {
 }
 
 impl PreparedToolCall {
+    fn tool_name(&self) -> &str {
+        match self {
+            Self::QueryCode(_) => "query_code",
+            Self::RunPolicy(_) => "run_policy",
+            Self::Standard { name, .. } => name,
+        }
+    }
+
     fn workspace_generation(&self) -> Option<u64> {
         match self {
             Self::QueryCode(prepared) => Some(prepared.workspace_generation()),
@@ -1045,22 +1146,6 @@ fn prepare_tool_call(
                 "activate_workspace is unavailable while the workspace is controlled by {authority}; update the client-provided workspace instead"
             ))));
         }
-    }
-    if name == "query_code" {
-        return service
-            .prepare_query_code(arguments)
-            .map(PreparedToolCall::QueryCode)
-            .map(Box::new)
-            .map(ToolCallPreparation::Ready)
-            .map_err(|error| map_service_error(error.code, error.message));
-    }
-    if name == "run_policy" {
-        return service
-            .prepare_run_policy(arguments)
-            .map(PreparedToolCall::RunPolicy)
-            .map(Box::new)
-            .map(ToolCallPreparation::Ready)
-            .map_err(|error| map_service_error(error.code, error.message));
     }
     let arguments = match normalize_tool_arguments(name, arguments, &workspace_root) {
         Ok(arguments) => arguments,
@@ -2230,6 +2315,209 @@ mod uri_tests {
     }
 
     #[test]
+    fn issue_1228_read_only_tools_are_backgrounded_but_workspace_mutations_are_serial() {
+        let spec = build_server_spec(
+            "test",
+            [
+                "scan_usages_by_location",
+                "get_symbol_sources",
+                "refresh",
+                "activate_workspace",
+            ]
+            .into_iter()
+            .map(|name| {
+                json!({
+                    "name": name,
+                    "description": "test",
+                    "inputSchema": { "type": "object" }
+                })
+            })
+            .collect(),
+        )
+        .expect("server spec");
+
+        for name in ["scan_usages_by_location", "get_symbol_sources"] {
+            let message = json!({
+                "jsonrpc": JSONRPC_VERSION,
+                "id": name,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": {} }
+            });
+            assert!(
+                background_tool_request(&message, &spec).is_some(),
+                "{name} must leave the stdin reader immediately"
+            );
+        }
+
+        for name in ["refresh", "activate_workspace"] {
+            let message = json!({
+                "jsonrpc": JSONRPC_VERSION,
+                "id": name,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": {} }
+            });
+            assert!(
+                background_tool_request(&message, &spec).is_none(),
+                "{name} must preserve reader ordering"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_1228_cancelled_scan_does_not_block_following_source_lookup() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub fn target() {}\npub fn caller() { target(); }\n",
+        )
+        .expect("write source");
+        let service = Arc::new(
+            SearchToolsService::new_deferred_manual(dir.path().to_path_buf()).expect("service"),
+        );
+        let spec = build_server_spec(
+            "test",
+            ["scan_usages_by_location", "get_symbol_sources"]
+                .into_iter()
+                .map(|name| {
+                    json!({
+                        "name": name,
+                        "description": "test",
+                        "inputSchema": { "type": "object" }
+                    })
+                })
+                .collect(),
+        )
+        .expect("server spec");
+        let mut connection = McpConnectionState::new(false);
+
+        let scan_message = json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "id": "slow-scan",
+            "method": "tools/call",
+            "params": {
+                "name": "scan_usages_by_location",
+                "arguments": {
+                    "targets": [{"path": "lib.rs", "line": 1}],
+                    "include_tests": true
+                }
+            }
+        });
+        let (scan_id, scan_params) =
+            background_tool_request(&scan_message, &spec).expect("scan is backgrounded");
+        let scan_call = match prepare_tool_call(
+            service.as_ref(),
+            &mut connection,
+            scan_params,
+            McpRenderOptions::default(),
+            &spec,
+        )
+        .expect("prepare scan")
+        {
+            ToolCallPreparation::Ready(call) => call,
+            ToolCallPreparation::Reply(reply) => panic!("unexpected scan reply: {reply}"),
+        };
+        let generation = scan_call.workspace_generation().expect("scan generation");
+        let cancellations = McpRequestCancellations::default();
+        let cancellation = cancellations
+            .register(&scan_id, generation, service.workspace_generation())
+            .expect("register scan");
+        let (worker_started_sender, worker_started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let (response_sender, response_receiver) = mpsc::sync_channel(2);
+        spawn_cancellable_tool_call_with_start_hook(
+            Arc::clone(&service),
+            scan_call,
+            scan_id.clone(),
+            cancellation,
+            cancellations.clone(),
+            response_sender,
+            Instant::now(),
+            move || {
+                worker_started_sender.send(()).expect("report worker start");
+                release_receiver.recv().expect("release scan worker");
+            },
+        )
+        .expect("spawn scan worker");
+        worker_started_receiver
+            .recv()
+            .expect("scan worker reached deterministic barrier");
+
+        assert!(
+            handle_notification(
+                service.as_ref(),
+                &mut connection,
+                &cancellations,
+                "notifications/cancelled",
+                json!({ "requestId": scan_id }),
+            )
+            .is_none()
+        );
+
+        let source_message = json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "id": "fast-source",
+            "method": "tools/call",
+            "params": {
+                "name": "get_symbol_sources",
+                "arguments": { "symbols": ["target"] }
+            }
+        });
+        let (_source_id, source_params) = background_tool_request(&source_message, &spec)
+            .expect("source lookup is backgrounded while scan worker is held");
+        let source_call = match prepare_tool_call(
+            service.as_ref(),
+            &mut connection,
+            source_params,
+            McpRenderOptions::default(),
+            &spec,
+        )
+        .expect("prepare source lookup")
+        {
+            ToolCallPreparation::Ready(call) => call,
+            ToolCallPreparation::Reply(reply) => panic!("unexpected source reply: {reply}"),
+        };
+        let source_result = execute_prepared_tool_call(service.as_ref(), source_call, None)
+            .expect("source lookup completes while scan remains held");
+        assert_eq!(source_result["isError"], false, "{source_result:#}");
+        assert_eq!(
+            source_result["structuredContent"]["sources"][0]["path"], "lib.rs",
+            "the lightweight request must return the real definition before the scan is released: {source_result:#}"
+        );
+        assert!(
+            source_result["structuredContent"]["sources"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("pub fn target")),
+            "{source_result:#}"
+        );
+
+        release_sender.send(()).expect("release scan");
+        let scan_response = response_receiver.recv().expect("scan response");
+        assert_eq!(
+            scan_response.value["result"]["structuredContent"]["summary"]["partial"], true,
+            "{}",
+            scan_response.value
+        );
+        assert_eq!(
+            scan_response.value["result"]["structuredContent"]["results"][0]["incomplete_reason"],
+            "cancelled",
+            "{}",
+            scan_response.value
+        );
+        let completion_id = scan_response
+            .completion_id
+            .expect("background response releases its in-flight slot");
+        cancellations.complete(&completion_id);
+        assert!(
+            cancellations
+                .active
+                .lock()
+                .expect("cancellation lock")
+                .is_empty(),
+            "writer completion must release the bounded in-flight slot"
+        );
+    }
+
+    #[test]
     fn immediate_response_queue_saturates_without_blocking_the_reader() {
         let (sender, _receiver) = mpsc::sync_channel(1);
         try_queue_response(
@@ -2401,7 +2689,7 @@ mod uri_tests {
             }
         });
         let (request_id, params) =
-            cancellable_tool_request(&message, &spec).expect("search_symbols is cancellable");
+            background_tool_request(&message, &spec).expect("search_symbols runs in background");
         let mut connection = McpConnectionState::new(false);
         let call = match prepare_tool_call(
             service.as_ref(),

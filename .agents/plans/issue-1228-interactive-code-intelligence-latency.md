@@ -15,8 +15,8 @@ The visible proof has two parts. Deterministic tests will prove cancellation pro
 - [x] (2026-07-28 08:32Z) Traced MCP admission, service dispatch, scan rendering, `UsageFinder`, cross-language cancellation checks, profiling, and benchmark/report seams on current source.
 - [x] (2026-07-28 08:32Z) Reviewed Benchmark Actions runs from July 24 through July 27 and separated persistent Click/Python latency signals from unrelated PHP and C++ correctness failures.
 - [x] (2026-07-28 08:32Z) Wrote this implementation plan with deterministic behavior gates and a separate stable wall-clock lane.
-- [x] (2026-07-28 09:21Z) Milestone 1 implementation complete: both scan surfaces share request cancellation and bounded candidate/source/callsite work, every bounded result carries a typed incomplete reason, five issue-specific unit/service tests and the large-response integration test pass, and the checkpoint is ready to commit on the existing issue branch.
-- [ ] Milestone 2: remove MCP reader head-of-line blocking for analyzer-backed query tools, add deterministic transport/concurrency tests and lifecycle timing spans, update this plan, and commit the milestone.
+- [x] (2026-07-28 09:21Z) Milestone 1 complete and checkpointed as `d9bb61bf`: both scan surfaces share request cancellation and bounded candidate/source/callsite work, every bounded result carries a typed incomplete reason, five issue-specific unit/service tests and the large-response integration test pass, and the post-checkpoint review found no semantic or scope correction.
+- [x] (2026-07-28 09:35Z) Milestone 2 implementation complete: every read-only tool call leaves the stdin reader for the existing four-slot bounded worker path, workspace-mutating lifecycle calls remain reader-ordered, query/policy snapshot preparation moved off the reader, lifecycle timing covers queue/execution/response-queue/writer phases, and all 14 MCP transport tests pass before checkpointing.
 - [ ] Milestone 3: extend the benchmark client and report with p50/p95, concurrent heavy/light and cancellation scenarios, phase attribution, and a pinned Bifrost corpus; validate and commit the milestone.
 - [ ] Milestone 4: run the full Rust gates and a fresh release-mode self-repository campaign, compare it with the recent Actions evidence, resolve any issue-scoped failures, complete the retrospective, and commit the post-milestone review.
 
@@ -49,6 +49,12 @@ The visible proof has two parts. Deterministic tests will prove cancellation pro
 - Observation: Fresh isolated Rust test builds spend most of their time compiling and linking rather than exercising the new tests. The five issue-specific tests execute in 0.06 seconds after a 1 minute 45 second clean build; the 350-file response-budget integration fixture executes in 2.89 seconds after a 3 minute clean integration build.
   Evidence: The exact validation transcripts are recorded below. This reinforces the decision to keep ordinary acceptance deterministic rather than enforcing five-second wall time in debug tests.
 
+- Observation: Merely expanding the old three-tool background allowlist would still leave expensive `query_code` and `run_policy` preparation on the stdin reader because `prepare_tool_call` eagerly captured an analyzer snapshot for those variants.
+  Evidence: `SearchToolsService::prepare_query_code` and `prepare_run_policy` both call `snapshot_for_query`. Milestone 2 now prepares ordinary normalized arguments and the accepted workspace generation on the reader, then performs snapshot acquisition inside the worker through `call_tool_output_with_cancellation`; direct prepared variants remain for internal callers and focused tests.
+
+- Observation: The existing transport boundaries were sufficient to make the fairness regression deterministic without a wall-clock timeout. A test-only worker-start hook can hold the real scan immediately before execution while the normal notification handler cancels its real token and a source lookup returns the actual `lib.rs` definition on the test thread.
+  Evidence: `issue_1228_cancelled_scan_does_not_block_following_source_lookup` verifies the source body before releasing the scan barrier, then verifies the scan's `cancelled` incomplete reason and explicitly performs the same completion cleanup as the writer.
+
 ## Decision Log
 
 - Decision: Stage the work as scan truthfulness, transport responsiveness, then benchmarking rather than changing every analyzer API at once.
@@ -79,11 +85,21 @@ The visible proof has two parts. Deterministic tests will prove cancellation pro
   Rationale: `scan_usages` previously left source volume unbounded even though `UsageFinder` already had deterministic source admission. A relatively generous ceiling bounds pathological scans without changing ordinary small and medium repository behavior, and every omission is now explicit rather than presented as exhaustive absence.
   Date/Author: 2026-07-28 / Codex
 
+- Decision: Background every read-only `tools/call` through the existing bounded request registry and keep only `activate_workspace`, `refresh`, `update_paths`, and `get_active_workspace` on the reader.
+  Rationale: A positive allowlist recreates head-of-line blocking whenever a tool is added or overlooked. The four lifecycle tools either mutate workspace state or are the cheap paired state read; all other advertised tools are read-only and can safely use workspace-generation suppression, bounded response queuing, and request-ID-based cancellation.
+  Date/Author: 2026-07-28 / Codex
+
+- Decision: Emit bounded-cardinality MCP timing labels by tool and phase without arguments or source text.
+  Rationale: `mcp_request.queue_wait`, `execution`, `response_queue_wait`, and `writer_delivery` make a slow request attributable while tool names come from the finite server specification. Arguments and request data would leak source and explode trace cardinality; request/iteration correlation already comes from the benchmark's profile boundaries and artifact identity.
+  Date/Author: 2026-07-28 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 is implemented. `UsageFinder::QueryResult` now distinguishes complete, cancelled, candidate-file-bounded, and source-byte-bounded queries; cancellation is checked during source admission as well as candidate and graph work. Both public scan surfaces receive the service token and one bounded execution context. Public results retain useful statuses and hits while serializing `complete: false` plus one of `cancelled`, `candidate_files`, `source_bytes`, `callsites`, or `response_budget`. A cancelled scan is an explicit failure rather than an empty success, and bounded zero-hit scans cannot become `verified_absent`.
 
-The remaining work is transport responsiveness and benchmark evidence: scans are now cancellable once they receive a request token, but the MCP reader still has to move analyzer-backed standard requests onto the bounded background path so it can receive cancellation notifications and lightweight requests while a scan runs.
+Milestone 2 removes the remaining stdin-reader head-of-line boundary. Read-only tool calls now share the existing maximum-four in-flight registry, cancellation map, workspace-generation suppression, fixed response queue, and writer completion cleanup. Snapshot construction for `query_code` and `run_policy` now occurs inside the worker. A held and cancelled real scan cannot prevent a following exact source body from completing, while workspace-mutating lifecycle calls remain reader-ordered. Profile traces now separate accepted-to-worker queue wait, worker execution, response-queue wait, and writer delivery for each finite tool name.
+
+The remaining work is benchmark productization and live evidence: expose request-ID-aware concurrent client operations, compute p50/p95 consistently, add the issue payload and fairness/cancellation scenarios against a pinned Bifrost corpus, wire the stable workflow lane, and then run the full gates and refresh recent Actions results.
 
 This section must be updated after each milestone with observed behavior, test counts, benchmark results, residual risks, and any scope moved to a follow-up issue.
 
@@ -243,6 +259,14 @@ Milestone 1 focused validation:
     scripts/with-isolated-cargo-target.sh cargo test --test searchtools_service scan_usages_demotes_large_result_to_summary_within_budget -- --exact --nocapture
     result: 1 passed; 0 failed; 189 filtered out; test finished in 2.89 s
 
+Milestone 2 focused validation:
+
+    scripts/with-isolated-cargo-target.sh cargo test --lib issue_1228 -- --nocapture
+    result after transport implementation: 7 passed; 0 failed; 1972 filtered out; tests finished in 0.06 s
+
+    scripts/with-isolated-cargo-target.sh cargo test --lib mcp_common::uri_tests -- --nocapture
+    result: 14 passed; 0 failed; 1965 filtered out; tests finished in 0.14 s
+
 ## Interfaces and Dependencies
 
 No new crate dependency is expected. Use `crate::CancellationToken`, `src/analyzer/usages/finder.rs` source-byte admission, `src/analyzer/usages/traits.rs::UsageScanScope`, the existing bounded MCP cancellation registry, `src/profiling.rs`, and the current benchmark session/profile infrastructure.
@@ -281,3 +305,7 @@ In `src/benchmark/mcp_session.rs`, expose request-ID-aware send, cancel, and rec
 Plan revision note (2026-07-28 08:32Z): Created the initial self-contained plan after syncing current master, validating the issue and current source seams, probing the live plugin, reviewing recent Benchmark Actions artifacts, and separating deterministic correctness gates from the stable release wall-clock contract.
 
 Plan revision note (2026-07-28 09:21Z): Updated the checkout state to the app-created issue branch at base `45841f1a`; recorded Milestone 1's cancellation, work-budget, incomplete-result, profiling, and regression-test implementation; documented the 64 MiB source budget and focused validation results; and removed stale detached-HEAD recovery guidance.
+
+Plan revision note (2026-07-28 09:24Z): Recorded Milestone 1 checkpoint `d9bb61bf` and its clean post-checkpoint review before beginning MCP transport work.
+
+Plan revision note (2026-07-28 09:35Z): Recorded Milestone 2's read-only background admission, deferred snapshot preparation, deterministic scan/source fairness test, four transport timing phases, and full focused transport validation; checkpoint hash remains to be recorded after commit.
