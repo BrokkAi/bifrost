@@ -26,6 +26,16 @@ modern `LanguageFn` binding and recent grammar work. Bifrost therefore vendors
 the exact source snapshot instead of depending on a stale release or an
 unpublishable Cargo git dependency.
 
+Vendoring is explicitly temporary. Upstream release request
+[`fwcd/tree-sitter-kotlin#242`](https://github.com/fwcd/tree-sitter-kotlin/issues/242)
+is the exit-condition tracker. When upstream publishes `0.4.0` or a later
+compatible release, Bifrost should replace the snapshot with an exact registry
+dependency after replaying this report's acceptance corpus and verifying that
+a second Kotlin grammar dependency cannot substitute native symbols at link
+time. The published `0.3.8` crate is not a drop-in interim dependency: it pins
+Tree-sitter below 0.23 and returns that runtime's `Language`, whereas Bifrost
+uses Tree-sitter 0.25.10 and this source revision exposes `LanguageFn`.
+
 ## Candidates and legal review
 
 | Candidate | Exact revision | Rust package | License | Copyright | ABI | Scanner |
@@ -120,9 +130,16 @@ mandatory package contents, checked by `scripts/check-crate-package.sh`.
 The native build follows the already proven Scala pattern: C11, the source
 directory on the include path, `-utf-8` under MSVC, and compile-time private
 prefixes for the language function and all five scanner lifecycle/state
-functions. After integration and query relocation, the verified publishable crate is 9,603,624
-bytes, below the unchanged 10,000,000-byte gate, and contains the Kotlin
+functions. After integration, query relocation, and removal of repository test
+implementations from the package, the verified publishable crate is 8,171,348
+bytes, below the unchanged 10,000,000-byte gate. The crate contains the Kotlin
 license, provenance, grammar source, parser, scanner, and all required headers.
+
+Repository integration-test Rust sources, their shared helpers, and Python
+tests are excluded from the published crate. Non-Rust fixtures referenced by
+inline `#[cfg(test)]` modules remain packaged so downstream `cargo test --lib`
+retains its source-backed inputs. `scripts/check-crate-package.sh` rejects
+either boundary drifting.
 
 The parser and scanner build and all four grammar smokes pass locally with
 Rust 1.96.0 on `aarch64-apple-darwin` through the shared Tree-sitter 0.25

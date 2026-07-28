@@ -21,6 +21,8 @@ The implementation must also record why the selected grammar beat the alternativ
 - [x] (2026-07-28 10:47Z) Integrate the vendored MIT license into Bifrost's supplemental notice generator and verify the publishable crate remains below its 10 MB gate.
 - [x] (2026-07-28 10:56Z) Run formatting, focused tests, notice regeneration/check, package check, license policy, all-target/all-feature clippy, and practical local target checks; record MSVC/Android CI-only coverage explicitly.
 - [x] (2026-07-28 11:15Z) Move unused upstream highlight/tag queries out of the vendored build surface into `resources/treesitter/kotlin/`, retain their upstream contents and attribution, and keep them excluded from the crate until a consumer is introduced.
+- [x] (2026-07-28 12:35Z) Record Kotlin vendoring as temporary until upstream publishes `0.4.0`, with `fwcd/tree-sitter-kotlin#242` as the exit-condition tracker and the acceptance suite as the dependency migration gate.
+- [x] (2026-07-28 12:35Z) Exclude repository integration-test Rust sources, shared integration-test helpers, and Python tests from the crate while retaining and inventory-checking fixtures required by inline library tests; verify the extracted 8,171,348-byte crate compiles its library-test harness and passes all four Kotlin smokes.
 
 ## Surprises & Discoveries
 
@@ -39,7 +41,7 @@ The implementation must also record why the selected grammar beat the alternativ
 - Observation: both candidates parsed all 53 ordinary files from the two pinned Kotlin example repositories cleanly. On the 228 additional pinned JetBrains PSI sources, including intentional recovery cases, `fwcd` yielded 106 error-bearing roots and 9 files with missing nodes versus `-ng` at 115 and 20. `-ng` was faster: 23.719 ms versus 32.434 ms median aggregate parse time across 11 warm runs.
   Evidence: the disposable Tree-sitter 0.25.10 comparison probe and the retained evaluation report.
 
-- Observation: direct vendoring initially appeared to exceed the 10 MB crate gate because the pre-Kotlin crate was already 9,331,190 bytes. Excluding documentation-site GIF demos from the Rust archive, while retaining them in the repository and docs site, produced a final verified crate of 9,603,624 bytes with every Kotlin build and legal file present and the unused reference queries excluded.
+- Observation: direct vendoring initially appeared to exceed the 10 MB crate gate because the pre-Kotlin crate was already 9,331,190 bytes. Excluding documentation-site GIF demos and repository test implementations from the Rust archive, while retaining the docs in the repository and source-backed fixtures required by inline tests, produced a final verified crate of 8,171,348 bytes with every Kotlin build and legal file present and the unused reference queries excluded.
   Evidence: pre- and post-integration runs of `scripts/check-crate-package.sh`.
 
 - Observation: this Mac's `cargo`/`rustc` come from rustup while the first `cargo clippy` dispatch found Homebrew's `clippy-driver`, producing Rust error E0514 despite identical version numbers. Invoking the rustup toolchain's exact `cargo-clippy` binary removed the mixed-compiler metadata and completed cleanly.
@@ -47,6 +49,9 @@ The implementation must also record why the selected grammar beat the alternativ
 
 - Observation: the upstream highlight query is editor reference material derived from an Apache-licensed nvim-treesitter query; it is not one of Bifrost's `definitions.scm`, `imports.scm`, or `identifiers.scm` analyzer inputs.
   Evidence: the query's retained source header and the explicit embedded-query registry in `src/analyzer/store/epoch.rs`.
+
+- Observation: Cargo's default package inventory included 291 top-level integration-test Rust targets plus `tests/common` helpers. Those repository/CI inputs consumed roughly 1.5 MB compressed, while the small non-Rust fixtures used by inline library tests must remain available in a published source package.
+  Evidence: the verified package inventory, per-file compression measurement, and source-backed fixture references under `src/`.
 
 ## Decision Log
 
@@ -70,9 +75,17 @@ The implementation must also record why the selected grammar beat the alternativ
   Rationale: Bifrost-owned Tree-sitter queries live under `resources/treesitter/<language>`. Keeping unrelated editor queries under `vendor/` obscures that ownership boundary, while deleting them would discard useful upstream reference material and attribution.
   Date/Author: 2026-07-28 / Codex
 
+- Decision: treat Kotlin vendoring as a temporary bridge to upstream `tree-sitter-kotlin` `0.4.0`, tracked by upstream issue `#242`.
+  Rationale: the published `0.3.8` crate is tied to Tree-sitter 0.21-0.22, while the selected source exposes the runtime-neutral `LanguageFn` required by Bifrost's Tree-sitter 0.25.10 stack. A published compatible release should own and distribute its generated parser instead of permanently consuming Bifrost's crate budget.
+  Date/Author: 2026-07-28 / Codex
+
+- Decision: do not publish repository integration-test implementations with the Rust crate; retain only fixtures needed by inline library tests and enforce both rules in the package inventory check.
+  Rationale: integration tests run from the repository and CI checkout, not as runtime inputs for crate consumers. Retaining referenced fixtures preserves downstream `cargo test --lib` behavior without spending the package budget on hundreds of integration-test targets.
+  Date/Author: 2026-07-28 / Codex
+
 ## Outcomes & Retrospective
 
-The selected `fwcd` grammar and generated native sources are vendored unchanged, private-linked, licensed, documented, and reproducibly regenerable without entering Kotlin into analyzer discovery. The upstream query contents remain unchanged under `resources/treesitter/kotlin/`; only their paths in `tree-sitter.json` differ from upstream. Four focused grammar tests pass. Format and diff checks, deterministic notices, `cargo deny`, publishable-crate verification, and all-target/all-feature clippy pass. An independent intent/build/license review found no blocking issues. Native sources compile locally for macOS, Linux x64/arm64, and Windows GNU; the repository's CI runners remain the authoritative MSVC and Android gates once these uncommitted changes are published. Issue #1236 can now register this exact `LanguageFn` and add Kotlin to normal analyzer dispatch without reopening grammar selection.
+The selected `fwcd` grammar and generated native sources are temporarily vendored unchanged, private-linked, licensed, documented, and reproducibly regenerable without entering Kotlin into analyzer discovery. Upstream issue `fwcd/tree-sitter-kotlin#242` tracks the exit to a published compatible dependency. The upstream query contents remain unchanged under `resources/treesitter/kotlin/`; only their paths in `tree-sitter.json` differ from upstream. Repository test implementations no longer ship in the crate, while required inline-test fixtures remain inventoried; the verified package is 8,171,348 bytes and its extracted library-test harness passes all four Kotlin smokes. Format and diff checks, deterministic notices, `cargo deny`, publishable-crate verification, and all-target/all-feature clippy pass. An independent intent/build/license review found no blocking issues. Native sources compile locally for macOS, Linux x64/arm64, and Windows GNU; the repository's CI runners remain the authoritative MSVC and Android gates once these uncommitted changes are published. Issue #1236 can now register this exact `LanguageFn` and add Kotlin to normal analyzer dispatch without reopening grammar selection.
 
 ## Context and Orientation
 

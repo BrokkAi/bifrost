@@ -14,6 +14,11 @@ keywords = ["analyzer", "tree-sitter", "lsp", "mcp", "code-analysis"]
 categories = ["development-tools", "parser-implementations", "command-line-utilities"]
 exclude = [
     ".agents/**",
+    # Repository test targets run from source checkouts and CI, not from the
+    # published crate. Retain non-Rust fixtures used by inline library tests.
+    "/tests/**/*.rs",
+    "/tests/common/**",
+    "/python_tests/**",
     # The documentation site owns these large demos; Rust consumers do not
     # need duplicate animated media in the crate archive.
     "docs/src/assets/*.gif",

@@ -14,6 +14,21 @@ The measured decision is recorded in
 repository. The selected generated parser declares Tree-sitter language ABI
 version 14 and is loaded through Bifrost's shared Tree-sitter 0.25.10 runtime.
 
+## Temporary vendoring and exit condition
+
+This snapshot is vendored only because upstream source version `0.4.0` has not
+been published to crates.io. The available `tree-sitter-kotlin` `0.3.8` crate
+uses the older Tree-sitter 0.21-0.22 Rust API and does not expose the modern
+`tree_sitter_language::LanguageFn` used by this revision. Upstream publication
+is tracked by [`fwcd/tree-sitter-kotlin#242`](https://github.com/fwcd/tree-sitter-kotlin/issues/242).
+
+Once upstream publishes `0.4.0` or a newer compatible release, replace this
+snapshot with an exact registry dependency after the release passes the same
+`.kt`, `.kts`, malformed-recovery, incremental-reparse, and representative
+corpus checks recorded here. The migration must also remove the native build
+and supplemental vendored-source notice, verify coexistence with another
+Kotlin grammar dependency, and re-run the crate-package inventory gate.
+
 Bifrost does not patch `grammar.js`, the generated files, the query contents,
 or the scanner. The upstream highlight and tag queries live under
 `resources/treesitter/kotlin/`, alongside the location reserved for future
