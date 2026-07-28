@@ -16,6 +16,12 @@ pub struct ScanUsagesByReferenceParams {
     /// `same_owner_sites`. See #1014 facet B.
     #[serde(default)]
     pub include_same_owner: bool,
+    /// Override the default wall-clock budget for this call. Interactive callers should leave this
+    /// unset; a batch/background caller issuing one scan per checkout rather than serving
+    /// keystrokes can request more time for a large workspace. Clamped to
+    /// [`SCAN_USAGES_MAX_DURATION_CEILING`].
+    #[serde(default)]
+    pub max_duration_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +34,9 @@ pub struct ScanUsagesByLocationParams {
     /// See [`ScanUsagesByReferenceParams::include_same_owner`].
     #[serde(default)]
     pub include_same_owner: bool,
+    /// See [`ScanUsagesByReferenceParams::max_duration_secs`].
+    #[serde(default)]
+    pub max_duration_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -669,15 +678,33 @@ pub(crate) struct ScanUsagesExecutionContext {
     max_callsites: usize,
 }
 
-// Leave two seconds of the five-second product envelope for cooperative
+// Leave two seconds of the seven-second product envelope for cooperative
 // shutdown, rendering, response delivery, and short non-interruptible cache
 // lookups that may already be in flight when the deadline is observed.
-const SCAN_USAGES_MAX_DURATION: Duration = Duration::from_secs(3);
+//
+// Raised from 3s: even after fixing the underlying candidate-discovery cost
+// (#1257), a full scan on a large workspace can still land just over a 3s
+// budget. 5s gives that case enough headroom without reopening the
+// interactive-latency work #1228/#1255 did.
+const SCAN_USAGES_MAX_DURATION: Duration = Duration::from_secs(5);
+
+/// Upper bound on a caller-requested `max_duration_secs` override (see
+/// [`ScanUsagesByReferenceParams::max_duration_secs`]). Keeps a budget override an escape hatch for
+/// large-workspace batch callers, not a way to opt out of bounded execution entirely.
+pub(crate) const SCAN_USAGES_MAX_DURATION_CEILING: Duration = Duration::from_secs(300);
 
 impl ScanUsagesExecutionContext {
-    pub(crate) fn with_cancellation(cancellation: CancellationToken) -> Self {
+    /// `max_duration`, when `Some`, overrides [`SCAN_USAGES_MAX_DURATION`] for this call (clamped to
+    /// [`SCAN_USAGES_MAX_DURATION_CEILING`]) -- see `max_duration_secs` on the request params.
+    pub(crate) fn with_cancellation_and_max_duration(
+        cancellation: CancellationToken,
+        max_duration: Option<Duration>,
+    ) -> Self {
+        let max_duration = max_duration
+            .unwrap_or(SCAN_USAGES_MAX_DURATION)
+            .min(SCAN_USAGES_MAX_DURATION_CEILING);
         Self {
-            cancellation: cancellation.with_timeout(SCAN_USAGES_MAX_DURATION),
+            cancellation: cancellation.with_timeout(max_duration),
             ..Self::default()
         }
     }
@@ -1460,7 +1487,7 @@ pub fn scan_usages_by_reference(
     analyzer: &dyn IAnalyzer,
     params: ScanUsagesByReferenceParams,
 ) -> ScanUsagesResult {
-    scan_usages_by_reference_with_context(analyzer, params, &ScanUsagesExecutionContext::default())
+    scan_usages_by_reference_with_cancellation(analyzer, params, CancellationToken::default())
 }
 
 pub(crate) fn scan_usages_by_reference_with_cancellation(
@@ -1468,10 +1495,11 @@ pub(crate) fn scan_usages_by_reference_with_cancellation(
     params: ScanUsagesByReferenceParams,
     cancellation: CancellationToken,
 ) -> ScanUsagesResult {
+    let max_duration = params.max_duration_secs.map(Duration::from_secs);
     scan_usages_by_reference_with_context(
         analyzer,
         params,
-        &ScanUsagesExecutionContext::with_cancellation(cancellation),
+        &ScanUsagesExecutionContext::with_cancellation_and_max_duration(cancellation, max_duration),
     )
 }
 
@@ -1502,7 +1530,7 @@ pub fn scan_usages_by_location(
     analyzer: &dyn IAnalyzer,
     params: ScanUsagesByLocationParams,
 ) -> ScanUsagesResult {
-    scan_usages_by_location_with_context(analyzer, params, &ScanUsagesExecutionContext::default())
+    scan_usages_by_location_with_cancellation(analyzer, params, CancellationToken::default())
 }
 
 pub(crate) fn scan_usages_by_location_with_cancellation(
@@ -1510,10 +1538,11 @@ pub(crate) fn scan_usages_by_location_with_cancellation(
     params: ScanUsagesByLocationParams,
     cancellation: CancellationToken,
 ) -> ScanUsagesResult {
+    let max_duration = params.max_duration_secs.map(Duration::from_secs);
     scan_usages_by_location_with_context(
         analyzer,
         params,
-        &ScanUsagesExecutionContext::with_cancellation(cancellation),
+        &ScanUsagesExecutionContext::with_cancellation_and_max_duration(cancellation, max_duration),
     )
 }
 

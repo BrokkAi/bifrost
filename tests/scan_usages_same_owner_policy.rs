@@ -48,6 +48,7 @@ fn scan(
             include_tests: true,
             paths: None,
             include_same_owner,
+            max_duration_secs: None,
         },
     );
     assert_eq!(

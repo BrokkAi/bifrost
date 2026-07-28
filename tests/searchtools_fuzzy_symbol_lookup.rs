@@ -456,6 +456,7 @@ const direct = ApiClient.create("/direct");
             include_tests: true,
             paths: None,
             include_same_owner: false,
+            max_duration_secs: None,
         },
     );
 
@@ -501,6 +502,7 @@ object Service {
             include_tests: true,
             paths: None,
             include_same_owner: false,
+            max_duration_secs: None,
         },
     );
 
@@ -616,6 +618,7 @@ object Use {
                 "decoy/Use.scala".to_string(),
             ]),
             include_same_owner: false,
+            max_duration_secs: None,
         },
     );
     assert_eq!(2, result.results.len(), "{result:#?}");
@@ -759,6 +762,7 @@ object Flags {
             include_tests: true,
             paths: Some(vec!["app/Use.scala".to_string()]),
             include_same_owner: false,
+            max_duration_secs: None,
         },
     );
     assert_eq!(3, result.results.len(), "{result:#?}");
@@ -1137,6 +1141,7 @@ func caller(options *Options, box *Box[int]) bool {
                 include_tests: true,
                 paths: None,
                 include_same_owner: false,
+                max_duration_secs: None,
             },
         );
 
@@ -1170,6 +1175,7 @@ fn scan_usages_reports_path_qualified_symbol_selector_as_unsupported() {
             include_tests: true,
             paths: None,
             include_same_owner: false,
+            max_duration_secs: None,
         },
     );
 
@@ -1199,6 +1205,7 @@ fn scan_usages_reports_plain_path_symbol_with_path_guidance() {
             include_tests: true,
             paths: None,
             include_same_owner: false,
+            max_duration_secs: None,
         },
     );
 
@@ -1234,6 +1241,7 @@ fn scan_usages_bounds_ambiguous_path_qualified_selector_message() {
             include_tests: true,
             paths: None,
             include_same_owner: false,
+            max_duration_secs: None,
         },
     );
 
@@ -2039,6 +2047,7 @@ class B {
             include_tests: true,
             paths: None,
             include_same_owner: false,
+            max_duration_secs: None,
         },
     );
 
@@ -2068,6 +2077,7 @@ fn scan_usages_finds_c_function_callers_through_header_declaration() {
             include_tests: true,
             paths: None,
             include_same_owner: false,
+            max_duration_secs: None,
         },
     );
 

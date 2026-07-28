@@ -34,7 +34,9 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
 pub(crate) use adapter::PythonAdapter;
-use cache::{weight_code_unit_set, weight_code_unit_vec, weight_project_file_set};
+use cache::{
+    weight_code_unit_set, weight_code_unit_vec, weight_export_index, weight_project_file_set,
+};
 use clones::{build_clone_candidate_data, refine_python_clone_similarity};
 pub(crate) use declarations::python_package_prefix_fq;
 use declarations::{
@@ -63,6 +65,13 @@ pub struct PythonAnalyzer {
     // on every call (previously uncached, called once per (candidate file, target) pair).
     imported_target_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
+    // `export_index_of` re-parses `file` from source on every call (it walks re-export chains, not
+    // the store-backed `FileState`). `resolve_exported_name`'s re-export BFS calls it once per hop
+    // per importing candidate, so on a workspace where many files resolve through a shared re-export
+    // chain this was previously O(candidates * chain depth) redundant full-file parses -- invisible
+    // while candidate discovery was single-threaded and dominated by slower costs, but the dominant
+    // cost once that walk was fixed and parallelized (#1257).
+    export_index: Cache<ProjectFile, Arc<ExportIndex>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
@@ -181,6 +190,7 @@ impl PythonAnalyzer {
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             imported_target_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
+            export_index: build_weighted_cache(memo_budget / 8, weight_export_index),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec),
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
@@ -247,7 +257,19 @@ impl PythonAnalyzer {
         results
     }
 
+    /// `get_with` (not get-then-insert): callers include the parallelized candidate walker's
+    /// re-export BFS, so two threads racing on the same file's first lookup must not both pay the
+    /// full disk-read-and-reparse cost below.
     pub fn export_index_of(&self, file: &ProjectFile) -> ExportIndex {
+        self.export_index
+            .get_with(file.clone(), || {
+                Arc::new(self.compute_export_index_of(file))
+            })
+            .as_ref()
+            .clone()
+    }
+
+    fn compute_export_index_of(&self, file: &ProjectFile) -> ExportIndex {
         let mut index = ExportIndex::empty();
         let mut events = Vec::new();
         let declarations = self.inner.top_level_declarations(file);
@@ -863,6 +885,7 @@ impl IAnalyzer for PythonAnalyzer {
                 weight_project_file_set,
             ),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
+            export_index: build_weighted_cache(self.memo_budget / 8, weight_export_index),
             direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
@@ -881,6 +904,7 @@ impl IAnalyzer for PythonAnalyzer {
                 weight_project_file_set,
             ),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
+            export_index: build_weighted_cache(self.memo_budget / 8, weight_export_index),
             direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),

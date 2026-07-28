@@ -2249,6 +2249,14 @@ impl SearchToolsService {
                 "{tool_name} requires `paths` to be an array of strings"
             )));
         }
+        if arguments
+            .get("max_duration_secs")
+            .is_some_and(|value| !value.is_u64())
+        {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "{tool_name} requires `max_duration_secs` to be a non-negative integer"
+            )));
+        }
         Ok(())
     }
 
