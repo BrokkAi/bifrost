@@ -377,9 +377,17 @@ fn merged_enclosing_scope_facts(
     inherited: Option<usize>,
 ) -> Option<usize> {
     let structural_local = collect_function_scope_facts_from_node(node, source);
-    let local = enclosing_scope_facts(analyzer, file, scope_facts, node)
-        .map(|indexed| indexed.merged_with_shadowing(&structural_local))
-        .unwrap_or(structural_local);
+    // A top-level function or class method has a complete indexed snapshot,
+    // including factory-return facts that the node-only structural pass cannot
+    // reconstruct. Nested functions and lambdas instead need their structural
+    // declarations to shadow the inherited outer snapshot.
+    let local = if inherited.is_none() && node.kind() == "function_definition" {
+        enclosing_scope_facts(analyzer, file, scope_facts, node)
+            .cloned()
+            .unwrap_or(structural_local)
+    } else {
+        structural_local
+    };
     match (local, inherited) {
         (local, Some(inherited_id)) => {
             let inherited = merged_facts.get(inherited_id)?;
