@@ -1,5 +1,6 @@
 use super::selectors::*;
 use super::*;
+use crate::cancellation::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanUsagesByReferenceParams {
@@ -171,6 +172,16 @@ impl ScanUsagesAbsenceCaveat {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanUsagesIncompleteReason {
+    Cancelled,
+    CandidateFiles,
+    SourceBytes,
+    Callsites,
+    ResponseBudget,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanUsagesEntry {
     pub input: ScanUsagesInput,
@@ -178,6 +189,8 @@ pub struct ScanUsagesEntry {
     pub status: ScanUsagesStatus,
     #[serde(skip_serializing_if = "is_true")]
     pub complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<ScanUsagesIncompleteReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -646,12 +659,60 @@ pub(super) struct IndexedResolvedScanTarget {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct ScanUsagesExecutionContext {
+    cancellation: CancellationToken,
+    max_candidate_files: usize,
+    max_path_scoped_candidate_files: usize,
+    max_source_bytes: usize,
+    max_callsites: usize,
+}
+
+impl ScanUsagesExecutionContext {
+    pub(crate) fn with_cancellation(cancellation: CancellationToken) -> Self {
+        Self {
+            cancellation,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limits(
+        cancellation: CancellationToken,
+        max_candidate_files: usize,
+        max_path_scoped_candidate_files: usize,
+        max_source_bytes: usize,
+        max_callsites: usize,
+    ) -> Self {
+        Self {
+            cancellation,
+            max_candidate_files,
+            max_path_scoped_candidate_files,
+            max_source_bytes,
+            max_callsites,
+        }
+    }
+}
+
+impl Default for ScanUsagesExecutionContext {
+    fn default() -> Self {
+        Self {
+            cancellation: CancellationToken::default(),
+            max_candidate_files: DEFAULT_MAX_FILES,
+            max_path_scoped_candidate_files: SCAN_USAGES_PATH_SCOPED_MAX_FILES,
+            max_source_bytes: SCAN_USAGES_MAX_SOURCE_BYTES,
+            max_callsites: SCAN_USAGES_MAX_CALLSITES,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(super) enum ScanUsagesWorkEntry {
     Usage {
         request: ScanUsageRequest,
         state: SymbolUsageRenderState,
         candidate_files_sample: Option<ScanUsagesCandidateFilesSample>,
         target_is_method: bool,
+        incomplete_reason: Option<ScanUsagesIncompleteReason>,
     },
     NotFound {
         request: ScanUsageRequest,
@@ -660,10 +721,18 @@ pub(super) enum ScanUsagesWorkEntry {
     Ambiguous {
         request: ScanUsageRequest,
         item: AmbiguousUsageSymbol,
+        incomplete_reason: Option<ScanUsagesIncompleteReason>,
     },
     Failure {
         request: ScanUsageRequest,
         failure: UsageFailureInfo,
+        incomplete_reason: Option<ScanUsagesIncompleteReason>,
+    },
+    Incomplete {
+        request: ScanUsageRequest,
+        symbol: Option<String>,
+        reason: ScanUsagesIncompleteReason,
+        message: String,
     },
     TooManyCallsites {
         request: ScanUsageRequest,
@@ -682,9 +751,69 @@ impl ScanUsagesWorkEntry {
             | ScanUsagesWorkEntry::NotFound { request, .. }
             | ScanUsagesWorkEntry::Ambiguous { request, .. }
             | ScanUsagesWorkEntry::Failure { request, .. }
+            | ScanUsagesWorkEntry::Incomplete { request, .. }
             | ScanUsagesWorkEntry::TooManyCallsites { request, .. } => request.index,
         }
     }
+}
+
+fn query_incomplete_reason(completion: UsageQueryCompletion) -> Option<ScanUsagesIncompleteReason> {
+    match completion {
+        UsageQueryCompletion::Complete => None,
+        UsageQueryCompletion::Cancelled => Some(ScanUsagesIncompleteReason::Cancelled),
+        UsageQueryCompletion::CandidateFilesBudgetExhausted => {
+            Some(ScanUsagesIncompleteReason::CandidateFiles)
+        }
+        UsageQueryCompletion::SourceBytesBudgetExhausted => {
+            Some(ScanUsagesIncompleteReason::SourceBytes)
+        }
+    }
+}
+
+fn incomplete_work_entry(
+    request: ScanUsageRequest,
+    symbol: Option<String>,
+    reason: ScanUsagesIncompleteReason,
+) -> ScanUsagesWorkEntry {
+    let message = match reason {
+        ScanUsagesIncompleteReason::Cancelled => {
+            "usage analysis was cancelled before it could produce a complete answer".to_string()
+        }
+        ScanUsagesIncompleteReason::CandidateFiles => {
+            "usage analysis exhausted its candidate-file budget".to_string()
+        }
+        ScanUsagesIncompleteReason::SourceBytes => {
+            "usage analysis exhausted its source-byte budget".to_string()
+        }
+        ScanUsagesIncompleteReason::Callsites => {
+            "usage analysis exhausted its callsite budget".to_string()
+        }
+        ScanUsagesIncompleteReason::ResponseBudget => {
+            "usage results were summarized to fit the response budget".to_string()
+        }
+    };
+    ScanUsagesWorkEntry::Incomplete {
+        request,
+        symbol,
+        reason,
+        message,
+    }
+}
+
+fn incomplete_requests(
+    symbols: Vec<ScanUsageRequest>,
+    targets: Vec<ScanUsageRequest>,
+    reason: ScanUsagesIncompleteReason,
+) -> Vec<ScanUsagesWorkEntry> {
+    targets
+        .into_iter()
+        .chain(symbols)
+        .map(|request| {
+            let symbol = matches!(request.input_kind, ScanUsagesInputKind::Symbol)
+                .then(|| request.label.clone());
+            incomplete_work_entry(request, symbol, reason)
+        })
+        .collect()
 }
 
 pub(crate) fn scan_usages_target_label(target: &ScanUsagesTarget) -> String {
@@ -1297,6 +1426,26 @@ pub fn scan_usages_by_reference(
     analyzer: &dyn IAnalyzer,
     params: ScanUsagesByReferenceParams,
 ) -> ScanUsagesResult {
+    scan_usages_by_reference_with_context(analyzer, params, &ScanUsagesExecutionContext::default())
+}
+
+pub(crate) fn scan_usages_by_reference_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    params: ScanUsagesByReferenceParams,
+    cancellation: CancellationToken,
+) -> ScanUsagesResult {
+    scan_usages_by_reference_with_context(
+        analyzer,
+        params,
+        &ScanUsagesExecutionContext::with_cancellation(cancellation),
+    )
+}
+
+pub(crate) fn scan_usages_by_reference_with_context(
+    analyzer: &dyn IAnalyzer,
+    params: ScanUsagesByReferenceParams,
+    context: &ScanUsagesExecutionContext,
+) -> ScanUsagesResult {
     let symbols = params
         .symbols
         .into_iter()
@@ -1311,12 +1460,33 @@ pub fn scan_usages_by_reference(
         symbols,
         Vec::new(),
         params.include_same_owner,
+        context,
     )
 }
 
 pub fn scan_usages_by_location(
     analyzer: &dyn IAnalyzer,
     params: ScanUsagesByLocationParams,
+) -> ScanUsagesResult {
+    scan_usages_by_location_with_context(analyzer, params, &ScanUsagesExecutionContext::default())
+}
+
+pub(crate) fn scan_usages_by_location_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    params: ScanUsagesByLocationParams,
+    cancellation: CancellationToken,
+) -> ScanUsagesResult {
+    scan_usages_by_location_with_context(
+        analyzer,
+        params,
+        &ScanUsagesExecutionContext::with_cancellation(cancellation),
+    )
+}
+
+pub(crate) fn scan_usages_by_location_with_context(
+    analyzer: &dyn IAnalyzer,
+    params: ScanUsagesByLocationParams,
+    context: &ScanUsagesExecutionContext,
 ) -> ScanUsagesResult {
     let targets = params
         .targets
@@ -1332,6 +1502,7 @@ pub fn scan_usages_by_location(
         Vec::new(),
         targets,
         params.include_same_owner,
+        context,
     )
 }
 
@@ -1344,6 +1515,7 @@ pub(super) fn scan_usages_backend(
     symbols: Vec<ScanUsageRequest>,
     targets: Vec<ScanUsageRequest>,
     include_same_owner: bool,
+    context: &ScanUsagesExecutionContext,
 ) -> ScanUsagesResult {
     let _scope = profiling::scope("searchtools::scan_usages_backend");
     // A batch is one read-only analyzer request. Keep the read cache alive across
@@ -1354,8 +1526,12 @@ pub(super) fn scan_usages_backend(
     let _analyzer_query = AnalyzerQueryScope::new(analyzer);
 
     let query_scope = ScanUsagesQueryScope::new(analyzer, paths, include_tests);
-    let reference_only_sibling_extensions =
-        present_reference_only_sibling_extensions_by_language(analyzer);
+    if context.cancellation.is_cancelled() {
+        let mut entries =
+            incomplete_requests(symbols, targets, ScanUsagesIncompleteReason::Cancelled);
+        entries.sort_by_key(ScanUsagesWorkEntry::index);
+        return render_scan_usages_with_budget(entries, query_scope.result_scope(), surface);
+    }
 
     // When the caller scopes the query to `paths`, the answer can only live in those files, so
     // resolve the candidate set straight from them instead of enumerating references across the
@@ -1364,26 +1540,72 @@ pub(super) fn scan_usages_backend(
     // no longer drags an O(workspace) reference scan behind it. The set is built once and reused
     // for every symbol; the finder's file filter still drops excluded test files on top.
     let path_scoped_candidates = query_scope.path_filter.as_ref().map(|filter| {
-        let files: HashSet<ProjectFile> = analyzer
-            .analyzed_files()
-            .into_iter()
-            .filter(|file| filter.matches(file))
-            .collect();
+        let _scope = profiling::scope("searchtools::scan_usages_path_candidates");
+        let mut files = HashSet::default();
+        for file in analyzer.analyzed_files() {
+            if context.cancellation.is_cancelled() {
+                break;
+            }
+            if filter.matches(&file) {
+                files.insert(file);
+            }
+        }
         ExplicitCandidateProvider::new(Arc::new(files))
     });
 
+    if context.cancellation.is_cancelled() {
+        let mut entries =
+            incomplete_requests(symbols, targets, ScanUsagesIncompleteReason::Cancelled);
+        entries.sort_by_key(ScanUsagesWorkEntry::index);
+        return render_scan_usages_with_budget(entries, query_scope.result_scope(), surface);
+    }
+
     let test_files = excluded_test_files(analyzer, include_tests);
+    if context.cancellation.is_cancelled() {
+        let mut entries =
+            incomplete_requests(symbols, targets, ScanUsagesIncompleteReason::Cancelled);
+        entries.sort_by_key(ScanUsagesWorkEntry::index);
+        return render_scan_usages_with_budget(entries, query_scope.result_scope(), surface);
+    }
+    let reference_only_sibling_extensions =
+        present_reference_only_sibling_extensions_by_language(analyzer);
+    if context.cancellation.is_cancelled() {
+        let mut entries =
+            incomplete_requests(symbols, targets, ScanUsagesIncompleteReason::Cancelled);
+        entries.sort_by_key(ScanUsagesWorkEntry::index);
+        return render_scan_usages_with_budget(entries, query_scope.result_scope(), surface);
+    }
 
     let mut work_entries = Vec::new();
     let mut resolved_targets = Vec::new();
 
     let resolver = WorkspaceFileResolver::new(analyzer.project());
     for request in targets {
+        if context.cancellation.is_cancelled() {
+            work_entries.push(incomplete_work_entry(
+                request,
+                None,
+                ScanUsagesIncompleteReason::Cancelled,
+            ));
+            continue;
+        }
         let target = match &request.input {
             ScanUsagesInput::Target(target) => target.clone(),
             ScanUsagesInput::Symbol(_) => unreachable!("target request has target input"),
         };
-        match resolve_scan_usages_target(analyzer, &resolver, target) {
+        let resolution = {
+            let _scope = profiling::scope("searchtools::scan_usages_target_resolution");
+            resolve_scan_usages_target(analyzer, &resolver, target)
+        };
+        if context.cancellation.is_cancelled() {
+            work_entries.push(incomplete_work_entry(
+                request,
+                None,
+                ScanUsagesIncompleteReason::Cancelled,
+            ));
+            continue;
+        }
+        match resolution {
             ScanUsageTargetResolution::Resolved { symbol, overloads } => {
                 resolved_targets.push(IndexedResolvedScanTarget {
                     request,
@@ -1396,16 +1618,32 @@ pub(super) fn scan_usages_backend(
                 work_entries.push(ScanUsagesWorkEntry::NotFound { request, item });
             }
             ScanUsageTargetResolution::Ambiguous(item) => {
-                work_entries.push(ScanUsagesWorkEntry::Ambiguous { request, item });
+                work_entries.push(ScanUsagesWorkEntry::Ambiguous {
+                    request,
+                    item,
+                    incomplete_reason: None,
+                });
             }
             ScanUsageTargetResolution::Failure(failure) => {
-                work_entries.push(ScanUsagesWorkEntry::Failure { request, failure });
+                work_entries.push(ScanUsagesWorkEntry::Failure {
+                    request,
+                    failure,
+                    incomplete_reason: None,
+                });
             }
         }
     }
 
     for request in symbols {
         let symbol = request.label.clone();
+        if context.cancellation.is_cancelled() {
+            work_entries.push(incomplete_work_entry(
+                request,
+                Some(symbol),
+                ScanUsagesIncompleteReason::Cancelled,
+            ));
+            continue;
+        }
         if symbol.trim().is_empty() {
             work_entries.push(ScanUsagesWorkEntry::NotFound {
                 request,
@@ -1420,7 +1658,19 @@ pub(super) fn scan_usages_backend(
             DefinitionSelector::Name(name) => (None, name),
             DefinitionSelector::FileAnchored { anchor, lookup } => (Some(anchor), lookup),
         };
-        let overloads = match resolve_codeunit_fuzzy(analyzer, lookup) {
+        let resolution = {
+            let _scope = profiling::scope("searchtools::scan_usages_symbol_resolution");
+            resolve_codeunit_fuzzy(analyzer, lookup)
+        };
+        if context.cancellation.is_cancelled() {
+            work_entries.push(incomplete_work_entry(
+                request,
+                Some(symbol),
+                ScanUsagesIncompleteReason::Cancelled,
+            ));
+            continue;
+        }
+        let overloads = match resolution {
             CodeUnitResolution::Resolved(overloads) => overloads,
             CodeUnitResolution::Ambiguous(candidate_targets) => {
                 let groups = distinct_definitions(analyzer, candidate_targets);
@@ -1432,7 +1682,11 @@ pub(super) fn scan_usages_backend(
                     groups,
                     "Ambiguous; re-call scan_usages_by_reference with one symbol from candidate_targets.",
                 );
-                work_entries.push(ScanUsagesWorkEntry::Ambiguous { request, item });
+                work_entries.push(ScanUsagesWorkEntry::Ambiguous {
+                    request,
+                    item,
+                    incomplete_reason: None,
+                });
                 continue;
             }
             CodeUnitResolution::NotFound => {
@@ -1483,7 +1737,11 @@ pub(super) fn scan_usages_backend(
                         groups,
                         "Ambiguous; re-call scan_usages_by_reference with one symbol from candidate_targets.",
                     );
-                    work_entries.push(ScanUsagesWorkEntry::Ambiguous { request, item });
+                    work_entries.push(ScanUsagesWorkEntry::Ambiguous {
+                        request,
+                        item,
+                        incomplete_reason: None,
+                    });
                     continue;
                 }
                 groups.into_iter().flat_map(|(_, units)| units).collect()
@@ -1505,25 +1763,44 @@ pub(super) fn scan_usages_backend(
             overloads,
             location_selected,
         } = resolved;
+        if context.cancellation.is_cancelled() {
+            work_entries.push(incomplete_work_entry(
+                request,
+                Some(symbol),
+                ScanUsagesIncompleteReason::Cancelled,
+            ));
+            continue;
+        }
         let resolved_definition = resolved_usage_definition(analyzer, &overloads);
         let target_is_method = overloads
             .iter()
             .any(|unit| unit.is_function() && display_parent_symbol_for_target(unit).is_some());
-        let finder = scoped_usage_finder(test_files.as_ref(), query_scope.path_filter.as_ref());
+        let finder = scoped_usage_finder(test_files.as_ref(), query_scope.path_filter.as_ref())
+            .with_cancellation(context.cancellation.clone());
         let max_candidate_files = if path_scoped_candidates.is_some() {
-            SCAN_USAGES_PATH_SCOPED_MAX_FILES
+            context.max_path_scoped_candidate_files
         } else {
-            DEFAULT_MAX_FILES
+            context.max_candidate_files
         };
-        let query = finder.query_with_provider(
+        let query = finder.query_with_provider_and_source_budget(
             analyzer,
             &overloads,
             path_scoped_candidates
                 .as_ref()
                 .map(|provider| provider as &dyn CandidateFileProvider),
             max_candidate_files,
-            SCAN_USAGES_MAX_CALLSITES,
+            context.max_callsites,
+            Some(context.max_source_bytes),
         );
+        let incomplete_reason = query_incomplete_reason(query.completion);
+        if incomplete_reason == Some(ScanUsagesIncompleteReason::Cancelled) {
+            work_entries.push(incomplete_work_entry(
+                request,
+                Some(symbol),
+                ScanUsagesIncompleteReason::Cancelled,
+            ));
+            continue;
+        }
         let truncated = query.candidate_files_truncated;
         let candidate_files_sample =
             query
@@ -1574,6 +1851,7 @@ pub(super) fn scan_usages_backend(
                     state,
                     candidate_files_sample,
                     target_is_method,
+                    incomplete_reason,
                 });
             }
             FuzzyResult::Ambiguous {
@@ -1611,6 +1889,7 @@ pub(super) fn scan_usages_backend(
                         state,
                         candidate_files_sample,
                         target_is_method,
+                        incomplete_reason,
                     });
                     continue;
                 }
@@ -1662,7 +1941,11 @@ pub(super) fn scan_usages_backend(
                     definition_sites_excluded: some_if_nonzero(definition_sites_excluded),
                     note: detail_source.note,
                 };
-                work_entries.push(ScanUsagesWorkEntry::Ambiguous { request, item });
+                work_entries.push(ScanUsagesWorkEntry::Ambiguous {
+                    request,
+                    item,
+                    incomplete_reason,
+                });
             }
             FuzzyResult::Failure {
                 fq_name,
@@ -1689,7 +1972,11 @@ pub(super) fn scan_usages_backend(
                     candidate_files_truncated: truncated,
                     candidate_files_sample,
                 };
-                work_entries.push(ScanUsagesWorkEntry::Failure { request, failure });
+                work_entries.push(ScanUsagesWorkEntry::Failure {
+                    request,
+                    failure,
+                    incomplete_reason,
+                });
             }
             FuzzyResult::TooManyCallsites {
                 short_name,
@@ -2531,6 +2818,7 @@ pub(super) fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsa
             state,
             candidate_files_sample,
             target_is_method,
+            incomplete_reason,
         } => {
             let usage = render_symbol_usages(state);
             classify_usage_entry(
@@ -2540,6 +2828,7 @@ pub(super) fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsa
                 false,
                 None,
                 *target_is_method,
+                *incomplete_reason,
             )
         }
         ScanUsagesWorkEntry::TooManyCallsites {
@@ -2558,6 +2847,7 @@ pub(super) fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsa
                 true,
                 Some((short_name.clone(), *total_callsites, *limit)),
                 *target_is_method,
+                Some(ScanUsagesIncompleteReason::Callsites),
             )
         }
         ScanUsagesWorkEntry::NotFound { request, item } => {
@@ -2568,7 +2858,11 @@ pub(super) fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsa
             });
             result
         }
-        ScanUsagesWorkEntry::Ambiguous { request, item } => {
+        ScanUsagesWorkEntry::Ambiguous {
+            request,
+            item,
+            incomplete_reason,
+        } => {
             let mut result = scan_usages_entry_base(request, ScanUsagesStatus::Ambiguous, true);
             result.symbol = Some(item.symbol.clone());
             result.short_name = Some(item.short_name.clone());
@@ -2578,7 +2872,11 @@ pub(super) fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsa
             result.candidate_details_truncated = item.candidate_details_truncated;
             result.candidates = item.candidates.clone();
             result.definition_sites_excluded = item.definition_sites_excluded;
-            result.complete = !item.candidate_files_truncated;
+            result.complete = incomplete_reason.is_none() && !item.candidate_files_truncated;
+            result.incomplete_reason = incomplete_reason.or_else(|| {
+                item.candidate_files_truncated
+                    .then_some(ScanUsagesIncompleteReason::CandidateFiles)
+            });
             result.message = Some(item.note.clone().unwrap_or_else(|| {
                 match request.surface {
                     ScanUsagesSurface::Reference => "Ambiguous; re-call scan_usages_by_reference with one symbol from candidate_targets.".to_string(),
@@ -2587,12 +2885,21 @@ pub(super) fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsa
             }));
             result
         }
-        ScanUsagesWorkEntry::Failure { request, failure } => {
+        ScanUsagesWorkEntry::Failure {
+            request,
+            failure,
+            incomplete_reason,
+        } => {
             let mut result = scan_usages_entry_base(
                 request,
                 ScanUsagesStatus::Failure,
-                !failure.candidate_files_truncated,
+                incomplete_reason.is_none() && !failure.candidate_files_truncated,
             );
+            result.incomplete_reason = incomplete_reason.or_else(|| {
+                failure
+                    .candidate_files_truncated
+                    .then_some(ScanUsagesIncompleteReason::CandidateFiles)
+            });
             result.symbol = Some(failure.symbol.clone());
             result.fq_name = Some(failure.fq_name.clone());
             result.reason_kind = Some(failure.reason_kind.clone());
@@ -2601,6 +2908,28 @@ pub(super) fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsa
                 Some(hint) => format!("{}; {hint}", failure.reason),
                 None => failure.reason.clone(),
             });
+            result
+        }
+        ScanUsagesWorkEntry::Incomplete {
+            request,
+            symbol,
+            reason,
+            message,
+        } => {
+            let mut result = scan_usages_entry_base(request, ScanUsagesStatus::Failure, false);
+            result.symbol.clone_from(symbol);
+            result.incomplete_reason = Some(*reason);
+            result.reason_kind = Some(
+                match reason {
+                    ScanUsagesIncompleteReason::Cancelled => "cancelled",
+                    ScanUsagesIncompleteReason::CandidateFiles => "candidate_files_budget",
+                    ScanUsagesIncompleteReason::SourceBytes => "source_bytes_budget",
+                    ScanUsagesIncompleteReason::Callsites => "callsites_budget",
+                    ScanUsagesIncompleteReason::ResponseBudget => "response_budget",
+                }
+                .to_string(),
+            );
+            result.message = Some(message.clone());
             result
         }
     }
@@ -2613,14 +2942,26 @@ pub(super) fn classify_usage_entry(
     too_many_callsites: bool,
     callsite_cap: Option<(String, usize, usize)>,
     target_is_method: bool,
+    incomplete_reason: Option<ScanUsagesIncompleteReason>,
 ) -> ScanUsagesEntry {
-    let complete =
-        !too_many_callsites && !usage.candidate_files_truncated && usage.files_truncated.is_none();
+    let incomplete_reason = incomplete_reason.or_else(|| {
+        usage
+            .candidate_files_truncated
+            .then_some(ScanUsagesIncompleteReason::CandidateFiles)
+    });
+    let incomplete_reason = incomplete_reason.or_else(|| {
+        usage
+            .files_truncated
+            .is_some()
+            .then_some(ScanUsagesIncompleteReason::ResponseBudget)
+    });
+    let complete = !too_many_callsites && incomplete_reason.is_none();
 
     if too_many_callsites {
         let (short_name, total_callsites, limit) =
             callsite_cap.expect("too_many_callsites entry includes cap details");
         let mut result = scan_usages_entry_base(request, ScanUsagesStatus::TooManyCallsites, false);
+        result.incomplete_reason = Some(ScanUsagesIncompleteReason::Callsites);
         populate_usage_payload(&mut result, usage, target_is_method, &[], request.surface);
         result.short_name = Some(short_name);
         result.total_callsites = Some(total_callsites);
@@ -2656,6 +2997,7 @@ pub(super) fn classify_usage_entry(
     };
 
     let mut result = scan_usages_entry_base(request, status, complete);
+    result.incomplete_reason = incomplete_reason;
     if usage.candidate_files_truncated {
         result.candidate_files_sample = candidate_files_sample;
     }
@@ -2794,6 +3136,7 @@ pub(super) fn scan_usages_entry_base(
         input_kind: request.input_kind,
         status,
         complete,
+        incomplete_reason: None,
         symbol: None,
         short_name: None,
         total_hits: None,

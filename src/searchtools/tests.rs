@@ -1,9 +1,11 @@
 use super::{
     ContainerListingEntry, DefinitionCandidateRenderCache, ScanUsageRequest,
-    ScanUsagesAbsenceCaveat, ScanUsagesCandidateFilesSample, ScanUsagesStatus, ScanUsagesSurface,
-    ScanUsagesWorkEntry, SourceBlock, SummaryElement, SymbolUsageRenderState, UsageFailureInfo,
-    UsageHitKind, UsageHitRow, UsageRendering, classify_scan_usages_entry,
-    definition_candidate_from_range, list_symbols, resolve_file_patterns, trim_summary_signature,
+    ScanUsagesAbsenceCaveat, ScanUsagesByLocationParams, ScanUsagesCandidateFilesSample,
+    ScanUsagesExecutionContext, ScanUsagesIncompleteReason, ScanUsagesStatus, ScanUsagesSurface,
+    ScanUsagesTarget, ScanUsagesWorkEntry, SourceBlock, SummaryElement, SymbolUsageRenderState,
+    UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering, classify_scan_usages_entry,
+    definition_candidate_from_range, list_symbols, resolve_file_patterns,
+    scan_usages_by_location_with_context, trim_summary_signature,
 };
 use super::{function_like_macro_query, route_summary_targets, usage_failure_hint};
 use crate::analyzer::{
@@ -518,6 +520,8 @@ fn usage_work_entry(
             omitted_count: 1,
         }),
         target_is_method: false,
+        incomplete_reason: candidate_files_truncated
+            .then_some(ScanUsagesIncompleteReason::CandidateFiles),
     }
 }
 
@@ -544,6 +548,10 @@ fn scan_usages_classification_matrix_keeps_status_and_completeness_separate() {
     ));
     assert_eq!(ScanUsagesStatus::Found, found_truncated.status);
     assert!(!found_truncated.complete);
+    assert_eq!(
+        Some(ScanUsagesIncompleteReason::CandidateFiles),
+        found_truncated.incomplete_reason
+    );
     assert!(found_truncated.absence_caveats.is_empty());
     assert!(found_truncated.candidate_files_sample.is_some());
 
@@ -611,6 +619,10 @@ fn scan_usages_classification_matrix_keeps_status_and_completeness_separate() {
     ));
     assert_eq!(ScanUsagesStatus::UnverifiedAbsent, truncated_absent.status);
     assert!(!truncated_absent.complete);
+    assert_eq!(
+        Some(ScanUsagesIncompleteReason::CandidateFiles),
+        truncated_absent.incomplete_reason
+    );
     assert!(
         truncated_absent
             .absence_caveats
@@ -708,6 +720,10 @@ fn scan_usages_classifies_callsite_cap_and_graph_failure_rows() {
     });
     assert_eq!(ScanUsagesStatus::TooManyCallsites, too_many.status);
     assert!(!too_many.complete);
+    assert_eq!(
+        Some(ScanUsagesIncompleteReason::Callsites),
+        too_many.incomplete_reason
+    );
     assert_eq!(Some(1001), too_many.total_callsites);
 
     let failure = classify_scan_usages_entry(&ScanUsagesWorkEntry::Failure {
@@ -721,10 +737,61 @@ fn scan_usages_classifies_callsite_cap_and_graph_failure_rows() {
             candidate_files_sample: None,
             hint: None,
         },
+        incomplete_reason: Some(ScanUsagesIncompleteReason::CandidateFiles),
     });
     assert_eq!(ScanUsagesStatus::Failure, failure.status);
     assert!(!failure.complete);
     assert_eq!(Some("no_graph_seed"), failure.reason_kind.as_deref());
+}
+
+#[test]
+fn issue_1228_source_budget_never_reports_verified_absence() {
+    use crate::analyzer::{RustAnalyzer, TestProject};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    ProjectFile::new(root.clone(), "lib.rs")
+        .write("pub fn target() {}\npub fn caller() { target(); }\n")
+        .unwrap();
+    let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
+    let context = ScanUsagesExecutionContext::with_limits(
+        crate::CancellationToken::default(),
+        1_000,
+        10_000,
+        0,
+        1_000,
+    );
+
+    let result = scan_usages_by_location_with_context(
+        &analyzer,
+        ScanUsagesByLocationParams {
+            targets: vec![ScanUsagesTarget {
+                path: "lib.rs".to_string(),
+                line: 1,
+                column: None,
+                symbol: None,
+            }],
+            include_tests: true,
+            paths: None,
+            include_same_owner: true,
+        },
+        &context,
+    );
+
+    assert!(result.summary.partial, "{result:#?}");
+    assert_eq!(result.summary.verified_absent, 0, "{result:#?}");
+    assert_eq!(result.results.len(), 1, "{result:#?}");
+    assert!(!result.results[0].complete, "{result:#?}");
+    assert_eq!(
+        result.results[0].incomplete_reason,
+        Some(ScanUsagesIncompleteReason::SourceBytes),
+        "{result:#?}"
+    );
+    assert_ne!(
+        result.results[0].status,
+        ScanUsagesStatus::VerifiedAbsent,
+        "{result:#?}"
+    );
 }
 
 /// #1100: `excluded_test_files` decides membership from paths alone instead of

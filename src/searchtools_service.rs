@@ -28,8 +28,9 @@ use crate::{
         classify_test_files, get_declarations_by_location, get_definitions_by_location,
         get_definitions_by_reference, get_summaries, get_symbol_ancestors, get_symbol_locations,
         get_symbol_sources, get_type_by_location, list_symbols, most_relevant_files,
-        refresh_result, rename_symbol, scan_usages_by_location, scan_usages_by_reference,
-        search_symbols_with_cancellation, symbol_source_candidate_files, usage_graph,
+        refresh_result, rename_symbol, scan_usages_by_location_with_cancellation,
+        scan_usages_by_reference_with_cancellation, search_symbols_with_cancellation,
+        symbol_source_candidate_files, usage_graph,
     },
     searchtools_render::{RenderOptions, RenderText},
     structured_data::{jq, xml_select, xml_skim},
@@ -797,7 +798,13 @@ impl SearchToolsService {
                     &snapshot,
                     arguments,
                     render_options,
-                    |workspace, params| scan_usages_by_reference(workspace.analyzer(), params),
+                    |workspace, params| {
+                        scan_usages_by_reference_with_cancellation(
+                            workspace.analyzer(),
+                            params,
+                            cancellation.cloned().unwrap_or_default(),
+                        )
+                    },
                 )
             }
             "scan_usages_by_location" => {
@@ -806,7 +813,13 @@ impl SearchToolsService {
                     &snapshot,
                     arguments,
                     render_options,
-                    |workspace, params| scan_usages_by_location(workspace.analyzer(), params),
+                    |workspace, params| {
+                        scan_usages_by_location_with_cancellation(
+                            workspace.analyzer(),
+                            params,
+                            cancellation.cloned().unwrap_or_default(),
+                        )
+                    },
                 )
             }
             "get_definitions_by_location" => {
@@ -3407,6 +3420,76 @@ mod search_symbols_cancellation_tests {
                 .is_some_and(|note| note.contains("cancelled") && note.contains("partial")),
             "{result:#}"
         );
+    }
+
+    fn assert_cancelled_scan_result(
+        result: &Value,
+        expected_input_kind: &str,
+        expected_count: usize,
+    ) {
+        assert_eq!(result["summary"]["partial"], true, "{result:#}");
+        assert_eq!(result["summary"]["verified_absent"], 0, "{result:#}");
+        assert_eq!(result["summary"]["failure"], expected_count, "{result:#}");
+        let entries = result["results"].as_array().expect("scan results array");
+        assert_eq!(entries.len(), expected_count, "{result:#}");
+        for entry in entries {
+            assert_eq!(entry["input_kind"], expected_input_kind);
+            assert_eq!(entry["complete"], false, "{result:#}");
+            assert_eq!(entry["incomplete_reason"], "cancelled", "{result:#}");
+            assert_eq!(entry["reason_kind"], "cancelled", "{result:#}");
+        }
+    }
+
+    #[test]
+    fn issue_1228_service_forwards_cancellation_to_scan_usages_by_reference() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "pub fn target() {}\n").unwrap();
+        let service =
+            SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
+                .unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let result = service
+            .call_tool_output_with_cancellation(
+                "scan_usages_by_reference",
+                json!({
+                    "symbols": ["target", "other"],
+                    "include_tests": true
+                }),
+                RenderOptions::default(),
+                Some(&cancellation),
+            )
+            .unwrap()
+            .into_value();
+
+        assert_cancelled_scan_result(&result, "symbol", 2);
+    }
+
+    #[test]
+    fn issue_1228_service_forwards_cancellation_to_scan_usages_by_location() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "pub fn target() {}\n").unwrap();
+        let service =
+            SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
+                .unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let result = service
+            .call_tool_output_with_cancellation(
+                "scan_usages_by_location",
+                json!({
+                    "targets": [{"path": "lib.rs", "line": 1}],
+                    "include_tests": true
+                }),
+                RenderOptions::default(),
+                Some(&cancellation),
+            )
+            .unwrap()
+            .into_value();
+
+        assert_cancelled_scan_result(&result, "target", 1);
     }
 
     #[test]
