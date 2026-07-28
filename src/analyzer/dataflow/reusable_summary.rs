@@ -14,7 +14,7 @@ use crate::analyzer::semantic::{
 };
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 
-use super::{PathQuality, PathQualityFrontier};
+use super::{PathQuality, PathQualityFrontier, UnmodeledCallBehavior};
 
 pub const SUMMARY_SCHEMA_VERSION: u32 = 1;
 pub const MAX_SUMMARY_TRANSFERS: usize = 65_536;
@@ -75,6 +75,19 @@ define_summary_digest!(
     /// Exceptional, escape, external-call, and unresolved-call behavior.
     SummaryBehaviorKey
 );
+
+impl SummaryBehaviorKey {
+    /// Derive a behavior identity that includes the configured fallback for
+    /// call arms without an executable body or applicable model.
+    pub fn with_unmodeled_call_behavior(self, behavior: UnmodeledCallBehavior) -> Self {
+        let mut bytes = Vec::with_capacity(80);
+        bytes.extend_from_slice(b"bifrost-summary-behavior/unmodeled-call/v1\0");
+        bytes.extend_from_slice(self.as_bytes());
+        bytes.extend_from_slice(behavior.label().as_bytes());
+        Self::hash_bytes(bytes)
+    }
+}
+
 define_summary_digest!(
     /// Stable identity of one summary-visible semantic event.
     SummaryEventKey

@@ -86,7 +86,6 @@ const EXIT_EVENT_POLICY: &str = r#"(policy
           :entries [])
       :uncertainty
         (uncertainty
-          :unknown-call inconclusive
           :escape inconclusive)
       :automaton
         (automaton
@@ -1000,7 +999,7 @@ fn typestate_same_site_endpoint_precedence_retains_only_the_dominant_binding() {
     let subjects = metrics
         .iter()
         .find(|metric| metric["name"] == "typestate.subjects")
-        .expect("typestate subject metric");
+        .unwrap_or_else(|| panic!("missing typestate subject metric: {report:#}"));
     assert_eq!(subjects["value"], 2);
     let initial_seeds = metrics
         .iter()

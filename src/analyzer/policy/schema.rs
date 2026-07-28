@@ -238,7 +238,8 @@ policy_records! {
     FindingCombination { labels: ["finding-combination"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(finding-combination :id ID :source PREDICATE :sink PREDICATE :message TEXT ...)", description: "Override generic presentation for one finite source/sink endpoint combination." }
     SubjectSet { labels: ["subject-set"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(subject-set [:include-matches [...]] [:entries [...]])", description: "Compose the values newly tracked by a typestate policy." }
     Subject { labels: ["subject"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(subject :id ID :selector SELECTOR :subject BINDING)", description: "Declare one policy-local typestate seed and its bound subject." }
-    Uncertainty { labels: ["uncertainty"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(uncertainty :unknown-call inconclusive :escape inconclusive)", description: "Make unknown-call and escape capability gaps explicit." }
+    CallModeling { labels: ["call-modeling"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: "(call-modeling :unmodeled paranoid|optimistic|require-model)", description: "Choose fallback semantics for call arms without an executable body or applicable model." }
+    Uncertainty { labels: ["uncertainty"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(uncertainty :escape inconclusive)", description: "Make escape capability gaps explicit." }
     Automaton { labels: ["automaton"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(automaton :states [...] :initial STATE :accepting-states [...] :error-states [...] :events [...] :transitions [...] [:terminal-expectations [...]])", description: "Define the public typestate states, events, transitions, and terminal obligations." }
     Event { labels: ["event"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(event :id ID (:calls CALLS | :matches MATCH-SET | :on SEMANTIC-EVENT) ...)", description: "Define one direct-call, endpoint, or semantic typestate event." }
     Calls { labels: ["calls"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(calls :selector SELECTOR :subject BINDING :phase PHASE)", description: "Observe a direct call selector using one tracked receiver, return, or argument binding." }
@@ -424,6 +425,7 @@ macro_rules! value_shapes {
                         Some(AtomDomain::CallPort)
                     }
                     Self::TaintMode => Some(AtomDomain::TaintMode),
+                    Self::UnmodeledCallBehavior => Some(AtomDomain::UnmodeledCallBehavior),
                     Self::TrustBoundary => Some(AtomDomain::TrustBoundary),
                     Self::SystemEntry => Some(AtomDomain::SystemEntry),
                     Self::DirectoryScope => Some(AtomDomain::DirectoryScope),
@@ -497,6 +499,7 @@ macro_rules! value_shapes {
                     | Self::Transfers
                     | Self::FindingCombinations
                     | Self::SubjectSet
+                    | Self::CallModelingSpec
                     | Self::UncertaintySpec
                     | Self::AutomatonSpec
                     | Self::CallsTrigger
@@ -594,6 +597,7 @@ macro_rules! value_shapes {
                     Self::Transfers => &[PolicyRecord::Transfer],
                     Self::FindingCombinations => &[PolicyRecord::FindingCombination],
                     Self::SubjectSet => &[PolicyRecord::SubjectSet],
+                    Self::CallModelingSpec => &[PolicyRecord::CallModeling],
                     Self::UncertaintySpec => &[PolicyRecord::Uncertainty],
                     Self::AutomatonSpec => &[PolicyRecord::Automaton],
                     Self::CallsTrigger => &[PolicyRecord::Calls],
@@ -626,6 +630,7 @@ macro_rules! value_shapes {
                     | Self::GeneratedRelation
                     | Self::EndpointRole
                     | Self::TaintMode
+                    | Self::UnmodeledCallBehavior
                     | Self::TrustBoundary
                     | Self::SystemEntry
                     | Self::DirectoryScope
@@ -689,6 +694,7 @@ value_shapes! {
     EndpointSemantics => "source-semantics or sink-semantics matching the endpoint role",
     PolicyPort => "matched-value, receiver, return-value, or an argument record",
     TaintMode => "the may analysis mode",
+    UnmodeledCallBehavior => "paranoid, optimistic, or require-model",
     TaintEndpointSet => "an endpoint-set record",
     MatchEndpointSet => "a match-directory or match-endpoints record",
     CategoryPredicate => "an exact any or all category predicate",
@@ -739,6 +745,7 @@ value_shapes! {
     Transfers => "transfer records",
     FindingCombinations => "finding-combination records",
     SubjectSet => "a subject-set record",
+    CallModelingSpec => "a call-modeling record",
     UncertaintySpec => "an uncertainty record",
     AutomatonSpec => "an automaton record",
     CallsTrigger => "a calls record",
@@ -882,6 +889,7 @@ policy_fields! {
     AnalysisType { record: Analysis, labels: ["type"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: AnalysisType, owner: OwnerApplicability::POLICY_ALL, signature: ":type match|taint|typestate", description: "Select the analysis variant; fields are never inferred from their presence." }
     AnalysisSelector { record: Analysis, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_MATCH, signature: ":selector (rql ...)|(rql-file ...)", description: "Select positive location-bearing match results." }
     AnalysisMode { record: Analysis, labels: ["mode"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintMode, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: ":mode may", description: "Select the schema-version-1 may analysis mode." }
+    AnalysisCallModeling { record: Analysis, labels: ["call-modeling"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: CallModelingSpec, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: ":call-modeling (call-modeling :unmodeled paranoid|optimistic|require-model)", description: "Choose fallback behavior for unmodeled calls; omission defaults to paranoid." }
     AnalysisSources { record: Analysis, labels: ["sources"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintSources, signature: ":sources (endpoint-set ...)", description: "Compose the complete taint source set." }
     AnalysisSinks { record: Analysis, labels: ["sinks"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintSinks, signature: ":sinks (endpoint-set ...)", description: "Compose the complete taint sink set." }
     AnalysisSanitizers { record: Analysis, labels: ["sanitizers"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintSanitizers, signature: ":sanitizers (endpoint-set ...)", description: "Compose optional sanitizer models; omission is empty." }
@@ -889,7 +897,7 @@ policy_fields! {
     AnalysisExternalModels { record: Analysis, labels: ["external-models"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintExternalModels, signature: ":external-models (endpoint-set ...)", description: "Compose optional external transfer models; omission is empty." }
     AnalysisFindingCombinations { record: Analysis, labels: ["finding-combinations"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: FindingCombinations, owner: OwnerApplicability::POLICY_TAINT, signature: ":finding-combinations [(finding-combination ...)...]", description: "Declare bounded explicit presentation/classification precedence rules." }
     AnalysisSubjects { record: Analysis, labels: ["subjects"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: SubjectSet, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":subjects (subject-set ...)", description: "Compose values newly tracked by typestate." }
-    AnalysisUncertainty { record: Analysis, labels: ["uncertainty"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: UncertaintySpec, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":uncertainty (uncertainty ...)", description: "Declare explicit handling for unknown calls and escapes." }
+    AnalysisUncertainty { record: Analysis, labels: ["uncertainty"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: UncertaintySpec, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":uncertainty (uncertainty ...)", description: "Declare explicit handling for subjects that escape the analysis root." }
     AnalysisAutomaton { record: Analysis, labels: ["automaton"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: AutomatonSpec, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":automaton (automaton ...)", description: "Declare the author-facing typestate automaton and terminal obligations." }
 
     RqlSchemaVersion { record: Rql, labels: ["schema-version"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SchemaVersion, owner: OwnerApplicability::BOTH, signature: ":schema-version N", description: "Pin the nested RQL version exactly; omission uses the RQL compatible head." }
@@ -995,7 +1003,7 @@ policy_fields! {
     SubjectId { record: Subject, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":id \"subject-id\"", description: "Set the policy-local subject identity." }
     SubjectSelector { record: Subject, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":selector SELECTOR", description: "Select values that begin typestate tracking." }
     SubjectBinding { record: Subject, labels: ["subject"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TypestateBinding, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":subject BINDING", description: "Bind the newly tracked value." }
-    UncertaintyUnknownCall { record: Uncertainty, labels: ["unknown-call"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: InconclusivePolicy, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":unknown-call inconclusive", description: "Mark unknown calls as analysis-incomplete." }
+    CallModelingUnmodeled { record: CallModeling, labels: ["unmodeled"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: UnmodeledCallBehavior, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: ":unmodeled paranoid|optimistic|require-model", description: "Choose conservative propagation, preserve-only propagation, or abstention when no call model applies." }
     UncertaintyEscape { record: Uncertainty, labels: ["escape"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: InconclusivePolicy, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":escape inconclusive", description: "Mark subjects escaping the analysis root as incomplete." }
     AutomatonStates { record: Automaton, labels: ["states"], placement: FieldPlacement::Keyword, required: Required, multiplicity: NON_EMPTY_SET_256, shape: StateIds, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":states [STATE...]", description: "Declare every typestate state." }
     AutomatonInitial { record: Automaton, labels: ["initial"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: StateId, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":initial STATE", description: "Select the declared initial state." }
@@ -1126,6 +1134,7 @@ pub enum AtomDomain {
     Port,
     CallPort,
     TaintMode,
+    UnmodeledCallBehavior,
     TrustBoundary,
     SystemEntry,
     DirectoryScope,
@@ -1229,6 +1238,9 @@ atom_values! {
     CallPortReceiver { domain: CallPort, spellings: ["receiver"], owner: OwnerApplicability::POLICY_TYPESTATE, description: "Bind the already tracked call receiver." }
     CallPortReturnValue { domain: CallPort, spellings: ["return-value"], owner: OwnerApplicability::POLICY_TYPESTATE, description: "Bind the already tracked normal return value." }
     ModeMay { domain: TaintMode, spellings: ["may"], owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, description: "Report flows or protocol paths that may occur." }
+    UnmodeledCallParanoid { domain: UnmodeledCallBehavior, spellings: ["paranoid"], owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, description: "Conservatively propagate every transfer justified by structured call-site metadata." }
+    UnmodeledCallOptimistic { domain: UnmodeledCallBehavior, spellings: ["optimistic"], owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, description: "Preserve existing facts without adding flows through the unseen body." }
+    UnmodeledCallRequireModel { domain: UnmodeledCallBehavior, spellings: ["require-model"], owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, description: "Abstain from input-dependent transfer when no exact or curated model applies." }
     TrustExternal { domain: TrustBoundary, spellings: ["external"], owner: OwnerApplicability::BOTH, description: "The value crosses an external trust boundary." }
     TrustInternal { domain: TrustBoundary, spellings: ["internal"], owner: OwnerApplicability::BOTH, description: "The value originates inside the system trust boundary." }
     TrustSameZone { domain: TrustBoundary, spellings: ["same-trust-zone"], owner: OwnerApplicability::BOTH, description: "The value remains in the same trust zone." }

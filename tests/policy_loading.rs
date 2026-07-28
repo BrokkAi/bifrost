@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
+use brokk_bifrost::analyzer::dataflow::UnmodeledCallBehavior;
 use brokk_bifrost::analyzer::structural::{CodeQuery, SCHEMA_VERSION as RQL_SCHEMA_VERSION};
 use brokk_bifrost::policy::{
     CatalogRegistryLimits, PolicyCategoryId, PolicyId, PolicyPort, PolicyRegistry,
@@ -729,7 +730,7 @@ fn typestate_reuses_directory_endpoints_without_creating_endpoint_runs() {
               (match-directory :path "endpoints" :scope recursive
                 :categories (all [resource.acquire]))])
             :uncertainty (uncertainty
-              :unknown-call inconclusive :escape inconclusive)
+              :escape inconclusive)
             :automaton (automaton
               :states [open closed violated]
               :initial open
@@ -752,11 +753,34 @@ fn typestate_reuses_directory_endpoints_without_creating_endpoint_runs() {
     let mut registry = registry_for(temp.path());
     let loaded = registry.load_policy_path("policy.rqlp").unwrap();
     let spec = loaded.resolved_typestate().unwrap();
+    assert_eq!(
+        spec.call_modeling.unmodeled,
+        UnmodeledCallBehavior::Paranoid
+    );
     assert_eq!(spec.subjects.len(), 1);
     assert_eq!(spec.endpoint_dependencies.len(), 2);
     assert_eq!(loaded.endpoint_dependencies().len(), 2);
+    let default_hash = loaded.semantic_hash();
     assert_eq!(registry.endpoints().len(), 0);
     assert_eq!(registry.policies().len(), 1);
+
+    let policy_path = temp.path().join("policy.rqlp");
+    let optimistic_source = fs::read_to_string(&policy_path).unwrap().replace(
+        ":mode may",
+        ":mode may\n            :call-modeling (call-modeling :unmodeled optimistic)",
+    );
+    fs::write(&policy_path, optimistic_source).unwrap();
+    let mut optimistic_registry = registry_for(temp.path());
+    let optimistic = optimistic_registry.load_policy_path("policy.rqlp").unwrap();
+    assert_eq!(
+        optimistic
+            .resolved_typestate()
+            .unwrap()
+            .call_modeling
+            .unmodeled,
+        UnmodeledCallBehavior::Optimistic
+    );
+    assert_ne!(default_hash, optimistic.semantic_hash());
 }
 
 #[test]

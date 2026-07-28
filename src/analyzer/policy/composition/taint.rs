@@ -123,6 +123,7 @@ pub(crate) fn compose_taint_policy(
     resolved_catalogs.dedup();
     let resolved_spec = ResolvedTaintPolicySpec::new(
         spec.mode,
+        spec.call_modeling,
         sources.endpoints,
         sinks.endpoints,
         sanitizers,
@@ -872,6 +873,7 @@ mod tests {
 
         let spec = TaintPolicySpec {
             mode: MayMode::May,
+            call_modeling: CallModelingSpec::default(),
             sources: TaintEndpointSet {
                 include_sets: vec![],
                 include_matches: vec![],
@@ -949,6 +951,7 @@ mod tests {
             .unwrap();
         let spec = TaintPolicySpec {
             mode: MayMode::May,
+            call_modeling: CallModelingSpec::default(),
             sources: TaintEndpointSet {
                 include_sets: vec![],
                 include_matches: vec![],
@@ -1015,6 +1018,7 @@ mod tests {
         };
         let base = |combinations| TaintPolicySpec {
             mode: MayMode::May,
+            call_modeling: CallModelingSpec::default(),
             sources: TaintEndpointSet {
                 include_sets: vec![],
                 include_matches: vec![],

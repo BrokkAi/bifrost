@@ -148,6 +148,22 @@ fn call_effect(dependency: SummaryDependencyKey) -> SummaryEffect {
 }
 
 #[test]
+fn summary_behavior_identity_partitions_unmodeled_call_profiles() {
+    let base = SummaryBehaviorKey::hash_bytes(b"analysis-specific-behavior");
+    let paranoid = base.with_unmodeled_call_behavior(UnmodeledCallBehavior::Paranoid);
+    let optimistic = base.with_unmodeled_call_behavior(UnmodeledCallBehavior::Optimistic);
+    let require_model = base.with_unmodeled_call_behavior(UnmodeledCallBehavior::RequireModel);
+
+    assert_eq!(
+        paranoid,
+        base.with_unmodeled_call_behavior(UnmodeledCallBehavior::Paranoid)
+    );
+    assert_ne!(paranoid, optimistic);
+    assert_ne!(paranoid, require_model);
+    assert_ne!(optimistic, require_model);
+}
+
+#[test]
 fn procedure_key_changes_for_every_summary_validity_dimension() {
     let base = key("helper");
     let base_identity = base.identity();

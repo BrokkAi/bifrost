@@ -21,7 +21,9 @@ This is intentionally staged. The control-flow invariant and shared fallback pro
   - [x] (2026-07-28 10:34 SAST) Made every retained call boundary continuation-capable and updated source-backed ICFG contracts for normal, exceptional, mixed known-plus-residual, external, and bodyless calls (`icfg_contract`: 25 passed).
   - [x] (2026-07-28 10:43 SAST) Added the shared paranoid-default profile, syntactic unresolved-call input binding, value-flow/taint behavior, typestate mapping, summary identity, and taint batch partitioning (`value_flow_client`: 10; `taint_client`: 26; `typestate_client`: 40; `dataflow_summaries`: 32 passed).
   - [x] (2026-07-28) Ran fresh-target strict all-feature clippy with the matching rustup `cargo-clippy`/`clippy-driver`; it passed in 3m59s. Checkpointed the milestone after formatting and diff validation.
-- [ ] Milestone 2: expose `:call-modeling (call-modeling :unmodeled ...)` through the declarative RQLP schema, canonical identity, validation, hover, grammar, and policy compilation.
+- [x] Milestone 2: expose `:call-modeling (call-modeling :unmodeled ...)` through the declarative RQLP schema, canonical identity, validation, hover, grammar, and policy compilation.
+  - [x] (2026-07-28 11:07 SAST) Added the declarative record/field/atom vocabulary, paranoid omission default, authored and resolved representations, canonical JSON and semantic hashing, mode-aware reusable-summary behavior identity, and typestate compilation.
+  - [x] (2026-07-28 11:11 SAST) Added behavior-focused parser/default/hover/identity/execution/docs/editor coverage. Policy library (271), CLI (19), docs (8), loading (16), match evaluation (13), reusable summaries (16), and the focused LSP test all pass; fresh-target strict all-feature clippy passed in 3m55s.
 - [ ] Milestone 3: bind exact external reusable summaries and curated policy models to live call sites with explicit precedence and cache invalidation.
 - [ ] Milestone 4: add structured mutable-receiver/argument, bounded heap/global, and operator effects through semantic adapters and the same typed summary pipeline.
 - [ ] Milestone 5: run cross-language acceptance coverage, full formatting/clippy/tests, specialist review, and reconcile the issue checklist with implemented and follow-up scope.
@@ -54,6 +56,12 @@ This is intentionally staged. The control-flow invariant and shared fallback pro
 - Observation: projecting residual arms changed the independent repeated-scan summary oracle as well as production solving. Updating the oracle to replay typed boundary continuations restored four recursion/return differential tests and confirms the change is semantic rather than solver-specific.
   Evidence: `tests/common/dataflow_summary_reference.rs`; all 32 `dataflow_summaries` tests pass.
 
+- Observation: the VS Code extension's dependencies are not installed in this worktree, so its TypeScript grammar test runner cannot start (`tsc: command not found`). The JSON grammar remains valid, and the repository's generic record/field TextMate rules already recognize the new declarative vocabulary; the fixture and scope assertions are checked in for the normal editor CI environment.
+  Evidence: `npm test -- --runInBand rql-policy-grammar.test.ts` under `editors/vscode` stopped before compilation because `node_modules` is absent; `jq empty editors/vscode/syntaxes/bifrost-rql.tmLanguage.json` passes.
+
+- Observation: conservative typestate can reach the authored terminal state and additional violating alternatives at the same site. Existing terminal projection attempted to serialize every reached state as a violation, including the expected state, and therefore failed once paranoid became the default.
+  Evidence: `bifrost_policy_cli::typestate_same_site_endpoint_precedence_retains_only_the_dominant_binding` exposed the forged expected-state violation. Filtering expected states before constructing violation evidence restored all 19 policy CLI tests.
+
 ## Decision Log
 
 - Decision: Separate continuation from transfer semantics. An unmaterialized call arm projects every semantically available normal and exceptional continuation regardless of the client-selected fallback profile.
@@ -84,9 +92,13 @@ This is intentionally staged. The control-flow invariant and shared fallback pro
   Rationale: Repository instructions forbid branch changes and PR creation unless the user asks. The detached worktree was safely fast-forwarded to the live remote before implementation.
   Date/Author: 2026-07-28 / Codex
 
+- Decision: Remove the older public typestate `unknown-call inconclusive` control and retain only the orthogonal escape behavior alongside the shared `call-modeling` record.
+  Rationale: Two public knobs for the same unresolved-call semantics would be contradictory. The new record is shared by taint and typestate, has one paranoid default, and participates in policy and summary identity.
+  Date/Author: 2026-07-28 / Codex
+
 ## Outcomes & Retrospective
 
-Milestone 1 establishes the foundational invariant: residual call arms now reach their normal and exceptional continuations and always retain incomplete boundary evidence. Value-flow and taint can apply one shared paranoid-default profile without requiring resolved formal bindings, while typestate maps the same profile into its existing uncertainty transitions. The profile participates in reusable carrier identity and taint batch compatibility. Focused coverage passes for ICFG (25), value-flow (10), taint (26), typestate (40), and differential summaries (32), and strict all-target/all-feature clippy passes. Public `.rqlp` configuration and exact external-model selection remain deliberately outside this checkpoint.
+Milestones 1 and 2 establish the foundational invariant and public policy surface. Residual call arms now reach their normal and exceptional continuations and always retain incomplete boundary evidence. Value-flow and taint apply one shared paranoid-default profile without requiring resolved formal bindings, while typestate maps the same profile into its existing uncertainty transitions. `.rqlp` can override that profile with a typed `call-modeling` record, and the selected mode participates in canonical policy, semantic, summary, and batch identities. Focused data-flow and policy coverage passes. Exact external-model selection and structured side effects remain the next milestones.
 
 ## Context and Orientation
 
@@ -227,3 +239,5 @@ The ICFG provider must return a continuation-capable boundary for every residual
 The external model resolver introduced in Milestone 3 must consume stable selectors and typed summary ports. It must not depend on source substrings or require a fake workspace `ProcedureHandle`. The same bound-transfer form should be consumable by value-flow, taint, and typestate.
 
 Revision note (2026-07-28): Initial plan created after live issue inspection and source diagnosis. It explicitly splits the immediately repairable call-continuation/profile work from external selector binding, structured side effects, and operator modeling because those capabilities do not yet exist in the semantic IR.
+
+Revision note (2026-07-28): Milestone 2 completed the public RQLP surface and removed the conflicting legacy unknown-call knob. The default change uncovered and fixed terminal typestate reporting for sets containing both expected and violating states.

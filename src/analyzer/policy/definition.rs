@@ -7,6 +7,7 @@
 use std::fmt;
 use std::str::FromStr;
 
+use crate::analyzer::dataflow::UnmodeledCallBehavior;
 use crate::analyzer::identifier::define_identifier;
 use crate::analyzer::semantic::WorkspaceRelativePath;
 use crate::analyzer::structural::CodeQuery;
@@ -221,6 +222,7 @@ pub enum MayMode {
 #[derive(Debug, Clone)]
 pub struct TaintPolicySpec {
     pub mode: MayMode,
+    pub call_modeling: CallModelingSpec,
     pub sources: TaintEndpointSet<TaintSourceSpec>,
     pub sinks: TaintEndpointSet<TaintSinkSpec>,
     pub sanitizers: TaintEndpointSet<TaintSanitizerSpec>,
@@ -406,6 +408,7 @@ pub enum TaintTransferEffect {
 #[derive(Debug, Clone)]
 pub struct TypestatePolicySpec {
     pub mode: MayMode,
+    pub call_modeling: CallModelingSpec,
     pub subjects: TypestateSubjectSet,
     pub uncertainty: TypestateUncertaintySpec,
     pub automaton: TypestateAutomatonSpec,
@@ -435,8 +438,12 @@ pub enum TypestateSeedBinding {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypestateUncertaintySpec {
-    pub unknown_call: InconclusivePolicy,
     pub escape: InconclusivePolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct CallModelingSpec {
+    pub unmodeled: UnmodeledCallBehavior,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
