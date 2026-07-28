@@ -127,6 +127,7 @@ fn is_excluded_reference_candidate(
     match language {
         Language::Go => is_go_declaration_name(node),
         Language::CSharp => is_csharp_tuple_element_name(node),
+        Language::Rust => is_rust_associated_type_declaration_name(node),
         Language::JavaScript | Language::TypeScript => is_js_ts_export_alias(node),
         _ => false,
     }
@@ -157,6 +158,29 @@ fn is_csharp_tuple_element_name(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
         parent.kind() == "tuple_element" && node_is_field(parent, node, "name")
     })
+}
+
+fn is_rust_associated_type_declaration_name(node: Node<'_>) -> bool {
+    let Some(declaration) = node.parent() else {
+        return false;
+    };
+    node_is_field(declaration, node, "name")
+        && match declaration.kind() {
+            "associated_type" => true,
+            "type_item" => rust_type_item_is_associated(declaration),
+            _ => false,
+        }
+}
+
+fn rust_type_item_is_associated(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            "impl_item" | "trait_item" => return true,
+            "function_item" | "mod_item" | "source_file" => return false,
+            _ => node = parent,
+        }
+    }
+    false
 }
 
 fn node_is_field(parent: Node<'_>, node: Node<'_>, field: &str) -> bool {
@@ -389,6 +413,50 @@ func run() {
             assert!(
                 offsets.contains(&reference),
                 "neighboring C# type/reference at byte {reference} must remain in the frontier: {offsets:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_reference_frontier_excludes_associated_type_declaration_name_but_keeps_uses() {
+        let source = r#"trait Service {
+    type Item;
+
+    fn make(&self) -> Self::Item;
+}
+
+impl Service for Worker {
+    type Item = Output;
+
+    fn make(&self) -> Self::Item {
+        todo!()
+    }
+}
+"#;
+        let offsets = reference_candidate_offsets(Language::Rust, "lib.rs", source);
+        let trait_decl = source.find("type Item;").expect("trait associated type");
+        let impl_decl = source.find("type Item =").expect("impl associated type");
+        let trait_use = source
+            .find("Self::Item;")
+            .expect("trait associated type use")
+            + "Self::".len();
+        let impl_use = source
+            .rfind("Self::Item")
+            .expect("impl associated type use")
+            + "Self::".len();
+        let impl_value = source.find("= Output").expect("impl value type") + "= ".len();
+
+        for declaration in [trait_decl + "type ".len(), impl_decl + "type ".len()] {
+            assert!(
+                !offsets.contains(&declaration),
+                "Rust associated type declaration name at byte {declaration} must not enter the reference frontier: {offsets:?}"
+            );
+        }
+
+        for reference in [trait_use, impl_use, impl_value] {
+            assert!(
+                offsets.contains(&reference),
+                "neighboring Rust associated type reference at byte {reference} must remain in the frontier: {offsets:?}"
             );
         }
     }
