@@ -35,6 +35,14 @@ required_vendor_files=(
     vendor/tree-sitter-scala/src/tree_sitter/alloc.h
     vendor/tree-sitter-scala/src/tree_sitter/array.h
     vendor/tree-sitter-scala/src/tree_sitter/parser.h
+    vendor/tree-sitter-kotlin/LICENSE
+    vendor/tree-sitter-kotlin/BIFROST_PROVENANCE.md
+    vendor/tree-sitter-kotlin/grammar.js
+    vendor/tree-sitter-kotlin/src/parser.c
+    vendor/tree-sitter-kotlin/src/scanner.c
+    vendor/tree-sitter-kotlin/src/tree_sitter/alloc.h
+    vendor/tree-sitter-kotlin/src/tree_sitter/array.h
+    vendor/tree-sitter-kotlin/src/tree_sitter/parser.h
 )
 
 for required_file in "${required_vendor_files[@]}"; do

@@ -225,6 +225,12 @@ async function main() {
       "https://github.com/tree-sitter/tree-sitter-scala/tree/a067c39163b62b19e76cea17476f3188da8c9e51",
       "compiled into Bifrost on every release target",
     ),
+    await vendoredLegalFile(
+      "vendor/tree-sitter-kotlin/LICENSE",
+      "Bifrost-pinned tree-sitter-kotlin parser",
+      "https://github.com/fwcd/tree-sitter-kotlin/tree/c8ac3d2627240160b999a2c100de3babbdb8f419",
+      "compiled into Bifrost on every release target",
+    ),
   ];
   await writeFile(outputPath, render(sections), "utf8");
   process.stdout.write(`Wrote supplemental notices to ${outputPath}\n`);
