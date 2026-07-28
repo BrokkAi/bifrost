@@ -44,6 +44,7 @@ jobs:
     name: build (${{ matrix.target }})
     needs: [release-context, notices]
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     permissions:
       contents: read
     strategy:
@@ -183,6 +184,7 @@ jobs:
     name: stage agent plugin package
     needs: [release-context, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
@@ -240,6 +242,7 @@ jobs:
     name: prepublication agent plugin smoke
     needs: [release-context, build, agent-plugin-package]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
@@ -301,6 +304,7 @@ jobs:
     name: release
     needs: [release-context, build, agent-plugin-prepublish-smoke]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: write
     steps:
@@ -331,6 +335,7 @@ jobs:
     name: Pi package
     needs: [release-context, release, publish-agent-plugin]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: write
     steps:
@@ -389,6 +394,7 @@ jobs:
     name: vscode extension
     needs: [release-context, release, publish-agent-plugin]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: write
     steps:
@@ -457,6 +463,7 @@ jobs:
     name: packaged agent plugin smoke
     needs: [release-context, release]
     runs-on: macos-latest
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
@@ -495,6 +502,7 @@ jobs:
     name: publish validated agent plugin
     needs: [release-context, release, agent-plugin-release-smoke]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: write
     steps:
@@ -529,6 +537,7 @@ jobs:
     name: sync generated release metadata
     needs: [release-context, vscode, agent-plugin-release-smoke]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: write
     concurrency:

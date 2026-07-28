@@ -754,6 +754,121 @@ fn policy_help_names_suppression_controls() {
 }
 
 #[test]
+fn proven_subset_callers_are_visible_and_reliable_without_claiming_exhaustiveness() {
+    let source = r#"class Smells {
+    void terminate() { System.exit(1); }
+    void directTerminate() { this.terminate(); }
+    void secondOrderTerminate() { this.directTerminate(); }
+}"#;
+    let policy = |id: &str, completeness: &str| {
+        format!(
+            r#"(policy
+  :id "{id}"
+  :name "Proven callers"
+  :message "Calls System.exit"
+  :severity warning
+  :analysis (analysis :type match :selector
+    (rql (language java
+      (callers :depth 2 :proof proven {completeness}
+        (enclosing-decl
+          (call :receiver (name "System") :callee (name "exit"))))))))"#
+        )
+    };
+    let project = InlineTestProject::new()
+        .file("src/Smells.java", source)
+        .file(
+            "policies/exhaustive.rqlp",
+            policy("test.exhaustive-callers", ""),
+        )
+        .file(
+            "policies/proven-subset.rqlp",
+            policy("test.proven-subset-callers", ":completeness proven-subset"),
+        )
+        .build();
+
+    let exhaustive = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/exhaustive.rqlp",
+            "--format",
+            "json",
+        ],
+    );
+    assert_status(&exhaustive, 2);
+    let exhaustive = json_stdout(&exhaustive);
+    assert_eq!(exhaustive["runs"][0]["completion"]["type"], "inconclusive");
+
+    let subset = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/proven-subset.rqlp",
+            "--format",
+            "json",
+        ],
+    );
+    assert_status(&subset, 1);
+    let subset = json_stdout(&subset);
+    assert_eq!(subset["runs"][0]["completion"]["type"], "proven_subset");
+    assert_eq!(subset["runs"][0]["findings"].as_array().unwrap().len(), 2);
+    assert!(
+        subset["runs"][0]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["impact"] == "declared_non_exhaustive")
+    );
+
+    let human = run(
+        project.root(),
+        &["--policy-file", "policies/proven-subset.rqlp"],
+    );
+    assert_status(&human, 1);
+    let human = String::from_utf8(human.stdout).expect("UTF-8 human report");
+    assert!(
+        human.contains("proven subset (not exhaustive; call_relation_candidates_omitted)"),
+        "{human}"
+    );
+    assert!(human.contains("non-exhaustive"), "{human}");
+
+    let sarif = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/proven-subset.rqlp",
+            "--format",
+            "sarif",
+        ],
+    );
+    assert_status(&sarif, 1);
+    let sarif = json_stdout(&sarif);
+    assert_eq!(
+        sarif["runs"][0]["invocations"][0]["executionSuccessful"],
+        true
+    );
+    assert!(
+        sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|notification| notification["descriptor"]["id"] == "BIFROST_POLICY_PROVEN_SUBSET"),
+        "{sarif:#}"
+    );
+
+    let below_threshold = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/proven-subset.rqlp",
+            "--fail-on",
+            "error",
+        ],
+    );
+    assert_status(&below_threshold, 2);
+}
+
+#[test]
 fn strict_versions_endpoint_roots_and_typestate_execution_have_typed_statuses() {
     let project = policy_project(&[]);
 
@@ -788,7 +903,7 @@ fn strict_versions_endpoint_roots_and_typestate_execution_have_typed_statuses() 
     assert!(
         String::from_utf8_lossy(&accepted_inference.stdout)
             .contains(
-                "policy bifrost.security.inferred-dynamic-eval inferred policy schema 1 and RQL schema 4"
+                "policy bifrost.security.inferred-dynamic-eval inferred policy schema 1 and RQL schema 5"
             )
     );
 

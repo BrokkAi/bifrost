@@ -12,15 +12,15 @@
       :type match
       :selector
         (rql
-          :schema-version 2
+          :schema-version 5
           (union
             (language python
-              (inside (loop) (call :receiver (name "re") :callee (name "compile"))))
+              (inside-decl (loop) (call :receiver (name "re") :callee (name "compile"))))
             (language java
-              (inside (loop) (call :receiver (name "Pattern") :callee (name "compile"))))
+              (inside-decl (loop) (call :receiver (name "Pattern") :callee (name "compile"))))
             (language javascript
-              (inside (loop) (call :callee (name "RegExp"))))
+              (inside-decl (loop) (call :callee (name "RegExp"))))
             (language typescript
-              (inside (loop) (call :callee (name "RegExp"))))
+              (inside-decl (loop) (call :callee (name "RegExp"))))
             (language rust
-              (inside (loop) (call :receiver (name "Regex") :callee (name "new"))))))))
+              (inside-decl (loop) (call :receiver (name "Regex") :callee (name "new"))))))))

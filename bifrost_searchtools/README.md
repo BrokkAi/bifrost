@@ -126,8 +126,10 @@ cannot be proven. Byte offsets remain internal.
 ## `query_code` detail and ranges
 
 `query_code` is a versioned typed query surface. Omit `schema_version` for the
-compatible head, currently v4, or pass `schema_version=2` to pin the pre-CFG
-vocabulary. Pass `schema_version=3` to pin CFG without typestate. Pass exactly
+compatible head, currently v5, or pass `schema_version=2` to pin the pre-CFG
+vocabulary. Pass `schema_version=3` to pin CFG without typestate or
+`schema_version=4` to pin typestate without declaration-bounded containment.
+Pass exactly
 one of `pattern`, `union`,
 `intersect`, or `except_`; set operands are complete query-plan dictionaries
 with compatible terminal domains. A structural `pattern` or composed set can be followed
@@ -145,6 +147,8 @@ points, control edges, typestate findings, typestate witnesses, or files. The CF
 one-hop; they do not provide ICFG, data-flow, or taint analysis. Schema v4 can
 consume a host-registered typestate protocol/binding pair and project its
 already-retained bounded witnesses; the Python call sends only `protocol_ref`.
+Schema v5 adds `inside_decl`, which matches containment only until a nested
+function, method, constructor, or lambda boundary.
 Compact output retains minimal pipeline provenance. Pass `result_detail="full"`
 when follow-up tooling needs deterministic IDs and precise ranges.
 

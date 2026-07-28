@@ -10,8 +10,8 @@ use super::ir::{
 };
 use super::schema::{
     ALL_QUERY_STEP_OPS, CodeQueryExecutionMode, PatternField, QueryField, QueryStepField,
-    StringPredicateField, reference_kind_from_label, rql_schema_version_registry,
-    usage_proof_from_label, usage_surface_from_label,
+    StringPredicateField, call_traversal_completeness_from_label, reference_kind_from_label,
+    rql_schema_version_registry, usage_proof_from_label, usage_surface_from_label,
 };
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{ALL_KINDS, NormalizedKind, Role};
@@ -107,6 +107,7 @@ struct QueryFields<'a> {
     intersect: Option<&'a Value>,
     except: Option<&'a Value>,
     inside: Option<&'a Value>,
+    inside_decl: Option<&'a Value>,
     not_inside: Option<&'a Value>,
     steps: Option<&'a Value>,
     limit: Option<&'a Value>,
@@ -135,6 +136,7 @@ fn collect_query_fields<'a>(
             QueryField::Intersect => fields.intersect = Some(value),
             QueryField::Except => fields.except = Some(value),
             QueryField::Inside => fields.inside = Some(value),
+            QueryField::InsideDecl => fields.inside_decl = Some(value),
             QueryField::NotInside => fields.not_inside = Some(value),
             QueryField::Steps => fields.steps = Some(value),
             QueryField::Limit => fields.limit = Some(value),
@@ -230,6 +232,19 @@ fn decode_plan(
         {
             return Err(QueryError::new(inside_path, "pattern must not be empty"));
         }
+        let inside_decl_path = child_path(path, "inside_decl");
+        let inside_decl = fields
+            .inside_decl
+            .map(|value| decode_pattern(value, &inside_decl_path, budget, 0))
+            .transpose()?;
+        if let Some(pattern) = &inside_decl
+            && pattern.is_empty()
+        {
+            return Err(QueryError::new(
+                inside_decl_path,
+                "pattern must not be empty",
+            ));
+        }
         let not_inside_path = child_path(path, "not_inside");
         let not_inside = fields
             .not_inside
@@ -256,6 +271,7 @@ fn decode_plan(
                 .unwrap_or_default(),
             root: root_pattern,
             inside,
+            inside_decl,
             not_inside,
         }))
     } else {
@@ -263,6 +279,7 @@ fn decode_plan(
             ("where", fields.where_globs),
             ("languages", fields.languages),
             ("inside", fields.inside),
+            ("inside_decl", fields.inside_decl),
             ("not_inside", fields.not_inside),
         ] {
             if value.is_some() {
@@ -485,7 +502,9 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
             match QueryStepField::from_label(key) {
                 Some(QueryStepField::Op) => {}
                 Some(QueryStepField::Depth | QueryStepField::Transitive) if hierarchy => {}
-                Some(QueryStepField::Depth | QueryStepField::Proof) if call => {}
+                Some(
+                    QueryStepField::Depth | QueryStepField::Proof | QueryStepField::Completeness,
+                ) if call => {}
                 Some(QueryStepField::Proof) if call_site => {}
                 Some(
                     QueryStepField::Receiver
@@ -505,6 +524,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::Transitive
                     | QueryStepField::ReferenceKinds
                     | QueryStepField::Proof
+                    | QueryStepField::Completeness
                     | QueryStepField::Surface
                     | QueryStepField::Receiver
                     | QueryStepField::ParameterIndex
@@ -663,7 +683,41 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 .transpose()?
                 .unwrap_or(NonZeroUsize::MIN);
             let proof = decode_optional_proof(object.get("proof"), &entry_path)?;
-            let filter = CallTraversalFilter { depth, proof };
+            let completeness = object
+                .get("completeness")
+                .map(|value| {
+                    let path = child_path(&entry_path, "completeness");
+                    let label = value.as_str().ok_or_else(|| {
+                        QueryError::new(&path, "expected exhaustive or proven_subset")
+                    })?;
+                    call_traversal_completeness_from_label(label).ok_or_else(|| {
+                        QueryError::new(path, "expected exhaustive or proven_subset")
+                    })
+                })
+                .transpose()?
+                .unwrap_or_default();
+            if matches!(
+                completeness,
+                super::schema::CallTraversalCompleteness::ProvenSubset
+            ) {
+                if !matches!(step, QueryStep::Callers(_)) {
+                    return Err(QueryError::new(
+                        child_path(&entry_path, "completeness"),
+                        "proven_subset is currently supported only for callers",
+                    ));
+                }
+                if proof != Some(crate::analyzer::usages::UsageProof::Proven) {
+                    return Err(QueryError::new(
+                        child_path(&entry_path, "completeness"),
+                        "proven_subset requires proof to be proven",
+                    ));
+                }
+            }
+            let filter = CallTraversalFilter {
+                depth,
+                proof,
+                completeness,
+            };
             step = match step {
                 QueryStep::Callers(_) => QueryStep::Callers(filter),
                 QueryStep::Callees(_) => QueryStep::Callees(filter),

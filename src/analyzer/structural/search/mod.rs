@@ -3469,6 +3469,9 @@ fn append_diagnostic_terminations(
     diagnostics: &[CodeQueryDiagnostic],
 ) {
     for diagnostic in diagnostics {
+        if diagnostic.impact == CodeQueryDiagnosticImpact::DeclaredNonExhaustive {
+            continue;
+        }
         let termination = match diagnostic.code {
             // Cancellation ownership is classified from the executor state
             // below. A diagnostic can be emitted or replayed by a parent that

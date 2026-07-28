@@ -1327,6 +1327,10 @@ fn compile_failure(failure: TypestatePolicyCompileFailure) -> TypestateCompilati
         TypestatePolicyCompileError::QueryIncomplete {
             completion: completion @ CodeQueryCompletion::Incomplete { .. },
             ..
+        }
+        | TypestatePolicyCompileError::QueryIncomplete {
+            completion: completion @ CodeQueryCompletion::ProvenSubset { .. },
+            ..
         } => {
             let mut reasons = super::evaluator::incomplete_reasons(&completion, false);
             if reasons.is_empty() {

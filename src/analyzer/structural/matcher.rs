@@ -72,6 +72,11 @@ pub(crate) fn match_query_candidates(
         {
             continue;
         }
+        if let Some(inside_decl) = &query.inside_decl
+            && !eval_declaration_containment(inside_decl, facts, id, &mut captures)
+        {
+            continue;
+        }
         if let Some(not_inside) = &query.not_inside {
             // Verifier-only negation: captures inside a failed positive probe
             // must not leak into the result.
@@ -97,6 +102,32 @@ fn eval_containment(
     while let Some(ancestor) = current {
         if eval_pattern(pattern, facts, ancestor, captures) {
             return true;
+        }
+        current = facts.node(ancestor).parent;
+    }
+    false
+}
+
+/// Does some strict ancestor of `node` match `pattern` before a non-matching
+/// callable declaration boundary? A matching callable ancestor itself remains
+/// visible, so direct contents of a function or lambda can select that owner.
+fn eval_declaration_containment(
+    pattern: &Pattern,
+    facts: &FileFacts,
+    node: u32,
+    captures: &mut Vec<CaptureBinding>,
+) -> bool {
+    let mut current = facts.node(node).parent;
+    while let Some(ancestor) = current {
+        if eval_pattern(pattern, facts, ancestor, captures) {
+            return true;
+        }
+        if facts
+            .node(ancestor)
+            .kind
+            .satisfies(NormalizedKind::Callable)
+        {
+            return false;
         }
         current = facts.node(ancestor).parent;
     }

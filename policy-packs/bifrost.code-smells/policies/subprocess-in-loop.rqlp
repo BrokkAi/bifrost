@@ -12,13 +12,13 @@
       :type match
       :selector
         (rql
-          :schema-version 2
+          :schema-version 5
           (union
             (language python
-              (inside (loop) (call :receiver (name "subprocess") :callee (name "run"))))
+              (inside-decl (loop) (call :receiver (name "subprocess") :callee (name "run"))))
             (language java
-              (inside (loop) (call :receiver (name "runtime") :callee (name "exec"))))
+              (inside-decl (loop) (call :receiver (name "runtime") :callee (name "exec"))))
             (language javascript
-              (inside (loop) (call :receiver (name "child_process") :callee (name "execSync"))))
+              (inside-decl (loop) (call :receiver (name "child_process") :callee (name "execSync"))))
             (language typescript
-              (inside (loop) (call :receiver (name "child_process") :callee (name "execSync"))))))))
+              (inside-decl (loop) (call :receiver (name "child_process") :callee (name "execSync"))))))))

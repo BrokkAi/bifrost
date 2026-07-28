@@ -12,20 +12,20 @@
       :type match
       :selector
         (rql
-          :schema-version 2
+          :schema-version 5
           (union
             (language python
-              (inside (loop) (call :receiver (name "requests") :callee (name "get"))))
+              (inside-decl (loop) (call :receiver (name "requests") :callee (name "get"))))
             (language python
-              (inside (loop) (call :receiver (name "requests") :callee (name "post"))))
+              (inside-decl (loop) (call :receiver (name "requests") :callee (name "post"))))
             (language java
-              (inside (loop) (call :receiver (name "client") :callee (name "send"))))
-            (language javascript (inside (loop) (call :callee (name "fetch"))))
-            (language typescript (inside (loop) (call :callee (name "fetch"))))
+              (inside-decl (loop) (call :receiver (name "client") :callee (name "send"))))
+            (language javascript (inside-decl (loop) (call :callee (name "fetch"))))
+            (language typescript (inside-decl (loop) (call :callee (name "fetch"))))
             (language rust
-              (inside (loop) (call :receiver (name "reqwest") :callee (name "get"))))
+              (inside-decl (loop) (call :receiver (name "reqwest") :callee (name "get"))))
             (language rust
-              (inside
+              (inside-decl
                 (loop)
                 (call
                   :receiver (name "ureq")
