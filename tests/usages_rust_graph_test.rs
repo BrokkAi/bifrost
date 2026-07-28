@@ -3445,6 +3445,53 @@ fn run() {
 }
 
 #[test]
+fn rust_graph_strategy_resolves_structured_scoped_associated_terminals() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
+pub trait Trait {
+    type Handle;
+}
+
+pub struct Owner;
+impl Trait for Owner {
+    type Handle = usize;
+}
+
+pub enum Status {
+    Ready,
+}
+
+pub struct Foo;
+impl Foo {
+    pub const CONST: usize = 1;
+}
+
+fn run(_: Owner::Handle) {
+    let _ = Status::Ready;
+    let _ = Foo::CONST;
+}
+"#,
+    )]);
+
+    let assoc_type_hits = rust_graph_hits(&analyzer, "Trait.Handle");
+    assert_eq!(
+        1,
+        assoc_type_hits.len(),
+        "associated type hits: {assoc_type_hits:?}"
+    );
+    assert!(assoc_type_hits[0].snippet.contains("Owner::Handle"));
+
+    let variant_hits = rust_graph_hits(&analyzer, "Status.Ready");
+    assert_eq!(1, variant_hits.len(), "enum variant hits: {variant_hits:?}");
+    assert!(variant_hits[0].snippet.contains("Status::Ready"));
+
+    let const_hits = rust_graph_hits(&analyzer, "Foo.CONST");
+    assert_eq!(1, const_hits.len(), "associated const hits: {const_hits:?}");
+    assert!(const_hits[0].snippet.contains("Foo::CONST"));
+}
+
+#[test]
 fn rust_graph_strategy_resolves_ufcs_trait_method_through_implementer() {
     let (project, analyzer) = rust_analyzer_with_files(&[
         (

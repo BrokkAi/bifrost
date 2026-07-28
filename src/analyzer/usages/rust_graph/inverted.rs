@@ -25,9 +25,9 @@ use super::extractor::{
     first_generic_type_argument, rust_reference_namespace, type_node_last_segment,
 };
 use super::hits::{rust_path_is_leading_absolute, rust_path_segments};
-use crate::analyzer::rust::RustReferenceNamespace;
 use crate::analyzer::rust::lexical_scope::RustLexicalScopeIndex;
 use crate::analyzer::rust::rust_focused_use_path;
+use crate::analyzer::rust::{RustBindingSeeds, RustReferenceNamespace};
 use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     EdgeCollector, UsageEdgeBuildOutput, UsageReferenceKind, build_edge_output,
@@ -42,7 +42,7 @@ use crate::analyzer::usages::rust_graph::resolver::{
 use crate::analyzer::usages::same_owner::route_same_owner;
 use crate::analyzer::{
     CodeUnit, GlobalUsageDefinitionIndex, IAnalyzer, ProjectFile, RustAnalyzer,
-    RustReferenceContext,
+    RustReferenceContext, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 use std::sync::Arc;
@@ -196,13 +196,23 @@ impl RustScan<'_, '_> {
     /// The callee fqn a `path::name` refers to: a module function via a namespace
     /// import, or an associated function on an imported / same-file type.
     fn scoped_callee(&self, node: Node<'_>, path: &str, name: &str) -> Option<String> {
-        let candidate = match super::resolve_scoped_associated_item(
+        let segments = rust_path_segments(node)?;
+        let namespace = rust_reference_namespace(node);
+        if let Some(candidate) =
+            self.resolve_direct_scoped_candidate(path, name, &segments, namespace)
+        {
+            return Some(candidate);
+        }
+
+        let owner_fqn = self.refs.resolve_scoped_owner(path)?;
+        let candidate = match super::resolve_scoped_associated_item_matching(
             self.rust,
             self.support,
             &self.refs,
             self.file,
             path,
             name,
+            scoped_item_matcher(namespace)?,
             node.start_byte(),
         ) {
             ReceiverAnalysisOutcome::Precise(mut candidates) if candidates.len() == 1 => {
@@ -214,8 +224,44 @@ impl RustScan<'_, '_> {
             | ReceiverAnalysisOutcome::Unsupported { .. }
             | ReceiverAnalysisOutcome::ExceededBudget { .. } => None,
         }?;
-        let segments = rust_path_segments(node)?;
-        self.authorize_nonmember_candidate(candidate, &segments, rust_reference_namespace(node))
+        self.authorize_member_candidate(candidate, &owner_fqn, &segments)
+    }
+
+    fn resolve_direct_scoped_candidate(
+        &self,
+        path: &str,
+        name: &str,
+        segments: &[Node<'_>],
+        namespace: RustReferenceNamespace,
+    ) -> Option<String> {
+        let candidate = self.refs.resolve_scoped(path, name)?.to_string();
+        self.authorize_nonmember_candidate(candidate, segments, namespace)
+    }
+
+    fn authorize_member_candidate(
+        &self,
+        candidate: String,
+        owner_fqn: &str,
+        segments: &[Node<'_>],
+    ) -> Option<String> {
+        let roots: std::collections::BTreeSet<CodeUnit> = self
+            .support
+            .fqn(owner_fqn)
+            .into_iter()
+            .filter(|unit| {
+                self.rust.supports_type_hierarchy(unit)
+                    || self.rust.is_type_alias(unit)
+                    || self.rust.is_rust_trait_declaration(unit)
+            })
+            .collect();
+        if roots.is_empty() {
+            return None;
+        }
+
+        let seeds = self.rust.usage_binding_seeds(&roots);
+        self.exact_ast_owner(segments, &seeds)
+            .is_some()
+            .then_some(candidate)
     }
 
     fn authorize_nonmember_candidate(
@@ -325,6 +371,48 @@ impl RustScan<'_, '_> {
             .then_some(candidate)
     }
 
+    fn exact_ast_owner(&self, segments: &[Node<'_>], seeds: &RustBindingSeeds) -> Option<CodeUnit> {
+        let segment_names = segments
+            .iter()
+            .map(|segment| simple_node_text(*segment, self.source))
+            .collect::<Option<Vec<_>>>()?;
+        let segment_refs = segment_names.iter().map(String::as_str).collect::<Vec<_>>();
+        let root = *segments.first()?;
+        let root_name = segment_names.first()?;
+        let rooted = matches!(root_name.as_str(), "crate" | "self" | "super");
+        let root_shadowed = !rooted
+            && self
+                .lexical_scope
+                .item_bound_at(root_name, root.start_byte())
+            && !self.rust.usage_root_declaration_matches_at(
+                self.file,
+                seeds,
+                root_name,
+                root.start_byte(),
+            )
+            && !self.rust.usage_local_module_prefix_visible_at(
+                self.file,
+                seeds,
+                root_name,
+                root.start_byte(),
+            );
+        let resolution = self.rust.usage_reference_at(
+            self.file,
+            seeds,
+            &segment_refs,
+            segments.last()?.start_byte(),
+            RustReferenceNamespace::Type,
+            root_shadowed,
+            crate::analyzer::usages::rust_graph::hits::rust_path_is_leading_absolute(
+                *segments.last()?,
+            ),
+        );
+        let root = self
+            .rust
+            .usage_exact_root_for_resolution(&resolution, seeds)?;
+        self.rust.canonical_rust_hierarchy_type(root)
+    }
+
     fn use_path_callee(
         &self,
         focused: Node<'_>,
@@ -391,6 +479,27 @@ impl RustScan<'_, '_> {
         self.collector
             .record_unproven_name(name, node.start_byte(), node.end_byte());
     }
+}
+
+fn scoped_item_matcher(namespace: RustReferenceNamespace) -> Option<fn(&CodeUnit) -> bool> {
+    match namespace {
+        RustReferenceNamespace::Value => Some(scoped_value_item_matches),
+        RustReferenceNamespace::Type => Some(scoped_type_item_matches),
+        RustReferenceNamespace::Any => Some(scoped_any_item_matches),
+        RustReferenceNamespace::Macro | RustReferenceNamespace::PathPrefix => None,
+    }
+}
+
+fn scoped_any_item_matches(unit: &CodeUnit) -> bool {
+    unit.is_function() || unit.is_field()
+}
+
+fn scoped_value_item_matches(unit: &CodeUnit) -> bool {
+    unit.is_function() || unit.is_field()
+}
+
+fn scoped_type_item_matches(unit: &CodeUnit) -> bool {
+    unit.is_field()
 }
 
 #[derive(Default)]
