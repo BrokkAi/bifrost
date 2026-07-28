@@ -20947,6 +20947,123 @@ void Parser::run() {
 }
 
 #[test]
+fn cpp_qpid_style_parameter_type_does_not_promote_to_out_of_line_method() {
+    let source = r#"
+namespace proton {
+class source {
+  public:
+    enum distribution_mode { COPY };
+    enum distribution_mode distribution_mode() const;
+};
+
+class source_options {
+  public:
+    source_options& distribution_mode(enum source::distribution_mode);
+};
+
+class other_source_options {
+  public:
+    other_source_options& distribution_mode(int);
+};
+
+source_options& source_options::distribution_mode(enum source::distribution_mode m) {
+    return *this;
+}
+
+int inspect(const source& s) {
+    return s.distribution_mode();
+}
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", source)
+        .build();
+
+    let parameter_qualifier = source
+        .find("enum source::distribution_mode m")
+        .expect("parameter qualifier")
+        + "enum ".len();
+    let parameter_terminal = source
+        .find("source::distribution_mode m")
+        .expect("parameter terminal")
+        + "source::".len();
+    let definition_name = source
+        .find("source_options::distribution_mode(enum")
+        .expect("out-of-line definition name")
+        + "source_options::".len();
+    let owner_qualifier = source
+        .find("source_options::distribution_mode(enum")
+        .expect("out-of-line owner qualifier");
+    let method_call = source.rfind("distribution_mode();").expect("member call");
+
+    let value = lookup_declaration_with_definition_key(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("app.cpp", source, parameter_qualifier),
+                location_query("app.cpp", source, parameter_terminal),
+                location_query("app.cpp", source, owner_qualifier),
+                location_query("app.cpp", source, definition_name),
+                location_query("app.cpp", source, method_call),
+            ]
+        })
+        .to_string(),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+
+    assert_eq!(results[0]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[0]["definitions"]
+            .as_array()
+            .expect("parameter qualifier definitions")
+            .len(),
+        1,
+        "{value}"
+    );
+    assert_eq!(results[0]["definitions"][0]["kind"], "class", "{value}");
+    assert_eq!(
+        results[0]["definitions"][0]["fqn"], "proton.source$distribution_mode",
+        "{value}"
+    );
+
+    assert_eq!(results[1]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[1]["definitions"]
+            .as_array()
+            .expect("parameter terminal definitions")
+            .len(),
+        1,
+        "{value}"
+    );
+    assert_eq!(results[1]["definitions"][0]["kind"], "class", "{value}");
+    assert_eq!(
+        results[1]["definitions"][0]["fqn"], "proton.source$distribution_mode",
+        "{value}"
+    );
+
+    assert_eq!(results[2]["status"], "resolved", "{value}");
+    assert_eq!(results[2]["definitions"][0]["kind"], "class", "{value}");
+    assert_eq!(
+        results[2]["definitions"][0]["fqn"], "proton.source_options",
+        "{value}"
+    );
+
+    assert_eq!(results[3]["status"], "no_declaration", "{value}");
+    assert_eq!(
+        results[3]["diagnostics"][0]["kind"], "declaration_or_import_site",
+        "{value}"
+    );
+
+    assert_eq!(results[4]["status"], "resolved", "{value}");
+    assert_eq!(results[4]["definitions"][0]["kind"], "function", "{value}");
+    assert_eq!(
+        results[4]["definitions"][0]["fqn"], "proton.source.distribution_mode",
+        "{value}"
+    );
+}
+
+#[test]
 fn cpp_out_of_line_method_prefers_lexical_namespace_owner() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

@@ -2014,6 +2014,36 @@ fn cpp_type_node_is_parameter_type(mut node: Node<'_>) -> bool {
     false
 }
 
+fn cpp_type_node_is_declaration_type(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if matches!(
+            parent.kind(),
+            "parameter_declaration"
+                | "optional_parameter_declaration"
+                | "declaration"
+                | "field_declaration"
+                | "function_definition"
+        ) {
+            return parent.child_by_field_name("type").is_some_and(|type_node| {
+                type_node.start_byte() <= node.start_byte()
+                    && node.end_byte() <= type_node.end_byte()
+            });
+        }
+        if matches!(
+            parent.kind(),
+            "compound_statement"
+                | "return_statement"
+                | "expression_statement"
+                | "argument_list"
+                | "initializer_list"
+        ) {
+            return false;
+        }
+        node = parent;
+    }
+    false
+}
+
 fn cpp_type_node_resolves_lexically(
     analyzer: &dyn IAnalyzer,
     visibility: &CppVisibilityIndex,
@@ -2456,6 +2486,7 @@ fn resolve_cpp_type_without_focused_qualifier(
     node: Node<'_>,
     text: &str,
 ) -> DefinitionLookupOutcome {
+    let declaration_type_context = cpp_type_node_is_declaration_type(node);
     if node.kind() == "qualified_identifier"
         && let (Some(scope), Some(name)) = (
             node.child_by_field_name("scope"),
@@ -2503,7 +2534,13 @@ fn resolve_cpp_type_without_focused_qualifier(
                 support,
                 &[owner],
                 cpp_node_text(name, source),
-            );
+            )
+            .into_iter()
+            .filter(|candidate| {
+                !declaration_type_context
+                    || cpp_unit_matches_kind(analyzer, support, candidate, CppTargetKind::Type)
+            })
+            .collect::<Vec<_>>();
             if !candidates.is_empty() {
                 return candidates_outcome(candidates);
             }
@@ -2525,7 +2562,13 @@ fn resolve_cpp_type_without_focused_qualifier(
                     support,
                     std::slice::from_ref(&parameter),
                     member,
-                );
+                )
+                .into_iter()
+                .filter(|candidate| {
+                    !declaration_type_context
+                        || cpp_unit_matches_kind(analyzer, support, candidate, CppTargetKind::Type)
+                })
+                .collect::<Vec<_>>();
                 if !candidates.is_empty() {
                     return candidates_outcome(candidates);
                 }
@@ -4808,10 +4851,17 @@ fn cpp_out_of_line_function_owner(
     root: Node<'_>,
     byte: usize,
 ) -> Option<CodeUnit> {
-    let mut node = smallest_named_node_covering(root, byte, byte)?;
+    let selected = smallest_named_node_covering(root, byte, byte)?;
+    let mut node = selected;
     loop {
         if node.kind() == "function_definition" {
             let declarator = node.child_by_field_name("declarator")?;
+            if declarator.start_byte() <= selected.start_byte()
+                && selected.end_byte() <= declarator.end_byte()
+                && !cpp_declarator_name_path_contains(declarator, selected)
+            {
+                return None;
+            }
             let qualified = cpp_declarator_qualified_name(declarator, source)?;
             // `qualified` is source declarator text (`Namespace::Class::method`);
             // re-tokenizing all `::` boundaries with the shared structured
@@ -5366,6 +5416,26 @@ fn cpp_declarator_name_node(node: Node<'_>) -> Option<Node<'_>> {
             .or_else(|| node.named_child(node.named_child_count().saturating_sub(1)))
             .and_then(cpp_declarator_name_node),
     }
+}
+
+fn cpp_declarator_name_path_contains(declarator: Node<'_>, candidate: Node<'_>) -> bool {
+    let Some(name) = cpp_declarator_name_node(declarator) else {
+        return false;
+    };
+    let mut current = Some(declarator);
+    while let Some(node) = current {
+        if cpp_same_node(node, candidate) {
+            return true;
+        }
+        if cpp_same_node(node, name) {
+            return false;
+        }
+        current = node
+            .child_by_field_name("declarator")
+            .or_else(|| node.child_by_field_name("name"))
+            .or_else(|| node.child_by_field_name("field"));
+    }
+    false
 }
 
 fn cpp_normalize_declared_type_for_visibility(
