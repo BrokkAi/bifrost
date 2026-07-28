@@ -13,8 +13,9 @@ This is deliberately the first extraction, not a new Cargo workspace. The curren
 - [x] (2026-07-28 19:45 SAST) Created branch `dave/separate-code-intelligence-runtime` from `origin/master` and mapped the existing MCP service and LSP request paths.
 - [x] (2026-07-28 20:05 SAST) Created and self-assigned GitHub issue #1260 to track this staged extraction.
 - [x] (2026-07-28 20:10 SAST) Defined `CodeIntelligenceRuntime` and migrated the direct MCP and LSP RQL query/policy execution calls.
-- [ ] Add direct runtime coverage plus MCP and LSP regression coverage, run the policy gate and Rust validation, then perform review.
-- [ ] Commit the finished refactor, push the branch, and open a ready-for-review pull request.
+- [x] (2026-07-28 20:35 SAST) Added direct runtime coverage and passed focused LSP and MCP regressions; passed `cargo fmt` and all-targets/all-features Clippy.
+- [x] (2026-07-28 20:40 SAST) Rebasing onto current `origin/master` completed without conflicts; local pre-PR review found no issues in the changed code.
+- [ ] Commit the completed validation record, push the branch, and open a ready-for-review pull request that fixes #1260.
 
 ## Surprises & Discoveries
 
@@ -23,6 +24,12 @@ This is deliberately the first extraction, not a new Cargo workspace. The curren
 
 - Observation: both hosts already execute the same RQL concepts but call lower-level analyzer/policy functions separately.
   Evidence: `SearchToolsService::query_code_result_for_snapshot` invokes structural execution with a registration lease, while `lsp::server::handle_run_rql_query_request` invokes structural execution directly; analogous policy calls are separate.
+
+- Observation: structural execution returns a mode-aware `CodeQueryResponse`, not always an ordinary result list.
+  Evidence: the direct runtime test must use `response.result()` before asserting structural matches, so explain-mode responses cannot accidentally be treated as results.
+
+- Observation: a policy finding does not produce a nonzero status unless the caller chooses a `PolicyFailOn` threshold.
+  Evidence: the direct runtime test uses `PolicyFailOn::Warning`; the default `Never` threshold intentionally returns status zero even with a warning finding.
 
 ## Decision Log
 
@@ -36,7 +43,11 @@ This is deliberately the first extraction, not a new Cargo workspace. The curren
 
 ## Outcomes & Retrospective
 
-Implementation has not begun. At completion, record the public behavior preserved, the shared API introduced, validation evidence, and the remaining extraction work needed before a multi-crate split.
+The first staged extraction is complete. `CodeIntelligenceRuntime` now owns typed structural-query and RQL-policy execution, including optional cancellation and the MCP typestate registration lease. `SearchToolsService` still owns snapshots, watcher updates, JSON validation, and rendering; the LSP server still owns overlays, worker lifecycle, progress, and LSP response mapping. Both hosts now call the runtime for their shared execution work.
+
+Observable behavior remains covered by the direct runtime integration suite (5 passed), the LSP unsaved-policy integration test (1 passed), and the full MCP integration suite (29 passed). Formatting and `cargo clippy --all-targets --all-features -- -D warnings` pass. The `bifrost-policy-checking` skill was not installed in this environment, so no skill-provided MCP policy gate was available.
+
+The remaining work for #1260 is deliberately future-facing: expand the runtime with more shared code-intelligence operations only when their host-specific orchestration is understood, then extract the proven module into a Cargo package. Do not move LSP overlays or MCP watcher ownership into that package.
 
 ## Context and Orientation
 
@@ -84,6 +95,22 @@ Work from `/Users/dave/.codex/worktrees/5d4b/bifrost`.
        RUSTC=/opt/homebrew/bin/rustc scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
 
 6. Check the finished diff, commit only files changed for this refactor, push `dave/separate-code-intelligence-runtime`, and create a ready-for-review PR.
+
+Completed evidence:
+
+       RUSTC=/opt/homebrew/bin/rustc scripts/with-isolated-cargo-target.sh cargo test --test code_intelligence_runtime --quiet
+       running 5 tests
+       .....
+       test result: ok. 5 passed
+
+       RUSTC=/opt/homebrew/bin/rustc scripts/with-isolated-cargo-target.sh cargo test --test bifrost_lsp_server bifrost_lsp_server_runs_unsaved_rqlp_source_with_workspace_identity --quiet
+       test result: ok. 1 passed
+
+       RUSTC=/opt/homebrew/bin/rustc scripts/with-isolated-cargo-target.sh cargo test --test bifrost_mcp_server --quiet
+       test result: ok. 29 passed
+
+       RUSTC=/opt/homebrew/bin/rustc scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
+       Finished `dev` profile [unoptimized + debuginfo]
 
 ## Validation and Acceptance
 
@@ -139,3 +166,5 @@ If preserving the MCP typestate registration lease requires an additional typed 
 Revision note (2026-07-28): created after source inspection. The plan explicitly limits this PR to a tested internal runtime extraction, so a later Cargo workspace split has an API to move rather than a speculative package boundary.
 
 Revision note (2026-07-28): issue #1260 was created and self-assigned before implementation continued. The first implementation slice routes the existing typed RQL query and policy calls through `CodeIntelligenceRuntime`; validation is still in progress.
+
+Revision note (2026-07-28): validation completed after a clean rebase onto current `origin/master`. The direct runtime, LSP, MCP, formatter, and all-feature Clippy checks passed; the plan records why no Cargo workspace split is included in this slice.
