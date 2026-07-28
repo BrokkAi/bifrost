@@ -449,6 +449,25 @@ comes through the local gate, but is not the focus.
   Durable provenance, per-repository accounting, exact evidence, and residual
   disposition are in
   `.agents/docs/reference-differential/cpp-task-top10-5e17ecf5-summary.md`.
+- [x] (2026-07-28) Merged concurrent `origin/master` head `b60688de` after
+  confirming its CLI and Git-selector changes were disjoint from the final
+  differential repairs. The integrated symbols CLI target passed all 28 tests.
+  The final feature-enabled matrix then exposed two Python usage-graph
+  regressions in the inverted lexical merge. After finding no existing owner,
+  created and assigned `FIRD:` issue #1229 to `jbellis` before editing.
+  Complete indexed top-level function facts now remain authoritative, while
+  nested functions and lambdas continue to merge structural local shadows.
+  Focused Python suites, formatting, all-target/all-feature Clippy, and the
+  complete `cargo test --features nlp,python` matrix pass at niceness 10 with
+  normal Cargo storage. Commit `3235743d` is on `origin/master`, and #1229 is
+  closed.
+- [x] (2026-07-28) Verified the accepted eleven-language set comprises all 110
+  task-selected repository envelopes, every campaign fixing commit is an
+  ancestor of remote `origin/master`, and local HEAD, the remote-tracking ref,
+  and the hosted master agree after publication. Removed 38 GB of disposable
+  corpus reports, logs, ledgers, caches, and exact diagnostics from the exact
+  campaign scratch directory plus the three named Qpid files in `/tmp`; the
+  compact checked-in summaries retain the final provenance and checksums.
 - [x] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [x] Complete C++ and publish its evidence and user summary.
@@ -461,7 +480,7 @@ comes through the local gate, but is not the focus.
 - [x] Complete Rust and publish its evidence and user summary.
 - [x] Complete Scala and publish its evidence and user summary.
 - [x] Complete Python and publish its evidence and user summary.
-- [ ] Prove all 110 accepted envelopes and every fixing head are present on
+- [x] Prove all 110 accepted envelopes and every fixing head are present on
   final `origin/master`, run the final local gate, and remove temporary
   diagnostics while retaining the compact checked-in evidence.
 
@@ -673,12 +692,37 @@ comes through the local gate, but is not the focus.
   test.
   Date/Author: 2026-07-27 / Codex
 
+- Decision: Use complete indexed lexical facts for a Python top-level function,
+  but keep structural recomputation plus inherited-shadow merging for nested
+  functions and lambdas.
+  Rationale: The index is the only layer with the complete factory-return map;
+  recomputing the same top-level function from node-local facts erased precise
+  receiver types. Nested scopes still need their own structural bindings, and
+  lambdas must retain parameter shadowing rather than inheriting module facts
+  unchanged.
+  Date/Author: 2026-07-28 / Codex
+
 ## Outcomes & Retrospective
 
-The top-ten expansion is in progress. The completed historical top-five
-campaign proved the method and remains useful regression evidence, but it does
-not satisfy this plan because current acceptance requires 110 envelopes from
-the live task-selected membership.
+The top-ten expansion is complete. All eleven user-confirmed language
+boundaries cover their ten live `SFT_PREDICATES` task-selected repositories,
+for 110 accepted repository envelopes. C++ closed with 72,177 classified
+sites, 58 exhaustively audited non-actionable raw rows, and no new or
+actionable residual; Python closed with 87,254 sites, 377 previously audited
+non-actionable module/import-collision rows, and no new identity. The durable
+C++, Python, and earlier language evidence records the exact selections,
+immutable heads, accounting, checksums, and residual dispositions.
+
+Every legitimate defect found during the expansion was assigned to `jbellis`
+before implementation, fixed with structured behavior coverage, published
+directly to `origin/master`, and closed. The final integration-only discovery,
+#1229, corrected the Python inverted graph's indexed-versus-structural lexical
+scope boundary and passed the complete feature-enabled local matrix. Final
+local HEAD, local `origin/master`, and hosted master agreed at `3235743d`
+before this closing evidence commit. Disposable campaign storage was removed
+only after compact provenance had been checked in: 38 GB under
+`/mnt/optane/tmp/bifrost-fird/` and three named Qpid scratch reports under
+`/tmp` are gone and cannot be recovered.
 
 ## Context and Orientation
 
