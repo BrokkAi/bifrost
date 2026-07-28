@@ -2474,7 +2474,7 @@ mod uri_tests {
         let (response_sender, response_receiver) = mpsc::sync_channel(2);
         spawn_cancellable_tool_call_with_start_hook(
             Arc::clone(&service),
-            scan_call,
+            *scan_call,
             scan_id.clone(),
             cancellation,
             cancellations.clone(),
@@ -2524,7 +2524,7 @@ mod uri_tests {
             ToolCallPreparation::Ready(call) => call,
             ToolCallPreparation::Reply(reply) => panic!("unexpected source reply: {reply}"),
         };
-        let source_result = execute_prepared_tool_call(service.as_ref(), source_call, None)
+        let source_result = execute_prepared_tool_call(service.as_ref(), *source_call, None)
             .expect("source lookup completes while scan remains held");
         assert_eq!(source_result["isError"], false, "{source_result:#}");
         assert_eq!(
