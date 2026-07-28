@@ -959,3 +959,253 @@ fn issue_1228_navigation_cancellation_reaches_rust_resolution() {
         "{result:#?}"
     );
 }
+
+#[test]
+fn issue_1228_uncancelled_mcp_rust_navigation_matches_direct_semantics() {
+    use crate::analyzer::Language;
+    use crate::test_support::AnalyzerFixture;
+
+    fn query_at(
+        source: &str,
+        path: &str,
+        snippet: &str,
+        focus: &str,
+    ) -> super::DefinitionReferenceQuery {
+        let snippet_start = source
+            .find(snippet)
+            .unwrap_or_else(|| panic!("missing `{snippet}`"));
+        let focus_start = snippet
+            .find(focus)
+            .unwrap_or_else(|| panic!("missing `{focus}` in `{snippet}`"));
+        let byte = snippet_start + focus_start;
+        let line_start = source[..byte].rfind('\n').map_or(0, |newline| newline + 1);
+        super::DefinitionReferenceQuery {
+            path: path.to_string(),
+            line: Some(
+                source[..byte]
+                    .bytes()
+                    .filter(|value| *value == b'\n')
+                    .count()
+                    + 1,
+            ),
+            column: Some(byte - line_start + 1),
+        }
+    }
+
+    let main = r#"
+use crate::api::{helper as aliased_helper, Runner, Service};
+use crate::prelude::*;
+
+macro_rules! local_macro {
+    () => {};
+}
+
+fn same_file() {}
+
+struct Local {
+    field: i32,
+}
+
+impl Local {
+    fn associated() {}
+
+    fn exercise(&self) {
+        Self::associated();
+        let _ = self.field;
+    }
+}
+
+fn caller(service: Service, local: Local) {
+    same_file();
+    aliased_helper();
+    globbed();
+    Service::new();
+    service.run();
+    let _: Service = Service::new();
+    crate::api::helper();
+    let _ = local.field;
+    local_macro!();
+    let shadowed = 1;
+    let _ = shadowed;
+}
+
+type ResultType = <Service as Runner>::Output;
+"#;
+    let fixture = AnalyzerFixture::new_for_language(
+        Language::Rust,
+        &[
+            (
+                "src/lib.rs",
+                "pub mod api;\npub mod prelude;\npub mod main;\n",
+            ),
+            (
+                "src/api.rs",
+                r#"
+pub trait Runner {
+    type Output;
+    fn run(&self);
+}
+
+pub struct Service {
+    pub value: i32,
+}
+
+impl Runner for Service {
+    type Output = i32;
+    fn run(&self) {}
+}
+
+impl Service {
+    pub fn new() -> Self {
+        Self { value: 0 }
+    }
+}
+
+pub fn helper() {}
+"#,
+            ),
+            ("src/prelude.rs", "pub fn globbed() {}\n"),
+            ("src/main.rs", main),
+        ],
+    );
+    let analyzer = fixture.analyzer.analyzer();
+    let references = vec![
+        (
+            "same-file call",
+            query_at(main, "src/main.rs", "same_file();", "same_file"),
+            "resolved",
+            None,
+        ),
+        (
+            "aliased import",
+            query_at(main, "src/main.rs", "aliased_helper();", "aliased_helper"),
+            "resolved",
+            None,
+        ),
+        (
+            "glob import",
+            query_at(main, "src/main.rs", "globbed();", "globbed"),
+            "no_definition",
+            Some("no_indexed_definition"),
+        ),
+        (
+            "scoped constructor",
+            query_at(main, "src/main.rs", "Service::new();", "new"),
+            "resolved",
+            None,
+        ),
+        (
+            "trait receiver method",
+            query_at(main, "src/main.rs", "service.run();", "run"),
+            "resolved",
+            None,
+        ),
+        (
+            "type reference",
+            query_at(
+                main,
+                "src/main.rs",
+                "let _: Service = Service::new();",
+                "Service",
+            ),
+            "resolved",
+            None,
+        ),
+        (
+            "crate scoped call",
+            query_at(main, "src/main.rs", "crate::api::helper();", "helper"),
+            "resolved",
+            None,
+        ),
+        (
+            "field",
+            query_at(main, "src/main.rs", "let _ = local.field;", "field"),
+            "resolved",
+            None,
+        ),
+        (
+            "Self associated call",
+            query_at(main, "src/main.rs", "Self::associated();", "associated"),
+            "resolved",
+            None,
+        ),
+        (
+            "macro",
+            query_at(main, "src/main.rs", "local_macro!();", "local_macro"),
+            "resolved",
+            None,
+        ),
+        (
+            "local binding",
+            query_at(main, "src/main.rs", "let _ = shadowed;", "shadowed"),
+            "no_definition",
+            Some("local_binding"),
+        ),
+        (
+            "associated type",
+            query_at(main, "src/main.rs", "<Service as Runner>::Output", "Output"),
+            "resolved",
+            None,
+        ),
+    ];
+    let params = super::GetDefinitionParams {
+        references: references
+            .iter()
+            .map(|(_, query, _, _)| query.clone())
+            .collect(),
+    };
+    let cancellation = crate::CancellationToken::new();
+
+    let direct_definitions = super::get_definitions_by_location(analyzer, params.clone());
+    let cancellable_definitions = super::get_definitions_by_location_with_cancellation(
+        analyzer,
+        params.clone(),
+        Some(&cancellation),
+    );
+    assert_eq!(
+        serde_json::to_value(&direct_definitions).unwrap(),
+        serde_json::to_value(&cancellable_definitions).unwrap(),
+        "an uncancelled MCP token must not select reduced Rust definition semantics"
+    );
+
+    let direct_declarations = super::get_declarations_by_location(analyzer, params.clone());
+    let cancellable_declarations = super::get_declarations_by_location_with_cancellation(
+        analyzer,
+        params,
+        Some(&cancellation),
+    );
+    assert_eq!(
+        serde_json::to_value(&direct_declarations).unwrap(),
+        serde_json::to_value(&cancellable_declarations).unwrap(),
+        "an uncancelled MCP token must not select reduced Rust declaration semantics"
+    );
+
+    let mut expectation_failures = Vec::new();
+    for ((label, _, expected_status, expected_diagnostic), result) in
+        references.iter().zip(&direct_definitions.results)
+    {
+        if result.status != *expected_status {
+            expectation_failures.push(format!(
+                "{label}: expected status {expected_status}, got {}",
+                result.status
+            ));
+        }
+        if *expected_status == "resolved" && result.definitions.is_empty() {
+            expectation_failures.push(format!("{label}: resolved without a definition"));
+        }
+        if let Some(expected_diagnostic) = expected_diagnostic
+            && !result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == *expected_diagnostic)
+        {
+            expectation_failures.push(format!("{label}: missing diagnostic {expected_diagnostic}"));
+        }
+    }
+    assert!(
+        expectation_failures.is_empty(),
+        "{}\n{direct_definitions:#?}",
+        expectation_failures.join("\n")
+    );
+    assert!(!cancellation.is_cancelled());
+}

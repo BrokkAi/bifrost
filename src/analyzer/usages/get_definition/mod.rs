@@ -980,14 +980,16 @@ fn resolve_one<'a>(
     let resolved = match language {
         Language::Rust => {
             if let Some(cancellation) = cancellation {
-                match rust::resolve_rust_bounded(
+                match rust::resolve_rust_cancellable(
                     analyzer,
                     &request.file,
                     &source,
                     tree.as_ref(),
                     &site,
+                    &mut context.rust_type_cache,
+                    operation,
                     ReceiverAnalysisBudget::default(),
-                    Some(cancellation),
+                    cancellation,
                 ) {
                     resolution_session::BoundedResolution::Complete { value, .. } => value,
                     resolution_session::BoundedResolution::Exceeded { limit, .. } => no_definition(

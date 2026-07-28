@@ -19,6 +19,7 @@ The visible proof has two parts. Deterministic tests will prove cancellation pro
 - [x] (2026-07-28 09:35Z) Milestone 2 complete and checkpointed as `fdb403f3`: every read-only tool call leaves the stdin reader for the existing four-slot bounded worker path, workspace-mutating lifecycle calls remain reader-ordered, query/policy snapshot preparation moved off the reader, lifecycle timing covers queue/execution/response-queue/writer phases, and all 14 MCP transport tests pass.
 - [x] (2026-07-28 11:04Z) Milestone 3 implementation and live campaign complete: the request-ID-aware benchmark client, pinned release-mode interactive manifest, p50/p95 and bounded-incomplete reporting, heavy/light cancellation case, workflow gate, and raw lifecycle profiles are in place; all ten measured scenarios passed the 5,000 ms contract.
 - [x] (2026-07-28 13:12Z) Milestone 4 complete: whole-diff security, correctness/performance, CI, architecture, and duplication reviews were applied; 26 issue-specific unit tests, 25 benchmark contract/runner tests, and the 2,041-test feature-enabled library suite pass; formatting and all-target/all-feature Clippy are clean; and the final 20-sample release gate passes all ten scenarios.
+- [x] (2026-07-28 15:08Z) Milestone 5 complete: cancellable MCP Rust navigation now uses the ordinary full resolver, reference-context construction is cooperative and cache-atomic, expensive context work is syntax-gated, the direct-versus-cancellable definition/declaration parity matrix passes, all navigation and feature-enabled tests pass, and the 20-sample latency gate remains below five seconds.
 
 ## Surprises & Discoveries
 
@@ -75,6 +76,18 @@ The visible proof has two parts. Deterministic tests will prove cancellation pro
 
 - Observation: This host exposed two independent validation-environment boundaries. The default `cargo clippy` lookup mixed rustup Cargo/rustc with Homebrew `cargo-clippy`/`clippy-driver`, producing an incompatible-crate error even though both reported 1.96.0; and the sandbox denied loopback binds used by three stderr-drain tests. Selecting the matching rustup toolchain made Clippy pass, and the full feature-enabled suite passed outside the network sandbox.
   Evidence: The final matched-toolchain isolated Clippy run completed with warnings denied and removed its managed target. The elevated library run completed with 2,035 passed, 0 failed, and 6 ignored.
+
+- Observation: The Milestone 4 latency fix selected `resolve_rust_bounded` whenever navigation carried a cancellation token, while token-free navigation retained `resolve_rust`. The bounded resolver intentionally covers fewer Rust shapes, so the public MCP and direct library surfaces can disagree even when the token is never cancelled.
+  Evidence: `src/analyzer/usages/get_definition/mod.rs::resolve_one` branches on `cancellation`; `src/analyzer/usages/get_definition/rust.rs::resolve_rust_bounded_in_session` handles fields, `self`, type references, and calls, while `resolve_rust_unscoped` additionally handles focused path segments, imports, macros, associated types, lexical shadowing, Cargo routing, and declaration-specific behavior.
+
+- Observation: The full Rust resolver's main cancellation gap is eager reference-context construction, not its declaration queries. `AnalyzerRustDefinitionProvider` already routes bounded declaration lookups through `ResolutionSession`, but `RustAnalyzer::forward_reference_context_of` builds and caches every import, namespace export, glob, and re-export without observing the request token.
+  Evidence: The 20-sample campaign measured `RustAnalyzer::build_reference_context` at 12,170 ms after the external request had timed out. `src/analyzer/rust/graph_support.rs::build_reference_context` has iterative import/export loops and inserts the result only after the full build, providing a natural cooperative checkpoint and no-partial-cache seam.
+
+- Observation: Making the full reference-context builder cooperative was necessary but not sufficient for the latency contract. Eagerly requesting it at the start of the full resolver would turn an ordinary imported bare call into a three-second cancellation instead of the previous correct 60 ms resolution.
+  Evidence: Full-resolver context access is now delayed until a focused use/scoped/token-tree/type shape or the final generic fallback actually needs it. The final release campaign resolves definition-by-location at 63.2 ms p95 while preserving exact direct-versus-cancellable results.
+
+- Observation: The installed Bifrost navigation tool itself can still stall on this large Rust resolver surface.
+  Evidence: A `scan_usages_by_location` request for `forward_reference_context_of` produced no result after more than 44 seconds and was terminated. Shell inspection was used only after that structured query failed; this should be tracked separately as code-intelligence tooling evidence rather than hidden inside issue #1228.
 
 ## Decision Log
 
@@ -138,6 +151,14 @@ The visible proof has two parts. Deterministic tests will prove cancellation pro
   Rationale: Unbounded parallel admission can leave a request with a large cohort of already-running file scans when its deadline expires, while fully serial work misses the product budget. A small batch bounds cancellation lag and retained CPU without serializing the full repository.
   Date/Author: 2026-07-28 / Codex
 
+- Decision: Use the full Rust definition resolver for both token-free and cancellable navigation, retaining the smaller bounded resolver only for internal receiver-query callers that explicitly request its reduced, work-bounded contract.
+  Rationale: Public navigation parity cannot be maintained by independently extending two semantic engines. A session-aware provider already supplies cancellable and limited declaration queries to the full resolver; unifying the public entry point preserves every intentional Rust navigation feature while leaving the separately-scoped receiver-query API intact.
+  Date/Author: 2026-07-28 / Codex
+
+- Decision: Add a cancellation-aware reference-context cache API that publishes only complete contexts, and route full-resolver context access through `RustDefinitionProvider`.
+  Rationale: The analyzer cache should remain shared for completed work, but a cancelled request must neither keep computing blindly nor expose a partially populated import map to later queries. A provider method lets ordinary callers retain the existing cached behavior while the cancellable navigation provider supplies `ResolutionSession::observe_cancellation` as the progress callback.
+  Date/Author: 2026-07-28 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 is implemented. `UsageFinder::QueryResult` now distinguishes complete, cancelled, candidate-file-bounded, and source-byte-bounded queries; cancellation is checked during source admission as well as candidate and graph work. Both public scan surfaces receive the service token and one bounded execution context. Public results retain useful statuses and hits while serializing `complete: false` plus one of `cancelled`, `candidate_files`, `source_bytes`, `callsites`, or `response_budget`. A cancelled scan is an explicit failure rather than an empty success, and bounded zero-hit scans cannot become `verified_absent`.
@@ -150,7 +171,9 @@ The final release campaign passed every case. Warm p50/p95 results in millisecon
 
 Milestone 4 closes the implementation with review-driven hardening: admission-time deadlines, bounded request/response channels, truthful partial-result oracles, cold-Git cancellation, cancellable navigation/source/summary checkpoints, structured dominant-phase reporting, and the Rust navigation/scan interaction found by the 20-sample campaign. The feature-enabled library suite now passes completely on this host when its loopback tests are run outside the network sandbox. The persistent Click/Python and unrelated PHP/C++ daily signals remain follow-up evidence rather than silently widening this issue's implementation scope; no completed Actions run yet contains these local changes, so causation remains unproven.
 
-This section must be updated after each milestone with observed behavior, test counts, benchmark results, residual risks, and any scope moved to a follow-up issue.
+Milestone 5 closes the semantic-parity gap without surrendering the latency result. Both public Rust navigation paths now invoke the same full resolver; the cancellable path supplies a `ResolutionSession` through the provider instead of selecting the reduced receiver-query resolver. Full reference-context construction checks cancellation throughout import/export traversal and publishes only a completed cache entry. Context acquisition is lazy after structured syntax gates, so common imported calls retain the fast exact path. A 12-case fixture compares complete serialized definition and declaration batches between token-free and live-token calls while independently asserting the direct definition outcomes; an interrupted-build regression proves no partial context is cached. The final release campaign remains green, the 651-test cross-language navigation suite passes, and the unrestricted all-feature library suite passes 2,037 tests with 6 intentional ignores. No known intentional Rust navigation feature is removed by this slice.
+
+Residual risk is now bounded and explicit: the public MCP request can still return `cancelled` or `budget_exceeded` when its documented request limits are actually reached, but an uncancelled request within those limits no longer selects different Rust semantics. The installed Bifrost usage-navigation stall observed while inspecting this work remains a separate tooling follow-up.
 
 ## Context and Orientation
 
@@ -220,6 +243,18 @@ Refresh the latest scheduled Benchmark Actions data. Recheck Click/Python `scan_
 
 Complete the plan's evidence and retrospective, perform a post-milestone review of the whole diff, rerun any gate affected by review fixes, and commit that review checkpoint on the current checkout.
 
+### Milestone 5: Rust navigation semantic parity under cancellation
+
+In `src/analyzer/usages/get_definition/rust.rs`, add a cancellable full-resolution entry point that constructs a bounded `ResolutionSession`, a session-aware `AnalyzerRustDefinitionProvider`, and a query-local type cache, then invokes the same `resolve_rust` function used by token-free navigation. Keep `resolve_rust_bounded` for internal receiver-query callers, but stop selecting it from `src/analyzer/usages/get_definition/mod.rs::resolve_one`. The session-aware provider used by full navigation must report ordinary semantics rather than activating the reduced `is_bounded` branches.
+
+In `src/analyzer/usages/rust_graph/resolver.rs`, make reference-context access a provider operation. Its default implementation will preserve the existing `RustAnalyzer::forward_reference_context_of` behavior. The session-aware analyzer provider will instead call a new cooperative API in `src/analyzer/rust/graph_support.rs`. Replace direct full-resolver calls to `forward_reference_context_of` with the provider operation so a cancelled session stops consistently no matter which Rust path, macro, type, field, or trait branch requested the context.
+
+In `src/analyzer/rust/graph_support.rs`, implement cooperative forward reference-context construction. Check progress before and during declaration, binding, namespace-export, glob-export, re-export, and export-graph traversal. Return `None` when progress stops, and insert into `forward_reference_contexts` only after a complete context has been constructed. Existing token-free callers continue through an always-progressing wrapper and observe byte-for-byte equivalent context contents.
+
+Add behavior-focused parity tests. A table-driven Rust fixture must pass the same batch of representative definition and declaration locations through the token-free searchtool functions and through their cancellation-aware siblings with a live, uncancelled token, then compare the complete serialized results. The matrix must include same-file and imported bare calls, aliases, scoped paths, typed receiver methods, fields, `Self`, macros, types, lexical bindings, and declaration-specific associated items; each expected direct result must also be asserted so parity cannot pass vacuously. Keep deterministic cancellation coverage proving that full-resolution work returns a `cancelled` diagnostic, and add a graph-support unit test showing a cancelled context is not cached and a subsequent uncancelled request builds and caches a complete context.
+
+At the milestone boundary, run the focused parity, cancellation, and graph-support tests, `cargo fmt`, all-target/all-feature Clippy, the feature-enabled library suites, and the 20-sample release latency campaign. Update every living section of this plan, review the full Milestone 5 diff, and checkpoint only the milestone files on the current branch.
+
 ## Concrete Steps
 
 All commands run from `/Users/dave/.codex/worktrees/8c634a25-8cac-4fde-9fd1-704a5b4025a8/bifrost`.
@@ -264,6 +299,8 @@ Milestone 2 is accepted when a deterministic transport test holds a heavy scan w
 Milestone 3 is accepted when all benchmark scenarios serialize p50 and p95, the client safely receives responses out of order, the pinned Bifrost target exercises the issue requests plus a resolution-valid scan control, and profiled output separates queue, execution, delivery, and named internal phases. Ordinary CI coverage must contain no five-second debug-build assertion.
 
 The full issue is accepted when the release stable-lane report shows each named warm common request has p95 below 5000 ms or returns an explicitly incomplete bounded response within 5000 ms; a cancelled symbol-qualified scan stops underlying work and does not starve the following source lookup; the benchmark identifies a dominant phase for any miss; all focused tests pass; `cargo fmt` is clean; all-target/all-feature Clippy passes with warnings denied; and the feature-enabled test suites pass or any environment-only linker limitation is reproduced and documented precisely.
+
+Milestone 5 is accepted when an uncancelled token produces exactly the same rendered Rust definition and declaration results as token-free navigation for the representative parity matrix; cancellation interrupts full reference-context work without caching a partial result; the existing cancellation diagnostic remains truthful; the 20-sample definition and fairness scenarios stay below five seconds; and the complete Rust navigation suite, formatting, Clippy, and feature-enabled tests pass.
 
 ## Idempotence and Recovery
 
@@ -354,7 +391,46 @@ Milestone 4 final validation:
     cargo fmt --check
     result: passed
 
-The final implementation must append focused test transcripts, final p50/p95 tables, dominant-phase evidence, and refreshed Actions run links here.
+Milestone 5 semantic-parity validation:
+
+    CARGO_TARGET_DIR=<managed retained target> cargo test --lib issue_1228 --no-default-features -- --nocapture
+    result: 28 passed; 0 failed; 1972 filtered out
+
+    CARGO_TARGET_DIR=<managed retained target> cargo test --test get_definition_test --no-default-features
+    result: 651 passed; 0 failed
+
+    PATH=<matching rustup 1.96.0 toolchain>:<system path> CARGO_TARGET_DIR=<managed retained target> cargo clippy --all-targets --all-features -- -D warnings
+    result: passed with warnings denied
+
+    BIFROST_SEMANTIC_INDEX=off CARGO_TARGET_DIR=<managed retained target> cargo test --features nlp,python --lib
+    result: 2037 passed; 0 failed; 6 ignored (the three local process/pipe tests required the standard unrestricted rerun after the sandbox denied them)
+
+    cargo fmt --check
+    result: passed
+
+Milestone 5 release benchmark:
+
+    scripts/run-interactive-latency.sh --profile
+    result: 10 passed scenarios; 0 failed; all warm p95 values below 5000 ms
+    report: benchmark/interactive-latency-output/run-20260728T145934Z.json (generated artifact, not committed)
+
+    case                                             p50 ms    p95 ms
+    search-common-symbols                              250.6     270.1
+    source-semantic-summary                              2.5      10.0
+    source-search-service                                4.5      10.3
+    source-usage-scan                                    3.8       9.5
+    source-symbol-search                                 4.6       9.7
+    definition-by-location                              54.9      63.2
+    summary-semantic-procedure                          18.1      23.9
+    scan-semantic-procedure-exact                     3339.0    3894.5
+    scan-semantic-procedure-line                      3308.0    3860.8
+    heavy-scan-does-not-block-source                    11.2      17.4
+
+    fairness light-request p95: 17.4 ms
+    fairness cancellation p95: 13.1 ms
+    exact and line scan bounded incomplete iterations: 20 of 20 each
+
+The focused test transcripts, final p50/p95 tables, dominant-phase evidence, and refreshed Actions run evidence are recorded above and below.
 
 Milestone 1 focused validation:
 
@@ -407,6 +483,8 @@ In `src/analyzer/usages/finder.rs`, make `QueryResult` expose a completion value
 
 In `src/benchmark/mcp_session.rs`, expose request-ID-aware send, cancel, and receive operations while retaining `call_tool` as the synchronous convenience wrapper. In `src/benchmark/report.rs`, compute `p50_ms` and `p95_ms` from every non-empty measured sample vector and retain raw durations for auditability.
 
+In `src/analyzer/usages/rust_graph/resolver.rs`, extend `RustDefinitionProvider` with a reference-context operation returning `Option<Arc<RustReferenceContext>>`. The default implementation returns the analyzer's ordinary cached context. `AnalyzerRustDefinitionProvider` overrides it so a session-aware full-navigation request calls the cooperative context builder and returns `None` after cancellation. In `src/analyzer/rust/graph_support.rs`, the cooperative builder accepts a progress callback, returns `None` on interruption, and never inserts an incomplete context into `forward_reference_contexts`.
+
 Plan revision note (2026-07-28 08:32Z): Created the initial self-contained plan after syncing current master, validating the issue and current source seams, probing the live plugin, reviewing recent Benchmark Actions artifacts, and separating deterministic correctness gates from the stable release wall-clock contract.
 
 Plan revision note (2026-07-28 09:21Z): Updated the checkout state to the app-created issue branch at base `45841f1a`; recorded Milestone 1's cancellation, work-budget, incomplete-result, profiling, and regression-test implementation; documented the 64 MiB source budget and focused validation results; and removed stale detached-HEAD recovery guidance.
@@ -420,3 +498,7 @@ Plan revision note (2026-07-28 09:37Z): Recorded Milestone 2 checkpoint `fdb403f
 Plan revision note (2026-07-28 11:35Z): Recorded the completed interactive benchmark implementation, exact/line scan cancellation discoveries, final ten-case release metrics, explicit bounded-incomplete reporting, clean benchmark and Clippy gates, and the July 28 scheduled regression report.
 
 Plan revision note (2026-07-28 13:12Z): Closed Milestone 4 after whole-diff specialist review, a 20-sample campaign exposed and fixed the definition/scan overlap, structured bounded Rust import resolution preserved definition correctness, the final ten-case release gate passed, all focused and feature-enabled tests passed, and matched-toolchain all-feature Clippy completed cleanly.
+
+Plan revision note (2026-07-28 14:06Z): Reopened the issue for Milestone 5 after identifying that the latency fix changed MCP Rust navigation to a reduced resolver. Added the full-resolver cooperative-cancellation design, direct-versus-cancellable definition/declaration parity matrix, no-partial-cache contract, and complete revalidation requirements needed to defend zero intentional semantic regressions.
+
+Plan revision note (2026-07-28 15:08Z): Closed Milestone 5 after routing cancellable MCP Rust navigation through the full resolver, making reference-context construction cooperative and cache-atomic, delaying context work until structured syntax requires it, adding exact definition/declaration parity and no-partial-cache regressions, and passing the complete navigation, Clippy, all-feature, and 20-sample release gates.
