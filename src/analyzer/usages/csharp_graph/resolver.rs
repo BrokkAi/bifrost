@@ -2166,6 +2166,24 @@ fn visible_extension_method_candidates_inner(
     if !usage && compatible_receiver_types.is_empty() {
         return Vec::new();
     }
+    if !usage
+        && !receiver_type_names.iter().any(|receiver| {
+            if let Some(session) = session {
+                !forward_type_declarations_for_fq_name_in_session(csharp, receiver, session)
+                    .is_empty()
+            } else {
+                !forward_type_declarations_for_fq_name(csharp, receiver).is_empty()
+            }
+        })
+    {
+        // Extension syntax loses to an applicable instance member. When the
+        // receiver type is outside the indexed workspace, Bifrost cannot prove
+        // that no such member exists, so a local extension is not a confident
+        // forward definition. Usage mode remains best-effort: direct inverse
+        // queries still retain these sites as unproven rather than dropping
+        // them (#1261).
+        return Vec::new();
+    }
     let scopes = extension_visibility_scopes(csharp, source, site, usage, session);
     let mut named_candidates = Vec::new();
     let named = if usage {

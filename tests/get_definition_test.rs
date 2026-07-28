@@ -17072,13 +17072,12 @@ fn csharp_chained_extension_method_call_resolves_forward() {
     );
 }
 
-// The canonical usagebench `csharp-parity-extension-method-call` shape uses an
-// unindexed BCL receiver: a property and an interface method both produce
-// `string`, then invoke the same `Tag(this string)` extension. Keep the
-// incompatible `Tag(this int)` overload so this proves we retained precise type
-// evidence rather than treating an unindexed receiver as a wildcard.
+// Exact receiver syntax is not enough to prove an extension call when the
+// receiver type itself is outside the indexed workspace: an applicable
+// external instance member would take precedence. Keep both direct and chained
+// receiver shapes, plus the Radarr-style `string.TrimEnd` collision.
 #[test]
-fn csharp_bcl_extension_receivers_resolve_forward() {
+fn csharp_unindexed_receiver_extensions_do_not_overclaim_external_instance_members() {
     let handlers = r#"namespace Example.Parity {
     public interface IHandler {
         string Handle(string name);
@@ -17089,9 +17088,7 @@ fn csharp_bcl_extension_receivers_resolve_forward() {
     }
     public static class StringExtensions {
         public static string Tag(this string value) { return $"tag:{value}"; }
-    }
-    public static class IntExtensions {
-        public static string Tag(this int value) { return value.ToString(); }
+        public static string TrimEnd(this string value, char first, char second) { return value; }
     }
 }
 "#;
@@ -17104,6 +17101,9 @@ fn csharp_bcl_extension_receivers_resolve_forward() {
     public static class ParityConsumer {
         public static string Run(IHandler handler) {
             return handler.Handle("Ada").Tag();
+        }
+        public static string Trim(string value) {
+            return value.TrimEnd('a', 'b');
         }
     }
 }
@@ -17118,22 +17118,24 @@ fn csharp_bcl_extension_receivers_resolve_forward() {
         .find("handler.Handle(\"Ada\").Tag()")
         .expect("chained extension call")
         + "handler.Handle(\"Ada\").".len();
-    for (label, offset) in [("direct", direct), ("chained", chained)] {
+    let trim = consumers
+        .find("value.TrimEnd('a', 'b')")
+        .expect("external instance collision")
+        + "value.".len();
+    for (label, offset) in [("direct", direct), ("chained", chained), ("trim", trim)] {
         let value = lookup(
             project.root(),
             &location_reference("src/Consumers.cs", consumers, offset),
         );
-        let definitions = value["results"][0]["definitions"]
-            .as_array()
-            .expect("resolved result should include definitions");
         assert_eq!(
-            value["results"][0]["status"], "resolved",
+            value["results"][0]["status"], "no_definition",
             "{label}: {value}"
         );
-        assert_eq!(definitions.len(), 1, "{label}: {value}");
-        assert_eq!(
-            definitions[0]["fqn"], "Example.Parity.StringExtensions.Tag",
-            "{label}: {value}"
+        assert!(
+            value["results"][0]["definitions"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "an unindexed receiver must not borrow a workspace extension: {label}: {value}"
         );
     }
 
@@ -17159,9 +17161,11 @@ fn csharp_bcl_extension_receivers_resolve_forward() {
         ("direct reference", &value["results"][0]),
         ("chained reference", &value["results"][1]),
     ] {
-        assert_eq!(result["status"], "resolved", "{label}: {value}");
-        assert_eq!(
-            result["definitions"][0]["fqn"], "Example.Parity.StringExtensions.Tag",
+        assert_eq!(result["status"], "no_definition", "{label}: {value}");
+        assert!(
+            result["definitions"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
             "{label}: {value}"
         );
     }
