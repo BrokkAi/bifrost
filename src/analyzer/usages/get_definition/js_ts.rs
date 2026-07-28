@@ -770,18 +770,10 @@ fn jsts_file_scoped_dotted_candidates(
     reference: &str,
     value_position: bool,
 ) -> Vec<CodeUnit> {
-    let qualifier = reference.split_once('.').map(|(qualifier, _)| qualifier);
     let mut candidates: Vec<_> = support
         .fqn(reference)
         .into_iter()
         .filter(|unit| unit.source() == file)
-        .filter(|unit| {
-            qualifier.is_none_or(|qualifier| {
-                !jsts_js_unbound_assigned_property_candidate_requires_exact_receiver(
-                    analyzer, unit, qualifier,
-                )
-            })
-        })
         .collect();
     if value_position {
         candidates = jsts_value_space_candidates(analyzer, candidates);
@@ -811,13 +803,6 @@ fn jsts_exact_scoped_dotted_candidates(ctx: JstsScopedDottedLookup<'_, '_>) -> V
         .fqn(ctx.reference)
         .into_iter()
         .filter(|unit| unit.source() == ctx.file)
-        .filter(|unit| {
-            !jsts_js_unbound_assigned_property_candidate_requires_exact_receiver(
-                ctx.analyzer,
-                unit,
-                ctx.receiver,
-            )
-        })
         .filter(|unit| {
             ctx.analyzer.ranges(unit).iter().any(|range| {
                 range.start_byte < ctx.before_byte

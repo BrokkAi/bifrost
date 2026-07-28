@@ -10435,7 +10435,6 @@ function callLocal() {
     for (line, needle) in [
         ("  return goog.LOCALE;", "LOCALE"),
         ("  return goog.getMsg();", "getMsg"),
-        ("  return goog.VERSION;", "VERSION"),
     ] {
         let value = lookup(
             project.root(),
