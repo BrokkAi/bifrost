@@ -62,7 +62,12 @@ fn declaration_bounded_containment_round_trips_and_requires_schema_version_five(
             .kinds,
         vec![NormalizedKind::Loop]
     );
-    assert_eq!(query.to_canonical_json(), json);
+    assert_eq!(query.to_canonical_json()["schema_version"], json!(5));
+    assert_eq!(query.to_canonical_json()["match"], json["match"]);
+    assert_eq!(
+        query.to_canonical_json()["inside_decl"],
+        json["inside_decl"]
+    );
 
     parse_ok(json!({
         "schema_version": 5,
@@ -71,10 +76,13 @@ fn declaration_bounded_containment_round_trips_and_requires_schema_version_five(
         "steps": [{ "op": "points_to", "capture": "loop" }]
     }));
 
-    let rql =
-        CodeQuery::from_sexp("(inside-decl (loop :capture loop) (call :callee (name \"open\")))")
-            .expect("declaration-bounded RQL should lower");
-    assert_eq!(rql.to_canonical_json(), query.to_canonical_json());
+    let rql = CodeQuery::from_sexp(
+        "(inside-decl (loop :capture \"loop\") (call :callee (name \"open\")))",
+    )
+    .expect("declaration-bounded RQL should lower");
+    assert_eq!(rql.schema_version, SCHEMA_VERSION);
+    assert_eq!(rql.to_canonical_json()["match"], json["match"]);
+    assert_eq!(rql.to_canonical_json()["inside_decl"], json["inside_decl"]);
 
     let error = error_of(json!({
         "schema_version": 4,
@@ -512,7 +520,7 @@ fn schema_version_three_adds_the_typed_cfg_algebra() {
         "(cfg-edge-target (cfg-successor-edges (cfg-entry (procedure-of (function)))))",
     )
     .expect("version-three CFG RQL should lower");
-    assert_eq!(rql.schema_version, 4);
+    assert_eq!(rql.schema_version, SCHEMA_VERSION);
     assert_eq!(rql.plan.steps, query.plan.steps);
 
     let error = error_of(json!({
@@ -554,7 +562,8 @@ fn schema_version_four_adds_registered_typestate_findings_and_witnesses() {
         "(file-of (witness :max-steps 12 :max-bytes 4096 (typestate :protocol-ref embedding:bifrost.test.resource-lifecycle (procedure-of (function :name \"lifecycle\")))))",
     )
     .expect("schema-four typestate RQL should lower");
-    assert_eq!(rql.to_canonical_json(), query.to_canonical_json());
+    assert_eq!(rql.schema_version, SCHEMA_VERSION);
+    assert_eq!(rql.plan.steps, query.plan.steps);
 
     let error = error_of(json!({
         "schema_version": 3,

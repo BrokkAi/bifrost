@@ -1985,6 +1985,9 @@ fn validate_json_query(
             | QueryField::InsideDecl
             | QueryField::NotInside => {
                 validate_json_pattern(child, &child_path, analysis);
+                if field == QueryField::InsideDecl {
+                    analysis.path(&child_path, key.range());
+                }
                 if field == QueryField::Match && json_pattern_anchors_root(child) == Some(false) {
                     analysis.error(
                         child.range(),
