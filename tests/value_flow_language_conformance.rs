@@ -116,7 +116,22 @@ const CALLS: &[CallSelector<'_>] = &[
     },
 ];
 
-const SINKS: &[CallArgumentSink<'_>] = &[
+const JAVA_SINKS: &[CallArgumentSink<'_>] = &[
+    CallArgumentSink {
+        alias: "flowed",
+        call: "sink_call",
+        argument: 0,
+        outcome: ExpectedSinkOutcome::Reached,
+    },
+    CallArgumentSink {
+        alias: "clean",
+        call: "sink_call",
+        argument: 1,
+        outcome: ExpectedSinkOutcome::NotReached,
+    },
+];
+
+const TYPESCRIPT_SINKS: &[CallArgumentSink<'_>] = &[
     CallArgumentSink {
         alias: "flowed",
         call: "sink_call",
@@ -205,9 +220,13 @@ const EXPECTED_PATH_QUALITIES: &[PathQuality] = &[PathQuality::PROVEN_COMPLETE];
 const EXPECTED_STEP_PROOF: ProofStatus = ProofStatus::Proven;
 const EXPECTED_STEP_COMPLETENESS: EvidenceCompleteness = EvidenceCompleteness::Complete;
 
-fn expected_meetings<'case>(carriers: &'case [CarrierMilestone]) -> [ExpectedMeeting<'case>; 1] {
+fn expected_meetings<'case>(
+    carriers: &'case [CarrierMilestone],
+    meeting_count: usize,
+) -> [ExpectedMeeting<'case>; 1] {
     [ExpectedMeeting {
         sink: "flowed",
+        meeting_count,
         may_status: ValueFlowMayStatus::Proven,
         must_status: ValueFlowMustStatus::NotEstablished,
         uncertain: false,
@@ -225,7 +244,7 @@ fn expected_meetings<'case>(carriers: &'case [CarrierMilestone]) -> [ExpectedMee
 #[test]
 fn java_exact_helper_flow() {
     let expected_carriers = expected_carriers("src/ExactFlowFixture.java");
-    let expected_meetings = expected_meetings(&expected_carriers);
+    let expected_meetings = expected_meetings(&expected_carriers, 1);
     assert_value_flow_conformance(&ValueFlowConformanceCase {
         name: "java",
         language: Language::Java,
@@ -237,10 +256,10 @@ fn java_exact_helper_flow() {
             procedure: "run",
             ordinal: 0,
         },
-        sinks: SINKS,
+        sinks: JAVA_SINKS,
         expected_discovery_status: SemanticInputStatus::Unknown,
         expected_discovery_complete: false,
-        expected_result_complete: false,
+        expected_result_complete: true,
         expected_meetings: &expected_meetings,
     });
 }
@@ -248,7 +267,7 @@ fn java_exact_helper_flow() {
 #[test]
 fn typescript_exact_helper_flow() {
     let expected_carriers = expected_carriers("src/exact_flow.ts");
-    let expected_meetings = expected_meetings(&expected_carriers);
+    let expected_meetings = expected_meetings(&expected_carriers, 6);
     assert_value_flow_conformance(&ValueFlowConformanceCase {
         name: "typescript",
         language: Language::TypeScript,
@@ -260,7 +279,7 @@ fn typescript_exact_helper_flow() {
             procedure: "run",
             ordinal: 0,
         },
-        sinks: SINKS,
+        sinks: TYPESCRIPT_SINKS,
         expected_discovery_status: SemanticInputStatus::Unknown,
         expected_discovery_complete: false,
         expected_result_complete: false,

@@ -357,6 +357,12 @@ fn assert_direct_call_project_conformance(
     });
     let has_unresolved_dynamic_dispatch =
         has_dynamic_dispatch_gap && !expectations.closed_dispatch_refinement;
+    let call_boundary_count = if expectations.unproven_link_unit {
+        2
+    } else {
+        usize::from(has_unresolved_dynamic_dispatch)
+    };
+    let has_call_boundary_continuations = call_boundary_count > 0;
 
     let mut icfg = IcfgGraph::materialize(
         project,
@@ -414,6 +420,17 @@ fn assert_direct_call_project_conformance(
             .outgoing_kind(ControlEdgeKind::Normal),
         root(),
     );
+    if has_call_boundary_continuations {
+        icfg.bind_node(
+            "icfg_exceptional_continuation",
+            fixture.caller_path,
+            PointSelector::new(fixture.call)
+                .procedure(fixture.caller_name)
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+            root(),
+        );
+    }
 
     if has_unresolved_dynamic_dispatch
         || expectations.unproven_link_unit
@@ -430,10 +447,23 @@ fn assert_direct_call_project_conformance(
                 .originating_call("direct_call"),
         );
     }
-    icfg.assert_successors(
-        "icfg_invoke",
-        &[icfg_edge("callee_entry", IcfgEdgeKind::Call).originating_call("direct_call")],
-    );
+    let mut invoke_successors =
+        vec![icfg_edge("callee_entry", IcfgEdgeKind::Call).originating_call("direct_call")];
+    for _ in 0..call_boundary_count {
+        invoke_successors.extend([
+            icfg_edge(
+                "icfg_normal_continuation",
+                IcfgEdgeKind::CallToNormalContinuation,
+            )
+            .originating_call("direct_call"),
+            icfg_edge(
+                "icfg_exceptional_continuation",
+                IcfgEdgeKind::CallToExceptionalContinuation,
+            )
+            .originating_call("direct_call"),
+        ]);
+    }
+    icfg.assert_successors("icfg_invoke", &invoke_successors);
     icfg.assert_predecessors(
         "callee_entry",
         &[icfg_edge("icfg_invoke", IcfgEdgeKind::Call).originating_call("direct_call")],
@@ -448,10 +478,41 @@ fn assert_direct_call_project_conformance(
         // but it does not invalidate proof for a retained exact candidate.
         icfg.assert_edge_proven_complete("callee_normal_exit", return_edge);
     }
+    let mut normal_continuation_predecessors = vec![
+        icfg_edge("callee_normal_exit", IcfgEdgeKind::NormalReturn).originating_call("direct_call"),
+    ];
+    if has_call_boundary_continuations {
+        let normal_boundary = icfg_edge(
+            "icfg_normal_continuation",
+            IcfgEdgeKind::CallToNormalContinuation,
+        )
+        .originating_call("direct_call");
+        let exceptional_boundary = icfg_edge(
+            "icfg_exceptional_continuation",
+            IcfgEdgeKind::CallToExceptionalContinuation,
+        )
+        .originating_call("direct_call");
+        normal_continuation_predecessors.extend((0..call_boundary_count).map(|_| {
+            icfg_edge("icfg_invoke", IcfgEdgeKind::CallToNormalContinuation)
+                .originating_call("direct_call")
+        }));
+        icfg.assert_predecessors(
+            "icfg_exceptional_continuation",
+            &(0..call_boundary_count)
+                .map(|_| {
+                    icfg_edge("icfg_invoke", IcfgEdgeKind::CallToExceptionalContinuation)
+                        .originating_call("direct_call")
+                })
+                .collect::<Vec<_>>(),
+        );
+        if call_boundary_count == 1 {
+            icfg.assert_edge_unproven_partial("icfg_invoke", normal_boundary);
+            icfg.assert_edge_unproven_partial("icfg_invoke", exceptional_boundary);
+        }
+    }
     icfg.assert_predecessors(
         "icfg_normal_continuation",
-        &[icfg_edge("callee_normal_exit", IcfgEdgeKind::NormalReturn)
-            .originating_call("direct_call")],
+        &normal_continuation_predecessors,
     );
     icfg.assert_reachable("icfg_caller_entry", "icfg_normal_continuation");
     icfg.assert_adjacency_symmetric();
@@ -6705,6 +6766,13 @@ def make_deferred():
         &[
             icfg_edge("async_normal", IcfgEdgeKind::CallToNormalContinuation)
                 .originating_call("async_call"),
+            icfg_edge("async_normal", IcfgEdgeKind::CallToNormalContinuation)
+                .originating_call("async_call"),
+            icfg_edge(
+                "async_exceptional",
+                IcfgEdgeKind::CallToExceptionalContinuation,
+            )
+            .originating_call("async_call"),
             icfg_edge(
                 "async_exceptional",
                 IcfgEdgeKind::CallToExceptionalContinuation,
@@ -6715,6 +6783,8 @@ def make_deferred():
     graph.assert_predecessors(
         "async_normal",
         &[
+            icfg_edge("async_invoke", IcfgEdgeKind::CallToNormalContinuation)
+                .originating_call("async_call"),
             icfg_edge("async_invoke", IcfgEdgeKind::CallToNormalContinuation)
                 .originating_call("async_call"),
         ],
@@ -6736,6 +6806,13 @@ def make_deferred():
         &[
             icfg_edge("generator_normal", IcfgEdgeKind::CallToNormalContinuation)
                 .originating_call("generator_call"),
+            icfg_edge("generator_normal", IcfgEdgeKind::CallToNormalContinuation)
+                .originating_call("generator_call"),
+            icfg_edge(
+                "generator_exceptional",
+                IcfgEdgeKind::CallToExceptionalContinuation,
+            )
+            .originating_call("generator_call"),
             icfg_edge(
                 "generator_exceptional",
                 IcfgEdgeKind::CallToExceptionalContinuation,
@@ -6746,6 +6823,8 @@ def make_deferred():
     graph.assert_predecessors(
         "generator_normal",
         &[
+            icfg_edge("generator_invoke", IcfgEdgeKind::CallToNormalContinuation)
+                .originating_call("generator_call"),
             icfg_edge("generator_invoke", IcfgEdgeKind::CallToNormalContinuation)
                 .originating_call("generator_call"),
         ],
@@ -12058,6 +12137,24 @@ fn php_first_class_callable_is_not_invoked_but_dynamic_calls_remain_boundaries()
             .procedure("invocation_forms")
             .effect("invoke"),
         root(),
+    )
+    .bind_node(
+        "icfg_dynamic_normal",
+        "src/InvocationForms.php",
+        PointSelector::new("$dynamic(nested())")
+            .procedure("invocation_forms")
+            .effect("call_continuation")
+            .outgoing_kind(ControlEdgeKind::Normal),
+        root(),
+    )
+    .bind_node(
+        "icfg_dynamic_exceptional",
+        "src/InvocationForms.php",
+        PointSelector::new("$dynamic(nested())")
+            .procedure("invocation_forms")
+            .effect("call_continuation")
+            .outgoing_kind(ControlEdgeKind::Exceptional),
+        root(),
     );
     icfg.assert_outcome(IcfgOutcomeKind::Unknown);
     icfg.assert_boundary(
@@ -12065,7 +12162,21 @@ fn php_first_class_callable_is_not_invoked_but_dynamic_calls_remain_boundaries()
         ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
             .originating_call("dynamic_call"),
     );
-    icfg.assert_successors("icfg_dynamic_invoke", &[]);
+    icfg.assert_successors(
+        "icfg_dynamic_invoke",
+        &[
+            icfg_edge(
+                "icfg_dynamic_normal",
+                IcfgEdgeKind::CallToNormalContinuation,
+            )
+            .originating_call("dynamic_call"),
+            icfg_edge(
+                "icfg_dynamic_exceptional",
+                IcfgEdgeKind::CallToExceptionalContinuation,
+            )
+            .originating_call("dynamic_call"),
+        ],
+    );
     icfg.assert_adjacency_symmetric();
 }
 
@@ -16570,6 +16681,16 @@ fn ruby_same_class_bare_call_uses_the_shared_icfg() {
                 .effect("call_continuation")
                 .outgoing_kind(ControlEdgeKind::Normal),
             root(),
+        )
+        .bind_node(
+            "exceptional_continuation",
+            "ruby/same_class.rb",
+            PointSelector::new("leaf")
+                .occurrence(1)
+                .procedure("root")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+            root(),
         );
 
     graph.assert_outcome(IcfgOutcomeKind::Unproven);
@@ -16580,7 +16701,19 @@ fn ruby_same_class_bare_call_uses_the_shared_icfg() {
     );
     graph.assert_successors(
         "invoke",
-        &[icfg_edge("callee_entry", IcfgEdgeKind::Call).originating_call("bare_call")],
+        &[
+            icfg_edge("callee_entry", IcfgEdgeKind::Call).originating_call("bare_call"),
+            icfg_edge(
+                "normal_continuation",
+                IcfgEdgeKind::CallToNormalContinuation,
+            )
+            .originating_call("bare_call"),
+            icfg_edge(
+                "exceptional_continuation",
+                IcfgEdgeKind::CallToExceptionalContinuation,
+            )
+            .originating_call("bare_call"),
+        ],
     );
     graph.assert_predecessors(
         "callee_entry",
@@ -16593,8 +16726,19 @@ fn ruby_same_class_bare_call_uses_the_shared_icfg() {
     );
     graph.assert_predecessors(
         "normal_continuation",
-        &[icfg_edge("callee_normal_exit", IcfgEdgeKind::NormalReturn)
-            .originating_call("bare_call")],
+        &[
+            icfg_edge("callee_normal_exit", IcfgEdgeKind::NormalReturn)
+                .originating_call("bare_call"),
+            icfg_edge("invoke", IcfgEdgeKind::CallToNormalContinuation)
+                .originating_call("bare_call"),
+        ],
+    );
+    graph.assert_predecessors(
+        "exceptional_continuation",
+        &[
+            icfg_edge("invoke", IcfgEdgeKind::CallToExceptionalContinuation)
+                .originating_call("bare_call"),
+        ],
     );
     graph.assert_reachable("caller_entry", "normal_continuation");
     graph.assert_adjacency_symmetric();
