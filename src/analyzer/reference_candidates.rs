@@ -125,7 +125,7 @@ fn is_excluded_reference_candidate(
     }
 
     match language {
-        Language::Go => is_go_field_or_type_declaration_name(node),
+        Language::Go => is_go_declaration_name(node),
         Language::CSharp => is_csharp_tuple_element_name(node),
         Language::JavaScript | Language::TypeScript => is_js_ts_export_alias(node),
         _ => false,
@@ -142,12 +142,14 @@ fn is_js_ts_export_alias(node: Node<'_>) -> bool {
             .is_some_and(|alias| alias == node)
 }
 
-fn is_go_field_or_type_declaration_name(node: Node<'_>) -> bool {
+fn is_go_declaration_name(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
-        matches!(
+        (matches!(
             parent.kind(),
-            "field_declaration" | "type_alias" | "type_spec"
-        ) && node_is_field(parent, node, "name")
+            "field_declaration" | "type_alias" | "type_spec" | "import_spec" | "package_clause"
+        ) && node_is_field(parent, node, "name"))
+            || (parent.kind() == "package_clause"
+                && matches!(node.kind(), "identifier" | "package_identifier"))
     })
 }
 
@@ -321,6 +323,44 @@ func use(repository Repository) Alias {
             assert!(
                 offsets.contains(&reference),
                 "neighboring Go type/reference at byte {reference} must remain in the frontier: {offsets:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_reference_frontier_excludes_package_and_import_declaration_names() {
+        let source = r#"package main
+
+import alias "example.com/app/sub"
+import _ "example.com/app/sidefx"
+import . "example.com/app/dot"
+
+func run() {
+    alias.Helper()
+    Helper()
+}
+"#;
+        let offsets = reference_candidate_offsets(Language::Go, "main.go", source);
+        let package_name = source.find("main").expect("package name");
+        let alias_name = source.find("alias").expect("import alias");
+        let blank_name = source.find("_ ").expect("blank import alias");
+        let dot_name = source.find(". \"").expect("dot import alias");
+
+        for declaration in [package_name, alias_name, blank_name, dot_name] {
+            assert!(
+                !offsets.contains(&declaration),
+                "Go declaration name at byte {declaration} must not enter the reference frontier: {offsets:?}"
+            );
+        }
+
+        let references = [
+            source.rfind("alias").expect("alias qualifier in call"),
+            source.rfind("Helper()").expect("dot-imported helper call"),
+        ];
+        for reference in references {
+            assert!(
+                offsets.contains(&reference),
+                "Go reference at byte {reference} must remain in the frontier: {offsets:?}"
             );
         }
     }
