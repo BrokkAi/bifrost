@@ -7158,6 +7158,52 @@ impl Provider {
 }
 
 #[test]
+fn rust_self_field_receiver_focus_reports_local_receiver_instead_of_owner_or_field_type() {
+    let source = r#"
+pub struct Model;
+
+pub struct Provider {
+    model: Model,
+}
+
+impl Provider {
+    fn run(&self) {
+        let _ = &self.model;
+        let _receiver = self;
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", source)
+        .build();
+
+    let start = source.find("self.model").expect("self field receiver");
+    let value = lookup(project.root(), &location_reference("lib.rs", source, start));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "local_receiver",
+        "{value}"
+    );
+
+    let standalone = source.rfind("self;").expect("standalone self reference");
+    let standalone_value = lookup(
+        project.root(),
+        &location_reference("lib.rs", source, standalone),
+    );
+    let standalone_result = &standalone_value["results"][0];
+    assert_eq!(
+        standalone_result["status"], "resolved",
+        "{standalone_value}"
+    );
+    assert_eq!(
+        standalone_result["definitions"][0]["kind"], "receiver_parameter",
+        "{standalone_value}"
+    );
+}
+
+#[test]
 fn go_selector_chain_resolves_promoted_embedded_fields_and_range_elements() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.com/app\n\ngo 1.22\n")
@@ -8046,6 +8092,143 @@ fn consume() {
         assert_eq!(result["status"], "resolved", "{value}");
         assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
     }
+}
+
+#[test]
+fn rust_scoped_type_path_prefers_exact_module_owner_and_terminal_type() {
+    let source = r#"
+mod http {
+    pub struct Version;
+}
+
+const http: () = ();
+
+fn run(_: http::Version) {}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    let owner = source.find("http::Version").expect("scoped owner");
+    let terminal = owner + "http::".len();
+
+    let owner_value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, owner),
+    );
+    let owner_result = &owner_value["results"][0];
+    assert_eq!(owner_result["status"], "resolved", "{owner_value}");
+    assert_eq!(
+        owner_result["definitions"][0]["fqn"], "http",
+        "{owner_value}"
+    );
+
+    let terminal_value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, terminal),
+    );
+    let terminal_result = &terminal_value["results"][0];
+    assert_eq!(terminal_result["status"], "resolved", "{terminal_value}");
+    assert_eq!(
+        terminal_result["definitions"][0]["fqn"], "http.Version",
+        "{terminal_value}"
+    );
+}
+
+#[test]
+fn rust_scoped_path_distinguishes_module_owner_from_terminal_type_alias() {
+    let source = r#"
+mod error {
+    pub type ApiResult = ();
+}
+
+const error: () = ();
+
+fn run(_: error::ApiResult) {}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    let owner = source
+        .find("error::ApiResult")
+        .expect("scoped module owner");
+    let terminal = owner + "error::".len();
+
+    let owner_value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, owner),
+    );
+    let owner_result = &owner_value["results"][0];
+    assert_eq!(owner_result["status"], "resolved", "{owner_value}");
+    assert_eq!(
+        owner_result["definitions"][0]["fqn"], "error",
+        "{owner_value}"
+    );
+
+    let terminal_value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, terminal),
+    );
+    let terminal_result = &terminal_value["results"][0];
+    assert_eq!(terminal_result["status"], "resolved", "{terminal_value}");
+    assert_eq!(
+        terminal_result["definitions"][0]["fqn"], "error.ApiResult",
+        "{terminal_value}"
+    );
+}
+
+#[test]
+fn rust_scoped_path_owner_prefers_type_namespace_over_imported_enum_variant() {
+    let source = r#"
+enum Token {
+    PTR,
+}
+
+use Token::PTR;
+
+pub struct PTR;
+
+impl PTR {
+    pub fn read() {}
+}
+
+fn run() {
+    PTR::read();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    let owner = source.find("PTR::read").expect("scoped type owner");
+    let terminal = owner + "PTR::".len();
+
+    let owner_value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, owner),
+    );
+    let owner_result = &owner_value["results"][0];
+    assert_eq!(owner_result["status"], "resolved", "{owner_value}");
+    assert_eq!(
+        owner_result["definitions"][0]["fqn"], "PTR",
+        "{owner_value}"
+    );
+    assert_eq!(
+        owner_result["definitions"][0]["kind"], "class",
+        "{owner_value}"
+    );
+
+    let terminal_value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, terminal),
+    );
+    let terminal_result = &terminal_value["results"][0];
+    assert_eq!(terminal_result["status"], "resolved", "{terminal_value}");
+    assert_eq!(
+        terminal_result["definitions"][0]["fqn"], "PTR.read",
+        "{terminal_value}"
+    );
 }
 
 #[test]

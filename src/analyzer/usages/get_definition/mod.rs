@@ -951,6 +951,8 @@ fn resolve_one<'a>(
         context.tree(&request.file, language, &source)
     };
     if let Some(tree) = tree.as_ref()
+        && !(language == Language::Rust
+            && rust::focused_site_is_field_receiver(tree.root_node(), &site))
         && let Some(identifier) = source.get(site.focus_start_byte..site.focus_end_byte)
     {
         match resolve_lexical_binding(
