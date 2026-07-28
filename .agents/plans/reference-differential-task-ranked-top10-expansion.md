@@ -425,9 +425,33 @@ comes through the local gate, but is not the focus.
   `.agents/docs/reference-differential/python-task-top10-d3a3e9b6-summary.md`
   with the provenance, aggregate accounting, checksums, repair evidence, and
   final zero-actionable disposition.
-- [ ] Publish the remaining mapped C++ semantic issue families and run one final
+- [x] (2026-07-28) Published the final C++ repairs and closed their assigned
+  issues. #1226 rejects the misbound Qpid qualified-type owner range; the
+  corrected #1185 preserves concrete receivers and structured out-of-line
+  operator ownership; and corrected #1186 follows only contiguous erroneous
+  tree-sitter wrapper siblings in recovered CIRCL macro tails. Final commits
+  `4edf61e3`, `e1acf863`, and `5e17ecf5` are on `origin/master`. Focused issue
+  suites, all 168 authoritative C++ usage tests, all 28 workspace-graph tests,
+  all 651 definition tests, formatting, and all-target/all-feature Clippy pass
+  with normal Cargo storage at niceness 10.
+- [x] (2026-07-28) The clean `5e17ecf5` C++ task-selected top-ten
+  certification completed all ten envelopes in 5:13.45. All records share
+  fingerprint `93d14bd1`, have clean Bifrost and clone heads, and report zero
+  file or candidate-limit errors. Across 72,177 sites, the run classified
+  10,422 consistent, 367 editor-only, 1,034 unproven, 60,296 inconclusive,
+  and 58 raw missing. Exact-key comparison against the clean `d3a3e9b6`
+  report removed 23 identities and introduced none; the 58 survivors are the
+  already-audited non-actionable subset of 56 declaration/type/self-owner
+  heads and two exact-unproven Qpid link-unit calls. The report SHA-256 is
+  `9397f5381ee975b7a894cdd44c7bccd76c598524d1260fab32a5a26dadfa8e70`;
+  the log SHA-256 is
+  `05e23c9dd00b2e919e17ff953864cb1eee8239de7c18987755ea362d60f29e36`.
+  Durable provenance, per-repository accounting, exact evidence, and residual
+  disposition are in
+  `.agents/docs/reference-differential/cpp-task-top10-5e17ecf5-summary.md`.
+- [x] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
-- [ ] Complete C++ and publish its evidence and user summary.
+- [x] Complete C++ and publish its evidence and user summary.
 - [x] Complete C# and publish its evidence and user summary.
 - [x] Complete Go and publish its evidence and user summary.
 - [x] Complete Java and publish its evidence and user summary.
