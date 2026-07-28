@@ -1,4 +1,4 @@
-use crate::analyzer::{CodeUnit, Language, LanguageAdapter, ProjectFile, SignatureMetadata};
+use crate::analyzer::{Language, LanguageAdapter, ProjectFile, SignatureMetadata};
 use tree_sitter::Tree;
 
 use super::declarations::parse_kotlin_file;
@@ -58,10 +58,6 @@ impl LanguageAdapter for KotlinAdapter {
         tree: &Tree,
     ) -> crate::analyzer::tree_sitter_analyzer::ParsedFile {
         parse_kotlin_file(file, source, tree)
-    }
-
-    fn preferred_type_candidate<'a>(&self, candidates: &'a [CodeUnit]) -> Option<&'a CodeUnit> {
-        candidates.first()
     }
 }
 

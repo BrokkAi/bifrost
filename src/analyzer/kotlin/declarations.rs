@@ -379,9 +379,11 @@ impl<'a> KotlinVisitor<'a> {
     }
 
     fn visit_secondary_constructor(&mut self, node: Node<'_>, parent: Option<&CodeUnit>) {
-        // A secondary constructor is only meaningful inside a class body; its
-        // callable identity is the class name (constructors and their class
-        // share a spelling, not an identity — the constructor is a Function).
+        // A secondary constructor is only meaningful inside a class body. All
+        // of a class's constructors share one synthetic callable identity
+        // named after the class (`Owner.Owner`, the Scala precedent): each
+        // constructor declaration accumulates its own range and signature on
+        // that unit, exactly like ordinary overloads sharing a spelling.
         let Some(owner) = parent else {
             return;
         };
@@ -391,13 +393,19 @@ impl<'a> KotlinVisitor<'a> {
             .next()
             .unwrap_or(owner.short_name())
             .to_string();
-        let code_unit = self.declare(
+        let code_unit = CodeUnit::new_fq(
+            self.file.clone(),
             CodeUnitType::Function,
-            SegmentKind::Member,
-            &class_name,
-            node,
-            parent,
-        );
+            self.package_name.to_string(),
+            format!("{}.{class_name}", owner.short_name()),
+            owner
+                .fq()
+                .clone()
+                .with_pushed(kotlin_segment(&class_name, SegmentKind::Member)),
+        )
+        .with_synthetic(true);
+        self.parsed
+            .add_code_unit(code_unit.clone(), node, self.source, parent.cloned(), None);
         let header_end = first_named_child(node, "function_value_parameters")
             .map(|parameters| parameters.end_byte())
             .unwrap_or(node.end_byte());

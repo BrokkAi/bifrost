@@ -16,11 +16,10 @@ After this change, Kotlin is a real analyzer language: a workspace containing `.
 
 - [x] (2026-07-28 15:20Z) Explored architecture: `LanguageAdapter`/`TreeSitterAnalyzer` framework, Scala/Ruby precedents, epoch persistence, workspace routing.
 - [x] (2026-07-28 15:40Z) ExecPlan written.
-- [ ] M1: `Language::Kotlin` variant added; compiler-driven sweep of exhaustive matches complete; parser + epoch registered; crate compiles with `cargo check --all-targets --all-features`.
-- [ ] M2: `src/analyzer/kotlin/declarations.rs` extraction for all principal declaration forms, with unit tests in the module.
-- [ ] M3: `KotlinAdapter` + `KotlinAnalyzer` wired through delegate/workspace/multi-analyzer; explicit-unsupported semantics provider.
-- [ ] M4: behavior tests in `tests/kotlin_analyzer_test.rs` (declaration forms, duplicate-name owners, `.kts` limits, skeletons, incremental updates, mixed-language via InlineTestProject); persistence round-trip + epoch invalidation tests.
-- [ ] Validation: `cargo fmt`, clippy `-D warnings`, targeted suites, full `--features nlp,python` gate.
+- [x] (2026-07-28 16:30Z) M1: `Language::Kotlin` variant added; compiler-driven sweep of 23 exhaustive-match sites complete; parser + epoch registered; crate compiles with `cargo check --all-targets --all-features`.
+- [x] (2026-07-28 17:10Z) M2+M3 (interleaved): `src/analyzer/kotlin/{declarations,adapter,mod}.rs` extraction + analyzer, wired through delegate/workspace/multi-analyzer with the explicit-unsupported semantics provider; 10 module tests pass.
+- [x] (2026-07-28 17:50Z) M4: 18 behavior tests in `tests/kotlin_analyzer_test.rs` (declaration forms, duplicate-name owners, constructors, `.kts` limits, skeletons, incremental updates, mixed-language via InlineTestProject); 3 persistence tests (warm hydration without reparse, dirty-file delta, Kotlin-scoped epoch bump leaving Java warm); capability-parity expectations updated.
+- [ ] Validation: `cargo fmt` done; isolated clippy `-D warnings` and full `--features nlp` gate running (completed: targeted kotlin/persistence/parity suites green; remaining: full-suite result).
 
 ## Surprises & Discoveries
 
@@ -31,7 +30,11 @@ After this change, Kotlin is a real analyzer language: a workspace containing `.
 - Observation: `AnalyzerDelegate::program_semantics_provider()` is infallible (returns `&dyn ProgramSemanticsProvider` for every variant), so Kotlin cannot simply opt out; it needs a manual trait impl that reports `SemanticOutcome::Unsupported` until #1241.
 - Observation: the fwcd grammar wraps an `object` expression body (`val x = object : T {}`) in `object_literal`, distinct from `object_declaration`, which keeps anonymous objects out of the declaration walk for free.
 - Observation: `enum_entry` bodies (`enum_class_body > enum_entry > class_body`) can declare methods; these are owned by the entry Field unit's *class* parent in JVM terms, but source-structurally by the entry. Decision below.
-- Observation: `InlineTestProject` (tests/common/inline_project.rs) infers analyzer languages from extensions; it will likely need a `kt`/`kts` mapping added to its extension table (verify during M4).
+- Observation: `InlineTestProject` needed no changes for Kotlin — language inference goes through `Language::from_extension`, so registering `kt`/`kts` in `model.rs` was sufficient.
+- Observation: `collect_parse_errors` walks named nodes, so error recovery that materializes only a *hidden* `MISSING _alpha_identifier` token (e.g. a dangling `when` arm) yields `has_error() == true` but an empty `ParseError` list. Kotlin recovery tests must use fixtures that produce a real `ERROR` node (a stray `]]]` run works) when they assert on `parse_errors`.
+  Evidence: probe test printed `has_error=true collected=0` for the dangling-`when` fixture and `has_error=true collected=1` for the stray-bracket fixture.
+- Observation: this machine has both a Homebrew Rust and rustup Rust of the same version; `cargo clippy` resolved Homebrew's `cargo-clippy` from PATH and produced E0514 mixed-compiler errors. Fix: prefix PATH with `~/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin` for clippy runs (via `scripts/with-isolated-cargo-target.sh`).
+- Observation: the `python` cargo feature builds pyo3 with `extension-module`, which cannot link test binaries on macOS; CI's test gates use `--features nlp` (Linux and macOS), with the Python extension exercised by `scripts/test_python.sh`. The local full gate here is therefore `cargo test --features nlp`.
 
 ## Decision Log
 
@@ -40,6 +43,15 @@ After this change, Kotlin is a real analyzer language: a workspace containing `.
   Date/Author: 2026-07-28 / Claude + dave.
 - Decision: Kotlin FQ names are source-level: dotted package + simple type names + member names (`com.example.Outer.Inner.method`). No `FooKt` file facade classes, no `$` object encoding, no JVM binary names. Companion objects use their declared name, defaulting to `Companion` (`com.example.Owner.Companion.of`), with `SegmentKind::Companion` for the companion segment.
   Rationale: Acceptance criterion "Stable source identities do not depend on absolute paths or compiler-generated JVM names". Top-level functions/properties attach directly under the package (like Go/Python top-level units), which keeps identity stable under `@file:JvmName` and file renames.
+  Date/Author: 2026-07-28 / Claude.
+- Decision (revised during M2): companion segments use `SegmentKind::Type`, NOT `SegmentKind::Companion` as first planned — `Companion` is the *Scala* `$`-suffix rendering rule (`Foo$`), which would corrupt Kotlin's plain-dot `Owner.Companion` spelling and trip the FqName round-trip assertion.
+  Rationale: `FqName::render` appends `$` to every `Companion`-kind segment; Kotlin has no such source spelling.
+  Date/Author: 2026-07-28 / Claude.
+- Decision (revised during M2): `typealias` maps to `CodeUnitType::Field` plus `mark_type_alias`, not `Class` as first planned.
+  Rationale: Scala's `type` aliases already use Field + type-alias mark, and the summary/skeleton/lookup pipelines are built around that shape; diverging for Kotlin would split the alias handling paths.
+  Date/Author: 2026-07-28 / Claude.
+- Decision (revised during M4): all of a class's constructors — the synthetic primary unit and every secondary constructor — share one synthetic Function identity `Owner.Owner`, accumulating ranges and signatures like ordinary overloads.
+  Rationale: `CodeUnit` equality includes the `synthetic` flag, so a non-synthetic secondary unit would split the constructor identity into two units under one FQ name; single-identity matches the overload model and the JVM view.
   Date/Author: 2026-07-28 / Claude.
 - Decision: Declaration kind mapping — `class_declaration` (incl. `enum class`, `annotation class`, `data class`, `value class`, `interface`), `object_declaration`, `companion_object`, and `type_alias` map to `CodeUnitType::Class` (with `type_alias` also recorded in `ParsedFile::type_aliases`); `function_declaration`, `secondary_constructor`, and a synthetic unit for a parameterful `primary_constructor` map to `CodeUnitType::Function`; `property_declaration` and `class_parameter`s declared `val`/`var` map to `CodeUnitType::Field`; `enum_entry` maps to `CodeUnitType::Field` (Java enum-constant precedent) unless it has a body, in which case it still maps to Field and its body members are indexed under the enum class.
   Rationale: Matches the documented `CodeUnitType` contract in `src/analyzer/model.rs` and JVM sibling precedents (Java constants, Scala class parameters); keeps the enum lean per its doc comment.
@@ -155,3 +167,5 @@ No new crate dependencies: the grammar is already vendored and compiled by `buil
 ---
 
 Revision note (2026-07-28, plan authoring): initial version, written after architecture exploration and before M1, capturing scope boundaries against sibling issues and the identity/`.kts` decisions up front, because those drive both the extractor design and the acceptance tests.
+
+Revision note (2026-07-28, M1–M4): recorded the three mid-implementation decision revisions (companion segment kind, typealias unit kind, unified synthetic constructor identity) with their triggers, plus the parse-error-collection, toolchain-shadowing, and macOS `python`-feature discoveries. Milestone plan held otherwise; M2 and M3 landed together (as one commit) because the delegate wiring was needed for the extractor's integration harness to compile.
