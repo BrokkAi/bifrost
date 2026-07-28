@@ -7629,6 +7629,80 @@ public static class Consumer {
 }
 
 #[test]
+fn csharp_graph_reports_unproven_unresolved_task_like_extension_receivers_without_ordinary_leakage() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "src/Extensions.cs",
+            r#"
+using Task = System.Threading.Tasks.Task;
+
+namespace Demo;
+
+public sealed class Result<T> {}
+
+public static class Extensions {
+    public static Result<T> DefaultAwait<T>(this Task<Result<T>> task) => default!;
+}
+"#,
+        ),
+        (
+            "src/Consumer.cs",
+            r#"
+using Task = System.Threading.Tasks.Task;
+
+namespace Demo;
+
+public sealed class LocalTask<T> {
+    public Result<T> DefaultAwait() => default!;
+}
+
+public static class Consumer {
+    public static Result<int> Run(Task<Result<int>> resultTask, LocalTask<int> localTask) {
+        var exact = resultTask.DefaultAwait();
+        var ordinary = localTask.DefaultAwait();
+        return exact;
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = member_function(&analyzer, "Demo.Extensions", "DefaultAwait");
+    let result = graph_result(&analyzer, &target);
+    let consumer = project.file("src/Consumer.cs");
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_by_overload,
+            unproven_total_by_overload,
+        } => {
+            assert!(
+                hits_by_overload
+                    .get(&target)
+                    .is_none_or(|hits| hits.is_empty()),
+                "unresolved external Task<T>-style receivers should stay unproven, not proven"
+            );
+            assert_eq!(
+                Some(&1),
+                unproven_total_by_overload.get(&target),
+                "the unresolved extension receiver should be retained as one unproven external hit"
+            );
+            let unproven = unproven_by_overload
+                .get(&target)
+                .expect("the unresolved extension hit should be rendered");
+            assert!(
+                unproven.iter().any(|hit| {
+                    hit.file == consumer
+                        && hit.snippet.contains("resultTask.DefaultAwait()")
+                }),
+                "unresolved Task<T>-style receiver should remain visible as unproven: {unproven:#?}"
+            );
+        }
+        other => panic!("expected success with one unproven Task-like extension hit, got {other:#?}"),
+    }
+}
+
+#[test]
 fn csharp_scan_usages_target_anchor_should_find_primitive_extension_receiver_usage() {
     let (project, _analyzer) = csharp_analyzer_with_files(&[
         (

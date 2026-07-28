@@ -2034,13 +2034,9 @@ fn extension_method_receiver_type_inner(
                 .find_map(|metadata| metadata.extension_receiver_type())?;
             let resolved =
                 resolve_member_type_fq_name(csharp, unit.source(), &owner, receiver_type, usage);
-            if usage {
-                resolved.map(CSharpExtensionReceiver::Exact)
-            } else {
-                resolved
-                    .or_else(|| Some(normalize_type_text(receiver_type)))
-                    .map(CSharpExtensionReceiver::Exact)
-            }
+            resolved
+                .or_else(|| Some(normalize_type_text(receiver_type)))
+                .map(CSharpExtensionReceiver::Exact)
         }
     }
 }
