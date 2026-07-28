@@ -594,6 +594,11 @@ fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
             insert(&mut object, "mode", json!(may_mode_label(spec.mode)));
             insert(
                 &mut object,
+                "call_modeling",
+                call_modeling_to_json(spec.call_modeling),
+            );
+            insert(
+                &mut object,
                 "sources",
                 endpoint_set_to_json(
                     &spec.sources,
@@ -651,6 +656,11 @@ fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
         PolicyAnalysis::Typestate { spec } => {
             let mut object = tagged("typestate");
             insert(&mut object, "mode", json!(may_mode_label(spec.mode)));
+            insert(
+                &mut object,
+                "call_modeling",
+                call_modeling_to_json(spec.call_modeling),
+            );
             insert(
                 &mut object,
                 "subjects",
@@ -1103,8 +1113,13 @@ fn typestate_seed_binding_to_json(binding: &TypestateSeedBinding) -> Value {
 
 fn typestate_uncertainty_to_json(uncertainty: &TypestateUncertaintySpec) -> Value {
     json!({
-        "unknown_call": inconclusive_policy_label(uncertainty.unknown_call),
         "escape": inconclusive_policy_label(uncertainty.escape),
+    })
+}
+
+fn call_modeling_to_json(call_modeling: CallModelingSpec) -> Value {
+    json!({
+        "unmodeled": call_modeling.unmodeled.label(),
     })
 }
 
@@ -1970,6 +1985,9 @@ mod tests {
                 analysis: PolicyAnalysis::Taint {
                     spec: TaintPolicySpec {
                         mode: MayMode::May,
+                        call_modeling: CallModelingSpec {
+                            unmodeled: crate::analyzer::dataflow::UnmodeledCallBehavior::Optimistic,
+                        },
                         sources: TaintEndpointSet {
                             include_sets: vec![],
                             include_matches: vec![MatchEndpointSetRef::Exact {
@@ -2001,6 +2019,7 @@ mod tests {
             Some(&json!({
                 "type": "taint",
                 "mode": "may",
+                "call_modeling": { "unmodeled": "optimistic" },
                 "sources": {
                     "include_sets": [],
                     "include_matches": [{
@@ -2071,9 +2090,9 @@ mod tests {
                 analysis: PolicyAnalysis::Typestate {
                     spec: TypestatePolicySpec {
                         mode: MayMode::May,
+                        call_modeling: CallModelingSpec::default(),
                         subjects: TypestateSubjectSet::default(),
                         uncertainty: TypestateUncertaintySpec {
-                            unknown_call: InconclusivePolicy::Inconclusive,
                             escape: InconclusivePolicy::Inconclusive,
                         },
                         automaton: TypestateAutomatonSpec {
@@ -2119,9 +2138,9 @@ mod tests {
             Some(&json!({
                 "type": "typestate",
                 "mode": "may",
+                "call_modeling": { "unmodeled": "paranoid" },
                 "subjects": { "include_matches": [], "entries": [] },
                 "uncertainty": {
-                    "unknown_call": "inconclusive",
                     "escape": "inconclusive",
                 },
                 "automaton": {

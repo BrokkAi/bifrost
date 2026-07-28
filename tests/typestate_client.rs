@@ -11,7 +11,8 @@ use brokk_bifrost::analyzer::dataflow::{
     SolverTermination, SummaryBehaviorKey, SummaryCompleteness, SummaryContextKey,
     SummaryDependencyKey, SummaryEffect, SummaryEffectKey, SummaryEventKey, SummaryEvidence,
     SummaryOrigin, SummaryRecursiveEdge, SummaryRecursiveGroupKey, SummarySchemaVersion,
-    SummarySemanticsVersion, SummaryWitnessStepKind, WitnessReconstructionLimits,
+    SummarySemanticsVersion, SummaryWitnessStepKind, UnmodeledCallBehavior,
+    WitnessReconstructionLimits,
 };
 use brokk_bifrost::analyzer::semantic::{
     AbstractObject, AccessPathRoot, CandidateCoverage, EvidenceCompleteness, IcfgEdgeKind,
@@ -46,6 +47,38 @@ use common::{
     BuiltInlineTestProject, InlineTestProject,
     semantic_graph::{SemanticGraph, mapped_source},
 };
+
+#[test]
+fn unmodeled_call_profiles_map_to_typestate_uncertainty_behavior() {
+    let base = ProtocolUncertaintySemantics {
+        ambiguous_dispatch: ProtocolUncertaintyBehavior::PreserveUncertainty,
+        unknown_call: ProtocolUncertaintyBehavior::PreserveUncertainty,
+        external_call: ProtocolUncertaintyBehavior::PreserveUncertainty,
+        escape: ProtocolUncertaintyBehavior::Abstain,
+        incomplete_analysis: ProtocolUncertaintyBehavior::PreserveUncertainty,
+    };
+    for (profile, expected) in [
+        (
+            UnmodeledCallBehavior::Paranoid,
+            ProtocolUncertaintyBehavior::ConservativeTransition,
+        ),
+        (
+            UnmodeledCallBehavior::Optimistic,
+            ProtocolUncertaintyBehavior::PreserveUncertainty,
+        ),
+        (
+            UnmodeledCallBehavior::RequireModel,
+            ProtocolUncertaintyBehavior::Abstain,
+        ),
+    ] {
+        let mapped = base.with_unmodeled_call_behavior(profile);
+        assert_eq!(mapped.unknown_call, expected);
+        assert_eq!(mapped.external_call, expected);
+        assert_eq!(mapped.escape, base.escape);
+        assert_eq!(mapped.ambiguous_dispatch, base.ambiguous_dispatch);
+        assert_eq!(mapped.incomplete_analysis, base.incomplete_analysis);
+    }
+}
 
 const RESOURCE_LIFECYCLE: &[u8] =
     include_bytes!("fixtures/typestate/resource-lifecycle.protocol.json");
@@ -3410,7 +3443,7 @@ fn real_summary_solver_executes_the_same_client_contract() {
     assert_eq!(report.findings()[0].witnesses().len(), 1);
     assert_eq!(
         report.findings()[0].witnesses()[0].witness().quality(),
-        PathQuality::PROVEN_COMPLETE
+        PathQuality::UNPROVEN_PARTIAL
     );
 }
 
@@ -3418,7 +3451,6 @@ fn real_summary_solver_executes_the_same_client_contract() {
 fn one_protocol_runs_equivalent_pre_resolved_typescript_and_java_lifecycles() {
     let protocol = observable_lifecycle_protocol();
     let expected_hash = protocol.hash();
-    let mut reference_outcome = None;
 
     // TypeScript still retains conservative unresolved-call coverage alongside
     // these source-resolved helpers; Java proves the same ICFG complete.
@@ -3606,14 +3638,29 @@ fn one_protocol_runs_equivalent_pre_resolved_typescript_and_java_lifecycles() {
                 .all(|(state, _, _, _)| *state == closed),
             "{language:?} retained a non-closed exit state: {state_outcomes:#?}"
         );
-        let outcome = state_outcomes;
-        if let Some(reference) = reference_outcome.as_ref() {
+        assert!(
+            state_outcomes
+                .iter()
+                .any(|(_, uncertainty, abstained, qualities)| {
+                    uncertainty.is_empty() && !abstained && qualities.contains(&(true, true))
+                })
+        );
+        if expected_complete {
             assert_eq!(
-                &outcome, reference,
-                "{language:?} lifecycle outcome diverged from the TypeScript reference"
+                state_outcomes.len(),
+                1,
+                "{language:?} complete dispatch retained a residual outcome"
             );
         } else {
-            reference_outcome = Some(outcome);
+            assert!(
+                state_outcomes
+                    .iter()
+                    .any(|(_, uncertainty, abstained, qualities)| {
+                        uncertainty.contains(TypestateUncertainty::UnknownCall)
+                            && !abstained
+                            && qualities.contains(&(false, false))
+                    })
+            );
         }
         assert_eq!(protocol.hash(), expected_hash);
     }

@@ -106,14 +106,7 @@ pub struct DispatchBoundary {
 
 impl DispatchBoundary {
     pub(crate) fn target_locator(&self) -> Option<&SemanticLocator> {
-        match &self.kind {
-            DispatchBoundaryKind::External(Some(target))
-            | DispatchBoundaryKind::Unmaterialized(target)
-            | DispatchBoundaryKind::Deferred { target, .. } => Some(target),
-            DispatchBoundaryKind::External(None)
-            | DispatchBoundaryKind::Unresolved
-            | DispatchBoundaryKind::Truncated => None,
-        }
+        self.kind.target_locator()
     }
 
     /// Validate one retained boundary independently of the dispatch result

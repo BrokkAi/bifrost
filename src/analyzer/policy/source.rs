@@ -9,6 +9,7 @@ use std::fmt;
 use std::ops::Range;
 use std::str::FromStr;
 
+use crate::analyzer::dataflow::UnmodeledCallBehavior;
 use crate::analyzer::semantic::WorkspaceRelativePath;
 use crate::analyzer::structural::query::schema::resolve_rql_schema_version;
 use crate::analyzer::structural::query::sexp::{
@@ -534,10 +535,24 @@ fn help_in_expr(expr: &Expr, byte_offset: usize) -> Option<PolicySourceHelp> {
                     });
                 }
             }
-            if let Some(value) = items.get(index + 1)
-                && let Some(help) = help_in_expr(value, byte_offset)
-            {
-                return Some(help);
+            if let Some(value) = items.get(index + 1) {
+                if value.range.contains(&byte_offset)
+                    && let Some(descriptor) = records
+                        .iter()
+                        .find_map(|record| lookup_field(*record, label))
+                    && let Some(domain) = descriptor.value_shape.atom_domain()
+                    && let Some(spelling) = value.as_symbol()
+                    && let Some(atom) = lookup_atom(domain, spelling)
+                {
+                    return Some(PolicySourceHelp {
+                        range: value.range.clone(),
+                        signature: spelling.to_owned(),
+                        description: atom.description.to_owned(),
+                    });
+                }
+                if let Some(help) = help_in_expr(value, byte_offset) {
+                    return Some(help);
+                }
             }
             index += 2;
         } else {
@@ -1114,6 +1129,11 @@ impl Decoder {
             .unwrap_or_default();
         Ok(TaintPolicySpec {
             mode: MayMode::May,
+            call_modeling: fields
+                .get("call-modeling")
+                .map(|value| self.decode_call_modeling(value, PolicyAnalysisKind::Taint))
+                .transpose()?
+                .unwrap_or_default(),
             sources,
             sinks,
             sanitizers,
@@ -1913,6 +1933,11 @@ impl Decoder {
         }
         Ok(TypestatePolicySpec {
             mode: MayMode::May,
+            call_modeling: fields
+                .get("call-modeling")
+                .map(|value| self.decode_call_modeling(value, PolicyAnalysisKind::Typestate))
+                .transpose()?
+                .unwrap_or_default(),
             subjects: self
                 .decode_subject_set(fields.required("subjects"), &format!("{path}/subjects"))?,
             uncertainty: self.decode_uncertainty(fields.required("uncertainty"))?,
@@ -1993,16 +2018,37 @@ impl Decoder {
     ) -> Result<TypestateUncertaintySpec, PolicySourceError> {
         let context = DecodeContext::policy(PolicyAnalysisKind::Typestate);
         let fields = RecordCursor::parse(expr, PolicyRecord::Uncertainty, context)?;
-        for value in [fields.required("unknown-call"), fields.required("escape")] {
-            match expect_atom(value, AtomDomain::Uncertainty, "uncertainty policy")? {
-                PolicyAtomValue::UncertaintyInconclusive => {}
-                atom => unreachable!("Uncertainty registry returned {atom:?}"),
-            }
+        match expect_atom(
+            fields.required("escape"),
+            AtomDomain::Uncertainty,
+            "uncertainty policy",
+        )? {
+            PolicyAtomValue::UncertaintyInconclusive => {}
+            atom => unreachable!("Uncertainty registry returned {atom:?}"),
         }
         Ok(TypestateUncertaintySpec {
-            unknown_call: InconclusivePolicy::Inconclusive,
             escape: InconclusivePolicy::Inconclusive,
         })
+    }
+
+    fn decode_call_modeling(
+        &mut self,
+        expr: &Expr,
+        analysis: PolicyAnalysisKind,
+    ) -> Result<CallModelingSpec, PolicySourceError> {
+        let context = DecodeContext::policy(analysis);
+        let fields = RecordCursor::parse(expr, PolicyRecord::CallModeling, context)?;
+        let unmodeled = match expect_atom(
+            fields.required("unmodeled"),
+            AtomDomain::UnmodeledCallBehavior,
+            "unmodeled call behavior",
+        )? {
+            PolicyAtomValue::UnmodeledCallParanoid => UnmodeledCallBehavior::Paranoid,
+            PolicyAtomValue::UnmodeledCallOptimistic => UnmodeledCallBehavior::Optimistic,
+            PolicyAtomValue::UnmodeledCallRequireModel => UnmodeledCallBehavior::RequireModel,
+            atom => unreachable!("UnmodeledCallBehavior registry returned {atom:?}"),
+        };
+        Ok(CallModelingSpec { unmodeled })
     }
 
     fn decode_automaton(
@@ -4291,6 +4337,41 @@ mod tests {
     }
 
     #[test]
+    fn call_modeling_modes_are_typed_and_default_to_paranoid() {
+        for (authored, expected) in [
+            (None, UnmodeledCallBehavior::Paranoid),
+            (Some("paranoid"), UnmodeledCallBehavior::Paranoid),
+            (Some("optimistic"), UnmodeledCallBehavior::Optimistic),
+            (Some("require-model"), UnmodeledCallBehavior::RequireModel),
+        ] {
+            let extra = authored
+                .map(|mode| format!(":call-modeling (call-modeling :unmodeled {mode})"))
+                .unwrap_or_default();
+            let parsed = parse(&taint_policy(&extra)).unwrap();
+            let RqlpDocument::Policy { definition } = parsed.document else {
+                panic!("expected policy")
+            };
+            let PolicyAnalysis::Taint { spec } = definition.analysis else {
+                panic!("expected taint policy")
+            };
+            assert_eq!(spec.call_modeling.unmodeled, expected);
+        }
+
+        let invalid =
+            taint_policy(":call-modeling (call-modeling :unmodeled assume-everything-is-fine)");
+        assert_error_token(&invalid, "invalid-enum-value", "assume-everything-is-fine");
+
+        let optimistic = taint_policy(":call-modeling (call-modeling :unmodeled optimistic)");
+        let help = rqlp_source_help_at(&optimistic, optimistic.find("optimistic").unwrap() + 2)
+            .expect("registered atom has hover help");
+        assert_eq!(help.signature, "optimistic");
+        assert!(
+            help.description
+                .contains("without adding flows through the unseen body")
+        );
+    }
+
+    #[test]
     fn decodes_exact_match_policy_and_infers_compatible_versions() {
         let parsed = parse(
             r#"(policy
@@ -4457,7 +4538,7 @@ mod tests {
                   :mode may
                   :subjects (subject-set :entries [])
                   :uncertainty
-                    (uncertainty :unknown-call inconclusive :escape inconclusive)
+                    (uncertainty :escape inconclusive)
                   :automaton
                     (automaton
                       :states [open closed error]
@@ -4644,7 +4725,7 @@ mod tests {
         let missing_expectation = r#"(policy :id "test.expectation" :name "Expectation"
           :message "M" :severity warning
           :analysis (analysis :type typestate :mode may :subjects (subject-set)
-            :uncertainty (uncertainty :unknown-call inconclusive :escape inconclusive)
+            :uncertainty (uncertainty :escape inconclusive)
             :automaton (automaton :states [open closed error] :initial open
               :accepting-states [closed] :error-states [error]
               :events [(event :id finish :on (normal-procedure-exit :scope analysis-root))]
@@ -4694,7 +4775,7 @@ mod tests {
     fn state_and_call_binding_errors_select_the_exact_token() {
         let unknown_state = r#"(policy :id "test.state" :name "State" :message "M" :severity warning
           :analysis (analysis :type typestate :mode may :subjects (subject-set)
-            :uncertainty (uncertainty :unknown-call inconclusive :escape inconclusive)
+            :uncertainty (uncertainty :escape inconclusive)
             :automaton (automaton :states [open closed error] :initial open
               :accepting-states [missing-state] :error-states [error]
               :events [(event :id finish :on (normal-procedure-exit :scope analysis-root))]
@@ -4703,7 +4784,7 @@ mod tests {
 
         let invalid_binding = r#"(policy :id "test.binding" :name "Binding" :message "M" :severity warning
           :analysis (analysis :type typestate :mode may :subjects (subject-set)
-            :uncertainty (uncertainty :unknown-call inconclusive :escape inconclusive)
+            :uncertainty (uncertainty :escape inconclusive)
             :automaton (automaton :states [open closed error] :initial open
               :accepting-states [closed] :error-states [error]
               :events [(event :id finish :calls (calls :selector (rql (call))

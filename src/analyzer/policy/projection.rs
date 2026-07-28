@@ -1877,7 +1877,7 @@ mod tests {
             :subjects (subject-set :entries [
               (subject :id resource :selector (rql (name "resource"))
                 :subject return-value)])
-            :uncertainty (uncertainty :unknown-call inconclusive :escape inconclusive)
+            :uncertainty (uncertainty :escape inconclusive)
             :automaton (automaton
               :states [open closed violated]
               :initial open

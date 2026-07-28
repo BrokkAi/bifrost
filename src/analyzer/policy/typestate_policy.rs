@@ -909,19 +909,30 @@ fn policy_violations(
                 }
             };
             let expected = resolved.expected_states.clone();
-            actual_states
-                .iter()
-                .map(|state| {
+            let mut violations = Vec::with_capacity(actual_states.len());
+            for state in actual_states {
+                let actual = policy_state(protocol, *state)?;
+                if expected.contains(&actual) {
+                    continue;
+                }
+                violations.push(
                     TypestateViolationEvidence::try_terminal_expectation(
                         PolicyTypestateExpectationId::new(key.as_str())
                             .map_err(|error| error.to_string())?,
                         terminal.clone(),
-                        policy_state(protocol, *state)?,
+                        actual,
                         expected.clone(),
                     )
-                    .map_err(|error| error.to_string())
-                })
-                .collect()
+                    .map_err(|error| error.to_string())?,
+                );
+            }
+            if violations.is_empty() {
+                return Err(
+                    "typestate terminal finding contains no state outside the expectation"
+                        .to_owned(),
+                );
+            }
+            Ok(violations)
         }
     }
 }
@@ -3356,7 +3367,8 @@ pub(crate) fn compile_protocol(
                 external_call: ProtocolUncertaintyBehavior::PreserveUncertainty,
                 escape: ProtocolUncertaintyBehavior::PreserveUncertainty,
                 incomplete_analysis: ProtocolUncertaintyBehavior::PreserveUncertainty,
-            },
+            }
+            .with_unmodeled_call_behavior(spec.call_modeling.unmodeled),
         },
     };
     protocol
@@ -3424,6 +3436,64 @@ const fn procedure_exit_kind(event: PolicySemanticEvent) -> ProtocolProcedureExi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::dataflow::UnmodeledCallBehavior;
+    use crate::analyzer::policy::definition::{
+        CallModelingSpec, InconclusivePolicy, TypestateUncertaintySpec,
+    };
+    use crate::analyzer::policy::resolved::ResolvedTypestateAutomatonSpec;
+
+    fn minimal_resolved_spec(behavior: UnmodeledCallBehavior) -> ResolvedTypestatePolicySpec {
+        let open = PolicyTypestateStateId::new("open").unwrap();
+        ResolvedTypestatePolicySpec::try_new(
+            MayMode::May,
+            CallModelingSpec {
+                unmodeled: behavior,
+            },
+            Vec::new(),
+            TypestateUncertaintySpec {
+                escape: InconclusivePolicy::Inconclusive,
+            },
+            ResolvedTypestateAutomatonSpec {
+                states: vec![open.clone()],
+                initial: open.clone(),
+                accepting_states: vec![open],
+                error_states: Vec::new(),
+                events: Vec::new(),
+                transitions: Vec::new(),
+                terminal_expectations: Vec::new(),
+            },
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn public_call_modeling_modes_compile_to_protocol_uncertainty() {
+        for (profile, expected) in [
+            (
+                UnmodeledCallBehavior::Paranoid,
+                ProtocolUncertaintyBehavior::ConservativeTransition,
+            ),
+            (
+                UnmodeledCallBehavior::Optimistic,
+                ProtocolUncertaintyBehavior::PreserveUncertainty,
+            ),
+            (
+                UnmodeledCallBehavior::RequireModel,
+                ProtocolUncertaintyBehavior::Abstain,
+            ),
+        ] {
+            let protocol = compile_protocol(&minimal_resolved_spec(profile)).unwrap();
+            let uncertainty = protocol.semantics().uncertainty;
+            assert_eq!(uncertainty.unknown_call, expected);
+            assert_eq!(uncertainty.external_call, expected);
+            assert_eq!(
+                uncertainty.escape,
+                ProtocolUncertaintyBehavior::PreserveUncertainty
+            );
+        }
+    }
 
     #[test]
     fn semantic_interruption_is_not_flattened_into_partial_data() {

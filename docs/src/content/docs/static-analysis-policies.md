@@ -283,6 +283,7 @@ and phase-specific API observations, then add a protocol automaton:
     (analysis
       :type typestate
       :mode may
+      :call-modeling (call-modeling :unmodeled paranoid)
       :subjects
         (subject-set
           :include-matches [
@@ -293,7 +294,6 @@ and phase-specific API observations, then add a protocol automaton:
           :entries [])
       :uncertainty
         (uncertainty
-          :unknown-call inconclusive
           :escape inconclusive)
       :automaton
         (automaton
@@ -335,6 +335,13 @@ events can transition away from them. Normal and exceptional **analysis-root**
 exits can require that an accepting state was already reached; helper returns
 remain interprocedural transfers, not implicit terminals. A terminal-expectation
 violation is distinct from a transition into an error state.
+
+`:call-modeling` is shared by taint and typestate policies. `paranoid` is the
+default when the record is omitted and conservatively models transfers that are
+justified by the structured call site. `optimistic` preserves existing facts
+without introducing unseen-body transfers, while `require-model` abstains when
+no applicable model exists. Every fallback retains incomplete call-boundary
+evidence; none of these settings turns an unresolved call into proof of safety.
 
 Endpoint categories and display/report text remain outside automaton and
 interprocedural-summary keys; the protocol analysis consumes resolved endpoint

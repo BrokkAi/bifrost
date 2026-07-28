@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
 
+use crate::analyzer::dataflow::UnmodeledCallBehavior;
 use crate::analyzer::semantic::ProgramPointHandle;
 use crate::analyzer::value_flow::{
     ValueFlowCarrierId, ValueFlowEventKind, ValueFlowObservationPhase, ValueFlowPlan,
@@ -546,6 +547,7 @@ fn compare_transforms(
 pub struct TaintBatchCompatibilityKey {
     workspace_snapshot: Box<str>,
     propagation_semantics: Box<str>,
+    unmodeled_call_behavior: UnmodeledCallBehavior,
     universe: TaintUniverseHash,
 }
 
@@ -553,6 +555,20 @@ impl TaintBatchCompatibilityKey {
     pub fn new(
         workspace_snapshot: impl Into<String>,
         propagation_semantics: impl Into<String>,
+        universe: TaintUniverseHash,
+    ) -> Result<Self, TaintPlanError> {
+        Self::with_call_behavior(
+            workspace_snapshot,
+            propagation_semantics,
+            UnmodeledCallBehavior::default(),
+            universe,
+        )
+    }
+
+    pub fn with_call_behavior(
+        workspace_snapshot: impl Into<String>,
+        propagation_semantics: impl Into<String>,
+        unmodeled_call_behavior: UnmodeledCallBehavior,
         universe: TaintUniverseHash,
     ) -> Result<Self, TaintPlanError> {
         let workspace_snapshot = workspace_snapshot.into();
@@ -563,6 +579,7 @@ impl TaintBatchCompatibilityKey {
         Ok(Self {
             workspace_snapshot: workspace_snapshot.into_boxed_str(),
             propagation_semantics: propagation_semantics.into_boxed_str(),
+            unmodeled_call_behavior,
             universe,
         })
     }
@@ -573,6 +590,10 @@ impl TaintBatchCompatibilityKey {
 
     pub const fn propagation_semantics(&self) -> &str {
         &self.propagation_semantics
+    }
+
+    pub const fn unmodeled_call_behavior(&self) -> UnmodeledCallBehavior {
+        self.unmodeled_call_behavior
     }
 
     pub const fn universe(&self) -> TaintUniverseHash {
@@ -594,7 +615,11 @@ impl TaintPolicyPlan {
         analysis: TaintAnalysisPlan,
     ) -> Result<Self, TaintPlanError> {
         let policy_id = policy_id.into();
-        if policy_id.is_empty() || compatibility.universe != analysis.universe().hash() {
+        if policy_id.is_empty()
+            || compatibility.universe != analysis.universe().hash()
+            || compatibility.unmodeled_call_behavior
+                != analysis.value_flow().unmodeled_call_behavior()
+        {
             return Err(TaintPlanError::InvalidPolicy);
         }
         Ok(Self {

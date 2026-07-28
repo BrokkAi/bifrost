@@ -1235,6 +1235,38 @@ fn bifrost_lsp_server_validates_and_hovers_unsaved_rqlp_source() {
         "{hover}"
     );
 
+    let configured = r#"(policy :analysis (analysis :type taint :mode may :call-modeling (call-modeling :unmodeled optimistic)))"#;
+    for (needle, offset, expected) in [
+        (":call-modeling", 2, "omission defaults to paranoid"),
+        (
+            "(call-modeling",
+            2,
+            "without an executable body or applicable model",
+        ),
+        (
+            "optimistic",
+            2,
+            "without adding flows through the unseen body",
+        ),
+    ] {
+        let hover = server.request(
+            "bifrost/policyHover",
+            json!({
+                "source": configured,
+                "position": {
+                    "line": 0,
+                    "character": configured.find(needle).unwrap() + offset,
+                }
+            }),
+        );
+        assert!(
+            hover["result"]["contents"]["value"]
+                .as_str()
+                .is_some_and(|value| value.contains(expected)),
+            "expected `{expected}` in {hover}"
+        );
+    }
+
     for (selector, expected) in [
         (
             r#"(rql (call :callee (name "run")))"#,
@@ -1580,7 +1612,7 @@ export function leak_resource(): object {
     :subjects (subject-set :entries [
       (subject :id resource :selector (rql (call :callee (name "open_resource")))
         :subject return-value)])
-    :uncertainty (uncertainty :unknown-call inconclusive :escape inconclusive)
+    :uncertainty (uncertainty :escape inconclusive)
     :automaton (automaton
       :states [open closed violated]
       :initial open

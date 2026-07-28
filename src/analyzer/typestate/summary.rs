@@ -7,8 +7,9 @@ use std::mem::size_of;
 use crate::analyzer::dataflow::{
     DataflowRequest, PathQuality, PathQualityFrontier, ProcedureSummaryKey, ReusableEndSummary,
     ReusableProcedureSummary, ReusableReachedFact, ReusableSummaryProvider,
-    SemanticProcedureSummary, SolverTermination, SummaryDependencyKey, SummaryExitKind,
-    SummaryRecursiveGroupKey, validate_recursive_summary_batch,
+    SemanticProcedureSummary, SemanticSummarySetValidationError, SolverTermination,
+    SummaryDependencyKey, SummaryExitKind, SummaryRecursiveGroupKey,
+    canonicalize_semantic_summary_items, validate_recursive_summary_batch,
 };
 use crate::analyzer::semantic::{
     DeclarationLocator, IcfgProvider, ProcedureHandle, ReturnTransferKind, SemanticArtifactKey,
@@ -115,21 +116,17 @@ pub struct ProtocolSemanticSummarySet<'summary> {
 
 impl<'summary> ProtocolSemanticSummarySet<'summary> {
     pub fn try_new(
-        mut summaries: Vec<&'summary SemanticProcedureSummary>,
+        summaries: Vec<&'summary SemanticProcedureSummary>,
     ) -> Result<Self, ProtocolSummaryError> {
-        if summaries
-            .iter()
-            .any(|summary| !summary.completeness().is_complete())
-        {
-            return Err(ProtocolSummaryError::IncompleteSemanticSummary);
-        }
-        summaries.sort_unstable_by(|left, right| left.key().cmp(right.key()));
-        if summaries
-            .windows(2)
-            .any(|pair| pair[0].key() == pair[1].key())
-        {
-            return Err(ProtocolSummaryError::AmbiguousSemanticSummary);
-        }
+        let summaries = canonicalize_semantic_summary_items(summaries, |summary| *summary, true)
+            .map_err(|error| match error {
+                SemanticSummarySetValidationError::Incomplete => {
+                    ProtocolSummaryError::IncompleteSemanticSummary
+                }
+                SemanticSummarySetValidationError::AmbiguousKey => {
+                    ProtocolSummaryError::AmbiguousSemanticSummary
+                }
+            })?;
         let mut by_artifact =
             HashMap::<SemanticArtifactKey, HashMap<DeclarationLocator, usize>>::new();
         for (index, summary) in summaries.iter().enumerate() {
@@ -143,7 +140,7 @@ impl<'summary> ProtocolSemanticSummarySet<'summary> {
             }
         }
         Ok(Self {
-            summaries: summaries.into_boxed_slice(),
+            summaries,
             by_artifact,
         })
     }

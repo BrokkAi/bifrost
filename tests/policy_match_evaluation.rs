@@ -304,7 +304,7 @@ fn typestate_policy() -> &'static str {
         :subjects (subject-set :entries [
           (subject :id resource :selector (rql (call :callee (name "open_resource")))
             :subject return-value)])
-        :uncertainty (uncertainty :unknown-call inconclusive :escape inconclusive)
+        :uncertainty (uncertainty :escape inconclusive)
         :automaton (automaton
           :states [open closed violated]
           :initial open

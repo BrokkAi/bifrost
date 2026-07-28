@@ -75,6 +75,9 @@
         }
       ]
     },
+    "call_modeling": {
+      "unmodeled": "paranoid"
+    },
     "mode": "may",
     "subjects": {
       "entries": [],
@@ -96,8 +99,7 @@
     },
     "type": "typestate",
     "uncertainty": {
-      "escape": "inconclusive",
-      "unknown_call": "inconclusive"
+      "escape": "inconclusive"
     }
   },
   "id": "bifrost.correctness.resource-lifecycle",

@@ -983,9 +983,31 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "assignment_expression" => {
                 self.assignment_expression(builder, node, entry, next, scope, stack)
             }
-            "binary_expression"
-            | "unary_expression"
-            | "update_expression"
+            "binary_expression" | "unary_expression" => {
+                if operation_can_throw_implicitly(node) {
+                    self.implicit_exception_gap(builder, entry, node)?;
+                }
+                let children = runtime_expression_children(node);
+                let terminal = self.point(builder, node, Vec::new())?;
+                let operands = children
+                    .iter()
+                    .map(|child| {
+                        self.expression_value(builder, *child, expression_value_kind(*child))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.session
+                    .append_language_defined_value_flows(builder, terminal, operands, result)?;
+                self.edge(builder, terminal, next)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &children,
+                    EdgeTarget::normal(terminal),
+                    scope,
+                    stack,
+                )
+            }
+            "update_expression"
             | "cast_expression"
             | "instanceof_expression"
             | "array_creation_expression"

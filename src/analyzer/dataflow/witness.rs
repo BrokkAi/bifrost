@@ -4,8 +4,8 @@ use std::{error::Error, fmt, num::NonZeroUsize};
 use std::{mem::size_of, sync::Arc};
 
 use crate::analyzer::semantic::{
-    CallSiteHandle, EvidenceCompleteness, IcfgEdgeKind, IcfgExitProfile, ProcedureIcfgEdge,
-    ProgramPointHandle, ProofStatus, ReturnTransferKind,
+    CallSiteHandle, DispatchBoundaryKind, EvidenceCompleteness, IcfgEdgeKind, IcfgExitProfile,
+    ProcedureIcfgEdge, ProgramPointHandle, ProofStatus, ReturnTransferKind,
 };
 
 use super::{FactId, PathQuality, PathQualityFrontier, SummaryEdge};
@@ -217,6 +217,7 @@ pub struct SummaryWitnessStep {
     source: ProgramPointHandle,
     target: Option<ProgramPointHandle>,
     origin: Option<CallSiteHandle>,
+    boundary: Option<DispatchBoundaryKind>,
     proof: ProofStatus,
     completeness: EvidenceCompleteness,
     input_fact: FactId,
@@ -230,6 +231,7 @@ impl SummaryWitnessStep {
         source: ProgramPointHandle,
         target: Option<ProgramPointHandle>,
         origin: Option<CallSiteHandle>,
+        boundary: Option<DispatchBoundaryKind>,
         proof: ProofStatus,
         completeness: EvidenceCompleteness,
         input_fact: FactId,
@@ -240,6 +242,7 @@ impl SummaryWitnessStep {
             source,
             target,
             origin,
+            boundary,
             proof,
             completeness,
             input_fact,
@@ -261,6 +264,10 @@ impl SummaryWitnessStep {
 
     pub const fn origin(&self) -> Option<&CallSiteHandle> {
         self.origin.as_ref()
+    }
+
+    pub const fn boundary(&self) -> Option<&DispatchBoundaryKind> {
+        self.boundary.as_ref()
     }
 
     pub const fn proof(&self) -> &ProofStatus {
@@ -290,6 +297,7 @@ impl SummaryWitnessStep {
         source: &ProgramPointHandle,
         target: Option<&ProgramPointHandle>,
         origin: Option<&CallSiteHandle>,
+        boundary: Option<&DispatchBoundaryKind>,
         proof: &ProofStatus,
         completeness: &EvidenceCompleteness,
         input_fact: FactId,
@@ -299,6 +307,7 @@ impl SummaryWitnessStep {
             && &self.source == source
             && self.target.as_ref() == target
             && self.origin.as_ref() == origin
+            && self.boundary.as_ref() == boundary
             && &self.proof == proof
             && &self.completeness == completeness
             && self.input_fact == input_fact
@@ -616,6 +625,7 @@ impl WitnessEvidenceNode {
                     point,
                     None,
                     None,
+                    None,
                     ProofStatus::Proven,
                     EvidenceCompleteness::Complete,
                     fact,
@@ -642,6 +652,7 @@ impl WitnessEvidenceNode {
                     edge.source.clone(),
                     Some(edge.target.clone()),
                     edge.origin.clone(),
+                    edge.boundary.clone(),
                     edge.proof.clone(),
                     edge.completeness.clone(),
                     input_fact,
@@ -708,6 +719,7 @@ impl WitnessEvidenceNode {
                     return_edge.source().clone(),
                     Some(return_edge.target().clone()),
                     return_edge.origin().cloned(),
+                    None,
                     return_edge.proof().clone(),
                     return_edge.completeness().clone(),
                     input_fact,
@@ -746,6 +758,7 @@ impl WitnessEvidenceNode {
                     return_edge.source().clone(),
                     Some(return_edge.target().clone()),
                     return_edge.origin().cloned(),
+                    None,
                     return_edge.proof().clone(),
                     return_edge.completeness().clone(),
                     input_fact,
@@ -772,6 +785,7 @@ impl WitnessEvidenceNode {
                 } if step.matches_derivation(
                     SummaryWitnessStepKind::Seed,
                     point,
+                    None,
                     None,
                     None,
                     &ProofStatus::Proven,
@@ -802,6 +816,7 @@ impl WitnessEvidenceNode {
                         &edge.source,
                         Some(&edge.target),
                         edge.origin.as_ref(),
+                        edge.boundary.as_ref(),
                         &edge.proof,
                         &edge.completeness,
                         input_fact,
@@ -838,6 +853,7 @@ impl WitnessEvidenceNode {
                         return_edge.source(),
                         Some(return_edge.target()),
                         return_edge.origin(),
+                        None,
                         return_edge.proof(),
                         return_edge.completeness(),
                         input_fact,
@@ -873,6 +889,7 @@ impl WitnessEvidenceNode {
                         return_edge.source(),
                         Some(return_edge.target()),
                         return_edge.origin(),
+                        None,
                         return_edge.proof(),
                         return_edge.completeness(),
                         input_fact,
@@ -980,6 +997,7 @@ impl WitnessEvidenceNode {
         Some(SummaryWitnessStep::new(
             SummaryWitnessStepKind::EndSummaryGap(exit.kind()),
             exit.callee_exit().clone(),
+            None,
             None,
             None,
             ProofStatus::Unproven(
@@ -1305,7 +1323,7 @@ impl WitnessStore {
         #[derive(Debug)]
         enum Task {
             Expand(WitnessEvidenceId),
-            Emit(SummaryWitnessStep),
+            Emit(Box<SummaryWitnessStep>),
             OmittedReusableSummary,
         }
 
@@ -1334,14 +1352,14 @@ impl WitnessStore {
                     self.validate_node(node)?;
                     match &node.kind {
                         WitnessEvidenceKind::Step { predecessor, step } => {
-                            stack.push(Task::Emit(step.clone()));
+                            stack.push(Task::Emit(Box::new(step.clone())));
                             if let Some(predecessor) = predecessor {
                                 stack.push(Task::Expand(*predecessor));
                             }
                         }
                         WitnessEvidenceKind::EndSummary { predecessor, .. } => {
                             if let Some(gap_step) = node.end_summary_gap_step() {
-                                stack.push(Task::Emit(gap_step));
+                                stack.push(Task::Emit(Box::new(gap_step)));
                             }
                             stack.push(Task::Expand(*predecessor));
                         }
@@ -1350,7 +1368,7 @@ impl WitnessStore {
                             summary,
                             return_step,
                         } => {
-                            stack.push(Task::Emit(return_step.clone()));
+                            stack.push(Task::Emit(Box::new(return_step.clone())));
                             stack.push(Task::Expand(*summary));
                             stack.push(Task::Expand(*incoming));
                         }
@@ -1359,13 +1377,14 @@ impl WitnessStore {
                             return_step,
                             ..
                         } => {
-                            stack.push(Task::Emit(return_step.clone()));
+                            stack.push(Task::Emit(Box::new(return_step.clone())));
                             stack.push(Task::OmittedReusableSummary);
                             stack.push(Task::Expand(*incoming));
                         }
                     }
                 }
                 Task::Emit(step) => {
+                    let step = *step;
                     if steps.len() >= limits.max_steps() {
                         truncated = true;
                         omitted_steps_lower_bound = 1 + stack

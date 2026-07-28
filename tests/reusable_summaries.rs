@@ -147,6 +147,133 @@ fn call_effect(dependency: SummaryDependencyKey) -> SummaryEffect {
     )
 }
 
+fn external_summary(name: &str, content: &[u8]) -> SemanticProcedureSummary {
+    external_summary_with_completeness(name, content, SummaryCompleteness::Complete)
+}
+
+fn external_compatibility(
+    summary: &SemanticProcedureSummary,
+    behavior: UnmodeledCallBehavior,
+) -> ExternalSummaryCompatibilityKey {
+    ExternalSummaryCompatibilityKey::new(
+        summary.key().schema(),
+        summary.key().semantics(),
+        summary.key().context(),
+        summary.key().behavior(),
+        summary.key().artifact().dependencies(),
+        behavior,
+    )
+}
+
+fn external_summary_with_completeness(
+    name: &str,
+    content: &[u8],
+    completeness: SummaryCompleteness,
+) -> SemanticProcedureSummary {
+    let origin = ExternalSummaryOrigin::new(
+        ExternalSummaryModelId::new(format!("test.{name}")).unwrap(),
+        ExternalSummaryContentHash::hash_bytes(content),
+        1,
+    )
+    .unwrap();
+    let identity = identity_with(
+        artifact(name, name.as_bytes()),
+        name,
+        SummarySemanticsVersion::hash_bytes(b"summary-semantics-v1"),
+        SummaryContextKey::hash_bytes(b"context-insensitive"),
+        SummaryBehaviorKey::hash_bytes(b"external-summary"),
+        SummaryOrigin::External(origin),
+    );
+    summary(
+        key_for(identity, &[]),
+        vec![transfer(
+            SummaryPort::Parameter(0),
+            SummaryPort::NormalReturn,
+        )],
+        Vec::new(),
+        Vec::new(),
+        None,
+        completeness,
+    )
+}
+
+#[test]
+fn external_summary_set_matches_structured_targets_and_hashes_content() {
+    let first = external_summary("ExternalApi", b"v1");
+    let first_compatibility = external_compatibility(&first, UnmodeledCallBehavior::Paranoid);
+    let artifact = first.key().artifact().clone();
+    let declaration = first.key().declaration().clone();
+    let locator = SemanticLocator::new(
+        artifact.mount(),
+        artifact.path().clone(),
+        artifact.language(),
+        declaration,
+        SemanticRole::Procedure,
+        anchor(42),
+    );
+    let first_set = ExternalSemanticSummarySet::try_new(vec![first], first_compatibility).unwrap();
+    assert!(first_set.summary_for(&locator).is_some());
+
+    let partial = external_summary_with_completeness(
+        "PartialExternalApi",
+        b"partial-v1",
+        SummaryCompleteness::partial(vec![SummaryIncompleteReason::Cancelled]).unwrap(),
+    );
+    let partial_compatibility = external_compatibility(&partial, UnmodeledCallBehavior::Paranoid);
+    let partial_set = ExternalSemanticSummarySet::try_new(vec![partial], partial_compatibility)
+        .expect("partial external summaries remain usable without claiming complete coverage");
+    assert_eq!(partial_set.entries().len(), 1);
+
+    let second = external_summary("ExternalApi", b"v2");
+    let second_compatibility = external_compatibility(&second, UnmodeledCallBehavior::Paranoid);
+    let second_set =
+        ExternalSemanticSummarySet::try_new(vec![second], second_compatibility).unwrap();
+    assert_ne!(first_set.fingerprint(), second_set.fingerprint());
+
+    let duplicate_first = external_summary("ExternalApi", b"v1");
+    let duplicate_compatibility =
+        external_compatibility(&duplicate_first, UnmodeledCallBehavior::Paranoid);
+    let duplicate = ExternalSemanticSummarySet::try_new(
+        vec![duplicate_first, external_summary("ExternalApi", b"v2")],
+        duplicate_compatibility,
+    );
+    assert_eq!(
+        duplicate.unwrap_err(),
+        ExternalSummarySetError::AmbiguousTarget
+    );
+    assert_eq!(
+        {
+            let inferred = summary(
+                key("inferred"),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                SummaryCompleteness::Complete,
+            );
+            let compatibility = external_compatibility(&inferred, UnmodeledCallBehavior::Paranoid);
+            ExternalSemanticSummarySet::try_new(vec![inferred], compatibility).unwrap_err()
+        },
+        ExternalSummarySetError::InferredSummary
+    );
+}
+
+#[test]
+fn summary_behavior_identity_partitions_unmodeled_call_profiles() {
+    let base = SummaryBehaviorKey::hash_bytes(b"analysis-specific-behavior");
+    let paranoid = base.with_unmodeled_call_behavior(UnmodeledCallBehavior::Paranoid);
+    let optimistic = base.with_unmodeled_call_behavior(UnmodeledCallBehavior::Optimistic);
+    let require_model = base.with_unmodeled_call_behavior(UnmodeledCallBehavior::RequireModel);
+
+    assert_eq!(
+        paranoid,
+        base.with_unmodeled_call_behavior(UnmodeledCallBehavior::Paranoid)
+    );
+    assert_ne!(paranoid, optimistic);
+    assert_ne!(paranoid, require_model);
+    assert_ne!(optimistic, require_model);
+}
+
 #[test]
 fn procedure_key_changes_for_every_summary_validity_dimension() {
     let base = key("helper");
@@ -789,6 +916,24 @@ fn algebra_limits_bound_work_without_breaking_maximum_size_join_idempotence() {
             limit: MAX_SUMMARY_COMPOSITION_STEPS,
         })
     );
+}
+
+#[test]
+fn curated_models_reject_transfer_sets_before_unbounded_canonicalization() {
+    let row = transfer(SummaryPort::Parameter(0), SummaryPort::NormalReturn);
+    let error = CuratedCallModel::try_new(
+        ExternalSummaryModelId::new("bounded-curated-model").unwrap(),
+        ExternalSummaryContentHash::hash_bytes(b"bounded-curated-model-v1"),
+        vec![row; MAX_SUMMARY_TRANSFERS + 1],
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        SummaryValidationError::TooManyTransfers {
+            actual,
+            limit: MAX_SUMMARY_TRANSFERS,
+        } if actual == MAX_SUMMARY_TRANSFERS + 1
+    ));
 }
 
 #[test]

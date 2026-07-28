@@ -13,6 +13,20 @@
           (language python
             (call :callee (name/regex "eval\\("))))))
 
+; Call-modeling uses ordinary policy record and keyword scopes.
+(policy
+  :id "bifrost.security.optimistic-flow"
+  :name "Optimistic flow"
+  :message "Example"
+  :severity warning
+  :analysis
+    (analysis
+      :type taint
+      :mode may
+      :call-modeling (call-modeling :unmodeled optimistic)
+      :sources (endpoint-set)
+      :sinks (endpoint-set)))
+
 ; Deferred selectors are policy syntax, not embedded RQL source.
 (endpoint
   :id "bifrost.sources.deferred"
