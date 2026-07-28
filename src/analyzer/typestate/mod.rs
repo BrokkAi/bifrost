@@ -8,6 +8,7 @@ mod binding;
 mod client;
 mod finding;
 mod hash;
+mod production;
 mod protocol;
 mod summary;
 
@@ -38,6 +39,14 @@ pub use finding::{
     collect_summary_findings_with_limits,
 };
 pub use hash::{TypestateBindingPlanHash, TypestateBindingSummaryHash, TypestateProtocolHash};
+pub use production::{
+    ProductionSemanticSummarySet, ProductionSummaryLifecycleCounters,
+    ProductionSummaryProjectionError, ProductionTypestateExecutionContext,
+    ProductionTypestateSolveError, ProductionTypestateSolveResult,
+    ProductionTypestateSummaryRepository, TypestateProductionCacheStatus,
+    TypestateSummaryRepositoryLimits, TypestateSummaryRepositoryRotation,
+    project_production_semantic_summaries, solve_typestate_with_production_summaries,
+};
 pub use protocol::{
     CompiledProtocol, CompiledProtocolEvent, CompiledProtocolGuard, CompiledProtocolTransition,
     CompiledTerminalExpectation, MAX_PROTOCOL_EVENTS, MAX_PROTOCOL_EXPECTATIONS,

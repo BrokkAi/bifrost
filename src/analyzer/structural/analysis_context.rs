@@ -14,7 +14,8 @@ use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::identifier::define_identifier;
 use crate::analyzer::semantic::{ProcedureHandle, SemanticArtifact, SemanticArtifactKey};
 use crate::analyzer::typestate::{
-    CompiledProtocol, TypestateBindingPlan, TypestateBindingPlanHash, TypestateProtocolHash,
+    CompiledProtocol, ProductionTypestateSummaryRepository, TypestateBindingPlan,
+    TypestateBindingPlanHash, TypestateProtocolHash,
 };
 use crate::cancellation::CancellationToken;
 
@@ -605,6 +606,7 @@ pub struct QueryAnalysisContext {
     workspace_generation: u64,
     by_ref: HashMap<ProtocolRef, ProtocolHandle>,
     registrations: Box<[Arc<ProtocolRegistration>]>,
+    summaries: Arc<ProductionTypestateSummaryRepository>,
 }
 
 static NEXT_QUERY_ANALYSIS_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -712,6 +714,27 @@ impl QueryAnalysisContext {
         validation_limits: QueryAnalysisValidationLimits,
         cancellation: Option<&CancellationToken>,
     ) -> Result<Self, QueryAnalysisContextError> {
+        Self::new_with_validation_and_summaries(
+            workspace,
+            workspace_generation,
+            registrations,
+            requested,
+            validation_limits,
+            cancellation,
+            Arc::new(ProductionTypestateSummaryRepository::new()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_validation_and_summaries(
+        workspace: &WorkspaceAnalyzer,
+        workspace_generation: u64,
+        registrations: &ProtocolRegistrationSet,
+        requested: &[ProtocolRef],
+        validation_limits: QueryAnalysisValidationLimits,
+        cancellation: Option<&CancellationToken>,
+        summaries: Arc<ProductionTypestateSummaryRepository>,
+    ) -> Result<Self, QueryAnalysisContextError> {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return Err(QueryAnalysisContextError::Cancelled);
         }
@@ -772,11 +795,16 @@ impl QueryAnalysisContext {
             workspace_generation,
             by_ref,
             registrations: imported.into_boxed_slice(),
+            summaries,
         })
     }
 
     pub fn handle(&self, protocol_ref: &ProtocolRef) -> Option<ProtocolHandle> {
         self.by_ref.get(protocol_ref).copied()
+    }
+
+    pub(crate) fn summaries(&self) -> &ProductionTypestateSummaryRepository {
+        self.summaries.as_ref()
     }
 
     pub fn resolve<'a>(

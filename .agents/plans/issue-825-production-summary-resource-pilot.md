@@ -15,12 +15,12 @@ This is the first #825 milestone, not the entire issue. It records repeated-root
 - [x] (2026-07-28 06:39Z) Refreshed the issue branch and `origin`, fetched live issue #825, and confirmed `HEAD`, `origin/master`, and the issue remote are all `b40d3611` with a clean worktree.
 - [x] (2026-07-28 06:39Z) Diagnosed the production gap across reusable summaries, CodeQuery, policy coordination, report rendering, and workspace generation ownership.
 - [x] (2026-07-28 06:39Z) Chose a workspace-generation-scoped in-memory lifetime and defined exact semantic parity independently from lifecycle metrics.
-- [ ] Implement the bounded generation owner, semantic projector, lifecycle counters, and focused repository/invalidation tests.
-- [ ] Extend protocol-summary evidence so accepted warm hits preserve the same bounded source-backed witnesses as cold solves; reject and recompute when that contract cannot be met.
-- [ ] Route the internal production client, CodeQuery/RQL, and `.rqlp` policy execution through the shared generation repository.
-- [ ] Add the equivalent Java/TypeScript resource pilot and cross-path parity assertions.
-- [ ] Record repeated-root and repeated-policy measurements and generation/dependency invalidation evidence.
-- [ ] Run focused and CI-equivalent validation, complete specialist review, address confirmed findings, and update the retrospective.
+- [x] (2026-07-28 14:04Z) Implemented the bounded generation owner, production semantic projector, operation-local and cumulative lifecycle counters, oldest-entry result eviction, retained-byte accounting, and focused repository/invalidation tests.
+- [x] (2026-07-28 14:04Z) Made exact generation-local result snapshots the witness-preserving production hit path; projected protocol rows are tried speculatively and rejected before publication to callers when their existing omission markers prove they cannot preserve exact witnesses.
+- [x] (2026-07-28 14:04Z) Routed the internal production client, CodeQuery/RQL, and `.rqlp` policy execution through shared workspace-generation or policy-batch repositories.
+- [x] (2026-07-28 14:04Z) Added equivalent Java/TypeScript resource-pilot coverage across internal, JSON CodeQuery, RQL, `.rqlp`, JSON, human, and SARIF paths.
+- [x] (2026-07-28 14:04Z) Recorded repeated-root and repeated-policy timings and proved generation and dependency invalidation.
+- [x] (2026-07-28 14:04Z) Completed five specialist reviews, addressed their critical/high findings, and passed focused all-feature tests, the Python harness, formatting, and strict all-target/all-feature Clippy.
 
 ## Surprises & Discoveries
 
@@ -35,6 +35,18 @@ This is the first #825 milestone, not the entire issue. It records repeated-root
 
 - Observation: several broad Bifrost `scan_usages_by_location`, `most_relevant_files`, and `search_symbols` calls produced no output after 30–120 seconds and were terminated, while exact source lookup remained responsive.
   Evidence: both the primary diagnostic and specialist agent reproduced the behavior; exact symbol sources plus `rg` were used only for the stalled reference-count checks.
+
+- Observation: an exact result hit must reproduce budget accounting as well as output to remain observationally identical in profiled and policy execution.
+  Evidence: the cache stores exact semantic, solver, and policy-provider execution charges; a hit stages all three and is rejected if any charge no longer fits.
+
+- Observation: policy compilation consumes presentation-dependent semantic bookkeeping before typestate execution even when two policies have the same analysis contract.
+  Evidence: normalizing only the policy-batch semantic-allowance key enabled a genuine second-policy hit while exact stored work was still replayed and budget-dependent results remained unpublishable.
+
+- Observation: production semantic projection can publish reusable helper rows while deliberately skipping an ineligible caller row.
+  Evidence: the two-caller production test records published protocol summaries with `ProjectionSkipped`, then proves a compatible helper row is attempted, rejected for witness omission, and recomputed to the uncached result.
+
+- Observation: prepared CodeQuery work now retains a repository generation lease and crossed Clippy's large-enum threshold.
+  Evidence: boxing the `ToolCallPreparation::Ready` payload restored a compact dispatch enum without changing the prepared-call contract.
 
 ## Decision Log
 
@@ -58,9 +70,37 @@ This is the first #825 milestone, not the entire issue. It records repeated-root
   Rationale: #823’s lifecycle evidence did not justify a portable persisted representation, and #825 first needs exact production behavior and useful warm measurements.
   Date/Author: 2026-07-28 / Codex
 
+- Decision: use an exact generation-local result snapshot as the accepted witness-preserving cache artifact in this milestone.
+  Rationale: existing portable protocol rows intentionally omit stable witness fragments. Exact snapshots preserve findings, witnesses, completeness, diagnostics, and work accounting today; compatible portable rows are still projected and exercised, but any actual witness-omitting application is rejected before it can affect output.
+  Date/Author: 2026-07-28 / Codex
+
+- Decision: prepared service work captures an `Arc` to the repository that matches its immutable workspace generation, and generation advance swaps in a successor repository.
+  Rationale: in-flight work may finish against its old immutable owner without racing publication into the new generation, while stale generation calls fail closed.
+  Date/Author: 2026-07-28 / Codex
+
+- Decision: treat unresolved call boundaries as an explicit reusable semantic effect and never erase incomplete evidence while projecting production summaries.
+  Rationale: an incomplete external or dynamic boundary is semantic evidence, not absence; preserving it keeps cold and warm completeness/diagnostics aligned.
+  Date/Author: 2026-07-28 / Codex
+
+- Decision: expose lifecycle deltas from each solve rather than subtracting two global repository snapshots.
+  Rationale: global before/after subtraction attributes concurrent requests to the wrong response. Operation-local counters are deterministic; cumulative counters remain available for repository observability.
+  Date/Author: 2026-07-28 / Codex
+
+- Decision: evict exact results by oldest insertion sequence under hard entry and retained-byte limits.
+  Rationale: the policy is deterministic, cheap at the current 1,024-entry bound, and makes eviction and subsequent recomputation directly testable without adding a more complex recency structure.
+  Date/Author: 2026-07-28 / Codex
+
 ## Outcomes & Retrospective
 
-Implementation has not started. The architectural diagnosis and chosen lifecycle are complete. Update this section after every checkpoint with the behavior proven, validation run, remaining risk, and whether production reuse was actually beneficial.
+The first production-summary integration milestone is implemented. `ProductionTypestateSummaryRepository` owns production semantic summaries, portable protocol rows, and exact witness-preserving results for one workspace generation or standalone policy batch. Publication is generation-guarded, dependency identities flow through callers, memory is bounded by entry and estimated owned-byte limits, and both cumulative and operation-local hit, miss, rejection, eviction, and recomputation counts are public.
+
+Cold and warm exact results are equal for Java and TypeScript, including findings, witnesses, completeness, coverage, and diagnostics. CodeQuery JSON and RQL use the same repository-aware public entry; `.rqlp` batches share one disposable repository; the canonical policy document preserves identity and evidence through JSON, human, and SARIF renderers. The Python work model exposes the five counters.
+
+Focused validation passed 103 all-feature Rust tests with two measurement tests ignored during the ordinary run, then both ignored measurements passed explicitly. The canonical Python harness passed 59 tests. `cargo check --all-targets --all-features`, `cargo fmt --all`, and isolated `cargo clippy --all-targets --all-features -- -D warnings` passed.
+
+Measured on this machine and debug test profile, repeated Java roots were 8,262 microseconds cold and 18 microseconds warm; TypeScript was 5,540 microseconds cold and 20 microseconds warm. Each pair recorded one miss, one recomputation, and one hit with exact result equality. A two-policy Java `.rqlp` batch took 3,136,979 microseconds; the second compatible policy recorded one hit and zero misses or recomputations.
+
+The deliberate remaining #825 work is portable cross-root witness-safe protocol reuse. Production semantic summaries and protocol rows are real and reusable candidates, but rows that actually omit a stable witness fragment are rejected and recomputed. This milestone therefore delivers safe production caching and exercises protocol projection without claiming that the later portable witness representation is complete. The larger representative-corpus campaign, persistence decision, and #826 precision evaluation also remain outside this checkpoint.
 
 ## Context and Orientation
 
@@ -88,13 +128,13 @@ Add a production semantic projector that walks call transfers iteratively from r
 
 Focused tests must prove deterministic projection, direct dependency invalidation, atomic recursion, artifact/configuration change invalidation, hard bounds, generation rotation, and the five counters. End this milestone with `cargo fmt --all -- --check`, the new focused test plus `reusable_summaries` and `typestate_client`, strict Clippy, a plan update, and a checkpoint commit.
 
-### Milestone 2: witness-preserving protocol reuse
+### Milestone 2: witness-preserving production admission
 
-Extend the stable protocol summary evidence contract so accepted rows carry bounded canonical witness fragments. A fragment contains workspace-relative semantic locators, edge kind, call origin, proof, and completeness; it contains no dense fact IDs, node indexes, absolute mount, policy fields, or renderer configuration. Bump the protocol summary schema.
+The implemented milestone retains exact, immutable, generation-local `TypestateSummaryResult` snapshots as the accepted production artifact. The result key covers root identity, protocol and binding hashes, canonical entry facts, provider execution state, and request allowance. Publication excludes cancelled, over-budget, limited, non-fixed-point, or witness-retention-truncated results. Hits atomically replay the exact semantic, solver, and policy-provider charge before returning the same snapshot.
 
-When projecting a complete result, retain fragments only under fixed production entry/byte/step bounds. When applying a cache hit, remap each fragment against the current protocol, binding plan, procedure points, and call sites, then insert it into the live witness arena so the same caller/callee/call-return path reconstructs as in the cold solve. If any requested evidence is unavailable or the fragment is truncated, reject the cache candidate before it affects the public result and recompute live. Do not fabricate edges or upgrade proof/completeness.
+Production semantic summaries are still projected into `CompleteSummaryRepository` and `CompleteProtocolSummaryRepository`. Compatible protocol rows are applied only in a speculative solve. If no row is used, that solve may be accepted; if a row is used, the existing witness-omission marker causes rejection and a cold solve before public output. The two-caller test proves the projected helper candidate is tried, rejection is counted, and the recomputed result equals the uncached oracle.
 
-Extend `tests/typestate_client.rs` to compare normalized complete cold and warm reports, including findings, witness steps, truncation, certainty, completeness, and diagnostics. Preserve tests for ambiguity, budget/cancellation, normal/exceptional return, direct/mutual recursion, protocol/binding changes, and incomplete publication. Run focused tests, formatting, strict Clippy, update this plan, and checkpoint.
+Portable canonical witness fragments remain a later #825 milestone. They are not required for exact same-root or same-policy production hits now, and this checkpoint does not bump the persisted protocol schema or claim accepted cross-root portable witness reuse.
 
 ### Milestone 3: production client, CodeQuery, and policy integration
 
@@ -184,44 +224,46 @@ The Bifrost navigation latency observation is not part of implementation. After 
 
 ## Interfaces and Dependencies
 
-Names may be refined, but the production layer must expose responsibility-equivalent interfaces:
+The implemented production layer exposes these responsibility-equivalent interfaces:
 
-    pub struct TypestateSummaryRepositoryScope;
-    pub struct TypestateSummaryGenerationLease;
-    pub struct ProtocolSummaryLifecycleCounters {
-        pub hits: u64,
-        pub misses: u64,
-        pub rejections: u64,
-        pub evictions: u64,
-        pub recomputations: u64,
+    pub struct ProductionTypestateSummaryRepository { ... }
+    pub struct TypestateSummaryRepositoryLimits { ... }
+    pub struct ProductionSummaryLifecycleCounters {
+        pub hits: usize,
+        pub misses: usize,
+        pub rejections: usize,
+        pub evictions: usize,
+        pub recomputations: usize,
     }
 
-    impl TypestateSummaryRepositoryScope {
-        pub fn new(generation: u64, limits: ...) -> Self;
-        pub fn lease(&self, generation: u64) -> Result<TypestateSummaryGenerationLease, ...>;
-        pub fn rotate(&self, next_generation: u64) -> ...;
-        pub fn counters(&self) -> ProtocolSummaryLifecycleCounters;
+    impl ProductionTypestateSummaryRepository {
+        pub fn new() -> Self;
+        pub fn with_limits(limits: TypestateSummaryRepositoryLimits) -> Self;
+        pub fn admit_generation(&self, generation: u64) -> TypestateSummaryRepositoryRotation;
+        pub fn successor_generation(&self, generation: u64) -> Self;
+        pub fn counters(&self) -> ProductionSummaryLifecycleCounters;
     }
 
     pub fn project_production_semantic_summaries(
         roots: &[ProcedureHandle],
         provider: &impl IcfgProvider,
-        lease: &TypestateSummaryGenerationLease,
-        budget: &mut SemanticBudget,
-        cancellation: &CancellationToken,
+        request: &mut SemanticRequest<'_>,
     ) -> Result<..., ...>;
 
     pub fn solve_typestate_with_production_summaries(
+        generation: u64,
         root: &ProcedureHandle,
         entry_facts: &[TypestateFact],
         provider: &impl IcfgProvider,
+        projection_provider: &impl IcfgProvider,
+        execution_context: ProductionTypestateExecutionContext<'_>,
         protocol: &CompiledProtocol,
         bindings: &TypestateBindingPlan,
-        lease: &TypestateSummaryGenerationLease,
+        repository: &ProductionTypestateSummaryRepository,
         semantic_budget: &mut SemanticBudget,
         request: &mut DataflowRequest<'_>,
     ) -> Result<..., ...>;
 
 The production layer reuses `SemanticProcedureSummary`, `CompleteSummaryRepository`, `ProtocolSemanticSummarySet`, `CompleteProtocolSummaryRepository`, `solve_typestate_with_reusable_summaries`, `SummaryWitness`, and existing canonical semantic locators. It adds no external crate dependency and no persistence format.
 
-Plan revision note (2026-07-28): Created after live issue/branch verification, Bifrost-backed diagnosis, and specialist implementation planning. The plan chooses workspace-generation ownership, treats exact witness parity as a cache admission requirement, integrates every named public path, and leaves the later representative benchmark/precision campaign outside this first milestone.
+Plan revision note (2026-07-28): Created after live issue/branch verification, Bifrost-backed diagnosis, and specialist implementation planning. Updated after implementation and review to record exact-result admission, speculative portable-row rejection, generation ownership, public-path integration, validation, and measurements. The later portable witness representation and representative benchmark/precision campaign remain outside this first milestone.

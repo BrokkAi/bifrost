@@ -491,6 +491,22 @@ struct WitnessAlternativeSets {
 }
 
 impl WitnessAlternatives {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.inner.as_ref().map_or(0, |inner| {
+            std::mem::size_of::<WitnessAlternativeSets>().saturating_add(
+                inner
+                    .by_quality
+                    .iter()
+                    .map(|alternatives| {
+                        alternatives
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<WitnessEvidenceId>())
+                    })
+                    .fold(0_usize, usize::saturating_add),
+            )
+        })
+    }
+
     pub(crate) fn ids(&self, quality: PathQuality) -> &[WitnessEvidenceId] {
         self.inner
             .as_ref()
@@ -1260,6 +1276,15 @@ impl WitnessTarget<'_> {
 }
 
 impl WitnessStore {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        size_of::<Self>().saturating_add(
+            self.nodes
+                .iter()
+                .map(WitnessEvidenceNode::retained_bytes)
+                .fold(0usize, usize::saturating_add),
+        )
+    }
+
     pub(crate) fn reconstruct(
         &self,
         evidence: WitnessEvidenceId,

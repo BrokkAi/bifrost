@@ -1,6 +1,7 @@
 mod common;
 
 use std::cell::Cell;
+use std::time::Instant;
 
 use brokk_bifrost::analyzer::dataflow::{
     DataflowEdge, DataflowOutput, DataflowRequest, DistributiveDataflowProblem, PathQuality,
@@ -12,29 +13,32 @@ use brokk_bifrost::analyzer::dataflow::{
 };
 use brokk_bifrost::analyzer::semantic::{
     AbstractObject, AccessPathRoot, CandidateCoverage, EvidenceCompleteness, IcfgEdgeKind,
-    ObjectCardinality, OracleCallContext, OracleLimits, ProcedureKind, ProcedurePortHandle,
-    ProofStatus, SemanticBudget, SemanticCallSite,
+    ObjectCardinality, OracleCallContext, OracleLimits, ProcedureHandle, ProcedureKind,
+    ProcedurePortHandle, ProofStatus, SemanticBudget, SemanticCallSite,
 };
 use brokk_bifrost::analyzer::typestate::{
     BoundTypestateSubjectSpec, CompiledProtocol, CompleteProtocolSummaryRepository,
-    ProtocolAnalysisMode, ProtocolEventKey, ProtocolEventOccurrence, ProtocolEventSpec,
-    ProtocolExpectationKey, ProtocolFactKey, ProtocolGuardSpec, ProtocolObservationPhase,
-    ProtocolObservationSpec, ProtocolProcedureExitKind, ProtocolSemanticSummarySet,
-    ProtocolSemantics, ProtocolSpec, ProtocolStateKey, ProtocolSummaryCacheStatus,
-    ProtocolSummaryError, ProtocolSummaryKey, ProtocolSummaryRepositoryLimits,
-    ProtocolSummarySolveError, ProtocolSummarySolveResult, ProtocolTerminalExpectationSpec,
-    ProtocolTerminalObservationSpec, ProtocolTransitionSpec, ProtocolUncertaintyBehavior,
-    ProtocolUncertaintySemantics, ProtocolUnmatchedEventBehavior, TypestateBindingContext,
-    TypestateBindingMultiplicity, TypestateBindingPlan, TypestateBindingQuality,
-    TypestateEventBindingSpec, TypestateFact, TypestateFindingCertainty, TypestateFindingKind,
-    TypestateFindingLimits, TypestateFlowProblem, TypestateFlowProblemError,
+    ProductionTypestateExecutionContext, ProductionTypestateSolveError,
+    ProductionTypestateSummaryRepository, ProtocolAnalysisMode, ProtocolEventKey,
+    ProtocolEventOccurrence, ProtocolEventSpec, ProtocolExpectationKey, ProtocolFactKey,
+    ProtocolGuardSpec, ProtocolObservationPhase, ProtocolObservationSpec,
+    ProtocolProcedureExitKind, ProtocolSemanticSummarySet, ProtocolSemantics, ProtocolSpec,
+    ProtocolStateKey, ProtocolSummaryCacheStatus, ProtocolSummaryError, ProtocolSummaryKey,
+    ProtocolSummaryRepositoryLimits, ProtocolSummarySolveError, ProtocolSummarySolveResult,
+    ProtocolTerminalExpectationSpec, ProtocolTerminalObservationSpec, ProtocolTransitionSpec,
+    ProtocolUncertaintyBehavior, ProtocolUncertaintySemantics, ProtocolUnmatchedEventBehavior,
+    TypestateBindingContext, TypestateBindingMultiplicity, TypestateBindingPlan,
+    TypestateBindingQuality, TypestateEventBindingSpec, TypestateFact, TypestateFindingCertainty,
+    TypestateFindingKind, TypestateFindingLimits, TypestateFlowProblem, TypestateFlowProblemError,
     TypestateInitialSeedSpec, TypestateObjectRole, TypestateObservationSite,
-    TypestateSubjectClassKey, TypestateSubjectKey, TypestateSummaryResult,
-    TypestateTerminalBindingSpec, TypestateUncertainty, collect_summary_findings,
-    collect_summary_findings_with_limits, solve_typestate_with_reusable_summaries,
+    TypestateProductionCacheStatus, TypestateSubjectClassKey, TypestateSubjectKey,
+    TypestateSummaryRepositoryLimits, TypestateSummaryResult, TypestateTerminalBindingSpec,
+    TypestateUncertainty, collect_summary_findings, collect_summary_findings_with_limits,
+    solve_typestate_with_production_summaries, solve_typestate_with_reusable_summaries,
     solve_typestate_with_summaries,
 };
 use brokk_bifrost::{AnalyzerConfig, Language, WorkspaceAnalyzer};
+use serde_json::json;
 
 use common::{
     BuiltInlineTestProject, InlineTestProject,
@@ -1008,6 +1012,428 @@ fn reusable_solve(
     )
 }
 
+#[test]
+fn production_cache_preserves_findings_witnesses_completeness_and_coverage() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/LifecycleFixture.java", JAVA_CONFORMANCE_SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let fixture = complete_java_fixture(&project, &analyzer, false);
+    let uncached = solve_summary(&fixture, &analyzer);
+    let uncached_findings =
+        collect_summary_findings(&fixture.protocol, &fixture.bindings, &uncached).unwrap();
+    let mut repository = ProductionTypestateSummaryRepository::new();
+
+    let mut solve = || {
+        let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+        let mut solver_budget = SolverBudget::default();
+        let mut semantic_budget = SemanticBudget::default();
+        let solved = solve_typestate_with_production_summaries(
+            41,
+            &fixture.root,
+            &[],
+            &analyzer.icfg_provider(),
+            &analyzer.icfg_provider(),
+            ProductionTypestateExecutionContext::Workspace,
+            &fixture.protocol,
+            &fixture.bindings,
+            &mut repository,
+            &mut semantic_budget,
+            &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+        )
+        .unwrap();
+        (solved, semantic_budget.used(), solver_budget.used())
+    };
+
+    let (first, first_semantic_work, first_solver_work) = solve();
+    assert_eq!(
+        first.cache_status(),
+        TypestateProductionCacheStatus::MissPublished
+    );
+    let first_findings =
+        collect_summary_findings(&fixture.protocol, &fixture.bindings, first.result()).unwrap();
+    assert_eq!(first_findings, uncached_findings);
+    assert_eq!(first.result().is_complete(), uncached.is_complete());
+    assert_eq!(
+        first.result().bindings_complete(),
+        uncached.bindings_complete()
+    );
+    assert_eq!(
+        first.result().bindings_summary_complete(),
+        uncached.bindings_summary_complete()
+    );
+    assert_eq!(first.result().result().facts(), uncached.result().facts());
+    assert_eq!(
+        first.result().result().reached(),
+        uncached.result().reached()
+    );
+    assert_eq!(
+        first.result().result().end_summaries(),
+        uncached.result().end_summaries()
+    );
+    assert_eq!(
+        first.result().result().coverage(),
+        uncached.result().coverage()
+    );
+
+    let (second, second_semantic_work, second_solver_work) = solve();
+    assert_eq!(second.cache_status(), TypestateProductionCacheStatus::Hit);
+    assert_eq!(second.result(), first.result());
+    assert_eq!(second_semantic_work, first_semantic_work);
+    assert_eq!(second_solver_work, first_solver_work);
+    assert_eq!(
+        collect_summary_findings(&fixture.protocol, &fixture.bindings, second.result()).unwrap(),
+        first_findings
+    );
+    drop(solve);
+    assert_eq!(
+        repository.counters(),
+        brokk_bifrost::analyzer::typestate::ProductionSummaryLifecycleCounters {
+            hits: 1,
+            misses: 1,
+            rejections: 0,
+            evictions: 0,
+            recomputations: 1,
+        }
+    );
+}
+
+#[test]
+fn production_cache_preserves_typescript_incomplete_diagnostics_and_witnesses() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("src/main.ts", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let fixture = fixture_from(
+        &project,
+        &analyzer,
+        TypestateBindingQuality::proven_unique(),
+        TypestateBindingQuality::proven_unique(),
+        true,
+        false,
+    );
+    let mut repository = ProductionTypestateSummaryRepository::new();
+    let solve = |repository: &mut ProductionTypestateSummaryRepository| {
+        let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+        let mut solver_budget = SolverBudget::default();
+        let mut semantic_budget = SemanticBudget::default();
+        solve_typestate_with_production_summaries(
+            12,
+            &fixture.root,
+            &[],
+            &analyzer.icfg_provider(),
+            &analyzer.icfg_provider(),
+            ProductionTypestateExecutionContext::Workspace,
+            &fixture.protocol,
+            &fixture.bindings,
+            repository,
+            &mut semantic_budget,
+            &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+        )
+        .unwrap()
+    };
+
+    let first = solve(&mut repository);
+    let first_report =
+        collect_summary_findings(&fixture.protocol, &fixture.bindings, first.result()).unwrap();
+    let second = solve(&mut repository);
+    let second_report =
+        collect_summary_findings(&fixture.protocol, &fixture.bindings, second.result()).unwrap();
+
+    assert_eq!(
+        first.cache_status(),
+        TypestateProductionCacheStatus::MissPublished
+    );
+    assert_eq!(second.cache_status(), TypestateProductionCacheStatus::Hit);
+    assert_eq!(second.result(), first.result());
+    assert_eq!(second_report, first_report);
+    assert_eq!(
+        second_report.analysis_complete(),
+        first_report.analysis_complete()
+    );
+}
+
+#[test]
+fn production_cache_reports_bounded_result_rejection_and_recomputation() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/LifecycleFixture.java", JAVA_CONFORMANCE_SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let fixture = complete_java_fixture(&project, &analyzer, false);
+    let mut repository =
+        ProductionTypestateSummaryRepository::with_limits(TypestateSummaryRepositoryLimits {
+            max_result_entries: 0,
+            ..TypestateSummaryRepositoryLimits::default()
+        });
+    let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let solved = solve_typestate_with_production_summaries(
+        9,
+        &fixture.root,
+        &[],
+        &analyzer.icfg_provider(),
+        &analyzer.icfg_provider(),
+        ProductionTypestateExecutionContext::Workspace,
+        &fixture.protocol,
+        &fixture.bindings,
+        &mut repository,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .unwrap();
+
+    assert_eq!(
+        solved.cache_status(),
+        TypestateProductionCacheStatus::MissCapacityRejected
+    );
+    assert_eq!(repository.retained_result_count(), 0);
+    assert_eq!(repository.counters().misses, 1);
+    assert_eq!(repository.counters().rejections, 1);
+    assert_eq!(repository.counters().recomputations, 1);
+}
+
+#[test]
+fn production_cache_keys_exact_results_by_remaining_solver_allowance() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/LifecycleFixture.java", JAVA_CONFORMANCE_SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let fixture = complete_java_fixture(&project, &analyzer, false);
+    let repository = ProductionTypestateSummaryRepository::new();
+    let solve = |solver_budget: &mut SolverBudget| {
+        let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+        let mut semantic_budget = SemanticBudget::default();
+        solve_typestate_with_production_summaries(
+            19,
+            &fixture.root,
+            &[],
+            &analyzer.icfg_provider(),
+            &analyzer.icfg_provider(),
+            ProductionTypestateExecutionContext::Workspace,
+            &fixture.protocol,
+            &fixture.bindings,
+            &repository,
+            &mut semantic_budget,
+            &mut DataflowRequest::new(solver_budget, &cancellation),
+        )
+        .unwrap()
+    };
+
+    let first = solve(&mut SolverBudget::default());
+    assert_eq!(
+        first.cache_status(),
+        TypestateProductionCacheStatus::MissPublished
+    );
+    let constrained = solve(&mut SolverBudget::uniform(1));
+    assert_ne!(
+        constrained.cache_status(),
+        TypestateProductionCacheStatus::Hit
+    );
+    let repeated = solve(&mut SolverBudget::default());
+    assert_eq!(repeated.cache_status(), TypestateProductionCacheStatus::Hit);
+    assert_eq!(repeated.result(), first.result());
+    assert_eq!(repository.counters().hits, 1);
+    assert_eq!(repository.counters().misses, 2);
+    assert_eq!(repository.counters().recomputations, 2);
+}
+
+#[test]
+fn production_cache_evicts_oldest_exact_result_and_recomputes_it() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/LifecycleFixture.java", JAVA_CONFORMANCE_SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let fixture = complete_java_fixture(&project, &analyzer, false);
+    let repository =
+        ProductionTypestateSummaryRepository::with_limits(TypestateSummaryRepositoryLimits {
+            max_result_entries: 1,
+            ..TypestateSummaryRepositoryLimits::default()
+        });
+    let solve = |solver_budget: &mut SolverBudget| {
+        let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+        let mut semantic_budget = SemanticBudget::default();
+        solve_typestate_with_production_summaries(
+            23,
+            &fixture.root,
+            &[],
+            &analyzer.icfg_provider(),
+            &analyzer.icfg_provider(),
+            ProductionTypestateExecutionContext::Workspace,
+            &fixture.protocol,
+            &fixture.bindings,
+            &repository,
+            &mut semantic_budget,
+            &mut DataflowRequest::new(solver_budget, &cancellation),
+        )
+        .unwrap()
+    };
+
+    let first = solve(&mut SolverBudget::default());
+    assert_eq!(
+        first.cache_status(),
+        TypestateProductionCacheStatus::MissPublished
+    );
+    assert_eq!(first.lifecycle().evictions, 0);
+
+    let second = solve(&mut SolverBudget::uniform(10_000_000));
+    assert_eq!(
+        second.cache_status(),
+        TypestateProductionCacheStatus::MissPublished
+    );
+    assert_eq!(second.result(), first.result());
+    assert_eq!(second.lifecycle().evictions, 1);
+    assert_eq!(repository.retained_result_count(), 1);
+
+    let third = solve(&mut SolverBudget::default());
+    assert_eq!(
+        third.cache_status(),
+        TypestateProductionCacheStatus::MissPublished
+    );
+    assert_eq!(third.result(), first.result());
+    assert_eq!(third.lifecycle().evictions, 1);
+    assert_eq!(repository.retained_result_count(), 1);
+    assert_eq!(repository.counters().hits, 0);
+    assert_eq!(repository.counters().misses, 3);
+    assert_eq!(repository.counters().evictions, 2);
+    assert_eq!(repository.counters().recomputations, 3);
+}
+
+#[test]
+fn production_cache_rejects_a_solve_from_an_older_generation() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/LifecycleFixture.java", JAVA_CONFORMANCE_SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let fixture = complete_java_fixture(&project, &analyzer, false);
+    let repository = ProductionTypestateSummaryRepository::new();
+    assert_eq!(
+        repository.admit_generation(31),
+        brokk_bifrost::analyzer::typestate::TypestateSummaryRepositoryRotation::Initialized
+    );
+    assert_eq!(
+        repository.admit_generation(32),
+        brokk_bifrost::analyzer::typestate::TypestateSummaryRepositoryRotation::Rotated {
+            evicted_entries: 0
+        }
+    );
+
+    let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let error = solve_typestate_with_production_summaries(
+        31,
+        &fixture.root,
+        &[],
+        &analyzer.icfg_provider(),
+        &analyzer.icfg_provider(),
+        ProductionTypestateExecutionContext::Workspace,
+        &fixture.protocol,
+        &fixture.bindings,
+        &repository,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ProductionTypestateSolveError::StaleGeneration {
+            current: 32,
+            requested: 31
+        }
+    ));
+    assert_eq!(repository.generation(), Some(32));
+    assert_eq!(repository.retained_result_count(), 0);
+    assert_eq!(repository.counters().rejections, 1);
+    assert_eq!(repository.counters().recomputations, 0);
+}
+
+#[test]
+#[ignore = "emits timing evidence; run explicitly with --ignored --nocapture"]
+fn production_summary_repeated_root_measurement() {
+    for language in [Language::Java, Language::TypeScript] {
+        let (project, path) = match language {
+            Language::Java => (
+                InlineTestProject::with_language(language)
+                    .file("src/LifecycleFixture.java", JAVA_CONFORMANCE_SOURCE)
+                    .build(),
+                "src/LifecycleFixture.java",
+            ),
+            Language::TypeScript => (
+                InlineTestProject::with_language(language)
+                    .file("src/main.ts", SOURCE)
+                    .build(),
+                "src/main.ts",
+            ),
+            _ => unreachable!("measurement enumerates Java and TypeScript"),
+        };
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let fixture = if language == Language::Java {
+            complete_java_fixture(&project, &analyzer, false)
+        } else {
+            fixture_from(
+                &project,
+                &analyzer,
+                TypestateBindingQuality::proven_unique(),
+                TypestateBindingQuality::proven_unique(),
+                true,
+                false,
+            )
+        };
+        let mut repository = ProductionTypestateSummaryRepository::new();
+        let mut run = || {
+            let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+            let mut solver_budget = SolverBudget::default();
+            let mut semantic_budget = SemanticBudget::default();
+            solve_typestate_with_production_summaries(
+                1,
+                &fixture.root,
+                &[],
+                &analyzer.icfg_provider(),
+                &analyzer.icfg_provider(),
+                ProductionTypestateExecutionContext::Workspace,
+                &fixture.protocol,
+                &fixture.bindings,
+                &mut repository,
+                &mut semantic_budget,
+                &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+            )
+            .unwrap()
+        };
+        let cold_started = Instant::now();
+        let cold = run();
+        let cold_micros = cold_started.elapsed().as_micros();
+        let warm_started = Instant::now();
+        let warm = run();
+        let warm_micros = warm_started.elapsed().as_micros();
+        assert_eq!(cold.result(), warm.result());
+        assert_eq!(warm.cache_status(), TypestateProductionCacheStatus::Hit);
+        drop(run);
+        let counters = repository.counters();
+        println!(
+            "BIFROST_PRODUCTION_SUMMARY_ROOT_MEASUREMENT={}",
+            json!({
+                "format": "bifrost_production_summary_root/v1",
+                "language": language.config_label(),
+                "fixture": path,
+                "repeated_roots": 2,
+                "cold_micros": cold_micros,
+                "warm_micros": warm_micros,
+                "retained_result_bytes": repository.retained_result_bytes(),
+                "counters": {
+                    "hits": counters.hits,
+                    "misses": counters.misses,
+                    "rejections": counters.rejections,
+                    "evictions": counters.evictions,
+                    "recomputations": counters.recomputations,
+                },
+                "exact_result_equality": true,
+            })
+        );
+    }
+}
+
 #[derive(Default)]
 struct FactOutput(Vec<TypestateFact>);
 
@@ -1442,6 +1868,58 @@ fn two_callers_reuse_one_helper_protocol_summary_inside_tabulation() {
     assert!(root_witness.truncated());
     assert!(!root_witness.retention_truncated());
     assert!(root_witness.omitted_steps_lower_bound() > 0);
+
+    let production_repository = ProductionTypestateSummaryRepository::new();
+    let production_solve = |root: &ProcedureHandle, bindings: &TypestateBindingPlan| {
+        let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+        let mut solver_budget = SolverBudget::default();
+        let mut semantic_budget = SemanticBudget::default();
+        solve_typestate_with_production_summaries(
+            73,
+            root,
+            &[],
+            &analyzer.icfg_provider(),
+            &analyzer.icfg_provider(),
+            ProductionTypestateExecutionContext::Workspace,
+            &protocol,
+            bindings,
+            &production_repository,
+            &mut semantic_budget,
+            &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+        )
+        .expect("production two-caller solve")
+    };
+    let production_first = production_solve(&caller_one_handle, &bindings);
+    assert!(matches!(
+        production_first.protocol_cache_status(),
+        Some(ProtocolSummaryCacheStatus::Published | ProtocolSummaryCacheStatus::ProjectionSkipped)
+    ));
+    assert!(production_first.published_protocol_summaries() > 0);
+    assert!(!production_first.rejected_protocol_reuse());
+
+    let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let uncached_second = solve_typestate_with_summaries(
+        &caller_two_handle,
+        &[],
+        &analyzer.icfg_provider(),
+        &protocol,
+        &bindings_with_unrelated_caller_subject,
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .expect("uncached second caller oracle");
+    let production_second =
+        production_solve(&caller_two_handle, &bindings_with_unrelated_caller_subject);
+    assert!(
+        production_second.rejected_protocol_reuse(),
+        "the compatible helper row must be tried and rejected before witness loss"
+    );
+    assert_eq!(production_second.result(), &uncached_second);
+    assert_eq!(production_second.lifecycle().misses, 1);
+    assert_eq!(production_second.lifecycle().rejections, 1);
+    assert_eq!(production_second.lifecycle().recomputations, 1);
 
     let changed_helper = reusable_semantic_summary_with_behavior_for(
         &helper_handle,

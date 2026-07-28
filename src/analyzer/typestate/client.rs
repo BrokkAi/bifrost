@@ -427,7 +427,7 @@ impl From<SummaryDataflowError> for TypestateSolveError {
 
 /// A summary result branded with the exact protocol and binding plan that
 /// produced its run-local IDs.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypestateSummaryResult {
     protocol_hash: TypestateProtocolHash,
     binding_plan_hash: TypestateBindingPlanHash,
@@ -460,6 +460,10 @@ impl TypestateSummaryResult {
 
     pub const fn result(&self) -> &SummaryDataflowResult<TypestateFact> {
         &self.result
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(self.result.retained_bytes())
     }
 
     pub fn is_complete(&self) -> bool {

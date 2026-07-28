@@ -148,12 +148,40 @@ impl<'summary> ProtocolSemanticSummarySet<'summary> {
         })
     }
 
+    pub fn len(&self) -> usize {
+        self.summaries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.summaries.is_empty()
+    }
+
     fn unique_summary_for(&self, procedure: &ProcedureHandle) -> Option<&SemanticProcedureSummary> {
         let index = self
             .by_artifact
             .get(procedure.artifact().key())?
             .get(procedure.semantics().locator().declaration())?;
         self.summaries.get(*index).copied()
+    }
+
+    pub(super) fn compatible_repository(
+        &self,
+        repository: &CompleteProtocolSummaryRepository,
+        protocol: &CompiledProtocol,
+        bindings: &TypestateBindingPlan,
+    ) -> CompleteProtocolSummaryRepository {
+        let mut compatible = CompleteProtocolSummaryRepository::with_limits(repository.limits());
+        let Some(contracts) = self.compute_binding_contracts(bindings, || false) else {
+            return compatible;
+        };
+        for summary in repository.entries.values() {
+            if summary.key().protocol() == protocol.hash()
+                && contracts.get(summary.key().procedure()) == Some(&summary.key().bindings())
+            {
+                compatible.insert(summary.clone());
+            }
+        }
+        compatible
     }
 
     /// Compute the propagation-relevant binding closure for a protocol artifact.
@@ -624,6 +652,10 @@ impl<'live> ProtocolLiveRemap<'live> {
 }
 
 impl ProtocolFactKey {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        size_of::<Self>().saturating_add(protocol_fact_heap_bytes(self))
+    }
+
     fn is_observed_effect(&self) -> bool {
         match self {
             Self::Zero => false,
@@ -1032,6 +1064,10 @@ impl CompleteProtocolSummaryRepository {
         self.retained_bytes
     }
 
+    pub const fn limits(&self) -> ProtocolSummaryRepositoryLimits {
+        self.limits
+    }
+
     pub fn clear(&mut self) {
         self.entries.clear();
         self.by_entry.clear();
@@ -1234,6 +1270,39 @@ impl CompleteProtocolSummaryRepository {
         self.by_entry
             .get(&lookup)
             .and_then(|key| self.entries.get(key))
+    }
+
+    pub(super) fn absorb(
+        &mut self,
+        source: CompleteProtocolSummaryRepository,
+        semantic_summaries: &ProtocolSemanticSummarySet<'_>,
+    ) -> Result<usize, ProtocolSummaryPublicationError> {
+        let started = self.len();
+        let mut ordinary = Vec::new();
+        let mut recursive = HashMap::<SummaryRecursiveGroupKey, Vec<ProtocolSummary>>::new();
+        for summary in source.entries.into_values() {
+            match summary.key().procedure().recursive_group() {
+                Some(group) => recursive.entry(group).or_default().push(summary),
+                None => ordinary.push(summary),
+            }
+        }
+        ordinary.sort_unstable_by(|left, right| left.key().cmp(right.key()));
+        for summary in ordinary {
+            self.publish(summary)?;
+        }
+        let mut recursive = recursive.into_iter().collect::<Vec<_>>();
+        recursive.sort_unstable_by_key(|(group, _)| *group);
+        for (group, mut summaries) in recursive {
+            summaries.sort_unstable_by(|left, right| left.key().cmp(right.key()));
+            let semantic = semantic_summaries
+                .summaries
+                .iter()
+                .copied()
+                .filter(|summary| summary.key().recursive_group() == Some(group))
+                .collect::<Vec<_>>();
+            self.publish_scc(summaries, &semantic)?;
+        }
+        Ok(self.len().saturating_sub(started))
     }
 }
 
@@ -1603,6 +1672,10 @@ impl ProtocolSummarySolveResult {
 
     pub const fn published_summaries(&self) -> usize {
         self.published_summaries
+    }
+
+    pub fn into_computed_result(self) -> TypestateSummaryResult {
+        *self.result
     }
 }
 
