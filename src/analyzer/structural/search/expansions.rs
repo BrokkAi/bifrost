@@ -20,11 +20,13 @@ struct CallPathNode {
     parent: Option<usize>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_call_declaration_expansions(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     diagnostic_start: usize,
     declaration: &DeclarationValue,
     incoming: bool,
+    declared_non_exhaustive: bool,
     omitted: usize,
     expansions: Vec<PipelineExpansion>,
     exhausted: bool,
@@ -36,10 +38,17 @@ fn finish_call_declaration_expansions(
     traversal_diagnostics.retain(|diagnostic| {
         diagnostic.code != CodeQueryDiagnosticCode::CallRelationTargetsAmbiguous
     });
+    if declared_non_exhaustive {
+        reclassify_declared_subset_omissions(&mut traversal_diagnostics);
+    }
     diagnostics.extend(traversal_diagnostics);
     diagnostics.push(CodeQueryDiagnostic {
         code: CodeQueryDiagnosticCode::CallRelationCandidatesOmitted,
-        impact: CodeQueryDiagnosticImpact::Incomplete,
+        impact: if declared_non_exhaustive {
+            CodeQueryDiagnosticImpact::DeclaredNonExhaustive
+        } else {
+            CodeQueryDiagnosticImpact::Incomplete
+        },
         branch: Vec::new(),
         language: crate::analyzer::common::language_for_file(declaration.unit.source())
             .config_label(),
@@ -50,7 +59,18 @@ fn finish_call_declaration_expansions(
             declaration.unit.fq_name()
         ),
     });
-    (expansions, true)
+    // The explicit proven-subset contract declines only the exhaustive
+    // negative claim caused by an unrenderable related declaration. It never
+    // hides a real traversal limit, which is carried by `exhausted`.
+    (expansions, exhausted || !declared_non_exhaustive)
+}
+
+fn reclassify_declared_subset_omissions(diagnostics: &mut [CodeQueryDiagnostic]) {
+    for diagnostic in diagnostics {
+        if diagnostic.code == CodeQueryDiagnosticCode::CallRelationCandidatesOmitted {
+            diagnostic.impact = CodeQueryDiagnosticImpact::DeclaredNonExhaustive;
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -69,6 +89,9 @@ pub(super) fn call_declaration_expansions(
     cache_profile: &mut Option<QueryCacheProfile>,
 ) -> (Vec<PipelineExpansion>, bool) {
     let incoming = matches!(step, QueryStep::Callers(_));
+    let declared_non_exhaustive = incoming
+        && filter.completeness
+            == crate::analyzer::structural::query::CallTraversalCompleteness::ProvenSubset;
     let diagnostic_start = diagnostics.len();
     let mut queue = VecDeque::from([CallTraversalWork {
         unit: declaration.unit.clone(),
@@ -87,11 +110,13 @@ pub(super) fn call_declaration_expansions(
                 diagnostic_start,
                 declaration,
                 incoming,
+                declared_non_exhaustive,
                 omitted,
                 expansions,
                 true,
             );
         }
+        let relation_diagnostic_start = diagnostics.len();
         let result = cached_call_relation(
             analyzer,
             &work.unit,
@@ -103,6 +128,9 @@ pub(super) fn call_declaration_expansions(
             diagnostics,
             cache_profile,
         );
+        if declared_non_exhaustive {
+            reclassify_declared_subset_omissions(&mut diagnostics[relation_diagnostic_start..]);
+        }
         exhausted |= result.truncated || result.cancelled;
         for site in result
             .sites
@@ -115,6 +143,7 @@ pub(super) fn call_declaration_expansions(
                     diagnostic_start,
                     declaration,
                     incoming,
+                    declared_non_exhaustive,
                     omitted,
                     expansions,
                     true,
@@ -135,6 +164,7 @@ pub(super) fn call_declaration_expansions(
                     diagnostic_start,
                     declaration,
                     incoming,
+                    declared_non_exhaustive,
                     omitted,
                     expansions,
                     true,
@@ -146,6 +176,7 @@ pub(super) fn call_declaration_expansions(
                     diagnostic_start,
                     declaration,
                     incoming,
+                    declared_non_exhaustive,
                     omitted,
                     expansions,
                     true,
@@ -166,6 +197,7 @@ pub(super) fn call_declaration_expansions(
                         diagnostic_start,
                         declaration,
                         incoming,
+                        declared_non_exhaustive,
                         omitted,
                         expansions,
                         true,
@@ -180,6 +212,7 @@ pub(super) fn call_declaration_expansions(
                     diagnostic_start,
                     declaration,
                     incoming,
+                    declared_non_exhaustive,
                     omitted,
                     expansions,
                     true,
@@ -214,6 +247,7 @@ pub(super) fn call_declaration_expansions(
         diagnostic_start,
         declaration,
         incoming,
+        declared_non_exhaustive,
         omitted,
         expansions,
         exhausted,

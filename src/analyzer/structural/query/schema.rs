@@ -79,6 +79,7 @@ pub enum ValueShape {
     ReferenceKindList,
     UsageProof,
     UsageSurface,
+    CallTraversalCompleteness,
     ProtocolRef,
 }
 
@@ -109,6 +110,7 @@ impl ValueShape {
             Self::ReferenceKindList => "one or more structured reference kinds",
             Self::UsageProof => "proven or unproven",
             Self::UsageSurface => "external_usages or lsp_references",
+            Self::CallTraversalCompleteness => "exhaustive or proven_subset",
             Self::ProtocolRef => "a bounded protocol reference in namespace:name form",
         }
     }
@@ -125,6 +127,28 @@ impl ValueShape {
     pub fn accepts_string(self, value: &str) -> bool {
         self.string_length_bounds()
             .is_none_or(|(minimum, maximum)| value.len() >= minimum && value.len() <= maximum)
+    }
+}
+
+/// The guarantee an author requests from one call-graph traversal.
+///
+/// An exhaustive traversal supports a negative conclusion. A proven subset
+/// intentionally reports only resolvable proven caller edges and therefore
+/// supports positive findings but never the assertion that all callers were
+/// found.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CallTraversalCompleteness {
+    #[default]
+    Exhaustive,
+    ProvenSubset,
+}
+
+impl CallTraversalCompleteness {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Exhaustive => "exhaustive",
+            Self::ProvenSubset => "proven_subset",
+        }
     }
 }
 
@@ -1009,6 +1033,7 @@ json_fields! {
     Transitive { label: "transitive", shape: TrueBoolean, signature: "\"transitive\": true", description: "Traverse the complete indexed hierarchy under the execution budget." }
     ReferenceKinds { label: "reference_kinds", shape: ReferenceKindList, signature: "\"reference_kinds\": [\"field_write\", ...]", description: "Restrict traversal to structured source-reference kinds." }
     Proof { label: "proof", shape: UsageProof, signature: "\"proof\": \"proven\" | \"unproven\"", description: "Restrict traversal to one usage-proof tier." }
+    Completeness { label: "completeness", shape: CallTraversalCompleteness, signature: "\"completeness\": \"exhaustive\" | \"proven_subset\"", description: "Require exhaustive call discovery or intentionally report only resolved proven callers." }
     Surface { label: "surface", shape: UsageSurface, signature: "\"surface\": \"external_usages\" | \"lsp_references\"", description: "Choose the external-usage or editor-visible reference surface." }
     Receiver { label: "receiver", shape: TrueBoolean, signature: "\"receiver\": true", description: "Select the explicit base or receiver expression of a call site." }
     ParameterIndex { label: "parameter_index", shape: NonNegativeInteger, signature: "\"parameter_index\": non-negative integer", description: "Select a zero-based formal parameter slot, excluding receiver-bound parameters." }
@@ -1132,6 +1157,14 @@ pub fn usage_proof_from_label(label: &str) -> Option<UsageProof> {
     match label {
         "proven" => Some(UsageProof::Proven),
         "unproven" => Some(UsageProof::Unproven),
+        _ => None,
+    }
+}
+
+pub fn call_traversal_completeness_from_label(label: &str) -> Option<CallTraversalCompleteness> {
+    match label {
+        "exhaustive" => Some(CallTraversalCompleteness::Exhaustive),
+        "proven_subset" => Some(CallTraversalCompleteness::ProvenSubset),
         _ => None,
     }
 }

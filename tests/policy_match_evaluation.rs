@@ -12,7 +12,7 @@ use brokk_bifrost::policy::{
     PolicyFindingId, PolicyIncompleteReason, PolicyRegistry, PolicyRegistryLimits, PolicyRun,
     PolicyRunCompletion, PolicyRunError, PolicySourceIdentity, TaintCatalogRegistry,
 };
-use brokk_bifrost::{CancellationToken, Language, TypescriptAnalyzer};
+use brokk_bifrost::{CancellationToken, IAnalyzer, JavaAnalyzer, Language, TypescriptAnalyzer};
 use common::InlineTestProject;
 
 fn registry_with_policy(source: &str) -> PolicyRegistry {
@@ -29,7 +29,7 @@ fn registry_with_policy(source: &str) -> PolicyRegistry {
 
 fn evaluate(
     source: &str,
-    analyzer: &TypescriptAnalyzer,
+    analyzer: &dyn IAnalyzer,
     budget: &mut PolicyBudget,
     cancellation: Option<&CancellationToken>,
 ) -> brokk_bifrost::policy::PolicyRun {
@@ -38,7 +38,7 @@ fn evaluate(
 
 fn try_evaluate(
     source: &str,
-    analyzer: &TypescriptAnalyzer,
+    analyzer: &dyn IAnalyzer,
     budget: &mut PolicyBudget,
     cancellation: Option<&CancellationToken>,
 ) -> Result<PolicyRun, PolicyRunError> {
@@ -148,6 +148,86 @@ fn public_evaluator_emits_normalized_unicode_workspace_paths() {
     assert_eq!(location.path(), "src/données.ts");
     assert!(location.byte_span().is_some());
     assert!(location.region().is_some());
+}
+
+#[test]
+fn proven_subset_callers_preserve_omissions_without_making_match_policy_unreliable() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Smells.java",
+            r#"class Smells {
+    void terminate() {
+        System.exit(1);
+    }
+
+    void directTerminate() {
+        this.terminate();
+    }
+
+    void secondOrderTerminate() {
+        this.directTerminate();
+    }
+}"#,
+        )
+        .build();
+    let analyzer = JavaAnalyzer::from_project(project.project().clone());
+    let policy = |id: &str, completeness: &str| {
+        format!(
+            r#"(policy
+  :id "{id}"
+  :name "Proven callers"
+  :message "Calls System.exit"
+  :severity warning
+  :analysis (analysis :type match :selector
+    (rql
+      (language java
+        (callers :depth 2 :proof proven {completeness}
+          (enclosing-decl
+            (call :receiver (name "System") :callee (name "exit"))))))))"#
+        )
+    };
+
+    let exhaustive = evaluate(
+        &policy("test.exhaustive-callers", ""),
+        &analyzer,
+        &mut PolicyBudget::default(),
+        None,
+    );
+    assert_eq!(exhaustive.findings().len(), 2);
+    assert!(matches!(
+        exhaustive.completion(),
+        PolicyRunCompletion::Inconclusive { reasons }
+            if reasons.contains(&PolicyIncompleteReason::PartialDiscovery)
+    ));
+
+    let subset = evaluate(
+        &policy("test.proven-subset-callers", ":completeness proven-subset"),
+        &analyzer,
+        &mut PolicyBudget::default(),
+        None,
+    );
+    assert_eq!(subset.findings().len(), 2);
+    assert!(
+        matches!(
+            subset.completion(),
+            PolicyRunCompletion::ProvenSubset { codes }
+                if codes.contains(&brokk_bifrost::analyzer::structural::CodeQueryDiagnosticCode::CallRelationCandidatesOmitted)
+        ),
+        "completion: {:#?}; diagnostics: {:#?}",
+        subset.completion(),
+        subset.diagnostics()
+    );
+    assert!(subset.completion().is_reliable());
+    assert!(!subset.completion().is_exhaustive());
+    assert!(subset.diagnostics().iter().any(|diagnostic| {
+        diagnostic.impact() == brokk_bifrost::policy::PolicyDiagnosticImpact::DeclaredNonExhaustive
+    }));
+    assert!(subset.findings().iter().all(|finding| {
+        finding
+            .completeness()
+            .reasons()
+            .contains(&brokk_bifrost::policy::FindingIncompleteReason::DeclaredNonExhaustive)
+    }));
 }
 
 fn target_finding_id(source: &str, message: &str, severity: &str) -> PolicyFindingId {

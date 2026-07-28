@@ -1590,7 +1590,7 @@ fn validate_typestate_violation(
 
 fn downgrade_completion(completion: &mut PolicyRunCompletion, reason: PolicyIncompleteReason) {
     match completion {
-        PolicyRunCompletion::Complete => {
+        PolicyRunCompletion::Complete | PolicyRunCompletion::ProvenSubset { .. } => {
             *completion = PolicyRunCompletion::inconclusive(vec![reason])
                 .expect("one typed incomplete reason is canonical");
         }

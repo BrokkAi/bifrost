@@ -96,6 +96,7 @@ fn parses_call_traversal_sites_and_formal_input_selectors() {
         QueryStep::Callers(CallTraversalFilter {
             depth: std::num::NonZeroUsize::new(3).unwrap(),
             proof: Some(UsageProof::Proven),
+            completeness: CallTraversalCompleteness::Exhaustive,
         })
     );
     assert_eq!(
@@ -109,6 +110,31 @@ fn parses_call_traversal_sites_and_formal_input_selectors() {
         QueryStep::CallInput(CallInputSelector::ParameterIndex(0))
     );
     assert_eq!(query.to_canonical_json()["steps"][1]["depth"], 3);
+
+    let proven_subset = parse_ok(json!({
+        "match": { "kind": "callable", "name": "sink" },
+        "steps": [
+            { "op": "enclosing_decl" },
+            {
+                "op": "callers",
+                "depth": 2,
+                "proof": "proven",
+                "completeness": "proven_subset"
+            }
+        ]
+    }));
+    assert_eq!(
+        proven_subset.plan.steps[1],
+        QueryStep::Callers(CallTraversalFilter {
+            depth: std::num::NonZeroUsize::new(2).unwrap(),
+            proof: Some(UsageProof::Proven),
+            completeness: CallTraversalCompleteness::ProvenSubset,
+        })
+    );
+    assert_eq!(
+        proven_subset.to_canonical_json()["steps"][1]["completeness"],
+        "proven_subset"
+    );
 
     let rql = CodeQuery::from_sexp(
         r#"(call-input :parameter-name "payload" (call-sites-to :proof proven (enclosing-decl (method (name "sink")))))"#,
@@ -129,6 +155,10 @@ fn parses_call_traversal_sites_and_formal_input_selectors() {
         json!({ "op": "call_input" }),
         json!({ "op": "call_input", "receiver": true, "parameter_index": 0 }),
         json!({ "op": "callers", "transitive": true }),
+        json!({ "op": "callers", "completeness": "proven_subset" }),
+        json!({ "op": "callers", "proof": "unproven", "completeness": "proven_subset" }),
+        json!({ "op": "callees", "proof": "proven", "completeness": "proven_subset" }),
+        json!({ "op": "uses", "completeness": "proven_subset" }),
     ] {
         assert!(
             parse(json!({
@@ -136,6 +166,35 @@ fn parses_call_traversal_sites_and_formal_input_selectors() {
                 "steps": [{ "op": "enclosing_decl" }, step]
             }))
             .is_err()
+        );
+    }
+
+    for (step, expected) in [
+        (
+            QueryStep::Callers(CallTraversalFilter {
+                depth: std::num::NonZeroUsize::MIN,
+                proof: None,
+                completeness: CallTraversalCompleteness::ProvenSubset,
+            }),
+            "requires proof to be proven",
+        ),
+        (
+            QueryStep::Callees(CallTraversalFilter {
+                depth: std::num::NonZeroUsize::MIN,
+                proof: Some(UsageProof::Proven),
+                completeness: CallTraversalCompleteness::ProvenSubset,
+            }),
+            "supported only for callers",
+        ),
+    ] {
+        let mut direct = proven_subset.clone();
+        direct.plan.steps[1] = step;
+        assert!(
+            direct
+                .validate_steps()
+                .expect_err("invalid direct IR must be rejected")
+                .to_string()
+                .contains(expected)
         );
     }
 }

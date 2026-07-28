@@ -2,7 +2,9 @@ use super::ir::{
     CallInputSelector, CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed,
     HierarchyTraversal, Pattern, QueryStep, StringPredicate,
 };
-use super::schema::{reference_kind_label, usage_proof_label, usage_surface_label};
+use super::schema::{
+    CallTraversalCompleteness, reference_kind_label, usage_proof_label, usage_surface_label,
+};
 use crate::analyzer::structural::kinds::{NormalizedKind, Role};
 use serde_json::{Map, Value, json};
 
@@ -178,6 +180,12 @@ fn query_step_to_json(step: &QueryStep) -> Value {
             }
             if let Some(proof) = filter.proof {
                 object.insert("proof".to_string(), json!(usage_proof_label(proof)));
+            }
+            if filter.completeness != CallTraversalCompleteness::Exhaustive {
+                object.insert(
+                    "completeness".to_string(),
+                    json!(filter.completeness.label()),
+                );
             }
         }
         QueryStep::CallSitesTo(filter) | QueryStep::CallSitesFrom(filter) => {

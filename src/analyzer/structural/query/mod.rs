@@ -26,7 +26,9 @@ pub use ir::{
     ReceiverTraversalFilter, ReferenceTraversalFilter, SCHEMA_VERSION, SetOperator,
     StringPredicate, TypestateTraversal, WitnessTraversal,
 };
-pub use schema::{ALL_CODE_QUERY_EXECUTION_MODES, CodeQueryExecutionMode};
+pub use schema::{
+    ALL_CODE_QUERY_EXECUTION_MODES, CallTraversalCompleteness, CodeQueryExecutionMode,
+};
 pub use source::{
     QuerySourceDiagnostic, QuerySourceEdit, QuerySourceFix, QuerySourceHelp, query_source_help_at,
     validate_query_source,

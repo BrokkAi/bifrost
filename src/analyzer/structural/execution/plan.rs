@@ -755,7 +755,8 @@ mod tests {
 
     use super::*;
     use crate::analyzer::structural::query::{
-        CallTraversalFilter, CodeQueryResultDetail, Pattern, SCHEMA_VERSION, StringPredicate,
+        CallTraversalCompleteness, CallTraversalFilter, CodeQueryResultDetail, Pattern,
+        SCHEMA_VERSION, StringPredicate,
     };
 
     fn seed(name: &str) -> CodeQuerySeed {
@@ -1307,6 +1308,7 @@ mod tests {
                 QueryStep::Callers(CallTraversalFilter {
                     depth: std::num::NonZeroUsize::new(2).expect("two is non-zero"),
                     proof: None,
+                    completeness: CallTraversalCompleteness::Exhaustive,
                 }),
             ],
         ));

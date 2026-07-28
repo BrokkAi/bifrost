@@ -753,7 +753,7 @@ impl<'a> SarifInvocation<'a> {
             && report
                 .runs()
                 .iter()
-                .all(|run| run.completion().is_complete());
+                .all(|run| run.completion().is_reliable());
 
         Self {
             execution_successful,
@@ -851,6 +851,11 @@ impl<'a> SarifNotification<'a> {
     fn policy_completion(run: &'a PolicyRun) -> Option<Self> {
         let (descriptor_id, text, level) = match run.completion() {
             PolicyRunCompletion::Complete => return None,
+            PolicyRunCompletion::ProvenSubset { .. } => (
+                "BIFROST_POLICY_PROVEN_SUBSET",
+                "Bifrost policy evaluation reported a proven subset, not an exhaustive result",
+                SarifNotificationLevel::Warning,
+            ),
             PolicyRunCompletion::Inconclusive { .. } => (
                 "BIFROST_POLICY_INCONCLUSIVE",
                 "Bifrost policy evaluation was inconclusive",

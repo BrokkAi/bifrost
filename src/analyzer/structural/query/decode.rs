@@ -10,8 +10,8 @@ use super::ir::{
 };
 use super::schema::{
     ALL_QUERY_STEP_OPS, CodeQueryExecutionMode, PatternField, QueryField, QueryStepField,
-    StringPredicateField, reference_kind_from_label, rql_schema_version_registry,
-    usage_proof_from_label, usage_surface_from_label,
+    StringPredicateField, call_traversal_completeness_from_label, reference_kind_from_label,
+    rql_schema_version_registry, usage_proof_from_label, usage_surface_from_label,
 };
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{ALL_KINDS, NormalizedKind, Role};
@@ -485,7 +485,9 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
             match QueryStepField::from_label(key) {
                 Some(QueryStepField::Op) => {}
                 Some(QueryStepField::Depth | QueryStepField::Transitive) if hierarchy => {}
-                Some(QueryStepField::Depth | QueryStepField::Proof) if call => {}
+                Some(
+                    QueryStepField::Depth | QueryStepField::Proof | QueryStepField::Completeness,
+                ) if call => {}
                 Some(QueryStepField::Proof) if call_site => {}
                 Some(
                     QueryStepField::Receiver
@@ -505,6 +507,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::Transitive
                     | QueryStepField::ReferenceKinds
                     | QueryStepField::Proof
+                    | QueryStepField::Completeness
                     | QueryStepField::Surface
                     | QueryStepField::Receiver
                     | QueryStepField::ParameterIndex
@@ -663,7 +666,41 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 .transpose()?
                 .unwrap_or(NonZeroUsize::MIN);
             let proof = decode_optional_proof(object.get("proof"), &entry_path)?;
-            let filter = CallTraversalFilter { depth, proof };
+            let completeness = object
+                .get("completeness")
+                .map(|value| {
+                    let path = child_path(&entry_path, "completeness");
+                    let label = value.as_str().ok_or_else(|| {
+                        QueryError::new(&path, "expected exhaustive or proven_subset")
+                    })?;
+                    call_traversal_completeness_from_label(label).ok_or_else(|| {
+                        QueryError::new(path, "expected exhaustive or proven_subset")
+                    })
+                })
+                .transpose()?
+                .unwrap_or_default();
+            if matches!(
+                completeness,
+                super::schema::CallTraversalCompleteness::ProvenSubset
+            ) {
+                if !matches!(step, QueryStep::Callers(_)) {
+                    return Err(QueryError::new(
+                        child_path(&entry_path, "completeness"),
+                        "proven_subset is currently supported only for callers",
+                    ));
+                }
+                if proof != Some(crate::analyzer::usages::UsageProof::Proven) {
+                    return Err(QueryError::new(
+                        child_path(&entry_path, "completeness"),
+                        "proven_subset requires proof to be proven",
+                    ));
+                }
+            }
+            let filter = CallTraversalFilter {
+                depth,
+                proof,
+                completeness,
+            };
             step = match step {
                 QueryStep::Callers(_) => QueryStep::Callers(filter),
                 QueryStep::Callees(_) => QueryStep::Callees(filter),

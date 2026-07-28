@@ -1,6 +1,6 @@
 use super::super::analysis_context::ProtocolRef;
 use super::super::kinds::{NormalizedKind, Role};
-use super::schema::{CodeQueryExecutionMode, QueryStepOp};
+use super::schema::{CallTraversalCompleteness, CodeQueryExecutionMode, QueryStepOp};
 use crate::analyzer::Language;
 use crate::analyzer::usages::{ReferenceKind, UsageHitSurface, UsageProof};
 use regex::Regex;
@@ -72,6 +72,7 @@ pub struct ReferenceTraversalFilter {
 pub struct CallTraversalFilter {
     pub depth: NonZeroUsize,
     pub proof: Option<UsageProof>,
+    pub completeness: CallTraversalCompleteness,
 }
 
 impl Default for CallTraversalFilter {
@@ -79,6 +80,7 @@ impl Default for CallTraversalFilter {
         Self {
             depth: NonZeroUsize::MIN,
             proof: None,
+            completeness: CallTraversalCompleteness::Exhaustive,
         }
     }
 }
@@ -323,6 +325,22 @@ pub(super) fn validate_query_steps(
     let mut value_kind = input;
     for (index, step) in steps.iter().enumerate() {
         let step_path = format!("{path}[{index}]");
+        if let QueryStep::Callers(filter) | QueryStep::Callees(filter) = step
+            && filter.completeness == CallTraversalCompleteness::ProvenSubset
+        {
+            if !matches!(step, QueryStep::Callers(_)) {
+                return Err(QueryError::new(
+                    format!("{step_path}.completeness"),
+                    "proven_subset is currently supported only for callers",
+                ));
+            }
+            if filter.proof != Some(UsageProof::Proven) {
+                return Err(QueryError::new(
+                    format!("{step_path}.completeness"),
+                    "proven_subset requires proof to be proven",
+                ));
+            }
+        }
         let minimum_schema_version = step.op().minimum_schema_version();
         if schema_version < minimum_schema_version {
             return Err(QueryError::new(
