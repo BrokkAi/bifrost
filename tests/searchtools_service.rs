@@ -8998,6 +8998,7 @@ fn scan_usages_demotes_large_result_to_summary_within_budget() {
     assert_eq!("summary", usage["rendering"]);
     assert_eq!(350, usage["total_hits"].as_u64().unwrap());
     assert!(!usage["complete"].as_bool().unwrap());
+    assert_eq!("response_budget", usage["incomplete_reason"]);
     assert_eq!(
         20,
         usage["files"].as_array().unwrap().len(),
@@ -9073,6 +9074,7 @@ fn scan_usages_too_many_callsites_returns_incomplete_summary_with_observed_files
         "payload: {value}"
     );
     assert_eq!(1000, usage["limit"].as_u64().unwrap(), "payload: {value}");
+    assert_eq!("callsites", usage["incomplete_reason"], "payload: {value}");
 
     assert_eq!("summary", usage["rendering"], "payload: {value}");
     assert_eq!(

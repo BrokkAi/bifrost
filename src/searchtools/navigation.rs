@@ -43,7 +43,37 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolLookupParams {
+    #[serde(deserialize_with = "deserialize_symbol_lookup_names")]
     pub symbols: Vec<String>,
+}
+
+pub(super) fn deserialize_symbol_lookup_names<'de, D>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let symbols = Vec::<String>::deserialize(deserializer)?;
+    if symbols.len() > SYMBOL_LOOKUP_MAX_SYMBOLS {
+        return Err(serde::de::Error::custom(format!(
+            "symbols accepts at most {SYMBOL_LOOKUP_MAX_SYMBOLS} entries"
+        )));
+    }
+    let mut total_bytes = 0usize;
+    for symbol in &symbols {
+        if symbol.len() > SYMBOL_LOOKUP_MAX_SYMBOL_BYTES {
+            return Err(serde::de::Error::custom(format!(
+                "each symbol must be at most {SYMBOL_LOOKUP_MAX_SYMBOL_BYTES} bytes"
+            )));
+        }
+        total_bytes = total_bytes.saturating_add(symbol.len());
+        if total_bytes > SYMBOL_LOOKUP_MAX_TOTAL_BYTES {
+            return Err(serde::de::Error::custom(format!(
+                "symbols must total at most {SYMBOL_LOOKUP_MAX_TOTAL_BYTES} bytes"
+            )));
+        }
+    }
+    Ok(symbols)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,13 +398,16 @@ pub fn search_symbols_with_cancellation(
         complete = false;
         HashMap::default()
     } else {
-        search_symbol_git_tiers(
+        let (tiers, git_ranking_complete) = search_symbol_git_tiers(
             analyzer,
             &file_entries
                 .iter()
                 .map(|(file, _)| file.clone())
                 .collect::<Vec<_>>(),
-        )
+            cancellation,
+        );
+        complete &= git_ranking_complete;
+        tiers
     };
     if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
         complete = false;
@@ -480,11 +513,22 @@ pub fn get_symbol_locations(
     analyzer: &dyn IAnalyzer,
     params: SymbolLookupParams,
 ) -> SymbolLocationsResult {
+    get_symbol_locations_with_cancellation(analyzer, params, None)
+}
+
+pub(crate) fn get_symbol_locations_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    params: SymbolLookupParams,
+    cancellation: Option<&crate::CancellationToken>,
+) -> SymbolLocationsResult {
     let mut outcomes: Vec<_> = params
         .symbols
         .into_par_iter()
         .enumerate()
         .filter_map(|(index, symbol)| {
+            if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+                return None;
+            }
             if symbol.trim().is_empty() {
                 return None;
             }
@@ -504,6 +548,9 @@ pub fn get_symbol_locations(
                     )),
                 ));
             };
+            if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+                return None;
+            }
             let locations: Vec<_> = code_units
                 .into_iter()
                 .filter_map(|code_unit| {
@@ -552,9 +599,22 @@ pub fn get_definitions_by_location(
     analyzer: &dyn IAnalyzer,
     params: GetDefinitionParams,
 ) -> GetDefinitionResult {
+    get_definitions_by_location_with_cancellation(analyzer, params, None)
+}
+
+pub(crate) fn get_definitions_by_location_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    params: GetDefinitionParams,
+    cancellation: Option<&crate::CancellationToken>,
+) -> GetDefinitionResult {
     let _scope = profiling::scope("searchtools::get_definitions_by_location");
     GetDefinitionResult {
-        results: get_navigation_by_location(analyzer, params, NavigationOperation::Definition),
+        results: get_navigation_by_location_with_cancellation(
+            analyzer,
+            params,
+            NavigationOperation::Definition,
+            cancellation,
+        ),
     }
 }
 
@@ -562,26 +622,40 @@ pub fn get_declarations_by_location(
     analyzer: &dyn IAnalyzer,
     params: GetDefinitionParams,
 ) -> GetDeclarationResult {
+    get_declarations_by_location_with_cancellation(analyzer, params, None)
+}
+
+pub(crate) fn get_declarations_by_location_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    params: GetDefinitionParams,
+    cancellation: Option<&crate::CancellationToken>,
+) -> GetDeclarationResult {
     let _scope = profiling::scope("searchtools::get_declarations_by_location");
     GetDeclarationResult {
-        results: get_navigation_by_location(analyzer, params, NavigationOperation::Declaration)
-            .into_iter()
-            .map(|result| DeclarationLookupResult {
-                query: result.query,
-                operation: result.operation,
-                status: result.status,
-                reference: result.reference,
-                declarations: result.definitions,
-                diagnostics: result.diagnostics,
-            })
-            .collect(),
+        results: get_navigation_by_location_with_cancellation(
+            analyzer,
+            params,
+            NavigationOperation::Declaration,
+            cancellation,
+        )
+        .into_iter()
+        .map(|result| DeclarationLookupResult {
+            query: result.query,
+            operation: result.operation,
+            status: result.status,
+            reference: result.reference,
+            declarations: result.definitions,
+            diagnostics: result.diagnostics,
+        })
+        .collect(),
     }
 }
 
-pub(super) fn get_navigation_by_location(
+fn get_navigation_by_location_with_cancellation(
     analyzer: &dyn IAnalyzer,
     params: GetDefinitionParams,
     operation: NavigationOperation,
+    cancellation: Option<&crate::CancellationToken>,
 ) -> Vec<DefinitionLookupResult> {
     let tool_name = match operation {
         NavigationOperation::Declaration => "get_declarations_by_location",
@@ -613,6 +687,9 @@ pub(super) fn get_navigation_by_location(
     let mut results: Vec<Option<DefinitionLookupResult>> = vec![None; params.references.len()];
 
     for (index, query) in params.references.into_iter().enumerate() {
+        if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+            break;
+        }
         match resolver.resolve_literal(&query.path) {
             ResolvedFileInput::File(file) => {
                 pending.push((
@@ -660,24 +737,31 @@ pub(super) fn get_navigation_by_location(
         }
     }
 
-    let requests: Vec<_> = pending
-        .iter()
-        .map(|(_, _, request)| request.clone())
-        .collect();
-    let outcomes = crate::analyzer::usages::get_definition::resolve_navigation_batch(
-        analyzer, requests, operation,
-    );
-
     let mut render_cache = DefinitionCandidateRenderCache::default();
-    for ((index, query, request), outcome) in pending.into_iter().zip(outcomes) {
-        results[index] = Some(render_definition_lookup(
+    for chunk in pending.chunks(8) {
+        if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+            break;
+        }
+        let requests = chunk
+            .iter()
+            .map(|(_, _, request)| request.clone())
+            .collect();
+        let outcomes = crate::analyzer::usages::get_definition::resolve_navigation_batch(
             analyzer,
-            query,
-            &request.file,
-            outcome,
+            requests,
             operation,
-            &mut render_cache,
-        ));
+            cancellation,
+        );
+        for ((index, query, request), outcome) in chunk.iter().zip(outcomes) {
+            results[*index] = Some(render_definition_lookup(
+                analyzer,
+                query.clone(),
+                &request.file,
+                outcome,
+                operation,
+                &mut render_cache,
+            ));
+        }
     }
 
     results.into_iter().flatten().collect()
@@ -1521,14 +1605,19 @@ pub(super) fn compare_ranked_search_candidates(
 pub(super) fn search_symbol_git_tiers(
     analyzer: &dyn IAnalyzer,
     files: &[ProjectFile],
-) -> HashMap<ProjectFile, usize> {
-    let ranked = most_important_project_files(analyzer, files, files.len());
+    cancellation: Option<&crate::CancellationToken>,
+) -> (HashMap<ProjectFile, usize>, bool) {
+    let (ranked, complete) =
+        most_important_project_files_with_cancellation(analyzer, files, files.len(), cancellation);
     let max_rank = ranked.len();
-    ranked
-        .into_iter()
-        .enumerate()
-        .map(|(index, file)| (file, max_rank.saturating_sub(index)))
-        .collect()
+    (
+        ranked
+            .into_iter()
+            .enumerate()
+            .map(|(index, file)| (file, max_rank.saturating_sub(index)))
+            .collect(),
+        complete,
+    )
 }
 
 pub(super) fn compare_search_symbol_files(

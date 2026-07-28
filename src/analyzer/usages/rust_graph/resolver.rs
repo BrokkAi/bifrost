@@ -6,6 +6,7 @@ use crate::analyzer::{
 };
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use tree_sitter::Node;
 
 /// Owned, query-shaped declaration access used by Rust forward resolution.
@@ -27,6 +28,14 @@ pub(crate) trait RustDefinitionProvider {
 
     fn observe_cancellation(&self) -> bool {
         true
+    }
+
+    fn forward_reference_context(
+        &self,
+        rust: &RustAnalyzer,
+        file: &ProjectFile,
+    ) -> Option<Arc<RustReferenceContext>> {
+        Some(rust.forward_reference_context_of(file))
     }
 
     fn ranges(&self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Vec<Range> {
@@ -380,7 +389,7 @@ pub(crate) fn lexical_import_fqn(
 ) -> Option<String> {
     let name = source.get(segment.start_byte()..segment.end_byte())?.trim();
     lexical_explicit_import_fqn(rust, support, file, source, segment).or_else(|| {
-        let forward = rust.forward_reference_context_of(file);
+        let forward = support.forward_reference_context(rust, file)?;
         forward
             .resolve_bare(name)
             .filter(|fqn| !support.fqn(fqn).is_empty())

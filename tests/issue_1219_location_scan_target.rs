@@ -2,15 +2,12 @@
 //! reference site it inspects — issue #1219.
 //!
 //! A line-only target (`{path, line, column}`, no `symbol`) against Bifrost's
-//! own tree ran ~21 minutes at 1200-1600% CPU. The reported contrast — the same
-//! line with `"symbol": "resolve_scan_usages_target"` "completed normally" —
-//! was not a faster scan: a bare identifier is not a Rust definition selector
-//! (Rust selectors are fully qualified, `searchtools.scan_usages.<name>`), so
-//! that request resolved to `not_found` and never scanned anything. The
-//! follow-up comment's fully qualified selector *did* resolve, and also took
-//! minutes. So there is no line-only-specific expansion: line-only targets bind
-//! to the same declaration a matching selector binds to, and the cost is the
-//! ordinary Rust usage scan.
+//! own tree ran ~21 minutes at 1200-1600% CPU. Symbol selectors were historically
+//! fully qualified, so the reported bare `"resolve_scan_usages_target"` selector
+//! initially returned `not_found`; #1228 made a matching short selector valid at
+//! an exact declaration location. Either way there is no line-only-specific
+//! expansion: line-only targets bind to the same declaration a matching selector
+//! binds to, and the cost is the ordinary Rust usage scan.
 //!
 //! Stack sampling put tree-sitter parsing under `parse_rust_tree` in the
 //! overwhelming majority of samples, reached from three independent directions
@@ -272,5 +269,28 @@ fn line_only_and_selector_qualified_targets_agree() {
         call_sites(&line_only),
         call_sites(&qualified),
         "line-only and selector-qualified targets must report the same usages"
+    );
+}
+
+#[test]
+fn issue_1228_short_selector_at_exact_location_resolves_the_declaration() {
+    let _guard = counter_lock();
+    let project = reference_heavy_project(3);
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+
+    let short_qualified = scan_at(&analyzer, Some("target_helper"));
+
+    assert_eq!(
+        short_qualified.status,
+        ScanUsagesStatus::Found,
+        "a precise source location makes its matching short selector unambiguous: {short_qualified:#?}"
+    );
+    assert_eq!(
+        call_sites(&short_qualified),
+        vec![
+            "src/consumer0.rs:3".to_string(),
+            "src/consumer1.rs:3".to_string(),
+            "src/consumer2.rs:3".to_string(),
+        ]
     );
 }

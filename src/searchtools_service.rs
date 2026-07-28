@@ -25,10 +25,12 @@ use crate::{
     searchtools::{
         ActivateWorkspaceParams, ActiveWorkspaceResult, GetActiveWorkspaceParams,
         MostRelevantFilesParams, RefreshParams, SymbolLookupParams, SymbolSourcesResult,
-        classify_test_files, get_declarations_by_location, get_definitions_by_location,
-        get_definitions_by_reference, get_summaries, get_symbol_ancestors, get_symbol_locations,
-        get_symbol_sources, get_type_by_location, list_symbols, most_relevant_files,
-        refresh_result, rename_symbol, scan_usages_by_location, scan_usages_by_reference,
+        classify_test_files, get_declarations_by_location_with_cancellation,
+        get_definitions_by_location_with_cancellation, get_definitions_by_reference,
+        get_summaries_with_cancellation, get_symbol_ancestors,
+        get_symbol_locations_with_cancellation, get_symbol_sources, get_type_by_location,
+        list_symbols, most_relevant_files, refresh_result, rename_symbol,
+        scan_usages_by_location_with_cancellation, scan_usages_by_reference_with_cancellation,
         search_symbols_with_cancellation, symbol_source_candidate_files, usage_graph,
     },
     searchtools_render::{RenderOptions, RenderText},
@@ -53,7 +55,44 @@ pub enum SearchToolsServiceErrorCode {
     Internal,
 }
 
+#[cfg(test)]
+mod issue_1228_response_budget_tests {
+    use super::*;
+    use crate::searchtools::{SourceBlock, SymbolSourcesResult};
+
+    #[test]
+    fn oversized_symbol_source_response_is_rejected_before_rendering() {
+        let result = SymbolSourcesResult {
+            sources: vec![SourceBlock {
+                label: "large".to_string(),
+                path: "large.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                text: "x".repeat(GET_SYMBOL_SOURCES_RESPONSE_BUDGET_BYTES + 1),
+                canonical_selector: None,
+                occurrence_role: None,
+                presentation: None,
+                note: None,
+            }],
+            not_found: Vec::new(),
+            ambiguous: Vec::new(),
+            ambiguous_paths: Vec::new(),
+        };
+
+        let error = SearchToolsService::symbol_sources_output(result, RenderOptions::default())
+            .expect_err("oversized response must be rejected");
+
+        assert_eq!(error.code, SearchToolsServiceErrorCode::InvalidParams);
+        assert!(
+            error.message.contains("response budget"),
+            "{}",
+            error.message
+        );
+    }
+}
+
 const MAX_QUERY_FILE_BYTES: u64 = 64 * 1024;
+const GET_SYMBOL_SOURCES_RESPONSE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -250,6 +289,7 @@ pub(crate) struct PreparedQueryCode {
 }
 
 impl PreparedQueryCode {
+    #[cfg(test)]
     pub(crate) const fn workspace_generation(&self) -> u64 {
         self.workspace_generation
     }
@@ -260,10 +300,12 @@ pub(crate) struct PreparedRunPolicy {
     root: PathBuf,
     policy_inputs: Vec<PolicyEvaluationInput>,
     options: PolicyEvaluationOptions,
+    #[cfg(test)]
     workspace_generation: u64,
 }
 
 impl PreparedRunPolicy {
+    #[cfg(test)]
     pub(crate) const fn workspace_generation(&self) -> u64 {
         self.workspace_generation
     }
@@ -738,13 +780,26 @@ impl SearchToolsService {
 
         let arguments = self.normalize_arguments_for_current_workspace(name, arguments)?;
         if name == "get_symbol_sources" {
-            return self
-                .handle_get_symbol_sources(strip_legacy_kind_filter(arguments), render_options);
+            return self.handle_get_symbol_sources(
+                strip_legacy_kind_filter(arguments),
+                render_options,
+                cancellation,
+            );
         }
         let snapshot = {
             let _scope = profiling::scope("SearchToolsService::snapshot_for_query");
             self.snapshot_for_query()?
         };
+        if cancellation.is_some_and(CancellationToken::is_cancelled)
+            && !matches!(
+                name,
+                "search_symbols" | "scan_usages_by_reference" | "scan_usages_by_location"
+            )
+        {
+            return Err(SearchToolsServiceError::internal(
+                "analyzer request was cancelled or exceeded its request-wide time budget",
+            ));
+        }
         let result = (|| match name {
             "search_symbols" => Self::decode_render_and_run(
                 &snapshot,
@@ -758,7 +813,13 @@ impl SearchToolsService {
                 &snapshot,
                 strip_legacy_kind_filter(arguments),
                 render_options,
-                |workspace, params| get_symbol_locations(workspace.analyzer(), params),
+                |workspace, params| {
+                    get_symbol_locations_with_cancellation(
+                        workspace.analyzer(),
+                        params,
+                        cancellation,
+                    )
+                },
             ),
             "get_symbol_ancestors" => Self::decode_render_and_run(
                 &snapshot,
@@ -770,7 +831,9 @@ impl SearchToolsService {
                 &snapshot,
                 arguments,
                 render_options,
-                |workspace, params| get_summaries(workspace.analyzer(), params),
+                |workspace, params| {
+                    get_summaries_with_cancellation(workspace.analyzer(), params, cancellation)
+                },
             ),
             "list_symbols" => Self::decode_render_and_run(
                 &snapshot,
@@ -797,7 +860,15 @@ impl SearchToolsService {
                     &snapshot,
                     arguments,
                     render_options,
-                    |workspace, params| scan_usages_by_reference(workspace.analyzer(), params),
+                    |workspace, params| {
+                        let _scan_scope =
+                            crate::profiling::scope("searchtools.scan_usages_backend");
+                        scan_usages_by_reference_with_cancellation(
+                            workspace.analyzer(),
+                            params,
+                            cancellation.cloned().unwrap_or_default(),
+                        )
+                    },
                 )
             }
             "scan_usages_by_location" => {
@@ -806,17 +877,33 @@ impl SearchToolsService {
                     &snapshot,
                     arguments,
                     render_options,
-                    |workspace, params| scan_usages_by_location(workspace.analyzer(), params),
+                    |workspace, params| {
+                        let _scan_scope =
+                            crate::profiling::scope("searchtools.scan_usages_backend");
+                        scan_usages_by_location_with_cancellation(
+                            workspace.analyzer(),
+                            params,
+                            cancellation.cloned().unwrap_or_default(),
+                        )
+                    },
                 )
             }
             "get_definitions_by_location" => {
                 Self::decode_and_run(&snapshot, arguments, |workspace, params| {
-                    get_definitions_by_location(workspace.analyzer(), params)
+                    get_definitions_by_location_with_cancellation(
+                        workspace.analyzer(),
+                        params,
+                        cancellation,
+                    )
                 })
             }
             "get_declarations_by_location" => {
                 Self::decode_and_run(&snapshot, arguments, |workspace, params| {
-                    get_declarations_by_location(workspace.analyzer(), params)
+                    get_declarations_by_location_with_cancellation(
+                        workspace.analyzer(),
+                        params,
+                        cancellation,
+                    )
                 })
             }
             "get_definitions_by_reference" => {
@@ -927,6 +1014,17 @@ impl SearchToolsService {
                 "Unknown tool: {name}"
             ))),
         })();
+        let result = if cancellation.is_some_and(CancellationToken::is_cancelled)
+            && !matches!(
+                name,
+                "search_symbols" | "scan_usages_by_reference" | "scan_usages_by_location"
+            ) {
+            Err(SearchToolsServiceError::internal(format!(
+                "{name} was cancelled or exceeded its request-wide time budget"
+            )))
+        } else {
+            result
+        };
         snapshot.finish(name, result)
     }
 
@@ -1845,12 +1943,23 @@ impl SearchToolsService {
         &self,
         arguments: Value,
         render_options: RenderOptions,
+        cancellation: Option<&CancellationToken>,
     ) -> Result<ToolOutput, SearchToolsServiceError> {
         let params = serde_json::from_value::<SymbolLookupParams>(arguments).map_err(|err| {
             SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
         })?;
         let initial_snapshot = self.snapshot_for_query()?;
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(SearchToolsServiceError::internal(
+                "get_symbol_sources was cancelled or exceeded its request-wide time budget",
+            ));
+        }
         let mut result = get_symbol_sources(initial_snapshot.analyzer(), params.clone());
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(SearchToolsServiceError::internal(
+                "get_symbol_sources was cancelled or exceeded its request-wide time budget",
+            ));
+        }
         if self.update_strategy == UpdateStrategy::WatchFiles {
             let candidate_files =
                 symbol_source_candidate_files(initial_snapshot.analyzer(), &result);
@@ -1865,6 +1974,11 @@ impl SearchToolsService {
                 Arc::clone(&session.snapshot)
             };
             let stale_files = stale_symbol_source_files(peek_snapshot.analyzer(), candidate_files)?;
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(SearchToolsServiceError::internal(
+                    "get_symbol_sources was cancelled or exceeded its request-wide time budget",
+                ));
+            }
 
             let final_snapshot = if stale_files.is_empty() {
                 Arc::clone(initial_snapshot.arc())
@@ -1898,6 +2012,16 @@ impl SearchToolsService {
         result: SymbolSourcesResult,
         render_options: RenderOptions,
     ) -> Result<ToolOutput, SearchToolsServiceError> {
+        let source_bytes = result
+            .sources
+            .iter()
+            .map(|source| source.text.len())
+            .sum::<usize>();
+        if source_bytes > GET_SYMBOL_SOURCES_RESPONSE_BUDGET_BYTES {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "get_symbol_sources resolved {source_bytes} bytes of source, exceeding the {GET_SYMBOL_SOURCES_RESPONSE_BUDGET_BYTES}-byte response budget; re-call with fewer or narrower symbols"
+            )));
+        }
         let rendered_text = result.render_text(render_options);
         let structured = serde_json::to_value(result).map_err(|err| {
             SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
@@ -2379,6 +2503,7 @@ impl SearchToolsService {
                 root,
                 policy_inputs,
                 options,
+                #[cfg(test)]
                 workspace_generation,
             });
         }
@@ -2394,7 +2519,7 @@ impl SearchToolsService {
             root,
             policy_inputs,
             options,
-            workspace_generation: _,
+            ..
         } = prepared;
         let result = (|| {
             let outcome = evaluate_policy_inputs_with_analyzer(
@@ -3407,6 +3532,76 @@ mod search_symbols_cancellation_tests {
                 .is_some_and(|note| note.contains("cancelled") && note.contains("partial")),
             "{result:#}"
         );
+    }
+
+    fn assert_cancelled_scan_result(
+        result: &Value,
+        expected_input_kind: &str,
+        expected_count: usize,
+    ) {
+        assert_eq!(result["summary"]["partial"], true, "{result:#}");
+        assert_eq!(result["summary"]["verified_absent"], 0, "{result:#}");
+        assert_eq!(result["summary"]["failure"], expected_count, "{result:#}");
+        let entries = result["results"].as_array().expect("scan results array");
+        assert_eq!(entries.len(), expected_count, "{result:#}");
+        for entry in entries {
+            assert_eq!(entry["input_kind"], expected_input_kind);
+            assert_eq!(entry["complete"], false, "{result:#}");
+            assert_eq!(entry["incomplete_reason"], "cancelled", "{result:#}");
+            assert_eq!(entry["reason_kind"], "cancelled", "{result:#}");
+        }
+    }
+
+    #[test]
+    fn issue_1228_service_forwards_cancellation_to_scan_usages_by_reference() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "pub fn target() {}\n").unwrap();
+        let service =
+            SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
+                .unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let result = service
+            .call_tool_output_with_cancellation(
+                "scan_usages_by_reference",
+                json!({
+                    "symbols": ["target", "other"],
+                    "include_tests": true
+                }),
+                RenderOptions::default(),
+                Some(&cancellation),
+            )
+            .unwrap()
+            .into_value();
+
+        assert_cancelled_scan_result(&result, "symbol", 2);
+    }
+
+    #[test]
+    fn issue_1228_service_forwards_cancellation_to_scan_usages_by_location() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "pub fn target() {}\n").unwrap();
+        let service =
+            SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
+                .unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let result = service
+            .call_tool_output_with_cancellation(
+                "scan_usages_by_location",
+                json!({
+                    "targets": [{"path": "lib.rs", "line": 1}],
+                    "include_tests": true
+                }),
+                RenderOptions::default(),
+                Some(&cancellation),
+            )
+            .unwrap()
+            .into_value();
+
+        assert_cancelled_scan_result(&result, "target", 1);
     }
 
     #[test]
