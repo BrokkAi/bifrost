@@ -14,11 +14,25 @@ keywords = ["analyzer", "tree-sitter", "lsp", "mcp", "code-analysis"]
 categories = ["development-tools", "parser-implementations", "command-line-utilities"]
 exclude = [
     ".agents/**",
+    # Repository test targets run from source checkouts and CI, not from the
+    # published crate. Retain non-Rust fixtures used by inline library tests.
+    "/tests/**/*.rs",
+    "/tests/common/**",
+    "/python_tests/**",
+    # The documentation site owns these large demos; Rust consumers do not
+    # need duplicate animated media in the crate archive.
+    "docs/src/assets/*.gif",
     "vendor/tree-sitter-scala/README.md",
     "vendor/tree-sitter-scala/queries/**",
     "vendor/tree-sitter-scala/src/grammar.json",
     "vendor/tree-sitter-scala/src/node-types.json",
     "vendor/tree-sitter-scala/tree-sitter.json",
+    # Retained upstream query references are not analyzer/runtime inputs yet.
+    "resources/treesitter/kotlin/highlights.scm",
+    "resources/treesitter/kotlin/tags.scm",
+    "vendor/tree-sitter-kotlin/src/grammar.json",
+    "vendor/tree-sitter-kotlin/src/node-types.json",
+    "vendor/tree-sitter-kotlin/tree-sitter.json",
 ]
 
 [lib]
@@ -87,9 +101,10 @@ tree-sitter = "0.25.10"
 tree-sitter-go = "0.25.0"
 tree-sitter-javascript = "0.25.0"
 tree-sitter-python = "0.25.0"
-# Scala's generated parser is compiled from vendor/tree-sitter-scala because
-# its Bifrost fixes are not available together in a published grammar crate.
-# See vendor/tree-sitter-scala/BIFROST_PATCH.md for provenance and regeneration.
+# Scala and Kotlin generated parsers are compiled from vendor/. Scala carries
+# Bifrost fixes not available together in a published crate; Kotlin's active
+# upstream source is ahead of its published crate. Their provenance files name
+# exact revisions and regeneration commands.
 tree-sitter-language = "0.1"
 
 # Grammars that still need older published releases for this port.
