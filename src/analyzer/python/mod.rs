@@ -219,6 +219,34 @@ impl PythonAnalyzer {
             .find(CodeUnit::is_module)
     }
 
+    /// Batched sibling of `resolve_module_code_unit`: resolves every FQN's path-symbol lookup in one
+    /// store transaction instead of one per FQN, then falls back to the (unbatched, rarer)
+    /// definition-lookup path per FQN exactly as the single-FQN version does. Preserves its per-item
+    /// semantics precisely, including that a path lookup which succeeds but finds no module unit does
+    /// *not* fall through to the definition lookup.
+    pub(crate) fn resolve_module_code_units_batch(
+        &self,
+        module_fqs: &[String],
+    ) -> Vec<Option<CodeUnit>> {
+        let path_results = self.inner.forward_path_module_fqns_batch(module_fqs);
+        let mut results: Vec<Option<CodeUnit>> = vec![None; module_fqs.len()];
+        let mut needs_definition_fallback = Vec::new();
+        for (i, units) in path_results.into_iter().enumerate() {
+            match units {
+                Some(units) => results[i] = units.into_iter().find(CodeUnit::is_module),
+                None => needs_definition_fallback.push(i),
+            }
+        }
+        for i in needs_definition_fallback {
+            results[i] = self
+                .inner
+                .forward_definition_fqn(&module_fqs[i])
+                .into_iter()
+                .find(CodeUnit::is_module);
+        }
+        results
+    }
+
     pub fn export_index_of(&self, file: &ProjectFile) -> ExportIndex {
         let mut index = ExportIndex::empty();
         let mut events = Vec::new();
@@ -830,7 +858,10 @@ impl IAnalyzer for PythonAnalyzer {
             inner,
             memo_budget: self.memo_budget,
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
-            imported_target_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
+            imported_target_files: build_weighted_cache(
+                self.memo_budget / 8,
+                weight_project_file_set,
+            ),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
             direct_descendant_index: Arc::new(OnceLock::new()),
@@ -845,7 +876,10 @@ impl IAnalyzer for PythonAnalyzer {
             inner,
             memo_budget: self.memo_budget,
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
-            imported_target_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
+            imported_target_files: build_weighted_cache(
+                self.memo_budget / 8,
+                weight_project_file_set,
+            ),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
             direct_descendant_index: Arc::new(OnceLock::new()),

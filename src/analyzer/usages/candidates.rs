@@ -201,43 +201,55 @@ fn find_direct_importers_with_cancellation(
     let mut files: Vec<_> = files.into_iter().collect();
     files.sort();
     let import_infos = import_provider.import_infos_for_files(&files);
-    let mut importers = HashSet::default();
-    for candidate in files {
+    // Each candidate's resolution is independent (own cache entries, own store-reader-pool
+    // checkout) and the pool is sized for `num_cpus` concurrent readers -- running this
+    // workspace-wide loop on a single thread leaves that capacity idle. `ImportAnalysisProvider:
+    // Sync` is what makes sharing `import_provider` across the pool sound.
+    let importers: Mutex<HashSet<ProjectFile>> = Mutex::new(HashSet::default());
+    // `try_for_each` (not `for_each`): returning `Err` on cancellation lets rayon stop dispatching
+    // new work across the pool instead of still visiting every remaining file -- with `for_each` a
+    // cancelled scan degrades from an immediate `break` to an O(files) pass that just skips work per
+    // item, so cancel latency would scale with workspace size instead of staying near-instant.
+    let _ = files.par_iter().try_for_each(|candidate| {
         if cancellation.is_cancelled() {
-            break;
+            return Err(());
         }
-        if source_files.contains(&candidate) {
-            continue;
+        if source_files.contains(candidate) {
+            return Ok(());
         }
         let imports = import_infos
             .as_ref()
-            .and_then(|infos| infos.get(&candidate))
+            .and_then(|infos| infos.get(candidate))
             .cloned()
-            .unwrap_or_else(|| import_provider.import_info_of(&candidate));
+            .unwrap_or_else(|| import_provider.import_info_of(candidate));
         let could_import_target = source_files
             .iter()
-            .any(|target| import_provider.could_import_file(&candidate, &imports, target));
+            .any(|target| import_provider.could_import_file(candidate, &imports, target));
         if cancellation.is_cancelled() {
-            break;
+            return Err(());
         }
         if could_import_target {
-            importers.insert(candidate);
-            continue;
+            if let Ok(mut sink) = importers.lock() {
+                sink.insert(candidate.clone());
+            }
+            return Ok(());
         }
         let imported = import_provider
-            .imported_code_units_from_infos(&candidate, &imports)
-            .unwrap_or_else(|| import_provider.imported_code_units_of(&candidate));
+            .imported_code_units_from_infos(candidate, &imports)
+            .unwrap_or_else(|| import_provider.imported_code_units_of(candidate));
         if cancellation.is_cancelled() {
-            break;
+            return Err(());
         }
         if imported
             .iter()
             .any(|unit| source_files.contains(unit.source()))
+            && let Ok(mut sink) = importers.lock()
         {
-            importers.insert(candidate);
+            sink.insert(candidate.clone());
         }
-    }
-    importers
+        Ok(())
+    });
+    importers.into_inner().expect("importers set poisoned")
 }
 
 fn find_transitive_importers_with_cancellation(
