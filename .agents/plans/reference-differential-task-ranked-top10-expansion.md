@@ -395,6 +395,36 @@ comes through the local gate, but is not the focus.
   `b62447367a064ae84bc025c7bbdad48b5a135f565c37ad7f43bb404856943c16`;
   and libzmq `get_tid` is consistent with SHA-256
   `b4e85b9a6940bf93ff79f0d49a5d7d97a7d289dcffb33ff136f85607c750d1c5`.
+- [x] (2026-07-28) Published the remaining mapped C++ repairs through clean
+  head `d3a3e9b6`: #1187 and #1221 restore structured nested-owner and
+  implicit-self field ranges, while #1190 restores declaration, template,
+  alias, using, and cast type references without admitting wrong-owner or
+  callable-shadow false positives. The final #1190 commit is `786bf00a`;
+  formatting, all-target/all-feature Clippy, all 168 C++ usage tests, all 28
+  workspace-graph tests, and the complete `nlp,python` matrix pass at niceness
+  10 with normal Cargo storage. Exact Qpid, libzmq, and log4cxx witnesses are
+  consistent, two independent Oldskool reviews found no blocker, the changes
+  are pushed to `origin/master`, and all three assigned issues are closed.
+- [x] (2026-07-28) Ran a clean `d3a3e9b6` C++ top-ten certification with four
+  concurrent repository jobs and twelve inner workers. All ten envelopes
+  completed in 5:09 with no file or candidate-limit errors. Exact-key
+  reconciliation reduced the trusted 150-row ledger to 81 current raw rows:
+  80 are mapped survivors and one new Qpid key was absent from the ledger.
+  Exact replay proved that bytes `5194..5200` select only the `source` owner in
+  `enum source::distribution_mode`, while forward lookup incorrectly returns
+  the same-named `distribution_mode()` method. Created `FIRD:` issue #1226
+  already assigned to `jbellis` before implementation and delegated the
+  structured forward-resolution correction to Oldskool.
+- [x] (2026-07-28) Completed the Python top-ten certification at clean pushed
+  head `d3a3e9b6`. All ten envelopes completed in 6:49 with one shared
+  fingerprint, clean Bifrost and repository heads, no file errors, no
+  candidate-limit event, and complete inverse target coverage. Exact identity
+  comparison against the 379-row pre-#1225 report removed only the two fixed
+  Caikit witnesses, retained the 377 previously dispositioned non-actionable
+  module/import-collision rows, and introduced zero novel identities. Added
+  `.agents/docs/reference-differential/python-task-top10-d3a3e9b6-summary.md`
+  with the provenance, aggregate accounting, checksums, repair evidence, and
+  final zero-actionable disposition.
 - [ ] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [ ] Complete C++ and publish its evidence and user summary.
@@ -406,7 +436,7 @@ comes through the local gate, but is not the focus.
 - [x] Complete PHP and publish its evidence and user summary.
 - [x] Complete Rust and publish its evidence and user summary.
 - [x] Complete Scala and publish its evidence and user summary.
-- [ ] Complete Python and publish its evidence and user summary.
+- [x] Complete Python and publish its evidence and user summary.
 - [ ] Prove all 110 accepted envelopes and every fixing head are present on
   final `origin/master`, run the final local gate, and remove temporary
   diagnostics while retaining the compact checked-in evidence.
