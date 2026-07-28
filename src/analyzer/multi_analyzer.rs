@@ -435,6 +435,20 @@ impl ImportAnalysisProvider for MultiAnalyzer {
             .map(|provider| provider.could_import_file(source_file, imports, target))
             .unwrap_or(false)
     }
+
+    /// Without this override, `MultiAnalyzer` falls back to the trait default (always `None`) instead
+    /// of forwarding to the per-language delegate's implementation -- silently defeating a delegate's
+    /// own `imported_code_units_from_infos` (e.g. Python's) for every workspace-level caller that goes
+    /// through `MultiAnalyzer`, which is the common case for a `scan_usages` on a real checkout.
+    fn imported_code_units_from_infos(
+        &self,
+        file: &ProjectFile,
+        imports: &[ImportInfo],
+    ) -> Option<HashSet<CodeUnit>> {
+        self.delegate_for_file(file)
+            .and_then(AnalyzerDelegate::import_analysis_provider)
+            .and_then(|provider| provider.imported_code_units_from_infos(file, imports))
+    }
 }
 
 impl TypeHierarchyProvider for MultiAnalyzer {

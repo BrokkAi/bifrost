@@ -46,11 +46,36 @@ pub(crate) fn imported_code_units_of<T: JsTsAnalyzerHost>(
         return (*cached).clone();
     }
 
+    let resolved = resolve_imported_code_units(host, file, host.ts_inner().import_info_of(file));
+
+    caches
+        .imported_code_units
+        .insert(file.clone(), Arc::new(resolved.clone()));
+    resolved
+}
+
+/// `imports` is intentionally unused: `imported_code_units_of`'s cache is keyed by `file` alone and,
+/// unlike Python's binding-name-keyed cache, stores a plain `HashSet<CodeUnit>` with no collision risk
+/// -- so routing through it (rather than re-resolving from the passed-in `imports`) is both correct and
+/// gets the caching this hook exists to provide, shared with `could_import_file` below.
+pub(crate) fn imported_code_units_from_infos<T: JsTsAnalyzerHost>(
+    host: &T,
+    file: &ProjectFile,
+    _imports: &[ImportInfo],
+) -> Option<HashSet<CodeUnit>> {
+    Some(imported_code_units_of(host, file))
+}
+
+fn resolve_imported_code_units<T: JsTsAnalyzerHost>(
+    host: &T,
+    file: &ProjectFile,
+    imports: impl IntoIterator<Item = ImportInfo>,
+) -> HashSet<CodeUnit> {
     let inner = host.ts_inner();
     let language = host.js_ts_language();
     let alias_resolver = host.alias_resolver();
     let mut resolved = HashSet::default();
-    for import in inner.import_info_of(file) {
+    for import in imports {
         for target in
             resolve_js_ts_import_paths(file, &import.raw_snippet, language, Some(alias_resolver))
         {
@@ -93,10 +118,6 @@ pub(crate) fn imported_code_units_of<T: JsTsAnalyzerHost>(
             }
         }
     }
-
-    caches
-        .imported_code_units
-        .insert(file.clone(), Arc::new(resolved.clone()));
     resolved
 }
 
@@ -179,23 +200,49 @@ pub(crate) fn relevant_imports_for<T: JsTsAnalyzerHost>(
     relevant
 }
 
+/// `imports` is intentionally unused, for the same reason as `imported_code_units_from_infos` above:
+/// the cache is keyed by `source_file` and holds every import's resolved target, so reusing it (instead
+/// of re-resolving from the passed-in slice) is correct and gets the caching this hook is for.
 pub(crate) fn could_import_file<T: JsTsAnalyzerHost>(
     host: &T,
     source_file: &ProjectFile,
-    imports: &[ImportInfo],
+    _imports: &[ImportInfo],
     target: &ProjectFile,
 ) -> bool {
-    let language = host.js_ts_language();
-    let alias_resolver = host.alias_resolver();
-    imports.iter().any(|import| {
-        resolve_js_ts_import_paths(
-            source_file,
-            &import.raw_snippet,
-            language,
-            Some(alias_resolver),
-        )
-        .into_iter()
-        .any(|candidate| candidate == *target)
+    resolved_import_target_files(host, source_file).contains(target)
+}
+
+/// The file-path resolution targets of `file`'s own imports (module specifier -> file), cached per
+/// file. Without this, `could_import_file` re-ran `resolve_js_ts_import_paths` for every
+/// (candidate, target) pair the shared usages candidate walker checks -- unbounded per-call cost on a
+/// large workspace, never cached before this.
+///
+/// `get_with` (not get-then-insert): `could_import_file` runs unconditionally for every candidate in
+/// the parallelized workspace-wide import-graph walk, so two worker threads can miss the cache for
+/// the same file at once. `get_with` guarantees only one thread ever runs the resolution closure per
+/// key, matching `PythonAnalyzer::resolve_import_target_files`'s equivalent fix.
+fn resolved_import_target_files<T: JsTsAnalyzerHost>(
+    host: &T,
+    file: &ProjectFile,
+) -> Arc<HashSet<ProjectFile>> {
+    let caches = host.memo_caches();
+    caches.imported_target_files.get_with(file.clone(), || {
+        let language = host.js_ts_language();
+        let alias_resolver = host.alias_resolver();
+        let targets: HashSet<ProjectFile> = host
+            .ts_inner()
+            .import_info_of(file)
+            .iter()
+            .flat_map(|import| {
+                resolve_js_ts_import_paths(
+                    file,
+                    &import.raw_snippet,
+                    language,
+                    Some(alias_resolver),
+                )
+            })
+            .collect();
+        Arc::new(targets)
     })
 }
 

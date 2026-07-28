@@ -34,7 +34,9 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
 pub(crate) use adapter::PythonAdapter;
-use cache::{weight_code_unit_set, weight_code_unit_vec, weight_project_file_set};
+use cache::{
+    weight_code_unit_set, weight_code_unit_vec, weight_export_index, weight_project_file_set,
+};
 use clones::{build_clone_candidate_data, refine_python_clone_similarity};
 pub(crate) use declarations::python_package_prefix_fq;
 use declarations::{
@@ -56,7 +58,20 @@ pub struct PythonAnalyzer {
     inner: TreeSitterAnalyzer<PythonAdapter>,
     memo_budget: u64,
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
+    // Every source file this file's imports resolve to, keyed on the file itself -- NOT deduped by
+    // binding name like `imported_code_units` (a HashMap<String, CodeUnit> would silently drop an
+    // import whose binding name collides with another's). `could_import_file` needs the undeduped
+    // set to answer "does ANY import here resolve into `target`" without re-resolving every import
+    // on every call (previously uncached, called once per (candidate file, target) pair).
+    imported_target_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
+    // `export_index_of` re-parses `file` from source on every call (it walks re-export chains, not
+    // the store-backed `FileState`). `resolve_exported_name`'s re-export BFS calls it once per hop
+    // per importing candidate, so on a workspace where many files resolve through a shared re-export
+    // chain this was previously O(candidates * chain depth) redundant full-file parses -- invisible
+    // while candidate discovery was single-threaded and dominated by slower costs, but the dominant
+    // cost once that walk was fixed and parallelized (#1257).
+    export_index: Cache<ProjectFile, Arc<ExportIndex>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
@@ -173,7 +188,9 @@ impl PythonAnalyzer {
             inner,
             memo_budget,
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
+            imported_target_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
+            export_index: build_weighted_cache(memo_budget / 8, weight_export_index),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec),
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
@@ -212,7 +229,47 @@ impl PythonAnalyzer {
             .find(CodeUnit::is_module)
     }
 
+    /// Batched sibling of `resolve_module_code_unit`: resolves every FQN's path-symbol lookup in one
+    /// store transaction instead of one per FQN, then falls back to the (unbatched, rarer)
+    /// definition-lookup path per FQN exactly as the single-FQN version does. Preserves its per-item
+    /// semantics precisely, including that a path lookup which succeeds but finds no module unit does
+    /// *not* fall through to the definition lookup.
+    pub(crate) fn resolve_module_code_units_batch(
+        &self,
+        module_fqs: &[String],
+    ) -> Vec<Option<CodeUnit>> {
+        let path_results = self.inner.forward_path_module_fqns_batch(module_fqs);
+        let mut results: Vec<Option<CodeUnit>> = vec![None; module_fqs.len()];
+        let mut needs_definition_fallback = Vec::new();
+        for (i, units) in path_results.into_iter().enumerate() {
+            match units {
+                Some(units) => results[i] = units.into_iter().find(CodeUnit::is_module),
+                None => needs_definition_fallback.push(i),
+            }
+        }
+        for i in needs_definition_fallback {
+            results[i] = self
+                .inner
+                .forward_definition_fqn(&module_fqs[i])
+                .into_iter()
+                .find(CodeUnit::is_module);
+        }
+        results
+    }
+
+    /// `get_with` (not get-then-insert): callers include the parallelized candidate walker's
+    /// re-export BFS, so two threads racing on the same file's first lookup must not both pay the
+    /// full disk-read-and-reparse cost below.
     pub fn export_index_of(&self, file: &ProjectFile) -> ExportIndex {
+        self.export_index
+            .get_with(file.clone(), || {
+                Arc::new(self.compute_export_index_of(file))
+            })
+            .as_ref()
+            .clone()
+    }
+
+    fn compute_export_index_of(&self, file: &ProjectFile) -> ExportIndex {
         let mut index = ExportIndex::empty();
         let mut events = Vec::new();
         let declarations = self.inner.top_level_declarations(file);
@@ -823,7 +880,12 @@ impl IAnalyzer for PythonAnalyzer {
             inner,
             memo_budget: self.memo_budget,
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
+            imported_target_files: build_weighted_cache(
+                self.memo_budget / 8,
+                weight_project_file_set,
+            ),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
+            export_index: build_weighted_cache(self.memo_budget / 8, weight_export_index),
             direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
@@ -837,7 +899,12 @@ impl IAnalyzer for PythonAnalyzer {
             inner,
             memo_budget: self.memo_budget,
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
+            imported_target_files: build_weighted_cache(
+                self.memo_budget / 8,
+                weight_project_file_set,
+            ),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
+            export_index: build_weighted_cache(self.memo_budget / 8, weight_export_index),
             direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),

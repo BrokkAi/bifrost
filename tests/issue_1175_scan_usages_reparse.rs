@@ -65,6 +65,7 @@ fn scan_widget(analyzer: &CppAnalyzer) -> ScanUsagesEntry {
             include_tests: true,
             paths: None,
             include_same_owner: false,
+            max_duration_secs: None,
         },
     );
     assert_eq!(result.results.len(), 1, "one requested symbol");
