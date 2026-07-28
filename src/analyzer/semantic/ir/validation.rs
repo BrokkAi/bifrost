@@ -2145,6 +2145,7 @@ fn validate_value_flow_kind(
             matches!(source_kind, SemanticValueKind::Return)
                 || matches!(target_kind, SemanticValueKind::Return)
         }
+        ValueFlowKind::LanguageDefined => true,
     };
     if !valid {
         return Err(SemanticIrError::procedure(
@@ -2712,6 +2713,9 @@ fn effect_capabilities(effect: &SemanticEffect) -> &'static [SemanticCapability]
                 &[SemanticCapability::Values, SemanticCapability::ReceiverFlow]
             }
             ValueFlowKind::Return => &[SemanticCapability::Values, SemanticCapability::ReturnFlow],
+            ValueFlowKind::LanguageDefined => {
+                &[SemanticCapability::Values, SemanticCapability::LocalFlow]
+            }
         },
         SemanticEffect::Allocation { .. } => &[SemanticCapability::Allocations],
         SemanticEffect::MemoryLoad { kind, .. } | SemanticEffect::MemoryStore { kind, .. } => {

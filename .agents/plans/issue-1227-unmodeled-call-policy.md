@@ -24,9 +24,16 @@ This is intentionally staged. The control-flow invariant and shared fallback pro
 - [x] Milestone 2: expose `:call-modeling (call-modeling :unmodeled ...)` through the declarative RQLP schema, canonical identity, validation, hover, grammar, and policy compilation.
   - [x] (2026-07-28 11:07 SAST) Added the declarative record/field/atom vocabulary, paranoid omission default, authored and resolved representations, canonical JSON and semantic hashing, mode-aware reusable-summary behavior identity, and typestate compilation.
   - [x] (2026-07-28 11:11 SAST) Added behavior-focused parser/default/hover/identity/execution/docs/editor coverage. Policy library (271), CLI (19), docs (8), loading (16), match evaluation (13), reusable summaries (16), and the focused LSP test all pass; fresh-target strict all-feature clippy passed in 3m55s.
-- [ ] Milestone 3: bind exact external reusable summaries and curated policy models to live call sites with explicit precedence and cache invalidation.
-- [ ] Milestone 4: add structured mutable-receiver/argument, bounded heap/global, and operator effects through semantic adapters and the same typed summary pipeline.
-- [ ] Milestone 5: run cross-language acceptance coverage, full formatting/clippy/tests, specialist review, and reconcile the issue checklist with implemented and follow-up scope.
+- [x] Milestone 3: bind exact external reusable summaries and curated models to live call sites with explicit precedence and cache invalidation.
+  - [x] (2026-07-28 12:04 SAST) Added a canonical, content-addressed external-summary set keyed by structured procedure locators, plus selector-bound curated models using `SummaryPort`, `SummaryTransfer`, and `SummaryEvidence`; value-flow applies exact summaries before curated models and either before fallback.
+  - [x] (2026-07-28 12:04 SAST) Bound receiver, parameter, normal/exceptional result, and explicitly supplied heap/capture ports to live carriers. External content, curated model, location-binding, fallback-profile, and call-mode identities now participate in value-flow and downstream taint summary/cache compatibility (`reusable_summaries`: 17; focused exact/curated/heap value-flow tests pass).
+- [x] Milestone 4: add structured mutable-receiver/argument, bounded heap/global, and operator effects through semantic adapters and the same typed summary pipeline.
+  - [x] (2026-07-28 12:16 SAST) Built deterministic paranoid profiles from structured receiver/argument values, their addressable locations, and bounded static/type/module/external locations. Java primitives remain inputs rather than mutable outputs; one iterative union-find pass and a component-to-location index replace per-call graph searches and all-carrier scans.
+  - [x] (2026-07-28 12:16 SAST) Java and TypeScript unary/binary lowering now emits `LanguageDefined` operand-to-result facts consumed by the neutral value-flow oracle. Source-backed tests cover normal and exceptional fallback results, receiver/argument-to-state flow in Java and TypeScript, bounded global and exact heap effects, unary/binary operations, and incomparable model-evidence alternatives (`value_flow_client`: 17 passed).
+- [x] Milestone 5: run cross-language acceptance coverage, full formatting/clippy/tests, manual specialist review, and reconcile the issue checklist with implemented and follow-up scope.
+  - [x] (2026-07-28 12:16 SAST) Manual correctness/performance review fixed undercounted nested fallback/location rows in retained-size and solver-work accounting, required one proven-and-complete summary evidence alternative rather than joining independent axes across alternatives, and removed the remaining call-times-carrier profile-construction scan.
+  - [x] (2026-07-28 12:16 SAST) Broad no-feature library run executed 1,970 tests: 1,967 passed in the managed sandbox and the three blocked MCP subprocess tests passed when rerun outside it (five matching tests passed). The issue-focused matrix then passed: CLI 19, summaries 32, ICFG 25, docs 8, loading 16, match evaluation 13, reusable summaries 17, semantic IR 11, taint 26, typestate 40, and value-flow 17.
+  - [x] (2026-07-28 12:19 SAST) Repeated fresh-target strict all-target/all-feature clippy after the post-review accounting and indexing fixes; it passed in 2m20s. Formatting and diff validation are clean.
 
 ## Surprises & Discoveries
 
@@ -62,6 +69,18 @@ This is intentionally staged. The control-flow invariant and shared fallback pro
 - Observation: conservative typestate can reach the authored terminal state and additional violating alternatives at the same site. Existing terminal projection attempted to serialize every reached state as a violation, including the expected state, and therefore failed once paranoid became the default.
   Evidence: `bifrost_policy_cli::typestate_same_site_endpoint_precedence_retains_only_the_dominant_binding` exposed the forged expected-state violation. Filtering expected states before constructing violation evidence restored all 19 policy CLI tests.
 
+- Observation: the existing `TaintExternalModelSpec` is resolved and canonicalized, but the repository still has no production `TaintPolicyEvaluator`; only the sealed adapter seam and test doubles exist. This issue therefore supplies the neutral curated-model binding consumed by value-flow and taint plans, without pretending that policy selector evaluation or label-specific sanitize/transform execution is already production-wired.
+  Evidence: `src/analyzer/policy/evaluator.rs` describes `TaintPolicyEvaluator` as the future taint compiler/solver adapter boundary; no production implementation exists under `src/`.
+
+- Observation: the initial structured fallback prototype checked receiver/argument reachability by scanning every local rule for every location at every call site. That shape would make policy construction scale as calls times locations times relations.
+  Evidence: the final implementation computes one iterative union-find component map over local rules, then performs bounded component lookups while constructing each call profile.
+
+- Observation: Java's current fixture lowering did not expose a static memory-load carrier for the bounded-global test. The test therefore uses the same stable static locator and abstract-location vocabulary to supply a bounded global carrier when the adapter does not produce one; it proves fallback behavior, not Java static-field lowering.
+  Evidence: `paranoid_fallback_models_bounded_globals_but_not_primitive_argument_mutation` constructs an `AccessPathRoot::Static` fallback only when no emitted static load exists.
+
+- Observation: review found two validity/accounting pitfalls after semantics were passing. Retained-size and solver-work estimates counted fallback records but not their nested carrier keys, and summary evidence checked proven and complete axes independently across alternatives.
+  Evidence: final accounting includes nested input/output/location keys and model-row work; modeled transfer quality now requires one alternative whose `PathQuality` is both proven and complete, with a regression test using incomparable alternatives.
+
 ## Decision Log
 
 - Decision: Separate continuation from transfer semantics. An unmaterialized call arm projects every semantically available normal and exceptional continuation regardless of the client-selected fallback profile.
@@ -96,9 +115,25 @@ This is intentionally staged. The control-flow invariant and shared fallback pro
   Rationale: Two public knobs for the same unresolved-call semantics would be contradictory. The new record is shared by taint and typestate, has one paranoid default, and participates in policy and summary identity.
   Date/Author: 2026-07-28 / Codex
 
+- Decision: Match exact indexed summaries with mount, workspace-relative path, language, and declaration, but not source anchors.
+  Rationale: indexed source coordinates can move without changing a library procedure's modeled interface. Artifact/model revisions and external content hashes remain in the selected summary identity and invalidate incompatible caches.
+  Date/Author: 2026-07-28 / Codex
+
+- Decision: Keep selector evaluation outside the neutral `CuratedCallModel`, and require adapters to bind a curated model to one validated live `CallSiteHandle`.
+  Rationale: RQLP, built-in model packs, and future library indexes need one transfer vocabulary, while selector matching belongs to their owning adapter. The current production taint adapter does not yet exist, so embedding policy dependencies in value-flow would create the parallel mechanism the issue warns against.
+  Date/Author: 2026-07-28 / Codex
+
+- Decision: Precompute undirected local carrier components once when deriving paranoid side-effect profiles.
+  Rationale: conservative alias/reachability needs structured transitive connectivity, but repeated graph searches in the plan-construction hot path would undermine the sub-five-second responsiveness goal tracked by #1228.
+  Date/Author: 2026-07-28 / Codex
+
 ## Outcomes & Retrospective
 
-Milestones 1 and 2 establish the foundational invariant and public policy surface. Residual call arms now reach their normal and exceptional continuations and always retain incomplete boundary evidence. Value-flow and taint apply one shared paranoid-default profile without requiring resolved formal bindings, while typestate maps the same profile into its existing uncertainty transitions. `.rqlp` can override that profile with a typed `call-modeling` record, and the selected mode participates in canonical policy, semantic, summary, and batch identities. Focused data-flow and policy coverage passes. Exact external-model selection and structured side effects remain the next milestones.
+Milestones 1 through 4 now cover the issue's runtime and authoring contract. Residual call arms reach normal and exceptional continuations while retaining incomplete boundary evidence. Value-flow and taint apply one shared paranoid-default profile without requiring resolved formal bindings, while typestate maps the same profile into its existing uncertainty transitions. `.rqlp` can override that profile with a typed `call-modeling` record, and the selected mode participates in canonical policy, semantic, summary, and batch identities.
+
+Exact external procedure summaries and selector-bound curated models use the existing reusable-summary ports, transfers, evidence, completeness, origins, and content identities. Exact summaries precede curated models, which precede fallback. Paranoid fallback includes structured mutable receiver/argument state and bounded globals without treating Java primitives as out parameters. Java and TypeScript unary/binary expressions emit neutral `LanguageDefined` facts that flow through the same value-flow and reusable-summary machinery.
+
+Final validation is green: the broad library surface passed apart from three sandbox-blocked subprocess tests that passed immediately outside the sandbox, the complete issue-focused matrix passed, and a fresh strict all-feature clippy run passed after review fixes. The implementation is ready for its Milestones 3-5 checkpoint on the current detached worktree. Production evaluation of authored taint external-model selectors remains the pre-existing future adapter gap; this issue does not claim that absent adapter.
 
 ## Context and Orientation
 
@@ -241,3 +276,5 @@ The external model resolver introduced in Milestone 3 must consume stable select
 Revision note (2026-07-28): Initial plan created after live issue inspection and source diagnosis. It explicitly splits the immediately repairable call-continuation/profile work from external selector binding, structured side effects, and operator modeling because those capabilities do not yet exist in the semantic IR.
 
 Revision note (2026-07-28): Milestone 2 completed the public RQLP surface and removed the conflicting legacy unknown-call knob. The default change uncovered and fixed terminal typestate reporting for sets containing both expected and violating states.
+
+Revision note (2026-07-28): Milestones 3 and 4 completed exact external-summary selection, neutral curated-model binding, structured side-effect fallback, and Java/TypeScript operator flows. The plan records the absent production taint-policy adapter explicitly and replaces a repeated reachability scan with one iterative connectivity pass for performance.

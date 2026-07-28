@@ -2,8 +2,8 @@ use std::{error::Error, fmt};
 
 use crate::analyzer::dataflow::{
     DataflowEdge, DataflowOutput, DataflowRequest, DistributiveDataflowProblem,
-    SummaryDataflowError, SummarySolveInput, UnmodeledCallBehavior, WitnessRetentionLimits,
-    solve_with_summaries,
+    SummaryDataflowError, SummaryExitKind, SummarySolveInput, SummaryTransfer,
+    UnmodeledCallBehavior, WitnessRetentionLimits, solve_with_summaries,
 };
 use crate::analyzer::semantic::{
     EvidenceCompleteness, IcfgEdgeKind, IcfgProvider, ProcedureHandle, ProofStatus, SemanticBudget,
@@ -11,8 +11,7 @@ use crate::analyzer::semantic::{
 
 use super::plan::CallFlowRuleKind;
 use super::{
-    ValueFlowCarrier, ValueFlowCarrierId, ValueFlowPlan, ValueFlowSinkId, ValueFlowSourceId,
-    ValueFlowSummaryResult,
+    ValueFlowCarrierId, ValueFlowPlan, ValueFlowSinkId, ValueFlowSourceId, ValueFlowSummaryResult,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -107,6 +106,18 @@ impl ActiveFlow {
         if !matches!(proof, ProofStatus::Proven)
             || !matches!(completeness, EvidenceCompleteness::Complete)
         {
+            self.uncertainty = self.uncertainty.with_semantic();
+        }
+        self
+    }
+
+    fn with_summary_quality(
+        mut self,
+        evidence: &crate::analyzer::dataflow::SummaryEvidence,
+    ) -> Self {
+        if !evidence.alternatives().iter().any(|alternative| {
+            alternative.quality().is_proven() && alternative.quality().is_complete()
+        }) {
             self.uncertainty = self.uncertainty.with_semantic();
         }
         self
@@ -335,6 +346,25 @@ impl<'plan> ValueFlowProblem<'plan> {
             self.emit_all(active, meetings, out);
             return;
         };
+        if let Some(summary) = edge
+            .boundary()
+            .and_then(|boundary| self.plan.external_summary_for_boundary(boundary))
+            && self.apply_modeled_transfers(
+                edge,
+                call,
+                summary.transfers(),
+                &active,
+                &meetings,
+                out,
+            )
+        {
+            return;
+        }
+        if let Some(model) = self.plan.curated_model_for_call(call)
+            && self.apply_modeled_transfers(edge, call, model.transfers(), &active, &meetings, out)
+        {
+            return;
+        }
         let mut propagated = match self.plan.unmodeled_call_behavior() {
             UnmodeledCallBehavior::Paranoid | UnmodeledCallBehavior::Optimistic => active.clone(),
             UnmodeledCallBehavior::RequireModel => active
@@ -352,32 +382,71 @@ impl<'plan> ValueFlowProblem<'plan> {
                 })
                 .collect(),
         };
-        let call_row = call
-            .procedure()
-            .semantics()
-            .call_site(call.id())
-            .expect("call handles are validated");
-        let result = match edge.kind() {
-            IcfgEdgeKind::CallToNormalContinuation => call_row.result,
-            IcfgEdgeKind::CallToExceptionalContinuation => call_row.thrown,
-            _ => None,
-        }
-        .and_then(|value| call.procedure().value_handle(value))
-        .and_then(|value| self.plan.carrier_id(&ValueFlowCarrier::Value(value)));
-        if self.plan.unmodeled_call_behavior() == UnmodeledCallBehavior::Paranoid
-            && let Some(result) = result
-        {
+        if self.plan.unmodeled_call_behavior() == UnmodeledCallBehavior::Paranoid {
+            let outputs = self
+                .plan
+                .fallback_outputs(call, edge.kind())
+                .collect::<Vec<_>>();
             for flow in active {
                 if self.plan.is_call_input(call, flow.carrier) {
-                    propagated.push(ActiveFlow {
-                        carrier: result,
-                        uncertainty: flow.uncertainty.with_semantic(),
-                        ..flow
-                    });
+                    for output in &outputs {
+                        propagated.push(ActiveFlow {
+                            carrier: *output,
+                            uncertainty: flow.uncertainty.with_semantic(),
+                            ..flow
+                        });
+                    }
                 }
             }
         }
         self.emit_all(propagated, meetings, out);
+    }
+
+    fn apply_modeled_transfers(
+        &self,
+        edge: DataflowEdge<'_, ValueFlowFact>,
+        call: &crate::analyzer::semantic::CallSiteHandle,
+        model: &[SummaryTransfer],
+        active: &[ActiveFlow],
+        meetings: &[ValueFlowFact],
+        out: &mut dyn DataflowOutput<ValueFlowFact>,
+    ) -> bool {
+        let exit = match edge.kind() {
+            IcfgEdgeKind::CallToNormalContinuation => SummaryExitKind::Normal,
+            IcfgEdgeKind::CallToExceptionalContinuation => SummaryExitKind::Exceptional,
+            _ => return false,
+        };
+        let transfers = model
+            .iter()
+            .filter(|transfer| transfer.exit().kind() == exit)
+            .map(|transfer| {
+                Some((
+                    self.plan.summary_port_carrier(call, transfer.input())?,
+                    self.plan
+                        .summary_port_carrier(call, transfer.exit().port())?,
+                    transfer.evidence(),
+                ))
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(transfers) = transfers else {
+            // The exact summary is not applicable until every referenced heap
+            // or capture port can be bound to a live structured carrier.
+            return false;
+        };
+
+        let mut propagated = active.to_vec();
+        for flow in active {
+            for (input, output, evidence) in &transfers {
+                if flow.carrier == *input {
+                    propagated.push(ActiveFlow {
+                        carrier: *output,
+                        ..flow.with_summary_quality(evidence)
+                    });
+                }
+            }
+        }
+        self.emit_all(propagated, meetings.to_vec(), out);
+        true
     }
 }
 

@@ -945,6 +945,7 @@ pub enum ValueFlowKind {
     Parameter,
     Receiver,
     Return,
+    LanguageDefined,
 }
 
 impl ValueFlowKind {
@@ -954,6 +955,7 @@ impl ValueFlowKind {
             Self::Parameter => "parameter",
             Self::Receiver => "receiver",
             Self::Return => "return",
+            Self::LanguageDefined => "language_defined",
         }
     }
 }

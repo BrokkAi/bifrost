@@ -147,6 +147,82 @@ fn call_effect(dependency: SummaryDependencyKey) -> SummaryEffect {
     )
 }
 
+fn external_summary(name: &str, content: &[u8]) -> SemanticProcedureSummary {
+    let origin = ExternalSummaryOrigin::new(
+        ExternalSummaryModelId::new(format!("test.{name}")).unwrap(),
+        ExternalSummaryContentHash::hash_bytes(content),
+        1,
+    )
+    .unwrap();
+    let identity = identity_with(
+        artifact(name, name.as_bytes()),
+        name,
+        SummarySemanticsVersion::hash_bytes(b"summary-semantics-v1"),
+        SummaryContextKey::hash_bytes(b"context-insensitive"),
+        SummaryBehaviorKey::hash_bytes(b"external-summary"),
+        SummaryOrigin::External(origin),
+    );
+    summary(
+        key_for(identity, &[]),
+        vec![transfer(
+            SummaryPort::Parameter(0),
+            SummaryPort::NormalReturn,
+        )],
+        Vec::new(),
+        Vec::new(),
+        None,
+        SummaryCompleteness::Complete,
+    )
+}
+
+#[test]
+fn external_summary_set_matches_structured_targets_and_hashes_content() {
+    assert_eq!(
+        ExternalSemanticSummarySet::default(),
+        ExternalSemanticSummarySet::try_new(Vec::new()).unwrap(),
+        "empty external-summary sets have one canonical identity"
+    );
+
+    let first = external_summary("ExternalApi", b"v1");
+    let artifact = first.key().artifact().clone();
+    let declaration = first.key().declaration().clone();
+    let locator = SemanticLocator::new(
+        artifact.mount(),
+        artifact.path().clone(),
+        artifact.language(),
+        declaration,
+        SemanticRole::Procedure,
+        anchor(42),
+    );
+    let first_set = ExternalSemanticSummarySet::try_new(vec![first]).unwrap();
+    assert!(first_set.summary_for(&locator).is_some());
+
+    let second_set =
+        ExternalSemanticSummarySet::try_new(vec![external_summary("ExternalApi", b"v2")]).unwrap();
+    assert_ne!(first_set.fingerprint(), second_set.fingerprint());
+
+    let duplicate = ExternalSemanticSummarySet::try_new(vec![
+        external_summary("ExternalApi", b"v1"),
+        external_summary("ExternalApi", b"v2"),
+    ]);
+    assert_eq!(
+        duplicate.unwrap_err(),
+        ExternalSummarySetError::AmbiguousTarget
+    );
+    assert_eq!(
+        ExternalSemanticSummarySet::try_new(vec![summary(
+            key("inferred"),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            SummaryCompleteness::Complete,
+        )])
+        .unwrap_err(),
+        ExternalSummarySetError::InferredSummary
+    );
+}
+
 #[test]
 fn summary_behavior_identity_partitions_unmodeled_call_profiles() {
     let base = SummaryBehaviorKey::hash_bytes(b"analysis-specific-behavior");

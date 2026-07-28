@@ -1124,10 +1124,40 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "member_expression" | "subscript_expression" => {
                 self.member_expression(builder, node, entry, next, scope, chain_skip, stack)
             }
+            "unary_expression" | "binary_expression" => {
+                if operation_can_throw_implicitly(node) {
+                    self.implicit_exception_gap(builder, entry, node)?;
+                }
+                let children = named_children(node)
+                    .into_iter()
+                    .filter(|child| child.kind() != "comment")
+                    .collect::<Vec<_>>();
+                let terminal = self.point(builder, node, Vec::new())?;
+                for child in &children {
+                    let source =
+                        self.expression_value(builder, *child, expression_value_kind(*child))?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::LanguageDefined,
+                            source,
+                            target: result,
+                        },
+                    )?;
+                }
+                self.edge(builder, terminal, next)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &children,
+                    EdgeTarget::normal(terminal),
+                    scope,
+                    stack,
+                )
+            }
             "augmented_assignment_expression"
-            | "unary_expression"
             | "update_expression"
-            | "binary_expression"
             | "sequence_expression"
             | "array"
             | "object"

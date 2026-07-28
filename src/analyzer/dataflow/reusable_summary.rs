@@ -10,7 +10,8 @@ use std::fmt;
 use std::mem::{size_of, size_of_val};
 
 use crate::analyzer::semantic::{
-    DeclarationLocator, EvidenceCompleteness, ProofStatus, SemanticArtifactKey, StableDigest,
+    DeclarationLocator, EvidenceCompleteness, ProofStatus, SemanticArtifactKey, SemanticLocator,
+    SemanticRole, StableDigest, WorkspaceMountId, WorkspaceRelativePath,
 };
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 
@@ -99,6 +100,14 @@ define_summary_digest!(
 define_summary_digest!(
     /// Content identity of one externally supplied semantic model.
     ExternalSummaryContentHash
+);
+define_summary_digest!(
+    /// Canonical identity of the exact external summaries available to a query.
+    ExternalSummarySetFingerprint
+);
+define_summary_digest!(
+    /// Content-addressed identity of one curated call-site model.
+    CuratedCallModelFingerprint
 );
 define_summary_digest!(
     /// Canonical identity of one recursive publication group.
@@ -1210,6 +1219,216 @@ impl SemanticProcedureSummary {
         .map_err(SummaryCompositionError::InvalidResult)
     }
 }
+
+/// Source-independent target identity used to match an external procedure
+/// summary to a structured dispatch boundary.
+///
+/// Source anchors are intentionally absent: editing coordinates in an indexed
+/// library must not change model selection. Artifact revision and model content
+/// remain part of the selected summary's own cache identity.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExternalSummaryTarget {
+    mount: WorkspaceMountId,
+    path: WorkspaceRelativePath,
+    language: crate::analyzer::semantic::SemanticLanguage,
+    declaration: DeclarationLocator,
+}
+
+impl ExternalSummaryTarget {
+    pub fn from_summary(summary: &SemanticProcedureSummary) -> Self {
+        Self {
+            mount: summary.key().artifact().mount(),
+            path: summary.key().artifact().path().clone(),
+            language: summary.key().artifact().language(),
+            declaration: summary.key().declaration().clone(),
+        }
+    }
+
+    pub fn matches(&self, locator: &SemanticLocator) -> bool {
+        locator.role() == SemanticRole::Procedure
+            && self.mount == locator.mount()
+            && self.path == *locator.path()
+            && self.language == locator.language()
+            && self.declaration == *locator.declaration()
+    }
+
+    fn compare_locator(&self, locator: &SemanticLocator) -> std::cmp::Ordering {
+        self.mount
+            .cmp(&locator.mount())
+            .then_with(|| self.path.cmp(locator.path()))
+            .then_with(|| self.language.cmp(&locator.language()))
+            .then_with(|| self.declaration.cmp(locator.declaration()))
+    }
+
+    pub const fn mount(&self) -> WorkspaceMountId {
+        self.mount
+    }
+
+    pub fn path(&self) -> &WorkspaceRelativePath {
+        &self.path
+    }
+
+    pub const fn language(&self) -> crate::analyzer::semantic::SemanticLanguage {
+        self.language
+    }
+
+    pub fn declaration(&self) -> &DeclarationLocator {
+        &self.declaration
+    }
+}
+
+/// Canonical query-scoped index for complete externally supplied procedure
+/// summaries. It resolves boundary locators without fabricating a live
+/// [`crate::analyzer::semantic::ProcedureHandle`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalSemanticSummarySet {
+    entries: Box<[(ExternalSummaryTarget, SemanticProcedureSummary)]>,
+    fingerprint: ExternalSummarySetFingerprint,
+}
+
+impl Default for ExternalSemanticSummarySet {
+    fn default() -> Self {
+        Self {
+            entries: Box::default(),
+            fingerprint: ExternalSummarySetFingerprint::hash_bytes(
+                b"bifrost-external-summary-set/v1\0",
+            ),
+        }
+    }
+}
+
+impl ExternalSemanticSummarySet {
+    pub fn try_new(
+        summaries: Vec<SemanticProcedureSummary>,
+    ) -> Result<Self, ExternalSummarySetError> {
+        let mut entries = Vec::with_capacity(summaries.len());
+        for summary in summaries {
+            if !matches!(summary.origin(), SummaryOrigin::External(_)) {
+                return Err(ExternalSummarySetError::InferredSummary);
+            }
+            if !summary.completeness().is_complete() {
+                return Err(ExternalSummarySetError::IncompleteSummary);
+            }
+            entries.push((ExternalSummaryTarget::from_summary(&summary), summary));
+        }
+        entries.sort_unstable_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.key().cmp(right.1.key()))
+        });
+        if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(ExternalSummarySetError::AmbiguousTarget);
+        }
+
+        let mut bytes = Vec::with_capacity(48usize.saturating_add(entries.len() * 32));
+        bytes.extend_from_slice(b"bifrost-external-summary-set/v1\0");
+        for (_, summary) in &entries {
+            bytes.extend_from_slice(summary.key().fingerprint().as_bytes());
+        }
+        Ok(Self {
+            entries: entries.into_boxed_slice(),
+            fingerprint: ExternalSummarySetFingerprint::hash_bytes(bytes),
+        })
+    }
+
+    pub fn summary_for(&self, locator: &SemanticLocator) -> Option<&SemanticProcedureSummary> {
+        if locator.role() != SemanticRole::Procedure {
+            return None;
+        }
+        self.entries
+            .binary_search_by(|(target, _)| target.compare_locator(locator))
+            .ok()
+            .map(|index| &self.entries[index].1)
+    }
+
+    pub fn entries(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&ExternalSummaryTarget, &SemanticProcedureSummary)> {
+        self.entries
+            .iter()
+            .map(|(target, summary)| (target, summary))
+    }
+
+    pub const fn fingerprint(&self) -> ExternalSummarySetFingerprint {
+        self.fingerprint
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// A curated, selector-bound call model using the same stable ports and
+/// evidence relation as reusable procedure summaries.
+///
+/// Analysis adapters bind this model to a live call site after evaluating a
+/// policy or model-pack selector. Keeping selector evaluation outside this
+/// neutral type lets RQLP, indexed libraries, and future built-ins share one
+/// transfer representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CuratedCallModel {
+    model: ExternalSummaryModelId,
+    content: ExternalSummaryContentHash,
+    fingerprint: CuratedCallModelFingerprint,
+    transfers: Box<[SummaryTransfer]>,
+}
+
+impl CuratedCallModel {
+    pub fn try_new(
+        model: ExternalSummaryModelId,
+        content: ExternalSummaryContentHash,
+        transfers: Vec<SummaryTransfer>,
+    ) -> Result<Self, SummaryValidationError> {
+        let transfers = canonicalize_transfers(transfers)?;
+        let mut bytes = Vec::with_capacity(96usize.saturating_add(model.as_str().len()));
+        bytes.extend_from_slice(b"bifrost-curated-call-model/v1\0");
+        bytes.extend_from_slice(model.as_str().as_bytes());
+        bytes.extend_from_slice(content.as_bytes());
+        Ok(Self {
+            model,
+            content,
+            fingerprint: CuratedCallModelFingerprint::hash_bytes(bytes),
+            transfers,
+        })
+    }
+
+    pub fn model(&self) -> &ExternalSummaryModelId {
+        &self.model
+    }
+
+    pub const fn content(&self) -> ExternalSummaryContentHash {
+        self.content
+    }
+
+    pub const fn fingerprint(&self) -> CuratedCallModelFingerprint {
+        self.fingerprint
+    }
+
+    pub fn transfers(&self) -> &[SummaryTransfer] {
+        &self.transfers
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalSummarySetError {
+    InferredSummary,
+    IncompleteSummary,
+    AmbiguousTarget,
+}
+
+impl fmt::Display for ExternalSummarySetError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InferredSummary => "external summary sets cannot contain inferred summaries",
+            Self::IncompleteSummary => "external summary sets require complete summaries",
+            Self::AmbiguousTarget => {
+                "external summary sets require exactly one summary per structured target"
+            }
+        })
+    }
+}
+
+impl std::error::Error for ExternalSummarySetError {}
 
 /// Explicit connection from one relation's normal output to the next input.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
