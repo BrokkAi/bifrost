@@ -700,8 +700,17 @@ fn scoped_call_owner(node: Node<'_>, ctx: &CppScan<'_, '_>) -> Option<String> {
         return None;
     }
     let scope = node.child_by_field_name("scope")?;
-    ctx.resolve_type(node_text(scope, ctx.source))
-        .map(|unit| unit.fq_name())
+    match resolve_type_node_lexically(
+        scope,
+        ctx.analyzer,
+        ctx.visibility,
+        &ctx.ordinary_type_imports,
+        ctx.file,
+        ctx.source,
+    ) {
+        LexicalTypeResolution::Resolved { unit, .. } => Some(unit.fq_name()),
+        LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => None,
+    }
 }
 
 /// The trailing member name of a `X::m` qualified identifier.

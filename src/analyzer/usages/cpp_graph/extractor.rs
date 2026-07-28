@@ -1237,7 +1237,15 @@ pub(in crate::analyzer::usages) fn resolve_bare_call_target(
             .clone()
             .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Ordinary { .. }))
             .flat_map(|binding| {
-                binding_type_candidates(binding, &transitive_bindings, visibility, file, name, None)
+                binding_type_candidates(
+                    binding,
+                    &transitive_bindings,
+                    visibility,
+                    file,
+                    name,
+                    None,
+                    call.start_byte(),
+                )
             })
             .collect::<Vec<_>>();
         if !direct_types.is_empty() {
@@ -1327,7 +1335,15 @@ pub(in crate::analyzer::usages) fn resolve_bare_call_target(
             .clone()
             .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Ordinary { .. }))
             .flat_map(|binding| {
-                binding_type_candidates(binding, &transitive_bindings, visibility, file, name, None)
+                binding_type_candidates(
+                    binding,
+                    &transitive_bindings,
+                    visibility,
+                    file,
+                    name,
+                    None,
+                    call.start_byte(),
+                )
             })
             .collect::<Vec<_>>();
         if direct_type_components.is_some_and(|components| components == qualified.as_slice())
@@ -2181,6 +2197,10 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         maybe_record_using_member_hit(node, ctx);
         return;
     }
+    if let Some(member) = recovered_direct_initializer_qualified_callable(node) {
+        maybe_record_qualified_method_value_hit(node, member, ctx);
+        return;
+    }
     if let Some(value) = explicit_qualified_callable_value(node) {
         maybe_record_qualified_method_value_hit(value.qualified, value.member, ctx);
         return;
@@ -2307,6 +2327,44 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
         MethodReceiverTargetResolution::Missing => {}
     }
+}
+
+fn recovered_direct_initializer_qualified_callable(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "qualified_identifier" {
+        return None;
+    }
+    let parameter = node
+        .parent()
+        .filter(|parent| parent.kind() == "parameter_declaration")?;
+    let parameter_declarator = parameter.child_by_field_name("declarator")?;
+    // Tree-sitter recovers `Value value(Owner::method(arg));` as a function
+    // declaration whose sole pseudo-parameter has `Owner::method` as its type
+    // and `(arg)` as an abstract function declarator. Ordinary qualified
+    // parameter types have named/pointer/reference declarators instead.
+    if parameter.child_by_field_name("type") != Some(node)
+        || parameter_declarator.kind() != "abstract_function_declarator"
+    {
+        return None;
+    }
+    let parameter_list = parameter
+        .parent()
+        .filter(|parent| parent.kind() == "parameter_list")?;
+    if parameter_list.named_child_count() != 1 {
+        return None;
+    }
+    let function_declarator = parameter_list
+        .parent()
+        .filter(|parent| parent.kind() == "function_declarator")?;
+    if function_declarator
+        .child_by_field_name("declarator")
+        .is_none_or(|declarator| declarator.kind() != "identifier")
+        || function_declarator
+            .parent()
+            .is_none_or(|parent| parent.kind() != "declaration")
+    {
+        return None;
+    }
+    node.child_by_field_name("name")
 }
 
 fn maybe_record_using_member_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -2491,6 +2549,24 @@ fn qualified_callable_value_resolution(
             LexicalScopeResolution::Missing => return LexicalCallableValueResolution::Missing,
         }
     };
+    if let Some(target_owner) = ctx.spec.owner.as_ref()
+        && let LexicalTypeResolution::Resolved { unit, .. } =
+            resolve_type_components_lexically_at_for_target(
+                qualified,
+                &owner_components,
+                global,
+                ctx.analyzer,
+                ctx.visibility,
+                &ctx.ordinary_type_imports,
+                ctx.file,
+                ctx.source,
+                target_owner,
+                false,
+                false,
+            )
+    {
+        return LexicalCallableValueResolution::Type(unit);
+    }
     ctx.visibility.resolve_callable_value_components_lexically(
         ctx.analyzer,
         ctx.file,
@@ -4307,14 +4383,12 @@ fn using_binding_target_components_for_name(
                 })
                 .cloned();
             resolved.or_else(|| {
-                let first = visible_candidates
-                    .iter()
-                    .find(|candidate| candidate.is_class() || is_type_alias(candidate))?;
-                let uniquely_named_type = visible_candidates.iter().all(|candidate| {
-                    (candidate.is_class() || is_type_alias(candidate))
-                        && same_logical_symbol(candidate, first)
-                });
-                (uniquely_named_type && target_tiers.len() == 1)
+                // A sole lexical namespace tier is itself enough to retain the
+                // directive. Candidate identity is resolved later, where
+                // target guidance and macro-expanded owner names are available.
+                // Dropping it here makes an unrelated same-terminal type hide
+                // the actual namespace member before lookup can compare owners.
+                (target_tiers.len() == 1)
                     .then(|| target_tiers.into_iter().next())
                     .flatten()
             })
@@ -4500,6 +4574,7 @@ fn binding_type_candidates(
     file: &ProjectFile,
     name: &str,
     direct_target: Option<&CodeUnit>,
+    reference_byte: usize,
 ) -> Vec<(CodeUnit, Vec<String>)> {
     let Some(qualified) = binding.resolved_target_components.clone() else {
         return Vec::new();
@@ -4529,15 +4604,40 @@ fn binding_type_candidates(
     targets
         .into_iter()
         .flat_map(|target| {
-            let qualified_name = target.join("::");
             let mut candidates = visibility
                 .visible_identifier_candidates(file, name)
-                .filter(move |candidate| {
+                .filter(|candidate| {
                     (candidate.is_class() || is_type_alias(candidate))
-                        && cpp_name_for(candidate) == qualified_name
+                        && macro_expanded_cpp_name_components(
+                            visibility,
+                            file,
+                            candidate,
+                            reference_byte,
+                        ) == target
                 })
                 .cloned()
                 .collect::<Vec<_>>();
+            if candidates.is_empty()
+                && matches!(binding.target, EffectiveUsingTarget::Namespace { .. })
+                && let Some(target_unit) = direct_target
+            {
+                let expanded_target_name = macro_expanded_cpp_name_components(
+                    visibility,
+                    file,
+                    target_unit,
+                    reference_byte,
+                );
+                if (target_unit.is_class() || is_type_alias(target_unit))
+                    && expanded_target_name == target
+                    && visibility.external_type_candidate_visible_at(
+                        file,
+                        target_unit,
+                        reference_byte,
+                    )
+                {
+                    candidates.push(target_unit.clone());
+                }
+            }
             if candidates.is_empty()
                 && matches!(binding.target, EffectiveUsingTarget::Namespace { .. })
                 && let Some(target_unit) = direct_target
@@ -4559,6 +4659,36 @@ fn binding_type_candidates(
                 .map(move |candidate| (candidate, target.clone()))
         })
         .collect()
+}
+
+fn macro_expanded_cpp_name_components(
+    visibility: &VisibilityIndex<'_>,
+    file: &ProjectFile,
+    unit: &CodeUnit,
+    reference_byte: usize,
+) -> Vec<String> {
+    crate::analyzer::symbol_lookup::parse_symbol_path(
+        crate::analyzer::Language::Cpp,
+        &cpp_name_for(unit),
+    )
+    .into_iter()
+    .flat_map(|component| {
+        let Some(replacement) =
+            visibility.object_macro_replacement_at(file, &component, reference_byte)
+        else {
+            return vec![component];
+        };
+        let expanded = crate::analyzer::symbol_lookup::parse_symbol_path(
+            crate::analyzer::Language::Cpp,
+            &replacement,
+        );
+        if expanded.is_empty() {
+            vec![component]
+        } else {
+            expanded
+        }
+    })
+    .collect()
 }
 
 fn resolved_type_import(
@@ -4648,7 +4778,15 @@ fn ordinary_type_import_resolution(
             .clone()
             .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Ordinary { .. }))
             .flat_map(|binding| {
-                binding_type_candidates(binding, &transitive, visibility, file, name, direct_target)
+                binding_type_candidates(
+                    binding,
+                    &transitive,
+                    visibility,
+                    file,
+                    name,
+                    direct_target,
+                    node.start_byte(),
+                )
             })
             .collect::<Vec<_>>();
         if !direct.is_empty() {
@@ -4657,7 +4795,15 @@ fn ordinary_type_import_resolution(
         let directives = at_tier
             .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Namespace { .. }))
             .flat_map(|binding| {
-                binding_type_candidates(binding, &transitive, visibility, file, name, direct_target)
+                binding_type_candidates(
+                    binding,
+                    &transitive,
+                    visibility,
+                    file,
+                    name,
+                    direct_target,
+                    node.start_byte(),
+                )
             })
             .collect::<Vec<_>>();
         if !directives.is_empty() {
@@ -4674,7 +4820,15 @@ fn ordinary_type_import_resolution(
             .clone()
             .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Ordinary { .. }))
             .flat_map(|binding| {
-                binding_type_candidates(binding, &transitive, visibility, file, name, direct_target)
+                binding_type_candidates(
+                    binding,
+                    &transitive,
+                    visibility,
+                    file,
+                    name,
+                    direct_target,
+                    node.start_byte(),
+                )
             })
             .collect::<Vec<_>>();
         if !direct.is_empty() {
@@ -4683,7 +4837,15 @@ fn ordinary_type_import_resolution(
         let directives = at_tier
             .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Namespace { .. }))
             .flat_map(|binding| {
-                binding_type_candidates(binding, &transitive, visibility, file, name, direct_target)
+                binding_type_candidates(
+                    binding,
+                    &transitive,
+                    visibility,
+                    file,
+                    name,
+                    direct_target,
+                    node.start_byte(),
+                )
             })
             .collect::<Vec<_>>();
         if !directives.is_empty() {

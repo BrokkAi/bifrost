@@ -368,7 +368,8 @@ impl TargetSpec {
         if target.is_function() {
             // Free functions declared inside a namespace have a module owner; that namespace is
             // not a call receiver, so resolve them as free functions rather than methods.
-            let owner_resolution = type_owner_resolution(analyzer, target);
+            let owner_resolution = type_owner_resolution(analyzer, target)
+                .or_else(|| target_forward_owner_resolution(analyzer, target));
             let owner_is_forward_declaration = owner_resolution
                 .as_ref()
                 .is_some_and(|owner| owner.is_forward_declaration);
@@ -1297,6 +1298,23 @@ impl<'a> VisibilityIndex<'a> {
             cursor.frontier = frontier;
         }
         Arc::clone(&cursor.environment)
+    }
+
+    pub(super) fn object_macro_replacement_at(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+        before_byte: usize,
+    ) -> Option<String> {
+        let environment = self.macro_environment(file, before_byte);
+        let binding = environment.binding(name)?;
+        if !binding.exact {
+            return None;
+        }
+        match &binding.definition {
+            MacroDefinition::Object { replacement } => Some(replacement.clone()),
+            MacroDefinition::Function { .. } | MacroDefinition::Unsupported => None,
+        }
     }
 
     fn apply_macro_events(
@@ -7239,6 +7257,60 @@ fn type_owner_resolution(
     code_unit: &CodeUnit,
 ) -> Option<ResolvedTypeOwner> {
     precise_parent_resolution(analyzer, code_unit).filter(|owner| !owner.unit.is_module())
+}
+
+/// Recover method identity for an indexed out-of-line definition when the
+/// analyzer has retained only its unique include-visible class forward
+/// declaration. This is deliberately target-only: canonical declaration
+/// resolution must continue to prefer the callable definition rather than
+/// replacing it with the forward owner.
+fn target_forward_owner_resolution(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+) -> Option<ResolvedTypeOwner> {
+    if !code_unit.is_function() {
+        return None;
+    }
+    let owner_name = code_unit.short_name().rsplit_once('.')?.0;
+    let owner_fqn = if code_unit.package_name().is_empty() {
+        owner_name.to_string()
+    } else {
+        format!("{}.{}", code_unit.package_name(), owner_name)
+    };
+    let cpp = resolve_analyzer::<CppAnalyzer>(analyzer)?;
+    let mut visible_files = HashSet::default();
+    collect_include_closure(
+        analyzer,
+        cpp.include_target_index(),
+        code_unit.source(),
+        &mut visible_files,
+        None,
+    );
+    let mut forward = None;
+    for candidate in analyzer
+        .global_usage_definition_index()
+        .by_fqn(&owner_fqn)
+        .iter()
+        .filter(|candidate| {
+            candidate.is_class()
+                && candidate.short_name() == owner_name
+                && candidate.package_name() == code_unit.package_name()
+                && visible_files.contains(candidate.source())
+        })
+    {
+        match cpp_class_declaration_strength(analyzer, candidate) {
+            CppClassDeclarationStrength::Forward if forward.is_none() => {
+                forward = Some(candidate.clone());
+            }
+            CppClassDeclarationStrength::Forward
+            | CppClassDeclarationStrength::Full
+            | CppClassDeclarationStrength::Unknown => return None,
+        }
+    }
+    forward.map(|unit| ResolvedTypeOwner {
+        unit,
+        is_forward_declaration: true,
+    })
 }
 
 pub(super) fn precise_parent_of(
