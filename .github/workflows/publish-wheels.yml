@@ -36,6 +36,7 @@ jobs:
     name: build (${{ matrix.target }})
     needs: [release-context, notices]
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -93,6 +94,7 @@ jobs:
     name: build sdist
     needs: [release-context, notices]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -123,6 +125,7 @@ jobs:
     name: publish to PyPI
     needs: [release-context, build, sdist]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     environment: release
     permissions:
       id-token: write
