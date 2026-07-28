@@ -2,9 +2,9 @@
   :schema-version 1
   :id "bifrost.performance.serialization-in-loop"
   :name "Serialization inside a loop"
-  :message "Avoid repeated serialization inside the loop"
+  :message "Review whether this lexically nested serialization repeats per iteration"
   :severity warning
-  :description "Serialization traverses values, encodes them, and allocates output. Hoist loop-invariant work or use a streaming/batched encoder."
+  :description "Serialization lexically nested under a loop may repeat traversal, encoding, and allocation. This structural prompt also includes deferred nested bodies; verify execution before hoisting or batching."
   :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
   :tags ["performance" "serialization" "loop" "code-smell"]
   :analysis

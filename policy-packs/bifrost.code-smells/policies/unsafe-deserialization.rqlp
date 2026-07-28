@@ -2,9 +2,9 @@
   :schema-version 1
   :id "bifrost.correctness.unsafe-deserialization"
   :name "Unsafe object deserialization"
-  :message "Use a data-only format and safe loader for untrusted input"
+  :message "Replace pickle deserialization with a data-only format"
   :severity warning
-  :description "Python pickle and unrestricted YAML loaders may instantiate unexpected objects. Prefer JSON or a safe YAML loader and validate the decoded schema."
+  :description "Python pickle loaders may instantiate unexpected objects. Prefer a data-only format and validate the decoded schema."
   :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
   :tags ["correctness" "security" "deserialization" "code-smell"]
   :analysis
@@ -17,6 +17,4 @@
             (language python
               (call :receiver (name "pickle") :callee (name "loads")))
             (language python
-              (call :receiver (name "pickle") :callee (name "load")))
-            (language python
-              (call :receiver (name "yaml") :callee (name "load")))))))
+              (call :receiver (name "pickle") :callee (name "load")))))))

@@ -23,7 +23,9 @@ if (( actual_bytes > max_crate_bytes )); then
 fi
 
 readonly package_files="$(mktemp)"
-trap 'rm -f "$package_files"' EXIT
+readonly manifest_policy_files="$(mktemp)"
+readonly checked_in_policy_files="$(mktemp)"
+trap 'rm -f "$package_files" "$manifest_policy_files" "$checked_in_policy_files"' EXIT
 tar -tzf "$archive" | sed 's@^[^/]*/@@' > "$package_files"
 
 if grep -Eq '^(tests/.*[.]rs|tests/common/|python_tests/)' "$package_files"; then
@@ -83,6 +85,16 @@ for required_file in "${required_inline_test_fixtures[@]}"; do
 done
 
 required_policy_files=(policy-packs/bifrost.code-smells/manifest.json)
+jq -r '.policies[].path' policy-packs/bifrost.code-smells/manifest.json \
+    | sed 's@^@policy-packs/bifrost.code-smells/@' \
+    | LC_ALL=C sort > "$manifest_policy_files"
+find policy-packs/bifrost.code-smells/policies -type f -name '*.rqlp' -print \
+    | LC_ALL=C sort > "$checked_in_policy_files"
+if ! cmp -s "$manifest_policy_files" "$checked_in_policy_files"; then
+    echo "Built-in policy manifest does not match the checked-in .rqlp inventory" >&2
+    diff -u "$manifest_policy_files" "$checked_in_policy_files" >&2 || true
+    exit 1
+fi
 while IFS= read -r required_file; do
     required_policy_files+=("$required_file")
 done < <(find policy-packs/bifrost.code-smells/policies -type f -name '*.rqlp' -print | LC_ALL=C sort)

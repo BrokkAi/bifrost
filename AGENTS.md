@@ -102,7 +102,9 @@ If the query is useful across repositories, add or extend a checked-in `.rqlp` r
 policy ID, explicit policy/RQL schema versions, inventory metadata, and a semantic hash in the pack manifest. A shippable
 rule needs behavior-focused positive and realistic near-miss coverage for every language it claims, including similarly
 named APIs, the same operation outside the relevant structural context, and nested/deferred bodies where containment is
-part of the rule. Phrase name-based performance matches as review prompts rather than proof of runtime cost or invariance.
+part of the rule. If current containment cannot distinguish a deferred body, either keep the rule out or make the deferred
+case an explicit tested lexical positive and state that boundary in the message and description. Phrase name-based
+performance matches as review prompts rather than proof of execution, runtime cost, or invariance.
 
 Do not replace a missing RQL/analyzer relation with regexes, source-text matching, or a coarse `file_of` projection. When
 the minimized query cannot express the review condition or produces an incomplete/misleading result, search open issues

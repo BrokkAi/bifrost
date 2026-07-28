@@ -2,9 +2,9 @@
   :schema-version 1
   :id "bifrost.performance.network-call-in-loop"
   :name "Network request inside a loop"
-  :message "Batch, prefetch, or bound concurrent network requests"
+  :message "Review whether this lexically nested network request repeats per iteration"
   :severity warning
-  :description "A serial network request per iteration amplifies latency and remote load. Prefer batching or explicit bounded concurrency with backpressure."
+  :description "A network call lexically nested under a loop may amplify latency and remote load. This structural prompt also includes deferred nested bodies; verify execution before batching or adding bounded concurrency."
   :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
   :tags ["performance" "network" "loop" "code-smell"]
   :analysis

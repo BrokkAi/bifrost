@@ -1240,13 +1240,122 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
         "src/app.py"
     );
 
-    let unknown = round_trip(
+    let cli = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .env("BIFROST_SEMANTIC_INDEX", "off")
+        .arg("--root")
+        .arg(project.root())
+        .arg("--policy-id")
+        .arg("bifrost.correctness.dynamic-evaluation")
+        .arg("--evaluation-date")
+        .arg("2026-07-28")
+        .arg("--fail-on")
+        .arg("warning")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("run equivalent CLI policy selection");
+    assert_eq!(
+        cli.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_report: Value = serde_json::from_slice(&cli.stdout).unwrap_or_else(|error| {
+        panic!(
+            "invalid CLI report: {error}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&cli.stdout),
+            String::from_utf8_lossy(&cli.stderr)
+        )
+    });
+    assert_eq!(
+        cli_report, structured["report"],
+        "CLI and MCP must return one canonical report"
+    );
+
+    let category = round_trip(
         &mut stdin,
         &mut reader,
         &mut stderr,
         json!({
             "jsonrpc": "2.0",
             "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "run_policy",
+                "arguments": {
+                    "policy_categories": ["correctness"],
+                    "evaluation_date": "2026-07-28",
+                    "fail_on": "never"
+                }
+            }
+        }),
+    );
+    let category_ids = category["result"]["structuredContent"]["report"]["runs"]
+        .as_array()
+        .expect("category runs")
+        .iter()
+        .map(|run| run["policy_id"].as_str().expect("category policy id"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        category_ids,
+        vec![
+            "bifrost.correctness.dynamic-evaluation",
+            "bifrost.correctness.unsafe-deserialization"
+        ],
+        "{category}"
+    );
+
+    let pack = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "run_policy",
+                "arguments": {
+                    "policy_packs": ["bifrost.code-smells"],
+                    "evaluation_date": "2026-07-28",
+                    "fail_on": "never"
+                }
+            }
+        }),
+    );
+    let pack_runs = pack["result"]["structuredContent"]["report"]["runs"]
+        .as_array()
+        .expect("pack runs");
+    let pack_ids = pack_runs
+        .iter()
+        .map(|run| run["policy_id"].as_str().expect("pack policy id"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pack_ids,
+        vec![
+            "bifrost.correctness.dynamic-evaluation",
+            "bifrost.correctness.unsafe-deserialization",
+            "bifrost.performance.database-call-in-loop",
+            "bifrost.performance.expensive-operation-in-nested-loop",
+            "bifrost.performance.file-read-in-loop",
+            "bifrost.performance.network-call-in-loop",
+            "bifrost.performance.parsing-in-loop",
+            "bifrost.performance.regex-compile-in-loop",
+            "bifrost.performance.serialization-in-loop",
+            "bifrost.performance.sleep-in-loop",
+            "bifrost.performance.sort-in-loop",
+            "bifrost.performance.subprocess-in-loop",
+        ],
+        "{pack}"
+    );
+
+    let unknown = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
             "method": "tools/call",
             "params": {
                 "name": "run_policy",

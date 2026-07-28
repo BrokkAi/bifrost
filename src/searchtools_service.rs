@@ -2283,9 +2283,9 @@ impl SearchToolsService {
             && params.policy_categories.is_empty()
             && params.policy_ids.is_empty()
         {
-            return Err(SearchToolsServiceError::invalid_params(format!(
-                "run_policy requires at least one policy file or built-in selector"
-            )));
+            return Err(SearchToolsServiceError::invalid_params(
+                "run_policy requires at least one policy file or built-in selector".to_string(),
+            ));
         }
 
         let mut unique_paths = BTreeSet::new();

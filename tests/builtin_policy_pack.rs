@@ -1,6 +1,6 @@
 mod common;
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use brokk_bifrost::AnalyzerConfig;
 use brokk_bifrost::policy::{
@@ -17,15 +17,14 @@ import re
 import requests
 import subprocess
 import time
-import yaml
 
 def dynamic(value):
-    return eval(value)
+    eval(value)
+    exec(value)
 
 def unsafe(value, stream):
     pickle.loads(value)
     pickle.load(stream)
-    yaml.load(value)
 
 def local_smells(items, cursor):
     for item in items:
@@ -36,6 +35,7 @@ def local_smells(items, cursor):
         json.loads(item)
         cursor.execute("select 1")
         requests.get("https://example.invalid")
+        requests.post("https://example.invalid")
         subprocess.run(["true"])
         time.sleep(1)
 
@@ -69,7 +69,47 @@ def safe(value, items):
     requests.get("https://example.invalid")
     time.sleep(1)
     yaml.safe_load(value)
+    yaml.load(value, Loader=yaml.SafeLoader)
+    for item in items:
+        items.sorted_copy()
+        re.search("x", item)
+        file_system.open_file(item)
+        json.dump(item)
+        json.load(item)
+        cursor.executemany(item)
+        requests.request(item)
+        subprocess.check_call([item])
+        time.monotonic()
+    for row in items:
+        for item in row:
+            cache.lookup(item)
     return evaluate(value)
+"#;
+
+const PYTHON_DEFERRED_LEXICAL_POSITIVES: &str = r#"import json
+import re
+import requests
+import subprocess
+import time
+
+def deferred(items, cursor):
+    for item in items:
+        def later():
+            items.sort()
+            re.compile("x")
+            open(item)
+            json.dumps(item)
+            json.loads(item)
+            cursor.execute(item)
+            requests.get(item)
+            subprocess.run([item])
+            time.sleep(1)
+
+def nested_deferred(rows):
+    for row in rows:
+        for item in row:
+            def later():
+                return open(item)
 "#;
 
 const JAVA_POSITIVES: &str = r#"class Smells {
@@ -108,12 +148,57 @@ const JAVA_NEAR_MISSES: &str = r#"class Safe {
         client.send(request, handler);
         runtime.exec(item);
         Thread.sleep(1);
+        for (String nested : items) {
+            items.sortedCopy();
+            Pattern.matches("x", nested);
+            Files.exists(path);
+            mapper.valueToTree(nested);
+            parser.canParse(nested);
+            statement.addBatch(nested);
+            client.close();
+            runtime.availableProcessors();
+            Thread.yield();
+        }
+    }
+}
+"#;
+
+const JAVA_DEFERRED_LEXICAL_POSITIVES: &str = r#"class Deferred {
+    void deferred(Iterable<String> items) {
+        for (String item : items) {
+            class Later {
+                void run() throws Exception {
+                    items.sort(null);
+                    Pattern.compile("x");
+                    Files.readString(path);
+                    mapper.writeValueAsString(item);
+                    parser.parse(item);
+                    statement.executeQuery(item);
+                    client.send(request, handler);
+                    runtime.exec(item);
+                    Thread.sleep(1);
+                }
+            }
+        }
+    }
+
+    void nestedDeferred(Iterable<Iterable<String>> rows) {
+        for (Iterable<String> row : rows) {
+            for (String item : row) {
+                class Later {
+                    void run() throws Exception {
+                        Files.readAllBytes(path);
+                    }
+                }
+            }
+        }
     }
 }
 "#;
 
 const JAVASCRIPT_POSITIVES: &str = r#"export function dynamicJs(value) {
-  return eval(value);
+  eval(value);
+  return (Function(value), value);
 }
 
 export function directJs(value) {
@@ -157,12 +242,52 @@ const JAVASCRIPT_NEAR_MISSES: &str = r#"export function safe(value) {
   db.query(value);
   fetch(value);
   child_process.execSync(value);
+  for (const item of value) {
+    compilePattern(item);
+    fs.existsSync(item);
+    JSON.isRawJSON(item);
+    parseSafely(item);
+    db.prepare(item);
+    fetchLater(item);
+    child_process.spawnSync(item);
+  }
+  for (const row of value) {
+    for (const item of row) {
+      cache.lookup(item);
+    }
+  }
   return evaluate(value);
 }
 "#;
 
+const JAVASCRIPT_DEFERRED_LEXICAL_POSITIVES: &str = r#"export function deferred(items) {
+  for (const item of items) {
+    function later() {
+      RegExp("x");
+      fs.readFileSync(item);
+      JSON.stringify(item);
+      JSON.parse(item);
+      db.query(item);
+      fetch(item);
+      child_process.execSync(item);
+    }
+  }
+}
+
+export function nestedDeferred(rows) {
+  for (const row of rows) {
+    for (const item of row) {
+      function later() {
+        fetch(item);
+      }
+    }
+  }
+}
+"#;
+
 const TYPESCRIPT_POSITIVES: &str = r#"export function dynamicTs(value: string): unknown {
-  return eval(value);
+  eval(value);
+  return (Function(value), value);
 }
 
 export function directTs(value: string): unknown {
@@ -208,42 +333,199 @@ const TYPESCRIPT_NEAR_MISSES: &str = r#"export function safe(value: string, item
   db.query(value);
   fetch(value);
   child_process.execSync(value);
+  for (const item of items) {
+    items.toSorted();
+    compilePattern(item);
+    fs.existsSync(item);
+    JSON.isRawJSON(item);
+    parseSafely(item);
+    db.prepare(item);
+    fetchLater(item);
+    child_process.spawnSync(item);
+  }
+  for (const row of [items]) {
+    for (const item of row) {
+      cache.lookup(item);
+    }
+  }
   return evaluate(value);
 }
 "#;
 
-fn expected_paths(policy_id: &str) -> BTreeSet<&'static str> {
-    let paths: &[&str] = match policy_id {
-        "bifrost.correctness.dynamic-evaluation" => &["positive.py", "positive.js", "positive.ts"],
-        "bifrost.correctness.unsafe-deserialization" => &["positive.py"],
-        "bifrost.performance.sort-in-loop" => &["positive.py", "Positive.java", "positive.ts"],
-        "bifrost.performance.regex-compile-in-loop"
-        | "bifrost.performance.file-read-in-loop"
-        | "bifrost.performance.serialization-in-loop"
-        | "bifrost.performance.parsing-in-loop"
-        | "bifrost.performance.database-call-in-loop"
-        | "bifrost.performance.network-call-in-loop"
-        | "bifrost.performance.subprocess-in-loop"
-        | "bifrost.performance.expensive-operation-in-nested-loop" => {
-            &["positive.py", "Positive.java", "positive.js", "positive.ts"]
-        }
-        "bifrost.performance.sleep-in-loop" => &["positive.py", "Positive.java"],
+const TYPESCRIPT_DEFERRED_LEXICAL_POSITIVES: &str = r#"export function deferred(items: string[]): void {
+  for (const item of items) {
+    function later(): void {
+      items.sort();
+      RegExp("x");
+      fs.readFileSync(item);
+      JSON.stringify(item);
+      JSON.parse(item);
+      db.query(item);
+      fetch(item);
+      child_process.execSync(item);
+    }
+  }
+}
+
+export function nestedDeferred(rows: string[][]): void {
+  for (const row of rows) {
+    for (const item of row) {
+      function later(): void {
+        JSON.parse(item);
+      }
+    }
+  }
+}
+"#;
+
+const TSX_SORT_POSITIVE: &str = r#"export function SortedRows({ rows }: { rows: string[][] }) {
+  for (const row of rows) {
+    row.sort();
+  }
+  return <div>{rows.length}</div>;
+}
+"#;
+
+const TSX_SORT_NEAR_MISS: &str = r#"export function StableRows({ rows }: { rows: string[][] }) {
+  rows.sort();
+  for (const row of rows) {
+    row.toSorted();
+  }
+  return <div>{rows.length}</div>;
+}
+"#;
+
+fn expected_finding_lines(policy_id: &str) -> BTreeMap<&'static str, Vec<u64>> {
+    let findings: &[(&str, &[u64])] = match policy_id {
+        "bifrost.correctness.dynamic-evaluation" => &[
+            ("positive.py", &[9, 10]),
+            ("positive.js", &[2, 3]),
+            ("positive.ts", &[2, 3]),
+        ],
+        "bifrost.correctness.unsafe-deserialization" => &[("positive.py", &[13, 14])],
+        "bifrost.performance.sort-in-loop" => &[
+            ("positive.py", &[18]),
+            ("deferred.py", &[10]),
+            ("Positive.java", &[4]),
+            ("Deferred.java", &[6]),
+            ("positive.ts", &[20]),
+            ("deferred.ts", &[4]),
+            ("positive.tsx", &[3]),
+            ("tsx/positive.tsx", &[3]),
+        ],
+        "bifrost.performance.regex-compile-in-loop" => &[
+            ("positive.py", &[19]),
+            ("deferred.py", &[11]),
+            ("Positive.java", &[5]),
+            ("Deferred.java", &[7]),
+            ("positive.js", &[20]),
+            ("deferred.js", &[4]),
+            ("positive.ts", &[21]),
+            ("deferred.ts", &[5]),
+        ],
+        "bifrost.performance.file-read-in-loop" => &[
+            ("positive.py", &[20, 32]),
+            ("deferred.py", &[12, 24]),
+            ("Positive.java", &[6, 19]),
+            ("Deferred.java", &[8, 25]),
+            ("positive.js", &[21]),
+            ("deferred.js", &[5]),
+            ("positive.ts", &[22]),
+            ("deferred.ts", &[6]),
+        ],
+        "bifrost.performance.serialization-in-loop" => &[
+            ("positive.py", &[21]),
+            ("deferred.py", &[13]),
+            ("Positive.java", &[7]),
+            ("Deferred.java", &[9]),
+            ("positive.js", &[22]),
+            ("deferred.js", &[6]),
+            ("positive.ts", &[23]),
+            ("deferred.ts", &[7]),
+        ],
+        "bifrost.performance.parsing-in-loop" => &[
+            ("positive.py", &[22]),
+            ("deferred.py", &[14]),
+            ("Positive.java", &[8]),
+            ("Deferred.java", &[10]),
+            ("positive.js", &[23]),
+            ("deferred.js", &[7]),
+            ("positive.ts", &[24, 34]),
+            ("deferred.ts", &[8, 20]),
+        ],
+        "bifrost.performance.database-call-in-loop" => &[
+            ("positive.py", &[23]),
+            ("deferred.py", &[15]),
+            ("Positive.java", &[9]),
+            ("Deferred.java", &[11]),
+            ("positive.js", &[24]),
+            ("deferred.js", &[8]),
+            ("positive.ts", &[25]),
+            ("deferred.ts", &[9]),
+        ],
+        "bifrost.performance.network-call-in-loop" => &[
+            ("positive.py", &[24, 25]),
+            ("deferred.py", &[16]),
+            ("Positive.java", &[10]),
+            ("Deferred.java", &[12]),
+            ("positive.js", &[25, 33]),
+            ("deferred.js", &[9, 19]),
+            ("positive.ts", &[26]),
+            ("deferred.ts", &[10]),
+        ],
+        "bifrost.performance.subprocess-in-loop" => &[
+            ("positive.py", &[26]),
+            ("deferred.py", &[17]),
+            ("Positive.java", &[11]),
+            ("Deferred.java", &[13]),
+            ("positive.js", &[26]),
+            ("deferred.js", &[10]),
+            ("positive.ts", &[27]),
+            ("deferred.ts", &[11]),
+        ],
+        "bifrost.performance.sleep-in-loop" => &[
+            ("positive.py", &[27]),
+            ("deferred.py", &[18]),
+            ("Positive.java", &[12]),
+            ("Deferred.java", &[14]),
+        ],
+        "bifrost.performance.expensive-operation-in-nested-loop" => &[
+            ("positive.py", &[30]),
+            ("deferred.py", &[21]),
+            ("Positive.java", &[17]),
+            ("Deferred.java", &[21]),
+            ("positive.js", &[31]),
+            ("deferred.js", &[16]),
+            ("positive.ts", &[32]),
+            ("deferred.ts", &[17]),
+        ],
         other => panic!("unexpected built-in policy {other}"),
     };
-    paths.iter().copied().collect()
+    findings
+        .iter()
+        .map(|(path, lines)| (*path, lines.to_vec()))
+        .collect()
 }
 
 #[test]
-fn code_smell_pack_matches_claimed_languages_and_excludes_outside_loop_near_misses() {
+fn code_smell_pack_matches_every_selector_alternative_and_excludes_near_misses() {
     let project = InlineTestProject::new()
         .file("positive.py", PYTHON_POSITIVES)
         .file("safe.py", PYTHON_NEAR_MISSES)
+        .file("deferred.py", PYTHON_DEFERRED_LEXICAL_POSITIVES)
         .file("Positive.java", JAVA_POSITIVES)
         .file("Safe.java", JAVA_NEAR_MISSES)
+        .file("Deferred.java", JAVA_DEFERRED_LEXICAL_POSITIVES)
         .file("positive.js", JAVASCRIPT_POSITIVES)
         .file("safe.js", JAVASCRIPT_NEAR_MISSES)
+        .file("deferred.js", JAVASCRIPT_DEFERRED_LEXICAL_POSITIVES)
         .file("positive.ts", TYPESCRIPT_POSITIVES)
         .file("safe.ts", TYPESCRIPT_NEAR_MISSES)
+        .file("deferred.ts", TYPESCRIPT_DEFERRED_LEXICAL_POSITIVES)
+        .file("positive.tsx", TSX_SORT_POSITIVE)
+        .file("safe.tsx", TSX_SORT_NEAR_MISS)
+        .file("tsx/positive.tsx", TSX_SORT_POSITIVE)
+        .file("tsx/safe.tsx", TSX_SORT_NEAR_MISS)
         .build();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let selected = built_in_policy_catalog()
@@ -274,14 +556,22 @@ fn code_smell_pack_matches_claimed_languages_and_excludes_outside_loop_near_miss
             run.policy_id(),
             run.completion()
         );
-        let actual = run
-            .findings()
-            .iter()
-            .map(|finding| finding.primary().path())
-            .collect::<BTreeSet<_>>();
+        let mut actual = BTreeMap::<_, Vec<_>>::new();
+        for finding in run.findings() {
+            actual.entry(finding.primary().path()).or_default().push(
+                finding
+                    .primary()
+                    .region()
+                    .expect("built-in match finding has a source region")
+                    .start_line(),
+            );
+        }
+        for lines in actual.values_mut() {
+            lines.sort_unstable();
+        }
         assert_eq!(
             actual,
-            expected_paths(run.policy_id().as_str()),
+            expected_finding_lines(run.policy_id().as_str()),
             "{}",
             run.policy_id()
         );

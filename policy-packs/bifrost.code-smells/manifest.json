@@ -18,17 +18,17 @@
     {
       "path": "policies/unsafe-deserialization.rqlp",
       "id": "bifrost.correctness.unsafe-deserialization",
-      "semantic_hash": "ba50f1778f098ee0430cd0cc7584cc8248d0e96125dfdb0dd9a23f4900413396",
+      "semantic_hash": "59c9395ba3184ae2a9b66df60dbccc34c99c4a8cc26e8ba23e5e34fb79ce5da3",
       "category": "correctness",
       "supported_languages": ["python"],
       "required_capabilities": ["structural-match", "normalized-call-roles"],
       "severity_rationale": "General-purpose object deserializers can construct unexpected objects or execute attacker-controlled behavior.",
-      "remediation": "Use a data-only format and safe loader, then validate the decoded schema before use."
+      "remediation": "Use a data-only format, then validate the decoded schema before use."
     },
     {
       "path": "policies/sort-in-loop.rqlp",
       "id": "bifrost.performance.sort-in-loop",
-      "semantic_hash": "00eacc749b99661d88ce481fa2425b0171a18f1638b5d658a287fa0e57995bc2",
+      "semantic_hash": "a6c2726cf7d7388a675c48909f69c4565dbc8037a85aaaa920198510526cbd82",
       "category": "performance",
       "supported_languages": ["python", "java", "typescript"],
       "required_capabilities": ["structural-match", "lexical-containment", "normalized-call"],
@@ -38,7 +38,7 @@
     {
       "path": "policies/regex-compile-in-loop.rqlp",
       "id": "bifrost.performance.regex-compile-in-loop",
-      "semantic_hash": "b78c96b659fa7b131319b64e07d5e95a6c03c090ffea0fff76e5f4fe25d925b8",
+      "semantic_hash": "b65057cb0195e0dec20f1b54e1c78d39477f75e44041f0eb6ce5087df77c93c6",
       "category": "performance",
       "supported_languages": ["python", "java", "javascript", "typescript"],
       "required_capabilities": ["structural-match", "lexical-containment", "normalized-call-roles"],
@@ -48,7 +48,7 @@
     {
       "path": "policies/file-read-in-loop.rqlp",
       "id": "bifrost.performance.file-read-in-loop",
-      "semantic_hash": "566d96870d6d7d566b1cf3eda50cdf6391f9379ac4c9afee8ba8de212937adf5",
+      "semantic_hash": "c4f9c53b9988b3a242e01058a7a90b8c80c03cab9811125753114e7ca3fa101b",
       "category": "performance",
       "supported_languages": ["python", "java", "javascript", "typescript"],
       "required_capabilities": ["structural-match", "lexical-containment", "normalized-call-roles"],
@@ -58,7 +58,7 @@
     {
       "path": "policies/serialization-in-loop.rqlp",
       "id": "bifrost.performance.serialization-in-loop",
-      "semantic_hash": "84ab09bcd2348b852ecdbb6a1476070a46ac9922d0714736f0df297a5eb2a79c",
+      "semantic_hash": "ea3e1a0541a019852a2601beaf14626d18e1499281917577464e2e6b5f479e4f",
       "category": "performance",
       "supported_languages": ["python", "java", "javascript", "typescript"],
       "required_capabilities": ["structural-match", "lexical-containment", "normalized-call-roles"],
@@ -68,7 +68,7 @@
     {
       "path": "policies/parsing-in-loop.rqlp",
       "id": "bifrost.performance.parsing-in-loop",
-      "semantic_hash": "e525572328fd117645f741bde10b9b8ad3af31693adbf79fed143852d15434d0",
+      "semantic_hash": "22ecb9e52bca95977e972af82d632a20e281aac1300c683ebe6283a29d07015b",
       "category": "performance",
       "supported_languages": ["python", "java", "javascript", "typescript"],
       "required_capabilities": ["structural-match", "lexical-containment", "normalized-call-roles"],
@@ -78,7 +78,7 @@
     {
       "path": "policies/database-call-in-loop.rqlp",
       "id": "bifrost.performance.database-call-in-loop",
-      "semantic_hash": "c7dc27b68b747f208dc4f3a84d323140c1c025e96b12b966816960a461ce3d17",
+      "semantic_hash": "686cb8f501e2d35da98fe280c828b17d0fcd1ea5b8805a69a604bde982fd96b4",
       "category": "performance",
       "supported_languages": ["python", "java", "javascript", "typescript"],
       "required_capabilities": ["structural-match", "lexical-containment", "normalized-call-roles"],
@@ -88,7 +88,7 @@
     {
       "path": "policies/network-call-in-loop.rqlp",
       "id": "bifrost.performance.network-call-in-loop",
-      "semantic_hash": "5279386b5b02b26e4a9c7cba16362a37f8ada4547a008d3cf357f1efa40def5f",
+      "semantic_hash": "55364c4a7300e84ce5e85cae04c6a00396f1fdd6ab8bad40d4df1bbfddcdeb8a",
       "category": "performance",
       "supported_languages": ["python", "java", "javascript", "typescript"],
       "required_capabilities": ["structural-match", "lexical-containment", "normalized-call-roles"],
@@ -98,7 +98,7 @@
     {
       "path": "policies/subprocess-in-loop.rqlp",
       "id": "bifrost.performance.subprocess-in-loop",
-      "semantic_hash": "70cedb8b87767b6c66478fcc9dd2eb0cd8c035222d118fb16fa31df93ef54734",
+      "semantic_hash": "cfd1d33f4deb0cbbb8f6e722244e2e18def8cb1cf56ca16e6f92436bcc70e0c0",
       "category": "performance",
       "supported_languages": ["python", "java", "javascript", "typescript"],
       "required_capabilities": ["structural-match", "lexical-containment", "normalized-call-roles"],
@@ -108,7 +108,7 @@
     {
       "path": "policies/sleep-in-loop.rqlp",
       "id": "bifrost.performance.sleep-in-loop",
-      "semantic_hash": "39256022b452f278a237bec24d537767fbd8ef3fde2894941590b5381956c629",
+      "semantic_hash": "ed842096f0bc0dd76f3496194f6d3fe2409fc774573221ebf71235d95ca6a841",
       "category": "performance",
       "supported_languages": ["python", "java"],
       "required_capabilities": ["structural-match", "lexical-containment", "normalized-call-roles"],
@@ -118,7 +118,7 @@
     {
       "path": "policies/expensive-operation-in-nested-loop.rqlp",
       "id": "bifrost.performance.expensive-operation-in-nested-loop",
-      "semantic_hash": "e6ffa723dd75c34443c385b6d5c61f242b625092abcb65dc316376495bf42d25",
+      "semantic_hash": "34498ff2ebea8884d04b2f5dd68e91400541332817c692cddcc4d2da17eb34d1",
       "category": "performance",
       "supported_languages": ["python", "java", "javascript", "typescript"],
       "required_capabilities": ["structural-match", "descendant-match", "normalized-call"],

@@ -2,9 +2,9 @@
   :schema-version 1
   :id "bifrost.performance.sort-in-loop"
   :name "Sorting inside a loop"
-  :message "Avoid sorting repeatedly inside the loop"
+  :message "Review whether this lexically nested sort repeats per iteration"
   :severity warning
-  :description "Sorting inside a loop multiplies comparison and allocation work. Sort before the loop or maintain the required order incrementally when the input is loop-invariant."
+  :description "A sort call lexically nested under a loop may multiply comparison and allocation work. This structural prompt also includes deferred nested bodies; verify execution and invariance before hoisting it."
   :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
   :tags ["performance" "collections" "loop" "code-smell"]
   :analysis
@@ -13,7 +13,9 @@
       :selector
         (rql
           :schema-version 2
-          (union
-            (language python (inside (loop) (call :callee (name "sort"))))
-            (language java (inside (loop) (call :callee (name "sort"))))
-            (language typescript (inside (loop) (call :callee (name "sort"))))))))
+          (where
+            "*.py" "**/*.py"
+            "*.java" "**/*.java"
+            "*.ts" "**/*.ts"
+            "*.tsx" "**/*.tsx"
+            (inside (loop) (call :callee (name "sort")))))))

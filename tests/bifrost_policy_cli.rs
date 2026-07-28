@@ -315,6 +315,78 @@ fn built_in_and_workspace_policies_run_in_one_batch() {
 }
 
 #[test]
+fn built_in_pack_and_category_selectors_run_valid_batches() {
+    let project = policy_project(&[]);
+    let category = run(
+        project.root(),
+        &[
+            "--policy-category",
+            "correctness",
+            "--evaluation-date",
+            "2026-07-28",
+            "--fail-on",
+            "never",
+            "--format",
+            "json",
+        ],
+    );
+    assert_status(&category, 0);
+    let category_report = json_stdout(&category);
+    let category_ids = category_report["runs"]
+        .as_array()
+        .expect("category runs")
+        .iter()
+        .map(|run| run["policy_id"].as_str().expect("category policy id"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        category_ids,
+        vec![
+            "bifrost.correctness.dynamic-evaluation",
+            "bifrost.correctness.unsafe-deserialization"
+        ]
+    );
+
+    let pack = run(
+        project.root(),
+        &[
+            "--policy-pack",
+            "bifrost.code-smells",
+            "--evaluation-date",
+            "2026-07-28",
+            "--fail-on",
+            "never",
+            "--format",
+            "json",
+        ],
+    );
+    assert_status(&pack, 0);
+    let pack_report = json_stdout(&pack);
+    let pack_ids = pack_report["runs"]
+        .as_array()
+        .expect("pack runs")
+        .iter()
+        .map(|run| run["policy_id"].as_str().expect("pack policy id"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pack_ids,
+        vec![
+            "bifrost.correctness.dynamic-evaluation",
+            "bifrost.correctness.unsafe-deserialization",
+            "bifrost.performance.database-call-in-loop",
+            "bifrost.performance.expensive-operation-in-nested-loop",
+            "bifrost.performance.file-read-in-loop",
+            "bifrost.performance.network-call-in-loop",
+            "bifrost.performance.parsing-in-loop",
+            "bifrost.performance.regex-compile-in-loop",
+            "bifrost.performance.serialization-in-loop",
+            "bifrost.performance.sleep-in-loop",
+            "bifrost.performance.sort-in-loop",
+            "bifrost.performance.subprocess-in-loop",
+        ]
+    );
+}
+
+#[test]
 fn unknown_built_in_selector_is_a_policy_invocation_error() {
     let project = policy_project(&[]);
     let output = run(

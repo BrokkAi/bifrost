@@ -21,8 +21,8 @@ The work also turns policy dogfooding into a durable maintenance practice. `AGEN
 - [x] (2026-07-28 09:45Z) Added MCP `list_policies` and extended `run_policy` with the same bounded selectors while preserving active-snapshot, suppression, cancellation, and canonical-report behavior.
 - [x] (2026-07-28 09:45Z) Extended crate/release smoke validation to require the manifest and sources and to execute a built-in rule through the staged MCP binary.
 - [x] (2026-07-28 09:45Z) Documented the user surface and updated root `AGENTS.md` with the durable rule-authoring, gap-filing, latency, and release-cadence protocol.
-- [ ] Profile the structural selectors on a pinned repository snapshot, record findings/near misses honestly, and link any uncovered capability gaps to existing or new focused issues.
-- [ ] Run formatting, focused tests, the full all-feature Clippy gate, relevant integration suites, package smoke, and specialist review; fix all confirmed release blockers.
+- [x] (2026-07-28 10:05Z) Recorded focused corpus timing and cancelled debug self-repository attempts honestly; linked declaration-bounded containment to new #1232, proven-only call-policy semantics to new #1233, CFG/value-flow to #824/#1205, and the exact 6.883-second plugin read to #1228.
+- [x] (2026-07-28 09:37Z) Ran formatting, the six-test exact selector corpus, all 23 policy CLI tests, all 29 MCP server tests, the rootless listing unit test, strict all-target/all-feature Clippy, clean-room crate packaging, and staged-plugin smoke. The host-side full gate passed all 2,011 enabled library tests (seven ignored) and every integration target before an unchanged Scala LSP diagnostics test blocked indefinitely; the exact test reproduced the same unbounded wait standalone. Security and DevOps review found no issues; senior and architecture re-review found no remaining critical, high, or medium findings after selector, host-contract, inventory, deferred-body, and TSX fixes.
 
 ## Surprises & Discoveries
 
@@ -43,6 +43,15 @@ The work also turns policy dogfooding into a durable maintenance practice. `AGEN
 
 - Observation: a bounded `enclosing-decl` then `callers :depth 2 :proof proven` policy can retain exact proven findings while still making the whole run inconclusive.
   Evidence: minimized Python/JavaScript/TypeScript dynamic-evaluation and Java `System.exit` chains returned their proven direct/second-order callers plus `CALL_RELATION_CANDIDATES_OMITTED`, which maps to `PartialDiscovery`. The candidate was removed because it would make the built-in pack status 2 on its positive fixture.
+
+- Observation: this macOS host needs one coherent rustup toolchain and CI's PyO3 dynamic-symbol configuration for the repository gates.
+  Evidence: a rustup `cargo` initially discovered Homebrew `cargo-clippy`, producing E0514 from different LLVM patch levels. Pinning rustup's `cargo` and `cargo-clippy` made strict Clippy pass. The first `nlp,python` link had unresolved `_Py*` symbols; pinning `/opt/homebrew/bin/python3.13` and `RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup'` matched CI and linked the full test matrix.
+
+- Observation: the unchanged Scala LSP semantic-diagnostics integration test can wait indefinitely for a publish notification on this host.
+  Evidence: the full host-side `nlp,python` run passed all 2,011 enabled library tests and reached `bifrost_lsp_server_scala_semantic_diagnostics_are_runtime_opt_in`, then made no progress for several minutes. The exact test reproduced the same stall standalone for more than three minutes at `read_notification("textDocument/publishDiagnostics")`; both processes were interrupted after preserving the witness.
+
+- Observation: specialist review caught test and host-contract gaps that the first checkpoint did not prove.
+  Evidence: the hardened corpus now exercises every selector alternative and asserts exact source lines, including root and nested TSX paths; unrestricted YAML loading was removed because safe `Loader` kwargs could not be excluded reliably; `sort-in-loop` is one language-neutral selector; `list_policies` validates arguments and returns while MCP is unbound; CLI and MCP reports compare byte-for-value as JSON; and package validation compares the complete directory inventory with the manifest before archive inspection.
 
 ## Decision Log
 
@@ -74,9 +83,19 @@ The work also turns policy dogfooding into a durable maintenance practice. `AGEN
   Rationale: The real call-graph query produced useful proven findings but also an unavoidable incomplete-run diagnostic on minimized positive fixtures. A built-in rule that makes an otherwise successful pack unreliable fails the release quality bar; the exact capability gap will be filed separately instead of weakening completion semantics.
   Date/Author: 2026-07-28 / Codex
 
+- Decision: Treat declaration-crossing containment as an explicit lexical policy boundary, not an unstated runtime claim.
+  Rationale: #1232 proves current RQL cannot exclude a deferred body relative to its containing loop. Each affected rule now calls itself a lexical review prompt, requires execution/invariance verification, and the fixture locks a deferred body as an expected lexical positive. Agents must keep a candidate out when that weaker contract is not itself useful.
+  Date/Author: 2026-07-28 / Codex
+
+- Decision: Do not declare the #1204 epic complete from this structural slice.
+  Rationale: live acceptance still requires bounded call-graph, CFG, and data-flow policies. #1233 and #824/#1205 own the capabilities needed to ship those honestly; follow-up links are not equivalent to meeting the inventory split. The current branch is release-ready structural functionality, while the epic remains open for its semantic wave.
+  Date/Author: 2026-07-28 / Codex
+
 ## Outcomes & Retrospective
 
-Implementation is in progress. At completion this section will compare the shipped catalog, host parity, package proof, profiling evidence, and linked follow-ups against the purpose above.
+The branch ships the first offline `bifrost.code-smells` structural wave: twelve human-reviewable policies, deterministic manifest and hashes, mixed built-in/workspace evaluation, CLI/MCP discovery and selection, exact canonical host parity, package/staged-plugin proof, and a durable review-to-policy maintenance protocol. Review tightened selector-alternative coverage, exact source-line assertions, TypeScript/TSX scope, language neutrality, safe-loader behavior, rootless discovery, and directory-to-manifest inventory validation. Final senior and architecture re-review found no remaining critical, high, or medium defect in this structural slice.
+
+The result is releasable but does not close the entire epic. The attempted bounded caller-chain policy produced honest partial discovery, current match-policy projection cannot turn CFG/data-flow terminal evidence into precise findings, and public general value flow is not ready. #1233 and #824/#1205 retain those acceptance items. #1232 owns declaration-bounded containment; until then loop rules are deliberately worded and tested as lexical prompts. The full repository gate is green through 2,011 enabled library tests and all preceding integrations, with the unrelated standalone Scala LSP notification hang recorded as the exact remaining environment/runtime blocker.
 
 ## Context and Orientation
 
@@ -175,6 +194,8 @@ Relevant open issues:
     #824  typed CFG, flow, taint, and typestate query/policy exposure
     #1205 source-backed cross-language value-flow conformance gate
     #1228 sub-five-second common code-intelligence latency and cancellation
+    #1232 declaration-bounded RQL containment
+    #1233 non-exhaustive proven-only call-graph match-policy semantics
 
 Related completed foundation:
 
