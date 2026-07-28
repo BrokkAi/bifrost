@@ -18234,6 +18234,51 @@ namespace Terminal.Gui {
 }
 
 #[test]
+fn csharp_unqualified_external_inherited_member_does_not_become_same_named_visible_type() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "MauiApp1/App.xaml.cs",
+            r#"namespace MauiApp1;
+
+public partial class App : Application
+{
+    public App()
+    {
+        MainPage = new AppShell();
+    }
+}
+"#,
+        )
+        .file(
+            "MauiApp1/AppShell.cs",
+            "namespace MauiApp1; public class AppShell : Shell {}\n",
+        )
+        .file(
+            "MauiApp1/MainPage.cs",
+            "namespace MauiApp1; public class MainPage {}\n",
+        )
+        .build();
+
+    let line = "        MainPage = new AppShell();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"MauiApp1/App.xaml.cs","line":7,"column":{}}}]}}"#,
+            column_of(line, "MainPage")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(
+        result["definitions"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "an external inherited value member must not resolve to a same-named workspace type: {value}"
+    );
+}
+
+#[test]
 fn csharp_this_method_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(

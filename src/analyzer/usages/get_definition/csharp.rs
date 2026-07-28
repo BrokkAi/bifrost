@@ -734,21 +734,28 @@ fn resolve_csharp_in_session(
                 );
             }
             if !bindings.is_shadowed(text) {
-                if csharp_is_unqualified_member_reference(identifier)
-                    && let Some(owner) =
+                if csharp_is_unqualified_member_reference(identifier) {
+                    if let Some(owner) =
                         csharp_enclosing_class(analyzer, definitions, file, identifier.start_byte())
-                {
-                    let outcome = csharp_member_outcome(
-                        analyzer,
-                        definitions,
-                        vec![owner],
-                        text,
-                        None,
-                        None,
-                        true,
-                    );
-                    if outcome.status != DefinitionLookupStatus::NoDefinition {
-                        return outcome;
+                    {
+                        let outcome = csharp_member_outcome(
+                            analyzer,
+                            definitions,
+                            vec![owner],
+                            text,
+                            None,
+                            None,
+                            true,
+                        );
+                        if outcome.status != DefinitionLookupStatus::NoDefinition {
+                            return outcome;
+                        }
+                    }
+                    if !csharp_identifier_allows_type_fallback(identifier) {
+                        return no_definition(
+                            "no_indexed_definition",
+                            format!("`{text}` did not resolve to an indexed C# member"),
+                        );
                     }
                 }
                 let outcome = csharp_type_outcome(
@@ -2197,6 +2204,14 @@ fn csharp_is_unqualified_member_reference(node: Node<'_>) -> bool {
             | "parameter"
             | "using_directive"
     )
+}
+
+fn csharp_identifier_allows_type_fallback(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    parent.kind() == "member_access_expression"
+        && csharp_member_access_receiver(parent).is_some_and(|receiver| same_node(receiver, node))
 }
 
 fn csharp_filter_candidates_by_arity(
