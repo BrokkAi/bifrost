@@ -23668,6 +23668,72 @@ object App:
 }
 
 #[test]
+fn scala_qualified_member_import_terminal_resolves_to_member_definition() {
+    let source = r#"
+package app
+
+class Renderer { def render(value: String): String = value }
+object Factory { def default: Renderer = new Renderer }
+
+object App:
+  import app.Factory.default
+  val direct = default.render("ok")
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/App.scala", source)
+        .build();
+
+    let default_start = source
+        .find("Factory.default")
+        .expect("qualified import terminal")
+        + "Factory.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/App.scala", source, default_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Factory$.default",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_import_selector_source_name_resolves_to_member_definition() {
+    let source = r#"
+package app
+
+class Renderer { def render(value: String): String = value }
+object Factory { def default: Renderer = new Renderer }
+
+object App:
+  import app.Factory.{default => renderer}
+  val direct = renderer.render("ok")
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/App.scala", source)
+        .build();
+
+    let default_start = source
+        .find("{default => renderer}")
+        .expect("selector source name")
+        + "{".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/App.scala", source, default_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Factory$.default",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_member_import_alias_does_not_shadow_its_own_qualifier() {
     let source = r#"
 package app
@@ -26541,6 +26607,23 @@ object Consumer {
         result["definitions"][0]["fqn"], "javaish.Builder.append",
         "{value}"
     );
+
+    let builder_start = scala_source
+        .find("javaish.Builder")
+        .expect("qualified Java constructor terminal")
+        + "javaish.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Consumer.scala", scala_source, builder_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["language"], "java", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "javaish.Builder",
+        "{value}"
+    );
 }
 
 #[test]
@@ -26562,6 +26645,17 @@ object Consumer {
     let value = lookup(
         project.root(),
         &location_reference("app/Consumer.scala", source, append_start),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+
+    let builder_start = source
+        .find("java.lang.StringBuilder")
+        .expect("qualified constructor terminal")
+        + "java.lang.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Consumer.scala", source, builder_start),
     );
 
     assert_eq!(value["results"][0]["status"], "no_definition", "{value}");

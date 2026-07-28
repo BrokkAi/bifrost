@@ -3838,6 +3838,18 @@ fn scala_import_reference_outcome(
     for info in relevant {
         saw_relevant = true;
         if let Some(structured_path) = info.path.as_ref() {
+            let focused_terminal_segment =
+                scala_direct_import_segment_index(import, focus_start_byte, focus_end_byte)
+                    .is_some_and(|focus_index| {
+                        focus_index + 1 == structured_path.segments.len()
+                            && structured_path.segments[focus_index] == name
+                    });
+            if (selected_name || focused_terminal_segment)
+                && let Some(outcome) =
+                    scala_import_member_outcome(scala, support, &resolver, structured_path)
+            {
+                return Some(outcome);
+            }
             if let Some(focus_index) =
                 scala_direct_import_segment_index(import, focus_start_byte, focus_end_byte)
                 && focus_index + 1 < structured_path.segments.len()
@@ -3914,6 +3926,41 @@ fn scala_import_reference_outcome(
             "`{name}` is part of a Scala import whose declaration is not indexed in this workspace"
         ))
     })
+}
+
+fn scala_import_member_outcome(
+    scala: &ScalaAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    resolver: &ScalaNameResolver<'_>,
+    structured_path: &StructuredImportPath,
+) -> Option<DefinitionLookupOutcome> {
+    let (member, owner_segments) = structured_path.segments.split_last()?;
+    if owner_segments.is_empty() {
+        return None;
+    }
+
+    let mut candidates = Vec::new();
+    for kind in [ScalaOwnerKind::SingletonObject, ScalaOwnerKind::Class] {
+        let ScalaNameResolution::Resolved(owner) =
+            resolver.resolve_owner_segments(owner_segments, kind)
+        else {
+            continue;
+        };
+        candidates.extend(
+            support
+                .fqn_direct_children(&owner.fqn)
+                .into_iter()
+                .filter(|unit| unit.identifier() == member.as_str())
+                .filter(|unit| unit.is_function() || unit.is_field())
+                .filter(|unit| !scala.is_type_alias(unit))
+                .filter(|unit| {
+                    scala.structural_parent_of(unit).as_ref() == Some(&owner._declaration)
+                }),
+        );
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    (!candidates.is_empty()).then(|| candidates_outcome(candidates))
 }
 
 /// Candidate spellings of `segments` qualified by each enclosing owner in
