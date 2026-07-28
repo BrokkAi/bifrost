@@ -1327,6 +1327,54 @@ object Use {
 }
 
 #[test]
+fn scala_graph_preserves_exact_companion_apply_edges() {
+    let source = r#"package app
+
+final class TextConverter private (val value: String)
+object TextConverter {
+  def apply(value: String): TextConverter = new TextConverter(value)
+}
+
+object Header {
+  final class Raw(val name: String, val value: String)
+  object Raw {
+    def apply(name: String, value: String): Raw = new Raw(name, value)
+  }
+}
+
+object Uci {
+  final class Move(val value: Int)
+  object Move {
+    def apply(value: Int): Move = new Move(value)
+  }
+}
+
+object Use {
+  val bare = TextConverter("plain") // positive-bare-apply
+  val qualified = Header.Raw("Name", "Value") // positive-qualified-apply
+  val nested = Uci.Move(1) // positive-nested-apply
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/Use.scala", source)]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    for (target_fqn, marker) in [
+        ("app.TextConverter$.apply", "positive-bare-apply"),
+        ("app.Header$.Raw$.apply", "positive-qualified-apply"),
+        ("app.Uci$.Move$.apply", "positive-nested-apply"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        assert_hit_contains(&hits, marker);
+    }
+}
+
+#[test]
 fn scala_usage_finder_applies_compilation_unit_import_precedence() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (
