@@ -67,7 +67,7 @@ The output should list `bifrost` as connected.
 
 ## Add Skills
 
-Install Bifrost's three generic code-intelligence skills into the project path
+Install Bifrost's four generic agent skills into the project path
 that OpenCode discovers:
 
 ```bash
@@ -80,6 +80,7 @@ This installs:
 - `bifrost-code-navigation`
 - `bifrost-code-reading`
 - `bifrost-codebase-search`
+- `bifrost-policy-checking`
 
 Restart OpenCode after installing the skills. To inspect the skills OpenCode
 discovered, run:
@@ -91,7 +92,7 @@ opencode debug skill
 OpenCode also scans the global `~/.agents/skills/` root. Avoid keeping different
 versions of the same Bifrost skill in both the project and global roots:
 same-named global copies can be selected instead of the project copies. Check
-the `location` reported for all three Bifrost skills and keep one intended
+the `location` reported for all four Bifrost skills and keep one intended
 scope current. To use global skills instead, install or refresh that scope:
 
 ```bash

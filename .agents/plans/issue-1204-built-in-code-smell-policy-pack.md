@@ -23,6 +23,7 @@ The work also turns policy dogfooding into a durable maintenance practice. `AGEN
 - [x] (2026-07-28 09:45Z) Documented the user surface and updated root `AGENTS.md` with the durable rule-authoring, gap-filing, latency, and release-cadence protocol.
 - [x] (2026-07-28 10:05Z) Recorded focused corpus timing and cancelled debug self-repository attempts honestly; linked declaration-bounded containment to new #1232, proven-only call-policy semantics to new #1233, CFG/value-flow to #824/#1205, and the exact 6.883-second plugin read to #1228.
 - [x] (2026-07-28 09:37Z) Ran formatting, the six-test exact selector corpus, all 23 policy CLI tests, all 29 MCP server tests, the rootless listing unit test, strict all-target/all-feature Clippy, clean-room crate packaging, and staged-plugin smoke. The host-side full gate passed all 2,011 enabled library tests (seven ignored) and every integration target before an unchanged Scala LSP diagnostics test blocked indefinitely; the exact test reproduced the same unbounded wait standalone. Security and DevOps review found no issues; senior and architecture re-review found no remaining critical, high, or medium findings after selector, host-contract, inventory, deferred-body, and TSX fixes.
+- [x] (2026-07-28 10:56Z) Shipped and validated the generic `bifrost-policy-checking` skill, Pi policy capability, Amp tool allowlist, embedded CLI installation, and staged fresh-host skill/tool contract.
 
 ## Surprises & Discoveries
 
@@ -52,6 +53,15 @@ The work also turns policy dogfooding into a durable maintenance practice. `AGEN
 
 - Observation: specialist review caught test and host-contract gaps that the first checkpoint did not prove.
   Evidence: the hardened corpus now exercises every selector alternative and asserts exact source lines, including root and nested TSX paths; unrestricted YAML loading was removed because safe `Loader` kwargs could not be excluded reliably; `sort-in-loop` is one language-neutral selector; `list_policies` validates arguments and returns while MCP is unbound; CLI and MCP reports compare byte-for-value as JSON; and package validation compares the complete directory inventory with the manifest before archive inspection.
+
+- Observation: the installed v0.8.11 Codex plugin is healthy outside this resumed task, but this task's tool inventory contains no Bifrost MCP tools even though its Bifrost skills are visible.
+  Evidence: `codex plugin list`, `codex mcp get bifrost`, launcher `doctor`, and the recorded-Codex release handshake all resolved the cached v0.8.11 package and binary; the standalone handshake advertised and successfully called `search_symbols`. The release smoke now requires that same Codex handshake to advertise `get_summaries` and `get_symbol_sources` alongside search and policy tools. The current task's callable tool registry contains none of the reading, search, or policy tools, so skill discovery and MCP tool attachment have diverged at the host task boundary.
+
+- Observation: a cold full-pack MCP evaluation of this repository remains far outside the interactive latency budget, while a warm single-policy rerun is fast.
+  Evidence: the packaged plugin's active-workspace `run_policy` call took 69.170 seconds from a fresh explicit cache and returned 14 findings with zero diagnostics; the warm `bifrost.performance.file-read-in-loop` rerun took 706 milliseconds. Open #1228 already covers common code-intelligence latency and head-of-line blocking, so this is additional evidence for the existing issue rather than a duplicate.
+
+- Observation: explicit-root MCP against this linked worktree cannot write the primary checkout's shared analyzer cache under the current sandbox.
+  Evidence: the first active-workspace call failed with SQLite `attempt to write a readonly database`; setting `BIFROST_CACHE_DIR` to a fresh private temporary directory preserved the same active source root and made the policy run complete. No tracked or shared cache file was modified to bypass the boundary.
 
 ## Decision Log
 
@@ -91,9 +101,17 @@ The work also turns policy dogfooding into a durable maintenance practice. `AGEN
   Rationale: live acceptance still requires bounded call-graph, CFG, and data-flow policies. #1233 and #824/#1205 own the capabilities needed to ship those honestly; follow-up links are not equivalent to meeting the inventory split. The current branch is release-ready structural functionality, while the epic remains open for its semantic wave.
   Date/Author: 2026-07-28 / Codex
 
+- Decision: Teach agents to derive categories from `list_policies` and select them through `run_policy`; do not add a redundant category-only MCP method.
+  Rationale: the manifest is already the versioned source of truth for packs, categories, and policy IDs, while `run_policy` already accepts a union of pack, category, exact-ID, and repository-file selectors. Selecting `bifrost.code-smells` is the durable meaning of all built-in code-smell categories because it automatically includes categories added by future releases.
+  Date/Author: 2026-07-28 / Codex
+
+- Decision: Treat the v0.8.11 reading-tool symptom as an unconfirmed task-level host attachment defect, not a Bifrost package defect.
+  Rationale: the cached package passes launcher readiness and a real MCP initialize, tools/list, and `search_symbols` call. A brand-new Codex task is the remaining host-level reproduction boundary; changing the working launcher or MCP config without that failure would be speculative.
+  Date/Author: 2026-07-28 / Codex
+
 ## Outcomes & Retrospective
 
-The branch ships the first offline `bifrost.code-smells` structural wave: twelve human-reviewable policies, deterministic manifest and hashes, mixed built-in/workspace evaluation, CLI/MCP discovery and selection, exact canonical host parity, package/staged-plugin proof, and a durable review-to-policy maintenance protocol. Review tightened selector-alternative coverage, exact source-line assertions, TypeScript/TSX scope, language neutrality, safe-loader behavior, rootless discovery, and directory-to-manifest inventory validation. Final senior and architecture re-review found no remaining critical, high, or medium defect in this structural slice.
+The branch ships the first offline `bifrost.code-smells` structural wave: twelve human-reviewable policies, deterministic manifest and hashes, mixed built-in/workspace evaluation, CLI/MCP discovery and selection, exact canonical host parity, package/staged-plugin proof, and a durable review-to-policy maintenance protocol. It now also ships a generic policy-checking skill across plugin, Pi, Amp, Codex-generated, and embedded CLI distributions. The skill discovers categories from `list_policies`, selects all built-ins by pack or a subset by category/ID, combines repository roots explicitly, and treats missing tools or unreliable reports as validation failures. Review tightened selector-alternative coverage, exact source-line assertions, TypeScript/TSX scope, language neutrality, safe-loader behavior, rootless discovery, and directory-to-manifest inventory validation. Final senior and architecture re-review found no remaining critical, high, or medium defect in this structural slice.
 
 The result is releasable but does not close the entire epic. The attempted bounded caller-chain policy produced honest partial discovery, current match-policy projection cannot turn CFG/data-flow terminal evidence into precise findings, and public general value flow is not ready. #1233 and #824/#1205 retain those acceptance items. #1232 owns declaration-bounded containment; until then loop rules are deliberately worded and tested as lexical prompts. The full repository gate is green through 2,011 enabled library tests and all preceding integrations, with the unrelated standalone Scala LSP notification hang recorded as the exact remaining environment/runtime blocker.
 

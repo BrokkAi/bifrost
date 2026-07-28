@@ -47,6 +47,8 @@ const PUBLIC_QUERY_SURFACES: &[&str] = &[
     "src/bin/bifrost/code_query_repl.rs",
     "plugins/bifrost-agent/skills/bifrost-codebase-search/SKILL.md",
     "plugins/bifrost-agent/codex-skills/bifrost-codebase-search/SKILL.md",
+    "plugins/bifrost-agent/skills/bifrost-policy-checking/SKILL.md",
+    "plugins/bifrost-agent/codex-skills/bifrost-policy-checking/SKILL.md",
     "plugins/bifrost-agent/amp-skills/bifrost-code-intelligence/SKILL.md",
     "plugins/bifrost-agent/amp-skills/bifrost-code-intelligence/mcp.json",
 ];

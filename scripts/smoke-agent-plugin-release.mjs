@@ -220,6 +220,10 @@ async function assertCodexSandboxWorkspaceBinding(launcherPath, pluginCwd, works
     const tools = toolList.result?.tools;
     assert.ok(Array.isArray(tools), "MCP tools/list did not return a tools array");
     assert.ok(tools.some((tool) => tool.name === "search_symbols"), "MCP tools/list did not advertise search_symbols");
+    assert.ok(tools.some((tool) => tool.name === "get_summaries"), "MCP tools/list did not advertise get_summaries");
+    assert.ok(tools.some((tool) => tool.name === "get_symbol_sources"), "MCP tools/list did not advertise get_symbol_sources");
+    assert.ok(tools.some((tool) => tool.name === "list_policies"), "MCP tools/list did not advertise list_policies");
+    assert.ok(tools.some((tool) => tool.name === "run_policy"), "MCP tools/list did not advertise run_policy");
     const search = await roundTrip(
       child,
       reader,

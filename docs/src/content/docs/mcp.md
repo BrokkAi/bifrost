@@ -185,8 +185,8 @@ Before asking an agent to claim “all callers” or “no matches,” teach it 
 
 MCP setup makes Bifrost tools available to an agent host. Agent Skills are
 separate instructions that teach the host when and how to use those tools. For
-hosts that load generic filesystem skills, install Bifrost's default
-code-intelligence skills with:
+hosts that load generic filesystem skills, install Bifrost's default code
+intelligence and policy-checking skills with:
 
 ```bash
 bifrost --root /path/to/project --install-skills --target project

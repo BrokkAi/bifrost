@@ -218,11 +218,12 @@ The built-in destinations are:
 - `--target global`: install to `~/.agents/skills`
 - `--skills-root /path/to/skills`: install to an explicit skill root
 
-The default skill set installs the three Bifrost code-intelligence skills:
+The default skill set installs four generic Bifrost agent skills:
 
 - `bifrost-code-navigation`
 - `bifrost-code-reading`
 - `bifrost-codebase-search`
+- `bifrost-policy-checking`
 
 Use `--skill-set all` to also install the Brokk workflow and review skills. Use
 `--mode copy` for self-contained copies, `--mode symlink` for checkout-local

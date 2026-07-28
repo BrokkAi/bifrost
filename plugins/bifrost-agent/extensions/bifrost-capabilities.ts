@@ -44,6 +44,13 @@ export const BIFROST_CAPABILITIES = [
     toolRequirements: [["find_filenames"], ["list_files"], ["most_relevant_files"]],
   },
   {
+    id: "policies",
+    label: "Policies",
+    description: "Built-in and repository RQL policy discovery and evaluation",
+    serverToolsets: ["extended"],
+    toolRequirements: [["list_policies"], ["run_policy"]],
+  },
+  {
     id: "quality",
     label: "Code quality",
     description: "Complexity, hotspots, clones, smells, dead code, and secrets",
@@ -88,6 +95,7 @@ export const DEFAULT_BIFROST_CAPABILITIES: readonly BifrostCapability[] = [
   "symbols",
   "query",
   "files",
+  "policies",
 ];
 
 const CAPABILITIES_BY_ID = new Map<BifrostCapability, BifrostCapabilityDefinition>(

@@ -121,6 +121,12 @@ During active development, leave each day's policy work release-ready: keep incr
 manifest and package checks, and run the staged-binary policy smoke. This cadence does not authorize version bumps,
 tags, publishing, or deployment without an explicit request.
 
+Before completing a code-changing task, use the `bifrost-policy-checking` skill when it is installed. Run the
+`bifrost.code-smells` pack together with every executable repository policy root explicitly named by the project, using
+one MCP `run_policy` request against the active workspace. Treat `finding` as work to review or fix and `unreliable` as a
+failed validation result; rerun the same selection after changes. Never infer success merely because the skill is visible
+when its `list_policies` or `run_policy` MCP tools are absent.
+
 # Design philosophy
 
 We build for correctness and generality. Adding narrow "fallbacks" is a smell. Always follow problems
