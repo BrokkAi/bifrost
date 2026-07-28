@@ -7876,6 +7876,118 @@ object Scala3Use:
 }
 
 #[test]
+fn scala_nested_wildcard_owner_import_tokens_are_exact_without_member_import_duplicates() {
+    let scala2 = r#"package app
+object Status2 {
+  import Registry._
+  import Registry.Sub._
+  def call(): Int = register(1)
+  def nested: Int = X
+  private object Registry {
+    def register(value: Int): Int = value
+    object Sub { val X: Int = 1 }
+  }
+}
+"#;
+    let scala3 = r#"package app
+object Status3:
+  import Registry.*
+  import Registry.Sub.*
+  def call(): Int = register(2)
+  def nested: Int = X
+  private object Registry:
+    def register(value: Int): Int = value
+    object Sub:
+      val X: Int = 1
+"#;
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        ("app/Scala2Use.scala", scala2),
+        ("app/Scala3Use.scala", scala3),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = ScalaUsageGraphStrategy::new();
+
+    for (fqn, path, source, import_line, token) in [
+        (
+            "app.Status2$.Registry$",
+            "app/Scala2Use.scala",
+            scala2,
+            "  import Registry._",
+            "Registry",
+        ),
+        (
+            "app.Status2$.Registry$.Sub$",
+            "app/Scala2Use.scala",
+            scala2,
+            "  import Registry.Sub._",
+            "Sub",
+        ),
+        (
+            "app.Status3$.Registry$",
+            "app/Scala3Use.scala",
+            scala3,
+            "  import Registry.*",
+            "Registry",
+        ),
+        (
+            "app.Status3$.Registry$.Sub$",
+            "app/Scala3Use.scala",
+            scala3,
+            "  import Registry.Sub.*",
+            "Sub",
+        ),
+    ] {
+        let target = definition(&analyzer, fqn);
+        let result =
+            strategy.find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000);
+        let import_hits = result
+            .all_hits_including_imports()
+            .into_iter()
+            .filter(|hit| hit.kind == UsageHitKind::Import)
+            .collect::<Vec<_>>();
+        let line_start = source.find(import_line).expect("import line offset");
+        let token_start = import_line.find(token).expect("import token");
+        assert!(
+            import_hits.iter().any(|hit| {
+                hit.file == project.file(path)
+                    && hit.start_offset == line_start + token_start
+                    && hit.end_offset == line_start + token_start + token.len()
+            }),
+            "missing wildcard owner import token {token:?} for {fqn}: {import_hits:#?}"
+        );
+    }
+
+    for (fqn, path, source, import_line) in [
+        (
+            "app.Status2$.Registry$.register",
+            "app/Scala2Use.scala",
+            scala2,
+            "  import Registry._",
+        ),
+        (
+            "app.Status3$.Registry$.register",
+            "app/Scala3Use.scala",
+            scala3,
+            "  import Registry.*",
+        ),
+    ] {
+        let target = definition(&analyzer, fqn);
+        let result =
+            strategy.find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000);
+        let import_line_number = line_of(source, import_line);
+        let import_hits = result
+            .all_hits_including_imports()
+            .into_iter()
+            .filter(|hit| hit.kind == UsageHitKind::Import && hit.file == project.file(path))
+            .collect::<Vec<_>>();
+        assert!(
+            import_hits.iter().all(|hit| hit.line != import_line_number),
+            "wildcard owner import must not add a member import hit for {fqn}: {import_hits:#?}"
+        );
+    }
+}
+
+#[test]
 fn scala_graph_resolves_visible_extension_method_usage() {
     let app_source = r#"
 package app

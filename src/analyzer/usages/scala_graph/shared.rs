@@ -7,10 +7,12 @@ use super::resolver::{
     scala_normalized_fq_name,
 };
 use super::syntax::{ScalaCallSiteShape, ScalaCallableSiteRole};
-use crate::analyzer::scala::scala_import_path;
+use crate::analyzer::scala::{scala_import_path, scala_nested_type_candidates};
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::common::usage_hit;
-use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges, UsageReferenceKind};
+use crate::analyzer::usages::inverted_edges::{
+    ClassRangeIndex, UsageEdgeWeights, UsageEdges, UsageReferenceKind,
+};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitKind};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageEdgeResolver, UsageQueryResolver, UsageScanScope};
@@ -39,7 +41,7 @@ struct ScalaQueryTargetCatalog {
     exact_owner_members: HashMap<(CodeUnit, String, ScalaReferenceRole), Vec<usize>>,
     logical: HashMap<(String, ScalaReferenceRole), Vec<usize>>,
     explicit_imports: HashMap<String, Vec<usize>>,
-    wildcard_imports: HashMap<(String, String), Vec<usize>>,
+    owner_imports: HashMap<String, Vec<usize>>,
 }
 
 enum ScalaCatalogBuildError {
@@ -68,7 +70,7 @@ impl ScalaQueryTargetCatalog {
         let mut exact_owner_members: HashMap<(CodeUnit, String, ScalaReferenceRole), Vec<usize>> =
             HashMap::default();
         let mut explicit_imports: HashMap<String, Vec<usize>> = HashMap::default();
-        let mut wildcard_imports: HashMap<(String, String), Vec<usize>> = HashMap::default();
+        let mut owner_imports: HashMap<String, Vec<usize>> = HashMap::default();
         let mut direct_descendants: HashMap<CodeUnit, Vec<CodeUnit>> = HashMap::default();
         if let Some(ancestors_by_unit) = scala.project_types().exact_direct_ancestors_snapshot() {
             for (unit, ancestors) in ancestors_by_unit {
@@ -397,42 +399,9 @@ impl ScalaQueryTargetCatalog {
                 .entry(scala_normalized_fq_name(&spec.target_fq_name))
                 .or_default()
                 .push(target_id);
-            if let Some(owner_fq_name) = spec.owner_fq_name.as_ref() {
-                explicit_imports
-                    .entry(scala_normalized_fq_name(owner_fq_name))
-                    .or_default()
-                    .push(target_id);
-                wildcard_imports
-                    .entry((
-                        scala_normalized_fq_name(owner_fq_name),
-                        spec.member_name.clone(),
-                    ))
-                    .or_default()
-                    .push(target_id);
-            }
-            wildcard_imports
-                .entry((
-                    scala_normalized_fq_name(spec.target.package_name()),
-                    spec.member_name.clone(),
-                ))
-                .or_default()
-                .push(target_id);
-            if let Some(parent) = spec.type_parent.as_ref() {
-                wildcard_imports
-                    .entry((
-                        scala_normalized_fq_name(&parent.fq_name()),
-                        spec.member_name.clone(),
-                    ))
-                    .or_default()
-                    .push(target_id);
-            }
-            if let (Some(owner), Some(owner_name)) = (spec.owner.as_ref(), spec.owner_name.as_ref())
-            {
-                wildcard_imports
-                    .entry((
-                        scala_normalized_fq_name(owner.package_name()),
-                        owner_name.clone(),
-                    ))
+            if spec.kind == TargetKind::Type {
+                owner_imports
+                    .entry(scala_normalized_fq_name(&spec.target_fq_name))
                     .or_default()
                     .push(target_id);
             }
@@ -450,7 +419,7 @@ impl ScalaQueryTargetCatalog {
         }
         for target_ids in explicit_imports
             .values_mut()
-            .chain(wildcard_imports.values_mut())
+            .chain(owner_imports.values_mut())
         {
             ensure_catalog_active(cancellation)?;
             target_ids.sort_unstable();
@@ -478,7 +447,7 @@ impl ScalaQueryTargetCatalog {
             exact_owner_members,
             logical,
             explicit_imports,
-            wildcard_imports,
+            owner_imports,
         })
     }
 
@@ -562,8 +531,10 @@ impl ScalaFileEligibility {
 
 struct ScalaQueryHitSink<'a> {
     analyzer: &'a dyn IAnalyzer,
+    scala: &'a ScalaAnalyzer,
     file: &'a ProjectFile,
     source: &'a str,
+    class_ranges: ClassRangeIndex,
     line_starts: Vec<usize>,
     catalog: &'a ScalaQueryTargetCatalog,
     eligibility: &'a ScalaFileEligibility,
@@ -577,6 +548,90 @@ struct ScalaQueryHitSink<'a> {
 }
 
 impl ScalaQueryHitSink<'_> {
+    fn wildcard_import_owner_target_ids(
+        &mut self,
+        import: &crate::analyzer::ImportInfo,
+        active_package: &str,
+        name: &str,
+    ) -> Vec<usize> {
+        let Some(structured_path) = import.path.as_ref() else {
+            return Vec::new();
+        };
+
+        let mut owner_scopes = Vec::new();
+        let mut current = self
+            .class_ranges
+            .enclosing_unit(structured_path.declaration_start_byte)
+            .cloned();
+        while let Some(owner) = current {
+            current = self.scala.structural_parent_of(&owner);
+            if owner.is_class() {
+                owner_scopes.push(owner.fq_name());
+            }
+        }
+
+        let mut selected = Vec::new();
+        for end_index in (0..structured_path.segments.len())
+            .filter(|index| structured_path.segments[*index] == name)
+        {
+            let segments = &structured_path.segments[..=end_index];
+            let mut owner_matches = Vec::new();
+            let mut owner_ambiguous = false;
+            'owners: for owner in &owner_scopes {
+                let owner_candidates = scala_nested_type_candidates(
+                    owner.trim_end_matches('$').to_string(),
+                    segments,
+                    true,
+                );
+                let matches = self.explicit_import_candidate_target_ids(owner_candidates);
+                if matches.is_empty() {
+                    continue;
+                }
+                owner_ambiguous = matches.len() > 1;
+                owner_matches = matches.into_iter().next().unwrap_or_default();
+                break 'owners;
+            }
+            if owner_ambiguous {
+                continue;
+            }
+            if !owner_matches.is_empty() {
+                selected.extend(owner_matches);
+                continue;
+            }
+
+            let package_matches = self.explicit_import_candidate_target_ids(
+                import_candidate_fq_names(&segments.join("."), active_package),
+            );
+            if package_matches.len() == 1 {
+                selected.extend(package_matches.into_iter().next().unwrap_or_default());
+            }
+        }
+
+        selected.sort_unstable();
+        selected.dedup();
+        selected
+    }
+
+    fn explicit_import_candidate_target_ids(
+        &self,
+        candidates: impl IntoIterator<Item = String>,
+    ) -> Vec<Vec<usize>> {
+        let mut matches = Vec::new();
+        for candidate in candidates {
+            let Some(target_ids) = self
+                .catalog
+                .owner_imports
+                .get(&scala_normalized_fq_name(&candidate))
+            else {
+                continue;
+            };
+            if !matches.iter().any(|existing| existing == target_ids) {
+                matches.push(target_ids.clone());
+            }
+        }
+        matches
+    }
+
     fn record_target_ids(
         &mut self,
         target_ids: &[usize],
@@ -762,19 +817,11 @@ impl ScalaReferenceSink for ScalaQueryHitSink<'_> {
             let Some(path) = scala_import_path(import) else {
                 continue;
             };
-            let candidates = import_candidate_fq_names(&path, active_package);
             if import.is_wildcard {
-                for candidate in candidates {
-                    if let Some(target_ids) = self
-                        .catalog
-                        .wildcard_imports
-                        .get(&(scala_normalized_fq_name(&candidate), name.to_string()))
-                    {
-                        matches.extend(target_ids.iter().copied());
-                    }
-                }
+                matches.extend(self.wildcard_import_owner_target_ids(import, active_package, name));
                 continue;
             }
+            let candidates = import_candidate_fq_names(&path, active_package);
             // `ImportInfo::local_name` is the shared `alias ?? identifier ??
             // tail-of-structured-path` desugar; scala's `identifier` is already
             // alias-resolved at construction, so this agrees with the old
@@ -904,8 +951,10 @@ impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
             };
             let mut sink = ScalaQueryHitSink {
                 analyzer,
+                scala: self.scala,
                 file,
                 source: &source,
+                class_ranges: ClassRangeIndex::build(analyzer, file),
                 line_starts: compute_line_starts(&source),
                 catalog: &catalog,
                 eligibility,
