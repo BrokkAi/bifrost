@@ -144,7 +144,40 @@ pub(in crate::analyzer::usages) fn resolve_receiver_type(
         })
 }
 
-/// Resolve a class reference written in a structured Python annotation.
+fn resolve_bare_annotation_symbol(
+    analyzer: &dyn IAnalyzer,
+    py: &PythonAnalyzer,
+    file: &ProjectFile,
+    raw_symbol: &str,
+) -> Vec<CodeUnit> {
+    let raw_symbol = raw_symbol.trim();
+    if raw_symbol.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    if let Some(binding) = py.import_binder_of(file).bindings.get(raw_symbol)
+        && binding.kind == ImportKind::Named
+        && let Some(imported) = binding.imported_name.as_ref()
+    {
+        let fqn = format!("{}.{}", binding.module_specifier, imported);
+        candidates
+            .extend(py.resolve_fqn_candidates(&fqn, |name| analyzer.definitions(name).collect()));
+    }
+
+    candidates.extend(
+        analyzer
+            .top_level_declarations(file)
+            .into_iter()
+            .filter(|code_unit| !code_unit.is_module() && code_unit.identifier() == raw_symbol),
+    );
+
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+/// Resolve a structured Python annotation reference.
 ///
 /// Only AST nodes that occur inside a function return type, parameter type, or
 /// annotated-assignment type are considered. In particular, string contents are
@@ -161,18 +194,22 @@ pub(in crate::analyzer::usages) fn annotation_reference_candidates(
     if !is_annotation_reference_node(node) {
         return None;
     }
-    eprintln!("ANNOTATION {:?} {:?}", node.kind(), node_text(node, source));
 
     let mut candidates = match node.kind() {
-        "identifier" | "string_content" => resolve_receiver_type(
-            analyzer,
-            py,
-            file,
-            node_text(node, source),
-            target_self_file,
-        )
-        .into_iter()
-        .collect(),
+        "identifier" | "string_content" => {
+            let mut candidates =
+                resolve_bare_annotation_symbol(analyzer, py, file, node_text(node, source));
+            if candidates.is_empty() {
+                candidates.extend(resolve_receiver_type(
+                    analyzer,
+                    py,
+                    file,
+                    node_text(node, source),
+                    target_self_file,
+                ));
+            }
+            candidates
+        }
         "attribute" => resolve_constructor_types(analyzer, py, file, source, node),
         _ => Vec::new(),
     };

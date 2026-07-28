@@ -4,7 +4,7 @@ use brokk_bifrost::usages::{PythonExportUsageGraphStrategy, UsageAnalyzer, Usage
 use brokk_bifrost::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, PythonAnalyzer,
 };
-use common::{InlineTestProject, call_search_tool_json};
+use common::{BuiltInlineTestProject, InlineTestProject, call_search_tool_json};
 use serde_json::json;
 use std::collections::BTreeMap;
 
@@ -64,6 +64,57 @@ fn assert_no_python_member_hit(service: &str, consumer: &str) {
         .into_either()
         .expect("graph should return success for member query");
     assert!(hits.is_empty(), "member query should not find proven hits");
+}
+
+fn nth_occurrence_range(source: &str, needle: &str, occurrence: usize) -> (usize, usize) {
+    let start = source
+        .match_indices(needle)
+        .nth(occurrence)
+        .unwrap_or_else(|| panic!("missing occurrence {occurrence} of {needle:?}"))
+        .0;
+    (start, start + needle.len())
+}
+
+fn assert_python_usage_hits(
+    project: &BuiltInlineTestProject,
+    target_fqn: &str,
+    expected_file: &str,
+    source: &str,
+    expected_sites: &[(&str, usize)],
+) {
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, target_fqn);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .unwrap_or_else(|_| panic!("graph should resolve usages for {target_fqn}"));
+    assert_eq!(hits.len(), expected_sites.len(), "{hits:#?}");
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file(expected_file)),
+        "{hits:#?}"
+    );
+    let mut actual_ranges: Vec<_> = hits
+        .iter()
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect();
+    actual_ranges.sort_unstable();
+
+    let mut expected_ranges: Vec<_> = expected_sites
+        .iter()
+        .map(|(needle, occurrence)| nth_occurrence_range(source, needle, *occurrence))
+        .collect();
+    expected_ranges.sort_unstable();
+    assert_eq!(actual_ranges, expected_ranges, "{hits:#?}");
+
+    for (needle, _) in expected_sites {
+        assert!(
+            hits.iter().any(|hit| hit.snippet.contains(needle)),
+            "missing snippet {needle:?}: {hits:#?}"
+        );
+    }
 }
 
 #[test]
@@ -414,6 +465,94 @@ fn annotation_references_resolve_reexported_classes_without_matching_other_class
             .all(|hit| !hit.snippet.contains("Account")),
         "User alias must not resolve to Other: {other_hits:#?}"
     );
+}
+
+#[test]
+fn same_file_alias_annotations_resolve_module_field_target() {
+    let source = "Payload = dict[str, int]\n\ndef decode(value: Payload) -> Payload:\n    local: Payload = value\n    return local\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", source)
+        .build();
+
+    assert_python_usage_hits(
+        &project,
+        "service.Payload",
+        "service.py",
+        source,
+        &[("Payload", 1), ("Payload", 2), ("Payload", 3)],
+    );
+}
+
+#[test]
+fn imported_alias_annotations_resolve_module_field_target() {
+    let source = "from service import Payload as Request\n\ndef decode(value: Request) -> Request:\n    local: Request = value\n    return local\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", "Payload = dict[str, int]\n")
+        .file("consumer.py", source)
+        .build();
+
+    assert_python_usage_hits(
+        &project,
+        "service.Payload",
+        "consumer.py",
+        source,
+        &[("Request", 1), ("Request", 2), ("Request", 3)],
+    );
+}
+
+#[test]
+fn paramspec_annotations_resolve_module_field_target() {
+    let source = "from typing import Callable\nfrom service import P\n\ndef wrap(func: Callable[P, int]) -> Callable[P, int]:\n    return func\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            "from typing import Callable, ParamSpec\n\nP = ParamSpec(\"P\")\n",
+        )
+        .file("consumer.py", source)
+        .build();
+
+    assert_python_usage_hits(
+        &project,
+        "service.P",
+        "consumer.py",
+        source,
+        &[("P", 1), ("P", 2)],
+    );
+}
+
+#[test]
+fn annotated_metadata_resolves_function_target() {
+    let source = "from typing import Annotated\n\ndef merge(existing: list[str] | None, new: list[str] | None) -> list[str]:\n    return existing or new or []\n\nState = Annotated[list[str], merge]\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", source)
+        .build();
+
+    assert_python_usage_hits(
+        &project,
+        "service.merge",
+        "service.py",
+        source,
+        &[("merge", 1)],
+    );
+}
+
+#[test]
+fn builtin_generic_annotation_does_not_resolve_same_name_method_target() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            "class RGBColor:\n    pass\n\nclass ColorMapType:\n    @classmethod\n    def list(cls):\n        return []\n\ndef render() -> list[RGBColor]:\n    return []\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.ColorMapType.list");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should return success for builtin generic annotation");
+    assert!(hits.is_empty(), "{hits:#?}");
 }
 
 #[test]
