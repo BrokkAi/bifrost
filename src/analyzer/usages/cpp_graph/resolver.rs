@@ -7271,12 +7271,8 @@ fn target_forward_owner_resolution(
     if !code_unit.is_function() {
         return None;
     }
-    let owner_name = code_unit.short_name().rsplit_once('.')?.0;
-    let owner_fqn = if code_unit.package_name().is_empty() {
-        owner_name.to_string()
-    } else {
-        format!("{}.{}", code_unit.package_name(), owner_name)
-    };
+    let interner = crate::analyzer::fq_name::segment_interner();
+    let owner_fqn = code_unit.fq().parent()?.display(interner);
     let cpp = resolve_analyzer::<CppAnalyzer>(analyzer)?;
     let mut visible_files = HashSet::default();
     collect_include_closure(
@@ -7291,12 +7287,7 @@ fn target_forward_owner_resolution(
         .global_usage_definition_index()
         .by_fqn(&owner_fqn)
         .iter()
-        .filter(|candidate| {
-            candidate.is_class()
-                && candidate.short_name() == owner_name
-                && candidate.package_name() == code_unit.package_name()
-                && visible_files.contains(candidate.source())
-        })
+        .filter(|candidate| candidate.is_class() && visible_files.contains(candidate.source()))
     {
         match cpp_class_declaration_strength(analyzer, candidate) {
             CppClassDeclarationStrength::Forward if forward.is_none() => {

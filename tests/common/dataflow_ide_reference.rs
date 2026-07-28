@@ -14,10 +14,10 @@ use brokk_bifrost::analyzer::dataflow::{
     DataflowEdge, DataflowOutput, IdeDataflowProblem, IdeDataflowSeed, IdeTransition,
 };
 use brokk_bifrost::analyzer::semantic::{
-    CallTransfer, ControlContinuation, ControlEdgeKind, IcfgEdgeKind, IcfgExitProfile,
-    IcfgProvider, MatchedReturnProjection, ProcedureHandle, ProcedureIcfgEdge, ProgramPointHandle,
-    ProgramPointId, ProofStatus, ReturnTransferKind, SemanticBudget, SemanticEffect,
-    SemanticProviderError, SemanticRequest,
+    CallBoundary, CallToReturnModel, CallTransfer, ControlContinuation, ControlEdgeKind,
+    IcfgEdgeKind, IcfgExitProfile, IcfgProvider, MatchedReturnProjection, ProcedureHandle,
+    ProcedureIcfgEdge, ProgramPointHandle, ProgramPointId, ProofStatus, ReturnTransferKind,
+    SemanticBudget, SemanticCallSite, SemanticEffect, SemanticProviderError, SemanticRequest,
 };
 
 pub type ReferenceStateKey<Fact> = (
@@ -275,6 +275,17 @@ where
                                 call_function: transition.function,
                             });
                         }
+                    }
+                    for boundary in transfers.boundaries.iter() {
+                        changed |= propagate_call_boundary(
+                            &mut jumps,
+                            problem,
+                            &point,
+                            path,
+                            jump,
+                            &semantic_call,
+                            boundary,
+                        )?;
                     }
                 }
                 changed |= propagate_local_edges(
@@ -627,14 +638,85 @@ where
 }
 
 fn descriptor<Fact>(edge: &ProcedureIcfgEdge) -> DataflowEdge<'_, Fact> {
-    DataflowEdge::new(
+    let descriptor = DataflowEdge::new(
         edge.kind,
         edge.origin.as_ref(),
         &edge.source,
         &edge.target,
         &edge.proof,
         &edge.completeness,
-    )
+    );
+    match edge.boundary.as_ref() {
+        Some(boundary) => descriptor.with_boundary(boundary),
+        None => descriptor,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn propagate_call_boundary<Problem>(
+    jumps: &mut HashMap<Path<Problem::Fact>, Problem::EdgeFunction>,
+    problem: &Problem,
+    point: &ProgramPointHandle,
+    path: &Path<Problem::Fact>,
+    jump: &Problem::EdgeFunction,
+    call: &SemanticCallSite,
+    boundary: &CallBoundary,
+) -> Result<bool, ReferenceIdeError>
+where
+    Problem: IdeDataflowProblem,
+{
+    let mut changed = false;
+    for (enabled, continuation, kind) in [
+        (
+            matches!(
+                boundary.model,
+                CallToReturnModel::Normal | CallToReturnModel::NormalAndExceptional
+            ),
+            call.normal_continuation,
+            IcfgEdgeKind::CallToNormalContinuation,
+        ),
+        (
+            matches!(
+                boundary.model,
+                CallToReturnModel::Exceptional | CallToReturnModel::NormalAndExceptional
+            ),
+            call.exceptional_continuation,
+            IcfgEdgeKind::CallToExceptionalContinuation,
+        ),
+    ] {
+        let (true, ControlContinuation::Target(target)) = (enabled, continuation) else {
+            continue;
+        };
+        let target =
+            point
+                .procedure()
+                .point_handle(target)
+                .ok_or(ReferenceIdeError::MissingPoint(
+                    "call-boundary continuation",
+                ))?;
+        let edge = ProcedureIcfgEdge {
+            source: point.clone(),
+            target,
+            kind,
+            origin: Some(boundary.origin.clone()),
+            proof: boundary.dispatch.proof.clone(),
+            completeness: boundary.dispatch.completeness.clone(),
+            boundary: Some(boundary.dispatch.kind.clone()),
+        };
+        for transition in transition_outputs(problem, &edge, path.fact) {
+            changed |= publish_jump(
+                jumps,
+                Path {
+                    entry: path.entry.clone(),
+                    point: edge.target.id(),
+                    fact: transition.fact,
+                },
+                compose(problem, jump, &transition.function),
+                problem,
+            );
+        }
+    }
+    Ok(changed)
 }
 
 fn invoked_call_at(
