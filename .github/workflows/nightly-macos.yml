@@ -16,6 +16,7 @@ jobs:
   agent-plugin:
     name: agent plugin
     runs-on: macos-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -35,6 +36,7 @@ jobs:
   pi-package:
     name: Pi package
     runs-on: macos-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -69,6 +71,7 @@ jobs:
   rust:
     name: rust (aarch64-apple-darwin)
     runs-on: macos-latest
+    timeout-minutes: 60
     env:
       RUSTFLAGS: '-C link-arg=-undefined -C link-arg=dynamic_lookup'
       CARGO_PROFILE_DEV_DEBUG: 0
@@ -117,6 +120,7 @@ jobs:
   python:
     name: python (aarch64-apple-darwin)
     runs-on: macos-latest
+    timeout-minutes: 60
     env:
       RUSTFLAGS: '-C link-arg=-undefined -C link-arg=dynamic_lookup'
     steps:
@@ -149,6 +153,7 @@ jobs:
     if: always()
     needs: [agent-plugin, pi-package, rust, python]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
       issues: write
