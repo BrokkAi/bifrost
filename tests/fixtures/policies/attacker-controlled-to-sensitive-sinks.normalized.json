@@ -1,5 +1,8 @@
 {
   "analysis": {
+    "call_modeling": {
+      "unmodeled": "paranoid"
+    },
     "external_models": {
       "entries": [],
       "include_matches": [],
