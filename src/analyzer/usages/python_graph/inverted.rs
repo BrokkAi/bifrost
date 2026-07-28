@@ -380,8 +380,13 @@ fn handle_annotation_reference(node: Node<'_>, ctx: &mut PyScan<'_, '_>) -> bool
         return false;
     };
 
+    let site = if node.kind() == "attribute" {
+        node.child_by_field_name("attribute").unwrap_or(node)
+    } else {
+        node
+    };
     for candidate in candidates {
-        ctx.record(candidate.fq_name(), node);
+        ctx.record(candidate.fq_name(), site);
     }
     true
 }

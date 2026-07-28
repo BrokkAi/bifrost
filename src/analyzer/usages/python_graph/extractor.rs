@@ -624,12 +624,17 @@ fn handle_annotation_reference_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) 
         return false;
     };
 
-    if ctx.target_member.is_none()
+    if (ctx.target.is_class() || ctx.target_member.is_none())
         && candidates
             .into_iter()
             .any(|candidate| candidate == *ctx.target)
     {
-        record_hit(node, ctx);
+        let site = if node.kind() == "attribute" {
+            node.child_by_field_name("attribute").unwrap_or(node)
+        } else {
+            node
+        };
+        record_hit(site, ctx);
     }
     true
 }

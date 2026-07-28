@@ -537,6 +537,85 @@ fn annotated_metadata_resolves_function_target() {
 }
 
 #[test]
+fn same_file_nested_annotation_owner_chain_resolves_class_target() {
+    let source = "class Outer:\n    class Inner:\n        pass\n\ndef decode(value: Outer.Inner) -> Outer.Inner:\n    local: Outer.Inner = value\n    return local\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", source)
+        .build();
+
+    assert_python_usage_hits(
+        &project,
+        "service.Outer$Inner",
+        "service.py",
+        source,
+        &[("Inner", 1), ("Inner", 2), ("Inner", 3)],
+    );
+}
+
+#[test]
+fn imported_owner_nested_annotation_chain_resolves_class_target() {
+    let source = "from service import Outer\n\ndef decode(value: Outer.Inner) -> Outer.Inner:\n    local: Outer.Inner = value\n    return local\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            "class Outer:\n    class Inner:\n        pass\n",
+        )
+        .file("consumer.py", source)
+        .build();
+
+    assert_python_usage_hits(
+        &project,
+        "service.Outer$Inner",
+        "consumer.py",
+        source,
+        &[("Inner", 0), ("Inner", 1), ("Inner", 2)],
+    );
+}
+
+#[test]
+fn different_nested_annotation_owner_chain_does_not_match_target() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            "class Outer:\n    class Inner:\n        pass\n\nclass Other:\n    class Inner:\n        pass\n",
+        )
+        .file(
+            "consumer.py",
+            "from service import Other\n\ndef decode(value: Other.Inner) -> Other.Inner:\n    local: Other.Inner = value\n    return local\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Outer$Inner");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should return success for non-matching nested owner chain");
+    assert!(hits.is_empty(), "{hits:#?}");
+}
+
+#[test]
+fn ambiguous_nested_annotation_owner_chain_does_not_count_as_proven_hit() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", "class Outer:\n    class Inner:\n        pass\n")
+        .file(
+            "consumer.py",
+            "from service import Outer\n\nclass Outer:\n    class Inner:\n        pass\n\ndef decode(value: Outer.Inner) -> Outer.Inner:\n    return value\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Outer$Inner");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should return success for ambiguous nested owner chain");
+    assert!(hits.is_empty(), "{hits:#?}");
+}
+
+#[test]
 fn builtin_generic_annotation_does_not_resolve_same_name_method_target() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(

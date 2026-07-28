@@ -210,12 +210,85 @@ pub(in crate::analyzer::usages) fn annotation_reference_candidates(
             }
             candidates
         }
-        "attribute" => resolve_constructor_types(analyzer, py, file, source, node),
+        "attribute" => resolve_annotation_attribute_types(analyzer, py, file, source, node),
         _ => Vec::new(),
     };
     candidates.sort();
     candidates.dedup();
     Some(candidates)
+}
+
+fn resolve_annotation_attribute_types(
+    analyzer: &dyn IAnalyzer,
+    py: &PythonAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> Vec<CodeUnit> {
+    // Preserve the established namespace-import path (`module.Type`) while
+    // adding owner-qualified nested classes (`Outer.Inner`). The constructor
+    // resolver already understands module/re-export bindings; it simply cannot
+    // interpret a class as the namespace for another class.
+    let mut candidates = resolve_constructor_types(analyzer, py, file, source, node);
+    let Some((root, attributes)) = annotation_attribute_chain(node) else {
+        return candidates;
+    };
+    let root_text = node_text(root, source);
+    let owners: Vec<_> = resolve_bare_annotation_symbol(analyzer, py, file, root_text)
+        .into_iter()
+        .filter(CodeUnit::is_class)
+        .collect();
+    let [owner] = owners.as_slice() else {
+        return candidates;
+    };
+    let mut owner = owner.clone();
+
+    for attribute in attributes {
+        let segment = node_text(attribute, source);
+        let next_candidates = exact_nested_annotation_class(analyzer, &owner, segment);
+        let [next] = next_candidates.as_slice() else {
+            return candidates;
+        };
+        owner = next.clone();
+    }
+
+    candidates.push(owner);
+    candidates
+}
+
+fn annotation_attribute_chain(node: Node<'_>) -> Option<(Node<'_>, Vec<Node<'_>>)> {
+    let mut attributes = Vec::new();
+    let mut current = node;
+    while current.kind() == "attribute" {
+        attributes.push(current.child_by_field_name("attribute")?);
+        current = current.child_by_field_name("object")?;
+    }
+    if current.kind() != "identifier" || attributes.is_empty() {
+        return None;
+    }
+    attributes.reverse();
+    Some((current, attributes))
+}
+
+fn exact_nested_annotation_class(
+    analyzer: &dyn IAnalyzer,
+    owner: &CodeUnit,
+    segment: &str,
+) -> Vec<CodeUnit> {
+    let mut candidates: Vec<_> = analyzer
+        .declarations(owner.source())
+        .into_iter()
+        .filter(|unit| {
+            unit.is_class()
+                && unit.identifier() == segment
+                && analyzer
+                    .parent_of(unit)
+                    .is_some_and(|parent| parent.fq_name() == owner.fq_name())
+        })
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    candidates
 }
 
 fn is_annotation_reference_node(node: Node<'_>) -> bool {
