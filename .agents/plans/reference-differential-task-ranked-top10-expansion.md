@@ -490,6 +490,58 @@ local gate, but is not the focus.
   already tracked-clean; the other 34 show only generated `.bifrost/` or
   `.brokk/` directories and need local Git excludes before acceptance runs.
   There are no missing-clone or missing-corpus blockers.
+- [x] (2026-07-28 20:14Z) Published the scope correction on integrated
+  `origin/master` head `31875c49`, applied a reversible local generated-cache
+  exclude to the 40 selected clones, and verified every clone is tracked-clean.
+  Built the clean release runner at niceness 10 with SHA-256
+  `f28bdeaba5624d13801fca0430adf8de8aff85839e3d42df3a53d5e9afd9363b`.
+  Its C# dry-run selected exactly ranks six through ten.
+- [x] (2026-07-28 20:35Z) C# ranks six through ten completed a clean-runner
+  triage baseline from source head `31875c49` in 2m15s. The five envelopes
+  contain 130 raw missing rows,
+  dominated by 125 extension-method sites. Exact reproduction confirmed the
+  generic/external extension-receiver inverse gap; filed and assigned
+  `FIRD: C# inverse misses forward-resolved extension-method calls` as #1261.
+  The worktree changed while the immutable runner was executing, so the
+  envelopes report the later dynamic checkout head and dirty flag and are not
+  acceptance evidence. Exhaustive triage subsequently reduced the rows to six
+  assigned roots: #1261, #1263, #1264, #1265, #1266, and #1267.
+- [ ] (2026-07-28 20:48Z) Go ranks six through ten completed as a fast
+  triage baseline in 24s: `gobl` and `helm` have zero raw missing, while
+  `rclone`, `opa`, and `mdsmith` contribute 38 rows now under exhaustive
+  review. Because the progress plan was modified during this overlapping run,
+  its envelopes correctly record `bifrost_dirty=true`; this baseline is not
+  acceptance evidence and will be rerun from the next clean integrated head.
+- [x] (2026-07-28 21:07Z) Exhaustive Go triage reduced all 38 rows to four
+  assigned roots: promoted methods through embedded interfaces (#1269), keyed
+  composite labels bypassing exact owner resolution (#1270), package/import
+  declaration sampling (#1271), and a field access misresolved as a promoted
+  interface method (#1272). The focused #1269 embedded-interface regression
+  passes with all features at niceness 10.
+- [x] (2026-07-28 21:07Z) Java, TypeScript, and PHP each completed five-repo
+  triage baselines with 50,000 accepted sampled sites and zero raw missing
+  rows. Java took 6m08s, TypeScript 19s, and PHP 31s. These overlapping
+  envelopes carry the dirty/dynamic checkout caveat and will be rerun for
+  acceptance from a clean integrated pushed head.
+- [x] (2026-07-28 21:07Z) JavaScript completed its five-repo triage baseline
+  in 1m55s with 79 raw rows. Independent exhaustive review found no genuine
+  inverse omission, but classified every row as a forward/candidate artifact
+  across runtime DOM/object properties, duplicate mirrored state declarations,
+  generated globals, declaration-site leakage, and one minified vendor
+  self-property. Representative exact reproduction and product-root grouping
+  remain in progress; wrong-forward rows are legitimate defects rather than
+  accepted residuals.
+- [x] (2026-07-28) Exact JavaScript probes reproduced the runtime-property,
+  mirrored-state, generated-global, and minified-vendor families without
+  truncation or file errors. No existing owner matched. Created and assigned
+  receiver-identity issue #1276 and namespace/global-assignment issue #1277 to
+  `jbellis` before implementation.
+- [x] (2026-07-28) Rust completed all five ranks-six-through-ten triage
+  envelopes in 13m00s with zero file errors. QWED and nmstate have zero raw
+  missing rows; Burn has 40, Wealthfolio 29, and Hickory DNS 23. Three
+  repositories reached the deliberate 1,000-target cap, so their sampled-site
+  partitions and all 92 raw rows require exhaustive disposition before the
+  clean acceptance replay.
 - [x] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [x] Complete C++ and publish its evidence and user summary.
