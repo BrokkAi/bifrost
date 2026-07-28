@@ -3452,6 +3452,8 @@ fn csharp_issue701_structured_type_roles_cover_alias_receivers_and_patterns_with
             r#"
 namespace Demo {
     public interface Marker { void Touch(); }
+    public class AsObservable { }
+    public class AsObservable<T> { }
     public class PatternType { }
     public class OtherType { }
     public class InheritedPattern { }
@@ -3510,6 +3512,7 @@ namespace App {
         public bool Shadowed(object member, int PatternType) => member is PatternType;
         public bool Switched(object member) => member switch { PatternType => true, _ => false };
         public bool Constant(object member) => member is Mode.Enabled;
+        public bool GenericPattern(object source) => source is AsObservable<int>;
         public bool BareConstant(object member) => member is LocalConstant;
         public bool Inherited(object member) {
             var value = InheritedOuter.Nested;
@@ -3765,6 +3768,25 @@ namespace App {
         "an inherited constant must not become a type hit: {inherited_pattern_hits:#?}"
     );
 
+    let generic_pattern = type_definition(&analyzer, "Demo.AsObservable`1");
+    let generic_pattern_hits = query(generic_pattern.clone());
+    assert_eq!(1, generic_pattern_hits.len(), "{generic_pattern_hits:#?}");
+    assert!(
+        generic_pattern_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("source is AsObservable<int>")),
+        "generic is-patterns should route to the generic type: {generic_pattern_hits:#?}"
+    );
+
+    let nongeneric_pattern = type_definition(&analyzer, "Demo.AsObservable");
+    let nongeneric_pattern_hits = query(nongeneric_pattern);
+    assert!(
+        nongeneric_pattern_hits
+            .iter()
+            .all(|hit| !hit.snippet.contains("source is AsObservable<int>")),
+        "generic is-patterns must not leak to the nongeneric sibling: {nongeneric_pattern_hits:#?}"
+    );
+
     let default_query = UsageFinder::new().query(&analyzer, &[nested], 1000, 1000);
     assert!(
         default_query.candidate_files.contains(&consumer),
@@ -3775,6 +3797,12 @@ namespace App {
     assert!(
         relative_default_query.candidate_files.contains(&consumer),
         "shared declaration routing should retain relative nested receiver candidates"
+    );
+    let generic_default_query =
+        UsageFinder::new().query(&analyzer, &[generic_pattern], 1000, 1000);
+    assert!(
+        generic_default_query.candidate_files.contains(&consumer),
+        "generic is-pattern type roles should route the consumer by default"
     );
 }
 
