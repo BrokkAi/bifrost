@@ -2006,6 +2006,16 @@ impl CodeUnit {
     // so languages like Scala can render idiomatic names without changing the
     // matching semantics encoded here.
     pub fn identifier(&self) -> &str {
+        // Structured field segments may contain literal dots (for example a
+        // Scala backticked media type). Prefer that exact leaf when present;
+        // cache/legacy units with no structured name retain the old fallback.
+        if self.0.kind == CodeUnitType::Field
+            && let Some(last) = self.0.fq.last()
+        {
+            return crate::analyzer::fq_name::segment_interner()
+                .resolve(last)
+                .0;
+        }
         let member_name = self
             .0
             .short_name

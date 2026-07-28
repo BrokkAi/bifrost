@@ -1757,6 +1757,70 @@ class Container {
 }
 
 #[test]
+fn scala_inverse_resolves_bare_stable_list_entries_for_backticked_fields_and_objects() {
+    let source = r#"package app
+
+sealed trait UsageRightsSpec
+case object StaffPhotographer extends UsageRightsSpec
+case object ContractPhotographer extends UsageRightsSpec
+
+trait MediaType
+
+object MimeDb {
+  lazy val `vnd.example+json`: MediaType = new MediaType {}
+  lazy val all: List[MediaType] = List(
+    `vnd.example+json` // positive-backticked-field-list-entry
+  )
+}
+
+object UsageRights {
+  val photographer: List[UsageRightsSpec] = List(
+    StaffPhotographer, // positive-stable-object-list-entry
+    ContractPhotographer
+  )
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/Witness.scala", source)]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = ScalaUsageGraphStrategy::new();
+    for (target, positive, token) in [
+        (
+            definition(&analyzer, "app.MimeDb$.`vnd.example+json`"),
+            "positive-backticked-field-list-entry",
+            "`vnd.example+json`",
+        ),
+        (
+            definition(&analyzer, "app.StaffPhotographer$"),
+            "positive-stable-object-list-entry",
+            "StaffPhotographer",
+        ),
+    ] {
+        let inverse_hits = reference_surface_hits(strategy.find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        assert_hit_contains(&targeted_hits, positive);
+        assert_hit_contains(&inverse_hits, positive);
+        let line = source
+            .lines()
+            .find(|line| line.contains(positive))
+            .expect("positive line");
+        let line_start = source.find(line).expect("line offset");
+        let token_start = line.find(token).expect("token start");
+        assert!(
+            inverse_hits.iter().any(|hit| {
+                hit.start_offset == line_start + token_start
+                    && hit.end_offset == line_start + token_start + token.len()
+            }),
+            "inverse query missed exact token {token:?}: {inverse_hits:#?}"
+        );
+    }
+}
+
+#[test]
 fn scala_inverse_classifies_parameter_default_identifiers_as_terms() {
     let source = r#"package app
 
