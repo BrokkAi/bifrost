@@ -1201,9 +1201,7 @@ fn jsts_unbound_assigned_property_shape<'a>(
     let Ok(source) = target.source().read_to_string() else {
         return None;
     };
-    let Some(tree) = parse_js_ts_tree(target.source(), &source, language) else {
-        return None;
-    };
+    let tree = parse_js_ts_tree(target.source(), &source, language)?;
     let root = tree.root_node();
     let lexical_bindings = JsTsLexicalBindingIndex::build(root, &source);
     let target_ranges = analyzer.ranges(target);
