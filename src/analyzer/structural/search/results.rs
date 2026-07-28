@@ -137,6 +137,7 @@ impl CodeQueryResponse {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CodeQueryCompletion {
     Complete,
+    ProvenSubset { codes: Vec<CodeQueryDiagnosticCode> },
     Incomplete { codes: Vec<CodeQueryDiagnosticCode> },
     Cancelled,
     Invalid { codes: Vec<CodeQueryDiagnosticCode> },
@@ -163,6 +164,13 @@ impl CodeQueryResult {
         let incomplete = self.diagnostic_codes_with_impact(CodeQueryDiagnosticImpact::Incomplete);
         if self.truncated || !incomplete.is_empty() {
             return CodeQueryCompletion::Incomplete { codes: incomplete };
+        }
+        let declared_non_exhaustive =
+            self.diagnostic_codes_with_impact(CodeQueryDiagnosticImpact::DeclaredNonExhaustive);
+        if !declared_non_exhaustive.is_empty() {
+            return CodeQueryCompletion::ProvenSubset {
+                codes: declared_non_exhaustive,
+            };
         }
         CodeQueryCompletion::Complete
     }
@@ -981,6 +989,7 @@ impl CodeQueryDiagnosticCode {
 #[serde(rename_all = "snake_case")]
 pub enum CodeQueryDiagnosticImpact {
     Advisory,
+    DeclaredNonExhaustive,
     Incomplete,
     Invalid,
 }
@@ -989,6 +998,7 @@ impl CodeQueryDiagnosticImpact {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Advisory => "advisory",
+            Self::DeclaredNonExhaustive => "declared_non_exhaustive",
             Self::Incomplete => "incomplete",
             Self::Invalid => "invalid",
         }

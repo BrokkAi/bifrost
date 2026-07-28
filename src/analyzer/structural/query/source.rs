@@ -1506,6 +1506,7 @@ fn validate_property_value(
         | super::schema::ValueShape::SchemaVersion
         | super::schema::ValueShape::UsageProof
         | super::schema::ValueShape::UsageSurface
+        | super::schema::ValueShape::CallTraversalCompleteness
         | super::schema::ValueShape::ProtocolRef
         | super::schema::ValueShape::TrueBoolean => {
             unreachable!("unsupported value shape for an RQL pattern property")

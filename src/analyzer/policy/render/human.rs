@@ -140,7 +140,7 @@ pub fn write_policy_human<W: Write>(
             }
         }
         write_run_diagnostics(&mut output, run)?;
-        if !run.completion().is_complete() || run.diagnostics_truncated() {
+        if !run.completion().is_exhaustive() || run.diagnostics_truncated() {
             let rule = report
                 .rules()
                 .iter()
@@ -2157,6 +2157,16 @@ fn write_run_completion<W: Write>(
     .map_err(map_io_error)?;
     match run.completion() {
         PolicyRunCompletion::Complete => write!(output, "complete").map_err(map_io_error)?,
+        PolicyRunCompletion::ProvenSubset { codes } => {
+            write!(output, "proven subset (not exhaustive; ").map_err(map_io_error)?;
+            for (index, code) in codes.iter().enumerate() {
+                if index > 0 {
+                    write!(output, ", ").map_err(map_io_error)?;
+                }
+                write!(output, "{}", code.as_str()).map_err(map_io_error)?;
+            }
+            write!(output, ")").map_err(map_io_error)?;
+        }
         PolicyRunCompletion::Inconclusive { reasons } => {
             write!(output, "inconclusive (").map_err(map_io_error)?;
             for (index, reason) in reasons.iter().enumerate() {
@@ -2185,7 +2195,11 @@ fn write_run_completion<W: Write>(
     if run.diagnostics_truncated() {
         write!(output, "; diagnostics truncated").map_err(map_io_error)?;
     }
-    writeln!(output, "; non-clean").map_err(map_io_error)
+    if run.completion().is_reliable() {
+        writeln!(output, "; non-exhaustive").map_err(map_io_error)
+    } else {
+        writeln!(output, "; non-clean").map_err(map_io_error)
+    }
 }
 
 fn write_capability<W: Write>(
@@ -2264,12 +2278,16 @@ fn write_summary<W: Write>(
         .filter(|review| review.result_omitted())
         .count();
     let mut complete = 0_usize;
+    let mut proven_subset = 0_usize;
     let mut inconclusive = 0_usize;
     let mut unsupported = 0_usize;
     let mut failed = 0_usize;
     for run in report.runs() {
         match run.completion() {
             PolicyRunCompletion::Complete => complete = complete.saturating_add(1),
+            PolicyRunCompletion::ProvenSubset { .. } => {
+                proven_subset = proven_subset.saturating_add(1);
+            }
             PolicyRunCompletion::Inconclusive { .. } => {
                 inconclusive = inconclusive.saturating_add(1);
             }
@@ -2300,6 +2318,7 @@ fn write_summary<W: Write>(
         write!(output, "; 0 policy runs").map_err(map_io_error)?;
     } else {
         write_run_count(output, complete, "complete")?;
+        write_run_count(output, proven_subset, "proven-subset (not exhaustive)")?;
         write_run_count(output, inconclusive, "inconclusive")?;
         write_run_count(output, unsupported, "unsupported")?;
         write_run_count(output, failed, "failed")?;
@@ -2553,6 +2572,7 @@ const fn diagnostic_severity(value: PolicyDiagnosticSeverity) -> &'static str {
 const fn diagnostic_impact(value: PolicyDiagnosticImpact) -> &'static str {
     match value {
         PolicyDiagnosticImpact::Advisory => "advisory",
+        PolicyDiagnosticImpact::DeclaredNonExhaustive => "declared_non_exhaustive",
         PolicyDiagnosticImpact::FindingPartial => "finding_partial",
         PolicyDiagnosticImpact::RunIncomplete => "run_incomplete",
         PolicyDiagnosticImpact::RunUnsupported => "run_unsupported",
@@ -2687,6 +2707,7 @@ const fn finding_incomplete_reason(value: FindingIncompleteReason) -> &'static s
         FindingIncompleteReason::TypestateScenariosTruncated => "typestate_scenarios_truncated",
         FindingIncompleteReason::WitnessTruncated => "witness_truncated",
         FindingIncompleteReason::EvidenceTruncated => "evidence_truncated",
+        FindingIncompleteReason::DeclaredNonExhaustive => "declared_non_exhaustive",
         FindingIncompleteReason::ProofPartial => "proof_partial",
         FindingIncompleteReason::StableAnchorWeak => "stable_anchor_weak",
     }

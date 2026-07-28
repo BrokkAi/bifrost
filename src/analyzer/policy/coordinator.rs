@@ -762,7 +762,7 @@ fn apply_policy_suppressions(
                         PolicySuppressionMatchState::StrongFinding
                     }
                     Some(_) => PolicySuppressionMatchState::CurrentFindingNotStrong,
-                    None if run.completion().is_complete() => {
+                    None if run.completion().is_exhaustive() => {
                         PolicySuppressionMatchState::FindingAbsent
                     }
                     None => PolicySuppressionMatchState::PolicyIncomplete,
@@ -1216,7 +1216,12 @@ fn report_exit_status(report: &PolicyReportDocument, threshold_exceeded: bool) -
         || report
             .runs()
             .iter()
-            .any(|run| !run.completion().is_complete());
+            .any(|run| !run.completion().is_reliable())
+        || (!threshold_exceeded
+            && report
+                .runs()
+                .iter()
+                .any(|run| !run.completion().is_exhaustive()));
     if unreliable {
         return POLICY_EXIT_UNRELIABLE;
     }

@@ -51,6 +51,7 @@ void test("includes native RQL scopes only inside inline rql bodies", async () =
   assertScoped(tokens, "call", rqlScope);
   assertScoped(tokens, "call", "entity.name.type.kind.bifrost-rql");
   assertScoped(tokens, ":callee", rqlScope);
+  assertScoped(tokens, ":completeness", "variable.parameter.role.bifrost-rql");
   assertNotScoped(tokens, "policy", rqlScope);
   assertNotScoped(tokens, "endpoint", rqlScope);
   assertNotScoped(tokens, "rql-file", rqlScope);

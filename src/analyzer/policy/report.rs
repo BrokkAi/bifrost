@@ -19,7 +19,7 @@ use super::definition::{
 use super::finding::{
     CompletionReasonError, PolicyDiagnostic, PolicyDiagnosticImpact, PolicyDiagnosticSeverity,
     PolicyFinding, PolicyFindingError, PolicyIncompleteReason, PolicyRun, PolicyRunCompletion,
-    PolicyRunError,
+    PolicyRunError, completion_allows_diagnostic_impact,
 };
 use super::finding_identity::{FindingIdentityStability, PolicyFindingId};
 use super::identity::{EndpointAnalysisProjectionHash, EndpointSemanticHash, PolicySemanticHash};
@@ -2645,24 +2645,6 @@ fn report_storage_size(
             retained_vec_size_from_parts(diagnostics, diagnostics.capacity())
                 .saturating_sub(size_of::<Vec<PolicyReportDiagnostic>>()),
         )
-}
-
-fn completion_allows_diagnostic_impact(
-    completion: &PolicyRunCompletion,
-    impact: PolicyDiagnosticImpact,
-) -> bool {
-    match impact {
-        PolicyDiagnosticImpact::Advisory | PolicyDiagnosticImpact::FindingPartial => true,
-        PolicyDiagnosticImpact::RunIncomplete => {
-            matches!(completion, PolicyRunCompletion::Inconclusive { .. })
-        }
-        PolicyDiagnosticImpact::RunUnsupported => {
-            matches!(completion, PolicyRunCompletion::Unsupported { .. })
-        }
-        PolicyDiagnosticImpact::RunFailed => {
-            matches!(completion, PolicyRunCompletion::Failed { .. })
-        }
-    }
 }
 
 #[cfg(test)]

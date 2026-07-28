@@ -1903,6 +1903,9 @@ fn diagnostic_codes_have_exhaustive_stable_impacts_and_completion() {
                 codes: vec![Code::InvalidPlan],
             },
             (Code::Cancelled, _) => CodeQueryCompletion::Cancelled,
+            (_, Impact::DeclaredNonExhaustive) => {
+                CodeQueryCompletion::ProvenSubset { codes: vec![code] }
+            }
             (_, Impact::Incomplete) => CodeQueryCompletion::Incomplete { codes: vec![code] },
             (_, Impact::Advisory) => CodeQueryCompletion::Complete,
             (_, Impact::Invalid) => unreachable!("only InvalidPlan is invalid"),

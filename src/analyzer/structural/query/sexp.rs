@@ -534,13 +534,23 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                         "proof",
                         Value::String(symbol_or_string(&pair[1])?.replace('-', "_")),
                     ),
+                    ":completeness" if matches!(form, RqlForm::Callers | RqlForm::Callees) => {
+                        let label = symbol_or_string(&pair[1])?.replace('-', "_");
+                        if super::schema::call_traversal_completeness_from_label(&label).is_none() {
+                            return Err(lower_error(
+                                &pair[1],
+                                "expected exhaustive or proven-subset",
+                            ));
+                        }
+                        ("completeness", Value::String(label))
+                    }
                     _ => {
                         return Err(lower_error(
                             &pair[0],
                             format!(
                                 "({head} ...) accepts :proof{}",
                                 if matches!(form, RqlForm::Callers | RqlForm::Callees) {
-                                    " and :depth"
+                                    " , :depth, and :completeness"
                                 } else {
                                     ""
                                 }
@@ -1376,6 +1386,33 @@ mod tests {
                 ]
             }))
         );
+    }
+
+    #[test]
+    fn callers_proven_subset_lowers_only_with_proven_proof() {
+        assert_eq!(
+            canonical(
+                r#"(callers :depth 2 :proof proven :completeness proven-subset (enclosing-decl (method :name "sink")))"#,
+            ),
+            canonical_json(json!({
+                "match": { "kind": "method", "name": "sink" },
+                "steps": [
+                    { "op": "enclosing_decl" },
+                    {
+                        "op": "callers",
+                        "depth": 2,
+                        "proof": "proven",
+                        "completeness": "proven_subset"
+                    }
+                ]
+            }))
+        );
+        for invalid in [
+            r#"(callers :completeness proven-subset (enclosing-decl (method :name "sink")))"#,
+            r#"(callees :proof proven :completeness proven-subset (enclosing-decl (method :name "sink")))"#,
+        ] {
+            assert!(CodeQuery::from_sexp(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]
