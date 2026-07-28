@@ -17799,6 +17799,77 @@ fn csharp_explicit_constructor_call_resolves_to_constructor_definition() {
 }
 
 #[test]
+fn csharp_implicit_struct_parameterless_construction_avoids_explicit_overload() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Lib/Types.cs",
+            r#"namespace Lib {
+public readonly struct Pixel {}
+public struct PixelRect {
+    public PixelRect(System.Collections.Generic.IEnumerable<Pixel> pixels) {}
+}
+public struct ExplicitZero {
+    public ExplicitZero() {}
+    public ExplicitZero(int value) {}
+}
+public class Service {
+    public Service(string name) {}
+}
+}
+"#,
+        )
+        .file(
+            "App/Controller.cs",
+            r#"using System.Collections.Generic;
+using Lib;
+
+namespace App {
+    public class Controller {
+        public void Handle(IEnumerable<Pixel> pixels) {
+            var implicitRect = new PixelRect();
+            var explicitRect = new PixelRect(pixels);
+            var zero = new ExplicitZero();
+            var service = new Service();
+        }
+    }
+}
+"#,
+        )
+        .build();
+
+    let source = r#"using System.Collections.Generic;
+using Lib;
+
+namespace App {
+    public class Controller {
+        public void Handle(IEnumerable<Pixel> pixels) {
+            var implicitRect = new PixelRect();
+            var explicitRect = new PixelRect(pixels);
+            var zero = new ExplicitZero();
+            var service = new Service();
+        }
+    }
+}
+"#;
+
+    for (needle, expected) in [
+        ("new PixelRect()", "Lib.PixelRect"),
+        ("new PixelRect(pixels)", "Lib.PixelRect.PixelRect"),
+        ("new ExplicitZero()", "Lib.ExplicitZero.ExplicitZero"),
+        ("new Service()", "Lib.Service.Service"),
+    ] {
+        let start = source.find(needle).expect("constructor site") + "new ".len();
+        let value = lookup(
+            project.root(),
+            &location_reference("App/Controller.cs", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
 fn csharp_partial_nested_constructor_resolves_after_persisted_startup() {
     let project = csharp_nested_partial_cacheinfo_project().build();
     let service = SearchToolsService::new_manual_for_project(project.project_dyn())

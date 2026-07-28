@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::declaration_range::node_for_exact_range;
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::csharp_graph::{
     csharp_extension_invocation_return_type_fq_name_in_session,
@@ -1786,23 +1787,42 @@ fn resolve_csharp_constructor(
         );
     }
     let owners = csharp_logical_visible_type_candidates(csharp, definitions, file, &reference);
+    let call_arity = csharp_argument_count(creation, source);
     let mut constructors = Vec::new();
+    let mut applicable = Vec::new();
+    let mut implicit_value_type_owners = Vec::new();
     for owner in &owners {
-        constructors.extend(definitions.members_for_owner_name(
+        let owner_constructors = definitions.members_for_owner_name(
             &owner.fq_name(),
             crate::analyzer::csharp_source_identifier(owner),
-        ));
+        );
+        let owner_applicable = csharp_filter_candidates_by_arity(
+            csharp,
+            definitions,
+            &owner_constructors,
+            Some(call_arity),
+        );
+        if !owner_applicable.is_empty() {
+            applicable.extend(owner_applicable);
+        } else if call_arity == 0
+            && !owner_constructors.is_empty()
+            && csharp_uses_implicit_parameterless_value_constructor(analyzer, definitions, owner)
+        {
+            implicit_value_type_owners.push(owner.clone());
+        }
+        constructors.extend(owner_constructors);
     }
     sort_units(&mut constructors);
     constructors.dedup();
-    let applicable = csharp_filter_candidates_by_arity(
-        csharp,
-        definitions,
-        &constructors,
-        Some(csharp_argument_count(creation, source)),
-    );
+    sort_units(&mut applicable);
+    applicable.dedup();
     if !applicable.is_empty() {
         return candidates_outcome(applicable);
+    }
+    sort_units(&mut implicit_value_type_owners);
+    implicit_value_type_owners.dedup();
+    if !implicit_value_type_owners.is_empty() {
+        return candidates_outcome(implicit_value_type_owners);
     }
     if !constructors.is_empty() {
         return candidates_outcome(constructors);
@@ -1815,6 +1835,32 @@ fn resolve_csharp_constructor(
         &reference,
         type_node.start_byte(),
     )
+}
+
+fn csharp_uses_implicit_parameterless_value_constructor(
+    analyzer: &dyn IAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    owner: &CodeUnit,
+) -> bool {
+    let Some(source) = definitions.query_optional(|| owner.source().read_to_string().ok()) else {
+        return false;
+    };
+    let Some(tree) = parse_csharp_tree(&source) else {
+        return false;
+    };
+    let ranges = definitions
+        .query(|| analyzer.ranges(owner).to_vec())
+        .unwrap_or_default();
+    let root = tree.root_node();
+    ranges.into_iter().any(|range| {
+        let Some(declaration) = node_for_exact_range(root, &range) else {
+            return false;
+        };
+        matches!(
+            declaration.kind(),
+            "struct_declaration" | "record_struct_declaration"
+        )
+    })
 }
 
 fn csharp_type_outcome(
