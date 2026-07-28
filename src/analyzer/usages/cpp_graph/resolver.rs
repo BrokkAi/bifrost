@@ -9,8 +9,9 @@ use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::{
     CallableArity, CodeUnit, CodeUnitType, CppAnalyzer, CppTemplateExpression, CppTemplateMetadata,
     CppTemplateParameterMetadata, CppTemplateTerm, IAnalyzer, IncludeTargetIndex, ProjectFile,
-    cpp_include_paths, cpp_node_text as node_text, cpp_template_term, normalize_cpp_whitespace,
-    recovered_exported_class_has_body, resolve_analyzer, resolve_include_targets_with_index,
+    Range, cpp_include_paths, cpp_node_text as node_text, cpp_template_term,
+    normalize_cpp_whitespace, recovered_exported_class_has_body, resolve_analyzer,
+    resolve_include_targets_with_index,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -6262,6 +6263,7 @@ pub(super) fn out_of_line_member_definition_owner<'tree>(
     let lexical_scope = enclosing_namespace_components(node, source)?;
     let mut owners = Vec::new();
     let mut innermost = None;
+
     for component_count in 1..=qualified.names.len() {
         if let LexicalTypeResolution::Resolved { unit, .. } = visibility
             .resolve_type_components_lexically(
@@ -6279,6 +6281,55 @@ pub(super) fn out_of_line_member_definition_owner<'tree>(
                 innermost = Some((qualified.nodes[component_count - 1], unit.clone()));
             }
             owners.push((qualified.nodes[component_count - 1], unit));
+        }
+    }
+
+    // The C++ analyzer has already reconciled an indexed out-of-line callable
+    // against the include-visible class table. Consult that canonical owner
+    // chain only when ordinary lexical lookup could not recover the innermost
+    // owner of a multi-segment qualifier. This covers mixed namespace/class
+    // paths such as `container::impl::queue::run` without adding indexed-scope
+    // queries to ordinary or malformed one-segment definitions.
+    if qualified.names.len() > 1 && innermost.is_none() {
+        let range = Range {
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+            start_line: node.start_position().row,
+            end_line: node.end_position().row,
+        };
+        if let Some(start) = analyzer.enclosing_code_unit(file, &range) {
+            let mut indexed_owner_components = crate::analyzer::symbol_lookup::parse_symbol_path(
+                crate::analyzer::Language::Cpp,
+                &cpp_name_for(&start),
+            );
+            indexed_owner_components.pop();
+            if indexed_owner_components.ends_with(&qualified.names) {
+                let namespace_count = indexed_owner_components.len() - qualified.names.len();
+                for component_count in 1..=qualified.names.len() {
+                    let expected = &indexed_owner_components[..namespace_count + component_count];
+                    let owner_node = qualified.nodes[component_count - 1];
+                    for owner in visibility
+                        .visible_identifier_candidates(file, &qualified.names[component_count - 1])
+                        .filter(|candidate| candidate.is_class())
+                        .filter(|candidate| {
+                            crate::analyzer::symbol_lookup::parse_symbol_path(
+                                crate::analyzer::Language::Cpp,
+                                &cpp_name_for(candidate),
+                            ) == expected
+                        })
+                    {
+                        if component_count == qualified.names.len() && innermost.is_none() {
+                            innermost = Some((owner_node, owner.clone()));
+                        }
+                        if !owners
+                            .iter()
+                            .any(|(_, existing)| same_symbol(existing, owner))
+                        {
+                            owners.push((owner_node, owner.clone()));
+                        }
+                    }
+                }
+            }
         }
     }
     (!owners.is_empty()).then_some(OutOfLineMemberDefinitionOwners { owners, innermost })

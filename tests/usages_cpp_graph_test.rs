@@ -10632,6 +10632,121 @@ void consume(n::Outer::Inner* value) {} // positive-ordinary-type-control
 }
 
 #[test]
+fn authoritative_cpp_out_of_line_owner_uses_indexed_mixed_class_chain() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "container.h",
+            r#"#pragma once
+namespace proton {
+class container {
+public:
+    class impl {
+    public:
+        class common_work_queue {
+        public:
+            void schedule();
+        };
+    };
+};
+}
+"#,
+        )
+        .file(
+            "container.cpp",
+            r#"#include "container.h"
+using namespace proton;
+void container::impl::common_work_queue::schedule() {}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "proton.container$impl$common_work_queue"
+            && slash_path(unit.source()) == "container.h"
+            && !unit.is_synthetic()
+    });
+    let site = project.file("container.cpp");
+    let source = site.read_to_string().expect("container source");
+    let expected = BTreeSet::from([fixture_token_range(
+        &source,
+        "void container::impl::common_work_queue::schedule() {}",
+        "common_work_queue",
+    )]);
+
+    let authoritative = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &site);
+    let whole = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&target))
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == site)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(
+        (&authoritative, &whole),
+        (&expected, &expected),
+        "the reconciled indexed callable identity must supply the mixed class owner chain"
+    );
+}
+
+#[test]
+fn authoritative_cpp_out_of_line_alias_owner_keeps_alias_identity() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "buffer.h",
+            r#"#pragma once
+namespace demo {
+class CharMessageBuffer {
+public:
+    const char* str();
+};
+typedef CharMessageBuffer MessageBuffer;
+}
+"#,
+        )
+        .file(
+            "buffer.cpp",
+            r#"#include "buffer.h"
+namespace demo {
+const char* MessageBuffer::str() { return ""; }
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.identifier() == "MessageBuffer"
+            && unit
+                .signature()
+                .is_some_and(|signature| signature.contains("typedef CharMessageBuffer"))
+    });
+    let site = project.file("buffer.cpp");
+    let source = site.read_to_string().expect("buffer source");
+    let expected = BTreeSet::from([fixture_token_range(
+        &source,
+        "const char* MessageBuffer::str() { return \"\"; }",
+        "MessageBuffer",
+    )]);
+
+    let authoritative = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &site);
+    let whole = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&target))
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == site)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(
+        (&authoritative, &whole),
+        (&expected, &expected),
+        "an alias-spelled out-of-line owner must retain the visible alias target"
+    );
+}
+
+#[test]
 fn authoritative_cpp_macro_decorated_owner_inverse_keeps_out_of_line_qualifiers_exact() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

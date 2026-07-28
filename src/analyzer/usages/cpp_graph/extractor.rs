@@ -554,9 +554,16 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         let terminal_destructor = out_of_line_destructor_type_reference(node);
         let innermost = owners.innermost().map(|(_, owner)| owner.clone());
         *ctx.raw_match_count += 1;
+        let mut matched_owner = false;
         for (owner_node, owner) in owners.owners {
             if same_visible_symbol(&owner, &ctx.spec.target) {
+                matched_owner = true;
                 push_hit(owner_node, ctx);
+            }
+        }
+        if !matched_owner && let Some(scopes) = target_guided_qualifier_type_scopes(node, ctx) {
+            for scope in scopes {
+                push_hit(scope, ctx);
             }
         }
         if let Some(terminal_destructor) = terminal_destructor
@@ -612,6 +619,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     if !recovered_type && is_declaration_name(node) {
+        let mut matched_owner = false;
         if let Some(owners) = out_of_line_member_definition_owner(
             ctx.analyzer,
             ctx.visibility,
@@ -621,11 +629,13 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         ) {
             for (owner_node, owner) in owners.owners {
                 if same_visible_symbol(&owner, &ctx.spec.target) {
+                    matched_owner = true;
                     *ctx.raw_match_count += 1;
                     push_hit(owner_node, ctx);
                 }
             }
-        } else if let Some(scopes) = target_guided_qualifier_type_scopes(node, ctx) {
+        }
+        if !matched_owner && let Some(scopes) = target_guided_qualifier_type_scopes(node, ctx) {
             *ctx.raw_match_count += 1;
             for scope in scopes {
                 push_hit(scope, ctx);
@@ -1539,10 +1549,18 @@ fn target_guided_qualifier_type_scopes<'tree>(
             }
             candidates.push(candidate.clone());
         }
-        let [candidate] = candidates.as_slice() else {
-            continue;
-        };
-        if same_visible_symbol(candidate, &ctx.spec.target) {
+        let direct_alias_target = ctx
+            .analyzer
+            .type_alias_provider()
+            .is_some_and(|provider| provider.is_type_alias(&ctx.spec.target))
+            && candidates
+                .iter()
+                .any(|candidate| same_symbol(candidate, &ctx.spec.target));
+        let unique_target = matches!(
+            candidates.as_slice(),
+            [candidate] if same_visible_symbol(candidate, &ctx.spec.target)
+        );
+        if direct_alias_target || unique_target {
             matches.push(qualified.nodes[component_count - 1]);
         }
     }
