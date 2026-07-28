@@ -10390,6 +10390,116 @@ function shadowed(Promise) { return Promise; }
 }
 
 #[test]
+fn javascript_unbound_namespace_assignments_do_not_become_exact_dotted_definitions() {
+    let defs = r#"
+goog.LOCALE = "en";
+goog.getMsg = function getMsg() {
+  return "ok";
+};
+"#;
+    let app = r#"
+goog.VERSION = "1";
+
+const googLocal = {
+  LOCALE: "local",
+  getMsg() {
+    return this.LOCALE;
+  },
+};
+
+function readCrossFile() {
+  return goog.LOCALE;
+}
+
+function callCrossFile() {
+  return goog.getMsg();
+}
+
+function readSameFile() {
+  return goog.VERSION;
+}
+
+function readLocal() {
+  return googLocal.LOCALE;
+}
+
+function callLocal() {
+  return googLocal.getMsg();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("defs.js", defs)
+        .file("app.js", app)
+        .build();
+
+    for (line, needle) in [
+        ("  return goog.LOCALE;", "LOCALE"),
+        ("  return goog.getMsg();", "getMsg"),
+        ("  return goog.VERSION;", "VERSION"),
+    ] {
+        let value = lookup(
+            project.root(),
+            &format!(
+                r#"{{"references":[{{"path":"app.js","line":{},"column":{}}}]}}"#,
+                app.lines()
+                    .position(|candidate| candidate == line)
+                    .expect("line present")
+                    + 1,
+                column_of(line, needle)
+            ),
+        );
+        assert_eq!(
+            value["results"][0]["status"], "no_definition",
+            "{needle}: {value}"
+        );
+        assert!(
+            value["results"][0]["definitions"].is_null(),
+            "{needle}: {value}"
+        );
+    }
+
+    let local_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":{},"column":{}}}]}}"#,
+            app.lines()
+                .position(|candidate| candidate == "  return googLocal.LOCALE;")
+                .expect("local field line")
+                + 1,
+            column_of("  return googLocal.LOCALE;", "LOCALE")
+        ),
+    );
+    assert_eq!(
+        local_value["results"][0]["status"], "resolved",
+        "{local_value}"
+    );
+    assert_eq!(
+        local_value["results"][0]["definitions"][0]["fqn"], "app.js.googLocal.LOCALE",
+        "{local_value}"
+    );
+
+    let local_call = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":{},"column":{}}}]}}"#,
+            app.lines()
+                .position(|candidate| candidate == "  return googLocal.getMsg();")
+                .expect("local method line")
+                + 1,
+            column_of("  return googLocal.getMsg();", "getMsg")
+        ),
+    );
+    assert_eq!(
+        local_call["results"][0]["status"], "resolved",
+        "{local_call}"
+    );
+    assert_eq!(
+        local_call["results"][0]["definitions"][0]["fqn"], "app.js.googLocal.getMsg",
+        "{local_call}"
+    );
+}
+
+#[test]
 fn typescript_local_bindings_and_uncontextual_object_keys_block_indexed_fallback() {
     let source = r#"
 class Record { value = 1 }

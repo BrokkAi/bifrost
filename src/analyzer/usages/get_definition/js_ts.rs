@@ -770,10 +770,18 @@ fn jsts_file_scoped_dotted_candidates(
     reference: &str,
     value_position: bool,
 ) -> Vec<CodeUnit> {
+    let qualifier = reference.split_once('.').map(|(qualifier, _)| qualifier);
     let mut candidates: Vec<_> = support
         .fqn(reference)
         .into_iter()
         .filter(|unit| unit.source() == file)
+        .filter(|unit| {
+            qualifier.is_none_or(|qualifier| {
+                !jsts_js_unbound_assigned_property_candidate_requires_exact_receiver(
+                    analyzer, unit, qualifier,
+                )
+            })
+        })
         .collect();
     if value_position {
         candidates = jsts_value_space_candidates(analyzer, candidates);
@@ -804,6 +812,13 @@ fn jsts_exact_scoped_dotted_candidates(ctx: JstsScopedDottedLookup<'_, '_>) -> V
         .into_iter()
         .filter(|unit| unit.source() == ctx.file)
         .filter(|unit| {
+            !jsts_js_unbound_assigned_property_candidate_requires_exact_receiver(
+                ctx.analyzer,
+                unit,
+                ctx.receiver,
+            )
+        })
+        .filter(|unit| {
             ctx.analyzer.ranges(unit).iter().any(|range| {
                 range.start_byte < ctx.before_byte
                     && jsts_visible_receiver_binding_scope(
@@ -830,6 +845,7 @@ fn jsts_exact_dotted_candidates(
     reference: &str,
     value_position: bool,
 ) -> Vec<CodeUnit> {
+    let qualifier = reference.split_once('.').map(|(qualifier, _)| qualifier);
     let mut candidates = support.fqn(reference);
     if let Some(top_level) = jsts_top_level_path_component(file) {
         let preferred: Vec<_> = candidates
@@ -840,6 +856,13 @@ fn jsts_exact_dotted_candidates(
         if !preferred.is_empty() {
             candidates = preferred;
         }
+    }
+    if let Some(qualifier) = qualifier {
+        candidates.retain(|unit| {
+            !jsts_js_unbound_assigned_property_candidate_requires_exact_receiver(
+                analyzer, unit, qualifier,
+            )
+        });
     }
     if value_position {
         candidates = jsts_value_space_candidates(analyzer, candidates);
@@ -1141,6 +1164,83 @@ fn jsts_top_level_path_component(file: &ProjectFile) -> Option<&str> {
         .components()
         .next()
         .and_then(|component| component.as_os_str().to_str())
+}
+
+fn jsts_js_unbound_assigned_property_candidate_requires_exact_receiver(
+    analyzer: &dyn IAnalyzer,
+    candidate: &CodeUnit,
+    qualifier: &str,
+) -> bool {
+    let Some((object_name, _property_name)) =
+        jsts_unbound_assigned_property_shape(analyzer, candidate)
+    else {
+        return false;
+    };
+    object_name == qualifier && object_name != "window"
+}
+
+fn jsts_unbound_assigned_property_shape<'a>(
+    analyzer: &dyn IAnalyzer,
+    target: &'a CodeUnit,
+) -> Option<(&'a str, &'a str)> {
+    if !target.is_field() && !target.is_function() {
+        return None;
+    }
+    if analyzer.parent_of(target).is_some() {
+        return None;
+    }
+    let (object_name, property_name) = target.short_name().split_once('.')?;
+    if object_name.is_empty() || property_name.is_empty() || property_name.contains('.') {
+        return None;
+    }
+
+    let language = crate::analyzer::common::language_for_file(target.source());
+    if !matches!(language, Language::JavaScript | Language::TypeScript) {
+        return None;
+    }
+    let Ok(source) = target.source().read_to_string() else {
+        return None;
+    };
+    let Some(tree) = parse_js_ts_tree(target.source(), &source, language) else {
+        return None;
+    };
+    let root = tree.root_node();
+    let lexical_bindings = JsTsLexicalBindingIndex::build(root, &source);
+    let target_ranges = analyzer.ranges(target);
+
+    let mut found = false;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "member_expression"
+            && node.parent().is_some_and(|parent| {
+                parent.kind() == "assignment_expression"
+                    && parent
+                        .child_by_field_name("left")
+                        .is_some_and(|left| left.id() == node.id())
+            })
+            && let (Some(object), Some(property)) = (
+                node.child_by_field_name("object"),
+                node.child_by_field_name("property"),
+            )
+            && node_text(object, &source) == object_name
+            && node_text(property, &source) == property_name
+            && target_ranges.iter().any(|range| {
+                range.start_byte <= property.start_byte() && property.end_byte() <= range.end_byte
+            })
+        {
+            found = true;
+            if lexical_bindings.is_bound_at(object_name, object.start_byte()) {
+                return None;
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+
+    found.then_some((object_name, property_name))
 }
 
 fn jsts_module_export_candidates(
@@ -3005,10 +3105,7 @@ fn jsts_indexed_callable_node(mut node: Node<'_>) -> Option<Node<'_>> {
     loop {
         if matches!(
             node.kind(),
-            "function_declaration"
-                | "function_expression"
-                | "arrow_function"
-                | "method_definition"
+            "function_declaration" | "function_expression" | "arrow_function" | "method_definition"
         ) {
             return Some(node);
         }
