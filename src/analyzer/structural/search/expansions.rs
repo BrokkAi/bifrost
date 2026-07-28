@@ -20,6 +20,7 @@ struct CallPathNode {
     parent: Option<usize>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_call_declaration_expansions(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     diagnostic_start: usize,
