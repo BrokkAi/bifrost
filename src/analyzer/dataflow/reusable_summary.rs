@@ -251,6 +251,11 @@ impl ProcedureSummaryIdentity {
     pub fn fingerprint(&self) -> StableDigest {
         fingerprint_procedure_identity(self)
     }
+
+    /// Conservative retained size of this owned identity and its heap fields.
+    pub fn retained_bytes(&self) -> usize {
+        size_of::<Self>().saturating_add(identity_heap_bytes(self))
+    }
 }
 
 /// A retained dependency either names an exact completed summary or an identity
@@ -759,6 +764,10 @@ pub enum SummaryEffectKey {
         event: SummaryEventKey,
         input: SummaryPort,
     },
+    /// A source-backed dispatch boundary whose affected input cannot be
+    /// represented as a stable procedure port. Its evidence retains the
+    /// boundary's proof and completeness without fabricating a heap location.
+    UnknownCallBoundary { event: SummaryEventKey },
     AmbiguousCall {
         event: SummaryEventKey,
         input: SummaryPort,
@@ -990,7 +999,12 @@ impl SemanticProcedureSummary {
         if completeness.is_complete() && transfers.iter().any(|row| !row.evidence.is_complete()) {
             return Err(SummaryValidationError::CompleteSummaryHasIncompleteTransfer);
         }
-        if completeness.is_complete() && effects.iter().any(|row| !row.evidence.is_complete()) {
+        if completeness.is_complete()
+            && effects.iter().any(|row| {
+                !row.evidence.is_complete()
+                    && !matches!(row.key, SummaryEffectKey::UnknownCallBoundary { .. })
+            })
+        {
             return Err(SummaryValidationError::CompleteSummaryHasIncompleteEffect);
         }
 
@@ -1984,7 +1998,8 @@ fn validate_effect_dependencies(
             }
             SummaryEffectKey::Allocation { .. }
             | SummaryEffectKey::Escape { .. }
-            | SummaryEffectKey::UnknownCall { .. } => {}
+            | SummaryEffectKey::UnknownCall { .. }
+            | SummaryEffectKey::UnknownCallBoundary { .. } => {}
         }
     }
     referenced.sort_unstable();
@@ -2085,7 +2100,8 @@ fn effect_reference_count(effect: &SummaryEffectKey) -> usize {
         SummaryEffectKey::AmbiguousCall { candidates, .. } => candidates.len(),
         SummaryEffectKey::Allocation { .. }
         | SummaryEffectKey::Escape { .. }
-        | SummaryEffectKey::UnknownCall { .. } => 0,
+        | SummaryEffectKey::UnknownCall { .. }
+        | SummaryEffectKey::UnknownCallBoundary { .. } => 0,
     }
 }
 
@@ -2168,7 +2184,8 @@ fn effect_heap_bytes(effect: &SummaryEffect) -> usize {
             ),
         SummaryEffectKey::Allocation { .. }
         | SummaryEffectKey::Escape { .. }
-        | SummaryEffectKey::UnknownCall { .. } => 0,
+        | SummaryEffectKey::UnknownCall { .. }
+        | SummaryEffectKey::UnknownCallBoundary { .. } => 0,
     };
     key_bytes.saturating_add(evidence_heap_bytes(effect.evidence()))
 }

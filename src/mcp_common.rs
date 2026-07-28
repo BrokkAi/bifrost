@@ -415,7 +415,7 @@ pub fn run_stdio_server(
                             let response_sender = response_sender.clone();
                             spawn_cancellable_tool_call(
                                 service,
-                                call,
+                                *call,
                                 id,
                                 cancellation,
                                 cancellations.clone(),
@@ -948,7 +948,7 @@ fn handle_tool_call(
     spec: &McpServerSpec,
 ) -> Result<Value, (i64, String)> {
     match prepare_tool_call(service, connection, params, render_options, spec)? {
-        ToolCallPreparation::Ready(call) => execute_prepared_tool_call(service, call, None),
+        ToolCallPreparation::Ready(call) => execute_prepared_tool_call(service, *call, None),
         ToolCallPreparation::Reply(result) => Ok(result),
     }
 }
@@ -978,7 +978,7 @@ impl PreparedToolCall {
 }
 
 enum ToolCallPreparation {
-    Ready(PreparedToolCall),
+    Ready(Box<PreparedToolCall>),
     Reply(Value),
 }
 
@@ -1034,6 +1034,7 @@ fn prepare_tool_call(
         return service
             .prepare_query_code(arguments)
             .map(PreparedToolCall::QueryCode)
+            .map(Box::new)
             .map(ToolCallPreparation::Ready)
             .map_err(|error| map_service_error(error.code, error.message));
     }
@@ -1041,6 +1042,7 @@ fn prepare_tool_call(
         return service
             .prepare_run_policy(arguments)
             .map(PreparedToolCall::RunPolicy)
+            .map(Box::new)
             .map(ToolCallPreparation::Ready)
             .map_err(|error| map_service_error(error.code, error.message));
     }
@@ -1049,14 +1051,16 @@ fn prepare_tool_call(
         Err(message) => return Ok(ToolCallPreparation::Reply(tool_error_result(message))),
     };
 
-    Ok(ToolCallPreparation::Ready(PreparedToolCall::Standard {
-        name: name.to_string(),
-        arguments,
-        render_options: RenderOptions {
-            render_line_numbers: render_options.render_line_numbers,
+    Ok(ToolCallPreparation::Ready(Box::new(
+        PreparedToolCall::Standard {
+            name: name.to_string(),
+            arguments,
+            render_options: RenderOptions {
+                render_line_numbers: render_options.render_line_numbers,
+            },
+            workspace_generation: service.workspace_generation(),
         },
-        workspace_generation: service.workspace_generation(),
-    }))
+    )))
 }
 
 fn execute_prepared_tool_call(
@@ -2382,7 +2386,7 @@ mod uri_tests {
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
         spawn_cancellable_tool_call(
             Arc::clone(&service),
-            call,
+            *call,
             request_id,
             cancellation,
             cancellations,

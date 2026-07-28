@@ -793,7 +793,7 @@ pub fn execute_request_with_limits(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResponse {
-    execute_request_internal(analyzer, None, query, limits, None, None)
+    execute_request_internal(analyzer, None, query, limits, None, None, None)
 }
 
 /// Honor the query's root execution mode with access to generation-bound
@@ -815,6 +815,7 @@ pub fn execute_workspace_request_with_limits(
         Some(workspace),
         query,
         limits,
+        None,
         None,
         None,
     )
@@ -854,6 +855,7 @@ pub fn execute_workspace_request_with_registration_limits(
         limits,
         None,
         Some((workspace_generation, registrations)),
+        None,
     )
 }
 
@@ -1289,7 +1291,15 @@ pub fn execute_request_with_cancellation(
     limits: CodeQueryExecutionLimits,
     cancellation: &CancellationToken,
 ) -> CodeQueryResponse {
-    execute_request_internal(analyzer, None, query, limits, Some(cancellation), None)
+    execute_request_internal(
+        analyzer,
+        None,
+        query,
+        limits,
+        Some(cancellation),
+        None,
+        None,
+    )
 }
 
 /// Execute a mode-aware workspace query with explicit limits and cooperative
@@ -1307,6 +1317,7 @@ pub fn execute_workspace_request_with_cancellation(
         query,
         limits,
         Some(cancellation),
+        None,
         None,
     )
 }
@@ -1326,6 +1337,31 @@ pub fn execute_workspace_request_with_registration_cancellation(
         limits,
         Some(cancellation),
         Some((workspace_generation, registrations)),
+        None,
+    )
+}
+
+/// Execute with a caller-owned generation-scoped typestate repository.
+///
+/// Long-lived hosts use this entry so separate JSON/RQL requests can share
+/// exact production results without introducing process-global state.
+pub fn execute_workspace_request_with_registration_lease(
+    workspace: &WorkspaceAnalyzer,
+    workspace_generation: u64,
+    registrations: &ProtocolRegistrationSet,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
+) -> CodeQueryResponse {
+    execute_request_internal(
+        workspace.analyzer(),
+        Some(workspace),
+        query,
+        limits,
+        cancellation,
+        Some((workspace_generation, registrations)),
+        Some(summary_lease),
     )
 }
 
@@ -1336,6 +1372,7 @@ fn execute_request_internal(
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
     registrations: Option<(u64, &ProtocolRegistrationSet)>,
+    summary_lease: Option<crate::analyzer::typestate::ProductionTypestateSummaryLease>,
 ) -> CodeQueryResponse {
     if query_plan_requires_typestate(&query.plan) && !limits.typestate.is_valid() {
         return CodeQueryResponse::Results(invalid_plan_result(
@@ -1348,7 +1385,21 @@ fn execute_request_internal(
         (workspace, registrations)
     {
         let requested = requested_protocol_refs(&query.plan);
-        match QueryAnalysisContext::new_with_validation(
+        let summary_lease = match summary_lease {
+            Some(summary_lease) => summary_lease,
+            None => {
+                let summaries = Arc::new(
+                    crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+                );
+                match summaries.lease(workspace_generation) {
+                    Ok(summary_lease) => summary_lease,
+                    Err(error) => {
+                        return CodeQueryResponse::Results(invalid_plan_result(error.to_string()));
+                    }
+                }
+            }
+        };
+        match QueryAnalysisContext::new_with_validation_and_summaries(
             workspace,
             workspace_generation,
             registrations,
@@ -1358,6 +1409,7 @@ fn execute_request_internal(
                 limits.semantic.max_source_bytes,
             ),
             cancellation,
+            summary_lease,
         ) {
             Ok(context) => Some(context),
             Err(error) => {

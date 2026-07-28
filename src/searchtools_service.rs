@@ -193,6 +193,8 @@ pub struct SearchToolsService {
     session: RwLock<Option<WorkspaceSession>>,
     workspace_generation: AtomicU64,
     query_protocols: RwLock<crate::analyzer::structural::ProtocolRegistrationSet>,
+    typestate_summaries:
+        RwLock<Arc<crate::analyzer::typestate::ProductionTypestateSummaryRepository>>,
     /// When constructed via `new_deferred`, the initial workspace build (file
     /// discovery + parse) runs on a background thread and lands here.
     /// `ensure_ready` joins it and installs the resulting session into `session`
@@ -236,6 +238,7 @@ pub(crate) struct PreparedQueryCode {
     arguments: Value,
     workspace_generation: u64,
     query_protocols: crate::analyzer::structural::ProtocolRegistrationSet,
+    typestate_summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
 }
 
 impl PreparedQueryCode {
@@ -488,6 +491,9 @@ impl SearchToolsService {
             session: RwLock::new(Some(session)),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            typestate_summaries: RwLock::new(Arc::new(
+                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::Manual,
@@ -545,6 +551,9 @@ impl SearchToolsService {
             session: RwLock::new(Some(session)),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            typestate_summaries: RwLock::new(Arc::new(
+                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::Manual,
@@ -914,13 +923,15 @@ impl SearchToolsService {
             arguments,
             workspace_generation,
             query_protocols,
+            typestate_summary_lease,
         } = self.prepare_query_code(arguments)?;
-        let result = Self::query_code_result_for_snapshot(
+        let result = self.query_code_result_for_snapshot(
             &snapshot,
             arguments,
             None,
             workspace_generation,
             &query_protocols,
+            typestate_summary_lease,
         );
         snapshot.finish("query_code", result)
     }
@@ -930,12 +941,24 @@ impl SearchToolsService {
         arguments: Value,
     ) -> Result<PreparedQueryCode, SearchToolsServiceError> {
         loop {
-            let generation = self.workspace_generation();
+            let (generation, typestate_summaries) = {
+                let typestate_summaries = self
+                    .typestate_summaries
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (
+                    self.workspace_generation(),
+                    Arc::clone(&typestate_summaries),
+                )
+            };
             let snapshot = self.snapshot_for_query()?;
             let query_protocols = self.query_protocol_snapshot()?;
             if generation != self.workspace_generation() {
                 continue;
             }
+            let typestate_summary_lease = typestate_summaries
+                .lease(generation)
+                .map_err(|error| SearchToolsServiceError::internal(error.to_string()))?;
             let root = snapshot.analyzer().project().root();
             let arguments =
                 crate::tool_arguments::normalize_tool_arguments("query_code", arguments, root)
@@ -945,6 +968,7 @@ impl SearchToolsService {
                 arguments,
                 workspace_generation: generation,
                 query_protocols,
+                typestate_summary_lease,
             });
         }
     }
@@ -959,14 +983,16 @@ impl SearchToolsService {
             arguments,
             workspace_generation,
             query_protocols,
+            typestate_summary_lease,
         } = prepared;
         let result = (|| {
-            let output = Self::query_code_result_for_snapshot(
+            let output = self.query_code_result_for_snapshot(
                 &snapshot,
                 arguments,
                 cancellation,
                 workspace_generation,
                 &query_protocols,
+                typestate_summary_lease,
             )?;
             let rendered_text = output.render_text();
             let structured = serde_json::to_value(&output).map_err(|err| {
@@ -981,33 +1007,26 @@ impl SearchToolsService {
     }
 
     fn query_code_result_for_snapshot(
+        &self,
         snapshot: &WorkspaceQueryScope,
         arguments: Value,
         cancellation: Option<&CancellationToken>,
         workspace_generation: u64,
         query_protocols: &crate::analyzer::structural::ProtocolRegistrationSet,
+        typestate_summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
     ) -> Result<crate::analyzer::structural::CodeQueryResponse, SearchToolsServiceError> {
         let query = Self::decode_query_code_input(snapshot, arguments)?;
-        Ok(cancellation.map_or_else(
-            || {
-                crate::analyzer::structural::execute_workspace_request_with_registrations(
-                    snapshot,
-                    workspace_generation,
-                    query_protocols,
-                    &query,
-                )
-            },
-            |cancellation| {
-                crate::analyzer::structural::execute_workspace_request_with_registration_cancellation(
-                    snapshot,
-                    workspace_generation,
-                    query_protocols,
-                    &query,
-                    crate::analyzer::structural::CodeQueryExecutionLimits::default(),
-                    cancellation,
-                )
-            },
-        ))
+        Ok(
+            crate::analyzer::structural::execute_workspace_request_with_registration_lease(
+                snapshot,
+                workspace_generation,
+                query_protocols,
+                &query,
+                crate::analyzer::structural::CodeQueryExecutionLimits::default(),
+                cancellation,
+                typestate_summary_lease,
+            ),
+        )
     }
 
     fn decode_query_code_input(
@@ -1128,11 +1147,18 @@ impl SearchToolsService {
     }
 
     fn advance_workspace_generation(&self) {
+        let mut summaries = self
+            .typestate_summaries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.query_protocols
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
-        self.workspace_generation.fetch_add(1, Ordering::AcqRel);
+        let previous = self.workspace_generation.fetch_add(1, Ordering::AcqRel);
+        let generation = previous.wrapping_add(1);
+        let successor = summaries.successor_generation(generation);
+        *summaries = Arc::new(successor);
     }
 
     // Note: `--root` and `new_for_python` take the path as-given (canonicalized
@@ -1177,6 +1203,9 @@ impl SearchToolsService {
             session: RwLock::new(Some(session)),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            typestate_summaries: RwLock::new(Arc::new(
+                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy,
@@ -1219,6 +1248,9 @@ impl SearchToolsService {
             session: RwLock::new(Some(session)),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            typestate_summaries: RwLock::new(Arc::new(
+                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy,
@@ -1260,6 +1292,9 @@ impl SearchToolsService {
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            typestate_summaries: RwLock::new(Arc::new(
+                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy,
@@ -1317,6 +1352,9 @@ impl SearchToolsService {
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(0),
             query_protocols: RwLock::new(Default::default()),
+            typestate_summaries: RwLock::new(Arc::new(
+                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy,
@@ -1471,6 +1509,9 @@ impl SearchToolsService {
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            typestate_summaries: RwLock::new(Arc::new(
+                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+            )),
             pending_build: Mutex::new(Some(handle)),
             build_error: Mutex::new(None),
             update_strategy,
@@ -2979,6 +3020,9 @@ public partial class MudDialogContainer
             })),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            typestate_summaries: RwLock::new(Arc::new(
+                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::WatchFiles,
@@ -3215,6 +3259,9 @@ mod client_roots_tests {
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(0),
             query_protocols: RwLock::new(Default::default()),
+            typestate_summaries: RwLock::new(Arc::new(
+                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::Manual,
@@ -3422,8 +3469,17 @@ mod query_protocol_tests {
     fn workspace_generation_advance_clears_live_registrations_but_not_prepared_snapshots() {
         let (_temp, service, protocol_ref) = protocol_service();
         let prepared = service.prepare_query_code(query(&protocol_ref)).unwrap();
+        let prepared_summaries = prepared.typestate_summary_lease.clone();
 
         service.advance_workspace_generation();
+        let current_summaries = Arc::clone(
+            &service
+                .typestate_summaries
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        assert_eq!(prepared_summaries.generation(), 1);
+        assert_eq!(current_summaries.generation(), Some(2));
 
         let live = service.query_protocol_snapshot().unwrap();
         assert_eq!(live.reference_count(), 0);
@@ -3438,12 +3494,77 @@ mod query_protocol_tests {
             prepared_value.get("diagnostics").is_none(),
             "prepared requests own their generation-consistent registration snapshot"
         );
+        assert_eq!(prepared_summaries.generation(), 1);
+        assert_eq!(current_summaries.generation(), Some(2));
 
         let current = service.query_code_result(query(&protocol_ref)).unwrap();
         assert_eq!(
             current.result().unwrap().diagnostics[0].code,
             CodeQueryDiagnosticCode::UnresolvedProtocolReference
         );
+    }
+
+    #[test]
+    fn repeated_queries_hit_generation_scoped_typestate_results_and_rotation_evicts_them() {
+        let (temp, service, protocol_ref) = protocol_service();
+        let mut request = query(&protocol_ref);
+        request["execution_mode"] = json!("profile");
+
+        let first = service.query_code_result(request.clone()).unwrap();
+        let second = service.query_code_result(request).unwrap();
+        let first = serde_json::to_value(first).unwrap();
+        let second = serde_json::to_value(second).unwrap();
+        assert_eq!(first.pointer("/results"), second.pointer("/results"),);
+        assert_eq!(
+            first.pointer("/diagnostics"),
+            second.pointer("/diagnostics"),
+        );
+        assert_eq!(
+            first.pointer("/work/semantic/typestate/summary_misses"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            first.pointer("/work/semantic/typestate/summary_recomputations"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            second.pointer("/work/semantic/typestate/summary_hits"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            second.pointer("/work/semantic/typestate/summary_recomputations"),
+            Some(&json!(0))
+        );
+
+        std::fs::write(
+            temp.path().join("lifecycle.rql"),
+            format!(
+                "(profile (typestate :protocol-ref \"{protocol_ref}\" (procedure-of (function :name \"lifecycle\"))))"
+            ),
+        )
+        .unwrap();
+        let rql = serde_json::to_value(
+            service
+                .query_code_result(json!({"query_file": "lifecycle.rql"}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rql.pointer("/results"), first.pointer("/results"));
+        assert_eq!(rql.pointer("/diagnostics"), first.pointer("/diagnostics"));
+        assert_eq!(
+            rql.pointer("/work/semantic/typestate/summary_hits"),
+            Some(&json!(1))
+        );
+
+        service.advance_workspace_generation();
+        let summaries = Arc::clone(
+            &service
+                .typestate_summaries
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let counters = summaries.counters();
+        assert!(counters.evictions > 0);
     }
 }
 
@@ -3481,6 +3602,9 @@ mod tests {
             })),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            typestate_summaries: RwLock::new(Arc::new(
+                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::WatchFiles,

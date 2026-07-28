@@ -1696,6 +1696,11 @@ class CodeQueryProfileTimings:
 class CodeQueryTypestateWork:
     solves: int = 0
     cache_hits: int = 0
+    summary_hits: int = 0
+    summary_misses: int = 0
+    summary_rejections: int = 0
+    summary_evictions: int = 0
+    summary_recomputations: int = 0
     reached_rows: int = 0
     findings: int = 0
     omitted_findings: int = 0
@@ -1714,6 +1719,11 @@ class CodeQueryTypestateWork:
         return cls(
             solves=int(data.get("solves", 0)),
             cache_hits=int(data.get("cache_hits", 0)),
+            summary_hits=int(data.get("summary_hits", 0)),
+            summary_misses=int(data.get("summary_misses", 0)),
+            summary_rejections=int(data.get("summary_rejections", 0)),
+            summary_evictions=int(data.get("summary_evictions", 0)),
+            summary_recomputations=int(data.get("summary_recomputations", 0)),
             reached_rows=int(data.get("reached_rows", 0)),
             findings=int(data.get("findings", 0)),
             omitted_findings=int(data.get("omitted_findings", 0)),

@@ -189,6 +189,11 @@ def _code_query_profile_payload() -> dict:
                 "typestate": {
                     "solves": 1,
                     "cache_hits": 2,
+                    "summary_hits": 3,
+                    "summary_misses": 4,
+                    "summary_rejections": 5,
+                    "summary_evictions": 6,
+                    "summary_recomputations": 7,
                     "findings": 1,
                     "witnesses": 1,
                     "witness_steps": 3,
@@ -636,6 +641,11 @@ class CodeQueryModelTest(unittest.TestCase):
         self.assertEqual(response.work.semantic.program_points, 3)
         self.assertEqual(response.work.semantic.request_cache_hits, 2)
         self.assertEqual(response.work.semantic.typestate.solves, 1)
+        self.assertEqual(response.work.semantic.typestate.summary_hits, 3)
+        self.assertEqual(response.work.semantic.typestate.summary_misses, 4)
+        self.assertEqual(response.work.semantic.typestate.summary_rejections, 5)
+        self.assertEqual(response.work.semantic.typestate.summary_evictions, 6)
+        self.assertEqual(response.work.semantic.typestate.summary_recomputations, 7)
         self.assertEqual(response.work.semantic.typestate.witness_steps, 3)
         self.assertEqual(response.access_path.selected, "posting:kind+name")
         self.assertEqual(response.access_path.candidate_facts, 1)
