@@ -295,11 +295,15 @@ function assertWorkspaceSymbolHit(response, scenario) {
 }
 
 async function assertWorkspaceCache(workspaceRoot, scenario) {
-  await fs.access(path.join(workspaceRoot, ".brokk", "bifrost_cache.db")).catch((error) => {
+  await fs.access(analyzerCachePath(workspaceRoot)).catch((error) => {
     throw new Error(`${scenario} did not keep analyzer storage in the bound disposable workspace`, {
       cause: error,
     });
   });
+}
+
+function analyzerCachePath(workspaceRoot) {
+  return path.join(workspaceRoot, ".bifrost", "cache", "bifrost_cache.db");
 }
 
 function fixtureMessage(name) {
@@ -341,7 +345,7 @@ function codexToolCall(id, workspaceRoot, threadId, pattern) {
 
 async function assertNoPluginWorkspaceCache(pluginCwd) {
   await assert.rejects(
-    fs.access(path.join(pluginCwd, ".brokk", "bifrost_cache.db")),
+    fs.access(analyzerCachePath(pluginCwd)),
     { code: "ENOENT" },
     "Packaged MCP launch wrote analyzer storage under the plugin directory"
   );
