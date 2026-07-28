@@ -142,10 +142,10 @@ impl TypestateQueryState {
                 self.work.solves = self.work.solves.saturating_add(1);
                 let mut solver_budget = SolverBudget::new(limits.solver_work);
                 let mut request = DataflowRequest::new(&mut solver_budget, cancellation);
-                let summaries = analysis_context.summaries();
+                let summary_lease = analysis_context.summary_lease();
                 let provider = workspace.icfg_provider();
                 let solved = solve_typestate_with_production_summaries(
-                    workspace_generation,
+                    summary_lease,
                     &analysis_root,
                     &[],
                     &provider,
@@ -153,7 +153,6 @@ impl TypestateQueryState {
                     ProductionTypestateExecutionContext::Workspace,
                     &protocol,
                     &bindings,
-                    summaries,
                     semantic_budget,
                     &mut request,
                 );

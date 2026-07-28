@@ -10,8 +10,8 @@ use brokk_bifrost::analyzer::structural::{
     CodeQuery, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, CodeQueryResponse,
     CodeQueryResultValue, CodeQuerySemanticCompleteness, ProtocolRegistration,
     ProtocolRegistrationSet, execute_workspace_request,
+    execute_workspace_request_with_registration_lease,
     execute_workspace_request_with_registration_limits,
-    execute_workspace_request_with_registration_repository,
     execute_workspace_request_with_registrations,
 };
 use brokk_bifrost::analyzer::typestate::{
@@ -111,14 +111,14 @@ impl Fixture {
     }
 
     fn execute(&self, query: &CodeQuery) -> CodeQueryResponse {
-        execute_workspace_request_with_registration_repository(
+        execute_workspace_request_with_registration_lease(
             &self.workspace,
             WORKSPACE_GENERATION,
             &self.registrations,
             query,
             CodeQueryExecutionLimits::default(),
             None,
-            Arc::clone(&self.summaries),
+            self.summaries.lease(WORKSPACE_GENERATION).unwrap(),
         )
     }
 }

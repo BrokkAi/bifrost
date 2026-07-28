@@ -238,7 +238,7 @@ pub(crate) struct PreparedQueryCode {
     arguments: Value,
     workspace_generation: u64,
     query_protocols: crate::analyzer::structural::ProtocolRegistrationSet,
-    typestate_summaries: Arc<crate::analyzer::typestate::ProductionTypestateSummaryRepository>,
+    typestate_summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
 }
 
 impl PreparedQueryCode {
@@ -923,7 +923,7 @@ impl SearchToolsService {
             arguments,
             workspace_generation,
             query_protocols,
-            typestate_summaries,
+            typestate_summary_lease,
         } = self.prepare_query_code(arguments)?;
         let result = self.query_code_result_for_snapshot(
             &snapshot,
@@ -931,7 +931,7 @@ impl SearchToolsService {
             None,
             workspace_generation,
             &query_protocols,
-            typestate_summaries,
+            typestate_summary_lease,
         );
         snapshot.finish("query_code", result)
     }
@@ -956,6 +956,9 @@ impl SearchToolsService {
             if generation != self.workspace_generation() {
                 continue;
             }
+            let typestate_summary_lease = typestate_summaries
+                .lease(generation)
+                .map_err(|error| SearchToolsServiceError::internal(error.to_string()))?;
             let root = snapshot.analyzer().project().root();
             let arguments =
                 crate::tool_arguments::normalize_tool_arguments("query_code", arguments, root)
@@ -965,7 +968,7 @@ impl SearchToolsService {
                 arguments,
                 workspace_generation: generation,
                 query_protocols,
-                typestate_summaries,
+                typestate_summary_lease,
             });
         }
     }
@@ -980,7 +983,7 @@ impl SearchToolsService {
             arguments,
             workspace_generation,
             query_protocols,
-            typestate_summaries,
+            typestate_summary_lease,
         } = prepared;
         let result = (|| {
             let output = self.query_code_result_for_snapshot(
@@ -989,7 +992,7 @@ impl SearchToolsService {
                 cancellation,
                 workspace_generation,
                 &query_protocols,
-                typestate_summaries,
+                typestate_summary_lease,
             )?;
             let rendered_text = output.render_text();
             let structured = serde_json::to_value(&output).map_err(|err| {
@@ -1010,18 +1013,18 @@ impl SearchToolsService {
         cancellation: Option<&CancellationToken>,
         workspace_generation: u64,
         query_protocols: &crate::analyzer::structural::ProtocolRegistrationSet,
-        typestate_summaries: Arc<crate::analyzer::typestate::ProductionTypestateSummaryRepository>,
+        typestate_summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
     ) -> Result<crate::analyzer::structural::CodeQueryResponse, SearchToolsServiceError> {
         let query = Self::decode_query_code_input(snapshot, arguments)?;
         Ok(
-            crate::analyzer::structural::execute_workspace_request_with_registration_repository(
+            crate::analyzer::structural::execute_workspace_request_with_registration_lease(
                 snapshot,
                 workspace_generation,
                 query_protocols,
                 &query,
                 crate::analyzer::structural::CodeQueryExecutionLimits::default(),
                 cancellation,
-                typestate_summaries,
+                typestate_summary_lease,
             ),
         )
     }
@@ -3466,7 +3469,7 @@ mod query_protocol_tests {
     fn workspace_generation_advance_clears_live_registrations_but_not_prepared_snapshots() {
         let (_temp, service, protocol_ref) = protocol_service();
         let prepared = service.prepare_query_code(query(&protocol_ref)).unwrap();
-        let prepared_summaries = Arc::clone(&prepared.typestate_summaries);
+        let prepared_summaries = prepared.typestate_summary_lease.clone();
 
         service.advance_workspace_generation();
         let current_summaries = Arc::clone(
@@ -3475,7 +3478,7 @@ mod query_protocol_tests {
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
-        assert!(!Arc::ptr_eq(&prepared_summaries, &current_summaries));
+        assert_eq!(prepared_summaries.generation(), 1);
         assert_eq!(current_summaries.generation(), Some(2));
 
         let live = service.query_protocol_snapshot().unwrap();
@@ -3491,7 +3494,7 @@ mod query_protocol_tests {
             prepared_value.get("diagnostics").is_none(),
             "prepared requests own their generation-consistent registration snapshot"
         );
-        assert_eq!(prepared_summaries.generation(), Some(1));
+        assert_eq!(prepared_summaries.generation(), 1);
         assert_eq!(current_summaries.generation(), Some(2));
 
         let current = service.query_code_result(query(&protocol_ref)).unwrap();

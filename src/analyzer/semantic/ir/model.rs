@@ -667,6 +667,15 @@ pub enum ProofStatus {
 }
 
 impl ProofStatus {
+    pub(crate) fn retained_heap_bytes(&self) -> usize {
+        match self {
+            Self::Proven => 0,
+            Self::Unproven(reason) => reason.len(),
+        }
+    }
+}
+
+impl ProofStatus {
     pub const fn label(&self) -> &'static str {
         match self {
             Self::Proven => "proven",
@@ -680,6 +689,15 @@ impl ProofStatus {
 pub enum EvidenceCompleteness {
     Complete,
     Partial(Box<str>),
+}
+
+impl EvidenceCompleteness {
+    pub(crate) fn retained_heap_bytes(&self) -> usize {
+        match self {
+            Self::Complete => 0,
+            Self::Partial(reason) => reason.len(),
+        }
+    }
 }
 
 impl EvidenceCompleteness {

@@ -285,8 +285,9 @@ impl SummaryEdge {
     }
 
     fn retained_heap_bytes(&self) -> usize {
-        proof_status_heap_bytes(&self.proof)
-            .saturating_add(evidence_completeness_heap_bytes(&self.completeness))
+        self.proof
+            .retained_heap_bytes()
+            .saturating_add(self.completeness.retained_heap_bytes())
     }
 }
 
@@ -394,28 +395,14 @@ impl SummaryBoundary {
     fn retained_heap_bytes(&self) -> usize {
         self.proof
             .as_ref()
-            .map_or(0, proof_status_heap_bytes)
+            .map_or(0, ProofStatus::retained_heap_bytes)
             .saturating_add(
                 self.completeness
                     .as_ref()
-                    .map_or(0, evidence_completeness_heap_bytes),
+                    .map_or(0, EvidenceCompleteness::retained_heap_bytes),
             )
             .saturating_add(size_of_val(self.provenance()))
             .saturating_add(summary_boundary_kind_heap_bytes(&self.kind))
-    }
-}
-
-fn proof_status_heap_bytes(proof: &ProofStatus) -> usize {
-    match proof {
-        ProofStatus::Proven => 0,
-        ProofStatus::Unproven(reason) => reason.len(),
-    }
-}
-
-fn evidence_completeness_heap_bytes(completeness: &EvidenceCompleteness) -> usize {
-    match completeness {
-        EvidenceCompleteness::Complete => 0,
-        EvidenceCompleteness::Partial(reason) => reason.len(),
     }
 }
 

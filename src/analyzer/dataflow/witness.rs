@@ -307,15 +307,9 @@ impl SummaryWitnessStep {
 }
 
 fn retained_evidence_bytes(proof: &ProofStatus, completeness: &EvidenceCompleteness) -> usize {
-    let proof_bytes = match proof {
-        ProofStatus::Proven => 0,
-        ProofStatus::Unproven(reason) => reason.len(),
-    };
-    let completeness_bytes = match completeness {
-        EvidenceCompleteness::Complete => 0,
-        EvidenceCompleteness::Partial(reason) => reason.len(),
-    };
-    proof_bytes.saturating_add(completeness_bytes)
+    proof
+        .retained_heap_bytes()
+        .saturating_add(completeness.retained_heap_bytes())
 }
 
 /// Work performed while reconstructing one retained witness.

@@ -1,5 +1,7 @@
 mod common;
 
+use std::sync::Arc;
+
 use brokk_bifrost::analyzer::dataflow::{SummaryEffectKey, SummaryPublicationOutcome};
 use brokk_bifrost::analyzer::semantic::{
     CancellationToken, ProcedureHandle, ProcedureKind, SemanticBudget, SemanticRequest,
@@ -141,19 +143,20 @@ fn generation_rotation_evicts_and_repeated_projection_hits() {
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let root = root_named(&project, &workspace, "src/main.ts", "lifecycle");
     let summaries = project_summaries(&workspace, root);
-    let repository = ProductionTypestateSummaryRepository::new();
+    let repository = Arc::new(ProductionTypestateSummaryRepository::new());
 
     assert_eq!(
         repository.admit_generation(7),
         TypestateSummaryRepositoryRotation::Initialized
     );
+    let lease = repository.lease(7).unwrap();
     repository.record_recomputation();
-    assert!(!repository.contains_semantic_set(&summaries));
+    assert!(!lease.contains_semantic_set(&summaries).unwrap());
     assert_eq!(
-        repository.publish_semantic_set(&summaries).unwrap(),
+        lease.publish_semantic_set(&summaries).unwrap(),
         SummaryPublicationOutcome::Inserted
     );
-    assert!(repository.contains_semantic_set(&summaries));
+    assert!(lease.contains_semantic_set(&summaries).unwrap());
     assert_eq!(
         repository.admit_generation(7),
         TypestateSummaryRepositoryRotation::Current
@@ -166,7 +169,9 @@ fn generation_rotation_evicts_and_repeated_projection_hits() {
             evicted_entries: entries
         }
     );
-    assert!(!repository.contains_semantic_set(&summaries));
+    let successor_lease = repository.lease(8).unwrap();
+    assert!(!successor_lease.contains_semantic_set(&summaries).unwrap());
+    assert!(lease.contains_semantic_set(&summaries).is_err());
     assert_eq!(
         repository.admit_generation(7),
         TypestateSummaryRepositoryRotation::Stale {
@@ -195,17 +200,21 @@ fn successor_generation_preserves_in_flight_snapshot_ownership() {
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let root = root_named(&project, &workspace, "src/main.ts", "lifecycle");
     let summaries = project_summaries(&workspace, root);
-    let current = ProductionTypestateSummaryRepository::new();
+    let current = Arc::new(ProductionTypestateSummaryRepository::new());
     current.admit_generation(7);
-    current.publish_semantic_set(&summaries).unwrap();
+    let current_lease = current.lease(7).unwrap();
+    current_lease.publish_semantic_set(&summaries).unwrap();
 
-    let successor = current.successor_generation(8);
+    let successor = Arc::new(current.successor_generation(8));
+    let successor_lease = successor.lease(8).unwrap();
+    current.record_miss();
 
     assert_eq!(current.generation(), Some(7));
-    assert!(current.contains_semantic_set(&summaries));
+    assert!(current_lease.contains_semantic_set(&summaries).unwrap());
     assert_eq!(successor.generation(), Some(8));
-    assert!(!successor.contains_semantic_set(&summaries));
+    assert!(!successor_lease.contains_semantic_set(&summaries).unwrap());
     assert_eq!(successor.counters().evictions, summaries.len());
+    assert_eq!(successor.counters().misses, 1);
 }
 
 #[test]

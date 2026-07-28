@@ -1024,7 +1024,7 @@ impl ProtocolSummaryLookupKey {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompleteProtocolSummaryRepository {
     entries: HashMap<ProtocolSummaryKey, ProtocolSummary>,
     by_entry: HashMap<ProtocolSummaryLookupKey, ProtocolSummaryKey>,
@@ -1272,28 +1272,20 @@ impl CompleteProtocolSummaryRepository {
             .and_then(|key| self.entries.get(key))
     }
 
-    pub(super) fn absorb(
+    pub(super) fn into_publication_batches(self) -> ProtocolSummaryPublicationBatches {
+        partition_protocol_summaries(self.entries.into_values())
+    }
+
+    pub(super) fn absorb_batches(
         &mut self,
-        source: CompleteProtocolSummaryRepository,
+        batches: ProtocolSummaryPublicationBatches,
         semantic_summaries: &ProtocolSemanticSummarySet<'_>,
     ) -> Result<usize, ProtocolSummaryPublicationError> {
         let started = self.len();
-        let mut ordinary = Vec::new();
-        let mut recursive = HashMap::<SummaryRecursiveGroupKey, Vec<ProtocolSummary>>::new();
-        for summary in source.entries.into_values() {
-            match summary.key().procedure().recursive_group() {
-                Some(group) => recursive.entry(group).or_default().push(summary),
-                None => ordinary.push(summary),
-            }
-        }
-        ordinary.sort_unstable_by(|left, right| left.key().cmp(right.key()));
-        for summary in ordinary {
+        for summary in batches.ordinary {
             self.publish(summary)?;
         }
-        let mut recursive = recursive.into_iter().collect::<Vec<_>>();
-        recursive.sort_unstable_by_key(|(group, _)| *group);
-        for (group, mut summaries) in recursive {
-            summaries.sort_unstable_by(|left, right| left.key().cmp(right.key()));
+        for (group, summaries) in batches.recursive {
             let semantic = semantic_summaries
                 .summaries
                 .iter()
@@ -1303,6 +1295,34 @@ impl CompleteProtocolSummaryRepository {
             self.publish_scc(summaries, &semantic)?;
         }
         Ok(self.len().saturating_sub(started))
+    }
+}
+
+pub(super) struct ProtocolSummaryPublicationBatches {
+    ordinary: Vec<ProtocolSummary>,
+    recursive: Vec<(SummaryRecursiveGroupKey, Vec<ProtocolSummary>)>,
+}
+
+fn partition_protocol_summaries(
+    summaries: impl IntoIterator<Item = ProtocolSummary>,
+) -> ProtocolSummaryPublicationBatches {
+    let mut ordinary = Vec::new();
+    let mut recursive = HashMap::<SummaryRecursiveGroupKey, Vec<ProtocolSummary>>::new();
+    for summary in summaries {
+        match summary.key().procedure().recursive_group() {
+            Some(group) => recursive.entry(group).or_default().push(summary),
+            None => ordinary.push(summary),
+        }
+    }
+    ordinary.sort_unstable_by(|left, right| left.key().cmp(right.key()));
+    let mut recursive = recursive.into_iter().collect::<Vec<_>>();
+    recursive.sort_unstable_by_key(|(group, _)| *group);
+    for (_, summaries) in &mut recursive {
+        summaries.sort_unstable_by(|left, right| left.key().cmp(right.key()));
+    }
+    ProtocolSummaryPublicationBatches {
+        ordinary,
+        recursive,
     }
 }
 
@@ -1993,22 +2013,14 @@ fn publish_protocol_summaries(
     binding_contracts: &ProtocolBindingContracts,
     projection_skipped: bool,
 ) -> Result<(ProtocolSummaryCacheStatus, usize), ProtocolSummarySolveError> {
-    let mut ordinary = Vec::new();
-    let mut recursive = HashMap::<SummaryRecursiveGroupKey, Vec<ProtocolSummary>>::new();
-    for summary in summaries {
-        if let Some(group) = summary.key.procedure().recursive_group() {
-            recursive.entry(group).or_default().push(summary);
-        } else {
-            ordinary.push(summary);
-        }
-    }
+    let batches = partition_protocol_summaries(summaries);
 
     let mut published_any = false;
     let mut recursive_batch_required = false;
     let mut capacity_exceeded = false;
     let mut conflict = false;
     let mut published = 0usize;
-    for summary in ordinary {
+    for summary in batches.ordinary {
         match repository.publish(summary) {
             Ok(ProtocolSummaryPublicationOutcome::Inserted) => {
                 published_any = true;
@@ -2027,7 +2039,7 @@ fn publish_protocol_summaries(
         }
     }
 
-    for (group, batch) in recursive {
+    for (group, batch) in batches.recursive {
         let semantic_manifest = binding_contracts
             .recursive_manifest(group)
             .ok_or(ProtocolSummaryError::ProcedureMismatch)?;

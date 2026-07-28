@@ -42,7 +42,7 @@ pub use hash::{TypestateBindingPlanHash, TypestateBindingSummaryHash, TypestateP
 pub use production::{
     ProductionSemanticSummarySet, ProductionSummaryLifecycleCounters,
     ProductionSummaryProjectionError, ProductionTypestateExecutionContext,
-    ProductionTypestateSolveError, ProductionTypestateSolveResult,
+    ProductionTypestateSolveError, ProductionTypestateSolveResult, ProductionTypestateSummaryLease,
     ProductionTypestateSummaryRepository, TypestateProductionCacheStatus,
     TypestateSummaryRepositoryLimits, TypestateSummaryRepositoryRotation,
     project_production_semantic_summaries, solve_typestate_with_production_summaries,

@@ -322,7 +322,7 @@ impl IcfgProvider for PolicyIcfgProvider<'_> {
 #[derive(Default)]
 pub(crate) struct ProductionTypestatePolicyEvaluator {
     prepared: RefCell<Option<CompiledTypestatePolicy>>,
-    summaries: ProductionTypestateSummaryRepository,
+    summaries: Arc<ProductionTypestateSummaryRepository>,
 }
 
 impl super::projection::sealed::TypestateAdapter for ProductionTypestatePolicyEvaluator {}
@@ -370,7 +370,10 @@ impl TypestatePolicyEvaluator for ProductionTypestatePolicyEvaluator {
                 "typestate policy evaluation lost its workspace semantic snapshot",
             );
         };
-        let summaries = &self.summaries;
+        let summary_lease = match self.summaries.lease(0) {
+            Ok(summary_lease) => summary_lease,
+            Err(error) => return failed_projection_payload(&error.to_string()),
+        };
         match evaluate_compiled_typestate(
             authority,
             policy,
@@ -379,7 +382,7 @@ impl TypestatePolicyEvaluator for ProductionTypestatePolicyEvaluator {
             context.cancellation,
             budget,
             &compiled,
-            summaries,
+            &summary_lease,
         ) {
             Ok(payload) => payload,
             Err(error) => failed_projection_payload(&error),
@@ -396,7 +399,7 @@ fn evaluate_compiled_typestate(
     cancellation: Option<&CancellationToken>,
     budget: &PolicyBudget,
     compiled: &CompiledTypestatePolicy,
-    summaries: &ProductionTypestateSummaryRepository,
+    summary_lease: &crate::analyzer::typestate::ProductionTypestateSummaryLease,
 ) -> Result<TypestateProjectionPayload, String> {
     let mut cache_work = ProductionSummaryLifecycleCounters::default();
     let uncancelled = CancellationToken::default();
@@ -424,7 +427,7 @@ fn evaluate_compiled_typestate(
     for root in &compiled.roots {
         let mut request = DataflowRequest::new(&mut solver_budget, cancellation);
         let production = solve_typestate_with_production_summaries(
-            0,
+            summary_lease,
             root,
             &[],
             &icfg_provider,
@@ -432,7 +435,6 @@ fn evaluate_compiled_typestate(
             ProductionTypestateExecutionContext::Policy(&icfg_provider.execution_budget),
             &compiled.protocol,
             &compiled.bindings,
-            summaries,
             semantic_budget
                 .as_mut()
                 .expect("nonempty roots retain a semantic budget"),

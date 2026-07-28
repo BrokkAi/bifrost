@@ -7,7 +7,7 @@
 //! standalone policy batches.
 
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::{cmp::Reverse, collections::BinaryHeap};
 
 use crate::analyzer::dataflow::{
@@ -173,6 +173,43 @@ pub enum TypestateSummaryRepositoryRotation {
 #[derive(Debug)]
 pub struct ProductionTypestateSummaryRepository {
     state: Mutex<ProductionTypestateSummaryRepositoryState>,
+    counters: Arc<Mutex<ProductionSummaryLifecycleCounters>>,
+    flights: Mutex<HashMap<ProductionSummaryResultKey, Arc<ProductionSummaryFlight>>>,
+}
+
+/// An immutable capability pairing one repository owner with one generation.
+///
+/// Every production lookup and publication requires this capability so a
+/// generation number cannot be paired with an unrelated repository by callers.
+#[derive(Debug, Clone)]
+pub struct ProductionTypestateSummaryLease {
+    generation: u64,
+    repository: Arc<ProductionTypestateSummaryRepository>,
+}
+
+impl ProductionTypestateSummaryLease {
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn contains_semantic_set(
+        &self,
+        summaries: &ProductionSemanticSummarySet,
+    ) -> Result<bool, ProductionTypestateSolveError> {
+        let state = self.repository.state_for_generation(self.generation)?;
+        Ok(summaries
+            .summaries
+            .iter()
+            .all(|summary| state.semantic.get(summary.key()) == Some(summary)))
+    }
+
+    pub fn publish_semantic_set(
+        &self,
+        summaries: &ProductionSemanticSummarySet,
+    ) -> Result<SummaryPublicationOutcome, ProductionTypestateSolveError> {
+        self.repository
+            .publish_semantic_set_for_generation(self.generation, summaries)
+    }
 }
 
 #[derive(Debug)]
@@ -185,7 +222,6 @@ struct ProductionTypestateSummaryRepositoryState {
     next_result_sequence: u64,
     max_result_entries: usize,
     max_result_bytes: usize,
-    counters: ProductionSummaryLifecycleCounters,
 }
 
 impl Default for ProductionTypestateSummaryRepository {
@@ -210,8 +246,9 @@ impl ProductionTypestateSummaryRepository {
                 next_result_sequence: 0,
                 max_result_entries: limits.max_result_entries,
                 max_result_bytes: limits.max_result_bytes,
-                counters: ProductionSummaryLifecycleCounters::default(),
             }),
+            counters: Arc::new(Mutex::new(ProductionSummaryLifecycleCounters::default())),
+            flights: Mutex::new(HashMap::default()),
         }
     }
 
@@ -220,7 +257,10 @@ impl ProductionTypestateSummaryRepository {
     }
 
     pub fn counters(&self) -> ProductionSummaryLifecycleCounters {
-        self.state().counters
+        *self
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn retained_result_count(&self) -> usize {
@@ -229,6 +269,23 @@ impl ProductionTypestateSummaryRepository {
 
     pub fn retained_result_bytes(&self) -> usize {
         self.state().retained_result_bytes
+    }
+
+    /// Admit and capture one generation as an opaque repository capability.
+    pub fn lease(
+        self: &Arc<Self>,
+        generation: u64,
+    ) -> Result<ProductionTypestateSummaryLease, ProductionTypestateSolveError> {
+        if let TypestateSummaryRepositoryRotation::Stale { current, requested } =
+            self.admit_generation(generation)
+        {
+            self.record_rejection();
+            return Err(ProductionTypestateSolveError::StaleGeneration { current, requested });
+        }
+        Ok(ProductionTypestateSummaryLease {
+            generation,
+            repository: Arc::clone(self),
+        })
     }
 
     /// Start a new generation without mutating the repository retained by
@@ -251,11 +308,9 @@ impl ProductionTypestateSummaryRepository {
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         successor_state.generation = Some(generation);
-        successor_state.counters = state.counters;
-        successor_state.counters.evictions = successor_state
-            .counters
-            .evictions
-            .saturating_add(evicted_entries);
+        successor.counters = Arc::clone(&self.counters);
+        drop(state);
+        successor.add_evictions(evicted_entries);
         successor
     }
 
@@ -283,26 +338,11 @@ impl ProductionTypestateSummaryRepository {
                 state.retained_result_bytes = 0;
                 state.next_result_sequence = 0;
                 state.generation = Some(generation);
-                state.counters.evictions = state.counters.evictions.saturating_add(evicted_entries);
+                drop(state);
+                self.add_evictions(evicted_entries);
                 TypestateSummaryRepositoryRotation::Rotated { evicted_entries }
             }
         }
-    }
-
-    pub fn contains_semantic_set(&self, summaries: &ProductionSemanticSummarySet) -> bool {
-        let state = self.state();
-        summaries
-            .summaries
-            .iter()
-            .all(|summary| state.semantic.get(summary.key()) == Some(summary))
-    }
-
-    pub fn publish_semantic_set(
-        &self,
-        summaries: &ProductionSemanticSummarySet,
-    ) -> Result<SummaryPublicationOutcome, SummaryPublicationError> {
-        let mut state = self.state();
-        Self::publish_semantic_set_locked(&mut state, summaries)
     }
 
     fn publish_semantic_set_for_generation(
@@ -311,10 +351,12 @@ impl ProductionTypestateSummaryRepository {
         summaries: &ProductionSemanticSummarySet,
     ) -> Result<SummaryPublicationOutcome, ProductionTypestateSolveError> {
         let mut state = self.state_for_generation(generation)?;
-        Self::publish_semantic_set_locked(&mut state, summaries).map_err(Into::into)
+        self.publish_semantic_set_locked(&mut state, summaries)
+            .map_err(Into::into)
     }
 
     fn publish_semantic_set_locked(
+        &self,
         state: &mut ProductionTypestateSummaryRepositoryState,
         summaries: &ProductionSemanticSummarySet,
     ) -> Result<SummaryPublicationOutcome, SummaryPublicationError> {
@@ -334,7 +376,7 @@ impl ProductionTypestateSummaryRepository {
                 Ok(SummaryPublicationOutcome::Inserted) => inserted = true,
                 Ok(SummaryPublicationOutcome::AlreadyPresent) => {}
                 Err(error) => {
-                    state.counters.rejections = state.counters.rejections.saturating_add(1);
+                    self.record_rejection();
                     return Err(error);
                 }
             }
@@ -347,18 +389,18 @@ impl ProductionTypestateSummaryRepository {
     }
 
     pub fn record_rejection(&self) {
-        let mut state = self.state();
-        state.counters.rejections = state.counters.rejections.saturating_add(1);
+        let mut counters = self.lifecycle_counters();
+        counters.rejections = counters.rejections.saturating_add(1);
     }
 
     pub fn record_miss(&self) {
-        let mut state = self.state();
-        state.counters.misses = state.counters.misses.saturating_add(1);
+        let mut counters = self.lifecycle_counters();
+        counters.misses = counters.misses.saturating_add(1);
     }
 
     pub fn record_recomputation(&self) {
-        let mut state = self.state();
-        state.counters.recomputations = state.counters.recomputations.saturating_add(1);
+        let mut counters = self.lifecycle_counters();
+        counters.recomputations = counters.recomputations.saturating_add(1);
     }
 
     fn result(
@@ -374,8 +416,8 @@ impl ProductionTypestateSummaryRepository {
     }
 
     fn record_hit(&self) {
-        let mut state = self.state();
-        state.counters.hits = state.counters.hits.saturating_add(1);
+        let mut counters = self.lifecycle_counters();
+        counters.hits = counters.hits.saturating_add(1);
     }
 
     fn publish_result(
@@ -402,7 +444,8 @@ impl ProductionTypestateSummaryRepository {
             .retained_bytes()
             .saturating_add(retained.retained_bytes());
         if state.max_result_entries == 0 || retained_bytes > state.max_result_bytes {
-            state.counters.rejections = state.counters.rejections.saturating_add(1);
+            drop(state);
+            self.record_rejection();
             return Ok((false, 0));
         }
         let mut evictions = 0usize;
@@ -415,7 +458,8 @@ impl ProductionTypestateSummaryRepository {
                 .min_by_key(|(_, value)| value.published_sequence)
                 .map(|(key, _)| key.clone())
             else {
-                state.counters.rejections = state.counters.rejections.saturating_add(1);
+                drop(state);
+                self.record_rejection();
                 return Ok((false, evictions));
             };
             let removed = state
@@ -433,7 +477,8 @@ impl ProductionTypestateSummaryRepository {
         state.next_result_sequence = state.next_result_sequence.saturating_add(1);
         state.retained_result_bytes = state.retained_result_bytes.saturating_add(retained_bytes);
         state.results.insert(key, retained);
-        state.counters.evictions = state.counters.evictions.saturating_add(evictions);
+        drop(state);
+        self.add_evictions(evictions);
         Ok((true, evictions))
     }
 
@@ -444,8 +489,11 @@ impl ProductionTypestateSummaryRepository {
         protocol: &CompiledProtocol,
         bindings: &TypestateBindingPlan,
     ) -> Result<CompleteProtocolSummaryRepository, ProductionTypestateSolveError> {
-        let state = self.state_for_generation(generation)?;
-        Ok(semantic_summaries.compatible_repository(&state.protocol, protocol, bindings))
+        let protocol_repository = {
+            let state = self.state_for_generation(generation)?;
+            state.protocol.clone()
+        };
+        Ok(semantic_summaries.compatible_repository(&protocol_repository, protocol, bindings))
     }
 
     fn protocol_limits(&self) -> ProtocolSummaryRepositoryLimits {
@@ -458,10 +506,11 @@ impl ProductionTypestateSummaryRepository {
         source: CompleteProtocolSummaryRepository,
         semantic_summaries: &ProtocolSemanticSummarySet<'_>,
     ) -> Result<usize, ProductionTypestateSolveError> {
+        let batches = source.into_publication_batches();
         let mut state = self.state_for_generation(generation)?;
         state
             .protocol
-            .absorb(source, semantic_summaries)
+            .absorb_batches(batches, semantic_summaries)
             .map_err(|error| {
                 ProductionTypestateSolveError::Protocol(ProtocolSummarySolveError::Publication(
                     error,
@@ -473,6 +522,37 @@ impl ProductionTypestateSummaryRepository {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lifecycle_counters(&self) -> std::sync::MutexGuard<'_, ProductionSummaryLifecycleCounters> {
+        self.counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn add_evictions(&self, evictions: usize) {
+        let mut counters = self.lifecycle_counters();
+        counters.evictions = counters.evictions.saturating_add(evictions);
+    }
+
+    fn begin_flight(
+        &self,
+        key: &ProductionSummaryResultKey,
+    ) -> ProductionSummaryFlightAdmission<'_> {
+        let mut flights = self
+            .flights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(flight) = flights.get(key) {
+            return ProductionSummaryFlightAdmission::Follower(Arc::clone(flight));
+        }
+        let flight = Arc::new(ProductionSummaryFlight::default());
+        flights.insert(key.clone(), Arc::clone(&flight));
+        ProductionSummaryFlightAdmission::Leader(Box::new(ProductionSummaryFlightLeader {
+            repository: self,
+            key: key.clone(),
+            flight,
+        }))
     }
 
     fn state_for_generation(
@@ -492,6 +572,63 @@ impl ProductionTypestateSummaryRepository {
                 current: 0,
                 requested,
             }),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ProductionSummaryFlight {
+    completed: Mutex<bool>,
+    completed_cv: Condvar,
+}
+
+impl ProductionSummaryFlight {
+    fn wait(&self) {
+        let mut completed = self
+            .completed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*completed {
+            completed = self
+                .completed_cv
+                .wait(completed)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+enum ProductionSummaryFlightAdmission<'a> {
+    Leader(Box<ProductionSummaryFlightLeader<'a>>),
+    Follower(Arc<ProductionSummaryFlight>),
+}
+
+struct ProductionSummaryFlightLeader<'a> {
+    repository: &'a ProductionTypestateSummaryRepository,
+    key: ProductionSummaryResultKey,
+    flight: Arc<ProductionSummaryFlight>,
+}
+
+impl Drop for ProductionSummaryFlightLeader<'_> {
+    fn drop(&mut self) {
+        {
+            let mut completed = self
+                .flight
+                .completed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *completed = true;
+            self.flight.completed_cv.notify_all();
+        }
+        let mut flights = self
+            .repository
+            .flights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if flights
+            .get(&self.key)
+            .is_some_and(|retained| Arc::ptr_eq(retained, &self.flight))
+        {
+            flights.remove(&self.key);
         }
     }
 }
@@ -636,7 +773,7 @@ impl From<SummaryPublicationError> for ProductionTypestateSolveError {
 /// Solve through the generation-scoped production cache without weakening witness evidence.
 #[allow(clippy::too_many_arguments)]
 pub fn solve_typestate_with_production_summaries<Provider, ProjectionProvider>(
-    generation: u64,
+    lease: &ProductionTypestateSummaryLease,
     root: &ProcedureHandle,
     entry_facts: &[TypestateFact],
     provider: &Provider,
@@ -644,7 +781,6 @@ pub fn solve_typestate_with_production_summaries<Provider, ProjectionProvider>(
     execution_context: ProductionTypestateExecutionContext<'_>,
     protocol: &CompiledProtocol,
     bindings: &TypestateBindingPlan,
-    repository: &ProductionTypestateSummaryRepository,
     semantic_budget: &mut crate::analyzer::semantic::SemanticBudget,
     request: &mut DataflowRequest<'_>,
 ) -> Result<ProductionTypestateSolveResult, ProductionTypestateSolveError>
@@ -652,13 +788,10 @@ where
     Provider: IcfgProvider + ?Sized,
     ProjectionProvider: IcfgProvider + ?Sized,
 {
+    let generation = lease.generation;
+    let repository = lease.repository.as_ref();
     let mut lifecycle = ProductionSummaryLifecycleCounters::default();
-    if let TypestateSummaryRepositoryRotation::Stale { current, requested } =
-        repository.admit_generation(generation)
-    {
-        repository.record_rejection();
-        return Err(ProductionTypestateSolveError::StaleGeneration { current, requested });
-    }
+    drop(repository.state_for_generation(generation)?);
     let semantic_work_before = semantic_budget.used();
     let solver_work_before = request.budget.used();
     let execution_before = execution_context.snapshot();
@@ -671,6 +804,28 @@ where
         execution_context.semantic_allowance_key(semantic_budget.remaining()),
         request.budget.remaining(),
     )?;
+    let _flight_leader = if repository.result(generation, &result_key)?.is_none() {
+        match repository.begin_flight(&result_key) {
+            ProductionSummaryFlightAdmission::Leader(leader) => Some(leader),
+            ProductionSummaryFlightAdmission::Follower(flight) => {
+                flight.wait();
+                return solve_typestate_with_production_summaries(
+                    lease,
+                    root,
+                    entry_facts,
+                    provider,
+                    projection_provider,
+                    execution_context,
+                    protocol,
+                    bindings,
+                    semantic_budget,
+                    request,
+                );
+            }
+        }
+    } else {
+        None
+    };
     if request.cancellation.is_cancelled() {
         repository.record_miss();
         repository.record_rejection();
@@ -710,11 +865,10 @@ where
 
     repository.record_recomputation();
     lifecycle.recomputations = lifecycle.recomputations.saturating_add(1);
-    let mut projection_budget = semantic_budget.clone();
     let semantic_summaries = match project_production_semantic_summaries(
         std::slice::from_ref(root),
         projection_provider,
-        &mut SemanticRequest::new(&mut projection_budget, request.cancellation),
+        &mut SemanticRequest::new(semantic_budget, request.cancellation),
     ) {
         Ok(summaries) => summaries,
         Err(_) => {
@@ -782,62 +936,27 @@ where
         CompleteProtocolSummaryRepository::with_limits(repository.protocol_limits())
     };
     let has_compatible_protocol_summaries = !compatible.is_empty();
-    let mut rejected_protocol_reuse = false;
-
-    let accepted = if has_compatible_protocol_summaries {
-        // Protocol rows do not yet carry stable witness fragments. Exercise them
-        // only speculatively: any actual row application marks witness retention
-        // incomplete and is rejected before it can affect a public result.
-        let mut speculative_semantic_budget = semantic_budget.clone();
-        let mut speculative_solver_budget = request.budget.clone();
-        let mut speculative_request =
-            DataflowRequest::new(&mut speculative_solver_budget, request.cancellation);
-        match solve_typestate_with_reusable_summaries(
-            root,
-            entry_facts,
-            provider,
-            protocol,
-            bindings,
-            &semantic_set,
-            &mut compatible,
-            &mut speculative_semantic_budget,
-            &mut speculative_request,
-        ) {
-            Ok(solved) if !solved.was_reused() => {
-                *semantic_budget = speculative_semantic_budget;
-                *request.budget = speculative_solver_budget;
-                Some(solved)
-            }
-            Ok(_) | Err(_) => {
-                rejected_protocol_reuse = true;
-                repository.record_rejection();
-                lifecycle.rejections = lifecycle.rejections.saturating_add(1);
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    let solved = match accepted {
-        Some(solved) => solved,
-        None => {
-            compatible =
-                CompleteProtocolSummaryRepository::with_limits(repository.protocol_limits());
-            solve_typestate_with_reusable_summaries(
-                root,
-                entry_facts,
-                provider,
-                protocol,
-                bindings,
-                &semantic_set,
-                &mut compatible,
-                semantic_budget,
-                request,
-            )
-            .map_err(ProductionTypestateSolveError::Protocol)?
-        }
-    };
+    let rejected_protocol_reuse = has_compatible_protocol_summaries;
+    if rejected_protocol_reuse {
+        // Portable protocol rows do not yet carry stable witness fragments.
+        // Reject them before execution so policy-provider budgets and latency
+        // cannot be consumed by a result that must be discarded anyway.
+        repository.record_rejection();
+        lifecycle.rejections = lifecycle.rejections.saturating_add(1);
+    }
+    compatible = CompleteProtocolSummaryRepository::with_limits(repository.protocol_limits());
+    let solved = solve_typestate_with_reusable_summaries(
+        root,
+        entry_facts,
+        provider,
+        protocol,
+        bindings,
+        &semantic_set,
+        &mut compatible,
+        semantic_budget,
+        request,
+    )
+    .map_err(ProductionTypestateSolveError::Protocol)?;
     let protocol_cache_status = solved.cache_status();
     let result = Arc::new(solved.into_computed_result());
     let published_protocol_summaries = if semantic_publication_accepted {

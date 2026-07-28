@@ -1345,14 +1345,14 @@ pub fn execute_workspace_request_with_registration_cancellation(
 ///
 /// Long-lived hosts use this entry so separate JSON/RQL requests can share
 /// exact production results without introducing process-global state.
-pub fn execute_workspace_request_with_registration_repository(
+pub fn execute_workspace_request_with_registration_lease(
     workspace: &WorkspaceAnalyzer,
     workspace_generation: u64,
     registrations: &ProtocolRegistrationSet,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
-    summaries: Arc<crate::analyzer::typestate::ProductionTypestateSummaryRepository>,
+    summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
 ) -> CodeQueryResponse {
     execute_request_internal(
         workspace.analyzer(),
@@ -1361,7 +1361,7 @@ pub fn execute_workspace_request_with_registration_repository(
         limits,
         cancellation,
         Some((workspace_generation, registrations)),
-        Some(summaries),
+        Some(summary_lease),
     )
 }
 
@@ -1372,7 +1372,7 @@ fn execute_request_internal(
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
     registrations: Option<(u64, &ProtocolRegistrationSet)>,
-    summaries: Option<Arc<crate::analyzer::typestate::ProductionTypestateSummaryRepository>>,
+    summary_lease: Option<crate::analyzer::typestate::ProductionTypestateSummaryLease>,
 ) -> CodeQueryResponse {
     if query_plan_requires_typestate(&query.plan) && !limits.typestate.is_valid() {
         return CodeQueryResponse::Results(invalid_plan_result(
@@ -1385,9 +1385,20 @@ fn execute_request_internal(
         (workspace, registrations)
     {
         let requested = requested_protocol_refs(&query.plan);
-        let summaries = summaries.unwrap_or_else(|| {
-            Arc::new(crate::analyzer::typestate::ProductionTypestateSummaryRepository::new())
-        });
+        let summary_lease = match summary_lease {
+            Some(summary_lease) => summary_lease,
+            None => {
+                let summaries = Arc::new(
+                    crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+                );
+                match summaries.lease(workspace_generation) {
+                    Ok(summary_lease) => summary_lease,
+                    Err(error) => {
+                        return CodeQueryResponse::Results(invalid_plan_result(error.to_string()));
+                    }
+                }
+            }
+        };
         match QueryAnalysisContext::new_with_validation_and_summaries(
             workspace,
             workspace_generation,
@@ -1398,7 +1409,7 @@ fn execute_request_internal(
                 limits.semantic.max_source_bytes,
             ),
             cancellation,
-            summaries,
+            summary_lease,
         ) {
             Ok(context) => Some(context),
             Err(error) => {

@@ -92,8 +92,8 @@ pub use search::{
     execute_with_limits, execute_workspace, execute_workspace_request,
     execute_workspace_request_with_cancellation, execute_workspace_request_with_limits,
     execute_workspace_request_with_registration_cancellation,
+    execute_workspace_request_with_registration_lease,
     execute_workspace_request_with_registration_limits,
-    execute_workspace_request_with_registration_repository,
     execute_workspace_request_with_registrations, execute_workspace_with_limits,
 };
 pub use spec::{RoleSink, StructuralSpec};
