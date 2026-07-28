@@ -21549,6 +21549,56 @@ int MULXQ();
 }
 
 #[test]
+fn cpp_recovered_preprocessor_tail_tokens_inside_recovered_declarations_stay_non_references() {
+    let source = r#"
+int R14();
+int R15();
+int DX();
+int AX();
+int MOVQ();
+int ADDQ();
+int ADCQ();
+int MULXQ();
+
+#define _fqMulBmi2(c, a, b) \
+    MOVL $0, R15 \
+    \ // T1 = a1 * b1, R15:R14:R13:R12 <- 16+ra:24+ra * 16+rb:24+rb
+    ADCQ $0, R11 \
+    MOVQ 24+b, DX \
+    ADDQ R14, R13 \
+    MULXQ 24+a, R14, R15 \
+    ADCQ AX, R14 \
+    ADCQ $0, R15 \
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("macro.h", source)
+        .build();
+
+    let mulxq = source.find("MULXQ 24+a").expect("recovered MULXQ line");
+    let r14 = source[mulxq..].find("R14").expect("recovered R14") + mulxq;
+    let r15 = source[mulxq..].rfind("R15").expect("recovered R15") + mulxq;
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("macro.h", source, r14),
+                location_query("macro.h", source, r15),
+            ]
+        })
+        .to_string(),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    for result in results {
+        assert_eq!(result["status"], "no_definition", "{value}");
+        assert_eq!(
+            result["diagnostics"][0]["kind"], "declaration_or_import_site",
+            "{value}"
+        );
+    }
+}
+
+#[test]
 fn cpp_recovered_preprocessor_tail_stops_before_later_clean_reference() {
     let source = r#"
 int keep() { return 1; }
@@ -21578,6 +21628,39 @@ int use() { return keep(); }
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "keep", "{value}");
+}
+
+#[test]
+fn cpp_recovered_preprocessor_tail_stops_before_later_clean_declaration_reference() {
+    let source = r#"
+int R15 = 7;
+
+#define _fqMulBmi2(c, a, b) \
+    MOVL $0, R15 \
+    \ // T0 = a0 * b0, R11:R10:R9:R8 <- 0+ra:8+ra * 0+rb:8+rb
+    MOVQ 0+b, DX \
+    MULXQ 0+a, R12, R13 \
+
+int use_after_macro = R15;
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("macro.h", source)
+        .build();
+
+    let later_r15 = source
+        .rfind("R15;")
+        .expect("later clean declaration reference");
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [location_query("macro.h", source, later_r15)]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "R15", "{value}");
 }
 
 #[test]

@@ -3941,12 +3941,7 @@ fn cpp_is_non_reference_preprocessor_body_token(node: Node<'_>) -> bool {
         }
         if matches!(
             parent.kind(),
-            "translation_unit"
-                | "declaration"
-                | "field_declaration"
-                | "expression_statement"
-                | "function_definition"
-                | "compound_statement"
+            "translation_unit" | "function_definition" | "compound_statement"
         ) {
             return false;
         }
