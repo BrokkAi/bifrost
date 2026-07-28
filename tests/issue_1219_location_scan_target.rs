@@ -111,6 +111,7 @@ fn scan_at(analyzer: &RustAnalyzer, symbol: Option<&str>) -> ScanUsagesEntry {
             include_tests: true,
             paths: None,
             include_same_owner: false,
+            max_duration_secs: None,
         },
     );
     assert_eq!(result.results.len(), 1, "one requested target");

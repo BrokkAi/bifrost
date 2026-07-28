@@ -450,6 +450,7 @@ class SearchToolsClient:
         *,
         include_tests: bool = False,
         paths: list[str] | None = None,
+        max_duration_secs: int | None = None,
     ) -> ScanUsagesResult:
         arguments: dict[str, Any] = {
             "include_tests": include_tests,
@@ -457,6 +458,8 @@ class SearchToolsClient:
         arguments["symbols"] = symbols
         if paths is not None:
             arguments["paths"] = paths
+        if max_duration_secs is not None:
+            arguments["max_duration_secs"] = max_duration_secs
         payload = self._call_tool_payload("scan_usages_by_reference", arguments)
         return ScanUsagesResult.from_dict(
             payload.structured,
@@ -469,6 +472,7 @@ class SearchToolsClient:
         *,
         include_tests: bool = False,
         paths: list[str] | None = None,
+        max_duration_secs: int | None = None,
     ) -> ScanUsagesResult:
         arguments: dict[str, Any] = {
             "targets": targets,
@@ -476,6 +480,8 @@ class SearchToolsClient:
         }
         if paths is not None:
             arguments["paths"] = paths
+        if max_duration_secs is not None:
+            arguments["max_duration_secs"] = max_duration_secs
         payload = self._call_tool_payload("scan_usages_by_location", arguments)
         return ScanUsagesResult.from_dict(
             payload.structured,

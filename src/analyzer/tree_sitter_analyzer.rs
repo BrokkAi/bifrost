@@ -867,6 +867,7 @@ struct BoundedFileCache<T> {
 
 type FileStateCache = BoundedFileCache<FileState>;
 type SummaryFileProjectionCache = BoundedFileCache<SummaryFileProjection>;
+type TopLevelClassUnitsByPackageCell = Arc<OnceLock<Arc<HashMap<String, Vec<CodeUnit>>>>>;
 
 #[derive(Debug, Default)]
 struct QueryReadCache {
@@ -883,7 +884,14 @@ struct QueryReadCache {
     /// asking it once per (file, using-directive) pair — which is exactly what
     /// C# import-graph candidate discovery does — re-hydrates every declaration
     /// in the workspace thousands of times per query (#1194).
-    top_level_class_units_by_package: Option<Arc<HashMap<String, Vec<CodeUnit>>>>,
+    ///
+    /// `Arc<OnceLock<..>>`, not a plain `Option`: candidate discovery can hydrate this from many
+    /// threads at once (parallel import-graph scans), and a check-then-compute-then-store `Option`
+    /// lets every thread that misses the check before the first writer finishes redo the same
+    /// whole-workspace scan. Cloning the `Arc` out from under `query_read_cache`'s coarse mutex (see
+    /// `top_level_class_units_by_package_cell`) and calling `get_or_init` on that handle keeps the
+    /// expensive hydration off the coarse lock while still guaranteeing only one thread runs it.
+    top_level_class_units_by_package: TopLevelClassUnitsByPackageCell,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -906,7 +914,7 @@ impl QueryReadCache {
             self.prepared_sources.clear();
             self.file_states.clear();
             self.prepared_syntax.clear();
-            self.top_level_class_units_by_package = None;
+            self.top_level_class_units_by_package = Arc::new(OnceLock::new());
         }
         if !self
             .contexts
@@ -925,7 +933,7 @@ impl QueryReadCache {
             self.prepared_sources.clear();
             self.file_states.clear();
             self.prepared_syntax.clear();
-            self.top_level_class_units_by_package = None;
+            self.top_level_class_units_by_package = Arc::new(OnceLock::new());
         }
     }
 
@@ -973,19 +981,12 @@ impl QueryReadCache {
         }
     }
 
-    fn top_level_class_units_by_package(&self) -> Option<Arc<HashMap<String, Vec<CodeUnit>>>> {
+    /// The single-flight cell backing `persisted_top_level_classes_in_package`. Callers clone this
+    /// `Arc` handle out from under the coarse `query_read_cache` mutex and call `get_or_init` on
+    /// their own copy, so the (potentially expensive) hydration never runs while that mutex is held.
+    fn top_level_class_units_by_package_cell(&self) -> Option<TopLevelClassUnitsByPackageCell> {
         self.is_active()
-            .then(|| self.top_level_class_units_by_package.clone())
-            .flatten()
-    }
-
-    fn retain_top_level_class_units_by_package(
-        &mut self,
-        index: &Arc<HashMap<String, Vec<CodeUnit>>>,
-    ) {
-        if self.is_active() {
-            self.top_level_class_units_by_package = Some(Arc::clone(index));
-        }
+            .then(|| Arc::clone(&self.top_level_class_units_by_package))
     }
 
     fn prepared_syntax_cell(
@@ -4102,9 +4103,74 @@ where
             )
             .map_err(|error| error.context("querying path-backed definition candidates"))?;
         let snapshot = self.live_snapshot();
+        Ok(self.decode_path_symbol_rows(fq_name, normalized, rows, &snapshot))
+    }
+
+    /// Batched sibling of `forward_path_module_fqn`/`sql_path_symbol_units`: resolves every FQN's
+    /// path-symbol rows in one store transaction instead of one per FQN. Row decoding (live-snapshot
+    /// filtering, dirty-row merge, sort+dedup) is unchanged, just run once per FQN against a shared
+    /// snapshot instead of re-fetching it per call.
+    ///
+    /// A whole-batch error (can't open the transaction) still returns `None` for every FQN, matching
+    /// `forward_path_module_fqn`'s single-item error behavior. A per-FQN error (caught once inside the
+    /// shared transaction) returns `None` for only that FQN -- the sibling FQNs in the same batch that
+    /// resolved successfully keep their results instead of being discarded by a shared failure.
+    pub(crate) fn forward_path_module_fqns_batch(
+        &self,
+        fq_names: &[String],
+    ) -> Vec<Option<Vec<CodeUnit>>> {
+        if !self.adapter.has_path_synthetic_module_units() {
+            return fq_names.iter().map(|_| Some(Vec::new())).collect();
+        }
+        let pairs: Vec<(String, String)> = fq_names
+            .iter()
+            .map(|fq_name| (fq_name.clone(), self.adapter.normalize_full_name(fq_name)))
+            .collect();
+        match self
+            .store_context
+            .store
+            .path_symbol_rows_by_fqns_for_langs_batch(
+                &self.storage_language_keys_for_queries(),
+                self.store_context.generations.as_ref(),
+                &pairs,
+            ) {
+            Ok(rows_per_fqn) => {
+                let snapshot = self.live_snapshot();
+                pairs
+                    .iter()
+                    .zip(rows_per_fqn)
+                    .map(|((fq_name, normalized), rows)| match rows {
+                        Ok(rows) => {
+                            Some(self.decode_path_symbol_rows(fq_name, normalized, rows, &snapshot))
+                        }
+                        Err(error) => {
+                            self.record_store_error(
+                                error.context("querying path-backed definition candidates"),
+                            );
+                            None
+                        }
+                    })
+                    .collect()
+            }
+            Err(error) => {
+                self.record_store_error(
+                    error.context("querying path-backed definition candidates (batch)"),
+                );
+                fq_names.iter().map(|_| None).collect()
+            }
+        }
+    }
+
+    fn decode_path_symbol_rows(
+        &self,
+        fq_name: &str,
+        normalized: &str,
+        rows: Vec<(String, PathSymbolRow)>,
+        snapshot: &LiveSnapshot,
+    ) -> Vec<CodeUnit> {
         let mut units = Vec::with_capacity(rows.len());
         for (lang, row) in rows {
-            if let Some(unit) = self.live_path_symbol_unit(&lang, &row, &snapshot)
+            if let Some(unit) = self.live_path_symbol_unit(&lang, &row, snapshot)
                 && (unit.fq_name() == fq_name
                     || self.adapter.normalize_full_name(&unit.fq_name()) == normalized)
             {
@@ -4118,7 +4184,7 @@ where
             .expect("dirty path-symbol mutex poisoned")
             .values()
         {
-            if let Some(unit) = self.live_path_symbol_unit(lang, row, &snapshot)
+            if let Some(unit) = self.live_path_symbol_unit(lang, row, snapshot)
                 && (unit.fq_name() == fq_name
                     || self.adapter.normalize_full_name(&unit.fq_name()) == normalized)
             {
@@ -4127,7 +4193,7 @@ where
         }
         units.sort_by_cached_key(|unit| self.definition_sort_key_for_unit(unit));
         units.dedup();
-        Ok(units)
+        units
     }
 
     fn live_path_symbol_unit(
@@ -6217,31 +6283,31 @@ where
     /// Without an active query scope there is nothing to retain the map against,
     /// so the single-package path runs exactly as before.
     fn persisted_top_level_classes_in_package(&self, package_name: &str) -> Vec<CodeUnit> {
-        if let Some(index) = self
+        let Some(cell) = self
             .query_read_cache_lock()
-            .top_level_class_units_by_package()
-        {
-            return index.get(package_name).cloned().unwrap_or_default();
-        }
-
-        let units = self.hydrated_persisted_top_level_classes(package_name);
-        if !self.query_read_cache_lock().is_active() {
-            return units
+            .top_level_class_units_by_package_cell()
+        else {
+            return self
+                .hydrated_persisted_top_level_classes(package_name)
                 .into_iter()
                 .filter(|unit| unit.package_name() == package_name)
                 .collect();
-        }
+        };
 
-        let mut index: HashMap<String, Vec<CodeUnit>> = HashMap::default();
-        for unit in units {
-            index
-                .entry(unit.package_name().to_string())
-                .or_default()
-                .push(unit);
-        }
-        let index = Arc::new(index);
-        self.query_read_cache_lock()
-            .retain_top_level_class_units_by_package(&index);
+        // `get_or_init` runs on this thread's own `Arc` handle, not while the coarse
+        // `query_read_cache` mutex is held, and guarantees the hydration below runs at most once
+        // even when many threads race here concurrently (#1194).
+        let index = cell.get_or_init(|| {
+            let units = self.hydrated_persisted_top_level_classes(package_name);
+            let mut index: HashMap<String, Vec<CodeUnit>> = HashMap::default();
+            for unit in units {
+                index
+                    .entry(unit.package_name().to_string())
+                    .or_default()
+                    .push(unit);
+            }
+            Arc::new(index)
+        });
         index.get(package_name).cloned().unwrap_or_default()
     }
 
