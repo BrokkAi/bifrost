@@ -15,7 +15,7 @@ This is deliberately the first extraction, not a new Cargo workspace. The curren
 - [x] (2026-07-28 20:10 SAST) Defined `CodeIntelligenceRuntime` and migrated the direct MCP and LSP RQL query/policy execution calls.
 - [x] (2026-07-28 20:35 SAST) Added direct runtime coverage and passed focused LSP and MCP regressions; passed `cargo fmt` and all-targets/all-features Clippy.
 - [x] (2026-07-28 20:40 SAST) Rebasing onto current `origin/master` completed without conflicts; local pre-PR review found no issues in the changed code.
-- [ ] Commit the completed validation record, push the branch, and open a ready-for-review pull request that fixes #1260.
+- [x] (2026-07-28 20:50 SAST) Pushed the branch and opened ready-for-review PR #1268, linked with `Fixes #1260`.
 
 ## Surprises & Discoveries
 
@@ -47,7 +47,7 @@ The first staged extraction is complete. `CodeIntelligenceRuntime` now owns type
 
 Observable behavior remains covered by the direct runtime integration suite (5 passed), the LSP unsaved-policy integration test (1 passed), and the full MCP integration suite (29 passed). Formatting and `cargo clippy --all-targets --all-features -- -D warnings` pass. The `bifrost-policy-checking` skill was not installed in this environment, so no skill-provided MCP policy gate was available.
 
-The remaining work for #1260 is deliberately future-facing: expand the runtime with more shared code-intelligence operations only when their host-specific orchestration is understood, then extract the proven module into a Cargo package. Do not move LSP overlays or MCP watcher ownership into that package.
+The remaining work for #1260 is deliberately future-facing: expand the runtime with more shared code-intelligence operations only when their host-specific orchestration is understood, then extract the proven module into a Cargo package. Do not move LSP overlays or MCP watcher ownership into that package. The implementation is proposed in PR #1268.
 
 ## Context and Orientation
 
@@ -168,3 +168,5 @@ Revision note (2026-07-28): created after source inspection. The plan explicitly
 Revision note (2026-07-28): issue #1260 was created and self-assigned before implementation continued. The first implementation slice routes the existing typed RQL query and policy calls through `CodeIntelligenceRuntime`; validation is still in progress.
 
 Revision note (2026-07-28): validation completed after a clean rebase onto current `origin/master`. The direct runtime, LSP, MCP, formatter, and all-feature Clippy checks passed; the plan records why no Cargo workspace split is included in this slice.
+
+Revision note (2026-07-28): PR #1268 was opened ready for review with `Fixes #1260`; this closes the execution milestone while leaving the issue's future extraction work explicitly scoped.
