@@ -44,6 +44,10 @@ use tests::detect_rust_test_assertion_smells;
 
 pub use graph_support::RustReferenceContext;
 use hierarchy::RustHierarchyIndex;
+pub use lexical_scope::{
+    reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
+    rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
+};
 use usage_index::RustUsageIndex;
 pub(crate) use usage_index::{RustBindingSeeds, RustReferenceNamespace};
 

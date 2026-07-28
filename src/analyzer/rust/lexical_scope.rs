@@ -1,18 +1,103 @@
 use crate::analyzer::ImportInfo;
 use crate::analyzer::usages::{ImportBinder, ImportBinding, ImportKind};
 use crate::hash::{HashMap, HashSet};
-use tree_sitter::{Node, Parser};
+use moka::sync::Cache;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use tree_sitter::{Node, Parser, Tree};
 
 use super::imports::{
     rust_import_body, rust_imports_from_use_declaration, split_rust_import_module_and_name,
 };
 
-pub(crate) fn parse_rust_tree(source: &str) -> Option<tree_sitter::Tree> {
+/// Source bytes retained by the shared Rust parse memo. Entries are weighed by
+/// their source length; the parsed trees they hold are several times larger, so
+/// keep this comfortably below the process's memory budget. 32 MiB covers every
+/// Rust file of a large workspace (Bifrost's own `src/` is ~20 MiB) in one pass.
+const RUST_TREE_CACHE_SOURCE_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
+
+static RUST_TREES: OnceLock<Cache<Arc<str>, Option<Tree>>> = OnceLock::new();
+static RUST_TREE_PARSES: AtomicUsize = AtomicUsize::new(0);
+static RUST_TREE_PARSE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+static RUST_TREE_PARSED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+fn rust_tree_cache() -> &'static Cache<Arc<str>, Option<Tree>> {
+    RUST_TREES.get_or_init(|| {
+        Cache::builder()
+            .max_capacity(RUST_TREE_CACHE_SOURCE_BUDGET_BYTES)
+            .weigher(|key: &Arc<str>, _value: &Option<Tree>| {
+                key.len().min(u32::MAX as usize) as u32
+            })
+            .build()
+    })
+}
+
+fn parse_rust_tree_uncached(source: &str) -> Option<Tree> {
+    RUST_TREE_PARSES.fetch_add(1, Ordering::Relaxed);
+    RUST_TREE_PARSED_BYTES.fetch_add(source.len(), Ordering::Relaxed);
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
         .ok()?;
     parser.parse(source, None)
+}
+
+/// Parse `source` as Rust, memoized on the exact source bytes.
+///
+/// This is a pure function of its argument, but the Rust usage and definition
+/// resolvers reach it once per *reference site* and once per *candidate
+/// declaration* — `rust_visible_import_resolution`, `lexical_package_at`, and
+/// every `is_rust_*_declaration` shape predicate re-parse the whole enclosing
+/// file each time they are asked a question about it. On a workspace-wide
+/// `scan_usages` that turned into hundreds of thousands of whole-file parses
+/// (issue #1219: ~20 minutes at 1200-1600% CPU on Bifrost's own tree, with
+/// tree-sitter parsing dominating every stack sample).
+///
+/// Memoizing here is observationally identical — the same source bytes always
+/// produce the same tree — and collapses that to one parse per distinct source.
+/// The key is the source text itself, so there is no hash-collision risk and no
+/// invalidation to get wrong: edited content is simply a different key, and the
+/// weighted cache ages stale entries out. `Tree::clone` is a refcount bump
+/// (`ts_tree_copy`), which is also tree-sitter's documented way to hand one
+/// parse to several threads.
+pub(crate) fn parse_rust_tree(source: &str) -> Option<Tree> {
+    RUST_TREE_PARSE_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    let cache = rust_tree_cache();
+    if let Some(cached) = cache.get(source) {
+        return cached;
+    }
+    let parsed = parse_rust_tree_uncached(source);
+    cache.insert(Arc::from(source), parsed.clone());
+    parsed
+}
+
+/// Number of Rust source texts actually handed to tree-sitter since the last
+/// reset — the complexity signal pinned by the issue #1219 regression tests.
+#[doc(hidden)]
+pub fn rust_tree_parse_count_for_test() -> usize {
+    RUST_TREE_PARSES.load(Ordering::Relaxed)
+}
+
+/// Number of `parse_rust_tree` calls since the last reset, cache hits included.
+#[doc(hidden)]
+pub fn rust_tree_parse_request_count_for_test() -> usize {
+    RUST_TREE_PARSE_REQUESTS.load(Ordering::Relaxed)
+}
+
+/// Source bytes actually handed to tree-sitter since the last reset. This is
+/// the load-bearing complexity signal: re-parsing a whole file per reference
+/// site and parsing one small token-tree fragment per reference site both grow
+/// the *call* count, but only the former grows the byte count with file size.
+#[doc(hidden)]
+pub fn rust_tree_parsed_bytes_for_test() -> usize {
+    RUST_TREE_PARSED_BYTES.load(Ordering::Relaxed)
+}
+
+#[doc(hidden)]
+pub fn reset_rust_tree_parse_counters_for_test() {
+    RUST_TREE_PARSES.store(0, Ordering::Relaxed);
+    RUST_TREE_PARSE_REQUESTS.store(0, Ordering::Relaxed);
+    RUST_TREE_PARSED_BYTES.store(0, Ordering::Relaxed);
 }
 
 pub(crate) fn insert_rust_import_binding(binder: &mut ImportBinder, import: &ImportInfo) {
