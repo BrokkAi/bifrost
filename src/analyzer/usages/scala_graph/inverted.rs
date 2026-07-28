@@ -680,6 +680,7 @@ impl ProjectTypes {
                     &visible_imports,
                     self,
                     false,
+                    &HashMap::default(),
                 );
                 let lexical_root = export
                     .owner_path
@@ -5413,7 +5414,33 @@ impl NameResolver {
         imports: &[crate::analyzer::ImportInfo],
         types: &ProjectTypes,
     ) -> Self {
-        Self::for_file_with_facts_impl(scala, source_file, package_prefixes, imports, types, true)
+        Self::for_file_with_package_context_and_owner_scopes(
+            scala,
+            source_file,
+            package_prefixes,
+            imports,
+            types,
+            &HashMap::default(),
+        )
+    }
+
+    fn for_file_with_package_context_and_owner_scopes(
+        scala: &ScalaAnalyzer,
+        source_file: Option<&ProjectFile>,
+        package_prefixes: &[String],
+        imports: &[crate::analyzer::ImportInfo],
+        types: &ProjectTypes,
+        import_owner_scopes: &HashMap<usize, Vec<String>>,
+    ) -> Self {
+        Self::for_file_with_facts_impl(
+            scala,
+            source_file,
+            package_prefixes,
+            imports,
+            types,
+            true,
+            import_owner_scopes,
+        )
     }
 
     fn for_type_hierarchy_file(
@@ -5618,6 +5645,7 @@ impl NameResolver {
                         &imports,
                         types,
                         false,
+                        &HashMap::default(),
                     )
                 }
                 None => Self::for_file_with_facts_impl(
@@ -5627,6 +5655,7 @@ impl NameResolver {
                     &[],
                     types,
                     false,
+                    &HashMap::default(),
                 ),
             },
             None => {
@@ -5644,6 +5673,7 @@ impl NameResolver {
                     &imports,
                     types,
                     false,
+                    &HashMap::default(),
                 )
             }
         }
@@ -5656,6 +5686,7 @@ impl NameResolver {
         imports: &[crate::analyzer::ImportInfo],
         types: &ProjectTypes,
         include_members: bool,
+        import_owner_scopes: &HashMap<usize, Vec<String>>,
     ) -> Self {
         let mut names = VisibleNameBindings::default();
         let mut object_names = VisibleNameBindings::default();
@@ -5736,19 +5767,15 @@ impl NameResolver {
             }
         }
 
-        // This whole-workspace resolver is constructed in a batch,
-        // bulk-projected path that must not point-hydrate a file's full
-        // declarations per wildcard import (see
-        // `scala_descendant_index_batches_file_hierarchy_facts_and_preserves_visibility`).
-        // `scala_enclosing_template_owner_fq_names` calls `ClassRangeIndex::build`,
-        // which does exactly that hydration, so this resolver keeps today's
-        // package-only wildcard qualification; only the request-scoped,
-        // single-file resolvers (`usages::get_definition::scala` and
-        // `scala::imports`) get the enclosing-owner enhancement.
         let wildcard_environment = resolve_scala_wildcard_import_environment(
             imports,
             active_package_prefixes,
-            |_declaration_start_byte| Vec::new(),
+            |declaration_start_byte| {
+                import_owner_scopes
+                    .get(&declaration_start_byte)
+                    .cloned()
+                    .unwrap_or_default()
+            },
             |candidate| ScalaWildcardOwnerFacts {
                 package: types.index.package_exists(candidate),
                 stable_singleton: types
@@ -5811,11 +5838,15 @@ impl NameResolver {
             // ambiguous earlier wildcard must not erase a later, independent
             // wildcard import; it only contributes no bindings of its own.
             for import in imports.iter().filter(|import| import.is_wildcard) {
-                // Same batch/no-hydration constraint as above.
                 let environment = resolve_scala_wildcard_import_environment(
                     std::slice::from_ref(import),
                     active_package_prefixes,
-                    |_declaration_start_byte| Vec::new(),
+                    |declaration_start_byte| {
+                        import_owner_scopes
+                            .get(&declaration_start_byte)
+                            .cloned()
+                            .unwrap_or_default()
+                    },
                     |candidate| ScalaWildcardOwnerFacts {
                         package: types.index.package_exists(candidate),
                         stable_singleton: types
@@ -6374,6 +6405,8 @@ where
                     &[],
                     &graph.types,
                 ));
+                let import_owner_scopes =
+                    scala_import_owner_scopes(&state.imports, &class_ranges, scala, &graph.types);
                 let mut ctx = ScalaScan {
                     scala,
                     source: parsed.source.as_str(),
@@ -6393,6 +6426,7 @@ where
                     resolver,
                     active_resolver_key: None,
                     resolver_contexts: HashMap::default(),
+                    import_owner_scopes,
                     types: &graph.types,
                     class_ranges,
                     sink: &mut sink,
@@ -6444,6 +6478,8 @@ pub(super) fn scan_scala_query_file(
         &[],
         &types,
     ));
+    let class_ranges = ClassRangeIndex::build(analyzer, file);
+    let import_owner_scopes = scala_import_owner_scopes(&imports, &class_ranges, scala, &types);
     let mut ctx = ScalaScan {
         scala,
         source,
@@ -6457,8 +6493,9 @@ pub(super) fn scan_scala_query_file(
         resolver,
         active_resolver_key: None,
         resolver_contexts: HashMap::default(),
+        import_owner_scopes,
         types: &types,
-        class_ranges: ClassRangeIndex::build(analyzer, file),
+        class_ranges,
         sink,
         cancellation,
     };
@@ -6481,6 +6518,7 @@ struct ScalaScan<'a, 'b> {
     resolver: Arc<NameResolver>,
     active_resolver_key: Option<(Vec<String>, Vec<usize>)>,
     resolver_contexts: HashMap<(Vec<String>, Vec<usize>), Arc<NameResolver>>,
+    import_owner_scopes: HashMap<usize, Vec<String>>,
     types: &'a ProjectTypes,
     class_ranges: ClassRangeIndex,
     sink: &'a mut dyn ScalaReferenceSink,
@@ -6516,13 +6554,16 @@ impl ScalaScan<'_, '_> {
             .iter()
             .filter_map(|index| self.imports.get(*index).cloned())
             .collect::<Vec<_>>();
-        let resolver = Arc::new(NameResolver::for_file_with_package_context(
-            self.scala,
-            Some(self.source_file),
-            &key.0,
-            &imports,
-            self.types,
-        ));
+        let resolver = Arc::new(
+            NameResolver::for_file_with_package_context_and_owner_scopes(
+                self.scala,
+                Some(self.source_file),
+                &key.0,
+                &imports,
+                self.types,
+                &self.import_owner_scopes,
+            ),
+        );
         self.resolver_contexts.insert(key.clone(), resolver.clone());
         self.resolver = resolver;
         self.active_package = key.0.last().cloned().unwrap_or_default();
@@ -7012,6 +7053,36 @@ impl ScalaScan<'_, '_> {
         self.sink
             .record_unproven_name(name, node.start_byte(), node.end_byte());
     }
+}
+
+fn scala_import_owner_scopes(
+    imports: &[crate::analyzer::ImportInfo],
+    class_ranges: &ClassRangeIndex,
+    scala: &ScalaAnalyzer,
+    types: &ProjectTypes,
+) -> HashMap<usize, Vec<String>> {
+    let mut scopes = HashMap::default();
+    for import in imports {
+        let Some(path) = import.path.as_ref() else {
+            continue;
+        };
+        let mut owners = Vec::new();
+        let mut current = class_ranges
+            .enclosing_unit(path.declaration_start_byte)
+            .cloned();
+        let mut seen = HashSet::default();
+        while let Some(owner) = current {
+            if !seen.insert(owner.clone()) {
+                break;
+            }
+            current = types.exact_structural_parent(scala, &owner);
+            if owner.is_class() {
+                owners.push(owner.fq_name());
+            }
+        }
+        scopes.insert(path.declaration_start_byte, owners);
+    }
+    scopes
 }
 
 const SCOPE_NODES: &[&str] = &[

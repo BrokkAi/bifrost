@@ -2120,6 +2120,97 @@ class Consumer {
 }
 
 #[test]
+fn scala_inverted_graph_resolves_nested_wildcard_imported_members_in_scala2_and_3() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "other/Imported.scala",
+            r#"package other
+object Imported {
+  def register(value: Int): Int = value + 1
+  val OK: String = "other"
+}
+"#,
+        )
+        .file(
+            "app/Scala2.scala",
+            r#"package app
+object Status2 {
+  import Registry._
+  def call(): Int = register(1)
+  def field: String = OK
+  object Inner {
+    import Registry._
+    def nested: String = OK
+  }
+  def ambiguous(): Int = {
+    import other.Imported._
+    register(2)
+  }
+  def unindexed: String = {
+    import cats.syntax.all._
+    OK
+  }
+  private object Registry {
+    def register(value: Int): Int = value
+    val OK: String = "scala2"
+  }
+}
+"#,
+        )
+        .file(
+            "app/Scala3.scala",
+            r#"package app
+object Status3:
+  import Registry.*
+  def call(): Int = register(3)
+  def field: String = OK
+  object Inner:
+    import Registry.*
+    def nested: String = OK
+  def ambiguous(): Int =
+    import other.Imported.*
+    register(4)
+  def unindexed: String =
+    import cats.syntax.all.*
+    OK
+  private object Registry:
+    def register(value: Int): Int = value
+    val OK: String = "scala3"
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+
+    for (caller, callee) in [
+        ("app.Status2$.call", "app.Status2$.Registry$.register"),
+        ("app.Status3$.call", "app.Status3$.Registry$.register"),
+    ] {
+        assert!(
+            has_edge(&value, caller, callee),
+            "expected {caller} -> {callee}: {}",
+            value["edges"]
+        );
+    }
+    for caller in [
+        "app.Status2$.ambiguous",
+        "app.Status2$.unindexed",
+        "app.Status3$.ambiguous",
+        "app.Status3$.unindexed",
+    ] {
+        for callee in [
+            "app.Status2$.Registry$.register",
+            "app.Status3$.Registry$.register",
+        ] {
+            assert!(
+                !has_edge(&value, caller, callee),
+                "unexpected {caller} -> {callee}: {}",
+                value["edges"]
+            );
+        }
+    }
+}
+
+#[test]
 fn scala_inverted_uses_parser_active_enclosing_package_for_constructors() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

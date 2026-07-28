@@ -4608,6 +4608,112 @@ object Owner {
 }
 
 #[test]
+fn scala_nested_wildcard_member_imports_use_enclosing_owner_roots_in_scala2_and_3() {
+    let scala2_source = r#"package app
+object Status2 {
+  import Registry._
+  def call(): Int = register(1) // positive-scala2-call
+  def field: String = OK // positive-scala2-field
+  object Inner {
+    import Registry._
+    def nested: String = OK // positive-scala2-nested
+  }
+  def ambiguous(): Int = {
+    import other.Imported._
+    register(2) // negative-scala2-ambiguous
+  }
+  def unindexed: String = {
+    import cats.syntax.all._
+    OK // negative-scala2-unindexed
+  }
+  private object Registry {
+    def register(value: Int): Int = value
+    val OK: String = "scala2"
+  }
+}
+"#;
+    let scala3_source = r#"package app
+object Status3:
+  import Registry.*
+  def call(): Int = register(3) // positive-scala3-call
+  def field: String = OK // positive-scala3-field
+  object Inner:
+    import Registry.*
+    def nested: String = OK // positive-scala3-nested
+  def ambiguous(): Int =
+    import other.Imported.*
+    register(4) // negative-scala3-ambiguous
+  def unindexed: String =
+    import cats.syntax.all.*
+    OK // negative-scala3-unindexed
+  private object Registry:
+    def register(value: Int): Int = value
+    val OK: String = "scala3"
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "other/Imported.scala",
+            r#"package other
+object Imported {
+  def register(value: Int): Int = value + 1
+  val OK: String = "other"
+}
+"#,
+        ),
+        ("app/Scala2.scala", scala2_source),
+        ("app/Scala3.scala", scala3_source),
+    ]);
+
+    let scala2_register = definition(&analyzer, "app.Status2$.Registry$.register");
+    let scala2_register_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&scala2_register)),
+    );
+    assert_hit_line(
+        &scala2_register_hits,
+        line_of(scala2_source, "positive-scala2-call"),
+    );
+    assert_no_hit_line(
+        &scala2_register_hits,
+        line_of(scala2_source, "negative-scala2-ambiguous"),
+    );
+    assert_no_hit_line(
+        &scala2_register_hits,
+        line_of(scala2_source, "negative-scala2-unindexed"),
+    );
+
+    let scala3_register = definition(&analyzer, "app.Status3$.Registry$.register");
+    let scala3_register_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&scala3_register)),
+    );
+    assert_hit_line(
+        &scala3_register_hits,
+        line_of(scala3_source, "positive-scala3-call"),
+    );
+    assert_no_hit_line(
+        &scala3_register_hits,
+        line_of(scala3_source, "negative-scala3-ambiguous"),
+    );
+    assert_no_hit_line(
+        &scala3_register_hits,
+        line_of(scala3_source, "negative-scala3-unindexed"),
+    );
+
+    let scala2_ok = definition(&analyzer, "app.Status2$.Registry$.OK");
+    let scala2_ok_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&scala2_ok)));
+    for marker in ["positive-scala2-field", "positive-scala2-nested"] {
+        assert_hit_line(&scala2_ok_hits, line_of(scala2_source, marker));
+    }
+
+    let scala3_ok = definition(&analyzer, "app.Status3$.Registry$.OK");
+    let scala3_ok_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&scala3_ok)));
+    for marker in ["positive-scala3-field", "positive-scala3-nested"] {
+        assert_hit_line(&scala3_ok_hits, line_of(scala3_source, marker));
+    }
+}
+
+#[test]
 fn scala_local_stable_member_imports_preserve_exact_owner_aliases_and_fail_closed() {
     let consumer_source = r#"package app
 import decoy.Imported.selfAddress
