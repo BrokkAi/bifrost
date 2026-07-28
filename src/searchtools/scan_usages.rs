@@ -1,6 +1,7 @@
 use super::selectors::*;
 use super::*;
 use crate::cancellation::CancellationToken;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanUsagesByReferenceParams {
@@ -176,6 +177,7 @@ impl ScanUsagesAbsenceCaveat {
 #[serde(rename_all = "snake_case")]
 pub enum ScanUsagesIncompleteReason {
     Cancelled,
+    TimeBudget,
     CandidateFiles,
     SourceBytes,
     Callsites,
@@ -667,11 +669,24 @@ pub(crate) struct ScanUsagesExecutionContext {
     max_callsites: usize,
 }
 
+// Leave two seconds of the five-second product envelope for cooperative
+// shutdown, rendering, response delivery, and short non-interruptible cache
+// lookups that may already be in flight when the deadline is observed.
+const SCAN_USAGES_MAX_DURATION: Duration = Duration::from_secs(3);
+
 impl ScanUsagesExecutionContext {
     pub(crate) fn with_cancellation(cancellation: CancellationToken) -> Self {
         Self {
-            cancellation,
+            cancellation: cancellation.with_timeout(SCAN_USAGES_MAX_DURATION),
             ..Self::default()
+        }
+    }
+
+    fn interruption_reason(&self) -> ScanUsagesIncompleteReason {
+        if self.cancellation.is_timed_out() {
+            ScanUsagesIncompleteReason::TimeBudget
+        } else {
+            ScanUsagesIncompleteReason::Cancelled
         }
     }
 
@@ -696,7 +711,7 @@ impl ScanUsagesExecutionContext {
 impl Default for ScanUsagesExecutionContext {
     fn default() -> Self {
         Self {
-            cancellation: CancellationToken::default(),
+            cancellation: CancellationToken::default().with_timeout(SCAN_USAGES_MAX_DURATION),
             max_candidate_files: DEFAULT_MAX_FILES,
             max_path_scoped_candidate_files: SCAN_USAGES_PATH_SCOPED_MAX_FILES,
             max_source_bytes: SCAN_USAGES_MAX_SOURCE_BYTES,
@@ -757,10 +772,13 @@ impl ScanUsagesWorkEntry {
     }
 }
 
-fn query_incomplete_reason(completion: UsageQueryCompletion) -> Option<ScanUsagesIncompleteReason> {
+fn query_incomplete_reason(
+    completion: UsageQueryCompletion,
+    interruption_reason: ScanUsagesIncompleteReason,
+) -> Option<ScanUsagesIncompleteReason> {
     match completion {
         UsageQueryCompletion::Complete => None,
-        UsageQueryCompletion::Cancelled => Some(ScanUsagesIncompleteReason::Cancelled),
+        UsageQueryCompletion::Cancelled => Some(interruption_reason),
         UsageQueryCompletion::CandidateFilesBudgetExhausted => {
             Some(ScanUsagesIncompleteReason::CandidateFiles)
         }
@@ -778,6 +796,9 @@ fn incomplete_work_entry(
     let message = match reason {
         ScanUsagesIncompleteReason::Cancelled => {
             "usage analysis was cancelled before it could produce a complete answer".to_string()
+        }
+        ScanUsagesIncompleteReason::TimeBudget => {
+            "usage analysis exhausted its wall-clock time budget".to_string()
         }
         ScanUsagesIncompleteReason::CandidateFiles => {
             "usage analysis exhausted its candidate-file budget".to_string()
@@ -1106,6 +1127,7 @@ pub(super) fn resolve_scan_usages_target(
             .filter_map(|unit| {
                 let selector_matches = selector.is_some_and(|symbol| {
                     unit.fq_name() == symbol
+                        || unit.short_name() == symbol
                         || definition_selector(&unit) == symbol
                         || display_symbol_for_target(&unit) == symbol
                 });
@@ -1527,8 +1549,7 @@ pub(super) fn scan_usages_backend(
 
     let query_scope = ScanUsagesQueryScope::new(analyzer, paths, include_tests);
     if context.cancellation.is_cancelled() {
-        let mut entries =
-            incomplete_requests(symbols, targets, ScanUsagesIncompleteReason::Cancelled);
+        let mut entries = incomplete_requests(symbols, targets, context.interruption_reason());
         entries.sort_by_key(ScanUsagesWorkEntry::index);
         return render_scan_usages_with_budget(entries, query_scope.result_scope(), surface);
     }
@@ -1554,24 +1575,21 @@ pub(super) fn scan_usages_backend(
     });
 
     if context.cancellation.is_cancelled() {
-        let mut entries =
-            incomplete_requests(symbols, targets, ScanUsagesIncompleteReason::Cancelled);
+        let mut entries = incomplete_requests(symbols, targets, context.interruption_reason());
         entries.sort_by_key(ScanUsagesWorkEntry::index);
         return render_scan_usages_with_budget(entries, query_scope.result_scope(), surface);
     }
 
     let test_files = excluded_test_files(analyzer, include_tests);
     if context.cancellation.is_cancelled() {
-        let mut entries =
-            incomplete_requests(symbols, targets, ScanUsagesIncompleteReason::Cancelled);
+        let mut entries = incomplete_requests(symbols, targets, context.interruption_reason());
         entries.sort_by_key(ScanUsagesWorkEntry::index);
         return render_scan_usages_with_budget(entries, query_scope.result_scope(), surface);
     }
     let reference_only_sibling_extensions =
         present_reference_only_sibling_extensions_by_language(analyzer);
     if context.cancellation.is_cancelled() {
-        let mut entries =
-            incomplete_requests(symbols, targets, ScanUsagesIncompleteReason::Cancelled);
+        let mut entries = incomplete_requests(symbols, targets, context.interruption_reason());
         entries.sort_by_key(ScanUsagesWorkEntry::index);
         return render_scan_usages_with_budget(entries, query_scope.result_scope(), surface);
     }
@@ -1585,7 +1603,7 @@ pub(super) fn scan_usages_backend(
             work_entries.push(incomplete_work_entry(
                 request,
                 None,
-                ScanUsagesIncompleteReason::Cancelled,
+                context.interruption_reason(),
             ));
             continue;
         }
@@ -1601,7 +1619,7 @@ pub(super) fn scan_usages_backend(
             work_entries.push(incomplete_work_entry(
                 request,
                 None,
-                ScanUsagesIncompleteReason::Cancelled,
+                context.interruption_reason(),
             ));
             continue;
         }
@@ -1640,7 +1658,7 @@ pub(super) fn scan_usages_backend(
             work_entries.push(incomplete_work_entry(
                 request,
                 Some(symbol),
-                ScanUsagesIncompleteReason::Cancelled,
+                context.interruption_reason(),
             ));
             continue;
         }
@@ -1666,7 +1684,7 @@ pub(super) fn scan_usages_backend(
             work_entries.push(incomplete_work_entry(
                 request,
                 Some(symbol),
-                ScanUsagesIncompleteReason::Cancelled,
+                context.interruption_reason(),
             ));
             continue;
         }
@@ -1767,7 +1785,7 @@ pub(super) fn scan_usages_backend(
             work_entries.push(incomplete_work_entry(
                 request,
                 Some(symbol),
-                ScanUsagesIncompleteReason::Cancelled,
+                context.interruption_reason(),
             ));
             continue;
         }
@@ -1792,12 +1810,21 @@ pub(super) fn scan_usages_backend(
             context.max_callsites,
             Some(context.max_source_bytes),
         );
-        let incomplete_reason = query_incomplete_reason(query.completion);
-        if incomplete_reason == Some(ScanUsagesIncompleteReason::Cancelled) {
+        let interrupted = context.cancellation.is_cancelled();
+        let interruption_reason = context.interruption_reason();
+        let incomplete_reason = if interrupted {
+            Some(interruption_reason)
+        } else {
+            query_incomplete_reason(query.completion, interruption_reason)
+        };
+        if matches!(
+            incomplete_reason,
+            Some(ScanUsagesIncompleteReason::Cancelled | ScanUsagesIncompleteReason::TimeBudget)
+        ) {
             work_entries.push(incomplete_work_entry(
                 request,
                 Some(symbol),
-                ScanUsagesIncompleteReason::Cancelled,
+                incomplete_reason.expect("interruption reason is present"),
             ));
             continue;
         }
@@ -2922,6 +2949,7 @@ pub(super) fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsa
             result.reason_kind = Some(
                 match reason {
                     ScanUsagesIncompleteReason::Cancelled => "cancelled",
+                    ScanUsagesIncompleteReason::TimeBudget => "time_budget",
                     ScanUsagesIncompleteReason::CandidateFiles => "candidate_files_budget",
                     ScanUsagesIncompleteReason::SourceBytes => "source_bytes_budget",
                     ScanUsagesIncompleteReason::Callsites => "callsites_budget",

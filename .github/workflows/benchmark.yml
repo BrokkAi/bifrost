@@ -373,3 +373,91 @@ jobs:
             echo "benchmark compare reported regressions in strict mode" >&2
             exit 1
           fi
+
+  interactive-latency:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: interactive-latency-release
+
+      - name: Cache benchmark repo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: benchmark/.cache/repos
+          key: interactive-latency-repo-${{ runner.os }}-${{ hashFiles('benchmark/interactive-latency.toml') }}
+          restore-keys: |
+            interactive-latency-repo-${{ runner.os }}-
+
+      - name: Build release benchmark binaries
+        run: cargo build --release --locked --bin bifrost --bin bifrost_benchmark
+
+      - name: Validate interactive latency manifest
+        run: ./target/release/bifrost_benchmark validate --manifest benchmark/interactive-latency.toml
+
+      - name: Run interactive latency gate
+        id: run_interactive_latency
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIFROST_BENCHMARK_BIFROST_BIN=./target/release/bifrost \
+            ./target/release/bifrost_benchmark run \
+              --manifest benchmark/interactive-latency.toml \
+              --output interactive-latency-output \
+              --profile
+
+      - name: Upload interactive latency artifacts
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: interactive-latency-${{ github.run_id }}
+          path: benchmark/interactive-latency-output
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Publish interactive latency summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_path=""
+          if compgen -G "benchmark/interactive-latency-output/run-*.json" > /dev/null; then
+            report_path="$(ls -t benchmark/interactive-latency-output/run-*.json | head -n1)"
+          fi
+          {
+            echo "# Interactive Code-Intelligence Latency"
+            echo
+            echo "- Release-mode gate: ${{ steps.run_interactive_latency.outcome }}"
+            if [ -n "$report_path" ]; then
+              echo "- Report: \`$report_path\`"
+              echo
+              echo "| Case | p50 | p95 | Budget | Bounded incomplete | Status |"
+              echo "| --- | ---: | ---: | ---: | ---: | --- |"
+              jq -r '.repos[].scenarios[] | "| \(.name)/\(.case_id // \"default\") | \((.p50_ms // 0) | tostring) ms | \((.p95_ms // 0) | tostring) ms | \((.latency_budget_ms // 0) | tostring) ms | \(.bounded_incomplete_iterations // 0) | \(if .success then \"ok\" else \"failed\" end) |"' "$report_path"
+            else
+              echo "- Report: none written"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce interactive latency outcome
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.run_interactive_latency.outcome }}" != "success" ]; then
+            echo "interactive latency gate failed" >&2
+            exit 1
+          fi

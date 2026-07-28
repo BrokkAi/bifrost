@@ -1,5 +1,5 @@
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -7,7 +7,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::mcp_common::{
     BENCHMARK_PROFILE_BOUNDARY_MARKER, BENCHMARK_PROFILE_BOUNDARY_METHOD, MCP_FILE_WATCHER_ENV,
@@ -269,6 +269,17 @@ pub struct McpSession {
     stdout: StdoutDrain,
     stderr: StderrDrain,
     next_id: u64,
+    buffered_responses: HashMap<String, Value>,
+    pending_tools: HashMap<u64, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct McpRequestId(u64);
+
+impl McpRequestId {
+    pub fn get(self) -> u64 {
+        self.0
+    }
 }
 
 struct StdoutDrain {
@@ -318,10 +329,6 @@ impl StdoutDrain {
         })
     }
 
-    fn receive(&self, timeout: Duration) -> Result<Value, String> {
-        receive_response(&self.responses, timeout)
-    }
-
     fn join(&mut self) {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -343,6 +350,47 @@ fn receive_response(
             Err("bifrost MCP stdout reader stopped early".to_string())
         }
     }
+}
+
+fn receive_response_for_id(
+    responses: &Receiver<Result<Value, String>>,
+    buffered: &mut HashMap<String, Value>,
+    id: &Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let requested_key = response_id_key(id)?;
+    if let Some(response) = buffered.remove(&requested_key) {
+        return Ok(response);
+    }
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "timed out after {}s waiting for bifrost MCP response id {id}",
+                timeout.as_secs_f64()
+            ));
+        }
+        let response = receive_response(responses, remaining)?;
+        let response_id = response
+            .get("id")
+            .ok_or_else(|| format!("bifrost MCP response is missing id: {response}"))?;
+        let response_key = response_id_key(response_id)?;
+        if response_key == requested_key {
+            return Ok(response);
+        }
+        if buffered.insert(response_key, response).is_some() {
+            return Err("bifrost MCP server returned a duplicate response id".to_string());
+        }
+    }
+}
+
+fn response_id_key(id: &Value) -> Result<String, String> {
+    if !id.is_string() && !id.is_number() && !id.is_null() {
+        return Err(format!("invalid JSON-RPC response id: {id}"));
+    }
+    serde_json::to_string(id).map_err(|error| format!("failed to encode response id: {error}"))
 }
 
 impl McpSession {
@@ -446,6 +494,8 @@ impl McpSession {
             stdout,
             stderr,
             next_id: 1,
+            buffered_responses: HashMap::new(),
+            pending_tools: HashMap::new(),
         })
     }
 
@@ -475,16 +525,41 @@ impl McpSession {
     }
 
     pub fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value, String> {
-        let id = self.take_id();
-        let response = self.request(json!({
+        let id = self.send_tool_call(name, arguments)?;
+        self.receive_tool_response(id)
+    }
+
+    pub fn send_tool_call(&mut self, name: &str, arguments: Value) -> Result<McpRequestId, String> {
+        let id = McpRequestId(self.take_id());
+        self.write_line(&json!({
             "jsonrpc": "2.0",
-            "id": id,
+            "id": id.get(),
             "method": "tools/call",
             "params": {
                 "name": name,
                 "arguments": arguments
             }
         }))?;
+        self.pending_tools.insert(id.get(), name.to_string());
+        Ok(id)
+    }
+
+    pub fn cancel_request(&mut self, id: McpRequestId) -> Result<(), String> {
+        self.notify(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": id.get() }
+        }))
+    }
+
+    pub fn receive_tool_response(&mut self, id: McpRequestId) -> Result<Value, String> {
+        let name = self
+            .pending_tools
+            .get(&id.get())
+            .cloned()
+            .ok_or_else(|| format!("no pending MCP tool request with id {}", id.get()))?;
+        let response = self.receive_response_for_id(&json!(id.get()))?;
+        self.pending_tools.remove(&id.get());
 
         if let Some(error) = response.get("error") {
             return Err(format!("bifrost MCP request failed for `{name}`: {error}"));
@@ -540,8 +615,21 @@ impl McpSession {
     }
 
     fn request(&mut self, payload: Value) -> Result<Value, String> {
+        let id = payload
+            .get("id")
+            .cloned()
+            .ok_or_else(|| "MCP request payload is missing id".to_string())?;
         self.write_line(&payload)?;
-        match self.stdout.receive(MCP_RESPONSE_TIMEOUT) {
+        self.receive_response_for_id(&id)
+    }
+
+    fn receive_response_for_id(&mut self, id: &Value) -> Result<Value, String> {
+        match receive_response_for_id(
+            &self.stdout.responses,
+            &mut self.buffered_responses,
+            id,
+            MCP_RESPONSE_TIMEOUT,
+        ) {
             Ok(response) => Ok(response),
             Err(error) => {
                 self.shutdown();
@@ -763,6 +851,30 @@ mod tests {
             .expect_err("silent child must time out");
 
         assert!(error.contains("timed out"), "{error}");
+    }
+
+    #[test]
+    fn issue_1228_response_router_matches_out_of_order_request_ids() {
+        let (sender, responses) = mpsc::channel();
+        sender
+            .send(Ok(json!({"jsonrpc": "2.0", "id": 2, "result": "light"})))
+            .unwrap();
+        sender
+            .send(Ok(json!({"jsonrpc": "2.0", "id": 1, "result": "heavy"})))
+            .unwrap();
+        let mut buffered = HashMap::new();
+
+        let heavy =
+            receive_response_for_id(&responses, &mut buffered, &json!(1), Duration::from_secs(1))
+                .unwrap();
+        assert_eq!(heavy["result"], "heavy");
+        assert_eq!(buffered.len(), 1);
+
+        let light =
+            receive_response_for_id(&responses, &mut buffered, &json!(2), Duration::from_secs(1))
+                .unwrap();
+        assert_eq!(light["result"], "light");
+        assert!(buffered.is_empty());
     }
 
     #[test]

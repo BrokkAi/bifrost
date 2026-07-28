@@ -152,7 +152,13 @@ pub(super) fn scan_files_for_target(
 
         let line_starts = prepared.line_starts();
         let lexical_scope = RustLexicalScopeIndex::new(tree.root_node(), source);
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
         let refs = rust.reference_context_of(file);
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
         let (mut direct_names, _) = match seeds {
             Some(seeds) => rust.usage_binding_names(file, seeds),
             None => (HashSet::default(), HashSet::default()),
@@ -166,6 +172,9 @@ pub(super) fn scan_files_for_target(
                 direct_names.insert(identity.name().to_string());
             }
             direct_names.extend(refs.bare_names_resolving_to(&target_fqn));
+        }
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
         }
         let mut local_hits = BTreeSet::new();
         let mut ctx = ScanCtx {
@@ -185,10 +194,18 @@ pub(super) fn scan_files_for_target(
             direct_names: &direct_names,
             lexical_scope: &lexical_scope,
             token_tree_roles: RustTokenTreeRoleCache::default(),
+            cancellation,
+            cancellation_checks_remaining: 0,
             hits: &mut local_hits,
         };
         scan_node(tree.root_node(), &mut ctx);
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
         record_module_qualified_hits(tree.root_node(), &mut ctx);
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
 
         if !local_hits.is_empty() {
             let mut sink = hits.lock().expect("poisoned Rust graph collector");
@@ -216,10 +233,22 @@ pub(super) struct ScanCtx<'a> {
     direct_names: &'a HashSet<String>,
     lexical_scope: &'a RustLexicalScopeIndex,
     token_tree_roles: RustTokenTreeRoleCache,
+    pub(super) cancellation: Option<&'a CancellationToken>,
+    cancellation_checks_remaining: usize,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
 }
 
 impl ScanCtx<'_> {
+    pub(super) fn cancellation_requested(&mut self) -> bool {
+        if self.cancellation_checks_remaining > 0 {
+            self.cancellation_checks_remaining -= 1;
+            return false;
+        }
+        self.cancellation_checks_remaining = 255;
+        self.cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+    }
+
     pub(super) fn target_identifier(&self) -> &str {
         self.target.identifier()
     }
@@ -395,6 +424,9 @@ fn scan_node(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
         root,
         ctx,
         |node, ctx| {
+            if ctx.cancellation_requested() {
+                return TreeWalkAction::Stop;
+            }
             match node.kind() {
                 "use_declaration" => {
                     record_use_import_hits(node, ctx);
@@ -676,7 +708,13 @@ pub(super) fn scan_files_for_member_target(
         }
         let line_starts = prepared.line_starts();
         let lexical_scope_index = RustLexicalScopeIndex::new(tree.root_node(), source);
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
         let refs = rust.reference_context_of(file);
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
         let mut owner_local_names: HashSet<String> = if file == target.source() {
             [owner.identifier().to_string()].into_iter().collect()
         } else {
@@ -689,6 +727,9 @@ pub(super) fn scan_files_for_member_target(
         } else {
             owner_local_names.clone()
         };
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
         if owner_local_names.is_empty()
             && receiver_type_names.is_empty()
             && !source.contains(&member_name)
@@ -712,6 +753,9 @@ pub(super) fn scan_files_for_member_target(
             file,
             &owner,
         ));
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
         receiver_names.sort();
         receiver_names.dedup();
         let static_owner_names = owner_local_names;
@@ -757,10 +801,15 @@ pub(super) fn scan_files_for_member_target(
             record_unproven_receivers,
             type_lookup_cache: &mut type_lookup_cache,
             token_tree_roles: RustTokenTreeRoleCache::default(),
+            cancellation,
+            cancellation_checks_remaining: 0,
             hits: &mut local_hits,
             unproven_hits: &mut local_unproven_hits,
         };
         scan_member_node(tree.root_node(), &mut ctx);
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
 
         if !local_hits.is_empty() {
             let mut sink = hits.lock().expect("poisoned Rust member collector");
@@ -812,44 +861,62 @@ struct MemberScanCtx<'a> {
     record_unproven_receivers: bool,
     type_lookup_cache: &'a mut RustTypeLookupCache,
     token_tree_roles: RustTokenTreeRoleCache,
+    cancellation: Option<&'a CancellationToken>,
+    cancellation_checks_remaining: usize,
     hits: &'a mut BTreeSet<UsageHit>,
     unproven_hits: &'a mut BTreeSet<UsageHit>,
 }
 
-fn scan_member_node(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
-    match node.kind() {
-        "field_expression" => record_instance_member_hit(node, ctx),
-        "token_tree" => {
-            record_token_tree_instance_member_hits(node, ctx);
-            record_token_tree_static_member_hits(node, ctx);
-        }
-        "scoped_identifier" | "scoped_type_identifier" => record_static_member_hit(node, ctx),
-        "type_binding" | "associated_type_binding"
-            if ctx.target_is_field && ctx.target_owner_is_trait =>
-        {
-            record_associated_type_binding_hit(node, ctx)
-        }
-        "tuple_struct_pattern" if ctx.target_is_enum_variant => {
-            record_tuple_variant_pattern_hit(node, ctx)
-        }
-        "identifier"
-            if ctx.target_is_pattern_value
-                && node
-                    .parent()
-                    .is_some_and(|parent| parent.kind() == "token_tree") =>
-        {
-            record_bare_token_tree_variant_pattern_hit(node, ctx)
-        }
-        "struct_expression" | "struct_pattern" if ctx.target_is_field => {
-            record_struct_field_hits(node, ctx)
-        }
-        _ => {}
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        scan_member_node(child, ctx);
-    }
+fn scan_member_node(root: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+    walk_tree_iterative(
+        root,
+        ctx,
+        |node, ctx| {
+            if ctx.cancellation_checks_remaining > 0 {
+                ctx.cancellation_checks_remaining -= 1;
+            } else {
+                ctx.cancellation_checks_remaining = 255;
+                if ctx
+                    .cancellation
+                    .is_some_and(CancellationToken::is_cancelled)
+                {
+                    return TreeWalkAction::Stop;
+                }
+            }
+            match node.kind() {
+                "field_expression" => record_instance_member_hit(node, ctx),
+                "token_tree" => {
+                    record_token_tree_instance_member_hits(node, ctx);
+                    record_token_tree_static_member_hits(node, ctx);
+                }
+                "scoped_identifier" | "scoped_type_identifier" => {
+                    record_static_member_hit(node, ctx)
+                }
+                "type_binding" | "associated_type_binding"
+                    if ctx.target_is_field && ctx.target_owner_is_trait =>
+                {
+                    record_associated_type_binding_hit(node, ctx)
+                }
+                "tuple_struct_pattern" if ctx.target_is_enum_variant => {
+                    record_tuple_variant_pattern_hit(node, ctx)
+                }
+                "identifier"
+                    if ctx.target_is_pattern_value
+                        && node
+                            .parent()
+                            .is_some_and(|parent| parent.kind() == "token_tree") =>
+                {
+                    record_bare_token_tree_variant_pattern_hit(node, ctx)
+                }
+                "struct_expression" | "struct_pattern" if ctx.target_is_field => {
+                    record_struct_field_hits(node, ctx)
+                }
+                _ => {}
+            }
+            TreeWalkAction::Descend
+        },
+        |_| {},
+    );
 }
 
 fn record_associated_type_binding_hit(binding: Node<'_>, ctx: &mut MemberScanCtx<'_>) {

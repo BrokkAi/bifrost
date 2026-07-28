@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::searchtools_service::{PreparedQueryCode, PreparedRunPolicy};
 use crate::{
     CancellationToken, SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode,
@@ -545,6 +546,7 @@ fn serial_tool_request(tool_name: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn spawn_cancellable_tool_call(
     service: Arc<SearchToolsService>,
     call: PreparedToolCall,
@@ -1047,7 +1049,9 @@ fn handle_tool_call(
 }
 
 enum PreparedToolCall {
+    #[cfg(test)]
     QueryCode(PreparedQueryCode),
+    #[cfg(test)]
     RunPolicy(PreparedRunPolicy),
     Standard {
         name: String,
@@ -1060,7 +1064,9 @@ enum PreparedToolCall {
 impl PreparedToolCall {
     fn tool_name(&self) -> &str {
         match self {
+            #[cfg(test)]
             Self::QueryCode(_) => "query_code",
+            #[cfg(test)]
             Self::RunPolicy(_) => "run_policy",
             Self::Standard { name, .. } => name,
         }
@@ -1068,7 +1074,9 @@ impl PreparedToolCall {
 
     fn workspace_generation(&self) -> Option<u64> {
         match self {
+            #[cfg(test)]
             Self::QueryCode(prepared) => Some(prepared.workspace_generation()),
+            #[cfg(test)]
             Self::RunPolicy(prepared) => Some(prepared.workspace_generation()),
             Self::Standard {
                 workspace_generation,
@@ -1170,11 +1178,13 @@ fn execute_prepared_tool_call(
     cancellation: Option<&CancellationToken>,
 ) -> Result<Value, (i64, String)> {
     let (name, render_options, output) = match call {
+        #[cfg(test)]
         PreparedToolCall::QueryCode(prepared) => (
             "query_code".to_string(),
             RenderOptions::default(),
             service.execute_prepared_query_code(prepared, cancellation),
         ),
+        #[cfg(test)]
         PreparedToolCall::RunPolicy(prepared) => (
             "run_policy".to_string(),
             RenderOptions::default(),

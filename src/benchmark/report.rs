@@ -46,8 +46,16 @@ pub struct ScenarioReport {
     pub measured_durations_ms: Vec<f64>,
     pub median_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p50_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub p95_ms: Option<f64>,
     pub mean_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_budget_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_budget_met: Option<bool>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bounded_incomplete_iterations: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_message: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -236,6 +244,8 @@ impl ScenarioReport {
         measured_durations_ms: Vec<f64>,
         failure_message: Option<String>,
     ) -> Self {
+        let p50_ms = percentile_ms(&measured_durations_ms, 50);
+        let p95_ms = percentile_ms(&measured_durations_ms, 95);
         Self {
             name,
             case_id: None,
@@ -244,8 +254,12 @@ impl ScenarioReport {
             skipped: false,
             first_duration_ms: None,
             median_ms: median_ms(&measured_durations_ms),
-            p95_ms: None,
+            p50_ms,
+            p95_ms,
             mean_ms: mean_ms(&measured_durations_ms),
+            latency_budget_ms: None,
+            latency_budget_met: None,
+            bounded_incomplete_iterations: 0,
             warmup_durations_ms,
             measured_durations_ms,
             failure_message,
@@ -262,13 +276,26 @@ impl ScenarioReport {
     ) -> Self {
         self.case_id = Some(case_id);
         self.first_duration_ms = Some(first_duration_ms);
-        self.p95_ms = percentile_ms(&self.measured_durations_ms, 95);
         self.query_code = Some(metrics);
         self
     }
 
     pub fn with_case_id(mut self, case_id: String) -> Self {
         self.case_id = Some(case_id);
+        self
+    }
+
+    pub fn with_latency_budget(mut self, max_p95_ms: f64) -> Self {
+        self.latency_budget_ms = Some(max_p95_ms);
+        self.latency_budget_met = self.p95_ms.map(|p95_ms| p95_ms <= max_p95_ms);
+        if self.success && self.latency_budget_met == Some(false) {
+            self.success = false;
+            self.failure_message = Some(format!(
+                "warm p95 {:.1} ms exceeded the {:.1} ms latency budget",
+                self.p95_ms.expect("failed budget has p95"),
+                max_p95_ms
+            ));
+        }
         self
     }
 
@@ -405,6 +432,10 @@ fn mean_ms(values: &[f64]) -> Option<f64> {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 fn median_ms(values: &[f64]) -> Option<f64> {
@@ -758,7 +789,8 @@ fn is_query_code_candidate_invariant_failure(scenario: &ScenarioCompareReport) -
 
 #[cfg(test)]
 mod tests {
-    use super::percentile_ms;
+    use super::{ScenarioReport, ScenarioTransport, percentile_ms};
+    use crate::benchmark::BenchmarkScenario;
 
     #[test]
     fn percentile_uses_nearest_rank() {
@@ -769,6 +801,35 @@ mod tests {
         assert_eq!(
             percentile_ms(&[10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0], 95),
             Some(10.0)
+        );
+    }
+
+    #[test]
+    fn issue_1228_all_scenarios_report_p50_p95_and_enforce_absolute_budget() {
+        let mut report = ScenarioReport::from_timings(
+            BenchmarkScenario::SearchSymbols,
+            ScenarioTransport::Mcp,
+            true,
+            vec![9.0],
+            vec![1.0, 2.0, 3.0, 4.0, 8.0],
+            None,
+        )
+        .with_latency_budget(5.0);
+        report.bounded_incomplete_iterations = 2;
+
+        assert_eq!(report.p50_ms, Some(3.0));
+        assert_eq!(report.p95_ms, Some(8.0));
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["bounded_incomplete_iterations"],
+            2
+        );
+        assert_eq!(report.latency_budget_met, Some(false));
+        assert!(!report.success);
+        assert!(
+            report
+                .failure_message
+                .as_deref()
+                .is_some_and(|message| message.contains("exceeded"))
         );
     }
 }

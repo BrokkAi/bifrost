@@ -335,19 +335,31 @@ fn print_run_summary(report: &BenchmarkRunReport, report_path: &Path) {
                 .as_deref()
                 .map(|case_id| format!("/{case_id}"))
                 .unwrap_or_default();
-            match scenario.median_ms {
-                Some(median) => {
+            match scenario.p50_ms.or(scenario.median_ms) {
+                Some(p50) => {
                     println!(
-                        "  {}{case_suffix}: {status} median={median:.1} ms{}{}",
+                        "  {}{case_suffix}: {status} p50={p50:.1} ms{}{}{}{}",
                         scenario.name.label(),
                         scenario
                             .p95_ms
                             .map(|p95| format!(" p95={p95:.1} ms"))
                             .unwrap_or_default(),
                         scenario
+                            .latency_budget_ms
+                            .map(|budget| format!(" budget={budget:.1} ms"))
+                            .unwrap_or_default(),
+                        scenario
                             .first_duration_ms
                             .map(|first| format!(" first={first:.1} ms"))
-                            .unwrap_or_default()
+                            .unwrap_or_default(),
+                        if scenario.bounded_incomplete_iterations > 0 {
+                            format!(
+                                " bounded_incomplete={}",
+                                scenario.bounded_incomplete_iterations
+                            )
+                        } else {
+                            String::new()
+                        }
                     );
                 }
                 None => {

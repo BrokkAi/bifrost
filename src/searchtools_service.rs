@@ -251,6 +251,7 @@ pub(crate) struct PreparedQueryCode {
 }
 
 impl PreparedQueryCode {
+    #[cfg(test)]
     pub(crate) const fn workspace_generation(&self) -> u64 {
         self.workspace_generation
     }
@@ -261,10 +262,12 @@ pub(crate) struct PreparedRunPolicy {
     root: PathBuf,
     policy_inputs: Vec<PolicyEvaluationInput>,
     options: PolicyEvaluationOptions,
+    #[cfg(test)]
     workspace_generation: u64,
 }
 
 impl PreparedRunPolicy {
+    #[cfg(test)]
     pub(crate) const fn workspace_generation(&self) -> u64 {
         self.workspace_generation
     }
@@ -2392,6 +2395,7 @@ impl SearchToolsService {
                 root,
                 policy_inputs,
                 options,
+                #[cfg(test)]
                 workspace_generation,
             });
         }
@@ -2407,7 +2411,7 @@ impl SearchToolsService {
             root,
             policy_inputs,
             options,
-            workspace_generation: _,
+            ..
         } = prepared;
         let result = (|| {
             let outcome = evaluate_policy_inputs_with_analyzer(

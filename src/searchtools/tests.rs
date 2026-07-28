@@ -15,6 +15,7 @@ use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 #[derive(Debug)]
 struct CountingProject {
@@ -792,6 +793,64 @@ fn issue_1228_source_budget_never_reports_verified_absence() {
         ScanUsagesStatus::VerifiedAbsent,
         "{result:#?}"
     );
+}
+
+#[test]
+fn issue_1228_time_budget_is_explicit_and_never_reports_verified_absence() {
+    use crate::analyzer::{RustAnalyzer, TestProject};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    ProjectFile::new(root.clone(), "lib.rs")
+        .write("pub fn target() {}\npub fn caller() { target(); }\n")
+        .unwrap();
+    let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
+    let context = ScanUsagesExecutionContext::with_limits(
+        crate::CancellationToken::default().with_timeout(Duration::ZERO),
+        1_000,
+        10_000,
+        usize::MAX,
+        1_000,
+    );
+
+    let result = scan_usages_by_location_with_context(
+        &analyzer,
+        ScanUsagesByLocationParams {
+            targets: vec![ScanUsagesTarget {
+                path: "lib.rs".to_string(),
+                line: 1,
+                column: None,
+                symbol: None,
+            }],
+            include_tests: true,
+            paths: None,
+            include_same_owner: true,
+        },
+        &context,
+    );
+
+    assert!(result.summary.partial, "{result:#?}");
+    assert_eq!(result.summary.verified_absent, 0, "{result:#?}");
+    assert_eq!(result.results.len(), 1, "{result:#?}");
+    assert!(!result.results[0].complete, "{result:#?}");
+    assert_eq!(
+        result.results[0].incomplete_reason,
+        Some(ScanUsagesIncompleteReason::TimeBudget),
+        "{result:#?}"
+    );
+    assert_eq!(
+        result.results[0].reason_kind.as_deref(),
+        Some("time_budget"),
+        "{result:#?}"
+    );
+    assert_ne!(
+        result.results[0].status,
+        ScanUsagesStatus::VerifiedAbsent,
+        "{result:#?}"
+    );
+    let json = serde_json::to_value(&result).unwrap();
+    assert_eq!(json["results"][0]["incomplete_reason"], "time_budget");
+    assert_eq!(json["results"][0]["reason_kind"], "time_budget");
 }
 
 /// #1100: `excluded_test_files` decides membership from paths alone instead of

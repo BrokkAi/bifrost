@@ -16,9 +16,9 @@ The visible proof has two parts. Deterministic tests will prove cancellation pro
 - [x] (2026-07-28 08:32Z) Reviewed Benchmark Actions runs from July 24 through July 27 and separated persistent Click/Python latency signals from unrelated PHP and C++ correctness failures.
 - [x] (2026-07-28 08:32Z) Wrote this implementation plan with deterministic behavior gates and a separate stable wall-clock lane.
 - [x] (2026-07-28 09:21Z) Milestone 1 complete and checkpointed as `d9bb61bf`: both scan surfaces share request cancellation and bounded candidate/source/callsite work, every bounded result carries a typed incomplete reason, five issue-specific unit/service tests and the large-response integration test pass, and the post-checkpoint review found no semantic or scope correction.
-- [x] (2026-07-28 09:35Z) Milestone 2 implementation complete: every read-only tool call leaves the stdin reader for the existing four-slot bounded worker path, workspace-mutating lifecycle calls remain reader-ordered, query/policy snapshot preparation moved off the reader, lifecycle timing covers queue/execution/response-queue/writer phases, and all 14 MCP transport tests pass before checkpointing.
-- [ ] Milestone 3: extend the benchmark client and report with p50/p95, concurrent heavy/light and cancellation scenarios, phase attribution, and a pinned Bifrost corpus; validate and commit the milestone.
-- [ ] Milestone 4: run the full Rust gates and a fresh release-mode self-repository campaign, compare it with the recent Actions evidence, resolve any issue-scoped failures, complete the retrospective, and commit the post-milestone review.
+- [x] (2026-07-28 09:35Z) Milestone 2 complete and checkpointed as `fdb403f3`: every read-only tool call leaves the stdin reader for the existing four-slot bounded worker path, workspace-mutating lifecycle calls remain reader-ordered, query/policy snapshot preparation moved off the reader, lifecycle timing covers queue/execution/response-queue/writer phases, and all 14 MCP transport tests pass.
+- [x] (2026-07-28 11:04Z) Milestone 3 implementation and live campaign complete: the request-ID-aware benchmark client, pinned release-mode interactive manifest, p50/p95 and bounded-incomplete reporting, heavy/light cancellation case, workflow gate, and raw lifecycle profiles are in place; all ten measured scenarios passed the 5,000 ms contract.
+- [ ] Milestone 4 in progress: formatting, 27 benchmark regression tests, and all-target/all-feature Clippy pass; the July 28 scheduled report has been refreshed, while the final focused unit run, whole-diff specialist review, checkpoint, and retrospective remain.
 
 ## Surprises & Discoveries
 
@@ -54,6 +54,18 @@ The visible proof has two parts. Deterministic tests will prove cancellation pro
 
 - Observation: The existing transport boundaries were sufficient to make the fairness regression deterministic without a wall-clock timeout. A test-only worker-start hook can hold the real scan immediately before execution while the normal notification handler cancels its real token and a source lookup returns the actual `lib.rs` definition on the test thread.
   Evidence: `issue_1228_cancelled_scan_does_not_block_following_source_lookup` verifies the source body before releasing the scan barrier, then verifies the scan's `cancelled` incomplete reason and explicitly performs the same completion cleanup as the writer.
+
+- Observation: A request deadline at the searchtool boundary was not sufficient until Rust's large per-file AST passes observed cancellation while walking nodes. The first release campaign still measured the line-only scan at 18-26 seconds after a four-second request token had expired.
+  Evidence: The Rust direct/member usage passes now check the shared token before and during prepared-syntax, lexical-scope, reference-context, binding, and resolution traversal. The member scan was converted from recursion to the shared iterative tree walk, whose new `Stop` action propagates cooperative termination.
+
+- Observation: The issue's short Rust selector can be resolved safely when its declaration location is exact. Requiring a fully-qualified name even at an exact declaration coordinate made the first benchmark case return a fast `not_found`, which would have been a vacuous latency success.
+  Evidence: `resolve_scan_usages_target` now accepts `CodeUnit::short_name()` only when the precise file/line/column target matches; `issue_1228_short_selector_at_exact_location_resolves_the_declaration` preserves ordinary ambiguity behavior while pinning this exact-location contract.
+
+- Observation: The passing release campaign legitimately used bounded time-budget responses for expensive usage scans, so a green scenario must expose that fact instead of looking indistinguishable from an exhaustive answer.
+  Evidence: `ScenarioReport::bounded_incomplete_iterations`, the CLI summary, and the Actions step summary now count measured iterations that passed via an explicitly incomplete result. The gate rejects incomplete results without an approved typed reason and rejects every timed-out `verified_absent` claim.
+
+- Observation: The July 28 scheduled benchmark retained the same four actionable regressions as July 27, with the two Click/Python latency signals worsening on the current commit.
+  Evidence: Run `30349710835` reports Click `scan_usages` at 14,421 ms versus a 2,469 ms baseline and `dead_code_smells` at 13,815 ms versus 1,240 ms, plus the existing FastRoute/PHP no-callsites and fmt/C++ no-locations correctness failures.
 
 ## Decision Log
 
@@ -93,13 +105,29 @@ The visible proof has two parts. Deterministic tests will prove cancellation pro
   Rationale: `mcp_request.queue_wait`, `execution`, `response_queue_wait`, and `writer_delivery` make a slow request attributable while tool names come from the finite server specification. Arguments and request data would leak source and explode trace cardinality; request/iteration correlation already comes from the benchmark's profile boundaries and artifact identity.
   Date/Author: 2026-07-28 / Codex
 
+- Decision: Give public MCP usage scans a three-second cooperative execution deadline inside the five-second response contract.
+  Rationale: The service needs time after analyzer interruption to classify partial evidence, render a truthful response, enqueue it, and deliver it. A deadline equal to the external budget would make a correct cooperative stop arrive too late, while deterministic work caps remain the backstop on hosts where work volume rather than time is dominant.
+  Date/Author: 2026-07-28 / Codex
+
+- Decision: Keep the interactive gate in `benchmark/interactive-latency.toml` rather than expanding the broad daily corpus manifest.
+  Rationale: The release gate has a distinct two-warmup/ten-measurement contract, raw MCP correctness oracles, absolute p95 budgets, cancellation/fairness semantics, and profile artifact policy. Separating it avoids silently changing historical daily-baseline membership and comparison semantics.
+  Date/Author: 2026-07-28 / Codex
+
+- Decision: Treat a short symbol selector as precise only when it accompanies an exact declaration location.
+  Rationale: File/line/column already disambiguate the selected declaration, so demanding an FQN adds no safety there. Short-name matching without that location would weaken the public ambiguity contract and remains unsupported.
+  Date/Author: 2026-07-28 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 is implemented. `UsageFinder::QueryResult` now distinguishes complete, cancelled, candidate-file-bounded, and source-byte-bounded queries; cancellation is checked during source admission as well as candidate and graph work. Both public scan surfaces receive the service token and one bounded execution context. Public results retain useful statuses and hits while serializing `complete: false` plus one of `cancelled`, `candidate_files`, `source_bytes`, `callsites`, or `response_budget`. A cancelled scan is an explicit failure rather than an empty success, and bounded zero-hit scans cannot become `verified_absent`.
 
 Milestone 2 removes the remaining stdin-reader head-of-line boundary. Read-only tool calls now share the existing maximum-four in-flight registry, cancellation map, workspace-generation suppression, fixed response queue, and writer completion cleanup. Snapshot construction for `query_code` and `run_policy` now occurs inside the worker. A held and cancelled real scan cannot prevent a following exact source body from completing, while workspace-mutating lifecycle calls remain reader-ordered. Profile traces now separate accepted-to-worker queue wait, worker execution, response-queue wait, and writer delivery for each finite tool name.
 
-The remaining work is benchmark productization and live evidence: expose request-ID-aware concurrent client operations, compute p50/p95 consistently, add the issue payload and fairness/cancellation scenarios against a pinned Bifrost corpus, wire the stable workflow lane, and then run the full gates and refresh recent Actions results.
+Milestone 3 productizes the latency contract. `McpSession` can send, cancel, and receive by JSON-RPC request ID while buffering out-of-order responses. The separate pinned Bifrost manifest runs nine common request cases plus one overlapping heavy-scan/light-source fairness case in release mode, with two warmups, ten measured samples, correctness oracles, and a 5,000 ms p95 budget. Reports retain raw samples, p50/p95, profile artifacts, absolute budget outcomes, and the number of measured samples accepted as truthful bounded-incomplete responses. The scheduled workflow builds and enforces this lane independently of the historical cross-repository comparison.
+
+The final release campaign passed every case. Warm p50/p95 results in milliseconds were: four-pattern symbol search 282/491; exact `SemanticProcedureSummary` source 10/13; exact `SearchToolsService` source 10/13; exact scan-tool source 11/29; exact symbol-search source 11/15; definition 60/73; summary 20/28; exact issue usage scan 3513/4107; line-only usage scan 3451/3733; and the light source request overlapped with a heavy scan 13/19. The expensive scans returned only complete results or typed bounded responses, and the fairness case cancelled and drained the heavy request without delaying the light response.
+
+The remaining Milestone 4 work is final focused execution after the report-field change, whole-diff specialist review, any resulting corrections, checkpoint commits, and precise documentation of the local all-feature test linker limitation. The persistent Click/Python and unrelated PHP/C++ daily signals remain follow-up evidence rather than silently widening this issue's implementation scope.
 
 This section must be updated after each milestone with observed behavior, test counts, benchmark results, residual risks, and any scope moved to a follow-up issue.
 
@@ -241,6 +269,7 @@ Recent scheduled Benchmark Actions:
     2026-07-25 run 30153610367: failure, 6 actionable regressions
     2026-07-26 run 30197412629: failure, 5 actionable regressions
     2026-07-27 run 30258351822: failure, 4 actionable regressions
+    2026-07-28 run 30349710835: failure, 4 actionable regressions
 
 Persistent measured signals from the downloaded reports:
 
@@ -248,6 +277,39 @@ Persistent measured signals from the downloaded reports:
     click-py dead_code_smells median: baseline 1240 ms; candidates 6585, 6695, 5357 ms
     fastroute-php scan_usages: candidate found no call sites
     fmt-cpp get_symbol_locations: candidate found no locations
+
+Latest July 28 values:
+
+    click-py scan_usages median: 14421 ms versus 2469 ms baseline (+484%)
+    click-py dead_code_smells median: 13815 ms versus 1240 ms baseline (+1014%)
+    fastroute-php scan_usages: candidate still found no call sites
+    fmt-cpp get_symbol_locations: candidate still found no locations
+
+Milestone 3 release benchmark:
+
+    BIFROST_BENCHMARK_BIFROST_BIN=<isolated release bifrost> <isolated release bifrost_benchmark> run --manifest benchmark/interactive-latency.toml --profile
+    result: 10 passed scenarios; 0 failed; all warm p95 values below 5000 ms
+    final report: benchmark/interactive-latency-output/run-20260728T110414Z.json (generated artifact, not committed)
+
+    case                                             p50 ms    p95 ms
+    search-common-symbols                              281.9     490.9
+    source-semantic-summary                             10.5      13.1
+    source-search-service                                9.6      13.2
+    source-usage-scan                                   11.1      29.3
+    source-symbol-search                                11.0      14.8
+    definition-semantic-summary                         59.6      72.7
+    summary-semantic-summary                            20.0      27.8
+    scan-semantic-summary-exact                       3512.9    4106.9
+    scan-semantic-summary-line-only                   3450.7    3733.3
+    heavy-scan-light-source fairness                    13.1      19.0
+
+Milestone 3 deterministic validation:
+
+    scripts/with-isolated-cargo-target.sh cargo test --test benchmark_manifest --test benchmark_repo_cache --test benchmark_workflow_policy --test bifrost_benchmark_run -- --nocapture
+    result: 27 passed; 0 failed
+
+    scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
+    result: passed with warnings denied
 
 The final implementation must append focused test transcripts, final p50/p95 tables, dominant-phase evidence, and refreshed Actions run links here.
 
@@ -309,3 +371,7 @@ Plan revision note (2026-07-28 09:21Z): Updated the checkout state to the app-cr
 Plan revision note (2026-07-28 09:24Z): Recorded Milestone 1 checkpoint `d9bb61bf` and its clean post-checkpoint review before beginning MCP transport work.
 
 Plan revision note (2026-07-28 09:35Z): Recorded Milestone 2's read-only background admission, deferred snapshot preparation, deterministic scan/source fairness test, four transport timing phases, and full focused transport validation; checkpoint hash remains to be recorded after commit.
+
+Plan revision note (2026-07-28 09:37Z): Recorded Milestone 2 checkpoint `fdb403f3` and began benchmark client/report integration.
+
+Plan revision note (2026-07-28 11:35Z): Recorded the completed interactive benchmark implementation, exact/line scan cancellation discoveries, final ten-case release metrics, explicit bounded-incomplete reporting, clean benchmark and Clippy gates, and the July 28 scheduled regression report.

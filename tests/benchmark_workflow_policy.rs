@@ -170,3 +170,31 @@ fn benchmark_workflow_enforces_actionable_regressions_by_default() {
         "the final gate must enforce a failed strict comparison"
     );
 }
+
+#[test]
+fn issue_1228_workflow_enforces_release_interactive_latency_with_profiles() {
+    let workflow = checked_in_workflow();
+    let job = workflow
+        .split_once("  interactive-latency:\n")
+        .map(|(_, job)| job)
+        .expect("workflow should define the interactive latency job");
+
+    assert!(job.contains("    timeout-minutes: 90\n"));
+    assert!(job.contains("cargo build --release --locked --bin bifrost --bin bifrost_benchmark"));
+    assert!(job.contains(
+        "./target/release/bifrost_benchmark validate --manifest benchmark/interactive-latency.toml"
+    ));
+    assert!(job.contains("BIFROST_BENCHMARK_BIFROST_BIN=./target/release/bifrost"));
+    assert!(job.contains("--manifest benchmark/interactive-latency.toml"));
+    assert!(job.contains("--profile"));
+    assert!(job.contains("| Bounded incomplete | Status |"));
+    assert!(job.contains(".bounded_incomplete_iterations // 0"));
+    assert!(
+        job.contains("      - name: Upload interactive latency artifacts\n        if: always()")
+    );
+    assert!(
+        job.contains(
+            "if [ \"${{ steps.run_interactive_latency.outcome }}\" != \"success\" ]; then"
+        )
+    );
+}

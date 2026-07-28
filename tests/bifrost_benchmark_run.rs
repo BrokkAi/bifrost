@@ -39,6 +39,7 @@ required_scenarios = [
   "call_hierarchy",
   "type_hierarchy",
   "query_code",
+  "interactive_code_intelligence",
 ]
 
 [[repos]]
@@ -60,6 +61,7 @@ scenarios = [
   "call_hierarchy",
   "type_hierarchy",
   "query_code",
+  "interactive_code_intelligence",
 ]
 search_patterns = ["method2"]
 location_symbols = ["A.method2"]
@@ -86,6 +88,9 @@ query_code_queries = [
   {{ id = "regex-class-a", workloads = ["regex"], query_json = '{{"match":{{"kind":"class","name":{{"regex":"^A$"}}}},"limit":20}}', expected_witness_json = '{{"result_type":"structural_match","path":"A.java","kind":"class"}}', min_results = 1, expected_truncated = false }},
   {{ id = "methods-inside-a", workloads = ["containment"], query_json = '{{"match":{{"kind":"method"}},"inside":{{"kind":"class","name":"A"}},"limit":100}}', expected_witness_json = '{{"result_type":"structural_match","path":"A.java","kind":"method"}}', min_results = 1, expected_truncated = false }},
   {{ id = "class-a-file", workloads = ["typed_traversal"], query_json = '{{"match":{{"kind":"class","name":"A"}},"steps":[{{"op":"file_of"}}],"limit":20}}', expected_witness_json = '{{"result_type":"file","path":"A.java"}}', min_results = 1, expected_truncated = false }},
+]
+interactive_queries = [
+  {{ id = "source-method2", tool = "get_symbol_sources", arguments_json = '{{"symbols":["A.method2"]}}', expected_json_pointer = "/structuredContent/sources/0/path", expected_json_value = "A.java", max_p95_ms = 60000.0 }},
 ]
 "#,
             toml_basic_string(&repo_root.display().to_string()),
@@ -119,7 +124,7 @@ query_code_queries = [
     let scenarios = report["repos"][0]["scenarios"]
         .as_array()
         .expect("scenario array");
-    assert_eq!(scenarios.len(), 16, "report: {report}");
+    assert_eq!(scenarios.len(), 17, "report: {report}");
     for scenario in scenarios {
         assert_eq!(scenario["success"], true, "report: {report}");
         assert!(
@@ -144,6 +149,23 @@ query_code_queries = [
     assert!(names.contains(&"call_hierarchy"), "report: {report}");
     assert!(names.contains(&"type_hierarchy"), "report: {report}");
     assert!(names.contains(&"query_code"), "report: {report}");
+    assert!(
+        names.contains(&"interactive_code_intelligence"),
+        "report: {report}"
+    );
+
+    let interactive = scenarios
+        .iter()
+        .find(|scenario| scenario["name"] == "interactive_code_intelligence")
+        .expect("interactive scenario");
+    assert_eq!(interactive["case_id"], "source-method2", "report: {report}");
+    assert!(interactive["p50_ms"].is_number(), "report: {report}");
+    assert!(interactive["p95_ms"].is_number(), "report: {report}");
+    assert_eq!(
+        interactive["latency_budget_ms"], 60000.0,
+        "report: {report}"
+    );
+    assert_eq!(interactive["latency_budget_met"], true, "report: {report}");
 
     let query_code = scenarios
         .iter()
