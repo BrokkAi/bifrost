@@ -34,7 +34,11 @@ pub(crate) fn resolve_git_file_path(path: &str, workspace_root: &Path) -> PathBu
     }
 }
 
-pub(crate) fn read_git_file(rev: &str, abs_path: &Path) -> Result<String, String> {
+/// Discovers the git repository containing `abs_path` and computes the
+/// repository-relative path used to look it up inside a revision tree. Shared
+/// by [`read_git_file`] and [`git_history_path_is_file`] so both consult the
+/// same repo-discovery/canonicalization rules.
+fn discover_history_repo_relative_path(abs_path: &Path) -> Result<(Repository, PathBuf), String> {
     if !abs_path.is_absolute() {
         return Err(format!(
             "git history path must be absolute after resolution: {}",
@@ -76,7 +80,40 @@ pub(crate) fn read_git_file(rev: &str, abs_path: &Path) -> Result<String, String
                 abs_path.display(),
                 canonical_workdir.display()
             )
-        })?;
+        })?
+        .to_path_buf();
+    Ok((repo, repo_rel))
+}
+
+/// Structured existence probe for the `#`-split boundary search in
+/// `split_git_history_source_selector` (bifrost#1216): a committed filename
+/// may itself contain `#` (e.g. `Foo.VerifyGeneratedCode#01.verified.cs`), so
+/// the CLI selector parser walks candidate anchors and needs to know which
+/// ones actually name a blob at `rev`. Unlike [`read_git_file`] this never
+/// reads blob content and never errors — any failure to discover the repo,
+/// resolve the revision, or find the path simply means "not a file", which is
+/// exactly what the caller needs to move on to the next candidate.
+pub(crate) fn git_history_path_is_file(rev: &str, abs_path: &Path) -> bool {
+    let Ok((repo, repo_rel)) = discover_history_repo_relative_path(abs_path) else {
+        return false;
+    };
+    let Ok(object) = repo.revparse_single(rev) else {
+        return false;
+    };
+    let Ok(commit) = object.peel_to_commit() else {
+        return false;
+    };
+    let Ok(tree) = commit.tree() else {
+        return false;
+    };
+    matches!(
+        tree.get_path(&repo_rel).ok().and_then(|entry| entry.kind()),
+        Some(ObjectType::Blob)
+    )
+}
+
+pub(crate) fn read_git_file(rev: &str, abs_path: &Path) -> Result<String, String> {
+    let (repo, repo_rel) = discover_history_repo_relative_path(abs_path)?;
 
     let object = repo
         .revparse_single(rev)
@@ -87,7 +124,7 @@ pub(crate) fn read_git_file(rev: &str, abs_path: &Path) -> Result<String, String
     let tree = commit
         .tree()
         .map_err(|err| format!("unable to read tree for git revision `{rev}`: {err}"))?;
-    let entry = tree.get_path(repo_rel).map_err(|err| {
+    let entry = tree.get_path(&repo_rel).map_err(|err| {
         format!(
             "path `{}` is absent at git revision `{rev}`: {err}",
             repo_rel.display()

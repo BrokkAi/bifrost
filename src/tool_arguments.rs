@@ -1,6 +1,6 @@
 use crate::analyzer::Language;
 use crate::git_file::parse_rev_path;
-use crate::git_file::{read_git_file, resolve_git_file_path};
+use crate::git_file::{git_history_path_is_file, read_git_file, resolve_git_file_path};
 use crate::workspace_document::has_portable_windows_path_prefix;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -301,7 +301,7 @@ fn normalize_cli_symbol_source_argument(
 ) -> Result<Option<String>, String> {
     let trimmed = raw.trim();
     if let Some((rev, path)) = parse_rev_path(trimmed) {
-        let (history_path, selector) = split_git_history_source_selector(path);
+        let (history_path, selector) = split_git_history_source_selector(rev, path, workspace_root);
         if !is_analyzable_source_path(rev) && is_analyzable_source_path(history_path) {
             let normalized = normalize_cli_revision_path_argument(
                 raw,
@@ -331,13 +331,63 @@ fn normalize_cli_symbol_source_argument(
     }
 }
 
-fn split_git_history_source_selector(path: &str) -> (&str, Option<&str>) {
+/// Splits a `REV:path#symbol` remainder into the historical file path and an
+/// optional symbol selector. A committed filename can itself contain `#`
+/// (e.g. `dir/Foo.VerifyGeneratedCode#01.verified.cs`), so a plain
+/// `split_once('#')` can truncate the path mid-filename (#1216). This mirrors
+/// the boundary rule that #1131 (commit c1053b7f) established for
+/// working-tree `path#symbol` anchors in
+/// `split_definition_selector_with_resolver` — prefer the `#`-position whose
+/// left side names a real file — but resolves existence against the git tree
+/// at `rev` (the historical file may not exist in the working tree at all)
+/// and, per #1216's prefix-collision requirement, prefers the *longest*
+/// resolvable path when more than one candidate exists: the unsplit path
+/// (no selector) outranks every split, and among splits the rightmost `#`
+/// (longest anchor) is tried before earlier ones.
+///
+/// When no candidate resolves against the historical tree (unknown revision,
+/// non-git workspace, or a path that genuinely does not exist at `rev`), this
+/// falls back to the original first-`#` split so behavior for those cases,
+/// and for `r#`-raw-identifier selectors, is unchanged.
+fn split_git_history_source_selector<'a>(
+    rev: &str,
+    path: &'a str,
+    workspace_root: &Path,
+) -> (&'a str, Option<&'a str>) {
+    if !path.contains('#') {
+        return (path, None);
+    }
+
+    if git_history_anchor_is_file(rev, path, workspace_root) {
+        return (path, None);
+    }
+
+    for (index, _) in path.match_indices('#').rev() {
+        let (anchor, rest) = path.split_at(index);
+        let selector = &rest[1..];
+        if !anchor.is_empty()
+            && !selector.is_empty()
+            && git_history_anchor_is_file(rev, anchor, workspace_root)
+        {
+            return (anchor, Some(selector));
+        }
+    }
+
     match path.split_once('#') {
         Some((path, selector)) if !path.is_empty() && !selector.is_empty() => {
             (path, Some(selector))
         }
         _ => (path, None),
     }
+}
+
+/// Structured (non-text-heuristic) check for whether `anchor` names a real
+/// blob at `rev`: resolves `anchor` the same way [`normalize_cli_revision_path_argument`]
+/// resolves the final historical path, then queries the repository's git
+/// tree via [`git_history_path_is_file`].
+fn git_history_anchor_is_file(rev: &str, anchor: &str, workspace_root: &Path) -> bool {
+    let abs_path = resolve_git_file_path(anchor, workspace_root);
+    git_history_path_is_file(rev, &abs_path)
 }
 
 fn is_analyzable_source_path(path: &str) -> bool {
@@ -641,10 +691,41 @@ fn outside_workspace_error(raw: &str, workspace_root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{normalize_tool_arguments, normalize_tool_arguments_for_cli};
+    use git2::{Repository, Signature};
     use serde_json::json;
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+
+    /// Stages and commits `paths` (already written under `repo`'s workdir),
+    /// mirroring `tests/bifrost_tool_cli.rs`'s `commit_paths` helper so unit
+    /// tests here can build small real git histories without process-spawning
+    /// the CLI binary.
+    fn commit_paths(repo: &Repository, paths: &[&str], message: &str) {
+        let mut index = repo.index().expect("repo index");
+        for path in paths {
+            index.add_path(Path::new(path)).expect("stage path");
+        }
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_id).expect("find tree");
+        let signature = Signature::now("Bifrost Test", "bifrost@example.com").expect("signature");
+        let parents = if let Ok(head) = repo.head() {
+            vec![head.peel_to_commit().expect("parent commit")]
+        } else {
+            Vec::new()
+        };
+        let parent_refs: Vec<_> = parents.iter().collect();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parent_refs,
+        )
+        .expect("commit");
+    }
 
     #[test]
     fn normalizes_absolute_literal_paths_for_tool_fields() {
@@ -1014,5 +1095,143 @@ mod tests {
 
         assert_eq!(normalized["file_paths"][0], "src/lib.rs");
         assert_eq!(normalized["fq_names"][0], fq_name);
+    }
+
+    // #1216 regression pin: an ordinary (no `#` in the filename) historical
+    // `REV:path#symbol` selector must still split at its one `#` exactly as
+    // before, with a single overlay for the historical path.
+    #[test]
+    fn git_history_symbol_source_ordinary_selector_splits_unchanged() {
+        let root = TempDir::new().expect("temp dir");
+        fs::write(root.path().join("Demo.java"), "class OldDemo {}\n").expect("write v1");
+        let repo = Repository::init(root.path()).expect("init repo");
+        commit_paths(&repo, &["Demo.java"], "v1");
+        fs::write(root.path().join("Demo.java"), "class NewDemo {}\n").expect("write v2");
+        commit_paths(&repo, &["Demo.java"], "v2");
+
+        let (normalized, overlays) = normalize_tool_arguments_for_cli(
+            "get_symbol_sources",
+            json!({ "symbols": ["HEAD~1:Demo.java#OldDemo"] }),
+            root.path(),
+        )
+        .expect("normalize");
+
+        assert_eq!(normalized["symbols"][0], "Demo.java#OldDemo");
+        assert_eq!(overlays.len(), 1, "{overlays:?}");
+        assert_eq!(overlays[0].rel_path, PathBuf::from("Demo.java"));
+        assert_eq!(overlays[0].content, "class OldDemo {}\n");
+    }
+
+    // #1216: a committed filename containing `#` with NO trailing symbol
+    // selector (the bug's original repro shape, e.g.
+    // `dir/Foo.VerifyGeneratedCode#01.verified.cs`) must keep the whole
+    // filename as the historical path rather than truncating it at the `#`.
+    // Before the fix, `split_once('#')` split this into path `Foo` (no
+    // extension, so `is_analyzable_source_path` rejected it) and a bogus
+    // selector `bar.py`, which made `normalize_cli_symbol_source_argument`
+    // bail out with `Ok(None)` and leave the raw `HEAD:...` string
+    // unnormalized with zero overlays.
+    #[test]
+    fn git_history_symbol_source_hash_named_file_without_selector_keeps_full_path() {
+        let root = TempDir::new().expect("temp dir");
+        fs::write(
+            root.path().join("Foo#bar.py"),
+            "class Foo:\n    def value(self):\n        return 1\n",
+        )
+        .expect("write file");
+        let repo = Repository::init(root.path()).expect("init repo");
+        commit_paths(&repo, &["Foo#bar.py"], "v1");
+
+        let (normalized, overlays) = normalize_tool_arguments_for_cli(
+            "get_symbol_sources",
+            json!({ "symbols": ["HEAD:Foo#bar.py"] }),
+            root.path(),
+        )
+        .expect("normalize");
+
+        assert_eq!(
+            normalized["symbols"][0], "Foo#bar.py",
+            "the full `#`-bearing filename must survive normalization unsplit"
+        );
+        assert_eq!(overlays.len(), 1, "{overlays:?}");
+        assert_eq!(overlays[0].rel_path, PathBuf::from("Foo#bar.py"));
+        assert_eq!(
+            overlays[0].content,
+            "class Foo:\n    def value(self):\n        return 1\n"
+        );
+    }
+
+    // #1216 acceptance criterion: when both a short path and a longer
+    // `#`-bearing path exist at the same revision (`Demo.py` and
+    // `Demo.py#extra.py`), the longest resolvable historical path must win.
+    // Before the fix, `split_once('#')` always took the *first* `#`, so the
+    // overlay materialized for `Demo.py#extra.py#Bar` was the short, wrong
+    // file (`Demo.py`) with a bogus `extra.py#Bar` selector tail.
+    #[test]
+    fn git_history_symbol_source_prefix_collision_selects_longest_committed_path() {
+        let root = TempDir::new().expect("temp dir");
+        fs::write(
+            root.path().join("Demo.py"),
+            "class Foo:\n    def value(self):\n        return 1\n",
+        )
+        .expect("write short file");
+        let repo = Repository::init(root.path()).expect("init repo");
+        commit_paths(&repo, &["Demo.py"], "v1");
+        fs::write(
+            root.path().join("Demo.py#extra.py"),
+            "class Bar:\n    def value(self):\n        return 2\n",
+        )
+        .expect("write long file");
+        commit_paths(&repo, &["Demo.py#extra.py"], "v2");
+
+        let (normalized, overlays) = normalize_tool_arguments_for_cli(
+            "get_symbol_sources",
+            json!({ "symbols": ["HEAD:Demo.py#extra.py#Bar"] }),
+            root.path(),
+        )
+        .expect("normalize");
+
+        assert_eq!(normalized["symbols"][0], "Demo.py#extra.py#Bar");
+        assert_eq!(overlays.len(), 1, "{overlays:?}");
+        assert_eq!(
+            overlays[0].rel_path,
+            PathBuf::from("Demo.py#extra.py"),
+            "the longer, resolvable historical path must win the collision"
+        );
+        assert_eq!(
+            overlays[0].content,
+            "class Bar:\n    def value(self):\n        return 2\n"
+        );
+    }
+
+    // #1216 regression pin: a historical selector whose symbol is itself a
+    // Rust raw identifier (`r#type`) must keep splitting at the first `#`
+    // (`lib.rs` / `r#type`), the same byte-for-byte behavior as before this
+    // fix and as the working-tree case fixed by #1128/#1131.
+    #[test]
+    fn git_history_symbol_source_raw_identifier_selector_unaffected() {
+        let root = TempDir::new().expect("temp dir");
+        fs::write(
+            root.path().join("lib.rs"),
+            "pub struct DbColumn {\n    pub r#type: String,\n}\n",
+        )
+        .expect("write file");
+        let repo = Repository::init(root.path()).expect("init repo");
+        commit_paths(&repo, &["lib.rs"], "v1");
+
+        let (normalized, overlays) = normalize_tool_arguments_for_cli(
+            "get_symbol_sources",
+            json!({ "symbols": ["HEAD:lib.rs#r#type"] }),
+            root.path(),
+        )
+        .expect("normalize");
+
+        assert_eq!(normalized["symbols"][0], "lib.rs#r#type");
+        assert_eq!(overlays.len(), 1, "{overlays:?}");
+        assert_eq!(overlays[0].rel_path, PathBuf::from("lib.rs"));
+        assert_eq!(
+            overlays[0].content,
+            "pub struct DbColumn {\n    pub r#type: String,\n}\n"
+        );
     }
 }

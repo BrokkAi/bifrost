@@ -247,6 +247,158 @@ fn tool_get_symbol_sources_accepts_git_history_path() {
     assert!(!source_text.contains("NewDemo"), "{payload}");
 }
 
+// #1216: a committed filename containing `#` (e.g.
+// `dir/Foo.VerifyGeneratedCode#01.verified.cs`) must be addressable via the
+// CLI as `REV:path#symbol` without the historical loader truncating the path
+// at the first `#`. End-to-end: real git repo fixture, real historical
+// source loading through the actual `bifrost` binary.
+#[test]
+fn tool_get_symbol_sources_git_history_hash_named_file_resolves_symbol() {
+    let temp = TempDir::new().expect("temp dir");
+    let root = temp.path();
+    fs::write(
+        root.join("Foo#bar.py"),
+        "class OldDemo:\n    def value(self):\n        return 1\n",
+    )
+    .expect("write v1");
+    let repo = Repository::init(root).expect("init repo");
+    commit_paths(&repo, &["Foo#bar.py"], "v1");
+    fs::write(
+        root.join("Foo#bar.py"),
+        "class NewDemo:\n    def value(self):\n        return 2\n",
+    )
+    .expect("write v2");
+    commit_paths(&repo, &["Foo#bar.py"], "v2");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(root)
+        .arg("--tool")
+        .arg("get_symbol_sources")
+        .arg("--args")
+        .arg(r#"{"symbols":["HEAD~1:Foo#bar.py#OldDemo"]}"#)
+        .output()
+        .expect("run bifrost --tool get_symbol_sources with hash-named git history path");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let payload: Value = serde_json::from_str(&stdout).expect("json stdout");
+    let structured = &payload["structuredContent"];
+    assert_eq!(payload["isError"], false, "{payload}");
+    assert_eq!(
+        0,
+        structured["not_found"].as_array().unwrap().len(),
+        "{payload}"
+    );
+    let source_text = structured["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|source| source["text"].as_str())
+        .find(|text| text.contains("value(self)"))
+        .expect("symbol source text");
+    assert!(source_text.contains("OldDemo"), "{payload}");
+    assert!(source_text.contains("return 1"), "{payload}");
+    assert!(!source_text.contains("NewDemo"), "{payload}");
+    assert!(!source_text.contains("return 2"), "{payload}");
+}
+
+// #1216 acceptance criterion: when both a short path (`Demo.py`) and a
+// longer `#`-bearing path (`Demo.py#extra.py`) are committed at the same
+// revision, the CLI-normalized historical selector must resolve against the
+// longest resolvable path, not the first `#`.
+//
+// Note: both paths are removed from the *current* HEAD (only the long path
+// is restored there) so the workspace's plain file listing cannot supply
+// `Demo.py` as an ordinary file. That isolates the assertion to the git
+// history loader's own split decision -- otherwise get_symbol_sources' own
+// (already correct, #1131) anchor resolver would independently pick apart
+// the reconstructed `path#symbol` string against whatever plain files happen
+// to exist on disk, and a forward, first-match walk over two anchors that
+// both exist as ordinary files would pick the short one first regardless of
+// what this fix does.
+#[test]
+fn tool_get_symbol_sources_git_history_prefix_collision_selects_longest_path() {
+    let temp = TempDir::new().expect("temp dir");
+    let root = temp.path();
+    fs::write(
+        root.join("Demo.py"),
+        "class Foo:\n    def value(self):\n        return 1\n",
+    )
+    .expect("write short file");
+    fs::write(
+        root.join("Demo.py#extra.py"),
+        "class Bar:\n    def value(self):\n        return 2\n",
+    )
+    .expect("write long file");
+    let repo = Repository::init(root).expect("init repo");
+    commit_paths(
+        &repo,
+        &["Demo.py", "Demo.py#extra.py"],
+        "v1: both paths present (the collision)",
+    );
+
+    fs::remove_file(root.join("Demo.py")).expect("remove short file from workdir");
+    let mut index = repo.index().expect("repo index");
+    index
+        .remove_path(Path::new("Demo.py"))
+        .expect("unstage short file");
+    index.write().expect("write index");
+    let tree_id = index.write_tree().expect("write tree");
+    let tree = repo.find_tree(tree_id).expect("find tree");
+    let signature = Signature::now("Bifrost Test", "bifrost@example.com").unwrap();
+    let parent = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        "v2: drop short path",
+        &tree,
+        &[&parent],
+    )
+    .expect("commit v2");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(root)
+        .arg("--tool")
+        .arg("get_symbol_sources")
+        .arg("--args")
+        .arg(r#"{"symbols":["HEAD~1:Demo.py#extra.py#Bar"]}"#)
+        .output()
+        .expect("run bifrost --tool get_symbol_sources with a prefix-colliding git history path");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let payload: Value = serde_json::from_str(&stdout).expect("json stdout");
+    let structured = &payload["structuredContent"];
+    assert_eq!(payload["isError"], false, "{payload}");
+    assert_eq!(
+        0,
+        structured["not_found"].as_array().unwrap().len(),
+        "{payload}"
+    );
+    let source_text = structured["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|source| source["text"].as_str())
+        .find(|text| text.contains("value(self)"))
+        .expect("symbol source text");
+    assert!(source_text.contains("Bar"), "{payload}");
+    assert!(source_text.contains("return 2"), "{payload}");
+    assert!(!source_text.contains("Foo"), "{payload}");
+    assert!(!source_text.contains("return 1"), "{payload}");
+}
+
 #[test]
 fn tool_get_symbol_sources_does_not_treat_colon_selectors_as_git_history() {
     let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
