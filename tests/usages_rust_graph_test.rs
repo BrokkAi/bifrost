@@ -7536,6 +7536,158 @@ fn rust_graph_strategy_finds_reexported_free_function_call() {
 }
 
 #[test]
+fn rust_graph_strategy_resolves_imported_uppercase_free_function_calls() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/api.rs",
+            r#"
+pub struct FQDN {
+    raw: String,
+}
+
+pub fn FQDN(input: &str) -> FQDN {
+    FQDN {
+        raw: input.to_string(),
+    }
+}
+"#,
+        ),
+        (
+            "src/lib.rs",
+            r#"
+mod api;
+
+use crate::api::FQDN;
+
+pub fn run() {
+    let _ = FQDN("example.testing.");
+}
+"#,
+        ),
+    ]);
+
+    let function_target = analyzer
+        .get_definitions("api.FQDN")
+        .into_iter()
+        .find(CodeUnit::is_function)
+        .expect("expected imported uppercase function target");
+    let type_target = analyzer
+        .get_definitions("api.FQDN")
+        .into_iter()
+        .find(CodeUnit::is_class)
+        .expect("expected same-named type target");
+
+    let function_hits = rust_graph_hits_for_target(&analyzer, function_target);
+    assert_eq!(
+        1,
+        function_hits.len(),
+        "expected the imported uppercase free-function call: {function_hits:?}"
+    );
+    assert!(
+        function_hits[0]
+            .snippet
+            .contains("FQDN(\"example.testing.\")"),
+        "hit should be the call site: {function_hits:?}",
+    );
+
+    let type_hits = rust_graph_hits_for_target(&analyzer, type_target);
+    assert_eq!(
+        2,
+        type_hits.len(),
+        "the return annotation and struct literal remain legitimate type references: {type_hits:?}"
+    );
+    assert!(
+        type_hits
+            .iter()
+            .all(|hit| hit.file == project.file("src/api.rs")),
+        "the lib.rs call must not be attributed to the same-named type: {type_hits:?}"
+    );
+}
+
+#[test]
+fn rust_graph_strategy_prefers_same_module_function_over_imported_module_name() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
+mod tests {
+    use std::cmp;
+
+    fn cmp(a: i32, b: i32) -> cmp::Ordering {
+        a.cmp(&b)
+    }
+
+    pub fn run() {
+        let _ = cmp(1, 2);
+    }
+}
+
+mod other {
+    pub fn cmp(_: i32, _: i32) {}
+}
+"#,
+    )]);
+
+    let local_target = definition(&analyzer, "tests.cmp");
+    let other_target = definition(&analyzer, "other.cmp");
+
+    let local_hits = rust_graph_hits_for_target(&analyzer, local_target);
+    assert_eq!(
+        1,
+        local_hits.len(),
+        "expected the same-module cmp() call to resolve locally: {local_hits:?}"
+    );
+    assert!(
+        local_hits[0].snippet.contains("cmp(1, 2)"),
+        "hit should be the local cmp() call: {local_hits:?}",
+    );
+
+    let other_hits = rust_graph_hits_for_target(&analyzer, other_target);
+    assert!(
+        other_hits.is_empty(),
+        "same-named function in another module must stay unmatched: {other_hits:?}"
+    );
+}
+
+#[test]
+fn rust_graph_strategy_resolves_scoped_module_function_calls_without_cross_matching() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/common.rs", "pub fn try_setup() {}\n"),
+        ("src/other.rs", "pub fn try_setup() {}\n"),
+        (
+            "src/lib.rs",
+            r#"
+mod common;
+mod other;
+
+pub fn run() {
+    common::try_setup();
+}
+"#,
+        ),
+    ]);
+
+    let common_target = definition(&analyzer, "common.try_setup");
+    let other_target = definition(&analyzer, "other.try_setup");
+
+    let common_hits = rust_graph_hits_for_target(&analyzer, common_target);
+    assert_eq!(
+        1,
+        common_hits.len(),
+        "expected the scoped common::try_setup() call: {common_hits:?}"
+    );
+    assert!(
+        common_hits[0].snippet.contains("common::try_setup()"),
+        "hit should be the scoped call: {common_hits:?}",
+    );
+
+    let other_hits = rust_graph_hits_for_target(&analyzer, other_target);
+    assert!(
+        other_hits.is_empty(),
+        "same-named function in another module must not be cross-matched: {other_hits:?}"
+    );
+}
+
+#[test]
 fn rust_graph_strategy_finds_method_call_on_constructor_returned_local() {
     let (project, analyzer) = build_233_reexport_project();
     let hits = rust_graph_hits(&analyzer, "service.Service.execute");
@@ -8925,6 +9077,208 @@ fn rust_rooted_module_qualifier_inside_use_path_is_exact() {
             hit.file != project.file("src/detable.rs") || hit.start_offset != unrelated
         }),
         "a nested same-named module qualifier must stay unrelated: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_super_glob_import_prefix_keeps_module_namespace_exact() {
+    let source = r#"
+mod parent {
+    pub struct Item;
+
+    mod child {
+        use super::*;
+
+        fn consume(_: Item) {}
+    }
+}
+
+fn parent() {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let module_target = analyzer
+        .get_definitions("parent")
+        .into_iter()
+        .find(CodeUnit::is_module)
+        .expect("parent module");
+    let value_target = analyzer
+        .get_definitions("parent")
+        .into_iter()
+        .find(CodeUnit::is_function)
+        .expect("parent function");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[module_target])
+        .all_hits_including_imports();
+    let expected = source.find("use super::*").expect("super glob import") + "use ".len();
+    let value_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[value_target])
+        .all_hits_including_imports();
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/lib.rs")
+                && hit.start_offset == expected
+                && hit.end_offset == expected + "super".len()
+                && hit.kind == UsageHitKind::Import
+        }),
+        "expected exact super::* module import hit: {hits:#?}"
+    );
+    assert!(
+        value_hits
+            .iter()
+            .all(|hit| hit.file != project.file("src/lib.rs") || hit.start_offset != expected),
+        "same-spelled value namespace must not capture super::*: {value_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_grouped_self_import_keeps_module_namespace_exact() {
+    let source = r#"
+mod quic_stream {
+    pub struct QuicStream;
+}
+
+fn quic_stream() {}
+
+use crate::quic_stream::{self, QuicStream};
+
+fn consume(_: QuicStream) {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let module_target = analyzer
+        .get_definitions("quic_stream")
+        .into_iter()
+        .find(CodeUnit::is_module)
+        .expect("quic_stream module");
+    let value_target = analyzer
+        .get_definitions("quic_stream")
+        .into_iter()
+        .find(CodeUnit::is_function)
+        .expect("quic_stream function");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[module_target])
+        .all_hits_including_imports();
+    let expected = source
+        .find("quic_stream::{self")
+        .expect("grouped self import module path");
+    let value_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[value_target])
+        .all_hits_including_imports();
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/lib.rs")
+                && hit.start_offset == expected
+                && hit.end_offset == expected + "quic_stream".len()
+                && hit.kind == UsageHitKind::Import
+        }),
+        "expected exact grouped self module-prefix import hit: {hits:#?}"
+    );
+    assert!(
+        value_hits
+            .iter()
+            .all(|hit| hit.file != project.file("src/lib.rs") || hit.start_offset != expected),
+        "same-spelled value namespace must not capture grouped self import: {value_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_named_type_import_alias_keeps_type_namespace_exact() {
+    let source = r#"
+mod defs {
+    pub struct TsigAlgorithm;
+    pub fn TsigAlgorithm() {}
+}
+
+use crate::defs::TsigAlgorithm as ImportedAlgorithm;
+
+fn consume(_: ImportedAlgorithm) {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let type_target = analyzer
+        .get_definitions("defs.TsigAlgorithm")
+        .into_iter()
+        .find(CodeUnit::is_class)
+        .expect("TsigAlgorithm type");
+    let value_target = analyzer
+        .get_definitions("defs.TsigAlgorithm")
+        .into_iter()
+        .find(CodeUnit::is_function)
+        .expect("TsigAlgorithm function");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[type_target])
+        .all_hits_including_imports();
+    let expected = source
+        .find("TsigAlgorithm as ImportedAlgorithm")
+        .expect("named type import");
+    let value_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[value_target])
+        .all_hits_including_imports();
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/lib.rs")
+                && hit.start_offset == expected
+                && hit.end_offset == expected + "TsigAlgorithm".len()
+                && hit.kind == UsageHitKind::Import
+        }),
+        "expected exact named type import hit: {hits:#?}"
+    );
+    assert!(
+        value_hits
+            .iter()
+            .all(|hit| hit.file != project.file("src/lib.rs") || hit.start_offset != expected),
+        "same-spelled value namespace must not capture the type import: {value_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_pub_use_reexport_keeps_type_namespace_exact() {
+    let source = r#"
+mod tools {
+    pub struct CommitActivityDraft;
+    pub fn CommitActivityDraft() {}
+}
+
+pub use crate::tools::CommitActivityDraft;
+
+fn consume(_: CommitActivityDraft) {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let type_target = analyzer
+        .get_definitions("tools.CommitActivityDraft")
+        .into_iter()
+        .find(CodeUnit::is_class)
+        .expect("CommitActivityDraft type");
+    let value_target = analyzer
+        .get_definitions("tools.CommitActivityDraft")
+        .into_iter()
+        .find(CodeUnit::is_function)
+        .expect("CommitActivityDraft function");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[type_target])
+        .all_hits_including_imports();
+    let expected = source
+        .find("use crate::tools::CommitActivityDraft;")
+        .expect("pub use reexport");
+    let value_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[value_target])
+        .all_hits_including_imports();
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/lib.rs")
+                && hit.start_offset == expected + "use crate::tools::".len()
+                && hit.end_offset == expected + "use crate::tools::CommitActivityDraft".len()
+                && hit.kind == UsageHitKind::Import
+        }),
+        "expected exact pub use re-export hit: {hits:#?}"
+    );
+    assert!(
+        value_hits
+            .iter()
+            .all(|hit| hit.file != project.file("src/lib.rs") || hit.start_offset != expected),
+        "same-spelled value namespace must not capture the re-export: {value_hits:#?}"
     );
 }
 
