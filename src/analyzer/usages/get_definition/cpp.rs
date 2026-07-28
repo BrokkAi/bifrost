@@ -3954,20 +3954,48 @@ fn cpp_is_non_reference_preprocessor_recovery_tail_token(node: Node<'_>) -> bool
     let Some(top_level) = cpp_translation_unit_child(node) else {
         return false;
     };
-    if top_level.kind() != "ERROR" {
+    if top_level.kind() != "ERROR" && !cpp_has_error_ancestor_before_translation_unit(node) {
         return false;
     }
-    let mut current = top_level.prev_named_sibling();
+    if !cpp_is_recovered_preprocessor_tail_segment(top_level) {
+        return false;
+    }
+    let mut current = Some(top_level);
     while let Some(sibling) = current {
         if sibling.kind() == "preproc_function_def" {
             return sibling.child_by_field_name("value").is_some();
         }
-        if sibling.kind() != "ERROR" {
+        if !cpp_is_recovered_preprocessor_tail_segment(sibling) {
             return false;
         }
         current = sibling.prev_named_sibling();
     }
     false
+}
+
+fn cpp_has_error_ancestor_before_translation_unit(mut node: Node<'_>) -> bool {
+    loop {
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        if parent.kind() == "translation_unit" {
+            return false;
+        }
+        if parent.kind() == "ERROR" {
+            return true;
+        }
+        node = parent;
+    }
+}
+
+fn cpp_is_recovered_preprocessor_tail_segment(node: Node<'_>) -> bool {
+    if node.kind() == "ERROR" {
+        return true;
+    }
+    matches!(
+        node.kind(),
+        "declaration" | "field_declaration" | "expression_statement"
+    ) && node.has_error()
 }
 
 fn cpp_translation_unit_child(mut node: Node<'_>) -> Option<Node<'_>> {
