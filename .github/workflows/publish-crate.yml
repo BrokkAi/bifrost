@@ -32,6 +32,7 @@ jobs:
     name: cargo publish
     needs: release-context
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     environment: release
     permissions:
       contents: read
@@ -45,6 +46,9 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - name: Verify packaged crate contents
+        run: bash scripts/check-crate-package.sh
 
       - name: Authenticate to crates.io (trusted publishing)
         id: auth

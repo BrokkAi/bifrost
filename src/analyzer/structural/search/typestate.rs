@@ -21,10 +21,11 @@ use crate::analyzer::structural::analysis_context::{
 };
 use crate::analyzer::structural::query::WitnessTraversal;
 use crate::analyzer::typestate::{
-    CompiledProtocol, ProtocolStateId, TypestateBindingPlan, TypestateFinding,
-    TypestateFindingCertainty, TypestateFindingKind, TypestateFindingLimits,
-    TypestateFindingReport, TypestateFlowProblemError, TypestateUncertainty,
-    TypestateUncertaintySet, collect_summary_findings_with_limits, solve_typestate_with_summaries,
+    CompiledProtocol, ProductionSummaryLifecycleCounters, ProductionTypestateExecutionContext,
+    ProtocolStateId, TypestateBindingPlan, TypestateFinding, TypestateFindingCertainty,
+    TypestateFindingKind, TypestateFindingLimits, TypestateFindingReport,
+    TypestateFlowProblemError, TypestateUncertainty, TypestateUncertaintySet,
+    collect_summary_findings_with_limits, solve_typestate_with_production_summaries,
 };
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
@@ -141,10 +142,15 @@ impl TypestateQueryState {
                 self.work.solves = self.work.solves.saturating_add(1);
                 let mut solver_budget = SolverBudget::new(limits.solver_work);
                 let mut request = DataflowRequest::new(&mut solver_budget, cancellation);
-                let solved = solve_typestate_with_summaries(
+                let summary_lease = analysis_context.summary_lease();
+                let provider = workspace.icfg_provider();
+                let solved = solve_typestate_with_production_summaries(
+                    summary_lease,
                     &analysis_root,
                     &[],
-                    &workspace.icfg_provider(),
+                    &provider,
+                    &provider,
+                    ProductionTypestateExecutionContext::Workspace,
                     &protocol,
                     &bindings,
                     semantic_budget,
@@ -163,11 +169,12 @@ impl TypestateQueryState {
                         return Vec::new();
                     }
                 };
+                self.record_summary_work(solved.lifecycle());
                 self.work.reached_rows = self
                     .work
                     .reached_rows
-                    .saturating_add(saturating_u64(solved.result().reached().len()));
-                match solved.result().termination() {
+                    .saturating_add(saturating_u64(solved.result().result().reached().len()));
+                match solved.result().result().termination() {
                     SolverTermination::FixedPoint => {
                         self.work.fixed_point_solves =
                             self.work.fixed_point_solves.saturating_add(1);
@@ -188,7 +195,7 @@ impl TypestateQueryState {
                         );
                     }
                 }
-                self.record_semantic_status(solved.result().coverage().semantic_status());
+                self.record_semantic_status(solved.result().result().coverage().semantic_status());
                 let finding_limits = TypestateFindingLimits::with_witness_limits(
                     limits.max_reached_rows,
                     limits.max_candidates,
@@ -204,7 +211,7 @@ impl TypestateQueryState {
                 let report = match collect_summary_findings_with_limits(
                     &protocol,
                     &bindings,
-                    &solved,
+                    solved.result(),
                     finding_limits,
                     cancellation,
                 ) {
@@ -442,6 +449,29 @@ impl TypestateQueryState {
 
     pub(super) const fn work(&self) -> CodeQueryTypestateWork {
         self.work
+    }
+
+    fn record_summary_work(&mut self, work: ProductionSummaryLifecycleCounters) {
+        self.work.summary_hits = self
+            .work
+            .summary_hits
+            .saturating_add(saturating_u64(work.hits));
+        self.work.summary_misses = self
+            .work
+            .summary_misses
+            .saturating_add(saturating_u64(work.misses));
+        self.work.summary_rejections = self
+            .work
+            .summary_rejections
+            .saturating_add(saturating_u64(work.rejections));
+        self.work.summary_evictions = self
+            .work
+            .summary_evictions
+            .saturating_add(saturating_u64(work.evictions));
+        self.work.summary_recomputations = self
+            .work
+            .summary_recomputations
+            .saturating_add(saturating_u64(work.recomputations));
     }
 
     pub(super) const fn semantic_budget_exhausted(&self) -> bool {

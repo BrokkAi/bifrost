@@ -10,14 +10,16 @@ use brokk_bifrost::analyzer::structural::{
     CodeQuery, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, CodeQueryResponse,
     CodeQueryResultValue, CodeQuerySemanticCompleteness, ProtocolRegistration,
     ProtocolRegistrationSet, execute_workspace_request,
+    execute_workspace_request_with_registration_lease,
     execute_workspace_request_with_registration_limits,
     execute_workspace_request_with_registrations,
 };
 use brokk_bifrost::analyzer::typestate::{
-    BoundTypestateSubjectSpec, CompiledProtocol, ProtocolEventKey, ProtocolExpectationKey,
-    ProtocolSpec, ProtocolStateKey, TypestateBindingContext, TypestateBindingPlan,
-    TypestateBindingQuality, TypestateEventBindingSpec, TypestateInitialSeedSpec,
-    TypestateObjectRole, TypestateObservationSite, TypestateSubjectClassKey, TypestateSubjectKey,
+    BoundTypestateSubjectSpec, CompiledProtocol, ProductionTypestateSummaryRepository,
+    ProtocolEventKey, ProtocolExpectationKey, ProtocolSpec, ProtocolStateKey,
+    TypestateBindingContext, TypestateBindingPlan, TypestateBindingQuality,
+    TypestateEventBindingSpec, TypestateInitialSeedSpec, TypestateObjectRole,
+    TypestateObservationSite, TypestateSubjectClassKey, TypestateSubjectKey,
     TypestateTerminalBindingSpec,
 };
 use brokk_bifrost::{AnalyzerConfig, Language, WorkspaceAnalyzer};
@@ -45,20 +47,48 @@ function lifecycle(): void {
   use(resource);
 }
 "#;
+const JAVA_SOURCE: &str = r#"
+class Resource {}
+
+class LifecycleFixture {
+  static Resource acquire() {
+    return null;
+  }
+
+  static void use(Resource resource) {}
+
+  static void close(Resource resource) {}
+
+  static void lifecycle() {
+    Resource resource = acquire();
+    close(resource);
+    use(resource);
+  }
+}
+"#;
 
 struct Fixture {
     _project: BuiltInlineTestProject,
     workspace: WorkspaceAnalyzer,
     registrations: ProtocolRegistrationSet,
+    summaries: Arc<ProductionTypestateSummaryRepository>,
 }
 
 impl Fixture {
     fn new() -> Self {
-        let project = InlineTestProject::with_language(Language::TypeScript)
-            .file("src/main.ts", SOURCE)
+        Self::for_language(Language::TypeScript, "src/main.ts", SOURCE)
+    }
+
+    fn java() -> Self {
+        Self::for_language(Language::Java, "src/LifecycleFixture.java", JAVA_SOURCE)
+    }
+
+    fn for_language(language: Language, path: &str, source: &str) -> Self {
+        let project = InlineTestProject::with_language(language)
+            .file(path, source)
             .build();
         let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-        let (root, protocol, bindings) = registered_plan(&project, &workspace);
+        let (root, protocol, bindings) = registered_plan(&project, &workspace, path, source);
         let mut registrations = ProtocolRegistrationSet::default();
         registrations
             .register(
@@ -76,15 +106,19 @@ impl Fixture {
             _project: project,
             workspace,
             registrations,
+            summaries: Arc::new(ProductionTypestateSummaryRepository::new()),
         }
     }
 
     fn execute(&self, query: &CodeQuery) -> CodeQueryResponse {
-        execute_workspace_request_with_registrations(
+        execute_workspace_request_with_registration_lease(
             &self.workspace,
             WORKSPACE_GENERATION,
             &self.registrations,
             query,
+            CodeQueryExecutionLimits::default(),
+            None,
+            self.summaries.lease(WORKSPACE_GENERATION).unwrap(),
         )
     }
 }
@@ -92,29 +126,33 @@ impl Fixture {
 fn registered_plan(
     project: &BuiltInlineTestProject,
     workspace: &WorkspaceAnalyzer,
+    path: &str,
+    source: &str,
 ) -> (ProcedureHandle, CompiledProtocol, TypestateBindingPlan) {
-    let graph = SemanticGraph::materialize(project, workspace, "src/main.ts");
+    let graph = SemanticGraph::materialize(project, workspace, path);
     let procedure = graph
         .artifact()
         .procedures()
         .iter()
         .find(|procedure| {
-            procedure.kind() == ProcedureKind::Function
-                && procedure
-                    .locator()
-                    .declaration()
-                    .segments()
-                    .last()
-                    .and_then(|segment| segment.name())
-                    == Some("lifecycle")
+            matches!(
+                procedure.kind(),
+                ProcedureKind::Function | ProcedureKind::Method
+            ) && procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some("lifecycle")
         })
         .expect("lifecycle procedure");
     let root = graph
         .artifact()
         .procedure_handle(procedure.id())
         .expect("scoped lifecycle handle");
-    let close_call = call_containing(procedure, "close(resource)");
-    let use_call = call_containing(procedure, "use(resource)");
+    let close_call = call_containing(procedure, source, "close(resource)");
+    let use_call = call_containing(procedure, source, "use(resource)");
     let subject_value = use_call.arguments[0].value;
     let object = AbstractObject::new(
         AccessPathRoot::Value(
@@ -196,12 +234,13 @@ fn registered_plan(
 
 fn call_containing<'procedure>(
     procedure: &'procedure brokk_bifrost::analyzer::semantic::ProcedureSemantics,
+    source: &str,
     text: &str,
 ) -> &'procedure SemanticCallSite {
     procedure
         .call_sites()
         .iter()
-        .find(|call| mapped_source(procedure, SOURCE, call.source).contains(text))
+        .find(|call| mapped_source(procedure, source, call.source).contains(text))
         .unwrap_or_else(|| panic!("missing call containing {text:?}"))
 }
 
@@ -282,6 +321,86 @@ fn registered_json_and_rql_return_equal_findings_and_retained_witnesses() {
 }
 
 #[test]
+fn java_and_typescript_resource_protocol_match_through_json_and_rql() {
+    for (fixture, kind) in [(Fixture::new(), "function"), (Fixture::java(), "method")] {
+        let json_query = CodeQuery::from_json(&json!({
+            "schema_version": 4,
+            "match": {"kind": kind, "name": "lifecycle"},
+            "steps": [
+                {"op": "procedure_of"},
+                {"op": "typestate", "protocol_ref": PROTOCOL_REF},
+                {"op": "witness", "max_steps": 32, "max_bytes": 16384},
+            ],
+        }))
+        .unwrap();
+        let json_response = fixture.execute(&json_query);
+        let rql = CodeQuery::from_sexp(&format!(
+            r#"(witness :max-steps 32 :max-bytes 16384
+                  (typestate :protocol-ref "{PROTOCOL_REF}"
+                    (procedure-of ({kind} :name "lifecycle"))))"#
+        ))
+        .unwrap();
+        let rql_response = fixture.execute(&rql);
+        assert_eq!(
+            serde_json::to_value(&json_response).unwrap(),
+            serde_json::to_value(&rql_response).unwrap()
+        );
+        assert!(
+            json_response.result().unwrap().results.iter().any(|item| {
+                matches!(item.value, CodeQueryResultValue::TypestateWitness { .. })
+            })
+        );
+    }
+}
+
+#[test]
+fn java_and_typescript_public_profiles_preserve_witnesses_on_exact_hits() {
+    for (fixture, kind) in [(Fixture::new(), "function"), (Fixture::java(), "method")] {
+        let query = CodeQuery::from_json(&json!({
+            "schema_version": 4,
+            "execution_mode": "profile",
+            "match": {"kind": kind, "name": "lifecycle"},
+            "steps": [
+                {"op": "procedure_of"},
+                {"op": "typestate", "protocol_ref": PROTOCOL_REF},
+                {"op": "witness", "max_steps": 32, "max_bytes": 16384}
+            ]
+        }))
+        .unwrap();
+        let cold = fixture.execute(&query);
+        let warm = fixture.execute(&query);
+        assert_eq!(
+            serde_json::to_value(cold.result().unwrap()).unwrap(),
+            serde_json::to_value(warm.result().unwrap()).unwrap()
+        );
+        assert!(warm.result().unwrap().results.iter().any(|item| {
+            matches!(
+                &item.value,
+                CodeQueryResultValue::TypestateWitness { value } if !value.steps.is_empty()
+            )
+        }));
+        let cold = serde_json::to_value(cold).unwrap();
+        let warm = serde_json::to_value(warm).unwrap();
+        assert_eq!(
+            cold.pointer("/work/semantic/typestate/summary_misses"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            cold.pointer("/work/semantic/typestate/summary_recomputations"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            warm.pointer("/work/semantic/typestate/summary_hits"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            warm.pointer("/work/semantic/typestate/summary_recomputations"),
+            Some(&json!(0))
+        );
+    }
+}
+
+#[test]
 fn typestate_public_identities_are_stable_across_absolute_checkout_roots() {
     fn identities(fixture: &Fixture) -> Vec<(String, String, String)> {
         let response = fixture.execute(&witness_query());
@@ -315,7 +434,8 @@ fn registered_root_survives_equivalent_semantic_rematerialization() {
         .file("src/main.ts", SOURCE)
         .build();
     let registration_workspace = project.workspace_analyzer(AnalyzerConfig::default());
-    let (root, protocol, bindings) = registered_plan(&project, &registration_workspace);
+    let (root, protocol, bindings) =
+        registered_plan(&project, &registration_workspace, "src/main.ts", SOURCE);
     let mut registrations = ProtocolRegistrationSet::default();
     registrations
         .register(
@@ -412,6 +532,26 @@ fn duplicate_analysis_branches_share_one_request_local_solve() {
     );
     assert_eq!(
         report.pointer("/work/semantic/typestate/cache_hits"),
+        Some(&json!(1))
+    );
+    assert_eq!(
+        report.pointer("/work/semantic/typestate/summary_hits"),
+        Some(&json!(0))
+    );
+    assert_eq!(
+        report.pointer("/work/semantic/typestate/summary_misses"),
+        Some(&json!(1))
+    );
+    assert_eq!(
+        report.pointer("/work/semantic/typestate/summary_rejections"),
+        Some(&json!(0))
+    );
+    assert_eq!(
+        report.pointer("/work/semantic/typestate/summary_evictions"),
+        Some(&json!(0))
+    );
+    assert_eq!(
+        report.pointer("/work/semantic/typestate/summary_recomputations"),
         Some(&json!(1))
     );
 }

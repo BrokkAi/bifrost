@@ -44,8 +44,12 @@ fn dirty_fingerprint() -> Option<String> {
         .filter(|hash| !hash.is_empty())
 }
 
-fn main() {
-    let source_dir = Path::new("vendor/tree-sitter-scala/src");
+fn compile_vendored_grammar(
+    source_dir: &str,
+    library_name: &str,
+    private_symbols: &[(&str, &str)],
+) {
+    let source_dir = Path::new(source_dir);
     let parser = source_dir.join("parser.c");
     let scanner = source_dir.join("scanner.c");
     let headers = [
@@ -65,41 +69,77 @@ fn main() {
     #[cfg(target_env = "msvc")]
     build.flag("-utf-8");
 
-    // A downstream crate may also link the published tree-sitter-scala crate.
-    // Keep every native symbol private so link order cannot substitute that
-    // parser (or its scanner) for Bifrost's pinned snapshot.
-    for (upstream, private) in [
-        ("tree_sitter_scala", "brokk_bifrost_tree_sitter_scala"),
-        (
-            "tree_sitter_scala_external_scanner_create",
-            "brokk_bifrost_tree_sitter_scala_external_scanner_create",
-        ),
-        (
-            "tree_sitter_scala_external_scanner_destroy",
-            "brokk_bifrost_tree_sitter_scala_external_scanner_destroy",
-        ),
-        (
-            "tree_sitter_scala_external_scanner_scan",
-            "brokk_bifrost_tree_sitter_scala_external_scanner_scan",
-        ),
-        (
-            "tree_sitter_scala_external_scanner_serialize",
-            "brokk_bifrost_tree_sitter_scala_external_scanner_serialize",
-        ),
-        (
-            "tree_sitter_scala_external_scanner_deserialize",
-            "brokk_bifrost_tree_sitter_scala_external_scanner_deserialize",
-        ),
-        ("token_name", "brokk_bifrost_tree_sitter_scala_token_name"),
-    ] {
+    for &(upstream, private) in private_symbols {
         build.define(upstream, Some(private));
     }
 
-    build.compile("brokk-bifrost-tree-sitter-scala");
+    build.compile(library_name);
 
     for path in [parser, scanner].into_iter().chain(headers) {
         println!("cargo:rerun-if-changed={}", path.display());
     }
+}
+
+fn main() {
+    // A downstream crate may also link published Scala or Kotlin grammar crates.
+    // Keep every native symbol private so link order cannot substitute another
+    // parser or scanner for Bifrost's pinned snapshots.
+    compile_vendored_grammar(
+        "vendor/tree-sitter-scala/src",
+        "brokk-bifrost-tree-sitter-scala",
+        &[
+            ("tree_sitter_scala", "brokk_bifrost_tree_sitter_scala"),
+            (
+                "tree_sitter_scala_external_scanner_create",
+                "brokk_bifrost_tree_sitter_scala_external_scanner_create",
+            ),
+            (
+                "tree_sitter_scala_external_scanner_destroy",
+                "brokk_bifrost_tree_sitter_scala_external_scanner_destroy",
+            ),
+            (
+                "tree_sitter_scala_external_scanner_scan",
+                "brokk_bifrost_tree_sitter_scala_external_scanner_scan",
+            ),
+            (
+                "tree_sitter_scala_external_scanner_serialize",
+                "brokk_bifrost_tree_sitter_scala_external_scanner_serialize",
+            ),
+            (
+                "tree_sitter_scala_external_scanner_deserialize",
+                "brokk_bifrost_tree_sitter_scala_external_scanner_deserialize",
+            ),
+            ("token_name", "brokk_bifrost_tree_sitter_scala_token_name"),
+        ],
+    );
+    compile_vendored_grammar(
+        "vendor/tree-sitter-kotlin/src",
+        "brokk-bifrost-tree-sitter-kotlin",
+        &[
+            ("tree_sitter_kotlin", "brokk_bifrost_tree_sitter_kotlin"),
+            (
+                "tree_sitter_kotlin_external_scanner_create",
+                "brokk_bifrost_tree_sitter_kotlin_external_scanner_create",
+            ),
+            (
+                "tree_sitter_kotlin_external_scanner_destroy",
+                "brokk_bifrost_tree_sitter_kotlin_external_scanner_destroy",
+            ),
+            (
+                "tree_sitter_kotlin_external_scanner_scan",
+                "brokk_bifrost_tree_sitter_kotlin_external_scanner_scan",
+            ),
+            (
+                "tree_sitter_kotlin_external_scanner_serialize",
+                "brokk_bifrost_tree_sitter_kotlin_external_scanner_serialize",
+            ),
+            (
+                "tree_sitter_kotlin_external_scanner_deserialize",
+                "brokk_bifrost_tree_sitter_kotlin_external_scanner_deserialize",
+            ),
+        ],
+    );
+
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=Cargo.lock");

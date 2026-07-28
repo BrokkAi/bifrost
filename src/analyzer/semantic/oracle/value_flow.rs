@@ -123,6 +123,15 @@ fn relation_matches_event(
                 && value_endpoint(&relation.source, *source)
                 && port_endpoint(&relation.target, ProcedurePortKind::NormalReturn)
         }
+        SemanticEffect::ValueFlow {
+            kind: ValueFlowKind::LanguageDefined,
+            source,
+            target,
+        } => {
+            relation.kind == ValueFlowRelationKind::LanguageDefined
+                && value_endpoint(&relation.source, *source)
+                && value_endpoint(&relation.target, *target)
+        }
         SemanticEffect::Allocation { allocation } => procedure
             .semantics()
             .allocation(*allocation)

@@ -140,6 +140,15 @@ fn typescript_direct_call_has_matched_entry_and_normal_return() {
                 .effect("call_continuation")
                 .outgoing_kind(ControlEdgeKind::Normal),
             root(),
+        )
+        .bind_node(
+            "caller_exceptional_continuation",
+            "src/direct.ts",
+            PointSelector::new("leaf()")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+            root(),
         );
 
     graph.assert_outcome(IcfgOutcomeKind::Unproven);
@@ -150,7 +159,19 @@ fn typescript_direct_call_has_matched_entry_and_normal_return() {
     );
     graph.assert_successors(
         "leaf_invoke",
-        &[icfg_edge("leaf_entry", IcfgEdgeKind::Call).originating_call("leaf_call")],
+        &[
+            icfg_edge("leaf_entry", IcfgEdgeKind::Call).originating_call("leaf_call"),
+            icfg_edge(
+                "caller_continuation",
+                IcfgEdgeKind::CallToNormalContinuation,
+            )
+            .originating_call("leaf_call"),
+            icfg_edge(
+                "caller_exceptional_continuation",
+                IcfgEdgeKind::CallToExceptionalContinuation,
+            )
+            .originating_call("leaf_call"),
+        ],
     );
     graph.assert_predecessors(
         "leaf_entry",
@@ -247,6 +268,15 @@ fn typescript_cross_file_call_materializes_target_on_demand() {
             root(),
         )
         .bind_node(
+            "exceptional_continuation",
+            "src/consumer.ts",
+            PointSelector::new("target()")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+            root(),
+        )
+        .bind_node(
             "doubled",
             "src/consumer.ts",
             PointSelector::new("value * 2")
@@ -263,7 +293,16 @@ fn typescript_cross_file_call_materializes_target_on_demand() {
     );
     graph.assert_successors(
         "invoke",
-        &[icfg_edge("target_entry", IcfgEdgeKind::Call).originating_call("target_call")],
+        &[
+            icfg_edge("target_entry", IcfgEdgeKind::Call).originating_call("target_call"),
+            icfg_edge("continuation", IcfgEdgeKind::CallToNormalContinuation)
+                .originating_call("target_call"),
+            icfg_edge(
+                "exceptional_continuation",
+                IcfgEdgeKind::CallToExceptionalContinuation,
+            )
+            .originating_call("target_call"),
+        ],
     );
     graph.assert_successors(
         "target_exit",
@@ -379,11 +418,19 @@ fn two_call_sites_to_one_callee_never_cross_return_contexts() {
     );
     graph.assert_predecessors(
         "first_continuation",
-        &[icfg_edge("first_exit", IcfgEdgeKind::NormalReturn).originating_call("first_call")],
+        &[
+            icfg_edge("first_exit", IcfgEdgeKind::NormalReturn).originating_call("first_call"),
+            icfg_edge("first_invoke", IcfgEdgeKind::CallToNormalContinuation)
+                .originating_call("first_call"),
+        ],
     );
     graph.assert_predecessors(
         "second_continuation",
-        &[icfg_edge("second_exit", IcfgEdgeKind::NormalReturn).originating_call("second_call")],
+        &[
+            icfg_edge("second_exit", IcfgEdgeKind::NormalReturn).originating_call("second_call"),
+            icfg_edge("second_invoke", IcfgEdgeKind::CallToNormalContinuation)
+                .originating_call("second_call"),
+        ],
     );
     graph.assert_outcome(IcfgOutcomeKind::Unproven);
     graph.assert_boundary(
@@ -606,6 +653,24 @@ fn java_instance_method_dispatch_enters_the_selected_method() {
                 .procedure("run")
                 .effect("entry"),
             ["run_call"],
+        )
+        .bind_node(
+            "normal_continuation",
+            "src/Methods.java",
+            PointSelector::new("service.run()")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+            root(),
+        )
+        .bind_node(
+            "exceptional_continuation",
+            "src/Methods.java",
+            PointSelector::new("service.run()")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+            root(),
         );
 
     graph.assert_outcome(IcfgOutcomeKind::Unproven);
@@ -616,7 +681,19 @@ fn java_instance_method_dispatch_enters_the_selected_method() {
     );
     graph.assert_successors(
         "invoke",
-        &[icfg_edge("run_entry", IcfgEdgeKind::Call).originating_call("run_call")],
+        &[
+            icfg_edge("run_entry", IcfgEdgeKind::Call).originating_call("run_call"),
+            icfg_edge(
+                "normal_continuation",
+                IcfgEdgeKind::CallToNormalContinuation,
+            )
+            .originating_call("run_call"),
+            icfg_edge(
+                "exceptional_continuation",
+                IcfgEdgeKind::CallToExceptionalContinuation,
+            )
+            .originating_call("run_call"),
+        ],
     );
     graph.assert_adjacency_symmetric();
 }
@@ -663,6 +740,24 @@ fn java_bodyless_dynamic_target_keeps_unmaterialized_and_open_world_boundaries()
                 .procedure("caller")
                 .effect("invoke"),
             root(),
+        )
+        .bind_node(
+            "normal_continuation",
+            "src/Bodyless.java",
+            PointSelector::new("work.run()")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+            root(),
+        )
+        .bind_node(
+            "exceptional_continuation",
+            "src/Bodyless.java",
+            PointSelector::new("work.run()")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+            root(),
         );
 
     graph.assert_outcome(IcfgOutcomeKind::Unproven);
@@ -676,7 +771,31 @@ fn java_bodyless_dynamic_target_keeps_unmaterialized_and_open_world_boundaries()
         ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
             .originating_call("run_call"),
     );
-    graph.assert_successors("invoke", &[]);
+    graph.assert_successors(
+        "invoke",
+        &[
+            icfg_edge(
+                "normal_continuation",
+                IcfgEdgeKind::CallToNormalContinuation,
+            )
+            .originating_call("run_call"),
+            icfg_edge(
+                "normal_continuation",
+                IcfgEdgeKind::CallToNormalContinuation,
+            )
+            .originating_call("run_call"),
+            icfg_edge(
+                "exceptional_continuation",
+                IcfgEdgeKind::CallToExceptionalContinuation,
+            )
+            .originating_call("run_call"),
+            icfg_edge(
+                "exceptional_continuation",
+                IcfgEdgeKind::CallToExceptionalContinuation,
+            )
+            .originating_call("run_call"),
+        ],
+    );
     graph.assert_adjacency_symmetric();
 }
 
@@ -725,6 +844,24 @@ fn cpp_implicit_object_call_keeps_virtual_dispatch_open() {
                 .procedure("run")
                 .effect("entry"),
             ["run_call"],
+        )
+        .bind_node(
+            "normal_continuation",
+            "dispatch.cpp",
+            PointSelector::new("run()")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+            root(),
+        )
+        .bind_node(
+            "exceptional_continuation",
+            "dispatch.cpp",
+            PointSelector::new("run()")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+            root(),
         );
 
     graph.assert_outcome(IcfgOutcomeKind::Unproven);
@@ -735,7 +872,19 @@ fn cpp_implicit_object_call_keeps_virtual_dispatch_open() {
     );
     graph.assert_successors(
         "invoke",
-        &[icfg_edge("run_entry", IcfgEdgeKind::Call).originating_call("run_call")],
+        &[
+            icfg_edge("run_entry", IcfgEdgeKind::Call).originating_call("run_call"),
+            icfg_edge(
+                "normal_continuation",
+                IcfgEdgeKind::CallToNormalContinuation,
+            )
+            .originating_call("run_call"),
+            icfg_edge(
+                "exceptional_continuation",
+                IcfgEdgeKind::CallToExceptionalContinuation,
+            )
+            .originating_call("run_call"),
+        ],
     );
     graph.assert_adjacency_symmetric();
 }
@@ -850,6 +999,24 @@ fn php_runtime_class_dispatch_keeps_current_targets_unproven() {
                     .procedure(target_procedure)
                     .effect("entry"),
                 ["runtime_call"],
+            )
+            .bind_node(
+                "normal_continuation",
+                "dispatch.php",
+                PointSelector::new(call_text)
+                    .procedure(procedure)
+                    .effect("call_continuation")
+                    .outgoing_kind(ControlEdgeKind::Normal),
+                root(),
+            )
+            .bind_node(
+                "exceptional_continuation",
+                "dispatch.php",
+                PointSelector::new(call_text)
+                    .procedure(procedure)
+                    .effect("call_continuation")
+                    .outgoing_kind(ControlEdgeKind::Exceptional),
+                root(),
             );
 
         graph.assert_outcome(IcfgOutcomeKind::Unproven);
@@ -860,7 +1027,19 @@ fn php_runtime_class_dispatch_keeps_current_targets_unproven() {
         );
         graph.assert_successors(
             "invoke",
-            &[icfg_edge("target_entry", IcfgEdgeKind::Call).originating_call("runtime_call")],
+            &[
+                icfg_edge("target_entry", IcfgEdgeKind::Call).originating_call("runtime_call"),
+                icfg_edge(
+                    "normal_continuation",
+                    IcfgEdgeKind::CallToNormalContinuation,
+                )
+                .originating_call("runtime_call"),
+                icfg_edge(
+                    "exceptional_continuation",
+                    IcfgEdgeKind::CallToExceptionalContinuation,
+                )
+                .originating_call("runtime_call"),
+            ],
         );
         graph.assert_adjacency_symmetric();
     }
@@ -1102,6 +1281,15 @@ fn explicit_throw_returns_to_the_exact_caller_handler() {
             root(),
         )
         .bind_node(
+            "normal_continuation",
+            "src/exceptional.ts",
+            PointSelector::new("fail(error)")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+            root(),
+        )
+        .bind_node(
             "catch_return",
             "src/exceptional.ts",
             PointSelector::new("return 1;")
@@ -1112,7 +1300,19 @@ fn explicit_throw_returns_to_the_exact_caller_handler() {
 
     graph.assert_successors(
         "invoke",
-        &[icfg_edge("fail_entry", IcfgEdgeKind::Call).originating_call("fail_call")],
+        &[
+            icfg_edge("fail_entry", IcfgEdgeKind::Call).originating_call("fail_call"),
+            icfg_edge(
+                "normal_continuation",
+                IcfgEdgeKind::CallToNormalContinuation,
+            )
+            .originating_call("fail_call"),
+            icfg_edge(
+                "handler_continuation",
+                IcfgEdgeKind::CallToExceptionalContinuation,
+            )
+            .originating_call("fail_call"),
+        ],
     );
     graph.assert_successors(
         "fail_exceptional_exit",
@@ -1239,6 +1439,24 @@ fn unresolved_and_external_calls_remain_typed_boundaries() {
                 .procedure("caller")
                 .effect("invoke"),
             root(),
+        )
+        .bind_node(
+            "missing_normal_continuation",
+            "src/unresolved.ts",
+            PointSelector::new("missing()")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+            root(),
+        )
+        .bind_node(
+            "missing_exceptional_continuation",
+            "src/unresolved.ts",
+            PointSelector::new("missing()")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+            root(),
         );
     unresolved.assert_outcome(IcfgOutcomeKind::Unknown);
     unresolved.assert_boundary(
@@ -1246,7 +1464,21 @@ fn unresolved_and_external_calls_remain_typed_boundaries() {
         ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
             .originating_call("missing_call"),
     );
-    unresolved.assert_successors("missing_invoke", &[]);
+    unresolved.assert_successors(
+        "missing_invoke",
+        &[
+            icfg_edge(
+                "missing_normal_continuation",
+                IcfgEdgeKind::CallToNormalContinuation,
+            )
+            .originating_call("missing_call"),
+            icfg_edge(
+                "missing_exceptional_continuation",
+                IcfgEdgeKind::CallToExceptionalContinuation,
+            )
+            .originating_call("missing_call"),
+        ],
+    );
 
     let external_project = InlineTestProject::with_language(Language::TypeScript)
         .file(
@@ -1285,6 +1517,24 @@ fn unresolved_and_external_calls_remain_typed_boundaries() {
                 .procedure("caller")
                 .effect("invoke"),
             root(),
+        )
+        .bind_node(
+            "external_normal_continuation",
+            "src/external.ts",
+            PointSelector::new("work()")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+            root(),
+        )
+        .bind_node(
+            "external_exceptional_continuation",
+            "src/external.ts",
+            PointSelector::new("work()")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+            root(),
         );
     external.assert_outcome(IcfgOutcomeKind::Unproven);
     external.assert_boundary(
@@ -1297,7 +1547,31 @@ fn unresolved_and_external_calls_remain_typed_boundaries() {
         ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
             .originating_call("external_call"),
     );
-    external.assert_successors("external_invoke", &[]);
+    external.assert_successors(
+        "external_invoke",
+        &[
+            icfg_edge(
+                "external_normal_continuation",
+                IcfgEdgeKind::CallToNormalContinuation,
+            )
+            .originating_call("external_call"),
+            icfg_edge(
+                "external_normal_continuation",
+                IcfgEdgeKind::CallToNormalContinuation,
+            )
+            .originating_call("external_call"),
+            icfg_edge(
+                "external_exceptional_continuation",
+                IcfgEdgeKind::CallToExceptionalContinuation,
+            )
+            .originating_call("external_call"),
+            icfg_edge(
+                "external_exceptional_continuation",
+                IcfgEdgeKind::CallToExceptionalContinuation,
+            )
+            .originating_call("external_call"),
+        ],
+    );
 }
 
 #[test]
@@ -1397,6 +1671,24 @@ fn ambiguous_go_promoted_call_without_retained_targets_remains_a_boundary() {
                 .procedure("caller")
                 .effect("invoke"),
             root(),
+        )
+        .bind_node(
+            "ambiguous_normal_continuation",
+            "main.go",
+            PointSelector::new("model.Run()")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+            root(),
+        )
+        .bind_node(
+            "ambiguous_exceptional_continuation",
+            "main.go",
+            PointSelector::new("model.Run()")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+            root(),
         );
 
     graph.assert_outcome(IcfgOutcomeKind::Ambiguous);
@@ -1405,7 +1697,21 @@ fn ambiguous_go_promoted_call_without_retained_targets_remains_a_boundary() {
         ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
             .originating_call("ambiguous_call"),
     );
-    graph.assert_successors("ambiguous_invoke", &[]);
+    graph.assert_successors(
+        "ambiguous_invoke",
+        &[
+            icfg_edge(
+                "ambiguous_normal_continuation",
+                IcfgEdgeKind::CallToNormalContinuation,
+            )
+            .originating_call("ambiguous_call"),
+            icfg_edge(
+                "ambiguous_exceptional_continuation",
+                IcfgEdgeKind::CallToExceptionalContinuation,
+            )
+            .originating_call("ambiguous_call"),
+        ],
+    );
     graph.assert_adjacency_symmetric();
 }
 
@@ -1659,15 +1965,75 @@ fn nested_calls_dispatch_by_the_exact_whole_call_span() {
                 .procedure("outer")
                 .effect("entry"),
             ["outer_call"],
+        )
+        .bind_node(
+            "inner_normal_continuation",
+            "src/nested.ts",
+            PointSelector::new("inner()")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+            root(),
+        )
+        .bind_node(
+            "inner_exceptional_continuation",
+            "src/nested.ts",
+            PointSelector::new("inner()")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+            root(),
+        )
+        .bind_node(
+            "outer_normal_continuation",
+            "src/nested.ts",
+            PointSelector::new("outer(inner())")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+            root(),
+        )
+        .bind_node(
+            "outer_exceptional_continuation",
+            "src/nested.ts",
+            PointSelector::new("outer(inner())")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+            root(),
         );
 
     graph.assert_successors(
         "inner_invoke",
-        &[icfg_edge("inner_entry", IcfgEdgeKind::Call).originating_call("inner_call")],
+        &[
+            icfg_edge("inner_entry", IcfgEdgeKind::Call).originating_call("inner_call"),
+            icfg_edge(
+                "inner_normal_continuation",
+                IcfgEdgeKind::CallToNormalContinuation,
+            )
+            .originating_call("inner_call"),
+            icfg_edge(
+                "inner_exceptional_continuation",
+                IcfgEdgeKind::CallToExceptionalContinuation,
+            )
+            .originating_call("inner_call"),
+        ],
     );
     graph.assert_successors(
         "outer_invoke",
-        &[icfg_edge("outer_entry", IcfgEdgeKind::Call).originating_call("outer_call")],
+        &[
+            icfg_edge("outer_entry", IcfgEdgeKind::Call).originating_call("outer_call"),
+            icfg_edge(
+                "outer_normal_continuation",
+                IcfgEdgeKind::CallToNormalContinuation,
+            )
+            .originating_call("outer_call"),
+            icfg_edge(
+                "outer_exceptional_continuation",
+                IcfgEdgeKind::CallToExceptionalContinuation,
+            )
+            .originating_call("outer_call"),
+        ],
     );
     graph.assert_reachable("inner_entry", "outer_invoke");
     graph.assert_adjacency_symmetric();

@@ -5,7 +5,7 @@ description: Use the canonical JSON representation for Bifrost's query_code engi
 
 JSON `CodeQuery` is the canonical machine-facing representation accepted by Bifrost's `query_code` tool. MCP hosts and the Python client send this shape directly. The RQL REPL prints the same representation with `:json`.
 
-The compatible head is schema version 4. It retains version 3's source-backed procedure-local CFG surface and version 2's structural/declaration/reference/call/import/hierarchy/receiver vocabulary, then adds host-registered diagnostic-neutral typestate findings and bounded witnesses. Explicit version-2 and version-3 pins keep their old meanings and reject later operations. Schema version 4 does not load protocol files from a query, compile policy findings, persist summaries, or expose the value-flow and taint clients.
+The compatible head is schema version 5. It retains version 3's source-backed procedure-local CFG surface and version 2's structural/declaration/reference/call/import/hierarchy/receiver vocabulary, adds host-registered diagnostic-neutral typestate findings and bounded witnesses, then adds declaration-bounded containment. Explicit version pins keep their old meanings and reject later operations. Schema version 5 does not load protocol files from a query, compile policy findings, persist summaries, or expose the value-flow and taint clients.
 
 ## Minimal Query
 
@@ -28,11 +28,12 @@ The `match` object is the root pattern. It must constrain at least one of `kind`
 
 | Field | Shape | Meaning |
 | --- | --- | --- |
-| `schema_version` | integer | Optional. Omit it for compatible head version 4; pass `2` to pin the pre-CFG vocabulary, `3` for CFG without typestate, or `4` explicitly. Other versions are rejected. |
+| `schema_version` | integer | Optional. Omit it for compatible head version 5; pass `2` to pin the pre-CFG vocabulary, `3` for CFG without typestate, `4` for typestate, or `5` explicitly. Other versions are rejected. |
 | `match` | pattern | Required root pattern. |
 | `where` | string array | Optional project-relative globs. Absolute paths or globs inside the active workspace are normalized by MCP and CLI entrypoints. |
 | `languages` | string array | Optional language labels such as `python`, `typescript`, `cpp`, or `csharp`. Empty means every structural adapter. |
 | `inside` | pattern | Require the root match to be lexically inside a matching ancestor. |
+| `inside_decl` | pattern | Require containment in a matching ancestor without crossing a nested callable declaration. |
 | `not_inside` | pattern | Reject the root match when a matching ancestor exists. |
 | `steps` | step array | Ordered typed transformations applied after structural matching. At most `16`. |
 | `limit` | integer | Maximum terminal results after pipeline deduplication. Defaults to `100`; valid range is `1` through `1000`. |
@@ -188,7 +189,7 @@ Steps execute in array order and are validated before the workspace is searched:
 | `references_of` | declaration | reference site | Exact structured source sites targeting the declaration. |
 | `used_by` | declaration | declaration | Smallest exact declaration enclosing each matching site. |
 | `uses` | declaration | declaration | Exact indexed declarations referenced by this semantic owner. |
-| `callers` | declaration | declaration | Resolved incoming call edges; accepts positive `depth` and optional `proof`. |
+| `callers` | declaration | declaration | Resolved incoming call edges; accepts positive `depth`, optional `proof`, and explicit `proven_subset` completeness. |
 | `callees` | declaration | declaration | Resolved outgoing call edges; accepts positive `depth` and optional `proof`. |
 | `call_sites_to` | declaration | call site | Structured incoming sites; accepts optional `proof`. |
 | `call_sites_from` | declaration | call site | Structured outgoing sites; accepts optional `proof`. |
@@ -277,6 +278,8 @@ Hierarchy and ownership results are restricted to declarations returned by the a
 Reference steps accept optional `reference_kinds`, `proof`, and `surface` fields. `reference_kinds` is a non-empty array drawn from `method_call`, `constructor_call`, `field_read`, `field_write`, `type_reference`, `static_reference`, `super_call`, and `inheritance`. `proof` is `proven` or `unproven`. `surface` is `external_usages` (the default) or `lsp_references`. Omitted kind and proof fields include both tiers; a kind filter excludes unclassified structured hits. See the executable [Reference Traversal](/code-query-tutorials/reference-traversal/) recipes.
 
 Call traversal is direct by default. `callers` and `callees` accept a positive finite `depth`; there is deliberately no unbounded `transitive` form. Traversal is iterative and cycle-safe. A real recursive or cyclic edge is returned, but Bifrost stops expanding when the next declaration is already present on that provenance path. The same declaration may still be expanded through a different path, preserving alternate provenance within the execution budget. Every declaration reached by a call step records the proving `call_site` under provenance `via`.
+
+`callers` is exhaustive by default: an omitted related declaration produces an incomplete diagnostic and prevents a complete-negative conclusion. A match policy that only needs positive, resolved callers may opt in to `{"op":"callers","depth":2,"proof":"proven","completeness":"proven_subset"}`. This form is accepted only with `proof: "proven"`; it preserves `call_relation_candidates_omitted` as a `declared_non_exhaustive` diagnostic and reports a proven subset rather than all callers. It is not available for `callees`, and it never relaxes budget, parser, cancellation, or analyzer-failure diagnostics.
 
 `call_sites_to` and `call_sites_from` expose the full call range, callee range, caller and callee declarations, call kind, proof tier, optional explicit receiver, and arguments. `call_input` requires exactly one of `{"receiver":true}`, `{"parameter_index":0}`, or `{"parameter_name":"payload"}`. Parameter indexes are zero-based formal slots and exclude receiver-bound parameters; keyword/named arguments bind by the callee's declared parameter name. A variadic slot may yield several expression rows. Spreads/splats are retained on the call-site result but are not guessed into a formal slot. An implicit receiver has no synthetic expression row.
 

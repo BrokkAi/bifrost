@@ -16,6 +16,7 @@ jobs:
   quick-policy:
     name: quick policy
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -57,6 +58,7 @@ jobs:
     name: dependency licenses
     needs: quick-policy
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -90,6 +92,7 @@ jobs:
     name: crate package
     needs: quick-policy
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -110,6 +113,7 @@ jobs:
     needs: quick-policy
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -136,6 +140,7 @@ jobs:
     name: ${{ matrix.name }} fixture provenance
     needs: quick-policy
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -174,6 +179,7 @@ jobs:
     name: vscode
     needs: quick-policy
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -209,6 +215,7 @@ jobs:
     name: Pi package (${{ matrix.os }})
     needs: quick-policy
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -248,6 +255,7 @@ jobs:
     name: rust (${{ matrix.target }})
     needs: quick-policy
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
       ANDROID_API: '21'
@@ -356,6 +364,7 @@ jobs:
     name: python (${{ matrix.target }})
     needs: quick-policy
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
     strategy:

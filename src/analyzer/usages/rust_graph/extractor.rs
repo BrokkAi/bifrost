@@ -36,6 +36,8 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use tree_sitter::{Node, Parser, Tree};
 
+const RUST_SCAN_PARALLEL_BATCH_SIZE: usize = 4;
+
 pub(crate) struct RustProjectGraph {
     parsed: HashMap<ProjectFile, Arc<PreparedSyntaxTree>>,
 }
@@ -132,69 +134,91 @@ pub(super) fn scan_files_for_target(
     let hits = Mutex::new(BTreeSet::new());
     let files_vec: Vec<_> = files.into_iter().collect();
 
-    files_vec.par_iter().for_each(|file| {
+    for batch in files_vec.chunks(RUST_SCAN_PARALLEL_BATCH_SIZE) {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return;
+            break;
         }
-        let Some(prepared) = graph
-            .parsed
-            .get(file)
-            .cloned()
-            .or_else(|| rust.prepared_syntax(file))
-        else {
-            return;
-        };
-        let source = prepared.source();
-        let tree = prepared.tree();
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return;
-        }
-
-        let line_starts = prepared.line_starts();
-        let lexical_scope = RustLexicalScopeIndex::new(tree.root_node(), source);
-        let refs = rust.reference_context_of(file);
-        let (mut direct_names, _) = match seeds {
-            Some(seeds) => rust.usage_binding_names(file, seeds),
-            None => (HashSet::default(), HashSet::default()),
-        };
-        // A file that re-exports a seed (`pub use path::name`) can also reference
-        // `name` directly in its own body, but a re-export is not recorded as a
-        // local import binding. Treat any seed rooted in this file as a direct name
-        // so those in-module references resolve.
-        if let Some(seeds) = seeds {
-            for identity in seeds.identities_in_file(file) {
-                direct_names.insert(identity.name().to_string());
+        batch.par_iter().for_each(|file| {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return;
             }
-            direct_names.extend(refs.bare_names_resolving_to(&target_fqn));
-        }
-        let mut local_hits = BTreeSet::new();
-        let mut ctx = ScanCtx {
-            file,
-            source,
-            line_starts,
-            analyzer,
-            rust,
-            refs: &refs,
-            support,
-            seeds,
-            target,
-            target_is_path_qualifier: target.is_class() || rust.is_type_alias(target),
-            target_is_module: target.is_module(),
-            target_is_macro: target.is_macro(),
-            target_is_pattern_value: rust.is_rust_const_or_static_declaration(target),
-            direct_names: &direct_names,
-            lexical_scope: &lexical_scope,
-            token_tree_roles: RustTokenTreeRoleCache::default(),
-            hits: &mut local_hits,
-        };
-        scan_node(tree.root_node(), &mut ctx);
-        record_module_qualified_hits(tree.root_node(), &mut ctx);
+            let Some(prepared) = graph
+                .parsed
+                .get(file)
+                .cloned()
+                .or_else(|| rust.prepared_syntax(file))
+            else {
+                return;
+            };
+            let source = prepared.source();
+            let tree = prepared.tree();
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return;
+            }
 
-        if !local_hits.is_empty() {
-            let mut sink = hits.lock().expect("poisoned Rust graph collector");
-            sink.extend(local_hits);
-        }
-    });
+            let line_starts = prepared.line_starts();
+            let lexical_scope = RustLexicalScopeIndex::new(tree.root_node(), source);
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return;
+            }
+            let refs = rust.reference_context_of(file);
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return;
+            }
+            let (mut direct_names, _) = match seeds {
+                Some(seeds) => rust.usage_binding_names(file, seeds),
+                None => (HashSet::default(), HashSet::default()),
+            };
+            // A file that re-exports a seed (`pub use path::name`) can also reference
+            // `name` directly in its own body, but a re-export is not recorded as a
+            // local import binding. Treat any seed rooted in this file as a direct name
+            // so those in-module references resolve.
+            if let Some(seeds) = seeds {
+                for identity in seeds.identities_in_file(file) {
+                    direct_names.insert(identity.name().to_string());
+                }
+                direct_names.extend(refs.bare_names_resolving_to(&target_fqn));
+            }
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return;
+            }
+            let mut local_hits = BTreeSet::new();
+            let mut ctx = ScanCtx {
+                file,
+                source,
+                line_starts,
+                analyzer,
+                rust,
+                refs: &refs,
+                support,
+                seeds,
+                target,
+                target_is_path_qualifier: target.is_class() || rust.is_type_alias(target),
+                target_is_module: target.is_module(),
+                target_is_macro: target.is_macro(),
+                target_is_pattern_value: rust.is_rust_const_or_static_declaration(target),
+                direct_names: &direct_names,
+                lexical_scope: &lexical_scope,
+                token_tree_roles: RustTokenTreeRoleCache::default(),
+                cancellation,
+                cancellation_checks_remaining: 0,
+                hits: &mut local_hits,
+            };
+            scan_node(tree.root_node(), &mut ctx);
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return;
+            }
+            record_module_qualified_hits(tree.root_node(), &mut ctx);
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return;
+            }
+
+            if !local_hits.is_empty() {
+                let mut sink = hits.lock().expect("poisoned Rust graph collector");
+                sink.extend(local_hits);
+            }
+        });
+    }
 
     hits.into_inner().expect("poisoned Rust graph collector")
 }
@@ -216,10 +240,16 @@ pub(super) struct ScanCtx<'a> {
     direct_names: &'a HashSet<String>,
     lexical_scope: &'a RustLexicalScopeIndex,
     token_tree_roles: RustTokenTreeRoleCache,
+    pub(super) cancellation: Option<&'a CancellationToken>,
+    cancellation_checks_remaining: usize,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
 }
 
 impl ScanCtx<'_> {
+    pub(super) fn cancellation_requested(&mut self) -> bool {
+        periodic_cancellation_requested(self.cancellation, &mut self.cancellation_checks_remaining)
+    }
+
     pub(super) fn target_identifier(&self) -> &str {
         self.target.identifier()
     }
@@ -338,6 +368,18 @@ impl ScanCtx<'_> {
     }
 }
 
+fn periodic_cancellation_requested(
+    cancellation: Option<&CancellationToken>,
+    checks_remaining: &mut usize,
+) -> bool {
+    if *checks_remaining > 0 {
+        *checks_remaining -= 1;
+        return false;
+    }
+    *checks_remaining = 255;
+    cancellation.is_some_and(CancellationToken::is_cancelled)
+}
+
 pub(super) fn rust_reference_namespace(node: Node<'_>) -> RustReferenceNamespace {
     let mut ancestor = Some(node);
     while let Some(current) = ancestor {
@@ -395,6 +437,9 @@ fn scan_node(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
         root,
         ctx,
         |node, ctx| {
+            if ctx.cancellation_requested() {
+                return TreeWalkAction::Stop;
+            }
             match node.kind() {
                 "use_declaration" => {
                     record_use_import_hits(node, ctx);
@@ -657,122 +702,149 @@ pub(super) fn scan_files_for_member_target(
     let constructor_returns = self_like_constructor_returns(rust, support, &owner);
     let self_like_constructors = self_like_constructor_seeds(rust, &constructor_returns);
 
-    files.par_iter().for_each(|file| {
+    let files_vec = files.into_iter().collect::<Vec<_>>();
+    for batch in files_vec.chunks(RUST_SCAN_PARALLEL_BATCH_SIZE) {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return;
+            break;
         }
-        let Some(prepared) = graph
-            .parsed
-            .get(file)
-            .cloned()
-            .or_else(|| rust.prepared_syntax(file))
-        else {
-            return;
-        };
-        let source = prepared.source();
-        let tree = prepared.tree();
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return;
-        }
-        let line_starts = prepared.line_starts();
-        let lexical_scope_index = RustLexicalScopeIndex::new(tree.root_node(), source);
-        let refs = rust.reference_context_of(file);
-        let mut owner_local_names: HashSet<String> = if file == target.source() {
-            [owner.identifier().to_string()].into_iter().collect()
-        } else {
-            rust.usage_binding_local_names(file, &owner_seeds)
-        };
-        owner_local_names.extend(refs.bare_names_resolving_to(&owner.fq_name()));
-        let trait_owner = is_trait_owner(rust, &owner);
-        let receiver_type_names = if trait_owner {
-            rust.trait_implementer_names(&owner, file)
-        } else {
-            owner_local_names.clone()
-        };
-        if owner_local_names.is_empty()
-            && receiver_type_names.is_empty()
-            && !source.contains(&member_name)
-        {
-            return;
-        }
-        let visible_bare_constructors =
-            visible_bare_constructor_names(rust, file, &self_like_constructors);
-        let mut receiver_names = infer_receiver_names(
-            source,
-            &receiver_type_names,
-            &constructor_returns,
-            &visible_bare_constructors,
-        );
-        receiver_names.extend(resolved_owner_receiver_names(
-            tree.root_node(),
-            source,
-            analyzer,
-            rust,
-            support,
-            file,
-            &owner,
-        ));
-        receiver_names.sort();
-        receiver_names.dedup();
-        let static_owner_names = owner_local_names;
-        // The raw-identifier escape sits between the path separator and the
-        // name in source text (`Trait::r#type`), so the plain `::{member}`
-        // substring check alone would miss a normalized raw-identifier member
-        // name's escaped spelling; check both (#1128).
-        let has_static_trait_call = trait_owner
-            && (source.contains(&format!("::{member_name}"))
-                || source.contains(&format!("::r#{member_name}")));
-        let record_unproven_receivers =
-            !receiver_names.is_empty() || !static_owner_names.is_empty() || has_static_trait_call;
-        let mut type_lookup_cache = RustTypeLookupCache::default();
-        let mut local_hits = BTreeSet::new();
-        let mut local_unproven_hits = BTreeSet::new();
-        let target_is_enum_variant = requested_target.is_field()
-            && rust
-                .structural_parent_of(requested_target)
-                .or_else(|| rust.parent_of(requested_target))
-                .is_some_and(|owner| rust.is_rust_enum_declaration(&owner));
-        let mut ctx = MemberScanCtx {
-            analyzer,
-            rust,
-            support,
-            refs: &refs,
-            file,
-            source,
-            root: tree.root_node(),
-            line_starts,
-            lexical_scope: &lexical_scope_index,
-            owner: &owner,
-            member_name: &member_name,
-            scan_target: target,
-            requested_target,
-            owner_seeds: &owner_seeds,
-            target_is_field: requested_target.is_field(),
-            target_is_enum_variant,
-            target_is_pattern_value: target_is_enum_variant
-                || rust.is_rust_const_or_static_declaration(requested_target),
-            target_owner_is_trait: trait_owner,
-            receiver_names: &receiver_names,
-            receiver_type_names: &receiver_type_names,
-            record_unproven_receivers,
-            type_lookup_cache: &mut type_lookup_cache,
-            token_tree_roles: RustTokenTreeRoleCache::default(),
-            hits: &mut local_hits,
-            unproven_hits: &mut local_unproven_hits,
-        };
-        scan_member_node(tree.root_node(), &mut ctx);
+        batch.par_iter().for_each(|file| {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return;
+            }
+            let Some(prepared) = graph
+                .parsed
+                .get(file)
+                .cloned()
+                .or_else(|| rust.prepared_syntax(file))
+            else {
+                return;
+            };
+            let source = prepared.source();
+            let tree = prepared.tree();
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return;
+            }
+            let line_starts = prepared.line_starts();
+            let lexical_scope_index = RustLexicalScopeIndex::new(tree.root_node(), source);
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return;
+            }
+            let refs = rust.reference_context_of(file);
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return;
+            }
+            let mut owner_local_names: HashSet<String> = if file == target.source() {
+                [owner.identifier().to_string()].into_iter().collect()
+            } else {
+                rust.usage_binding_local_names(file, &owner_seeds)
+            };
+            owner_local_names.extend(refs.bare_names_resolving_to(&owner.fq_name()));
+            let trait_owner = is_trait_owner(rust, &owner);
+            let receiver_type_names = if trait_owner {
+                rust.trait_implementer_names(&owner, file)
+            } else {
+                owner_local_names.clone()
+            };
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return;
+            }
+            if owner_local_names.is_empty()
+                && receiver_type_names.is_empty()
+                && !source.contains(&member_name)
+            {
+                return;
+            }
+            let visible_bare_constructors =
+                visible_bare_constructor_names(rust, file, &self_like_constructors);
+            let mut receiver_names = infer_receiver_names(
+                tree.root_node(),
+                source,
+                &receiver_type_names,
+                &constructor_returns,
+                &visible_bare_constructors,
+                cancellation,
+            );
+            receiver_names.extend(resolved_owner_receiver_names(
+                tree.root_node(),
+                source,
+                analyzer,
+                rust,
+                support,
+                file,
+                &owner,
+                cancellation,
+            ));
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return;
+            }
+            receiver_names.sort();
+            receiver_names.dedup();
+            let static_owner_names = owner_local_names;
+            // The raw-identifier escape sits between the path separator and the
+            // name in source text (`Trait::r#type`), so the plain `::{member}`
+            // substring check alone would miss a normalized raw-identifier member
+            // name's escaped spelling; check both (#1128).
+            let has_static_trait_call = trait_owner
+                && (source.contains(&format!("::{member_name}"))
+                    || source.contains(&format!("::r#{member_name}")));
+            let record_unproven_receivers = !receiver_names.is_empty()
+                || !static_owner_names.is_empty()
+                || has_static_trait_call;
+            let mut type_lookup_cache = RustTypeLookupCache::default();
+            let mut local_hits = BTreeSet::new();
+            let mut local_unproven_hits = BTreeSet::new();
+            let target_is_enum_variant = requested_target.is_field()
+                && rust
+                    .structural_parent_of(requested_target)
+                    .or_else(|| rust.parent_of(requested_target))
+                    .is_some_and(|owner| rust.is_rust_enum_declaration(&owner));
+            let mut ctx = MemberScanCtx {
+                analyzer,
+                rust,
+                support,
+                refs: &refs,
+                file,
+                source,
+                root: tree.root_node(),
+                line_starts,
+                lexical_scope: &lexical_scope_index,
+                owner: &owner,
+                member_name: &member_name,
+                scan_target: target,
+                requested_target,
+                owner_seeds: &owner_seeds,
+                target_is_field: requested_target.is_field(),
+                target_is_enum_variant,
+                target_is_pattern_value: target_is_enum_variant
+                    || rust.is_rust_const_or_static_declaration(requested_target),
+                target_owner_is_trait: trait_owner,
+                receiver_names: &receiver_names,
+                receiver_type_names: &receiver_type_names,
+                record_unproven_receivers,
+                type_lookup_cache: &mut type_lookup_cache,
+                token_tree_roles: RustTokenTreeRoleCache::default(),
+                cancellation,
+                cancellation_checks_remaining: 0,
+                hits: &mut local_hits,
+                unproven_hits: &mut local_unproven_hits,
+            };
+            scan_member_node(tree.root_node(), &mut ctx);
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return;
+            }
 
-        if !local_hits.is_empty() {
-            let mut sink = hits.lock().expect("poisoned Rust member collector");
-            sink.extend(local_hits);
-        }
-        if !local_unproven_hits.is_empty() {
-            let mut sink = unproven_hits
-                .lock()
-                .expect("poisoned Rust member unproven collector");
-            sink.extend(local_unproven_hits);
-        }
-    });
+            if !local_hits.is_empty() {
+                let mut sink = hits.lock().expect("poisoned Rust member collector");
+                sink.extend(local_hits);
+            }
+            if !local_unproven_hits.is_empty() {
+                let mut sink = unproven_hits
+                    .lock()
+                    .expect("poisoned Rust member unproven collector");
+                sink.extend(local_unproven_hits);
+            }
+        });
+    }
 
     RustMemberScanResult {
         hits: hits.into_inner().expect("poisoned Rust member collector"),
@@ -812,44 +884,57 @@ struct MemberScanCtx<'a> {
     record_unproven_receivers: bool,
     type_lookup_cache: &'a mut RustTypeLookupCache,
     token_tree_roles: RustTokenTreeRoleCache,
+    cancellation: Option<&'a CancellationToken>,
+    cancellation_checks_remaining: usize,
     hits: &'a mut BTreeSet<UsageHit>,
     unproven_hits: &'a mut BTreeSet<UsageHit>,
 }
 
-fn scan_member_node(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
-    match node.kind() {
-        "field_expression" => record_instance_member_hit(node, ctx),
-        "token_tree" => {
-            record_token_tree_instance_member_hits(node, ctx);
-            record_token_tree_static_member_hits(node, ctx);
-        }
-        "scoped_identifier" | "scoped_type_identifier" => record_static_member_hit(node, ctx),
-        "type_binding" | "associated_type_binding"
-            if ctx.target_is_field && ctx.target_owner_is_trait =>
-        {
-            record_associated_type_binding_hit(node, ctx)
-        }
-        "tuple_struct_pattern" if ctx.target_is_enum_variant => {
-            record_tuple_variant_pattern_hit(node, ctx)
-        }
-        "identifier"
-            if ctx.target_is_pattern_value
-                && node
-                    .parent()
-                    .is_some_and(|parent| parent.kind() == "token_tree") =>
-        {
-            record_bare_token_tree_variant_pattern_hit(node, ctx)
-        }
-        "struct_expression" | "struct_pattern" if ctx.target_is_field => {
-            record_struct_field_hits(node, ctx)
-        }
-        _ => {}
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        scan_member_node(child, ctx);
-    }
+fn scan_member_node(root: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+    walk_tree_iterative(
+        root,
+        ctx,
+        |node, ctx| {
+            if periodic_cancellation_requested(
+                ctx.cancellation,
+                &mut ctx.cancellation_checks_remaining,
+            ) {
+                return TreeWalkAction::Stop;
+            }
+            match node.kind() {
+                "field_expression" => record_instance_member_hit(node, ctx),
+                "token_tree" => {
+                    record_token_tree_instance_member_hits(node, ctx);
+                    record_token_tree_static_member_hits(node, ctx);
+                }
+                "scoped_identifier" | "scoped_type_identifier" => {
+                    record_static_member_hit(node, ctx)
+                }
+                "type_binding" | "associated_type_binding"
+                    if ctx.target_is_field && ctx.target_owner_is_trait =>
+                {
+                    record_associated_type_binding_hit(node, ctx)
+                }
+                "tuple_struct_pattern" if ctx.target_is_enum_variant => {
+                    record_tuple_variant_pattern_hit(node, ctx)
+                }
+                "identifier"
+                    if ctx.target_is_pattern_value
+                        && node
+                            .parent()
+                            .is_some_and(|parent| parent.kind() == "token_tree") =>
+                {
+                    record_bare_token_tree_variant_pattern_hit(node, ctx)
+                }
+                "struct_expression" | "struct_pattern" if ctx.target_is_field => {
+                    record_struct_field_hits(node, ctx)
+                }
+                _ => {}
+            }
+            TreeWalkAction::Descend
+        },
+        |_| {},
+    );
 }
 
 fn record_associated_type_binding_hit(binding: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
@@ -1122,10 +1207,12 @@ fn record_instance_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
             .get_source(&enclosing, false)
             .map(|enclosing_source| {
                 receiver_explicitly_mismatched(
+                    ctx.root,
                     ctx.source,
                     &enclosing_source,
                     ctx.receiver_type_names,
                     receiver_name,
+                    ctx.cancellation,
                 )
             })
             .unwrap_or(false);
@@ -1236,10 +1323,12 @@ fn record_token_tree_instance_member_hits(node: Node<'_>, ctx: &mut MemberScanCt
                 .get_source(&enclosing, false)
                 .map(|enclosing_source| {
                     receiver_explicitly_mismatched(
+                        ctx.root,
                         ctx.source,
                         &enclosing_source,
                         ctx.receiver_type_names,
                         receiver_name,
+                        ctx.cancellation,
                     )
                 })
                 .unwrap_or(false);
@@ -1448,10 +1537,12 @@ fn receiver_name_explicitly_mismatched(
         .get_source(enclosing, false)
         .map(|enclosing_source| {
             receiver_explicitly_mismatched(
+                ctx.root,
                 ctx.source,
                 &enclosing_source,
                 ctx.receiver_type_names,
                 receiver_name,
+                ctx.cancellation,
             )
         })
         .unwrap_or(false)
@@ -2533,13 +2624,13 @@ fn visible_bare_constructor_names(
 }
 
 fn expanded_receiver_type_names(
+    root: Node<'_>,
     source: &str,
     owner_local_names: &HashSet<String>,
+    cancellation: Option<&CancellationToken>,
 ) -> HashSet<String> {
     let mut owner_type_names = owner_local_names.clone();
-    let aliases = parse_rust_source(source)
-        .map(|tree| collect_type_aliases(tree.root_node(), source))
-        .unwrap_or_default();
+    let aliases = collect_type_aliases(root, source, cancellation);
 
     loop {
         let mut changed = false;
@@ -2557,17 +2648,25 @@ fn expanded_receiver_type_names(
 }
 
 fn receiver_explicitly_mismatched(
+    file_root: Node<'_>,
     file_source: &str,
     enclosing_source: &str,
     owner_local_names: &HashSet<String>,
     receiver_name: &str,
+    cancellation: Option<&CancellationToken>,
 ) -> bool {
-    let owner_type_names = expanded_receiver_type_names(file_source, owner_local_names);
+    let owner_type_names =
+        expanded_receiver_type_names(file_root, file_source, owner_local_names, cancellation);
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return false;
+    }
     let Some(tree) = parse_rust_source(enclosing_source) else {
         return false;
     };
 
-    for (name, ty) in collect_explicit_receiver_annotations(tree.root_node(), enclosing_source) {
+    for (name, ty) in
+        collect_explicit_receiver_annotations(tree.root_node(), enclosing_source, cancellation)
+    {
         if name == receiver_name {
             return ty.as_ref().is_none_or(|ty| !owner_type_names.contains(ty));
         }
@@ -2577,17 +2676,25 @@ fn receiver_explicitly_mismatched(
 }
 
 fn infer_receiver_names(
+    root: Node<'_>,
     source: &str,
     owner_local_names: &HashSet<String>,
     self_like_constructors: &HashMap<String, SelfLikeConstructor>,
     visible_bare_constructors: &HashSet<String>,
+    cancellation: Option<&CancellationToken>,
 ) -> Vec<String> {
-    let owner_type_names = expanded_receiver_type_names(source, owner_local_names);
+    let owner_type_names =
+        expanded_receiver_type_names(root, source, owner_local_names, cancellation);
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Vec::new();
+    }
     let bindings = collect_receiver_bindings(
+        root,
         source,
         &owner_type_names,
         self_like_constructors,
         visible_bare_constructors,
+        cancellation,
     );
     let mut receivers: Vec<_> = bindings
         .snapshot()
@@ -2607,10 +2714,15 @@ fn resolved_owner_receiver_names(
     support: &GlobalUsageDefinitionIndex,
     file: &ProjectFile,
     owner: &CodeUnit,
+    cancellation: Option<&CancellationToken>,
 ) -> Vec<String> {
     let mut receivers = Vec::new();
     let mut stack = vec![root];
+    let mut cancellation_checks_remaining = 0;
     while let Some(node) = stack.pop() {
+        if periodic_cancellation_requested(cancellation, &mut cancellation_checks_remaining) {
+            break;
+        }
         if matches!(node.kind(), "parameter" | "let_declaration")
             && let Some(pattern) = node.child_by_field_name("pattern")
             && let Some(name) = simple_pattern_name(pattern, source)
@@ -2637,25 +2749,26 @@ fn resolved_owner_receiver_names(
 }
 
 fn collect_receiver_bindings(
+    root: Node<'_>,
     source: &str,
     owner_type_names: &HashSet<String>,
     self_like_constructors: &HashMap<String, SelfLikeConstructor>,
     visible_bare_constructors: &HashSet<String>,
+    cancellation: Option<&CancellationToken>,
 ) -> LocalInferenceEngine<String> {
     let mut engine = LocalInferenceEngine::new(LocalInferenceConfig::default());
-    let Some(tree) = parse_rust_source(source) else {
-        return engine;
-    };
-    let root = tree.root_node();
 
     // A stable owner-type name to seed receivers whose owner type is known only
     // indirectly (a function whose return type is the owner). Any element of
     // `owner_type_names` matches in `infer_receiver_names`, so pick deterministically.
     let owner_repr = owner_type_names.iter().min().cloned();
 
-    let option_field_types = collect_option_field_types(root, source);
+    let option_field_types = collect_option_field_types(root, source, cancellation);
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return engine;
+    }
     let mut aliases = Vec::new();
-    for event in collect_receiver_events(root, source, &option_field_types) {
+    for event in collect_receiver_events(root, source, &option_field_types, cancellation) {
         match event {
             ReceiverEvent::TypedBinding { name, ty } => {
                 if owner_type_names.contains(&ty) {
@@ -2738,10 +2851,18 @@ fn parse_rust_source(source: &str) -> Option<Tree> {
     parser.parse(source, None)
 }
 
-fn collect_type_aliases(root: Node<'_>, source: &str) -> Vec<(String, String)> {
+fn collect_type_aliases(
+    root: Node<'_>,
+    source: &str,
+    cancellation: Option<&CancellationToken>,
+) -> Vec<(String, String)> {
     let mut aliases = Vec::new();
     let mut stack = vec![root];
+    let mut cancellation_checks_remaining = 0;
     while let Some(node) = stack.pop() {
+        if periodic_cancellation_requested(cancellation, &mut cancellation_checks_remaining) {
+            break;
+        }
         if node.kind() == "type_item"
             && let (Some(alias), Some(target)) = (
                 node.child_by_field_name("name")
@@ -2764,10 +2885,15 @@ fn collect_type_aliases(root: Node<'_>, source: &str) -> Vec<(String, String)> {
 fn collect_explicit_receiver_annotations(
     root: Node<'_>,
     source: &str,
+    cancellation: Option<&CancellationToken>,
 ) -> Vec<(String, Option<String>)> {
     let mut bindings = Vec::new();
     let mut stack = vec![root];
+    let mut cancellation_checks_remaining = 0;
     while let Some(node) = stack.pop() {
+        if periodic_cancellation_requested(cancellation, &mut cancellation_checks_remaining) {
+            break;
+        }
         match node.kind() {
             "parameter" | "let_declaration" => {
                 if let Some((name, ty)) = explicit_receiver_annotation(node, source) {
@@ -2785,10 +2911,18 @@ fn collect_explicit_receiver_annotations(
     bindings
 }
 
-fn collect_option_field_types(root: Node<'_>, source: &str) -> HashMap<String, String> {
+fn collect_option_field_types(
+    root: Node<'_>,
+    source: &str,
+    cancellation: Option<&CancellationToken>,
+) -> HashMap<String, String> {
     let mut fields = HashMap::default();
     let mut stack = vec![root];
+    let mut cancellation_checks_remaining = 0;
     while let Some(node) = stack.pop() {
+        if periodic_cancellation_requested(cancellation, &mut cancellation_checks_remaining) {
+            break;
+        }
         if node.kind() == "field_declaration"
             && let (Some(name), Some(ty)) = (
                 node.child_by_field_name("name")
@@ -2812,10 +2946,15 @@ fn collect_receiver_events(
     root: Node<'_>,
     source: &str,
     option_field_types: &HashMap<String, String>,
+    cancellation: Option<&CancellationToken>,
 ) -> Vec<ReceiverEvent> {
     let mut events = Vec::new();
     let mut stack = vec![root];
+    let mut cancellation_checks_remaining = 0;
     while let Some(node) = stack.pop() {
+        if periodic_cancellation_requested(cancellation, &mut cancellation_checks_remaining) {
+            break;
+        }
         match node.kind() {
             "parameter" => {
                 if let Some((name, ty)) = typed_parameter_binding(node, source) {
@@ -3112,5 +3251,31 @@ mod tests {
         let second = second.parsed.get(&file).expect("reused prepared syntax");
         assert!(Arc::ptr_eq(first, second));
         assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 1);
+    }
+
+    #[test]
+    fn issue_1228_receiver_event_walk_stops_before_late_bindings_after_cancellation() {
+        let mut source = String::from("struct Owner;\nfn scan() {\n");
+        for index in 0..400 {
+            source.push_str(&format!("let filler_{index} = {index};\n"));
+        }
+        source.push_str("let late: Owner = Owner;\n}\n");
+        let tree = parse_rust_source(&source).expect("parse receiver fixture");
+        let cancellation = CancellationToken::cancel_after_checks_for_test(2);
+
+        let events = collect_receiver_events(
+            tree.root_node(),
+            &source,
+            &HashMap::default(),
+            Some(&cancellation),
+        );
+
+        assert!(cancellation.is_cancelled());
+        assert!(
+            !events.iter().any(
+                |event| matches!(event, ReceiverEvent::TypedBinding { name, .. } if name == "late")
+            ),
+            "nodes after cancellation must not participate in receiver inference"
+        );
     }
 }

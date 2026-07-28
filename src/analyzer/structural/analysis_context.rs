@@ -14,7 +14,8 @@ use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::identifier::define_identifier;
 use crate::analyzer::semantic::{ProcedureHandle, SemanticArtifact, SemanticArtifactKey};
 use crate::analyzer::typestate::{
-    CompiledProtocol, TypestateBindingPlan, TypestateBindingPlanHash, TypestateProtocolHash,
+    CompiledProtocol, ProductionTypestateSummaryLease, ProductionTypestateSummaryRepository,
+    TypestateBindingPlan, TypestateBindingPlanHash, TypestateProtocolHash,
 };
 use crate::cancellation::CancellationToken;
 
@@ -605,6 +606,7 @@ pub struct QueryAnalysisContext {
     workspace_generation: u64,
     by_ref: HashMap<ProtocolRef, ProtocolHandle>,
     registrations: Box<[Arc<ProtocolRegistration>]>,
+    summary_lease: ProductionTypestateSummaryLease,
 }
 
 static NEXT_QUERY_ANALYSIS_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -712,8 +714,42 @@ impl QueryAnalysisContext {
         validation_limits: QueryAnalysisValidationLimits,
         cancellation: Option<&CancellationToken>,
     ) -> Result<Self, QueryAnalysisContextError> {
+        let summaries = Arc::new(ProductionTypestateSummaryRepository::new());
+        let summary_lease = summaries.lease(workspace_generation).map_err(|_| {
+            QueryAnalysisContextError::WorkspaceGenerationMismatch {
+                registered: summaries.generation().unwrap_or(workspace_generation),
+                current: workspace_generation,
+            }
+        })?;
+        Self::new_with_validation_and_summaries(
+            workspace,
+            workspace_generation,
+            registrations,
+            requested,
+            validation_limits,
+            cancellation,
+            summary_lease,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_validation_and_summaries(
+        workspace: &WorkspaceAnalyzer,
+        workspace_generation: u64,
+        registrations: &ProtocolRegistrationSet,
+        requested: &[ProtocolRef],
+        validation_limits: QueryAnalysisValidationLimits,
+        cancellation: Option<&CancellationToken>,
+        summary_lease: ProductionTypestateSummaryLease,
+    ) -> Result<Self, QueryAnalysisContextError> {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return Err(QueryAnalysisContextError::Cancelled);
+        }
+        if summary_lease.generation() != workspace_generation {
+            return Err(QueryAnalysisContextError::WorkspaceGenerationMismatch {
+                registered: summary_lease.generation(),
+                current: workspace_generation,
+            });
         }
         let generation = NEXT_QUERY_ANALYSIS_GENERATION
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -772,11 +808,16 @@ impl QueryAnalysisContext {
             workspace_generation,
             by_ref,
             registrations: imported.into_boxed_slice(),
+            summary_lease,
         })
     }
 
     pub fn handle(&self, protocol_ref: &ProtocolRef) -> Option<ProtocolHandle> {
         self.by_ref.get(protocol_ref).copied()
+    }
+
+    pub(crate) const fn summary_lease(&self) -> &ProductionTypestateSummaryLease {
+        &self.summary_lease
     }
 
     pub fn resolve<'a>(

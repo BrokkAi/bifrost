@@ -1235,6 +1235,38 @@ fn bifrost_lsp_server_validates_and_hovers_unsaved_rqlp_source() {
         "{hover}"
     );
 
+    let configured = r#"(policy :analysis (analysis :type taint :mode may :call-modeling (call-modeling :unmodeled optimistic)))"#;
+    for (needle, offset, expected) in [
+        (":call-modeling", 2, "omission defaults to paranoid"),
+        (
+            "(call-modeling",
+            2,
+            "without an executable body or applicable model",
+        ),
+        (
+            "optimistic",
+            2,
+            "without adding flows through the unseen body",
+        ),
+    ] {
+        let hover = server.request(
+            "bifrost/policyHover",
+            json!({
+                "source": configured,
+                "position": {
+                    "line": 0,
+                    "character": configured.find(needle).unwrap() + offset,
+                }
+            }),
+        );
+        assert!(
+            hover["result"]["contents"]["value"]
+                .as_str()
+                .is_some_and(|value| value.contains(expected)),
+            "expected `{expected}` in {hover}"
+        );
+    }
+
     for (selector, expected) in [
         (
             r#"(rql (call :callee (name "run")))"#,
@@ -1580,7 +1612,7 @@ export function leak_resource(): object {
     :subjects (subject-set :entries [
       (subject :id resource :selector (rql (call :callee (name "open_resource")))
         :subject return-value)])
-    :uncertainty (uncertainty :unknown-call inconclusive :escape inconclusive)
+    :uncertainty (uncertainty :escape inconclusive)
     :automaton (automaton
       :states [open closed violated]
       :initial open
@@ -1911,7 +1943,7 @@ fn bifrost_lsp_server_completes_optional_schema_versions_from_unsaved_rqlp_sourc
     );
     let completion = &response["result"]["items"][0];
     assert_eq!(
-        completion["textEdit"]["newText"], ":schema-version 4",
+        completion["textEdit"]["newText"], ":schema-version 5",
         "{response}"
     );
     assert_eq!(
@@ -7755,6 +7787,19 @@ fn bifrost_lsp_server_scala_semantic_diagnostics_are_runtime_opt_in() {
             .as_array()
             .is_some_and(Vec::is_empty),
         "Scala semantic diagnostics must be disabled by default: {disabled}"
+    );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": uri}}
+    }));
+    let initially_published = server.read_notification("textDocument/publishDiagnostics");
+    assert!(
+        initially_published["params"]["diagnostics"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "default-off Scala diagnostics must publish an empty report: {initially_published}"
     );
 
     server.notify_value(json!({

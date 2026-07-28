@@ -181,12 +181,14 @@ pub(crate) fn resolved_typestate_to_json(
     Ok(json!({
         "type": "typestate",
         "mode": may_mode_label(spec.mode),
+        "call_modeling": {
+            "unmodeled": spec.call_modeling.unmodeled.label(),
+        },
         "subjects": subjects
             .into_iter()
             .map(resolved_typestate_subject_to_json)
             .collect::<Vec<_>>(),
         "uncertainty": {
-            "unknown_call": inconclusive_label(spec.uncertainty.unknown_call),
             "escape": inconclusive_label(spec.uncertainty.escape),
         },
         "automaton": resolved_typestate_automaton_to_json(&spec.automaton),
@@ -266,6 +268,9 @@ fn resolved_taint_to_json(
     Ok(json!({
         "type": "taint",
         "mode": may_mode_label(spec.mode),
+        "call_modeling": {
+            "unmodeled": spec.call_modeling.unmodeled.label(),
+        },
         "sources": sources
             .into_iter()
             .map(|endpoint| resolved_taint_source_to_json(endpoint, selectors))

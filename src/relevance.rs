@@ -351,37 +351,60 @@ pub(crate) fn most_important_project_files(
     candidates: &[ProjectFile],
     top_k: usize,
 ) -> Vec<ProjectFile> {
+    most_important_project_files_with_cancellation(analyzer, candidates, top_k, None).0
+}
+
+pub(crate) fn most_important_project_files_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    candidates: &[ProjectFile],
+    top_k: usize,
+    cancellation: Option<&crate::CancellationToken>,
+) -> (Vec<ProjectFile>, bool) {
     let _scope = profiling::scope("relevance::most_important_project_files");
     if top_k == 0 || candidates.is_empty() {
-        return Vec::new();
+        return (Vec::new(), true);
     }
 
     let Some(repo) = GitProjectContext::discover(analyzer.project().root()) else {
-        return Vec::new();
+        return (Vec::new(), true);
     };
     let candidate_set: HashSet<_> = candidates.iter().cloned().collect();
     // Peel HEAD to a tree once for the whole call instead of per candidate: a full scan of an
     // untracked candidate set previously re-resolved `HEAD` and re-peeled to a tree once per file.
     let Some(head_tree) = repo.head_tree() else {
-        return Vec::new();
+        return (Vec::new(), true);
     };
+    if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+        return (Vec::new(), false);
+    }
     if !candidate_set
         .iter()
         .any(|file| repo.is_tracked_in_tree(file, &head_tree))
     {
-        return Vec::new();
+        return (Vec::new(), true);
     }
 
-    let Ok(changes) = repo.recent_commit_changes(COMMITS_TO_PROCESS) else {
-        return Vec::new();
+    let (changes, history_complete) = if cancellation.is_some() {
+        match repo.cached_recent_commit_changes(COMMITS_TO_PROCESS) {
+            Ok(Some(changes)) => (changes, true),
+            Ok(None) | Err(_) => (Vec::new(), false),
+        }
+    } else {
+        let Ok(changes) = repo.recent_commit_changes(COMMITS_TO_PROCESS) else {
+            return (Vec::new(), true);
+        };
+        (changes, true)
     };
     if changes.is_empty() {
-        return Vec::new();
+        return (Vec::new(), history_complete);
     }
 
     let mut scores: HashMap<ProjectFile, f64> = HashMap::default();
     let mut canonicalizer = RenameCanonicalizer::default();
     for (index, change) in changes.into_iter().enumerate() {
+        if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+            return (Vec::new(), false);
+        }
         canonicalizer.record_renames(&change.renames);
         let age_weight = commit_age_weight(index, Some(DEFAULT_RECENCY_HALF_LIFE));
         for path in change.paths {
@@ -401,7 +424,10 @@ pub(crate) fn most_important_project_files(
         .collect::<Vec<_>>();
     ranked.sort_by(compare_file_relevance);
     ranked.truncate(top_k);
-    ranked.into_iter().map(|item| item.file).collect()
+    (
+        ranked.into_iter().map(|item| item.file).collect(),
+        history_complete && !cancellation.is_some_and(crate::CancellationToken::is_cancelled),
+    )
 }
 
 fn commit_age_weight(index: usize, half_life: Option<f64>) -> f64 {
@@ -1245,6 +1271,34 @@ impl GitProjectContext {
         self.recent_commit_changes_with_cache(limit, &cache)
     }
 
+    /// Return commit-change history only when both cache layers are already
+    /// warm. Interactive cancellable queries use this path so ranking never
+    /// starts an uninterruptible Git subprocess; a cold cache is a truthful
+    /// incomplete ranking rather than a latency-budget violation.
+    fn cached_recent_commit_changes(
+        &self,
+        limit: usize,
+    ) -> Result<Option<Vec<CommitChange>>, String> {
+        let cache = repo_commit_change_cache(&self.repo_root);
+        let Some(head) = self.head_commit_oid() else {
+            return Ok(Some(Vec::new()));
+        };
+        let ordered_oids = {
+            let guard = cache.recent_oids.lock().expect("recent oids mutex");
+            let Some(cached) = guard
+                .as_ref()
+                .filter(|cached| cached.head == head && cached.oids.len() >= limit)
+            else {
+                return Ok(None);
+            };
+            cached.oids[..limit].to_vec()
+        };
+        match self.collect_cached_commit_changes(&ordered_oids, &cache) {
+            Ok(changes) => Ok(Some(changes)),
+            Err(_) => Ok(None),
+        }
+    }
+
     fn recent_commit_changes_with_cache(
         &self,
         limit: usize,
@@ -1760,8 +1814,8 @@ mod weight_benchmark;
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_RECENCY_HALF_LIFE, FileRelevance, GitProjectContext, RepoCommitChangeCache,
-        UsageReferenceWeights, clear_repo_commit_change_cache_for_root,
+        DEFAULT_RECENCY_HALF_LIFE, FileRelevance, GIT_REV_LIST_SPAWNS, GitProjectContext,
+        RepoCommitChangeCache, UsageReferenceWeights, clear_repo_commit_change_cache_for_root,
         clear_repo_root_cache_for_project, commit_age_weight, most_important_project_files,
         most_relevant_project_files_with_half_life, related_files_by_git, related_files_by_imports,
         repo_commit_change_cache, repo_root_cache, weighted_page_rank,
@@ -2995,6 +3049,24 @@ mod tests {
         let cached_larger = context.recent_commit_oids_cached(5, &cache).unwrap();
         assert_eq!(2, cache.recent_oid_fills.load(Ordering::Relaxed));
         assert_eq!(5, cached_larger.len());
+    }
+
+    #[test]
+    fn issue_1228_cancellable_git_ranking_never_spawns_on_a_cold_cache() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        write_file(root, "File.java", "class File {}");
+        let repo = Repository::init(root).unwrap();
+        commit_paths_at(&repo, "initial", &["File.java"], &[], 1);
+        clear_repo_commit_change_cache_for_root(root);
+        clear_repo_root_cache_for_project(root);
+        let context = git_context(root);
+        let before = GIT_REV_LIST_SPAWNS.load(Ordering::Relaxed);
+
+        let cached = context.cached_recent_commit_changes(1).unwrap();
+
+        assert!(cached.is_none());
+        assert_eq!(GIT_REV_LIST_SPAWNS.load(Ordering::Relaxed), before);
     }
 
     /// M5 unit test for the discover repo-root cache's fallback path: a poisoned/stale cache

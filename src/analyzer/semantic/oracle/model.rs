@@ -1127,6 +1127,19 @@ pub enum DispatchBoundaryKind {
     Truncated,
 }
 
+impl DispatchBoundaryKind {
+    /// Exact structured target retained for a non-materialized dispatch arm.
+    /// Unresolved and truncated residual arms do not name one target.
+    pub fn target_locator(&self) -> Option<&SemanticLocator> {
+        match self {
+            Self::External(Some(target))
+            | Self::Unmaterialized(target)
+            | Self::Deferred { target, .. } => Some(target),
+            Self::External(None) | Self::Unresolved | Self::Truncated => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DeferredInvocationKind {
     Async,

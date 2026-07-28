@@ -815,6 +815,16 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                         )),
                         false,
                     ),
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::LanguageDefined,
+                        source,
+                        target,
+                    } => (
+                        ValueFlowRelationKind::LanguageDefined,
+                        ValueFlowEndpoint::Value(value_handle(procedure, *source)?),
+                        ValueFlowEndpoint::Value(value_handle(procedure, *target)?),
+                        false,
+                    ),
                     SemanticEffect::Allocation { allocation } => {
                         let allocation =
                             procedure.allocation_handle(*allocation).ok_or_else(|| {

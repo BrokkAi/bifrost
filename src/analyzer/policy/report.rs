@@ -17,9 +17,9 @@ use super::definition::{
     TaintSystemEntry, TaintTrustBoundary,
 };
 use super::finding::{
-    CompletionReasonError, PolicyDiagnostic, PolicyDiagnosticImpact, PolicyDiagnosticSeverity,
-    PolicyFinding, PolicyFindingError, PolicyIncompleteReason, PolicyRun, PolicyRunCompletion,
-    PolicyRunError,
+    CompletionReasonError, PolicyDiagnostic, PolicyDiagnosticSeverity, PolicyFinding,
+    PolicyFindingError, PolicyIncompleteReason, PolicyRun, PolicyRunCompletion, PolicyRunError,
+    completion_allows_diagnostic_impact,
 };
 use super::finding_identity::{FindingIdentityStability, PolicyFindingId};
 use super::identity::{EndpointAnalysisProjectionHash, EndpointSemanticHash, PolicySemanticHash};
@@ -2647,24 +2647,6 @@ fn report_storage_size(
         )
 }
 
-fn completion_allows_diagnostic_impact(
-    completion: &PolicyRunCompletion,
-    impact: PolicyDiagnosticImpact,
-) -> bool {
-    match impact {
-        PolicyDiagnosticImpact::Advisory | PolicyDiagnosticImpact::FindingPartial => true,
-        PolicyDiagnosticImpact::RunIncomplete => {
-            matches!(completion, PolicyRunCompletion::Inconclusive { .. })
-        }
-        PolicyDiagnosticImpact::RunUnsupported => {
-            matches!(completion, PolicyRunCompletion::Unsupported { .. })
-        }
-        PolicyDiagnosticImpact::RunFailed => {
-            matches!(completion, PolicyRunCompletion::Failed { .. })
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2672,10 +2654,10 @@ mod tests {
     use crate::analyzer::policy::definition::{PolicyAnalysis, PolicySelector, RqlpDocument};
     use crate::analyzer::policy::finding::{
         FindingCertainty, FindingCompleteness, FindingIncompleteReason, MatchFindingEvidence,
-        PolicyByteSpan, PolicyCapability, PolicyDiagnosticCode, PolicyDisplayRegion,
-        PolicyFailureReason, PolicyFindingEvidence, PolicyQueryProof, PolicyQueryProvenance,
-        PolicyQueryResultRef, PolicySourceLocation, PolicyWorkReport, ProofMetadata, ProofReason,
-        ProofState,
+        PolicyByteSpan, PolicyCapability, PolicyDiagnosticCode, PolicyDiagnosticImpact,
+        PolicyDisplayRegion, PolicyFailureReason, PolicyFindingEvidence, PolicyQueryProof,
+        PolicyQueryProvenance, PolicyQueryResultRef, PolicySourceLocation, PolicyWorkReport,
+        ProofMetadata, ProofReason, ProofState,
     };
     use crate::analyzer::policy::finding_identity::{
         MatchFindingAnchor, MatchResultDomain, OpaqueFindingKey, SourceSliceHash,

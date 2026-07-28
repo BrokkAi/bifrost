@@ -23,6 +23,7 @@ export interface PolicySourceLocation {
 
 export type PolicyRunCompletion =
   | { type: "complete" }
+  | { type: "proven_subset"; codes: readonly unknown[] }
   | { type: "inconclusive"; reasons: readonly unknown[] }
   | { type: "unsupported"; capability: unknown }
   | { type: "failed"; reasons: readonly unknown[] };
@@ -268,6 +269,8 @@ export function policyCompletionLabel(completion: PolicyRunCompletion): string {
   switch (completion.type) {
     case "complete":
       return "complete";
+    case "proven_subset":
+      return "proven subset";
     case "inconclusive":
       return "inconclusive";
     case "unsupported":
@@ -281,6 +284,10 @@ export function policyCompletionDetail(completion: PolicyRunCompletion): string 
   switch (completion.type) {
     case "complete":
       return "The policy run is complete.";
+    case "proven_subset":
+      return `The policy run reports only a proven subset, not all callers: ${formatUnknown(
+        completion.codes
+      )}.`;
     case "inconclusive":
       return `The policy run was inconclusive: ${formatUnknown(completion.reasons)}.`;
     case "unsupported":
@@ -430,6 +437,8 @@ function isPolicyCompletion(value: unknown): value is PolicyRunCompletion {
   switch (value.type) {
     case "complete":
       return true;
+    case "proven_subset":
+      return Array.isArray(value.codes);
     case "inconclusive":
     case "failed":
       return Array.isArray(value.reasons);

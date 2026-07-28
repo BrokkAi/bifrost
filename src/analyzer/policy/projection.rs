@@ -1590,7 +1590,7 @@ fn validate_typestate_violation(
 
 fn downgrade_completion(completion: &mut PolicyRunCompletion, reason: PolicyIncompleteReason) {
     match completion {
-        PolicyRunCompletion::Complete => {
+        PolicyRunCompletion::Complete | PolicyRunCompletion::ProvenSubset { .. } => {
             *completion = PolicyRunCompletion::inconclusive(vec![reason])
                 .expect("one typed incomplete reason is canonical");
         }
@@ -1877,7 +1877,7 @@ mod tests {
             :subjects (subject-set :entries [
               (subject :id resource :selector (rql (name "resource"))
                 :subject return-value)])
-            :uncertainty (uncertainty :unknown-call inconclusive :escape inconclusive)
+            :uncertainty (uncertainty :escape inconclusive)
             :automaton (automaton
               :states [open closed violated]
               :initial open

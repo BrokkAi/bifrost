@@ -297,13 +297,14 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             .at(&items[0])?;
             Ok(Some(Value::Object(query)))
         }
-        RqlForm::Inside | RqlForm::NotInside => {
+        RqlForm::Inside | RqlForm::InsideDecl | RqlForm::NotInside => {
             expect_len(expr, items, 3, head)?;
             let mut query = query_object(&items[2])?;
-            let field = if form == RqlForm::Inside {
-                "inside"
-            } else {
-                "not_inside"
+            let field = match form {
+                RqlForm::Inside => "inside",
+                RqlForm::InsideDecl => "inside_decl",
+                RqlForm::NotInside => "not_inside",
+                _ => unreachable!("containment forms were filtered above"),
             };
             insert_unique(&mut query, field, pattern_to_json(&items[1])?).at(expr)?;
             Ok(Some(Value::Object(query)))
@@ -534,13 +535,23 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                         "proof",
                         Value::String(symbol_or_string(&pair[1])?.replace('-', "_")),
                     ),
+                    ":completeness" if matches!(form, RqlForm::Callers | RqlForm::Callees) => {
+                        let label = symbol_or_string(&pair[1])?.replace('-', "_");
+                        if super::schema::call_traversal_completeness_from_label(&label).is_none() {
+                            return Err(lower_error(
+                                &pair[1],
+                                "expected exhaustive or proven-subset",
+                            ));
+                        }
+                        ("completeness", Value::String(label))
+                    }
                     _ => {
                         return Err(lower_error(
                             &pair[0],
                             format!(
                                 "({head} ...) accepts :proof{}",
                                 if matches!(form, RqlForm::Callers | RqlForm::Callees) {
-                                    " and :depth"
+                                    " , :depth, and :completeness"
                                 } else {
                                     ""
                                 }
@@ -796,6 +807,7 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::Explain
         | RqlForm::Profile
         | RqlForm::Inside
+        | RqlForm::InsideDecl
         | RqlForm::NotInside
         | RqlForm::Union
         | RqlForm::Intersect
@@ -1376,6 +1388,33 @@ mod tests {
                 ]
             }))
         );
+    }
+
+    #[test]
+    fn callers_proven_subset_lowers_only_with_proven_proof() {
+        assert_eq!(
+            canonical(
+                r#"(callers :depth 2 :proof proven :completeness proven-subset (enclosing-decl (method :name "sink")))"#,
+            ),
+            canonical_json(json!({
+                "match": { "kind": "method", "name": "sink" },
+                "steps": [
+                    { "op": "enclosing_decl" },
+                    {
+                        "op": "callers",
+                        "depth": 2,
+                        "proof": "proven",
+                        "completeness": "proven_subset"
+                    }
+                ]
+            }))
+        );
+        for invalid in [
+            r#"(callers :completeness proven-subset (enclosing-decl (method :name "sink")))"#,
+            r#"(callees :proof proven :completeness proven-subset (enclosing-decl (method :name "sink")))"#,
+        ] {
+            assert!(CodeQuery::from_sexp(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]

@@ -13,7 +13,12 @@ assert.ok(npmExecPath, "npm_execpath is required to run npm portably");
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = path.resolve(packageDir, "..", "..");
 
-const canonicalSkillNames = ["bifrost-code-navigation", "bifrost-code-reading", "bifrost-codebase-search"];
+const canonicalSkillNames = [
+  "bifrost-code-navigation",
+  "bifrost-code-reading",
+  "bifrost-codebase-search",
+  "bifrost-policy-checking",
+];
 const sourceManifest = JSON.parse(await fsp.readFile(path.join(packageDir, "package.json"), "utf8"));
 const piPeerPackages = [
   "@earendil-works/pi-coding-agent",
@@ -120,7 +125,7 @@ try {
   assert.deepEqual(
     probeResult.skillNames,
     canonicalSkillNames,
-    "installed tarball must load exactly the three canonical Bifrost skills",
+    "installed tarball must load exactly the four canonical Bifrost skills",
   );
   assert.equal(installedManifest.pi.skills.length, canonicalSkillNames.length);
 

@@ -13,8 +13,8 @@ import {
 
 test("normalizes capability order and builds existing Bifrost toolsets", () => {
   assert.deepEqual(
-    normalizeCapabilities(["text", "symbols", "quality", "symbols", "unknown"]),
-    ["symbols", "quality", "text"],
+    normalizeCapabilities(["text", "policies", "symbols", "quality", "symbols", "unknown"]),
+    ["symbols", "policies", "quality", "text"],
   );
   assert.equal(serverToolsetExpression(["symbols"]), "symbol|slopcop");
   assert.equal(
@@ -34,10 +34,13 @@ test("classifies broad extended tools and excludes removed Git wrappers", () => 
   assert.equal(toolBelongsToSelection("compute_cyclomatic_complexity", ["symbols"]), false);
   assert.equal(capabilityForTool("query_code"), "query");
   assert.equal(capabilityForTool("list_files"), "files");
+  assert.equal(capabilityForTool("list_policies"), "policies");
+  assert.equal(capabilityForTool("run_policy"), "policies");
   assert.equal(capabilityForTool("get_git_log"), undefined);
   assert.equal(capabilityForTool("jq"), "transforms");
   assert.equal(toolBelongsToSelection("jq", ["query"]), false);
   assert.equal(toolBelongsToSelection("query_code", ["query"]), true);
+  assert.equal(toolBelongsToSelection("run_policy", ["policies"]), true);
 });
 
 test("uses one stable namespace for every Pi-visible tool", () => {

@@ -7,8 +7,9 @@ use std::mem::size_of;
 use crate::analyzer::dataflow::{
     DataflowRequest, PathQuality, PathQualityFrontier, ProcedureSummaryKey, ReusableEndSummary,
     ReusableProcedureSummary, ReusableReachedFact, ReusableSummaryProvider,
-    SemanticProcedureSummary, SolverTermination, SummaryDependencyKey, SummaryExitKind,
-    SummaryRecursiveGroupKey, validate_recursive_summary_batch,
+    SemanticProcedureSummary, SemanticSummarySetValidationError, SolverTermination,
+    SummaryDependencyKey, SummaryExitKind, SummaryRecursiveGroupKey,
+    canonicalize_semantic_summary_items, validate_recursive_summary_batch,
 };
 use crate::analyzer::semantic::{
     DeclarationLocator, IcfgProvider, ProcedureHandle, ReturnTransferKind, SemanticArtifactKey,
@@ -115,21 +116,17 @@ pub struct ProtocolSemanticSummarySet<'summary> {
 
 impl<'summary> ProtocolSemanticSummarySet<'summary> {
     pub fn try_new(
-        mut summaries: Vec<&'summary SemanticProcedureSummary>,
+        summaries: Vec<&'summary SemanticProcedureSummary>,
     ) -> Result<Self, ProtocolSummaryError> {
-        if summaries
-            .iter()
-            .any(|summary| !summary.completeness().is_complete())
-        {
-            return Err(ProtocolSummaryError::IncompleteSemanticSummary);
-        }
-        summaries.sort_unstable_by(|left, right| left.key().cmp(right.key()));
-        if summaries
-            .windows(2)
-            .any(|pair| pair[0].key() == pair[1].key())
-        {
-            return Err(ProtocolSummaryError::AmbiguousSemanticSummary);
-        }
+        let summaries = canonicalize_semantic_summary_items(summaries, |summary| *summary, true)
+            .map_err(|error| match error {
+                SemanticSummarySetValidationError::Incomplete => {
+                    ProtocolSummaryError::IncompleteSemanticSummary
+                }
+                SemanticSummarySetValidationError::AmbiguousKey => {
+                    ProtocolSummaryError::AmbiguousSemanticSummary
+                }
+            })?;
         let mut by_artifact =
             HashMap::<SemanticArtifactKey, HashMap<DeclarationLocator, usize>>::new();
         for (index, summary) in summaries.iter().enumerate() {
@@ -143,9 +140,17 @@ impl<'summary> ProtocolSemanticSummarySet<'summary> {
             }
         }
         Ok(Self {
-            summaries: summaries.into_boxed_slice(),
+            summaries,
             by_artifact,
         })
+    }
+
+    pub fn len(&self) -> usize {
+        self.summaries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.summaries.is_empty()
     }
 
     fn unique_summary_for(&self, procedure: &ProcedureHandle) -> Option<&SemanticProcedureSummary> {
@@ -154,6 +159,26 @@ impl<'summary> ProtocolSemanticSummarySet<'summary> {
             .get(procedure.artifact().key())?
             .get(procedure.semantics().locator().declaration())?;
         self.summaries.get(*index).copied()
+    }
+
+    pub(super) fn compatible_repository(
+        &self,
+        repository: &CompleteProtocolSummaryRepository,
+        protocol: &CompiledProtocol,
+        bindings: &TypestateBindingPlan,
+    ) -> CompleteProtocolSummaryRepository {
+        let mut compatible = CompleteProtocolSummaryRepository::with_limits(repository.limits());
+        let Some(contracts) = self.compute_binding_contracts(bindings, || false) else {
+            return compatible;
+        };
+        for summary in repository.entries.values() {
+            if summary.key().protocol() == protocol.hash()
+                && contracts.get(summary.key().procedure()) == Some(&summary.key().bindings())
+            {
+                compatible.insert(summary.clone());
+            }
+        }
+        compatible
     }
 
     /// Compute the propagation-relevant binding closure for a protocol artifact.
@@ -624,6 +649,10 @@ impl<'live> ProtocolLiveRemap<'live> {
 }
 
 impl ProtocolFactKey {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        size_of::<Self>().saturating_add(protocol_fact_heap_bytes(self))
+    }
+
     fn is_observed_effect(&self) -> bool {
         match self {
             Self::Zero => false,
@@ -992,7 +1021,7 @@ impl ProtocolSummaryLookupKey {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompleteProtocolSummaryRepository {
     entries: HashMap<ProtocolSummaryKey, ProtocolSummary>,
     by_entry: HashMap<ProtocolSummaryLookupKey, ProtocolSummaryKey>,
@@ -1030,6 +1059,10 @@ impl CompleteProtocolSummaryRepository {
 
     pub const fn retained_bytes(&self) -> usize {
         self.retained_bytes
+    }
+
+    pub const fn limits(&self) -> ProtocolSummaryRepositoryLimits {
+        self.limits
     }
 
     pub fn clear(&mut self) {
@@ -1234,6 +1267,59 @@ impl CompleteProtocolSummaryRepository {
         self.by_entry
             .get(&lookup)
             .and_then(|key| self.entries.get(key))
+    }
+
+    pub(super) fn into_publication_batches(self) -> ProtocolSummaryPublicationBatches {
+        partition_protocol_summaries(self.entries.into_values())
+    }
+
+    pub(super) fn absorb_batches(
+        &mut self,
+        batches: ProtocolSummaryPublicationBatches,
+        semantic_summaries: &ProtocolSemanticSummarySet<'_>,
+    ) -> Result<usize, ProtocolSummaryPublicationError> {
+        let started = self.len();
+        for summary in batches.ordinary {
+            self.publish(summary)?;
+        }
+        for (group, summaries) in batches.recursive {
+            let semantic = semantic_summaries
+                .summaries
+                .iter()
+                .copied()
+                .filter(|summary| summary.key().recursive_group() == Some(group))
+                .collect::<Vec<_>>();
+            self.publish_scc(summaries, &semantic)?;
+        }
+        Ok(self.len().saturating_sub(started))
+    }
+}
+
+pub(super) struct ProtocolSummaryPublicationBatches {
+    ordinary: Vec<ProtocolSummary>,
+    recursive: Vec<(SummaryRecursiveGroupKey, Vec<ProtocolSummary>)>,
+}
+
+fn partition_protocol_summaries(
+    summaries: impl IntoIterator<Item = ProtocolSummary>,
+) -> ProtocolSummaryPublicationBatches {
+    let mut ordinary = Vec::new();
+    let mut recursive = HashMap::<SummaryRecursiveGroupKey, Vec<ProtocolSummary>>::new();
+    for summary in summaries {
+        match summary.key().procedure().recursive_group() {
+            Some(group) => recursive.entry(group).or_default().push(summary),
+            None => ordinary.push(summary),
+        }
+    }
+    ordinary.sort_unstable_by(|left, right| left.key().cmp(right.key()));
+    let mut recursive = recursive.into_iter().collect::<Vec<_>>();
+    recursive.sort_unstable_by_key(|(group, _)| *group);
+    for (_, summaries) in &mut recursive {
+        summaries.sort_unstable_by(|left, right| left.key().cmp(right.key()));
+    }
+    ProtocolSummaryPublicationBatches {
+        ordinary,
+        recursive,
     }
 }
 
@@ -1604,6 +1690,10 @@ impl ProtocolSummarySolveResult {
     pub const fn published_summaries(&self) -> usize {
         self.published_summaries
     }
+
+    pub fn into_computed_result(self) -> TypestateSummaryResult {
+        *self.result
+    }
 }
 
 /// Opt-in reusable solve path. The existing source-backed solver remains unchanged.
@@ -1920,22 +2010,14 @@ fn publish_protocol_summaries(
     binding_contracts: &ProtocolBindingContracts,
     projection_skipped: bool,
 ) -> Result<(ProtocolSummaryCacheStatus, usize), ProtocolSummarySolveError> {
-    let mut ordinary = Vec::new();
-    let mut recursive = HashMap::<SummaryRecursiveGroupKey, Vec<ProtocolSummary>>::new();
-    for summary in summaries {
-        if let Some(group) = summary.key.procedure().recursive_group() {
-            recursive.entry(group).or_default().push(summary);
-        } else {
-            ordinary.push(summary);
-        }
-    }
+    let batches = partition_protocol_summaries(summaries);
 
     let mut published_any = false;
     let mut recursive_batch_required = false;
     let mut capacity_exceeded = false;
     let mut conflict = false;
     let mut published = 0usize;
-    for summary in ordinary {
+    for summary in batches.ordinary {
         match repository.publish(summary) {
             Ok(ProtocolSummaryPublicationOutcome::Inserted) => {
                 published_any = true;
@@ -1954,7 +2036,7 @@ fn publish_protocol_summaries(
         }
     }
 
-    for (group, batch) in recursive {
+    for (group, batch) in batches.recursive {
         let semantic_manifest = binding_contracts
             .recursive_manifest(group)
             .ok_or(ProtocolSummaryError::ProcedureMismatch)?;

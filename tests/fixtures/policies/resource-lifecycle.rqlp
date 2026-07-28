@@ -8,6 +8,7 @@
     (analysis
       :type typestate
       :mode may
+      :call-modeling (call-modeling :unmodeled paranoid)
       :subjects
         (subject-set
           :include-matches [
@@ -18,7 +19,6 @@
           :entries [])
       :uncertainty
         (uncertainty
-          :unknown-call inconclusive
           :escape inconclusive)
       :automaton
         (automaton

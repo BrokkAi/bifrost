@@ -713,6 +713,9 @@ fn plan_summary_text(plan: &CodeQueryPlan) -> String {
             if let Some(pattern) = &seed.inside {
                 parts.push(format!("inside {}", pattern_summary(pattern)));
             }
+            if let Some(pattern) = &seed.inside_decl {
+                parts.push(format!("inside-decl {}", pattern_summary(pattern)));
+            }
             if let Some(pattern) = &seed.not_inside {
                 parts.push(format!("not inside {}", pattern_summary(pattern)));
             }

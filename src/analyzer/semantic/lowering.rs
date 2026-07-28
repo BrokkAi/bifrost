@@ -23,7 +23,7 @@ use super::{
     SemanticGapId, SemanticGapImpacts, SemanticGapKind, SemanticGapSubject, SemanticLocator,
     SemanticOutcome, SemanticProviderError, SemanticRole, SemanticValue, SemanticValueKind,
     SemanticWork, SourceAnchor, SourceMapping, SourceMappingId, SourceMappingKind, SourcePosition,
-    SourceSpan, ValueId,
+    SourceSpan, ValueFlowKind, ValueId,
 };
 
 /// Common operational failures produced while lowering one procedure.
@@ -1112,6 +1112,27 @@ impl<'a> ProcedureLoweringSession<'a> {
             point,
             SemanticEvent::new(effect, metadata.source, metadata.evidence),
         )?;
+        Ok(())
+    }
+
+    pub(crate) fn append_language_defined_value_flows(
+        &self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        sources: impl IntoIterator<Item = ValueId>,
+        target: ValueId,
+    ) -> Result<(), ProcedureLoweringError> {
+        for source in sources {
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::LanguageDefined,
+                    source,
+                    target,
+                },
+            )?;
+        }
         Ok(())
     }
 

@@ -84,6 +84,7 @@ const CODE_SKILL_NAMES: &[&str] = &[
     "bifrost-code-navigation",
     "bifrost-code-reading",
     "bifrost-codebase-search",
+    "bifrost-policy-checking",
 ];
 
 const EMBEDDED_SKILLS: &[EmbeddedSkill] = &[
@@ -102,6 +103,10 @@ const EMBEDDED_SKILLS: &[EmbeddedSkill] = &[
     EmbeddedSkill {
         name: "bifrost-codebase-search",
         content: include_str!("../plugins/bifrost-agent/skills/bifrost-codebase-search/SKILL.md"),
+    },
+    EmbeddedSkill {
+        name: "bifrost-policy-checking",
+        content: include_str!("../plugins/bifrost-agent/skills/bifrost-policy-checking/SKILL.md"),
     },
     EmbeddedSkill {
         name: "git-exploration",

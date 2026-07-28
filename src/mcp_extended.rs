@@ -14,6 +14,7 @@ use std::path::PathBuf;
 
 pub const EXTENDED_TOOL_NAMES: &[&str] = &[
     "query_code",
+    "list_policies",
     "run_policy",
     "get_symbol_locations",
     "get_symbol_ancestors",
@@ -26,6 +27,7 @@ pub const EXTENDED_TOOL_NAMES: &[&str] = &[
 ];
 
 pub(crate) const MAX_RUN_POLICY_PATH_BYTES: usize = 1_024;
+pub(crate) const MAX_RUN_POLICY_SELECTOR_BYTES: usize = 256;
 
 pub fn run_extended_stdio_server(
     root: PathBuf,
@@ -268,6 +270,10 @@ fn query_plan_properties(
             "type": "object",
             "description": "Optional containment constraint: the match must be lexically inside a node matching this pattern (same shape as match)."
         },
+        "inside_decl": {
+            "type": "object",
+            "description": "Optional declaration-bounded containment: the match must be inside a node matching this pattern without crossing a callable declaration (same shape as match)."
+        },
         "not_inside": {
             "type": "object",
             "description": "Optional negative containment: the match must NOT be inside a node matching this pattern."
@@ -318,7 +324,7 @@ fn query_plan_properties(
 }
 
 fn query_plan_source_variants() -> Vec<Value> {
-    let seed_scope_fields = ["inside", "not_inside", "where", "languages"];
+    let seed_scope_fields = ["inside", "inside_decl", "not_inside", "where", "languages"];
     let sources = ["match", "union", "intersect", "except"];
     sources
         .into_iter()
@@ -373,7 +379,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         .collect::<Vec<_>>()
         .join(", ");
     let query_code_description = format!(
-        "Query normalized code structure, compose compatible typed branches with union, intersect, or except, then optionally apply typed semantic steps. Schema version 4 supports {step_vocabulary}; explicit version-2 pins retain the pre-CFG vocabulary and version-3 pins retain CFG without typestate. Set branches must produce the same terminal domain; a common steps suffix may continue from that domain. Set execution_mode to explain for planning without workspace execution or profile for the exact ordinary result plus structured operator measurements; results is the default. Hierarchy steps are direct by default and accept either a positive depth or transitive: true. Call traversal is direct by default, accepts only finite positive depth, and can expose call sites plus one direct receiver or formal-parameter input. Reference and call steps preserve proof-bearing exact indexed targets and sites. Java, JavaScript, TypeScript, C++, C#, Go, PHP, Python, Ruby, Rust, and Scala receiver_targets, points_to, and member_targets expose bounded demand-driven receiver provenance; unsupported source forms return explicit analysis rows. Procedure-local CFG steps expose source-backed procedure, program_point, and control_edge results with proof and completeness. Schema-v4 typestate accepts only a host-registered protocol_ref, maps procedure to diagnostic-neutral typestate_finding, and projects already-retained bounded typestate_witness rows without rerunning the solver; an unconfigured host returns an explicit unresolved-reference diagnostic. Results include only declarations indexed by the workspace analyzer; observing library usages does not imply that library declarations are queryable. Terminal values are tagged structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, file, reference_site, call_site, expression_site, or receiver_analysis results with provenance. Minimal query: {{\"match\":{{\"kind\":\"call\",\"callee\":{{\"name\":\"eval\"}}}}}}. Typestate example: {{\"schema_version\":4,\"match\":{{\"kind\":\"function\",\"name\":\"run\"}},\"steps\":[{{\"op\":\"procedure_of\"}},{{\"op\":\"typestate\",\"protocol_ref\":\"embedding:resource-lifecycle\"}},{{\"op\":\"witness\",\"max_steps\":32,\"max_bytes\":16384}}]}}. Guide: https://bifrost.brokk.ai/code-querying/"
+        "Query normalized code structure, compose compatible typed branches with union, intersect, or except, then optionally apply typed semantic steps. Schema version 5 supports {step_vocabulary} and declaration-bounded inside_decl containment; explicit version-2 pins retain the pre-CFG vocabulary, version-3 pins retain CFG without typestate, and version-4 pins retain typestate without declaration-bounded containment. Set branches must produce the same terminal domain; a common steps suffix may continue from that domain. Set execution_mode to explain for planning without workspace execution or profile for the exact ordinary result plus structured operator measurements; results is the default. Hierarchy steps are direct by default and accept either a positive depth or transitive: true. Call traversal is direct by default, accepts only finite positive depth, and can expose call sites plus one direct receiver or formal-parameter input. Reference and call steps preserve proof-bearing exact indexed targets and sites. Java, JavaScript, TypeScript, C++, C#, Go, PHP, Python, Ruby, Rust, and Scala receiver_targets, points_to, and member_targets expose bounded demand-driven receiver provenance; unsupported source forms return explicit analysis rows. Procedure-local CFG steps expose source-backed procedure, program_point, and control_edge results with proof and completeness. Schema-v4 typestate accepts only a host-registered protocol_ref, maps procedure to diagnostic-neutral typestate_finding, and projects already-retained bounded typestate_witness rows without rerunning the solver; an unconfigured host returns an explicit unresolved-reference diagnostic. Results include only declarations indexed by the workspace analyzer; observing library usages does not imply that library declarations are queryable. Terminal values are tagged structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, file, reference_site, call_site, expression_site, or receiver_analysis results with provenance. Minimal query: {{\"match\":{{\"kind\":\"call\",\"callee\":{{\"name\":\"eval\"}}}}}}. Typestate example: {{\"schema_version\":4,\"match\":{{\"kind\":\"function\",\"name\":\"run\"}},\"steps\":[{{\"op\":\"procedure_of\"}},{{\"op\":\"typestate\",\"protocol_ref\":\"embedding:resource-lifecycle\"}},{{\"op\":\"witness\",\"max_steps\":32,\"max_bytes\":16384}}]}}. Guide: https://bifrost.brokk.ai/code-querying/"
     );
     let query_step_variants = query_step_input_variants();
     let query_plan_schema = query_plan_schema(&pattern_schema_description, &query_step_variants);
@@ -409,7 +415,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                 "type": "integer",
                 "default": SCHEMA_VERSION,
                 "enum": schema_versions,
-                "description": "Optional query schema version. Omit for compatible head v4; pin v3 for CFG without typestate or v2 for the pre-CFG vocabulary."
+                "description": "Optional query schema version. Omit for compatible head v5; pin v4 for typestate without declaration-bounded containment, v3 for CFG without typestate, or v2 for the pre-CFG vocabulary."
             },
             "query_file": {
                 "type": "string",
@@ -458,8 +464,17 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
             }),
         ),
         tool_descriptor(
+            "list_policies",
+            "List the deterministic built-in policy-pack manifest, including stable policy ids, categories, supported languages, capabilities, and semantic hashes. Does not construct or query a workspace analyzer.",
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        ),
+        tool_descriptor(
             "run_policy",
-            "Evaluate one or more explicit workspace-relative .rqlp policy files against the active immutable workspace snapshot. Returns the canonical schema-2 report and computed policy status. Built-in policy-pack discovery is intentionally outside this tool.",
+            "Evaluate built-in policy selections and/or explicit workspace-relative .rqlp files against the active immutable workspace snapshot. Returns the canonical schema-2 report and computed policy status.",
             json!({
                 "type": "object",
                 "properties": {
@@ -474,7 +489,43 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "minItems": 1,
                         "maxItems": max_policy_files,
                         "uniqueItems": true,
-                        "description": "Explicit workspace policy roots to evaluate together."
+                        "description": "Optional explicit workspace policy roots to evaluate together."
+                    },
+                    "policy_packs": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_RUN_POLICY_SELECTOR_BYTES
+                        },
+                        "minItems": 1,
+                        "maxItems": max_policy_files,
+                        "uniqueItems": true,
+                        "description": "Optional built-in pack ids."
+                    },
+                    "policy_categories": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_RUN_POLICY_SELECTOR_BYTES
+                        },
+                        "minItems": 1,
+                        "maxItems": max_policy_files,
+                        "uniqueItems": true,
+                        "description": "Optional built-in policy categories."
+                    },
+                    "policy_ids": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_RUN_POLICY_SELECTOR_BYTES
+                        },
+                        "minItems": 1,
+                        "maxItems": max_policy_files,
+                        "uniqueItems": true,
+                        "description": "Optional stable built-in policy ids."
                     },
                     "suppression_file": {
                         "type": "string",
@@ -494,7 +545,13 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "description": "Finding threshold used to compute the returned policy status."
                     }
                 },
-                "required": ["policy_files", "evaluation_date"],
+                "required": ["evaluation_date"],
+                "anyOf": [
+                    { "required": ["policy_files"] },
+                    { "required": ["policy_packs"] },
+                    { "required": ["policy_categories"] },
+                    { "required": ["policy_ids"] }
+                ],
                 "additionalProperties": false
             }),
         ),
@@ -766,7 +823,7 @@ mod tests {
         assert_eq!(advertised, registered);
         assert_eq!(
             query_code["inputSchema"]["properties"]["schema_version"]["enum"],
-            json!([2, 3, 4])
+            json!([2, 3, 4, 5])
         );
         assert_eq!(
             query_code["inputSchema"]["properties"]["execution_mode"]["enum"],
@@ -794,6 +851,7 @@ mod tests {
         for field in [
             "match",
             "inside",
+            "inside_decl",
             "not_inside",
             "where",
             "languages",
@@ -828,6 +886,7 @@ mod tests {
                     "intersect",
                     "except",
                     "inside",
+                    "inside_decl",
                     "languages",
                     "not_inside",
                     "where",
@@ -866,17 +925,15 @@ mod tests {
     }
 
     #[test]
-    fn run_policy_schema_requires_bounded_explicit_inputs() {
+    fn run_policy_schema_requires_bounded_mixed_inputs() {
         let descriptor = extended_tool_descriptors()
             .into_iter()
             .find(|descriptor| descriptor["name"] == "run_policy")
             .expect("run_policy descriptor");
         let schema = &descriptor["inputSchema"];
         let policy_files = &schema["properties"]["policy_files"];
-        assert_eq!(
-            schema["required"],
-            json!(["policy_files", "evaluation_date"])
-        );
+        assert_eq!(schema["required"], json!(["evaluation_date"]));
+        assert_eq!(schema["anyOf"].as_array().map(Vec::len), Some(4));
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(policy_files["minItems"], 1);
         assert_eq!(
@@ -888,6 +945,19 @@ mod tests {
             policy_files["items"]["maxLength"],
             MAX_RUN_POLICY_PATH_BYTES
         );
+        for selector in ["policy_packs", "policy_categories", "policy_ids"] {
+            let property = &schema["properties"][selector];
+            assert_eq!(property["minItems"], 1);
+            assert_eq!(
+                property["maxItems"],
+                crate::analyzer::policy::PolicyBatchBudget::default().max_policies()
+            );
+            assert_eq!(property["uniqueItems"], true);
+            assert_eq!(
+                property["items"]["maxLength"],
+                MAX_RUN_POLICY_SELECTOR_BYTES
+            );
+        }
         assert_eq!(
             schema["properties"]["evaluation_date"]["pattern"],
             "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"

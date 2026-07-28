@@ -3040,14 +3040,13 @@ fn compare_completeness(left: &EvidenceCompleteness, right: &EvidenceCompletenes
 }
 
 fn compare_call_to_return_model(
-    left: Option<crate::analyzer::semantic::CallToReturnModel>,
-    right: Option<crate::analyzer::semantic::CallToReturnModel>,
+    left: crate::analyzer::semantic::CallToReturnModel,
+    right: crate::analyzer::semantic::CallToReturnModel,
 ) -> Ordering {
     let rank = |model| match model {
-        None => 0,
-        Some(crate::analyzer::semantic::CallToReturnModel::Normal) => 1,
-        Some(crate::analyzer::semantic::CallToReturnModel::Exceptional) => 2,
-        Some(crate::analyzer::semantic::CallToReturnModel::NormalAndExceptional) => 3,
+        crate::analyzer::semantic::CallToReturnModel::Normal => 0,
+        crate::analyzer::semantic::CallToReturnModel::Exceptional => 1,
+        crate::analyzer::semantic::CallToReturnModel::NormalAndExceptional => 2,
     };
     rank(left).cmp(&rank(right))
 }

@@ -3,6 +3,7 @@ mod common;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::Instant;
 
 use serde_json::Value;
 
@@ -10,6 +11,32 @@ use common::{BuiltInlineTestProject, InlineTestProject};
 
 const APP: &str = include_str!("fixtures/policy-cli/project/src/app.py");
 const RESOURCE_SOURCE: &str = include_str!("fixtures/policy-cli/project/src/resource.ts");
+const CROSS_LANGUAGE_TYPESCRIPT_RESOURCE_SOURCE: &str = r#"interface Resource {}
+
+function openResource(): Resource {
+  return {};
+}
+
+function closeResource(resource: Resource): void {}
+
+export function leaksResource(): void {
+  const resource = openResource();
+}
+"#;
+const JAVA_RESOURCE_SOURCE: &str = r#"class Resource {}
+
+class ResourceLifecycle {
+  static Resource openResource() {
+    return null;
+  }
+
+  static void closeResource(Resource resource) {}
+
+  static void leaksResource() {
+    Resource resource = ResourceLifecycle.openResource();
+  }
+}
+"#;
 const DYNAMIC: &str = include_str!("fixtures/policy-cli/project/policies/dynamic-eval.rqlp");
 const INFERRED: &str =
     include_str!("fixtures/policy-cli/project/policies/inferred-dynamic-eval.rqlp");
@@ -25,6 +52,36 @@ const INFERRED_ACQUIRE_ENDPOINT: &str =
     include_str!("fixtures/policy-cli/overrides/resource-acquire-inferred.rqlp");
 const CLOSE_ENDPOINT: &str =
     include_str!("fixtures/policy-cli/project/policies/endpoints/resource-close.rqlp");
+const CROSS_LANGUAGE_ACQUIRE_ENDPOINT: &str = r#"(endpoint
+  :schema-version 1
+  :id "bifrost.resources.acquire"
+  :name "Resource acquisition"
+  :display-name "acquired resource"
+  :role source
+  :categories [resource.lifecycle resource.acquire]
+  :selector
+    (rql
+      :schema-version 2
+      (union
+        (language typescript (call :callee (name "openResource")))
+        (language java (call :callee (name "openResource")))))
+  :binding return-value
+  :supersedes [])"#;
+const CROSS_LANGUAGE_CLOSE_ENDPOINT: &str = r#"(endpoint
+  :schema-version 1
+  :id "bifrost.resources.close"
+  :name "Resource close"
+  :display-name "resource close"
+  :role sink
+  :categories [resource.lifecycle resource.close]
+  :selector
+    (rql
+      :schema-version 2
+      (union
+        (language typescript (call :callee (name "closeResource")))
+        (language java (call :callee (name "closeResource")))))
+  :binding (argument :index 0)
+  :supersedes [])"#;
 const DOMINANT_CLOSE_ENDPOINT: &str = r#"(endpoint
   :schema-version 1
   :id "bifrost.resources.close-dominant"
@@ -86,7 +143,6 @@ const EXIT_EVENT_POLICY: &str = r#"(policy
           :entries [])
       :uncertainty
         (uncertainty
-          :unknown-call inconclusive
           :escape inconclusive)
       :automaton
         (automaton
@@ -123,6 +179,37 @@ fn policy_project(extra: &[(&str, String)]) -> BuiltInlineTestProject {
         project = project.file(*path, source.clone());
     }
     project.build()
+}
+
+fn resource_policy_project(path: &str, source: &str) -> BuiltInlineTestProject {
+    InlineTestProject::new()
+        .file(path, source)
+        .file("policies/resource-lifecycle.rqlp", RESOURCE)
+        .file(
+            "policies/endpoints/resource-acquire.rqlp",
+            CROSS_LANGUAGE_ACQUIRE_ENDPOINT,
+        )
+        .file(
+            "policies/endpoints/resource-close.rqlp",
+            CROSS_LANGUAGE_CLOSE_ENDPOINT,
+        )
+        .build()
+}
+
+fn repeated_java_resource_policy_project(copy: String) -> BuiltInlineTestProject {
+    InlineTestProject::new()
+        .file("src/ResourceLifecycle.java", JAVA_RESOURCE_SOURCE)
+        .file("policies/resource-lifecycle.rqlp", RESOURCE)
+        .file("policies/resource-lifecycle-copy.rqlp", copy)
+        .file(
+            "policies/endpoints/resource-acquire.rqlp",
+            CROSS_LANGUAGE_ACQUIRE_ENDPOINT,
+        )
+        .file(
+            "policies/endpoints/resource-close.rqlp",
+            CROSS_LANGUAGE_CLOSE_ENDPOINT,
+        )
+        .build()
 }
 
 fn bifrost(root: &Path) -> Command {
@@ -173,6 +260,145 @@ fn assert_single_terminal_safe_line(output: &Output) {
     for escaped in ["\\u{A}", "\\u{1B}", "\\u{202E}", "\\u{2066}"] {
         assert!(stderr.contains(escaped), "missing {escaped} in {stderr:?}");
     }
+}
+
+#[test]
+fn built_in_policy_catalog_lists_without_constructing_a_workspace() {
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--list-policies")
+        .output()
+        .expect("run policy listing");
+    assert_status(&output, 0);
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    let manifest = json_stdout(&output);
+    assert_eq!(manifest["id"], "bifrost.code-smells");
+    assert_eq!(manifest["policies"].as_array().map(Vec::len), Some(12));
+    assert_eq!(
+        manifest["policies"][0]["id"],
+        "bifrost.correctness.dynamic-evaluation"
+    );
+}
+
+#[test]
+fn built_in_and_workspace_policies_run_in_one_batch() {
+    let project = policy_project(&[]);
+    let output = run(
+        project.root(),
+        &[
+            "--policy-id",
+            "bifrost.correctness.dynamic-evaluation",
+            "--policy-file",
+            "policies/no-exec.rqlp",
+            "--evaluation-date",
+            "2026-07-28",
+            "--fail-on",
+            "never",
+            "--format",
+            "json",
+        ],
+    );
+    assert_status(&output, 0);
+    let report = json_stdout(&output);
+    let policy_ids = report["runs"]
+        .as_array()
+        .expect("policy runs")
+        .iter()
+        .map(|run| run["policy_id"].as_str().expect("policy id"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        policy_ids,
+        vec![
+            "bifrost.correctness.dynamic-evaluation",
+            "bifrost.security.no-exec"
+        ]
+    );
+}
+
+#[test]
+fn built_in_pack_and_category_selectors_run_valid_batches() {
+    let project = policy_project(&[]);
+    let category = run(
+        project.root(),
+        &[
+            "--policy-category",
+            "correctness",
+            "--evaluation-date",
+            "2026-07-28",
+            "--fail-on",
+            "never",
+            "--format",
+            "json",
+        ],
+    );
+    assert_status(&category, 0);
+    let category_report = json_stdout(&category);
+    let category_ids = category_report["runs"]
+        .as_array()
+        .expect("category runs")
+        .iter()
+        .map(|run| run["policy_id"].as_str().expect("category policy id"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        category_ids,
+        vec![
+            "bifrost.correctness.dynamic-evaluation",
+            "bifrost.correctness.unsafe-deserialization"
+        ]
+    );
+
+    let pack = run(
+        project.root(),
+        &[
+            "--policy-pack",
+            "bifrost.code-smells",
+            "--evaluation-date",
+            "2026-07-28",
+            "--fail-on",
+            "never",
+            "--format",
+            "json",
+        ],
+    );
+    assert_status(&pack, 0);
+    let pack_report = json_stdout(&pack);
+    let pack_ids = pack_report["runs"]
+        .as_array()
+        .expect("pack runs")
+        .iter()
+        .map(|run| run["policy_id"].as_str().expect("pack policy id"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pack_ids,
+        vec![
+            "bifrost.correctness.dynamic-evaluation",
+            "bifrost.correctness.unsafe-deserialization",
+            "bifrost.performance.database-call-in-loop",
+            "bifrost.performance.expensive-operation-in-nested-loop",
+            "bifrost.performance.file-read-in-loop",
+            "bifrost.performance.network-call-in-loop",
+            "bifrost.performance.parsing-in-loop",
+            "bifrost.performance.regex-compile-in-loop",
+            "bifrost.performance.serialization-in-loop",
+            "bifrost.performance.sleep-in-loop",
+            "bifrost.performance.sort-in-loop",
+            "bifrost.performance.subprocess-in-loop",
+        ]
+    );
+}
+
+#[test]
+fn unknown_built_in_selector_is_a_policy_invocation_error() {
+    let project = policy_project(&[]);
+    let output = run(
+        project.root(),
+        &["--policy-pack", "bifrost.missing", "--format", "json"],
+    );
+    assert_status(&output, 2);
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("unknown built-in policy pack `bifrost.missing`")
+    );
 }
 
 #[test]
@@ -528,6 +754,121 @@ fn policy_help_names_suppression_controls() {
 }
 
 #[test]
+fn proven_subset_callers_are_visible_and_reliable_without_claiming_exhaustiveness() {
+    let source = r#"class Smells {
+    void terminate() { System.exit(1); }
+    void directTerminate() { this.terminate(); }
+    void secondOrderTerminate() { this.directTerminate(); }
+}"#;
+    let policy = |id: &str, completeness: &str| {
+        format!(
+            r#"(policy
+  :id "{id}"
+  :name "Proven callers"
+  :message "Calls System.exit"
+  :severity warning
+  :analysis (analysis :type match :selector
+    (rql (language java
+      (callers :depth 2 :proof proven {completeness}
+        (enclosing-decl
+          (call :receiver (name "System") :callee (name "exit"))))))))"#
+        )
+    };
+    let project = InlineTestProject::new()
+        .file("src/Smells.java", source)
+        .file(
+            "policies/exhaustive.rqlp",
+            policy("test.exhaustive-callers", ""),
+        )
+        .file(
+            "policies/proven-subset.rqlp",
+            policy("test.proven-subset-callers", ":completeness proven-subset"),
+        )
+        .build();
+
+    let exhaustive = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/exhaustive.rqlp",
+            "--format",
+            "json",
+        ],
+    );
+    assert_status(&exhaustive, 2);
+    let exhaustive = json_stdout(&exhaustive);
+    assert_eq!(exhaustive["runs"][0]["completion"]["type"], "inconclusive");
+
+    let subset = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/proven-subset.rqlp",
+            "--format",
+            "json",
+        ],
+    );
+    assert_status(&subset, 1);
+    let subset = json_stdout(&subset);
+    assert_eq!(subset["runs"][0]["completion"]["type"], "proven_subset");
+    assert_eq!(subset["runs"][0]["findings"].as_array().unwrap().len(), 2);
+    assert!(
+        subset["runs"][0]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["impact"] == "declared_non_exhaustive")
+    );
+
+    let human = run(
+        project.root(),
+        &["--policy-file", "policies/proven-subset.rqlp"],
+    );
+    assert_status(&human, 1);
+    let human = String::from_utf8(human.stdout).expect("UTF-8 human report");
+    assert!(
+        human.contains("proven subset (not exhaustive; call_relation_candidates_omitted)"),
+        "{human}"
+    );
+    assert!(human.contains("non-exhaustive"), "{human}");
+
+    let sarif = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/proven-subset.rqlp",
+            "--format",
+            "sarif",
+        ],
+    );
+    assert_status(&sarif, 1);
+    let sarif = json_stdout(&sarif);
+    assert_eq!(
+        sarif["runs"][0]["invocations"][0]["executionSuccessful"],
+        true
+    );
+    assert!(
+        sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|notification| notification["descriptor"]["id"] == "BIFROST_POLICY_PROVEN_SUBSET"),
+        "{sarif:#}"
+    );
+
+    let below_threshold = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/proven-subset.rqlp",
+            "--fail-on",
+            "error",
+        ],
+    );
+    assert_status(&below_threshold, 2);
+}
+
+#[test]
 fn strict_versions_endpoint_roots_and_typestate_execution_have_typed_statuses() {
     let project = policy_project(&[]);
 
@@ -562,7 +903,7 @@ fn strict_versions_endpoint_roots_and_typestate_execution_have_typed_statuses() 
     assert!(
         String::from_utf8_lossy(&accepted_inference.stdout)
             .contains(
-                "policy bifrost.security.inferred-dynamic-eval inferred policy schema 1 and RQL schema 4"
+                "policy bifrost.security.inferred-dynamic-eval inferred policy schema 1 and RQL schema 5"
             )
     );
 
@@ -965,6 +1306,221 @@ fn typestate_finding_identity_locations_and_witnesses_match_human_and_sarif() {
 }
 
 #[test]
+fn java_and_typescript_resource_rqlp_retain_identity_through_all_renderers() {
+    for (language, project) in [
+        (
+            "typescript",
+            resource_policy_project("src/resource.ts", CROSS_LANGUAGE_TYPESCRIPT_RESOURCE_SOURCE),
+        ),
+        (
+            "java",
+            resource_policy_project("src/ResourceLifecycle.java", JAVA_RESOURCE_SOURCE),
+        ),
+    ] {
+        let arguments = [
+            "--policy-file",
+            "policies/resource-lifecycle.rqlp",
+            "--fail-on",
+            "never",
+        ];
+        let json = run(
+            project.root(),
+            &[&arguments[..], &["--format", "json"]].concat(),
+        );
+        assert_status(&json, 2);
+        let json = json_stdout(&json);
+        let findings = json["runs"][0]["findings"]
+            .as_array()
+            .expect("findings array");
+        assert_eq!(findings.len(), 1, "{language} report: {json:#}");
+        let finding = &findings[0];
+        let finding_id = finding["id"].as_str().expect("finding id");
+        let policy_id = finding["policy_id"].as_str().expect("policy id");
+        assert_eq!(policy_id, "bifrost.test.resource-lifecycle");
+        assert!(!finding["witnesses"].as_array().unwrap().is_empty());
+
+        let human = run(project.root(), &[&arguments[..], &["--verbose"]].concat());
+        assert_status(&human, 2);
+        let human = String::from_utf8(human.stdout).expect("UTF-8 typestate report");
+        assert!(human.contains(finding_id), "{human}");
+        assert!(human.contains(policy_id), "{human}");
+
+        let sarif = run(
+            project.root(),
+            &[&arguments[..], &["--format", "sarif"]].concat(),
+        );
+        assert_status(&sarif, 2);
+        let sarif = json_stdout(&sarif);
+        let result = &sarif["runs"][0]["results"][0];
+        assert_eq!(result["ruleId"], policy_id);
+        assert_eq!(result["properties"]["bifrost.findingId"], finding_id);
+        assert_eq!(
+            result["properties"]["bifrost.certainty"],
+            finding["certainty"]
+        );
+        assert_eq!(
+            result["properties"]["bifrost.findingCompleteness"],
+            finding["completeness"]
+        );
+        assert!(!result["codeFlows"].as_array().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn repeated_typestate_policies_share_production_summaries_with_explicit_counters() {
+    let copy = RESOURCE
+        .replace(
+            "bifrost.test.resource-lifecycle",
+            "bifrost.test.resource-lifecycle-copy",
+        )
+        .replace("Resource lifecycle", "Resource lifecycle copy");
+    let project = repeated_java_resource_policy_project(copy);
+    let output = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/resource-lifecycle.rqlp",
+            "--policy-file",
+            "policies/resource-lifecycle-copy.rqlp",
+            "--format",
+            "json",
+            "--fail-on",
+            "never",
+        ],
+    );
+    assert_status(&output, 2);
+    let report = json_stdout(&output);
+    let runs = report["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2);
+    let metric = |run: &Value, name: &str| {
+        run["work"]["metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|metric| metric["name"] == name)
+            .unwrap_or_else(|| panic!("missing {name} in {}", run["policy_id"]))["value"]
+            .as_u64()
+            .unwrap()
+    };
+    let first = runs
+        .iter()
+        .find(|run| run["policy_id"] == "bifrost.test.resource-lifecycle")
+        .unwrap();
+    let repeated = runs
+        .iter()
+        .find(|run| run["policy_id"] == "bifrost.test.resource-lifecycle-copy")
+        .unwrap();
+
+    assert!(metric(first, "typestate.summary_misses") > 0);
+    assert_eq!(
+        metric(first, "typestate.summary_recomputations"),
+        metric(first, "typestate.summary_misses")
+    );
+    // Policy-batch exact results are presentation-neutral and replay their
+    // original semantic, solver, and provider-execution charges. The second
+    // policy therefore reuses the first result even though policy/finding IDs
+    // remain policy-specific.
+    assert!(metric(repeated, "typestate.summary_hits") > 0);
+    assert_eq!(metric(repeated, "typestate.summary_misses"), 0);
+    assert_eq!(metric(repeated, "typestate.summary_recomputations"), 0);
+    let first_finding = &first["findings"][0];
+    let repeated_finding = &repeated["findings"][0];
+    for field in [
+        "message",
+        "severity",
+        "certainty",
+        "completeness",
+        "primary",
+        "related",
+        "witnesses_truncated",
+    ] {
+        assert_eq!(first_finding[field], repeated_finding[field], "{field}");
+    }
+    let first_witnesses = first_finding["witnesses"].as_array().unwrap();
+    let repeated_witnesses = repeated_finding["witnesses"].as_array().unwrap();
+    assert_eq!(first_witnesses.len(), repeated_witnesses.len());
+    for (first_witness, repeated_witness) in first_witnesses.iter().zip(repeated_witnesses) {
+        assert_eq!(first_witness["steps"], repeated_witness["steps"]);
+        assert_eq!(first_witness["truncated"], repeated_witness["truncated"]);
+    }
+    assert_eq!(first["diagnostics"], repeated["diagnostics"]);
+    for run in runs {
+        assert_eq!(metric(run, "typestate.summary_evictions"), 0);
+        let _ = metric(run, "typestate.summary_rejections");
+    }
+}
+
+#[test]
+#[ignore = "emits timing evidence; run explicitly with --ignored --nocapture"]
+fn production_summary_repeated_policy_measurement() {
+    let copy = RESOURCE
+        .replace(
+            "bifrost.test.resource-lifecycle",
+            "bifrost.test.resource-lifecycle-copy",
+        )
+        .replace("Resource lifecycle", "Resource lifecycle copy");
+    let project = repeated_java_resource_policy_project(copy);
+    let started = Instant::now();
+    let output = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/resource-lifecycle.rqlp",
+            "--policy-file",
+            "policies/resource-lifecycle-copy.rqlp",
+            "--format",
+            "json",
+            "--fail-on",
+            "never",
+        ],
+    );
+    let batch_micros = started.elapsed().as_micros();
+    assert_status(&output, 2);
+    let report = json_stdout(&output);
+    let runs = report["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2);
+    let metric = |run: &Value, name: &str| {
+        run["work"]["metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|metric| metric["name"] == name)
+            .unwrap_or_else(|| panic!("missing {name} in {}", run["policy_id"]))["value"]
+            .as_u64()
+            .unwrap()
+    };
+    let measurements = runs
+        .iter()
+        .map(|run| {
+            serde_json::json!({
+                "policy_id": run["policy_id"],
+                "hits": metric(run, "typestate.summary_hits"),
+                "misses": metric(run, "typestate.summary_misses"),
+                "rejections": metric(run, "typestate.summary_rejections"),
+                "evictions": metric(run, "typestate.summary_evictions"),
+                "recomputations": metric(run, "typestate.summary_recomputations"),
+                "finding_ids": run["findings"].as_array().unwrap().iter()
+                    .map(|finding| finding["id"].clone())
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(measurements[1]["hits"].as_u64().unwrap() > 0);
+    assert_eq!(measurements[1]["recomputations"], 0);
+    println!(
+        "BIFROST_PRODUCTION_SUMMARY_POLICY_MEASUREMENT={}",
+        serde_json::json!({
+            "format": "bifrost_production_summary_policy/v1",
+            "fixture": "inline:src/ResourceLifecycle.java",
+            "language": "java",
+            "repeated_policies": 2,
+            "batch_micros": batch_micros,
+            "runs": measurements,
+        })
+    );
+}
+
+#[test]
 fn typestate_same_site_endpoint_precedence_retains_only_the_dominant_binding() {
     let project = policy_project(&[
         (
@@ -1000,7 +1556,7 @@ fn typestate_same_site_endpoint_precedence_retains_only_the_dominant_binding() {
     let subjects = metrics
         .iter()
         .find(|metric| metric["name"] == "typestate.subjects")
-        .expect("typestate subject metric");
+        .unwrap_or_else(|| panic!("missing typestate subject metric: {report:#}"));
     assert_eq!(subjects["value"], 2);
     let initial_seeds = metrics
         .iter()

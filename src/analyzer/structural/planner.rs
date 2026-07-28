@@ -207,13 +207,16 @@ impl SourceCandidateIndex<'_> {
 }
 
 /// Literal strings that must all appear in a file's source for the query's
-/// root (plus `inside`) constraints to possibly match. Empty when the query
+/// root (plus positive containment) constraints to possibly match. Empty when the query
 /// has no exact-name anchors (regex/text/kind-only queries prune nothing).
 fn collect_positive_source_anchors(query: &CodeQuerySeed) -> Vec<String> {
     let mut anchors = Vec::new();
     collect_pattern_anchors(&query.root, &mut anchors);
     if let Some(inside) = &query.inside {
         collect_pattern_anchors(inside, &mut anchors);
+    }
+    if let Some(inside_decl) = &query.inside_decl {
+        collect_pattern_anchors(inside_decl, &mut anchors);
     }
     // query.not_inside intentionally ignored: verifier-only.
     anchors.sort_unstable();
@@ -272,6 +275,16 @@ mod tests {
             "inside": { "kind": "class", "name": "Controller" }
         }));
         assert_eq!(anchors, vec!["Controller", "run", "shell", "subprocess"]);
+    }
+
+    #[test]
+    fn declaration_bounded_containment_contributes_positive_anchors() {
+        let anchors = anchors_of(json!({
+            "schema_version": 5,
+            "match": { "kind": "call", "name": "run" },
+            "inside_decl": { "kind": "loop", "name": "retry" }
+        }));
+        assert_eq!(anchors, vec!["retry", "run"]);
     }
 
     #[test]
