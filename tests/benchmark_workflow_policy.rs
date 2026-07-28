@@ -180,14 +180,10 @@ fn issue_1228_workflow_enforces_release_interactive_latency_with_profiles() {
         .expect("workflow should define the interactive latency job");
 
     assert!(job.contains("    timeout-minutes: 90\n"));
-    assert!(job.contains("cargo build --release --locked --bin bifrost --bin bifrost_benchmark"));
-    assert!(job.contains(
-        "./target/release/bifrost_benchmark validate --manifest benchmark/interactive-latency.toml"
-    ));
-    assert!(job.contains("BIFROST_BENCHMARK_BIFROST_BIN=./target/release/bifrost"));
-    assert!(job.contains("--manifest benchmark/interactive-latency.toml"));
-    assert!(job.contains("--profile"));
+    assert!(job.contains("scripts/run-interactive-latency.sh --profile"));
+    assert!(job.contains("if-no-files-found: error"));
     assert!(job.contains("| Bounded incomplete | Status |"));
+    assert!(job.contains("Light p95 | Cancel p95 | Dominant phase"));
     assert!(job.contains(".bounded_incomplete_iterations // 0"));
     assert!(
         job.contains("      - name: Upload interactive latency artifacts\n        if: always()")

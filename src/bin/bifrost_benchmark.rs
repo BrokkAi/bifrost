@@ -369,6 +369,25 @@ fn print_run_summary(report: &BenchmarkRunReport, report_path: &Path) {
             if let Some(message) = &scenario.failure_message {
                 println!("    failure: {message}");
             }
+            if let Some(fairness) = &scenario.mcp_fairness {
+                println!(
+                    "    fairness: light_p95={:.1} ms cancellation_p95={:.1} ms",
+                    fairness.light_request_p95_ms.unwrap_or_default(),
+                    fairness.cancellation_p95_ms.unwrap_or_default()
+                );
+            }
+            for phase in &scenario.transport_phases {
+                println!(
+                    "    phase {}[{}]: p50={:.1} ms p95={:.1} ms",
+                    phase.phase,
+                    phase.tool,
+                    phase.p50_ms.unwrap_or_default(),
+                    phase.p95_ms.unwrap_or_default()
+                );
+            }
+            if let Some(dominant) = &scenario.dominant_phase {
+                println!("    dominant phase: {dominant}");
+            }
         }
     }
     println!("wrote {}", report_path.display());

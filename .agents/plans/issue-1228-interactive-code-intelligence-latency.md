@@ -18,7 +18,7 @@ The visible proof has two parts. Deterministic tests will prove cancellation pro
 - [x] (2026-07-28 09:21Z) Milestone 1 complete and checkpointed as `d9bb61bf`: both scan surfaces share request cancellation and bounded candidate/source/callsite work, every bounded result carries a typed incomplete reason, five issue-specific unit/service tests and the large-response integration test pass, and the post-checkpoint review found no semantic or scope correction.
 - [x] (2026-07-28 09:35Z) Milestone 2 complete and checkpointed as `fdb403f3`: every read-only tool call leaves the stdin reader for the existing four-slot bounded worker path, workspace-mutating lifecycle calls remain reader-ordered, query/policy snapshot preparation moved off the reader, lifecycle timing covers queue/execution/response-queue/writer phases, and all 14 MCP transport tests pass.
 - [x] (2026-07-28 11:04Z) Milestone 3 implementation and live campaign complete: the request-ID-aware benchmark client, pinned release-mode interactive manifest, p50/p95 and bounded-incomplete reporting, heavy/light cancellation case, workflow gate, and raw lifecycle profiles are in place; all ten measured scenarios passed the 5,000 ms contract.
-- [ ] Milestone 4 in progress: formatting, 27 benchmark regression tests, and all-target/all-feature Clippy pass; the July 28 scheduled report has been refreshed, while the final focused unit run, whole-diff specialist review, checkpoint, and retrospective remain.
+- [x] (2026-07-28 13:12Z) Milestone 4 complete: whole-diff security, correctness/performance, CI, architecture, and duplication reviews were applied; 26 issue-specific unit tests, 25 benchmark contract/runner tests, and the 2,041-test feature-enabled library suite pass; formatting and all-target/all-feature Clippy are clean; and the final 20-sample release gate passes all ten scenarios.
 
 ## Surprises & Discoveries
 
@@ -67,6 +67,15 @@ The visible proof has two parts. Deterministic tests will prove cancellation pro
 - Observation: The July 28 scheduled benchmark retained the same four actionable regressions as July 27, with the two Click/Python latency signals worsening on the current commit.
   Evidence: Run `30349710835` reports Click `scan_usages` at 14,421 ms versus a 2,469 ms baseline and `dead_code_smells` at 13,815 ms versus 1,240 ms, plus the existing FastRoute/PHP no-callsites and fmt/C++ no-locations correctness failures.
 
+- Observation: Ten samples were insufficient to expose a bimodal interaction between definition navigation and the usage-scan gate. In the first 20-sample campaign, an MCP definition warmup timed out while an uncancellable Rust reference-context build continued for 12.4 seconds; its background CPU work overlapped the next scenario and pushed the exact scan to an 8,704 ms p95 despite a 3,317 ms p50.
+  Evidence: `run-20260728T124342Z.json` recorded definition cancellation, `RustAnalyzer::build_reference_context` at 12,170 ms, and exact-scan samples of 11,588 and 8,704 ms before the remaining samples settled around three seconds. Routing cancellable Rust navigation through bounded structured resolution made the definition p95 57.5 ms and removed the scan tail in the final full campaign.
+
+- Observation: Serializing reference-context cache construction was not a safe performance optimization. An atomic cache experiment prevented duplicate construction but also serialized unrelated scan work and increased candidate discovery to 19.4 seconds, so it was reverted.
+  Evidence: The retained experiment profile under `20260728T122307764264Z-65518-0` showed repeated 10-19 second exact scans. Bounding Rust direct/member file admission to parallel batches of four preserved cancellation checkpoints and produced a focused exact-scan p95 of 3,743 ms before the final full gate.
+
+- Observation: This host exposed two independent validation-environment boundaries. The default `cargo clippy` lookup mixed rustup Cargo/rustc with Homebrew `cargo-clippy`/`clippy-driver`, producing an incompatible-crate error even though both reported 1.96.0; and the sandbox denied loopback binds used by three stderr-drain tests. Selecting the matching rustup toolchain made Clippy pass, and the full feature-enabled suite passed outside the network sandbox.
+  Evidence: The final matched-toolchain isolated Clippy run completed with warnings denied and removed its managed target. The elevated library run completed with 2,035 passed, 0 failed, and 6 ignored.
+
 ## Decision Log
 
 - Decision: Stage the work as scan truthfulness, transport responsiveness, then benchmarking rather than changing every analyzer API at once.
@@ -110,11 +119,23 @@ The visible proof has two parts. Deterministic tests will prove cancellation pro
   Date/Author: 2026-07-28 / Codex
 
 - Decision: Keep the interactive gate in `benchmark/interactive-latency.toml` rather than expanding the broad daily corpus manifest.
-  Rationale: The release gate has a distinct two-warmup/ten-measurement contract, raw MCP correctness oracles, absolute p95 budgets, cancellation/fairness semantics, and profile artifact policy. Separating it avoids silently changing historical daily-baseline membership and comparison semantics.
+  Rationale: The release gate has a distinct two-warmup/twenty-measurement contract, raw MCP correctness oracles, absolute p95 budgets, cancellation/fairness semantics, and profile artifact policy. Separating it avoids silently changing historical daily-baseline membership and comparison semantics.
   Date/Author: 2026-07-28 / Codex
 
 - Decision: Treat a short symbol selector as precise only when it accompanies an exact declaration location.
   Rationale: File/line/column already disambiguate the selected declaration, so demanding an FQN adds no safety there. Short-name matching without that location would weaken the public ambiguity contract and remains unsupported.
+  Date/Author: 2026-07-28 / Codex
+
+- Decision: Use twenty measured samples for the release p95 gate and retain the raw fairness light-request and cancellation distributions separately.
+  Rationale: With ten samples, the nearest-rank p95 is simply the maximum and the initial green campaign missed a cross-scenario tail that appeared in a longer run. Twenty samples both exercises warm stability and makes one isolated maximum distinct from p95 while preserving every raw sample for audit.
+  Date/Author: 2026-07-28 / Codex
+
+- Decision: Route cancellable Rust navigation through the existing bounded structured resolver, and extend that resolver to follow a visible imported bare call using the import binder and analyzer declarations.
+  Rationale: The ordinary resolver eagerly constructed a complete reference context for every import in the file before resolving one focused call. The bounded resolver already carries cancellation and work accounting; resolving the one visible import structurally preserves the expected definition without source-text scanning or a 12-second background task.
+  Date/Author: 2026-07-28 / Codex
+
+- Decision: Admit Rust direct/member usage work in cancellation-checked parallel batches of four.
+  Rationale: Unbounded parallel admission can leave a request with a large cohort of already-running file scans when its deadline expires, while fully serial work misses the product budget. A small batch bounds cancellation lag and retained CPU without serializing the full repository.
   Date/Author: 2026-07-28 / Codex
 
 ## Outcomes & Retrospective
@@ -123,11 +144,11 @@ Milestone 1 is implemented. `UsageFinder::QueryResult` now distinguishes complet
 
 Milestone 2 removes the remaining stdin-reader head-of-line boundary. Read-only tool calls now share the existing maximum-four in-flight registry, cancellation map, workspace-generation suppression, fixed response queue, and writer completion cleanup. Snapshot construction for `query_code` and `run_policy` now occurs inside the worker. A held and cancelled real scan cannot prevent a following exact source body from completing, while workspace-mutating lifecycle calls remain reader-ordered. Profile traces now separate accepted-to-worker queue wait, worker execution, response-queue wait, and writer delivery for each finite tool name.
 
-Milestone 3 productizes the latency contract. `McpSession` can send, cancel, and receive by JSON-RPC request ID while buffering out-of-order responses. The separate pinned Bifrost manifest runs nine common request cases plus one overlapping heavy-scan/light-source fairness case in release mode, with two warmups, ten measured samples, correctness oracles, and a 5,000 ms p95 budget. Reports retain raw samples, p50/p95, profile artifacts, absolute budget outcomes, and the number of measured samples accepted as truthful bounded-incomplete responses. The scheduled workflow builds and enforces this lane independently of the historical cross-repository comparison.
+Milestone 3 productizes the latency contract. `McpSession` can send, cancel, and receive by JSON-RPC request ID while buffering out-of-order responses. The separate pinned Bifrost manifest runs nine common request cases plus one overlapping heavy-scan/light-source fairness case in release mode, with two warmups, twenty measured samples, correctness oracles, and a 5,000 ms p95 budget. Reports retain raw samples, p50/p95, profile artifacts, absolute budget outcomes, and the number of measured samples accepted as truthful bounded-incomplete responses. The scheduled workflow builds and enforces this lane independently of the historical cross-repository comparison.
 
-The final release campaign passed every case. Warm p50/p95 results in milliseconds were: four-pattern symbol search 282/491; exact `SemanticProcedureSummary` source 10/13; exact `SearchToolsService` source 10/13; exact scan-tool source 11/29; exact symbol-search source 11/15; definition 60/73; summary 20/28; exact issue usage scan 3513/4107; line-only usage scan 3451/3733; and the light source request overlapped with a heavy scan 13/19. The expensive scans returned only complete results or typed bounded responses, and the fairness case cancelled and drained the heavy request without delaying the light response.
+The final release campaign passed every case. Warm p50/p95 results in milliseconds were: four-pattern symbol search 229/249; exact `SemanticProcedureSummary` source 6/11; exact `SearchToolsService` source 4/9; exact scan-tool source 4/7; exact symbol-search source 4/10; definition 47/58; summary 21/28; exact issue usage scan 3552/3897; line-only usage scan 3309/3901; and the fairness case 10/13. The expensive scans returned typed `time_budget` incomplete results in all twenty measured iterations rather than false verified absence. In the fairness case, the overlapped source lookup p95 was 8.9 ms and cancellation-to-heavy-completion p95 was 11.1 ms.
 
-The remaining Milestone 4 work is final focused execution after the report-field change, whole-diff specialist review, any resulting corrections, checkpoint commits, and precise documentation of the local all-feature test linker limitation. The persistent Click/Python and unrelated PHP/C++ daily signals remain follow-up evidence rather than silently widening this issue's implementation scope.
+Milestone 4 closes the implementation with review-driven hardening: admission-time deadlines, bounded request/response channels, truthful partial-result oracles, cold-Git cancellation, cancellable navigation/source/summary checkpoints, structured dominant-phase reporting, and the Rust navigation/scan interaction found by the 20-sample campaign. The feature-enabled library suite now passes completely on this host when its loopback tests are run outside the network sandbox. The persistent Click/Python and unrelated PHP/C++ daily signals remain follow-up evidence rather than silently widening this issue's implementation scope; no completed Actions run yet contains these local changes, so causation remains unproven.
 
 This section must be updated after each milestone with observed behavior, test counts, benchmark results, residual risks, and any scope moved to a follow-up issue.
 
@@ -285,23 +306,28 @@ Latest July 28 values:
     fastroute-php scan_usages: candidate still found no call sites
     fmt-cpp get_symbol_locations: candidate still found no locations
 
-Milestone 3 release benchmark:
+Final release benchmark:
 
-    BIFROST_BENCHMARK_BIFROST_BIN=<isolated release bifrost> <isolated release bifrost_benchmark> run --manifest benchmark/interactive-latency.toml --profile
+    scripts/run-interactive-latency.sh --profile
     result: 10 passed scenarios; 0 failed; all warm p95 values below 5000 ms
-    final report: benchmark/interactive-latency-output/run-20260728T110414Z.json (generated artifact, not committed)
+    final report: benchmark/interactive-latency-output/run-20260728T130512Z.json (generated artifact, not committed)
 
     case                                             p50 ms    p95 ms
-    search-common-symbols                              281.9     490.9
-    source-semantic-summary                             10.5      13.1
-    source-search-service                                9.6      13.2
-    source-usage-scan                                   11.1      29.3
-    source-symbol-search                                11.0      14.8
-    definition-semantic-summary                         59.6      72.7
-    summary-semantic-summary                            20.0      27.8
-    scan-semantic-summary-exact                       3512.9    4106.9
-    scan-semantic-summary-line-only                   3450.7    3733.3
-    heavy-scan-light-source fairness                    13.1      19.0
+    search-common-symbols                              229.2     249.1
+    source-semantic-summary                              6.0      11.3
+    source-search-service                                3.9       9.4
+    source-usage-scan                                    4.1       7.1
+    source-symbol-search                                 3.7       9.7
+    definition-by-location                              46.7      57.5
+    summary-semantic-procedure                          20.6      28.2
+    scan-semantic-procedure-exact                     3551.7    3897.0
+    scan-semantic-procedure-line                      3308.7    3901.1
+    heavy-scan-does-not-block-source                     9.5      13.1
+
+    fairness light-request p95: 8.9 ms
+    fairness cancellation p95: 11.1 ms
+    exact and line scan dominant phase: execution[scan_usages_by_location]
+    exact and line scan bounded incomplete iterations: 20 of 20 each
 
 Milestone 3 deterministic validation:
 
@@ -310,6 +336,23 @@ Milestone 3 deterministic validation:
 
     scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
     result: passed with warnings denied
+
+Milestone 4 final validation:
+
+    cargo test --lib issue_1228 --no-default-features
+    result: 26 passed; 0 failed; 1972 filtered out
+
+    cargo test --test benchmark_manifest --test benchmark_workflow_policy --test bifrost_benchmark_run
+    result: 25 passed; 0 failed
+
+    PATH=<matching rustup 1.96.0 toolchain>:<system path> scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
+    result: passed with warnings denied; managed isolated target removed
+
+    BIFROST_SEMANTIC_INDEX=off cargo test --features nlp,python --lib
+    result: 2035 passed; 0 failed; 6 ignored (loopback tests run outside the network sandbox)
+
+    cargo fmt --check
+    result: passed
 
 The final implementation must append focused test transcripts, final p50/p95 tables, dominant-phase evidence, and refreshed Actions run links here.
 
@@ -375,3 +418,5 @@ Plan revision note (2026-07-28 09:35Z): Recorded Milestone 2's read-only backgro
 Plan revision note (2026-07-28 09:37Z): Recorded Milestone 2 checkpoint `fdb403f3` and began benchmark client/report integration.
 
 Plan revision note (2026-07-28 11:35Z): Recorded the completed interactive benchmark implementation, exact/line scan cancellation discoveries, final ten-case release metrics, explicit bounded-incomplete reporting, clean benchmark and Clippy gates, and the July 28 scheduled regression report.
+
+Plan revision note (2026-07-28 13:12Z): Closed Milestone 4 after whole-diff specialist review, a 20-sample campaign exposed and fixed the definition/scan overlap, structured bounded Rust import resolution preserved definition correctness, the final ten-case release gate passed, all focused and feature-enabled tests passed, and matched-toolchain all-feature Clippy completed cleanly.

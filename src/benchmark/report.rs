@@ -56,6 +56,12 @@ pub struct ScenarioReport {
     pub latency_budget_met: Option<bool>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub bounded_incomplete_iterations: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_fairness: Option<McpFairnessTimingReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transport_phases: Vec<McpTransportPhaseReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dominant_phase: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_message: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -71,6 +77,53 @@ pub struct QueryCodeBenchmarkMetrics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warmup_transition: Option<QueryCodeProfileMetrics>,
     pub warm: QueryCodeProfileMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpFairnessTimingReport {
+    pub light_request_durations_ms: Vec<f64>,
+    pub cancellation_durations_ms: Vec<f64>,
+    pub light_request_p50_ms: Option<f64>,
+    pub light_request_p95_ms: Option<f64>,
+    pub cancellation_p50_ms: Option<f64>,
+    pub cancellation_p95_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpTransportPhaseReport {
+    pub phase: String,
+    pub tool: String,
+    pub durations_ms: Vec<f64>,
+    pub p50_ms: Option<f64>,
+    pub p95_ms: Option<f64>,
+}
+
+impl McpTransportPhaseReport {
+    pub(crate) fn from_timings(phase: String, tool: String, durations_ms: Vec<f64>) -> Self {
+        Self {
+            p50_ms: percentile_ms(&durations_ms, 50),
+            p95_ms: percentile_ms(&durations_ms, 95),
+            phase,
+            tool,
+            durations_ms,
+        }
+    }
+}
+
+impl McpFairnessTimingReport {
+    pub fn from_timings(
+        light_request_durations_ms: Vec<f64>,
+        cancellation_durations_ms: Vec<f64>,
+    ) -> Self {
+        Self {
+            light_request_p50_ms: percentile_ms(&light_request_durations_ms, 50),
+            light_request_p95_ms: percentile_ms(&light_request_durations_ms, 95),
+            cancellation_p50_ms: percentile_ms(&cancellation_durations_ms, 50),
+            cancellation_p95_ms: percentile_ms(&cancellation_durations_ms, 95),
+            light_request_durations_ms,
+            cancellation_durations_ms,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -260,6 +313,9 @@ impl ScenarioReport {
             latency_budget_ms: None,
             latency_budget_met: None,
             bounded_incomplete_iterations: 0,
+            mcp_fairness: None,
+            transport_phases: Vec::new(),
+            dominant_phase: None,
             warmup_durations_ms,
             measured_durations_ms,
             failure_message,
@@ -296,6 +352,24 @@ impl ScenarioReport {
                 max_p95_ms
             ));
         }
+        self
+    }
+
+    pub fn with_transport_phases(mut self, phases: Vec<McpTransportPhaseReport>) -> Self {
+        if !self.success || self.latency_budget_met == Some(false) {
+            self.dominant_phase = phases
+                .iter()
+                .filter_map(|phase| phase.p95_ms.map(|p95| (phase, p95)))
+                .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                .map(|(phase, _)| format!("{}[{}]", phase.phase, phase.tool));
+            if let (Some(message), Some(dominant)) = (
+                self.failure_message.as_mut(),
+                self.dominant_phase.as_deref(),
+            ) {
+                message.push_str(&format!("; dominant transport phase: {dominant}"));
+            }
+        }
+        self.transport_phases = phases;
         self
     }
 
@@ -789,7 +863,7 @@ fn is_query_code_candidate_invariant_failure(scenario: &ScenarioCompareReport) -
 
 #[cfg(test)]
 mod tests {
-    use super::{ScenarioReport, ScenarioTransport, percentile_ms};
+    use super::{McpTransportPhaseReport, ScenarioReport, ScenarioTransport, percentile_ms};
     use crate::benchmark::BenchmarkScenario;
 
     #[test]
@@ -814,7 +888,19 @@ mod tests {
             vec![1.0, 2.0, 3.0, 4.0, 8.0],
             None,
         )
-        .with_latency_budget(5.0);
+        .with_latency_budget(5.0)
+        .with_transport_phases(vec![
+            McpTransportPhaseReport::from_timings(
+                "queue_wait".to_string(),
+                "search_symbols".to_string(),
+                vec![1.0],
+            ),
+            McpTransportPhaseReport::from_timings(
+                "execution".to_string(),
+                "search_symbols".to_string(),
+                vec![7.0],
+            ),
+        ]);
         report.bounded_incomplete_iterations = 2;
 
         assert_eq!(report.p50_ms, Some(3.0));
@@ -825,6 +911,10 @@ mod tests {
         );
         assert_eq!(report.latency_budget_met, Some(false));
         assert!(!report.success);
+        assert_eq!(
+            report.dominant_phase.as_deref(),
+            Some("execution[search_symbols]")
+        );
         assert!(
             report
                 .failure_message

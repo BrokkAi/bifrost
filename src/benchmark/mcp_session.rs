@@ -17,6 +17,7 @@ const STDERR_TAIL_CAPACITY_BYTES: usize = 256 * 1024;
 const STDERR_READ_BUFFER_BYTES: usize = 8 * 1024;
 const PROFILE_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(5);
 const MCP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const MAX_BUFFERED_MCP_RESPONSES: usize = 16;
 const BENCHMARK_QUERY_ACCESS_ENV: &str = "BIFROST_BENCHMARK_QUERY_CODE_ACCESS";
 const SERVER_QUERY_ACCESS_ENV: &str = "BIFROST_QUERY_CODE_ACCESS_MODE";
 
@@ -125,6 +126,7 @@ struct StderrDrain {
 #[derive(Debug, Default)]
 struct BoundaryState {
     observed: u64,
+    activity: u64,
     closed: bool,
 }
 
@@ -185,6 +187,46 @@ impl StderrDrain {
         }
     }
 
+    fn wait_for_text_since(
+        &self,
+        cursor: StderrCursor,
+        needle: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.capture_since(cursor).text.contains(needle) {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "timed out waiting for MCP stderr marker `{needle}`"
+                ));
+            }
+            let (state, changed) = &*self.boundaries;
+            let state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous_activity = state.activity;
+            let (state, wait) = changed
+                .wait_timeout_while(state, remaining, |state| {
+                    state.activity == previous_activity && !state.closed
+                })
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.closed && !self.capture_since(cursor).text.contains(needle) {
+                return Err(format!(
+                    "MCP stderr closed before marker `{needle}` was observed"
+                ));
+            }
+            if wait.timed_out() {
+                return Err(format!(
+                    "timed out waiting for MCP stderr marker `{needle}`"
+                ));
+            }
+        }
+    }
+
     fn join(&mut self) {
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
@@ -219,14 +261,15 @@ fn drain_stderr(
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(bytes.to_vec());
                 let observed = count_profile_boundaries(&mut marker_prefix, bytes);
+                let (state, changed) = boundaries;
+                let mut state = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.activity = state.activity.saturating_add(1);
                 if observed > 0 {
-                    let (state, changed) = boundaries;
-                    let mut state = state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     state.observed = state.observed.saturating_add(observed as u64);
-                    changed.notify_all();
                 }
+                changed.notify_all();
             }
             Err(err) => {
                 tail.lock()
@@ -289,7 +332,7 @@ struct StdoutDrain {
 
 impl StdoutDrain {
     fn spawn(stdout: ChildStdout) -> Result<Self, String> {
-        let (sender, responses) = mpsc::channel();
+        let (sender, responses) = mpsc::sync_channel(MAX_BUFFERED_MCP_RESPONSES);
         let worker = thread::Builder::new()
             .name("bifrost-benchmark-stdout".to_string())
             .spawn(move || {
@@ -355,6 +398,7 @@ fn receive_response(
 fn receive_response_for_id(
     responses: &Receiver<Result<Value, String>>,
     buffered: &mut HashMap<String, Value>,
+    pending_tools: &HashMap<u64, String>,
     id: &Value,
     timeout: Duration,
 ) -> Result<Value, String> {
@@ -379,6 +423,20 @@ fn receive_response_for_id(
         let response_key = response_id_key(response_id)?;
         if response_key == requested_key {
             return Ok(response);
+        }
+        let known_pending_id = response_id
+            .as_u64()
+            .is_some_and(|id| pending_tools.contains_key(&id));
+        if !known_pending_id {
+            return Err(format!(
+                "bifrost MCP server returned unexpected response id {response_id}"
+            ));
+        }
+        if buffered.len() >= pending_tools.len().min(MAX_BUFFERED_MCP_RESPONSES) {
+            return Err(format!(
+                "bifrost MCP response buffer exceeded its {}-response bound",
+                MAX_BUFFERED_MCP_RESPONSES
+            ));
         }
         if buffered.insert(response_key, response).is_some() {
             return Err("bifrost MCP server returned a duplicate response id".to_string());
@@ -553,12 +611,20 @@ impl McpSession {
     }
 
     pub fn receive_tool_response(&mut self, id: McpRequestId) -> Result<Value, String> {
+        self.receive_tool_response_with_timeout(id, MCP_RESPONSE_TIMEOUT)
+    }
+
+    pub fn receive_tool_response_with_timeout(
+        &mut self,
+        id: McpRequestId,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         let name = self
             .pending_tools
             .get(&id.get())
             .cloned()
             .ok_or_else(|| format!("no pending MCP tool request with id {}", id.get()))?;
-        let response = self.receive_response_for_id(&json!(id.get()))?;
+        let response = self.receive_response_for_id_with_timeout(&json!(id.get()), timeout)?;
         self.pending_tools.remove(&id.get());
 
         if let Some(error) = response.get("error") {
@@ -588,6 +654,15 @@ impl McpSession {
 
     pub fn stderr_since(&self, cursor: StderrCursor) -> CapturedStderr {
         self.stderr.capture_since(cursor)
+    }
+
+    pub fn wait_for_stderr_marker(
+        &self,
+        cursor: StderrCursor,
+        marker: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        self.stderr.wait_for_text_since(cursor, marker, timeout)
     }
 
     pub fn stderr_tail(&self) -> CapturedStderr {
@@ -624,11 +699,20 @@ impl McpSession {
     }
 
     fn receive_response_for_id(&mut self, id: &Value) -> Result<Value, String> {
+        self.receive_response_for_id_with_timeout(id, MCP_RESPONSE_TIMEOUT)
+    }
+
+    fn receive_response_for_id_with_timeout(
+        &mut self,
+        id: &Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         match receive_response_for_id(
             &self.stdout.responses,
             &mut self.buffered_responses,
+            &self.pending_tools,
             id,
-            MCP_RESPONSE_TIMEOUT,
+            timeout,
         ) {
             Ok(response) => Ok(response),
             Err(error) => {
@@ -733,8 +817,23 @@ fn bifrost_binary_name() -> OsString {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
     use std::net::{TcpListener, TcpStream};
     use std::time::Duration;
+
+    struct DelayedReader {
+        cursor: Cursor<Vec<u8>>,
+        delay: Option<Duration>,
+    }
+
+    impl Read for DelayedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(delay) = self.delay.take() {
+                thread::sleep(delay);
+            }
+            self.cursor.read(buffer)
+        }
+    }
 
     #[test]
     fn stderr_drain_continuously_consumes_and_keeps_bounded_tail() {
@@ -832,6 +931,27 @@ mod tests {
     }
 
     #[test]
+    fn issue_1228_stderr_marker_wait_proves_backend_entry() {
+        let reader = DelayedReader {
+            cursor: Cursor::new(
+                b"[bifrost-timing] BEGIN searchtools.scan_usages_backend\n".to_vec(),
+            ),
+            delay: Some(Duration::from_millis(20)),
+        };
+        let mut drain = StderrDrain::spawn(reader, STDERR_TAIL_CAPACITY_BYTES).unwrap();
+        let cursor = drain.cursor();
+
+        drain
+            .wait_for_text_since(
+                cursor,
+                "BEGIN searchtools.scan_usages_backend",
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        drain.join();
+    }
+
+    #[test]
     fn stderr_capture_does_not_report_evicted_pre_cursor_lines_as_truncated() {
         let mut tail = StderrTail::new(8);
         tail.push(b"old\n".to_vec());
@@ -863,17 +983,50 @@ mod tests {
             .send(Ok(json!({"jsonrpc": "2.0", "id": 1, "result": "heavy"})))
             .unwrap();
         let mut buffered = HashMap::new();
+        let pending_tools = HashMap::from([(1, "heavy".to_string()), (2, "light".to_string())]);
 
-        let heavy =
-            receive_response_for_id(&responses, &mut buffered, &json!(1), Duration::from_secs(1))
-                .unwrap();
+        let heavy = receive_response_for_id(
+            &responses,
+            &mut buffered,
+            &pending_tools,
+            &json!(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
         assert_eq!(heavy["result"], "heavy");
         assert_eq!(buffered.len(), 1);
 
-        let light =
-            receive_response_for_id(&responses, &mut buffered, &json!(2), Duration::from_secs(1))
-                .unwrap();
+        let light = receive_response_for_id(
+            &responses,
+            &mut buffered,
+            &pending_tools,
+            &json!(2),
+            Duration::from_secs(1),
+        )
+        .unwrap();
         assert_eq!(light["result"], "light");
+        assert!(buffered.is_empty());
+    }
+
+    #[test]
+    fn issue_1228_response_router_rejects_unknown_ids_instead_of_buffering_them() {
+        let (sender, responses) = mpsc::channel();
+        sender
+            .send(Ok(json!({"jsonrpc": "2.0", "id": 999, "result": {}})))
+            .unwrap();
+        let mut buffered = HashMap::new();
+        let pending_tools = HashMap::from([(1, "expected".to_string())]);
+
+        let error = receive_response_for_id(
+            &responses,
+            &mut buffered,
+            &pending_tools,
+            &json!(1),
+            Duration::from_secs(1),
+        )
+        .expect_err("unknown response id must fail closed");
+
+        assert!(error.contains("unexpected response id 999"), "{error}");
         assert!(buffered.is_empty());
     }
 

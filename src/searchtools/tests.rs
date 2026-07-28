@@ -2,10 +2,10 @@ use super::{
     ContainerListingEntry, DefinitionCandidateRenderCache, ScanUsageRequest,
     ScanUsagesAbsenceCaveat, ScanUsagesByLocationParams, ScanUsagesCandidateFilesSample,
     ScanUsagesExecutionContext, ScanUsagesIncompleteReason, ScanUsagesStatus, ScanUsagesSurface,
-    ScanUsagesTarget, ScanUsagesWorkEntry, SourceBlock, SummaryElement, SymbolUsageRenderState,
-    UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering, classify_scan_usages_entry,
-    definition_candidate_from_range, list_symbols, resolve_file_patterns,
-    scan_usages_by_location_with_context, trim_summary_signature,
+    ScanUsagesTarget, ScanUsagesWorkEntry, SourceBlock, SummaryElement, SymbolLookupParams,
+    SymbolUsageRenderState, UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering,
+    classify_scan_usages_entry, definition_candidate_from_range, list_symbols,
+    resolve_file_patterns, scan_usages_by_location_with_context, trim_summary_signature,
 };
 use super::{function_like_macro_query, route_summary_targets, usage_failure_hint};
 use crate::analyzer::{
@@ -905,5 +905,57 @@ fn excluded_test_files_path_predicate_matches_full_classification() {
     assert!(
         !by_path.is_empty(),
         "fixture must actually produce excluded files or the equivalence is vacuous"
+    );
+}
+
+#[test]
+fn issue_1228_symbol_lookup_batches_have_count_and_byte_limits() {
+    let too_many = serde_json::json!({
+        "symbols": vec!["symbol"; super::SYMBOL_LOOKUP_MAX_SYMBOLS + 1]
+    });
+    let error = serde_json::from_value::<SymbolLookupParams>(too_many)
+        .expect_err("oversized symbol batch must be rejected");
+    assert!(error.to_string().contains("at most"), "{error}");
+
+    let oversized_symbol = serde_json::json!({
+        "symbols": ["x".repeat(super::SYMBOL_LOOKUP_MAX_SYMBOL_BYTES + 1)]
+    });
+    let error = serde_json::from_value::<SymbolLookupParams>(oversized_symbol)
+        .expect_err("oversized symbol selector must be rejected");
+    assert!(error.to_string().contains("each symbol"), "{error}");
+}
+
+#[test]
+fn issue_1228_navigation_cancellation_reaches_rust_resolution() {
+    use crate::analyzer::{RustAnalyzer, TestProject};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    ProjectFile::new(root.clone(), "lib.rs")
+        .write("pub fn target() {}\npub fn caller() { target(); }\n")
+        .unwrap();
+    let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
+    let cancellation = crate::CancellationToken::cancel_after_checks_for_test(5);
+
+    let result = super::get_definitions_by_location_with_cancellation(
+        &analyzer,
+        super::GetDefinitionParams {
+            references: vec![super::DefinitionReferenceQuery {
+                path: "lib.rs".to_string(),
+                line: Some(2),
+                column: Some(19),
+            }],
+        },
+        Some(&cancellation),
+    );
+
+    assert!(cancellation.is_cancelled());
+    assert_eq!(result.results.len(), 1, "{result:#?}");
+    assert!(
+        result.results[0]
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == "cancelled"),
+        "{result:#?}"
     );
 }

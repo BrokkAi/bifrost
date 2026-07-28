@@ -30,7 +30,19 @@ impl CancellationToken {
     /// Return a child token that cancels itself after `duration` while still
     /// sharing explicit cancellation with the original token and its clones.
     pub(crate) fn with_timeout(mut self, duration: Duration) -> Self {
-        self.deadline = Some(Instant::now() + duration);
+        let deadline = Instant::now() + duration;
+        self.deadline = Some(
+            self.deadline
+                .map_or(deadline, |current| current.min(deadline)),
+        );
+        self
+    }
+
+    pub(crate) fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(
+            self.deadline
+                .map_or(deadline, |current| current.min(deadline)),
+        );
         self
     }
 
@@ -109,5 +121,15 @@ mod tests {
 
         assert!(token.is_cancelled());
         assert!(!token.is_timed_out());
+    }
+
+    #[test]
+    fn issue_1228_nested_timeouts_preserve_the_earliest_deadline() {
+        let token = CancellationToken::default()
+            .with_timeout(Duration::ZERO)
+            .with_timeout(Duration::from_secs(60));
+
+        assert!(token.is_cancelled());
+        assert!(token.is_timed_out());
     }
 }

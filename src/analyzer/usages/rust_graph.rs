@@ -68,10 +68,19 @@ pub(in crate::analyzer::usages) fn rust_usage_candidate_files(
     analyzer: &dyn IAnalyzer,
     target: &CodeUnit,
 ) -> HashSet<ProjectFile> {
+    let _scope = crate::profiling::scope("RustQueryResolver::candidate_files");
     let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
         return HashSet::default();
     };
-    let seeds = rust.usage_binding_seeds(&infer_graph_seeds(rust, target).roots);
+    let roots = {
+        let _scope = crate::profiling::scope("RustQueryResolver::candidate_seeds");
+        infer_graph_seeds(rust, target).roots
+    };
+    let seeds = {
+        let _scope = crate::profiling::scope("RustQueryResolver::binding_seeds");
+        rust.usage_binding_seeds(&roots)
+    };
+    let _scope = crate::profiling::scope("RustQueryResolver::usage_importers");
     rust.usage_importers(&seeds)
 }
 

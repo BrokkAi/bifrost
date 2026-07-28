@@ -39,7 +39,8 @@ use crate::path_utils::{
 use crate::profiling;
 pub use crate::relevance::MostRelevantFilesRankingMode;
 use crate::relevance::{
-    DEFAULT_RECENCY_HALF_LIFE, most_important_project_files, most_relevant_project_files,
+    DEFAULT_RECENCY_HALF_LIFE, most_important_project_files,
+    most_important_project_files_with_cancellation, most_relevant_project_files,
     most_relevant_project_files_with_ranking_mode,
 };
 use crate::text_utils::{
@@ -127,6 +128,10 @@ pub use navigation::get_type_by_location;
 pub use navigation::rename_symbol;
 pub use navigation::search_symbols;
 pub use navigation::search_symbols_with_cancellation;
+pub(crate) use navigation::{
+    get_declarations_by_location_with_cancellation, get_definitions_by_location_with_cancellation,
+    get_symbol_locations_with_cancellation,
+};
 pub use scan_usages::AmbiguousUsageCandidate;
 pub use scan_usages::AmbiguousUsageCandidateDetail;
 pub use scan_usages::AmbiguousUsageSymbol;
@@ -188,6 +193,7 @@ pub use summaries::SummaryBlock;
 pub use summaries::SummaryElement;
 pub use summaries::SummaryResult;
 pub use summaries::get_summaries;
+pub(crate) use summaries::get_summaries_with_cancellation;
 pub use summaries::list_symbols;
 pub use summaries::most_relevant_files;
 
@@ -212,6 +218,9 @@ const FILE_SEARCH_LIMIT: usize = 100;
 pub(crate) const SEARCH_SYMBOL_MAX_PATTERNS: usize = 64;
 pub(crate) const SEARCH_SYMBOL_MAX_PATTERN_BYTES: usize = 4_096;
 pub(crate) const SEARCH_SYMBOL_MAX_TOTAL_PATTERN_BYTES: usize = 65_536;
+pub(crate) const SYMBOL_LOOKUP_MAX_SYMBOLS: usize = 64;
+pub(crate) const SYMBOL_LOOKUP_MAX_SYMBOL_BYTES: usize = 4_096;
+pub(crate) const SYMBOL_LOOKUP_MAX_TOTAL_BYTES: usize = 65_536;
 
 const FILE_SKIM_LIMIT: usize = 20;
 

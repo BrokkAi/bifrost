@@ -1,5 +1,5 @@
 warmup_iterations = 2
-measured_iterations = 10
+measured_iterations = 20
 output_dir = "interactive-latency-output"
 repo_cache_dir = ".cache/repos"
 required_languages = ["rust"]
@@ -14,7 +14,7 @@ extensions = ["rs"]
 scenarios = ["interactive_code_intelligence", "mcp_fairness"]
 
 interactive_queries = [
-  { id = "search-common-symbols", tool = "search_symbols", arguments_json = '{"patterns":["SemanticProcedureSummary","SearchToolsService","scan_usages_by_reference","search_symbols"],"include_tests":true}', expected_json_pointer = "/structuredContent/files", max_p95_ms = 5000.0 },
+  { id = "search-common-symbols", tool = "search_symbols", arguments_json = '{"patterns":["solve_typestate.*summary","solve_taint.*summary","ProtocolSemanticSummarySet","TaintSemanticSummarySet"],"include_tests":true,"limit":100}', expected_json_pointer = "/structuredContent/files", max_p95_ms = 5000.0 },
   { id = "source-semantic-summary", tool = "get_symbol_sources", arguments_json = '{"symbols":["src/analyzer/dataflow/reusable_summary.rs#SemanticProcedureSummary"]}', expected_json_pointer = "/structuredContent/sources/0/path", expected_json_value = "src/analyzer/dataflow/reusable_summary.rs", max_p95_ms = 5000.0 },
   { id = "source-search-service", tool = "get_symbol_sources", arguments_json = '{"symbols":["src/searchtools_service.rs#SearchToolsService"]}', expected_json_pointer = "/structuredContent/sources/0/path", expected_json_value = "src/searchtools_service.rs", max_p95_ms = 5000.0 },
   { id = "source-usage-scan", tool = "get_symbol_sources", arguments_json = '{"symbols":["src/searchtools/scan_usages.rs#scan_usages_by_reference"]}', expected_json_pointer = "/structuredContent/sources/0/path", expected_json_value = "src/searchtools/scan_usages.rs", max_p95_ms = 5000.0 },

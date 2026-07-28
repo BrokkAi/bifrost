@@ -13,7 +13,7 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const JSONRPC_VERSION: &str = "2.0";
 const PROTOCOL_VERSION: &str = "2025-11-25";
@@ -27,6 +27,7 @@ const SERVER_BUSY: i64 = -32000;
 const GET_SUMMARIES_RESPONSE_BUDGET_BYTES: usize = 4_096;
 const MAX_IN_FLIGHT_CANCELLABLE_REQUESTS: usize = 4;
 const MAX_PENDING_MCP_RESPONSES: usize = 4;
+const MCP_ANALYZER_REQUEST_BUDGET: Duration = Duration::from_secs(5);
 const AGENTS_GUIDANCE_URI: &str = "bifrost://agent-guidance/agents.md";
 const AGENTS_GUIDANCE_MIME_TYPE: &str = "text/markdown";
 const ROOTS_REQUEST_ID_PREFIX: &str = "bifrost-roots-";
@@ -94,14 +95,31 @@ enum McpRequestRegistrationError {
 }
 
 impl McpRequestCancellations {
+    #[cfg(test)]
     fn register(
         &self,
         id: &Value,
         workspace_generation: u64,
         current_workspace_generation: u64,
     ) -> Result<CancellationToken, McpRequestRegistrationError> {
+        self.register_at(
+            id,
+            workspace_generation,
+            current_workspace_generation,
+            Instant::now(),
+        )
+    }
+
+    fn register_at(
+        &self,
+        id: &Value,
+        workspace_generation: u64,
+        current_workspace_generation: u64,
+        accepted_at: Instant,
+    ) -> Result<CancellationToken, McpRequestRegistrationError> {
         let key = request_id_key(id);
-        let token = CancellationToken::default();
+        let token =
+            CancellationToken::default().with_deadline(accepted_at + MCP_ANALYZER_REQUEST_BUDGET);
         let mut active = self.active.lock().expect("MCP cancellation lock poisoned");
         if active.contains_key(&key) {
             return Err(McpRequestRegistrationError::DuplicateId);
@@ -188,16 +206,6 @@ impl OutboundMcpResponse {
         }
     }
 
-    #[cfg(test)]
-    fn scoped(value: Value, workspace_generation: u64) -> Self {
-        Self {
-            value,
-            workspace_generation: Some(workspace_generation),
-            completion_id: None,
-            timing: None,
-        }
-    }
-
     fn scoped_request(
         value: Value,
         workspace_generation: u64,
@@ -218,6 +226,16 @@ impl OutboundMcpResponse {
     fn is_current(&self, service: &SearchToolsService) -> bool {
         self.workspace_generation
             .is_none_or(|generation| generation == service.workspace_generation())
+    }
+
+    fn stale_workspace_error(&self, service: &SearchToolsService) -> Option<Value> {
+        (!self.is_current(service)).then(|| {
+            error_response(
+                self.completion_id.clone().unwrap_or(Value::Null),
+                RESOURCE_NOT_FOUND,
+                "workspace changed while the tool call was running; retry the request".to_string(),
+            )
+        })
     }
 }
 
@@ -348,17 +366,15 @@ pub fn run_stdio_server(
                 let _delivery_scope = response.timing.as_ref().map(|timing| {
                     profiling::scope(format!("mcp_request.writer_delivery[{}]", timing.tool_name))
                 });
-                let write_result = if response.is_current(writer_service.as_ref()) {
-                    serde_json::to_string(&response.value)
-                        .map_err(|err| format!("Failed to serialize MCP response: {err}"))
-                        .and_then(|encoded| {
-                            writeln!(stdout, "{encoded}")
-                                .and_then(|_| stdout.flush())
-                                .map_err(|err| format!("Failed to write MCP response: {err}"))
-                        })
-                } else {
-                    Ok(())
-                };
+                let stale_error = response.stale_workspace_error(writer_service.as_ref());
+                let response_value = stale_error.as_ref().unwrap_or(&response.value);
+                let write_result = serde_json::to_string(response_value)
+                    .map_err(|err| format!("Failed to serialize MCP response: {err}"))
+                    .and_then(|encoded| {
+                        writeln!(stdout, "{encoded}")
+                            .and_then(|_| stdout.flush())
+                            .map_err(|err| format!("Failed to write MCP response: {err}"))
+                    });
                 if let Some(completion_id) = response.completion_id {
                     writer_cancellations.complete(&completion_id);
                 }
@@ -402,10 +418,11 @@ pub fn run_stdio_server(
                             let workspace_generation = call.workspace_generation().expect(
                                 "cancellable tool preparation captures a workspace generation",
                             );
-                            let cancellation = match cancellations.register(
+                            let cancellation = match cancellations.register_at(
                                 &id,
                                 workspace_generation,
                                 service.workspace_generation(),
+                                accepted_at,
                             ) {
                                 Ok(cancellation) => cancellation,
                                 Err(error) => {
@@ -2113,7 +2130,11 @@ pub fn symbol_names_schema() -> Value {
         "properties": {
             "symbols": {
                 "type": "array",
-                "items": { "type": "string" },
+                "maxItems": crate::searchtools::SYMBOL_LOOKUP_MAX_SYMBOLS,
+                "items": {
+                    "type": "string",
+                    "maxLength": crate::searchtools::SYMBOL_LOOKUP_MAX_SYMBOL_BYTES
+                },
                 "description": "Fully qualified or short symbol names to resolve, or project-relative file paths/globs for file-backed symbol views."
             }
         },
@@ -2322,6 +2343,23 @@ mod uri_tests {
             cancellations.register(&json!(0), generation, generation),
             Err(McpRequestRegistrationError::DuplicateId)
         ));
+    }
+
+    #[test]
+    fn issue_1228_request_deadline_starts_at_admission() {
+        let cancellations = McpRequestCancellations::default();
+        let generation = 7;
+        let token = cancellations
+            .register_at(
+                &json!("late"),
+                generation,
+                generation,
+                Instant::now() - MCP_ANALYZER_REQUEST_BUDGET,
+            )
+            .unwrap();
+
+        assert!(token.is_cancelled());
+        assert!(token.is_timed_out());
     }
 
     #[test]
@@ -2546,7 +2584,7 @@ mod uri_tests {
     }
 
     #[test]
-    fn prepared_query_is_pinned_to_its_workspace_and_revoked_response_is_suppressed() {
+    fn prepared_query_is_pinned_to_its_workspace_and_revoked_response_gets_terminal_error() {
         let first = tempfile::tempdir().expect("first workspace");
         let second = tempfile::tempdir().expect("second workspace");
         std::fs::write(
@@ -2595,11 +2633,22 @@ mod uri_tests {
             result["structuredContent"]["results"][0]["path"], "app.ts",
             "execution remains pinned to the first workspace snapshot"
         );
-        let response =
-            OutboundMcpResponse::scoped(success_response(request_id, result), accepted_generation);
+        let response = OutboundMcpResponse::scoped_request(
+            success_response(request_id.clone(), result),
+            accepted_generation,
+            request_id,
+            "query_code".to_string(),
+        );
+        let stale_error = response
+            .stale_workspace_error(&service)
+            .expect("revoked response must become a terminal error");
+        assert_eq!(stale_error["id"], "workspace-scoped");
+        assert_eq!(stale_error["error"]["code"], RESOURCE_NOT_FOUND);
         assert!(
-            !response.is_current(&service),
-            "the writer must suppress results after their workspace authority is revoked"
+            stale_error["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("workspace changed")),
+            "{stale_error}"
         );
     }
 

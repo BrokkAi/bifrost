@@ -5257,6 +5257,13 @@ fn rust_callable_candidates(
                     reference_byte,
                 )
         });
+        if candidates.is_empty()
+            && support.observe_cancellation()
+            && let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer)
+        {
+            candidates =
+                rust_imported_export_candidates(rust, support, file, name, Some(reference_byte));
+        }
         return candidates;
     }
     if candidates.is_empty()
@@ -5579,6 +5586,56 @@ fn use_service(service: Service) {
             matches!(
                 value.definitions.as_slice(),
                 [definition] if definition.fq_name() == "Service.run"
+            ),
+            "{value:#?}"
+        );
+    }
+
+    #[test]
+    fn issue_1228_bounded_definition_lookup_resolves_imported_bare_call() {
+        let source = r#"
+use crate::navigation::get_definitions_by_location;
+
+pub fn dispatch() {
+    get_definitions_by_location();
+}
+"#
+        .to_string();
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Rust,
+            &[
+                ("src/lib.rs", "mod navigation;\nmod service;\n"),
+                (
+                    "src/navigation.rs",
+                    "pub fn get_definitions_by_location() {}\n",
+                ),
+                ("src/service.rs", &source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "src/service.rs");
+        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let site = site_for_last(&source, &file, "get_definitions_by_location");
+
+        let outcome = resolve_rust_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+
+        let BoundedResolution::Complete { value, .. } = outcome else {
+            panic!("imported call lookup should complete");
+        };
+        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
+        assert!(
+            matches!(
+                value.definitions.as_slice(),
+                [definition]
+                    if definition.identifier() == "get_definitions_by_location"
+                        && rel_path_string(definition.source()) == "src/navigation.rs"
             ),
             "{value:#?}"
         );

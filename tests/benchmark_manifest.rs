@@ -122,13 +122,34 @@ fn issue_1228_checked_in_interactive_latency_manifest_is_pinned_and_bounded() {
         .expect("checked-in interactive latency manifest should validate");
 
     assert_eq!(manifest.warmup_iterations, 2);
-    assert_eq!(manifest.measured_iterations, 10);
+    assert_eq!(manifest.measured_iterations, 20);
     assert_eq!(manifest.repos.len(), 1);
     let target = &manifest.repos[0];
     assert_eq!(target.name, "bifrost-self");
     assert_eq!(target.commit, "45841f1a9e665a056380eb7c0a1b8485389cb48c");
     assert_eq!(target.interactive_queries.len(), 9);
     assert!(target.mcp_fairness.is_some());
+    let search_case = target
+        .interactive_queries
+        .iter()
+        .find(|case| case.id == "search-common-symbols")
+        .expect("issue search_symbols reproduction");
+    let search_arguments: serde_json::Value =
+        serde_json::from_str(&search_case.arguments_json).expect("search arguments");
+    assert_eq!(
+        search_arguments,
+        serde_json::json!({
+            "patterns": [
+                "solve_typestate.*summary",
+                "solve_taint.*summary",
+                "ProtocolSemanticSummarySet",
+                "TaintSemanticSummarySet"
+            ],
+            "include_tests": true,
+            "limit": 100
+        }),
+        "the release gate must preserve the exact issue #1228 search reproduction"
+    );
     assert!(
         target
             .interactive_queries

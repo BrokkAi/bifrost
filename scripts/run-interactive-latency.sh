@@ -11,6 +11,8 @@ if [[ "${cargo_target}" != /* ]]; then
 fi
 
 cargo build --release --locked --bin bifrost --bin bifrost_benchmark
+"${cargo_target}/release/bifrost_benchmark" validate \
+  --manifest benchmark/interactive-latency.toml
 BIFROST_BENCHMARK_BIFROST_BIN="${cargo_target}/release/bifrost" \
   "${cargo_target}/release/bifrost_benchmark" run \
     --manifest benchmark/interactive-latency.toml \

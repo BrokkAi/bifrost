@@ -1,11 +1,12 @@
 use crate::benchmark::mcp_iteration::{
-    IterationId, run_profiled_iteration, start_initialized_session,
+    IterationId, run_profiled_iteration, start_initialized_session, transport_phase_report,
 };
 use crate::benchmark::mcp_session::McpSession;
 use crate::benchmark::query_code;
 use crate::benchmark::repo_cache::prepare_repo;
 use crate::benchmark::report::{
-    BenchmarkRepoReport, BenchmarkRunReport, ScenarioReport, ScenarioTransport,
+    BenchmarkRepoReport, BenchmarkRunReport, McpFairnessTimingReport, ScenarioReport,
+    ScenarioTransport,
 };
 use crate::benchmark::subset_workspace::prepare_subset_workspace;
 use crate::benchmark::{
@@ -27,7 +28,7 @@ use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct RunRequest {
@@ -376,6 +377,7 @@ fn run_interactive_query_case(
                     bounded_incomplete_iterations,
                     Some(error),
                     profile_artifacts,
+                    profile,
                 );
             }
         }
@@ -407,6 +409,7 @@ fn run_interactive_query_case(
                     bounded_incomplete_iterations,
                     Some(error),
                     profile_artifacts,
+                    profile,
                 );
             }
         }
@@ -420,18 +423,32 @@ fn run_interactive_query_case(
         bounded_incomplete_iterations,
         None,
         profile_artifacts,
+        profile,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn interactive_case_report(
     case: &InteractiveQueryBenchmarkCase,
-    success: bool,
+    mut success: bool,
     warmup_durations_ms: Vec<f64>,
     measured_durations_ms: Vec<f64>,
     bounded_incomplete_iterations: usize,
-    failure_message: Option<String>,
+    mut failure_message: Option<String>,
     profile_artifacts: Vec<PathBuf>,
+    profile: Option<&BenchmarkProfile>,
 ) -> ScenarioReport {
+    let phases = match transport_phase_report(profile, &profile_artifacts) {
+        Ok(phases) => phases,
+        Err(error) => {
+            success = false;
+            failure_message = Some(match failure_message {
+                Some(primary) => format!("{primary}; profile diagnostics failed: {error}"),
+                None => error,
+            });
+            Vec::new()
+        }
+    };
     let mut report = ScenarioReport::from_timings(
         BenchmarkScenario::InteractiveCodeIntelligence,
         ScenarioTransport::Mcp,
@@ -441,7 +458,8 @@ fn interactive_case_report(
         failure_message,
     )
     .with_case_id(case.id.clone())
-    .with_latency_budget(case.max_p95_ms);
+    .with_latency_budget(case.max_p95_ms)
+    .with_transport_phases(phases);
     report.bounded_incomplete_iterations = bounded_incomplete_iterations;
     report.profile_artifacts = profile_artifacts;
     report
@@ -501,20 +519,45 @@ fn assert_interactive_result(
     if case.allow_bounded_incomplete
         && result.pointer("/structuredContent/summary/partial") == Some(&Value::Bool(true))
     {
-        assert_scan_results_are_complete_or_bounded(&case.id, result, true)?;
+        let arguments = parse_arguments(&case.arguments_json, &case.id)?;
+        let expected_targets = arguments["targets"]
+            .as_array()
+            .ok_or_else(|| format!("interactive scan case `{}` omitted target inputs", case.id))?;
+        assert_scan_results_are_complete_or_bounded(
+            &case.id,
+            result,
+            true,
+            Some(expected_targets),
+        )?;
+        if let Some(observed) = result.pointer(&case.expected_json_pointer) {
+            assert_expected_benchmark_value(case, observed)?;
+        }
         return Ok(InteractiveCompletion::BoundedIncomplete);
     }
     let observed = result.pointer(&case.expected_json_pointer).ok_or_else(|| {
         format!(
-            "interactive case `{}` result omitted JSON pointer `{}`: {result}",
-            case.id, case.expected_json_pointer
+            "interactive case `{}` result omitted JSON pointer `{}`; {}",
+            case.id,
+            case.expected_json_pointer,
+            redacted_result_shape(result)
         )
     })?;
+    assert_expected_benchmark_value(case, observed)?;
+    Ok(InteractiveCompletion::Complete)
+}
+
+fn assert_expected_benchmark_value(
+    case: &InteractiveQueryBenchmarkCase,
+    observed: &Value,
+) -> Result<(), String> {
     if let Some(expected) = &case.expected_json_value {
         if observed != expected {
             return Err(format!(
-                "interactive case `{}` expected `{}` at `{}` but got `{observed}`",
-                case.id, expected, case.expected_json_pointer
+                "interactive case `{}` expected `{}` at `{}` but got {}",
+                case.id,
+                expected,
+                case.expected_json_pointer,
+                json_value_shape(observed)
             ));
         }
     } else if !is_meaningful_benchmark_value(observed) {
@@ -523,7 +566,7 @@ fn assert_interactive_result(
             case.id, case.expected_json_pointer
         ));
     }
-    Ok(InteractiveCompletion::Complete)
+    Ok(())
 }
 
 fn is_meaningful_benchmark_value(value: &Value) -> bool {
@@ -533,6 +576,36 @@ fn is_meaningful_benchmark_value(value: &Value) -> bool {
         Value::String(value) => !value.trim().is_empty(),
         Value::Array(values) => !values.is_empty(),
         Value::Object(values) => !values.is_empty(),
+    }
+}
+
+fn redacted_result_shape(result: &Value) -> String {
+    fn sorted_keys(value: &Value) -> Vec<&str> {
+        let mut keys = value
+            .as_object()
+            .into_iter()
+            .flat_map(|object| object.keys().map(String::as_str))
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys
+    }
+
+    format!(
+        "result shape={} top-level keys={:?} structuredContent keys={:?}",
+        json_value_shape(result),
+        sorted_keys(result),
+        sorted_keys(&result["structuredContent"])
+    )
+}
+
+fn json_value_shape(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(_) => "boolean".to_string(),
+        Value::Number(_) => "number".to_string(),
+        Value::String(value) => format!("string({} bytes)", value.len()),
+        Value::Array(values) => format!("array({} items)", values.len()),
+        Value::Object(values) => format!("object({} keys)", values.len()),
     }
 }
 
@@ -549,16 +622,36 @@ fn run_mcp_fairness_scenario(
     let scan_arguments = match parse_arguments(&case.scan_arguments_json, &case.id) {
         Ok(arguments) => arguments,
         Err(error) => {
-            return fairness_report(case, false, Vec::new(), Vec::new(), Some(error), Vec::new());
+            return fairness_report(
+                case,
+                false,
+                Vec::new(),
+                Vec::new(),
+                McpFairnessSamples::default(),
+                Some(error),
+                Vec::new(),
+                profile,
+            );
         }
     };
     let source_arguments = match parse_arguments(&case.source_arguments_json, &case.id) {
         Ok(arguments) => arguments,
         Err(error) => {
-            return fairness_report(case, false, Vec::new(), Vec::new(), Some(error), Vec::new());
+            return fairness_report(
+                case,
+                false,
+                Vec::new(),
+                Vec::new(),
+                McpFairnessSamples::default(),
+                Some(error),
+                Vec::new(),
+                profile,
+            );
         }
     };
-    let mut session = match start_initialized_session(workspace_path, false, profile.is_some()) {
+    // Timing stays enabled even without profile artifacts because the backend
+    // marker below is the synchronization proof that the heavy scan is active.
+    let mut session = match start_initialized_session(workspace_path, false, true) {
         Ok(session) => session,
         Err(error) => {
             return fairness_report(
@@ -566,16 +659,19 @@ fn run_mcp_fairness_scenario(
                 false,
                 Vec::new(),
                 Vec::new(),
+                McpFairnessSamples::default(),
                 Some(format!(
                     "failed to start fairness MCP session for `{}`: {error}",
                     target.name
                 )),
                 Vec::new(),
+                profile,
             );
         }
     };
     let mut warmup_durations_ms = Vec::with_capacity(manifest.warmup_iterations);
     let mut measured_durations_ms = Vec::with_capacity(manifest.measured_iterations);
+    let mut measured_samples = McpFairnessSamples::default();
     let mut profile_artifacts = Vec::new();
 
     for iteration in 0..manifest.warmup_iterations {
@@ -591,15 +687,17 @@ fn run_mcp_fairness_scenario(
         );
         profile_artifacts.extend(artifact);
         match outcome {
-            Ok(duration_ms) => warmup_durations_ms.push(duration_ms),
+            Ok(iteration) => warmup_durations_ms.push(iteration.budget_duration_ms()),
             Err(error) => {
                 return fairness_report(
                     case,
                     false,
                     warmup_durations_ms,
                     measured_durations_ms,
+                    measured_samples,
                     Some(error),
                     profile_artifacts,
+                    profile,
                 );
             }
         }
@@ -618,15 +716,25 @@ fn run_mcp_fairness_scenario(
         );
         profile_artifacts.extend(artifact);
         match outcome {
-            Ok(duration_ms) => measured_durations_ms.push(duration_ms),
+            Ok(iteration) => {
+                measured_durations_ms.push(iteration.budget_duration_ms());
+                measured_samples
+                    .light_request_durations_ms
+                    .push(iteration.light_request_ms);
+                measured_samples
+                    .cancellation_durations_ms
+                    .push(iteration.cancellation_ms);
+            }
             Err(error) => {
                 return fairness_report(
                     case,
                     false,
                     warmup_durations_ms,
                     measured_durations_ms,
+                    measured_samples,
                     Some(error),
                     profile_artifacts,
+                    profile,
                 );
             }
         }
@@ -637,19 +745,35 @@ fn run_mcp_fairness_scenario(
         true,
         warmup_durations_ms,
         measured_durations_ms,
+        measured_samples,
         None,
         profile_artifacts,
+        profile,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fairness_report(
     case: &McpFairnessBenchmarkCase,
-    success: bool,
+    mut success: bool,
     warmup_durations_ms: Vec<f64>,
     measured_durations_ms: Vec<f64>,
-    failure_message: Option<String>,
+    measured_samples: McpFairnessSamples,
+    mut failure_message: Option<String>,
     profile_artifacts: Vec<PathBuf>,
+    profile: Option<&BenchmarkProfile>,
 ) -> ScenarioReport {
+    let phases = match transport_phase_report(profile, &profile_artifacts) {
+        Ok(phases) => phases,
+        Err(error) => {
+            success = false;
+            failure_message = Some(match failure_message {
+                Some(primary) => format!("{primary}; profile diagnostics failed: {error}"),
+                None => error,
+            });
+            Vec::new()
+        }
+    };
     let mut report = ScenarioReport::from_timings(
         BenchmarkScenario::McpFairness,
         ScenarioTransport::Mcp,
@@ -659,9 +783,36 @@ fn fairness_report(
         failure_message,
     )
     .with_case_id(case.id.clone())
-    .with_latency_budget(case.max_p95_ms);
+    .with_latency_budget(case.max_p95_ms)
+    .with_transport_phases(phases);
+    if !measured_samples.light_request_durations_ms.is_empty()
+        || !measured_samples.cancellation_durations_ms.is_empty()
+    {
+        report.mcp_fairness = Some(McpFairnessTimingReport::from_timings(
+            measured_samples.light_request_durations_ms,
+            measured_samples.cancellation_durations_ms,
+        ));
+    }
     report.profile_artifacts = profile_artifacts;
     report
+}
+
+#[derive(Debug, Default)]
+struct McpFairnessSamples {
+    light_request_durations_ms: Vec<f64>,
+    cancellation_durations_ms: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct McpFairnessIteration {
+    light_request_ms: f64,
+    cancellation_ms: f64,
+}
+
+impl McpFairnessIteration {
+    fn budget_duration_ms(self) -> f64 {
+        self.light_request_ms.max(self.cancellation_ms)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -674,7 +825,7 @@ fn run_mcp_fairness_iteration(
     profile: Option<&BenchmarkProfile>,
     phase: &str,
     iteration: usize,
-) -> (Result<f64, String>, Option<PathBuf>) {
+) -> (Result<McpFairnessIteration, String>, Option<PathBuf>) {
     let (outcome, artifact) = run_profiled_iteration(
         session,
         profile,
@@ -686,18 +837,32 @@ fn run_mcp_fairness_iteration(
             iteration,
         },
         |session| {
+            let response_timeout = Duration::from_secs_f64(case.max_p95_ms / 1_000.0);
+            let scan_start_cursor = session.stderr_cursor();
             let scan_id =
                 session.send_tool_call("scan_usages_by_location", scan_arguments.clone())?;
+            session.wait_for_stderr_marker(
+                scan_start_cursor,
+                "BEGIN searchtools.scan_usages_backend",
+                response_timeout,
+            )?;
             let source_start = Instant::now();
             let source_id =
                 session.send_tool_call("get_symbol_sources", source_arguments.clone())?;
-            let source_result = session.receive_tool_response(source_id)?;
+            let source_result =
+                session.receive_tool_response_with_timeout(source_id, response_timeout)?;
             let source_duration_ms = elapsed_ms(source_start);
             assert_fairness_source_result(case, &source_result)?;
+            let cancellation_start = Instant::now();
             session.cancel_request(scan_id)?;
-            let scan_result = session.receive_tool_response(scan_id)?;
-            assert_fairness_scan_result(case, &scan_result)?;
-            Ok(source_duration_ms)
+            let scan_result =
+                session.receive_tool_response_with_timeout(scan_id, response_timeout)?;
+            let cancellation_duration_ms = elapsed_ms(cancellation_start);
+            assert_fairness_scan_result(case, scan_arguments, &scan_result)?;
+            Ok(McpFairnessIteration {
+                light_request_ms: source_duration_ms,
+                cancellation_ms: cancellation_duration_ms,
+            })
         },
     );
     (outcome.map(|timed| timed.value), artifact)
@@ -712,8 +877,9 @@ fn assert_fairness_source_result(
         .and_then(Value::as_array)
         .ok_or_else(|| {
             format!(
-                "fairness case `{}` source lookup omitted sources: {result}",
-                case.id
+                "fairness case `{}` source lookup omitted sources; {}",
+                case.id,
+                redacted_result_shape(result)
             )
         })?;
     let valid_source = sources.iter().any(|source| {
@@ -724,8 +890,10 @@ fn assert_fairness_source_result(
     });
     if !valid_source {
         return Err(format!(
-            "fairness case `{}` did not return a non-empty source block for `{}`: {result}",
-            case.id, case.expected_source_path
+            "fairness case `{}` did not return a non-empty source block for `{}`; {}",
+            case.id,
+            case.expected_source_path,
+            redacted_result_shape(result)
         ));
     }
     Ok(())
@@ -733,22 +901,44 @@ fn assert_fairness_source_result(
 
 fn assert_fairness_scan_result(
     case: &McpFairnessBenchmarkCase,
+    scan_arguments: &Value,
     result: &Value,
 ) -> Result<(), String> {
-    assert_scan_results_are_complete_or_bounded(&case.id, result, false)
+    let expected_targets = scan_arguments["targets"]
+        .as_array()
+        .ok_or_else(|| format!("fairness case `{}` omitted target inputs", case.id))?;
+    assert_scan_results_are_complete_or_bounded(&case.id, result, false, Some(expected_targets))
 }
 
 fn assert_scan_results_are_complete_or_bounded(
     case_id: &str,
     result: &Value,
     require_incomplete: bool,
+    expected_targets: Option<&[Value]>,
 ) -> Result<(), String> {
     let structured = result
         .get("structuredContent")
         .ok_or_else(|| format!("case `{case_id}` scan omitted structuredContent"))?;
-    let results = structured["results"]
-        .as_array()
-        .ok_or_else(|| format!("case `{case_id}` scan omitted results: {result}"))?;
+    let results = structured["results"].as_array().ok_or_else(|| {
+        format!(
+            "case `{case_id}` scan omitted results; {}",
+            redacted_result_shape(result)
+        )
+    })?;
+    if let Some(expected_targets) = expected_targets {
+        let requested = structured["summary"]["requested"].as_u64();
+        if requested != Some(expected_targets.len() as u64)
+            || results.len() != expected_targets.len()
+            || results
+                .iter()
+                .zip(expected_targets)
+                .any(|(result, expected)| result.get("input") != Some(expected))
+        {
+            return Err(format!(
+                "case `{case_id}` scan did not preserve requested target count, identity, and order"
+            ));
+        }
+    }
     let mut saw_incomplete = false;
     let honest_completion = !results.is_empty()
         && results.iter().all(|entry| {
@@ -770,12 +960,22 @@ fn assert_scan_results_are_complete_or_bounded(
                             | "response_budget"
                     )
                 );
+            let has_recovery = entry["message"]
+                .as_str()
+                .is_some_and(|message| !message.trim().is_empty())
+                || entry["notes"].as_array().is_some_and(|notes| {
+                    notes
+                        .iter()
+                        .any(|note| note.as_str().is_some_and(|note| !note.trim().is_empty()))
+                });
+            let explicitly_bounded = explicitly_bounded && has_recovery;
             saw_incomplete |= explicitly_bounded;
             explicitly_bounded
         });
     if !honest_completion || require_incomplete && !saw_incomplete {
         return Err(format!(
-            "case `{case_id}` scan did not report complete or explicitly bounded results: {result}"
+            "case `{case_id}` scan did not report complete or explicitly bounded results; {}",
+            redacted_result_shape(result)
         ));
     }
     Ok(())
@@ -1690,7 +1890,8 @@ mod issue_1228_tests {
         InteractiveQueryBenchmarkCase {
             id: "bounded-scan".to_string(),
             tool: InteractiveQueryTool::ScanUsagesByLocation,
-            arguments_json: "{}".to_string(),
+            arguments_json: r#"{"targets":[{"path":"lib.rs","line":7,"symbol":"target"}]}"#
+                .to_string(),
             expected_json_pointer: "/structuredContent/results/0/definition_path".to_string(),
             expected_json_value: Some(Value::String("lib.rs".to_string())),
             allow_bounded_incomplete: true,
@@ -1702,12 +1903,14 @@ mod issue_1228_tests {
     fn issue_1228_interactive_gate_accepts_only_truthful_bounded_scan_results() {
         let bounded = json!({
             "structuredContent": {
-                "summary": { "partial": true },
+                "summary": { "partial": true, "requested": 1 },
                 "results": [{
+                    "input": {"path":"lib.rs","line":7,"symbol":"target"},
                     "status": "failure",
                     "complete": false,
                     "incomplete_reason": "time_budget",
-                    "reason_kind": "time_budget"
+                    "reason_kind": "time_budget",
+                    "message": "Retry with a narrower path scope"
                 }]
             }
         });
@@ -1718,11 +1921,13 @@ mod issue_1228_tests {
 
         let false_absence = json!({
             "structuredContent": {
-                "summary": { "partial": true },
+                "summary": { "partial": true, "requested": 1 },
                 "results": [{
+                    "input": {"path":"lib.rs","line":7,"symbol":"target"},
                     "status": "verified_absent",
                     "complete": false,
-                    "incomplete_reason": "time_budget"
+                    "incomplete_reason": "time_budget",
+                    "message": "Retry with a narrower path scope"
                 }]
             }
         });
@@ -1730,5 +1935,38 @@ mod issue_1228_tests {
             assert_interactive_result(&bounded_scan_case(), &false_absence).is_err(),
             "a timed-out scan must never pass the gate as verified absence"
         );
+
+        let arbitrary_partial = json!({
+            "structuredContent": {
+                "summary": { "partial": true, "requested": 1 },
+                "results": [{
+                    "input": {"path":"other.rs","line":1},
+                    "status": "failure",
+                    "complete": false,
+                    "incomplete_reason": "time_budget"
+                }]
+            }
+        });
+        assert!(
+            assert_interactive_result(&bounded_scan_case(), &arbitrary_partial).is_err(),
+            "a partial result must preserve input identity and actionable recovery guidance"
+        );
+    }
+
+    #[test]
+    fn issue_1228_oracle_failures_redact_returned_source_text() {
+        let mut case = bounded_scan_case();
+        case.allow_bounded_incomplete = false;
+        let result = json!({
+            "structuredContent": {
+                "sources": [{"path": "secret.rs", "text": "TOP-SECRET-SOURCE"}]
+            }
+        });
+
+        let error = assert_interactive_result(&case, &result)
+            .expect_err("missing oracle pointer must fail");
+
+        assert!(!error.contains("TOP-SECRET-SOURCE"), "{error}");
+        assert!(error.contains("structuredContent keys"), "{error}");
     }
 }

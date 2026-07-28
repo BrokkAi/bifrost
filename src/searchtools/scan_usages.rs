@@ -1290,39 +1290,51 @@ pub(super) fn retain_hits_resolving_to_overloads(
     analyzer: &dyn IAnalyzer,
     overloads: &[CodeUnit],
     hits: Vec<UsageHit>,
-) -> Vec<UsageHit> {
+    cancellation: &CancellationToken,
+) -> (Vec<UsageHit>, bool) {
     if hits.is_empty() || overloads.is_empty() {
-        return hits;
+        return (hits, true);
     }
 
-    let requests: Vec<_> = hits
-        .iter()
-        .map(
-            |hit| crate::analyzer::usages::get_definition::DefinitionLookupRequest {
-                file: hit.file.clone(),
-                line: None,
-                column: None,
-                start_byte: Some(hit.start_offset),
-                end_byte: Some(hit.end_offset),
-            },
-        )
-        .collect();
-    let outcomes =
-        crate::analyzer::usages::get_definition::resolve_definition_batch(analyzer, requests);
-
-    hits.into_iter()
-        .zip(outcomes)
-        .filter_map(|(hit, outcome)| {
-            (!outcome.definitions.is_empty()
-                && outcome
-                    .definitions
-                    .iter()
-                    .any(|definition| overloads.contains(definition))
-                || (outcome.definitions.is_empty()
-                    && unresolved_hit_matches_target_shape(analyzer, overloads, &hit)))
-            .then_some(hit)
-        })
-        .collect()
+    let mut retained = Vec::new();
+    // Keep the non-cancellable definition resolver slices deliberately small;
+    // the shared request token is checked between slices.
+    for chunk in hits.chunks(8) {
+        if cancellation.is_cancelled() {
+            return (retained, false);
+        }
+        let requests = chunk
+            .iter()
+            .map(
+                |hit| crate::analyzer::usages::get_definition::DefinitionLookupRequest {
+                    file: hit.file.clone(),
+                    line: None,
+                    column: None,
+                    start_byte: Some(hit.start_offset),
+                    end_byte: Some(hit.end_offset),
+                },
+            )
+            .collect();
+        let outcomes =
+            crate::analyzer::usages::get_definition::resolve_definition_batch(analyzer, requests);
+        retained.extend(
+            chunk
+                .iter()
+                .cloned()
+                .zip(outcomes)
+                .filter_map(|(hit, outcome)| {
+                    (!outcome.definitions.is_empty()
+                        && outcome
+                            .definitions
+                            .iter()
+                            .any(|definition| overloads.contains(definition))
+                        || (outcome.definitions.is_empty()
+                            && unresolved_hit_matches_target_shape(analyzer, overloads, &hit)))
+                    .then_some(hit)
+                }),
+        );
+    }
+    (retained, !cancellation.is_cancelled())
 }
 
 pub(super) fn resolved_usage_definition(
@@ -1812,7 +1824,7 @@ pub(super) fn scan_usages_backend(
         );
         let interrupted = context.cancellation.is_cancelled();
         let interruption_reason = context.interruption_reason();
-        let incomplete_reason = if interrupted {
+        let mut incomplete_reason = if interrupted {
             Some(interruption_reason)
         } else {
             query_incomplete_reason(query.completion, interruption_reason)
@@ -1896,7 +1908,21 @@ pub(super) fn scan_usages_backend(
                                 .flat_map(|hits| hits.iter().cloned())
                         })
                         .collect();
-                    let hits = retain_hits_resolving_to_overloads(analyzer, &overloads, hits);
+                    let (hits, resolution_complete) = retain_hits_resolving_to_overloads(
+                        analyzer,
+                        &overloads,
+                        hits,
+                        &context.cancellation,
+                    );
+                    if !resolution_complete {
+                        incomplete_reason = Some(context.interruption_reason());
+                        work_entries.push(incomplete_work_entry(
+                            request,
+                            Some(symbol),
+                            incomplete_reason.expect("interruption reason is present"),
+                        ));
+                        continue;
+                    }
                     let filtered = filter_and_dedupe_hits(analyzer, &overloads, hits);
                     let state = SymbolUsageRenderState::new(
                         symbol,

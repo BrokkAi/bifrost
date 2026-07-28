@@ -401,23 +401,13 @@ jobs:
           restore-keys: |
             interactive-latency-repo-${{ runner.os }}-
 
-      - name: Build release benchmark binaries
-        run: cargo build --release --locked --bin bifrost --bin bifrost_benchmark
-
-      - name: Validate interactive latency manifest
-        run: ./target/release/bifrost_benchmark validate --manifest benchmark/interactive-latency.toml
-
       - name: Run interactive latency gate
         id: run_interactive_latency
         continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
-          BIFROST_BENCHMARK_BIFROST_BIN=./target/release/bifrost \
-            ./target/release/bifrost_benchmark run \
-              --manifest benchmark/interactive-latency.toml \
-              --output interactive-latency-output \
-              --profile
+          scripts/run-interactive-latency.sh --profile
 
       - name: Upload interactive latency artifacts
         if: always()
@@ -425,7 +415,7 @@ jobs:
         with:
           name: interactive-latency-${{ github.run_id }}
           path: benchmark/interactive-latency-output
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
 
       - name: Publish interactive latency summary
@@ -444,9 +434,9 @@ jobs:
             if [ -n "$report_path" ]; then
               echo "- Report: \`$report_path\`"
               echo
-              echo "| Case | p50 | p95 | Budget | Bounded incomplete | Status |"
-              echo "| --- | ---: | ---: | ---: | ---: | --- |"
-              jq -r '.repos[].scenarios[] | "| \(.name)/\(.case_id // \"default\") | \((.p50_ms // 0) | tostring) ms | \((.p95_ms // 0) | tostring) ms | \((.latency_budget_ms // 0) | tostring) ms | \(.bounded_incomplete_iterations // 0) | \(if .success then \"ok\" else \"failed\" end) |"' "$report_path"
+              echo "| Case | p50 | p95 | Budget | Light p95 | Cancel p95 | Dominant phase | Bounded incomplete | Status |"
+              echo "| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- |"
+              jq -r '.repos[].scenarios[] | "| \(.name)/\(.case_id // \"default\") | \((.p50_ms // 0) | tostring) ms | \((.p95_ms // 0) | tostring) ms | \((.latency_budget_ms // 0) | tostring) ms | \((.mcp_fairness.light_request_p95_ms // 0) | tostring) ms | \((.mcp_fairness.cancellation_p95_ms // 0) | tostring) ms | \(.dominant_phase // \"-\") | \(.bounded_incomplete_iterations // 0) | \(if .success then \"ok\" else \"failed\" end) |"' "$report_path"
             else
               echo "- Report: none written"
             fi
