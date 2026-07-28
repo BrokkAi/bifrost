@@ -199,6 +199,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "activate_workspace",
             "get_active_workspace",
             "query_code",
+            "list_policies",
             "run_policy",
             "get_symbol_locations",
             "get_symbol_ancestors",
@@ -241,6 +242,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "activate_workspace",
             "get_active_workspace",
             "query_code",
+            "list_policies",
             "run_policy",
             "get_symbol_locations",
             "get_symbol_ancestors",
@@ -1174,6 +1176,95 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
 }
 
 #[test]
+fn bifrost_mcp_lists_and_runs_built_in_policies() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("src/app.py", MCP_POLICY_APP)
+        .build();
+    let mut child = spawn_server(project.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let listed = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "list_policies", "arguments": {} }
+        }),
+    );
+    assert_eq!(listed["result"]["isError"], false, "{listed}");
+    assert_eq!(
+        listed["result"]["structuredContent"]["id"],
+        "bifrost.code-smells"
+    );
+    assert_eq!(
+        listed["result"]["structuredContent"]["policies"]
+            .as_array()
+            .map(Vec::len),
+        Some(12)
+    );
+
+    let run = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "run_policy",
+                "arguments": {
+                    "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
+                    "evaluation_date": "2026-07-28",
+                    "fail_on": "warning"
+                }
+            }
+        }),
+    );
+    assert_eq!(run["result"]["isError"], false, "{run}");
+    let structured = &run["result"]["structuredContent"];
+    assert_eq!(structured["status"], "finding", "{run}");
+    assert_eq!(
+        structured["report"]["runs"][0]["policy_id"],
+        "bifrost.correctness.dynamic-evaluation"
+    );
+    assert_eq!(
+        structured["report"]["runs"][0]["findings"][0]["primary"]["path"],
+        "src/app.py"
+    );
+
+    let unknown = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "run_policy",
+                "arguments": {
+                    "policy_ids": ["bifrost.correctness.missing"],
+                    "evaluation_date": "2026-07-28"
+                }
+            }
+        }),
+    );
+    assert_eq!(unknown["error"]["code"], -32602, "{unknown}");
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
 fn bifrost_split_servers_publish_expected_tool_sets() {
     let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -1245,6 +1336,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "search_file_contents",
             "find_files_containing",
             "query_code",
+            "list_policies",
             "run_policy",
             "get_symbol_locations",
             "get_symbol_ancestors",
@@ -1261,6 +1353,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
         "extended",
         &[
             "query_code",
+            "list_policies",
             "run_policy",
             "get_symbol_locations",
             "get_symbol_ancestors",

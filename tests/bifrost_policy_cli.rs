@@ -263,6 +263,73 @@ fn assert_single_terminal_safe_line(output: &Output) {
 }
 
 #[test]
+fn built_in_policy_catalog_lists_without_constructing_a_workspace() {
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--list-policies")
+        .output()
+        .expect("run policy listing");
+    assert_status(&output, 0);
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    let manifest = json_stdout(&output);
+    assert_eq!(manifest["id"], "bifrost.code-smells");
+    assert_eq!(manifest["policies"].as_array().map(Vec::len), Some(12));
+    assert_eq!(
+        manifest["policies"][0]["id"],
+        "bifrost.correctness.dynamic-evaluation"
+    );
+}
+
+#[test]
+fn built_in_and_workspace_policies_run_in_one_batch() {
+    let project = policy_project(&[]);
+    let output = run(
+        project.root(),
+        &[
+            "--policy-id",
+            "bifrost.correctness.dynamic-evaluation",
+            "--policy-file",
+            "policies/no-exec.rqlp",
+            "--evaluation-date",
+            "2026-07-28",
+            "--fail-on",
+            "never",
+            "--format",
+            "json",
+        ],
+    );
+    assert_status(&output, 0);
+    let report = json_stdout(&output);
+    let policy_ids = report["runs"]
+        .as_array()
+        .expect("policy runs")
+        .iter()
+        .map(|run| run["policy_id"].as_str().expect("policy id"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        policy_ids,
+        vec![
+            "bifrost.correctness.dynamic-evaluation",
+            "bifrost.security.no-exec"
+        ]
+    );
+}
+
+#[test]
+fn unknown_built_in_selector_is_a_policy_invocation_error() {
+    let project = policy_project(&[]);
+    let output = run(
+        project.root(),
+        &["--policy-pack", "bifrost.missing", "--format", "json"],
+    );
+    assert_status(&output, 2);
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("unknown built-in policy pack `bifrost.missing`")
+    );
+}
+
+#[test]
 fn thresholds_cover_clean_rated_and_unrated_findings() {
     let project = policy_project(&[]);
     let cases: &[(&[&str], i32)] = &[

@@ -81,3 +81,15 @@ for required_file in "${required_inline_test_fixtures[@]}"; do
         exit 1
     fi
 done
+
+required_policy_files=(policy-packs/bifrost.code-smells/manifest.json)
+while IFS= read -r required_file; do
+    required_policy_files+=("$required_file")
+done < <(find policy-packs/bifrost.code-smells/policies -type f -name '*.rqlp' -print | LC_ALL=C sort)
+
+for required_file in "${required_policy_files[@]}"; do
+    if ! grep -Fqx "$required_file" "$package_files"; then
+        echo "Packaged crate is missing built-in policy source: ${required_file}" >&2
+        exit 1
+    fi
+done

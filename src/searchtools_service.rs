@@ -4,9 +4,10 @@ use crate::{
     AnalyzerConfig, CancellationToken, FilesystemProject, Project, ProjectChangeWatcher,
     ProjectFile, WorkspaceAnalyzer,
     analyzer::policy::{
-        POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE, PolicyEvaluationDate,
-        PolicyEvaluationOptions, PolicyFailOn, PolicyReportDocument, PolicySuppressionOptions,
-        PolicySuppressionSource, evaluate_policy_files_with_analyzer,
+        BuiltInPolicySelection, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE,
+        PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyFailOn,
+        PolicyReportDocument, PolicySuppressionOptions, PolicySuppressionSource,
+        built_in_policy_catalog, evaluate_policy_inputs_with_analyzer,
     },
     analyzer::semantic::WorkspaceRelativePath,
     code_quality::{
@@ -57,7 +58,14 @@ const MAX_QUERY_FILE_BYTES: u64 = 64 * 1024;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RunPolicyParams {
+    #[serde(default)]
     policy_files: Vec<String>,
+    #[serde(default)]
+    policy_packs: Vec<String>,
+    #[serde(default)]
+    policy_categories: Vec<String>,
+    #[serde(default)]
+    policy_ids: Vec<String>,
     suppression_file: Option<String>,
     evaluation_date: PolicyEvaluationDate,
     #[serde(default)]
@@ -250,7 +258,7 @@ impl PreparedQueryCode {
 pub(crate) struct PreparedRunPolicy {
     snapshot: WorkspaceQueryScope,
     root: PathBuf,
-    policy_files: Vec<PathBuf>,
+    policy_inputs: Vec<PolicyEvaluationInput>,
     options: PolicyEvaluationOptions,
     workspace_generation: u64,
 }
@@ -714,6 +722,14 @@ impl SearchToolsService {
         if name == "query_code" {
             let prepared = self.prepare_query_code(arguments)?;
             return self.execute_prepared_query_code(prepared, cancellation);
+        }
+        if name == "list_policies" {
+            let catalog = built_in_policy_catalog().map_err(|error| {
+                SearchToolsServiceError::internal(format!(
+                    "failed to load built-in policy catalog: {error}"
+                ))
+            })?;
+            return Self::structured_only(catalog.manifest());
         }
         if name == "run_policy" {
             let prepared = self.prepare_run_policy(arguments)?;
@@ -2230,14 +2246,50 @@ impl SearchToolsService {
             ))
         })?;
         let max_policy_files = crate::analyzer::policy::PolicyBatchBudget::default().max_policies();
-        if params.policy_files.is_empty() || params.policy_files.len() > max_policy_files {
+        if params.policy_files.len() > max_policy_files {
             return Err(SearchToolsServiceError::invalid_params(format!(
-                "run_policy requires between 1 and {max_policy_files} policy_files"
+                "run_policy accepts at most {max_policy_files} policy_files entries"
+            )));
+        }
+        for (label, values) in [
+            ("policy_packs", &params.policy_packs),
+            ("policy_categories", &params.policy_categories),
+            ("policy_ids", &params.policy_ids),
+        ] {
+            if values.len() > max_policy_files {
+                return Err(SearchToolsServiceError::invalid_params(format!(
+                    "run_policy accepts at most {max_policy_files} {label} entries"
+                )));
+            }
+            let mut unique = BTreeSet::new();
+            for value in values {
+                if value.is_empty()
+                    || value.len() > crate::mcp_extended::MAX_RUN_POLICY_SELECTOR_BYTES
+                {
+                    return Err(SearchToolsServiceError::invalid_params(format!(
+                        "run_policy {label} entries must contain between 1 and {} bytes",
+                        crate::mcp_extended::MAX_RUN_POLICY_SELECTOR_BYTES
+                    )));
+                }
+                if !unique.insert(value.as_str()) {
+                    return Err(SearchToolsServiceError::invalid_params(format!(
+                        "run_policy {label} entry `{value}` is duplicated"
+                    )));
+                }
+            }
+        }
+        if params.policy_files.is_empty()
+            && params.policy_packs.is_empty()
+            && params.policy_categories.is_empty()
+            && params.policy_ids.is_empty()
+        {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "run_policy requires at least one policy file or built-in selector"
             )));
         }
 
         let mut unique_paths = BTreeSet::new();
-        let mut policy_files = Vec::with_capacity(params.policy_files.len());
+        let mut policy_inputs = Vec::with_capacity(params.policy_files.len());
         for raw_path in params.policy_files {
             if raw_path.len() > crate::mcp_extended::MAX_RUN_POLICY_PATH_BYTES {
                 return Err(SearchToolsServiceError::invalid_params(format!(
@@ -2266,7 +2318,35 @@ impl SearchToolsService {
                     path.as_str()
                 )));
             }
-            policy_files.push(PathBuf::from(path.as_str()));
+            policy_inputs.push(PolicyEvaluationInput::workspace_file(path.as_str()));
+        }
+
+        let selection = BuiltInPolicySelection {
+            packs: params.policy_packs,
+            categories: params.policy_categories,
+            policy_ids: params.policy_ids,
+        };
+        let selected = built_in_policy_catalog()
+            .map_err(|error| {
+                SearchToolsServiceError::internal(format!(
+                    "failed to load built-in policy catalog: {error}"
+                ))
+            })?
+            .select(&selection)
+            .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
+        let mut built_in_inputs = selected
+            .into_iter()
+            .map(|policy| {
+                PolicyEvaluationInput::embedded(policy.source_identity(), policy.source())
+            })
+            .collect::<Vec<_>>();
+        built_in_inputs.append(&mut policy_inputs);
+        let policy_inputs = built_in_inputs;
+        if policy_inputs.len() > max_policy_files {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "run_policy resolves to {} policies but accepts at most {max_policy_files}",
+                policy_inputs.len()
+            )));
         }
 
         let suppressions = params
@@ -2297,7 +2377,7 @@ impl SearchToolsService {
             return Ok(PreparedRunPolicy {
                 snapshot,
                 root,
-                policy_files,
+                policy_inputs,
                 options,
                 workspace_generation,
             });
@@ -2312,14 +2392,14 @@ impl SearchToolsService {
         let PreparedRunPolicy {
             snapshot,
             root,
-            policy_files,
+            policy_inputs,
             options,
             workspace_generation: _,
         } = prepared;
         let result = (|| {
-            let outcome = evaluate_policy_files_with_analyzer(
+            let outcome = evaluate_policy_inputs_with_analyzer(
                 &root,
-                &policy_files,
+                &policy_inputs,
                 &snapshot,
                 &options,
                 cancellation,

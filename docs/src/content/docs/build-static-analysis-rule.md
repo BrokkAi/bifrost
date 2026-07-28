@@ -203,5 +203,9 @@ For a native `.rqlp` policy, use `--format human|json|sarif` instead. All three 
 - The integration handles all seven terminal result variants and every receiver-analysis outcome.
 - Errors, diagnostics, result truncation, proof tiers, and provenance truncation have explicit policy.
 - Fixture tests cover a true positive, a convincing negative, and relevant diagnostics.
+- A rule proposed from code review has positive and realistic near-miss fixtures
+  for every claimed language. If structured RQL cannot express the boundary, keep
+  the candidate out of the built-in pack and file or link a minimized analyzer/RQL
+  issue instead of adding source-text matching.
 - CI records the engine, query, workspace, and source revisions.
 - Reports cite exact returned locations and do not claim unsupported control or data flow; endpoint matches and source/sink co-presence are not reachability.

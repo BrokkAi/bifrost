@@ -1,0 +1,44 @@
+(policy
+  :schema-version 1
+  :id "bifrost.performance.expensive-operation-in-nested-loop"
+  :name "Expensive operation inside nested loops"
+  :message "Move or batch the expensive operation outside the nested loops"
+  :severity warning
+  :description "This nested loop contains structured I/O, parsing, serialization, sorting, database, network, or subprocess work. Hoist invariants, batch external operations, or reduce the iteration space."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["performance" "nested-loop" "io" "code-smell"]
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql
+          :schema-version 2
+          (union
+            (language python
+              (loop
+                (has
+                  (loop
+                    (has
+                      (call :callee
+                        (name/regex "^(open|sort|compile|dumps|loads|execute|query|get|post|run)$")))))))
+            (language java
+              (loop
+                (has
+                  (loop
+                    (has
+                      (call :callee
+                        (name/regex "^(sort|compile|readString|readAllBytes|writeValueAsString|parse|executeQuery|send|exec|sleep)$")))))))
+            (language javascript
+              (loop
+                (has
+                  (loop
+                    (has
+                      (call :callee
+                        (name/regex "^(sort|RegExp|readFileSync|stringify|parse|query|fetch|execSync)$")))))))
+            (language typescript
+              (loop
+                (has
+                  (loop
+                    (has
+                      (call :callee
+                        (name/regex "^(sort|RegExp|readFileSync|stringify|parse|query|fetch|execSync)$")))))))))))

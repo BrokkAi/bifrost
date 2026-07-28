@@ -1,0 +1,24 @@
+(policy
+  :schema-version 1
+  :id "bifrost.performance.serialization-in-loop"
+  :name "Serialization inside a loop"
+  :message "Avoid repeated serialization inside the loop"
+  :severity warning
+  :description "Serialization traverses values, encodes them, and allocates output. Hoist loop-invariant work or use a streaming/batched encoder."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["performance" "serialization" "loop" "code-smell"]
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql
+          :schema-version 2
+          (union
+            (language python
+              (inside (loop) (call :receiver (name "json") :callee (name "dumps"))))
+            (language java
+              (inside (loop) (call :callee (name "writeValueAsString"))))
+            (language javascript
+              (inside (loop) (call :receiver (name "JSON") :callee (name "stringify"))))
+            (language typescript
+              (inside (loop) (call :receiver (name "JSON") :callee (name "stringify"))))))))

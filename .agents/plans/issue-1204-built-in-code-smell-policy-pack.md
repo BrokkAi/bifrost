@@ -15,12 +15,12 @@ The work also turns policy dogfooding into a durable maintenance practice. `AGEN
 - [x] (2026-07-28 07:10Z) Fetched `origin`, confirmed the existing issue branch is clean and exactly aligned with `origin/master`, and read live issue #1204 plus related issues #824, #1205, #1207, #1228, and #1071.
 - [x] (2026-07-28 07:10Z) Confirmed the shared policy coordinator, schema-2 report, durable suppression path, explicit-file CLI, and explicit-file MCP runner are already present on `master`.
 - [x] (2026-07-28 07:10Z) Confirmed open #1228 already covers current-plugin calls exceeding five seconds; observed a six-pattern `search_symbols` call taking 35.241 seconds and an exact `get_symbol_sources` call taking 18.220 seconds after the slow search.
-- [ ] Add the embedded pack manifest, source catalog, selection model, and mixed workspace/embedded coordinator inputs.
-- [ ] Add twelve reviewed `.rqlp` policies and one reusable multi-language fixture corpus with a positive and near miss for every claimed language/rule pair.
-- [ ] Add deterministic CLI listing plus pack/category/policy selection, including mixed built-in and workspace batches.
-- [ ] Add MCP `list_policies` and extend `run_policy` with the same selectors while preserving active-snapshot, suppression, cancellation, and canonical-report behavior.
-- [ ] Extend crate/release smoke validation to prove the manifest and sources are shipped and executable from an installed artifact.
-- [ ] Document the code-review workflow and update root `AGENTS.md` with the durable rule-authoring, gap-filing, latency, and release-cadence protocol.
+- [x] (2026-07-28 09:45Z) Added the embedded pack manifest, source catalog, selection model, semantic-hash validation, and mixed workspace/embedded coordinator inputs.
+- [x] (2026-07-28 09:45Z) Added twelve structured `.rqlp` policies and one reusable Python/Java/JavaScript/TypeScript fixture corpus with positive and outside-context near-miss coverage for every claimed rule/language pair.
+- [x] (2026-07-28 09:45Z) Added deterministic CLI listing plus pack/category/policy selection, including mixed built-in and workspace batches.
+- [x] (2026-07-28 09:45Z) Added MCP `list_policies` and extended `run_policy` with the same bounded selectors while preserving active-snapshot, suppression, cancellation, and canonical-report behavior.
+- [x] (2026-07-28 09:45Z) Extended crate/release smoke validation to require the manifest and sources and to execute a built-in rule through the staged MCP binary.
+- [x] (2026-07-28 09:45Z) Documented the user surface and updated root `AGENTS.md` with the durable rule-authoring, gap-filing, latency, and release-cadence protocol.
 - [ ] Profile the structural selectors on a pinned repository snapshot, record findings/near misses honestly, and link any uncovered capability gaps to existing or new focused issues.
 - [ ] Run formatting, focused tests, the full all-feature Clippy gate, relevant integration suites, package smoke, and specialist review; fix all confirmed release blockers.
 
@@ -37,6 +37,12 @@ The work also turns policy dogfooding into a durable maintenance practice. `AGEN
 
 - Observation: current plugin latency remains well above the desired five-second interaction budget for ordinary bounded navigation calls.
   Evidence: this session observed 35.241 seconds for one six-pattern `search_symbols` request and 18.220 seconds for an exact four-symbol source request queued after it. Open #1228 already records the same class of head-of-line blocking and common-query latency regression.
+
+- Observation: lexical `inside (loop)` crosses a function declaration nested beneath that loop, so a deferred `open()` body is reported as file I/O performed by the loop.
+  Evidence: adding `def later(): return open(item)` beneath a Python `for` caused `bifrost.performance.file-read-in-loop` to report the deferred call. RQL has no declaration-bounded containment relation that can exclude the nested body while retaining calls in the surrounding function.
+
+- Observation: a bounded `enclosing-decl` then `callers :depth 2 :proof proven` policy can retain exact proven findings while still making the whole run inconclusive.
+  Evidence: minimized Python/JavaScript/TypeScript dynamic-evaluation and Java `System.exit` chains returned their proven direct/second-order callers plus `CALL_RELATION_CANDIDATES_OMITTED`, which maps to `PartialDiscovery`. The candidate was removed because it would make the built-in pack status 2 on its positive fixture.
 
 ## Decision Log
 
@@ -62,6 +68,10 @@ The work also turns policy dogfooding into a durable maintenance practice. `AGEN
 
 - Decision: Interpret the requested daily release cadence as a repository practice and release-readiness requirement, not authorization to auto-increment versions, create tags, or publish packages from this branch.
   Rationale: The current release pipeline is tag- and version-gated across several privileged publishers. Automatic daily versioning is a separate externally mutating design choice. This branch will keep every milestone releasable and extend package smoke so a daily release can safely include the pack.
+  Date/Author: 2026-07-28 / Codex
+
+- Decision: Defer the planned bounded call-graph rule and ship twelve complete structural rules.
+  Rationale: The real call-graph query produced useful proven findings but also an unavoidable incomplete-run diagnostic on minimized positive fixtures. A built-in rule that makes an otherwise successful pack unreliable fails the release quality bar; the exact capability gap will be filed separately instead of weakening completion semantics.
   Date/Author: 2026-07-28 / Codex
 
 ## Outcomes & Retrospective
@@ -192,3 +202,5 @@ In `src/analyzer/policy/builtin.rs`, expose serializable manifest values, a dete
 The implementation uses existing `serde`, `serde_json`, policy registries, analyzers, coordinator budgets, cancellation tokens, and report types. It adds no network dependency and no alternate query or policy engine.
 
 Revision note (2026-07-28): Initial plan created after reconciling live issue, repository, related-issue, and plugin-latency state. The plan deliberately ships a structural first pack and links semantic-rule gaps to #824/#1205 instead of manufacturing file-level CFG/data-flow findings.
+
+Revision note (2026-07-28): Updated after the first executable milestone. Catalog, coordinator, twelve rules, CLI/MCP parity, package smoke, docs, and durable `AGENTS.md` guidance are implemented. A bounded call-graph candidate was rejected because honest partial-discovery diagnostics made the run unreliable, and lexical containment across nested callable declarations was minimized for focused follow-up issues.

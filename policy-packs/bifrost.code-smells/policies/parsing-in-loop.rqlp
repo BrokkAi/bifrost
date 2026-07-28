@@ -1,0 +1,24 @@
+(policy
+  :schema-version 1
+  :id "bifrost.performance.parsing-in-loop"
+  :name "Parsing inside a loop"
+  :message "Parse loop-invariant input once or use a batched parser"
+  :severity warning
+  :description "Repeated parsing performs tokenization, validation, and object construction on every iteration. Parse once when the input is invariant."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["performance" "parsing" "loop" "code-smell"]
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql
+          :schema-version 2
+          (union
+            (language python
+              (inside (loop) (call :receiver (name "json") :callee (name "loads"))))
+            (language java
+              (inside (loop) (call :callee (name "parse"))))
+            (language javascript
+              (inside (loop) (call :receiver (name "JSON") :callee (name "parse"))))
+            (language typescript
+              (inside (loop) (call :receiver (name "JSON") :callee (name "parse"))))))))

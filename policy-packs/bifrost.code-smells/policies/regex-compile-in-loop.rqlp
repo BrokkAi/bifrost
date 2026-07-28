@@ -1,0 +1,24 @@
+(policy
+  :schema-version 1
+  :id "bifrost.performance.regex-compile-in-loop"
+  :name "Regular-expression compilation inside a loop"
+  :message "Compile the regular expression once and reuse it"
+  :severity warning
+  :description "Repeated regular-expression compilation rebuilds parser and matcher state. Hoist loop-invariant patterns outside the loop."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["performance" "regex" "loop" "code-smell"]
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql
+          :schema-version 2
+          (union
+            (language python
+              (inside (loop) (call :receiver (name "re") :callee (name "compile"))))
+            (language java
+              (inside (loop) (call :receiver (name "Pattern") :callee (name "compile"))))
+            (language javascript
+              (inside (loop) (call :callee (name "RegExp"))))
+            (language typescript
+              (inside (loop) (call :callee (name "RegExp"))))))))

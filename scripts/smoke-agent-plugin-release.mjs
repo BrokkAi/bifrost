@@ -153,6 +153,10 @@ async function withDisposableSmokeWorkspace(scenario) {
       path.join(workspace, "BifrostReleaseSmoke.java"),
       "public class BifrostReleaseSmokeWorkspace {}\n"
     );
+    await fs.writeFile(
+      path.join(workspace, "BifrostPolicySmoke.py"),
+      "def evaluate_untrusted(value):\n    return eval(value)\n"
+    );
     return await scenario(workspace);
   } finally {
     await fs.rm(workspace, { recursive: true, force: true });
@@ -277,6 +281,34 @@ async function assertMcpRootsWorkspaceBinding(launcherPath, pluginCwd, workspace
     });
     assert.equal(search.result?.isError, false, `MCP roots search_symbols returned an error: ${JSON.stringify(search)}`);
     assertWorkspaceSymbolHit(search, "MCP roots");
+    const catalog = await roundTrip(child, reader, {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "list_policies", arguments: {} },
+    });
+    assert.equal(catalog.result?.isError, false, `MCP list_policies returned an error: ${JSON.stringify(catalog)}`);
+    assert.equal(catalog.result?.structuredContent?.id, "bifrost.code-smells");
+    assert.equal(catalog.result?.structuredContent?.policies?.length, 12);
+    const policy = await roundTrip(child, reader, {
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: {
+        name: "run_policy",
+        arguments: {
+          policy_ids: ["bifrost.correctness.dynamic-evaluation"],
+          evaluation_date: "2026-07-28",
+          fail_on: "never",
+        },
+      },
+    });
+    assert.equal(policy.result?.isError, false, `MCP built-in policy run returned an error: ${JSON.stringify(policy)}`);
+    assert.equal(policy.result?.structuredContent?.status, "clean");
+    assert.equal(
+      policy.result?.structuredContent?.report?.runs?.[0]?.findings?.[0]?.primary?.path,
+      "BifrostPolicySmoke.py"
+    );
   });
 
   assert.match(logs, /source=roots\/list/);

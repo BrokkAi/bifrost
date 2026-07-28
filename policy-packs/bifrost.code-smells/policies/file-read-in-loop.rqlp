@@ -1,0 +1,25 @@
+(policy
+  :schema-version 1
+  :id "bifrost.performance.file-read-in-loop"
+  :name "File read inside a loop"
+  :message "Move repeated file I/O outside the loop or batch it"
+  :severity warning
+  :description "Opening or synchronously reading a file per iteration can multiply I/O and allocation. Read once, stream, or batch when semantics permit."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["performance" "io" "loop" "code-smell"]
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql
+          :schema-version 2
+          (union
+            (language python (inside (loop) (call :callee (name "open"))))
+            (language java
+              (inside (loop) (call :receiver (name "Files") :callee (name "readString"))))
+            (language java
+              (inside (loop) (call :receiver (name "Files") :callee (name "readAllBytes"))))
+            (language javascript
+              (inside (loop) (call :receiver (name "fs") :callee (name "readFileSync"))))
+            (language typescript
+              (inside (loop) (call :receiver (name "fs") :callee (name "readFileSync"))))))))

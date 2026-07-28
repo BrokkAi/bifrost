@@ -31,6 +31,24 @@ Every `.rqlp` file contains exactly one top-level document:
 Passing an endpoint to `--policy-file` is an error; Bifrost does not turn it
 into a match policy behind the author's back.
 
+### Built-in code-smell pack
+
+The installed binary embeds `bifrost.code-smells`, an initial catalog of twelve
+structured match policies. It covers dynamic evaluation, unsafe Python object
+deserialization, and review prompts for sorting, regular-expression compilation,
+file reads, serialization, parsing, database calls, network calls, subprocesses,
+sleep, and expensive operations beneath nested loops. Every rule is an ordinary
+checked-in `.rqlp` source with a stable ID and semantic hash; the manifest also
+records its category, claimed languages, required capabilities, severity
+rationale, and remediation.
+
+Use `bifrost --list-policies` or MCP `list_policies` to inspect the exact catalog
+in the running build. Select it with `--policy-pack bifrost.code-smells`, a
+`--policy-category`, or a stable `--policy-id`; MCP `run_policy` exposes the same
+pack/category/ID selectors. These are deliberately review-oriented structural
+matches. A call name or lexical location is evidence of the parsed shape, not
+proof of runtime dispatch, loop invariance, or measured cost.
+
 ### A runnable match policy
 
 This complete checked fixture selects direct Python call syntax whose callee is

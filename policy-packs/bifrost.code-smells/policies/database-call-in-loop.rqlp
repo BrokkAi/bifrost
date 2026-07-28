@@ -1,0 +1,24 @@
+(policy
+  :schema-version 1
+  :id "bifrost.performance.database-call-in-loop"
+  :name "Database call inside a loop"
+  :message "Batch or prefetch database work instead of querying per iteration"
+  :severity warning
+  :description "One database call per loop iteration is a common N+1 pattern. Prefer set-oriented queries, batching, or prefetching."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["performance" "database" "n-plus-one" "loop" "code-smell"]
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql
+          :schema-version 2
+          (union
+            (language python
+              (inside (loop) (call :receiver (name "cursor") :callee (name "execute"))))
+            (language java
+              (inside (loop) (call :receiver (name "statement") :callee (name "executeQuery"))))
+            (language javascript
+              (inside (loop) (call :receiver (name "db") :callee (name "query"))))
+            (language typescript
+              (inside (loop) (call :receiver (name "db") :callee (name "query"))))))))

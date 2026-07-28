@@ -1,0 +1,24 @@
+(policy
+  :schema-version 1
+  :id "bifrost.performance.subprocess-in-loop"
+  :name "Subprocess creation inside a loop"
+  :message "Avoid launching one subprocess per loop iteration"
+  :severity warning
+  :description "Process creation is expensive and repeated launches can exhaust operating-system resources. Reuse one process or batch its input."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["performance" "subprocess" "loop" "code-smell"]
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql
+          :schema-version 2
+          (union
+            (language python
+              (inside (loop) (call :receiver (name "subprocess") :callee (name "run"))))
+            (language java
+              (inside (loop) (call :receiver (name "runtime") :callee (name "exec"))))
+            (language javascript
+              (inside (loop) (call :receiver (name "child_process") :callee (name "execSync"))))
+            (language typescript
+              (inside (loop) (call :receiver (name "child_process") :callee (name "execSync"))))))))
