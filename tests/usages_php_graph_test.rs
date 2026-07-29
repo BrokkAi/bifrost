@@ -98,6 +98,84 @@ function build(): Target {
 }
 
 #[test]
+fn php_graph_reports_route_collector_self_calls_without_same_named_near_misses() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "src/RouteCollector.php",
+            r#"<?php
+namespace FastRoute;
+
+class RouteCollector {
+    public function addRoute(string $route): void {}
+
+    public function addAny(string $route): void {
+        $this->addRoute($route);
+    }
+}
+"#,
+        ),
+        (
+            "src/OtherCollector.php",
+            r#"<?php
+namespace FastRoute;
+
+class OtherCollector {
+    public function addRoute(string $route): void {}
+
+    public function addAny(string $route): void {
+        $this->addRoute($route);
+    }
+}
+"#,
+        ),
+        (
+            "src/Consumer.php",
+            r#"<?php
+namespace FastRoute;
+
+function configureOther(OtherCollector $collector): void {
+    $collector->addRoute('/near-miss');
+}
+"#,
+        ),
+    ]);
+
+    let result = scan_usages_by_reference(
+        &analyzer,
+        ScanUsagesByReferenceParams {
+            symbols: vec!["FastRoute.RouteCollector.addRoute".to_string()],
+            include_tests: true,
+            paths: None,
+            include_same_owner: true,
+            max_duration_secs: None,
+        },
+    );
+    let entry = result.results.first().expect("one target result");
+    assert_eq!(
+        ScanUsagesStatus::NoExternalUsages,
+        entry.status,
+        "{entry:#?}"
+    );
+    assert_eq!(Some(1), entry.same_owner_sites, "{entry:#?}");
+    assert_eq!(0, entry.total_hits.unwrap_or_default(), "{entry:#?}");
+    let sites: Vec<_> = entry
+        .same_owner_files
+        .iter()
+        .flat_map(|file| file.hits.iter().map(|hit| (file.path.as_str(), hit)))
+        .collect();
+    assert_eq!(1, sites.len(), "{entry:#?}");
+    assert_eq!("src/RouteCollector.php", sites[0].0, "{entry:#?}");
+    assert!(
+        sites[0]
+            .1
+            .snippet
+            .as_deref()
+            .is_some_and(|snippet| snippet.contains("$this->addRoute($route)")),
+        "expected the RouteCollector self call: {entry:#?}"
+    );
+}
+
+#[test]
 fn php_signature_metadata_captures_declared_type_text_from_ast() {
     let (_project, analyzer) = php_analyzer_with_files(&[(
         "Factory.php",
