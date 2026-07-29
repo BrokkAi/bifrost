@@ -35,9 +35,13 @@ include-build = true
 include-dev = false
 unused-allowed-license = "allow"
 exceptions = [
-    # Bifrost itself is the LGPL-covered work, not a generally allowed
-    # third-party dependency.
+    # Bifrost's first-party workspace packages are the LGPL-covered work, not
+    # generally allowed third-party dependencies.
     { crate = "brokk-bifrost", allow = ["LGPL-3.0-or-later"] },
+    { crate = "brokk-bifrost-analysis", allow = ["LGPL-3.0-or-later"] },
+    { crate = "brokk-bifrost-lsp", allow = ["LGPL-3.0-or-later"] },
+    { crate = "brokk-bifrost-mcp", allow = ["LGPL-3.0-or-later"] },
+    { crate = "brokk-bifrost-runtime", allow = ["LGPL-3.0-or-later"] },
     # Only the optional nlp feature reaches this MPL crate through hf-hub.
     # Any prebuilt nlp artifact must also inform recipients how to obtain the
     # option-ext source, as documented on the public third-party-notices page.

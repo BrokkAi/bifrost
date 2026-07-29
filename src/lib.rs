@@ -23,9 +23,8 @@ pub use brokk_bifrost_analysis::{
     TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
     WorkspaceAnalyzer, collect_workspace_files, execute_request, execute_request_with_cancellation,
     execute_request_with_limits, reset_rust_tree_parse_counters_for_test,
-    reset_workspace_file_listing_count_for_test, rust_tree_parse_count_for_test,
-    rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test, summarize_inputs,
-    workspace_file_listing_count_for_test,
+    rust_tree_parse_count_for_test, rust_tree_parse_request_count_for_test,
+    rust_tree_parsed_bytes_for_test, summarize_inputs,
 };
 pub use brokk_bifrost_analysis::{
     analyzer, cache_db, cache_gc, cancellation, code_quality, compact_graph, diff_analysis,
