@@ -221,7 +221,11 @@ pub(super) fn resolve_js_ts(
                 value_position,
             );
         }
-        let receiver_candidates = if let Some(binding) = imports.bindings.get(qualifier)
+        let imported_receiver_binding = imports
+            .bindings
+            .get(qualifier)
+            .filter(|binding| matches!(binding.kind, ImportKind::Named | ImportKind::Default));
+        let receiver_candidates = if let Some(binding) = imported_receiver_binding
             && matches!(binding.kind, ImportKind::Named | ImportKind::Default)
         {
             let exported_name = match binding.kind {
@@ -248,11 +252,20 @@ pub(super) fn resolve_js_ts(
             }
             same_file
         };
-        let member_candidates = if language == Language::TypeScript {
-            ts_member_candidates(analyzer, support, receiver_candidates, name, value_position)
-        } else {
-            jsts_member_candidates(analyzer, support, receiver_candidates, name, value_position)
-        };
+        let member_candidates =
+            if language == Language::JavaScript && imported_receiver_binding.is_some() {
+                jsts_file_scoped_member_candidates(
+                    analyzer,
+                    support,
+                    receiver_candidates,
+                    name,
+                    value_position,
+                )
+            } else if language == Language::TypeScript {
+                ts_member_candidates(analyzer, support, receiver_candidates, name, value_position)
+            } else {
+                jsts_member_candidates(analyzer, support, receiver_candidates, name, value_position)
+            };
         if !member_candidates.is_empty() {
             return js_ts_candidates_outcome(analyzer, member_candidates);
         }
@@ -348,8 +361,17 @@ pub(super) fn resolve_js_ts(
                 format!("`{reference}` did not resolve to an indexed JS/TS definition"),
             );
         }
-        let exact_same_file =
-            jsts_file_scoped_dotted_candidates(analyzer, support, file, reference, value_position);
+        let exact_same_file = jsts_unproven_same_file_dotted_candidates(
+            analyzer,
+            support,
+            file,
+            reference,
+            qualifier,
+            tree.root_node(),
+            source,
+            site.range.start_byte,
+            value_position,
+        );
         if !exact_same_file.is_empty() {
             return js_ts_candidates_outcome(analyzer, exact_same_file);
         }
@@ -783,6 +805,99 @@ fn jsts_file_scoped_dotted_candidates(
     candidates
 }
 
+fn jsts_unproven_same_file_dotted_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    reference: &str,
+    qualifier: &str,
+    root: Node<'_>,
+    source: &str,
+    before_byte: usize,
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    let mut candidates =
+        jsts_file_scoped_dotted_candidates(analyzer, support, file, reference, value_position);
+    candidates.retain(|unit| {
+        !jsts_js_unbound_assigned_property_candidate_requires_exact_receiver(
+            analyzer, unit, qualifier,
+        ) || jsts_same_file_unbound_assignment_matches_reference_scope(
+            analyzer,
+            unit,
+            qualifier,
+            root,
+            source,
+            before_byte,
+        )
+    });
+    candidates
+}
+
+fn jsts_same_file_unbound_assignment_matches_reference_scope(
+    analyzer: &dyn IAnalyzer,
+    target: &CodeUnit,
+    qualifier: &str,
+    root: Node<'_>,
+    source: &str,
+    before_byte: usize,
+) -> bool {
+    let Some((object_name, property_name)) = jsts_unbound_assigned_property_shape(analyzer, target)
+    else {
+        return false;
+    };
+    if object_name != qualifier {
+        return false;
+    }
+    let target_ranges = analyzer.ranges(target);
+    let reference_scope = smallest_named_node_covering(root, before_byte, before_byte)
+        .and_then(jsts_nearest_reference_fallback_scope)
+        .unwrap_or(JstsReceiverBindingScope {
+            start_byte: root.start_byte(),
+            end_byte: root.end_byte(),
+        });
+
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "member_expression"
+            && node.parent().is_some_and(|parent| {
+                parent.kind() == "assignment_expression"
+                    && parent
+                        .child_by_field_name("left")
+                        .is_some_and(|left| left.id() == node.id())
+            })
+            && let (Some(object), Some(property)) = (
+                node.child_by_field_name("object"),
+                node.child_by_field_name("property"),
+            )
+            && node_text(object, source) == object_name
+            && node_text(property, source) == property_name
+            && property.start_byte() < before_byte
+            && target_ranges.iter().any(|range| {
+                range.start_byte <= property.start_byte() && property.end_byte() <= range.end_byte
+            })
+        {
+            let assignment_scope =
+                jsts_nearest_reference_fallback_scope(node).unwrap_or(JstsReceiverBindingScope {
+                    start_byte: root.start_byte(),
+                    end_byte: root.end_byte(),
+                });
+            if assignment_scope == reference_scope {
+                return true;
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    false
+}
+
+fn jsts_nearest_reference_fallback_scope(node: Node<'_>) -> Option<JstsReceiverBindingScope> {
+    jsts_nearest_lexical_scope(node).or_else(|| jsts_nearest_var_scope(node))
+}
+
 #[derive(Clone, Copy)]
 struct JstsScopedDottedLookup<'a, 'tree> {
     analyzer: &'a dyn IAnalyzer,
@@ -1169,9 +1284,6 @@ fn jsts_unbound_assigned_property_shape<'a>(
     target: &'a CodeUnit,
 ) -> Option<(&'a str, &'a str)> {
     if !target.is_field() && !target.is_function() {
-        return None;
-    }
-    if analyzer.parent_of(target).is_some() {
         return None;
     }
     let [object_id, property_id] = target.fq().segments() else {
