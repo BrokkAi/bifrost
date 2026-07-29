@@ -354,10 +354,22 @@ jobs:
           ref: ${{ needs.release-context.outputs.commit }}
 
       - name: Verify release tag still selects the validated commit
-        run: >
-          bash scripts/verify-release-tag-commit.sh
-          "${{ needs.release-context.outputs.tag }}"
-          "${{ needs.release-context.outputs.commit }}"
+        # Recovery dispatches run this workflow revision while checking out the
+        # immutable release source, so keep the verifier in this workflow.
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
+        run: |
+          tag_ref="refs/tags/$RELEASE_TAG"
+          remote_refs="$(git ls-remote --tags origin "${tag_ref}*")"
+          actual_commit="$(awk -v tag_ref="$tag_ref" '
+            $2 == (tag_ref "^{}") { print $1; found = 1; exit }
+            $2 == tag_ref { fallback = $1 }
+            END { if (!found && fallback) print fallback }
+          ' <<< "$remote_refs")"
+          test -n "$actual_commit"
+          test "$actual_commit" = "$RELEASE_COMMIT"
 
       - name: Record validated release identity
         shell: bash
@@ -386,10 +398,20 @@ jobs:
           merge-multiple: true
 
       - name: Verify release tag still selects the validated commit
-        run: >
-          bash scripts/verify-release-tag-commit.sh
-          "${{ needs.release-context.outputs.tag }}"
-          "${{ needs.release-context.outputs.commit }}"
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
+        run: |
+          tag_ref="refs/tags/$RELEASE_TAG"
+          remote_refs="$(git ls-remote --tags origin "${tag_ref}*")"
+          actual_commit="$(awk -v tag_ref="$tag_ref" '
+            $2 == (tag_ref "^{}") { print $1; found = 1; exit }
+            $2 == tag_ref { fallback = $1 }
+            END { if (!found && fallback) print fallback }
+          ' <<< "$remote_refs")"
+          test -n "$actual_commit"
+          test "$actual_commit" = "$RELEASE_COMMIT"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
@@ -622,10 +644,20 @@ jobs:
           path: dist
 
       - name: Verify release tag still selects the validated commit
-        run: >
-          bash scripts/verify-release-tag-commit.sh
-          "${{ needs.release-context.outputs.tag }}"
-          "${{ needs.release-context.outputs.commit }}"
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
+        run: |
+          tag_ref="refs/tags/$RELEASE_TAG"
+          remote_refs="$(git ls-remote --tags origin "${tag_ref}*")"
+          actual_commit="$(awk -v tag_ref="$tag_ref" '
+            $2 == (tag_ref "^{}") { print $1; found = 1; exit }
+            $2 == tag_ref { fallback = $1 }
+            END { if (!found && fallback) print fallback }
+          ' <<< "$remote_refs")"
+          test -n "$actual_commit"
+          test "$actual_commit" = "$RELEASE_COMMIT"
 
       - name: Upload Pi package artifact to GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
@@ -664,10 +696,20 @@ jobs:
           path: dist
 
       - name: Verify release tag still selects the validated commit
-        run: >
-          bash scripts/verify-release-tag-commit.sh
-          "${{ needs.release-context.outputs.tag }}"
-          "${{ needs.release-context.outputs.commit }}"
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
+        run: |
+          tag_ref="refs/tags/$RELEASE_TAG"
+          remote_refs="$(git ls-remote --tags origin "${tag_ref}*")"
+          actual_commit="$(awk -v tag_ref="$tag_ref" '
+            $2 == (tag_ref "^{}") { print $1; found = 1; exit }
+            $2 == tag_ref { fallback = $1 }
+            END { if (!found && fallback) print fallback }
+          ' <<< "$remote_refs")"
+          test -n "$actual_commit"
+          test "$actual_commit" = "$RELEASE_COMMIT"
 
       - name: Upload editor artifact to GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
@@ -706,10 +748,20 @@ jobs:
           path: dist
 
       - name: Verify release tag still selects the validated commit
-        run: >
-          bash scripts/verify-release-tag-commit.sh
-          "${{ needs.release-context.outputs.tag }}"
-          "${{ needs.release-context.outputs.commit }}"
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
+        run: |
+          tag_ref="refs/tags/$RELEASE_TAG"
+          remote_refs="$(git ls-remote --tags origin "${tag_ref}*")"
+          actual_commit="$(awk -v tag_ref="$tag_ref" '
+            $2 == (tag_ref "^{}") { print $1; found = 1; exit }
+            $2 == tag_ref { fallback = $1 }
+            END { if (!found && fallback) print fallback }
+          ' <<< "$remote_refs")"
+          test -n "$actual_commit"
+          test "$actual_commit" = "$RELEASE_COMMIT"
 
       - name: Publish extension to Visual Studio Marketplace
         run: >
@@ -779,10 +831,20 @@ jobs:
           path: dist
 
       - name: Verify release tag still selects the validated commit
-        run: >
-          bash scripts/verify-release-tag-commit.sh
-          "${{ needs.release-context.outputs.tag }}"
-          "${{ needs.release-context.outputs.commit }}"
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
+        run: |
+          tag_ref="refs/tags/$RELEASE_TAG"
+          remote_refs="$(git ls-remote --tags origin "${tag_ref}*")"
+          actual_commit="$(awk -v tag_ref="$tag_ref" '
+            $2 == (tag_ref "^{}") { print $1; found = 1; exit }
+            $2 == tag_ref { fallback = $1 }
+            END { if (!found && fallback) print fallback }
+          ' <<< "$remote_refs")"
+          test -n "$actual_commit"
+          test "$actual_commit" = "$RELEASE_COMMIT"
 
       - name: Upload agent plugin to GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2

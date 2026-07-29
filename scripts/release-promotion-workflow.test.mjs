@@ -71,13 +71,13 @@ test("release context captures a commit and every called workflow receives it", 
 
 test("publish actions fail closed if the remote tag no longer selects the validated commit", () => {
   assert.match(tagVerifier, /git ls-remote --tags origin/u);
+  assert.match(tagVerifier, /"\$\{tag_ref\}\*"/u);
   assert.match(tagVerifier, /refs\/tags\/\$\{release_tag\}/u);
   assert.match(tagVerifier, /test "\$actual_commit" = "\$expected_commit"/u);
-  assert.ok(
-    (release.match(/scripts\/verify-release-tag-commit\.sh/gu) ?? []).length >= 6,
-  );
-  assert.match(cratePublisher, /scripts\/verify-release-tag-commit\.sh/u);
-  assert.match(wheelPublisher, /scripts\/verify-release-tag-commit\.sh/u);
+  for (const workflow of [release, cratePublisher, wheelPublisher]) {
+    assert.match(workflow, /git ls-remote --tags origin/u);
+    assert.match(workflow, /test "\$actual_commit" = "\$RELEASE_COMMIT"/u);
+  }
 });
 
 test("reusable workflow inputs are environment-bound before shell execution", () => {
@@ -97,7 +97,6 @@ test("promotion evidence covers validation before every external publisher", () 
     "build",
     "agent-plugin-package",
     "agent-plugin-prepublish-smoke",
-    "agent-plugin-release-smoke",
     "pi-package",
     "vscode-package",
   ]) {
@@ -114,6 +113,10 @@ test("promotion evidence covers validation before every external publisher", () 
   ]) {
     jobNeedsPromotionEvidence(job);
   }
+  assert.match(
+    jobBlock(release, "agent-plugin-release-smoke"),
+    /^    needs: \[release-context, agent-plugin-package, release\]$/mu,
+  );
 
   assert.match(
     jobBlock(release, "publish-crate-runtime"),
