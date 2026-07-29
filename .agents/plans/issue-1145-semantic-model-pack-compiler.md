@@ -17,7 +17,8 @@ This issue stops at the schema/compiler boundary. The produced pack is not insta
 - [x] (2026-07-29 08:13Z) Added declaration and generator fixtures plus behavior-focused integration and unit tests for equivalence, invalid inputs, corruption, non-canonical bytes, cross-shard references, and resource caps.
 - [x] (2026-07-29 08:13Z) Added public semantic-model-pack documentation, sidebar navigation, and exact fixture-backed documentation checks.
 - [x] (2026-07-29 10:16Z) Ran architecture, security, intent, duplication, and DevOps reviews; addressed the confirmed schema, vocabulary, capture-binding, integrity, decoder-validation, cross-shard-reference, and compiler-limit findings.
-- [x] (2026-07-29 09:43Z) Completed the Rust, docs, and package validation matrix; recorded the policy-checking service as unavailable rather than treating tool visibility as a successful policy run.
+- [x] (2026-07-29 09:43Z) Completed the Rust, docs, and package validation matrix; recorded the policy-checking service as unavailable in the implementation session rather than treating tool visibility as a successful policy run.
+- [x] (2026-07-29 09:55Z) Rebased the five issue commits onto current `origin/master`, reran formatting, strict all-feature Clippy, and the 19 semantic-pack plus five docs-focused tests, and exercised the newly available policy service before publication.
 
 ## Surprises & Discoveries
 
@@ -35,8 +36,8 @@ This issue stops at the schema/compiler boundary. The produced pack is not insta
   Evidence: descriptors now carry compiler-derived sorted definition/reference inventories, allowing manifest decoding to prove pack-wide uniqueness and reference closure before individual shards are loaded.
 - Observation: Three process-spawning MCP session tests cannot run inside the filesystem sandbox even though they pass with ordinary host permissions.
   Evidence: the sandboxed all-feature run reported `PermissionDenied` only for the three `benchmark::mcp_session` cases; the elevated exact rerun passed all 2,071 runnable library tests, with seven ignored, and continued through every runnable integration target without a failure.
-- Observation: The installed policy skill does not imply that its runtime service is callable.
-  Evidence: the active tool inventory contains neither `list_policies` nor `run_policy`, so the required combined `bifrost.code-smells` and repository-policy run could not be executed or represented as clean.
+- Observation: The installed policy skill does not imply that its runtime service is callable or that a completed response is reliable.
+  Evidence: the implementation session exposed neither `list_policies` nor `run_policy`. During publication the tools became callable, but the first `bifrost.code-smells` run cancelled at 5.06 seconds and the warm run returned `status: unreliable` because multiple repository-wide queries exhausted their fact budgets. Existing issues #1296 and #1306 own this behavior.
 
 ## Decision Log
 
@@ -78,7 +79,9 @@ This issue stops at the schema/compiler boundary. The produced pack is not insta
 
 The version-one authoring and artifact contract is implemented for both typed machine producers and strict YAML/JSON authors. Nineteen focused integration tests and seven artifact unit tests cover source equivalence, schema drift, deterministic lowering, digest boundaries, compression, semantic canonicality, cross-shard references, corrupt artifacts, and resource limits. Architecture, security, intent, duplication, and DevOps reviews were completed and all confirmed findings were addressed.
 
-Release validation is green for formatting, strict all-target/all-feature Clippy, the all-feature Rust test matrix, the matching-toolchain doctest stage, docs checks/build, and crate packaging. The all-feature library suite reported 2,071 passed and seven ignored before all runnable integration targets completed without failure. The docs build produced 58 pages and checked 5,555 links. The packaged crate was 7,093,389 bytes and included the public schema while excluding development fixtures. The sole unexecuted gate is the repository policy run because the session exposes neither policy-listing nor policy-execution tools; that environmental limitation is explicit rather than reported as success.
+Release validation is green for formatting, strict all-target/all-feature Clippy, the all-feature Rust test matrix, the matching-toolchain doctest stage, docs checks/build, and crate packaging. The all-feature library suite reported 2,071 passed and seven ignored before all runnable integration targets completed without failure. The docs build produced 58 pages and checked 5,555 links. The packaged crate was 7,093,389 bytes and included the public schema while excluding development fixtures.
+
+The built-in `bifrost.code-smells` gate was ultimately executable but unreliable: the cold request cancelled at the MCP deadline and warm requests completed with inconclusive repository-wide policies after fact-budget exhaustion. Changed-file prompts were reviewed individually. Fixture reads and serialization operate on different fixtures or mutated values per iteration, while semantic-model sorting canonicalizes distinct selector, fact, and shard-local sets; none is loop-invariant work that can be hoisted. The service limitation is tracked by #1296 and #1306 and is not represented as a clean policy result.
 
 ## Context and Orientation
 
@@ -196,3 +199,5 @@ Plan revision note (2026-07-29 08:13Z): Marked the authoring, artifact, fixture,
 Plan revision note (2026-07-29 10:16Z): Recorded and resolved specialist-review findings by tightening schema version/variant closure, adding trigger-bound captures and missing declaration vocabulary, separating the validated compiled boundary, covering full manifest integrity and envelope agreement, validating semantic canonicality on decode, carrying cross-shard reference inventories, and aligning compiler output limits with decoder defaults.
 
 Plan revision note (2026-07-29 09:43Z): Completed final Rust, docs, and packaging validation; documented the host's mixed Homebrew/rustup toolchain and sandbox-only process-test failures; verified the affected stages with a consistent rustup toolchain and host permissions; and recorded the unavailable policy service as the only remaining environmental validation limitation.
+
+Plan revision note (2026-07-29 09:55Z): Rebased onto current `origin/master`, reran the post-rebase Rust gates, and replaced the earlier unavailable-policy note with the actual cold-cancellation and warm-unreliable results after the MCP tools became callable. Reviewed every changed-file prompt and linked the existing runtime owners rather than claiming a clean policy result.
