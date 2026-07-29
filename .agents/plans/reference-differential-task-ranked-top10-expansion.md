@@ -590,6 +590,17 @@ local gate, but is not the focus.
   inference. Both focused #1267 target-specific and inverted-graph regressions
   pass with all features; repository-wide Clippy and test gates remain to be
   repeated on the committed follow-up.
+- [x] (2026-07-28) The next complete-gate attempt reached four Rust
+  whole-workspace graph regressions introduced by #1280's exact associated-path
+  authorization. Owner proof received the terminal member segment, macro token
+  paths sent members through the nonmember validator, and undeclared syntactic
+  `Owner.member` placeholders prevented same-file owner and trait fallback.
+  Corrected all three at their structured boundaries: owner-only AST slices,
+  declaration-parent routing for token-tree members, and exact same-file owner
+  selection before the existing associated-item resolver. The complete
+  whole-workspace Rust graph target passes 21/21 and the target-specific Rust
+  usage suite passes 210/210 with all features. Repository-wide Clippy and the
+  full matrix remain to be repeated on the committed follow-up.
 - [x] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [x] Complete C++ and publish its evidence and user summary.

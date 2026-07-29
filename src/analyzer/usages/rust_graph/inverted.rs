@@ -204,13 +204,17 @@ impl RustScan<'_, '_> {
             return Some(candidate);
         }
 
-        let owner_fqn = self.refs.resolve_scoped_owner(path)?;
-        let candidate = match super::resolve_scoped_associated_item_matching(
+        let owner_segments = segments.get(..segments.len().checked_sub(1)?)?;
+        let owner_fqn = self
+            .refs
+            .resolve_scoped_owner(path)
+            .or_else(|| self.exact_local_scoped_owner(owner_segments))?;
+        let candidate = match super::resolver::resolve_owner_associated_item_matching(
             self.rust,
             self.support,
             &self.refs,
             self.file,
-            path,
+            &owner_fqn,
             name,
             scoped_item_matcher(namespace)?,
             node.start_byte(),
@@ -227,6 +231,30 @@ impl RustScan<'_, '_> {
         self.authorize_member_candidate(candidate, &owner_fqn, &segments)
     }
 
+    fn exact_local_scoped_owner(&self, owner_segments: &[Node<'_>]) -> Option<String> {
+        let terminal = simple_node_text(*owner_segments.last()?, self.source)?;
+        let mut owners = self
+            .same_file_nonmembers
+            .get(&terminal)?
+            .iter()
+            .filter(|unit| {
+                self.rust.supports_type_hierarchy(unit)
+                    || self.rust.is_type_alias(unit)
+                    || self.rust.is_rust_trait_declaration(unit)
+            })
+            .filter_map(|unit| {
+                let roots = std::collections::BTreeSet::from([unit.clone()]);
+                let seeds = self.rust.usage_binding_seeds(&roots);
+                self.exact_ast_owner(owner_segments, &seeds)
+                    .is_some()
+                    .then(|| unit.fq_name())
+            })
+            .collect::<Vec<_>>();
+        owners.sort();
+        owners.dedup();
+        (owners.len() == 1).then(|| owners.remove(0))
+    }
+
     fn resolve_direct_scoped_candidate(
         &self,
         path: &str,
@@ -235,6 +263,9 @@ impl RustScan<'_, '_> {
         namespace: RustReferenceNamespace,
     ) -> Option<String> {
         let candidate = self.refs.resolve_scoped(path, name)?.to_string();
+        if self.support.fqn(&candidate).is_empty() {
+            return None;
+        }
         self.authorize_nonmember_candidate(candidate, segments, namespace)
     }
 
@@ -244,6 +275,7 @@ impl RustScan<'_, '_> {
         owner_fqn: &str,
         segments: &[Node<'_>],
     ) -> Option<String> {
+        let owner_segments = segments.get(..segments.len().checked_sub(1)?)?;
         let roots: std::collections::BTreeSet<CodeUnit> = self
             .support
             .fqn(owner_fqn)
@@ -259,9 +291,33 @@ impl RustScan<'_, '_> {
         }
 
         let seeds = self.rust.usage_binding_seeds(&roots);
-        self.exact_ast_owner(segments, &seeds)
+        self.exact_ast_owner(owner_segments, &seeds)
             .is_some()
             .then_some(candidate)
+    }
+
+    fn authorize_token_path_candidate(
+        &self,
+        candidate: String,
+        path: &[Node<'_>],
+        namespace: RustReferenceNamespace,
+    ) -> Option<String> {
+        let mut member_owners = self
+            .support
+            .fqn(&candidate)
+            .into_iter()
+            .filter_map(|unit| self.rust.parent_of(&unit))
+            .filter(|owner| !owner.is_module() && !owner.is_file_scope())
+            .collect::<Vec<_>>();
+        member_owners.sort();
+        member_owners.dedup();
+        if member_owners.len() == 1 {
+            return self.authorize_member_candidate(candidate, &member_owners[0].fq_name(), path);
+        }
+        if !member_owners.is_empty() {
+            return None;
+        }
+        self.authorize_nonmember_candidate(candidate, path, namespace)
     }
 
     fn authorize_nonmember_candidate(
@@ -666,7 +722,8 @@ fn handle_token_tree_paths(node: Node<'_>, ctx: &mut RustScan<'_, '_>) {
                 namespace
             }
         };
-        let Some(callee) = ctx.authorize_nonmember_candidate(segment.fqn, &segment.path, namespace)
+        let Some(callee) =
+            ctx.authorize_token_path_candidate(segment.fqn, &segment.path, namespace)
         else {
             continue;
         };
