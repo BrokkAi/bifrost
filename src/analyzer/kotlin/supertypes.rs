@@ -3,7 +3,9 @@
 //! A Kotlin class header lists its superclass, its interfaces, and any
 //! interface delegation in one comma-separated *delegation specifier* list:
 //!
-//!     class Child : Base(seed), Contract, Logged by logger
+//! ```text
+//! class Child : Base(seed), Contract, Logged by logger
+//! ```
 //!
 //! What resolution needs from each entry is the dotted type path that names
 //! the supertype — `Base`, `Contract`, `Logged` — with constructor arguments,

@@ -9,9 +9,11 @@
 //! `import` inside a block, no static/instance distinction, and no selector
 //! list. A header is exactly one of
 //!
-//!     import a.b.C          binds `C`
-//!     import a.b.C as D     binds `D`
-//!     import a.b.*          binds every name `a.b` exports
+//! ```text
+//! import a.b.C          binds C
+//! import a.b.C as D     binds D
+//! import a.b.*          binds every name a.b exports
+//! ```
 //!
 //! where the path may name a package member (`a.b.C`), a nested type
 //! (`a.b.Outer.Inner`), or a member of an object, companion, or enum
