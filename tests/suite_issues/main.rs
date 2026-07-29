@@ -1,0 +1,27 @@
+//! Consolidated `suite_issues` test harness.
+//!
+//! Each module below was previously its own `tests/*.rs` integration binary.
+//! They were merged so the suite links the library once instead of once per
+//! file; module scoping keeps every test path and helper name isolated.
+//! Run a single former file with:
+//!     cargo test --test suite_issues -- <module>::
+
+#[path = "../common/mod.rs"]
+mod common;
+
+mod issue_1089_crate_name_directory_mapping;
+mod issue_1092_cpp_header_source_identity;
+mod issue_1093_cpp_using_namespace_owner;
+mod issue_1120_cpp_bare_call_lexical_scope;
+mod issue_1121_cpp_nested_class_out_of_line;
+mod issue_1126_import_boundary_claims;
+mod issue_1128_rust_raw_identifiers;
+mod issue_1142_rust_inline_mod_items;
+mod issue_1158_boundary_claim_gate;
+mod issue_1162_separator_aware_enclosing_scope;
+mod issue_1174_python_cross_language_claims;
+mod issue_1184_cpp_file_local_globals;
+mod issue_1185_cpp_member_calls;
+mod issue_1225_python_annotation_inverse;
+mod issue_693_profile;
+mod issue_csharp_verbatim_identifiers;

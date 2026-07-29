@@ -113,8 +113,8 @@ run_persistence() {
             BIFROST_SEMANTIC_CFG_PERSIST_DB=$template \
             BIFROST_SEMANTIC_CFG_BENCH_ROUND=0 \
             BIFROST_SEMANTIC_INDEX=off \
-            cargo test --release --test measure_semantic_cfg_persistence \
-                semantic_cfg_persistence_measurement -- --ignored --nocapture \
+            cargo test --release --test suite_semantic \
+                measure_semantic_cfg_persistence::semantic_cfg_persistence_measurement -- --ignored --nocapture \
                 >"$seed_log" 2>&1; then
             tail -n 240 "$seed_log" >&2
             exit 1
@@ -152,8 +152,8 @@ run_persistence() {
                     BIFROST_SEMANTIC_CFG_PERSIST_DB=$database \
                     BIFROST_SEMANTIC_CFG_BENCH_ROUND=$round \
                     BIFROST_SEMANTIC_INDEX=off \
-                    cargo test --release --test measure_semantic_cfg_persistence \
-                        semantic_cfg_persistence_measurement -- --ignored --nocapture \
+                    cargo test --release --test suite_semantic \
+                        measure_semantic_cfg_persistence::semantic_cfg_persistence_measurement -- --ignored --nocapture \
                         >"$log_file" 2>&1; then
                     tail -n 240 "$log_file" >&2
                     exit 1
@@ -168,8 +168,8 @@ run_persistence() {
 
     if ! BIFROST_SEMANTIC_CFG_PERSIST_SAMPLES_FILE=$samples_file \
         BIFROST_SEMANTIC_INDEX=off \
-        cargo test --release --test measure_semantic_cfg_persistence \
-            semantic_cfg_persistence_measurement -- --ignored --nocapture \
+        cargo test --release --test suite_semantic \
+            measure_semantic_cfg_persistence::semantic_cfg_persistence_measurement -- --ignored --nocapture \
             >"$aggregate_log" 2>&1; then
         tail -n 240 "$aggregate_log" >&2
         exit 1
@@ -194,8 +194,8 @@ run_sample() {
     if ! BIFROST_SEMANTIC_CFG_LAYOUT=$layout \
         BIFROST_SEMANTIC_CFG_BENCH_ROUND=$round \
         BIFROST_SEMANTIC_INDEX=off \
-        cargo test --release --test measure_semantic_cfg \
-            semantic_cfg_representation_measurement -- --ignored --nocapture \
+        cargo test --release --test suite_semantic \
+            measure_semantic_cfg::semantic_cfg_representation_measurement -- --ignored --nocapture \
             >"$log_file" 2>&1; then
         tail -n 240 "$log_file" >&2
         exit 1
@@ -220,8 +220,8 @@ done
 aggregate_log="$work_dir/aggregate.log"
 if ! BIFROST_SEMANTIC_CFG_SAMPLES_FILE=$samples_file \
     BIFROST_SEMANTIC_INDEX=off \
-    cargo test --release --test measure_semantic_cfg \
-        semantic_cfg_representation_measurement -- --ignored --nocapture \
+    cargo test --release --test suite_semantic \
+        measure_semantic_cfg::semantic_cfg_representation_measurement -- --ignored --nocapture \
         >"$aggregate_log" 2>&1; then
     tail -n 240 "$aggregate_log" >&2
     exit 1

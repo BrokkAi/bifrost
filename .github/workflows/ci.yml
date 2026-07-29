@@ -207,8 +207,9 @@ jobs:
       - name: Run RQL runtime tests
         run: >-
           node scripts/ci-timing.mjs --label rql-runtime -- cargo test --features nlp,python
-          --test code_intelligence_runtime --test structural_search_cross_language
-          --test structural_search_planner --test structural_search_python
+          --test suite_cross_language --test suite_mcp_cli --
+          code_intelligence_runtime:: structural_search_cross_language::
+          structural_search_planner:: structural_search_python::
 
   mcp-contract:
     name: MCP contract
@@ -238,7 +239,7 @@ jobs:
           toolchain: 1.96.0
 
       - name: Run MCP contract tests
-        run: node scripts/ci-timing.mjs --label mcp-contract -- cargo test --features nlp,python --test bifrost_mcp_server
+        run: node scripts/ci-timing.mjs --label mcp-contract -- cargo test --features nlp,python --test suite_mcp_cli -- bifrost_mcp_server::
 
   lsp-contract:
     name: LSP contract
@@ -268,7 +269,7 @@ jobs:
           toolchain: 1.96.0
 
       - name: Run LSP contract tests
-        run: node scripts/ci-timing.mjs --label lsp-contract -- cargo test --features nlp,python --test bifrost_lsp_server
+        run: node scripts/ci-timing.mjs --label lsp-contract -- cargo test --features nlp,python --test suite_mcp_cli -- bifrost_lsp_server::
 
   policy-pack:
     name: policy pack
@@ -294,9 +295,10 @@ jobs:
       - name: Run policy-pack tests
         run: >-
           node scripts/ci-timing.mjs --label policy-pack -- cargo test --features nlp,python
-          --test builtin_policy_pack --test bifrost_policy_cli --test policy_loading
-          --test policy_loading_workspace --test policy_match_evaluation --test policy_rendering
-          --test policy_sarif_rendering --test policy_source
+          --test suite_bench_policy --
+          builtin_policy_pack:: bifrost_policy_cli:: policy_loading::
+          policy_loading_workspace:: policy_match_evaluation:: policy_rendering::
+          policy_sarif_rendering:: policy_source::
 
   agent-plugin:
     name: agent plugin (${{ matrix.os }})

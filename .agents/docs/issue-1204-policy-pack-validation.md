@@ -46,7 +46,7 @@ also have no defensible Rust equivalent in this catalog.
 Passing commands during implementation:
 
 ```text
-cargo test --test builtin_policy_pack -- --nocapture
+cargo test --test suite_bench_policy -- builtin_policy_pack:: --nocapture
 cargo test --lib run_policy_schema_requires_bounded_mixed_inputs
 cargo test --lib checked_in_catalog_is_internally_consistent
 cargo test --lib list_policies_is_rootless_and_rejects_nonempty_arguments

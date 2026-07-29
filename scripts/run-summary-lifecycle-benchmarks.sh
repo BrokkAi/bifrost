@@ -105,8 +105,8 @@ for benchmark_case in "${cases[@]}"; do
                 BIFROST_SUMMARY_LIFECYCLE_PAYLOAD_FILE=$payload_file \
                 BIFROST_SUMMARY_LIFECYCLE_FIXTURE_ROOT="$work_dir/fixtures" \
                 BIFROST_SEMANTIC_INDEX=off \
-                cargo test --locked --release --test measure_summary_lifecycle \
-                    summary_lifecycle_measurement -- --ignored --nocapture \
+                cargo test --locked --release --test suite_semantic \
+                    measure_summary_lifecycle::summary_lifecycle_measurement -- --ignored --nocapture \
                     >"$log_file" 2>&1; then
                 tail -n 240 "$log_file" >&2
                 exit 1
@@ -122,8 +122,8 @@ done
 aggregate_log="$work_dir/aggregate.log"
 if ! BIFROST_SUMMARY_LIFECYCLE_SAMPLES_FILE=$samples_file \
     BIFROST_SEMANTIC_INDEX=off \
-    cargo test --locked --release --test measure_summary_lifecycle \
-        summary_lifecycle_measurement -- --ignored --nocapture \
+    cargo test --locked --release --test suite_semantic \
+        measure_summary_lifecycle::summary_lifecycle_measurement -- --ignored --nocapture \
         >"$aggregate_log" 2>&1; then
     tail -n 240 "$aggregate_log" >&2
     exit 1

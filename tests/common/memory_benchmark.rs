@@ -1,5 +1,4 @@
-#[path = "usage_graph.rs"]
-mod usage_graph;
+use crate::common::usage_graph;
 
 use brokk_bifrost::SearchToolsService;
 use serde::Serialize;
