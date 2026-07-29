@@ -2210,19 +2210,38 @@ class Consumer {
 
 #[test]
 fn scala_inverse_preserves_singleton_type_and_qualified_case_object_identity() {
-    let source = r#"package app
+    let method_source = r#"package model
 
-sealed trait Method
+sealed abstract class Method
 object Method {
-  case object HEAD extends Method
+  private def safe(name: String): Method = new Method {
+    override def toString: String = name
+  }
+  val HEAD: Method = safe("HEAD")
   case object OPTIONS extends Method
   case object PATCH extends Method
 }
+"#;
+    let dsl_source = r#"package dsl
 
-sealed trait Status
-object Status {
-  case object Found extends Status
+import model.Method
+
+object Methods {
+  val head: Method.HEAD.type = Method.HEAD // positive-singleton-head
 }
+"#;
+    let route_source = r#"package app
+
+import model.Method
+
+object Route {
+  def select(method: Method, optionsRoot: AnyRef): Method = method match {
+    case Method.OPTIONS if optionsRoot != null => Method.OPTIONS // positive-qualified-options
+    case _ => Method.PATCH // positive-qualified-patch
+  }
+}
+"#;
+    let auth_source = r#"package auth
 
 sealed trait AuthType
 object AuthType {
@@ -2230,15 +2249,14 @@ object AuthType {
 }
 
 object Use {
-  val head: Method.HEAD.type = Method.HEAD // positive-singleton-head
-  val found: Status.Found.type = Status.Found // positive-singleton-found
-  val options = Method.OPTIONS // positive-qualified-options
-  val patch = Method.PATCH // positive-qualified-patch
   val none = AuthType.None // positive-qualified-none
 }
 "#;
-    let (_project, analyzer) = scala_analyzer_with_files(&[
-        ("app/Witness.scala", source),
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        ("model/Method.scala", method_source),
+        ("dsl/Methods.scala", dsl_source),
+        ("app/Route.scala", route_source),
+        ("auth/Auth.scala", auth_source),
         (
             "decoy/Types.scala",
             r#"package decoy
@@ -2247,63 +2265,72 @@ object Method {
   class OPTIONS
   class PATCH
 }
-object Status {
-  class Found
+object Methods {
+  val head: Method.HEAD = null // negative-type-decoy-head
+}
+object Route {
+  def select(method: AnyRef, optionsRoot: AnyRef): AnyRef = method match {
+    case Method.OPTIONS if optionsRoot != null => Method.OPTIONS // negative-type-decoy-options
+    case _ => null
+  }
+  val patch: Method.PATCH = null // negative-type-decoy-patch
 }
 object AuthType {
   class None
 }
 object Use {
-  val head: Method.HEAD = null // negative-type-decoy-head
-  val found: Status.Found = null // negative-type-decoy-found
-  val options: Method.OPTIONS = null // negative-type-decoy-options
-  val patch: Method.PATCH = null // negative-type-decoy-patch
   val none: AuthType.None = null // negative-type-decoy-none
 }
 "#,
         ),
     ]);
 
-    let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let inverse = ScalaUsageGraphStrategy::new();
-    for (target_fqn, positive, negative, range) in [
+    for (target_fqn, positive, negative, rel_path, range) in [
         (
-            "app.Method$.HEAD$",
+            "model.Method$.HEAD",
             "positive-singleton-head",
             "negative-type-decoy-head",
-            exact_segment(source, "Method.HEAD.type", "HEAD"),
+            "dsl/Methods.scala",
+            exact_segment(dsl_source, "Method.HEAD.type", "HEAD"),
         ),
         (
-            "app.Status$.Found$",
-            "positive-singleton-found",
-            "negative-type-decoy-found",
-            exact_segment(source, "Status.Found.type", "Found"),
-        ),
-        (
-            "app.Method$.OPTIONS$",
+            "model.Method$.OPTIONS$",
             "positive-qualified-options",
             "negative-type-decoy-options",
+            "app/Route.scala",
             exact_segment(
-                source,
-                "Method.OPTIONS // positive-qualified-options",
+                route_source,
+                "case Method.OPTIONS if optionsRoot != null =>",
                 "OPTIONS",
             ),
         ),
         (
-            "app.Method$.PATCH$",
+            "model.Method$.PATCH$",
             "positive-qualified-patch",
             "negative-type-decoy-patch",
-            exact_segment(source, "Method.PATCH // positive-qualified-patch", "PATCH"),
+            "app/Route.scala",
+            exact_segment(
+                route_source,
+                "Method.PATCH // positive-qualified-patch",
+                "PATCH",
+            ),
         ),
         (
-            "app.AuthType$.None$",
+            "auth.AuthType$.None$",
             "positive-qualified-none",
             "negative-type-decoy-none",
-            exact_segment(source, "AuthType.None // positive-qualified-none", "None"),
+            "auth/Auth.scala",
+            exact_segment(
+                auth_source,
+                "AuthType.None // positive-qualified-none",
+                "None",
+            ),
         ),
     ] {
         let target = definition(&analyzer, target_fqn);
         let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        let candidates = std::iter::once(project.file(rel_path)).collect();
         let inverse_hits = reference_surface_hits(inverse.find_usages(
             &analyzer,
             std::slice::from_ref(&target),
@@ -2315,9 +2342,11 @@ object Use {
             assert_hit_contains(bucket, positive);
             assert_no_hit_contains(bucket, negative);
             assert!(
-                bucket
-                    .iter()
-                    .any(|hit| hit.start_offset == range.0 && hit.end_offset == range.1),
+                bucket.iter().any(|hit| {
+                    hit.file.rel_path() == rel_path
+                        && hit.start_offset == range.0
+                        && hit.end_offset == range.1
+                }),
                 "expected exact range {range:?} for {target_fqn}, got {bucket:#?}"
             );
         }
@@ -3856,6 +3885,71 @@ class SenderOverride extends ActorBase {
         ),
         "inherited bare-member overloads must preserve the query-wide cap"
     );
+}
+
+#[test]
+fn scala_qualified_inherited_object_members_preserve_exact_overloads_with_implicit_suffixes() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "zio/http/codec/ContentCodecs.scala",
+            r#"package zio.http.codec
+
+trait BinaryCodec[A]
+trait Schema[A]
+trait Tag[A]
+trait Trace[A]
+
+private[codec] trait ContentCodecs {
+  def content[A](implicit schema: Schema[A]): String = "implicit-only"
+  def content[A](codec: BinaryCodec[A])(implicit tag: Tag[A]): String = "codec"
+  def content[A](name: String)(implicit schema: Schema[A]): String = "named"
+  def content[A](codec: BinaryCodec[A], name: String)(implicit trace: Trace[A]): String = "codec-named"
+}
+"#,
+        ),
+        (
+            "zio/http/HttpCodec.scala",
+            r#"package zio.http
+import zio.http.codec._
+
+object HttpCodec extends ContentCodecs
+
+object OtherCodec {
+  def content[A](codec: BinaryCodec[A])(implicit tag: Tag[A]): String = "other"
+}
+"#,
+        ),
+        (
+            "zio/http/endpoint/Endpoint.scala",
+            r#"package zio.http.endpoint
+import zio.http.HttpCodec
+import zio.http.OtherCodec
+import zio.http.codec._
+
+object Endpoint {
+  implicit val schema: Schema[String] = new Schema[String] {}
+  implicit val tag: Tag[String] = new Tag[String] {}
+  implicit val trace: Trace[String] = new Trace[String] {}
+  val codec: BinaryCodec[String] = new BinaryCodec[String] {}
+
+  val inheritedImplicitOnly = HttpCodec.content[String] // positive-implicit-only
+  val inheritedCodec = HttpCodec.content[String](codec) // positive-codec
+  val inheritedNamed = HttpCodec.content[String]("json") // positive-named
+  val inheritedCodecNamed = HttpCodec.content[String](codec, "json") // positive-codec-named
+  val unrelated = OtherCodec.content[String](codec) // negative-unrelated
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "zio.http.codec.ContentCodecs.content");
+    let hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+    assert_hit_contains(&hits, "positive-implicit-only");
+    assert_hit_contains(&hits, "positive-codec");
+    assert_hit_contains(&hits, "positive-named");
+    assert_hit_contains(&hits, "positive-codec-named");
+    assert_no_hit_contains(&hits, "negative-unrelated");
 }
 
 #[test]

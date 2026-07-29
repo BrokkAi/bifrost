@@ -3070,22 +3070,52 @@ object App {
 fn object_qualified_inherited_member_calls_resolve_to_trait_owner() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
-            "example/App.scala",
-            r#"package example
+            "zio/http/codec/ContentCodecs.scala",
+            r#"package zio.http.codec
 
-trait ContentCodecs {
-  def content[A]: String = "ok"
+trait BinaryCodec[A]
+trait Schema[A]
+trait Tag[A]
+trait Trace[A]
+
+private[codec] trait ContentCodecs {
+  def content[A](implicit schema: Schema[A]): String = "implicit-only"
+  def content[A](codec: BinaryCodec[A])(implicit tag: Tag[A]): String = "codec"
+  def content[A](name: String)(implicit schema: Schema[A]): String = "named"
+  def content[A](codec: BinaryCodec[A], name: String)(implicit trace: Trace[A]): String = "codec-named"
 }
+"#,
+        )
+        .file(
+            "zio/http/HttpCodec.scala",
+            r#"package zio.http
+import zio.http.codec._
 
 object HttpCodec extends ContentCodecs
 
 object OtherCodec {
-  def content[A]: String = "other"
+  def content[A](codec: BinaryCodec[A])(implicit tag: Tag[A]): String = "other"
 }
+"#,
+        )
+        .file(
+            "zio/http/endpoint/Endpoint.scala",
+            r#"package zio.http.endpoint
+import zio.http.HttpCodec
+import zio.http.OtherCodec
+import zio.http.codec._
 
-object Use {
-  def inherited(): String = HttpCodec.content[String]
-  def unrelated(): String = OtherCodec.content[String]
+object Endpoint {
+  implicit val schema: Schema[String] = new Schema[String] {}
+  implicit val tag: Tag[String] = new Tag[String] {}
+  implicit val trace: Trace[String] = new Trace[String] {}
+  val codec: BinaryCodec[String] = new BinaryCodec[String] {}
+
+  def inheritedImplicitOnly(): String = HttpCodec.content[String]
+  def inheritedCodec(): String = HttpCodec.content[String](codec)
+  def inheritedNamed(): String = HttpCodec.content[String]("json")
+  def inheritedCodecNamed(): String = HttpCodec.content[String](codec, "json")
+  def unrelated(): String = OtherCodec.content[String](codec)
 }
 "#,
         )
@@ -3093,12 +3123,47 @@ object Use {
 
     let value = usage_graph_at(project.root(), "{}");
     assert!(
-        has_edge(&value, "example.Use$.inherited", "example.ContentCodecs.content"),
-        "qualified inherited object member should edge to the trait owner: {}",
+        has_edge(
+            &value,
+            "zio.http.endpoint.Endpoint$.inheritedImplicitOnly",
+            "zio.http.codec.ContentCodecs.content"
+        ),
+        "qualified inherited implicit-only object member should edge to the trait owner: {}",
         value["edges"]
     );
     assert!(
-        !has_edge(&value, "example.Use$.unrelated", "example.ContentCodecs.content"),
+        has_edge(
+            &value,
+            "zio.http.endpoint.Endpoint$.inheritedCodec",
+            "zio.http.codec.ContentCodecs.content"
+        ),
+        "qualified inherited object member with an omitted implicit list should edge to the trait owner: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(
+            &value,
+            "zio.http.endpoint.Endpoint$.inheritedNamed",
+            "zio.http.codec.ContentCodecs.content"
+        ),
+        "qualified inherited named overload should edge to the trait owner: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(
+            &value,
+            "zio.http.endpoint.Endpoint$.inheritedCodecNamed",
+            "zio.http.codec.ContentCodecs.content"
+        ),
+        "qualified inherited multi-argument overload should edge to the trait owner: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(
+            &value,
+            "zio.http.endpoint.Endpoint$.unrelated",
+            "zio.http.codec.ContentCodecs.content"
+        ),
         "unrelated same-name receiver must not edge to the trait member: {}",
         value["edges"]
     );

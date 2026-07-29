@@ -7999,6 +7999,7 @@ fn record_reference(
                     .parent()
                     .and_then(|expression| expression.child_by_field_name("value"))
             {
+                let call_shape = call_site_shape_for_reference(node);
                 if record_union_receiver_parameterless_methods(qualifier, name, node, ctx, bindings)
                 {
                     return;
@@ -8029,15 +8030,52 @@ fn record_reference(
                                 return;
                             }
                             if let Some(exact_owner) = exact_owner.as_ref() {
-                                match ctx.types.bare_member_declarations_for_owner(
-                                    ctx.scala,
-                                    exact_owner,
-                                    name,
-                                    None,
-                                ) {
+                                let resolution = call_shape.as_ref().map_or_else(
+                                    || {
+                                        ctx.types.bare_member_declarations_for_owner(
+                                            ctx.scala,
+                                            exact_owner,
+                                            name,
+                                            None,
+                                        )
+                                    },
+                                    |shape| {
+                                        ctx.types
+                                            .effective_method_declarations_for_exact_owner_with_shape(
+                                                ctx.scala,
+                                                exact_owner,
+                                                name,
+                                                shape,
+                                            )
+                                    },
+                                );
+                                match resolution {
                                     BareMemberResolution::Resolved(methods) => {
                                         for method in methods {
-                                            ctx.record_exact_callable(method, node);
+                                            if let Some(shape) = call_shape.as_ref() {
+                                                ctx.record_exact_callable_with_shape(
+                                                    method, node, shape,
+                                                );
+                                            } else {
+                                                ctx.record_exact_callable(method, node);
+                                            }
+                                        }
+                                        return;
+                                    }
+                                    BareMemberResolution::Unresolved => return,
+                                    BareMemberResolution::NoMatch => {}
+                                }
+                            } else if let Some(shape) = call_shape.as_ref() {
+                                match ctx
+                                    .types
+                                    .effective_method_declarations_for_owner_with_shape(
+                                        ctx.scala, &owner, name, shape,
+                                    ) {
+                                    BareMemberResolution::Resolved(methods) => {
+                                        for method in methods {
+                                            ctx.record_exact_callable_with_shape(
+                                                method, node, shape,
+                                            );
                                         }
                                         return;
                                     }
