@@ -116,6 +116,152 @@ fn scala_reference_definition_keeps_parameter_a_local_identity() {
 }
 
 #[test]
+fn scala_reference_definition_prefers_terminal_of_qualified_companion_apply() {
+    let source = r#"package app
+
+object Result {
+  opaque type Success[+A] = A
+  object Success {
+    def apply[A](value: A): Success[A] = value
+  }
+}
+
+object Consumer {
+  val success = Result.Success(1)
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Result.scala", source)
+        .build();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_reference",
+        &json!({
+            "references": [{
+                "symbol": "app.Consumer",
+                "context": "  val success = Result.Success(1)",
+                "target": "Success"
+            }]
+        })
+        .to_string(),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "app.Result$.Success$.apply",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_reference_definition_prefers_terminal_of_qualified_stable_object() {
+    let source = r#"package chess
+
+sealed trait Color
+object Color {
+  case object White extends Color
+  case object Black extends Color
+}
+
+object Consumer {
+  lazy val white = Color.White
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("chess/Color.scala", source)
+        .build();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_reference",
+        &json!({
+            "references": [{
+                "symbol": "chess.Consumer",
+                "context": "  lazy val white = Color.White",
+                "target": "White"
+            }]
+        })
+        .to_string(),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "chess.Color$.White$",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_reference_definition_prefers_terminal_of_qualified_member_import() {
+    let source = r#"package app
+
+class Renderer { def render(value: String): String = value }
+object Factory { def default: Renderer = new Renderer }
+
+object Consumer {
+  import app.Factory.default
+  val direct = default.render("ok")
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/App.scala", source)
+        .build();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_reference",
+        &json!({
+            "references": [{
+                "symbol": "app.Consumer",
+                "context": "  import app.Factory.default",
+                "target": "default"
+            }]
+        })
+        .to_string(),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "app.Factory$.default",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_reference_definition_prefers_terminal_of_companion_member_over_class_owner() {
+    let source = r#"package app
+
+class RetryConfig
+object RetryConfig {
+  def builder: RetryConfig = new RetryConfig
+}
+
+object Consumer {
+  val config = RetryConfig.builder
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/RetryConfig.scala", source)
+        .build();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_reference",
+        &json!({
+            "references": [{
+                "symbol": "app.Consumer",
+                "context": "  val config = RetryConfig.builder",
+                "target": "builder"
+            }]
+        })
+        .to_string(),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "app.RetryConfig$.builder",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_term_namespace_resolves_explicitly_imported_stable_object() {
     let consumer = "package app\nimport terms.None\nobject Consumer { val empty = None }\n";
     let project = InlineTestProject::with_language(Language::Scala)

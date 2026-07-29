@@ -473,12 +473,35 @@ impl ScalaQueryTargetCatalog {
                 [
                     Some(spec.member_name.clone()),
                     spec.owner_name.clone(),
+                    companion_query_surface_name(spec),
                     Some(spec.target.identifier().to_string()),
                 ]
             })
             .flatten()
             .collect()
     }
+}
+
+fn companion_query_surface_name(spec: &TargetSpec) -> Option<String> {
+    if spec.kind != TargetKind::Method
+        || !matches!(
+            spec.member_name.as_str(),
+            "apply" | "unapply" | "unapplySeq"
+        )
+    {
+        return None;
+    }
+    let mut segments = crate::analyzer::symbol_lookup::parse_symbol_path(
+        Language::Scala,
+        spec.target.short_name(),
+    );
+    let owner = segments
+        .pop()
+        .and_then(|member| {
+            matches!(member.as_str(), "apply" | "unapply" | "unapplySeq").then_some(())
+        })
+        .and_then(|_| segments.pop())?;
+    Some(owner.trim_end_matches('$').to_string())
 }
 
 /// The final `.`-joined segment of a Scala `short_name` (a package-less name
@@ -725,6 +748,7 @@ impl ScalaReferenceSink for ScalaQueryHitSink<'_> {
     fn record_callable(
         &mut self,
         target: ScalaResolvedReference,
+        role: ScalaReferenceRole,
         call_shape: &ScalaCallSiteShape,
         _reference_kind: UsageReferenceKind,
         hit_kind: UsageHitKind,
@@ -738,19 +762,11 @@ impl ScalaReferenceSink for ScalaQueryHitSink<'_> {
         // Exact descendant/override projections still need the secondary
         // target filter: their event unit differs from the queried ancestor,
         // and one physical override CodeUnit can represent several shapes.
-        let exact_target = match &target {
-            ScalaResolvedReference::Exact(unit) => Some(unit),
-            ScalaResolvedReference::Logical(_) => None,
-        };
-        let target_ids = self
-            .catalog
-            .target_ids(&target, ScalaReferenceRole::Callable)
+        let raw_target_ids = self.catalog.target_ids(&target, role);
+        let target_ids = raw_target_ids
             .iter()
             .copied()
             .filter(|target_id| {
-                if exact_target.is_some_and(|unit| &self.catalog.targets[*target_id] == unit) {
-                    return true;
-                }
                 let spec = &self.catalog.specs[*target_id];
                 if spec.kind != TargetKind::Method || spec.callable_alternatives.is_empty() {
                     return true;

@@ -3873,6 +3873,84 @@ namespace System.Reflection.Emit {
 }
 
 #[test]
+fn csharp_issue1293_declaration_patterns_and_is_not_patterns_route_to_type_targets() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Types.cs",
+            r#"
+namespace Demo {
+    public class FillMemoryPool { }
+    public class Blockchain {
+        public class PersistCompleted { }
+    }
+    public class TaskManager {
+        public class NewTasks { }
+    }
+}
+"#,
+        ),
+        (
+            "Consumer.cs",
+            r#"
+using Demo;
+namespace App {
+    public class Consumer {
+        public bool Match(object message) {
+            switch (message) {
+                case FillMemoryPool fill:
+                    return fill != null;
+                case Blockchain.PersistCompleted pc:
+                    return pc != null;
+            }
+            return message is not TaskManager.NewTasks tasks || tasks == null;
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let consumer = project.file("Consumer.cs");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    for (fq_name, expected_snippet) in [
+        ("Demo.FillMemoryPool", "case FillMemoryPool fill:"),
+        (
+            "Demo.Blockchain$PersistCompleted",
+            "case Blockchain.PersistCompleted pc:",
+        ),
+        (
+            "Demo.TaskManager$NewTasks",
+            "message is not TaskManager.NewTasks tasks",
+        ),
+    ] {
+        let target = type_definition(&analyzer, fq_name);
+        let graph = graph_hits(&analyzer, &target);
+        assert_eq!(1, graph.len(), "{fq_name}: {graph:#?}");
+        assert!(
+            graph
+                .iter()
+                .all(|hit| { hit.file == consumer && hit.snippet.contains(expected_snippet) }),
+            "{fq_name} graph hits should stay on the declaration-pattern operand: {graph:#?}"
+        );
+
+        let routed = UsageFinder::new()
+            .query_with_provider(&analyzer, &[target], Some(&provider), 1, 1000)
+            .result
+            .into_either()
+            .unwrap_or_else(|error| panic!("{fq_name} should route: {error}"));
+        assert_eq!(1, routed.len(), "{fq_name}: {routed:#?}");
+        assert!(
+            routed
+                .iter()
+                .all(|hit| { hit.file == consumer && hit.snippet.contains(expected_snippet) }),
+            "{fq_name} routed hits should stay on the declaration-pattern operand: {routed:#?}"
+        );
+    }
+}
+
+#[test]
 fn csharp_tuple_element_type_is_a_usage_but_its_declaration_name_is_not() {
     let (project, analyzer) = csharp_analyzer_with_files(&[
         (

@@ -4,6 +4,13 @@
 # Typestate canonical contracts are compared byte for byte.
 tests/fixtures/typestate/*.canonical*.json text eol=lf
 
+# Semantic-model source, schema, and text goldens are exact cross-platform contracts.
+schemas/semantic-model-pack-v1.schema.json text eol=lf
+tests/fixtures/semantic-model-packs/*.json text eol=lf
+tests/fixtures/semantic-model-packs/*.yaml text eol=lf
+tests/fixtures/semantic-model-packs/*.deflate binary
+docs/src/content/docs/semantic-model-packs.md text eol=lf
+
 # This reviewed upstream artifact is verified by its exact SHA-256 digest.
 tests/fixtures/sarif/sarif-schema-2.1.0.json text eol=lf
 

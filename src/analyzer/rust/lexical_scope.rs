@@ -315,19 +315,35 @@ fn collect_visible_use_statements<'tree>(
     node: Node<'tree>,
     reference_byte: usize,
     out: &mut Vec<Node<'tree>>,
-) {
-    if node.kind() == "use_declaration" {
-        if use_statement_visible_at(node, reference_byte) {
-            out.push(node);
+) -> usize {
+    // Module and block items are visible throughout their enclosing lexical
+    // scope, so inspect every direct item along the reference's scope chain.
+    // Imports inside sibling functions, blocks, impls, traits, and modules
+    // cannot be visible and their subtrees may be skipped entirely.
+    let mut visited = 0;
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        visited += 1;
+        if node.kind() == "use_declaration" {
+            if use_statement_visible_at(node, reference_byte) {
+                out.push(node);
+            }
+            continue;
         }
-        return;
+
+        let mut cursor = node.walk();
+        let children = node
+            .named_children(&mut cursor)
+            .filter(|child| {
+                !lexical_scope_kind(child.kind()) || contains_byte(*child, reference_byte)
+            })
+            .collect::<Vec<_>>();
+        // Preserve the source-order traversal used by the former recursive
+        // implementation so duplicate invalid imports retain deterministic
+        // last-write behavior in the best-effort binder.
+        stack.extend(children.into_iter().rev());
     }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.start_byte() <= reference_byte || child.end_byte() >= reference_byte {
-            collect_visible_use_statements(child, reference_byte, out);
-        }
-    }
+    visited
 }
 
 fn use_statement_visible_at(node: Node<'_>, reference_byte: usize) -> bool {
@@ -925,4 +941,72 @@ fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
         false,
         &crate::analyzer::common::RUST_IDENTIFIER_SIGIL,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fmt::Write as _;
+
+    use super::*;
+
+    #[test]
+    fn visible_use_collection_only_descends_into_the_reference_scope_chain() {
+        let mut source = String::from(
+            r#"
+mod selected {
+    use crate::ModuleWide;
+
+    fn target() {
+        use crate::Local;
+        let marker = ModuleWide::new();
+    }
+
+    fn sibling() {
+        use crate::SiblingOnly;
+        let _ = SiblingOnly::new();
+    }
+
+    use crate::TrailingModuleWide;
+}
+"#,
+        );
+        for index in 0..128 {
+            writeln!(
+                source,
+                "fn unrelated_{index}() {{ use crate::Hidden{index}; let _ = Hidden{index}::new(); }}"
+            )
+            .expect("write fixture");
+        }
+
+        let reference_byte = source.find("marker").expect("reference marker");
+        let tree = parse_rust_tree_uncached(&source).expect("parse Rust fixture");
+        let root = tree.root_node();
+        let mut imports = Vec::new();
+        let visited = collect_visible_use_statements(root, reference_byte, &mut imports);
+        let snippets = imports
+            .iter()
+            .map(|node| &source[node.byte_range()])
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            snippets,
+            [
+                "use crate::ModuleWide;",
+                "use crate::Local;",
+                "use crate::TrailingModuleWide;"
+            ]
+        );
+
+        let mut all_nodes = vec![root];
+        let mut total_named_nodes = 0;
+        while let Some(node) = all_nodes.pop() {
+            total_named_nodes += 1;
+            let mut cursor = node.walk();
+            all_nodes.extend(node.named_children(&mut cursor));
+        }
+        assert!(
+            visited * 4 < total_named_nodes,
+            "reference-scoped traversal visited {visited} of {total_named_nodes} named nodes"
+        );
+    }
 }

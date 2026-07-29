@@ -2799,7 +2799,14 @@ fn go_spec_orders_evaluation(mut node: Node<'_>) -> bool {
 
 fn runtime_expression_children(node: Node<'_>) -> Vec<Node<'_>> {
     match node.kind() {
-        "expression_statement" | "return_statement" | "inc_statement" | "dec_statement" => {
+        "return_statement" => {
+            return named_children(node)
+                .into_iter()
+                .flat_map(expression_sequence)
+                .filter(|child| !is_go_type_syntax(child.kind()))
+                .collect();
+        }
+        "expression_statement" | "inc_statement" | "dec_statement" => {
             return named_children(node)
                 .into_iter()
                 .filter(|child| !is_go_type_syntax(child.kind()))

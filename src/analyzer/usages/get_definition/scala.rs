@@ -6653,6 +6653,11 @@ fn resolve_scala_field(
                     );
                 }
                 ScalaExactMemberResolution::NoMatch => {
+                    let stable_members =
+                        scala_stable_term_member_candidate_units(ctx, &owner_fqn, member);
+                    if !stable_members.is_empty() {
+                        return candidates_outcome(stable_members);
+                    }
                     let extensions = scala_extension_candidate_units(
                         ctx,
                         resolver,
@@ -6692,6 +6697,10 @@ fn resolve_scala_field(
         );
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
+        }
+        let stable_members = scala_stable_term_member_candidate_units(ctx, &owner_fqn, member);
+        if !stable_members.is_empty() {
+            return candidates_outcome(stable_members);
         }
         return scala_extension_candidates(
             ctx,

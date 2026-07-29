@@ -1,0 +1,16 @@
+schema_version: 2
+pack_id: INVALID PACK
+version: not-semver
+producer:
+  name: broken
+  version: nope
+language: Java
+ecosystem: maven
+compatibility:
+  bifrost: nope
+provenance:
+  source: test
+license: Not-A-Real-License
+completeness: partial
+safety: {}
+shards: []

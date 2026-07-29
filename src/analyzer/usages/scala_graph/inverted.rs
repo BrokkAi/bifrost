@@ -136,9 +136,11 @@ pub(super) trait ScalaReferenceSink {
         end: usize,
     );
 
+    #[allow(clippy::too_many_arguments)]
     fn record_callable(
         &mut self,
         target: ScalaResolvedReference,
+        role: ScalaReferenceRole,
         call_shape: &ScalaCallSiteShape,
         reference_kind: UsageReferenceKind,
         hit_kind: UsageHitKind,
@@ -146,14 +148,7 @@ pub(super) trait ScalaReferenceSink {
         end: usize,
     ) {
         let _ = call_shape;
-        self.record(
-            target,
-            ScalaReferenceRole::Callable,
-            reference_kind,
-            hit_kind,
-            start,
-            end,
-        );
+        self.record(target, role, reference_kind, hit_kind, start, end);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5513,7 +5508,7 @@ impl NameResolver {
                     .filter(|unit| unit.is_class() && unit.short_name().ends_with('$'));
                 let stable_singleton = objects.next().is_some() && objects.next().is_none();
                 ScalaWildcardOwnerFacts {
-                    package: types.index.package_exists(candidate),
+                    package: types.index.package_container_exists(candidate),
                     stable_singleton,
                 }
             },
@@ -5777,7 +5772,7 @@ impl NameResolver {
                     .unwrap_or_default()
             },
             |candidate| ScalaWildcardOwnerFacts {
-                package: types.index.package_exists(candidate),
+                package: types.index.package_container_exists(candidate),
                 stable_singleton: types
                     .object_by_normalized_fqn(scala, &scala_normalized_fq_name(candidate))
                     .is_some(),
@@ -5812,6 +5807,14 @@ impl NameResolver {
                     wildcard_extension_owners.push(normalized_owner);
                 }
             } else {
+                for child_package in types.index.child_packages(&owner.fqn) {
+                    package_names.add_candidate(
+                        scala_short_name_terminal_segment(&child_package),
+                        child_package,
+                        None,
+                        128,
+                    );
+                }
                 for (simple, decl) in types.package_types_in(&owner.fqn).iter() {
                     names.add_declaration(simple.clone(), decl, 128);
                 }
@@ -5848,7 +5851,7 @@ impl NameResolver {
                             .unwrap_or_default()
                     },
                     |candidate| ScalaWildcardOwnerFacts {
-                        package: types.index.package_exists(candidate),
+                        package: types.index.package_container_exists(candidate),
                         stable_singleton: types
                             .object_by_normalized_fqn(scala, &scala_normalized_fq_name(candidate))
                             .is_some(),
@@ -6368,6 +6371,58 @@ impl ScalaReferenceSink for ScalaEdgeSink<'_, '_> {
 
     fn record_unproven_name(&mut self, name: &str, start: usize, end: usize) {
         self.collector.record_unproven_name(name, start, end);
+    }
+
+    fn record_import_name(
+        &mut self,
+        imports: &[crate::analyzer::ImportInfo],
+        active_package: &str,
+        name: &str,
+        start: usize,
+        end: usize,
+    ) {
+        let package_prefixes = if active_package.is_empty() {
+            Vec::new()
+        } else {
+            vec![active_package.to_string()]
+        };
+        let environment = resolve_scala_wildcard_import_environment(
+            imports,
+            &package_prefixes,
+            |_| Vec::new(),
+            |candidate| ScalaWildcardOwnerFacts {
+                package: self.types.index.package_container_exists(candidate),
+                stable_singleton: self
+                    .types
+                    .object_by_normalized_fqn(self.scala, &scala_normalized_fq_name(candidate))
+                    .is_some(),
+            },
+        );
+        let mut recorded = HashSet::default();
+        for owner in environment.owners {
+            if !owner.is_singleton() || scala_short_name_terminal_segment(&owner.fqn) != name {
+                continue;
+            }
+            let normalized = scala_normalized_fq_name(&owner.fqn);
+            let Some(target) = self
+                .types
+                .object_by_normalized_fqn(self.scala, &normalized)
+                .cloned()
+            else {
+                continue;
+            };
+            if !recorded.insert(target.fq_name()) {
+                continue;
+            }
+            self.record(
+                ScalaResolvedReference::Exact(target),
+                ScalaReferenceRole::StableObject,
+                UsageReferenceKind::Other,
+                UsageHitKind::Import,
+                start,
+                end,
+            );
+        }
     }
 }
 
@@ -6931,8 +6986,14 @@ impl ScalaScan<'_, '_> {
 
     fn lexically_visible_object_unit(&self, byte: usize, name: &str) -> Option<CodeUnit> {
         self.class_ranges.find_in_enclosing_units(byte, |owner| {
-            self.types
-                .exact_nested_object_for_owner(self.scala, owner, name)
+            if self.types.type_is_stable_owner(self.scala, owner)
+                && scala_simple_type_name(owner) == name
+            {
+                Some(owner.clone())
+            } else {
+                self.types
+                    .exact_nested_object_for_owner(self.scala, owner, name)
+            }
         })
     }
 
@@ -7002,7 +7063,19 @@ impl ScalaScan<'_, '_> {
                 | ScalaReferenceRole::CompanionExtractor
                 | ScalaReferenceRole::CompanionValue
         ));
-        self.record_exact(callee, role, node);
+        let Some(call_shape) = call_site_shape_for_reference(node) else {
+            self.record_exact(callee, role, node);
+            return;
+        };
+        self.sink.record_callable(
+            ScalaResolvedReference::Exact(callee),
+            role,
+            &call_shape,
+            classify_reference_node(node),
+            UsageHitKind::Reference,
+            node.start_byte(),
+            node.end_byte(),
+        );
     }
 
     fn record_exact_callable_with_shape(
@@ -7014,6 +7087,7 @@ impl ScalaScan<'_, '_> {
         let hit_kind = self.callable_reference_hit_kind(node, &callee);
         self.sink.record_callable(
             ScalaResolvedReference::Exact(callee),
+            ScalaReferenceRole::Callable,
             call_shape,
             classify_reference_node(node),
             hit_kind,
@@ -7413,6 +7487,16 @@ fn record_reference(
                     };
                     let name = node_text(field, ctx.source);
                     if name.is_empty() {
+                        return;
+                    }
+                    // A parser-proven stable application such as
+                    // `Uri.UserInfo(...)` names a type/companion application,
+                    // even when `Uri` is also a resolvable stable receiver.
+                    // Resolve that namespace form before ordinary receiver
+                    // method lookup can consume the terminal as a member.
+                    if qualified_stable_type_reference(field, ctx.source).is_some()
+                        && record_qualified_stable_reference(field, ctx, bindings)
+                    {
                         return;
                     }
                     if receiver.kind() == "identifier"
@@ -8615,7 +8699,17 @@ fn record_qualified_stable_reference(
         .segments
         .first()
         .and_then(|root| ctx.lexically_visible_object_unit(node.start_byte(), root));
-    let lexical_type_root = ctx.exact_lexically_visible_type_root(node);
+    // Term-shaped stable applications hand us the terminal field node, so the
+    // generic type-root helper would interpret `UserInfo` as the root of
+    // `Uri.UserInfo(...)`. An exact lexical object for the parser-proven first
+    // segment is stronger evidence and owns this stable path.
+    let term_application_lexical_object =
+        reference.expression.kind() == "field_expression" && lexical_object_root.is_some();
+    let lexical_type_root = if term_application_lexical_object {
+        ScalaTypeNamespaceResolution::NoMatch
+    } else {
+        ctx.exact_lexically_visible_type_root(node)
+    };
     let class_lookup_blocked = matches!(
         lexical_type_root,
         ScalaTypeNamespaceResolution::AuthoritativeMiss | ScalaTypeNamespaceResolution::Ambiguous
@@ -8632,15 +8726,19 @@ fn record_qualified_stable_reference(
         }
         ScalaTypeNamespaceResolution::NoMatch => {
             let root = reference.segments.first().expect("qualified stable root");
-            let mut roots =
-                ctx.types
-                    .stable_roots_for_resolved_type_name(ctx.scala, &ctx.resolver, root);
-            if roots.is_empty()
-                && let Some(object) = lexical_object_root
-            {
-                roots.push(object);
+            if term_application_lexical_object {
+                lexical_object_root.into_iter().collect()
+            } else {
+                let mut roots =
+                    ctx.types
+                        .stable_roots_for_resolved_type_name(ctx.scala, &ctx.resolver, root);
+                if roots.is_empty()
+                    && let Some(object) = lexical_object_root
+                {
+                    roots.push(object);
+                }
+                roots
             }
-            roots
         }
         ScalaTypeNamespaceResolution::AuthoritativeMiss
         | ScalaTypeNamespaceResolution::Ambiguous => Vec::new(),
@@ -8748,7 +8846,35 @@ fn record_qualified_stable_reference(
         Some(ctx.source_file),
     );
     if let Some(target) = resolution.type_target {
-        ctx.record_exact(target, ScalaReferenceRole::Type, node);
+        ctx.record_exact(target.clone(), ScalaReferenceRole::Type, node);
+        let exact_companions = ctx.types.exact_companion_objects(ctx.scala, &target);
+        let has_exact_companion_callable = resolution.callable_targets.iter().any(|callable| {
+            ctx.scala
+                .structural_parent_of(callable)
+                .is_some_and(|owner| exact_companions.contains(&owner))
+        });
+        if role == TypeApplicationRole::BareApplication && !has_exact_companion_callable {
+            for constructor in ctx
+                .types
+                .exact_member_declarations(ctx.scala, &target, target.identifier())
+                .into_iter()
+                .filter(CodeUnit::is_synthetic)
+                .filter(|constructor| {
+                    ctx.types.constructor_target_matches(
+                        ctx.scala,
+                        constructor,
+                        call_site_shape_for_reference(reference.expression).as_ref(),
+                        ScalaCallableSiteRole::PrimaryConstruction,
+                    )
+                })
+            {
+                ctx.record_exact_companion_callable(
+                    constructor,
+                    ScalaReferenceRole::CompanionApplication,
+                    node,
+                );
+            }
+        }
     }
     for callable in resolution.callable_targets {
         if role == TypeApplicationRole::ExplicitConstructor {

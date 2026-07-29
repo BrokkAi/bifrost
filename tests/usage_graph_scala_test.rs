@@ -1079,6 +1079,40 @@ object Use { def click: Int = BrowserEval.clickAtActionable }
 }
 
 #[test]
+fn scala_inverted_records_wildcard_import_owner_edges() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Request.scala",
+            r#"package app
+class Request
+object Request {
+  val Method: String = "GET"
+}
+"#,
+        )
+        .file(
+            "app/Use.scala",
+            r#"package app
+object Use {
+  import Request._
+}
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "app.Use$", "app.Request$"),
+        "wildcard import owner span should edge to the exact stable object owner: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Use$", "app.Request"),
+        "wildcard import owner span must not edge to the class namespace: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn resolves_instance_object_and_unqualified_calls() {
     let value = usage_graph();
 

@@ -505,6 +505,15 @@ fn definition(analyzer: &ScalaAnalyzer, fq_name: &str) -> CodeUnit {
         .unwrap_or_else(|| panic!("missing definition for {fq_name}"))
 }
 
+fn definition_by(analyzer: &ScalaAnalyzer, predicate: impl Fn(&CodeUnit) -> bool) -> CodeUnit {
+    analyzer
+        .get_analyzed_files()
+        .into_iter()
+        .flat_map(|file| analyzer.get_declarations(&file))
+        .find(|unit| predicate(unit))
+        .unwrap_or_else(|| panic!("missing Scala definition matching predicate"))
+}
+
 fn hit_snippets(result: FuzzyResult) -> Vec<String> {
     result
         .into_either()
@@ -1419,6 +1428,144 @@ object Use {
         ));
         assert_hit_contains(&hits, marker);
     }
+}
+
+#[test]
+fn scala_graph_resolves_wildcard_imported_nested_companion_apply() {
+    let consumer_source = r#"package app
+
+import cloud.common.formats.reader._
+
+object Use {
+  val exact = converters.TextConverter("value") // positive-wildcard-imported-apply
+  val other = decoy.common.formats.reader.converters.TextConverter("value") // negative-wrong-owner
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "cloud/common/formats/reader/converters/TextConverter.scala",
+            r#"package cloud.common.formats.reader.converters
+
+class TextConverter private (input: String)
+object TextConverter {
+  def apply(input: String): TextConverter = new TextConverter(input)
+}
+"#,
+        ),
+        (
+            "decoy/common/formats/reader/converters/TextConverter.scala",
+            r#"package decoy.common.formats.reader.converters
+
+class TextConverter private (input: String)
+object TextConverter {
+  def apply(input: String): TextConverter = new TextConverter(input)
+}
+"#,
+        ),
+        ("app/Use.scala", consumer_source),
+    ]);
+    let target = definition(
+        &analyzer,
+        "cloud.common.formats.reader.converters$.TextConverter$.apply",
+    );
+    let hits = scala_reference_hits(&analyzer, &target, &["app/Use.scala"]);
+
+    assert_reference_hit_contains(&hits, "positive-wildcard-imported-apply");
+    assert_no_hit_contains(&hits, "negative-wrong-owner");
+}
+
+#[test]
+fn scala_graph_resolves_same_file_nested_companion_apply_overload_exactly() {
+    let source = r#"package app
+
+object Uri {
+  case class UserInfo(user: String, password: Option[String])
+  object UserInfo {
+    def apply(user: String, password: Option[String], strict: Boolean): UserInfo =
+      new UserInfo(user, password)
+    def apply(user: String, password: Option[String]): UserInfo =
+      new UserInfo(user, password)
+  }
+
+  object Parser {
+    val exact = Uri.UserInfo("user", None) // positive-exact-overload
+    val other = Uri.UserInfo("user", None, true) // negative-other-overload
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/Uri.scala", source)]);
+    let target = definition_by(&analyzer, |unit| {
+        unit.is_function()
+            && unit.fq_name() == "app.Uri$.UserInfo$.apply"
+            && analyzer.ranges(unit).iter().any(|range| {
+                range.start_line
+                    == line_of(
+                        source,
+                        "def apply(user: String, password: Option[String]): UserInfo =",
+                    )
+            })
+    });
+    let hits = scala_reference_hits(&analyzer, &target, &["app/Uri.scala"]);
+
+    assert_reference_hit_contains(&hits, "positive-exact-overload");
+}
+
+#[test]
+fn scala_graph_resolves_nested_case_class_companion_apply_with_overloads_exactly() {
+    let source = r#"package app
+
+object Uci {
+  case class Move(orig: String, dest: String, promotion: Option[String])
+  object Move {
+    def apply(move: String): Move = new Move(move, move, None)
+  }
+
+  val exact = Uci.Move("a", "b", None) // positive-generated-overload
+  val other = Uci.Move("a") // secondary-explicit-overload
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/Uci.scala", source)]);
+    let target = definition_by(&analyzer, |unit| {
+        unit.is_function()
+            && unit.fq_name() == "app.Uci$.Move$.apply"
+            && analyzer.ranges(unit).iter().any(|range| {
+                range.start_line
+                    == line_of(
+                        source,
+                        "    def apply(move: String): Move = new Move(move, move, None)",
+                    )
+            })
+    });
+    let hits = scala_reference_hits(&analyzer, &target, &["app/Uci.scala"]);
+
+    assert_reference_hit_contains(&hits, "positive-generated-overload");
+}
+
+#[test]
+fn scala_graph_resolves_explicit_apply_member_exactly() {
+    let source = r#"package app
+
+object Forwarded {
+  def apply(value: String): String = value
+  def apply(value: Int): String = value.toString
+}
+
+object Use {
+  val exact = Forwarded.apply("x") // positive-explicit-apply
+  val other = Forwarded.apply(1) // negative-other-explicit-apply
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/Forwarded.scala", source)]);
+    let target = definition_by(&analyzer, |unit| {
+        unit.is_function()
+            && unit.fq_name() == "app.Forwarded$.apply"
+            && analyzer.ranges(unit).iter().any(|range| {
+                range.start_line == line_of(source, "  def apply(value: String): String = value")
+            })
+    });
+    let hits = scala_reference_hits(&analyzer, &target, &["app/Forwarded.scala"]);
+
+    assert_reference_hit_contains(&hits, "positive-explicit-apply");
 }
 
 #[test]
@@ -6917,6 +7064,14 @@ fn assert_hit_contains(hits: &[UsageHit], needle: &str) {
     );
 }
 
+fn assert_reference_hit_contains(hits: &[UsageHit], needle: &str) {
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains(needle) && hit.kind == UsageHitKind::Reference),
+        "expected reference hit containing {needle:?}, got {hits:#?}"
+    );
+}
+
 fn assert_hit_line(hits: &[UsageHit], line: usize) {
     assert!(
         hits.iter().any(|hit| hit.line == line),
@@ -6971,6 +7126,27 @@ fn scala_hits(analyzer: &ScalaAnalyzer, target: &CodeUnit, candidates: &[&str]) 
         })
         .collect();
     hits(ScalaUsageGraphStrategy::new().find_usages(
+        analyzer,
+        std::slice::from_ref(target),
+        &candidate_files,
+        1000,
+    ))
+}
+
+fn scala_reference_hits(
+    analyzer: &ScalaAnalyzer,
+    target: &CodeUnit,
+    candidates: &[&str],
+) -> Vec<UsageHit> {
+    let candidate_files = analyzer
+        .get_analyzed_files()
+        .into_iter()
+        .filter(|file| {
+            let rel_path = rel_path_string(file);
+            candidates.iter().any(|candidate| rel_path == *candidate)
+        })
+        .collect();
+    reference_surface_hits(ScalaUsageGraphStrategy::new().find_usages(
         analyzer,
         std::slice::from_ref(target),
         &candidate_files,

@@ -1069,7 +1069,7 @@ fn resolve_rust_unscoped(
                     if !local.is_empty() {
                         return candidates_outcome(local);
                     }
-                    if let Some(unit) = rust_enclosing_scope_member_fallback(
+                    if let Some(unit) = rust_enclosing_scope_type_fallback(
                         analyzer,
                         file,
                         reference,
@@ -1143,7 +1143,7 @@ fn resolve_rust_unscoped(
         // a future upstream regression — a genuinely-external `::` path yields
         // `None` here and still draws the boundary.
         if let Some(unit) =
-            rust_enclosing_scope_member_fallback(analyzer, file, reference, site.focus_start_byte)
+            rust_enclosing_scope_type_fallback(analyzer, file, reference, site.focus_start_byte)
         {
             return candidates_outcome(vec![unit]);
         }
@@ -1717,6 +1717,19 @@ fn rust_visible_import_resolution(
             }
         }
         let mut targets = rust_forward_import_targets(rust, file, &binder, reference);
+        if !explicitly_bound {
+            let scoped_glob_targets = rust_scoped_glob_forward_import_targets(
+                rust,
+                file,
+                source,
+                scope_start,
+                &binder,
+                reference,
+            );
+            if !scoped_glob_targets.is_empty() {
+                targets = scoped_glob_targets;
+            }
+        }
         // `self`/`super` imports that resolve within the current file: the
         // standard target resolution looks in the file's parent package and
         // misses them, so steer them to the current file directly.
@@ -1783,6 +1796,46 @@ fn rust_visible_import_resolution(
         }
     }
     RustVisibleImportResolution::Unbound
+}
+
+fn rust_scoped_glob_forward_import_targets(
+    rust: &RustAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    scope_start: usize,
+    binder: &ImportBinder,
+    reference: &str,
+) -> Vec<(ProjectFile, String)> {
+    let mut targets = Vec::new();
+    for binding in binder.bindings.values() {
+        let segments = crate::analyzer::symbol_lookup::parse_symbol_path(
+            Language::Rust,
+            &binding.module_specifier,
+        );
+        if binding.kind != ImportKind::Glob
+            || !matches!(segments.first().map(String::as_str), Some("self" | "super"))
+        {
+            continue;
+        }
+        let Some(package) = resolve_import_package_scoped(
+            rust,
+            file,
+            source,
+            scope_start,
+            &binding.module_specifier,
+        ) else {
+            continue;
+        };
+        targets.extend(
+            rust.get_analyzed_files()
+                .into_iter()
+                .filter(|candidate| rust_package_name(candidate) == package)
+                .map(|candidate| (candidate, reference.to_string())),
+        );
+    }
+    targets.sort();
+    targets.dedup();
+    targets
 }
 
 /// Resolve an import's module specifier to its package, scope-aware:
@@ -2677,6 +2730,7 @@ fn rust_focused_use_path_outcome(
         &focused_path.full_path,
         role,
         resolved_fqn.as_deref(),
+        false,
     ))
 }
 
@@ -2707,6 +2761,8 @@ fn rust_focused_scoped_prefix_outcome(
     }
 
     let refs = support.forward_reference_context(rust, file)?;
+    let uses_module_package_fallback =
+        rust_scoped_prefix_uses_module_package_fallback(rust, file, &refs, prefix, source);
     let resolved_fqn = rust_scoped_prefix_fqn(rust, file, &refs, prefix, source);
     let root = rust_scoped_path_root(prefix);
     Some(rust_focused_prefix_resolution_outcome(
@@ -2722,6 +2778,7 @@ fn rust_focused_scoped_prefix_outcome(
         prefix_text,
         RustFocusedPathRole::Owner,
         resolved_fqn.as_deref(),
+        uses_module_package_fallback,
     ))
 }
 
@@ -2790,6 +2847,7 @@ fn rust_focused_token_tree_prefix_outcome(
         prefix,
         RustFocusedPathRole::Owner,
         resolved_fqn.as_deref(),
+        false,
     ))
 }
 
@@ -2797,6 +2855,125 @@ fn rust_focused_token_tree_prefix_outcome(
 enum RustFocusedPathRole {
     Owner,
     Declaration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustOwnerRootAvailability {
+    Indexed,
+    Boundary,
+    CargoBoundary,
+    Unbound,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rust_owner_root_availability(
+    analyzer: &dyn IAnalyzer,
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    site: &ResolvedReferenceSite,
+    root: Node<'_>,
+    root_name: &str,
+) -> RustOwnerRootAvailability {
+    if matches!(root.kind(), "crate" | "self" | "super") {
+        return RustOwnerRootAvailability::Indexed;
+    }
+
+    match rust_visible_import_resolution(
+        rust,
+        support,
+        file,
+        source,
+        site.focus_start_byte,
+        root_name,
+        RustBareReferenceRole::Owner,
+    ) {
+        RustVisibleImportResolution::Resolved(candidates)
+        | RustVisibleImportResolution::GlobResolved(candidates)
+            if !candidates.is_empty() =>
+        {
+            return RustOwnerRootAvailability::Indexed;
+        }
+        RustVisibleImportResolution::BoundButUnindexed => {
+            return RustOwnerRootAvailability::Boundary;
+        }
+        RustVisibleImportResolution::Resolved(_)
+        | RustVisibleImportResolution::GlobResolved(_)
+        | RustVisibleImportResolution::Unbound => {}
+    }
+
+    let mut syntax_root = root;
+    while let Some(parent) = syntax_root.parent() {
+        syntax_root = parent;
+    }
+    if !rust_current_module_candidates(
+        analyzer,
+        rust,
+        support,
+        file,
+        syntax_root,
+        site.focus_start_byte,
+        site.focus_end_byte,
+        root_name,
+        RustBareReferenceRole::Owner,
+    )
+    .is_empty()
+    {
+        return RustOwnerRootAvailability::Indexed;
+    }
+
+    let rust_2015 = rust.file_uses_rust_2015_edition(file);
+    let explicit_extern_route = rust_2015
+        .then(|| rust_visible_extern_crate_binding(root, source, root_name))
+        .flatten();
+    let cargo_root_in_scope = !rust_2015 || explicit_extern_route.is_some();
+    let cargo_route = explicit_extern_route.as_deref().unwrap_or(root_name);
+    if let Some(root_file) = rust.resolve_cargo_crate_root_file(file, cargo_route) {
+        if !cargo_root_in_scope {
+            return RustOwnerRootAvailability::Boundary;
+        }
+        let external = support
+            .fqn(&rust_package_name(&root_file))
+            .into_iter()
+            .filter(|candidate| {
+                rust_role_accepts_imported(rust, RustBareReferenceRole::Owner, candidate)
+            })
+            .collect();
+        return match rust.candidates_in_cargo_library_route(file, cargo_route, external) {
+            Some(candidates) if !candidates.is_empty() => RustOwnerRootAvailability::Indexed,
+            Some(_) | None => RustOwnerRootAvailability::Boundary,
+        };
+    }
+    if cargo_root_in_scope && rust.has_available_declared_cargo_dependency(file, cargo_route) {
+        return RustOwnerRootAvailability::CargoBoundary;
+    }
+
+    RustOwnerRootAvailability::Unbound
+}
+
+fn rust_scoped_prefix_uses_module_package_fallback(
+    rust: &RustAnalyzer,
+    file: &ProjectFile,
+    refs: &RustReferenceContext,
+    prefix: Node<'_>,
+    source: &str,
+) -> bool {
+    let ("scoped_identifier" | "scoped_type_identifier") = prefix.kind() else {
+        return false;
+    };
+    let Some(path) = prefix.child_by_field_name("path") else {
+        return false;
+    };
+    let Some(name) = prefix.child_by_field_name("name") else {
+        return false;
+    };
+    let path = rust_node_text(path, source).trim();
+    let name = rust_node_text(name, source).trim();
+    refs.resolve_scoped(path, name).is_none()
+        && rust
+            .resolve_module_package(file, rust_node_text(prefix, source).trim())
+            .is_some()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2813,8 +2990,12 @@ fn rust_focused_prefix_resolution_outcome(
     focused_path: &str,
     role: RustFocusedPathRole,
     resolved_fqn: Option<&str>,
+    uses_module_package_fallback: bool,
 ) -> DefinitionLookupOutcome {
     let root_name = rust_node_text(root, source).trim();
+    let root_availability = (role == RustFocusedPathRole::Owner).then(|| {
+        rust_owner_root_availability(analyzer, rust, support, file, source, site, root, root_name)
+    });
     if role == RustFocusedPathRole::Owner && focused_path == focused_text && root_name == "self" {
         let lexical_module =
             rust_enclosing_inline_module_candidates(analyzer, support, file, source, root);
@@ -2895,7 +3076,7 @@ fn rust_focused_prefix_resolution_outcome(
                 if !local.is_empty() {
                     return candidates_outcome(local);
                 }
-                if let Some(unit) = rust_enclosing_scope_member_fallback(
+                if let Some(unit) = rust_enclosing_scope_type_fallback(
                     analyzer,
                     file,
                     focused_text,
@@ -2981,6 +3162,10 @@ fn rust_focused_prefix_resolution_outcome(
     }
 
     if let Some(fqn) = resolved_fqn
+        && !(role == RustFocusedPathRole::Owner
+            && focused_path != focused_text
+            && uses_module_package_fallback
+            && root_availability != Some(RustOwnerRootAvailability::Indexed))
         && !enclosing_module_self_root
     {
         let mut candidates: Vec<_> = support
@@ -3003,7 +3188,10 @@ fn rust_focused_prefix_resolution_outcome(
     }
 
     if role == RustFocusedPathRole::Owner {
-        let mut candidates = if enclosing_module_self_root {
+        let skip_unavailable_scoped_fallback = focused_path != focused_text
+            && uses_module_package_fallback
+            && root_availability != Some(RustOwnerRootAvailability::Indexed);
+        let mut candidates = if enclosing_module_self_root || skip_unavailable_scoped_fallback {
             Vec::new()
         } else {
             rust.resolve_module_package(file, focused_path)
@@ -3033,19 +3221,25 @@ fn rust_focused_prefix_resolution_outcome(
 
     if enclosing_module_self_root
         || rust_binder_has_external_binding(&binder, root_name)
+        || matches!(
+            root_availability,
+            Some(RustOwnerRootAvailability::Boundary | RustOwnerRootAvailability::CargoBoundary)
+        )
         || rust_extern_prelude_root(rust, support, file, refs, root, root_name)
     {
+        if root_availability == Some(RustOwnerRootAvailability::CargoBoundary) {
+            return boundary_unchecked(format!(
+                "focused Rust path segment `{focused_text}` resolves through a declared Cargo dependency whose crate root is not indexed"
+            ));
+        }
         // Before a confident boundary claim, resolve the focused segment against
         // the enclosing type/trait scope: `Self::TransactionManager::run` names
         // the associated type `Connection::TransactionManager`, which shares its
         // spelling with an imported trait but is a distinct namespace and lives
         // in this file (issue #1126 diesel `TransactionManager`).
-        if let Some(unit) = rust_enclosing_scope_member_fallback(
-            analyzer,
-            file,
-            focused_text,
-            site.focus_start_byte,
-        ) {
+        if let Some(unit) =
+            rust_enclosing_scope_type_fallback(analyzer, file, focused_text, site.focus_start_byte)
+        {
             return candidates_outcome(vec![unit]);
         }
         // Only for a *bound* alias root (`use forc_pkg as pkg; pkg::Item`) do we
@@ -5666,27 +5860,24 @@ fn rust_reference_looks_external(reference: &str) -> bool {
         })
 }
 
-/// Resolve a name to a workspace-internal declaration that lives in an
-/// *enclosing type/trait/impl/enum* scope of the reference — an enum variant,
+/// Resolve a type-shaped name to a workspace-internal declaration that lives
+/// in an *enclosing type/trait/impl/enum* scope of the reference — an
 /// associated type, nested type, or the enclosing type itself.
 ///
 /// An explicit `use` binds a bare name in the *module* namespace only; Rust
-/// keeps enum-variant, associated-item, and type namespaces separate, so such a
-/// path segment (`Error::Variant`, `Self::AssocType`, a variant declaration
-/// name) is never shadowed by a same-named import. Consulting this before any
-/// "explicitly imported across an unindexed boundary" claim upholds the
-/// invariant that a confident non-indexing claim is never emitted for a name the
-/// workspace actually declares (issue #1126: diesel `Expression`/
-/// `TransactionManager`, meilisearch `Error`, nushell `SqliteError`).
-fn rust_enclosing_scope_member_fallback(
+/// keeps associated types and imported types distinct. A field/enum variant is
+/// deliberately not eligible here: bare `PTR::read` cannot use an enclosing
+/// `RData::PTR` variant as a path owner, and an explicitly imported but
+/// unindexed `PTR` must remain a boundary instead of being stolen by that
+/// variant (#1283). Consulting enclosing classes before a boundary still
+/// preserves the #1126 safety net for workspace traits and associated types.
+fn rust_enclosing_scope_type_fallback(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     name: &str,
     byte: usize,
 ) -> Option<CodeUnit> {
-    resolve_in_enclosing_scopes(analyzer, file, name, byte, |candidate| {
-        candidate.is_field() || candidate.is_class()
-    })
+    resolve_in_enclosing_scopes(analyzer, file, name, byte, CodeUnit::is_class)
 }
 
 /// True when the focused owner/qualifier resolves to a Rust crate or module that

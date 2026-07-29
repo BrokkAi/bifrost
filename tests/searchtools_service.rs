@@ -6515,6 +6515,73 @@ export function run() {
 }
 
 #[test]
+fn scan_usages_by_location_resolves_javascript_imported_singleton_object_members() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("state.js", "export const state = {\n  imgWidth: 0,\n};\n")
+        .file(
+            "consumer.js",
+            r#"import { state } from "./state.js";
+import { state as editorState } from "./state.js";
+
+export function direct() {
+  return state.imgWidth;
+}
+
+export function aliased() {
+  return editorState.imgWidth;
+}
+
+export function unrelated() {
+  const state = { imgWidth: 1 };
+  return state.imgWidth;
+}
+
+export function shadow(editorState) {
+  return editorState.imgWidth;
+}
+"#,
+        )
+        .file(
+            "other.js",
+            r#"export function localOnly() {
+  const state = { imgWidth: 1 };
+  return state.imgWidth;
+}
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"state.js","line":2,"column":3,"symbol":"state.imgWidth"}],"include_tests":true}"#,
+        )
+        .expect("location scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let result = only_result(&value);
+
+    assert_eq!(0, status_count(&value, "ambiguous"), "payload: {value}");
+    assert_eq!(0, status_count(&value, "failure"), "payload: {value}");
+    assert_eq!(0, status_count(&value, "not_found"), "payload: {value}");
+    assert_eq!("found", result["status"], "payload: {value}");
+    assert_eq!(0, result["unproven_hits"], "payload: {value}");
+    assert_eq!(2, result["total_hits"], "payload: {value}");
+
+    let files = result["files"].as_array().expect("files array");
+    assert_eq!(1, files.len(), "payload: {value}");
+    assert_eq!("consumer.js", files[0]["path"], "payload: {value}");
+    let lines: BTreeSet<u64> = files[0]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["line"].as_u64().expect("hit line"))
+        .collect();
+    assert_eq!(BTreeSet::from([5, 9]), lines, "payload: {value}");
+}
+
+#[test]
 fn scan_usages_by_reference_resolves_javascript_commonjs_export_value_roles() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(

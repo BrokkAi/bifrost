@@ -65,6 +65,23 @@ const BIFROST_CACHE_GITIGNORE_ENTRY = ".bifrost/cache";
 const BIFROST_CACHE_GITIGNORE_LINE = `${BIFROST_CACHE_GITIGNORE_ENTRY}/`;
 
 export type BifrostGitignoreState = "configured" | "missing" | "legacy-whole-directory";
+export type BifrostGitignorePromptDecision = "accept" | "decline" | "defer";
+
+export const BIFROST_GITIGNORE_ASK_AGAIN_LATER = "Ask Again Later";
+export const BIFROST_GITIGNORE_DONT_ASK_AGAIN = "Don't Ask Again";
+
+export function decideBifrostGitignorePrompt(
+  choice: string | undefined,
+  acceptedChoice: "Add" | "Replace"
+): BifrostGitignorePromptDecision {
+  if (choice === acceptedChoice) {
+    return "accept";
+  }
+  if (choice === BIFROST_GITIGNORE_DONT_ASK_AGAIN) {
+    return "decline";
+  }
+  return "defer";
+}
 
 export function resolveLaunchMode(
   mode: LaunchMode,

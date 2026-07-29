@@ -306,7 +306,7 @@ lang_epoch!(
     Go,
     "go",
     "treesitter/go/",
-    "go-canonical-import-path-fqn-2026-06;synthetic-file-scope-code-units-2026-07;raw-package-qualifier-2026-07;fq-interned-segments-2026-07"
+    "go-canonical-import-path-fqn-2026-06;synthetic-file-scope-code-units-2026-07;raw-package-qualifier-2026-07;fq-interned-segments-2026-07;return-expression-list-value-identity-2026-07"
 );
 // Salt bumped: out-of-line member definitions whose owner class is named with
 // no namespace segment of its own (`Class::method` under an in-effect `using

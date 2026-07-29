@@ -7,9 +7,10 @@ use crate::{
         BuiltInPolicySelection, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE,
         PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyFailOn,
         PolicyReportDocument, PolicySuppressionOptions, PolicySuppressionSource,
-        built_in_policy_catalog, evaluate_policy_inputs_with_analyzer,
+        built_in_policy_catalog,
     },
     analyzer::semantic::WorkspaceRelativePath,
+    code_intelligence::CodeIntelligenceRuntime,
     code_quality::{
         analyze_git_hotspots, compute_cognitive_complexity, compute_cyclomatic_complexity,
         report_comment_density_for_code_unit, report_comment_density_for_files,
@@ -1130,17 +1131,14 @@ impl SearchToolsService {
         typestate_summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
     ) -> Result<crate::analyzer::structural::CodeQueryResponse, SearchToolsServiceError> {
         let query = Self::decode_query_code_input(snapshot, arguments)?;
-        Ok(
-            crate::analyzer::structural::execute_workspace_request_with_registration_lease(
-                snapshot,
+        Ok(CodeIntelligenceRuntime::new(snapshot, cancellation)
+            .execute_query_with_registration_lease(
                 workspace_generation,
                 query_protocols,
                 &query,
                 crate::analyzer::structural::CodeQueryExecutionLimits::default(),
-                cancellation,
                 typestate_summary_lease,
-            ),
-        )
+            ))
     }
 
     fn decode_query_code_input(
@@ -2530,16 +2528,13 @@ impl SearchToolsService {
             ..
         } = prepared;
         let result = (|| {
-            let outcome = evaluate_policy_inputs_with_analyzer(
-                &root,
-                &policy_inputs,
-                &snapshot,
-                &options,
-                cancellation,
-            )
-            .map_err(|error| {
-                SearchToolsServiceError::internal(format!("run_policy evaluation failed: {error}"))
-            })?;
+            let outcome = CodeIntelligenceRuntime::new(&snapshot, cancellation)
+                .evaluate_policy_inputs(&root, &policy_inputs, &options)
+                .map_err(|error| {
+                    SearchToolsServiceError::internal(format!(
+                        "run_policy evaluation failed: {error}"
+                    ))
+                })?;
             let exit_status = outcome.exit_status();
             let status = match exit_status {
                 POLICY_EXIT_CLEAN => "clean",

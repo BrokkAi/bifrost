@@ -521,6 +521,20 @@ void test("detects existing bifrost gitignore entries", () => {
   assert.equal(lifecycle.gitignoreIncludesLegacyBifrostEntry(".bifrost/**\n"), false);
 });
 
+void test("distinguishes accepting, declining, and deferring the bifrost gitignore prompt", () => {
+  assert.equal(lifecycle.decideBifrostGitignorePrompt("Add", "Add"), "accept");
+  assert.equal(lifecycle.decideBifrostGitignorePrompt("Replace", "Replace"), "accept");
+  assert.equal(
+    lifecycle.decideBifrostGitignorePrompt(lifecycle.BIFROST_GITIGNORE_DONT_ASK_AGAIN, "Add"),
+    "decline"
+  );
+  assert.equal(
+    lifecycle.decideBifrostGitignorePrompt(lifecycle.BIFROST_GITIGNORE_ASK_AGAIN_LATER, "Replace"),
+    "defer"
+  );
+  assert.equal(lifecycle.decideBifrostGitignorePrompt(undefined, "Add"), "defer");
+});
+
 void test("appends bifrost gitignore entry when missing", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
   const gitignorePath = path.join(temp, ".gitignore");

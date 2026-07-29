@@ -4,6 +4,8 @@ on:
   push:
     branches: [master]
   pull_request:
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
@@ -13,8 +15,48 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  ci-impact:
+    name: ci impact
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      schema_version: ${{ steps.classify.outputs.schema_version }}
+      mode: ${{ steps.classify.outputs.mode }}
+      selected: ${{ steps.classify.outputs.selected }}
+      dependency_licenses: ${{ steps.classify.outputs.dependency_licenses }}
+      crate_package: ${{ steps.classify.outputs.crate_package }}
+      agent_plugin: ${{ steps.classify.outputs.agent_plugin }}
+      external_fixture: ${{ steps.classify.outputs.external_fixture }}
+      vscode: ${{ steps.classify.outputs.vscode }}
+      pi_package: ${{ steps.classify.outputs.pi_package }}
+      rust: ${{ steps.classify.outputs.rust }}
+      python: ${{ steps.classify.outputs.python }}
+      rql_runtime: ${{ steps.classify.outputs.rql_runtime }}
+      mcp_contract: ${{ steps.classify.outputs.mcp_contract }}
+      lsp_contract: ${{ steps.classify.outputs.lsp_contract }}
+      policy_pack: ${{ steps.classify.outputs.policy_pack }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify validation impact
+        id: classify
+        env:
+          CI_IMPACT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: >-
+          node scripts/ci-impact.mjs
+          --event "$GITHUB_EVENT_NAME"
+          --ref "$GITHUB_REF"
+          --base "$CI_IMPACT_BASE_SHA"
+          --head "$GITHUB_SHA"
+          --output "$GITHUB_OUTPUT"
+          --summary "$GITHUB_STEP_SUMMARY"
+
   quick-policy:
     name: quick policy
+    needs: ci-impact
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -31,7 +73,7 @@ jobs:
         timeout-minutes: 2
 
       - name: Audit GitHub Actions
-        run: bash scripts/check-github-actions-security.sh
+        run: node scripts/ci-timing.mjs --label quick-policy-actions-audit -- bash scripts/check-github-actions-security.sh
         timeout-minutes: 2
 
       - name: Install Rust toolchain
@@ -46,17 +88,46 @@ jobs:
           node-version: 22
 
       - name: Check formatting
-        run: cargo fmt --check
+        run: node scripts/ci-timing.mjs --label quick-policy-format -- cargo fmt --check
 
       - name: Test repository policy
-        run: node --test scripts/github-actions-policy.test.mjs scripts/release-version.test.mjs plugins/bifrost-agent/test/sync-release-version.test.mjs
+        run: >-
+          node scripts/ci-timing.mjs --label quick-policy-node-tests -- node --test
+          scripts/ci-impact.test.mjs scripts/ci-timing.test.mjs scripts/ci-impact-workflow.test.mjs
+          scripts/github-actions-policy.test.mjs scripts/release-promotion-workflow.test.mjs scripts/release-version.test.mjs
+          plugins/bifrost-agent/test/sync-release-version.test.mjs
 
       - name: Check release metadata projections
-        run: node scripts/release-version.mjs check
+        run: node scripts/ci-timing.mjs --label quick-policy-release-metadata -- node scripts/release-version.mjs check
+
+  lint:
+    name: lint
+    needs: quick-policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.0
+          components: clippy
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: lint-all-features
+
+      - name: Cargo clippy
+        run: node scripts/ci-timing.mjs --label lint-all-features -- cargo clippy --all-targets --all-features -- -D warnings
 
   dependency-licenses:
     name: dependency licenses
-    needs: quick-policy
+    needs: [ci-impact, quick-policy, lint]
+    if: needs.ci-impact.outputs.dependency_licenses == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -75,22 +146,22 @@ jobs:
           node-version: 22
 
       - name: Install pinned license tools
-        run: |
-          cargo install --locked cargo-about --version 0.9.1 --features cli
-          cargo install --locked cargo-deny --version 0.20.2
+        run: >-
+          node scripts/ci-timing.mjs --label dependency-license-install -- bash -lc
+          'cargo install --locked cargo-about --version 0.9.1 --features cli && cargo install --locked cargo-deny --version 0.20.2'
 
       - name: Check all-feature license policy
-        run: cargo deny --config licenses/deny.toml --locked check licenses
+        run: node scripts/ci-timing.mjs --label dependency-license-check -- cargo deny --config licenses/deny.toml --locked check licenses
 
       - name: Generate Rust notice report
-        run: |
-          scripts/generate-rust-third-party-notices.sh /tmp/THIRD_PARTY_LICENSES.html
-          node scripts/generate-supplemental-third-party-notices.mjs /tmp/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt
-          cmp licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt /tmp/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt
+        run: >-
+          node scripts/ci-timing.mjs --label dependency-notice-report -- bash -lc
+          'scripts/generate-rust-third-party-notices.sh /tmp/THIRD_PARTY_LICENSES.html && node scripts/generate-supplemental-third-party-notices.mjs /tmp/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt && cmp licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt /tmp/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt'
 
   crate-package:
     name: crate package
-    needs: quick-policy
+    needs: [ci-impact, quick-policy, lint]
+    if: needs.ci-impact.outputs.crate_package == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -104,14 +175,133 @@ jobs:
           toolchain: 1.96.0
 
       - name: Check publishable crate
-        run: scripts/check-crate-package.sh
+        run: node scripts/ci-timing.mjs --label crate-package -- bash scripts/check-crate-package.sh
 
-  # This cross-platform launcher smoke is integration-like. Run it after master
-  # updates; release packaging repeats the focused launcher tests before upload.
+  rql-runtime:
+    name: RQL runtime
+    needs: [ci-impact, quick-policy, lint]
+    if: needs.ci-impact.outputs.rql_runtime == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Set up Java
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Run RQL runtime tests
+        run: >-
+          node scripts/ci-timing.mjs --label rql-runtime -- cargo test --features nlp,python
+          --test code_intelligence_runtime --test structural_search_cross_language
+          --test structural_search_planner --test structural_search_python
+
+  mcp-contract:
+    name: MCP contract
+    needs: [ci-impact, quick-policy, lint]
+    if: needs.ci-impact.outputs.mcp_contract == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Set up Java
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Run MCP contract tests
+        run: node scripts/ci-timing.mjs --label mcp-contract -- cargo test --features nlp,python --test bifrost_mcp_server
+
+  lsp-contract:
+    name: LSP contract
+    needs: [ci-impact, quick-policy, lint]
+    if: needs.ci-impact.outputs.lsp_contract == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Set up Java
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Run LSP contract tests
+        run: node scripts/ci-timing.mjs --label lsp-contract -- cargo test --features nlp,python --test bifrost_lsp_server
+
+  policy-pack:
+    name: policy pack
+    needs: [ci-impact, quick-policy, lint]
+    if: needs.ci-impact.outputs.policy_pack == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Run policy-pack tests
+        run: >-
+          node scripts/ci-timing.mjs --label policy-pack -- cargo test --features nlp,python
+          --test builtin_policy_pack --test bifrost_policy_cli --test policy_loading
+          --test policy_loading_workspace --test policy_match_evaluation --test policy_rendering
+          --test policy_sarif_rendering --test policy_source
+
   agent-plugin:
     name: agent plugin (${{ matrix.os }})
-    needs: quick-policy
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: [ci-impact, quick-policy]
+    if: needs.ci-impact.outputs.agent_plugin == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -129,16 +319,15 @@ jobs:
           node-version: 22
 
       - name: Test launcher
-        run: node --test plugins/bifrost-agent/test/launcher.test.mjs
+        run: node scripts/ci-timing.mjs --label agent-plugin-launcher -- node --test plugins/bifrost-agent/test/launcher.test.mjs
 
       - name: Validate manifests
-        run: node scripts/check-codex-plugin-manifest.mjs
+        run: node scripts/ci-timing.mjs --label agent-plugin-manifests -- node scripts/check-codex-plugin-manifest.mjs
 
-  # Security boundary: checked-in binaries are opaque review surfaces. Rebuild them from
-  # versioned source with pinned toolchains to reject tampered or malicious test payloads.
   external-fixture:
     name: ${{ matrix.name }} fixture provenance
-    needs: quick-policy
+    needs: [ci-impact, quick-policy, lint]
+    if: needs.ci-impact.outputs.external_fixture == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
@@ -169,15 +358,16 @@ jobs:
 
       - name: Rebuild and verify C# external fixture
         if: matrix.fixture == 'csharp'
-        run: bash scripts/verify-csharp-external-fixture.sh
+        run: node scripts/ci-timing.mjs --label csharp-fixture -- bash scripts/verify-csharp-external-fixture.sh
 
       - name: Rebuild and verify Java class fixture
         if: matrix.fixture == 'java'
-        run: bash scripts/verify-java-class-fixture.sh
+        run: node scripts/ci-timing.mjs --label java-fixture -- bash scripts/verify-java-class-fixture.sh
 
   vscode:
     name: vscode
-    needs: quick-policy
+    needs: [ci-impact, quick-policy]
+    if: needs.ci-impact.outputs.vscode == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -193,27 +383,24 @@ jobs:
           cache-dependency-path: editors/vscode/package-lock.json
 
       - name: Install extension dependencies
-        run: npm ci
+        run: node ../../scripts/ci-timing.mjs --label vscode-install -- npm ci
         working-directory: editors/vscode
 
       - name: Check extension
-        run: npm test
+        run: node ../../scripts/ci-timing.mjs --label vscode-test -- npm test
         working-directory: editors/vscode
 
       - name: Package and inspect extension notices
         shell: bash
         working-directory: editors/vscode
-        run: |
-          npx --no-install vsce package --out /tmp/bifrost-ci.vsix
-          unzip -Z1 /tmp/bifrost-ci.vsix > /tmp/bifrost-vsix-files.txt
-          grep -Fx 'extension/LICENSE.md' /tmp/bifrost-vsix-files.txt
-          grep -Fx 'extension/GPL-3.0.md' /tmp/bifrost-vsix-files.txt
-          grep -Fx 'extension/SOURCE.md' /tmp/bifrost-vsix-files.txt
-          grep -Fx 'extension/THIRD_PARTY_LICENSES.txt' /tmp/bifrost-vsix-files.txt
+        run: >-
+          node ../../scripts/ci-timing.mjs --label vscode-package -- bash -lc
+          'npx --no-install vsce package --out /tmp/bifrost-ci.vsix && unzip -Z1 /tmp/bifrost-ci.vsix > /tmp/bifrost-vsix-files.txt && grep -Fx "extension/LICENSE.md" /tmp/bifrost-vsix-files.txt && grep -Fx "extension/GPL-3.0.md" /tmp/bifrost-vsix-files.txt && grep -Fx "extension/SOURCE.md" /tmp/bifrost-vsix-files.txt && grep -Fx "extension/THIRD_PARTY_LICENSES.txt" /tmp/bifrost-vsix-files.txt'
 
   pi-package:
     name: Pi package (${{ matrix.os }})
-    needs: quick-policy
+    needs: [ci-impact, quick-policy]
+    if: needs.ci-impact.outputs.pi_package == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -233,27 +420,28 @@ jobs:
           cache-dependency-path: plugins/bifrost-agent/package-lock.json
 
       - name: Install package dependencies
-        run: npm ci
+        run: node ../../scripts/ci-timing.mjs --label pi-install -- npm ci
         working-directory: plugins/bifrost-agent
 
       - name: Check package
-        run: npm run check
+        run: node ../../scripts/ci-timing.mjs --label pi-check -- npm run check
         working-directory: plugins/bifrost-agent
 
       - name: Test package
-        run: npm test
+        run: node ../../scripts/ci-timing.mjs --label pi-test -- npm test
         working-directory: plugins/bifrost-agent
 
       - name: Test packed package install
-        run: npm run test:packed
+        run: node ../../scripts/ci-timing.mjs --label pi-packed-install -- npm run test:packed
         working-directory: plugins/bifrost-agent
 
       - name: Validate shared plugin manifests
-        run: node scripts/check-codex-plugin-manifest.mjs
+        run: node scripts/ci-timing.mjs --label pi-manifests -- node scripts/check-codex-plugin-manifest.mjs
 
   rust:
     name: rust (${{ matrix.target }})
-    needs: quick-policy
+    needs: [ci-impact, quick-policy, lint]
+    if: needs.ci-impact.outputs.rust == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     env:
@@ -345,8 +533,10 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: cargo clippy
-        run: cargo clippy --all-targets ${{ matrix.cargo-flags }} --target ${{ matrix.target }} -- -D warnings
+      - name: Cargo clippy
+        run: >-
+          node scripts/ci-timing.mjs --label rust-clippy-${{ matrix.target }} -- cargo clippy --all-targets
+          ${{ matrix.cargo-flags }} --target ${{ matrix.target }} -- -D warnings
 
       - name: Install uv
         if: matrix.can-test
@@ -356,13 +546,16 @@ jobs:
           python-version: '3.12'
           enable-cache: false
 
-      - name: cargo test
+      - name: Cargo test
         if: matrix.can-test
-        run: cargo test --target ${{ matrix.target }} ${{ matrix.cargo-flags }} ${{ matrix.test-args }}
+        run: >-
+          node scripts/ci-timing.mjs --label rust-test-${{ matrix.target }} -- cargo test --target
+          ${{ matrix.target }} ${{ matrix.cargo-flags }} ${{ matrix.test-args }}
 
   python:
     name: python (${{ matrix.target }})
-    needs: quick-policy
+    needs: [ci-impact, quick-policy, lint]
+    if: needs.ci-impact.outputs.python == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     env:
@@ -402,5 +595,104 @@ jobs:
           version: 0.11.31
           python-version: '3.12'
 
-      - name: Run python tests
-        run: bash scripts/test_python.sh
+      - name: Run Python tests
+        run: node scripts/ci-timing.mjs --label python-${{ matrix.target }} -- bash scripts/test_python.sh
+
+  pr-verification:
+    name: PR verification
+    if: ${{ always() }}
+    needs:
+      - ci-impact
+      - quick-policy
+      - lint
+      - dependency-licenses
+      - crate-package
+      - rql-runtime
+      - mcp-contract
+      - lsp-contract
+      - policy-pack
+      - agent-plugin
+      - external-fixture
+      - vscode
+      - pi-package
+      - rust
+      - python
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CI_IMPACT_RESULT: ${{ needs.ci-impact.result }}
+      QUICK_POLICY_RESULT: ${{ needs.quick-policy.result }}
+      LINT_RESULT: ${{ needs.lint.result }}
+      DEPENDENCY_LICENSES_SELECTED: ${{ needs.ci-impact.outputs.dependency_licenses }}
+      DEPENDENCY_LICENSES_RESULT: ${{ needs.dependency-licenses.result }}
+      CRATE_PACKAGE_SELECTED: ${{ needs.ci-impact.outputs.crate_package }}
+      CRATE_PACKAGE_RESULT: ${{ needs.crate-package.result }}
+      RQL_RUNTIME_SELECTED: ${{ needs.ci-impact.outputs.rql_runtime }}
+      RQL_RUNTIME_RESULT: ${{ needs.rql-runtime.result }}
+      MCP_CONTRACT_SELECTED: ${{ needs.ci-impact.outputs.mcp_contract }}
+      MCP_CONTRACT_RESULT: ${{ needs.mcp-contract.result }}
+      LSP_CONTRACT_SELECTED: ${{ needs.ci-impact.outputs.lsp_contract }}
+      LSP_CONTRACT_RESULT: ${{ needs.lsp-contract.result }}
+      POLICY_PACK_SELECTED: ${{ needs.ci-impact.outputs.policy_pack }}
+      POLICY_PACK_RESULT: ${{ needs.policy-pack.result }}
+      AGENT_PLUGIN_SELECTED: ${{ needs.ci-impact.outputs.agent_plugin }}
+      AGENT_PLUGIN_RESULT: ${{ needs.agent-plugin.result }}
+      EXTERNAL_FIXTURE_SELECTED: ${{ needs.ci-impact.outputs.external_fixture }}
+      EXTERNAL_FIXTURE_RESULT: ${{ needs.external-fixture.result }}
+      VSCODE_SELECTED: ${{ needs.ci-impact.outputs.vscode }}
+      VSCODE_RESULT: ${{ needs.vscode.result }}
+      PI_PACKAGE_SELECTED: ${{ needs.ci-impact.outputs.pi_package }}
+      PI_PACKAGE_RESULT: ${{ needs.pi-package.result }}
+      RUST_SELECTED: ${{ needs.ci-impact.outputs.rust }}
+      RUST_RESULT: ${{ needs.rust.result }}
+      PYTHON_SELECTED: ${{ needs.ci-impact.outputs.python }}
+      PYTHON_RESULT: ${{ needs.python.result }}
+      SCHEMA_VERSION: ${{ needs.ci-impact.outputs.schema_version }}
+      MODE: ${{ needs.ci-impact.outputs.mode }}
+      SELECTED: ${{ needs.ci-impact.outputs.selected }}
+    steps:
+      - name: Verify selected validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          failures=0
+
+          check_result() {
+            local name="$1"
+            local selected="$2"
+            local result="$3"
+            printf '| %s | %s | %s |\n' "$name" "$selected" "$result" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$selected" = "true" ] && [ "$result" != "success" ]; then
+              echo "selected check $name finished as $result" >&2
+              failures=1
+            fi
+          }
+
+          {
+            echo '## PR verification'
+            echo
+            echo "Schema version: \`${SCHEMA_VERSION:-unavailable}\`  "
+            echo "Selection mode: \`${MODE:-unavailable}\`  "
+            echo "Selected components: \`${SELECTED:-unavailable}\`"
+            echo
+            echo '| Check | Selected | Result |'
+            echo '| --- | --- | --- |'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          check_result 'ci impact' true "$CI_IMPACT_RESULT"
+          check_result 'quick policy' true "$QUICK_POLICY_RESULT"
+          check_result 'lint' true "$LINT_RESULT"
+          check_result 'dependency licenses' "$DEPENDENCY_LICENSES_SELECTED" "$DEPENDENCY_LICENSES_RESULT"
+          check_result 'crate package' "$CRATE_PACKAGE_SELECTED" "$CRATE_PACKAGE_RESULT"
+          check_result 'RQL runtime' "$RQL_RUNTIME_SELECTED" "$RQL_RUNTIME_RESULT"
+          check_result 'MCP contract' "$MCP_CONTRACT_SELECTED" "$MCP_CONTRACT_RESULT"
+          check_result 'LSP contract' "$LSP_CONTRACT_SELECTED" "$LSP_CONTRACT_RESULT"
+          check_result 'policy pack' "$POLICY_PACK_SELECTED" "$POLICY_PACK_RESULT"
+          check_result 'agent plugin' "$AGENT_PLUGIN_SELECTED" "$AGENT_PLUGIN_RESULT"
+          check_result 'external fixture' "$EXTERNAL_FIXTURE_SELECTED" "$EXTERNAL_FIXTURE_RESULT"
+          check_result 'VS Code' "$VSCODE_SELECTED" "$VSCODE_RESULT"
+          check_result 'Pi package' "$PI_PACKAGE_SELECTED" "$PI_PACKAGE_RESULT"
+          check_result 'Rust matrix' "$RUST_SELECTED" "$RUST_RESULT"
+          check_result 'Python matrix' "$PYTHON_SELECTED" "$PYTHON_RESULT"
+
+          exit "$failures"

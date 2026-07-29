@@ -78,6 +78,8 @@ fn cargo_crate(
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RustCargoRouteIndex {
     routes_by_manifest_and_name: HashMap<(PathBuf, String), Vec<RustCargoRoute>>,
+    declared_dependencies_by_manifest_and_name:
+        HashMap<(PathBuf, String), Vec<RustCargoDependencyKind>>,
     target_roots_by_file: HashMap<ProjectFile, crate::hash::HashSet<ProjectFile>>,
     targets_by_root: HashMap<ProjectFile, crate::hash::HashSet<RustCargoTarget>>,
     files_by_reachable_root: HashMap<ProjectFile, Vec<ProjectFile>>,
@@ -481,6 +483,10 @@ impl RustCargoRouteIndex {
             crate_by_directory.insert(cargo_crate.directory.clone(), index);
         }
         let mut routes_by_manifest_and_name: HashMap<_, Vec<RustCargoRoute>> = HashMap::default();
+        let mut declared_dependencies_by_manifest_and_name: HashMap<
+            _,
+            Vec<RustCargoDependencyKind>,
+        > = HashMap::default();
         let mut target_roots_by_file: HashMap<ProjectFile, crate::hash::HashSet<ProjectFile>> =
             HashMap::default();
         let mut targets_by_root: HashMap<ProjectFile, crate::hash::HashSet<RustCargoTarget>> =
@@ -521,6 +527,13 @@ impl RustCargoRouteIndex {
                 cargo_dependency_tables_with_kind(&cargo_crate.manifest)
             {
                 for (exposed_name, raw_dependency) in dependencies {
+                    declared_dependencies_by_manifest_and_name
+                        .entry((
+                            cargo_crate.directory.clone(),
+                            normalize_crate_name(exposed_name),
+                        ))
+                        .or_default()
+                        .push(dependency_kind);
                     let dependency = effective_cargo_dependency(
                         root,
                         &cargo_crate.directory,
@@ -591,6 +604,7 @@ impl RustCargoRouteIndex {
         }
         let mut index = Self {
             routes_by_manifest_and_name,
+            declared_dependencies_by_manifest_and_name,
             target_roots_by_file,
             targets_by_root,
             files_by_reachable_root: HashMap::default(),
@@ -669,6 +683,30 @@ impl RustCargoRouteIndex {
             return false;
         };
         first.edition == "2015" && targets.all(|target| target.edition == "2015")
+    }
+
+    pub(super) fn has_available_declared_dependency(
+        &self,
+        file: &ProjectFile,
+        route_name: &str,
+    ) -> bool {
+        let normalized = normalize_crate_name(route_name);
+        self.target_roots_by_file
+            .get(file)
+            .into_iter()
+            .flatten()
+            .filter_map(|root| self.targets_by_root.get(root))
+            .flatten()
+            .any(|target| {
+                self.declared_dependencies_by_manifest_and_name
+                    .get(&(target.manifest.clone(), normalized.clone()))
+                    .is_some_and(|kinds| {
+                        kinds
+                            .iter()
+                            .copied()
+                            .any(|kind| cargo_dependency_available_to_target(kind, target))
+                    })
+            })
     }
 
     pub(super) fn external_module_declarations(&self) -> &[RustCargoModuleDeclaration] {
@@ -883,9 +921,18 @@ fn cargo_route_available_to_target(route: &RustCargoRoute, target: &RustCargoTar
             target.kind,
             RustCargoTargetKind::Library | RustCargoTargetKind::Build
         ),
-        Some(RustCargoDependencyKind::Normal) => target.kind != RustCargoTargetKind::Build,
-        Some(RustCargoDependencyKind::Development) => target.development_capable,
-        Some(RustCargoDependencyKind::Build) => target.kind == RustCargoTargetKind::Build,
+        Some(kind) => cargo_dependency_available_to_target(kind, target),
+    }
+}
+
+fn cargo_dependency_available_to_target(
+    kind: RustCargoDependencyKind,
+    target: &RustCargoTarget,
+) -> bool {
+    match kind {
+        RustCargoDependencyKind::Normal => target.kind != RustCargoTargetKind::Build,
+        RustCargoDependencyKind::Development => target.development_capable,
+        RustCargoDependencyKind::Build => target.kind == RustCargoTargetKind::Build,
     }
 }
 

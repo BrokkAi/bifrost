@@ -28,6 +28,7 @@ const GET_SUMMARIES_RESPONSE_BUDGET_BYTES: usize = 4_096;
 const MAX_IN_FLIGHT_CANCELLABLE_REQUESTS: usize = 4;
 const MAX_PENDING_MCP_RESPONSES: usize = 4;
 const MCP_ANALYZER_REQUEST_BUDGET: Duration = Duration::from_secs(5);
+pub(crate) const BENCHMARK_MCP_REQUEST_BUDGET_SECS: u64 = 60;
 const AGENTS_GUIDANCE_URI: &str = "bifrost://agent-guidance/agents.md";
 const AGENTS_GUIDANCE_MIME_TYPE: &str = "text/markdown";
 const ROOTS_REQUEST_ID_PREFIX: &str = "bifrost-roots-";
@@ -39,6 +40,8 @@ pub(crate) const BENCHMARK_PROFILE_BOUNDARY_METHOD: &str = "bifrost/benchmark-pr
 pub(crate) const BENCHMARK_PROFILE_BOUNDARY_MARKER: &str =
     "\n\u{1e}bifrost-benchmark-profile-boundary\u{1e}\n";
 pub(crate) const MCP_FILE_WATCHER_ENV: &str = "BIFROST_MCP_FILE_WATCHER";
+pub(crate) const BENCHMARK_MCP_REQUEST_BUDGET_SECS_ENV: &str =
+    "BIFROST_BENCHMARK_MCP_REQUEST_BUDGET_SECS";
 
 pub const SEARCHTOOLS_INSTRUCTIONS: &str =
     "Analyzer-backed search tools for source code workspaces.";
@@ -119,7 +122,7 @@ impl McpRequestCancellations {
     ) -> Result<CancellationToken, McpRequestRegistrationError> {
         let key = request_id_key(id);
         let token =
-            CancellationToken::default().with_deadline(accepted_at + MCP_ANALYZER_REQUEST_BUDGET);
+            CancellationToken::default().with_deadline(accepted_at + mcp_analyzer_request_budget());
         let mut active = self.active.lock().expect("MCP cancellation lock poisoned");
         if active.contains_key(&key) {
             return Err(McpRequestRegistrationError::DuplicateId);
@@ -182,6 +185,22 @@ impl McpRequestCancellations {
             request.cancellation.cancel();
         }
     }
+}
+
+fn mcp_analyzer_request_budget() -> Duration {
+    benchmark_mcp_request_budget_secs(std::env::var(BENCHMARK_MCP_REQUEST_BUDGET_SECS_ENV).ok())
+        .map(Duration::from_secs)
+        .unwrap_or(MCP_ANALYZER_REQUEST_BUDGET)
+}
+
+fn benchmark_mcp_request_budget_secs(value: Option<String>) -> Option<u64> {
+    value
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| {
+            (MCP_ANALYZER_REQUEST_BUDGET.as_secs()..=BENCHMARK_MCP_REQUEST_BUDGET_SECS)
+                .contains(seconds)
+        })
 }
 
 struct OutboundMcpResponse {
@@ -2360,6 +2379,27 @@ mod uri_tests {
 
         assert!(token.is_cancelled());
         assert!(token.is_timed_out());
+    }
+
+    #[test]
+    fn benchmark_request_budget_override_accepts_only_supported_bounds() {
+        assert_eq!(benchmark_mcp_request_budget_secs(None), None);
+        assert_eq!(
+            benchmark_mcp_request_budget_secs(Some("invalid".to_string())),
+            None
+        );
+        assert_eq!(
+            benchmark_mcp_request_budget_secs(Some("4".to_string())),
+            None
+        );
+        assert_eq!(
+            benchmark_mcp_request_budget_secs(Some(BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string())),
+            Some(BENCHMARK_MCP_REQUEST_BUDGET_SECS)
+        );
+        assert_eq!(
+            benchmark_mcp_request_budget_secs(Some("61".to_string())),
+            None
+        );
     }
 
     #[test]
