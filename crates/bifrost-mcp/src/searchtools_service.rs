@@ -4088,8 +4088,10 @@ mod query_protocol_tests {
     use crate::cancellation::CancellationToken;
     use serde_json::json;
 
-    const RESOURCE_LIFECYCLE: &[u8] =
-        include_bytes!("../tests/fixtures/typestate/resource-lifecycle.protocol.json");
+    const RESOURCE_LIFECYCLE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/typestate/resource-lifecycle.protocol.json"
+    ));
 
     fn protocol_service() -> (tempfile::TempDir, SearchToolsService, ProtocolRef) {
         let temp = tempfile::tempdir().unwrap();

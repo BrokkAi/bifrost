@@ -54,19 +54,7 @@ function isRqlPath(path) {
 
 function isMcpPath(path) {
   return (
-    startsWithAny(path, ["src/mcp_", "crates/bifrost-analysis/src/searchtools/"]) ||
-    [
-      "src/mcp_cli.rs",
-      "src/mcp_common.rs",
-      "src/mcp_core.rs",
-      "src/mcp_extended.rs",
-      "src/mcp_nlp.rs",
-      "src/mcp_registry.rs",
-      "src/mcp_slopcop.rs",
-      "src/mcp_text.rs",
-      "src/searchtools_service.rs",
-      "tests/bifrost_mcp_server.rs",
-    ].includes(path)
+    startsWithAny(path, ["crates/bifrost-mcp/", "crates/bifrost-analysis/src/searchtools/"])
   );
 }
 

@@ -89,6 +89,7 @@ cc = "1.2"
 [features]
 default = []
 nlp = ["dep:hf-hub", "dep:tokenizers", "dep:fastrq"]
+test-support = []
 
 [dev-dependencies]
 filetime = "0.2"

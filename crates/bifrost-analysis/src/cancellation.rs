@@ -1,8 +1,9 @@
 use std::sync::Arc;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 /// Cloneable cooperative-cancellation flag for bounded in-process work.
 ///
@@ -14,7 +15,7 @@ pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
     timed_out: Arc<AtomicBool>,
     deadline: Option<Instant>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     cancel_after_checks: Option<Arc<AtomicUsize>>,
 }
 
@@ -29,7 +30,8 @@ impl CancellationToken {
 
     /// Return a child token that cancels itself after `duration` while still
     /// sharing explicit cancellation with the original token and its clones.
-    pub(crate) fn with_timeout(mut self, duration: Duration) -> Self {
+    #[doc(hidden)]
+    pub fn with_timeout(mut self, duration: Duration) -> Self {
         let deadline = Instant::now() + duration;
         self.deadline = Some(
             self.deadline
@@ -52,7 +54,7 @@ impl CancellationToken {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(remaining) = &self.cancel_after_checks {
             let previous = remaining
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
@@ -84,8 +86,9 @@ impl CancellationToken {
         false
     }
 
-    #[cfg(test)]
-    pub(crate) fn cancel_after_checks_for_test(checks: usize) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn cancel_after_checks_for_test(checks: usize) -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
             timed_out: Arc::new(AtomicBool::new(false)),

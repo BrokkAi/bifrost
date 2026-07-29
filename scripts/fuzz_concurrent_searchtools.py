@@ -83,7 +83,7 @@ def build_queries() -> list[Query]:
         ),
         Query(
             "summaries:service",
-            lambda client: client.get_summaries(["src/searchtools_service.rs"]),
+            lambda client: client.get_summaries(["crates/bifrost-mcp/src/searchtools_service.rs"]),
         ),
         Query(
             "summaries:python-module",
@@ -99,7 +99,7 @@ def build_queries() -> list[Query]:
         ),
         Query(
             "list:service",
-            lambda client: client.list_symbols(["src/searchtools_service.rs"]),
+            lambda client: client.list_symbols(["crates/bifrost-mcp/src/searchtools_service.rs"]),
         ),
         Query(
             "list:python-module",
@@ -111,7 +111,9 @@ def build_queries() -> list[Query]:
         ),
         Query(
             "relevant:service",
-            lambda client: client.most_relevant_files(["src/searchtools_service.rs"], limit=20),
+            lambda client: client.most_relevant_files(
+                ["crates/bifrost-mcp/src/searchtools_service.rs"], limit=20
+            ),
         ),
         Query(
             "relevant:client",

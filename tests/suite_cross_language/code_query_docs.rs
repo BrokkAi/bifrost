@@ -42,7 +42,7 @@ const PUBLIC_QUERY_SURFACES: &[&str] = &[
     "docs/src/content/docs/code-query-tutorials/receiver-traversal.md",
     "docs/src/content/docs/mcp.md",
     "docs/src/content/docs/python-client.md",
-    "src/mcp_extended.rs",
+    "crates/bifrost-mcp/src/mcp_extended.rs",
     "src/bin/bifrost.rs",
     "src/bin/bifrost/code_query_repl.rs",
     "plugins/bifrost-agent/skills/bifrost-codebase-search/SKILL.md",

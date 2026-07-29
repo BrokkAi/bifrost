@@ -1,4 +1,42 @@
 //! MCP host implementation for the `brokk-bifrost` facade.
-//!
-//! Tool schemas, workspace lifecycle, rendering, and transport code move into
-//! this package after the shared runtime boundary is independently buildable.
+
+#[cfg(feature = "nlp")]
+pub use brokk_bifrost_analysis::nlp;
+pub use brokk_bifrost_analysis::{
+    AnalyzerConfig, CancellationToken, FilesystemProject, Project, ProjectFile, WorkspaceAnalyzer,
+    analyzer, cache_db, cancellation, code_quality, collect_workspace_files, diff_analysis,
+    file_tools, git_file, gitblob, hash, path_normalization, path_utils, profiling, searchtools,
+    searchtools_render, sexp, symbol_rename, workspace_document,
+};
+pub use brokk_bifrost_runtime::{CodeIntelligenceRuntime, code_intelligence};
+
+pub mod mcp_cli;
+pub mod mcp_common;
+pub mod mcp_core;
+pub mod mcp_extended;
+pub mod mcp_nlp;
+pub mod mcp_registry;
+pub mod mcp_slopcop;
+pub mod mcp_text;
+mod project_watcher;
+pub mod scoped_project;
+pub mod searchtools_service;
+pub mod structured_data;
+pub mod tool_arguments;
+
+#[cfg(test)]
+mod test_support;
+
+pub use project_watcher::{ChangeDelta, ProjectChangeWatcher};
+pub use searchtools_service::{
+    SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode, ToolOutput,
+};
+
+/// Process-boundary constants used by the repository benchmark application.
+#[doc(hidden)]
+pub mod benchmark_api {
+    pub use crate::mcp_common::{
+        BENCHMARK_MCP_REQUEST_BUDGET_SECS, BENCHMARK_MCP_REQUEST_BUDGET_SECS_ENV,
+        BENCHMARK_PROFILE_BOUNDARY_MARKER, BENCHMARK_PROFILE_BOUNDARY_METHOD, MCP_FILE_WATCHER_ENV,
+    };
+}

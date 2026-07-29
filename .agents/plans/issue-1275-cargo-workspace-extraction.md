@@ -17,8 +17,8 @@ A developer will be able to run `cargo test -p brokk-bifrost-mcp` or `cargo test
 - [x] (2026-07-29 10:05Z) Established workspace metadata, four compiling package skeletons, an executable dependency-boundary check, and a package-neutral percent-decoder without moving protocol behavior.
 - [x] (2026-07-29 11:44Z) Extracted analysis and the typed runtime into independently compiling packages, preserved the root Rust API, and passed 1,781 analysis unit tests plus runtime/facade contract tests.
 - [x] (2026-07-29 12:38Z) Extracted the LSP host and its 193-test subprocess contract, preserved root/benchmark callers, and passed 297 independent package tests.
-- [ ] Extract and independently validate the MCP host package, then reconnect the CLI and Python facade.
-- [ ] Move component tests and CI impact mappings onto the proven package boundaries.
+- [x] (2026-07-29 13:19Z) Extracted and independently validated the MCP host package, then reconnected the CLI, Python facade, and root build identity.
+- [x] (2026-07-29 13:19Z) Moved both protocol subprocess contracts and CI impact mappings onto the proven package boundaries.
 - [ ] Make crate packaging, notices, wheels, and the release-promotion DAG workspace-aware.
 - [ ] Run the complete local validation, policy gate, packaged-consumer smoke, and cross-platform CI matrix.
 
@@ -69,6 +69,15 @@ A developer will be able to run `cargo test -p brokk-bifrost-mcp` or `cargo test
 - Observation: This workstation's default `rustdoc` and `rustc` are different builds of Rust 1.96.0.
   Evidence: executable tests passed, but the automatic doctest phase rejected artifacts built by the rustup Rustc because PATH selected Homebrew Rustdoc (LLVM 22.1.6 versus 22.1.2). `RUSTDOC=/Users/dave/.cargo/bin/rustdoc cargo test -p brokk-bifrost-lsp --doc --all-features` passed. This is a local toolchain-path issue, not an LSP failure.
 
+- Observation: The subprocess MCP contract, like the LSP contract, needs an executable owned by the package under test.
+  Evidence: `bifrost-mcp-test-server` accepts the MCP-only compatibility arguments and invokes the extracted host directly; 26 real protocol tests now run without selecting the root facade or LSP package.
+
+- Observation: The MCP contract had one root CLI policy-mode assertion mixed into the host protocol suite.
+  Evidence: The package test server intentionally implements only MCP serving. The existing root `bifrost_policy_cli` integration suite remains the owner of CLI policy-mode behavior, while the moved MCP suite retains tool registration, invocation, cancellation, rendering, workspace, and session-refresh coverage.
+
+- Observation: Root build identity can remain facade-owned without introducing a reverse dependency.
+  Evidence: The MCP host exposes a typed `run_stdio_server_with_build_identity` entry point; the root binary injects `BIFROST_BUILD_IDENTITY`, and `mcp_build_identity_facade` proves that an MCP initialize response reports the exact facade identity.
+
 ## Decision Log
 
 - Decision: Keep the repository-root package named `brokk-bifrost`, with library name `brokk_bifrost`, as the only compatibility facade promised to existing users.
@@ -111,6 +120,14 @@ A developer will be able to run `cargo test -p brokk-bifrost-mcp` or `cargo test
   Rationale: Root sits above both hosts and legitimately benchmarks real handler paths, but broad public handler visibility would turn former same-crate implementation details into an accidental API.
   Date/Author: 2026-07-29 / Codex
 
+- Decision: Keep the MCP package's legacy stdio entry point and add a typed build-identity variant for the facade.
+  Rationale: Package-local callers retain a useful default based on the package version, while the public `bifrost` binary can preserve its richer source-derived identity without the MCP package depending back on root.
+  Date/Author: 2026-07-29 / Codex
+
+- Decision: Keep CLI policy-mode validation in the root integration suite rather than teaching the MCP package test server unrelated application modes.
+  Rationale: The extracted package owns MCP transport and service behavior; root owns CLI argument dispatch. Separating those contracts makes the independent-host test truthful without reducing behavior coverage.
+  Date/Author: 2026-07-29 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 is complete. The repository is now a non-virtual Cargo workspace with the root facade as its default member and four version-matched implementation package skeletons. The checked-in graph validator rejects reverse dependencies, cross-host dependencies, host-only external dependencies below their layer, unexpected members, and version drift. Search tooling no longer imports the LSP module for percent decoding; the shared utility retains Unicode behavior and adds malformed-escape coverage. No production module has moved yet, so public behavior and root packaging remain unchanged.
@@ -118,6 +135,8 @@ Milestone 1 is complete. The repository is now a non-virtual Cargo workspace wit
 Milestone 2 is complete. Analyzer, policy/query, search, storage, optional NLP, resource, vendored grammar, and reference-differential code now build in `brokk-bifrost-analysis`; `CodeIntelligenceRuntime` builds in `brokk-bifrost-runtime` with only analysis beneath it. The root crate is a compatibility facade for the moved API, proven by a real inline-project query. The runtime integration contract passes in its package, the full analysis library suite passes 1,781 tests with six intentional ignores, and the runtime dependency tree contains no LSP, MCP, or PyO3 dependency. The analysis `.crate` also verifies independently from its packaged contents.
 
 Milestone 3 is complete. LSP transport, overlays, request lifecycle, progress, conversion, and handlers now compile in `brokk-bifrost-lsp`, and root preserves `brokk_bifrost::lsp` through a dependency re-export. The real subprocess contract and shared client harness moved with the host; the package's own test server keeps those tests independent of the facade. The package passed 104 unit tests and 193 subprocess tests, its tree contains analysis/runtime and LSP transport but no MCP package, and every remaining root integration test compile-checks against the relocated shared client. CI now runs the LSP package directly for LSP-selected changes.
+
+Milestone 4 is complete. MCP descriptors, registry, transport, service lifecycle, watcher/scoped-project support, structured outputs, and tool argument handling now compile in `brokk-bifrost-mcp`. Root preserves the existing Rust paths, owns PyO3 and the public binary, and injects its build identity through the typed host entry point. The independent package passed 101 unit tests, 26 subprocess protocol tests, and its doctest compile; its dependency tree contains analysis/runtime but no LSP transport. The root facade query/MCP contract, broad integration-test compile, exact build-identity test, and all 59 Python tests pass. CI now selects the MCP package directly for MCP-only changes while shared changes still select both hosts.
 
 ## Context and Orientation
 

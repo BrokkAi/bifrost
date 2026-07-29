@@ -242,6 +242,7 @@ dependencies = [
  "bincode",
  "brokk-bifrost-analysis",
  "brokk-bifrost-lsp",
+ "brokk-bifrost-mcp",
  "brokk-bifrost-runtime",
  "cap-fs-ext",
  "cap-std",
@@ -404,6 +405,20 @@ version = "0.8.12"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-runtime",
+ "git2",
+ "glob",
+ "jaq-core",
+ "jaq-json",
+ "jaq-std",
+ "notify",
+ "quick-xml",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "url",
+ "xee-xpath",
+ "xot",
 ]
 
 [[package]]

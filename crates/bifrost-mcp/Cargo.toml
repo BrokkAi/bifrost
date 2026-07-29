@@ -11,6 +11,27 @@ publish = true
 [lib]
 name = "brokk_bifrost_mcp"
 
+[features]
+default = []
+nlp = ["brokk-bifrost-analysis/nlp"]
+
 [dependencies]
 brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.12" }
 brokk-bifrost-runtime = { path = "../bifrost-runtime", version = "=0.8.12" }
+git2 = { version = "0.20.2", default-features = false }
+glob = "0.3.3"
+jaq-core = "3.0"
+jaq-json = "2.0"
+jaq-std = "3.0"
+notify = "6.1.1"
+quick-xml = "0.40"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+url = { version = "2.5.8", default-features = false, features = ["std"] }
+xee-xpath = "0.1.5"
+xot = "0.31"
+
+[dev-dependencies]
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.12", features = ["test-support"] }
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+tempfile = "3.23.0"

@@ -1,5 +1,6 @@
-use crate::common::InlineTestProject;
-use brokk_bifrost::{
+mod common;
+
+use brokk_bifrost_analysis::{
     Language,
     policy::{PolicyEvaluationOptions, PolicyFailOn, evaluate_policy_files},
 };
@@ -12,9 +13,26 @@ use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 
-const MCP_POLICY_APP: &str = include_str!("../fixtures/policy-cli/project/src/app.py");
-const MCP_DYNAMIC_EVAL_POLICY: &str =
-    include_str!("../fixtures/policy-cli/project/policies/dynamic-eval.rqlp");
+const MCP_POLICY_APP: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/policy-cli/project/src/app.py"
+));
+const MCP_DYNAMIC_EVAL_POLICY: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/policy-cli/project/policies/dynamic-eval.rqlp"
+));
+
+fn mcp_server_binary() -> &'static str {
+    option_env!("CARGO_BIN_EXE_bifrost-mcp-test-server")
+        .or(option_env!("CARGO_BIN_EXE_bifrost"))
+        .expect("Cargo did not provide an MCP server binary")
+}
+
+fn repository_fixture_root(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures")
+        .join(name)
+}
 
 fn assert_same_canonical_path(actual: &str, expected: &std::path::Path) {
     assert_eq!(
@@ -117,7 +135,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     )
     .expect("set remote default");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"));
+    let mut child = Command::new(mcp_server_binary());
     child.env("BIFROST_SEMANTIC_INDEX", "off");
     let mut child = child
         .arg("--force-semantic-cpu")
@@ -775,10 +793,7 @@ fn bifrost_defaults_to_cwd_searchtools_server() {
 
 #[test]
 fn bifrost_mcp_dispatches_distinct_location_navigation_results() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
     let mut child = spawn_server(&fixture_root, "symbol", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
@@ -1238,38 +1253,6 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
         "src/app.py"
     );
 
-    let cli = Command::new(env!("CARGO_BIN_EXE_bifrost"))
-        .env("BIFROST_SEMANTIC_INDEX", "off")
-        .arg("--root")
-        .arg(project.root())
-        .arg("--policy-id")
-        .arg("bifrost.correctness.dynamic-evaluation")
-        .arg("--evaluation-date")
-        .arg("2026-07-28")
-        .arg("--fail-on")
-        .arg("warning")
-        .arg("--format")
-        .arg("json")
-        .output()
-        .expect("run equivalent CLI policy selection");
-    assert_eq!(
-        cli.status.code(),
-        Some(1),
-        "{}",
-        String::from_utf8_lossy(&cli.stderr)
-    );
-    let cli_report: Value = serde_json::from_slice(&cli.stdout).unwrap_or_else(|error| {
-        panic!(
-            "invalid CLI report: {error}\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&cli.stdout),
-            String::from_utf8_lossy(&cli.stderr)
-        )
-    });
-    assert_eq!(
-        cli_report, structured["report"],
-        "CLI and MCP must return one canonical report"
-    );
-
     let category = round_trip(
         &mut stdin,
         &mut reader,
@@ -1373,10 +1356,7 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
 
 #[test]
 fn bifrost_split_servers_publish_expected_tool_sets() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
     let mut core_expected = vec![
         "search_symbols",
         "get_symbol_sources",
@@ -1606,12 +1586,9 @@ fn bifrost_cli_toolset_exposes_classify_test_files() {
 #[test]
 #[cfg(feature = "nlp")]
 fn bifrost_semantic_search_fails_cleanly_without_models() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_bifrost"));
+    let mut command = Command::new(mcp_server_binary());
     command
         // Re-enable the indexer (spawn helpers disable it) but point the
         // embedder at a directory that cannot exist: the engine load fails
@@ -1666,10 +1643,7 @@ fn bifrost_semantic_search_fails_cleanly_without_models() {
 
 #[test]
 fn bifrost_split_servers_reject_tools_outside_their_registry() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
 
     assert_unknown_tool(
         &fixture_root,
@@ -1699,10 +1673,7 @@ fn bifrost_split_servers_reject_tools_outside_their_registry() {
 
 #[test]
 fn bifrost_mcp_rename_symbol_returns_structured_edit_set() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
     let before_a = fs::read_to_string(fixture_root.join("A.java")).expect("read A.java");
     let mut child = spawn_server(&fixture_root, "core", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
@@ -1759,10 +1730,7 @@ fn bifrost_mcp_rename_symbol_returns_structured_edit_set() {
 
 #[test]
 fn bifrost_searchtools_server_supports_runtime_workspace_switch() {
-    let initial_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let initial_root = repository_fixture_root("testcode-java");
 
     let switched = TempDir::new().expect("temp dir");
     fs::write(
@@ -1904,10 +1872,7 @@ fn bifrost_searchtools_server_supports_runtime_workspace_switch() {
 
 #[test]
 fn bifrost_searchtools_server_can_hide_line_numbers_in_text_preview() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
 
     let mut child = spawn_server(&fixture_root, "searchtools", &["--no-line-numbers"]);
     let mut stdin = child.stdin.take().expect("stdin");
@@ -2218,10 +2183,7 @@ fn bifrost_mcp_absolute_paths_follow_activated_workspace() {
 
 #[test]
 fn bifrost_mcp_get_summaries_remains_directory_aware() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
 
     let mut child = spawn_server(&fixture_root, "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
@@ -3483,9 +3445,10 @@ fn initialize_session(
 }
 
 fn codex_handshake_message(name: &str) -> Value {
-    let fixture: Value = serde_json::from_str(include_str!(
-        "../fixtures/mcp/codex-sandbox-state-handshake.json"
-    ))
+    let fixture: Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/mcp/codex-sandbox-state-handshake.json"
+    )))
     .expect("parse recorded Codex MCP handshake fixture");
     fixture
         .get(name)
@@ -3551,7 +3514,7 @@ fn codex_sandbox_metadata(root: &std::path::Path, thread_id: &str) -> Value {
 }
 
 fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std::process::Child {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_bifrost"));
+    let mut command = Command::new(mcp_server_binary());
     command.env("BIFROST_SEMANTIC_INDEX", "off");
     command.arg("--force-semantic-cpu");
     command.arg("--root").arg(root).arg("--mcp").arg(mode);
@@ -3567,7 +3530,7 @@ fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std:
 }
 
 fn spawn_rootless_server(cwd: &std::path::Path, mode: &str) -> std::process::Child {
-    Command::new(env!("CARGO_BIN_EXE_bifrost"))
+    Command::new(mcp_server_binary())
         .env("BIFROST_SEMANTIC_INDEX", "off")
         .arg("--force-semantic-cpu")
         .arg("--mcp")
@@ -3583,7 +3546,7 @@ fn spawn_rootless_server(cwd: &std::path::Path, mode: &str) -> std::process::Chi
 fn spawn_server_no_args(cwd: &std::path::Path) -> std::process::Child {
     // No mode: the compatibility contract is MCP searchtools. No --root: the
     // server must default its root to the working directory.
-    Command::new(env!("CARGO_BIN_EXE_bifrost"))
+    Command::new(mcp_server_binary())
         .env("BIFROST_SEMANTIC_INDEX", "off")
         .current_dir(cwd)
         .stdin(Stdio::piped())

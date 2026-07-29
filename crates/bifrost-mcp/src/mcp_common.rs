@@ -28,7 +28,8 @@ const GET_SUMMARIES_RESPONSE_BUDGET_BYTES: usize = 4_096;
 const MAX_IN_FLIGHT_CANCELLABLE_REQUESTS: usize = 4;
 const MAX_PENDING_MCP_RESPONSES: usize = 4;
 const MCP_ANALYZER_REQUEST_BUDGET: Duration = Duration::from_secs(5);
-pub(crate) const BENCHMARK_MCP_REQUEST_BUDGET_SECS: u64 = 60;
+#[doc(hidden)]
+pub const BENCHMARK_MCP_REQUEST_BUDGET_SECS: u64 = 60;
 const AGENTS_GUIDANCE_URI: &str = "bifrost://agent-guidance/agents.md";
 const AGENTS_GUIDANCE_MIME_TYPE: &str = "text/markdown";
 const ROOTS_REQUEST_ID_PREFIX: &str = "bifrost-roots-";
@@ -36,12 +37,15 @@ const CODEX_MCP_CLIENT_NAME: &str = "codex-mcp-client";
 const CODEX_SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
 const AGENTS_GUIDANCE_TEXT: &str = include_str!("../resources/agent-guidance/bifrost-agents.md");
 
-pub(crate) const BENCHMARK_PROFILE_BOUNDARY_METHOD: &str = "bifrost/benchmark-profile-boundary";
-pub(crate) const BENCHMARK_PROFILE_BOUNDARY_MARKER: &str =
+#[doc(hidden)]
+pub const BENCHMARK_PROFILE_BOUNDARY_METHOD: &str = "bifrost/benchmark-profile-boundary";
+#[doc(hidden)]
+pub const BENCHMARK_PROFILE_BOUNDARY_MARKER: &str =
     "\n\u{1e}bifrost-benchmark-profile-boundary\u{1e}\n";
-pub(crate) const MCP_FILE_WATCHER_ENV: &str = "BIFROST_MCP_FILE_WATCHER";
-pub(crate) const BENCHMARK_MCP_REQUEST_BUDGET_SECS_ENV: &str =
-    "BIFROST_BENCHMARK_MCP_REQUEST_BUDGET_SECS";
+#[doc(hidden)]
+pub const MCP_FILE_WATCHER_ENV: &str = "BIFROST_MCP_FILE_WATCHER";
+#[doc(hidden)]
+pub const BENCHMARK_MCP_REQUEST_BUDGET_SECS_ENV: &str = "BIFROST_BENCHMARK_MCP_REQUEST_BUDGET_SECS";
 
 pub const SEARCHTOOLS_INSTRUCTIONS: &str =
     "Analyzer-backed search tools for source code workspaces.";
@@ -355,6 +359,15 @@ pub fn run_stdio_server(
     render_options: McpRenderOptions,
     spec: &McpServerSpec,
 ) -> Result<(), String> {
+    run_stdio_server_with_build_identity(root, render_options, spec, env!("CARGO_PKG_VERSION"))
+}
+
+pub fn run_stdio_server_with_build_identity(
+    root: Option<PathBuf>,
+    render_options: McpRenderOptions,
+    spec: &McpServerSpec,
+    build_identity: &str,
+) -> Result<(), String> {
     // Explicit roots build in the background. Rootless servers answer initialize
     // without touching process cwd and bind only from a client-provided workspace.
     let accepts_client_roots = root.is_none();
@@ -499,6 +512,7 @@ pub fn run_stdio_server(
                         message,
                         render_options,
                         spec,
+                        build_identity,
                     )
                 }
             }
@@ -713,6 +727,7 @@ fn dispatch_message(
     message: Value,
     render_options: McpRenderOptions,
     spec: &McpServerSpec,
+    build_identity: &str,
 ) -> Option<Value> {
     let Some(object) = message.as_object() else {
         return Some(error_response(
@@ -793,6 +808,7 @@ fn dispatch_message(
                 params,
                 render_options,
                 spec,
+                build_identity,
             ))
         }
         None => handle_notification(service, connection, cancellations, method, params),
@@ -921,11 +937,13 @@ fn dispatch_request(
     params: Value,
     render_options: McpRenderOptions,
     spec: &McpServerSpec,
+    build_identity: &str,
 ) -> Value {
     let response = match method {
         "initialize" => Ok(initialize_result(
             spec.instructions,
             connection.accepts_codex_sandbox_state(),
+            build_identity,
         )),
         "ping" => Ok(json!({})),
         BENCHMARK_PROFILE_BOUNDARY_METHOD => write_benchmark_profile_boundary(),
@@ -996,7 +1014,11 @@ fn handle_notification(
     }
 }
 
-fn initialize_result(instructions: &str, advertise_codex_sandbox_state: bool) -> Value {
+fn initialize_result(
+    instructions: &str,
+    advertise_codex_sandbox_state: bool,
+    build_identity: &str,
+) -> Value {
     let mut result = json!({
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": {
@@ -1006,7 +1028,7 @@ fn initialize_result(instructions: &str, advertise_codex_sandbox_state: bool) ->
         "serverInfo": {
             "name": "bifrost",
             "version": env!("CARGO_PKG_VERSION"),
-            "buildIdentity": crate::BIFROST_BUILD_IDENTITY,
+            "buildIdentity": build_identity,
         },
         "instructions": instructions,
     });
@@ -2861,12 +2883,18 @@ mod uri_tests {
         std::fs::create_dir_all(dir.path().join("policies")).expect("policy directory");
         std::fs::write(
             dir.path().join("src/app.py"),
-            include_str!("../tests/fixtures/policy-cli/project/src/app.py"),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/policy-cli/project/src/app.py"
+            )),
         )
         .expect("write source");
         std::fs::write(
             dir.path().join("policies/dynamic-eval.rqlp"),
-            include_str!("../tests/fixtures/policy-cli/project/policies/dynamic-eval.rqlp"),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/policy-cli/project/policies/dynamic-eval.rqlp"
+            )),
         )
         .expect("write policy");
         let service =
