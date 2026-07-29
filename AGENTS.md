@@ -60,6 +60,18 @@ pushing rather than waiting for the CI matrix to report it back.
 Full test-suite gates must pass `--features nlp,python`: `default = []`, so a featureless `cargo test` silently
 skips every `#![cfg(feature = "nlp")]` integration suite (they report `ok. 0 passed`, which looks green).
 
+The `python` feature needs a Python interpreter at or above the `abi3-py312` floor, and pyo3's build script resolves
+`python3` through `PATH` — not through a shell alias. On macOS `/usr/bin/python3` (3.9) usually wins that lookup even
+when your interactive `python3` is newer, which fails the build with "cannot set a minimum Python version 3.12 higher
+than the interpreter version 3.9". Point pyo3 at a suitable interpreter when that happens:
+
+    PYO3_PYTHON=$(brew --prefix python@3.13)/bin/python3.13 cargo test --features nlp,python
+
+Do not enable `extension-module` for tests. It suppresses libpython linkage, which is right for the wheel (the host
+interpreter supplies `Py*` at load time) and fatal for any executable, so a test build fails with undefined `_Py*`
+symbols while linking the cdylib. Maturin turns it on for the wheel via `pyproject.toml`; leave it off everywhere else.
+This also means `cargo test --all-features` is not a substitute for `--features nlp,python`.
+
 We are okay with allow(clippy::too_many_arguments) rather than packing necessary parms into a struct just to
 make clippy shut up.
 

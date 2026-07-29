@@ -125,7 +125,7 @@ moka = { version = "0.12.11", features = ["sync"] }
 notify = "6.1.1"
 nu-ansi-term = "0.50"
 once_cell = "1.21.3"
-pyo3 = { version = "0.23.5", features = ["abi3-py312", "extension-module"], optional = true }
+pyo3 = { version = "0.23.5", features = ["abi3-py312"], optional = true }
 rayon = "1.10.0"
 reedline = "0.49"
 regex = "1.12.2"
@@ -191,6 +191,14 @@ nlp = ["dep:hf-hub", "dep:tokenizers", "dep:fastrq"]
 # Maturin turns this on automatically via pyproject.toml; the `bifrost` CLI
 # binary builds without it on every platform.
 python = ["dep:pyo3"]
+# Suppresses libpython linkage, which a Python extension needs (the host
+# interpreter supplies `Py*` at load time) and an executable cannot tolerate
+# (the symbols stay undefined and the link fails). Kept out of `python` so
+# `cargo test --features python` can link its test binaries; maturin turns it
+# on for the cdylib via pyproject.toml. Building the cdylib without maturin
+# still fails to link, exactly as before -- maturin supplies the
+# `-undefined dynamic_lookup` that a bare `cargo build` does not.
+extension-module = ["pyo3/extension-module"]
 
 [dev-dependencies]
 filetime = "0.2"
