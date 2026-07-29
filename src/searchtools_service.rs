@@ -22,6 +22,7 @@ use crate::{
     file_tools::{
         find_filenames, find_files_containing, get_file_contents, list_files, search_file_contents,
     },
+    path_normalization::NormalizePath,
     profiling,
     searchtools::{
         ActivateWorkspaceParams, ActiveWorkspaceResult, GetActiveWorkspaceParams,
@@ -1414,7 +1415,8 @@ impl SearchToolsService {
     ) -> Result<Self, String> {
         let canonical = root
             .canonicalize()
-            .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?;
+            .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?
+            .normalize();
         if !canonical.is_dir() {
             return Err(format!(
                 "project root is not a directory: {}",
@@ -1504,12 +1506,15 @@ impl SearchToolsService {
     /// The persisted analyzer builds in the background so workspace negotiation
     /// cannot consume an admitted tool request's interactive latency budget.
     pub fn bind_client_workspace(&self, root: PathBuf) -> Result<PathBuf, SearchToolsServiceError> {
-        let canonical = root.canonicalize().map_err(|err| {
-            SearchToolsServiceError::invalid_params(format!(
-                "Failed to resolve client workspace root {}: {err}",
-                root.display()
-            ))
-        })?;
+        let canonical = root
+            .canonicalize()
+            .map_err(|err| {
+                SearchToolsServiceError::invalid_params(format!(
+                    "Failed to resolve client workspace root {}: {err}",
+                    root.display()
+                ))
+            })?
+            .normalize();
         if !canonical.is_dir() {
             return Err(SearchToolsServiceError::invalid_params(format!(
                 "Client workspace root is not a directory: {}",
@@ -1634,7 +1639,8 @@ impl SearchToolsService {
         let semantic_indexing = semantic_indexing_enabled();
         let canonical = root
             .canonicalize()
-            .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?;
+            .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?
+            .normalize();
         if !canonical.is_dir() {
             return Err(format!(
                 "project root is not a directory: {}",
@@ -2853,7 +2859,8 @@ fn start_session_watcher(
 fn resolve_workspace_root(path: &Path) -> Result<PathBuf, String> {
     let canonical = path
         .canonicalize()
-        .map_err(|err| format!("{err} ({})", path.display()))?;
+        .map_err(|err| format!("{err} ({})", path.display()))?
+        .normalize();
     if !canonical.is_dir() {
         return Err(format!("not a directory: {}", canonical.display()));
     }
@@ -2862,7 +2869,7 @@ fn resolve_workspace_root(path: &Path) -> Result<PathBuf, String> {
         && let Some(workdir) = repo.workdir()
         && let Ok(canon_workdir) = workdir.canonicalize()
     {
-        return Ok(canon_workdir);
+        return Ok(canon_workdir.normalize());
     }
 
     Ok(canonical)
