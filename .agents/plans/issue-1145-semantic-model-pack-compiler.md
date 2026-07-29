@@ -12,10 +12,10 @@ This issue stops at the schema/compiler boundary. The produced pack is not insta
 
 - [x] (2026-07-29 07:21Z) Refreshed the live branch, remote, and issue #1145 state and confirmed that the existing issue branch is clean.
 - [x] (2026-07-29 07:21Z) Inspected the analyzer module boundary, canonical hashing helper, identifier rules, packaging exclusions, and documentation navigation.
-- [ ] Add the strict public authoring model, source loaders, validation, compiler options, diagnostics, and generated JSON Schema.
-- [ ] Add the canonical compiled manifest/shard model, stable semantic/content/stored digests, deterministic routing metadata, measured raw-DEFLATE compression, and bounded decoder.
-- [ ] Add declaration and generator fixtures plus behavior-focused integration tests for equivalence, invalid inputs, corruption, non-canonical bytes, and resource caps.
-- [ ] Add public semantic-model-pack documentation and documentation example checks.
+- [x] (2026-07-29 08:13Z) Added the strict public authoring model, source loaders, validation, compiler options, diagnostics, and generated JSON Schema.
+- [x] (2026-07-29 08:13Z) Added the canonical compiled manifest/shard model, stable semantic/content/stored digests, deterministic routing metadata, measured raw-DEFLATE compression, and bounded decoder.
+- [x] (2026-07-29 08:13Z) Added declaration and generator fixtures plus behavior-focused integration and unit tests for equivalence, invalid inputs, corruption, non-canonical bytes, cross-shard references, and resource caps.
+- [x] (2026-07-29 08:13Z) Added public semantic-model-pack documentation, sidebar navigation, and exact fixture-backed documentation checks.
 - [ ] Run specialist review, address confirmed findings, execute the complete Rust/docs/package/policy validation matrix, and record outcomes.
 
 ## Surprises & Discoveries
@@ -24,6 +24,10 @@ This issue stops at the schema/compiler boundary. The produced pack is not insta
   Evidence: `git rev-list --left-right --count HEAD...origin/master` returned `0 5`; work continues on the prepared branch.
 - Observation: The installed Bifrost navigation skill is present, but its MCP search and source-reading tools are not callable in this session.
   Evidence: the active tool inventory contained no `search_symbols`, `get_symbol_sources`, or `get_summaries` entry, so repository-local `rg` and focused file reads are the available fallback.
+- Observation: Declaration references must be collected across the whole pack before individual shards can be validated, because a member or relation may point into a later shard.
+  Evidence: the focused `cross_shard_references_are_resolved_after_global_collection` test moves the owning type to a later shard and compiles successfully after validation became two-pass.
+- Observation: The shared default Cargo target contains an incompatible build-script artifact even though both diagnostics print the same Rust version; isolated targets are unaffected.
+  Evidence: `cargo clippy --lib --tests -- -D warnings` failed with E0514 for `cc`, while the managed isolated `cargo check --lib` and all focused test binaries compiled successfully. Final validation will use the required isolated-target helper rather than cleaning shared user artifacts.
 
 ## Decision Log
 
@@ -42,10 +46,16 @@ This issue stops at the schema/compiler boundary. The produced pack is not insta
 - Decision: Do not introduce analyzer activation or conversion adapters in this change.
   Rationale: Existing JVM and C# external declarations are useful vocabulary references, but connecting compiled packs to analyzers would cross the runtime-matching and installation boundaries explicitly excluded by #1145.
   Date/Author: 2026-07-29 / Codex
+- Decision: Distinguish stable-ID template positions from language-name template positions during validation.
+  Rationale: Stable IDs intentionally accept only lowercase portable characters, while real declaration names may be qualified or case-sensitive. Applying the stable-ID rule to both would reject valid generated declarations and still fail to constrain ID-only transforms.
+  Date/Author: 2026-07-29 / Codex
+- Decision: Validate declaration references after a pack-wide declaration-ID collection pass.
+  Rationale: Shards are routing/storage boundaries, not semantic visibility boundaries; source order must not decide whether a cross-shard owner or relation reference is valid.
+  Date/Author: 2026-07-29 / Codex
 
 ## Outcomes & Retrospective
 
-Implementation is in progress. This section will record the delivered API, verification evidence, and any deferred limitations after the final validation milestone.
+The version-one authoring and artifact contract is implemented and its focused checks are green: 13 integration tests cover schema/source/compiler behavior, three unit tests cover internally consistent adversarial compressed artifacts, and one docs test ties both published examples to checked fixtures. Specialist review and the full release-validation matrix remain before completion.
 
 ## Context and Orientation
 
@@ -150,3 +160,5 @@ The public types include `AuthoredSemanticModelPack`, `CompiledSemanticModelPack
 Add direct dependencies on `serde-saphyr` for strict reviewed YAML, `schemars` for a Rust-derived JSON Schema, `spdx` for standard license-expression validation, and `flate2` for a fixed raw-DEFLATE codec. Reuse `serde`, `serde_json`, `semver`, `sha2`, and `src/analyzer/canonical_hash.rs` already present in the crate.
 
 Plan revision note (2026-07-29 07:21Z): Created the initial self-contained implementation plan after refreshing the live issue and repository state. It fixes the typed-plus-source API, canonical JSON artifact, digest boundaries, compression rule, resource limits, and strict follow-on issue boundaries approved in the preceding planning discussion.
+
+Plan revision note (2026-07-29 08:13Z): Marked the authoring, artifact, fixture, and documentation milestones complete after focused tests passed; recorded the two-pass cross-shard reference requirement, separate stable-ID/language-name template validation, and the shared-target compiler contamination that makes isolated final checks mandatory.

@@ -1,0 +1,1097 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AuthoredSemanticModelPack",
+  "type": "object",
+  "properties": {
+    "compatibility": {
+      "$ref": "#/$defs/Compatibility"
+    },
+    "completeness": {
+      "$ref": "#/$defs/Completeness"
+    },
+    "ecosystem": {
+      "type": "string"
+    },
+    "language": {
+      "type": "string"
+    },
+    "license": {
+      "type": "string"
+    },
+    "pack_id": {
+      "type": "string"
+    },
+    "producer": {
+      "$ref": "#/$defs/Producer"
+    },
+    "provenance": {
+      "$ref": "#/$defs/Provenance"
+    },
+    "safety": {
+      "$ref": "#/$defs/Safety"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "shards": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AuthoredShard"
+      }
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "pack_id",
+    "version",
+    "producer",
+    "language",
+    "ecosystem",
+    "compatibility",
+    "provenance",
+    "license",
+    "completeness",
+    "safety",
+    "shards"
+  ],
+  "$defs": {
+    "ActivationSelector": {
+      "type": "object",
+      "properties": {
+        "artifact_sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "configurations": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "module": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NameSelector"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "package": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NameSelector"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "targets": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "toolchain": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NameSelector"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "AsciiTransform": {
+      "type": "string",
+      "enum": [
+        "lowercase",
+        "uppercase",
+        "snake_case",
+        "kebab_case",
+        "pascal_case",
+        "camel_case"
+      ]
+    },
+    "AuthoredPayload": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "declaration_facts"
+            },
+            "members": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/MemberFact"
+              }
+            },
+            "relations": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/RelationFact"
+              }
+            },
+            "types": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/TypeFact"
+              }
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "generator_rules"
+            },
+            "rules": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/GeneratorRule"
+              }
+            }
+          },
+          "required": [
+            "kind",
+            "rules"
+          ]
+        }
+      ]
+    },
+    "AuthoredShard": {
+      "type": "object",
+      "properties": {
+        "activation": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ActivationSelector"
+          }
+        },
+        "id": {
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/AuthoredPayload"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "activation",
+        "payload"
+      ]
+    },
+    "CaptureCardinality": {
+      "type": "string",
+      "enum": [
+        "one",
+        "optional",
+        "many"
+      ]
+    },
+    "CaptureDeclaration": {
+      "type": "object",
+      "properties": {
+        "cardinality": {
+          "$ref": "#/$defs/CaptureCardinality"
+        },
+        "name": {
+          "type": "string"
+        },
+        "value_kind": {
+          "$ref": "#/$defs/CaptureValueKind"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "value_kind",
+        "cardinality"
+      ]
+    },
+    "CaptureValueKind": {
+      "type": "string",
+      "enum": [
+        "identifier",
+        "type",
+        "string",
+        "path"
+      ]
+    },
+    "Compatibility": {
+      "type": "object",
+      "properties": {
+        "bifrost": {
+          "type": "string"
+        },
+        "toolchains": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/VersionConstraint"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "bifrost"
+      ]
+    },
+    "Completeness": {
+      "type": "string",
+      "enum": [
+        "partial",
+        "complete"
+      ]
+    },
+    "EmittedDeclarationKind": {
+      "type": "string",
+      "enum": [
+        "type",
+        "member"
+      ]
+    },
+    "GeneratorRule": {
+      "type": "object",
+      "properties": {
+        "captures": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/CaptureDeclaration"
+          }
+        },
+        "emissions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RuleEmission"
+          }
+        },
+        "id": {
+          "type": "string"
+        },
+        "trigger": {
+          "$ref": "#/$defs/RuleTrigger"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "trigger",
+        "emissions"
+      ]
+    },
+    "Locator": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "source"
+            },
+            "path": {
+              "type": "string"
+            },
+            "symbol": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "artifact"
+            },
+            "path": {
+              "type": "string"
+            },
+            "symbol": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "path",
+            "symbol"
+          ]
+        }
+      ]
+    },
+    "MemberFact": {
+      "type": "object",
+      "properties": {
+        "aliases": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "id": {
+          "type": "string"
+        },
+        "locator": {
+          "$ref": "#/$defs/Locator"
+        },
+        "member_kind": {
+          "$ref": "#/$defs/MemberKind"
+        },
+        "name": {
+          "type": "string"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "signature": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Signature"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "owner",
+        "name",
+        "member_kind",
+        "locator"
+      ]
+    },
+    "MemberKind": {
+      "type": "string",
+      "enum": [
+        "constructor",
+        "method",
+        "function",
+        "field",
+        "property",
+        "constant",
+        "event"
+      ]
+    },
+    "NameSelector": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "Parameter": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "optional": {
+          "type": "boolean",
+          "default": false
+        },
+        "type": {
+          "$ref": "#/$defs/TypeRef"
+        },
+        "variadic": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type"
+      ]
+    },
+    "Producer": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version"
+      ]
+    },
+    "Provenance": {
+      "type": "object",
+      "properties": {
+        "revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source"
+      ]
+    },
+    "RelationFact": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "relation_kind": {
+          "$ref": "#/$defs/RelationKind"
+        },
+        "to": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "relation_kind",
+        "from",
+        "to"
+      ]
+    },
+    "RelationKind": {
+      "type": "string",
+      "enum": [
+        "owns",
+        "extends",
+        "implements",
+        "aliases",
+        "navigates_to",
+        "references"
+      ]
+    },
+    "RuleEmission": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "declaration_kind": {
+              "$ref": "#/$defs/EmittedDeclarationKind"
+            },
+            "id": {
+              "$ref": "#/$defs/TemplateExpression"
+            },
+            "kind": {
+              "type": "string",
+              "const": "declaration"
+            },
+            "name": {
+              "$ref": "#/$defs/TemplateExpression"
+            },
+            "owner": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TemplateExpression"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TemplateTypeRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "name",
+            "declaration_kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "from": {
+              "$ref": "#/$defs/TemplateExpression"
+            },
+            "id": {
+              "$ref": "#/$defs/TemplateExpression"
+            },
+            "kind": {
+              "type": "string",
+              "const": "alias"
+            },
+            "to": {
+              "$ref": "#/$defs/TemplateExpression"
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "from",
+            "to"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "from": {
+              "$ref": "#/$defs/TemplateExpression"
+            },
+            "id": {
+              "$ref": "#/$defs/TemplateExpression"
+            },
+            "kind": {
+              "type": "string",
+              "const": "relation"
+            },
+            "relation_kind": {
+              "$ref": "#/$defs/RelationKind"
+            },
+            "to": {
+              "$ref": "#/$defs/TemplateExpression"
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "relation_kind",
+            "from",
+            "to"
+          ]
+        }
+      ]
+    },
+    "RuleTrigger": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "construct": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "language_construct"
+            }
+          },
+          "required": [
+            "kind",
+            "construct"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "annotation"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "macro_invocation"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "generator_invocation"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "resolved_owner"
+            },
+            "owner": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "owner"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "resolved_call"
+            },
+            "name": {
+              "type": "string"
+            },
+            "owner": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "owner",
+            "name"
+          ]
+        }
+      ]
+    },
+    "Safety": {
+      "type": "object",
+      "properties": {
+        "generated_code_only": {
+          "type": "boolean",
+          "default": false
+        },
+        "review_required": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "Signature": {
+      "type": "object",
+      "properties": {
+        "parameters": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Parameter"
+          }
+        },
+        "returns": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TypeRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type_parameters": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "TemplateExpression": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "op": {
+              "type": "string",
+              "const": "literal"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "op": {
+              "type": "string",
+              "const": "capture"
+            }
+          },
+          "required": [
+            "op",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": {
+              "type": "string",
+              "const": "concat"
+            },
+            "values": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/TemplateExpression"
+              }
+            }
+          },
+          "required": [
+            "op",
+            "values"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": {
+              "type": "string",
+              "const": "transform"
+            },
+            "transform": {
+              "$ref": "#/$defs/AsciiTransform"
+            },
+            "value": {
+              "$ref": "#/$defs/TemplateExpression"
+            }
+          },
+          "required": [
+            "op",
+            "transform",
+            "value"
+          ]
+        }
+      ]
+    },
+    "TemplateTypeRef": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "arguments": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/TemplateTypeRef"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "const": "named"
+            },
+            "name": {
+              "$ref": "#/$defs/TemplateExpression"
+            },
+            "nullable": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": [
+            "kind",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "capture"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "element": {
+              "$ref": "#/$defs/TemplateTypeRef"
+            },
+            "kind": {
+              "type": "string",
+              "const": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "element"
+          ]
+        }
+      ]
+    },
+    "TypeFact": {
+      "type": "object",
+      "properties": {
+        "aliases": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "extension_surfaces": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "id": {
+          "type": "string"
+        },
+        "locator": {
+          "$ref": "#/$defs/Locator"
+        },
+        "name": {
+          "type": "string"
+        },
+        "supertypes": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TypeRef"
+          }
+        },
+        "type_kind": {
+          "$ref": "#/$defs/TypeKind"
+        },
+        "type_parameters": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "type_kind",
+        "locator"
+      ]
+    },
+    "TypeKind": {
+      "type": "string",
+      "enum": [
+        "class",
+        "interface",
+        "trait",
+        "struct",
+        "enum",
+        "record",
+        "module",
+        "type_alias"
+      ]
+    },
+    "TypeRef": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "arguments": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/TypeRef"
+              }
+            },
+            "id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "named"
+            },
+            "nullable": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "type_parameter"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "element": {
+              "$ref": "#/$defs/TypeRef"
+            },
+            "kind": {
+              "type": "string",
+              "const": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "element"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "elements": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/TypeRef"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "const": "tuple"
+            }
+          },
+          "required": [
+            "kind",
+            "elements"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "function"
+            },
+            "parameters": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/TypeRef"
+              }
+            },
+            "result": {
+              "$ref": "#/$defs/TypeRef"
+            }
+          },
+          "required": [
+            "kind",
+            "parameters",
+            "result"
+          ]
+        }
+      ]
+    },
+    "VersionConstraint": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "requirement": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "requirement"
+      ]
+    }
+  }
+}
