@@ -10,9 +10,9 @@ mod source;
 mod validate;
 
 pub use artifact::{
-    ArtifactEncoding, ArtifactError, CompiledPackManifest, CompiledSemanticModelPack,
-    CompiledShard, CompiledShardDescriptor, DecodeLimits, PayloadKind, decode_manifest,
-    decode_shard,
+    ArtifactEncoding, ArtifactError, CompiledPackManifest, CompiledPayload,
+    CompiledSemanticModelPack, CompiledShard, CompiledShardDescriptor, DecodeLimits, PayloadKind,
+    decode_manifest, decode_shard, decode_shard_for_manifest,
 };
 pub use compiler::{CompilerOptions, CompressionPolicy, compile_pack, compile_source};
 pub use model::*;

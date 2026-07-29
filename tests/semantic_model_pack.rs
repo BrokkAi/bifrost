@@ -82,7 +82,7 @@ fn ordered_parameter_changes_semantic_identity() {
             .push(Parameter {
                 name: "second".to_owned(),
                 r#type: TypeRef::Named {
-                    id: "java.lang.Integer".to_owned(),
+                    name: "java.lang.Integer".to_owned(),
                     arguments: Vec::new(),
                     nullable: false,
                 },
@@ -153,13 +153,79 @@ fn unknown_fields_versions_and_yaml_extensions_are_rejected() {
 }
 
 #[test]
+fn unknown_fields_are_rejected_inside_every_tagged_variant_family() {
+    for (source, pointers) in [
+        (
+            DECLARATIONS_JSON,
+            vec![
+                "/shards/0/payload",
+                "/shards/0/payload/types/0/hierarchy/0/target",
+            ],
+        ),
+        (
+            RULES_JSON,
+            vec![
+                "/shards/0/payload/rules/0/trigger",
+                "/shards/0/payload/rules/0/emissions/0/declaration",
+                "/shards/0/payload/rules/0/emissions/0/id",
+            ],
+        ),
+    ] {
+        for pointer in pointers {
+            let mut value: serde_json::Value = serde_json::from_slice(source).unwrap();
+            value
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
+            let encoded = serde_json::to_vec(&value).unwrap();
+            for format in [SourceFormat::Json, SourceFormat::Yaml] {
+                let diagnostics =
+                    compile_source(format, &encoded, &CompilerOptions::default()).unwrap_err();
+                assert_eq!(
+                    diagnostics[0].code, "source.parse",
+                    "{format:?} accepted unknown field at {pointer}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn schema_pins_version_one_exactly() {
+    let schema: serde_json::Value = serde_json::from_str(&authoring_json_schema()).unwrap();
+    let version = &schema["properties"]["schema_version"];
+    assert_eq!(version["minimum"], 1);
+    assert_eq!(version["maximum"], 1);
+}
+
+#[test]
+fn language_names_and_owner_type_parameters_are_not_stable_ids() {
+    let mut authored = authored_declarations();
+    let AuthoredPayload::DeclarationFacts { types, members, .. } = &mut authored.shards[0].payload
+    else {
+        unreachable!()
+    };
+    types[0].type_parameters = vec!["TValue".to_owned()];
+    members[0].name = "getURL".to_owned();
+    let signature = members[0].signature.as_mut().unwrap();
+    signature.parameters[0].name = "_value".to_owned();
+    signature.returns = Some(TypeRef::TypeParameter {
+        name: "TValue".to_owned(),
+    });
+
+    compile_pack(&authored, &CompilerOptions::default()).unwrap();
+}
+
+#[test]
 fn capture_type_cardinality_and_identifier_errors_are_aggregated() {
     let mut authored: AuthoredSemanticModelPack = serde_json::from_slice(RULES_JSON).unwrap();
     let AuthoredPayload::GeneratorRules { rules } = &mut authored.shards[0].payload else {
         unreachable!()
     };
     rules[0].captures[0].cardinality = CaptureCardinality::Many;
-    rules[0].captures[1].value_kind = CaptureValueKind::String;
+    rules[0].captures[2].value_kind = CaptureValueKind::String;
     rules[0].emissions.push(RuleEmission::Alias {
         id: TemplateExpression::Literal {
             value: "INVALID ID".to_owned(),
@@ -168,12 +234,22 @@ fn capture_type_cardinality_and_identifier_errors_are_aggregated() {
             name: "missing".to_owned(),
         },
         to: TemplateExpression::Capture {
-            name: "entity".to_owned(),
+            name: "owner_id".to_owned(),
         },
     });
     let diagnostics = compile_pack(&authored, &CompilerOptions::default()).unwrap_err();
 
     assert!(diagnostics.iter().any(|d| d.code == "capture.cardinality"));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.code == "capture.binding_cardinality_mismatch")
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.code == "capture.binding_type_mismatch")
+    );
     assert!(
         diagnostics
             .iter()
@@ -185,6 +261,130 @@ fn capture_type_cardinality_and_identifier_errors_are_aggregated() {
             .iter()
             .any(|d| d.code == "template.invalid_identifier_literal")
     );
+}
+
+#[test]
+fn provenance_changes_content_but_not_semantic_identity() {
+    let baseline = compile_pack(&authored_declarations(), &CompilerOptions::default()).unwrap();
+    let mut authored = authored_declarations();
+    authored.producer.name = "different-scanner".to_owned();
+    authored.provenance.source = "https://mirror.example/widget.jar".to_owned();
+    authored.license = "MIT".to_owned();
+    let changed = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+
+    assert_eq!(
+        baseline.shards[0].descriptor.semantic_sha256,
+        changed.shards[0].descriptor.semantic_sha256
+    );
+    assert_eq!(
+        baseline.manifest.semantic_sha256,
+        changed.manifest.semantic_sha256
+    );
+    assert_ne!(
+        baseline.shards[0].descriptor.content_sha256,
+        changed.shards[0].descriptor.content_sha256
+    );
+    assert_ne!(
+        baseline.manifest.content_sha256,
+        changed.manifest.content_sha256
+    );
+}
+
+#[test]
+fn automatic_compression_uses_the_documented_threshold() {
+    let mut minimal = authored_declarations();
+    minimal.producer.name = "p".to_owned();
+    minimal.language = "j".to_owned();
+    minimal.ecosystem = "e".to_owned();
+    minimal.compatibility.bifrost = "*".to_owned();
+    minimal.compatibility.toolchains.clear();
+    minimal.provenance.source = "s".to_owned();
+    minimal.provenance.revision = None;
+    minimal.shards[0].activation[0] = ActivationSelector {
+        package: Some(NameSelector {
+            name: "p".to_owned(),
+            version: None,
+        }),
+        module: None,
+        toolchain: None,
+        targets: Vec::new(),
+        configurations: Vec::new(),
+        artifact_sha256: None,
+    };
+    let AuthoredPayload::DeclarationFacts {
+        types,
+        members,
+        relations,
+    } = &mut minimal.shards[0].payload
+    else {
+        unreachable!()
+    };
+    types[0].name = "T".to_owned();
+    types[0].type_parameters.clear();
+    types[0].hierarchy.clear();
+    types[0].aliases.clear();
+    types[0].extension_surfaces.clear();
+    types[0].locator = Locator::Artifact {
+        path: "T".to_owned(),
+        symbol: "T".to_owned(),
+    };
+    members.clear();
+    relations.clear();
+    let small = compile_pack(&minimal, &CompilerOptions::default()).unwrap();
+    assert_eq!(small.shards[0].descriptor.encoding, ArtifactEncoding::Raw);
+
+    let mut authored = authored_declarations();
+    let AuthoredPayload::DeclarationFacts { relations, .. } = &mut authored.shards[0].payload
+    else {
+        unreachable!()
+    };
+    for index in 0..200 {
+        relations.push(RelationFact {
+            id: format!("relation.widget.generated-{index}"),
+            relation_kind: RelationKind::References,
+            from: "member.widget.create".to_owned(),
+            to: "type.widget".to_owned(),
+        });
+    }
+    let large = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+    assert_eq!(
+        large.shards[0].descriptor.encoding,
+        ArtifactEncoding::Deflate
+    );
+}
+
+#[test]
+fn compiler_limits_keep_default_artifacts_decodable() {
+    let compiled = compile_pack(&authored_declarations(), &CompilerOptions::default()).unwrap();
+    let manifest = decode_manifest(&compiled.manifest_bytes, &DecodeLimits::default()).unwrap();
+    decode_shard_for_manifest(
+        &manifest,
+        &manifest.shards[0],
+        &compiled.shards[0].bytes,
+        &DecodeLimits::default(),
+    )
+    .unwrap();
+
+    let manifest_error = compile_pack(
+        &authored_declarations(),
+        &CompilerOptions {
+            max_manifest_bytes: 1,
+            ..CompilerOptions::default()
+        },
+    )
+    .unwrap_err();
+    assert_eq!(manifest_error[0].code, "limit.manifest_bytes");
+
+    let stored_error = compile_pack(
+        &authored_declarations(),
+        &CompilerOptions {
+            max_stored_shard_bytes: 1,
+            compression: CompressionPolicy::AlwaysDeflate,
+            ..CompilerOptions::default()
+        },
+    )
+    .unwrap_err();
+    assert_eq!(stored_error[0].code, "limit.stored_shard_bytes");
 }
 
 #[test]
@@ -306,9 +506,14 @@ fn checked_in_golden_artifacts_are_exact_and_decodable() {
         assert_eq!(compiled.shards[0].bytes, shard);
 
         let decoded_manifest = decode_manifest(manifest, &DecodeLimits::default()).unwrap();
-        let decoded_shard =
-            decode_shard(&decoded_manifest.shards[0], shard, &DecodeLimits::default()).unwrap();
-        assert_eq!(decoded_shard.pack_id, decoded_manifest.pack_id);
+        let decoded_shard = decode_shard_for_manifest(
+            &decoded_manifest,
+            &decoded_manifest.shards[0],
+            shard,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(decoded_shard.pack_id(), decoded_manifest.pack_id);
     }
 }
 
@@ -356,7 +561,7 @@ fn source_record_depth_and_selector_limits_fail_closed() {
         unreachable!()
     };
     let mut nested = TypeRef::Named {
-        id: "java.lang.String".to_owned(),
+        name: "java.lang.String".to_owned(),
         arguments: Vec::new(),
         nullable: false,
     };
@@ -365,7 +570,10 @@ fn source_record_depth_and_selector_limits_fail_closed() {
             element: Box::new(nested),
         };
     }
-    types[0].supertypes.push(nested);
+    types[0].hierarchy.push(HierarchyFact {
+        hierarchy_kind: HierarchyKind::Extends,
+        target: nested,
+    });
     authored.shards[0].activation[0].toolchain = Some(NameSelector {
         name: "unknown-toolchain".to_owned(),
         version: Some(">=1.0.0".to_owned()),
@@ -373,7 +581,7 @@ fn source_record_depth_and_selector_limits_fail_closed() {
     let diagnostics = compile_pack(
         &authored,
         &CompilerOptions {
-            max_records_per_shard: 2,
+            max_records_per_shard: 1,
             max_depth: 3,
             ..CompilerOptions::default()
         },

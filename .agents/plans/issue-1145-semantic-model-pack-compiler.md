@@ -16,7 +16,8 @@ This issue stops at the schema/compiler boundary. The produced pack is not insta
 - [x] (2026-07-29 08:13Z) Added the canonical compiled manifest/shard model, stable semantic/content/stored digests, deterministic routing metadata, measured raw-DEFLATE compression, and bounded decoder.
 - [x] (2026-07-29 08:13Z) Added declaration and generator fixtures plus behavior-focused integration and unit tests for equivalence, invalid inputs, corruption, non-canonical bytes, cross-shard references, and resource caps.
 - [x] (2026-07-29 08:13Z) Added public semantic-model-pack documentation, sidebar navigation, and exact fixture-backed documentation checks.
-- [ ] Run specialist review, address confirmed findings, execute the complete Rust/docs/package/policy validation matrix, and record outcomes.
+- [x] (2026-07-29 10:16Z) Ran architecture, security, intent, duplication, and DevOps reviews; addressed the confirmed schema, vocabulary, capture-binding, integrity, decoder-validation, cross-shard-reference, and compiler-limit findings.
+- [ ] Execute the complete Rust/docs/package/policy validation matrix and record outcomes.
 
 ## Surprises & Discoveries
 
@@ -28,6 +29,10 @@ This issue stops at the schema/compiler boundary. The produced pack is not insta
   Evidence: the focused `cross_shard_references_are_resolved_after_global_collection` test moves the owning type to a later shard and compiles successfully after validation became two-pass.
 - Observation: The shared default Cargo target contains an incompatible build-script artifact even though both diagnostics print the same Rust version; isolated targets are unaffected.
   Evidence: `cargo clippy --lib --tests -- -D warnings` failed with E0514 for `cc`, while the managed isolated `cargo check --lib` and all focused test binaries compiled successfully. Final validation will use the required isolated-target helper rather than cleaning shared user artifacts.
+- Observation: A syntactically strict compiled struct is not a sufficient trust boundary: compact JSON can still contain semantically invalid values or non-normalized semantic-set ordering after an attacker recomputes byte hashes.
+  Evidence: Specialist review produced both cases; the decoder now reconstructs an authored pack, runs bounded semantic validation, compares shared normalization, and adversarial tests rehash both invalid forms.
+- Observation: Cross-shard references cannot be fully validated by an independently decoded shard.
+  Evidence: descriptors now carry compiler-derived sorted definition/reference inventories, allowing manifest decoding to prove pack-wide uniqueness and reference closure before individual shards are loaded.
 
 ## Decision Log
 
@@ -52,6 +57,18 @@ This issue stops at the schema/compiler boundary. The produced pack is not insta
 - Decision: Validate declaration references after a pack-wide declaration-ID collection pass.
   Rationale: Shards are routing/storage boundaries, not semantic visibility boundaries; source order must not decide whether a cross-shard owner or relation reference is valid.
   Date/Author: 2026-07-29 / Codex
+- Decision: Bind captures to explicit trigger-relative sources and projections rather than declaring only their result type and cardinality.
+  Rationale: A machine-authored rule must say how a trigger produces each value. The typed binding also lets compilation reject unavailable sources, kind mismatches, and cardinality mismatches before runtime integration.
+  Date/Author: 2026-07-29 / Codex
+- Decision: Keep the decoded compiled payload behind an immutable validated wrapper and expose read-only typed views.
+  Rationale: Direct deserialization into publicly mutable authoring structures would let callers bypass normalization and semantic validation while presenting a value as compiled IR.
+  Date/Author: 2026-07-29 / Codex
+- Decision: Use ordinary SHA-256 for exact content and stored byte identities, and reserve domain-separated length-framed hashing for semantic identities.
+  Rationale: Content fields should be independently reproducible with standard tooling; semantic identity benefits from explicit domain separation. The public documentation specifies both domains and framing.
+  Date/Author: 2026-07-29 / Codex
+- Decision: Add a full manifest content digest and a manifest-bound shard decoder.
+  Rationale: The semantic digest intentionally excludes provenance, license, and producer, but those fields still require integrity protection and must agree with duplicated shard envelope fields.
+  Date/Author: 2026-07-29 / Codex
 
 ## Outcomes & Retrospective
 
@@ -63,7 +80,7 @@ The crate root is `src/lib.rs`, and analyzer-owned public APIs are exported thro
 
 An authored pack is the human- or producer-written value. A compiled pack is an in-memory manifest plus separately addressable shard byte strings. A shard is one independently loadable group containing exactly one payload kind: declaration facts or generator rules. Canonical means that one semantic value has one compact JSON encoding: object field order follows Rust struct field order, semantic sets are sorted by stable identifier, and ordered values such as parameters and concatenation operands retain their authored order. A routing key is a small manifest value, such as a package/module selector or generator trigger kind, that lets a later runtime avoid loading unrelated shards.
 
-Three digests serve different boundaries. The semantic digest covers activation, compatibility, completeness, safety, and the payload after default expansion. The content digest covers the entire uncompressed compiled shard including provenance and license. The stored digest covers the actual raw or compressed bytes and detects transport/storage corruption. Digests are lowercase SHA-256 hexadecimal strings with domain separation.
+Three shard digests serve different boundaries. The semantic digest covers activation, compatibility, completeness, safety, and the payload after default expansion. The content digest covers the entire uncompressed compiled shard including provenance and license. The stored digest covers the actual raw or compressed bytes and detects transport/storage corruption. Digests are lowercase SHA-256 hexadecimal strings; semantic digests use documented domain separation, while exact byte digests use ordinary SHA-256. A separate manifest content digest integrity-protects its complete non-self-referential view.
 
 The compiler enforces conservative defaults: at most 64 MiB of source input or uncompressed data per shard, 1 GiB across a pack, 4,096 shards, two million records per pack, 250,000 records per shard, 16 KiB per string, and depth 64 for type/template trees. All limits live in public option structs so tests and embedders can lower them defensively.
 
@@ -153,6 +170,13 @@ The live issue is `https://github.com/BrokkAi/bifrost/issues/1145`. Its parent e
         limits: &DecodeLimits,
     ) -> Result<CompiledShard, ArtifactError>;
 
+    pub fn decode_shard_for_manifest(
+        manifest: &CompiledPackManifest,
+        descriptor: &CompiledShardDescriptor,
+        bytes: &[u8],
+        limits: &DecodeLimits,
+    ) -> Result<CompiledShard, ArtifactError>;
+
     pub fn authoring_json_schema() -> String;
 
 The public types include `AuthoredSemanticModelPack`, `CompiledSemanticModelPack`, `CompiledPackManifest`, `CompiledShardDescriptor`, `CompiledShard`, `CompilerOptions`, `DecodeLimits`, `Diagnostic`, `SourceFormat`, and the tagged declaration/generator vocabulary. `CompilerOptions` carries source and semantic limits plus a compression policy with automatic, always-raw, and always-compressed modes. `DecodeLimits` independently caps manifest bytes, stored shard bytes, raw shard bytes, and total decoded records.
@@ -162,3 +186,5 @@ Add direct dependencies on `serde-saphyr` for strict reviewed YAML, `schemars` f
 Plan revision note (2026-07-29 07:21Z): Created the initial self-contained implementation plan after refreshing the live issue and repository state. It fixes the typed-plus-source API, canonical JSON artifact, digest boundaries, compression rule, resource limits, and strict follow-on issue boundaries approved in the preceding planning discussion.
 
 Plan revision note (2026-07-29 08:13Z): Marked the authoring, artifact, fixture, and documentation milestones complete after focused tests passed; recorded the two-pass cross-shard reference requirement, separate stable-ID/language-name template validation, and the shared-target compiler contamination that makes isolated final checks mandatory.
+
+Plan revision note (2026-07-29 10:16Z): Recorded and resolved specialist-review findings by tightening schema version/variant closure, adding trigger-bound captures and missing declaration vocabulary, separating the validated compiled boundary, covering full manifest integrity and envelope agreement, validating semantic canonicality on decode, carrying cross-shard reference inventories, and aligning compiler output limits with decoder defaults.

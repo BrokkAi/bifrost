@@ -29,27 +29,50 @@ shards:
             kind: annotation
             name: com.acme.GenerateBuilder
           captures:
+            - name: owner_id
+              binding:
+                source:
+                  kind: enclosing_declaration
+                projection: stable_id
+              value_kind: stable_id
+              cardinality: one
             - name: entity
+              binding:
+                source:
+                  kind: enclosing_declaration
+                projection: name
               value_kind: identifier
               cardinality: one
             - name: entity_type
+              binding:
+                source:
+                  kind: enclosing_declaration
+                projection: type
               value_kind: type
               cardinality: one
           emissions:
             - kind: declaration
               id:
-                op: transform
-                transform: snake_case
-                value:
-                  op: capture
-                  name: entity
+                op: concat
+                values:
+                  - op: capture
+                    name: owner_id
+                  - op: literal
+                    value: .builder
               name:
                 op: transform
                 transform: pascal_case
                 value:
                   op: capture
                   name: entity
-              declaration_kind: type
-              type:
-                kind: capture
-                name: entity_type
+              declaration:
+                kind: member
+                owner:
+                  op: capture
+                  name: owner_id
+                member_kind: method
+                visibility: public
+                signature:
+                  returns:
+                    kind: capture
+                    name: entity_type

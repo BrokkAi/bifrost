@@ -51,6 +51,26 @@ pub(crate) fn hash_domain_bytes(domain: &[u8], bytes: &[u8]) -> [u8; 32] {
     hasher.finish()
 }
 
+pub(crate) fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+pub(crate) fn lower_hex_string(bytes: &[u8; 32]) -> String {
+    let mut output = String::with_capacity(64);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output
+}
+
+pub(crate) fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 pub(crate) fn write_lower_hex(bytes: &[u8; 32], formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     for byte in bytes {
         write!(formatter, "{byte:02x}")?;

@@ -1,3 +1,6 @@
+mod common;
+
+use common::normalize_line_endings;
 use std::fs;
 use std::path::Path;
 
@@ -7,7 +10,9 @@ const MARKER: &str = "<!-- semantic-model-doc-test:";
 #[test]
 fn documented_source_examples_match_checked_fixtures() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let document = fs::read_to_string(root.join(DOC)).expect("read semantic-model docs");
+    let document = normalize_line_endings(
+        &fs::read_to_string(root.join(DOC)).expect("read semantic-model docs"),
+    );
     let mut found = Vec::new();
     let mut remainder = document.as_str();
 
@@ -23,7 +28,9 @@ fn documented_source_examples_match_checked_fixtures() {
         remainder = &remainder[fence_start..];
         let fence_end = remainder.find("\n```").expect("closed YAML fence");
         let documented = &remainder[..fence_end];
-        let checked = fs::read_to_string(root.join(fixture)).expect("read checked fixture");
+        let checked = normalize_line_endings(
+            &fs::read_to_string(root.join(fixture)).expect("read checked fixture"),
+        );
         assert_eq!(
             documented.trim_end(),
             checked.trim_end(),

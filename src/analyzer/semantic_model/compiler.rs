@@ -1,6 +1,7 @@
 use super::artifact::{
-    ArtifactEncoding, ArtifactError, CompiledPackManifest, CompiledSemanticModelPack,
-    CompiledShard, CompiledShardArtifact, CompiledShardDescriptor, canonical_json, content_digest,
+    ArtifactEncoding, ArtifactError, CompiledPackManifest, CompiledPayload,
+    CompiledSemanticModelPack, CompiledShard, CompiledShardArtifact, CompiledShardDescriptor,
+    DecodeLimits, canonical_json, content_digest, declaration_inventory, manifest_content_digest,
     manifest_semantic_digest, routing_keys, semantic_digest, stored_digest,
 };
 use super::model::*;
@@ -20,6 +21,8 @@ pub enum CompressionPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompilerOptions {
     pub max_source_bytes: usize,
+    pub max_manifest_bytes: usize,
+    pub max_stored_shard_bytes: usize,
     pub max_raw_shard_bytes: usize,
     pub max_total_raw_bytes: u64,
     pub max_shards: usize,
@@ -32,15 +35,18 @@ pub struct CompilerOptions {
 
 impl Default for CompilerOptions {
     fn default() -> Self {
+        let decode_limits = DecodeLimits::default();
         Self {
             max_source_bytes: 64 * 1024 * 1024,
-            max_raw_shard_bytes: 64 * 1024 * 1024,
-            max_total_raw_bytes: 1024 * 1024 * 1024,
-            max_shards: 4_096,
-            max_records_per_shard: 250_000,
-            max_records_per_pack: 2_000_000,
-            max_text_bytes: 16 * 1024,
-            max_depth: 64,
+            max_manifest_bytes: decode_limits.max_manifest_bytes,
+            max_stored_shard_bytes: decode_limits.max_stored_shard_bytes,
+            max_raw_shard_bytes: decode_limits.max_raw_shard_bytes,
+            max_total_raw_bytes: decode_limits.max_total_raw_bytes,
+            max_shards: decode_limits.max_shards,
+            max_records_per_shard: decode_limits.max_records_per_shard,
+            max_records_per_pack: decode_limits.max_total_records as usize,
+            max_text_bytes: decode_limits.max_text_bytes,
+            max_depth: decode_limits.max_depth,
             compression: CompressionPolicy::Automatic,
         }
     }
@@ -96,7 +102,7 @@ pub fn compile_pack(
             license: normalized.license.clone(),
             completeness: normalized.completeness,
             safety: normalized.safety.clone(),
-            payload: shard.payload.clone(),
+            payload: CompiledPayload(shard.payload.clone()),
         };
         let raw = canonical_json(&compiled).map_err(artifact_diagnostic)?;
         if raw.len() > options.max_raw_shard_bytes {
@@ -131,14 +137,27 @@ pub fn compile_pack(
         } else {
             (ArtifactEncoding::Raw, raw.clone())
         };
+        if bytes.len() > options.max_stored_shard_bytes {
+            return Err(vec![Diagnostic::error(
+                "limit.stored_shard_bytes",
+                format!("$.shards[{}]", shard.id),
+                format!(
+                    "stored shard exceeds {} bytes",
+                    options.max_stored_shard_bytes
+                ),
+            )]);
+        }
+        let (defined_ids, referenced_ids) = declaration_inventory(&compiled.payload.0);
         let descriptor = CompiledShardDescriptor {
             shard_id: compiled.shard_id.clone(),
             payload_kind: compiled.payload_kind(),
-            routing_keys: routing_keys(&compiled.activation, &compiled.payload),
+            routing_keys: routing_keys(&compiled.activation, &compiled.payload.0),
             encoding,
             raw_size: raw.len() as u64,
             stored_size: bytes.len() as u64,
             record_count: compiled.record_count() as u64,
+            defined_ids,
+            referenced_ids,
             semantic_sha256: semantic_digest(&compiled).map_err(artifact_diagnostic)?,
             content_sha256: content_digest(&raw),
             stored_sha256: stored_digest(&bytes),
@@ -159,13 +178,25 @@ pub fn compile_pack(
         completeness: normalized.completeness,
         safety: normalized.safety,
         semantic_sha256: String::new(),
+        content_sha256: String::new(),
         shards: artifacts
             .iter()
             .map(|artifact| artifact.descriptor.clone())
             .collect(),
     };
     manifest.semantic_sha256 = manifest_semantic_digest(&manifest).map_err(artifact_diagnostic)?;
+    manifest.content_sha256 = manifest_content_digest(&manifest).map_err(artifact_diagnostic)?;
     let manifest_bytes = canonical_json(&manifest).map_err(artifact_diagnostic)?;
+    if manifest_bytes.len() > options.max_manifest_bytes {
+        return Err(vec![Diagnostic::error(
+            "limit.manifest_bytes",
+            "$",
+            format!(
+                "compiled manifest exceeds {} bytes",
+                options.max_manifest_bytes
+            ),
+        )]);
+    }
     Ok(CompiledSemanticModelPack {
         manifest,
         manifest_bytes,
@@ -192,7 +223,7 @@ fn compression_is_worthwhile(raw: usize, compressed: usize) -> bool {
         && compressed.saturating_mul(100) <= raw.saturating_mul(95)
 }
 
-fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemanticModelPack {
+pub(crate) fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemanticModelPack {
     pack.compatibility.toolchains.sort_by(|left, right| {
         (&left.name, &left.requirement).cmp(&(&right.name, &right.requirement))
     });
@@ -215,7 +246,7 @@ fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemanticModelPack {
                     fact.aliases.dedup();
                     fact.extension_surfaces.sort_unstable();
                     fact.extension_surfaces.dedup();
-                    fact.supertypes.sort_by_key(type_ref_sort_key);
+                    fact.hierarchy.sort_by_key(hierarchy_sort_key);
                 }
                 for fact in &mut *members {
                     fact.aliases.sort_unstable();
@@ -238,6 +269,6 @@ fn selector_sort_key(selector: &ActivationSelector) -> Vec<u8> {
     serde_json::to_vec(selector).expect("authoring model is JSON serializable")
 }
 
-fn type_ref_sort_key(reference: &TypeRef) -> Vec<u8> {
-    serde_json::to_vec(reference).expect("authoring model is JSON serializable")
+fn hierarchy_sort_key(hierarchy: &HierarchyFact) -> Vec<u8> {
+    serde_json::to_vec(hierarchy).expect("authoring model is JSON serializable")
 }

@@ -1,4 +1,5 @@
 use super::model::*;
+use crate::analyzer::canonical_hash::is_lower_sha256;
 use crate::analyzer::identifier::validate_identifier;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -47,11 +48,28 @@ pub(crate) fn validate_pack(
     pack: &AuthoredSemanticModelPack,
     limits: ValidationLimits,
 ) -> Vec<Diagnostic> {
+    validate_pack_internal(pack, limits, true)
+}
+
+pub(crate) fn validate_pack_locally(
+    pack: &AuthoredSemanticModelPack,
+    limits: ValidationLimits,
+) -> Vec<Diagnostic> {
+    validate_pack_internal(pack, limits, false)
+}
+
+fn validate_pack_internal(
+    pack: &AuthoredSemanticModelPack,
+    limits: ValidationLimits,
+    validate_references: bool,
+) -> Vec<Diagnostic> {
     let mut validator = Validator {
         diagnostics: Vec::new(),
         limits,
         stable_ids: HashMap::new(),
         declaration_ids: HashSet::new(),
+        type_parameters_by_id: HashMap::new(),
+        validate_references,
     };
     validator.validate(pack);
     validator
@@ -65,6 +83,8 @@ struct Validator {
     limits: ValidationLimits,
     stable_ids: HashMap<String, String>,
     declaration_ids: HashSet<String>,
+    type_parameters_by_id: HashMap<String, Vec<String>>,
+    validate_references: bool,
 }
 
 impl Validator {
@@ -100,6 +120,7 @@ impl Validator {
         if let Some(revision) = &pack.provenance.revision {
             self.text("$.provenance.revision", revision);
         }
+        self.text("$.license", &pack.license);
         if let Err(error) = spdx::Expression::parse(&pack.license) {
             self.error(
                 "license.invalid_spdx",
@@ -114,6 +135,13 @@ impl Validator {
                 format!("pack has more than {} shards", self.limits.max_shards),
             );
         }
+        if pack.shards.is_empty() {
+            self.error(
+                "pack.no_shards",
+                "$.shards",
+                "a semantic-model pack must contain at least one shard",
+            );
+        }
 
         for shard in &pack.shards {
             if let AuthoredPayload::DeclarationFacts { types, members, .. } = &shard.payload {
@@ -121,6 +149,11 @@ impl Validator {
                     .extend(types.iter().map(|fact| fact.id.clone()));
                 self.declaration_ids
                     .extend(members.iter().map(|fact| fact.id.clone()));
+                self.type_parameters_by_id.extend(
+                    types
+                        .iter()
+                        .map(|fact| (fact.id.clone(), fact.type_parameters.clone())),
+                );
             }
         }
 
@@ -143,6 +176,13 @@ impl Validator {
                 );
             }
             let records = shard.payload.record_count();
+            if records == 0 {
+                self.error(
+                    "shard.empty_payload",
+                    format!("{path}.payload"),
+                    "a shard payload must contain at least one record",
+                );
+            }
             total_records = total_records.saturating_add(records);
             if records > self.limits.max_records_per_shard {
                 self.error(
@@ -212,7 +252,7 @@ impl Validator {
             self.stable_component(&format!("{path}.configurations[{index}]"), configuration);
         }
         if let Some(digest) = &selector.artifact_sha256
-            && !is_sha256(digest)
+            && !is_lower_sha256(digest)
         {
             self.error(
                 "selector.invalid_digest",
@@ -237,10 +277,10 @@ impl Validator {
                         &format!("{fact_path}.type_parameters"),
                         &fact.type_parameters,
                     );
-                    for (type_index, reference) in fact.supertypes.iter().enumerate() {
+                    for (type_index, hierarchy) in fact.hierarchy.iter().enumerate() {
                         self.type_ref(
-                            &format!("{fact_path}.supertypes[{type_index}]"),
-                            reference,
+                            &format!("{fact_path}.hierarchy[{type_index}].target"),
+                            &hierarchy.target,
                             &fact.type_parameters,
                         );
                     }
@@ -258,17 +298,30 @@ impl Validator {
                 for (index, fact) in members.iter().enumerate() {
                     let fact_path = format!("{path}.members[{index}]");
                     self.stable_id(&format!("{fact_path}.id"), &fact.id);
-                    self.stable_component(&format!("{fact_path}.name"), &fact.name);
+                    self.language_identifier(&format!("{fact_path}.name"), &fact.name);
                     self.locator(&format!("{fact_path}.locator"), &fact.locator);
                     if let Some(signature) = &fact.signature {
-                        self.signature(&format!("{fact_path}.signature"), signature);
+                        let owner_parameters = self
+                            .type_parameters_by_id
+                            .get(&fact.owner)
+                            .cloned()
+                            .unwrap_or_default();
+                        self.signature(
+                            &format!("{fact_path}.signature"),
+                            signature,
+                            &owner_parameters,
+                        );
+                    }
+                    for (alias_index, alias) in fact.aliases.iter().enumerate() {
+                        self.qualified_name(&format!("{fact_path}.aliases[{alias_index}]"), alias);
                     }
                 }
                 for (index, relation) in relations.iter().enumerate() {
                     self.stable_id(&format!("{path}.relations[{index}].id"), &relation.id);
                 }
                 for (index, fact) in members.iter().enumerate() {
-                    if !self.declaration_ids.contains(&fact.owner) {
+                    self.stable_reference(&format!("{path}.members[{index}].owner"), &fact.owner);
+                    if self.validate_references && !self.declaration_ids.contains(&fact.owner) {
                         self.error(
                             "reference.missing_owner",
                             format!("{path}.members[{index}].owner"),
@@ -278,7 +331,11 @@ impl Validator {
                 }
                 for (index, relation) in relations.iter().enumerate() {
                     for (field, target) in [("from", &relation.from), ("to", &relation.to)] {
-                        if !self.declaration_ids.contains(target) {
+                        self.stable_reference(
+                            &format!("{path}.relations[{index}].{field}"),
+                            target,
+                        );
+                        if self.validate_references && !self.declaration_ids.contains(target) {
                             self.error(
                                 "reference.missing_declaration",
                                 format!("{path}.relations[{index}].{field}"),
@@ -296,15 +353,17 @@ impl Validator {
         }
     }
 
-    fn signature(&mut self, path: &str, signature: &Signature) {
+    fn signature(&mut self, path: &str, signature: &Signature, owner_type_parameters: &[String]) {
         self.unique_names(
             &format!("{path}.type_parameters"),
             &signature.type_parameters,
         );
+        let mut available_type_parameters = owner_type_parameters.to_vec();
+        available_type_parameters.extend(signature.type_parameters.iter().cloned());
         let mut parameter_names = HashSet::new();
         for (index, parameter) in signature.parameters.iter().enumerate() {
             let parameter_path = format!("{path}.parameters[{index}]");
-            self.stable_component(&format!("{parameter_path}.name"), &parameter.name);
+            self.language_identifier(&format!("{parameter_path}.name"), &parameter.name);
             if !parameter_names.insert(&parameter.name) {
                 self.error(
                     "parameter.duplicate",
@@ -315,14 +374,14 @@ impl Validator {
             self.type_ref(
                 &format!("{parameter_path}.type"),
                 &parameter.r#type,
-                &signature.type_parameters,
+                &available_type_parameters,
             );
         }
         if let Some(returns) = &signature.returns {
             self.type_ref(
                 &format!("{path}.returns"),
                 returns,
-                &signature.type_parameters,
+                &available_type_parameters,
             );
         }
     }
@@ -339,8 +398,27 @@ impl Validator {
                 continue;
             }
             match reference {
-                TypeRef::Named { id, arguments, .. } => {
-                    self.qualified_name(&format!("{current_path}.id"), id);
+                TypeRef::Named {
+                    name, arguments, ..
+                } => {
+                    self.qualified_name(&format!("{current_path}.name"), name);
+                    for (index, argument) in arguments.iter().enumerate().rev() {
+                        stack.push((
+                            argument,
+                            depth + 1,
+                            format!("{current_path}.arguments[{index}]"),
+                        ));
+                    }
+                }
+                TypeRef::Declared { id, arguments, .. } => {
+                    self.stable_reference(&format!("{current_path}.id"), id);
+                    if self.validate_references && !self.declaration_ids.contains(id) {
+                        self.error(
+                            "reference.missing_declaration",
+                            format!("{current_path}.id"),
+                            format!("unknown declaration id `{id}`"),
+                        );
+                    }
                     for (index, argument) in arguments.iter().enumerate().rev() {
                         stack.push((
                             argument,
@@ -350,6 +428,7 @@ impl Validator {
                     }
                 }
                 TypeRef::TypeParameter { name } => {
+                    self.language_identifier(&format!("{current_path}.name"), name);
                     if !type_parameters.contains(name) {
                         self.error(
                             "type.unknown_parameter",
@@ -407,13 +486,14 @@ impl Validator {
             }
             RuleTrigger::ResolvedCall { owner, name } => {
                 self.qualified_name(&format!("{path}.trigger.owner"), owner);
-                self.stable_component(&format!("{path}.trigger.name"), name);
+                self.language_identifier(&format!("{path}.trigger.name"), name);
             }
         }
         let mut captures = HashMap::new();
         for (index, capture) in rule.captures.iter().enumerate() {
             let capture_path = format!("{path}.captures[{index}].name");
             self.stable_component(&capture_path, &capture.name);
+            self.capture_binding(&format!("{path}.captures[{index}]"), capture, &rule.trigger);
             if captures.insert(capture.name.as_str(), capture).is_some() {
                 self.error(
                     "capture.duplicate",
@@ -435,9 +515,7 @@ impl Validator {
                 RuleEmission::Declaration {
                     id,
                     name,
-                    owner,
-                    r#type,
-                    ..
+                    declaration,
                 } => {
                     self.template(
                         &format!("{emission_path}.id"),
@@ -451,16 +529,60 @@ impl Validator {
                         &captures,
                         TemplatePosition::LanguageName,
                     );
-                    if let Some(owner) = owner {
-                        self.template(
-                            &format!("{emission_path}.owner"),
-                            owner,
-                            &captures,
-                            TemplatePosition::StableId,
-                        );
-                    }
-                    if let Some(reference) = r#type {
-                        self.template_type(&format!("{emission_path}.type"), reference, &captures);
+                    match declaration {
+                        EmittedDeclaration::Type {
+                            type_parameters,
+                            hierarchy,
+                            extension_surfaces,
+                            ..
+                        } => {
+                            for (parameter_index, parameter) in type_parameters.iter().enumerate() {
+                                self.template(
+                                    &format!(
+                                        "{emission_path}.declaration.type_parameters[{parameter_index}]"
+                                    ),
+                                    parameter,
+                                    &captures,
+                                    TemplatePosition::LanguageName,
+                                );
+                            }
+                            for (hierarchy_index, hierarchy) in hierarchy.iter().enumerate() {
+                                self.template_type(
+                                    &format!(
+                                        "{emission_path}.declaration.hierarchy[{hierarchy_index}].target"
+                                    ),
+                                    &hierarchy.target,
+                                    &captures,
+                                );
+                            }
+                            for (surface_index, surface) in extension_surfaces.iter().enumerate() {
+                                self.template(
+                                    &format!(
+                                        "{emission_path}.declaration.extension_surfaces[{surface_index}]"
+                                    ),
+                                    surface,
+                                    &captures,
+                                    TemplatePosition::LanguageName,
+                                );
+                            }
+                        }
+                        EmittedDeclaration::Member {
+                            owner, signature, ..
+                        } => {
+                            self.template(
+                                &format!("{emission_path}.declaration.owner"),
+                                owner,
+                                &captures,
+                                TemplatePosition::StableId,
+                            );
+                            if let Some(signature) = signature {
+                                self.template_signature(
+                                    &format!("{emission_path}.declaration.signature"),
+                                    signature,
+                                    &captures,
+                                );
+                            }
+                        }
                     }
                 }
                 RuleEmission::Alias { id, from, to }
@@ -485,6 +607,103 @@ impl Validator {
                     );
                 }
             }
+        }
+    }
+
+    fn capture_binding(&mut self, path: &str, capture: &CaptureDeclaration, trigger: &RuleTrigger) {
+        let expected_kind = match capture.binding.projection {
+            CaptureProjection::Name => CaptureValueKind::Identifier,
+            CaptureProjection::StableId => CaptureValueKind::StableId,
+            CaptureProjection::Type => CaptureValueKind::Type,
+            CaptureProjection::Text => CaptureValueKind::String,
+            CaptureProjection::Path => CaptureValueKind::Path,
+        };
+        if capture.value_kind != expected_kind {
+            self.error(
+                "capture.binding_type_mismatch",
+                format!("{path}.value_kind"),
+                format!(
+                    "binding projection requires value kind `{}`",
+                    capture_value_kind_name(expected_kind)
+                ),
+            );
+        }
+        let expected_cardinality = match capture.binding.source {
+            CaptureSource::MatchedNode
+            | CaptureSource::EnclosingDeclaration
+            | CaptureSource::ResolvedOwner => CaptureCardinality::One,
+            CaptureSource::Argument { .. } | CaptureSource::AnnotationArgument { .. } => {
+                CaptureCardinality::Optional
+            }
+            CaptureSource::Arguments { .. } => CaptureCardinality::Many,
+        };
+        if capture.cardinality != expected_cardinality {
+            self.error(
+                "capture.binding_cardinality_mismatch",
+                format!("{path}.cardinality"),
+                format!(
+                    "capture source requires cardinality `{}`",
+                    capture_cardinality_name(expected_cardinality)
+                ),
+            );
+        }
+        let compatible = match capture.binding.source {
+            CaptureSource::AnnotationArgument { .. } => {
+                matches!(trigger, RuleTrigger::Annotation { .. })
+            }
+            CaptureSource::Argument { .. } | CaptureSource::Arguments { .. } => matches!(
+                trigger,
+                RuleTrigger::MacroInvocation { .. }
+                    | RuleTrigger::GeneratorInvocation { .. }
+                    | RuleTrigger::ResolvedCall { .. }
+            ),
+            CaptureSource::ResolvedOwner => matches!(
+                trigger,
+                RuleTrigger::ResolvedOwner { .. } | RuleTrigger::ResolvedCall { .. }
+            ),
+            CaptureSource::MatchedNode | CaptureSource::EnclosingDeclaration => true,
+        };
+        if !compatible {
+            self.error(
+                "capture.binding_incompatible_trigger",
+                format!("{path}.binding.source"),
+                "capture source is not available from this trigger kind",
+            );
+        }
+        if let CaptureSource::AnnotationArgument { name } = &capture.binding.source {
+            self.language_identifier(&format!("{path}.binding.source.name"), name);
+        }
+    }
+
+    fn template_signature(
+        &mut self,
+        path: &str,
+        signature: &TemplateSignature,
+        captures: &HashMap<&str, &CaptureDeclaration>,
+    ) {
+        for (index, parameter) in signature.type_parameters.iter().enumerate() {
+            self.template(
+                &format!("{path}.type_parameters[{index}]"),
+                parameter,
+                captures,
+                TemplatePosition::LanguageName,
+            );
+        }
+        for (index, parameter) in signature.parameters.iter().enumerate() {
+            self.template(
+                &format!("{path}.parameters[{index}].name"),
+                &parameter.name,
+                captures,
+                TemplatePosition::LanguageName,
+            );
+            self.template_type(
+                &format!("{path}.parameters[{index}].type"),
+                &parameter.r#type,
+                captures,
+            );
+        }
+        if let Some(returns) = &signature.returns {
+            self.template_type(&format!("{path}.returns"), returns, captures);
         }
     }
 
@@ -557,6 +776,15 @@ impl Validator {
         captures: &HashMap<&str, &CaptureDeclaration>,
         position: TemplatePosition,
     ) {
+        if matches!(position, TemplatePosition::StableId)
+            && !stable_id_template_has_valid_boundaries(root, self.limits.max_depth)
+        {
+            self.error(
+                "template.invalid_identifier_boundary",
+                path,
+                "stable-id templates must begin and end with a lowercase ASCII alphanumeric",
+            );
+        }
         let mut stack = vec![(root, 1usize, path.to_owned(), true)];
         while let Some((expression, depth, current_path, is_root)) = stack.pop() {
             if depth > self.limits.max_depth {
@@ -608,7 +836,23 @@ impl Validator {
                         format!("{current_path}.name"),
                         format!("capture `{name}` must have cardinality `one` here"),
                     ),
-                    Some(capture) if capture.value_kind != CaptureValueKind::Identifier => {
+                    Some(capture)
+                        if matches!(position, TemplatePosition::StableId)
+                            && capture.value_kind != CaptureValueKind::StableId =>
+                    {
+                        self.error(
+                            "capture.type_mismatch",
+                            format!("{current_path}.name"),
+                            format!("capture `{name}` is not a stable-id capture"),
+                        );
+                    }
+                    Some(capture)
+                        if matches!(position, TemplatePosition::LanguageName)
+                            && !matches!(
+                                capture.value_kind,
+                                CaptureValueKind::Identifier | CaptureValueKind::StableId
+                            ) =>
+                    {
                         self.error(
                             "capture.type_mismatch",
                             format!("{current_path}.name"),
@@ -661,7 +905,7 @@ impl Validator {
                 path: value,
                 symbol,
             } => {
-                self.text(&format!("{path}.path"), value);
+                self.locator_path(&format!("{path}.path"), value);
                 if let Some(symbol) = symbol {
                     self.text(&format!("{path}.symbol"), symbol);
                 }
@@ -670,7 +914,7 @@ impl Validator {
                 path: value,
                 symbol,
             } => {
-                self.text(&format!("{path}.path"), value);
+                self.locator_path(&format!("{path}.path"), value);
                 self.text(&format!("{path}.symbol"), symbol);
             }
         }
@@ -695,6 +939,26 @@ impl Validator {
         }
     }
 
+    fn stable_reference(&mut self, path: &str, value: &str) {
+        if let Err(error) = validate_identifier(value, 256, true) {
+            self.error("identifier.invalid_reference", path, error.to_string());
+        }
+    }
+
+    fn language_identifier(&mut self, path: &str, value: &str) {
+        self.text(path, value);
+        if value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+        {
+            self.error(
+                "name.invalid_identifier",
+                path,
+                "language identifiers must contain no whitespace or control characters",
+            );
+        }
+    }
+
     fn qualified_name(&mut self, path: &str, value: &str) {
         self.text(path, value);
         if value.trim().is_empty() || value.chars().any(char::is_whitespace) {
@@ -709,7 +973,7 @@ impl Validator {
     fn unique_names(&mut self, path: &str, values: &[String]) {
         let mut seen = HashSet::new();
         for (index, value) in values.iter().enumerate() {
-            self.stable_component(&format!("{path}[{index}]"), value);
+            self.language_identifier(&format!("{path}[{index}]"), value);
             if !seen.insert(value) {
                 self.error(
                     "name.duplicate",
@@ -721,12 +985,14 @@ impl Validator {
     }
 
     fn version(&mut self, path: &str, value: &str) {
+        self.text(path, value);
         if Version::parse(value).is_err() {
             self.error("version.invalid", path, "expected a semantic version");
         }
     }
 
     fn version_requirement(&mut self, path: &str, value: &str) {
+        self.text(path, value);
         if VersionReq::parse(value).is_err() {
             self.error(
                 "version.invalid_requirement",
@@ -745,6 +1011,32 @@ impl Validator {
                 "limit.text_bytes",
                 path,
                 format!("text exceeds {} bytes", self.limits.max_text_bytes),
+            );
+        }
+        if value.contains('\0') {
+            self.error("text.nul", path, "text must not contain NUL characters");
+        }
+    }
+
+    fn locator_path(&mut self, path: &str, value: &str) {
+        use std::path::{Component, Path};
+
+        self.text(path, value);
+        if value.contains('\\')
+            || Path::new(value).components().any(|component| {
+                matches!(
+                    component,
+                    Component::Prefix(_)
+                        | Component::RootDir
+                        | Component::ParentDir
+                        | Component::CurDir
+                )
+            })
+        {
+            self.error(
+                "locator.invalid_path",
+                path,
+                "locator paths must be relative canonical slash-separated paths",
             );
         }
     }
@@ -780,9 +1072,58 @@ fn is_language_name_fragment(value: &str) -> bool {
             .all(|character| !character.is_control() && !character.is_whitespace())
 }
 
-fn is_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+fn stable_id_template_has_valid_boundaries(
+    expression: &TemplateExpression,
+    max_depth: usize,
+) -> bool {
+    stable_id_template_boundary(expression, true, max_depth)
+        && stable_id_template_boundary(expression, false, max_depth)
+}
+
+fn stable_id_template_boundary(
+    mut expression: &TemplateExpression,
+    first: bool,
+    max_depth: usize,
+) -> bool {
+    for _ in 0..max_depth {
+        match expression {
+            TemplateExpression::Literal { value } => {
+                let boundary = if first {
+                    value.as_bytes().first()
+                } else {
+                    value.as_bytes().last()
+                };
+                return boundary
+                    .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+            }
+            TemplateExpression::Capture { .. } => return true,
+            TemplateExpression::Concat { values } => {
+                let next = if first { values.first() } else { values.last() };
+                let Some(next) = next else {
+                    return false;
+                };
+                expression = next;
+            }
+            TemplateExpression::Transform { value, .. } => expression = value,
+        }
+    }
+    false
+}
+
+fn capture_value_kind_name(kind: CaptureValueKind) -> &'static str {
+    match kind {
+        CaptureValueKind::Identifier => "identifier",
+        CaptureValueKind::StableId => "stable_id",
+        CaptureValueKind::Type => "type",
+        CaptureValueKind::String => "string",
+        CaptureValueKind::Path => "path",
+    }
+}
+
+fn capture_cardinality_name(cardinality: CaptureCardinality) -> &'static str {
+    match cardinality {
+        CaptureCardinality::One => "one",
+        CaptureCardinality::Optional => "optional",
+        CaptureCardinality::Many => "many",
+    }
 }

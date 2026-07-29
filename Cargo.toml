@@ -49,6 +49,8 @@ exclude = [
     "tests/fixtures/sarif/**",
     "tests/fixtures/scala-issue-1016/**",
     "tests/fixtures/scala-issue-1068/**",
+    "tests/fixtures/semantic-model-packs/**",
+    "!tests/fixtures/semantic-model-packs/declarations-v1.json",
     "tests/fixtures/testcode-cpp/**",
     "tests/fixtures/testcode-cs/**",
     "tests/fixtures/testcode-git-rank-java/**",

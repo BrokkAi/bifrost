@@ -33,7 +33,8 @@
     "schema_version": {
       "type": "integer",
       "format": "uint32",
-      "minimum": 0
+      "maximum": 1,
+      "minimum": 1
     },
     "shards": {
       "type": "array",
@@ -159,6 +160,7 @@
               }
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind"
           ]
@@ -177,6 +179,7 @@
               }
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "rules"
@@ -207,6 +210,22 @@
         "payload"
       ]
     },
+    "CaptureBinding": {
+      "type": "object",
+      "properties": {
+        "projection": {
+          "$ref": "#/$defs/CaptureProjection"
+        },
+        "source": {
+          "$ref": "#/$defs/CaptureSource"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "projection"
+      ]
+    },
     "CaptureCardinality": {
       "type": "string",
       "enum": [
@@ -218,6 +237,9 @@
     "CaptureDeclaration": {
       "type": "object",
       "properties": {
+        "binding": {
+          "$ref": "#/$defs/CaptureBinding"
+        },
         "cardinality": {
           "$ref": "#/$defs/CaptureCardinality"
         },
@@ -231,14 +253,124 @@
       "additionalProperties": false,
       "required": [
         "name",
+        "binding",
         "value_kind",
         "cardinality"
+      ]
+    },
+    "CaptureProjection": {
+      "type": "string",
+      "enum": [
+        "name",
+        "stable_id",
+        "type",
+        "text",
+        "path"
+      ]
+    },
+    "CaptureSource": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "matched_node"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "enclosing_declaration"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "resolved_owner"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "index": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "argument"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "index"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "from": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "arguments"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "from"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "annotation_argument"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "name"
+          ]
+        }
       ]
     },
     "CaptureValueKind": {
       "type": "string",
       "enum": [
         "identifier",
+        "stable_id",
         "type",
         "string",
         "path"
@@ -270,11 +402,105 @@
         "complete"
       ]
     },
-    "EmittedDeclarationKind": {
-      "type": "string",
-      "enum": [
-        "type",
-        "member"
+    "EmittedDeclaration": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "extension_surfaces": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/TemplateExpression"
+              }
+            },
+            "hierarchy": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/TemplateHierarchyFact"
+              }
+            },
+            "is_abstract": {
+              "type": "boolean",
+              "default": false
+            },
+            "is_sealed": {
+              "type": "boolean",
+              "default": false
+            },
+            "kind": {
+              "type": "string",
+              "const": "type"
+            },
+            "type_kind": {
+              "$ref": "#/$defs/TypeKind"
+            },
+            "type_parameters": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/TemplateExpression"
+              }
+            },
+            "visibility": {
+              "$ref": "#/$defs/Visibility"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "type_kind",
+            "visibility"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "is_abstract": {
+              "type": "boolean",
+              "default": false
+            },
+            "is_static": {
+              "type": "boolean",
+              "default": false
+            },
+            "is_virtual": {
+              "type": "boolean",
+              "default": false
+            },
+            "kind": {
+              "type": "string",
+              "const": "member"
+            },
+            "member_kind": {
+              "$ref": "#/$defs/MemberKind"
+            },
+            "owner": {
+              "$ref": "#/$defs/TemplateExpression"
+            },
+            "signature": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TemplateSignature"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "visibility": {
+              "$ref": "#/$defs/Visibility"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "owner",
+            "member_kind",
+            "visibility"
+          ]
+        }
       ]
     },
     "GeneratorRule": {
@@ -307,6 +533,30 @@
         "emissions"
       ]
     },
+    "HierarchyFact": {
+      "type": "object",
+      "properties": {
+        "hierarchy_kind": {
+          "$ref": "#/$defs/HierarchyKind"
+        },
+        "target": {
+          "$ref": "#/$defs/TypeRef"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "hierarchy_kind",
+        "target"
+      ]
+    },
+    "HierarchyKind": {
+      "type": "string",
+      "enum": [
+        "extends",
+        "implements",
+        "uses_trait"
+      ]
+    },
     "Locator": {
       "oneOf": [
         {
@@ -326,6 +576,7 @@
               ]
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "path"
@@ -345,6 +596,7 @@
               "type": "string"
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "path",
@@ -365,6 +617,18 @@
         },
         "id": {
           "type": "string"
+        },
+        "is_abstract": {
+          "type": "boolean",
+          "default": false
+        },
+        "is_static": {
+          "type": "boolean",
+          "default": false
+        },
+        "is_virtual": {
+          "type": "boolean",
+          "default": false
         },
         "locator": {
           "$ref": "#/$defs/Locator"
@@ -387,6 +651,9 @@
               "type": "null"
             }
           ]
+        },
+        "visibility": {
+          "$ref": "#/$defs/Visibility"
         }
       },
       "additionalProperties": false,
@@ -395,6 +662,7 @@
         "owner",
         "name",
         "member_kind",
+        "visibility",
         "locator"
       ]
     },
@@ -513,10 +781,6 @@
     "RelationKind": {
       "type": "string",
       "enum": [
-        "owns",
-        "extends",
-        "implements",
-        "aliases",
         "navigates_to",
         "references"
       ]
@@ -526,8 +790,8 @@
         {
           "type": "object",
           "properties": {
-            "declaration_kind": {
-              "$ref": "#/$defs/EmittedDeclarationKind"
+            "declaration": {
+              "$ref": "#/$defs/EmittedDeclaration"
             },
             "id": {
               "$ref": "#/$defs/TemplateExpression"
@@ -538,33 +802,14 @@
             },
             "name": {
               "$ref": "#/$defs/TemplateExpression"
-            },
-            "owner": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/TemplateExpression"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "type": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/TemplateTypeRef"
-                },
-                {
-                  "type": "null"
-                }
-              ]
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "id",
             "name",
-            "declaration_kind"
+            "declaration"
           ]
         },
         {
@@ -584,6 +829,7 @@
               "$ref": "#/$defs/TemplateExpression"
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "id",
@@ -611,6 +857,7 @@
               "$ref": "#/$defs/TemplateExpression"
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "id",
@@ -634,6 +881,7 @@
               "const": "language_construct"
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "construct"
@@ -650,6 +898,7 @@
               "type": "string"
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "name"
@@ -666,6 +915,7 @@
               "type": "string"
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "name"
@@ -682,6 +932,7 @@
               "type": "string"
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "name"
@@ -698,6 +949,7 @@
               "type": "string"
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "owner"
@@ -717,6 +969,7 @@
               "type": "string"
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "owner",
@@ -782,6 +1035,7 @@
               "type": "string"
             }
           },
+          "additionalProperties": false,
           "required": [
             "op",
             "value"
@@ -798,6 +1052,7 @@
               "const": "capture"
             }
           },
+          "additionalProperties": false,
           "required": [
             "op",
             "name"
@@ -817,6 +1072,7 @@
               }
             }
           },
+          "additionalProperties": false,
           "required": [
             "op",
             "values"
@@ -836,6 +1092,7 @@
               "$ref": "#/$defs/TemplateExpression"
             }
           },
+          "additionalProperties": false,
           "required": [
             "op",
             "transform",
@@ -843,6 +1100,76 @@
           ]
         }
       ]
+    },
+    "TemplateHierarchyFact": {
+      "type": "object",
+      "properties": {
+        "hierarchy_kind": {
+          "$ref": "#/$defs/HierarchyKind"
+        },
+        "target": {
+          "$ref": "#/$defs/TemplateTypeRef"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "hierarchy_kind",
+        "target"
+      ]
+    },
+    "TemplateParameter": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/TemplateExpression"
+        },
+        "optional": {
+          "type": "boolean",
+          "default": false
+        },
+        "type": {
+          "$ref": "#/$defs/TemplateTypeRef"
+        },
+        "variadic": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type"
+      ]
+    },
+    "TemplateSignature": {
+      "type": "object",
+      "properties": {
+        "parameters": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TemplateParameter"
+          }
+        },
+        "returns": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TemplateTypeRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type_parameters": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TemplateExpression"
+          }
+        }
+      },
+      "additionalProperties": false
     },
     "TemplateTypeRef": {
       "oneOf": [
@@ -868,6 +1195,7 @@
               "default": false
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "name"
@@ -884,6 +1212,7 @@
               "type": "string"
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "name"
@@ -900,6 +1229,7 @@
               "const": "array"
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "element"
@@ -924,21 +1254,29 @@
             "type": "string"
           }
         },
+        "hierarchy": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/HierarchyFact"
+          }
+        },
         "id": {
           "type": "string"
+        },
+        "is_abstract": {
+          "type": "boolean",
+          "default": false
+        },
+        "is_sealed": {
+          "type": "boolean",
+          "default": false
         },
         "locator": {
           "$ref": "#/$defs/Locator"
         },
         "name": {
           "type": "string"
-        },
-        "supertypes": {
-          "type": "array",
-          "default": [],
-          "items": {
-            "$ref": "#/$defs/TypeRef"
-          }
         },
         "type_kind": {
           "$ref": "#/$defs/TypeKind"
@@ -949,6 +1287,9 @@
           "items": {
             "type": "string"
           }
+        },
+        "visibility": {
+          "$ref": "#/$defs/Visibility"
         }
       },
       "additionalProperties": false,
@@ -956,6 +1297,7 @@
         "id",
         "name",
         "type_kind",
+        "visibility",
         "locator"
       ]
     },
@@ -963,6 +1305,8 @@
       "type": "string",
       "enum": [
         "class",
+        "annotation",
+        "delegate",
         "interface",
         "trait",
         "struct",
@@ -984,18 +1328,47 @@
                 "$ref": "#/$defs/TypeRef"
               }
             },
-            "id": {
-              "type": "string"
-            },
             "kind": {
               "type": "string",
               "const": "named"
+            },
+            "name": {
+              "type": "string"
             },
             "nullable": {
               "type": "boolean",
               "default": false
             }
           },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "arguments": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/TypeRef"
+              }
+            },
+            "id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "declared"
+            },
+            "nullable": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "additionalProperties": false,
           "required": [
             "kind",
             "id"
@@ -1012,6 +1385,7 @@
               "type": "string"
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "name"
@@ -1028,6 +1402,7 @@
               "const": "array"
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "element"
@@ -1047,6 +1422,7 @@
               "const": "tuple"
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "elements"
@@ -1069,6 +1445,7 @@
               "$ref": "#/$defs/TypeRef"
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "parameters",
@@ -1091,6 +1468,17 @@
       "required": [
         "name",
         "requirement"
+      ]
+    },
+    "Visibility": {
+      "type": "string",
+      "enum": [
+        "public",
+        "protected",
+        "internal",
+        "protected_internal",
+        "package",
+        "private"
       ]
     }
   }

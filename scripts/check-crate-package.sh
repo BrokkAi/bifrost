@@ -56,6 +56,7 @@ forbidden_patterns=(
     'tests/fixtures/proxygroup_test_regression[.]go'
     'tests/fixtures/sarif/'
     'tests/fixtures/scala-issue-'
+    'tests/fixtures/semantic-model-packs/'
     'tests/fixtures/testcode-cpp/'
     'tests/fixtures/testcode-cs/'
     'tests/fixtures/testcode-git-rank-java/'
@@ -84,6 +85,7 @@ kept_exception_files=(
     scripts/voyage_sidecar.py
     tests/fixtures/policies/dynamic-eval.rqlp
     tests/fixtures/policies/endpoints/http-request-parameter.rqlp
+    tests/fixtures/semantic-model-packs/declarations-v1.json
 )
 
 embedded_skill_count=0
@@ -162,9 +164,18 @@ required_inline_test_fixtures=(
     tests/fixtures/policy-cli/project/policies/resource-lifecycle.rqlp
     tests/fixtures/policy-cli/project/src/app.py
     tests/fixtures/policy-cli/project/src/resource.ts
+    tests/fixtures/semantic-model-packs/declarations-v1.json
     tests/fixtures/testcode-java/A.java
     tests/fixtures/typestate/resource-lifecycle.protocol.json
 )
+
+required_public_contracts=(schemas/semantic-model-pack-v1.schema.json)
+for required_file in "${required_public_contracts[@]}"; do
+    if ! grep -Fqx "$required_file" "$package_files"; then
+        echo "Packaged crate is missing public contract: ${required_file}" >&2
+        exit 1
+    fi
+done
 
 for required_file in "${required_inline_test_fixtures[@]}"; do
     if ! grep -Fqx "$required_file" "$package_files"; then

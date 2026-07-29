@@ -33,10 +33,13 @@ shards:
         - id: type.widget
           name: com.acme.Widget
           type_kind: class
+          visibility: public
           type_parameters: [t]
-          supertypes:
-            - kind: named
-              id: java.lang.Object
+          hierarchy:
+            - hierarchy_kind: extends
+              target:
+                kind: named
+                name: java.lang.Object
           aliases: [com.acme.LegacyWidget]
           extension_surfaces: [com.acme.WidgetExtensions]
           locator:
@@ -48,22 +51,23 @@ shards:
           owner: type.widget
           name: create
           member_kind: method
+          visibility: public
           signature:
             parameters:
               - name: input
                 type:
                   kind: named
-                  id: java.lang.String
+                  name: java.lang.String
             returns:
               kind: named
-              id: com.acme.Widget
+              name: com.acme.Widget
           aliases: []
           locator:
             kind: artifact
             path: com/acme/Widget.class
             symbol: create(java.lang.String)
       relations:
-        - id: relation.widget.owns-create
-          relation_kind: owns
-          from: type.widget
-          to: member.widget.create
+        - id: relation.widget.navigation
+          relation_kind: navigates_to
+          from: member.widget.create
+          to: type.widget
