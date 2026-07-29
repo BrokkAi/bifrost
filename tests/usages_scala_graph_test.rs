@@ -1007,6 +1007,53 @@ object Owner {
 }
 
 #[test]
+fn scala_usage_finder_finds_anonymous_template_mixin_parent_with_constructor_args() {
+    let source = r#"package app
+sealed abstract class Glyph(label: String)
+object Glyph {
+  sealed trait Assessment extends Glyph
+  object Assessment {
+    val exact = new Glyph("x") with Assessment // positive-anonymous-template-parent
+  }
+
+  sealed trait AssessmentDecoy extends Glyph
+  object AssessmentDecoy {
+    val decoy = new Glyph("y") with AssessmentDecoy // negative-anonymous-template-parent
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/Use.scala", source)]);
+
+    let target = definition(&analyzer, "app.Glyph$.Assessment");
+    let target_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+    assert_hit_line(
+        &target_hits,
+        line_of(source, "positive-anonymous-template-parent"),
+    );
+    assert_no_hit_line(
+        &target_hits,
+        line_of(source, "negative-anonymous-template-parent"),
+    );
+
+    let companion = definition(&analyzer, "app.Glyph$.Assessment$");
+    let companion_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&companion)));
+    assert_no_hit_line(
+        &companion_hits,
+        line_of(source, "positive-anonymous-template-parent"),
+    );
+
+    let decoy = definition(&analyzer, "app.Glyph$.AssessmentDecoy");
+    let decoy_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&decoy)));
+    assert_no_hit_line(
+        &decoy_hits,
+        line_of(source, "positive-anonymous-template-parent"),
+    );
+}
+
+#[test]
 fn scala_type_roles_cover_anonymous_mixins_and_infix_type_operators() {
     let use_source = r#"package app
 
@@ -2159,6 +2206,122 @@ class Consumer {
     );
     assert_no_hit_contains(&inverse_checkbox_hits, "negative-parameter-field-shadow");
     assert_no_hit_contains(&inverse_checkbox_hits, "negative-local-field-shadow");
+}
+
+#[test]
+fn scala_inverse_preserves_singleton_type_and_qualified_case_object_identity() {
+    let source = r#"package app
+
+sealed trait Method
+object Method {
+  case object HEAD extends Method
+  case object OPTIONS extends Method
+  case object PATCH extends Method
+}
+
+sealed trait Status
+object Status {
+  case object Found extends Status
+}
+
+sealed trait AuthType
+object AuthType {
+  case object None extends AuthType
+}
+
+object Use {
+  val head: Method.HEAD.type = Method.HEAD // positive-singleton-head
+  val found: Status.Found.type = Status.Found // positive-singleton-found
+  val options = Method.OPTIONS // positive-qualified-options
+  val patch = Method.PATCH // positive-qualified-patch
+  val none = AuthType.None // positive-qualified-none
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("app/Witness.scala", source),
+        (
+            "decoy/Types.scala",
+            r#"package decoy
+object Method {
+  class HEAD
+  class OPTIONS
+  class PATCH
+}
+object Status {
+  class Found
+}
+object AuthType {
+  class None
+}
+object Use {
+  val head: Method.HEAD = null // negative-type-decoy-head
+  val found: Status.Found = null // negative-type-decoy-found
+  val options: Method.OPTIONS = null // negative-type-decoy-options
+  val patch: Method.PATCH = null // negative-type-decoy-patch
+  val none: AuthType.None = null // negative-type-decoy-none
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let inverse = ScalaUsageGraphStrategy::new();
+    for (target_fqn, positive, negative, range) in [
+        (
+            "app.Method$.HEAD$",
+            "positive-singleton-head",
+            "negative-type-decoy-head",
+            exact_segment(source, "Method.HEAD.type", "HEAD"),
+        ),
+        (
+            "app.Status$.Found$",
+            "positive-singleton-found",
+            "negative-type-decoy-found",
+            exact_segment(source, "Status.Found.type", "Found"),
+        ),
+        (
+            "app.Method$.OPTIONS$",
+            "positive-qualified-options",
+            "negative-type-decoy-options",
+            exact_segment(
+                source,
+                "Method.OPTIONS // positive-qualified-options",
+                "OPTIONS",
+            ),
+        ),
+        (
+            "app.Method$.PATCH$",
+            "positive-qualified-patch",
+            "negative-type-decoy-patch",
+            exact_segment(source, "Method.PATCH // positive-qualified-patch", "PATCH"),
+        ),
+        (
+            "app.AuthType$.None$",
+            "positive-qualified-none",
+            "negative-type-decoy-none",
+            exact_segment(source, "AuthType.None // positive-qualified-none", "None"),
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        let inverse_hits = reference_surface_hits(inverse.find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+
+        for bucket in [&targeted_hits, &inverse_hits] {
+            assert_hit_contains(bucket, positive);
+            assert_no_hit_contains(bucket, negative);
+            assert!(
+                bucket
+                    .iter()
+                    .any(|hit| hit.start_offset == range.0 && hit.end_offset == range.1),
+                "expected exact range {range:?} for {target_fqn}, got {bucket:#?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -6639,6 +6802,15 @@ fn authoritative_scala_hits(analyzer: &ScalaAnalyzer, target: &CodeUnit) -> Vec<
                 100,
             )
             .result,
+    )
+}
+
+fn exact_segment(source: &str, line: &str, token: &str) -> (usize, usize) {
+    let line_start = source.find(line).expect("fixture line");
+    let token_start = line.find(token).expect("fixture token");
+    (
+        line_start + token_start,
+        line_start + token_start + token.len(),
     )
 }
 

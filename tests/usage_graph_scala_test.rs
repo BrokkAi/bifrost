@@ -3067,6 +3067,44 @@ object App {
 }
 
 #[test]
+fn object_qualified_inherited_member_calls_resolve_to_trait_owner() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "example/App.scala",
+            r#"package example
+
+trait ContentCodecs {
+  def content[A]: String = "ok"
+}
+
+object HttpCodec extends ContentCodecs
+
+object OtherCodec {
+  def content[A]: String = "other"
+}
+
+object Use {
+  def inherited(): String = HttpCodec.content[String]
+  def unrelated(): String = OtherCodec.content[String]
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "example.Use$.inherited", "example.ContentCodecs.content"),
+        "qualified inherited object member should edge to the trait owner: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "example.Use$.unrelated", "example.ContentCodecs.content"),
+        "unrelated same-name receiver must not edge to the trait member: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn scala_inverted_fails_closed_for_ambiguous_declaration_type_paths() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
