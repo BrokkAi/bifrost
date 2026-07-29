@@ -39,6 +39,7 @@ mod rust;
 mod scala;
 pub mod semantic;
 pub(crate) mod semantic_diagnostics;
+pub mod semantic_model;
 mod source_content;
 pub mod store;
 pub mod structural;
