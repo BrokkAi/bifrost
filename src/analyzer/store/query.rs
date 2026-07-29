@@ -5,10 +5,12 @@ use git2::Oid;
 
 use crate::CancellationToken;
 use crate::analyzer::store::liveness::{LiveSnapshot, Liveness};
-use crate::analyzer::store::{CandidateRow, LimitedQueryRows, Result, StoreError};
+use crate::analyzer::store::{
+    CandidateRow, LimitedQueryRows, Result, SearchCandidateKey, SearchCandidateNameRow, StoreError,
+};
 use crate::analyzer::tree_sitter_analyzer::LanguageAdapter;
 use crate::analyzer::{CodeUnit, ProjectFile};
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 
 pub struct QueryResolver<'a, A: LanguageAdapter> {
     adapter: &'a A,
@@ -116,6 +118,76 @@ impl<'a, A: LanguageAdapter> QueryResolver<'a, A> {
             }
         }
 
+        LimitedQueryRows::complete(out, inspected)
+    }
+
+    /// Decide which persisted declarations a `search_symbols` pattern batch can
+    /// match, using only the cheap name projection.
+    ///
+    /// A unit's fully-qualified name is `package_name` plus its short name, and
+    /// `package_name` is hydrated from the persisted content qualifier together
+    /// with the live path the blob is mounted at. Both inputs are constant per
+    /// `(blob, language)` and per `(blob, language, qualifier)` respectively, so
+    /// they are memoized: a workspace with tens of thousands of declarations
+    /// spread over a few hundred files hydrates a few hundred package prefixes
+    /// instead of one per declaration (issue #1199).
+    ///
+    /// Liveness is intentionally *not* applied here. This pass only narrows the
+    /// key set; the full hydration pass re-applies stat validation and the
+    /// authoritative match predicate, so this must stay a superset and must not
+    /// become the place where a candidate is finally accepted.
+    pub(crate) fn match_candidate_names_cancellable(
+        &self,
+        langs: &[String],
+        rows: &[SearchCandidateNameRow],
+        mut keep: impl FnMut(&str, &str) -> bool,
+        cancellation: Option<&CancellationToken>,
+    ) -> LimitedQueryRows<SearchCandidateKey> {
+        let mut paths: HashMap<(Oid, usize), Vec<ProjectFile>> = HashMap::default();
+        let mut packages: HashMap<(Oid, usize, &str), Vec<String>> = HashMap::default();
+        let mut out = Vec::new();
+        let mut inspected = 0usize;
+        for row in rows {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return LimitedQueryRows::incomplete(out, inspected);
+            }
+            inspected = inspected.saturating_add(1);
+            let Some(lang) = langs.get(row.lang_index) else {
+                continue;
+            };
+            let files = paths
+                .entry((row.blob_oid, row.lang_index))
+                .or_insert_with(|| {
+                    self.paths_for_oid(row.blob_oid)
+                        .into_iter()
+                        .filter(|file| self.adapter.storage_language_key_for_file(file) == *lang)
+                        .collect()
+                });
+            if files.is_empty() {
+                continue;
+            }
+            let package_names = packages
+                .entry((row.blob_oid, row.lang_index, row.content_qualifier.as_str()))
+                .or_insert_with(|| {
+                    files
+                        .iter()
+                        .map(|file| {
+                            self.adapter
+                                .hydrate_content_qualifier(&row.content_qualifier, file)
+                        })
+                        .collect()
+                });
+            if package_names
+                .iter()
+                .any(|package_name| keep(package_name, &row.short_name))
+            {
+                out.push(SearchCandidateKey {
+                    lang_index: row.lang_index,
+                    blob_oid: row.blob_oid,
+                    unit_key: row.unit_key,
+                });
+            }
+        }
         LimitedQueryRows::complete(out, inspected)
     }
 

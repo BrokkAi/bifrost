@@ -20,6 +20,7 @@ use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use git2::{ObjectType, Oid};
 use rayon::prelude::*;
 use regex::RegexBuilder;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
@@ -1558,6 +1559,12 @@ pub struct TreeSitterAnalyzer<A> {
     definition_candidates_query_count: Arc<AtomicUsize>,
     enclosing_code_unit_query_count: Arc<AtomicUsize>,
     full_declaration_scan_count: Arc<AtomicUsize>,
+    /// Persisted declarations that a `search_symbols` request hydrated into
+    /// `CodeUnit`s. The scan count alone cannot see the #1199 regression shape:
+    /// one shared scan still hydrated the entire workspace projection before
+    /// any pattern was applied, so this counter pins the *per-scan* work to the
+    /// size of the answer rather than the size of the workspace.
+    search_candidate_hydration_count: Arc<AtomicUsize>,
     /// Whole-workspace declaration scans issued to answer a *package-scoped*
     /// class lookup (`class_declarations_in_package`). Pinned by #1194.
     package_declaration_scan_count: Arc<AtomicUsize>,
@@ -1599,6 +1606,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             definition_candidates_query_count: Arc::clone(&self.definition_candidates_query_count),
             enclosing_code_unit_query_count: Arc::clone(&self.enclosing_code_unit_query_count),
             full_declaration_scan_count: Arc::clone(&self.full_declaration_scan_count),
+            search_candidate_hydration_count: Arc::clone(&self.search_candidate_hydration_count),
             package_declaration_scan_count: Arc::clone(&self.package_declaration_scan_count),
             global_usage_definition_index_build_count: Arc::clone(
                 &self.global_usage_definition_index_build_count,
@@ -1782,6 +1790,7 @@ where
             definition_candidates_query_count: Arc::new(AtomicUsize::new(0)),
             enclosing_code_unit_query_count: Arc::new(AtomicUsize::new(0)),
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
+            search_candidate_hydration_count: Arc::new(AtomicUsize::new(0)),
             package_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
             global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
             workspace_path_scan_count: Arc::new(AtomicUsize::new(0)),
@@ -1968,6 +1977,7 @@ where
             definition_candidates_query_count: Arc::new(AtomicUsize::new(0)),
             enclosing_code_unit_query_count: Arc::new(AtomicUsize::new(0)),
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
+            search_candidate_hydration_count: Arc::new(AtomicUsize::new(0)),
             package_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
             global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
             workspace_path_scan_count: Arc::new(AtomicUsize::new(0)),
@@ -4665,6 +4675,18 @@ where
     }
 
     #[doc(hidden)]
+    pub fn reset_search_candidate_hydration_count_for_test(&self) {
+        self.search_candidate_hydration_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn search_candidate_hydration_count_for_test(&self) -> usize {
+        self.search_candidate_hydration_count
+            .load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
     pub fn reset_global_usage_definition_index_build_count_for_test(&self) {
         self.global_usage_definition_index_build_count
             .store(0, Ordering::Relaxed);
@@ -5704,16 +5726,36 @@ where
         self.fq_matches(unit, |name| compiled.is_match(name))
     }
 
-    fn fq_matches(&self, unit: &CodeUnit, mut matches: impl FnMut(&str) -> bool) -> bool {
-        let fq_name = self.adapter.normalize_full_name(&unit.fq_name());
+    fn fq_matches(&self, unit: &CodeUnit, matches: impl FnMut(&str) -> bool) -> bool {
+        self.fq_name_matches(unit.package_name(), unit.short_name(), matches)
+    }
+
+    /// The authoritative symbol-search match predicate, expressed over the two
+    /// fields `CodeUnit::fq_name` is built from.
+    ///
+    /// Taking the parts rather than a `CodeUnit` lets the persisted candidate
+    /// scan decide matches before paying to construct a unit, without the
+    /// bounded pre-pass and the final pass being able to disagree.
+    fn fq_name_matches(
+        &self,
+        package_name: &str,
+        short_name: &str,
+        mut matches: impl FnMut(&str) -> bool,
+    ) -> bool {
+        // Mirrors `CodeUnit::fq_name`.
+        let raw: Cow<'_, str> = if package_name.is_empty() {
+            Cow::Borrowed(short_name)
+        } else {
+            Cow::Owned(format!("{package_name}.{short_name}"))
+        };
+        let fq_name = self.adapter.normalize_full_name(&raw);
         if self.adapter.is_anonymous_structure(&fq_name) {
             return false;
         }
         if matches(&fq_name) {
             return true;
         }
-        let raw = unit.fq_name();
-        fq_name != raw && matches(&raw)
+        fq_name != *raw && matches(&raw)
     }
 
     fn sql_search_symbol_candidates(
@@ -5729,12 +5771,19 @@ where
         }
         self.full_declaration_scan_count
             .fetch_add(1, Ordering::Relaxed);
-        let rows = self.store_query_or_record(
-            self.store_context.store.search_candidate_rows_for_langs(
-                &self.storage_language_keys_for_queries(),
-                self.store_context.generations.as_ref(),
-                cancellation,
-            ),
+        let langs = self.storage_language_keys_for_queries();
+        // Phase one enumerates only the names a pattern can match. Phase two
+        // hydrates the full candidate projection for the keys that matched, so
+        // signature text, primary ranges, and `CodeUnit` construction cost
+        // proportionally to the answer instead of to the workspace (#1199).
+        let name_rows = self.store_query_or_record(
+            self.store_context
+                .store
+                .search_candidate_name_rows_for_langs(
+                    &langs,
+                    self.store_context.generations.as_ref(),
+                    cancellation,
+                ),
             format!(
                 "searching symbol candidates for {} patterns",
                 patterns.patterns().len()
@@ -5745,8 +5794,29 @@ where
             self.project.root(),
             self.live_snapshot(),
         );
-        let mut complete = rows.complete;
-        let mut inspected = rows.inspected;
+        let mut complete = name_rows.complete;
+        let mut inspected = name_rows.inspected;
+        let matched = resolver.match_candidate_names_cancellable(
+            &langs,
+            &name_rows.rows,
+            |package_name, short_name| {
+                self.fq_name_matches(package_name, short_name, |name| patterns.is_match(name))
+            },
+            cancellation,
+        );
+        complete &= matched.complete;
+        let rows = self.store_query_or_record(
+            self.store_context.store.search_candidate_rows_for_keys(
+                &langs,
+                self.store_context.generations.as_ref(),
+                &matched.rows,
+                cancellation,
+            ),
+            format!("hydrating {} matched symbol candidates", matched.rows.len()),
+        )?;
+        complete &= rows.complete;
+        self.search_candidate_hydration_count
+            .fetch_add(rows.rows.len(), Ordering::Relaxed);
         let resolved = resolver.resolve_rows_with_payload_cancellable(
             rows.rows
                 .into_iter()

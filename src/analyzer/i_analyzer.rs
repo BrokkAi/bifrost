@@ -352,6 +352,14 @@ pub trait IAnalyzer: Send + Sync + Any {
         0
     }
     #[doc(hidden)]
+    fn reset_search_candidate_hydration_count_for_test(&self) {}
+    /// Declarations a symbol search hydrated into `CodeUnit`s. Bounded work
+    /// means this tracks the matched answer, not the workspace (#1199).
+    #[doc(hidden)]
+    fn search_candidate_hydration_count_for_test(&self) -> usize {
+        0
+    }
+    #[doc(hidden)]
     fn reset_package_declaration_scan_count_for_test(&self) {}
     #[doc(hidden)]
     fn package_declaration_scan_count_for_test(&self) -> usize {

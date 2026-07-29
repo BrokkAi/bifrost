@@ -394,6 +394,14 @@ impl IAnalyzer for RustAnalyzer {
         self.inner.full_declaration_scan_count_for_test()
     }
 
+    fn reset_search_candidate_hydration_count_for_test(&self) {
+        self.inner.reset_search_candidate_hydration_count_for_test();
+    }
+
+    fn search_candidate_hydration_count_for_test(&self) -> usize {
+        self.inner.search_candidate_hydration_count_for_test()
+    }
+
     fn reset_candidate_hydration_count_for_test(&self) {
         self.inner.reset_full_hydration_count_for_test();
     }
