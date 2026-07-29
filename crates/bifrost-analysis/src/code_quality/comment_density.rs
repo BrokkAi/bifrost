@@ -122,8 +122,7 @@ pub fn report_comment_density_for_files(
     } else {
         DEFAULT_COMMENT_DENSITY_MAX_FILES
     };
-    let project = analyzer.project();
-    let resolver = WorkspaceFileResolver::new(project);
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
     let mut lines: Vec<String> = vec!["## Comment density by file".to_string(), String::new()];
     let mut files_shown: i32 = 0;
     let mut rows_emitted: i32 = 0;

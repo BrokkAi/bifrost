@@ -574,6 +574,18 @@ impl IAnalyzer for MultiAnalyzer {
             .retain(|active| !Arc::ptr_eq(active, context));
     }
 
+    /// The first delegate's cell — the same delegate `project()` answers from,
+    /// so the memoized listing describes exactly the workspace this analyzer
+    /// reports. `begin_query` propagates to every delegate, so it is active
+    /// whenever this analyzer's own scope is.
+    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
+        self.delegates
+            .values()
+            .next()?
+            .analyzer()
+            .workspace_file_index_cell()
+    }
+
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         match self.delegate_for_file(file) {
             Some(delegate) => delegate.analyzer().top_level_declarations(file),

@@ -109,7 +109,7 @@ pub use i_analyzer::AnalyzerQueryScope;
 pub(crate) use i_analyzer::default_parent_fq_name;
 pub use i_analyzer::{
     AnalyzerQueryContext, AnalyzerSnapshotCaches, IAnalyzer, QueryBatch, SearchSymbolCandidates,
-    SearchSymbolPatternBatch,
+    SearchSymbolPatternBatch, WorkspaceFileIndex, WorkspaceFileIndexCell,
 };
 pub use java::JavaAnalyzer;
 pub use javascript::JavascriptAnalyzer;

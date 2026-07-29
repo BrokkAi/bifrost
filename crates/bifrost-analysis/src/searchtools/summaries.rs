@@ -173,7 +173,7 @@ fn route_summary_targets_with_cancellation(
     cancellation: Option<&crate::CancellationToken>,
 ) -> SummaryTargets {
     let _scope = profiling::scope("searchtools::route_summary_targets");
-    let resolver = WorkspaceFileResolver::new(analyzer.project());
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
     // Materialized only for targets that actually name a container. Summary
     // routing used to build the whole workspace file set up front purely to ask
     // "is this target a directory?", so every `get_summaries` request — the
@@ -506,6 +506,10 @@ pub fn get_summaries_with_cancellation(
     cancellation: Option<&crate::CancellationToken>,
 ) -> SummaryResult {
     let _scope = profiling::scope("searchtools::get_summaries");
+    // Same request boundary as `get_symbol_sources`: routing builds a resolver
+    // per target through `resolve_file_patterns`, so without a shared listing
+    // an N-target request walked the workspace O(N) times (#1334).
+    let _analyzer_query = AnalyzerQueryScope::new(analyzer);
     let targets = route_summary_targets_with_cancellation(analyzer, &params.targets, cancellation);
     summarize_routed_targets_with_cancellation(analyzer, &targets, cancellation)
 }
@@ -815,7 +819,7 @@ pub fn most_relevant_files_with_cancellation(
     if cancellation.is_cancelled() {
         return Err(most_relevant_files_cancellation_message(cancellation));
     }
-    let resolver = WorkspaceFileResolver::new(analyzer.project());
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
     let mut seeds = Vec::new();
     let mut not_found = Vec::new();
     let mut ambiguous_paths = Vec::new();

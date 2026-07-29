@@ -127,7 +127,7 @@ pub fn symbol_source_candidate_files(
     analyzer: &dyn IAnalyzer,
     result: &SymbolSourcesResult,
 ) -> BTreeSet<ProjectFile> {
-    let resolver = WorkspaceFileResolver::new(analyzer.project());
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
     let mut files = BTreeSet::new();
 
     for source in &result.sources {
@@ -259,6 +259,15 @@ pub fn get_symbol_sources(
     analyzer: &dyn IAnalyzer,
     params: SymbolLookupParams,
 ) -> SymbolSourcesResult {
+    // One tool call is one read-only analyzer request. The scope is what lets
+    // every `WorkspaceFileResolver` built below -- one per call site, times one
+    // per symbol in the parallel loop -- share a single workspace listing
+    // instead of each walking the repository (#1334), and it lets the per-symbol
+    // fan-out reuse hydrated file states the way every other batched tool
+    // already does. Nested scopes opened by callees do not clear the cache
+    // while this outer scope is active.
+    let _analyzer_query = AnalyzerQueryScope::new(analyzer);
+
     let selected_symbols: Vec<_> = params
         .symbols
         .into_iter()

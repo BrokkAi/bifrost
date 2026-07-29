@@ -27,5 +27,6 @@ mod issue_1218_boundary_candidate_honesty;
 mod issue_1225_python_annotation_inverse;
 mod issue_1325_csharp_census_complexity;
 mod issue_1332_search_notes_honesty;
+mod issue_1334_resolver_walk_memo;
 mod issue_693_profile;
 mod issue_csharp_verbatim_identifiers;
