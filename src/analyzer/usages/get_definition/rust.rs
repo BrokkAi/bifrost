@@ -768,6 +768,12 @@ fn resolve_rust_unscoped(
     }
     if let Some(tree) = tree
         && let Some(outcome) =
+            rust_enum_variant_declaration_outcome(analyzer, support, file, source, tree, site)
+    {
+        return outcome;
+    }
+    if let Some(tree) = tree
+        && let Some(outcome) =
             rust_exact_reference_role_outcome(analyzer, support, file, source, tree, site)
     {
         return outcome;
@@ -2428,11 +2434,13 @@ fn rust_self_scoped_associated_type_candidates(
 ) -> Option<Vec<CodeUnit>> {
     let node =
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
-    let scoped = rust_enclosing_scoped_type_identifier_name(
-        node,
-        site.focus_start_byte,
-        site.focus_end_byte,
-    )?;
+    // `Self::Assoc` is a `scoped_type_identifier` in a type position but a
+    // `scoped_identifier` when it is immediately used as a value/callee. Both
+    // forms name the enclosing trait or impl's associated item; resolving only
+    // the type-shaped node lets an unrelated import of `Assoc` win for the
+    // value-shaped form.
+    let scoped =
+        rust_enclosing_scoped_terminal_name(node, site.focus_start_byte, site.focus_end_byte)?;
     let path = scoped.child_by_field_name("path")?;
     if rust_node_text(path, source).trim() != "Self" {
         return None;
@@ -2447,6 +2455,36 @@ fn rust_self_scoped_associated_type_candidates(
         CodeUnit::is_field,
     )?;
     Some(vec![associated_type])
+}
+
+fn rust_enum_variant_declaration_outcome(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+) -> Option<DefinitionLookupOutcome> {
+    let focused =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
+    let variant = std::iter::successors(Some(focused), |node| node.parent())
+        .find(|node| node.kind() == "enum_variant")?;
+    let name = variant.child_by_field_name("name")?;
+    if !(name.start_byte() <= site.focus_start_byte && site.focus_end_byte <= name.end_byte()) {
+        return None;
+    }
+    let variant_name = rust_node_text(name, source).trim();
+    let candidates: Vec<_> = support
+        .file_identifier(file, variant_name)
+        .into_iter()
+        .filter(CodeUnit::is_field)
+        .filter(|candidate| {
+            analyzer.ranges(candidate).iter().any(|range| {
+                range.start_byte == variant.start_byte() && range.end_byte == variant.end_byte()
+            })
+        })
+        .collect();
+    (!candidates.is_empty()).then(|| candidates_outcome(candidates))
 }
 
 fn rust_enclosing_scoped_type_identifier_name(
