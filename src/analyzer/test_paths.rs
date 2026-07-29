@@ -59,6 +59,11 @@ pub fn has_test_filename_convention(path: &str, language: Language) -> bool {
                 || file_name.ends_with("Spec.scala")
                 || file_name.ends_with("Suite.scala")
         }
+        Language::Kotlin => {
+            file_name.ends_with("Test.kt")
+                || file_name.ends_with("Tests.kt")
+                || file_name.ends_with("Spec.kt")
+        }
         Language::Ruby => {
             lower == "spec_helper.rb"
                 || lower == "test_helper.rb"
@@ -89,6 +94,9 @@ pub fn has_test_filename_convention(path: &str, language: Language) -> bool {
                 || file_name.ends_with("Test.scala")
                 || file_name.ends_with("Spec.scala")
                 || file_name.ends_with("Suite.scala")
+                || file_name.ends_with("Test.kt")
+                || file_name.ends_with("Tests.kt")
+                || file_name.ends_with("Spec.kt")
                 || file_name.ends_with("Test.cs")
                 || file_name.ends_with("Tests.cs")
                 || file_name.ends_with("Test.php")
@@ -209,6 +217,28 @@ mod tests {
         assert!(has_test_filename_convention(
             "FooSpec.scala",
             Language::Scala
+        ));
+    }
+
+    #[test]
+    fn kotlin_pascal_case_suffixes_are_recognized() {
+        for path in ["SampleTest.kt", "SampleTests.kt", "SampleSpec.kt"] {
+            assert!(
+                has_test_filename_convention(path, Language::Kotlin),
+                "{path}"
+            );
+        }
+        assert!(!has_test_filename_convention("Sample.kt", Language::Kotlin));
+        // Suffix-anchored, not substring: a production file merely containing
+        // "Test" is not a test file.
+        assert!(!has_test_filename_convention(
+            "Testament.kt",
+            Language::Kotlin
+        ));
+        // Case-sensitive, matching the other PascalCase JVM languages.
+        assert!(!has_test_filename_convention(
+            "sampletest.kt",
+            Language::Kotlin
         ));
     }
 }

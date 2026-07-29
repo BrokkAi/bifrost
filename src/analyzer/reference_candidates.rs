@@ -213,7 +213,12 @@ pub(crate) fn is_reference_candidate_node(language: Language, kind: &str) -> boo
     }
     match language {
         Language::None => false,
-        Language::Java | Language::Go | Language::Python | Language::Php | Language::Scala => false,
+        Language::Java
+        | Language::Go
+        | Language::Python
+        | Language::Php
+        | Language::Scala
+        | Language::Kotlin => false,
         Language::Cpp => matches!(kind, "operator_name" | "destructor_name" | "this"),
         Language::JavaScript | Language::TypeScript => matches!(kind, "this"),
         Language::Rust => matches!(kind, "self" | "super" | "crate"),

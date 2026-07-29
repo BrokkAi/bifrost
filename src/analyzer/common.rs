@@ -208,6 +208,128 @@ pub(crate) fn node_source_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     source.get(node.byte_range()).unwrap_or("")
 }
 
+/// One unit of pending skeleton-rendering work.
+enum SkeletonWork {
+    /// Emit `unit`'s signatures, then enqueue its children.
+    Render { unit: CodeUnit, indent: String },
+    /// Emit the trailing `[...]` elision marker and/or closing brace that
+    /// follow a unit's children.
+    Close {
+        indent: String,
+        child_indent: String,
+        elide: bool,
+        close_brace: bool,
+    },
+}
+
+/// Render `code_unit`'s skeleton — its signature, then its children indented
+/// beneath it, closing class-like units with `}`.
+///
+/// `header_only` keeps just the field children and marks the elided remainder
+/// with `[...]`.
+///
+/// Shared by the language analyzers that override `direct_children` (to hide
+/// synthetic units) and therefore cannot use the engine's own renderer, which
+/// reads `TreeSitterAnalyzer::direct_children` directly. Dispatching through
+/// `&dyn IAnalyzer` here means each analyzer's overrides still apply.
+///
+/// Iterative rather than recursive: declaration nesting is attacker-controlled
+/// (a generated or hostile source file can nest types thousands deep), so a
+/// recursive walk risks exhausting the native stack.
+pub(crate) fn render_skeleton(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
+    code_unit: &CodeUnit,
+    header_only: bool,
+) -> String {
+    let mut out = String::new();
+    let mut stack = vec![SkeletonWork::Render {
+        unit: code_unit.clone(),
+        indent: String::new(),
+    }];
+
+    while let Some(work) = stack.pop() {
+        match work {
+            SkeletonWork::Render { unit, indent } => {
+                for signature in analyzer.signatures(&unit) {
+                    if signature.is_empty() {
+                        continue;
+                    }
+                    for line in signature.lines() {
+                        out.push_str(&indent);
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                }
+
+                let all_children = analyzer.direct_children(&unit);
+                let all_child_count = all_children.len();
+                let is_class = unit.is_class();
+                let children: Vec<CodeUnit> = if header_only {
+                    all_children
+                        .into_iter()
+                        .filter(CodeUnit::is_field)
+                        .collect()
+                } else {
+                    all_children
+                };
+
+                if children.is_empty() && !is_class {
+                    continue;
+                }
+                let child_indent = format!("{indent}  ");
+                // Pushed before the children so it pops after them. The
+                // elision marker compares against the pre-filter child count,
+                // so it fires exactly when `header_only` dropped something.
+                stack.push(SkeletonWork::Close {
+                    indent,
+                    child_indent: child_indent.clone(),
+                    elide: header_only && all_child_count > children.len(),
+                    close_brace: is_class,
+                });
+                for child in children.into_iter().rev() {
+                    stack.push(SkeletonWork::Render {
+                        unit: child,
+                        indent: child_indent.clone(),
+                    });
+                }
+            }
+            SkeletonWork::Close {
+                indent,
+                child_indent,
+                elide,
+                close_brace,
+            } => {
+                if elide {
+                    out.push_str(&child_indent);
+                    out.push_str("[...]\n");
+                }
+                if close_brace {
+                    out.push_str(&indent);
+                    out.push_str("}\n");
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// `text` with every whitespace run collapsed to a single space and the ends
+/// trimmed.
+///
+/// Used to render a multi-line source header (a class or callable signature)
+/// as one stable line.
+pub(crate) fn collapse_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for token in text.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(token);
+    }
+    out
+}
+
 /// [`node_source_text`] with leading/trailing whitespace trimmed. Trimming is
 /// load-bearing on the usages side, where a "name" node can span a compound
 /// token whose canonical text is the trimmed inner identifier; declaration-side

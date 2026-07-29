@@ -113,6 +113,31 @@ pub(crate) fn named_children<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
     node.named_children(&mut cursor).collect()
 }
 
+/// The first direct named child of `node` whose kind is `kind`.
+///
+/// Distinct from a bare "first named child": this selects by kind, which is how
+/// declaration walks reach a specific grammar slot (a `class_body`, a
+/// `type_identifier`) without assuming child order.
+pub(crate) fn first_named_child_of_kind<'tree>(
+    node: Node<'tree>,
+    kind: &str,
+) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == kind)
+}
+
+/// Whether `node` has an anonymous (token) child spelled `token`.
+///
+/// Restricted to anonymous children on purpose: grammars can spell the same
+/// text as either a keyword token or a named node, and callers asking this
+/// question want the keyword.
+pub(crate) fn has_token_child(node: Node<'_>, token: &str) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| !child.is_named() && child.kind() == token)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

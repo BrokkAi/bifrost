@@ -2218,3 +2218,158 @@ fn hidden_python_path_module_fq_reopens_warm_without_reparse() {
         Path::new(".github/download-models-weights.py")
     );
 }
+
+mod common;
+use common::InlineTestProject;
+
+fn parsed_language_file_count(events: &[BuildProgressEvent], language: Language) -> usize {
+    events
+        .iter()
+        .filter(|event| event.phase == BuildProgressPhase::Parse)
+        .filter(|event| event.language == language)
+        .filter(|event| event.file.is_some())
+        .count()
+}
+
+const KOTLIN_SERVICE_KT: &str = "package app\n\nclass Service(val id: Int) {\n    fun serve(): Int = id\n\n    companion object {\n        fun default(): Service = Service(0)\n    }\n}\n";
+const KOTLIN_UTIL_KT: &str =
+    "package app\n\nfun helper(count: Int = 1): Int = count\n\ntypealias Ids = List<Int>\n";
+
+#[test]
+fn kotlin_persisted_build_hydrates_without_reparse_and_restores_declarations() {
+    let built = InlineTestProject::with_language(Language::Kotlin)
+        .file("src/Service.kt", KOTLIN_SERVICE_KT)
+        .file("src/Util.kt", KOTLIN_UTIL_KT)
+        .build();
+    let repo = init_git_repo(built.root());
+    commit_all(&repo, "init");
+    let project = built.project_dyn();
+
+    let cold_events = Arc::new(Mutex::new(Vec::new()));
+    let cold = build_persisted_with_progress(Arc::clone(&project), AnalyzerConfig::default(), {
+        let events = Arc::clone(&cold_events);
+        move |event| events.lock().unwrap().push(event)
+    });
+    let cold_names = declaration_names(cold.analyzer());
+    for expected in [
+        "app.Service",
+        "app.Service.Service",
+        "app.Service.id",
+        "app.Service.serve",
+        "app.Service.Companion",
+        "app.Service.Companion.default",
+        "app.helper",
+        "app.Ids",
+    ] {
+        assert!(cold_names.contains(expected), "missing {expected}");
+    }
+    assert_eq!(
+        parsed_language_file_count(&cold_events.lock().unwrap(), Language::Kotlin),
+        2
+    );
+    let cold_service = cold.analyzer().get_definitions("app.Service");
+    let cold_signature = cold.analyzer().signatures(&cold_service[0]);
+    drop(cold);
+
+    let warm_events = Arc::new(Mutex::new(Vec::new()));
+    let warm = build_persisted_with_progress(project, AnalyzerConfig::default(), {
+        let events = Arc::clone(&warm_events);
+        move |event| events.lock().unwrap().push(event)
+    });
+    assert_eq!(cold_names, declaration_names(warm.analyzer()));
+    assert_eq!(
+        parsed_language_file_count(&warm_events.lock().unwrap(), Language::Kotlin),
+        0,
+        "warm rebuild must hydrate Kotlin state without reparsing"
+    );
+    let warm_service = warm.analyzer().get_definitions("app.Service");
+    assert_eq!(
+        warm.analyzer().signatures(&warm_service[0]),
+        cold_signature,
+        "signatures must survive the store round-trip"
+    );
+}
+
+#[test]
+fn kotlin_dirty_file_reconcile_parses_only_changed_blob() {
+    let built = InlineTestProject::with_language(Language::Kotlin)
+        .file("src/Service.kt", KOTLIN_SERVICE_KT)
+        .file("src/Util.kt", KOTLIN_UTIL_KT)
+        .build();
+    let repo = init_git_repo(built.root());
+    commit_all(&repo, "init");
+    let project = built.project_dyn();
+
+    let _ = build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    write_file(
+        built.root(),
+        "src/Util.kt",
+        "package app\n\nfun renamedHelper(count: Int = 1): Int = count\n",
+    );
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let rebuilt = build_persisted_with_progress(project, AnalyzerConfig::default(), {
+        let events = Arc::clone(&events);
+        move |event| events.lock().unwrap().push(event)
+    });
+    let names = declaration_names(rebuilt.analyzer());
+    assert!(names.contains("app.renamedHelper"));
+    assert!(!names.contains("app.helper"));
+    assert!(names.contains("app.Service.serve"));
+    assert_eq!(
+        parsed_language_file_count(&events.lock().unwrap(), Language::Kotlin),
+        1,
+        "only the edited Kotlin file may reparse"
+    );
+}
+
+#[test]
+fn kotlin_epoch_bump_invalidates_kotlin_rows_but_not_java_rows() {
+    // Mixed-language epoch scoping: a Kotlin analysis-epoch change must force
+    // Kotlin re-analysis while the Java analyzer keeps hydrating warm.
+    let built = InlineTestProject::new()
+        .file("src/Service.kt", KOTLIN_SERVICE_KT)
+        .file(
+            "src/Client.java",
+            "package app;\n\nclass Client {\n    int use() { return 1; }\n}\n",
+        )
+        .build();
+    assert_eq!(
+        built.languages(),
+        BTreeSet::from([Language::Java, Language::Kotlin])
+    );
+    let repo = init_git_repo(built.root());
+    commit_all(&repo, "init");
+    let project = built.project_dyn();
+
+    let _ = build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+
+    let store = brokk_bifrost::analyzer::store::AnalyzerStore::open_persistent(&analyzer_db_path(
+        built.root(),
+    ))
+    .expect("open persisted analyzer store");
+    store
+        .ensure_language_epoch_value("kotlin", "kotlin-epoch-invalidation-test")
+        .expect("bump kotlin epoch");
+    drop(store);
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let rebuilt = build_persisted_with_progress(project, AnalyzerConfig::default(), {
+        let events = Arc::clone(&events);
+        move |event| events.lock().unwrap().push(event)
+    });
+    let names = declaration_names(rebuilt.analyzer());
+    assert!(names.contains("app.Service.serve"));
+    assert!(names.contains("app.Client"));
+    let events = events.lock().unwrap();
+    assert_eq!(
+        parsed_language_file_count(&events, Language::Kotlin),
+        1,
+        "a stale Kotlin epoch must force Kotlin re-analysis"
+    );
+    assert_eq!(
+        parsed_language_file_count(&events, Language::Java),
+        0,
+        "the Java epoch is untouched, so Java must hydrate warm"
+    );
+}
