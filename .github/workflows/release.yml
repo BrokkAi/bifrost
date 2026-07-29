@@ -477,6 +477,7 @@ jobs:
       version: ${{ needs.release-context.outputs.version }}
       commit: ${{ needs.release-context.outputs.commit }}
     permissions:
+      contents: read
       id-token: write
 
   pi-package:
