@@ -518,9 +518,13 @@ pub fn park(_: SignalHandle) {}
         .find(|site| site.path == "src/lib.rs" && site.start_byte == decoy_start)
         .expect("opaque nested-wrapper reference site");
     assert_eq!(
+        decoy.forward_status, "unresolvable_import_boundary",
+        "an unproven wrapper must not turn a same-named physical file into a local declaration route: {decoy:#?}"
+    );
+    assert_eq!(
         decoy.classification,
-        ReferenceClassification::Missing,
-        "the forward index may see the same-named file, but an unproven wrapper must not give it a physical inverse route: {decoy:#?}"
+        ReferenceClassification::Inconclusive,
+        "a forward boundary is not a proven target and therefore cannot be an inverse omission: {decoy:#?}"
     );
     assert!(decoy.inverse_hit.is_none(), "{decoy:#?}");
 }
