@@ -459,7 +459,7 @@ pub(super) struct RustUsageIndex {
     physical_roots: HashMap<ProjectFile, ModuleKey>,
     actual_crate_roots: HashSet<ProjectFile>,
     physical_owners: RustPhysicalOwnerIndex,
-    origin_routes_by_file: HashMap<ProjectFile, Vec<RustOriginRoute>>,
+    origin_routes_by_file: HashMap<ProjectFile, HashMap<String, Vec<RustOriginRoute>>>,
     macro_visible_ranges: HashMap<CodeUnit, HashMap<RustMacroScopeKey, Vec<(usize, usize)>>>,
     module_aliases: RustModuleAliasRoutes,
     module_files: RustModuleFiles,
@@ -1867,6 +1867,7 @@ impl RustAnalyzer {
         let mut matches: HashSet<RustSymbolIdentity> = index
             .origin_routes_by_file
             .get(file)
+            .and_then(|routes| routes.get(segments[0]))
             .into_iter()
             .flatten()
             .filter(|route| {
@@ -2010,6 +2011,7 @@ impl RustAnalyzer {
                     index
                         .origin_routes_by_file
                         .get(&resolved.target_file)
+                        .and_then(|routes| routes.get(terminal))
                         .into_iter()
                         .flatten()
                         .filter(|route| {
@@ -2171,7 +2173,7 @@ fn build_origin_routes(
     importer_reverse: &HashMap<ProjectFile, Vec<RustImportEdge>>,
     declaration_domains: &HashMap<RustSymbolIdentity, Vec<Domain>>,
     module_domains: &HashMap<ModuleKey, Vec<Domain>>,
-) -> HashMap<ProjectFile, Vec<RustOriginRoute>> {
+) -> HashMap<ProjectFile, HashMap<String, Vec<RustOriginRoute>>> {
     type ExactKey = (ProjectFile, ModuleKey, String);
     type ModuleEdgeKey = (ProjectFile, ModuleKey);
     let mut exact_edges: HashMap<ExactKey, Vec<&RustImportEdge>> = HashMap::default();
@@ -2206,7 +2208,8 @@ fn build_origin_routes(
         );
     }
     let mut visited = HashSet::default();
-    let mut routes: HashMap<ProjectFile, Vec<RustOriginRoute>> = HashMap::default();
+    let mut routes: HashMap<ProjectFile, HashMap<String, Vec<RustOriginRoute>>> =
+        HashMap::default();
     while let Some((target, origin, domain)) = pending.pop_front() {
         if !visited.insert((target.clone(), origin.clone(), domain.clone())) {
             continue;
@@ -2254,8 +2257,14 @@ fn build_origin_routes(
                 RustImportEdgeKind::Glob => vec![target.name.clone()],
                 RustImportEdgeKind::Qualified(path) => path.clone(),
             };
+            let first_segment = path
+                .first()
+                .expect("origin routes always have a non-empty path")
+                .clone();
             routes
                 .entry(edge.importer.clone())
+                .or_default()
+                .entry(first_segment)
                 .or_default()
                 .push(RustOriginRoute {
                     importer_module: edge.importer_module.clone(),
