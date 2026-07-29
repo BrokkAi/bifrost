@@ -1174,8 +1174,13 @@ fn jsts_unbound_assigned_property_shape<'a>(
     if analyzer.parent_of(target).is_some() {
         return None;
     }
-    let (object_name, property_name) = target.short_name().split_once('.')?;
-    if object_name.is_empty() || property_name.is_empty() || property_name.contains('.') {
+    let [object_id, property_id] = target.fq().segments() else {
+        return None;
+    };
+    let interner = crate::analyzer::fq_name::segment_interner();
+    let (object_name, _) = interner.resolve(*object_id);
+    let (property_name, _) = interner.resolve(*property_id);
+    if object_name.is_empty() || property_name.is_empty() {
         return None;
     }
 
