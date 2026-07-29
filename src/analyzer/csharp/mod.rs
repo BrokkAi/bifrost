@@ -187,10 +187,25 @@ pub(crate) fn csharp_is_expression_type_operand(parent: Node<'_>, node: Node<'_>
         "is_pattern_expression" => parent
             .child_by_field_name("pattern")
             .is_some_and(|pattern| {
-                pattern.start_byte() == node.start_byte() && pattern.end_byte() == node.end_byte()
+                pattern.start_byte() == node.start_byte()
+                    && pattern.end_byte() == node.end_byte()
+                    && csharp_pattern_has_structured_type(pattern)
             }),
         _ => false,
     }
+}
+
+fn csharp_pattern_has_structured_type(mut pattern: Node<'_>) -> bool {
+    while pattern.kind() == "parenthesized_pattern" {
+        let Some(inner) = pattern.named_child(0) else {
+            return false;
+        };
+        pattern = inner;
+    }
+    matches!(
+        pattern.kind(),
+        "type_pattern" | "declaration_pattern" | "recursive_pattern"
+    )
 }
 
 #[derive(Clone)]

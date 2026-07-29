@@ -579,6 +579,17 @@ local gate, but is not the focus.
   Fresh exact replays on committed head `ea66ce09` resolve
   `org.http4s.Method$.HEAD` and `zio.http.Method$.OPTIONS$` with zero
   actionable rows. Clean five-repository acceptance replay is still required.
+- [x] (2026-07-28) The complete all-feature gate exposed a C# inverted-graph
+  parity regression in #1267's pattern-role expansion. `constant_pattern`
+  already receives a guarded type-or-value interpretation, but the enclosing
+  `is_pattern_expression` was independently classified as an ordinary type
+  operand and recorded inherited constants and parameter shadows as visible
+  types. Restricted that shared classification to genuinely type-bearing
+  pattern wrappers and strengthened both C# scan paths to treat any nearest
+  field/property/constant as a value shadow without requiring declared-type
+  inference. Both focused #1267 target-specific and inverted-graph regressions
+  pass with all features; repository-wide Clippy and test gates remain to be
+  repeated on the committed follow-up.
 - [x] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [x] Complete C++ and publish its evidence and user summary.

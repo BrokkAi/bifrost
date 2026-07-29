@@ -2857,6 +2857,26 @@ pub(super) fn usage_class_field_receiver_type(
     }
 }
 
+/// Whether an unqualified identifier binds to a value member on the enclosing
+/// type or its nearest declaring ancestor. This is deliberately independent of
+/// declared-type inference: constants and other value members still shadow a
+/// visible type with the same name even when their type cannot be resolved.
+pub(super) fn usage_unqualified_value_member_shadows_type(
+    node: Node<'_>,
+    name: &str,
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+) -> bool {
+    let Some(enclosing) = enclosing_declared_type(node, csharp, file, source) else {
+        return false;
+    };
+    nearest_member_candidates_for_owner(analyzer, csharp, &enclosing, name, None)
+        .iter()
+        .any(CodeUnit::is_field)
+}
+
 /// Whether an unqualified `member_name` is bound by a local (parameter or local
 /// variable) of the same name in scope — in which case it is provably *not* the
 /// field, so the occurrence should be skipped rather than treated as an ambiguous
