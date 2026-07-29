@@ -7652,6 +7652,81 @@ pub fn run() {
 }
 
 #[test]
+fn rust_graph_strategy_resolves_same_package_bin_imported_free_function_call() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"import_model_weights\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub mod inference;\npub use inference::infer;\n",
+        ),
+        ("src/inference.rs", "pub fn infer() {}\n"),
+        (
+            "src/bin/safetensors.rs",
+            "use import_model_weights::infer;\n\nfn main() {\n    infer();\n}\n",
+        ),
+    ]);
+
+    let target = definition(&analyzer, "inference.infer");
+    let hits = authoritative_hits(
+        &analyzer,
+        &target,
+        [project.file("src/bin/safetensors.rs")]
+            .into_iter()
+            .collect(),
+    );
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/bin/safetensors.rs") && hit.snippet.contains("infer();")
+        }),
+        "expected same-package bin->lib infer() call: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_graph_strategy_resolves_path_attribute_module_qualified_function_call() {
+    let bench = "#[path = \"common/mod.rs\"]\nmod common;\n\nfn main() {\n    common::report_failures();\n    common::other();\n}\n";
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"bench_path\"\nversion = \"0.1.0\"\n\n[[bench]]\nname = \"binary_ops\"\npath = \"benches/binary_ops.rs\"\nharness = false\n",
+        ),
+        ("src/lib.rs", "pub fn placeholder() {}\n"),
+        (
+            "benches/common/mod.rs",
+            "pub fn report_failures() {}\npub fn other() {}\n",
+        ),
+        ("benches/binary_ops.rs", bench),
+    ]);
+
+    let target = definition(&analyzer, "benches.common.report_failures");
+    let hits = authoritative_hits(
+        &analyzer,
+        &target,
+        [project.file("benches/binary_ops.rs")]
+            .into_iter()
+            .collect(),
+    );
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("benches/binary_ops.rs")
+                && hit.snippet.contains("common::report_failures()")
+        }),
+        "expected #[path] module-qualified call: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            hit.start_offset != bench.find("common::other").expect("other call") + "common::".len()
+        }),
+        "same-module sibling function must stay unrelated: {hits:#?}"
+    );
+}
+
+#[test]
 fn rust_graph_strategy_prefers_same_module_function_over_imported_module_name() {
     let (_project, analyzer) = rust_analyzer_with_files(&[(
         "src/lib.rs",
@@ -9230,7 +9305,53 @@ fn consume(_: QuicStream) {}
 }
 
 #[test]
-fn rust_named_type_import_alias_keeps_type_namespace_exact() {
+fn rust_grouped_same_crate_use_prefix_keeps_module_namespace_exact() {
+    let source = r#"
+mod error {
+    pub struct ApiResult;
+}
+mod other {
+    pub struct ApiResult;
+}
+
+use crate::{error::ApiResult, other::ApiResult as OtherApiResult};
+
+fn consume(_: ApiResult, _: OtherApiResult) {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let target = analyzer
+        .get_definitions("error")
+        .into_iter()
+        .find(CodeUnit::is_module)
+        .expect("error module");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .all_hits_including_imports();
+    let expected = source
+        .find("error::ApiResult")
+        .expect("grouped same-crate prefix");
+    let unrelated = source
+        .find("other::ApiResult")
+        .expect("unrelated grouped prefix");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/lib.rs")
+                && hit.start_offset == expected
+                && hit.end_offset == expected + "error".len()
+                && hit.kind == UsageHitKind::Import
+        }),
+        "grouped same-crate module prefix must retain exact identity: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| { hit.file != project.file("src/lib.rs") || hit.start_offset != unrelated }),
+        "unrelated grouped module prefix must stay unmatched: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_named_import_alias_preserves_type_and_value_namespaces() {
     let source = r#"
 mod defs {
     pub struct TsigAlgorithm;
@@ -9272,10 +9393,62 @@ fn consume(_: ImportedAlgorithm) {}
         "expected exact named type import hit: {hits:#?}"
     );
     assert!(
-        value_hits
-            .iter()
-            .all(|hit| hit.file != project.file("src/lib.rs") || hit.start_offset != expected),
-        "same-spelled value namespace must not capture the type import: {value_hits:#?}"
+        value_hits.iter().any(|hit| {
+            hit.file == project.file("src/lib.rs")
+                && hit.start_offset == expected
+                && hit.end_offset == expected + "TsigAlgorithm".len()
+                && hit.kind == UsageHitKind::Import
+        }),
+        "one Rust use item imports every matching namespace: {value_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_grouped_named_type_import_alias_keeps_exact_identity() {
+    let source = r#"
+mod tsig {
+    pub struct TsigAlgorithm { _private: () }
+    pub fn TsigAlgorithm() {}
+}
+mod other {
+    pub struct TsigAlgorithm;
+}
+
+use crate::{other::TsigAlgorithm as OtherAlgorithm, tsig::TsigAlgorithm as TestTsigAlgorithm};
+
+fn consume(_: TestTsigAlgorithm, _: OtherAlgorithm) {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let type_target = analyzer
+        .get_definitions("tsig.TsigAlgorithm")
+        .into_iter()
+        .find(CodeUnit::is_class)
+        .expect("TsigAlgorithm type");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[type_target])
+        .all_hits_including_imports();
+    let expected = source
+        .find("tsig::TsigAlgorithm as TestTsigAlgorithm")
+        .expect("grouped named type import");
+    let unrelated = source
+        .find("other::TsigAlgorithm as OtherAlgorithm")
+        .expect("unrelated grouped type import");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/lib.rs")
+                && hit.start_offset == expected + "tsig::".len()
+                && hit.end_offset == expected + "tsig::TsigAlgorithm".len()
+                && hit.kind == UsageHitKind::Import
+        }),
+        "grouped aliased type import must retain exact identity: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != project.file("src/lib.rs")
+                || hit.start_offset != unrelated + "other::".len()
+        }),
+        "unrelated grouped aliased type import must stay unmatched: {hits:#?}"
     );
 }
 

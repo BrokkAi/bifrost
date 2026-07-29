@@ -9593,6 +9593,88 @@ val answer: Int = 42
 }
 
 #[test]
+fn scala_usage_finder_resolves_imported_function_values_under_qualified_higher_order_calls() {
+    let consumer_source = r#"
+package app
+
+import pkg.Helpers.sourceField
+
+object Consumer {
+  val direct = List("mimeType").map(sourceField) // imported-qualified-hof
+
+  def shadowed: List[Int] = {
+    def sourceField(value: Int): Int = value + 1
+    List(1).map(sourceField) // local-shadow-qualified-hof
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "pkg/Helpers.scala",
+            r#"
+package pkg
+
+object Helpers {
+  def sourceField(value: String): String = value.reverse
+}
+"#,
+        ),
+        ("app/Consumer.scala", consumer_source),
+    ]);
+
+    let source_field = definition(&analyzer, "pkg.Helpers$.sourceField");
+    let hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&source_field)),
+    );
+    assert_hit_contains(&hits, "imported-qualified-hof");
+    assert_no_hit_contains(&hits, "local-shadow-qualified-hof");
+}
+
+#[test]
+fn scala_usage_finder_resolves_qualified_function_values_with_exact_owner_identity() {
+    let consumer_source = r#"
+package app
+
+object Role {
+  def promotable(value: Char): Option[Int] = Some(value.toInt)
+}
+
+object OtherRole {
+  def promotable(value: Char): Option[Int] = None
+}
+
+object Tree {
+  def build(value: String): Int = value.length
+}
+
+object OtherTree {
+  def build(value: String): Int = 0
+}
+
+object Consumer {
+  val promoted = List('a').flatMap(Role.promotable) // exact-qualified-promotable
+  val built = List("a").map(Tree.build) // exact-qualified-build
+  val otherPromoted = List('a').flatMap(OtherRole.promotable) // wrong-owner-promotable
+  val otherBuilt = List("a").map(OtherTree.build) // wrong-owner-build
+}
+"#;
+    let (_project, analyzer) =
+        scala_analyzer_with_files(&[("app/Consumer.scala", consumer_source)]);
+
+    let promotable = definition(&analyzer, "app.Role$.promotable");
+    let promotable_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&promotable)));
+    assert_hit_contains(&promotable_hits, "exact-qualified-promotable");
+    assert_no_hit_contains(&promotable_hits, "wrong-owner-promotable");
+
+    let build = definition(&analyzer, "app.Tree$.build");
+    let build_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&build)));
+    assert_hit_contains(&build_hits, "exact-qualified-build");
+    assert_no_hit_contains(&build_hits, "wrong-owner-build");
+}
+
+#[test]
 fn scala_graph_resolves_imported_constructor_targets() {
     let consumer_source = r#"
 package app
@@ -11945,5 +12027,117 @@ class Unrelated {{
         ] {
             assert_no_hit_contains(&concrete_hits, &marker);
         }
+    }
+}
+
+#[test]
+fn scala_usage_finder_resolves_bare_object_owned_parameterless_members() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/Config.scala",
+        r#"package app
+
+object Config {
+  def fromConfig: Int = 1
+  def awsCredentials: String = "creds"
+
+  def useMembers(): (Int, String, Int, String) = {
+    val first = fromConfig // positive-bare-from-config
+    val second = awsCredentials // positive-bare-aws-credentials
+    val fromConfig = 99
+    val awsCredentials = "shadow"
+    (
+      first,
+      second,
+      fromConfig, // negative-shadow-from-config
+      awsCredentials, // negative-shadow-aws-credentials
+    )
+  }
+}
+
+object OtherConfig {
+  def fromConfig: Int = 2
+  def awsCredentials: String = "other"
+}
+"#,
+    )]);
+
+    for (target, positive, negative) in [
+        (
+            "app.Config$.fromConfig",
+            "positive-bare-from-config",
+            "negative-shadow-from-config",
+        ),
+        (
+            "app.Config$.awsCredentials",
+            "positive-bare-aws-credentials",
+            "negative-shadow-aws-credentials",
+        ),
+    ] {
+        let target = definition(&analyzer, target);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_contains(&target_hits, positive);
+        assert_no_hit_contains(&target_hits, negative);
+    }
+}
+
+#[test]
+fn scala_usage_finder_resolves_exact_qualified_parameterless_and_invoked_members() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/Schema.scala",
+        r#"package app
+
+trait SchemaLike {
+  def root: String
+  def children: List[String]
+}
+
+final class Schema extends SchemaLike {
+  def root: String = "root"
+  def children: List[String] = Nil
+  def annotate(value: String): String = value.reverse
+}
+
+final class OtherSchema extends SchemaLike {
+  def root: String = "other-root"
+  def children: List[String] = List("x")
+  def annotate(value: String): String = value
+}
+
+object UseSchema {
+  def consume(schema: Schema, other: OtherSchema): Unit = {
+    val root = schema.root // positive-qualified-root
+    val kids = schema.children // positive-qualified-children
+    val annotated = schema.annotate("x") // positive-qualified-annotate
+    val wrongRoot = other.root // negative-wrong-owner-root
+    val wrongKids = other.children // negative-wrong-owner-children
+    val wrongAnnotated = other.annotate("x") // negative-wrong-owner-annotate
+  }
+}
+"#,
+    )]);
+
+    for (target, positive, negative) in [
+        (
+            "app.Schema.root",
+            "positive-qualified-root",
+            "negative-wrong-owner-root",
+        ),
+        (
+            "app.Schema.children",
+            "positive-qualified-children",
+            "negative-wrong-owner-children",
+        ),
+        (
+            "app.Schema.annotate",
+            "positive-qualified-annotate",
+            "negative-wrong-owner-annotate",
+        ),
+    ] {
+        let target = definition(&analyzer, target);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_contains(&target_hits, positive);
+        assert_no_hit_contains(&target_hits, negative);
     }
 }
