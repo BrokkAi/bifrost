@@ -9,6 +9,7 @@ default-members = ["."]
 resolver = "3"
 
 [workspace.package]
+version = "0.8.12"
 edition = "2024"
 license = "LGPL-3.0-or-later"
 repository = "https://github.com/BrokkAi/bifrost"
@@ -16,10 +17,10 @@ homepage = "https://github.com/BrokkAi/bifrost"
 
 [package]
 name = "brokk-bifrost"
-# Single source of truth for both the crate and the Python wheel. The Python
-# package (`brokk-bifrost-searchtools`) inherits this version via maturin's
-# `dynamic = ["version"]` in pyproject.toml — keep it here, nowhere else.
-version = "0.8.12"
+# The workspace version is the single source of truth for this facade, all
+# implementation packages, and the Python wheel. Maturin inherits it through
+# `dynamic = ["version"]` in pyproject.toml.
+version.workspace = true
 edition = "2024"
 description = "Tree-sitter-backed multi-language code analyzer with bundled LSP and MCP search-tool servers. Powers Brokk's `bifrost` binary."
 license = "LGPL-3.0-or-later"
@@ -47,40 +48,17 @@ exclude = [
     "CODE_OF_CONDUCT.md",
     "CONTRIBUTING.md",
     "SECURITY.md",
-    # Repository test targets run from source checkouts and CI, not from the
-    # published crate. Retain non-Rust fixtures used by inline library tests.
-    "/tests/**/*.rs",
-    "/tests/common/**",
+    # Repository tests and fixtures run from source checkouts and CI, not from
+    # the published facade package.
+    "tests/**",
     "/python_tests/**",
-    # Fixtures consumed only by the excluded integration-test targets. Inline
-    # #[cfg(test)] modules keep csharp-external (with its source provenance),
-    # two policies/*.rqlp files, policy-cli/project, typestate, and the
-    # testcode-java sources below.
-    "tests/fixtures/mcp/**",
-    "tests/fixtures/policies/**",
-    "!tests/fixtures/policies/dynamic-eval.rqlp",
-    "!tests/fixtures/policies/endpoints/http-request-parameter.rqlp",
-    "tests/fixtures/policy-cli/overrides/**",
-    "tests/fixtures/proxygroup_test_regression.go",
-    "tests/fixtures/sarif/**",
-    "tests/fixtures/scala-issue-1016/**",
-    "tests/fixtures/scala-issue-1068/**",
-    "tests/fixtures/semantic-model-packs/**",
-    "!tests/fixtures/semantic-model-packs/declarations-v1.json",
-    "tests/fixtures/testcode-cpp/**",
-    "tests/fixtures/testcode-cs/**",
-    "tests/fixtures/testcode-git-rank-java/**",
-    "tests/fixtures/testcode-go/**",
-    "tests/fixtures/testcode-java/bin/**",
     # The documentation site is published separately; none of it is a crate
     # build or runtime input.
     "docs/**",
     # Benchmark baselines and runner tooling are development-only.
     "benchmark/**",
-    # Editor extension sources ship through the VS Code marketplace. The
-    # Rune IR TextMate grammar stays: an inline test include_str!'s it.
+    # Editor extension sources ship through the VS Code marketplace.
     "editors/**",
-    "!editors/vscode/syntaxes/bifrost-rune-ir.tmLanguage.json",
     # Agent plugin manifests/tests ship through plugin marketplaces. Only
     # the SKILL.md files embedded into the binary via include_str! stay;
     # anything else placed under skills/ must not ship.

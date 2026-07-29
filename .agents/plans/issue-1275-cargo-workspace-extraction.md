@@ -19,7 +19,7 @@ A developer will be able to run `cargo test -p brokk-bifrost-mcp` or `cargo test
 - [x] (2026-07-29 12:38Z) Extracted the LSP host and its 193-test subprocess contract, preserved root/benchmark callers, and passed 297 independent package tests.
 - [x] (2026-07-29 13:19Z) Extracted and independently validated the MCP host package, then reconnected the CLI, Python facade, and root build identity.
 - [x] (2026-07-29 13:19Z) Moved both protocol subprocess contracts and CI impact mappings onto the proven package boundaries.
-- [ ] Make crate packaging, notices, wheels, and the release-promotion DAG workspace-aware.
+- [x] (2026-07-29 13:35Z) Made lockstep versioning, package archives, notices, wheel inputs, and the release-promotion DAG workspace-aware.
 - [ ] Run the complete local validation, policy gate, packaged-consumer smoke, and cross-platform CI matrix.
 
 ## Surprises & Discoveries
@@ -78,6 +78,12 @@ A developer will be able to run `cargo test -p brokk-bifrost-mcp` or `cargo test
 - Observation: Root build identity can remain facade-owned without introducing a reverse dependency.
   Evidence: The MCP host exposes a typed `run_stdio_server_with_build_identity` entry point; the root binary injects `BIFROST_BUILD_IDENTITY`, and `mcp_build_identity_facade` proves that an MCP initialize response reports the exact facade identity.
 
+- Observation: Stable Cargo still resolves registry dependencies while creating a dependent archive with `cargo package --no-verify`.
+  Evidence: Packaging runtime before analysis was public initially failed with “no matching package named `brokk-bifrost-analysis` found”. Command-local `[patch.crates-io]` configuration makes all unpublished workspace packages resolvable for archive creation without leaking patches into normalized manifests.
+
+- Observation: The root dependency graph remains the correct union for binary/wheel Rust notices after extraction, but cargo-about also reports path-based first-party workspace members.
+  Evidence: Filtering used-by entries without a registry source removes all five Bifrost packages while retaining third-party dependencies; the generated HTML contains `serde` and no `brokk-bifrost` entry.
+
 ## Decision Log
 
 - Decision: Keep the repository-root package named `brokk-bifrost`, with library name `brokk_bifrost`, as the only compatibility facade promised to existing users.
@@ -128,6 +134,14 @@ A developer will be able to run `cargo test -p brokk-bifrost-mcp` or `cargo test
   Rationale: The extracted package owns MCP transport and service behavior; root owns CLI argument dispatch. Separating those contracts makes the independent-host test truthful without reducing behavior coverage.
   Date/Author: 2026-07-29 / Codex
 
+- Decision: Use `[workspace.package].version` as the sole package version and keep exact `=version` requirements on every implementation edge.
+  Rationale: Cargo can inherit package metadata but cannot interpolate the package version into dependency requirements. Release-version checks enforce inheritance, while the dependency graph validator rejects non-exact implementation requirements or drift.
+  Date/Author: 2026-07-29 / Codex
+
+- Decision: Publish analysis, then runtime, then MCP and LSP in parallel, and the facade last; verify each uploaded checksum before unlocking dependents.
+  Rationale: This is the Cargo dependency order, avoids unresolved registry dependencies, and turns registry propagation into a bounded evidence check rather than an arbitrary delay.
+  Date/Author: 2026-07-29 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 is complete. The repository is now a non-virtual Cargo workspace with the root facade as its default member and four version-matched implementation package skeletons. The checked-in graph validator rejects reverse dependencies, cross-host dependencies, host-only external dependencies below their layer, unexpected members, and version drift. Search tooling no longer imports the LSP module for percent decoding; the shared utility retains Unicode behavior and adds malformed-escape coverage. No production module has moved yet, so public behavior and root packaging remain unchanged.
@@ -137,6 +151,8 @@ Milestone 2 is complete. Analyzer, policy/query, search, storage, optional NLP, 
 Milestone 3 is complete. LSP transport, overlays, request lifecycle, progress, conversion, and handlers now compile in `brokk-bifrost-lsp`, and root preserves `brokk_bifrost::lsp` through a dependency re-export. The real subprocess contract and shared client harness moved with the host; the package's own test server keeps those tests independent of the facade. The package passed 104 unit tests and 193 subprocess tests, its tree contains analysis/runtime and LSP transport but no MCP package, and every remaining root integration test compile-checks against the relocated shared client. CI now runs the LSP package directly for LSP-selected changes.
 
 Milestone 4 is complete. MCP descriptors, registry, transport, service lifecycle, watcher/scoped-project support, structured outputs, and tool argument handling now compile in `brokk-bifrost-mcp`. Root preserves the existing Rust paths, owns PyO3 and the public binary, and injects its build identity through the typed host entry point. The independent package passed 101 unit tests, 26 subprocess protocol tests, and its doctest compile; its dependency tree contains analysis/runtime but no LSP transport. The root facade query/MCP contract, broad integration-test compile, exact build-identity test, and all 59 Python tests pass. CI now selects the MCP package directly for MCP-only changes while shared changes still select both hosts.
+
+Milestone 5 is complete. All five packages inherit `0.8.12` from `[workspace.package]`, while exact dependency requirements and the package graph remain enforced. The package-set validator creates archives with command-local unpublished-dependency patches, rejects test/development leakage, unpacks every archive, and builds a facade consumer with default and `nlp,python` features. The verified compressed sizes are 6,584,756 bytes (analysis), 27,955 bytes (runtime), 116,807 bytes (MCP), 106,533 bytes (LSP), and 291,488 bytes (facade). Release publication now follows the dependency DAG and validates exact registry checksums; all 45 Node script/workflow tests pass. Notice generation covers the root release dependency union without listing first-party workspace crates, and Maturin continues to build the same root package/version from the same immutable commit.
 
 ## Context and Orientation
 
@@ -431,3 +447,7 @@ Revision note (2026-07-29): Completed Milestone 1 with a green workspace skeleto
 Revision note (2026-07-29): Completed Milestone 2 by physically extracting analysis/resources/native grammars and the typed runtime, preserving the root API through re-exports, and validating the complete analysis suite, runtime contract, root facade, optional NLP compile, dependency graph, notices, and independent analysis archive.
 
 Revision note (2026-07-29): Completed Milestone 3 by extracting LSP production code and its real-process contract into an independently testable package, retaining only a narrow hidden benchmark seam, updating CI selection/execution, and verifying all remaining root test targets compile with the relocated client harness.
+
+Revision note (2026-07-29): Completed Milestone 4 by extracting the MCP host and real-process contract, reconnecting the root CLI/Python facade through one-way APIs, preserving exact build identity, and validating independent MCP, root facade, broad compile, CI-impact, and Python behavior.
+
+Revision note (2026-07-29): Completed Milestone 5 with workspace-owned versioning, five archive-content checks, an unpacked full-feature consumer, first-party-free notice generation, and a checksum-gated dependency-order crates.io publication DAG.

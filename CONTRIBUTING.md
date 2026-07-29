@@ -40,6 +40,18 @@ scripts/test_python.sh
 
 That wrapper provisions a uv-managed Python 3.12 environment, makes `maturin` available, installs the editable native extension, and then runs the unittest suite.
 
+For host-local changes, run the independently owned package contract first:
+
+```bash
+cargo test -p brokk-bifrost-mcp --features nlp
+cargo test -p brokk-bifrost-lsp --all-features
+```
+
+Changes in `brokk-bifrost-analysis` or `brokk-bifrost-runtime` affect both
+hosts and should use the full workspace gate. MCP and LSP are versioned
+implementation dependencies of the stable `brokk-bifrost` facade, not
+separate public API commitments.
+
 ## Python Development
 
 For repo-local development without installing the package, `SearchToolsClient(..., library_path=...)` can load a built debug library such as `target/debug/libbrokk_bifrost.so`.
@@ -66,7 +78,7 @@ citation live in [`docs/src/content/docs/cite-bifrost.md`](docs/src/content/docs
 
 The Rust crate, the `bifrost` binary, the Python wheel, and the agent/editor
 plugin release metadata are versioned **together** and cut from a **single tag**.
-`Cargo.toml` is the committed source of truth for the release version:
+`Cargo.toml`'s `[workspace.package]` version is the committed source of truth for the release version:
 `pyproject.toml` inherits it via maturin's `dynamic = ["version"]`, and
 `scripts/release-version.mjs sync` copies it into the plugin and editor metadata
 that require literal JSON versions.
@@ -134,7 +146,7 @@ directory instead of hand-editing checksums.
 
 To cut a release:
 
-1. Bump `version` in `Cargo.toml`, run the version-sync command above, review
+1. Bump `[workspace.package].version` in `Cargo.toml`, run the version-sync command above, review
    the generated metadata, and merge. Release workflows generate the Rust
    dependency report from the tagged `Cargo.lock`; it is not committed.
 2. If skills, agents, launcher files, MCP config, or plugin manifests changed,
@@ -172,6 +184,13 @@ receives the same tag, version, and immutable source commit. Wheel/sdist filenam
 are checked against the validated version before the gate, and the crate package
 contents are checked before trusted crates.io publication.
 
+The package-set check creates and unpacks all five `.crate` archives, then
+builds a temporary consumer with local registry patches. Publication follows
+the dependency graph: `brokk-bifrost-analysis`, then
+`brokk-bifrost-runtime`, then MCP and LSP (which may run in parallel), and the
+stable `brokk-bifrost` facade last. Each publication waits for crates.io to
+expose the exact version and archive checksum before its dependents proceed.
+
 Use the **Release** workflow's unqualified `vX.Y.Z` `tag` input for a manual release. If a target fails,
 use GitHub Actions' **Re-run failed jobs** for that workflow run to reuse its
 validated artifacts. If a new run is necessary, dispatch the same tag again; never
@@ -189,8 +208,8 @@ GitHub Actions allowlist entry is needed.
 
 ## Version Policy
 
-- The crate version in `Cargo.toml` is the single source of truth for the Rust
-  crate, Python package, and release-aligned plugin/editor metadata. Never add a
+- The workspace package version in `Cargo.toml` is the single source of truth for all Rust
+  packages, the Python package, and release-aligned plugin/editor metadata. Never add a
   `version` to `pyproject.toml`; run `node scripts/release-version.mjs sync` to
   update JSON metadata from `Cargo.toml`.
 - The Tree-sitter grammar crate versions are intentionally not forced to share

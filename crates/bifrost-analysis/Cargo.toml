@@ -1,6 +1,6 @@
 [package]
 name = "brokk-bifrost-analysis"
-version = "0.8.12"
+version.workspace = true
 edition.workspace = true
 description = "Protocol-neutral analysis engine for brokk-bifrost"
 license.workspace = true

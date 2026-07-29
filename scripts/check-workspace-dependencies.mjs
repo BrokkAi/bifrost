@@ -79,6 +79,15 @@ export function validateWorkspaceGraph(metadata) {
       if (EXPECTED_MEMBERS.has(dependency.name) && !allowed.has(dependency.name)) {
         errors.push(`${pkg.name} must not depend on workspace package ${dependency.name}`);
       }
+      if (
+        EXPECTED_MEMBERS.has(dependency.name) &&
+        allowed.has(dependency.name) &&
+        dependency.req !== `=${facade.version}`
+      ) {
+        errors.push(
+          `${pkg.name} dependency on ${dependency.name} must require exactly =${facade.version}`,
+        );
+      }
       if (forbiddenExternal.has(dependency.name)) {
         errors.push(`${pkg.name} must not depend on host-specific package ${dependency.name}`);
       }

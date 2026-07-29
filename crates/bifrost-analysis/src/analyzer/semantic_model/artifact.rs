@@ -905,7 +905,7 @@ mod tests {
     use std::io::Write;
 
     const DECLARATIONS: &[u8] =
-        include_bytes!("../../../tests/fixtures/semantic-model-packs/declarations-v1.json");
+        include_bytes!("../../../testdata/semantic-model-packs/declarations-v1.json");
 
     #[test]
     fn shard_decoder_rejects_noncanonical_json_with_valid_digests() {

@@ -12,7 +12,7 @@ const names = [
 ];
 
 function dependency(name) {
-  return { name };
+  return { name, req: "=0.8.12" };
 }
 
 function metadata(overrides = {}) {
@@ -98,6 +98,21 @@ test("rejects member version drift", () => {
       metadata({ versions: { "brokk-bifrost-runtime": "0.8.13" } }),
     ),
     ["brokk-bifrost-runtime version 0.8.13 does not match facade version 0.8.12"],
+  );
+});
+
+test("rejects a non-exact implementation dependency version", () => {
+  assert.deepEqual(
+    validateWorkspaceGraph(
+      metadata({
+        dependencies: {
+          "brokk-bifrost-runtime": [{ name: "brokk-bifrost-analysis", req: "^0.8.12" }],
+        },
+      }),
+    ),
+    [
+      "brokk-bifrost-runtime dependency on brokk-bifrost-analysis must require exactly =0.8.12",
+    ],
   );
 });
 

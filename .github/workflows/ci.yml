@@ -174,8 +174,8 @@ jobs:
         with:
           toolchain: 1.96.0
 
-      - name: Check publishable crate
-        run: node scripts/ci-timing.mjs --label crate-package -- bash scripts/check-crate-package.sh
+      - name: Check publishable workspace package set
+        run: node scripts/ci-timing.mjs --label crate-package -- bash scripts/check-workspace-packages.sh
 
   rql-runtime:
     name: RQL runtime

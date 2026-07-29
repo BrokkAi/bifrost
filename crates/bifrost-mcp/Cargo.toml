@@ -1,12 +1,13 @@
 [package]
 name = "brokk-bifrost-mcp"
-version = "0.8.12"
+version.workspace = true
 edition.workspace = true
 description = "Internal MCP host implementation for brokk-bifrost"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 publish = true
+exclude = ["src/bin/bifrost-mcp-test-server.rs", "tests/**"]
 
 [lib]
 name = "brokk_bifrost_mcp"

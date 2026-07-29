@@ -1,6 +1,6 @@
 [package]
 name = "brokk-bifrost-runtime"
-version = "0.8.12"
+version.workspace = true
 edition.workspace = true
 description = "Internal code-intelligence runtime for brokk-bifrost"
 license.workspace = true
