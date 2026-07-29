@@ -191,12 +191,19 @@ pub(crate) fn csharp_is_expression_type_operand(parent: Node<'_>, node: Node<'_>
                     && pattern.end_byte() == node.end_byte()
                     && csharp_pattern_has_structured_type(pattern)
             }),
+        "switch_expression_arm" | "switch_section" => {
+            parent.named_child(0).is_some_and(|pattern| {
+                pattern.start_byte() == node.start_byte()
+                    && pattern.end_byte() == node.end_byte()
+                    && csharp_pattern_has_structured_type(pattern)
+            })
+        }
         _ => false,
     }
 }
 
 fn csharp_pattern_has_structured_type(mut pattern: Node<'_>) -> bool {
-    while pattern.kind() == "parenthesized_pattern" {
+    while matches!(pattern.kind(), "parenthesized_pattern" | "negated_pattern") {
         let Some(inner) = pattern.named_child(0) else {
             return false;
         };
@@ -1266,7 +1273,7 @@ fn csharp_type_node_identity_with_terminal_suffix(
                     stack.push(inner);
                 }
             }
-            "parenthesized_pattern" => {
+            "parenthesized_pattern" | "negated_pattern" => {
                 if let Some(inner) = current.named_child(0) {
                     stack.push(inner);
                 }
@@ -1374,7 +1381,7 @@ fn csharp_pattern_type_wrapper<'tree>(
             .child_by_field_name("type")
             .filter(|candidate| same_csharp_node(*candidate, node))
             .map(|_| parent),
-        "parenthesized_pattern" => parent
+        "parenthesized_pattern" | "negated_pattern" => parent
             .named_child(0)
             .filter(|candidate| same_csharp_node(*candidate, node))
             .map(|_| parent),
@@ -1525,7 +1532,7 @@ pub(crate) fn csharp_type_terminal_identifier(mut node: Node<'_>) -> Option<Node
                     .child_by_field_name("type")
                     .or_else(|| node.named_child(0))?;
             }
-            "parenthesized_pattern" => node = node.named_child(0)?,
+            "parenthesized_pattern" | "negated_pattern" => node = node.named_child(0)?,
             _ => return None,
         }
     }
@@ -1560,7 +1567,7 @@ pub(crate) fn csharp_type_leftmost_identifier(mut node: Node<'_>) -> Option<Node
                     .child_by_field_name("type")
                     .or_else(|| node.named_child(0))?;
             }
-            "parenthesized_pattern" => node = node.named_child(0)?,
+            "parenthesized_pattern" | "negated_pattern" => node = node.named_child(0)?,
             _ => return None,
         }
     }
