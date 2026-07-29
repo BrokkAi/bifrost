@@ -1132,11 +1132,6 @@ impl RustUsageIndex {
             .iter()
             .map(|file| (file.clone(), ModuleKey::new(file, &rust_package_name(file))))
             .collect();
-        let actual_crate_roots = files
-            .iter()
-            .filter(|file| rust_package_name(file) == rust_crate_root_package(file))
-            .cloned()
-            .collect();
         let mut exports_by_file: HashMap<ProjectFile, ExportIndex> = HashMap::default();
         let mut imports_by_file: HashMap<ProjectFile, Vec<RustProjectedImport>> =
             HashMap::default();
@@ -1148,6 +1143,17 @@ impl RustUsageIndex {
         let mut module_extents: HashMap<ProjectFile, Vec<(ModuleKey, usize, usize)>> =
             HashMap::default();
         let mut module_files = RustModuleFiles::new(&files, analyzer.cargo_routes());
+        let actual_crate_roots = files
+            .iter()
+            .filter(|file| {
+                rust_package_name(file) == rust_crate_root_package(file)
+                    || module_files
+                        .cargo_routes
+                        .target_roots_for_file(file)
+                        .contains(file)
+            })
+            .cloned()
+            .collect();
         for (file_id, file) in files.iter().enumerate() {
             let declarations = analyzer.declarations(file);
             let prepared = analyzer.prepared_syntax(file);

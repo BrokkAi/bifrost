@@ -1,9 +1,9 @@
-use crate::analyzer::rust::{RustReferenceNamespace, rust_focused_use_path};
+use crate::analyzer::rust::{RustReferenceNamespace, rust_focused_use_path, rust_package_name};
 use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, reclassify_import_hit_at, usage_hit};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::rust_graph::extractor::{ScanCtx, rust_reference_namespace};
 use crate::analyzer::usages::rust_graph::resolver::{
-    RustDefinitionProvider, RustTokenPathRole, lexical_explicit_import_fqn,
+    RustDefinitionProvider, RustTokenPathRole, lexical_explicit_import_fqn, resolve_rust_path_fqn,
     resolve_rust_token_tree_paths, rust_unique_nominal_reference_namespace,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
@@ -93,14 +93,16 @@ fn record_scoped_identifier_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     };
     let segments = path_segment_texts(&path, ctx.source);
     let root_shadowed = path_root_shadowed(&path, ctx);
-    if !ctx.matches_path(
+    let seeded_match = ctx.matches_path(
         &segments,
         node.start_byte(),
         rust_reference_namespace(node),
         root_shadowed,
         rust_path_is_leading_absolute(node),
-    ) && (root_shadowed || !structured_path_matches_unique_target(node, ctx))
-    {
+    );
+    let structured_match = structured_path_matches_unique_target(node, ctx)
+        || structured_scoped_value_matches_unique_target(node, ctx);
+    if !seeded_match && !structured_match {
         return;
     }
 
@@ -191,6 +193,66 @@ fn record_scoped_target_segment_hit(
 
 fn structured_path_matches_unique_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     structured_scoped_type_fqn(node, ctx).is_some_and(|fqn| ctx.matches_unique_resolved_fqn(&fqn))
+}
+
+fn structured_scoped_value_matches_unique_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    if node.kind() != "scoped_identifier" {
+        return false;
+    }
+    let Some(path) = node.child_by_field_name("path") else {
+        return false;
+    };
+    let Some(name) = node.child_by_field_name("name") else {
+        return false;
+    };
+    let Some(owner) = structured_lexical_item_owner_fqn(path, ctx).or_else(|| {
+        resolve_rust_path_fqn(ctx.rust, ctx.refs, ctx.file, node_text(path, ctx.source))
+    }) else {
+        return false;
+    };
+    ctx.matches_unique_visible_candidate_in_namespace(
+        RustDefinitionProvider::members_for_owner_name(
+            ctx.support,
+            &owner,
+            node_text(name, ctx.source),
+        ),
+        name.start_byte(),
+        rust_reference_namespace(node),
+    )
+}
+
+fn structured_lexical_item_owner_fqn(path: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
+    let segments = rust_path_segments(path)?;
+    let root = *segments.first()?;
+    let root_name = node_text(root, ctx.source);
+    if !ctx.path_root_shadowed_at(root_name, root.start_byte()) {
+        return None;
+    }
+
+    let mut enclosing_modules = Vec::new();
+    let mut ancestor = path.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == "mod_item"
+            && let Some(name) = node.child_by_field_name("name")
+        {
+            enclosing_modules.push(node_text(name, ctx.source).to_string());
+        }
+        ancestor = node.parent();
+    }
+    enclosing_modules.reverse();
+
+    let mut components = Vec::new();
+    let package = rust_package_name(ctx.file);
+    if !package.is_empty() {
+        components.push(package);
+    }
+    components.extend(enclosing_modules);
+    components.extend(
+        segments
+            .into_iter()
+            .map(|segment| node_text(segment, ctx.source).to_string()),
+    );
+    (!components.is_empty()).then(|| components.join("."))
 }
 
 fn structured_scoped_type_fqn(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
