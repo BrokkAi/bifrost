@@ -154,7 +154,6 @@ pub struct SkimFile {
 pub(super) struct SummaryTargets {
     pub(super) file_targets: Vec<ProjectFile>,
     pub(super) listings: Vec<ContainerListing>,
-    pub(super) unmatched_file_targets: Vec<String>,
     pub(super) symbol_targets: Vec<String>,
     pub(super) ambiguous_paths: Vec<AmbiguousPathInput>,
 }
@@ -178,7 +177,6 @@ fn route_summary_targets_with_cancellation(
     let mut file_targets = BTreeSet::new();
     let mut listings = Vec::new();
     let mut listed_containers = HashSet::default();
-    let mut unmatched_file_targets = Vec::new();
     let mut symbol_targets = Vec::new();
     let mut ambiguous_paths = Vec::new();
 
@@ -247,18 +245,20 @@ fn route_summary_targets_with_cancellation(
             continue;
         }
 
-        if looks_like_file_target(target) {
-            unmatched_file_targets.push(target.to_string());
-            continue;
-        }
-
+        // A file-*shaped* target that matched no file is still a symbol
+        // candidate: C# members legitimately end in a segment that also spells
+        // a file extension (`MetadataConfiguration.Properties` vs
+        // `.properties`), and short-circuiting here reported "no workspace
+        // file matched" for a symbol that resolves (#1196). File shape only
+        // picks the wording of the not-found note, which
+        // `summarize_symbol_targets_with_cancellation` applies once symbol
+        // resolution has had its say.
         symbol_targets.push(target.to_string());
     }
 
     SummaryTargets {
         file_targets: file_targets.into_iter().collect(),
         listings,
-        unmatched_file_targets,
         symbol_targets,
         ambiguous_paths,
     }
@@ -449,7 +449,16 @@ fn summarize_symbol_targets_with_cancellation(
                 }
             }
             SelectableDefinitionResolution::Ambiguous(item) => ambiguous.push(item),
-            SelectableDefinitionResolution::NotFound(target) => not_found.push(target),
+            // A file-shaped target that resolved to nothing keeps the
+            // file-flavored note routing used to emit up front; see the
+            // routing comment for why the shape check moved down here (#1196).
+            SelectableDefinitionResolution::NotFound(item) => {
+                not_found.push(if looks_like_file_target(&target) {
+                    file_not_found_input(target)
+                } else {
+                    item
+                });
+            }
         }
     }
 
@@ -741,13 +750,6 @@ fn summarize_routed_targets_with_cancellation(
 
     file_output.summaries.extend(symbol_output.summaries);
     file_output.listings = summary_targets.listings.clone();
-    file_output.not_found.extend(
-        summary_targets
-            .unmatched_file_targets
-            .iter()
-            .cloned()
-            .map(file_not_found_input),
-    );
     file_output.not_found.extend(symbol_output.not_found);
     file_output.ambiguous.extend(symbol_output.ambiguous);
     file_output

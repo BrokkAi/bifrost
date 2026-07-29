@@ -2266,6 +2266,204 @@ fn csharp_generic_type_resolves_without_arity_spelling() {
     }
 }
 
+// Issue #1196: `Autofac.Builder.MetadataConfiguration.Properties` reported
+// not_found while bare `Properties` was ambiguous — the I2
+// more-specific-spelling-fails violation. The cause is not arity (arity-free
+// members of top-level generics already alias fine, see the sibling tests
+// below): the member's own terminal segment spells a file extension, so
+// `looks_like_file_target` claimed the whole selector as a `.properties` file
+// path and short-circuited with "no workspace file matched" *before* symbol
+// resolution ever ran. File shape may only choose the wording of a not-found
+// note, never gate resolution.
+#[test]
+fn csharp_member_named_like_a_file_extension_resolves() {
+    let project = autofac_metadata_configuration_project();
+
+    for selector in [
+        // The control: the arity-full spelling has always resolved.
+        "Autofac.Builder.MetadataConfiguration`1.Properties",
+        // The issue shape.
+        "Autofac.Builder.MetadataConfiguration.Properties",
+        // Owner-qualified without the namespace, both spellings.
+        "MetadataConfiguration`1.Properties",
+        "MetadataConfiguration.Properties",
+    ] {
+        let result = call_tool(
+            &project,
+            "get_symbol_sources",
+            &serde_json::json!({ "symbols": [selector] }).to_string(),
+        );
+        assert!(
+            result["not_found"].as_array().unwrap().is_empty(),
+            "{selector} must resolve: {result}"
+        );
+        let sources = result["sources"].as_array().unwrap();
+        assert_eq!(1, sources.len(), "{selector}: {result}");
+        assert_eq!(
+            "src/Autofac/Builder/MetadataConfiguration.cs",
+            sources[0]["path"].as_str().unwrap(),
+            "{selector} must reach the generic owner's member: {result}"
+        );
+    }
+}
+
+// The I2 pair the fuzzer reports on: the bare terminal name is ambiguous
+// (two unrelated `Properties` members), so the strictly more specific
+// qualified spelling must be no worse — it must resolve. `get_summaries`
+// routed the same way and had the same violation.
+#[test]
+fn csharp_qualified_member_is_never_worse_than_the_ambiguous_bare_name() {
+    let project = autofac_metadata_configuration_project();
+
+    for tool in ["get_symbol_sources", "get_summaries"] {
+        let key = if tool == "get_summaries" {
+            "targets"
+        } else {
+            "symbols"
+        };
+        let bare = call_tool(
+            &project,
+            tool,
+            &serde_json::json!({ key: ["Properties"] }).to_string(),
+        );
+        assert_eq!(
+            1,
+            bare["ambiguous"].as_array().unwrap().len(),
+            "{tool}: bare `Properties` must be ambiguous: {bare}"
+        );
+
+        let qualified = call_tool(
+            &project,
+            tool,
+            &serde_json::json!({ key: ["Autofac.Builder.MetadataConfiguration.Properties"] })
+                .to_string(),
+        );
+        assert!(
+            qualified["not_found"].as_array().unwrap().is_empty(),
+            "{tool}: the more specific spelling must not be worse than the ambiguous bare one: {qualified}"
+        );
+    }
+}
+
+// The reordering that fixed #1196 must not cost a genuinely missing file its
+// file-flavored diagnostic: a file-shaped target that resolves to no symbol
+// either still reports the "no workspace file matched" note on both surfaces.
+#[test]
+fn unresolvable_file_shaped_targets_keep_the_file_not_found_note() {
+    let project = autofac_metadata_configuration_project();
+
+    for (tool, key) in [
+        ("get_symbol_sources", "symbols"),
+        ("get_summaries", "targets"),
+    ] {
+        let result = call_tool(
+            &project,
+            tool,
+            &serde_json::json!({ key: ["src/Autofac/Missing.cs"] }).to_string(),
+        );
+        let not_found = result["not_found"].as_array().unwrap();
+        assert_eq!(1, not_found.len(), "{tool}: {result}");
+        assert!(
+            not_found[0]["note"]
+                .as_str()
+                .unwrap()
+                .contains("no workspace file matched this path"),
+            "{tool}: {result}"
+        );
+    }
+}
+
+// #1057 ambiguity semantics for the arity-free alias #1196's issue report
+// suspected: an arity-free owner spelling that genuinely spans several
+// arities must ambiguate over *all* of them, never silently pick one.
+#[test]
+fn csharp_arity_free_member_ambiguates_across_arities() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "src/Multi/Owner.cs",
+            "namespace Multi;\n\npublic class Owner<T>\n{\n    public int Shared => 1;\n}\n\npublic class Owner<T1, T2>\n{\n    public int Shared => 2;\n}\n",
+        )
+        .build();
+
+    let result = call_tool(
+        &project,
+        "get_symbol_sources",
+        r#"{"symbols":["Multi.Owner.Shared"]}"#,
+    );
+    let ambiguous = result["ambiguous"].as_array().unwrap();
+    assert_eq!(
+        1,
+        ambiguous.len(),
+        "arity-free owner spanning two arities must ambiguate: {result}"
+    );
+    let matches = string_array(&ambiguous[0]["matches"]);
+    assert_eq!(2, matches.len(), "{result}");
+    for arity in ["Owner`1.Shared", "Owner`2.Shared"] {
+        assert!(
+            matches.iter().any(|item| item.contains(arity)),
+            "both arities must be offered ({arity}): {result}"
+        );
+    }
+
+    // Each arity-full spelling still selects exactly one of them.
+    for arity in ["Multi.Owner`1.Shared", "Multi.Owner`2.Shared"] {
+        let picked = call_tool(
+            &project,
+            "get_symbol_sources",
+            &serde_json::json!({ "symbols": [arity] }).to_string(),
+        );
+        assert_eq!(
+            1,
+            picked["sources"].as_array().unwrap().len(),
+            "{arity} must resolve to one member: {picked}"
+        );
+    }
+}
+
+// 11029d0f's shape (members of a *nested* generic type) stays green.
+#[test]
+fn csharp_nested_generic_member_spellings_stay_resolvable() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "src/Ns/Outer.cs",
+            "namespace Ns;\n\npublic class Outer\n{\n    public class Inner<T>\n    {\n        public void Method() { }\n    }\n}\n",
+        )
+        .build();
+
+    for selector in [
+        "Ns.Outer.Inner.Method",
+        "Outer.Inner.Method",
+        "Ns.Outer.Inner`1.Method",
+    ] {
+        let result = call_tool(
+            &project,
+            "get_symbol_sources",
+            &serde_json::json!({ "symbols": [selector] }).to_string(),
+        );
+        assert!(
+            result["not_found"].as_array().unwrap().is_empty(),
+            "{selector} must resolve: {result}"
+        );
+        assert_eq!(1, result["sources"].as_array().unwrap().len(), "{result}");
+    }
+}
+
+/// Autofac's `MetadataConfiguration<TMetadata>` plus an unrelated
+/// `Properties` member elsewhere, so the bare terminal name is ambiguous
+/// exactly as it is in the real workspace.
+fn autofac_metadata_configuration_project() -> common::BuiltInlineTestProject {
+    InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "src/Autofac/Builder/MetadataConfiguration.cs",
+            "namespace Autofac.Builder;\n\npublic class MetadataConfiguration<TMetadata>\n{\n    private readonly Dictionary<string, object> _properties = new();\n\n    public IEnumerable<KeyValuePair<string, object>> Properties => _properties;\n}\n",
+        )
+        .file(
+            "src/Autofac/Core/ResolveRequest.cs",
+            "namespace Autofac.Core;\n\npublic class ResolveRequest\n{\n    public IDictionary<string, object> Properties { get; } = new Dictionary<string, object>();\n}\n",
+        )
+        .build()
+}
+
 // ---------------------------------------------------------------------------
 // `path#terminal` member resolution (issue #1056)
 //
