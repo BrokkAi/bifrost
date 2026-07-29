@@ -65,6 +65,7 @@ const REQUIRED_JSON_EXAMPLES: &[&str] = &[
     "scope",
     "cfg-entry-successor",
     "typestate-witness",
+    "value-flow-witness",
 ];
 
 #[derive(Debug)]
@@ -131,6 +132,10 @@ fn documented_code_queries_parse() {
         seen.contains(&("rql".to_string(), "typestate-witness".to_string())),
         "missing registered typestate RQL example"
     );
+    assert!(
+        seen.contains(&("rql".to_string(), "value-flow-witness".to_string())),
+        "missing registered value-flow RQL example"
+    );
 }
 
 #[test]
@@ -184,37 +189,41 @@ fn query_documentation_tracks_public_contracts() {
     let python_client = fs::read_to_string(root.join("docs/src/content/docs/python-client.md"))
         .expect("read Python client documentation");
     for required in [
-        "compatible-head version-5",
+        "compatible-head version-6",
         "schema_version=2",
         "schema_version=3",
         "schema_version=4",
         "inside_decl",
-        "twelve possible classes",
+        "fourteen possible classes",
         "CodeQueryProcedure",
         "CodeQueryProgramPoint",
         "CodeQueryControlEdge",
         "CodeQueryTypestateFinding",
         "CodeQueryTypestateWitness",
+        "CodeQueryFlowEndpoint",
+        "CodeQueryFlowWitness",
         "CodeQueryReceiverAnalysis",
     ] {
         assert!(
             python_client.contains(required),
-            "Python client documentation must track the schema-v5 result contract: missing {required:?}"
+            "Python client documentation must track the schema-v6 result contract: missing {required:?}"
         );
     }
 
     let python_client_source = fs::read_to_string(root.join("bifrost_searchtools/client.py"))
         .expect("read Python client source");
     for required in [
-        "schema version 5",
+        "schema version 6",
         "cfg_successor_edges",
         "cfg_edge_target",
         "typestate",
         "witness",
+        "value_flow",
+        "plan_ref",
     ] {
         assert!(
             python_client_source.contains(required),
-            "Python query_code docstring must track the schema-v5 operation contract: missing {required:?}"
+            "Python query_code docstring must track the schema-v6 operation contract: missing {required:?}"
         );
     }
 }

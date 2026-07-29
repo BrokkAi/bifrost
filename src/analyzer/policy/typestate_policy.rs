@@ -2062,6 +2062,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
             max_pipeline_rows,
             semantic,
             typestate: self.query_limits.typestate,
+            value_flow: self.query_limits.value_flow,
         })
     }
 
@@ -2659,6 +2660,15 @@ fn selected_site_quality(item: &CodeQueryResultItem) -> (ProofStatus, EvidenceCo
                 ProofStatus::Unproven("selector receiver analysis has no exact proof".into()),
                 EvidenceCompleteness::Partial(
                     "selector receiver analysis has no exhaustive evidence".into(),
+                ),
+            ),
+            CodeQueryResultValue::FlowEndpoint { .. }
+            | CodeQueryResultValue::FlowWitness { .. } => (
+                ProofStatus::Unproven(
+                    "value-flow selector results are not policy-classified".into(),
+                ),
+                EvidenceCompleteness::Partial(
+                    "value-flow selector results are not policy-classified".into(),
                 ),
             ),
             CodeQueryResultValue::StructuralMatch { .. }

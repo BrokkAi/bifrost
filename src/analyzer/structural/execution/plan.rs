@@ -683,6 +683,7 @@ pub struct CodeQuerySemanticRequest {
     pub program_points: bool,
     pub control_edges: bool,
     pub typestate: bool,
+    pub value_flow: bool,
 }
 
 impl CodeQuerySemanticRequest {
@@ -697,6 +698,7 @@ impl CodeQuerySemanticRequest {
                 QuerySemanticFacet::ProgramPoints => request.program_points = true,
                 QuerySemanticFacet::ControlEdges => request.control_edges = true,
                 QuerySemanticFacet::Typestate => request.typestate = true,
+                QuerySemanticFacet::ValueFlow => request.value_flow = true,
             }
         }
         Some(request)
@@ -1083,18 +1085,21 @@ mod tests {
                     program_points: false,
                     control_edges: false,
                     typestate: false,
+                    value_flow: false,
                 },
                 CodeQuerySemanticRequest {
                     procedures: true,
                     program_points: true,
                     control_edges: false,
                     typestate: false,
+                    value_flow: false,
                 },
                 CodeQuerySemanticRequest {
                     procedures: true,
                     program_points: true,
                     control_edges: true,
                     typestate: false,
+                    value_flow: false,
                 },
             ]
         );
@@ -1130,12 +1135,57 @@ mod tests {
                     program_points: false,
                     control_edges: false,
                     typestate: false,
+                    value_flow: false,
                 },
                 CodeQuerySemanticRequest {
                     procedures: true,
                     program_points: false,
                     control_edges: false,
                     typestate: true,
+                    value_flow: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn public_explain_reports_value_flow_without_resolving_or_rerunning_for_witnesses() {
+        let query = query(branch(
+            seed("run"),
+            vec![
+                QueryStep::ProcedureOf,
+                QueryStep::ValueFlow(crate::analyzer::structural::query::ValueFlowTraversal {
+                    plan_ref: "test:request-to-sink".parse().unwrap(),
+                }),
+                QueryStep::Witness(crate::analyzer::structural::query::WitnessTraversal::default()),
+            ],
+        ));
+        let physical =
+            PhysicalQueryPlan::select(LogicalQueryPlan::lower(&query).expect("query should lower"));
+        let public = physical.public_explain(&query, 1);
+        let requests = public
+            .physical_plan
+            .nodes
+            .iter()
+            .filter_map(|node| node.semantic_request)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            requests,
+            vec![
+                CodeQuerySemanticRequest {
+                    procedures: true,
+                    program_points: false,
+                    control_edges: false,
+                    typestate: false,
+                    value_flow: false,
+                },
+                CodeQuerySemanticRequest {
+                    procedures: true,
+                    program_points: false,
+                    control_edges: false,
+                    typestate: false,
+                    value_flow: true,
                 },
             ]
         );

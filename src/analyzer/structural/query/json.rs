@@ -146,6 +146,12 @@ fn query_step_to_json(step: &QueryStep) -> Value {
                 json!(traversal.protocol_ref.to_string()),
             );
         }
+        QueryStep::ValueFlow(traversal) => {
+            object.insert(
+                "plan_ref".to_string(),
+                json!(traversal.plan_ref.to_string()),
+            );
+        }
         QueryStep::Witness(traversal) => {
             if let Some(max_steps) = traversal.max_steps {
                 object.insert("max_steps".to_string(), json!(max_steps));

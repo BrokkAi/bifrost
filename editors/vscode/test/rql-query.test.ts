@@ -4,6 +4,7 @@ import {
   RQL_LANGUAGE_ID,
   RUN_RQL_QUERY_METHOD,
   codePointColumnToUtf16,
+  flowWitnessStepTargets,
   formatRqlQueryOutput,
   groupRqlQueryResults,
   queryResultDescription,
@@ -14,6 +15,8 @@ import {
   runRqlQuery,
   typestateWitnessStepTargets,
   type RqlControlEdgeResult,
+  type RqlFlowEndpointResult,
+  type RqlFlowWitnessResult,
   type RqlProcedureResult,
   type RqlProgramPointResult,
   type RqlQueryRunner,
@@ -468,5 +471,76 @@ void test("renders typestate findings and exposes navigable witness steps", () =
   const steps = typestateWitnessStepTargets(witness);
   assert.equal(steps[0].label, "1. normal edge");
   assert.equal(steps[0].uri, "file:///workspace/src/run.ts");
+  assert.deepEqual(steps[0].range, range);
+});
+
+void test("renders diagnostic-neutral flow endpoints and navigable witnesses", () => {
+  const range = {
+    start_line: 12,
+    start_column: 5,
+    end_line: 12,
+    end_column: 16
+  };
+  const endpoint: RqlFlowEndpointResult = {
+    uri: "file:///workspace/src/run.ts",
+    path: "src/run.ts",
+    result_type: "flow_endpoint",
+    id: "endpoint-a",
+    plan_ref: "embedding:request-to-sink",
+    source: { id: "source-a", path: "src/run.ts", range, phase: "before_effects", ordinal: 0 },
+    sink: { id: "sink-a", path: "src/run.ts", range, phase: "after_effects", ordinal: 0 },
+    reachability: "reached",
+    certainty: "may",
+    must: "not_established",
+    ambiguous: true,
+    completion: "budget_exhausted",
+    semantic_status: "ambiguous",
+    solver_termination: "budget_exhausted",
+    language: "typescript",
+    range,
+    retained_witnesses: 1,
+    omitted_witnesses: 0
+  };
+  const witness: RqlFlowWitnessResult = {
+    uri: endpoint.uri,
+    path: endpoint.path,
+    witnessStepUris: [endpoint.uri],
+    result_type: "flow_witness",
+    id: "witness-a",
+    endpoint_id: endpoint.id,
+    plan_ref: endpoint.plan_ref,
+    witness_index: 0,
+    language: endpoint.language,
+    range,
+    quality: { proof: "unproven", completeness: "partial" },
+    steps: [
+      {
+        kind: { type: "end_summary_gap", return_kind: "normal" },
+        source: { path: endpoint.path, range },
+        evidence: { proof: "unproven", completeness: "partial" },
+        boundary: "unmaterialized"
+      }
+    ],
+    retained_bytes: 96,
+    truncated: true,
+    omitted_steps_lower_bound: 1
+  };
+
+  assert.equal(queryResultLabel(endpoint), "reached: sink-a");
+  assert.equal(
+    queryResultDescription(endpoint),
+    "may · budget_exhausted · embedding:request-to-sink"
+  );
+  assert.equal(queryResultIcon(endpoint), "target");
+  assert.match(queryResultTooltip(endpoint), /ambiguous: yes/);
+  assert.match(queryResultTooltip(endpoint), /must: not_established/);
+  assert.deepEqual(queryResultRange(endpoint), range);
+
+  assert.equal(queryResultIcon(witness), "debug-alt");
+  assert.match(queryResultTooltip(witness), /at least 1 step/);
+  const steps = flowWitnessStepTargets(witness);
+  assert.equal(steps[0].label, "1. normal summary gap");
+  assert.match(steps[0].tooltip, /Boundary: unmaterialized/);
+  assert.equal(steps[0].uri, endpoint.uri);
   assert.deepEqual(steps[0].range, range);
 });

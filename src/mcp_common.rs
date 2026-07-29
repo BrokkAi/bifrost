@@ -1086,7 +1086,7 @@ fn handle_tool_call(
 
 enum PreparedToolCall {
     #[cfg(test)]
-    QueryCode(PreparedQueryCode),
+    QueryCode(Box<PreparedQueryCode>),
     #[cfg(test)]
     RunPolicy(PreparedRunPolicy),
     Standard {
@@ -1218,7 +1218,7 @@ fn execute_prepared_tool_call(
         PreparedToolCall::QueryCode(prepared) => (
             "query_code".to_string(),
             RenderOptions::default(),
-            service.execute_prepared_query_code(prepared, cancellation),
+            service.execute_prepared_query_code(*prepared, cancellation),
         ),
         #[cfg(test)]
         PreparedToolCall::RunPolicy(prepared) => (
@@ -2666,9 +2666,12 @@ mod uri_tests {
             "rebinding must revoke accepted work from the old workspace"
         );
 
-        let result =
-            execute_prepared_tool_call(&service, PreparedToolCall::QueryCode(prepared), None)
-                .expect("the immutable first-workspace snapshot remains executable");
+        let result = execute_prepared_tool_call(
+            &service,
+            PreparedToolCall::QueryCode(Box::new(prepared)),
+            None,
+        )
+        .expect("the immutable first-workspace snapshot remains executable");
         assert_eq!(
             result["structuredContent"]["results"][0]["path"], "app.ts",
             "execution remains pinned to the first workspace snapshot"
@@ -2733,7 +2736,7 @@ mod uri_tests {
             .expect("query preparation");
         spawn_cancellable_tool_call(
             Arc::clone(&service),
-            PreparedToolCall::QueryCode(prepared),
+            PreparedToolCall::QueryCode(Box::new(prepared)),
             request_id,
             cancellation,
             cancellations,

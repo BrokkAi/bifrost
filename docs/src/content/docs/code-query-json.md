@@ -5,7 +5,7 @@ description: Use the canonical JSON representation for Bifrost's query_code engi
 
 JSON `CodeQuery` is the canonical machine-facing representation accepted by Bifrost's `query_code` tool. MCP hosts and the Python client send this shape directly. The RQL REPL prints the same representation with `:json`.
 
-The compatible head is schema version 5. It retains version 3's source-backed procedure-local CFG surface and version 2's structural/declaration/reference/call/import/hierarchy/receiver vocabulary, adds host-registered diagnostic-neutral typestate findings and bounded witnesses, then adds declaration-bounded containment. Explicit version pins keep their old meanings and reject later operations. Schema version 5 does not load protocol files from a query, compile policy findings, persist summaries, or expose the value-flow and taint clients.
+The compatible head is schema version 6. It retains version 3's source-backed procedure-local CFG surface and version 2's structural/declaration/reference/call/import/hierarchy/receiver vocabulary, adds host-registered diagnostic-neutral typestate findings and bounded witnesses in version 4, declaration-bounded containment in version 5, and host-registered diagnostic-neutral value-flow endpoints and witnesses in version 6. Explicit version pins keep their old meanings and reject later operations. Schema version 6 does not load plans from a query, classify policy findings, or expose taint-policy semantics.
 
 ## Minimal Query
 
@@ -28,7 +28,7 @@ The `match` object is the root pattern. It must constrain at least one of `kind`
 
 | Field | Shape | Meaning |
 | --- | --- | --- |
-| `schema_version` | integer | Optional. Omit it for compatible head version 5; pass `2` to pin the pre-CFG vocabulary, `3` for CFG without typestate, `4` for typestate, or `5` explicitly. Other versions are rejected. |
+| `schema_version` | integer | Optional. Omit it for compatible head version 6; pass `2` to pin the pre-CFG vocabulary, `3` for CFG without typestate, `4` for typestate, `5` for declaration-bounded containment without value flow, or `6` explicitly. Other versions are rejected. |
 | `match` | pattern | Required root pattern. |
 | `where` | string array | Optional project-relative globs. Absolute paths or globs inside the active workspace are normalized by MCP and CLI entrypoints. |
 | `languages` | string array | Optional language labels such as `python`, `typescript`, `cpp`, or `csharp`. Empty means every structural adapter. |
@@ -185,7 +185,8 @@ Steps execute in array order and are validated before the workspace is searched:
 | `cfg_edge_source` (v3) | control edge | program point | Source endpoint of an edge. |
 | `cfg_edge_target` (v3) | control edge | program point | Target endpoint of an edge. |
 | `typestate` (v4) | procedure | typestate finding | Run the host-registered protocol/binding pair named by `protocol_ref` once for the exact procedure. |
-| `witness` (v4) | typestate finding | typestate witness | Project already-retained evidence, optionally reducing it with non-negative `max_steps` and `max_bytes`. |
+| `value_flow` (v6) | procedure | flow endpoint | Run the host-registered `ValueFlowPlan` named by `plan_ref` once for the exact procedure. |
+| `witness` (v4/v6) | typestate finding or flow endpoint | matching witness domain | Project already-retained evidence, optionally reducing it with non-negative `max_steps` and `max_bytes`. |
 | `references_of` | declaration | reference site | Exact structured source sites targeting the declaration. |
 | `used_by` | declaration | declaration | Smallest exact declaration enclosing each matching site. |
 | `uses` | declaration | declaration | Exact indexed declarations referenced by this semantic owner. |
@@ -197,7 +198,7 @@ Steps execute in array order and are validated before the workspace is searched:
 | `receiver_targets` | structural match, reference site, call site, or expression site | receiver analysis | Receiver values extracted from a call/member site or supplied as an exact expression. |
 | `points_to` | structural match, reference site, or expression site | receiver analysis | Bounded value, allocation, type, module, current-receiver, and factory provenance. |
 | `member_targets` | structural match or reference site | receiver analysis | Exact indexed declarations selected by a receiver-qualified member access. |
-| `file_of` | structural match, declaration, procedure, program point, control edge, typestate finding, typestate witness, reference site, call site, expression site, or receiver analysis | file | Exact project file containing the analyzed input value. |
+| `file_of` | structural match, declaration, procedure, program point, control edge, typestate finding, typestate witness, flow endpoint, flow witness, reference site, call site, expression site, or receiver analysis | file | Exact project file containing the analyzed input value. |
 | `imports_of` | file | file | Direct project-local files imported by the input file. |
 | `importers_of` | file | file | Direct project-local files importing the input file. |
 | `supertypes` | declaration | declaration | Direct ancestors by default, or a bounded/full indexed ancestor closure. |
@@ -252,6 +253,25 @@ An embedding first registers an in-memory compiled protocol and its pre-resolved
 `typestate_finding` rows carry stable protocol and binding-plan hashes, canonical subject identity, finding kind, certainty (`may`, `must`, or `inconclusive`), exact primary range, proof/completeness flags, uncertainty causes, abstention, and retained/omitted witness counts. They deliberately have no policy ID, severity, message, CWE, CVSS, or SARIF fields. `typestate_witness` rows retain the same identity plus ordered source-backed steps, semantic evidence, truncation flags, and omission lower bounds.
 
 One request solves each exact procedure/protocol/binding tuple at most once. `witness` only trims retained evidence and never reruns the solver. Solver, finding, witness, semantic, and ordinary pipeline work all remain finitely bounded; profile mode reports typestate solves, request-cache hits, reached rows, findings, witnesses, steps, bytes, termination, and exhaustion. Missing references, stale workspace generations or artifacts, wrong roots, cancellation, provider failure, and exhausted budgets are explicit incomplete diagnostics, never clean empty negatives.
+
+### Registered value-flow endpoints and witnesses (schema v6)
+
+The host registers an already-built `ValueFlowPlan` under a namespaced reference. A query sends only that reference:
+
+<!-- code-query-test:json:value-flow-witness -->
+```json
+{
+  "schema_version": 6,
+  "match": {"kind": "method", "name": "run"},
+  "steps": [
+    {"op": "procedure_of"},
+    {"op": "value_flow", "plan_ref": "embedding:request-to-sink"},
+    {"op": "witness", "max_steps": 32, "max_bytes": 16384}
+  ]
+}
+```
+
+`flow_endpoint` rows keep reachability (`reached`, `not_reached`, or `inconclusive`), exact/may certainty, ambiguity, completion, must-status (`not_established`), and solver termination as separate fields. `flow_witness` rows contain bounded ordered source-backed steps plus truncation metadata. The adapter consumes the existing plan and solver, caches one solve per procedure/plan tuple within the request, and never performs policy classification.
 
 ```json
 {

@@ -246,3 +246,12 @@ void test("highlights schema-v4 typestate forms and bounded witness options", as
   assertScoped(tokens, "32", "constant.numeric.integer.decimal.bifrost-rql");
   assertScoped(tokens, "16384", "constant.numeric.integer.decimal.bifrost-rql");
 });
+
+void test("highlights schema-v6 value-flow forms and plan references", async () => {
+  const tokens = tokenizeGrammar(
+    await grammar(),
+    '(witness :max-steps 32 (value-flow :plan-ref "test:request-to-sink" (procedure-of (function))))'
+  );
+  assertScoped(tokens, "value-flow", "support.function.wrapper.bifrost-rql");
+  assertScoped(tokens, ":plan-ref", "variable.parameter.role.bifrost-rql");
+});

@@ -50,6 +50,10 @@ fn query_step_input_variants() -> Vec<Value> {
         .value_shape()
         .string_length_bounds()
         .expect("protocol-ref shape has string bounds");
+    let (plan_ref_minimum, plan_ref_maximum) = QueryStepField::PlanRef
+        .value_shape()
+        .string_length_bounds()
+        .expect("plan-ref shape has string bounds");
     let plain = ALL_QUERY_STEP_OPS
         .iter()
         .copied()
@@ -60,6 +64,7 @@ fn query_step_input_variants() -> Vec<Value> {
                 && !op.allows_call_site_options()
                 && !op.allows_receiver_options()
                 && !op.allows_typestate_options()
+                && !op.allows_value_flow_options()
                 && !op.allows_witness_options()
                 && op.label() != "call_input"
         })
@@ -99,6 +104,12 @@ fn query_step_input_variants() -> Vec<Value> {
         .iter()
         .copied()
         .filter(|op| op.allows_typestate_options())
+        .map(|op| op.label())
+        .collect::<Vec<_>>();
+    let value_flow_steps = ALL_QUERY_STEP_OPS
+        .iter()
+        .copied()
+        .filter(|op| op.allows_value_flow_options())
         .map(|op| op.label())
         .collect::<Vec<_>>();
     let witness_steps = ALL_QUERY_STEP_OPS
@@ -234,6 +245,20 @@ fn query_step_input_variants() -> Vec<Value> {
                 }
             },
             "required": ["op", "protocol_ref"],
+            "additionalProperties": false
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "type": "string", "enum": value_flow_steps },
+                "plan_ref": {
+                    "type": "string",
+                    "minLength": plan_ref_minimum,
+                    "maxLength": plan_ref_maximum,
+                    "description": QueryStepField::PlanRef.description()
+                }
+            },
+            "required": ["op", "plan_ref"],
             "additionalProperties": false
         }),
         json!({
@@ -379,7 +404,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         .collect::<Vec<_>>()
         .join(", ");
     let query_code_description = format!(
-        "Query normalized code structure, compose compatible typed branches with union, intersect, or except, then optionally apply typed semantic steps. Schema version 5 supports {step_vocabulary} and declaration-bounded inside_decl containment; explicit version-2 pins retain the pre-CFG vocabulary, version-3 pins retain CFG without typestate, and version-4 pins retain typestate without declaration-bounded containment. Set branches must produce the same terminal domain; a common steps suffix may continue from that domain. Set execution_mode to explain for planning without workspace execution or profile for the exact ordinary result plus structured operator measurements; results is the default. Hierarchy steps are direct by default and accept either a positive depth or transitive: true. Call traversal is direct by default, accepts only finite positive depth, and can expose call sites plus one direct receiver or formal-parameter input. Reference and call steps preserve proof-bearing exact indexed targets and sites. Java, JavaScript, TypeScript, C++, C#, Go, PHP, Python, Ruby, Rust, and Scala receiver_targets, points_to, and member_targets expose bounded demand-driven receiver provenance; unsupported source forms return explicit analysis rows. Procedure-local CFG steps expose source-backed procedure, program_point, and control_edge results with proof and completeness. Schema-v4 typestate accepts only a host-registered protocol_ref, maps procedure to diagnostic-neutral typestate_finding, and projects already-retained bounded typestate_witness rows without rerunning the solver; an unconfigured host returns an explicit unresolved-reference diagnostic. Results include only declarations indexed by the workspace analyzer; observing library usages does not imply that library declarations are queryable. Terminal values are tagged structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, file, reference_site, call_site, expression_site, or receiver_analysis results with provenance. Minimal query: {{\"match\":{{\"kind\":\"call\",\"callee\":{{\"name\":\"eval\"}}}}}}. Typestate example: {{\"schema_version\":4,\"match\":{{\"kind\":\"function\",\"name\":\"run\"}},\"steps\":[{{\"op\":\"procedure_of\"}},{{\"op\":\"typestate\",\"protocol_ref\":\"embedding:resource-lifecycle\"}},{{\"op\":\"witness\",\"max_steps\":32,\"max_bytes\":16384}}]}}. Guide: https://bifrost.brokk.ai/code-querying/"
+        "Query normalized code structure, compose compatible typed branches with union, intersect, or except, then optionally apply typed semantic steps. Schema version 6 supports {step_vocabulary}; explicit version-2 pins retain the pre-CFG vocabulary, version-3 pins retain CFG without typestate, version-4 pins retain typestate without declaration-bounded containment, and version-5 pins retain containment without value flow. Set branches must produce the same terminal domain; a common steps suffix may continue from that domain. Set execution_mode to explain for planning without workspace execution or profile for the exact ordinary result plus structured operator measurements; results is the default. Procedure-local CFG steps expose source-backed procedure, program_point, and control_edge results. Schema-v4 typestate accepts a host-registered protocol_ref and projects retained typestate witnesses. Schema-v6 value_flow accepts a host-registered plan_ref, consumes the existing ValueFlowPlan and solver, and returns diagnostic-neutral flow_endpoint rows whose reachability, exact/may certainty, ambiguity, completion, and solver termination remain independent; witness projects retained flow_witness rows without rerunning the solver. No policy classification is implied. Results include only declarations indexed by the workspace analyzer. Terminal values are tagged structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, flow_endpoint, flow_witness, file, reference_site, call_site, expression_site, or receiver_analysis results with provenance. Minimal query: {{\"match\":{{\"kind\":\"call\",\"callee\":{{\"name\":\"eval\"}}}}}}. Value-flow example: {{\"schema_version\":6,\"match\":{{\"kind\":\"method\",\"name\":\"run\"}},\"steps\":[{{\"op\":\"procedure_of\"}},{{\"op\":\"value_flow\",\"plan_ref\":\"embedding:request-to-sink\"}},{{\"op\":\"witness\",\"max_steps\":32,\"max_bytes\":16384}}]}}. Guide: https://bifrost.brokk.ai/code-querying/"
     );
     let query_step_variants = query_step_input_variants();
     let query_plan_schema = query_plan_schema(&pattern_schema_description, &query_step_variants);
@@ -415,7 +440,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                 "type": "integer",
                 "default": SCHEMA_VERSION,
                 "enum": schema_versions,
-                "description": "Optional query schema version. Omit for compatible head v5; pin v4 for typestate without declaration-bounded containment, v3 for CFG without typestate, or v2 for the pre-CFG vocabulary."
+                "description": "Optional query schema version. Omit for compatible head v6; pin v5 for declaration-bounded containment without value flow, v4 for typestate without containment, v3 for CFG without typestate, or v2 for the pre-CFG vocabulary."
             },
             "query_file": {
                 "type": "string",
@@ -786,6 +811,18 @@ mod tests {
             })
             .expect("typestate traversal schema");
         assert_eq!(typestate_variant["required"], json!(["op", "protocol_ref"]));
+        let value_flow_variant = steps["items"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| {
+                variant["properties"]["op"]["enum"]
+                    .as_array()
+                    .is_some_and(|ops| ops.iter().any(|op| op == "value_flow"))
+            })
+            .expect("value-flow traversal completion schema");
+        assert_eq!(value_flow_variant["required"], json!(["op", "plan_ref"]));
+        assert_eq!(value_flow_variant["properties"]["plan_ref"]["minLength"], 3);
         let witness_variant = steps["items"]["oneOf"]
             .as_array()
             .unwrap()
@@ -823,7 +860,7 @@ mod tests {
         assert_eq!(advertised, registered);
         assert_eq!(
             query_code["inputSchema"]["properties"]["schema_version"]["enum"],
-            json!([2, 3, 4, 5])
+            json!([2, 3, 4, 5, 6])
         );
         assert_eq!(
             query_code["inputSchema"]["properties"]["execution_mode"]["enum"],

@@ -191,6 +191,60 @@ export interface RqlTypestateWitnessResult extends RqlQueryResultBase {
   retention_truncated?: boolean;
 }
 
+export type RqlFlowReachability = "reached" | "not_reached" | "inconclusive";
+export type RqlFlowCertainty = "exact" | "may";
+export type RqlFlowCompletion =
+  "complete" | "incomplete" | "budget_exhausted" | "cancelled" | "unsupported";
+
+export interface RqlFlowEvent {
+  id: string;
+  path: string;
+  range: RqlResultRange;
+  phase: string;
+  ordinal: number;
+}
+
+export interface RqlFlowEndpointResult extends RqlQueryResultBase {
+  result_type: "flow_endpoint";
+  id: string;
+  plan_ref: string;
+  source?: RqlFlowEvent;
+  sink: RqlFlowEvent;
+  reachability: RqlFlowReachability;
+  certainty?: RqlFlowCertainty;
+  must: "not_established";
+  ambiguous?: boolean;
+  completion: RqlFlowCompletion;
+  semantic_status: string;
+  solver_termination: "fixed_point" | "budget_exhausted" | "cancelled";
+  language: string;
+  range: RqlResultRange;
+  path_qualities?: RqlSemanticEvidence[];
+  retained_witnesses: number;
+  omitted_witnesses: number;
+}
+
+export interface RqlFlowWitnessStep extends RqlTypestateWitnessStep {
+  boundary?: string;
+}
+
+export interface RqlFlowWitnessResult extends RqlQueryResultBase {
+  result_type: "flow_witness";
+  id: string;
+  endpoint_id: string;
+  plan_ref: string;
+  witness_index: number;
+  language: string;
+  range: RqlResultRange;
+  quality: RqlSemanticEvidence;
+  steps: RqlFlowWitnessStep[];
+  retained_bytes: number;
+  truncated?: boolean;
+  omitted_steps_lower_bound: number;
+  alternatives_truncated?: boolean;
+  retention_truncated?: boolean;
+}
+
 export interface RqlReferenceSiteResult extends RqlQueryResultBase {
   result_type: "reference_site";
   language: string;
@@ -288,6 +342,8 @@ export type RqlQueryResultItem =
   | RqlControlEdgeResult
   | RqlTypestateFindingResult
   | RqlTypestateWitnessResult
+  | RqlFlowEndpointResult
+  | RqlFlowWitnessResult
   | RqlFileResult
   | RqlReferenceSiteResult
   | RqlCallSiteResult
@@ -393,6 +449,10 @@ export function queryResultLabel(result: RqlQueryResultItem): string {
       return typestateFindingKindLabel(result.finding_kind);
     case "typestate_witness":
       return `witness ${result.witness_index + 1}: ${result.steps.length} step${result.steps.length === 1 ? "" : "s"}`;
+    case "flow_endpoint":
+      return `${result.reachability}: ${result.sink.id}`;
+    case "flow_witness":
+      return `flow witness ${result.witness_index + 1}: ${result.steps.length} step${result.steps.length === 1 ? "" : "s"}`;
     case "file":
       return result.path;
     case "reference_site":
@@ -417,6 +477,10 @@ export function queryResultDescription(result: RqlQueryResultItem): string {
     case "typestate_finding":
       return `${result.certainty} · ${result.protocol_ref} · ${result.range.start_line}:${result.range.start_column}`;
     case "typestate_witness":
+      return `${semanticEvidenceLabel(result.quality)} · ${result.truncated ? "truncated" : "complete"}`;
+    case "flow_endpoint":
+      return `${result.certainty ?? "n/a"} · ${result.completion} · ${result.plan_ref}`;
+    case "flow_witness":
       return `${semanticEvidenceLabel(result.quality)} · ${result.truncated ? "truncated" : "complete"}`;
     case "file":
       return `file · ${result.language}`;
@@ -489,6 +553,26 @@ export function queryResultTooltip(result: RqlQueryResultItem): string {
         (result.retention_truncated ? "\n\nWitness retention hit its request bound." : "") +
         typestateUncertaintyLabel(result.uncertainty)
       );
+    case "flow_endpoint":
+      return (
+        `**Value-flow endpoint (${result.reachability})** at ${result.path}:${result.range.start_line}:${result.range.start_column}` +
+        `\n\nPlan: \`${result.plan_ref}\`` +
+        `\n\nCertainty: ${result.certainty ?? "not applicable"}; ambiguous: ${result.ambiguous ? "yes" : "no"}` +
+        `\n\nCompletion: ${result.completion}; must: ${result.must}` +
+        `\n\nWitnesses: ${result.retained_witnesses} retained, ${result.omitted_witnesses} omitted`
+      );
+    case "flow_witness":
+      return (
+        `**Value-flow witness ${result.witness_index + 1}** at ${result.path}:${result.range.start_line}:${result.range.start_column}` +
+        `\n\nPlan: \`${result.plan_ref}\`` +
+        `\n\nEvidence: ${semanticEvidenceLabel(result.quality)}` +
+        `\n\nSteps: ${result.steps.length}; retained bytes: ${result.retained_bytes}` +
+        (result.truncated
+          ? `\n\nTruncated; at least ${result.omitted_steps_lower_bound} step(s) omitted.`
+          : "") +
+        (result.alternatives_truncated ? "\n\nAlternative witnesses were omitted." : "") +
+        (result.retention_truncated ? "\n\nWitness retention hit its request bound." : "")
+      );
     case "file":
       return `**file** at ${result.path}\n\nLanguage: ${result.language}`;
     case "reference_site":
@@ -539,6 +623,10 @@ export function queryResultIcon(result: RqlQueryResultItem): string {
       return "symbol-event";
     case "typestate_witness":
       return "debug-alt";
+    case "flow_endpoint":
+      return "target";
+    case "flow_witness":
+      return "debug-alt";
     case "file":
       return "file-code";
     case "reference_site":
@@ -565,6 +653,8 @@ export function queryResultRange(result: RqlQueryResultItem): RqlResultRange | u
     case "control_edge":
     case "typestate_finding":
     case "typestate_witness":
+    case "flow_endpoint":
+    case "flow_witness":
       return result.range;
     case "structural_match":
     case "declaration":
@@ -604,6 +694,24 @@ export function typestateWitnessStepTargets(
       `**${typestateWitnessStepKindLabel(step.kind)}** at ` +
       `${step.source.path}:${step.source.range.start_line}:${step.source.range.start_column}` +
       `\n\nEvidence: ${semanticEvidenceLabel(step.evidence)}`
+  }));
+}
+
+export function flowWitnessStepTargets(
+  result: RqlFlowWitnessResult
+): RqlTypestateWitnessStepTarget[] {
+  return result.steps.map((step, index) => ({
+    index,
+    uri: result.witnessStepUris?.[index] ?? result.uri,
+    path: step.source.path,
+    range: step.source.range,
+    label: `${index + 1}. ${typestateWitnessStepKindLabel(step.kind)}`,
+    description: `${step.source.path}:${step.source.range.start_line}:${step.source.range.start_column}`,
+    tooltip:
+      `**${typestateWitnessStepKindLabel(step.kind)}** at ` +
+      `${step.source.path}:${step.source.range.start_line}:${step.source.range.start_column}` +
+      `\n\nEvidence: ${semanticEvidenceLabel(step.evidence)}` +
+      (step.boundary ? `\n\nBoundary: ${step.boundary}` : "")
   }));
 }
 

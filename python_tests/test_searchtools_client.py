@@ -28,6 +28,10 @@ from bifrost_searchtools import (
     CodeQueryExpressionSite,
     CodeQueryExplain,
     CodeQueryFile,
+    CodeQueryFlowCertainty,
+    CodeQueryFlowCompletion,
+    CodeQueryFlowEndpoint,
+    CodeQueryFlowWitness,
     CodeQueryMatch,
     CodeQueryOperatorDisposition,
     CodeQueryPhysicalOperator,
@@ -570,6 +574,76 @@ class CodeQueryModelTest(unittest.TestCase):
             CodeQueryResult.from_dict(
                 {"results": [malformed_terminal], "truncated": False}
             )
+
+    def test_schema_v6_value_flow_results_preserve_orthogonal_statuses(self) -> None:
+        source_range = {
+            "start_line": 3,
+            "start_column": 5,
+            "end_line": 3,
+            "end_column": 17,
+        }
+        evidence = {"proof": "proven", "completeness": "complete"}
+        event = {
+            "id": "event-1",
+            "path": "src/Flow.java",
+            "range": source_range,
+            "phase": "after_effects",
+            "ordinal": 0,
+        }
+        endpoint = {
+            "result_type": "flow_endpoint",
+            "id": "endpoint-1",
+            "plan_ref": "test:request-to-sink",
+            "source": {**event, "phase": "before_effects"},
+            "sink": event,
+            "reachability": "reached",
+            "certainty": "may",
+            "must": "not_established",
+            "ambiguous": True,
+            "completion": "incomplete",
+            "semantic_status": "ambiguous",
+            "solver_termination": "fixed_point",
+            "path": "src/Flow.java",
+            "language": "java",
+            "range": source_range,
+            "path_qualities": [evidence],
+            "retained_witnesses": 1,
+            "omitted_witnesses": 0,
+        }
+        witness = {
+            "result_type": "flow_witness",
+            "id": "witness-1",
+            "endpoint_id": endpoint["id"],
+            "plan_ref": endpoint["plan_ref"],
+            "witness_index": 0,
+            "path": "src/Flow.java",
+            "language": "java",
+            "range": source_range,
+            "quality": evidence,
+            "steps": [
+                {
+                    "kind": {"type": "edge", "edge_kind": "normal"},
+                    "source": {"path": "src/Flow.java", "range": source_range},
+                    "target": {"path": "src/Flow.java", "range": source_range},
+                    "boundary": "dispatch",
+                    "evidence": evidence,
+                }
+            ],
+            "retained_bytes": 96,
+            "omitted_steps_lower_bound": 0,
+        }
+        result = CodeQueryResult.from_dict(
+            {"results": [endpoint, witness], "truncated": False}
+        )
+
+        self.assertIsInstance(result.results[0], CodeQueryFlowEndpoint)
+        self.assertIs(result.results[0].certainty, CodeQueryFlowCertainty.MAY)
+        self.assertIs(result.results[0].completion, CodeQueryFlowCompletion.INCOMPLETE)
+        self.assertTrue(result.results[0].ambiguous)
+        self.assertIsInstance(result.results[1], CodeQueryFlowWitness)
+        self.assertEqual(result.results[1].steps[0].boundary, "dispatch")
+        self.assertIn("flow endpoint; reached; may; incomplete", result.render_text())
+        self.assertIn("flow witness; 1 steps", result.render_text())
 
     def test_execution_mode_alias_is_reexported_from_public_import_paths(self) -> None:
         self.assertIs(CodeQueryExecutionMode, ModelCodeQueryExecutionMode)

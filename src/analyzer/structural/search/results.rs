@@ -263,6 +263,14 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryTypestateWitness>,
     },
+    FlowEndpoint {
+        #[serde(flatten)]
+        value: Box<CodeQueryFlowEndpoint>,
+    },
+    FlowWitness {
+        #[serde(flatten)]
+        value: Box<CodeQueryFlowWitness>,
+    },
     File {
         #[serde(flatten)]
         value: CodeQueryFile,
@@ -487,6 +495,121 @@ pub struct CodeQueryTypestateWitness {
     #[serde(skip_serializing_if = "is_false")]
     pub abstained: bool,
     pub steps: Vec<CodeQueryTypestateWitnessStep>,
+    pub retained_bytes: usize,
+    #[serde(skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    pub omitted_steps_lower_bound: usize,
+    #[serde(skip_serializing_if = "is_false")]
+    pub alternatives_truncated: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub retention_truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeQueryFlowReachability {
+    Reached,
+    NotReached,
+    Inconclusive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeQueryFlowCertainty {
+    Exact,
+    May,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeQueryFlowMustStatus {
+    NotEstablished,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeQueryFlowCompletion {
+    Complete,
+    Incomplete,
+    BudgetExhausted,
+    Cancelled,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeQueryFlowSolverTermination {
+    FixedPoint,
+    BudgetExhausted,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryFlowEvent {
+    pub id: String,
+    pub path: String,
+    pub range: CodeQueryRange,
+    pub phase: &'static str,
+    pub ordinal: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryFlowEndpoint {
+    pub id: String,
+    pub plan_ref: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<CodeQueryFlowEvent>,
+    pub sink: CodeQueryFlowEvent,
+    pub reachability: CodeQueryFlowReachability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certainty: Option<CodeQueryFlowCertainty>,
+    pub must: CodeQueryFlowMustStatus,
+    #[serde(skip_serializing_if = "is_false")]
+    pub ambiguous: bool,
+    pub completion: CodeQueryFlowCompletion,
+    pub semantic_status: &'static str,
+    pub solver_termination: CodeQueryFlowSolverTermination,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub path_qualities: Vec<CodeQuerySemanticEvidence>,
+    pub retained_witnesses: usize,
+    pub omitted_witnesses: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CodeQueryFlowWitnessStepKind {
+    Seed,
+    Edge { edge_kind: &'static str },
+    EndSummaryGap { return_kind: &'static str },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryFlowWitnessStep {
+    pub kind: CodeQueryFlowWitnessStepKind,
+    pub source: CodeQuerySourceSite,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<CodeQuerySourceSite>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<CodeQuerySourceSite>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boundary: Option<String>,
+    pub evidence: CodeQuerySemanticEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryFlowWitness {
+    pub id: String,
+    pub endpoint_id: String,
+    pub plan_ref: String,
+    pub witness_index: usize,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub quality: CodeQuerySemanticEvidence,
+    pub steps: Vec<CodeQueryFlowWitnessStep>,
     pub retained_bytes: usize,
     #[serde(skip_serializing_if = "is_false")]
     pub truncated: bool,
@@ -794,6 +917,18 @@ pub enum CodeQueryResultRef {
         procedure_kind: &'static str,
         range: CodeQueryRange,
     },
+    FlowEndpoint {
+        id: String,
+        plan_ref: String,
+        path: String,
+        range: CodeQueryRange,
+    },
+    FlowWitness {
+        id: String,
+        endpoint_id: String,
+        path: String,
+        range: CodeQueryRange,
+    },
     ProgramPoint {
         id: String,
         procedure_id: String,
@@ -908,6 +1043,15 @@ pub enum CodeQueryDiagnosticCode {
     TypestateSolverBudgetExhausted,
     TypestateFindingBudgetExhausted,
     TypestateWitnessTruncated,
+    UnresolvedValueFlowPlanReference,
+    ValueFlowRegistrationStale,
+    ValueFlowHandleStale,
+    ValueFlowRootMismatch,
+    ValueFlowCapabilityUnsupported,
+    ValueFlowAnalysisPartial,
+    ValueFlowProviderFailed,
+    ValueFlowSolverBudgetExhausted,
+    ValueFlowWitnessTruncated,
     ReceiverAnalysisPartial,
     ReceiverAnalysisFailed,
     CallRelationBudgetExhausted,
@@ -958,6 +1102,15 @@ impl CodeQueryDiagnosticCode {
             Self::TypestateSolverBudgetExhausted => "typestate_solver_budget_exhausted",
             Self::TypestateFindingBudgetExhausted => "typestate_finding_budget_exhausted",
             Self::TypestateWitnessTruncated => "typestate_witness_truncated",
+            Self::UnresolvedValueFlowPlanReference => "unresolved_value_flow_plan_reference",
+            Self::ValueFlowRegistrationStale => "value_flow_registration_stale",
+            Self::ValueFlowHandleStale => "value_flow_handle_stale",
+            Self::ValueFlowRootMismatch => "value_flow_root_mismatch",
+            Self::ValueFlowCapabilityUnsupported => "value_flow_capability_unsupported",
+            Self::ValueFlowAnalysisPartial => "value_flow_analysis_partial",
+            Self::ValueFlowProviderFailed => "value_flow_provider_failed",
+            Self::ValueFlowSolverBudgetExhausted => "value_flow_solver_budget_exhausted",
+            Self::ValueFlowWitnessTruncated => "value_flow_witness_truncated",
             Self::ReceiverAnalysisPartial => "receiver_analysis_partial",
             Self::ReceiverAnalysisFailed => "receiver_analysis_failed",
             Self::CallRelationBudgetExhausted => "call_relation_budget_exhausted",
@@ -1036,6 +1189,55 @@ pub struct CodeQueryExecutionLimits {
     pub max_pipeline_rows: usize,
     pub semantic: CodeQuerySemanticLimits,
     pub typestate: CodeQueryTypestateLimits,
+    pub value_flow: CodeQueryValueFlowLimits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeQueryValueFlowLimits {
+    pub solver_work: crate::analyzer::dataflow::SolverWork,
+    pub max_retained_relations: usize,
+    pub max_retained_bytes: usize,
+    pub max_endpoints: usize,
+    pub max_witnesses: usize,
+    pub max_witness_steps: usize,
+    pub max_witness_expansions: usize,
+    pub max_witness_bytes: usize,
+    pub max_total_witness_steps: usize,
+    pub max_total_witness_expansions: usize,
+    pub max_total_witness_bytes: usize,
+}
+
+impl CodeQueryValueFlowLimits {
+    pub fn is_valid(self) -> bool {
+        let hard_solver = crate::analyzer::dataflow::SolverWork::default_limits();
+        let solver_valid = crate::analyzer::dataflow::SolverBudgetDimension::ALL
+            .into_iter()
+            .all(|dimension| {
+                let value = self.solver_work.get(dimension);
+                value > 0 && value <= hard_solver.get(dimension)
+            });
+        solver_valid
+            && self.max_retained_relations > 0
+            && self.max_retained_relations <= u32::MAX as usize
+            && self.max_retained_bytes > 0
+            && self.max_retained_bytes <= 64 * 1024 * 1024
+            && self.max_endpoints > 0
+            && self.max_endpoints <= 50_000
+            && self.max_witnesses > 0
+            && self.max_witnesses <= 50_000
+            && self.max_witness_steps > 0
+            && self.max_witness_steps <= 16_384
+            && self.max_witness_expansions > 0
+            && self.max_witness_expansions <= 65_536
+            && self.max_witness_bytes > 0
+            && self.max_witness_bytes <= 16 * 1024 * 1024
+            && self.max_total_witness_steps > 0
+            && self.max_total_witness_steps <= 1_000_000
+            && self.max_total_witness_expansions > 0
+            && self.max_total_witness_expansions <= 4_000_000
+            && self.max_total_witness_bytes > 0
+            && self.max_total_witness_bytes <= 64 * 1024 * 1024
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1149,6 +1351,8 @@ pub struct CodeQuerySemanticWork {
     pub budget_exhausted: bool,
     #[serde(skip_serializing_if = "CodeQueryTypestateWork::is_empty")]
     pub typestate: CodeQueryTypestateWork,
+    #[serde(skip_serializing_if = "CodeQueryValueFlowWork::is_empty")]
+    pub value_flow: CodeQueryValueFlowWork,
 }
 
 impl CodeQuerySemanticWork {
@@ -1182,6 +1386,7 @@ impl CodeQuerySemanticWork {
             traversal_steps: self.traversal_steps.saturating_add(other.traversal_steps),
             budget_exhausted: self.budget_exhausted || other.budget_exhausted,
             typestate: self.typestate.saturating_add(other.typestate),
+            value_flow: self.value_flow.saturating_add(other.value_flow),
         }
     }
 
@@ -1217,6 +1422,7 @@ impl CodeQuerySemanticWork {
             traversal_steps: self.traversal_steps.saturating_sub(earlier.traversal_steps),
             budget_exhausted: self.budget_exhausted && !earlier.budget_exhausted,
             typestate: self.typestate.saturating_sub(earlier.typestate),
+            value_flow: self.value_flow.saturating_sub(earlier.value_flow),
         }
     }
 }
@@ -1346,6 +1552,115 @@ impl CodeQueryTypestateWork {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct CodeQueryValueFlowWork {
+    pub solves: u64,
+    pub cache_hits: u64,
+    pub reached_rows: u64,
+    pub meetings: u64,
+    pub sink_outcomes: u64,
+    pub omitted_endpoints: u64,
+    pub witnesses: u64,
+    pub omitted_witnesses: u64,
+    pub witness_expansions: u64,
+    pub witness_steps: u64,
+    pub witness_bytes: u64,
+    pub fixed_point_solves: u64,
+    pub cancelled_solves: u64,
+    pub budget_exhausted_solves: u64,
+    pub failed_solves: u64,
+    pub endpoint_truncated: bool,
+    pub witness_truncated: bool,
+}
+
+impl CodeQueryValueFlowWork {
+    pub const fn is_empty(&self) -> bool {
+        self.solves == 0
+            && self.cache_hits == 0
+            && self.reached_rows == 0
+            && self.meetings == 0
+            && self.sink_outcomes == 0
+            && self.omitted_endpoints == 0
+            && self.witnesses == 0
+            && self.omitted_witnesses == 0
+            && self.witness_expansions == 0
+            && self.witness_steps == 0
+            && self.witness_bytes == 0
+            && self.fixed_point_solves == 0
+            && self.cancelled_solves == 0
+            && self.budget_exhausted_solves == 0
+            && self.failed_solves == 0
+            && !self.endpoint_truncated
+            && !self.witness_truncated
+    }
+
+    pub(crate) const fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            solves: self.solves.saturating_sub(earlier.solves),
+            cache_hits: self.cache_hits.saturating_sub(earlier.cache_hits),
+            reached_rows: self.reached_rows.saturating_sub(earlier.reached_rows),
+            meetings: self.meetings.saturating_sub(earlier.meetings),
+            sink_outcomes: self.sink_outcomes.saturating_sub(earlier.sink_outcomes),
+            omitted_endpoints: self
+                .omitted_endpoints
+                .saturating_sub(earlier.omitted_endpoints),
+            witnesses: self.witnesses.saturating_sub(earlier.witnesses),
+            omitted_witnesses: self
+                .omitted_witnesses
+                .saturating_sub(earlier.omitted_witnesses),
+            witness_expansions: self
+                .witness_expansions
+                .saturating_sub(earlier.witness_expansions),
+            witness_steps: self.witness_steps.saturating_sub(earlier.witness_steps),
+            witness_bytes: self.witness_bytes.saturating_sub(earlier.witness_bytes),
+            fixed_point_solves: self
+                .fixed_point_solves
+                .saturating_sub(earlier.fixed_point_solves),
+            cancelled_solves: self
+                .cancelled_solves
+                .saturating_sub(earlier.cancelled_solves),
+            budget_exhausted_solves: self
+                .budget_exhausted_solves
+                .saturating_sub(earlier.budget_exhausted_solves),
+            failed_solves: self.failed_solves.saturating_sub(earlier.failed_solves),
+            endpoint_truncated: self.endpoint_truncated && !earlier.endpoint_truncated,
+            witness_truncated: self.witness_truncated && !earlier.witness_truncated,
+        }
+    }
+
+    pub(crate) const fn saturating_add(self, other: Self) -> Self {
+        Self {
+            solves: self.solves.saturating_add(other.solves),
+            cache_hits: self.cache_hits.saturating_add(other.cache_hits),
+            reached_rows: self.reached_rows.saturating_add(other.reached_rows),
+            meetings: self.meetings.saturating_add(other.meetings),
+            sink_outcomes: self.sink_outcomes.saturating_add(other.sink_outcomes),
+            omitted_endpoints: self
+                .omitted_endpoints
+                .saturating_add(other.omitted_endpoints),
+            witnesses: self.witnesses.saturating_add(other.witnesses),
+            omitted_witnesses: self
+                .omitted_witnesses
+                .saturating_add(other.omitted_witnesses),
+            witness_expansions: self
+                .witness_expansions
+                .saturating_add(other.witness_expansions),
+            witness_steps: self.witness_steps.saturating_add(other.witness_steps),
+            witness_bytes: self.witness_bytes.saturating_add(other.witness_bytes),
+            fixed_point_solves: self
+                .fixed_point_solves
+                .saturating_add(other.fixed_point_solves),
+            cancelled_solves: self.cancelled_solves.saturating_add(other.cancelled_solves),
+            budget_exhausted_solves: self
+                .budget_exhausted_solves
+                .saturating_add(other.budget_exhausted_solves),
+            failed_solves: self.failed_solves.saturating_add(other.failed_solves),
+            endpoint_truncated: self.endpoint_truncated || other.endpoint_truncated,
+            witness_truncated: self.witness_truncated || other.witness_truncated,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct DetailedCodeQueryResult {
     pub result: CodeQueryResult,
@@ -1432,6 +1747,8 @@ pub(crate) enum DetailedCodeQueryDomain {
     ControlEdge,
     TypestateFinding,
     TypestateWitness,
+    FlowEndpoint,
+    FlowWitness,
     File,
     ReferenceSite,
     CallSite,
@@ -1468,6 +1785,13 @@ pub(crate) enum DetailedCodeQueryKey {
         id: String,
         finding_id: String,
     },
+    FlowEndpoint {
+        id: String,
+    },
+    FlowWitness {
+        id: String,
+        endpoint_id: String,
+    },
     File,
     ReferenceSite {
         target_id: Option<String>,
@@ -1498,6 +1822,7 @@ impl Default for CodeQueryExecutionLimits {
             max_pipeline_rows: MAX_PIPELINE_ROWS,
             semantic: CodeQuerySemanticLimits::default(),
             typestate: CodeQueryTypestateLimits::default(),
+            value_flow: CodeQueryValueFlowLimits::default(),
         }
     }
 }
@@ -1525,6 +1850,24 @@ impl Default for CodeQueryTypestateLimits {
             max_total_witness_expansions:
                 crate::analyzer::typestate::MAX_TYPESTATE_FINDING_WITNESS_EXPANSIONS,
             max_witness_bytes: crate::analyzer::typestate::MAX_TYPESTATE_FINDING_WITNESS_BYTES,
+        }
+    }
+}
+
+impl Default for CodeQueryValueFlowLimits {
+    fn default() -> Self {
+        Self {
+            solver_work: crate::analyzer::dataflow::SolverWork::default_limits(),
+            max_retained_relations: 262_144,
+            max_retained_bytes: 16 * 1024 * 1024,
+            max_endpoints: 50_000,
+            max_witnesses: 4_096,
+            max_witness_steps: 4_096,
+            max_witness_expansions: 16_384,
+            max_witness_bytes: 4 * 1024 * 1024,
+            max_total_witness_steps: 262_144,
+            max_total_witness_expansions: 1_048_576,
+            max_total_witness_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -1587,6 +1930,12 @@ impl DetailedCodeQueryResult {
                     ) | (
                         DetailedCodeQueryDomain::TypestateWitness,
                         DetailedCodeQueryKey::TypestateWitness { .. }
+                    ) | (
+                        DetailedCodeQueryDomain::FlowEndpoint,
+                        DetailedCodeQueryKey::FlowEndpoint { .. }
+                    ) | (
+                        DetailedCodeQueryDomain::FlowWitness,
+                        DetailedCodeQueryKey::FlowWitness { .. }
                     ) | (DetailedCodeQueryDomain::File, DetailedCodeQueryKey::File)
                         | (
                             DetailedCodeQueryDomain::ReferenceSite,
@@ -1699,6 +2048,19 @@ fn detailed_semantic_identity(
                 finding_id: value.finding_id.clone(),
             },
         )),
+        CodeQueryResultValue::FlowEndpoint { value } => Some((
+            DetailedCodeQueryDomain::FlowEndpoint,
+            DetailedCodeQueryKey::FlowEndpoint {
+                id: value.id.clone(),
+            },
+        )),
+        CodeQueryResultValue::FlowWitness { value } => Some((
+            DetailedCodeQueryDomain::FlowWitness,
+            DetailedCodeQueryKey::FlowWitness {
+                id: value.id.clone(),
+                endpoint_id: value.endpoint_id.clone(),
+            },
+        )),
         CodeQueryResultValue::StructuralMatch { .. }
         | CodeQueryResultValue::Declaration { .. }
         | CodeQueryResultValue::File { .. }
@@ -1738,7 +2100,9 @@ fn assert_detailed_terminal_identities(
                 | DetailedCodeQueryDomain::ProgramPoint
                 | DetailedCodeQueryDomain::ControlEdge
                 | DetailedCodeQueryDomain::TypestateFinding
-                | DetailedCodeQueryDomain::TypestateWitness,
+                | DetailedCodeQueryDomain::TypestateWitness
+                | DetailedCodeQueryDomain::FlowEndpoint
+                | DetailedCodeQueryDomain::FlowWitness,
             DetailedCodeQueryProvenanceIdentities::Primary(_),
         ) | (
             DetailedCodeQueryDomain::File
@@ -1761,7 +2125,9 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::ProgramPoint { id, .. }
         | DetailedCodeQueryKey::ControlEdge { id, .. }
         | DetailedCodeQueryKey::TypestateFinding { id }
-        | DetailedCodeQueryKey::TypestateWitness { id, .. } => Some(id),
+        | DetailedCodeQueryKey::TypestateWitness { id, .. }
+        | DetailedCodeQueryKey::FlowEndpoint { id }
+        | DetailedCodeQueryKey::FlowWitness { id, .. } => Some(id),
         DetailedCodeQueryKey::StructuralMatch { .. }
         | DetailedCodeQueryKey::Declaration { .. }
         | DetailedCodeQueryKey::File
@@ -1784,6 +2150,8 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::ControlEdge { .. }
                 | CodeQueryResultValue::TypestateFinding { .. }
                 | CodeQueryResultValue::TypestateWitness { .. }
+                | CodeQueryResultValue::FlowEndpoint { .. }
+                | CodeQueryResultValue::FlowWitness { .. }
                 | CodeQueryResultValue::File { .. }
                 | CodeQueryResultValue::ReferenceSite { .. }
                 | CodeQueryResultValue::CallSite { .. }
@@ -1895,6 +2263,31 @@ impl CodeQueryResult {
                     CodeQueryResultValue::TypestateWitness { value } => {
                         out.push_str(&format!(
                             "{}:{}:{} [typestate witness; {} step{}{}] {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.steps.len(),
+                            if value.steps.len() == 1 { "" } else { "s" },
+                            if value.truncated { "; truncated" } else { "" },
+                            value.id,
+                        ));
+                    }
+                    CodeQueryResultValue::FlowEndpoint { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [flow endpoint; {:?}; {:?}; {:?}{}] {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.reachability,
+                            value.certainty,
+                            value.completion,
+                            if value.ambiguous { "; ambiguous" } else { "" },
+                            value.id,
+                        ));
+                    }
+                    CodeQueryResultValue::FlowWitness { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [flow witness; {} step{}{}] {}\n",
                             value.path,
                             value.range.start_line,
                             value.range.start_column,

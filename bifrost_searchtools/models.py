@@ -878,6 +878,192 @@ class CodeQueryTypestateWitness:
         )
 
 
+class CodeQueryFlowReachability(StrEnum):
+    REACHED = "reached"
+    NOT_REACHED = "not_reached"
+    INCONCLUSIVE = "inconclusive"
+
+
+class CodeQueryFlowCertainty(StrEnum):
+    EXACT = "exact"
+    MAY = "may"
+
+
+class CodeQueryFlowCompletion(StrEnum):
+    COMPLETE = "complete"
+    INCOMPLETE = "incomplete"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    CANCELLED = "cancelled"
+    UNSUPPORTED = "unsupported"
+
+
+@dataclass(frozen=True)
+class CodeQueryFlowEvent:
+    id: str
+    path: str
+    range: CodeQueryRange
+    phase: str
+    ordinal: int
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryFlowEvent:
+        return cls(
+            id=data["id"],
+            path=data["path"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            phase=data["phase"],
+            ordinal=_strict_nonnegative_int(data, "ordinal"),
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryFlowEndpoint:
+    id: str
+    plan_ref: str
+    sink: CodeQueryFlowEvent
+    reachability: CodeQueryFlowReachability
+    must: str
+    ambiguous: bool
+    completion: CodeQueryFlowCompletion
+    semantic_status: str
+    solver_termination: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    retained_witnesses: int
+    omitted_witnesses: int
+    source: CodeQueryFlowEvent | None = None
+    certainty: CodeQueryFlowCertainty | None = None
+    path_qualities: tuple[CodeQuerySemanticEvidence, ...] = ()
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryFlowEndpoint:
+        certainty = data.get("certainty")
+        return cls(
+            id=data["id"],
+            plan_ref=data["plan_ref"],
+            source=(
+                CodeQueryFlowEvent.from_dict(data["source"])
+                if data.get("source") is not None
+                else None
+            ),
+            sink=CodeQueryFlowEvent.from_dict(data["sink"]),
+            reachability=CodeQueryFlowReachability(data["reachability"]),
+            certainty=(
+                CodeQueryFlowCertainty(certainty) if certainty is not None else None
+            ),
+            must=data["must"],
+            ambiguous=_strict_bool(data, "ambiguous", False),
+            completion=CodeQueryFlowCompletion(data["completion"]),
+            semantic_status=data["semantic_status"],
+            solver_termination=data["solver_termination"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            path_qualities=tuple(
+                CodeQuerySemanticEvidence.from_dict(value)
+                for value in _strict_list(data, "path_qualities", [])
+            ),
+            retained_witnesses=_strict_nonnegative_int(data, "retained_witnesses"),
+            omitted_witnesses=_strict_nonnegative_int(data, "omitted_witnesses"),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        certainty = self.certainty.value if self.certainty is not None else "n/a"
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[flow endpoint; {self.reachability}; {certainty}; {self.completion}]"
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryFlowWitnessStep:
+    kind: CodeQueryTypestateWitnessStepKind
+    source: CodeQuerySourceSite
+    evidence: CodeQuerySemanticEvidence
+    target: CodeQuerySourceSite | None = None
+    origin: CodeQuerySourceSite | None = None
+    boundary: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryFlowWitnessStep:
+        return cls(
+            kind=CodeQueryTypestateWitnessStepKind.from_dict(data["kind"]),
+            source=CodeQuerySourceSite.from_dict(data["source"]),
+            evidence=CodeQuerySemanticEvidence.from_dict(data["evidence"]),
+            target=(
+                CodeQuerySourceSite.from_dict(data["target"])
+                if "target" in data
+                else None
+            ),
+            origin=(
+                CodeQuerySourceSite.from_dict(data["origin"])
+                if "origin" in data
+                else None
+            ),
+            boundary=data.get("boundary"),
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryFlowWitness:
+    id: str
+    endpoint_id: str
+    plan_ref: str
+    witness_index: int
+    path: str
+    language: str
+    range: CodeQueryRange
+    quality: CodeQuerySemanticEvidence
+    steps: tuple[CodeQueryFlowWitnessStep, ...]
+    retained_bytes: int
+    omitted_steps_lower_bound: int
+    truncated: bool = False
+    alternatives_truncated: bool = False
+    retention_truncated: bool = False
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryFlowWitness:
+        return cls(
+            id=data["id"],
+            endpoint_id=data["endpoint_id"],
+            plan_ref=data["plan_ref"],
+            witness_index=_strict_nonnegative_int(data, "witness_index"),
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            quality=CodeQuerySemanticEvidence.from_dict(data["quality"]),
+            steps=tuple(
+                CodeQueryFlowWitnessStep.from_dict(step)
+                for step in _strict_list(data, "steps")
+            ),
+            retained_bytes=_strict_nonnegative_int(data, "retained_bytes"),
+            omitted_steps_lower_bound=_strict_nonnegative_int(
+                data, "omitted_steps_lower_bound"
+            ),
+            truncated=_strict_bool(data, "truncated", False),
+            alternatives_truncated=_strict_bool(
+                data, "alternatives_truncated", False
+            ),
+            retention_truncated=_strict_bool(data, "retention_truncated", False),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        suffix = "; truncated" if self.truncated else ""
+        return (
+            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
+            f"[flow witness; {len(self.steps)} steps{suffix}; {self.plan_ref}]"
+        )
+
+
 @dataclass(frozen=True)
 class CodeQueryFile:
     path: str
@@ -1192,6 +1378,8 @@ CodeQueryResultItem = (
     | CodeQueryControlEdge
     | CodeQueryTypestateFinding
     | CodeQueryTypestateWitness
+    | CodeQueryFlowEndpoint
+    | CodeQueryFlowWitness
     | CodeQueryFile
     | CodeQueryReferenceSite
     | CodeQueryCallSite
@@ -1216,6 +1404,10 @@ def _code_query_result_item(data: dict) -> CodeQueryResultItem:
         return CodeQueryTypestateFinding.from_dict(data)
     if result_type == "typestate_witness":
         return CodeQueryTypestateWitness.from_dict(data)
+    if result_type == "flow_endpoint":
+        return CodeQueryFlowEndpoint.from_dict(data)
+    if result_type == "flow_witness":
+        return CodeQueryFlowWitness.from_dict(data)
     if result_type == "file":
         return CodeQueryFile.from_dict(data)
     if result_type == "reference_site":
@@ -1252,6 +1444,15 @@ class CodeQueryDiagnosticCode(StrEnum):
     TYPESTATE_SOLVER_BUDGET_EXHAUSTED = "typestate_solver_budget_exhausted"
     TYPESTATE_FINDING_BUDGET_EXHAUSTED = "typestate_finding_budget_exhausted"
     TYPESTATE_WITNESS_TRUNCATED = "typestate_witness_truncated"
+    UNRESOLVED_VALUE_FLOW_PLAN_REFERENCE = "unresolved_value_flow_plan_reference"
+    VALUE_FLOW_REGISTRATION_STALE = "value_flow_registration_stale"
+    VALUE_FLOW_HANDLE_STALE = "value_flow_handle_stale"
+    VALUE_FLOW_ROOT_MISMATCH = "value_flow_root_mismatch"
+    VALUE_FLOW_CAPABILITY_UNSUPPORTED = "value_flow_capability_unsupported"
+    VALUE_FLOW_ANALYSIS_PARTIAL = "value_flow_analysis_partial"
+    VALUE_FLOW_PROVIDER_FAILED = "value_flow_provider_failed"
+    VALUE_FLOW_SOLVER_BUDGET_EXHAUSTED = "value_flow_solver_budget_exhausted"
+    VALUE_FLOW_WITNESS_TRUNCATED = "value_flow_witness_truncated"
     RECEIVER_ANALYSIS_PARTIAL = "receiver_analysis_partial"
     RECEIVER_ANALYSIS_FAILED = "receiver_analysis_failed"
     CALL_RELATION_BUDGET_EXHAUSTED = "call_relation_budget_exhausted"
@@ -1771,6 +1972,52 @@ class CodeQueryTypestateWork:
 
 
 @dataclass(frozen=True)
+class CodeQueryValueFlowWork:
+    solves: int = 0
+    cache_hits: int = 0
+    reached_rows: int = 0
+    meetings: int = 0
+    sink_outcomes: int = 0
+    omitted_endpoints: int = 0
+    witnesses: int = 0
+    omitted_witnesses: int = 0
+    witness_expansions: int = 0
+    witness_steps: int = 0
+    witness_bytes: int = 0
+    fixed_point_solves: int = 0
+    cancelled_solves: int = 0
+    budget_exhausted_solves: int = 0
+    failed_solves: int = 0
+    endpoint_truncated: bool = False
+    witness_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CodeQueryValueFlowWork:
+        numeric = {
+            "solves",
+            "cache_hits",
+            "reached_rows",
+            "meetings",
+            "sink_outcomes",
+            "omitted_endpoints",
+            "witnesses",
+            "omitted_witnesses",
+            "witness_expansions",
+            "witness_steps",
+            "witness_bytes",
+            "fixed_point_solves",
+            "cancelled_solves",
+            "budget_exhausted_solves",
+            "failed_solves",
+        }
+        return cls(
+            **{key: int(data.get(key, 0)) for key in numeric},
+            endpoint_truncated=bool(data.get("endpoint_truncated", False)),
+            witness_truncated=bool(data.get("witness_truncated", False)),
+        )
+
+
+@dataclass(frozen=True)
 class CodeQuerySemanticWork:
     materialization_attempts: int = 0
     unique_materialized_files: int = 0
@@ -1783,6 +2030,7 @@ class CodeQuerySemanticWork:
     traversal_steps: int = 0
     budget_exhausted: bool = False
     typestate: CodeQueryTypestateWork = field(default_factory=CodeQueryTypestateWork)
+    value_flow: CodeQueryValueFlowWork = field(default_factory=CodeQueryValueFlowWork)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CodeQuerySemanticWork:
@@ -1798,6 +2046,7 @@ class CodeQuerySemanticWork:
             traversal_steps=int(data.get("traversal_steps", 0)),
             budget_exhausted=bool(data.get("budget_exhausted", False)),
             typestate=CodeQueryTypestateWork.from_dict(data.get("typestate", {})),
+            value_flow=CodeQueryValueFlowWork.from_dict(data.get("value_flow", {})),
         )
 
 

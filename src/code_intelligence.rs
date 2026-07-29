@@ -17,6 +17,7 @@ use crate::analyzer::policy::{
 };
 use crate::analyzer::structural::{
     CodeQuery, CodeQueryExecutionLimits, CodeQueryResponse, ProtocolRegistrationSet,
+    ValueFlowPlanRegistrationSet, execute_workspace_request_with_analysis_registration_lease,
     execute_workspace_request_with_cancellation, execute_workspace_request_with_limits,
     execute_workspace_request_with_registration_lease,
 };
@@ -78,6 +79,28 @@ impl<'a> CodeIntelligenceRuntime<'a> {
             self.workspace,
             workspace_generation,
             registrations,
+            query,
+            limits,
+            self.cancellation,
+            summary_lease,
+        )
+    }
+
+    /// Execute a query with caller-owned typestate and value-flow registrations.
+    pub fn execute_query_with_analysis_registration_lease(
+        &self,
+        workspace_generation: u64,
+        registrations: &ProtocolRegistrationSet,
+        value_flow_registrations: &ValueFlowPlanRegistrationSet,
+        query: &CodeQuery,
+        limits: CodeQueryExecutionLimits,
+        summary_lease: ProductionTypestateSummaryLease,
+    ) -> CodeQueryResponse {
+        execute_workspace_request_with_analysis_registration_lease(
+            self.workspace,
+            workspace_generation,
+            registrations,
+            value_flow_registrations,
             query,
             limits,
             self.cancellation,

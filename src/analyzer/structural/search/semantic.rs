@@ -2,6 +2,7 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use super::typestate::{SemanticTypestateFindingValue, TypestateQueryState};
+use super::value_flow::{SemanticFlowEndpointValue, SemanticFlowWitnessValue, ValueFlowQueryState};
 use super::{
     CodeQueryControlEdge, CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact,
     CodeQueryProcedure, CodeQueryProgramPoint, CodeQueryProgramPointBoundary,
@@ -21,7 +22,10 @@ use crate::analyzer::semantic::{
     SemanticGap, SemanticLocator, SemanticOutcome, SemanticRequest, SemanticValue, SemanticWork,
     SourceMapping,
 };
-use crate::analyzer::structural::analysis_context::{ProtocolRef, QueryAnalysisContext};
+use crate::analyzer::structural::analysis_context::{
+    ProtocolRef, QueryAnalysisContext, ValueFlowPlanRef,
+};
+use crate::analyzer::structural::query::WitnessTraversal;
 use crate::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -130,6 +134,7 @@ pub(super) struct SemanticQueryContext<'a> {
     uncancelled: CancellationToken,
     limits: CodeQuerySemanticLimits,
     typestate_limits: super::CodeQueryTypestateLimits,
+    value_flow_limits: super::CodeQueryValueFlowLimits,
     workspace_generation: u64,
     analysis_context: Option<&'a QueryAnalysisContext>,
     budget: SemanticBudget,
@@ -144,6 +149,7 @@ pub(super) struct SemanticQueryContext<'a> {
     indexed_source_identities: HashMap<ProjectFile, Option<ContentIdentity>>,
     budget_exhausted: bool,
     typestate: TypestateQueryState,
+    value_flow: ValueFlowQueryState,
 }
 
 impl<'a> SemanticQueryContext<'a> {
@@ -158,6 +164,7 @@ impl<'a> SemanticQueryContext<'a> {
             cancellation,
             limits,
             super::CodeQueryTypestateLimits::default(),
+            super::CodeQueryValueFlowLimits::default(),
             0,
             None,
         )
@@ -168,6 +175,7 @@ impl<'a> SemanticQueryContext<'a> {
         cancellation: Option<&'a CancellationToken>,
         limits: CodeQuerySemanticLimits,
         typestate_limits: super::CodeQueryTypestateLimits,
+        value_flow_limits: super::CodeQueryValueFlowLimits,
         workspace_generation: u64,
         analysis_context: Option<&'a QueryAnalysisContext>,
     ) -> Self {
@@ -178,6 +186,7 @@ impl<'a> SemanticQueryContext<'a> {
             uncancelled: CancellationToken::default(),
             limits,
             typestate_limits,
+            value_flow_limits,
             workspace_generation,
             analysis_context,
             budget: SemanticBudget::new(semantic_budget_limits(limits))
@@ -193,6 +202,7 @@ impl<'a> SemanticQueryContext<'a> {
             indexed_source_identities: HashMap::default(),
             budget_exhausted: false,
             typestate: TypestateQueryState::default(),
+            value_flow: ValueFlowQueryState::default(),
         }
     }
 
@@ -403,6 +413,7 @@ impl<'a> SemanticQueryContext<'a> {
         self.reported.clear();
         let mut diagnostics = std::mem::take(&mut self.diagnostics);
         diagnostics.extend(self.typestate.take_diagnostics());
+        diagnostics.extend(self.value_flow.take_diagnostics());
         diagnostics
     }
 
@@ -429,8 +440,12 @@ impl<'a> SemanticQueryContext<'a> {
             nested_entries: saturating_u64(used.nested_entries),
             retained_bytes: saturating_u64(self.retained_bytes),
             traversal_steps: saturating_u64(self.traversal_steps),
-            budget_exhausted: self.budget_exhausted || self.typestate.semantic_budget_exhausted(),
+            budget_exhausted: self.budget_exhausted
+                || self.typestate.semantic_budget_exhausted()
+                || self.value_flow.semantic_budget_exhausted()
+                || self.value_flow.query_budget_exhausted(),
             typestate: self.typestate.work(),
+            value_flow: self.value_flow.work(),
         }
     }
 
@@ -454,6 +469,35 @@ impl<'a> SemanticQueryContext<'a> {
 
     pub(super) fn typestate_witness_truncated(&mut self, count: usize) {
         self.typestate.witness_truncated(count);
+    }
+
+    pub(super) fn value_flow_endpoints(
+        &mut self,
+        procedure: &SemanticProcedureValue,
+        plan_ref: &ValueFlowPlanRef,
+        max_endpoints: usize,
+    ) -> Vec<SemanticFlowEndpointValue> {
+        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
+        self.value_flow.endpoints(
+            self.workspace,
+            self.workspace_generation,
+            self.analysis_context,
+            procedure,
+            plan_ref,
+            &mut self.budget,
+            self.value_flow_limits,
+            max_endpoints,
+            cancellation,
+        )
+    }
+
+    pub(super) fn value_flow_witnesses(
+        &mut self,
+        endpoint: &SemanticFlowEndpointValue,
+        traversal: &WitnessTraversal,
+    ) -> Vec<SemanticFlowWitnessValue> {
+        self.value_flow
+            .witnesses(self.workspace, endpoint, traversal, self.value_flow_limits)
     }
 
     fn finish_procedure_lookup(
