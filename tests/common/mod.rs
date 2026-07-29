@@ -3,6 +3,7 @@ pub mod dataflow_reference;
 pub mod dataflow_summary_reference;
 mod inline_project;
 pub mod lsp_click;
+#[path = "../../crates/bifrost-lsp/tests/common/lsp_client.rs"]
 pub mod lsp_client;
 pub mod search_tools;
 pub mod semantic_graph;

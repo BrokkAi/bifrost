@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use brokk_bifrost::{
+use brokk_bifrost_analysis::{
     AnalyzerConfig, Language, Project, ProjectFile, TestProject, WorkspaceAnalyzer,
 };
 use std::collections::BTreeSet;

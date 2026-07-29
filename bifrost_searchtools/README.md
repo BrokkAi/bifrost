@@ -126,9 +126,10 @@ cannot be proven. Byte offsets remain internal.
 ## `query_code` detail and ranges
 
 `query_code` is a versioned typed query surface. Omit `schema_version` for the
-compatible head, currently v5, or pass `schema_version=2` to pin the pre-CFG
+compatible head, currently v6, or pass `schema_version=2` to pin the pre-CFG
 vocabulary. Pass `schema_version=3` to pin CFG without typestate or
 `schema_version=4` to pin typestate without declaration-bounded containment.
+Pass `schema_version=5` to pin containment without value flow.
 Pass exactly
 one of `pattern`, `union`,
 `intersect`, or `except_`; set operands are complete query-plan dictionaries
@@ -136,19 +137,23 @@ with compatible terminal domains. A structural `pattern` or composed set can be 
 by ordered `steps` using `enclosing_decl`, `file_of`, `imports_of`,
 `importers_of`, `supertypes`, `subtypes`, `members`, `owner`, `procedure_of`,
 `cfg_entry`, `cfg_exits`, `cfg_successor_edges`, `cfg_predecessor_edges`,
-`cfg_edge_source`, `cfg_edge_target`, `typestate`, and `witness`. Import
+`cfg_edge_source`, `cfg_edge_target`, `typestate`, `value_flow`, and `witness`. Import
 operations traverse one direct project-local edge per step. Hierarchy operations
 are direct by default and accept a positive `depth` or `transitive: true`.
 Declaration results are limited to declarations indexed by the workspace
 analyzer, so references into an unindexed library do not manufacture library
 declarations. Results are tagged as structural matches, declarations, reference
 sites, call sites, expression sites, receiver analyses, procedures, program
-points, control edges, typestate findings, typestate witnesses, or files. The CFG operations are procedure-local and
-one-hop; they do not provide ICFG, data-flow, or taint analysis. Schema v4 can
+points, control edges, typestate findings, typestate witnesses, flow endpoints,
+flow witnesses, or files. The CFG operations are procedure-local and one-hop.
+Schema v4 can
 consume a host-registered typestate protocol/binding pair and project its
 already-retained bounded witnesses; the Python call sends only `protocol_ref`.
 Schema v5 adds `inside_decl`, which matches containment only until a nested
 function, method, constructor, or lambda boundary.
+Schema v6 consumes a host-registered `ValueFlowPlan` by `plan_ref` and preserves
+reachability, exact/may certainty, ambiguity, completion, and budget status as
+independent diagnostic-neutral fields. It does not classify policy findings.
 Compact output retains minimal pipeline provenance. Pass `result_detail="full"`
 when follow-up tooling needs deterministic IDs and precise ranges.
 
@@ -162,7 +167,9 @@ its `.result` is the ordinary typed result, while `.explain`, `.timings_ns`,
 observations. Explain physical nodes declare any `semantic_request`, while
 profile `.work.semantic` accounts materialization, cache reuse, CFG rows,
 retained bytes, traversal, and budget exhaustion; `.work.semantic.typestate`
-accounts solver reuse, findings, retained witnesses, and termination. Profile timings are elapsed nanoseconds, and
+accounts solver reuse, findings, retained witnesses, and termination;
+`.work.semantic.value_flow` reports flow solves, meetings, endpoints, witnesses,
+and termination. Profile timings are elapsed nanoseconds, and
 `temporary_capacity_bytes_lower_bound` is deliberately only a lower-bound
 container-capacity estimate. In the public v2 profile contract, top-level and
 per-operator `.cache_layers` are lists of `{layer, metrics}` records. The nested

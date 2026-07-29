@@ -933,6 +933,37 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         if value.truncated { "; truncated" } else { "" },
                     ));
                 }
+                CodeQueryResultValue::FlowEndpoint { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let id = sanitize_terminal_text(&value.id);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} ({:?}; {:?}; {:?}{})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "flow endpoint:", use_color),
+                        paint(Style::new().bold(), &id, use_color),
+                        value.reachability,
+                        value.certainty,
+                        value.completion,
+                        if value.ambiguous { "; ambiguous" } else { "" },
+                    ));
+                }
+                CodeQueryResultValue::FlowWitness { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let id = sanitize_terminal_text(&value.id);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} ({} step{}{})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "flow witness:", use_color),
+                        paint(Style::new().bold(), &id, use_color),
+                        value.steps.len(),
+                        if value.steps.len() == 1 { "" } else { "s" },
+                        if value.truncated { "; truncated" } else { "" },
+                    ));
+                }
                 CodeQueryResultValue::File { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     out.push_str(&format!(

@@ -8,7 +8,7 @@
 //! #1162, #1163). The `FqName` representation records the structure once, at
 //! construction, so the split-based re-inference must not creep back in.
 //!
-//! This gate walks `src/analyzer/**/*.rs` and fails on three name-parsing
+//! This gate walks `crates/bifrost-analysis/src/analyzer/**/*.rs` and fails on three name-parsing
 //! shapes — the exact bug surface the plan set out to kill:
 //!
 //!   A. Splitting the result of a `CodeUnit` name accessor
@@ -32,7 +32,8 @@
 //!      Shape A's exact re-inference bug; only the source formatting differs,
 //!      and the M4/batch-1/batch-2 census's per-line Shape A matcher could not
 //!      see either (two real instances were found this way in
-//!      `src/analyzer/common.rs` and `src/analyzer/scala/mod.rs` during
+//!      `crates/bifrost-analysis/src/analyzer/common.rs` and
+//!      `crates/bifrost-analysis/src/analyzer/scala/mod.rs` during
 //!      issue #1168's batch 2 and fixed in batch 3 — see the ExecPlan's
 //!      Outcomes for the census).
 //!
@@ -84,7 +85,7 @@ const SPLIT_METHODS: &[&str] = &[
 const ACCESSORS: &[&str] = &[".short_name()", ".package_name()", ".fq_name()"];
 
 fn analyzer_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/analyzer")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/bifrost-analysis/src/analyzer")
 }
 
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {

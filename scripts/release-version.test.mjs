@@ -6,9 +6,10 @@ import {
   normalizeReleaseTag,
   readCargoVersion,
   validatePyprojectVersionInheritance,
+  validateWorkspaceVersionInheritance,
 } from "./release-version.mjs";
 
-test("reads only the root package version from Cargo.toml", () => {
+test("reads only the workspace package version from Cargo.toml", () => {
   const manifest = [
     '[workspace.package]',
     'version = "9.9.9"',
@@ -20,13 +21,13 @@ test("reads only the root package version from Cargo.toml", () => {
     '[dependencies.example]',
     'version = "1.0.0"',
   ].join("\n");
-  assert.equal(readCargoVersion(manifest), "0.8.8");
+  assert.equal(readCargoVersion(manifest), "9.9.9");
 });
 
-test("rejects Cargo.toml without exactly one package version", () => {
+test("rejects Cargo.toml without exactly one workspace package version", () => {
   assert.throws(
     () => readCargoVersion('[package]\nname = "brokk-bifrost"\n'),
-    /Expected exactly one package version/u,
+    /does not contain \[workspace\.package\]/u,
   );
 });
 
@@ -47,13 +48,19 @@ test("rejects unprefixed and malformed release tags", () => {
 
 test("requires the release tag to match the Cargo package version", () => {
   assert.deepEqual(
-    confirmReleaseVersion("v0.8.8", '[package]\nversion = "0.8.8"\n'),
+    confirmReleaseVersion("v0.8.8", '[workspace.package]\nversion = "0.8.8"\n'),
     { tag: "v0.8.8", version: "0.8.8" },
   );
   assert.throws(
-    () => confirmReleaseVersion("v0.8.7", '[package]\nversion = "0.8.8"\n'),
-    /does not match Cargo\.toml package version/u,
+    () => confirmReleaseVersion("v0.8.7", '[workspace.package]\nversion = "0.8.8"\n'),
+    /does not match Cargo\.toml workspace package version/u,
   );
+});
+
+test("requires every released package to inherit the workspace version", (context) => {
+  const originalCwd = process.cwd();
+  context.after(() => process.chdir(originalCwd));
+  assert.doesNotThrow(() => validateWorkspaceVersionInheritance(originalCwd));
 });
 
 test("accepts pyproject dynamic version inheritance", () => {

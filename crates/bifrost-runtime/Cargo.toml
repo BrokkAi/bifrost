@@ -1,0 +1,20 @@
+[package]
+name = "brokk-bifrost-runtime"
+version.workspace = true
+edition.workspace = true
+description = "Internal code-intelligence runtime for brokk-bifrost"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+exclude = ["tests/**"]
+
+[lib]
+name = "brokk_bifrost_runtime"
+
+[dependencies]
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.12" }
+
+[dev-dependencies]
+serde_json = "1.0.145"
+tempfile = "3.23.0"

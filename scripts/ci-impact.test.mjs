@@ -39,11 +39,21 @@ test("runtime and individual host paths select their contracts", () => {
     ["lsp_contract", "mcp_contract", "rql_runtime"],
   );
   assert.deepEqual(
-    selected(classifyChangeSet({ eventName: "pull_request", changedPaths: ["src/mcp_extended.rs"] })),
+    selected(
+      classifyChangeSet({
+        eventName: "pull_request",
+        changedPaths: ["crates/bifrost-mcp/src/mcp_extended.rs"],
+      }),
+    ),
     ["mcp_contract", "rql_runtime"],
   );
   assert.deepEqual(
-    selected(classifyChangeSet({ eventName: "pull_request", changedPaths: ["src/lsp/server.rs"] })),
+    selected(
+      classifyChangeSet({
+        eventName: "pull_request",
+        changedPaths: ["crates/bifrost-lsp/src/lsp/server.rs"],
+      }),
+    ),
     ["lsp_contract", "rql_runtime"],
   );
 });
@@ -70,7 +80,9 @@ test("combined paths union selected checks", () => {
 test("deleted paths use the same conservative mapping as changed paths", () => {
   const decision = classifyChangeSet({
     eventName: "pull_request",
-    changedPaths: ["policy-packs/bifrost.code-smells/policies/removed-rule.rqlp"],
+    changedPaths: [
+      "crates/bifrost-analysis/policy-packs/bifrost.code-smells/policies/removed-rule.rqlp",
+    ],
   });
   assert.deepEqual(selected(decision), ["lsp_contract", "mcp_contract", "policy_pack", "rql_runtime", "vscode"]);
 });

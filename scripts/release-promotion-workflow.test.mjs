@@ -105,7 +105,7 @@ test("promotion evidence covers validation before every external publisher", () 
   }
   for (const job of [
     "release",
-    "publish-crate",
+    "publish-crate-analysis",
     "publish-wheels",
     "publish-agent-plugin",
     "publish-pi-package",
@@ -114,6 +114,24 @@ test("promotion evidence covers validation before every external publisher", () 
   ]) {
     jobNeedsPromotionEvidence(job);
   }
+
+  assert.match(
+    jobBlock(release, "publish-crate-runtime"),
+    /^    needs: \[release-context, publish-crate-analysis\]$/mu,
+  );
+  for (const host of ["mcp", "lsp"]) {
+    assert.match(
+      jobBlock(release, `publish-crate-${host}`),
+      /^    needs: \[release-context, publish-crate-runtime\]$/mu,
+    );
+  }
+  assert.match(
+    jobBlock(release, "publish-crate-facade"),
+    /^    needs: \[release-context, publish-crate-mcp, publish-crate-lsp\]$/mu,
+  );
+  assert.match(cratePublisher, /^      package:/mu);
+  assert.match(cratePublisher, /wait-for-crate-version\.sh/u);
+  assert.match(cratePublisher, /steps\.package\.outputs\.checksum/u);
 });
 
 test("publishers preserve their platform, environment, and OIDC protections", () => {

@@ -209,7 +209,7 @@ class SearchToolsClient:
     ) -> CodeQueryResponse:
         """Query normalized code structure across supported languages.
 
-        The compatible head is schema version 5; pass ``schema_version=2`` to
+        The compatible head is schema version 6; pass ``schema_version=2`` to
         pin the pre-CFG vocabulary or ``schema_version=3`` for CFG without
         typestate. A query starts with normalized syntactic
         structure or a typed set of complete query branches, then optionally
@@ -223,6 +223,11 @@ class SearchToolsClient:
         projection; callers send only ``protocol_ref`` and finite reductions.
         Version 5 adds ``inside_decl`` for containment that stops at nested
         callable declarations.
+        Version 6 adds a host-registered ``value_flow`` step from procedures to
+        diagnostic-neutral flow endpoints and reuses ``witness`` for bounded
+        retained flow paths. Callers send only ``plan_ref``; reachability,
+        exact/may certainty, ambiguity, completion, and budget status remain
+        separate typed result fields.
         Hierarchy steps are direct by default and accept a positive ``depth`` or
         ``transitive=True``. Declaration results are limited to declarations
         indexed by the workspace analyzer. Pass exactly one of ``pattern``,

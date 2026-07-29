@@ -41,7 +41,7 @@ jobs:
       contents: read
 
   crate-package:
-    name: verify crate package contents
+    name: verify workspace package contents
     needs: release-context
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -57,8 +57,8 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
-      - name: Verify packaged crate contents
-        run: bash scripts/check-crate-package.sh
+      - name: Verify packaged workspace contents
+        run: bash scripts/check-workspace-packages.sh
 
   build-wheels:
     name: build and verify release wheels
@@ -403,14 +403,67 @@ jobs:
             dist/${{ env.BIN_NAME }}-${{ needs.release-context.outputs.tag }}-*.zip
             dist/${{ env.BIN_NAME }}-${{ needs.release-context.outputs.tag }}-*.sha256
 
-  publish-crate:
-    name: publish crate after promotion evidence
+  publish-crate-analysis:
+    name: publish analysis crate after promotion evidence
     needs: [release-context, promotion-evidence]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
       version: ${{ needs.release-context.outputs.version }}
       commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-analysis
+    permissions:
+      contents: read
+      id-token: write
+
+  publish-crate-runtime:
+    name: publish runtime crate after analysis
+    needs: [release-context, publish-crate-analysis]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-runtime
+    permissions:
+      contents: read
+      id-token: write
+
+  publish-crate-mcp:
+    name: publish MCP crate after runtime
+    needs: [release-context, publish-crate-runtime]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-mcp
+    permissions:
+      contents: read
+      id-token: write
+
+  publish-crate-lsp:
+    name: publish LSP crate after runtime
+    needs: [release-context, publish-crate-runtime]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-lsp
+    permissions:
+      contents: read
+      id-token: write
+
+  publish-crate-facade:
+    name: publish facade crate after hosts
+    needs: [release-context, publish-crate-mcp, publish-crate-lsp]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost
     permissions:
       contents: read
       id-token: write
@@ -846,7 +899,11 @@ jobs:
       - vscode-package
       - promotion-evidence
       - release
-      - publish-crate
+      - publish-crate-analysis
+      - publish-crate-runtime
+      - publish-crate-mcp
+      - publish-crate-lsp
+      - publish-crate-facade
       - publish-wheels
       - publish-agent-plugin
       - publish-pi-package
@@ -871,7 +928,11 @@ jobs:
       VSCODE_BUILD: ${{ needs.vscode-package.result }}
       PROMOTION_EVIDENCE: ${{ needs.promotion-evidence.result }}
       GITHUB_RELEASE: ${{ needs.release.result }}
-      CRATE: ${{ needs.publish-crate.result }}
+      CRATE_ANALYSIS: ${{ needs.publish-crate-analysis.result }}
+      CRATE_RUNTIME: ${{ needs.publish-crate-runtime.result }}
+      CRATE_MCP: ${{ needs.publish-crate-mcp.result }}
+      CRATE_LSP: ${{ needs.publish-crate-lsp.result }}
+      CRATE_FACADE: ${{ needs.publish-crate-facade.result }}
       WHEELS: ${{ needs.publish-wheels.result }}
       AGENT_PLUGIN: ${{ needs.publish-agent-plugin.result }}
       PI_PACKAGE: ${{ needs.publish-pi-package.result }}
@@ -899,7 +960,11 @@ jobs:
             echo "| VS Code extension built and tested | $VSCODE_BUILD |"
             echo "| Common build, package, and smoke evidence | $PROMOTION_EVIDENCE |"
             echo "| GitHub Release | $GITHUB_RELEASE |"
-            echo "| crates.io | $CRATE |"
+            echo "| crates.io analysis | $CRATE_ANALYSIS |"
+            echo "| crates.io runtime | $CRATE_RUNTIME |"
+            echo "| crates.io MCP | $CRATE_MCP |"
+            echo "| crates.io LSP | $CRATE_LSP |"
+            echo "| crates.io facade | $CRATE_FACADE |"
             echo "| PyPI | $WHEELS |"
             echo "| Agent plugin release asset | $AGENT_PLUGIN |"
             echo "| Pi package release asset | $PI_PACKAGE |"

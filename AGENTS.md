@@ -56,15 +56,24 @@ in-process tests would perturb — and requires a keep-separate entry in that ma
 
 Before pushing Rust changes, run the same core checks that CI enforces locally when practical.
 
-At minimum, run `cargo fmt` and `cargo clippy --all-targets --all-features -- -D warnings`. There is no longer any
+Do not enable `nlp` for routine task-scoped validation unless the change touches semantic search/NLP, the user
+explicitly requests the comprehensive gate, or an actual pre-push/merge/release gate is being performed. NLP builds
+can consume tens of GiB per worktree, so running them opportunistically across several worktrees can exhaust the host
+disk. For changes unrelated to NLP, run the focused featureless Rust tests; add `--features python` only when the Rust
+Python surface needs coverage. The existence of an ExecPlan or a request for code review does not by itself justify an
+NLP build.
+
+For those pre-push gates, at minimum run `cargo fmt` and
+`cargo clippy --all-targets --all-features -- -D warnings`. There is no longer any
 compile-time GPU backend: `--all-features` just means `nlp,python` (the embedding sidecar selects CUDA/Metal at
 runtime), so this is safe on every machine. The `clippy-no-cuda` alias is a legacy equivalent of the same command;
 note it is broken inside nested worktrees (`.claude/worktrees/*`) because cargo merges the duplicate alias arrays
 from both `.cargo/config.toml` files — use the expanded command there. If clippy fails, fix that locally before
 pushing rather than waiting for the CI matrix to report it back.
 
-Full test-suite gates must pass `--features nlp,python`: `default = []`, so a featureless `cargo test` silently
-skips every `#![cfg(feature = "nlp")]` integration suite (they report `ok. 0 passed`, which looks green).
+When a comprehensive full-suite gate is actually required, it must pass `--features nlp,python`: `default = []`, so a
+featureless `cargo test` silently skips every `#![cfg(feature = "nlp")]` integration suite (they report `ok. 0 passed`,
+which looks green). Do not promote this comprehensive command into the default validation for an unrelated change.
 
 The `python` feature needs a Python interpreter at or above the `abi3-py312` floor, and pyo3's build script resolves
 `python3` through `PATH` — not through a shell alias. On macOS `/usr/bin/python3` (3.9) usually wins that lookup even
@@ -90,6 +99,8 @@ not remove them. Run isolated builds through `scripts/with-isolated-cargo-target
 
 The helper removes its unique target on success, failure, or interruption. Set `BIFROST_KEEP_TARGET=1` only when the
 artifacts are deliberately needed after the command; retained targets are marked so automated cleanup skips them.
+Before an authorized all-feature/NLP build, check available disk space and avoid running another NLP build concurrently
+in a sibling worktree. The helper controls cleanup but cannot reduce the build's peak disk footprint.
 
 Use `scripts/cleanup-bifrost-tmp.sh` to inspect stale Bifrost temporary directories. It is a dry run by default; review
 its candidates before rerunning with `--apply`. The command skips young directories, live helper PIDs, open directories,
@@ -104,8 +115,8 @@ campaigns.
 # RQL syntax maintenance
 
 All new CodeQuery JSON fields, RQL forms, properties, roles, kinds, aliases, and constrained values must enter through
-the declarative schema registries under `src/analyzer/structural/query/schema.rs` or the kind/role registries in
-`src/analyzer/structural/kinds.rs`. Every entry must provide its accepted spellings, value shape, signature, description,
+the declarative schema registries under `crates/bifrost-analysis/src/analyzer/structural/query/schema.rs` or the kind/role registries in
+`crates/bifrost-analysis/src/analyzer/structural/kinds.rs`. Every entry must provide its accepted spellings, value shape, signature, description,
 and exhaustive parser/decoder/validator handling; do not add private keyword lists or editor-only documentation tables.
 
 When visible RQL vocabulary changes, add behavior-focused parser, validation-range, hover, and execution tests as

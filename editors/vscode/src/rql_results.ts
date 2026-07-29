@@ -7,6 +7,7 @@ import type {
 } from "./rql_query";
 import {
   groupRqlQueryResults,
+  flowWitnessStepTargets,
   queryResultDescription,
   queryResultIcon,
   queryResultLabel,
@@ -43,6 +44,11 @@ export class RqlQueryResultsProvider implements vscode.TreeDataProvider<RqlQuery
         (target) => new RqlQueryWitnessStepItem(target)
       );
     }
+    if (element instanceof RqlQueryValueItem && element.result.result_type === "flow_witness") {
+      return flowWitnessStepTargets(element.result).map(
+        (target) => new RqlQueryWitnessStepItem(target)
+      );
+    }
     if (element) {
       return [];
     }
@@ -70,7 +76,8 @@ class RqlQueryValueItem extends vscode.TreeItem {
   constructor(readonly result: RqlQueryResultItem) {
     super(
       compactText(queryResultLabel(result)),
-      result.result_type === "typestate_witness" && result.steps.length > 0
+      (result.result_type === "typestate_witness" || result.result_type === "flow_witness") &&
+        result.steps.length > 0
         ? vscode.TreeItemCollapsibleState.Collapsed
         : vscode.TreeItemCollapsibleState.None
     );

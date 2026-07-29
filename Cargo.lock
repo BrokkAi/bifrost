@@ -240,6 +240,81 @@ name = "brokk-bifrost"
 version = "0.8.12"
 dependencies = [
  "bincode",
+ "brokk-bifrost-analysis",
+ "brokk-bifrost-lsp",
+ "brokk-bifrost-mcp",
+ "brokk-bifrost-runtime",
+ "cap-fs-ext",
+ "cap-std",
+ "chrono",
+ "csv",
+ "cvss",
+ "fastrq",
+ "filetime",
+ "git2",
+ "glob",
+ "goblin",
+ "growable-bloom-filter",
+ "hf-hub",
+ "ignore",
+ "indicatif 0.18.6",
+ "jaq-core",
+ "jaq-json",
+ "jaq-std",
+ "jclassfile",
+ "json-spanned-value",
+ "jsonschema",
+ "libc",
+ "lsp-types",
+ "moka",
+ "notify",
+ "nu-ansi-term",
+ "once_cell",
+ "pretty_assertions",
+ "pyo3",
+ "quick-xml",
+ "rayon",
+ "reedline",
+ "regex",
+ "rusqlite",
+ "rusqlite_migration",
+ "rustc-hash",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shlex",
+ "smallvec",
+ "strsim",
+ "tempfile",
+ "tokenizers",
+ "toml",
+ "tree-sitter",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
+ "tree-sitter-go",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-language",
+ "tree-sitter-php",
+ "tree-sitter-python",
+ "tree-sitter-ruby",
+ "tree-sitter-rust",
+ "tree-sitter-scala",
+ "tree-sitter-typescript",
+ "url",
+ "walkdir",
+ "windows-sys 0.61.2",
+ "xee-xpath",
+ "xot",
+ "zip",
+]
+
+[[package]]
+name = "brokk-bifrost-analysis"
+version = "0.8.12"
+dependencies = [
+ "bincode",
  "cap-fs-ext",
  "cap-std",
  "cc",
@@ -255,7 +330,6 @@ dependencies = [
  "growable-bloom-filter",
  "hf-hub",
  "ignore",
- "indicatif 0.18.6",
  "jaq-core",
  "jaq-json",
  "jaq-std",
@@ -263,17 +337,12 @@ dependencies = [
  "json-spanned-value",
  "jsonschema",
  "libc",
- "lsp-server",
- "lsp-types",
  "moka",
- "notify",
  "nu-ansi-term",
  "once_cell",
  "pretty_assertions",
- "pyo3",
  "quick-xml",
  "rayon",
- "reedline",
  "regex",
  "rusqlite",
  "rusqlite_migration",
@@ -310,6 +379,55 @@ dependencies = [
  "xee-xpath",
  "xot",
  "zip",
+]
+
+[[package]]
+name = "brokk-bifrost-lsp"
+version = "0.8.12"
+dependencies = [
+ "brokk-bifrost-analysis",
+ "brokk-bifrost-runtime",
+ "glob",
+ "libc",
+ "lsp-server",
+ "lsp-types",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "tree-sitter",
+]
+
+[[package]]
+name = "brokk-bifrost-mcp"
+version = "0.8.12"
+dependencies = [
+ "brokk-bifrost-analysis",
+ "brokk-bifrost-runtime",
+ "git2",
+ "glob",
+ "jaq-core",
+ "jaq-json",
+ "jaq-std",
+ "notify",
+ "quick-xml",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "url",
+ "xee-xpath",
+ "xot",
+]
+
+[[package]]
+name = "brokk-bifrost-runtime"
+version = "0.8.12"
+dependencies = [
+ "brokk-bifrost-analysis",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

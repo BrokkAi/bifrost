@@ -11,9 +11,9 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 output=$1
 mkdir -p "$(dirname "$output")"
 
-version=$(sed -nE 's/^version = "([^"]+)"/\1/p' "$repo_root/Cargo.toml" | head -n 1)
+version=$(cd "$repo_root" && node scripts/release-version.mjs print)
 if [[ -z "$version" ]]; then
-  echo "could not read the package version from Cargo.toml" >&2
+  echo "could not read the workspace package version from Cargo.toml" >&2
   exit 1
 fi
 
@@ -31,9 +31,12 @@ cargo about generate \
   -o "$temporary"
 
 test -s "$temporary"
-grep -Fq "brokk-bifrost" "$temporary"
-grep -Fq "${version}</a>" "$temporary"
+if grep -Fq "brokk-bifrost" "$temporary"; then
+  echo "generated third-party notices contain first-party workspace packages" >&2
+  exit 1
+fi
+grep -Fq "serde" "$temporary"
 
 mv "$temporary" "$output"
 trap - EXIT
-echo "Generated Rust third-party notices for brokk-bifrost ${version} at ${output}"
+echo "Generated Rust third-party notices for the Bifrost ${version} release graph at ${output}"
