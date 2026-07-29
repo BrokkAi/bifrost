@@ -188,16 +188,22 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
         let owner_seed_allowed = is_static_member(target)
             || !target.short_name().contains('.')
             || analyzer.parent_of(target).is_some();
-        let exported_local_property_root =
-            declared_default_export_local_property_root(analyzer, index.as_ref(), target, language);
+        let exported_local_property =
+            exported_local_property_binding(analyzer, index.as_ref(), target, language);
         let mut seeds = index.seeds_for_target(
             target.source(),
             &target_seed,
             target.short_name(),
             owner_seed_allowed,
         );
-        if exported_local_property_root.is_some() {
-            seeds.insert((target.source().clone(), "default".to_string()));
+        if let Some(binding) = &exported_local_property {
+            seeds.extend(
+                binding
+                    .exported_names
+                    .iter()
+                    .cloned()
+                    .map(|name| (target.source().clone(), name)),
+            );
         }
         let scan_hits = if seeds.is_empty() {
             let mut scan_files: HashSet<ProjectFile> =
@@ -213,7 +219,9 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
                 target,
                 &BTreeSet::new(),
                 language,
-                exported_local_property_root.as_deref(),
+                exported_local_property
+                    .as_ref()
+                    .map(|binding| binding.receiver_root.as_str()),
                 scan_scope.cancellation(),
             )
         } else {
@@ -232,7 +240,9 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
                 target,
                 &seeds,
                 language,
-                exported_local_property_root.as_deref(),
+                exported_local_property
+                    .as_ref()
+                    .map(|binding| binding.receiver_root.as_str()),
                 scan_scope.cancellation(),
             )
         };
@@ -479,32 +489,18 @@ fn target_seed_identifier(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> String
     target.identifier().trim_end_matches("$static").to_string()
 }
 
-fn declared_default_export_local_property_root(
+struct ExportedLocalPropertyBinding {
+    receiver_root: String,
+    exported_names: BTreeSet<String>,
+}
+
+fn exported_local_property_binding(
     analyzer: &dyn IAnalyzer,
     index: &JsTsUsageIndex,
     target: &CodeUnit,
     language: Language,
-) -> Option<String> {
-    if language != Language::JavaScript
-        || !target.is_field()
-        || analyzer.parent_of(target).is_some()
-    {
-        return None;
-    }
-    let exported_root = match index
-        .exports_by_file
-        .get(target.source())?
-        .exports_by_name
-        .get("default")?
-    {
-        ExportEntry::Default {
-            local_name: Some(local_name),
-        } => local_name,
-        ExportEntry::Default { local_name: None }
-        | ExportEntry::Local { .. }
-        | ExportEntry::ReexportedNamed { .. } => return None,
-    };
-    if !analyzer.declarations(target.source()).contains(target) {
+) -> Option<ExportedLocalPropertyBinding> {
+    if language != Language::JavaScript || !target.is_field() {
         return None;
     }
     let target_member = member_name(target)?;
@@ -513,18 +509,42 @@ fn declared_default_export_local_property_root(
     let parser_language = js_ts_tree_sitter_language_for_file(target.source(), language)?;
     parser.set_language(&parser_language).ok()?;
     let tree = parser.parse(source.as_str(), None)?;
-    direct_property_definitions(
+    let receiver_root = direct_property_definitions(
         tree.root_node(),
         source.as_str(),
         &analyzer.ranges(target),
         &target_member,
     )
     .into_iter()
-    .any(|definition| {
-        definition.receiver.members.is_empty()
-            && slice(definition.receiver.root, source.as_str()) == exported_root
+    .find_map(|definition| {
+        definition
+            .receiver
+            .members
+            .is_empty()
+            .then(|| slice(definition.receiver.root, source.as_str()).to_string())
+    })?;
+
+    let exported_names = index
+        .exports_by_file
+        .get(target.source())?
+        .exports_by_name
+        .iter()
+        .filter_map(|(exported_name, entry)| match entry {
+            ExportEntry::Local { local_name } if local_name == &receiver_root => {
+                Some(exported_name.clone())
+            }
+            ExportEntry::Default {
+                local_name: Some(local_name),
+            } if local_name == &receiver_root => Some(exported_name.clone()),
+            ExportEntry::Local { .. }
+            | ExportEntry::Default { .. }
+            | ExportEntry::ReexportedNamed { .. } => None,
+        })
+        .collect::<BTreeSet<_>>();
+    (!exported_names.is_empty()).then_some(ExportedLocalPropertyBinding {
+        receiver_root,
+        exported_names,
     })
-    .then(|| exported_root.clone())
 }
 
 impl UsageAnalyzer for JsTsExportUsageGraphStrategy {
