@@ -29,10 +29,10 @@ The work is intentionally incremental. Each milestone is independently tested an
 - [x] (2026-07-29 09:19Z) Milestone 2: added explicit completion, effective-ranking, and incomplete-reason metadata; in-flight usage cancellation now returns deterministic history/import results while pre-dispatch cancellation remains an error.
 - [x] (2026-07-29 09:34Z) Milestone 3: map seed declarations to exact ecosystems and skip every unrelated edge builder; a mixed Rust/Python test proves the selected Rust graph ranks a real target identically to the former all-ecosystem build.
 - [x] (2026-07-29 09:51Z) Milestone 4: added a snapshot-owned, generation-keyed, representation-versioned, byte-bounded complete-value cache with cooperative same-key single-flight and warm `Arc` reuse.
-- [ ] Decision gate: benchmark the exact issue request cold and warm, and decide whether milestones 5 and 6 are still justified.
-- [ ] Milestone 5, conditional: stage and retain Rust export indexes and reference contexts so one graph build does not repeat or evict expensive materialization.
-- [ ] Milestone 6, conditional: build independent selected ecosystem partitions concurrently under a bounded scheduler, but only if profiling shows useful residual multi-ecosystem latency.
-- [ ] Run formatting, focused tests, `cargo clippy --all-targets --all-features -- -D warnings`, the relevant feature-complete test gates, and the repository policy packs; update the retrospective.
+- [x] (2026-07-29 10:24Z) Decision gate: the release benchmark measured a 2.892-second cold build and 2.481-millisecond warm median; the exact ready-server debug MCP request returned an explicit fallback in 6.150 seconds and the immediate follow-up search completed in 0.838 seconds.
+- [x] (2026-07-29 10:24Z) Milestone 5, conditionally stopped: milestones 1 through 4 achieve the interactive product goal, so no broad Rust materialization change is justified on this behind-master branch without a residual exact-ranking requirement.
+- [x] (2026-07-29 10:24Z) Milestone 6, conditionally stopped: the exact request selects only Rust, so multi-ecosystem concurrency cannot improve it; individual language extraction already uses Rayon.
+- [x] (2026-07-29 11:32Z) Final validation: formatting, the twelve issue units, 27 ranking integrations, two Python model tests, the release benchmark, and all-feature Clippy are green. The core suite passed 2,030 tests before three unrelated subprocess tests hit sandbox permissions; the feature-complete test link and MCP policy gate are recorded environment/tooling limitations rather than claimed green.
 
 ## Surprises & Discoveries
 
@@ -60,6 +60,24 @@ The work is intentionally incremental. Each milestone is independently tested an
 - Observation: RQL's structural postings cannot answer caller-to-callee relevance, but its `CompleteValueCache` is already the correct low-level concurrency primitive for immutable, cancellation-safe publication.
   Evidence: milestone 4 reuses `CompleteValueCache` under a separate neutral `SnapshotWorkspaceUsageGraphCache`; twelve issue-specific tests cover warm reuse, cancelled non-publication, generation identity, generation races, and concurrent single-flight without adding usage values to RQL's `DerivedLayer` enum.
 
+- Observation: release cache reuse removes essentially all graph-construction cost from a warm request.
+  Evidence: the 500-module Go benchmark measured 2892.207 ms for the first ranking and a 2.481 ms median across five warm rankings, with peak RSS increasing from 88,064,000 bytes after the cold ranking to 88,129,536 bytes after all warm rankings.
+
+- Observation: the exact Rust request now honors the product boundary even though it does not finish exact graph construction inside the budget.
+  Evidence: after waiting for the persisted debug MCP workspace to become ready, the exact two-seed call returned 30 files with `complete: false`, `ranking_mode_used: "history_imports"`, and `incomplete_reason: "time_budget"` in 6.150 seconds. A same-process `search_symbols` request immediately afterward completed in 0.838 seconds, proving cancelled graph work was not still monopolizing the server.
+
+- Observation: a first tool request sent while the debug server was still rebuilding its persisted analyzer snapshot can expire before dispatch and therefore remains a startup error rather than a ranking fallback.
+  Evidence: the un-gated probe spent 100.821 seconds in analyzer startup and returned `most_relevant_files exceeded its request-wide time budget`. The corrected probe first awaited `get_active_workspace`, separating analyzer readiness from issue #1304 ranking latency.
+
+- Observation: the requested `--features nlp,python` release benchmark could not link on this Mac because PyO3's Python C symbols were unavailable to the test executable.
+  Evidence: compilation completed, then the arm64 linker reported unresolved `_Py*` symbols. The same benchmark was rerun successfully with `--no-default-features`; usage ranking and the snapshot cache are not feature-gated.
+
+- Observation: the strict all-target/all-feature Clippy gate needs one repository-approved exemption for an existing nine-argument JS/TS definition helper.
+  Evidence: with the Homebrew Cargo and Rust compiler kept on one toolchain, `cargo clippy --all-targets --all-features -- -D warnings -A clippy::too_many_arguments` completed successfully. Before the exemption, Clippy reported only the pre-existing helper plus two issue-branch style findings, which were fixed by naming the profiled graph outcome before matching it and keeping the summaries test module after all items.
+
+- Observation: the installed Bifrost 0.8.12 policy runner cannot complete the required built-in pack on this workspace inside its request deadline.
+  Evidence: two identical `run_policy` requests for `bifrost.code-smells`, evaluation date 2026-07-29, and `fail_on: warning` each returned `policy evaluation cancelled` after 5.3 seconds. Existing issue #1306 already contains equivalent cold and warm evidence, so this plan does not duplicate the report or claim a clean policy result.
+
 ## Decision Log
 
 - Decision: preserve the current issue branch and do not rebase onto the newly fetched master.
@@ -84,7 +102,11 @@ The work is intentionally incremental. Each milestone is independently tested an
 
 ## Outcomes & Retrospective
 
-Milestones 1 through 4 are complete. The MCP service cooperatively cancels slow graph work and returns explicit deterministic fallback results. Rust-only seeds skip every unrelated ecosystem builder. A complete graph is now retained in the analyzer snapshot as a byte-accounted `Arc`, keyed by selected ecosystems, representation version, and the entire ordered source-generation vector. Same-key callers elect one builder and wait cooperatively; cancelled or generation-stale leaders publish nothing. The product wiring test receives the identical `Arc` on a warm request, five cache lifecycle tests pass, all twelve issue-specific tests pass, and all 27 ranking integration tests remain green. The exact cold/warm decision benchmark is next.
+Milestones 1 through 4 are complete. The MCP service cooperatively cancels slow graph work and returns explicit deterministic fallback results. Rust-only seeds skip every unrelated ecosystem builder. A complete graph is now retained in the analyzer snapshot as a byte-accounted `Arc`, keyed by selected ecosystems, representation version, and the entire ordered source-generation vector. Same-key callers elect one builder and wait cooperatively; cancelled or generation-stale leaders publish nothing. The product wiring test receives the identical `Arc` on a warm request, five cache lifecycle tests pass, all twelve issue-specific tests pass, and all 27 ranking integration tests remain green.
+
+The decision gate is complete and stops the conditional milestones. The original ready-server request no longer hangs: it returns an honest deterministic fallback close to the five-second deadline, and a lightweight request immediately afterward remains responsive. Separately, a completed graph's warm ranking is effectively free at 2.481 ms median in the release benchmark. Milestone 5 would broaden Rust resolution/materialization on a branch that is behind newer Rust inverse-edge work without being necessary for interactive responsiveness. Milestone 6 cannot affect a Rust-only selected ecosystem and would duplicate concurrency already present inside language builders.
+
+Final validation is proportionate and explicit. Formatting, issue-focused Rust and Python tests, ranking integration tests, the core-feature release benchmark, and all-feature Clippy pass. The feature-complete benchmark reached the linker but this Mac did not expose PyO3's Python C symbols. The core suite passed 2,030 tests and failed only three unrelated MCP stderr subprocess tests because the sandbox denied process operations; an unsandboxed isolated rebuild of those three was stopped after severe machine-wide compiler contention made it consume 16 wall-clock minutes for about 82 CPU seconds. The required MCP policy selection was attempted twice and remained untrustworthy because installed Bifrost issue #1306 cancelled it at 5.3 seconds. These limitations do not affect the exercised issue path, but they are not represented as green gates.
 
 ## Context and Orientation
 
@@ -217,6 +239,37 @@ Milestone 4 validation evidence:
 
 Verbose per-file profiling changes the absolute Rust time, but the ordinary request and lower-noise history/import comparison establish the product failure and fallback viability independently.
 
+Decision-gate benchmark evidence:
+
+    release benchmark, 500 generated Go modules, 5 warm iterations:
+      analyzer_build_ms=2983.422
+      ranking_first_ms=2892.207
+      ranking_warm_median_ms=2.481
+      peak_rss_after_first_ranking_bytes=88064000
+      peak_rss_after_warm_ranking_bytes=88129536
+    exact debug MCP request after get_active_workspace:
+      elapsed_seconds=6.150390
+      complete=false
+      ranking_mode_used=history_imports
+      incomplete_reason=time_budget
+      files=30
+    immediate same-process search_symbols follow-up:
+      elapsed_seconds=0.837735
+      isError=false
+
+Final validation evidence:
+
+    PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+      scripts/with-isolated-cargo-target.sh /opt/homebrew/bin/cargo clippy \
+      --all-targets --all-features -- -D warnings -A clippy::too_many_arguments
+      finished successfully
+    cargo fmt --all -- --check
+      finished successfully
+    cargo test --no-default-features
+      2030 passed; 3 unrelated MCP stderr tests blocked by sandbox process permissions; 7 ignored
+    run_policy({policy_packs: ["bifrost.code-smells"], evaluation_date: "2026-07-29", fail_on: "warning"})
+      two attempts; both cancelled after approximately 5.3 seconds; tracked by issue #1306
+
 ## Interfaces and Dependencies
 
 Milestone 1 must leave the existing public function usable:
@@ -243,3 +296,7 @@ Plan revision note (2026-07-29 09:19Z): Completed milestone 2 and recorded the p
 Plan revision note (2026-07-29 09:34Z): Completed milestone 3 and recorded the exact seed-ecosystem selection representation, mixed-language parity evidence, builder instrumentation, and focused validation. Unrelated catalog nodes remain deterministic zero-mass nodes; only their expensive edge construction is skipped.
 
 Plan revision note (2026-07-29 09:51Z): Completed milestone 4 and recorded the neutral snapshot-cache boundary, selected-set cache representation, byte accounting, same-key behavior, generation validity, warm product wiring, and focused validation. The implementation deliberately reuses RQL's low-level complete-value cache without treating structural postings as usage edges.
+
+Plan revision note (2026-07-29 10:24Z): Completed the decision gate, recorded release cold/warm and exact MCP evidence, separated analyzer startup from ready-server latency, and conditionally stopped milestones 5 and 6. The current result meets the user's explicit early-stop criterion: responsive honest fallback, warm reuse, and no stranded background work; multi-threading cannot improve the selected Rust-only request.
+
+Plan revision note (2026-07-29 11:32Z): Closed the final validation milestone with exact successful gates and exact limitations. Formatting, focused tests, ranking integrations, release measurement, and all-feature Clippy pass. The feature-complete PyO3 link limitation, three sandbox-blocked unrelated subprocess tests, and installed-plugin policy cancellation tracked by #1306 remain explicit rather than being reported as successes.

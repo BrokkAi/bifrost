@@ -432,7 +432,7 @@ fn build_usage_ranking_graph_for_ecosystems_with_cancellation(
         }
     }
 
-    let graph = match {
+    let graph_outcome = {
         let _scope = profiling::scope("relevance::usage_graph_construction");
         build_workspace_usage_graph_with_cancellation(
             analyzer,
@@ -440,7 +440,8 @@ fn build_usage_ranking_graph_for_ecosystems_with_cancellation(
             selected_ecosystems,
             cancellation,
         )
-    } {
+    };
+    let graph = match graph_outcome {
         WorkspaceUsageGraphBuildOutcome::Complete(graph) => graph,
         WorkspaceUsageGraphBuildOutcome::Cancelled => return Cancellable::Cancelled,
     };

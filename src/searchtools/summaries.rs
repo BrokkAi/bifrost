@@ -924,29 +924,6 @@ fn most_relevant_files_incomplete_reason(
     }
 }
 
-#[cfg(test)]
-mod issue_1304_tests {
-    use super::*;
-    use std::time::Duration;
-
-    #[test]
-    fn timeout_and_explicit_cancellation_have_distinct_reasons() {
-        let timed_out = crate::CancellationToken::default().with_timeout(Duration::ZERO);
-        assert!(timed_out.is_cancelled());
-        assert_eq!(
-            most_relevant_files_incomplete_reason(&timed_out),
-            MostRelevantFilesIncompleteReason::TimeBudget
-        );
-
-        let cancelled = crate::CancellationToken::default();
-        cancelled.cancel();
-        assert_eq!(
-            most_relevant_files_incomplete_reason(&cancelled),
-            MostRelevantFilesIncompleteReason::Cancelled
-        );
-    }
-}
-
 pub(super) fn validate_most_relevant_files_params(
     params: &MostRelevantFilesParams,
 ) -> Result<(), String> {
@@ -1244,4 +1221,27 @@ pub(super) fn trim_summary_signature(signature: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod issue_1304_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn timeout_and_explicit_cancellation_have_distinct_reasons() {
+        let timed_out = crate::CancellationToken::default().with_timeout(Duration::ZERO);
+        assert!(timed_out.is_cancelled());
+        assert_eq!(
+            most_relevant_files_incomplete_reason(&timed_out),
+            MostRelevantFilesIncompleteReason::TimeBudget
+        );
+
+        let cancelled = crate::CancellationToken::default();
+        cancelled.cancel();
+        assert_eq!(
+            most_relevant_files_incomplete_reason(&cancelled),
+            MostRelevantFilesIncompleteReason::Cancelled
+        );
+    }
 }
