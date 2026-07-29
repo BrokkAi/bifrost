@@ -7,6 +7,7 @@ use brokk_bifrost_analysis::analyzer::policy::{
 use brokk_bifrost_analysis::analyzer::structural::{
     RuneIrLanguage, RuneIrLimits, RuneIrSelection, render_source_rune_ir,
 };
+use common::lsp_client::{LspServer, uri_for};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs;

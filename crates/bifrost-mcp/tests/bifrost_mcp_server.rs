@@ -4,6 +4,7 @@ use brokk_bifrost_analysis::{
     Language,
     policy::{PolicyEvaluationOptions, PolicyFailOn, evaluate_policy_files},
 };
+use common::InlineTestProject;
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
