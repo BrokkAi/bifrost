@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use lsp_types::{Position, Range as LspRange, Uri};
 
 use crate::analyzer::Range as ByteRange;
+use crate::path_utils::percent_decode;
 use crate::text_utils::find_line_index_for_offset;
 
 /// Convert a byte offset within `content` to an LSP [`Position`].
@@ -165,34 +166,6 @@ fn should_percent_encode(ch: char) -> bool {
         'a'..='z' | 'A'..='Z' | '0'..='9' |
         '-' | '.' | '_' | '~' | '/' | ':'
     )
-}
-
-pub(crate) fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let (Some(h), Some(l)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
-        {
-            out.push((h << 4) | l);
-            i += 3;
-            continue;
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -390,13 +363,6 @@ mod tests {
                 character: 3
             }
         );
-    }
-
-    #[test]
-    fn percent_decode_handles_unicode_and_spaces() {
-        assert_eq!(percent_decode("a%20b"), "a b");
-        assert_eq!(percent_decode("%E2%9C%93"), "✓");
-        assert_eq!(percent_decode("plain/path"), "plain/path");
     }
 
     #[test]

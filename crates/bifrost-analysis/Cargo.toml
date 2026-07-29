@@ -1,0 +1,12 @@
+[package]
+name = "brokk-bifrost-analysis"
+version = "0.8.12"
+edition.workspace = true
+description = "Internal analysis implementation for brokk-bifrost"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+
+[lib]
+name = "brokk_bifrost_analysis"

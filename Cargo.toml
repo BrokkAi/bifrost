@@ -1,3 +1,19 @@
+[workspace]
+members = [
+    "crates/bifrost-analysis",
+    "crates/bifrost-lsp",
+    "crates/bifrost-mcp",
+    "crates/bifrost-runtime",
+]
+default-members = ["."]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "LGPL-3.0-or-later"
+repository = "https://github.com/BrokkAi/bifrost"
+homepage = "https://github.com/BrokkAi/bifrost"
+
 [package]
 name = "brokk-bifrost"
 # Single source of truth for both the crate and the Python wheel. The Python

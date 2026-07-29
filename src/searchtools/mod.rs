@@ -29,12 +29,11 @@ use crate::analyzer::{
     Range, SearchSymbolPatternBatch, SummaryFileProjection, go_module_roots,
 };
 use crate::hash::{HashMap, HashSet};
-use crate::lsp::conversion::percent_decode;
 use crate::model_context;
 pub use crate::navigation::NavigationOperation;
 use crate::path_utils::{
     AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver, has_drive_letter_prefix,
-    normalize_pattern, rel_path_string, workspace_rel_path,
+    normalize_pattern, percent_decode, rel_path_string, workspace_rel_path,
 };
 use crate::profiling;
 pub use crate::relevance::MostRelevantFilesRankingMode;
