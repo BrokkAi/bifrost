@@ -25,7 +25,7 @@ How to see it working: the tests in `tests/kotlin_imports_and_hierarchy.rs` and 
 - [x] (2026-07-29) ExecPlan authored.
 - [x] (2026-07-29) M1: Generalize the JVM external declaration index and dependency plumbing to cover Kotlin.
 - [x] (2026-07-29) M2: Kotlin structured imports and `ImportAnalysisProvider`.
-- [ ] M3: Kotlin supertypes, type-name resolution, and `TypeHierarchyProvider`.
+- [x] (2026-07-29) M3: Kotlin supertypes, type-name resolution, and `TypeHierarchyProvider`.
 - [ ] M4: Shared JVM usage-candidate realm (`UsageEcosystem::Jvm`).
 - [ ] M5: Cross-language JVM source realm resolution.
 - [ ] M6: Explicit unsupported outcomes, epoch bump, and full validation.

@@ -11,10 +11,14 @@
 //! joined with an ordinary dot. `.kts` scripts are indexed through the same
 //! walk; top-level script *statements* are not declarations and are skipped.
 //!
-//! Boundaries owned by sibling issues: structured imports and supertype
-//! hierarchy (#1237), navigation (#1238), usage graphs (#1239), RQL (#1240),
-//! CFG (#1241). Local functions, lambdas, and anonymous objects inside bodies
-//! are deliberately not indexed as declarations in this tier.
+//! Name-resolution facts this walk records for issue #1237 live alongside the
+//! declarations: structured imports (see `super::imports`) and the dotted
+//! supertype paths of each class-like declaration (see `super::supertypes`).
+//!
+//! Boundaries owned by sibling issues: navigation (#1238), usage graphs
+//! (#1239), RQL (#1240), CFG (#1241). Local functions, lambdas, and anonymous
+//! objects inside bodies are deliberately not indexed as declarations in this
+//! tier.
 
 use crate::analyzer::common::{
     collapse_whitespace, node_source_text as node_text,
@@ -257,6 +261,7 @@ impl<'a> KotlinVisitor<'a> {
         let code_unit = self.declare(CodeUnitType::Class, SegmentKind::Type, name, node, parent);
         self.parsed
             .add_signature(code_unit.clone(), kotlin_class_signature(node, self.source));
+        self.record_supertypes(&code_unit, node);
 
         if let Some(primary) = first_named_child(node, "primary_constructor") {
             self.visit_primary_constructor(primary, name, &code_unit);
@@ -297,12 +302,24 @@ impl<'a> KotlinVisitor<'a> {
         // name-resolution rule and must not leak into rendered source text.
         self.parsed
             .add_signature(code_unit.clone(), kotlin_class_signature(node, self.source));
+        self.record_supertypes(&code_unit, node);
 
         if let Some(body) = first_named_child(node, "class_body") {
             stack.push(KotlinWork {
                 node: body,
                 parent: Some(code_unit),
             });
+        }
+    }
+
+    /// Record the dotted paths of what a class-like declaration extends or
+    /// implements. The full header text is already the declaration's rendered
+    /// signature, so only the resolvable paths are stored here.
+    fn record_supertypes(&mut self, code_unit: &CodeUnit, node: Node<'_>) {
+        let supertypes = super::supertypes::extract_kotlin_supertypes(node, self.source);
+        if !supertypes.is_empty() {
+            self.parsed
+                .set_raw_supertypes(code_unit.clone(), supertypes);
         }
     }
 

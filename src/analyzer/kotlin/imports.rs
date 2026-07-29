@@ -41,8 +41,6 @@ use super::KotlinAnalyzer;
 /// Kotlin/JVM only — a name that would resolve solely through a Kotlin/JS or
 /// Kotlin/Native default import stays unresolved rather than being guessed at,
 /// because guessing would claim a resolution the target platform may not have.
-// Read by the type-name resolution ladder, which lands next.
-#[allow(dead_code)]
 pub(crate) const KOTLIN_DEFAULT_IMPORT_PACKAGES: &[&str] = &[
     "kotlin",
     "kotlin.annotation",
@@ -140,8 +138,7 @@ impl KotlinAnalyzer {
     /// and `import a.b.Registry.register` are the same single lookup as
     /// `import a.b.C`, with no need to split the path and walk owners.
     fn declarations_named(&self, fqn: &str) -> Vec<CodeUnit> {
-        self.inner
-            .global_usage_definition_index()
+        IAnalyzer::global_usage_definition_index(&self.inner)
             .by_fqn(fqn)
             .iter()
             .filter(|unit| unit.fq_name() == fqn && !unit.is_synthetic())

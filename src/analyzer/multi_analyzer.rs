@@ -149,8 +149,7 @@ impl AnalyzerDelegate {
             Self::Rust(analyzer) => analyzer.type_hierarchy_provider(),
             Self::Scala(analyzer) => analyzer.type_hierarchy_provider(),
             Self::Ruby(analyzer) => Some(analyzer),
-            // Kotlin type-hierarchy modeling is issue #1237.
-            Self::Kotlin(_) => None,
+            Self::Kotlin(analyzer) => analyzer.type_hierarchy_provider(),
         }
     }
 

@@ -17,11 +17,15 @@
 
 mod adapter;
 pub(crate) mod declarations;
+mod hierarchy;
 pub(crate) mod imports;
 pub(crate) mod language;
+mod supertypes;
+pub(crate) mod types;
 
 use crate::analyzer::js_ts::cache::{
-    build_weighted_cache, weight_code_unit_set, weight_project_file_set,
+    build_weighted_cache, weight_code_unit_set, weight_code_unit_vec_by_unit,
+    weight_project_file_set,
 };
 use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
@@ -29,7 +33,7 @@ use crate::analyzer::pool_memo::PoolSafeMemo;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer, JvmAnalyzerConfig,
     Language, Project, ProjectFile, SemanticDiagnostic, SignatureMetadata, TreeSitterAnalyzer,
-    TypeAliasProvider, UsageFactsIndex,
+    TypeAliasProvider, TypeHierarchyProvider, UsageFactsIndex,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -54,6 +58,8 @@ pub struct KotlinAnalyzer {
     same_package_reference_index:
         Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     top_level_declarations_by_package: Arc<OnceLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
+    direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
+    direct_descendant_index: Arc<OnceLock<crate::analyzer::DirectDescendantIndex>>,
 }
 
 crate::analyzer::impl_forward_query_provider!(KotlinAnalyzer);
@@ -85,6 +91,8 @@ impl KotlinAnalyzer {
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             same_package_reference_index: Arc::new(PoolSafeMemo::new()),
             top_level_declarations_by_package: Arc::new(OnceLock::new()),
+            direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
+            direct_descendant_index: Arc::new(OnceLock::new()),
         }
     }
 
@@ -124,10 +132,6 @@ impl KotlinAnalyzer {
     }
 
     /// Kotlin's view of the shared JVM dependency realm.
-    // Exercised by `analyzer::jvm::external`'s tests today; the type-name
-    // resolution ladder that reads it in normal operation lands next, at which
-    // point this attribute goes away.
-    #[allow(dead_code)]
     pub(crate) fn external_declaration_index(&self) -> &JvmExternalDeclarationIndex {
         self.external_index.get_or_init(|| {
             JvmExternalDeclarationIndex::build_for_project(&self.jvm_config, self.inner.project())
@@ -326,6 +330,10 @@ impl IAnalyzer for KotlinAnalyzer {
     }
 
     fn type_alias_provider(&self) -> Option<&dyn TypeAliasProvider> {
+        Some(self)
+    }
+
+    fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
         Some(self)
     }
 
