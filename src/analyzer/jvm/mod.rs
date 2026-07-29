@@ -8,3 +8,4 @@
 
 pub(crate) mod dependency_discovery;
 pub(crate) mod external;
+pub(crate) mod realm;

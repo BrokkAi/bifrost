@@ -1,4 +1,5 @@
 use crate::analyzer::common::language_for_file;
+use crate::analyzer::jvm::realm::JvmSourceRealm;
 use crate::analyzer::{
     CSharpAnalyzer, CloneSmell, CloneSmellWeights, CodeUnit, CommentDensityStats, CppAnalyzer,
     DeclarationInfo, ExceptionHandlingSmell, ExceptionSmellWeights, GlobalUsageDefinitionIndex,
@@ -364,10 +365,36 @@ impl MultiAnalyzer {
     fn delegate_for_code_unit(&self, code_unit: &CodeUnit) -> Option<&AnalyzerDelegate> {
         self.delegate_for_file(code_unit.source())
     }
+
+    /// The Kotlin delegate, together with a view of the whole JVM source realm,
+    /// when this workspace has Kotlin alongside at least one other JVM
+    /// language.
+    ///
+    /// A Kotlin analyzer only indexes `.kt` files, so on its own it cannot see
+    /// that the interface a Kotlin class implements is declared in a Java file
+    /// next door. `MultiAnalyzer` is the only place that holds every delegate,
+    /// so it is where the realm view is constructed. `None` means the widening
+    /// would add nothing and the delegate's own answer already stands.
+    fn kotlin_realm(&self) -> Option<(&KotlinAnalyzer, JvmSourceRealm<'_>)> {
+        let Some(AnalyzerDelegate::Kotlin(kotlin)) = self.delegates.get(&Language::Kotlin) else {
+            return None;
+        };
+        let realm = JvmSourceRealm::of(self);
+        realm
+            .has_peers_of(Language::Kotlin)
+            .then_some((kotlin, realm))
+    }
 }
 
 impl ImportAnalysisProvider for MultiAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
+        // A Kotlin file can import a Java or Scala declaration from the same
+        // workspace, and only the multi-analyzer can see both sides.
+        if language_for_file(file) == Language::Kotlin
+            && let Some((kotlin, realm)) = self.kotlin_realm()
+        {
+            return kotlin.imported_code_units_in_realm(file, Some(&realm));
+        }
         self.delegate_for_file(file)
             .and_then(AnalyzerDelegate::import_analysis_provider)
             .map(|provider| provider.imported_code_units_of(file))
@@ -475,6 +502,14 @@ impl TypeHierarchyProvider for MultiAnalyzer {
     }
 
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        // A Kotlin class can extend a Java class or implement a Scala trait
+        // declared in the same workspace; resolving that needs every JVM
+        // delegate, which only the multi-analyzer holds.
+        if language_for_file(code_unit.source()) == Language::Kotlin
+            && let Some((kotlin, realm)) = self.kotlin_realm()
+        {
+            return kotlin.direct_ancestors_in_realm(code_unit, Some(&realm));
+        }
         self.delegate_for_code_unit(code_unit)
             .and_then(AnalyzerDelegate::type_hierarchy_provider)
             .map(|provider| provider.get_direct_ancestors(code_unit))
@@ -482,10 +517,24 @@ impl TypeHierarchyProvider for MultiAnalyzer {
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
-        self.delegate_for_code_unit(code_unit)
+        let mut descendants = self
+            .delegate_for_code_unit(code_unit)
             .and_then(AnalyzerDelegate::type_hierarchy_provider)
             .map(|provider| provider.get_direct_descendants(code_unit))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Kotlin subclasses of a Java or Scala type are invisible to that
+        // language's own descendant index, which only walks its own
+        // declarations. Kotlin's realm-aware index does resolve across the
+        // realm, so folding it in is what makes `Api`'s Kotlin implementors
+        // show up. The reverse direction — Java and Scala subclasses of a
+        // Kotlin type — needs those languages' resolvers to become
+        // realm-aware, which belongs to #1239.
+        if language_for_file(code_unit.source()) != Language::Kotlin
+            && let Some((kotlin, realm)) = self.kotlin_realm()
+        {
+            descendants.extend(kotlin.direct_descendants_in_realm(code_unit, Some(&realm)));
+        }
+        descendants
     }
 }
 

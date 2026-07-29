@@ -22,6 +22,7 @@
 //! see [`KOTLIN_DEFAULT_IMPORT_PACKAGES`].
 
 use crate::analyzer::common::language_for_file as file_language;
+use crate::analyzer::jvm::realm::JvmSourceRealm;
 use crate::analyzer::tree_walk::{first_named_child_of_kind as first_named_child, named_children};
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, ProjectFile,
@@ -137,13 +138,20 @@ impl KotlinAnalyzer {
     /// segments, nested types, and members alike — so `import a.b.Outer.Inner`
     /// and `import a.b.Registry.register` are the same single lookup as
     /// `import a.b.C`, with no need to split the path and walk owners.
-    fn declarations_named(&self, fqn: &str) -> Vec<CodeUnit> {
-        IAnalyzer::global_usage_definition_index(&self.inner)
+    fn declarations_named(&self, fqn: &str, realm: Option<&JvmSourceRealm<'_>>) -> Vec<CodeUnit> {
+        let mut units: Vec<CodeUnit> = IAnalyzer::global_usage_definition_index(&self.inner)
             .by_fqn(fqn)
             .iter()
             .filter(|unit| unit.fq_name() == fqn && !unit.is_synthetic())
             .cloned()
-            .collect()
+            .collect();
+        // A Kotlin file can import a Java or Scala declaration from the same
+        // workspace, so the realm's other members answer for the names Kotlin's
+        // own index does not hold.
+        if let Some(realm) = realm {
+            units.extend(realm.peer_declarations_by_fqn(fqn, Language::Kotlin));
+        }
+        units
     }
 
     /// The top-level declarations a Kotlin package exports, keyed by package.
@@ -175,11 +183,15 @@ impl KotlinAnalyzer {
     /// (`import a.b.Mode.*`, which imports an enum's entries or an object's
     /// members). Both forms are legal Kotlin and are distinguished by what the
     /// workspace actually declares, not by guessing from the spelling.
-    fn star_imported_declarations(&self, path: &str) -> Vec<CodeUnit> {
+    fn star_imported_declarations(
+        &self,
+        path: &str,
+        realm: Option<&JvmSourceRealm<'_>>,
+    ) -> Vec<CodeUnit> {
         if let Some(units) = self.top_level_declarations_by_package().get(path) {
             return units.as_ref().clone();
         }
-        self.declarations_named(path)
+        self.declarations_named(path, realm)
             .iter()
             .filter(|owner| owner.is_class())
             .flat_map(|owner| self.inner.direct_children(owner))
@@ -187,18 +199,49 @@ impl KotlinAnalyzer {
             .collect()
     }
 
-    fn resolve_import_infos(&self, imports: &[ImportInfo]) -> HashSet<CodeUnit> {
+    fn resolve_import_infos(
+        &self,
+        imports: &[ImportInfo],
+        realm: Option<&JvmSourceRealm<'_>>,
+    ) -> HashSet<CodeUnit> {
         let mut resolved = HashSet::default();
         for import in imports {
             let Some(path) = kotlin_import_path(import) else {
                 continue;
             };
             if import.is_wildcard {
-                resolved.extend(self.star_imported_declarations(&path));
+                resolved.extend(self.star_imported_declarations(&path, realm));
             } else {
-                resolved.extend(self.declarations_named(&path));
+                resolved.extend(self.declarations_named(&path, realm));
             }
         }
+        resolved
+    }
+
+    /// The declarations a Kotlin file imports, widened to the whole JVM source
+    /// realm when a realm view is supplied.
+    ///
+    /// The realm-aware and realm-less answers are cached separately: a
+    /// Kotlin-only result must never be served to a caller that can also see
+    /// Java and Scala declarations.
+    pub(crate) fn imported_code_units_in_realm(
+        &self,
+        file: &ProjectFile,
+        realm: Option<&JvmSourceRealm<'_>>,
+    ) -> HashSet<CodeUnit> {
+        let cache = match realm {
+            Some(_) => &self.realm_imported_code_units,
+            None => &self.imported_code_units,
+        };
+        if let Some(cached) = cache.get(file) {
+            return (*cached).clone();
+        }
+        if file_language(file) != Language::Kotlin {
+            return HashSet::default();
+        }
+        let imports = self.inner.import_info_of(file);
+        let resolved = self.resolve_import_infos(&imports, realm);
+        cache.insert(file.clone(), Arc::new(resolved.clone()));
         resolved
     }
 
@@ -256,17 +299,7 @@ impl KotlinAnalyzer {
 
 impl ImportAnalysisProvider for KotlinAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
-        if let Some(cached) = self.imported_code_units.get(file) {
-            return (*cached).clone();
-        }
-        if file_language(file) != Language::Kotlin {
-            return HashSet::default();
-        }
-        let imports = self.inner.import_info_of(file);
-        let resolved = self.resolve_import_infos(&imports);
-        self.imported_code_units
-            .insert(file.clone(), Arc::new(resolved.clone()));
-        resolved
+        self.imported_code_units_in_realm(file, None)
     }
 
     fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
@@ -278,7 +311,7 @@ impl ImportAnalysisProvider for KotlinAnalyzer {
         _file: &ProjectFile,
         imports: &[ImportInfo],
     ) -> Option<HashSet<CodeUnit>> {
-        Some(self.resolve_import_infos(imports))
+        Some(self.resolve_import_infos(imports, None))
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
@@ -334,11 +367,11 @@ impl ImportAnalysisProvider for KotlinAnalyzer {
             if import.is_wildcard {
                 return path == target_package
                     || self
-                        .star_imported_declarations(&path)
+                        .star_imported_declarations(&path, None)
                         .iter()
                         .any(|unit| unit.source() == target);
             }
-            self.declarations_named(&path)
+            self.declarations_named(&path, None)
                 .iter()
                 .any(|unit| unit.source() == target)
         })

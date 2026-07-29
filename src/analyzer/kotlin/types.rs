@@ -31,7 +31,8 @@
 //! without three copies of the precedence rules.
 
 use crate::analyzer::jvm::external::JvmExternalType;
-use crate::analyzer::{CodeUnit, IAnalyzer, ImportInfo, ProjectFile};
+use crate::analyzer::jvm::realm::JvmSourceRealm;
+use crate::analyzer::{CodeUnit, IAnalyzer, ImportInfo, Language, ProjectFile};
 
 use super::KotlinAnalyzer;
 use super::imports::{KOTLIN_DEFAULT_IMPORT_PACKAGES, kotlin_import_path};
@@ -230,6 +231,15 @@ impl KotlinAnalyzer {
         file: &ProjectFile,
         raw_name: &str,
     ) -> Option<KotlinTypeResolution> {
+        self.resolve_type_name_with_external_in_realm(file, raw_name, None)
+    }
+
+    pub(crate) fn resolve_type_name_with_external_in_realm(
+        &self,
+        file: &ProjectFile,
+        raw_name: &str,
+        realm: Option<&JvmSourceRealm<'_>>,
+    ) -> Option<KotlinTypeResolution> {
         let package_name = self.inner.package_name_of(file).unwrap_or_default();
         let imports = self.inner.import_info_of(file);
         let scope = KotlinNameScope {
@@ -238,20 +248,21 @@ impl KotlinAnalyzer {
             // A name spelled at file level sees no enclosing declaration.
             scope_owners: Vec::new(),
         };
-        self.resolve_type_name_in_scope(raw_name, &scope)
+        self.resolve_type_name_in_scope(raw_name, &scope, realm)
     }
 
     fn resolve_type_name_in_scope(
         &self,
         raw_name: &str,
         scope: &KotlinNameScope<'_>,
+        realm: Option<&JvmSourceRealm<'_>>,
     ) -> Option<KotlinTypeResolution> {
         let external = self.external_declaration_index();
         let source_first = resolve_kotlin_type_name(raw_name, scope, |candidate| {
-            self.source_type_exists(candidate)
+            self.realm_type_exists(candidate, realm)
         });
         if let KotlinTypeName::Resolved(fqn) = source_first
-            && let Some(unit) = self.source_type_by_fqn(&fqn)
+            && let Some(unit) = self.realm_type_by_fqn(&fqn, realm)
         {
             return Some(KotlinTypeResolution::Source(unit));
         }
@@ -284,6 +295,29 @@ impl KotlinAnalyzer {
             .iter()
             .find(|unit| unit.is_class() && unit.fq_name() == fqn && !unit.is_synthetic())
             .cloned()
+    }
+
+    /// A type named `fqn` anywhere in the JVM realm: Kotlin's own declarations
+    /// first, then the Java and Scala members when a realm view is supplied.
+    ///
+    /// Kotlin's own index is consulted first so a same-language declaration
+    /// always wins a tie, and so a realm-less caller pays nothing.
+    pub(crate) fn realm_type_by_fqn(
+        &self,
+        fqn: &str,
+        realm: Option<&JvmSourceRealm<'_>>,
+    ) -> Option<CodeUnit> {
+        if let Some(unit) = self.source_type_by_fqn(fqn) {
+            return Some(unit);
+        }
+        realm?
+            .peer_types_by_fqn(fqn, Language::Kotlin)
+            .into_iter()
+            .next()
+    }
+
+    pub(crate) fn realm_type_exists(&self, fqn: &str, realm: Option<&JvmSourceRealm<'_>>) -> bool {
+        self.realm_type_by_fqn(fqn, realm).is_some()
     }
 
     /// The scope owners visible inside `owner`: the declaration itself, each
@@ -356,6 +390,7 @@ impl KotlinAnalyzer {
         &self,
         owner: &CodeUnit,
         raw_name: &str,
+        realm: Option<&JvmSourceRealm<'_>>,
     ) -> Option<KotlinTypeResolution> {
         let imports = self.inner.import_info_of(owner.source());
         let scope = KotlinNameScope {
@@ -363,6 +398,6 @@ impl KotlinAnalyzer {
             imports: &imports,
             scope_owners: self.scope_owners_for(owner),
         };
-        self.resolve_type_name_in_scope(raw_name, &scope)
+        self.resolve_type_name_in_scope(raw_name, &scope, realm)
     }
 }

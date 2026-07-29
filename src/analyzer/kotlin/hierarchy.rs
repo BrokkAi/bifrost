@@ -7,6 +7,7 @@
 //! each candidate's supertype paths and imports together, so inverting the
 //! whole workspace costs one hydration pass rather than one per class.
 
+use crate::analyzer::jvm::realm::JvmSourceRealm;
 use crate::analyzer::{
     CodeUnit, CodeUnitType, DirectDescendantIndex, ImportInfo, TypeHierarchyProvider,
 };
@@ -23,31 +24,65 @@ const HIERARCHY_FACT_BATCH_SIZE: usize = 4_096;
 
 impl TypeHierarchyProvider for KotlinAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        if let Some(cached) = self.direct_ancestors.get(code_unit) {
-            return (*cached).clone();
-        }
-        let ancestors = self.resolve_direct_ancestors(code_unit);
-        self.direct_ancestors
-            .insert(code_unit.clone(), Arc::new(ancestors.clone()));
-        ancestors
+        self.direct_ancestors_in_realm(code_unit, None)
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
-        self.direct_descendant_index
-            .get_or_init(|| self.build_direct_descendant_index())
-            .descendants(code_unit)
+        self.direct_descendants_in_realm(code_unit, None)
     }
 }
 
 impl KotlinAnalyzer {
-    fn resolve_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+    /// Direct ancestors of a Kotlin declaration, widened to the whole JVM
+    /// source realm when a realm view is supplied.
+    ///
+    /// The realm-aware and realm-less answers are cached separately: they are
+    /// different questions, and a Kotlin-only cache entry must never be served
+    /// to a caller that can see Java and Scala declarations too.
+    pub(crate) fn direct_ancestors_in_realm(
+        &self,
+        code_unit: &CodeUnit,
+        realm: Option<&JvmSourceRealm<'_>>,
+    ) -> Vec<CodeUnit> {
+        let cache = match realm {
+            Some(_) => &self.realm_direct_ancestors,
+            None => &self.direct_ancestors,
+        };
+        if let Some(cached) = cache.get(code_unit) {
+            return (*cached).clone();
+        }
+        let ancestors = self.resolve_direct_ancestors(code_unit, realm);
+        cache.insert(code_unit.clone(), Arc::new(ancestors.clone()));
+        ancestors
+    }
+
+    pub(crate) fn direct_descendants_in_realm(
+        &self,
+        code_unit: &CodeUnit,
+        realm: Option<&JvmSourceRealm<'_>>,
+    ) -> HashSet<CodeUnit> {
+        let index = match realm {
+            Some(_) => &self.realm_direct_descendant_index,
+            None => &self.direct_descendant_index,
+        };
+        index
+            .get_or_init(|| self.build_direct_descendant_index(realm))
+            .descendants(code_unit)
+    }
+
+    fn resolve_direct_ancestors(
+        &self,
+        code_unit: &CodeUnit,
+        realm: Option<&JvmSourceRealm<'_>>,
+    ) -> Vec<CodeUnit> {
         if !code_unit.is_class() {
             return Vec::new();
         }
         let mut ancestors = Vec::new();
         let mut seen = HashSet::default();
         for spelled in self.inner.raw_supertypes_of(code_unit) {
-            let Some(resolution) = self.resolve_type_name_for_owner(code_unit, &spelled) else {
+            let Some(resolution) = self.resolve_type_name_for_owner(code_unit, &spelled, realm)
+            else {
                 // An unresolvable supertype yields no ancestor. Kotlin code
                 // routinely extends types from dependencies that are not on the
                 // configured classpath, and inventing a declaration for one
@@ -63,7 +98,10 @@ impl KotlinAnalyzer {
         ancestors
     }
 
-    fn build_direct_descendant_index(&self) -> DirectDescendantIndex {
+    fn build_direct_descendant_index(
+        &self,
+        realm: Option<&JvmSourceRealm<'_>>,
+    ) -> DirectDescendantIndex {
         let _scope = crate::profiling::scope("KotlinAnalyzer::build_direct_descendant_index");
         let mut candidates = self
             .inner
@@ -91,6 +129,7 @@ impl KotlinAnalyzer {
                     &facts.declaration,
                     &facts.raw_supertypes,
                     &facts.imports,
+                    realm,
                 );
                 if !resolved.is_empty() {
                     ancestors_by_owner.insert(facts.declaration.clone(), resolved);
@@ -119,6 +158,7 @@ impl KotlinAnalyzer {
         owner: &CodeUnit,
         raw_supertypes: &[String],
         imports: &[ImportInfo],
+        realm: Option<&JvmSourceRealm<'_>>,
     ) -> Vec<CodeUnit> {
         if raw_supertypes.is_empty() {
             return Vec::new();
@@ -133,12 +173,12 @@ impl KotlinAnalyzer {
         for spelled in raw_supertypes {
             let KotlinTypeName::Resolved(fqn) =
                 resolve_kotlin_type_name(spelled, &scope, |candidate| {
-                    self.source_type_exists(candidate)
+                    self.realm_type_exists(candidate, realm)
                 })
             else {
                 continue;
             };
-            if let Some(unit) = self.source_type_by_fqn(&fqn)
+            if let Some(unit) = self.realm_type_by_fqn(&fqn, realm)
                 && seen.insert(unit.fq_name())
             {
                 ancestors.push(unit);

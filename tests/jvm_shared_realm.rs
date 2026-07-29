@@ -151,3 +151,183 @@ fn java_only_workspace_still_reports_java_nodes_and_edges() {
     );
     common::usage_graph::assert_every_edge_endpoint_is_a_node(&graph);
 }
+
+// ---------------------------------------------------------------------------
+// Cross-language source resolution
+// ---------------------------------------------------------------------------
+
+use brokk_bifrost::{
+    AnalyzerDelegate, CodeUnit, IAnalyzer, ImportAnalysisProvider, JavaAnalyzer, KotlinAnalyzer,
+    Language, MultiAnalyzer, ScalaAnalyzer, TypeHierarchyProvider,
+};
+use std::collections::BTreeMap;
+
+/// A multi-language analyzer over an inline workspace, with one delegate per
+/// JVM language the fixture actually uses.
+fn jvm_workspace(files: &[(&str, &str)]) -> (common::BuiltInlineTestProject, MultiAnalyzer) {
+    let mut project = InlineTestProject::new();
+    for (path, contents) in files {
+        project = project.file(*path, *contents);
+    }
+    let built = project.build();
+
+    let mut delegates = BTreeMap::new();
+    for language in built.languages() {
+        let delegate = match language {
+            Language::Java => AnalyzerDelegate::Java(JavaAnalyzer::new(built.project_dyn())),
+            Language::Scala => AnalyzerDelegate::Scala(ScalaAnalyzer::new(built.project_dyn())),
+            Language::Kotlin => AnalyzerDelegate::Kotlin(KotlinAnalyzer::new(built.project_dyn())),
+            other => panic!("unexpected language in JVM fixture: {other:?}"),
+        };
+        delegates.insert(language, delegate);
+    }
+    (built, MultiAnalyzer::new(delegates))
+}
+
+fn definition(analyzer: &MultiAnalyzer, fq_name: &str) -> CodeUnit {
+    analyzer
+        .get_definitions(fq_name)
+        .into_iter()
+        .find(CodeUnit::is_class)
+        .unwrap_or_else(|| panic!("no class declaration named {fq_name}"))
+}
+
+fn sorted_fq_names(units: &[CodeUnit]) -> Vec<String> {
+    let mut names: Vec<String> = units.iter().map(CodeUnit::fq_name).collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn kotlin_class_implementing_a_java_interface_resolves_the_java_declaration() {
+    let (_built, analyzer) = jvm_workspace(&[
+        ("src/app/Api.java", JAVA_API),
+        (
+            "src/app/Impl.kt",
+            "package app\n\
+             \n\
+             class Impl : Api {\n\
+                 override fun describe(): String = \"impl\"\n\
+             }\n",
+        ),
+    ]);
+    let impl_unit = definition(&analyzer, "app.Impl");
+    assert_eq!(
+        sorted_fq_names(&analyzer.get_direct_ancestors(&impl_unit)),
+        vec!["app.Api".to_string()],
+        "the JVM realm lets a Kotlin class name a Java interface declared next \
+         door with no import"
+    );
+}
+
+#[test]
+fn kotlin_class_extending_a_scala_trait_resolves_the_scala_declaration() {
+    let (_built, analyzer) = jvm_workspace(&[
+        ("src/lib/Service.scala", "package lib\n\ntrait Service\n"),
+        (
+            "src/app/Impl.kt",
+            "package app\n\nimport lib.Service\n\nclass Impl : Service\n",
+        ),
+    ]);
+    let impl_unit = definition(&analyzer, "app.Impl");
+    assert_eq!(
+        sorted_fq_names(&analyzer.get_direct_ancestors(&impl_unit)),
+        vec!["lib.Service".to_string()]
+    );
+}
+
+#[test]
+fn kotlin_imports_resolve_java_and_scala_declarations() {
+    let (built, analyzer) = jvm_workspace(&[
+        (
+            "src/lib/Api.java",
+            "package lib;\n\npublic interface Api {}\n",
+        ),
+        ("src/lib/Service.scala", "package lib\n\ntrait Service\n"),
+        (
+            "src/app/App.kt",
+            "package app\n\
+             \n\
+             import lib.Api\n\
+             import lib.Service\n\
+             \n\
+             class App\n",
+        ),
+    ]);
+    let mut imported: Vec<String> = analyzer
+        .imported_code_units_of(&built.file("src/app/App.kt"))
+        .iter()
+        .map(CodeUnit::fq_name)
+        .collect();
+    imported.sort();
+    assert_eq!(
+        imported,
+        vec!["lib.Api".to_string(), "lib.Service".to_string()]
+    );
+}
+
+#[test]
+fn java_interface_descendants_include_its_kotlin_implementors() {
+    let (_built, analyzer) = jvm_workspace(&[
+        ("src/app/Api.java", JAVA_API),
+        (
+            "src/app/JavaImpl.java",
+            "package app;\n\
+             \n\
+             public class JavaImpl implements Api {\n\
+                 public String describe() { return \"java\"; }\n\
+             }\n",
+        ),
+        (
+            "src/app/KotlinImpl.kt",
+            "package app\n\
+             \n\
+             class KotlinImpl : Api {\n\
+                 override fun describe(): String = \"kotlin\"\n\
+             }\n",
+        ),
+    ]);
+    let api = definition(&analyzer, "app.Api");
+    let mut descendants: Vec<String> = analyzer
+        .get_direct_descendants(&api)
+        .iter()
+        .map(CodeUnit::fq_name)
+        .collect();
+    descendants.sort();
+    assert_eq!(
+        descendants,
+        vec!["app.JavaImpl".to_string(), "app.KotlinImpl".to_string()],
+        "a Java interface's implementors span the realm, not just its own language"
+    );
+}
+
+#[test]
+fn kotlin_only_workspace_resolves_exactly_as_before() {
+    // A realm of one adds nothing, and must take nothing away.
+    let (_built, analyzer) = jvm_workspace(&[(
+        "src/app/Types.kt",
+        "package app\n\nopen class Base\n\nclass Child : Base()\n",
+    )]);
+    let child = definition(&analyzer, "app.Child");
+    assert_eq!(
+        sorted_fq_names(&analyzer.get_direct_ancestors(&child)),
+        vec!["app.Base".to_string()]
+    );
+}
+
+#[test]
+fn a_java_name_the_kotlin_file_cannot_see_stays_unresolved() {
+    let (_built, analyzer) = jvm_workspace(&[
+        (
+            "src/other/Hidden.java",
+            "package other;\n\npublic interface Hidden {}\n",
+        ),
+        ("src/app/Impl.kt", "package app\n\nclass Impl : Hidden\n"),
+    ]);
+    let impl_unit = definition(&analyzer, "app.Impl");
+    assert!(
+        analyzer.get_direct_ancestors(&impl_unit).is_empty(),
+        "sharing a realm widens the declaration universe, not Kotlin's own \
+         visibility rules: a different package still needs an import"
+    );
+}

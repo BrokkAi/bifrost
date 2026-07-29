@@ -27,7 +27,7 @@ How to see it working: the tests in `tests/kotlin_imports_and_hierarchy.rs` and 
 - [x] (2026-07-29) M2: Kotlin structured imports and `ImportAnalysisProvider`.
 - [x] (2026-07-29) M3: Kotlin supertypes, type-name resolution, and `TypeHierarchyProvider`.
 - [x] (2026-07-29) M4: Shared JVM usage-candidate realm (`UsageEcosystem::Jvm`).
-- [ ] M5: Cross-language JVM source realm resolution.
+- [x] (2026-07-29) M5: Cross-language JVM source realm resolution.
 - [ ] M6: Explicit unsupported outcomes, epoch bump, and full validation.
 
 Use timestamps to measure rates of progress.
@@ -65,6 +65,14 @@ Use timestamps to measure rates of progress.
 
 - Decision: Cross-language *source* resolution in this issue is delivered as a query-time realm view (`src/analyzer/jvm/realm.rs`) that Kotlin consults, not as back-references stored inside each analyzer.
   Rationale: `MultiAnalyzer` owns the per-language delegates; storing sibling analyzers inside each delegate would create `Arc` cycles between Java, Scala, and Kotlin (`CLAUDE.md` warns against naive reference counting). A view constructed from `&dyn IAnalyzer` at the `MultiAnalyzer` boundary — the same `resolve_analyzer::<T>` precedent `src/analyzer/usages/java_graph/jvm_scala.rs` already uses — has no ownership at all.
+  Date/Author: 2026-07-29, David Baker Effendi (via agent).
+
+- Decision: `MultiAnalyzer::get_direct_descendants` unions the owning language's answer with Kotlin's realm-aware descendant index, so a Java interface reports its Kotlin implementors.
+  Rationale: this was the one cross-language direction reachable without touching Java's or Scala's resolvers, because Kotlin's own index already resolves across the realm — only the *query entry point* needed widening. The reverse direction (Java or Scala subclasses of a Kotlin type) does need those resolvers to become realm-aware, and stays with #1239.
+  Date/Author: 2026-07-29, David Baker Effendi (via agent).
+
+- Decision: Realm-aware and realm-less results are cached in separate slots on `KotlinAnalyzer` rather than one shared slot.
+  Rationale: they answer strictly different questions. Serving a Kotlin-only cache entry to a caller that can see Java and Scala declarations would silently drop cross-language results; serving the wider entry to a bare `KotlinAnalyzer` would invent them. Two small caches are cheaper than either bug.
   Date/Author: 2026-07-29, David Baker Effendi (via agent).
 
 - Decision: Java's and Scala's own hierarchy/import resolvers are *not* rewritten to consume the realm view in this issue; only Kotlin's are realm-aware.

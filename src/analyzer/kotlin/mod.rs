@@ -53,13 +53,20 @@ pub struct KotlinAnalyzer {
     external_index: Arc<OnceLock<JvmExternalDeclarationIndex>>,
     memo_budget: u64,
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
+    /// Import and hierarchy answers computed with the whole JVM source realm
+    /// in view. Kept apart from the Kotlin-only caches above because they
+    /// answer a strictly wider question: serving one for the other would
+    /// silently drop, or invent, cross-language results.
+    realm_imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     same_package_reference_index:
         Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     top_level_declarations_by_package: Arc<OnceLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
+    realm_direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     direct_descendant_index: Arc<OnceLock<crate::analyzer::DirectDescendantIndex>>,
+    realm_direct_descendant_index: Arc<OnceLock<crate::analyzer::DirectDescendantIndex>>,
 }
 
 crate::analyzer::impl_forward_query_provider!(KotlinAnalyzer);
@@ -86,13 +93,19 @@ impl KotlinAnalyzer {
             jvm_config,
             external_index: Arc::new(OnceLock::new()),
             memo_budget,
-            imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
+            imported_code_units: build_weighted_cache(memo_budget / 8, weight_code_unit_set),
+            realm_imported_code_units: build_weighted_cache(memo_budget / 8, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             same_package_reference_index: Arc::new(PoolSafeMemo::new()),
             top_level_declarations_by_package: Arc::new(OnceLock::new()),
-            direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
+            direct_ancestors: build_weighted_cache(memo_budget / 16, weight_code_unit_vec_by_unit),
+            realm_direct_ancestors: build_weighted_cache(
+                memo_budget / 16,
+                weight_code_unit_vec_by_unit,
+            ),
             direct_descendant_index: Arc::new(OnceLock::new()),
+            realm_direct_descendant_index: Arc::new(OnceLock::new()),
         }
     }
 
