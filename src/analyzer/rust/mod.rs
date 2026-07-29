@@ -194,6 +194,15 @@ impl RustAnalyzer {
         self.cargo_routes().file_uses_rust_2015_edition(file)
     }
 
+    pub(crate) fn has_available_declared_cargo_dependency(
+        &self,
+        file: &ProjectFile,
+        route: &str,
+    ) -> bool {
+        self.cargo_routes()
+            .has_available_declared_dependency(file, route)
+    }
+
     pub(crate) fn files_share_cargo_target(
         &self,
         left: &ProjectFile,

@@ -8232,6 +8232,167 @@ fn run() {
 }
 
 #[test]
+fn rust_http_version_owner_prefers_external_crate_over_same_file_type() {
+    let http_source = r#"
+pub enum Version {
+    Http2,
+}
+
+impl Version {
+    fn to_http(self) -> http::Version {
+        match self {
+            Self::Http2 => http::Version::HTTP_2,
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nhttp = \"1\"\n",
+        )
+        .file("src/lib.rs", "pub mod http;\n")
+        .file("src/http.rs", http_source)
+        .build();
+
+    let start = http_source
+        .find("Version::HTTP_2")
+        .expect("http::Version use");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/http.rs", http_source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
+    assert!(result["definitions"][0].is_null(), "{value}");
+}
+
+#[test]
+fn rust_http_version_owner_without_dependency_reports_no_definition() {
+    let http_source = r#"
+pub enum Version {
+    Http2,
+}
+
+impl Version {
+    fn to_http(self) -> http::Version {
+        match self {
+            Self::Http2 => http::Version::HTTP_2,
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file("src/lib.rs", "pub mod http;\n")
+        .file("src/http.rs", http_source)
+        .build();
+
+    let start = http_source
+        .find("Version::HTTP_2")
+        .expect("http::Version use");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/http.rs", http_source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"][0].is_null(), "{value}");
+}
+
+#[test]
+fn rust_builtin_result_beats_crate_reexport_in_nested_test_module() {
+    let engine_source = r#"
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct ReconcileTestPorts {
+        sync_state: Result<SyncState, String>,
+    }
+}
+
+pub struct SyncState;
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "pub mod engine;\nmod error;\npub use error::Result;\n",
+        )
+        .file("src/error.rs", "pub type Result<T> = std::result::Result<T, DeviceSyncError>;\npub struct DeviceSyncError;\n")
+        .file("src/engine/mod.rs", engine_source)
+        .build();
+
+    let start = engine_source
+        .find("Result<SyncState, String>")
+        .expect("builtin Result");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/engine/mod.rs", engine_source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"][0].is_null(), "{value}");
+}
+
+#[test]
+fn rust_bare_same_file_type_still_resolves_after_cross_file_filter() {
+    let source = r#"
+pub struct Result;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ReconcileTestPorts {
+        sync_state: Result,
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    let start = source.find("Result,\n").expect("same-file Result type");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Result", "{value}");
+}
+
+#[test]
+fn rust_bound_same_name_module_root_is_not_suppressed() {
+    let http_source = r#"
+use crate::client as http;
+
+fn run(_: http::Version) {}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "pub mod client;\npub mod http;\n")
+        .file("src/client.rs", "pub struct Version;\n")
+        .file("src/http.rs", http_source)
+        .build();
+
+    let start = http_source
+        .find("http::Version")
+        .expect("bound http::Version");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/http.rs", http_source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "client", "{value}");
+}
+
+#[test]
 fn rust_focused_prefix_candidates_stay_within_rust() {
     let rust_source = r#"struct IndexedOwner;
 impl IndexedOwner {
