@@ -394,11 +394,12 @@ pub fn search_symbols_with_cancellation(
     let total_files = grouped.len();
     let limit_truncated = total_files > effective_limit;
     let mut file_entries: Vec<_> = grouped.into_iter().collect();
+    let mut history_unavailable = false;
     let git_tiers = if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
         complete = false;
         HashMap::default()
     } else {
-        let (tiers, git_ranking_complete) = search_symbol_git_tiers(
+        let (tiers, git_ranking_status) = search_symbol_git_tiers(
             analyzer,
             &file_entries
                 .iter()
@@ -406,7 +407,13 @@ pub fn search_symbols_with_cancellation(
                 .collect::<Vec<_>>(),
             cancellation,
         );
-        complete &= git_ranking_complete;
+        match git_ranking_status {
+            crate::relevance::HistoryRankingStatus::Complete => {}
+            crate::relevance::HistoryRankingStatus::Cancelled => complete = false,
+            crate::relevance::HistoryRankingStatus::HistoryUnavailable => {
+                history_unavailable = true;
+            }
+        }
         tiers
     };
     if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
@@ -474,7 +481,13 @@ pub fn search_symbols_with_cancellation(
         complete = false;
     }
     let truncated = !complete || limit_truncated;
-    let note = search_symbols_note(!complete, limit_truncated, files.len(), total_files);
+    let note = search_symbols_note(
+        !complete,
+        limit_truncated,
+        history_unavailable,
+        files.len(),
+        total_files,
+    );
 
     SearchSymbolsResult {
         patterns,
@@ -486,12 +499,13 @@ pub fn search_symbols_with_cancellation(
 }
 
 pub(super) fn search_symbols_note(
-    incomplete: bool,
+    cancelled: bool,
     limit_truncated: bool,
+    history_unavailable: bool,
     shown: usize,
     total: usize,
 ) -> Option<String> {
-    if incomplete {
+    if cancelled {
         Some(format!(
             "Search was cancelled before all matching symbols could be examined. Results are partial; showing {shown} files observed before cancellation."
         ))
@@ -502,6 +516,11 @@ pub(super) fn search_symbols_note(
     } else if total == 0 {
         Some(
             "No files matched. Try a broader identifier, qualified, or regex-like pattern; if the symbol is itself a test (or lives under a test-tree path), set `include_tests` to true."
+                .to_string(),
+        )
+    } else if history_unavailable {
+        Some(
+            "Commit-history relevance ranking was unavailable for this request; results are complete but ordered without recency weighting."
                 .to_string(),
         )
     } else {
@@ -1607,8 +1626,11 @@ pub(super) fn search_symbol_git_tiers(
     analyzer: &dyn IAnalyzer,
     files: &[ProjectFile],
     cancellation: Option<&crate::CancellationToken>,
-) -> (HashMap<ProjectFile, usize>, bool) {
-    let (ranked, complete) =
+) -> (
+    HashMap<ProjectFile, usize>,
+    crate::relevance::HistoryRankingStatus,
+) {
+    let (ranked, status) =
         most_important_project_files_with_cancellation(analyzer, files, files.len(), cancellation);
     let max_rank = ranked.len();
     (
@@ -1617,7 +1639,7 @@ pub(super) fn search_symbol_git_tiers(
             .enumerate()
             .map(|(index, file)| (file, max_rank.saturating_sub(index)))
             .collect(),
-        complete,
+        status,
     )
 }
 
