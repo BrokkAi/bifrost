@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::mcp_common::{
+use brokk_bifrost_mcp::benchmark_api::{
     BENCHMARK_MCP_REQUEST_BUDGET_SECS, BENCHMARK_MCP_REQUEST_BUDGET_SECS_ENV,
     BENCHMARK_PROFILE_BOUNDARY_MARKER, BENCHMARK_PROFILE_BOUNDARY_METHOD, MCP_FILE_WATCHER_ENV,
 };

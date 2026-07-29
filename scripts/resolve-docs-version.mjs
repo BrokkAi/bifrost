@@ -1,14 +1,11 @@
 #!/usr/bin/env node
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { readCargoVersion as parseCargoVersion } from './release-version.mjs';
 
 function readCargoVersion() {
   const cargoToml = readFileSync(new URL('../Cargo.toml', import.meta.url), 'utf8');
-  const match = cargoToml.match(/^version\s*=\s*"([^"]+)"/m);
-  if (!match) {
-    throw new Error('Could not find package version in Cargo.toml');
-  }
-  return match[1];
+  return parseCargoVersion(cargoToml);
 }
 
 function parseReleaseTag(rawTag) {

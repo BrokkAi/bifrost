@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "pack_id": "acme.widget",
+  "version": "1.2.0",
+  "producer": { "name": "artifact-scanner", "version": "2.0.0" },
+  "language": "java",
+  "ecosystem": "maven",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <1.0.0",
+    "toolchains": [{ "name": "jdk", "requirement": ">=17.0.0" }]
+  },
+  "provenance": {
+    "source": "https://repo.example/acme/widget-1.2.0.jar",
+    "revision": "sha256:example"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [{
+    "id": "declarations.widget",
+    "activation": [{
+      "package": { "name": "com.acme:widget", "version": ">=1.0.0, <2.0.0" },
+      "targets": ["jvm"],
+      "configurations": ["release"]
+    }],
+    "payload": {
+      "kind": "declaration_facts",
+      "types": [{
+        "id": "type.widget",
+        "name": "com.acme.Widget",
+        "type_kind": "class",
+        "visibility": "public",
+        "type_parameters": ["t"],
+        "hierarchy": [{
+          "hierarchy_kind": "extends",
+          "target": { "kind": "named", "name": "java.lang.Object" }
+        }],
+        "aliases": ["com.acme.LegacyWidget"],
+        "extension_surfaces": ["com.acme.WidgetExtensions"],
+        "locator": {
+          "kind": "artifact",
+          "path": "com/acme/Widget.class",
+          "symbol": "com.acme.Widget"
+        }
+      }],
+      "members": [{
+        "id": "member.widget.create",
+        "owner": "type.widget",
+        "name": "create",
+        "member_kind": "method",
+        "visibility": "public",
+        "signature": {
+          "parameters": [{
+            "name": "input",
+            "type": { "kind": "named", "name": "java.lang.String" }
+          }],
+          "returns": { "kind": "named", "name": "com.acme.Widget" }
+        },
+        "aliases": [],
+        "locator": {
+          "kind": "artifact",
+          "path": "com/acme/Widget.class",
+          "symbol": "create(java.lang.String)"
+        }
+      }],
+      "relations": [{
+        "id": "relation.widget.navigation",
+        "relation_kind": "navigates_to",
+        "from": "member.widget.create",
+        "to": "type.widget"
+      }]
+    }
+  }]
+}

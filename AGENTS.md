@@ -115,8 +115,8 @@ campaigns.
 # RQL syntax maintenance
 
 All new CodeQuery JSON fields, RQL forms, properties, roles, kinds, aliases, and constrained values must enter through
-the declarative schema registries under `src/analyzer/structural/query/schema.rs` or the kind/role registries in
-`src/analyzer/structural/kinds.rs`. Every entry must provide its accepted spellings, value shape, signature, description,
+the declarative schema registries under `crates/bifrost-analysis/src/analyzer/structural/query/schema.rs` or the kind/role registries in
+`crates/bifrost-analysis/src/analyzer/structural/kinds.rs`. Every entry must provide its accepted spellings, value shape, signature, description,
 and exhaustive parser/decoder/validator handling; do not add private keyword lists or editor-only documentation tables.
 
 When visible RQL vocabulary changes, add behavior-focused parser, validation-range, hover, and execution tests as

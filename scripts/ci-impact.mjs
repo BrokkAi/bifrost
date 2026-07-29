@@ -40,8 +40,12 @@ function startsWithAny(path, prefixes) {
 
 function isRqlPath(path) {
   return (
-    startsWithAny(path, ["src/analyzer/structural/", "src/analyzer/policy/", "policy-packs/"]) ||
-    path === "tests/code_intelligence_runtime.rs" ||
+    startsWithAny(path, [
+      "crates/bifrost-analysis/src/analyzer/structural/",
+      "crates/bifrost-analysis/src/analyzer/policy/",
+      "crates/bifrost-analysis/policy-packs/",
+    ]) ||
+    path === "crates/bifrost-runtime/tests/code_intelligence_runtime.rs" ||
     /^(tests\/(structural_search_|policy_|builtin_policy_pack\.rs|bifrost_policy_cli\.rs)|editors\/vscode\/(src\/rql|test\/rql|syntaxes\/bifrost-rql))/u.test(
       path,
     )
@@ -50,24 +54,12 @@ function isRqlPath(path) {
 
 function isMcpPath(path) {
   return (
-    startsWithAny(path, ["src/mcp_", "src/searchtools/"]) ||
-    [
-      "src/mcp_cli.rs",
-      "src/mcp_common.rs",
-      "src/mcp_core.rs",
-      "src/mcp_extended.rs",
-      "src/mcp_nlp.rs",
-      "src/mcp_registry.rs",
-      "src/mcp_slopcop.rs",
-      "src/mcp_text.rs",
-      "src/searchtools_service.rs",
-      "tests/bifrost_mcp_server.rs",
-    ].includes(path)
+    startsWithAny(path, ["crates/bifrost-mcp/", "crates/bifrost-analysis/src/searchtools/"])
   );
 }
 
 function isLspPath(path) {
-  return startsWithAny(path, ["src/lsp/"]) || path === "tests/bifrost_lsp_server.rs";
+  return startsWithAny(path, ["crates/bifrost-lsp/"]);
 }
 
 function isPluginPath(path) {
@@ -85,7 +77,7 @@ function classifyPath(path) {
   if (isRqlPath(path)) {
     return { components: RQL_COMPONENTS, reason: "RQL, structural-query, or policy surface" };
   }
-  if (path === "src/code_intelligence.rs") {
+  if (path === "crates/bifrost-runtime/src/code_intelligence.rs") {
     return { components: RUNTIME_COMPONENTS, reason: "shared code-intelligence runtime" };
   }
   if (isMcpPath(path)) {

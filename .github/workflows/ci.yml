@@ -93,7 +93,7 @@ jobs:
       - name: Test repository policy
         run: >-
           node scripts/ci-timing.mjs --label quick-policy-node-tests -- node --test
-          scripts/ci-impact.test.mjs scripts/ci-timing.test.mjs scripts/ci-impact-workflow.test.mjs
+          scripts/check-workspace-dependencies.test.mjs scripts/ci-impact.test.mjs scripts/ci-timing.test.mjs scripts/ci-impact-workflow.test.mjs
           scripts/github-actions-policy.test.mjs scripts/release-promotion-workflow.test.mjs scripts/release-version.test.mjs
           plugins/bifrost-agent/test/sync-release-version.test.mjs
 
@@ -174,8 +174,8 @@ jobs:
         with:
           toolchain: 1.96.0
 
-      - name: Check publishable crate
-        run: node scripts/ci-timing.mjs --label crate-package -- bash scripts/check-crate-package.sh
+      - name: Check publishable workspace package set
+        run: node scripts/ci-timing.mjs --label crate-package -- bash scripts/check-workspace-packages.sh
 
   rql-runtime:
     name: RQL runtime
@@ -206,9 +206,14 @@ jobs:
 
       - name: Run RQL runtime tests
         run: >-
-          node scripts/ci-timing.mjs --label rql-runtime -- cargo test --features nlp,python
-          --test suite_cross_language --test suite_mcp_cli --
-          code_intelligence_runtime:: structural_search_cross_language::
+          node scripts/ci-timing.mjs --label rql-runtime -- cargo test
+          -p brokk-bifrost-runtime --all-features
+
+      - name: Run structural query contract tests
+        run: >-
+          node scripts/ci-timing.mjs --label structural-query-contract -- cargo test
+          --features nlp,python --test suite_cross_language --
+          structural_search_cross_language::
           structural_search_planner:: structural_search_python::
 
   mcp-contract:
@@ -239,9 +244,7 @@ jobs:
           toolchain: 1.96.0
 
       - name: Run MCP contract tests
-        run: >-
-          node scripts/ci-timing.mjs --label mcp-contract -- cargo test --features nlp,python
-          --test suite_mcp_cli -- bifrost_mcp_server::
+        run: node scripts/ci-timing.mjs --label mcp-contract -- cargo test -p brokk-bifrost-mcp --features nlp
 
   lsp-contract:
     name: LSP contract
@@ -271,9 +274,7 @@ jobs:
           toolchain: 1.96.0
 
       - name: Run LSP contract tests
-        run: >-
-          node scripts/ci-timing.mjs --label lsp-contract -- cargo test --features nlp,python
-          --test suite_mcp_cli -- bifrost_lsp_server::
+        run: node scripts/ci-timing.mjs --label lsp-contract -- cargo test -p brokk-bifrost-lsp --all-features
 
   policy-pack:
     name: policy pack

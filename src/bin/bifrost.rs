@@ -9,7 +9,7 @@ mod code_query_repl;
 
 use brokk_bifrost::ToolOutput;
 use brokk_bifrost::lsp::run_lsp_stdio_server;
-use brokk_bifrost::mcp_common::{McpRenderOptions, run_stdio_server};
+use brokk_bifrost::mcp_common::{McpRenderOptions, run_stdio_server_with_build_identity};
 use brokk_bifrost::mcp_registry::{
     resolve_server_spec, resolve_server_spec_for_render_options, searchtools_toolset_order,
 };
@@ -602,7 +602,13 @@ fn run_inner(
         .as_deref()
         .is_none_or(brokk_bifrost::mcp_registry::workspace_is_git);
     let spec = resolve_server_spec_for_render_options(mode, render_options, git_repo)?;
-    run_stdio_server(initial_root, render_options, &spec).map(|()| CliRunResult::Complete)
+    run_stdio_server_with_build_identity(
+        initial_root,
+        render_options,
+        &spec,
+        brokk_bifrost::BIFROST_BUILD_IDENTITY,
+    )
+    .map(|()| CliRunResult::Complete)
 }
 
 fn parse_policy_format(value: &str) -> Result<PolicyOutputFormat, String> {

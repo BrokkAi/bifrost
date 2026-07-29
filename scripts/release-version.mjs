@@ -22,16 +22,35 @@ export function normalizeReleaseTag(input) {
 }
 
 export function readCargoVersion(contents) {
-  const packageSection = readTomlSection(contents, "package", "Cargo.toml");
+  const packageSection = readTomlSection(contents, "workspace.package", "Cargo.toml");
   const matches = [
     ...packageSection.matchAll(/^\s*version\s*=\s*"([^"]+)"\s*(?:#.*)?$/gmu),
   ];
   if (matches.length !== 1) {
     throw new Error(
-      `Expected exactly one package version in Cargo.toml, found ${matches.length}.`,
+      `Expected exactly one workspace package version in Cargo.toml, found ${matches.length}.`,
     );
   }
   return matches[0][1];
+}
+
+export function validateWorkspaceVersionInheritance(repoRoot) {
+  const manifests = [
+    "Cargo.toml",
+    "crates/bifrost-analysis/Cargo.toml",
+    "crates/bifrost-runtime/Cargo.toml",
+    "crates/bifrost-mcp/Cargo.toml",
+    "crates/bifrost-lsp/Cargo.toml",
+  ];
+  for (const relativePath of manifests) {
+    const packageSection = readTomlSection(readFile(repoRoot, relativePath), "package", relativePath);
+    if (!/^\s*version\.workspace\s*=\s*true\s*(?:#.*)?$/mu.test(packageSection)) {
+      throw new Error(`${relativePath} must inherit version.workspace = true.`);
+    }
+    if (/^\s*version\s*=\s*"/mu.test(packageSection)) {
+      throw new Error(`${relativePath} must not declare an independent package version.`);
+    }
+  }
 }
 
 export function validatePyprojectVersionInheritance(contents) {
@@ -59,7 +78,7 @@ export function confirmReleaseVersion(tagInput, cargoTomlContents) {
   const cargoVersion = readCargoVersion(cargoTomlContents);
   if (release.version !== cargoVersion) {
     throw new Error(
-      `Release tag version ${release.version} does not match Cargo.toml package version ${cargoVersion}.`,
+      `Release tag version ${release.version} does not match Cargo.toml workspace package version ${cargoVersion}.`,
     );
   }
   return release;
@@ -67,6 +86,7 @@ export function confirmReleaseVersion(tagInput, cargoTomlContents) {
 
 export function checkReleaseVersion({ repoRoot = process.cwd(), tag, githubOutput } = {}) {
   const cargoVersion = readCargoVersion(readFile(repoRoot, "Cargo.toml"));
+  validateWorkspaceVersionInheritance(repoRoot);
   validatePyprojectVersionInheritance(readFile(repoRoot, "pyproject.toml"));
 
   let release;
@@ -101,6 +121,7 @@ export function checkReleaseVersion({ repoRoot = process.cwd(), tag, githubOutpu
 
 export function syncReleaseVersion({ repoRoot = process.cwd() } = {}) {
   const version = readCargoVersion(readFile(repoRoot, "Cargo.toml"));
+  validateWorkspaceVersionInheritance(repoRoot);
   validatePyprojectVersionInheritance(readFile(repoRoot, "pyproject.toml"));
   const { updates, canCopyReleaseChecksums } = collectProjectionUpdates(repoRoot, version);
   for (const update of updates) {
@@ -284,8 +305,12 @@ function main(args) {
     syncReleaseVersion();
     return;
   }
+  if (command === "print" && rest.length === 0) {
+    console.log(readCargoVersion(readFile(process.cwd(), "Cargo.toml")));
+    return;
+  }
   throw new Error(
-    "Usage: node scripts/release-version.mjs check [--tag TAG] [--github-output PATH]\n       node scripts/release-version.mjs sync",
+    "Usage: node scripts/release-version.mjs check [--tag TAG] [--github-output PATH]\n       node scripts/release-version.mjs sync\n       node scripts/release-version.mjs print",
   );
 }
 

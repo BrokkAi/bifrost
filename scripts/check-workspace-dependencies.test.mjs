@@ -1,0 +1,124 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { validateWorkspaceGraph } from "./check-workspace-dependencies.mjs";
+
+const names = [
+  "brokk-bifrost",
+  "brokk-bifrost-analysis",
+  "brokk-bifrost-runtime",
+  "brokk-bifrost-mcp",
+  "brokk-bifrost-lsp",
+];
+
+function dependency(name) {
+  return { name, req: "=0.8.12" };
+}
+
+function metadata(overrides = {}) {
+  const dependencies = {
+    "brokk-bifrost": [],
+    "brokk-bifrost-analysis": [],
+    "brokk-bifrost-runtime": [dependency("brokk-bifrost-analysis")],
+    "brokk-bifrost-mcp": [
+      dependency("brokk-bifrost-analysis"),
+      dependency("brokk-bifrost-runtime"),
+    ],
+    "brokk-bifrost-lsp": [
+      dependency("brokk-bifrost-analysis"),
+      dependency("brokk-bifrost-runtime"),
+    ],
+    ...overrides.dependencies,
+  };
+  const versions = { ...Object.fromEntries(names.map((name) => [name, "0.8.12"])), ...overrides.versions };
+  const packageNames = overrides.names ?? names;
+  const packages = packageNames.map((name) => ({
+    id: `path+file:///workspace/${name}#${name}@${versions[name] ?? "0.8.12"}`,
+    name,
+    version: versions[name] ?? "0.8.12",
+    dependencies: dependencies[name] ?? [],
+  }));
+  return {
+    packages,
+    workspace_members: packages.map((pkg) => pkg.id),
+  };
+}
+
+test("accepts the intended one-way workspace graph", () => {
+  assert.deepEqual(validateWorkspaceGraph(metadata()), []);
+});
+
+test("rejects a runtime dependency on a protocol host", () => {
+  const errors = validateWorkspaceGraph(
+    metadata({
+      dependencies: {
+        "brokk-bifrost-runtime": [
+          dependency("brokk-bifrost-analysis"),
+          dependency("brokk-bifrost-lsp"),
+        ],
+      },
+    }),
+  );
+  assert.deepEqual(errors, [
+    "brokk-bifrost-runtime must not depend on workspace package brokk-bifrost-lsp",
+  ]);
+});
+
+test("rejects a missing required runtime dependency", () => {
+  assert.deepEqual(
+    validateWorkspaceGraph(
+      metadata({ dependencies: { "brokk-bifrost-runtime": [] } }),
+    ),
+    [
+      "brokk-bifrost-runtime must depend on workspace package brokk-bifrost-analysis",
+    ],
+  );
+});
+
+test("rejects MCP dependencies on LSP transport packages", () => {
+  const errors = validateWorkspaceGraph(
+    metadata({
+      dependencies: {
+        "brokk-bifrost-mcp": [
+          dependency("brokk-bifrost-analysis"),
+          dependency("brokk-bifrost-runtime"),
+          dependency("lsp-types"),
+        ],
+      },
+    }),
+  );
+  assert.deepEqual(errors, [
+    "brokk-bifrost-mcp must not depend on host-specific package lsp-types",
+  ]);
+});
+
+test("rejects member version drift", () => {
+  assert.deepEqual(
+    validateWorkspaceGraph(
+      metadata({ versions: { "brokk-bifrost-runtime": "0.8.13" } }),
+    ),
+    ["brokk-bifrost-runtime version 0.8.13 does not match facade version 0.8.12"],
+  );
+});
+
+test("rejects a non-exact implementation dependency version", () => {
+  assert.deepEqual(
+    validateWorkspaceGraph(
+      metadata({
+        dependencies: {
+          "brokk-bifrost-runtime": [{ name: "brokk-bifrost-analysis", req: "^0.8.12" }],
+        },
+      }),
+    ),
+    [
+      "brokk-bifrost-runtime dependency on brokk-bifrost-analysis must require exactly =0.8.12",
+    ],
+  );
+});
+
+test("rejects unexpected workspace members", () => {
+  assert.deepEqual(
+    validateWorkspaceGraph(metadata({ names: [...names, "surprise-package"] })),
+    ["unexpected workspace package surprise-package"],
+  );
+});

@@ -85,7 +85,7 @@ test("GitHub outputs are emitted only after successful release validation", asyn
         [releaseVersionScript, "check", "--tag", "v1.2.4", "--github-output", outputPath],
         { cwd: root },
       ),
-      /does not match Cargo\.toml package version/u,
+      /does not match Cargo\.toml workspace package version/u,
     );
     assert.equal(await readFile(outputPath, "utf8"), "");
   } finally {
@@ -98,8 +98,20 @@ async function createFixture(cargoVersion, projectionVersion, lineEnding) {
   await writeFixtureFile(
     root,
     "Cargo.toml",
-    `[package]${lineEnding}version = "${cargoVersion}"${lineEnding}`,
+    `[workspace.package]${lineEnding}version = "${cargoVersion}"${lineEnding}${lineEnding}[package]${lineEnding}name = "fixture"${lineEnding}version.workspace = true${lineEnding}`,
   );
+  for (const [relativePath, packageName] of [
+    ["crates/bifrost-analysis/Cargo.toml", "brokk-bifrost-analysis"],
+    ["crates/bifrost-runtime/Cargo.toml", "brokk-bifrost-runtime"],
+    ["crates/bifrost-mcp/Cargo.toml", "brokk-bifrost-mcp"],
+    ["crates/bifrost-lsp/Cargo.toml", "brokk-bifrost-lsp"],
+  ]) {
+    await writeFixtureFile(
+      root,
+      relativePath,
+      `[package]${lineEnding}name = "${packageName}"${lineEnding}version.workspace = true${lineEnding}`,
+    );
+  }
   await writeFixtureFile(
     root,
     "pyproject.toml",

@@ -16,12 +16,10 @@ import {
   CODEX_SKILL_BUNDLE_ROOT,
   buildCodexSkillBundleFiles,
 } from "./generate-codex-skill-bundle.mjs";
+import { readCargoVersion } from "./release-version.mjs";
 
 const cargoToml = fs.readFileSync("Cargo.toml", "utf8");
-const cargoVersion = cargoToml.match(/^version = "([^"]+)"$/m)?.[1];
-if (!cargoVersion) {
-  throw new Error("Could not read package version from Cargo.toml");
-}
+const cargoVersion = readCargoVersion(cargoToml);
 
 const codexManifestPath = "plugins/bifrost-agent/.codex-plugin/plugin.json";
 const codexManifest = JSON.parse(fs.readFileSync(codexManifestPath, "utf8"));
