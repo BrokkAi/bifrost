@@ -970,11 +970,8 @@ fn analyze_python_candidates_with_usage_graph(
         },
         |unit| unit.is_function() || unit.is_class(),
         |nodes, targets| {
-            crate::analyzer::usages::python_graph::build_python_usage_edges_for_targets(
-                analyzer,
-                nodes,
-                targets,
-                |_| true,
+            crate::analyzer::usages::python_graph::build_cached_python_usage_edges_for_targets(
+                analyzer, nodes, targets,
             )
         },
         |analyzer, declarations_by_fqn, candidate, usage| {

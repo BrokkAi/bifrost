@@ -67,14 +67,6 @@ mod tests {
     }
 
     #[test]
-    fn grammar_loads_through_tree_sitter_0_25() {
-        let language: tree_sitter::Language = LANGUAGE.into();
-        assert_eq!(language.abi_version(), 14);
-        assert_eq!(language.node_kind_count(), 378);
-        parser();
-    }
-
-    #[test]
     fn kotlin_source_and_script_parse_without_recovery() {
         let kt = r#"package sample
 

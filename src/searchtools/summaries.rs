@@ -1,6 +1,7 @@
 use super::navigation::deserialize_symbol_lookup_names;
 use super::selectors::*;
 use super::*;
+use std::cell::OnceCell;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilePatternsParams {
@@ -154,7 +155,6 @@ pub struct SkimFile {
 pub(super) struct SummaryTargets {
     pub(super) file_targets: Vec<ProjectFile>,
     pub(super) listings: Vec<ContainerListing>,
-    pub(super) unmatched_file_targets: Vec<String>,
     pub(super) symbol_targets: Vec<String>,
     pub(super) ambiguous_paths: Vec<AmbiguousPathInput>,
 }
@@ -174,11 +174,18 @@ fn route_summary_targets_with_cancellation(
 ) -> SummaryTargets {
     let _scope = profiling::scope("searchtools::route_summary_targets");
     let resolver = WorkspaceFileResolver::new(analyzer.project());
-    let workspace_files = analyzer.project().all_files().unwrap_or_default();
+    // Materialized only for targets that actually name a container. Summary
+    // routing used to build the whole workspace file set up front purely to ask
+    // "is this target a directory?", so every `get_summaries` request — the
+    // overwhelmingly common shape being a plain file path — paid a full
+    // ignore-aware traversal of the repository (#1325: ~4-9s per call on a
+    // 2,700-file C# tree, half the fuzzer census's tool time). The directory
+    // question is now answered by a `stat` and the listing is built only when
+    // that says yes.
+    let workspace_files: OnceCell<BTreeSet<ProjectFile>> = OnceCell::new();
     let mut file_targets = BTreeSet::new();
     let mut listings = Vec::new();
     let mut listed_containers = HashSet::default();
-    let mut unmatched_file_targets = Vec::new();
     let mut symbol_targets = Vec::new();
     let mut ambiguous_paths = Vec::new();
 
@@ -191,7 +198,7 @@ fn route_summary_targets_with_cancellation(
             break;
         }
         if matches!(
-            split_definition_selector(target),
+            split_definition_selector_with_workspace_files(&resolver, target),
             DefinitionSelector::FileAnchored { .. }
         ) {
             symbol_targets.push(target.to_string());
@@ -209,7 +216,13 @@ fn route_summary_targets_with_cancellation(
         // path cannot itself collide with a directory (a path cannot be both
         // on a real filesystem), so this reordering cannot regress plain file
         // targets.
-        if let Some(listing) = directory_listing(&workspace_files, target) {
+        if let Some(directory) = directory_listing_root(target)
+            && analyzer.project().has_directory(&directory)
+            && let Some(listing) = directory_listing(
+                workspace_files.get_or_init(|| analyzer.project().all_files().unwrap_or_default()),
+                target,
+            )
+        {
             let key = (listing.kind, listing.target.clone());
             if listed_containers.insert(key) {
                 listings.push(listing);
@@ -247,20 +260,38 @@ fn route_summary_targets_with_cancellation(
             continue;
         }
 
-        if looks_like_file_target(target) {
-            unmatched_file_targets.push(target.to_string());
-            continue;
-        }
-
+        // A file-*shaped* target that matched no file is still a symbol
+        // candidate: C# members legitimately end in a segment that also spells
+        // a file extension (`MetadataConfiguration.Properties` vs
+        // `.properties`), and short-circuiting here reported "no workspace
+        // file matched" for a symbol that resolves (#1196). File shape only
+        // picks the wording of the not-found note, which
+        // `summarize_symbol_targets_with_cancellation` applies once symbol
+        // resolution has had its say.
         symbol_targets.push(target.to_string());
     }
 
     SummaryTargets {
         file_targets: file_targets.into_iter().collect(),
         listings,
-        unmatched_file_targets,
         symbol_targets,
         ambiguous_paths,
+    }
+}
+
+/// The workspace-relative directory `target` would list, if any: the empty
+/// path for the workspace root, `None` for spellings that cannot name a
+/// workspace directory at all (absolute, root-anchored, or `..`-escaping).
+///
+/// Split out of [`directory_listing`] so the cheap "is this even a directory?"
+/// pre-check and the listing itself normalize the target identically.
+pub(super) fn directory_listing_root(target: &str) -> Option<PathBuf> {
+    let normalized = normalize_pattern(target.trim());
+    let normalized = normalized.trim_end_matches('/');
+    if normalized.is_empty() || normalized == "." {
+        Some(PathBuf::new())
+    } else {
+        workspace_rel_path(normalized)
     }
 }
 
@@ -268,13 +299,7 @@ pub(super) fn directory_listing(
     files: &BTreeSet<ProjectFile>,
     target: &str,
 ) -> Option<ContainerListing> {
-    let normalized = normalize_pattern(target.trim());
-    let normalized = normalized.trim_end_matches('/');
-    let directory = if normalized.is_empty() || normalized == "." {
-        PathBuf::new()
-    } else {
-        workspace_rel_path(normalized)?
-    };
+    let directory = directory_listing_root(target)?;
 
     let mut entries_by_path = HashMap::default();
     for file in files {
@@ -449,7 +474,16 @@ fn summarize_symbol_targets_with_cancellation(
                 }
             }
             SelectableDefinitionResolution::Ambiguous(item) => ambiguous.push(item),
-            SelectableDefinitionResolution::NotFound(target) => not_found.push(target),
+            // A file-shaped target that resolved to nothing keeps the
+            // file-flavored note routing used to emit up front; see the
+            // routing comment for why the shape check moved down here (#1196).
+            SelectableDefinitionResolution::NotFound(item) => {
+                not_found.push(if looks_like_file_target(&target) {
+                    file_not_found_input(target)
+                } else {
+                    item
+                });
+            }
         }
     }
 
@@ -741,13 +775,6 @@ fn summarize_routed_targets_with_cancellation(
 
     file_output.summaries.extend(symbol_output.summaries);
     file_output.listings = summary_targets.listings.clone();
-    file_output.not_found.extend(
-        summary_targets
-            .unmatched_file_targets
-            .iter()
-            .cloned()
-            .map(file_not_found_input),
-    );
     file_output.not_found.extend(symbol_output.not_found);
     file_output.ambiguous.extend(symbol_output.ambiguous);
     file_output

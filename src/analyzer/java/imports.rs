@@ -1,12 +1,12 @@
 use super::*;
-use crate::analyzer::jvm::external::JavaExternalType;
+use crate::analyzer::jvm::external::JvmExternalType;
 use crate::analyzer::{ImportInfo, build_reverse_file_index};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JavaTypeResolution {
     Source(CodeUnit),
-    External(JavaExternalType),
+    External(JvmExternalType),
 }
 
 impl ImportAnalysisProvider for JavaAnalyzer {
@@ -564,7 +564,7 @@ impl JavaAnalyzer {
         file: &ProjectFile,
         name: &str,
         access_package: &str,
-    ) -> Option<JavaExternalType> {
+    ) -> Option<JvmExternalType> {
         if let Some(external_type) = self.resolve_external_imports(file, name, access_package) {
             return Some(external_type);
         }
@@ -581,7 +581,7 @@ impl JavaAnalyzer {
         file: &ProjectFile,
         name: &str,
         access_package: &str,
-    ) -> Option<JavaExternalType> {
+    ) -> Option<JvmExternalType> {
         let external = self.external_declaration_index();
         for import in self.inner.import_info_of(file) {
             let Some(import_path) = non_static_import_path(&import) else {
@@ -599,7 +599,7 @@ impl JavaAnalyzer {
             }
         }
 
-        let mut wildcard_match: Option<JavaExternalType> = None;
+        let mut wildcard_match: Option<JvmExternalType> = None;
         for import in self.inner.import_info_of(file) {
             let Some(import_path) = non_static_import_path(&import) else {
                 continue;

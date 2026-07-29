@@ -1,0 +1,413 @@
+//! Canonical Go package identity: same-named packages in different
+//! directories must produce distinct, import-path-qualified fully-qualified
+//! names so a bare `pkg.Symbol` is only ever a fuzzy query, never an exact
+//! identity.
+
+use crate::common::InlineTestProject;
+use brokk_bifrost::{
+    GoAnalyzer, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile,
+    searchtools::{
+        DefinitionReferenceQuery, GetDefinitionParams, ScanUsagesByReferenceParams,
+        ScanUsagesStatus, SearchSymbolsParams, SymbolLookupParams, get_definitions_by_location,
+        get_symbol_locations, get_symbol_sources, scan_usages_by_reference, search_symbols,
+    },
+};
+
+fn canonical_project() -> crate::common::BuiltInlineTestProject {
+    InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/repo\n")
+        .file("a/list/list.go", "package list\nfunc Run() string { return \"a\" }\n")
+        .file("b/list/list.go", "package list\nfunc Run() string { return \"b\" }\n")
+        .file(
+            "a/srv/server.go",
+            "package srv\n// Server serves requests.\ntype Server struct{}\nfunc (s *Server) New() string { return \"method\" }\n",
+        )
+        .file("Server/pkg.go", "package Server\nfunc New() string { return \"package\" }\n")
+        .file("gin/gin.go", "package gin\ntype Engine struct{}\nfunc New() *Engine { return &Engine{} }\n")
+        .file(
+            "cache/cache.go",
+            "package cache\n\ntype ChainCache[T any] struct{}\nfunc (c *ChainCache[T]) Set(value T) {}\n\ntype LoadableCache struct{}\nfunc (c *LoadableCache) Get() string { return \"value\" }\n\n// Reader reads bytes.\ntype Reader interface { Read() error }\n\ntype Pair[A, B any] struct{}\nfunc (p *Pair[A, B]) Swap() {}\n",
+        )
+        .file(
+            "a/list/list_test.go",
+            "package list\nimport \"testing\"\nfunc TestListRun(t *testing.T) {}\n",
+        )
+        .file(
+            "b/list/list_test.go",
+            "package list\nimport \"testing\"\nfunc TestListRun(t *testing.T) {}\n",
+        )
+        .file(
+            "consumer/main.go",
+            "package consumer\nimport \"example.com/repo/a/list\"\nfunc Use() string { return list.Run() }\n",
+        )
+        .build()
+}
+
+#[test]
+fn definitions_are_import_path_qualified_not_bare_package() {
+    let project = canonical_project();
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
+
+    assert_eq!(
+        1,
+        analyzer
+            .get_definitions("example.com/repo/a/list.TestListRun")
+            .len()
+    );
+    assert_eq!(
+        1,
+        analyzer
+            .get_definitions("example.com/repo/b/list.TestListRun")
+            .len()
+    );
+    assert_eq!(
+        1,
+        analyzer
+            .get_definitions("example.com/repo/a/list.Run")
+            .len()
+    );
+    // The bare package-clause name must never be an exact identity.
+    assert!(
+        analyzer.get_definitions("list.TestListRun").is_empty(),
+        "bare `list.TestListRun` must not resolve as an exact definition"
+    );
+}
+
+#[test]
+fn search_symbols_reports_canonical_symbols() {
+    let project = canonical_project();
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
+
+    let result = search_symbols(
+        &analyzer,
+        SearchSymbolsParams {
+            patterns: vec!["TestListRun".to_string()],
+            include_tests: true,
+            limit: 10,
+        },
+    );
+
+    let symbols: std::collections::BTreeSet<String> = result
+        .files
+        .iter()
+        .flat_map(|file| file.functions.iter().map(|hit| hit.symbol.clone()))
+        .collect();
+
+    assert!(
+        symbols.contains("example.com/repo/a/list.TestListRun"),
+        "{symbols:#?}"
+    );
+    assert!(
+        symbols.contains("example.com/repo/b/list.TestListRun"),
+        "{symbols:#?}"
+    );
+    assert!(
+        !symbols.contains("list.TestListRun"),
+        "canonical output must not emit the bare package name: {symbols:#?}"
+    );
+}
+
+#[test]
+fn get_symbol_sources_resolves_exact_canonical_and_flags_bare_ambiguity() {
+    let project = canonical_project();
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
+
+    let exact = get_symbol_sources(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["example.com/repo/a/list.TestListRun".to_string()],
+        },
+    );
+    assert!(exact.not_found.is_empty(), "{exact:#?}");
+    assert!(exact.ambiguous.is_empty(), "{exact:#?}");
+    assert_eq!(1, exact.sources.len(), "{exact:#?}");
+
+    let bare = get_symbol_sources(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["list.TestListRun".to_string()],
+        },
+    );
+    assert_eq!(1, bare.ambiguous.len(), "{bare:#?}");
+    let matches: std::collections::BTreeSet<String> =
+        bare.ambiguous[0].matches.iter().cloned().collect();
+    assert!(
+        matches.contains("example.com/repo/a/list.TestListRun")
+            && matches.contains("example.com/repo/b/list.TestListRun"),
+        "ambiguity matches must be canonical: {matches:#?}"
+    );
+}
+
+#[test]
+fn get_symbol_sources_normalizes_go_receiver_selectors() {
+    let project = canonical_project();
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
+
+    for symbol in [
+        "(*ChainCache[T]).Set",
+        "(c *ChainCache[T]) Set",
+        "example.com/repo/cache.(*LoadableCache).Get",
+        "(p *Pair[A, B]) Swap",
+    ] {
+        let result = get_symbol_sources(
+            &analyzer,
+            SymbolLookupParams {
+                symbols: vec![symbol.to_string()],
+            },
+        );
+
+        assert!(result.not_found.is_empty(), "{symbol}: {result:#?}");
+        assert!(result.ambiguous.is_empty(), "{symbol}: {result:#?}");
+        assert_eq!(1, result.sources.len(), "{symbol}: {result:#?}");
+        assert_eq!("cache/cache.go", result.sources[0].path, "{symbol}");
+    }
+}
+
+#[test]
+fn get_symbol_sources_renders_complete_go_type_declarations() {
+    let project = canonical_project();
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
+
+    for (symbol, expected_text, expected_start_line) in [
+        (
+            "example.com/repo/a/srv.Server",
+            "// Server serves requests.\ntype Server struct{}",
+            2,
+        ),
+        (
+            "example.com/repo/cache.Reader",
+            "// Reader reads bytes.\ntype Reader interface { Read() error }",
+            9,
+        ),
+    ] {
+        let result = get_symbol_sources(
+            &analyzer,
+            SymbolLookupParams {
+                symbols: vec![symbol.to_string()],
+            },
+        );
+
+        assert!(result.not_found.is_empty(), "{symbol}: {result:#?}");
+        assert!(result.ambiguous.is_empty(), "{symbol}: {result:#?}");
+        assert_eq!(1, result.sources.len(), "{symbol}: {result:#?}");
+        assert_eq!(
+            expected_start_line, result.sources[0].start_line,
+            "{symbol}"
+        );
+        assert_eq!(expected_text, result.sources[0].text, "{symbol}");
+
+        let code_unit = analyzer
+            .get_definitions(symbol)
+            .into_iter()
+            .next()
+            .expect("test symbol should resolve");
+        assert_eq!(
+            expected_text,
+            analyzer
+                .get_source(&code_unit, true)
+                .expect("source should render"),
+            "{symbol}"
+        );
+    }
+}
+
+#[test]
+fn get_symbol_locations_uses_canonical_suffix_without_losing_ambiguity() {
+    let project = canonical_project();
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
+
+    let exact = get_symbol_locations(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["example.com/repo/a/list.Run".to_string()],
+        },
+    );
+    assert!(exact.not_found.is_empty(), "{exact:#?}");
+    assert_eq!(1, exact.locations.len(), "{exact:#?}");
+    assert_eq!("example.com/repo/a/list.Run", exact.locations[0].symbol);
+
+    let bare = get_symbol_locations(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["list.Run".to_string()],
+        },
+    );
+    assert_eq!(
+        vec!["list.Run".to_string()],
+        bare.not_found
+            .iter()
+            .map(|item| item.input.clone())
+            .collect::<Vec<_>>(),
+        "ambiguous bare suffix must not collapse to one location: {bare:#?}"
+    );
+    assert!(bare.locations.is_empty(), "{bare:#?}");
+}
+
+#[test]
+fn get_symbol_locations_resolves_unique_short_go_suffix() {
+    let project = canonical_project();
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
+
+    let result = get_symbol_locations(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["gin.New".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert_eq!(1, result.locations.len(), "{result:#?}");
+    assert_eq!("example.com/repo/gin.New", result.locations[0].symbol);
+}
+
+#[test]
+fn get_symbol_locations_prefers_full_match_over_suffix_sibling() {
+    let project = canonical_project();
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
+
+    let result = get_symbol_locations(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["Server.New".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert_eq!(1, result.locations.len(), "{result:#?}");
+    assert_eq!(
+        "example.com/repo/a/srv.Server.New",
+        result.locations[0].symbol
+    );
+}
+
+#[test]
+fn scan_usages_resolves_canonical_and_flags_bare_ambiguity() {
+    let project = canonical_project();
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
+
+    let canonical = scan_usages_by_reference(
+        &analyzer,
+        ScanUsagesByReferenceParams {
+            symbols: vec!["example.com/repo/a/list.Run".to_string()],
+            include_tests: true,
+            paths: None,
+            include_same_owner: false,
+            max_duration_secs: None,
+        },
+    );
+    assert_eq!(1, canonical.results.len(), "{canonical:#?}");
+    assert_eq!(ScanUsagesStatus::Found, canonical.results[0].status);
+    assert!(
+        canonical.results[0]
+            .files
+            .iter()
+            .any(|file| file.path == "consumer/main.go"),
+        "{canonical:#?}"
+    );
+
+    let bare = scan_usages_by_reference(
+        &analyzer,
+        ScanUsagesByReferenceParams {
+            symbols: vec!["list.Run".to_string()],
+            include_tests: true,
+            paths: None,
+            include_same_owner: false,
+            max_duration_secs: None,
+        },
+    );
+    assert_eq!(1, bare.results.len(), "{bare:#?}");
+    assert_eq!(ScanUsagesStatus::Ambiguous, bare.results[0].status);
+    let targets: std::collections::BTreeSet<String> =
+        bare.results[0].candidate_targets.iter().cloned().collect();
+    assert!(
+        targets.contains("example.com/repo/a/list.Run")
+            && targets.contains("example.com/repo/b/list.Run"),
+        "candidate targets must be canonical: {targets:#?}"
+    );
+}
+
+#[test]
+fn imports_resolve_to_the_exact_canonical_package() {
+    let project = canonical_project();
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
+    let consumer = ProjectFile::new(project.root().to_path_buf(), "consumer/main.go");
+
+    let resolved = analyzer.imported_code_units_of(&consumer);
+    assert!(
+        resolved
+            .iter()
+            .any(|cu| cu.package_name() == "example.com/repo/a/list" && cu.identifier() == "Run"),
+        "{resolved:#?}"
+    );
+    assert!(
+        !resolved
+            .iter()
+            .any(|cu| cu.package_name() == "example.com/repo/b/list"),
+        "import of a/list must not pull in the same-named b/list: {resolved:#?}"
+    );
+}
+
+#[test]
+fn definition_lookup_resolves_sibling_module_package_clause_without_workspace_hydration() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("app/go.mod", "module example.com/app\n")
+        .file(
+            "app/main.go",
+            "package main\nimport \"example.com/application\"\nfunc Run() { views.Draw() }\n",
+        )
+        // This path would be selected by an unbounded `example.com/app`
+        // prefix match for the `example.com/application` import.
+        .file("app/lication/wrong.go", "package wrong\nfunc Draw() {}\n")
+        .file("application/go.mod", "module example.com/application\n")
+        .file("application/render.go", "package views\nfunc Draw() {}\n")
+        .build();
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
+    analyzer.reset_full_hydration_count_for_test();
+
+    for _ in 0..2 {
+        let result = get_definitions_by_location(
+            &analyzer,
+            GetDefinitionParams {
+                references: vec![DefinitionReferenceQuery {
+                    path: "app/main.go".to_string(),
+                    line: Some(3),
+                    column: Some(20),
+                }],
+            },
+        );
+        assert_eq!(result.results[0].status, "resolved", "{result:#?}");
+        assert_eq!(
+            result.results[0].definitions[0].fqn.as_deref(),
+            Some("example.com/application.Draw"),
+            "{result:#?}"
+        );
+        assert_eq!(
+            result.results[0].definitions[0].path, "application/render.go",
+            "{result:#?}"
+        );
+    }
+
+    assert_eq!(analyzer.workspace_path_index_build_count_for_test(), 1);
+    assert_eq!(
+        analyzer.full_hydration_count_for_test(),
+        0,
+        "definition lookup should read package metadata without hydrating file states"
+    );
+}
+
+#[test]
+fn list_symbols_keeps_bare_identifiers_with_canonical_group_header() {
+    let project = canonical_project();
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
+    let file = ProjectFile::new(project.root().to_path_buf(), "a/list/list.go");
+
+    let outline = analyzer.list_symbols(&file);
+    assert!(
+        outline.contains("- Run"),
+        "outline must list the bare identifier: {outline}"
+    );
+    assert!(
+        outline.contains("# example.com/repo/a/list"),
+        "group header should carry the canonical import path: {outline}"
+    );
+}

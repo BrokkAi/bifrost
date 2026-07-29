@@ -1575,6 +1575,13 @@ fn tool_arguments(target: &BenchmarkRepoTarget, scenario: BenchmarkScenario) -> 
         BenchmarkScenario::ScanUsages => {
             let mut args = json!({
                 "include_tests": true,
+                // A benchmark establishes whether the resolver can discover a
+                // real call site, rather than whether that site is external to
+                // its declaring type. Ask the structured scan to return the
+                // separately classified self/own-type sites so a same-owner-only
+                // target (such as FastRoute::RouteCollector::addRoute) remains a
+                // valid resolver regression probe.
+                "include_same_owner": true,
                 // The regular benchmark is a compatibility and performance
                 // comparison, not an interactive request. It needs a complete
                 // result so it can compare semantics with the blessed baseline.
@@ -1770,6 +1777,11 @@ fn assert_scenario_result(
                     || entry["files"]
                         .as_array()
                         .is_some_and(|files| !files.is_empty()))
+                    || entry["status"].as_str() == Some("no_external_usages")
+                        && (entry["same_owner_sites"].as_u64().unwrap_or(0) > 0
+                            || entry["same_owner_files"]
+                                .as_array()
+                                .is_some_and(|files| !files.is_empty()))
             });
             if !has_hits {
                 if structured["summary"]["partial"].as_bool() == Some(true) {
@@ -2065,6 +2077,66 @@ mod issue_1228_tests {
         assert!(
             assert_scenario_result(&target, BenchmarkScenario::ScanUsages, &result).is_ok(),
             "the scenario verifies discoverable call sites, not exhaustive rendering"
+        );
+    }
+
+    #[test]
+    fn benchmark_scan_requests_and_accepts_same_owner_callsite_evidence() {
+        let target: BenchmarkRepoTarget = serde_json::from_value(json!({
+            "name": "fastroute-shaped",
+            "url": "https://example.invalid/fastroute-shaped",
+            "commit": "deadbeef",
+            "languages": ["php"],
+            "scenarios": ["scan_usages"],
+            "usage_symbols": ["FastRoute.RouteCollector.addRoute"]
+        }))
+        .expect("minimal benchmark target");
+
+        let arguments = tool_arguments(&target, BenchmarkScenario::ScanUsages);
+        assert_eq!(arguments["include_same_owner"], Value::Bool(true));
+
+        let result = json!({
+            "structuredContent": {
+                "summary": { "partial": false },
+                "results": [{
+                    "status": "no_external_usages",
+                    "total_hits": 0,
+                    "same_owner_sites": 2,
+                    "same_owner_files": [{ "path": "src/RouteCollector.php", "hits": [{}] }]
+                }]
+            }
+        });
+        assert!(
+            assert_scenario_result(&target, BenchmarkScenario::ScanUsages, &result).is_ok(),
+            "a classified same-owner call site is still structured resolver evidence"
+        );
+    }
+
+    #[test]
+    fn benchmark_scan_rejects_empty_same_owner_status() {
+        let target: BenchmarkRepoTarget = serde_json::from_value(json!({
+            "name": "same-owner-near-miss",
+            "url": "https://example.invalid/same-owner-near-miss",
+            "commit": "deadbeef",
+            "languages": [],
+            "scenarios": []
+        }))
+        .expect("minimal benchmark target");
+        let result = json!({
+            "structuredContent": {
+                "summary": { "partial": false },
+                "results": [{
+                    "status": "no_external_usages",
+                    "total_hits": 0,
+                    "same_owner_sites": 0,
+                    "same_owner_files": []
+                }]
+            }
+        });
+
+        assert!(
+            assert_scenario_result(&target, BenchmarkScenario::ScanUsages, &result).is_err(),
+            "status alone is not call-site evidence"
         );
     }
 

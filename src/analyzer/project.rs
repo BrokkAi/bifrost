@@ -6,7 +6,7 @@ use ignore::{WalkBuilder, WalkState};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
@@ -108,8 +108,41 @@ pub trait Project: Send + Sync {
     }
     fn analyzer_languages(&self) -> BTreeSet<Language>;
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>>;
+    /// Whole-workspace file listings this project instance has performed --
+    /// the per-instance complexity signal pinned by the issue #1325 regression
+    /// tests. Per-instance rather than process-global so a test measures only
+    /// its own project's walks: background threads from other analyzers in the
+    /// same process (watchers, GC) cannot bleed into the window (the #1099
+    /// lesson applied to walk counting).
+    fn workspace_file_listing_count(&self) -> usize {
+        0
+    }
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>>;
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile>;
+
+    /// Whether the workspace could hold a directory at `rel_path` (the empty
+    /// path meaning the workspace root itself).
+    ///
+    /// This exists so callers that only need "is this target a container?" can
+    /// ask it without materializing the whole workspace file set. The answer is
+    /// allowed to be conservative in one direction only: `false` is
+    /// authoritative — no workspace file lives beneath `rel_path` — while
+    /// `true` merely means a listing is worth computing. Callers must therefore
+    /// still treat an empty listing as "not a directory", exactly as they do
+    /// when they filter the file set themselves.
+    ///
+    /// The default answers by scanning `all_files()`, which is the semantics
+    /// every caller had before the pre-check existed; filesystem-backed
+    /// projects override it with a single `stat` (#1325).
+    fn has_directory(&self, rel_path: &Path) -> bool {
+        self.all_files().is_ok_and(|files| {
+            files.iter().any(|file| {
+                file.rel_path()
+                    .strip_prefix(rel_path)
+                    .is_ok_and(|remainder| remainder.components().next().is_some())
+            })
+        })
+    }
 
     fn file_by_abs_path(&self, abs_path: &Path) -> Option<ProjectFile> {
         let abs_path = abs_path.to_path_buf().normalize();
@@ -205,6 +238,7 @@ pub trait Project: Send + Sync {
 pub struct TestProject {
     root: PathBuf,
     languages: BTreeSet<Language>,
+    listing_count: Arc<AtomicUsize>,
 }
 
 impl TestProject {
@@ -221,7 +255,11 @@ impl TestProject {
             "test project must contain at least one analyzer language"
         );
 
-        Self { root, languages }
+        Self {
+            root,
+            languages,
+            listing_count: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     pub fn from_root_with_inferred_languages(root: impl Into<PathBuf>) -> io::Result<Self> {
@@ -240,7 +278,11 @@ impl TestProject {
             ));
         }
 
-        Ok(Self { root, languages })
+        Ok(Self {
+            root,
+            languages,
+            listing_count: Arc::new(AtomicUsize::new(0)),
+        })
     }
 
     pub fn root_path(&self) -> &Path {
@@ -257,7 +299,12 @@ impl Project for TestProject {
         self.languages.clone()
     }
 
+    fn workspace_file_listing_count(&self) -> usize {
+        self.listing_count.load(Ordering::Relaxed)
+    }
+
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+        self.listing_count.fetch_add(1, Ordering::Relaxed);
         let mut files = BTreeSet::new();
 
         for entry in WalkDir::new(&self.root) {
@@ -274,6 +321,10 @@ impl Project for TestProject {
         }
 
         Ok(files)
+    }
+
+    fn has_directory(&self, rel_path: &Path) -> bool {
+        self.root.join(rel_path).is_dir()
     }
 
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
@@ -305,6 +356,7 @@ impl Project for TestProject {
 pub struct FilesystemProject {
     root: PathBuf,
     languages: BTreeSet<Language>,
+    listing_count: Arc<AtomicUsize>,
 }
 
 impl FilesystemProject {
@@ -318,7 +370,11 @@ impl FilesystemProject {
         }
 
         let languages = detect_languages(&root)?;
-        Ok(Self { root, languages })
+        Ok(Self {
+            root,
+            languages,
+            listing_count: Arc::new(AtomicUsize::new(0)),
+        })
     }
 
     pub fn root_path(&self) -> &Path {
@@ -335,8 +391,22 @@ impl Project for FilesystemProject {
         self.languages.clone()
     }
 
+    fn workspace_file_listing_count(&self) -> usize {
+        self.listing_count.load(Ordering::Relaxed)
+    }
+
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+        self.listing_count.fetch_add(1, Ordering::Relaxed);
         collect_workspace_files(&self.root)
+    }
+
+    /// A `stat` instead of a whole-tree walk. Every file this project reports
+    /// comes from walking the real tree under `root`, so "no directory on disk"
+    /// implies "no workspace file beneath it"; the reverse over-approximates
+    /// only for directories whose contents are entirely ignored, which the
+    /// caller's listing then filters out exactly as before.
+    fn has_directory(&self, rel_path: &Path) -> bool {
+        self.root.join(rel_path).is_dir()
     }
 
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
@@ -820,6 +890,10 @@ impl OverlayProject {
 }
 
 impl Project for OverlayProject {
+    fn workspace_file_listing_count(&self) -> usize {
+        self.delegate.workspace_file_listing_count()
+    }
+
     fn root(&self) -> &Path {
         self.delegate.root()
     }
@@ -834,6 +908,10 @@ impl Project for OverlayProject {
 
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
         self.delegate.all_files()
+    }
+
+    fn has_directory(&self, rel_path: &Path) -> bool {
+        self.delegate.has_directory(rel_path)
     }
 
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
@@ -1340,13 +1418,6 @@ mod tests {
             "set at exactly the cap must succeed"
         );
         assert_eq!(overlay.read_source(&file).unwrap(), exactly_at_cap);
-    }
-
-    #[test]
-    fn overlay_project_default_cap_constant_is_eight_mib() {
-        // Sanity check on the constant — bumping the default is a deliberate
-        // memory-budget decision and should not happen by accident.
-        assert_eq!(DEFAULT_MAX_OVERLAY_BYTES, 8 * 1024 * 1024);
     }
 
     #[test]

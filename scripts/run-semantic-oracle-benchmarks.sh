@@ -83,8 +83,8 @@ for round in 0 1 2 3 4 5 6; do
     printf 'semantic oracle benchmark: round %s/6\n' "$round" >&2
     if ! BIFROST_SEMANTIC_ORACLE_BENCH_ROUND=$round \
         BIFROST_SEMANTIC_INDEX=off \
-        cargo test --release --test measure_semantic_oracles \
-            semantic_oracle_lifecycle_measurement -- --ignored --nocapture \
+        cargo test --release --test suite_semantic \
+            measure_semantic_oracles::semantic_oracle_lifecycle_measurement -- --ignored --nocapture \
             >"$log_file" 2>&1; then
         tail -n 240 "$log_file" >&2
         exit 1

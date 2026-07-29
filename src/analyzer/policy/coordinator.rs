@@ -818,7 +818,10 @@ fn open_policy_workspace_root(
 fn check_policy_cancellation(
     cancellation: Option<&CancellationToken>,
 ) -> Result<(), PolicyCoordinatorError> {
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+    if let Some(cancellation) = cancellation
+        && cancellation.is_cancelled()
+        && !cancellation.is_timed_out()
+    {
         return Err(PolicyCoordinatorError::new("policy evaluation cancelled"));
     }
     Ok(())
@@ -1551,6 +1554,59 @@ mod tests {
         };
 
         assert_eq!(error.to_string(), "policy evaluation cancelled");
+    }
+
+    #[test]
+    fn issue_1306_timed_out_policy_source_returns_a_canonical_incomplete_report() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("app.ts"), "export const value = 1;\n")
+            .expect("source fixture");
+        let project = FilesystemProject::new(workspace.path().to_path_buf()).expect("project");
+        let project: Arc<dyn Project> = Arc::new(project);
+        let analyzer = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let cancellation = CancellationToken::default().with_timeout(std::time::Duration::ZERO);
+
+        let outcome = evaluate_policy_source(
+            workspace.path(),
+            PolicySourceIdentity::new("policies/live.rqlp"),
+            &match_policy("test.timed-out", "Timed out"),
+            &analyzer,
+            &evaluation_options(),
+            Some(&cancellation),
+        )
+        .expect("request deadline should retain a canonical policy report");
+
+        assert_eq!(outcome.exit_status(), POLICY_EXIT_UNRELIABLE);
+        assert!(outcome.report().diagnostics().is_empty());
+        assert!(matches!(
+            outcome.report().runs()[0].completion(),
+            PolicyRunCompletion::Inconclusive { reasons }
+                if reasons.contains(&crate::analyzer::policy::PolicyIncompleteReason::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn issue_1306_deadline_racing_client_cancellation_keeps_the_canonical_report() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("app.ts"), "export const value = 1;\n")
+            .expect("source fixture");
+        let project = FilesystemProject::new(workspace.path().to_path_buf()).expect("project");
+        let project: Arc<dyn Project> = Arc::new(project);
+        let analyzer = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let cancellation = CancellationToken::default().with_timeout(std::time::Duration::ZERO);
+        cancellation.cancel();
+
+        let outcome = evaluate_policy_source(
+            workspace.path(),
+            PolicySourceIdentity::new("policies/live.rqlp"),
+            &match_policy("test.deadline-race", "Deadline race"),
+            &analyzer,
+            &evaluation_options(),
+            Some(&cancellation),
+        )
+        .expect("an expired deadline must not become a cancellation error");
+
+        assert_eq!(outcome.exit_status(), POLICY_EXIT_UNRELIABLE);
     }
 
     #[test]

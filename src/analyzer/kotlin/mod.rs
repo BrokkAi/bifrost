@@ -1,35 +1,86 @@
-//! Kotlin analyzer: core parsing, declaration indexing, and persistence
-//! (issue #1236).
+//! Kotlin analyzer: parsing, declaration indexing, persistence, and name
+//! resolution.
 //!
 //! `KotlinAnalyzer` is a thin wrapper over the shared
 //! [`TreeSitterAnalyzer`] engine: file enumeration, incremental updates,
 //! persisted store round-trips, and every declaration-oriented query delegate
 //! to the engine, with Kotlin-specific behavior isolated in
-//! [`adapter::KotlinAdapter`] and [`declarations`].
+//! [`adapter::KotlinAdapter`] and [`declarations`] (issue #1236).
+//!
+//! Name resolution is split across [`imports`] (structured import facts and
+//! the file relationships they create), [`supertypes`] (what a class-like
+//! declaration extends), [`types`] (the resolution ladder), and [`hierarchy`]
+//! (ancestors and descendants). Kotlin also joins the shared JVM realm here:
+//! it reads the same jar-backed dependency index Java and Scala use, and
+//! `MultiAnalyzer` widens its import and hierarchy resolution across Java and
+//! Scala sources through `crate::analyzer::jvm::realm` (issue #1237).
+//!
+//! Deliberate boundaries within Kotlin/JVM name resolution: Kotlin/JS and
+//! Kotlin/Native default imports are not modelled, `expect`/`actual` pairs are
+//! indexed as ordinary declarations with no link asserted between them, and a
+//! type reachable only through an unconfigured classpath stays explicitly
+//! unknown.
 //!
 //! Capabilities owned by sibling issues stay explicitly unsupported here:
-//! structured imports and type hierarchy (#1237), definition navigation
-//! (#1238), usage graphs (#1239), structural RQL (#1240), and CFG/semantic
-//! lowering (#1241 — the analyzer delegate hands out the shared
-//! `UnsupportedProgramSemantics` provider instead of lowering).
+//! definition navigation (#1238), usage graphs (#1239 — Kotlin is a member of
+//! the shared JVM usage-candidate realm but has no edge builder yet),
+//! structural RQL (#1240), and CFG/semantic lowering (#1241 — the analyzer
+//! delegate hands out the shared `UnsupportedProgramSemantics` provider
+//! instead of lowering).
 
 mod adapter;
 pub(crate) mod declarations;
+mod hierarchy;
+pub(crate) mod imports;
 pub(crate) mod language;
+mod supertypes;
+pub(crate) mod types;
 
+use crate::analyzer::js_ts::cache::{
+    build_weighted_cache, weight_code_unit_set, weight_code_unit_vec_by_unit,
+    weight_project_file_set,
+};
+use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
+use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
+use crate::analyzer::pool_memo::PoolSafeMemo;
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer, Language, Project,
-    ProjectFile, SemanticDiagnostic, SignatureMetadata, TreeSitterAnalyzer, TypeAliasProvider,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer,
+    ImportAnalysisProvider, JvmAnalyzerConfig, Language, Project, ProjectFile, SemanticDiagnostic,
+    SignatureMetadata, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
     UsageFactsIndex,
 };
+use crate::hash::{HashMap, HashSet};
+use moka::sync::Cache;
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub(crate) use adapter::KotlinAdapter;
 
 #[derive(Clone)]
 pub struct KotlinAnalyzer {
     inner: TreeSitterAnalyzer<KotlinAdapter>,
+    /// Kotlin's share of the JVM dependency realm: the same jar-backed index
+    /// Java and Scala consult, built from the same discovered Maven/Gradle
+    /// artifacts. Built lazily because opening jars is expensive and many
+    /// workspaces never ask a question that needs it.
+    jvm_config: JvmAnalyzerConfig,
+    external_index: Arc<OnceLock<JvmExternalDeclarationIndex>>,
+    memo_budget: u64,
+    imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
+    /// Import and hierarchy answers computed with the whole JVM source realm
+    /// in view. Kept apart from the Kotlin-only caches above because they
+    /// answer a strictly wider question: serving one for the other would
+    /// silently drop, or invent, cross-language results.
+    realm_imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
+    referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
+    reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    same_package_reference_index:
+        Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    top_level_declarations_by_package: Arc<OnceLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
+    direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
+    realm_direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
+    direct_descendant_index: Arc<OnceLock<crate::analyzer::DirectDescendantIndex>>,
+    realm_direct_descendant_index: Arc<OnceLock<crate::analyzer::DirectDescendantIndex>>,
 }
 
 crate::analyzer::impl_forward_query_provider!(KotlinAnalyzer);
@@ -40,8 +91,35 @@ impl KotlinAnalyzer {
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
+        let jvm_config = config.jvm.clone();
+        let inner = TreeSitterAnalyzer::new_with_config(project, KotlinAdapter, config);
+        Self::from_inner(inner, memo_budget, jvm_config)
+    }
+
+    fn from_inner(
+        inner: TreeSitterAnalyzer<KotlinAdapter>,
+        memo_budget: u64,
+        jvm_config: JvmAnalyzerConfig,
+    ) -> Self {
         Self {
-            inner: TreeSitterAnalyzer::new_with_config(project, KotlinAdapter, config),
+            inner,
+            jvm_config,
+            external_index: Arc::new(OnceLock::new()),
+            memo_budget,
+            imported_code_units: build_weighted_cache(memo_budget / 8, weight_code_unit_set),
+            realm_imported_code_units: build_weighted_cache(memo_budget / 8, weight_code_unit_set),
+            referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
+            reverse_import_index: Arc::new(PoolSafeMemo::new()),
+            same_package_reference_index: Arc::new(PoolSafeMemo::new()),
+            top_level_declarations_by_package: Arc::new(OnceLock::new()),
+            direct_ancestors: build_weighted_cache(memo_budget / 16, weight_code_unit_vec_by_unit),
+            realm_direct_ancestors: build_weighted_cache(
+                memo_budget / 16,
+                weight_code_unit_vec_by_unit,
+            ),
+            direct_descendant_index: Arc::new(OnceLock::new()),
+            realm_direct_descendant_index: Arc::new(OnceLock::new()),
         }
     }
 
@@ -58,21 +136,33 @@ impl KotlinAnalyzer {
         store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
     ) -> Result<Self, crate::analyzer::store::StoreError> {
-        Ok(Self {
-            inner: TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
-                project,
-                KotlinAdapter,
-                config,
-                store_context,
-                progress,
-            )?,
-        })
+        let memo_budget = config.memo_cache_budget_bytes();
+        let jvm_config = config.jvm.clone();
+        let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+            project,
+            KotlinAdapter,
+            config,
+            store_context,
+            progress,
+        )?;
+        Ok(Self::from_inner(inner, memo_budget, jvm_config))
     }
 
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
-        Self {
-            inner: self.inner.clone_with_project(project),
-        }
+        // A different project root means different files and a different
+        // classpath, so nothing derived from either survives the move.
+        Self::from_inner(
+            self.inner.clone_with_project(project),
+            self.memo_budget,
+            self.jvm_config.clone(),
+        )
+    }
+
+    /// Kotlin's view of the shared JVM dependency realm.
+    pub(crate) fn external_declaration_index(&self) -> &JvmExternalDeclarationIndex {
+        self.external_index.get_or_init(|| {
+            JvmExternalDeclarationIndex::build_for_project(&self.jvm_config, self.inner.project())
+        })
     }
 }
 
@@ -237,22 +327,44 @@ impl IAnalyzer for KotlinAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        Self {
-            inner: self.inner.update(changed_files),
+        // Every import- and package-derived index is rebuilt from the new
+        // generation: an edit anywhere can add, remove, or rename a
+        // declaration that some other file's import resolves to.
+        let mut updated = Self::from_inner(
+            self.inner.update(changed_files),
+            self.memo_budget,
+            self.jvm_config.clone(),
+        );
+        // A touched build manifest can add or drop dependencies, so the
+        // jar-backed index is discarded and rebuilt on demand; every other
+        // edit leaves the classpath alone and the existing index stands.
+        if !changed_files.iter().any(is_jvm_dependency_input) {
+            updated.external_index = Arc::clone(&self.external_index);
         }
+        updated
     }
 
     fn update_all(&self) -> Self {
-        Self {
-            inner: self.inner.update_all(),
-        }
+        Self::from_inner(
+            self.inner.update_all(),
+            self.memo_budget,
+            self.jvm_config.clone(),
+        )
     }
 
     fn project(&self) -> &dyn Project {
         self.inner.project()
     }
 
+    fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
+        Some(self)
+    }
+
     fn type_alias_provider(&self) -> Option<&dyn TypeAliasProvider> {
+        Some(self)
+    }
+
+    fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
         Some(self)
     }
 

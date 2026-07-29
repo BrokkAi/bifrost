@@ -100,8 +100,8 @@ for dataset in "${datasets[@]}"; do
         if ! BIFROST_DATAFLOW_LIFECYCLE_DATASET=$dataset \
             BIFROST_DATAFLOW_LIFECYCLE_ROUND=$round \
             BIFROST_SEMANTIC_INDEX=off \
-            cargo test --locked --release --test measure_dataflow_lifecycle \
-                dataflow_lifecycle_measurement -- --ignored --nocapture \
+            cargo test --locked --release --test suite_semantic \
+                measure_dataflow_lifecycle::dataflow_lifecycle_measurement -- --ignored --nocapture \
                 >"$log_file" 2>&1; then
             tail -n 240 "$log_file" >&2
             exit 1
@@ -116,8 +116,8 @@ done
 aggregate_log="$work_dir/aggregate.log"
 if ! BIFROST_DATAFLOW_LIFECYCLE_SAMPLES_FILE=$samples_file \
     BIFROST_SEMANTIC_INDEX=off \
-    cargo test --locked --release --test measure_dataflow_lifecycle \
-        dataflow_lifecycle_measurement -- --ignored --nocapture \
+    cargo test --locked --release --test suite_semantic \
+        measure_dataflow_lifecycle::dataflow_lifecycle_measurement -- --ignored --nocapture \
         >"$aggregate_log" 2>&1; then
     tail -n 240 "$aggregate_log" >&2
     exit 1

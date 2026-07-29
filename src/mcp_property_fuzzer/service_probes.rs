@@ -1024,7 +1024,7 @@ fn execute_probes(
 ) {
     // Owned work items: workers never borrow the probe slice, which keeps the
     // borrow story trivial and lets the calling thread apply results.
-    let work: Vec<(usize, &'static str, Value, bool)> = probes
+    let work: Vec<(usize, &'static str, Value, bool, String)> = probes
         .iter()
         .enumerate()
         .filter(|(_, probe)| probe.outcome.is_none())
@@ -1035,9 +1035,11 @@ fn execute_probes(
                 probe.arguments.clone(),
                 // Scans are the expensive calls; they run single-mode.
                 !matches!(probe.kind, ProbeKind::Scan { .. }),
+                probe.id.clone(),
             )
         })
         .collect();
+    let trace = std::env::var_os("BIFROST_FUZZER_PROBE_TRACE").is_some();
     if work.is_empty() {
         return;
     }
@@ -1052,9 +1054,13 @@ fn execute_probes(
             scope.spawn(move || {
                 loop {
                     let claim = next.fetch_add(1, Ordering::Relaxed);
-                    let Some((index, tool, arguments, run_mode_b)) = work.get(claim) else {
+                    let Some((index, tool, arguments, run_mode_b, probe_id)) = work.get(claim)
+                    else {
                         break;
                     };
+                    if trace {
+                        eprintln!("[probe-start] {tool} {probe_id}");
+                    }
                     let started = Instant::now();
                     let mut outcome = call_tool(service, tool, arguments, true);
                     let compared_modes =
@@ -1068,6 +1074,9 @@ fn execute_probes(
                             structured_of(call_tool(service, tool, arguments, false));
                     }
                     let elapsed_ms = started.elapsed().as_millis() as u64;
+                    if trace {
+                        eprintln!("[probe-done] {elapsed_ms}ms {tool} {probe_id}");
+                    }
                     if sender
                         .send((*index, outcome, compared_modes, elapsed_ms))
                         .is_err()

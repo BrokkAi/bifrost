@@ -154,9 +154,7 @@ pub(crate) fn symbol_source_candidate_files(
         .filter(|symbol| !symbol.is_empty())
     {
         let (mut anchor, mut lookup) =
-            match split_definition_selector_with_resolver(symbol, |anchor| {
-                matches!(resolver.resolve_literal(anchor), ResolvedFileInput::File(_))
-            }) {
+            match split_definition_selector_with_workspace_files(&resolver, symbol) {
                 DefinitionSelector::Name(name) => (None, name),
                 DefinitionSelector::FileAnchored { anchor, lookup } => {
                     if let ResolvedFileInput::File(file) = resolver.resolve_literal(&anchor) {
@@ -272,12 +270,7 @@ pub fn get_symbol_sources(
         .enumerate()
         .map(|(index, symbol)| {
             let file_anchored = matches!(
-                split_definition_selector_with_resolver(&symbol, |anchor| {
-                    matches!(
-                        WorkspaceFileResolver::new(analyzer.project()).resolve_literal(anchor),
-                        ResolvedFileInput::File(_)
-                    )
-                }),
+                split_workspace_definition_selector(analyzer, &symbol),
                 DefinitionSelector::FileAnchored { .. }
             );
             // Exact fully-qualified lookup wins before file patterns, so a
@@ -305,13 +298,7 @@ pub fn get_symbol_sources(
                 }
                 SelectableDefinitionResolution::NotFound(_) => {
                     if let DefinitionSelector::FileAnchored { anchor, lookup } =
-                        split_definition_selector_with_resolver(&symbol, |anchor| {
-                            matches!(
-                                WorkspaceFileResolver::new(analyzer.project())
-                                    .resolve_literal(anchor),
-                                ResolvedFileInput::File(_)
-                            )
-                        })
+                        split_workspace_definition_selector(analyzer, &symbol)
                     {
                         let generated =
                             java_generated_accessor_source_blocks(analyzer, lookup, Some(&anchor));
@@ -389,16 +376,18 @@ pub fn get_symbol_sources(
                 };
             }
 
-            if looks_like_file_target(&symbol) {
-                if let Some(item) = unsupported_selector_shape_not_found_input(analyzer, &symbol) {
-                    return (index, SourceLookupOutcome::NotFound(item));
-                }
-                return (
-                    index,
-                    SourceLookupOutcome::NotFound(file_not_found_input(symbol)),
-                );
-            }
-
+            // File *shape* only decides how an unresolvable target is
+            // reported; it must never gate symbol resolution. A real member
+            // name can end in a segment that also spells a file extension --
+            // Autofac's `Autofac.Builder.MetadataConfiguration.Properties`
+            // reads as a `.properties` file to `looks_like_file_target` -- so
+            // short-circuiting here reported "no workspace file matched" for a
+            // symbol that resolves perfectly well, and the strictly more
+            // specific spelling failed where the bare name was ambiguous
+            // (#1196). The file-shaped diagnostics now live in the not-found
+            // arm below, after resolution has had its say; `resolve_file_patterns`
+            // above has already ruled out every real file for this input, so
+            // the file reading is dead by the time we get here anyway.
             match resolve_selectable_definitions(analyzer, &symbol, resolve_codeunit_fuzzy) {
                 SelectableDefinitionResolution::Resolved(code_units) => {
                     let sources = preferred_source_blocks_for_resolved_units(analyzer, &code_units);
@@ -419,8 +408,17 @@ pub fn get_symbol_sources(
                     if !generated.is_empty() {
                         return (index, SourceLookupOutcome::Found(generated));
                     }
-                    let target = unsupported_selector_shape_not_found_input(analyzer, &symbol)
-                        .unwrap_or(target);
+                    if let Some(item) =
+                        unsupported_selector_shape_not_found_input(analyzer, &symbol)
+                    {
+                        return (index, SourceLookupOutcome::NotFound(item));
+                    }
+                    if looks_like_file_target(&symbol) {
+                        return (
+                            index,
+                            SourceLookupOutcome::NotFound(file_not_found_input(symbol)),
+                        );
+                    }
                     (index, SourceLookupOutcome::NotFound(target))
                 }
             }
@@ -782,9 +780,4 @@ pub(super) fn python_expanded_comment_start(source: &str, start_byte: usize) -> 
 
 pub(super) fn line_starts(source: &str) -> Vec<usize> {
     compute_line_starts(source)
-}
-
-#[cfg(test)]
-pub(super) fn split_logical_lines(content: &str) -> Vec<&str> {
-    model_context::logical_lines(content)
 }

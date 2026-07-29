@@ -618,12 +618,7 @@ pub(super) fn resolve_selectable_definitions(
     input: &str,
     resolve: impl Fn(&dyn IAnalyzer, &str) -> CodeUnitResolution,
 ) -> SelectableDefinitionResolution {
-    let selector = split_definition_selector_with_resolver(input, |anchor| {
-        matches!(
-            WorkspaceFileResolver::new(analyzer.project()).resolve_literal(anchor),
-            ResolvedFileInput::File(_)
-        )
-    });
+    let selector = split_workspace_definition_selector(analyzer, input);
     let (mut anchor, mut lookup) = match selector {
         DefinitionSelector::Name(name) => (None, name),
         DefinitionSelector::FileAnchored { anchor, lookup } => (Some(anchor), lookup),
@@ -739,19 +734,50 @@ pub(super) fn capped_ambiguous_symbol(target: &str, mut matches: Vec<String>) ->
 }
 
 /// Split a definition selector into an optional file anchor and the name to
-/// resolve. A plain input (`Anchor`) has no anchor; a file-anchored selector
+/// resolve, checking candidate anchors against the real workspace file set. A
+/// plain input (`Anchor`) has no anchor; a file-anchored selector
 /// (`charts/Anchor.ts#Anchor`), returned in a prior ambiguity result, picks one
 /// of several same-named definitions.
-pub(super) fn split_definition_selector(input: &str) -> DefinitionSelector<'_> {
-    split_definition_selector_with_resolver(input, looks_like_path_selector_anchor)
+///
+/// Every caller must split against the workspace, never against a
+/// shape heuristic: the heuristic accepts an extensionless directory-shaped
+/// prefix as an anchor, so a `#`-bearing *filename* (Autofac's
+/// `…VerifyGeneratedCode#01.verified.cs`) truncated at its first `#` produced a
+/// plausible-looking anchor that names nothing and the real file was never
+/// tried (#1198).
+pub(super) fn split_workspace_definition_selector<'a>(
+    analyzer: &dyn IAnalyzer,
+    input: &'a str,
+) -> DefinitionSelector<'a> {
+    split_definition_selector_with_workspace_files(
+        &WorkspaceFileResolver::new(analyzer.project()),
+        input,
+    )
+}
+
+/// [`split_workspace_definition_selector`] for callers that already hold a
+/// [`WorkspaceFileResolver`] (its basename index is built once per instance).
+pub(super) fn split_definition_selector_with_workspace_files<'a>(
+    resolver: &WorkspaceFileResolver<'_>,
+    input: &'a str,
+) -> DefinitionSelector<'a> {
+    split_definition_selector_with_resolver(input, |anchor| {
+        matches!(resolver.resolve_literal(anchor), ResolvedFileInput::File(_))
+    })
 }
 
 /// File-aware split: `#`-bearing paths (marked's fixture
 /// `bin-config#hash.js`) mean the first `#` is not always the anchor
-/// boundary. Walk every split point and prefer the first whose anchor is a
+/// boundary. Walk every split point and keep the *longest* anchor that names a
 /// real file; fall back to the plain parse when none checks out (the
 /// `file.rs#r#type` raw-identifier case keeps its first-`#` split because
-/// `file.rs` resolves).
+/// `file.rs#r` is not a file while `file.rs` is).
+///
+/// Longest-first matches the rule #1216 settled on for historical
+/// `REV:path#symbol` selectors against the revision tree: when both the short
+/// prefix and the longer `#`-bearing path exist (`a.cs` and `a.cs#x.cs`), the
+/// deeper filename is the one the user spelled out, and the shorter one stays
+/// addressable by simply not typing the extra segment.
 ///
 /// The single-`#` fallback below only re-checks `anchor_is_file` for a
 /// slash-free anchor. A slash (or backslash) is an unambiguous, intentional
@@ -781,12 +807,12 @@ pub(super) fn split_definition_selector(input: &str) -> DefinitionSelector<'_> {
 /// correctly (`DbColumn.r` is not a file), so the heuristic is not yet
 /// redundant. The #1128/#1131 anchor canaries pin this behavior unchanged. See
 /// the M2 Decision Log in `.agents/plans/fqname-interned-segments.md`.
-pub(super) fn split_definition_selector_with_resolver<'a>(
+fn split_definition_selector_with_resolver<'a>(
     input: &'a str,
     anchor_is_file: impl Fn(&str) -> bool,
 ) -> DefinitionSelector<'a> {
     if input.matches('#').count() > 1 {
-        for (index, _) in input.match_indices('#') {
+        for (index, _) in input.match_indices('#').rev() {
             let (anchor, name) = input.split_at(index);
             let name = &name[1..];
             if !anchor.is_empty()
@@ -1023,18 +1049,18 @@ fn cpp_canonical_selectors(
     analyzer: &dyn IAnalyzer,
     units: &[CodeUnit],
 ) -> HashMap<CodeUnit, String> {
-    let mut by_fqn_signature: HashMap<(String, Option<String>), Vec<CodeUnit>> = HashMap::default();
+    let mut by_fqn_signature: HashMap<(String, Vec<String>), Vec<CodeUnit>> = HashMap::default();
     for unit in units {
         if language_for_target(unit) == Language::Cpp && unit.is_callable() {
             by_fqn_signature
-                .entry((unit.fq_name(), unit.signature().map(str::to_string)))
+                .entry((unit.fq_name(), cpp_callable_signature_key(analyzer, unit)))
                 .or_default()
                 .push(unit.clone());
         }
     }
 
     let mut family_by_unit = HashMap::default();
-    let mut families_by_fqn_signature: HashMap<(String, Option<String>), HashSet<String>> =
+    let mut families_by_fqn_signature: HashMap<(String, Vec<String>), HashSet<String>> =
         HashMap::default();
     for ((fqn, signature), members) in &by_fqn_signature {
         for (member, family) in cpp_callable_family_selectors(analyzer, members) {
@@ -1098,6 +1124,21 @@ fn cpp_canonical_selectors(
     out
 }
 
+/// Use the persisted, parameter-bearing signature inventory to distinguish C++
+/// overloads. `CodeUnit::signature` is optional and is absent for declarations
+/// headed by project macros (for example fmt's `FMT_BEGIN_NAMESPACE` headers),
+/// even though the structured index has their signatures. Falling back to the
+/// unit field only preserves the older shapes whose metadata is genuinely
+/// unavailable.
+fn cpp_callable_signature_key(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Vec<String> {
+    let signatures = analyzer.signatures(unit);
+    if signatures.is_empty() {
+        unit.signature().map(str::to_string).into_iter().collect()
+    } else {
+        signatures
+    }
+}
+
 /// Partition resolved overloads into distinct selectable definitions, preserving
 /// first-seen order. Overloads of one symbol share a selector and scan together.
 /// An FQN present in multiple language/file domains is file-anchored in every
@@ -1122,10 +1163,9 @@ pub(super) fn distinct_definitions(
     //     scan_usages) keeps merging their call sites under one selector.
     //
     // The signature key is `IAnalyzer::signatures(unit)` (the parameter-bearing
-    // overload label list), NOT `CodeUnit::signature()`: the latter is `None`
-    // for the top-level functions and classes that reach this grouping, so it
-    // cannot tell an arity overload apart from a twin. `signatures(unit)`
-    // returns distinct labels for overloads (`compute(value: Int)` vs
+    // overload label list), NOT `CodeUnit::signature()`: the latter is absent
+    // for some macro-headed C++ declarations. The structured inventory returns
+    // distinct labels for overloads (`compute(value: Int)` vs
     // `compute(left: Int, right: Int)`) and an identical label (or empty list)
     // for twins/partial parts, which is exactly the discriminator we need.
     //
@@ -1147,9 +1187,7 @@ pub(super) fn distinct_definitions(
             .or_default()
             .insert((language, module_path));
         let signature = if language == Language::Cpp && unit.is_callable() {
-            unit.signature()
-                .map(|signature| vec![signature.to_string()])
-                .unwrap_or_default()
+            cpp_callable_signature_key(analyzer, unit)
         } else {
             analyzer.signatures(unit)
         };

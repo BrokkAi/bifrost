@@ -22,6 +22,7 @@ use crate::{
     file_tools::{
         find_filenames, find_files_containing, get_file_contents, list_files, search_file_contents,
     },
+    path_normalization::NormalizePath,
     profiling,
     searchtools::{
         ActivateWorkspaceParams, ActiveWorkspaceResult, GetActiveWorkspaceParams,
@@ -231,6 +232,7 @@ enum UpdateStrategy {
 
 type WatcherStarter =
     Arc<dyn Fn(Arc<dyn Project>) -> Result<ProjectChangeWatcher, String> + Send + Sync + 'static>;
+type PendingWorkspaceBuild = JoinHandle<Result<(u64, PathBuf, WorkspaceSession), String>>;
 
 fn production_watcher_starter() -> WatcherStarter {
     Arc::new(ProjectChangeWatcher::start)
@@ -243,12 +245,13 @@ pub struct SearchToolsService {
     query_protocols: RwLock<crate::analyzer::structural::ProtocolRegistrationSet>,
     typestate_summaries:
         RwLock<Arc<crate::analyzer::typestate::ProductionTypestateSummaryRepository>>,
-    /// When constructed via `new_deferred`, the initial workspace build (file
-    /// discovery + parse) runs on a background thread and lands here.
+    /// A deferred workspace build (file discovery + parse) runs on a background
+    /// thread and lands here. The result carries the binding generation and root
+    /// so a superseded client workspace can never be published later.
     /// `ensure_ready` joins it and installs the resulting session into `session`
     /// on first access. `None` once the session is ready (or for
     /// synchronously-built services).
-    pending_build: Mutex<Option<JoinHandle<Result<WorkspaceSession, String>>>>,
+    pending_build: Mutex<Option<PendingWorkspaceBuild>>,
     /// Records a deferred-build failure (e.g. the workspace walk hit an IO
     /// error) so every access after the first surfaces it instead of hanging.
     build_error: Mutex<Option<String>>,
@@ -775,7 +778,7 @@ impl SearchToolsService {
             return Self::structured_only(catalog.manifest());
         }
         if name == "run_policy" {
-            let prepared = self.prepare_run_policy(arguments)?;
+            let prepared = self.prepare_run_policy_with_cancellation(arguments, cancellation)?;
             return self.execute_prepared_run_policy(prepared, cancellation);
         }
 
@@ -1412,7 +1415,8 @@ impl SearchToolsService {
     ) -> Result<Self, String> {
         let canonical = root
             .canonicalize()
-            .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?;
+            .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?
+            .normalize();
         if !canonical.is_dir() {
             return Err(format!(
                 "project root is not a directory: {}",
@@ -1499,13 +1503,18 @@ impl SearchToolsService {
     /// client through roots or negotiated host metadata. Unlike the user-facing
     /// activation tool, this deliberately does not promote a nested directory to
     /// an enclosing Git repository: the client-provided boundary is authoritative.
+    /// The persisted analyzer builds in the background so workspace negotiation
+    /// cannot consume an admitted tool request's interactive latency budget.
     pub fn bind_client_workspace(&self, root: PathBuf) -> Result<PathBuf, SearchToolsServiceError> {
-        let canonical = root.canonicalize().map_err(|err| {
-            SearchToolsServiceError::invalid_params(format!(
-                "Failed to resolve client workspace root {}: {err}",
-                root.display()
-            ))
-        })?;
+        let canonical = root
+            .canonicalize()
+            .map_err(|err| {
+                SearchToolsServiceError::invalid_params(format!(
+                    "Failed to resolve client workspace root {}: {err}",
+                    root.display()
+                ))
+            })?
+            .normalize();
         if !canonical.is_dir() {
             return Err(SearchToolsServiceError::invalid_params(format!(
                 "Client workspace root is not a directory: {}",
@@ -1518,28 +1527,40 @@ impl SearchToolsService {
         }
 
         let cache_db_path = client_cache_db_path(&canonical);
-        let (project, workspace) = build_persisted_workspace_at(canonical.clone(), &cache_db_path)
-            .map_err(|err| {
+        let generation = self.workspace_generation().wrapping_add(1);
+        let build_root = canonical.clone();
+        let build_cache_db_path = cache_db_path.clone();
+        let update_strategy = self.update_strategy;
+        let semantic_indexing = self.semantic_indexing;
+        let watcher_starter = Arc::clone(&self.watcher_starter);
+        let handle = std::thread::Builder::new()
+            .name("bifrost-index-build".to_string())
+            .spawn(
+                move || -> Result<(u64, PathBuf, WorkspaceSession), String> {
+                    let (project, workspace) =
+                        build_persisted_workspace_at(build_root.clone(), &build_cache_db_path)?;
+                    let session = assemble_session(
+                        project,
+                        workspace,
+                        update_strategy,
+                        semantic_indexing,
+                        &watcher_starter,
+                        Some(&build_cache_db_path),
+                    )?;
+                    Ok((generation, build_root, session))
+                },
+            )
+            .map_err(|error| {
                 SearchToolsServiceError::internal(format!(
-                    "Failed to bind client workspace {}: {err}",
+                    "Failed to start client workspace build for {}: {error}",
                     canonical.display()
                 ))
             })?;
-        let new_session = assemble_session(
-            project,
-            workspace,
-            self.update_strategy,
-            self.semantic_indexing,
-            &self.watcher_starter,
-            Some(&cache_db_path),
-        )
-        .map_err(|err| {
-            SearchToolsServiceError::internal(format!(
-                "Failed to bind client workspace {}: {err}",
-                canonical.display()
-            ))
-        })?;
 
+        let mut pending = self
+            .pending_build
+            .lock()
+            .map_err(|_| SearchToolsServiceError::internal("index build lock poisoned"))?;
         let mut session = self
             .session
             .write()
@@ -1549,10 +1570,18 @@ impl SearchToolsService {
             .write()
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?;
         self.advance_workspace_generation();
-        let old_session = session.replace(new_session);
+        debug_assert_eq!(self.workspace_generation(), generation);
+        let old_pending = pending.replace(handle);
+        let old_session = session.take();
         *active_root = Some(canonical.clone());
+        *self
+            .build_error
+            .lock()
+            .map_err(|_| SearchToolsServiceError::internal("index build lock poisoned"))? = None;
         drop(active_root);
         drop(session);
+        drop(pending);
+        drop(old_pending);
         if let Some(old_session) = old_session {
             old_session.close_semantic();
         }
@@ -1562,6 +1591,10 @@ impl SearchToolsService {
     /// Remove a workspace previously supplied through MCP roots or negotiated
     /// host metadata, so revoked scope never remains queryable.
     pub fn unbind_client_workspace(&self) -> Result<(), SearchToolsServiceError> {
+        let mut pending = self
+            .pending_build
+            .lock()
+            .map_err(|_| SearchToolsServiceError::internal("index build lock poisoned"))?;
         let mut session = self
             .session
             .write()
@@ -1574,10 +1607,13 @@ impl SearchToolsService {
         if was_bound {
             self.advance_workspace_generation();
         }
+        let old_pending = pending.take();
         let old_session = session.take();
         active_root.take();
         drop(active_root);
         drop(session);
+        drop(pending);
+        drop(old_pending);
         if let Some(old_session) = old_session {
             old_session.close_semantic();
         }
@@ -1603,7 +1639,8 @@ impl SearchToolsService {
         let semantic_indexing = semantic_indexing_enabled();
         let canonical = root
             .canonicalize()
-            .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?;
+            .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?
+            .normalize();
         if !canonical.is_dir() {
             return Err(format!(
                 "project root is not a directory: {}",
@@ -1615,9 +1652,9 @@ impl SearchToolsService {
             .spawn({
                 let canonical = canonical.clone();
                 let watcher_starter = Arc::clone(&watcher_starter);
-                move || -> Result<WorkspaceSession, String> {
+                move || -> Result<(u64, PathBuf, WorkspaceSession), String> {
                     let project: Arc<dyn Project> = Arc::new(
-                        FilesystemProject::new(canonical)
+                        FilesystemProject::new(canonical.clone())
                             .map_err(|err| format!("Failed to initialize project root: {err}"))?,
                     );
                     let workspace = WorkspaceAnalyzer::build_persisted(
@@ -1625,14 +1662,15 @@ impl SearchToolsService {
                         AnalyzerConfig::default(),
                     )
                     .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
-                    assemble_session(
+                    let session = assemble_session(
                         project,
                         workspace,
                         update_strategy,
                         semantic_indexing,
                         &watcher_starter,
                         None,
-                    )
+                    )?;
+                    Ok((1, canonical, session))
                 }
             })
             .map_err(|err| format!("Failed to spawn index build thread: {err}"))?;
@@ -1667,7 +1705,14 @@ impl SearchToolsService {
                 .join()
                 .map_err(|_| SearchToolsServiceError::internal("index build thread panicked"))?;
             match built {
-                Ok(session) => {
+                Ok((generation, root, session)) => {
+                    if generation != self.workspace_generation()
+                        || self.active_workspace_root().as_ref() != Some(&root)
+                    {
+                        return Err(SearchToolsServiceError::internal(
+                            "workspace changed while its analyzer snapshot was initializing; retry the request",
+                        ));
+                    }
                     let mut guard = self.session.write().map_err(|_| {
                         SearchToolsServiceError::internal("SearchToolsService lock poisoned")
                     })?;
@@ -1724,6 +1769,40 @@ impl SearchToolsService {
         }
         drop(pending);
         Ok(())
+    }
+
+    fn ensure_ready_with_cancellation(
+        &self,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<(), SearchToolsServiceError> {
+        let Some(cancellation) = cancellation else {
+            return self.ensure_ready();
+        };
+
+        loop {
+            let build_is_pending = match self.pending_build.try_lock() {
+                Ok(pending) => pending.as_ref().is_some_and(|handle| !handle.is_finished()),
+                Err(std::sync::TryLockError::WouldBlock) => true,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(SearchToolsServiceError::internal(
+                        "index build lock poisoned",
+                    ));
+                }
+            };
+
+            if !build_is_pending {
+                return self.ensure_ready();
+            }
+            if cancellation.is_cancelled() {
+                let message = if cancellation.is_timed_out() {
+                    "workspace snapshot was not ready within the request-wide time budget; retry after workspace initialization completes"
+                } else {
+                    "workspace snapshot acquisition was cancelled"
+                };
+                return Err(SearchToolsServiceError::internal(message));
+            }
+            std::thread::park_timeout(std::time::Duration::from_millis(5));
+        }
     }
 
     pub fn close(&self) -> Result<(), SearchToolsServiceError> {
@@ -1945,6 +2024,14 @@ impl SearchToolsService {
             Arc::clone(&session.snapshot),
             Arc::clone(&session.document_root),
         ))
+    }
+
+    fn snapshot_for_query_with_cancellation(
+        &self,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<WorkspaceQueryScope, SearchToolsServiceError> {
+        self.ensure_ready_with_cancellation(cancellation)?;
+        self.snapshot_for_query()
     }
 
     /// Whether `session`'s watcher (if active) currently has a delta that a
@@ -2386,9 +2473,10 @@ impl SearchToolsService {
         ))
     }
 
-    pub(crate) fn prepare_run_policy(
+    pub(crate) fn prepare_run_policy_with_cancellation(
         &self,
         arguments: Value,
+        cancellation: Option<&CancellationToken>,
     ) -> Result<PreparedRunPolicy, SearchToolsServiceError> {
         let params = serde_json::from_value::<RunPolicyParams>(arguments).map_err(|error| {
             SearchToolsServiceError::invalid_params(format!(
@@ -2519,7 +2607,10 @@ impl SearchToolsService {
 
         loop {
             let workspace_generation = self.workspace_generation();
-            let snapshot = self.snapshot_for_query()?;
+            let snapshot = {
+                let _scope = profiling::scope("run_policy.snapshot_for_query");
+                self.snapshot_for_query_with_cancellation(cancellation)?
+            };
             if workspace_generation != self.workspace_generation() {
                 continue;
             }
@@ -2548,6 +2639,7 @@ impl SearchToolsService {
             ..
         } = prepared;
         let result = (|| {
+            let _scope = profiling::scope("run_policy.evaluate_policy_inputs");
             let outcome = CodeIntelligenceRuntime::new(&snapshot, cancellation)
                 .evaluate_policy_inputs(&root, &policy_inputs, &options)
                 .map_err(|error| {
@@ -2644,7 +2736,7 @@ impl Drop for SearchToolsService {
         // any semantic indexer it started) is closed rather than detached.
         if let Ok(pending) = self.pending_build.get_mut()
             && let Some(handle) = pending.take()
-            && let Ok(Ok(session)) = handle.join()
+            && let Ok(Ok((_, _, session))) = handle.join()
         {
             session.close_semantic();
             return;
@@ -2767,7 +2859,8 @@ fn start_session_watcher(
 fn resolve_workspace_root(path: &Path) -> Result<PathBuf, String> {
     let canonical = path
         .canonicalize()
-        .map_err(|err| format!("{err} ({})", path.display()))?;
+        .map_err(|err| format!("{err} ({})", path.display()))?
+        .normalize();
     if !canonical.is_dir() {
         return Err(format!("not a directory: {}", canonical.display()));
     }
@@ -2776,7 +2869,7 @@ fn resolve_workspace_root(path: &Path) -> Result<PathBuf, String> {
         && let Some(workdir) = repo.workdir()
         && let Ok(canon_workdir) = workdir.canonicalize()
     {
-        return Ok(canon_workdir);
+        return Ok(canon_workdir.normalize());
     }
 
     Ok(canonical)
@@ -2819,6 +2912,23 @@ mod watcher_startup_tests {
             calls.fetch_add(1, Ordering::SeqCst);
             Err(WATCHER_FAILURE.to_string())
         })
+    }
+
+    fn unbound_watching_service(starter: WatcherStarter) -> SearchToolsService {
+        SearchToolsService {
+            root: RwLock::new(None),
+            session: RwLock::new(None),
+            workspace_generation: AtomicU64::new(0),
+            query_protocols: RwLock::new(Default::default()),
+            typestate_summaries: RwLock::new(Arc::new(
+                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+            )),
+            pending_build: Mutex::new(None),
+            build_error: Mutex::new(None),
+            update_strategy: UpdateStrategy::WatchFiles,
+            semantic_indexing: false,
+            watcher_starter: starter,
+        }
     }
 
     fn assert_watcher_error(error: &SearchToolsServiceError) {
@@ -2950,6 +3060,148 @@ mod watcher_startup_tests {
             assert_watcher_error(&error);
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn issue_1306_run_policy_deadline_does_not_block_on_deferred_workspace_startup() {
+        let (_temp, root) = workspace("DeferredPolicy.java", "class DeferredPolicy {}\n");
+        let (startup_started_tx, startup_started_rx) = mpsc::channel();
+        let (release_startup_tx, release_startup_rx) = mpsc::sync_channel(1);
+        let release_startup_rx = Arc::new(Mutex::new(release_startup_rx));
+        let starter: WatcherStarter = Arc::new(move |project| {
+            startup_started_tx
+                .send(())
+                .expect("test should observe watcher startup");
+            release_startup_rx
+                .lock()
+                .expect("release lock")
+                .recv_timeout(Duration::from_secs(5))
+                .expect("test should release watcher startup");
+            ProjectChangeWatcher::start_polling_for_tests(project)
+        });
+        let service = unbound_watching_service(starter);
+        service
+            .bind_client_workspace(root)
+            .expect("client binding should start a deferred build");
+        startup_started_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("deferred build should reach watcher startup");
+        let cancellation = CancellationToken::default().with_timeout(Duration::ZERO);
+
+        let error = match service.prepare_run_policy_with_cancellation(
+            json!({
+                "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
+                "evaluation_date": "2026-07-29",
+                "fail_on": "warning"
+            }),
+            Some(&cancellation),
+        ) {
+            Ok(_) => panic!("expired request should not join the deferred build"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, SearchToolsServiceErrorCode::Internal);
+        assert!(error.message.contains("workspace snapshot was not ready"));
+        assert!(error.message.contains("retry"));
+        release_startup_tx
+            .send(())
+            .expect("release deferred watcher startup");
+    }
+
+    #[test]
+    fn superseded_client_workspace_build_cannot_publish_after_rebinding() {
+        let (_first_temp, first_root) = workspace("First.java", "class First {}\n");
+        let (_second_temp, second_root) = workspace("Second.java", "class Second {}\n");
+        let blocked_root = first_root.clone();
+        let (first_started_tx, first_started_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::sync_channel(1);
+        let release_first_rx = Arc::new(Mutex::new(release_first_rx));
+        let (first_finished_tx, first_finished_rx) = mpsc::channel();
+        let starter: WatcherStarter = Arc::new(move |project| {
+            if project.root() == blocked_root {
+                first_started_tx
+                    .send(())
+                    .expect("test should observe the first build");
+                release_first_rx
+                    .lock()
+                    .expect("release lock")
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("test should release the first build");
+                let watcher = ProjectChangeWatcher::start_polling_for_tests(project)?;
+                first_finished_tx
+                    .send(())
+                    .expect("test should observe the first build finishing");
+                Ok(watcher)
+            } else {
+                ProjectChangeWatcher::start_polling_for_tests(project)
+            }
+        });
+        let service = unbound_watching_service(starter);
+
+        service
+            .bind_client_workspace(first_root)
+            .expect("first client binding should start");
+        first_started_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("first build should reach watcher startup");
+        service
+            .bind_client_workspace(second_root.clone())
+            .expect("replacement client binding should start");
+        service
+            .ensure_ready()
+            .expect("replacement workspace should become ready");
+
+        assert_eq!(service.active_workspace_root(), Some(second_root.clone()));
+        let symbols = service
+            .call_tool_value("list_symbols", json!({"file_patterns": ["Second.java"]}))
+            .expect("replacement workspace should be queryable");
+        assert_eq!(symbols["files"][0]["path"], "Second.java");
+
+        release_first_tx
+            .send(())
+            .expect("release superseded workspace build");
+        first_finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("superseded workspace build should finish");
+        assert_eq!(service.active_workspace_root(), Some(second_root));
+    }
+
+    #[test]
+    fn failed_client_workspace_build_can_be_retried_after_unbinding() {
+        let (_temp, root) = workspace("Retry.java", "class Retry {}\n");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let starter: WatcherStarter = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |project| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(WATCHER_FAILURE.to_string())
+                } else {
+                    ProjectChangeWatcher::start_polling_for_tests(project)
+                }
+            })
+        };
+        let service = unbound_watching_service(starter);
+
+        service
+            .bind_client_workspace(root.clone())
+            .expect("client binding should start before deferred failure");
+        let error = service
+            .ensure_ready()
+            .expect_err("first deferred build should fail");
+        assert_watcher_error(&error);
+
+        service
+            .unbind_client_workspace()
+            .expect("failed client binding should be revocable");
+        service
+            .bind_client_workspace(root.clone())
+            .expect("client binding should be retryable");
+        service
+            .ensure_ready()
+            .expect("retried client binding should become ready");
+
+        assert_eq!(service.active_workspace_root(), Some(root));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -3500,6 +3752,7 @@ mod client_roots_tests {
         service
             .bind_client_workspace(canonical_linked.clone())
             .unwrap();
+        service.ensure_ready().unwrap();
 
         assert!(client_cache_db_path(&canonical_linked).exists());
         assert!(

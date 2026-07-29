@@ -116,8 +116,14 @@ fn find_import_graph_candidates(
     // (3) Importers — only if the analyzer exposes import analysis. Ruby
     // `require` chains make a transitive walk necessary: a call site can live
     // in a file that requires an intermediary, rather than the declaration
-    // file itself. Other languages retain the cheaper direct-importer scan.
-    if let Some(import_provider) = analyzer.import_analysis_provider() {
+    // file itself. Python is deliberately excluded here: its analyzer-owned
+    // usage index below provides the same structured importer relation (with
+    // re-export expansion) without re-resolving every workspace import on
+    // every query. Keeping both paths made a warm Python query repeatedly pay
+    // for a workspace-wide candidate walk before the index could narrow it.
+    if language_for_target(target) != Language::Python
+        && let Some(import_provider) = analyzer.import_analysis_provider()
+    {
         if let Some(cancellation) = cancellation {
             let importers = if language_for_target(target) == Language::Ruby {
                 find_transitive_importers_with_cancellation(

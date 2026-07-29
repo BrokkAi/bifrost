@@ -425,7 +425,7 @@ lang_epoch!(
     Kotlin,
     "kotlin",
     "treesitter/kotlin/",
-    "tree-sitter-kotlin-fwcd-c8ac3d26-2026-07;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07"
+    "tree-sitter-kotlin-fwcd-c8ac3d26-2026-07;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07"
 );
 
 #[cfg(test)]

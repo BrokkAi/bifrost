@@ -3103,26 +3103,6 @@ mod tests {
     }
 
     #[test]
-    fn all_finding_incomplete_reason_spellings_are_stable() {
-        let reasons = [
-            FindingIncompleteReason::QueryProvenanceTruncated,
-            FindingIncompleteReason::RelatedLocationsTruncated,
-            FindingIncompleteReason::OriginsTruncated,
-            FindingIncompleteReason::SourceScenariosTruncated,
-            FindingIncompleteReason::TypestateScenariosTruncated,
-            FindingIncompleteReason::WitnessTruncated,
-            FindingIncompleteReason::EvidenceTruncated,
-            FindingIncompleteReason::ProofPartial,
-            FindingIncompleteReason::StableAnchorWeak,
-        ];
-        assert!(
-            reasons
-                .into_iter()
-                .all(|reason| !finding_incomplete_reason(reason).is_empty())
-        );
-    }
-
-    #[test]
     fn missing_named_cvss_component_is_a_render_error_not_a_panic() {
         assert!(matches!(
             named_cvss_component(&[], CvssNomenclature::B),

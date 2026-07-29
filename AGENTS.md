@@ -46,6 +46,12 @@ expansion by exact name order, unless that order or membership is itself the use
 Prefer behavior-focused coverage that proves the advertised surface works end to end, for example listing a tool and
 successfully calling it, over tests that duplicate registry construction logic.
 
+New integration tests go in `tests/<suite>/<name>.rs` plus one `mod <name>;` line in that harness's `main.rs` (the
+suites and their members are listed in `.agents/docs/test-harness-consolidation-2026-07.md`); do not add a new
+`tests/*.rs` file at the root. A new standalone `tests/*.rs` binary is reserved for tests that need process
+isolation — process-global counters, in-process env mutation, or pristine rayon/`OnceLock` state that concurrent
+in-process tests would perturb — and requires a keep-separate entry in that manifest explaining the reason.
+
 # Rust CI Checks
 
 Before pushing Rust changes, run the same core checks that CI enforces locally when practical.

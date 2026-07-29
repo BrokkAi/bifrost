@@ -1108,7 +1108,7 @@ pub(super) fn resolve_scan_usages_target(
 
     let selector = match target.symbol.as_deref() {
         None => None,
-        Some(symbol) => match split_definition_selector(symbol) {
+        Some(symbol) => match split_definition_selector_with_workspace_files(resolver, symbol) {
             DefinitionSelector::Name(name) => Some(name),
             DefinitionSelector::FileAnchored { anchor, lookup } => {
                 let anchor_file = match resolver.resolve_literal(&anchor) {
@@ -1714,7 +1714,7 @@ pub(super) fn scan_usages_backend(
             });
             continue;
         }
-        let (anchor, lookup) = match split_definition_selector(&symbol) {
+        let (anchor, lookup) = match split_workspace_definition_selector(analyzer, &symbol) {
             DefinitionSelector::Name(name) => (None, name),
             DefinitionSelector::FileAnchored { anchor, lookup } => (Some(anchor), lookup),
         };
@@ -2215,7 +2215,10 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         .iter()
         .map(|node| UsageGraphNode {
             fqn: node.key.fqn.clone(),
-            language: node.key.ecosystem.as_str().to_string(),
+            // The node's own source language, not its realm: sharing a
+            // candidate space must not cost a consumer the ability to tell
+            // Java from Scala from Kotlin.
+            language: node.language_label().to_string(),
             path: rel_path_string(node.primary.source()),
             start_line: node
                 .primary_range
@@ -2334,15 +2337,31 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         );
     }
     {
-        let _scope = profiling::scope("usage_graph::resolve_java");
+        // One JVM realm, several resolvers: Java, Scala, and Kotlin
+        // declarations share one candidate space, so both builders run over the
+        // same fqn set and merge into it. Each resolver only scans files of its
+        // own language, so the passes cover disjoint call sites and cannot
+        // double count. Kotlin's own builder arrives with #1239.
+        let _scope = profiling::scope("usage_graph::resolve_jvm");
         let java_edges = crate::analyzer::usages::java_graph::build_java_usage_edges(
             analyzer,
-            catalog.fqns(UsageEcosystem::Java),
+            catalog.fqns(UsageEcosystem::Jvm),
             keep_file,
         );
         record_inverted(
-            UsageEcosystem::Java,
+            UsageEcosystem::Jvm,
             java_edges,
+            &mut edge_sites,
+            &mut truncated_symbols,
+        );
+        let scala_edges = crate::analyzer::usages::scala_graph::build_scala_usage_edges(
+            analyzer,
+            catalog.fqns(UsageEcosystem::Jvm),
+            keep_file,
+        );
+        record_inverted(
+            UsageEcosystem::Jvm,
+            scala_edges,
             &mut edge_sites,
             &mut truncated_symbols,
         );
@@ -2385,20 +2404,6 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         record_inverted(
             UsageEcosystem::Ruby,
             ruby_edges,
-            &mut edge_sites,
-            &mut truncated_symbols,
-        );
-    }
-    {
-        let _scope = profiling::scope("usage_graph::resolve_scala");
-        let scala_edges = crate::analyzer::usages::scala_graph::build_scala_usage_edges(
-            analyzer,
-            catalog.fqns(UsageEcosystem::Scala),
-            keep_file,
-        );
-        record_inverted(
-            UsageEcosystem::Scala,
-            scala_edges,
             &mut edge_sites,
             &mut truncated_symbols,
         );

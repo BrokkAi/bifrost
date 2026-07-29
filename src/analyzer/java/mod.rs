@@ -3,7 +3,6 @@ mod cache;
 mod clones;
 mod comments;
 pub(crate) mod declarations;
-pub(crate) mod dependency_discovery;
 mod exceptions;
 mod hierarchy;
 pub(crate) mod imports;
@@ -26,7 +25,8 @@ use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::analyzer::jvm::external::JavaExternalDeclarationIndex;
+use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
+use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
 pub(crate) use adapter::JavaAdapter;
 use cache::JavaMemoCaches;
 use clones::{build_clone_candidate_data, refine_java_clone_similarity};
@@ -36,7 +36,6 @@ use declarations::{
     is_declaration_parent, is_java_anonymous_structure, node_text, normalize_java_full_name,
     parse_tree,
 };
-pub(crate) use dependency_discovery::is_java_dependency_input;
 use exceptions::detect_exception_handling_smells_java;
 use tests::detect_test_assertion_smells_java;
 
@@ -44,8 +43,8 @@ use tests::detect_test_assertion_smells_java;
 pub struct JavaAnalyzer {
     inner: TreeSitterAnalyzer<JavaAdapter>,
     memo_caches: Arc<JavaMemoCaches>,
-    java_config: crate::analyzer::JavaAnalyzerConfig,
-    pub(crate) external_index: Arc<std::sync::OnceLock<JavaExternalDeclarationIndex>>,
+    java_config: crate::analyzer::JvmAnalyzerConfig,
+    pub(crate) external_index: Arc<std::sync::OnceLock<JvmExternalDeclarationIndex>>,
 }
 
 crate::analyzer::impl_forward_query_provider!(JavaAnalyzer);
@@ -64,7 +63,7 @@ impl JavaAnalyzer {
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
-        let java_config = config.java.clone();
+        let java_config = config.jvm.clone();
         let inner = TreeSitterAnalyzer::new_with_config(project, JavaAdapter, config);
         Self {
             inner,
@@ -90,7 +89,7 @@ impl JavaAnalyzer {
         F: Fn(BuildProgressEvent) + Send + Sync + 'static,
     {
         let memo_budget = config.memo_cache_budget_bytes();
-        let java_config = config.java.clone();
+        let java_config = config.jvm.clone();
         let inner = TreeSitterAnalyzer::new_with_config_and_progress(
             project,
             JavaAdapter,
@@ -112,7 +111,7 @@ impl JavaAnalyzer {
         progress: Option<BuildProgress>,
     ) -> Result<Self, crate::analyzer::store::StoreError> {
         let memo_budget = config.memo_cache_budget_bytes();
-        let java_config = config.java.clone();
+        let java_config = config.jvm.clone();
         let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             project,
             JavaAdapter,
@@ -201,9 +200,9 @@ impl JavaAnalyzer {
             .map(|package| package.to_string())
     }
 
-    pub(crate) fn external_declaration_index(&self) -> &JavaExternalDeclarationIndex {
+    pub(crate) fn external_declaration_index(&self) -> &JvmExternalDeclarationIndex {
         self.external_index.get_or_init(|| {
-            JavaExternalDeclarationIndex::build_for_project(&self.java_config, self.inner.project())
+            JvmExternalDeclarationIndex::build_for_project(&self.java_config, self.inner.project())
         })
     }
 
@@ -424,7 +423,7 @@ impl IAnalyzer for JavaAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        let external_index = if changed_files.iter().any(is_java_dependency_input) {
+        let external_index = if changed_files.iter().any(is_jvm_dependency_input) {
             Arc::new(std::sync::OnceLock::new())
         } else {
             self.external_index.clone()

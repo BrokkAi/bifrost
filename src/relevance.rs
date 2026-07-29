@@ -558,6 +558,27 @@ fn related_files_by_usage_graph_with_cancellation(
     Cancellable::Complete(ranked)
 }
 
+/// Outcome of computing commit-history data for relevance ranking on a request that may carry a
+/// cancellation token. A cold or otherwise unavailable commit-change cache degrades ranking
+/// *quality* (files/symbols are returned unranked by recency) but the candidate set itself stays
+/// complete; only a genuine cancellation token firing makes the returned set an incomplete subset.
+/// Keeping these as distinct variants (rather than folding both into one `bool`) is the fix for
+/// issue #1332: a downstream response builder must never re-guess which condition produced a
+/// non-`Complete` result, since "cancelled" and "history unavailable" require different wording
+/// and different `truncated` semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryRankingStatus {
+    /// Commit-history data was available (or none was needed); ranking used the full window.
+    Complete,
+    /// A cancellation token fired mid-computation; the returned file set may be an incomplete
+    /// subset of the true answer.
+    Cancelled,
+    /// No cancellation occurred, but the commit-change cache was cold (or the lookup otherwise
+    /// failed), so files were returned without recency-weighted ranking. The candidate set is
+    /// still complete.
+    HistoryUnavailable,
+}
+
 pub(crate) fn most_important_project_files(
     analyzer: &dyn IAnalyzer,
     candidates: &[ProjectFile],
@@ -571,51 +592,51 @@ pub(crate) fn most_important_project_files_with_cancellation(
     candidates: &[ProjectFile],
     top_k: usize,
     cancellation: Option<&crate::CancellationToken>,
-) -> (Vec<ProjectFile>, bool) {
+) -> (Vec<ProjectFile>, HistoryRankingStatus) {
     let _scope = profiling::scope("relevance::most_important_project_files");
     if top_k == 0 || candidates.is_empty() {
-        return (Vec::new(), true);
+        return (Vec::new(), HistoryRankingStatus::Complete);
     }
 
     let Some(repo) = GitProjectContext::discover(analyzer.project().root()) else {
-        return (Vec::new(), true);
+        return (Vec::new(), HistoryRankingStatus::Complete);
     };
     let candidate_set: HashSet<_> = candidates.iter().cloned().collect();
     // Peel HEAD to a tree once for the whole call instead of per candidate: a full scan of an
     // untracked candidate set previously re-resolved `HEAD` and re-peeled to a tree once per file.
     let Some(head_tree) = repo.head_tree() else {
-        return (Vec::new(), true);
+        return (Vec::new(), HistoryRankingStatus::Complete);
     };
     if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
-        return (Vec::new(), false);
+        return (Vec::new(), HistoryRankingStatus::Cancelled);
     }
     if !candidate_set
         .iter()
         .any(|file| repo.is_tracked_in_tree(file, &head_tree))
     {
-        return (Vec::new(), true);
+        return (Vec::new(), HistoryRankingStatus::Complete);
     }
 
-    let (changes, history_complete) = if cancellation.is_some() {
+    let (changes, history_status) = if cancellation.is_some() {
         match repo.cached_recent_commit_changes(COMMITS_TO_PROCESS) {
-            Ok(Some(changes)) => (changes, true),
-            Ok(None) | Err(_) => (Vec::new(), false),
+            Ok(Some(changes)) => (changes, HistoryRankingStatus::Complete),
+            Ok(None) | Err(_) => (Vec::new(), HistoryRankingStatus::HistoryUnavailable),
         }
     } else {
         let Ok(changes) = repo.recent_commit_changes(COMMITS_TO_PROCESS) else {
-            return (Vec::new(), true);
+            return (Vec::new(), HistoryRankingStatus::Complete);
         };
-        (changes, true)
+        (changes, HistoryRankingStatus::Complete)
     };
     if changes.is_empty() {
-        return (Vec::new(), history_complete);
+        return (Vec::new(), history_status);
     }
 
     let mut scores: HashMap<ProjectFile, f64> = HashMap::default();
     let mut canonicalizer = RenameCanonicalizer::default();
     for (index, change) in changes.into_iter().enumerate() {
         if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
-            return (Vec::new(), false);
+            return (Vec::new(), HistoryRankingStatus::Cancelled);
         }
         canonicalizer.record_renames(&change.renames);
         let age_weight = commit_age_weight(index, Some(DEFAULT_RECENCY_HALF_LIFE));
@@ -636,9 +657,14 @@ pub(crate) fn most_important_project_files_with_cancellation(
         .collect::<Vec<_>>();
     ranked.sort_by(compare_file_relevance);
     ranked.truncate(top_k);
+    let final_status = if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+        HistoryRankingStatus::Cancelled
+    } else {
+        history_status
+    };
     (
         ranked.into_iter().map(|item| item.file).collect(),
-        history_complete && !cancellation.is_some_and(crate::CancellationToken::is_cancelled),
+        final_status,
     )
 }
 

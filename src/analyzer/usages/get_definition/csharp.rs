@@ -500,7 +500,7 @@ fn resolve_csharp_in_session(
 
     match csharp_reference_node(node, definitions) {
         Some(CSharpReferenceNode::Attribute(name)) => {
-            csharp_attribute_outcome(csharp, definitions, file, name, source)
+            csharp_attribute_outcome(analyzer, csharp, definitions, file, name, source)
         }
         Some(CSharpReferenceNode::Type(type_node)) => {
             let reference = csharp_reference_type_text(type_node, source);
@@ -514,6 +514,7 @@ fn resolve_csharp_in_session(
                 file,
                 &reference,
                 type_node.start_byte(),
+                CodeUnit::is_class,
             ) {
                 return candidates_outcome(vec![unit]);
             }
@@ -1955,6 +1956,28 @@ fn csharp_type_outcome(
     }
     // `csharp_import_boundary_for_type` fuses the unresolved-using signal with
     // the workspace type/namespace check; its negation is the workspace gate.
+    if csharp_import_boundary_for_type(csharp, definitions, file, reference)
+        && let Some(candidate) = csharp_indexed_non_type_candidate(
+            analyzer,
+            definitions,
+            file,
+            reference,
+            byte,
+            |unit| !unit.is_class(),
+        )
+    {
+        // #1218: every type-shaped resolver above has already failed to find
+        // `reference` as a type, and this retry excludes classes explicitly
+        // (rather than trusting that exhaustion), so a hit here is
+        // guaranteed to be a different-kind declaration (property/field/
+        // method/...) that merely shares the failed type reference's
+        // spelling. The boundary claim would call it "not indexed" while
+        // the index plainly contains it.
+        return no_definition(
+            "indexed_declaration_wrong_kind",
+            csharp_indexed_candidate_honesty_message(reference, "type", &candidate),
+        );
+    }
     gated_boundary(
         || !csharp_import_boundary_for_type(csharp, definitions, file, reference),
         format!("`{reference}` appears to cross a C# using boundary not indexed in this workspace"),
@@ -1964,6 +1987,7 @@ fn csharp_type_outcome(
 }
 
 fn csharp_attribute_outcome(
+    analyzer: &dyn IAnalyzer,
     csharp: &CSharpAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
@@ -1985,15 +2009,40 @@ fn csharp_attribute_outcome(
         return outcome;
     }
     let reference = names.first().map(String::as_str).unwrap_or_default();
+    let boundary = csharp_attribute_alias_boundary(csharp, definitions, file, name, source)
+        || names
+            .iter()
+            .any(|name| csharp_import_boundary_for_type(csharp, definitions, file, name));
+    // #1218: same honesty check as `csharp_type_outcome` — an attribute name
+    // that fails every type-shaped resolver above but is indexed as some
+    // other kind of declaration reachable from this reference's enclosing
+    // scope must not be called "not indexed". Classes are excluded: unlike
+    // the plain type path, `attribute_type_candidates` above already
+    // considered every same-spelled *class* and rejected the ones that are
+    // not attribute-applicable (don't derive `System.Attribute`) — that
+    // rejection is deliberate and must not be second-guessed here, so a
+    // class match is not "different-kind" evidence (Generated/ExportProxyCmdlet's
+    // `internal class Parameter` vs the external `ParameterAttribute`
+    // shorthand: the boundary claim there is the honest answer).
+    if boundary
+        && let Some(candidate) = csharp_indexed_non_type_candidate(
+            analyzer,
+            definitions,
+            file,
+            reference,
+            name.start_byte(),
+            |unit| !unit.is_class(),
+        )
+    {
+        return no_definition(
+            "indexed_declaration_wrong_kind",
+            csharp_indexed_candidate_honesty_message(reference, "attribute type", &candidate),
+        );
+    }
     // Both disjuncts are workspace-fused boundary predicates (alias target /
     // using target the workspace does not index); their negation is the gate.
     gated_boundary(
-        || {
-            !(csharp_attribute_alias_boundary(csharp, definitions, file, name, source)
-                || names
-                    .iter()
-                    .any(|name| csharp_import_boundary_for_type(csharp, definitions, file, name)))
-        },
+        || !boundary,
         format!("`{reference}` appears to cross a C# using boundary not indexed in this workspace"),
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed C# attribute type"),
@@ -3032,6 +3081,7 @@ fn resolve_csharp_in_enclosing_scopes(
     file: &ProjectFile,
     name: &str,
     byte: usize,
+    accept: impl Fn(&CodeUnit) -> bool,
 ) -> Option<CodeUnit> {
     if name.is_empty() || name.contains('.') {
         return None;
@@ -3050,7 +3100,51 @@ fn resolve_csharp_in_enclosing_scopes(
         name,
         || definitions.scope_step(),
         |fqn| definitions.fqn(fqn),
-        CodeUnit::is_class,
+        accept,
+    )
+}
+
+/// The #1218 shape: a reference fails C# type resolution and looks like it
+/// crosses an unindexed `using` boundary, but the exact identifier is
+/// nonetheless indexed as *some other kind* of declaration reachable from the
+/// reference's enclosing scope chain (e.g. a property that merely shares its
+/// spelling with an unrelated, genuinely-external BCL type — Newtonsoft.Json's
+/// deprecated `Binder` property is declared `SerializationBinder Binder`,
+/// where the type `SerializationBinder` is `System.Runtime.Serialization`'s
+/// abstract class, not this workspace's own `JsonSerializer.SerializationBinder`
+/// property, but both share the bare spelling `SerializationBinder`).
+///
+/// `resolve_csharp_in_enclosing_scopes` and
+/// `resolve_csharp_nested_type_in_enclosing_classes` already walk this same
+/// scope chain, filtered to `CodeUnit::is_class` so they only ever *resolve*
+/// to a real type. Retrying the identical walk with `accept` explicitly
+/// excluding the kinds those earlier resolvers already vetted, purely to
+/// decide whether the boundary message is honest, cannot substitute a
+/// wrong-kind declaration as the answer (it is never returned as a
+/// definition) — it only downgrades a dishonest "not indexed" claim to an
+/// accurate "not a type here; a `{kind}` of that name is indexed at
+/// `{path}`" message. Same invariant as #1126/#1089/#1174, applied along the
+/// declaration-kind axis instead of shadowing/naming/language.
+fn csharp_indexed_non_type_candidate(
+    analyzer: &dyn IAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    reference: &str,
+    byte: usize,
+    accept: impl Fn(&CodeUnit) -> bool,
+) -> Option<CodeUnit> {
+    resolve_csharp_in_enclosing_scopes(analyzer, definitions, file, reference, byte, accept)
+}
+
+fn csharp_indexed_candidate_honesty_message(
+    reference: &str,
+    subject: &str,
+    candidate: &CodeUnit,
+) -> String {
+    format!(
+        "`{reference}` does not resolve to an indexed C# {subject} here; `{reference}` is indexed as `{}` ({})",
+        candidate.fq_name(),
+        rel_path_string(candidate.source()),
     )
 }
 

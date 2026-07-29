@@ -586,6 +586,28 @@ pub struct SearchCandidateRow {
     pub in_test_region: bool,
 }
 
+/// The minimum persisted projection a `search_symbols` pattern batch needs to
+/// decide whether a declaration matches: its short name plus the qualifier its
+/// package prefix hydrates from. `lang_index` indexes the caller's storage
+/// language-key slice so a row never allocates a language string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SearchCandidateNameRow {
+    pub lang_index: usize,
+    pub blob_oid: Oid,
+    pub unit_key: i64,
+    pub short_name: String,
+    pub content_qualifier: String,
+}
+
+/// A declaration identity that survived pattern matching and therefore earns
+/// the full candidate projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SearchCandidateKey {
+    pub lang_index: usize,
+    pub blob_oid: Oid,
+    pub unit_key: i64,
+}
+
 /// Persisted facts required to derive callable arity and return types without
 /// reconstructing a complete file state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2497,12 +2519,23 @@ impl AnalyzerStore {
         search_candidate_rows_by_lang_conn(&conn, lang)
     }
 
-    pub(crate) fn search_candidate_rows_for_langs(
+    /// Enumerate the declaration projection needed to *decide* whether a
+    /// `search_symbols` pattern batch matches, and nothing else.
+    ///
+    /// Matching only consults a unit's fully-qualified name, which is built
+    /// from its short name plus the package prefix hydrated from
+    /// `content_qualifier` and the live path. Signature text, primary ranges,
+    /// and candidate flags are needed only for units that actually match, so
+    /// they are deliberately excluded here and fetched by key afterwards
+    /// (issue #1199): a broad request over this repository previously paid for
+    /// ~13 MB of signature/range columns and a temp-B-tree sort to answer a
+    /// query whose result was a few dozen rows.
+    pub(crate) fn search_candidate_name_rows_for_langs(
         &self,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
         cancellation: Option<&CancellationToken>,
-    ) -> Result<LimitedQueryRows<SearchCandidateRow>> {
+    ) -> Result<LimitedQueryRows<SearchCandidateNameRow>> {
         // Pattern matching is performed after language-specific FQN hydration.
         // One request may carry several patterns, so the storage projection
         // intentionally supplies one complete declaration candidate set for
@@ -2513,12 +2546,17 @@ impl AnalyzerStore {
         let mut out = Vec::new();
         let mut inspected = 0usize;
         let mut complete = true;
-        for lang in langs {
+        for (lang_index, lang) in langs.iter().enumerate() {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 complete = false;
                 break;
             }
-            let rows = search_candidate_rows_by_lang_conn_cancellable(&tx, lang, cancellation)?;
+            let rows = search_candidate_name_rows_by_lang_conn_cancellable(
+                &tx,
+                lang_index,
+                lang,
+                cancellation,
+            )?;
             inspected = inspected.saturating_add(rows.inspected);
             out.extend(rows.rows);
             if !rows.complete {
@@ -2526,6 +2564,69 @@ impl AnalyzerStore {
                 break;
             }
         }
+        tx.commit()?;
+        if complete && !cancellation.is_some_and(CancellationToken::is_cancelled) {
+            Ok(LimitedQueryRows::complete(out, inspected))
+        } else {
+            Ok(LimitedQueryRows::incomplete(out, inspected))
+        }
+    }
+
+    /// Hydrate the full search-candidate projection for the declaration keys a
+    /// pattern batch already matched.
+    ///
+    /// The projection is fetched one *blob* at a time rather than one unit at a
+    /// time. `code_units` is keyed by `(blob_oid, lang, unit_key)`, so a blob is
+    /// an index range scan, and the work is proportional to the number of files
+    /// in the answer instead of either the number of matched units (which
+    /// degrades to tens of thousands of point lookups when a pattern is broad)
+    /// or the whole workspace projection.
+    pub(crate) fn search_candidate_rows_for_keys(
+        &self,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+        keys: &[SearchCandidateKey],
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<LimitedQueryRows<SearchCandidateRow>> {
+        if keys.is_empty() {
+            return Ok(LimitedQueryRows::complete(Vec::new(), 0));
+        }
+        let mut wanted: HashMap<(usize, Oid), HashSet<i64>> = HashMap::default();
+        for key in keys {
+            wanted
+                .entry((key.lang_index, key.blob_oid))
+                .or_default()
+                .insert(key.unit_key);
+        }
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        let sql = search_candidate_sql("units.lang = ?1 AND units.blob_oid = ?2");
+        let mut stmt = tx.prepare_cached(&sql)?;
+        let mut out = Vec::new();
+        let mut inspected = 0usize;
+        let mut complete = true;
+        for ((lang_index, blob_oid), unit_keys) in &wanted {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                complete = false;
+                break;
+            }
+            let Some(lang) = langs.get(*lang_index) else {
+                continue;
+            };
+            let mut query = stmt.query(rusqlite::params![lang, blob_oid.to_string()])?;
+            while let Some(row) = query.next()? {
+                inspected = inspected.saturating_add(1);
+                // `unit_key` is column 2 of the shared candidate projection.
+                // Testing it before materializing keeps a blob's unmatched
+                // declarations from allocating their signature text.
+                if !unit_keys.contains(&row.get::<_, i64>(2)?) {
+                    continue;
+                }
+                out.push(search_candidate_row_from_row(row)?);
+            }
+        }
+        drop(stmt);
         tx.commit()?;
         if complete && !cancellation.is_some_and(CancellationToken::is_cancelled) {
             Ok(LimitedQueryRows::complete(out, inspected))
@@ -5683,32 +5784,10 @@ where
     Ok(out)
 }
 
-fn search_candidate_rows_by_lang_conn(
-    conn: &Connection,
-    lang: &str,
-) -> Result<Vec<SearchCandidateRow>> {
-    Ok(search_candidate_rows_by_lang_conn_while(conn, lang, || true)?.rows)
-}
-
-fn search_candidate_rows_by_lang_conn_cancellable(
-    conn: &Connection,
-    lang: &str,
-    cancellation: Option<&CancellationToken>,
-) -> Result<LimitedQueryRows<SearchCandidateRow>> {
-    match cancellation {
-        Some(cancellation) => {
-            search_candidate_rows_by_lang_conn_while(conn, lang, || !cancellation.is_cancelled())
-        }
-        None => search_candidate_rows_by_lang_conn_while(conn, lang, || true),
-    }
-}
-
-fn search_candidate_rows_by_lang_conn_while(
-    conn: &Connection,
-    lang: &str,
-    mut continue_query: impl FnMut() -> bool,
-) -> Result<LimitedQueryRows<SearchCandidateRow>> {
-    let sql = format!(
+/// The full search-candidate projection, parameterized by its row predicate so
+/// the by-key hydration and the whole-language enumeration cannot drift apart.
+fn search_candidate_sql(predicate: &str) -> String {
+    format!(
         "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
                 units.content_qualifier, units.signature, units.synthetic,
                 units.is_type_alias, units.top_level_ordinal, units.in_declarations,
@@ -5723,9 +5802,61 @@ fn search_candidate_rows_by_lang_conn_while(
           AND primary_range.lang = units.lang
           AND primary_range.unit_key = units.unit_key
           AND primary_range.ordinal = 0
+         WHERE {predicate} AND units.in_declarations = 1
+           AND {PARSED_BLOB_COMPLETE_CONDITION}"
+    )
+}
+
+fn search_candidate_rows_by_lang_conn(
+    conn: &Connection,
+    lang: &str,
+) -> Result<Vec<SearchCandidateRow>> {
+    let sql = format!(
+        "{} ORDER BY units.blob_oid, units.unit_key",
+        search_candidate_sql("units.lang = ?1")
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut query = stmt.query([lang])?;
+    let mut rows = Vec::new();
+    while let Some(row) = query.next()? {
+        rows.push(search_candidate_row_from_row(row)?);
+    }
+    Ok(rows)
+}
+
+fn search_candidate_name_rows_by_lang_conn_cancellable(
+    conn: &Connection,
+    lang_index: usize,
+    lang: &str,
+    cancellation: Option<&CancellationToken>,
+) -> Result<LimitedQueryRows<SearchCandidateNameRow>> {
+    match cancellation {
+        Some(cancellation) => {
+            search_candidate_name_rows_by_lang_conn_while(conn, lang_index, lang, || {
+                !cancellation.is_cancelled()
+            })
+        }
+        None => search_candidate_name_rows_by_lang_conn_while(conn, lang_index, lang, || true),
+    }
+}
+
+fn search_candidate_name_rows_by_lang_conn_while(
+    conn: &Connection,
+    lang_index: usize,
+    lang: &str,
+    mut continue_query: impl FnMut() -> bool,
+) -> Result<LimitedQueryRows<SearchCandidateNameRow>> {
+    // No `ORDER BY`: candidates are deduplicated through an ordered map after
+    // matching, so the storage order carries no meaning, while sorting the
+    // whole declaration projection cost a temp B-tree over every workspace
+    // declaration on every request (issue #1199).
+    let sql = format!(
+        "SELECT units.blob_oid, units.unit_key, units.short_name, units.content_qualifier
+         FROM code_units AS units
+         JOIN blob_meta AS meta
+           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
          WHERE units.lang = ?1 AND units.in_declarations = 1
-           AND {PARSED_BLOB_COMPLETE_CONDITION}
-         ORDER BY units.blob_oid, units.unit_key"
+           AND {PARSED_BLOB_COMPLETE_CONDITION}"
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let mut query = stmt.query([lang])?;
@@ -5736,7 +5867,17 @@ fn search_candidate_rows_by_lang_conn_while(
             return Ok(LimitedQueryRows::incomplete(rows, inspected));
         }
         inspected = inspected.saturating_add(1);
-        rows.push(search_candidate_row_from_row(row)?);
+        let oid_text = row.get::<_, String>(0)?;
+        let blob_oid = Oid::from_str(&oid_text).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+        })?;
+        rows.push(SearchCandidateNameRow {
+            lang_index,
+            blob_oid,
+            unit_key: row.get(1)?,
+            short_name: row.get(2)?,
+            content_qualifier: row.get(3)?,
+        });
     }
     if !continue_query() {
         Ok(LimitedQueryRows::incomplete(rows, inspected))

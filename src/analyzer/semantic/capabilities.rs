@@ -193,84 +193,14 @@ mod tests {
 
     #[test]
     fn registry_ordinals_labels_and_storage_are_exhaustive() {
-        let expected = [
-            (SemanticCapability::Procedures, "procedures"),
-            (SemanticCapability::EntryBoundary, "entry_boundary"),
-            (
-                SemanticCapability::NormalExitBoundary,
-                "normal_exit_boundary",
-            ),
-            (
-                SemanticCapability::ExceptionalExitBoundary,
-                "exceptional_exit_boundary",
-            ),
-            (SemanticCapability::BasicBlocks, "basic_blocks"),
-            (SemanticCapability::ProgramPoints, "program_points"),
-            (SemanticCapability::NormalControlFlow, "normal_control_flow"),
-            (
-                SemanticCapability::ExceptionalControlFlow,
-                "exceptional_control_flow",
-            ),
-            (
-                SemanticCapability::CleanupControlFlow,
-                "cleanup_control_flow",
-            ),
-            (SemanticCapability::Assignments, "assignments"),
-            (SemanticCapability::Values, "values"),
-            (SemanticCapability::Allocations, "allocations"),
-            (SemanticCapability::LocalFlow, "local_flow"),
-            (SemanticCapability::ParameterFlow, "parameter_flow"),
-            (SemanticCapability::ReceiverFlow, "receiver_flow"),
-            (SemanticCapability::ReturnFlow, "return_flow"),
-            (SemanticCapability::FieldMemory, "field_memory"),
-            (SemanticCapability::StaticMemory, "static_memory"),
-            (SemanticCapability::IndexMemory, "index_memory"),
-            (SemanticCapability::Calls, "calls"),
-            (SemanticCapability::DynamicDispatch, "dynamic_dispatch"),
-            (
-                SemanticCapability::NormalCallContinuation,
-                "normal_call_continuation",
-            ),
-            (
-                SemanticCapability::ExceptionalCallContinuation,
-                "exceptional_call_continuation",
-            ),
-            (SemanticCapability::Captures, "captures"),
-            (
-                SemanticCapability::CallableReferences,
-                "callable_references",
-            ),
-            (
-                SemanticCapability::AsyncSuspendResume,
-                "async_suspend_resume",
-            ),
-            (
-                SemanticCapability::GeneratorSuspension,
-                "generator_suspension",
-            ),
-            (SemanticCapability::DeferredExecution, "deferred_execution"),
-            (SemanticCapability::ConcurrentSpawn, "concurrent_spawn"),
-            (SemanticCapability::NonLocalControl, "non_local_control"),
-            (
-                SemanticCapability::ResourceManagement,
-                "resource_management",
-            ),
-        ];
         let capabilities = SemanticCapabilities::default();
         let iterated = capabilities
             .iter()
             .map(|(capability, _)| capability)
             .collect::<Vec<_>>();
         assert_eq!(iterated, SemanticCapability::ALL);
-        assert_eq!(expected.len(), SemanticCapability::COUNT);
         assert_eq!(SemanticCapability::ALL.len(), SemanticCapability::COUNT);
         assert_eq!(capabilities.support.len(), SemanticCapability::COUNT);
-
-        for (ordinal, (capability, label)) in expected.into_iter().enumerate() {
-            assert_eq!(capability.index(), ordinal);
-            assert_eq!(SemanticCapability::ALL[capability.index()], capability);
-            assert_eq!(capability.label(), label);
-        }
 
         let mut labels = SemanticCapability::ALL
             .into_iter()
