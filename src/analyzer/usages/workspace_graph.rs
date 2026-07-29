@@ -6,18 +6,29 @@ use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeMap;
 
+/// The name universe a declaration's identity belongs to.
+///
+/// One ecosystem is one candidate space: two declarations in the same
+/// ecosystem with the same fully-qualified name are the same node, and a
+/// reference resolved anywhere in the ecosystem can land on any of its nodes.
+///
+/// Java, Scala, and Kotlin share a single `Jvm` ecosystem because they compile
+/// to one classpath and can name one another's types directly. Sharing the
+/// candidate space is not the same as collapsing source-language identity:
+/// every node still knows the language it was declared in (see
+/// [`WorkspaceUsageNode::source_language`]), and each language keeps its own
+/// resolver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum UsageEcosystem {
     JavaScriptTypeScript,
     Python,
     Go,
     Rust,
-    Java,
+    Jvm,
     CSharp,
     Cpp,
     Php,
     Ruby,
-    Scala,
     Unknown,
 }
 
@@ -28,14 +39,11 @@ impl UsageEcosystem {
             Language::Python => Self::Python,
             Language::Go => Self::Go,
             Language::Rust => Self::Rust,
-            Language::Java => Self::Java,
+            Language::Java | Language::Scala | Language::Kotlin => Self::Jvm,
             Language::CSharp => Self::CSharp,
             Language::Cpp => Self::Cpp,
             Language::Php => Self::Php,
             Language::Ruby => Self::Ruby,
-            Language::Scala => Self::Scala,
-            // Kotlin usage-graph ecosystem membership is issue #1239.
-            Language::Kotlin => Self::Unknown,
             Language::None => Self::Unknown,
         }
     }
@@ -50,12 +58,11 @@ impl UsageEcosystem {
             Self::Python => "python",
             Self::Go => "go",
             Self::Rust => "rust",
-            Self::Java => "java",
+            Self::Jvm => "jvm",
             Self::CSharp => "csharp",
             Self::Cpp => "cpp",
             Self::Php => "php",
             Self::Ruby => "ruby",
-            Self::Scala => "scala",
             Self::Unknown => "unknown",
         }
     }
@@ -95,6 +102,34 @@ pub(crate) struct WorkspaceUsageNode {
     pub(crate) declaration_files: Vec<ProjectFile>,
     pub(crate) truncated_inbound: Option<usize>,
     pub(crate) unproven_inbound: usize,
+}
+
+impl WorkspaceUsageNode {
+    /// The language this node's declaration was written in.
+    ///
+    /// Distinct from its ecosystem: a Java, a Scala, and a Kotlin declaration
+    /// all live in the `Jvm` candidate space, but a consumer still needs to
+    /// know which one it is looking at.
+    pub(crate) fn source_language(&self) -> Language {
+        language_for_target(&self.primary)
+    }
+
+    /// A stable label naming what this node is, for reporting.
+    ///
+    /// JVM nodes report their own language rather than the shared realm, so
+    /// sharing a candidate space never costs a consumer the ability to tell
+    /// Java from Scala from Kotlin.
+    pub(crate) fn language_label(&self) -> &'static str {
+        match self.key.ecosystem {
+            UsageEcosystem::Jvm => match self.source_language() {
+                Language::Java => "java",
+                Language::Scala => "scala",
+                Language::Kotlin => "kotlin",
+                _ => UsageEcosystem::Jvm.as_str(),
+            },
+            ecosystem => ecosystem.as_str(),
+        }
+    }
 }
 
 pub(crate) struct WorkspaceUsageCatalog {
@@ -221,10 +256,23 @@ pub(crate) fn build_workspace_usage_graph(
         UsageEcosystem::Rust,
         super::rust_graph::build_rust_usage_edge_weights
     );
+    // One JVM realm, several resolvers. Java, Scala, and Kotlin declarations
+    // share one node space, so both builders run over the *same* candidate set
+    // and merge into it. There is no double counting: each resolver only scans
+    // files of its own language, so the two passes cover disjoint call sites.
+    // Kotlin's own edge builder arrives with #1239; until then Kotlin
+    // declarations are realm members that Java and Scala references can resolve
+    // onto, with no outbound edges of their own — an explicit gap, not a
+    // silent one.
     record_package_edges!(
-        "workspace_usage_graph::resolve_java",
-        UsageEcosystem::Java,
+        "workspace_usage_graph::resolve_jvm_java",
+        UsageEcosystem::Jvm,
         super::java_graph::build_java_usage_edge_weights
+    );
+    record_package_edges!(
+        "workspace_usage_graph::resolve_jvm_scala",
+        UsageEcosystem::Jvm,
+        super::scala_graph::build_scala_usage_edge_weights
     );
     record_package_edges!(
         "workspace_usage_graph::resolve_csharp",
@@ -246,12 +294,6 @@ pub(crate) fn build_workspace_usage_graph(
         UsageEcosystem::Ruby,
         super::ruby_graph::build_ruby_usage_edge_weights
     );
-    record_package_edges!(
-        "workspace_usage_graph::resolve_scala",
-        UsageEcosystem::Scala,
-        super::scala_graph::build_scala_usage_edge_weights
-    );
-
     let _jsts_scope = crate::profiling::scope("workspace_usage_graph::resolve_jsts");
     let scoped_nodes: HashSet<_> = catalog
         .nodes
