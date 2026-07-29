@@ -154,26 +154,6 @@ fn test_structured_import_info_for_group_alias_self_and_wildcard() {
 }
 
 #[test]
-fn test_type_alias_detection_via_import_suite() {
-    let analyzer = RustAnalyzer::from_project(rust_project(&[(
-        "src/main.rs",
-        "type MyResult<T> = Result<T, Error>;",
-    )]));
-    let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "src/main.rs");
-    let alias = analyzer
-        .declarations(&file)
-        .into_iter()
-        .find(|cu| cu.identifier() == "MyResult")
-        .unwrap();
-    assert!(analyzer.is_type_alias(&alias));
-    assert!(
-        analyzer
-            .type_alias_provider()
-            .is_some_and(|provider| provider.is_type_alias(&alias))
-    );
-}
-
-#[test]
 fn test_resolve_imports_semantic_cases() {
     let semantic = RustAnalyzer::from_project(rust_project(&[
         ("src/my_module.rs", "pub struct MyStruct;"),

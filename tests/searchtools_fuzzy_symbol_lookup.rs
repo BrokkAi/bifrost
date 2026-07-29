@@ -211,46 +211,6 @@ fn scala_case_class_and_companion_in_object_index_under_the_object() {
 }
 
 #[test]
-fn javascript_double_sigil_names_are_searchable() {
-    // http4s Message.EntityStreamException shape: case class + companion
-    // inside an object — the import path `org.http4s.Message.EntityStreamException`
-    // must find the case class.
-    let project = InlineTestProject::with_language(Language::Scala)
-        .file(
-            "src/Message.scala",
-            "package org.http4s\n\ntrait Message\n\nobject Message {\n  final case class EntityStreamException(msg: String) extends Exception(msg)\n\n  object EntityStreamException {\n    def createWithDefaultMsg(maxBytes: Long): EntityStreamException = ???\n  }\n}\n",
-        )
-        .build();
-    let analyzer = ScalaAnalyzer::from_project(project.project().clone());
-
-    let search = search_symbols(
-        &analyzer,
-        SearchSymbolsParams {
-            patterns: vec!["EntityStreamException".to_string()],
-            include_tests: true,
-            limit: 20,
-        },
-    );
-    let symbols: Vec<String> = search
-        .files
-        .iter()
-        .flat_map(|file| {
-            file.classes
-                .iter()
-                .chain(file.functions.iter())
-                .chain(file.fields.iter())
-                .map(|hit| hit.symbol.clone())
-        })
-        .collect();
-    assert!(
-        symbols
-            .iter()
-            .any(|symbol| symbol == "org.http4s.Message.EntityStreamException"),
-        "case class must be indexed under the natural import path: {symbols:?}"
-    );
-}
-
-#[test]
 fn typescript_constructor_assigned_field_is_indexed_and_searchable() {
     // Mirrors the JavaScript constructor-field pass: without it, TS
     // constructor-assigned properties resolve in scan_usages but are

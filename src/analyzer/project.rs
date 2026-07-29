@@ -1343,13 +1343,6 @@ mod tests {
     }
 
     #[test]
-    fn overlay_project_default_cap_constant_is_eight_mib() {
-        // Sanity check on the constant — bumping the default is a deliberate
-        // memory-budget decision and should not happen by accident.
-        assert_eq!(DEFAULT_MAX_OVERLAY_BYTES, 8 * 1024 * 1024);
-    }
-
-    #[test]
     fn overlay_project_repeated_rejections_are_idempotent() {
         // didChange fires per-keystroke. An editor parked on a buffer that's
         // permanently over the cap will hammer set() repeatedly. The

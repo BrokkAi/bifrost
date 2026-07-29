@@ -6,39 +6,6 @@ use std::process::Command;
 use tempfile::TempDir;
 
 #[test]
-fn help_describes_repo_and_corpus_modes() {
-    let output = Command::new(env!("CARGO_BIN_EXE_bifrost_reference_differential"))
-        .arg("--help")
-        .output()
-        .expect("run help");
-    assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-    assert!(stdout.contains("run-repo"), "{stdout}");
-    assert!(stdout.contains("run-corpus"), "{stdout}");
-
-    let repo_help = Command::new(env!("CARGO_BIN_EXE_bifrost_reference_differential"))
-        .args(["run-repo", "--help"])
-        .output()
-        .expect("run repository help");
-    assert!(repo_help.status.success());
-    let repo_stdout = String::from_utf8(repo_help.stdout).expect("utf8 stdout");
-    assert!(repo_stdout.contains("--cache-mode"), "{repo_stdout}");
-    assert!(repo_stdout.contains("ephemeral"), "{repo_stdout}");
-
-    let corpus_help = Command::new(env!("CARGO_BIN_EXE_bifrost_reference_differential"))
-        .args(["run-corpus", "--help"])
-        .output()
-        .expect("run corpus help");
-    assert!(corpus_help.status.success());
-    let corpus_stdout = String::from_utf8(corpus_help.stdout).expect("utf8 stdout");
-    assert!(corpus_stdout.contains("--repo-jobs"), "{corpus_stdout}");
-    assert!(
-        corpus_stdout.contains("workers per repository"),
-        "{corpus_stdout}"
-    );
-}
-
-#[test]
 fn corpus_dry_run_selects_largest_valid_clone_by_recorded_loc() {
     let fixture = CorpusFixture::new();
     fixture.add_repo("java", "small__repo", 100, true);

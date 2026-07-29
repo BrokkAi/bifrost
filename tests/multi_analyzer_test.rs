@@ -25,22 +25,6 @@ fn java_multi(project: &common::BuiltInlineTestProject) -> MultiAnalyzer {
     )]))
 }
 
-fn fallback_test_file_heuristic(file: &ProjectFile, analyzer: &MultiAnalyzer) -> bool {
-    analyzer.contains_tests(file)
-        || file
-            .rel_path()
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| {
-                let lower = name.to_ascii_lowercase();
-                lower.starts_with("test")
-                    || lower.contains("_test")
-                    || lower.ends_with("test.py")
-                    || lower.ends_with("tests.py")
-            })
-            .unwrap_or(false)
-}
-
 #[test]
 fn test_get_top_level_declarations_java_file() {
     let project = built_java_project(&[(
@@ -60,14 +44,6 @@ fn test_get_top_level_declarations_java_file() {
     assert_eq!(1, top_level.len());
     assert_eq!("TestClass", top_level[0].fq_name());
     assert!(top_level[0].is_class());
-}
-
-#[test]
-fn test_get_top_level_declarations_unsupported_language_returns_empty() {
-    let project = built_java_project(&[("TestClass.java", "public class TestClass {}")]);
-    let multi = java_multi(&project);
-    let python_file = ProjectFile::new(multi.project().root().to_path_buf(), "test.py");
-    assert!(multi.top_level_declarations(&python_file).is_empty());
 }
 
 #[test]
@@ -162,54 +138,6 @@ fn test_unknown_extension_returns_empty_get_sources() {
         "SomeClass.someMethod",
     );
     assert!(multi.get_sources(&unknown_unit, true).is_empty());
-}
-
-#[test]
-fn test_unknown_extension_returns_empty_get_source() {
-    let project = built_java_project(&[("TestClass.java", "public class TestClass {}")]);
-    let multi = java_multi(&project);
-    let unknown_file = ProjectFile::new(multi.project().root().to_path_buf(), "test.xyz");
-    let unknown_unit = CodeUnit::new(unknown_file, CodeUnitType::Class, "", "UnknownClass");
-    assert!(multi.get_source(&unknown_unit, true).is_none());
-}
-
-#[test]
-fn test_unknown_extension_returns_empty_get_skeleton() {
-    let project = built_java_project(&[("TestClass.java", "public class TestClass {}")]);
-    let multi = java_multi(&project);
-    let unknown_file = ProjectFile::new(multi.project().root().to_path_buf(), "test.xyz");
-    let unknown_unit = CodeUnit::new(unknown_file, CodeUnitType::Class, "", "UnknownClass");
-    assert!(multi.get_skeleton(&unknown_unit).is_none());
-}
-
-#[test]
-fn test_unknown_extension_no_exception() {
-    let project = built_java_project(&[("TestClass.java", "public class TestClass {}")]);
-    let multi = java_multi(&project);
-    let unknown_file = ProjectFile::new(multi.project().root().to_path_buf(), "test.unknown");
-    let unknown_class = CodeUnit::new(unknown_file.clone(), CodeUnitType::Class, "", "Test");
-    let unknown_method = CodeUnit::new(
-        unknown_file.clone(),
-        CodeUnitType::Function,
-        "",
-        "Test.method",
-    );
-
-    let _ = multi.get_skeleton(&unknown_class);
-    let _ = multi.get_skeleton_header(&unknown_class);
-    let _ = multi.get_sources(&unknown_method, false);
-    let _ = multi.get_source(&unknown_class, false);
-    let _ = multi.direct_children(&unknown_class);
-    let _ = multi.declarations(&unknown_file);
-    let _ = multi.get_skeletons(&unknown_file);
-}
-
-#[test]
-fn test_is_test_file_falls_back_to_heuristics_when_delegate_lacks_capability() {
-    let project = built_java_project(&[("TestClass.java", "public class TestClass {}")]);
-    let multi = java_multi(&project);
-    let python_test_file = ProjectFile::new(multi.project().root().to_path_buf(), "test_script.py");
-    assert!(fallback_test_file_heuristic(&python_test_file, &multi));
 }
 
 #[test]

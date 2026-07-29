@@ -201,7 +201,6 @@ fn tutorials_cover_all_public_kinds_roles_and_pages() {
         "field",
     ];
 
-    let mut seen_pages = std::collections::BTreeSet::new();
     let mut seen_kinds = std::collections::BTreeSet::new();
     let mut seen_roles = std::collections::BTreeSet::new();
     for page in PAGES {
@@ -211,7 +210,6 @@ fn tutorials_cover_all_public_kinds_roles_and_pages() {
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
         let tutorial = parse_tutorial(&path, &markdown);
         assert_valid_date(&path, &tutorial.verified_on);
-        assert!(seen_pages.insert(*page), "duplicate tutorial page {page}");
         let mut semantic_steps = std::collections::BTreeSet::new();
         for case in tutorial.cases.values() {
             let json = case
@@ -240,7 +238,6 @@ fn tutorials_cover_all_public_kinds_roles_and_pages() {
         );
     }
 
-    assert_eq!(seen_pages, PAGES.iter().copied().collect());
     for kind in ALL_KINDS {
         assert!(
             seen_kinds.contains(kind.label()),

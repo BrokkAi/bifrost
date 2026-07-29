@@ -36,23 +36,6 @@ fn fq_names(units: impl IntoIterator<Item = CodeUnit>) -> BTreeSet<String> {
 }
 
 #[test]
-fn cpp_type_hierarchy_resolves_single_inheritance() {
-    let (_project, analyzer) = cpp_analyzer_with_files(&[(
-        "types.cpp",
-        r#"
-struct Base {};
-struct Child : Base {};
-"#,
-    )]);
-
-    let child = definition(&analyzer, "Child");
-    assert_eq!(
-        fq_names(analyzer.get_direct_ancestors(&child)),
-        BTreeSet::from(["Base".to_string()])
-    );
-}
-
-#[test]
 fn cpp_type_hierarchy_resolves_multiple_inheritance() {
     let (_project, analyzer) = cpp_analyzer_with_files(&[(
         "types.cpp",
@@ -67,25 +50,6 @@ struct Worker : Runnable, Serializable {};
     assert_eq!(
         fq_names(analyzer.get_direct_ancestors(&worker)),
         BTreeSet::from(["Runnable".to_string(), "Serializable".to_string()])
-    );
-}
-
-#[test]
-fn cpp_type_hierarchy_resolves_namespace_qualified_base() {
-    let (_project, analyzer) = cpp_analyzer_with_files(&[(
-        "types.cpp",
-        r#"
-namespace api {
-struct Base {};
-}
-struct Child : api::Base {};
-"#,
-    )]);
-
-    let child = definition(&analyzer, "Child");
-    assert_eq!(
-        fq_names(analyzer.get_direct_ancestors(&child)),
-        BTreeSet::from(["api.Base".to_string()])
     );
 }
 

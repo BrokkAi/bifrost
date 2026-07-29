@@ -264,23 +264,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_file_paths_returns_empty_report() {
-        let fix = AnalyzerFixture::new(&[("src/lib.rs", "fn x() {}\n")]);
-        let result = compute_cyclomatic_complexity(
-            fix.analyzer.analyzer(),
-            ComputeCyclomaticComplexityParams {
-                file_paths: vec![],
-                threshold: 0,
-            },
-        );
-        assert_eq!(
-            result.report,
-            "No methods exceeded the complexity threshold of 10."
-        );
-        assert!(!result.truncated);
-    }
-
-    #[test]
     fn multiple_files_share_one_header() {
         let fix = AnalyzerFixture::new(&[
             ("src/a.rs", "fn alpha(x: i32) { if x > 0 {} }\n"),

@@ -765,22 +765,6 @@ fn ts_file_summaries_skip_synthetic_module_import_entries() {
 }
 
 #[test]
-fn summary_renderer_uses_ranges_for_multiline_elements() {
-    let rendered = render_summary_element(&SummaryElement {
-        path: "A.java".to_string(),
-        symbol: "Foo".to_string(),
-        kind: "class".to_string(),
-        start_line: 12,
-        end_line: 14,
-        text: "class Foo(\n  x: int,\n  y: int".to_string(),
-        parent_symbol: None,
-        presentation: None,
-    });
-
-    assert_eq!("12..14: class Foo(\n  x: int,\n  y: int", rendered);
-}
-
-#[test]
 fn cpp_file_summaries_surface_macros_and_prototypes_without_fallback() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

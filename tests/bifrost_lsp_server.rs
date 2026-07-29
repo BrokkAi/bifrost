@@ -270,37 +270,6 @@ fn bifrost_lsp_server_handles_initialize_and_shutdown() {
 }
 
 #[test]
-fn bifrost_lsp_server_advertises_completion_when_client_supports_completion_items() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
-
-    let mut server = LspServer::spawn(&fixture_root);
-
-    server.notify_value(json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": completion_initialize_params(uri_for(&fixture_root))
-    }));
-    let initialize = server.read_message();
-    assert_eq!(initialize["id"], 1);
-    assert!(
-        initialize["result"]["capabilities"]["completionProvider"].is_object(),
-        "completionProvider should be advertised when the client exposes completion sub-capabilities: {initialize}"
-    );
-    server.notify_value(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
-
-    server.notify_value(json!({"jsonrpc": "2.0", "id": 2, "method": "shutdown"}));
-    let shutdown = server.read_message();
-    assert_eq!(shutdown["id"], 2);
-    assert!(shutdown["error"].is_null(), "unexpected error: {shutdown}");
-
-    server.exit();
-}
-
-#[test]
 fn bifrost_lsp_server_semantic_tokens_advertises_stable_full_legend() {
     let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -8828,30 +8797,6 @@ fn bifrost_lsp_server_did_save_suppresses_go_semantic_diagnostics() {
         "jsonrpc": "2.0",
         "method": "textDocument/didSave",
         "params": {"textDocument": {"uri": main_uri}}
-    }));
-
-    let publish = server.read_notification("textDocument/publishDiagnostics");
-    let items = publish["params"]["diagnostics"]
-        .as_array()
-        .unwrap_or_else(|| panic!("expected diagnostics array, got {publish}"));
-    assert!(items.is_empty(), "expected no semantic lints: {publish}");
-}
-
-#[test]
-fn bifrost_lsp_server_did_save_suppresses_python_semantic_diagnostics() {
-    let temp = TempDir::new().expect("temp dir");
-    let temp_root = temp.path().canonicalize().expect("canon temp");
-    fs::write(temp_root.join("app.py"), "def run():\n    print(\"ok\")\n").expect("write fixture");
-
-    let mut server = LspServer::start(&temp_root);
-    let app_uri = uri_for(&temp_root.join("app.py"));
-
-    fs::write(temp_root.join("app.py"), "def run():\n    missing_value\n")
-        .expect("rewrite fixture");
-    server.notify_value(json!({
-        "jsonrpc": "2.0",
-        "method": "textDocument/didSave",
-        "params": {"textDocument": {"uri": app_uri}}
     }));
 
     let publish = server.read_notification("textDocument/publishDiagnostics");

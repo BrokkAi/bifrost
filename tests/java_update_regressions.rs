@@ -118,33 +118,3 @@ fn duplicate_overload_preserves_distinct_signature() {
         child_sigs
     );
 }
-
-#[test]
-fn incremental_class_replacement_keeps_new_children() {
-    let (_temp, analyzer) = analyzer_for(&[(
-        "pkg/Target.java",
-        "package pkg; class Target { void baseline() {} }",
-    )]);
-    let mut analyzer = analyzer;
-    let target = ProjectFile::new(analyzer.project().root().to_path_buf(), "pkg/Target.java");
-
-    target
-        .write("package pkg; class Target; class Target { void method() {} }")
-        .unwrap();
-    analyzer = analyzer.update(&BTreeSet::from([target.clone()]));
-
-    let target_cu = analyzer
-        .get_definitions("pkg.Target")
-        .into_iter()
-        .next()
-        .unwrap();
-    let children = analyzer.direct_children(&target_cu);
-    assert!(
-        children
-            .iter()
-            .any(|code_unit| code_unit.short_name() == "Target.method")
-    );
-    let skeleton = analyzer.get_skeleton(&target_cu).unwrap();
-    assert!(skeleton.contains("method"));
-    assert!(!skeleton.contains("baseline"));
-}

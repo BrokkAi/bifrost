@@ -783,8 +783,3 @@ pub(super) fn python_expanded_comment_start(source: &str, start_byte: usize) -> 
 pub(super) fn line_starts(source: &str) -> Vec<usize> {
     compute_line_starts(source)
 }
-
-#[cfg(test)]
-pub(super) fn split_logical_lines(content: &str) -> Vec<&str> {
-    model_context::logical_lines(content)
-}

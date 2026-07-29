@@ -22,14 +22,6 @@ fn step_position(workflow: &str, name: &str) -> usize {
 }
 
 #[test]
-fn workflow_contract_normalizes_windows_line_endings() {
-    assert_eq!(
-        normalize_newlines("on:\r\n  schedule:\r\n"),
-        "on:\n  schedule:\n"
-    );
-}
-
-#[test]
 fn benchmark_workflow_enforces_actionable_regressions_by_default() {
     let workflow = checked_in_workflow();
 

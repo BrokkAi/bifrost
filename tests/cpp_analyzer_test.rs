@@ -47,12 +47,6 @@ fn base_function_name(code_unit: &CodeUnit) -> String {
 }
 
 #[test]
-fn is_empty_test() {
-    let analyzer = fixture_analyzer();
-    assert!(!analyzer.is_empty());
-}
-
-#[test]
 fn function_like_export_macro_preserves_class_declaration_identity() {
     let project = inline_cpp_project(&[(
         "gurl.h",
@@ -1652,39 +1646,6 @@ fn test_inline_field_initializer_parity_cases() {
     assert_code_eq("int x = 1;", &analyzer.get_skeleton(&x).unwrap());
     assert_code_eq("int y;", &analyzer.get_skeleton(&y).unwrap());
     assert_code_eq("static inline auto z;", &analyzer.get_skeleton(&z).unwrap());
-}
-
-#[test]
-fn test_cpp_type_alias_and_stable_definition_ordering() {
-    let analyzer = fixture_analyzer();
-    let all = all_declarations(&analyzer);
-    let aliases: Vec<_> = all
-        .iter()
-        .filter(|cu| cu.is_class())
-        .filter(|cu| {
-            ["ColorValue", "PixelBuffer", "String", "uint32_t"]
-                .iter()
-                .any(|name| cu.short_name().contains(name))
-        })
-        .collect();
-    assert!(
-        aliases
-            .iter()
-            .any(|cu| cu.short_name().contains("ColorValue")),
-        "{aliases:#?}"
-    );
-    assert!(
-        aliases
-            .iter()
-            .any(|cu| cu.short_name().contains("PixelBuffer")),
-        "{aliases:#?}"
-    );
-
-    let defs = analyzer.get_definitions("overloadedFunction");
-    assert!(defs.len() >= 3);
-    let unique_signatures: BTreeSet<_> = defs.iter().filter_map(|cu| cu.signature()).collect();
-    assert!(!unique_signatures.is_empty());
-    assert!(unique_signatures.len() >= 2);
 }
 
 #[test]

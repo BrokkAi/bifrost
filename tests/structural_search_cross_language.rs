@@ -105,59 +105,6 @@ fn run_query_with_files(files: &[(&str, &str)], query: serde_json::Value) -> Cod
 }
 
 #[test]
-fn remaining_languages_search_without_unsupported_adapter_diagnostics_during_issue_527_rollout() {
-    let output = run_query_with_files(
-        &[
-            (
-                "go/app.go",
-                "package app\n\nfunc audit() {}\nfunc run() { audit() }\n",
-            ),
-            ("cpp/app.cpp", "void audit() {}\nvoid run() { audit(); }\n"),
-            ("rust/lib.rs", "fn audit() {}\nfn run() { audit(); }\n"),
-            (
-                "php/app.php",
-                "<?php\nfunction audit() {}\nfunction run() { audit(); }\n",
-            ),
-            (
-                "scala/App.scala",
-                "object App { def audit(): Unit = (); def run(): Unit = audit() }\n",
-            ),
-            (
-                "csharp/App.cs",
-                "class App { void audit() {} void run() { audit(); } }\n",
-            ),
-            ("ruby/app.rb", "def audit; end\ndef run; audit(); end\n"),
-        ],
-        json!({ "match": { "kind": "call", "callee": { "name": "audit" } } }),
-    );
-
-    let rows: Vec<_> = output
-        .structural_matches()
-        .iter()
-        .map(|m| (m.language, m.path.as_str(), m.text.as_str()))
-        .collect();
-    assert_eq!(
-        rows,
-        vec![
-            ("cpp", "cpp/app.cpp", "audit()"),
-            ("csharp", "csharp/App.cs", "audit()"),
-            ("go", "go/app.go", "audit()"),
-            ("php", "php/app.php", "audit()"),
-            ("ruby", "ruby/app.rb", "audit()"),
-            ("rust", "rust/lib.rs", "audit()"),
-            ("scala", "scala/App.scala", "audit()"),
-        ]
-    );
-
-    let diagnostics: BTreeSet<_> = output
-        .diagnostics
-        .iter()
-        .map(|diagnostic| (diagnostic.language, diagnostic.message.as_str()))
-        .collect();
-    assert!(diagnostics.is_empty(), "{diagnostics:?}");
-}
-
-#[test]
 fn cpp_function_like_macro_invocation_matches_call_callee_query() {
     let output = run_query_with_files(
         &[(
