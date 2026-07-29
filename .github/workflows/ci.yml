@@ -206,9 +206,14 @@ jobs:
 
       - name: Run RQL runtime tests
         run: >-
-          node scripts/ci-timing.mjs --label rql-runtime -- cargo test --features nlp,python
-          --test suite_cross_language --test suite_mcp_cli --
-          code_intelligence_runtime:: structural_search_cross_language::
+          node scripts/ci-timing.mjs --label rql-runtime -- cargo test
+          -p brokk-bifrost-runtime --all-features
+
+      - name: Run structural query contract tests
+        run: >-
+          node scripts/ci-timing.mjs --label structural-query-contract -- cargo test
+          --features nlp,python --test suite_cross_language --
+          structural_search_cross_language::
           structural_search_planner:: structural_search_python::
 
   mcp-contract:
