@@ -13,17 +13,17 @@ pub(crate) mod wildcard_imports;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
-use crate::analyzer::java::is_java_dependency_input;
 use crate::analyzer::js_ts::cache::{
     build_weighted_cache, weight_code_unit_set, weight_code_unit_vec_by_unit,
     weight_project_file_set,
 };
-use crate::analyzer::jvm::external::JavaExternalDeclarationIndex;
+use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
+use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BulkFileStateSource, CodeUnit, IAnalyzer,
-    ImportAnalysisProvider, JavaAnalyzerConfig, Language, PoolSafeMemo, Project, ProjectFile,
+    ImportAnalysisProvider, JvmAnalyzerConfig, Language, PoolSafeMemo, Project, ProjectFile,
     SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
     UsageFactsIndex,
@@ -231,8 +231,8 @@ pub(crate) fn scala_parenthesized_arity(source: &str) -> Option<usize> {
 #[derive(Clone)]
 pub struct ScalaAnalyzer {
     inner: TreeSitterAnalyzer<ScalaAdapter>,
-    java_config: JavaAnalyzerConfig,
-    external_index: Arc<OnceLock<JavaExternalDeclarationIndex>>,
+    java_config: JvmAnalyzerConfig,
+    external_index: Arc<OnceLock<JvmExternalDeclarationIndex>>,
     memo_budget: u64,
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
@@ -457,7 +457,7 @@ impl ScalaAnalyzer {
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
-        let java_config = config.java.clone();
+        let java_config = config.jvm.clone();
         let inner = TreeSitterAnalyzer::new_with_config(project, ScalaAdapter, config);
         Self::from_inner(inner, memo_budget, java_config)
     }
@@ -465,7 +465,7 @@ impl ScalaAnalyzer {
     fn from_inner(
         inner: TreeSitterAnalyzer<ScalaAdapter>,
         memo_budget: u64,
-        java_config: JavaAnalyzerConfig,
+        java_config: JvmAnalyzerConfig,
     ) -> Self {
         Self {
             inner,
@@ -511,9 +511,9 @@ impl ScalaAnalyzer {
         })
     }
 
-    pub(crate) fn external_declaration_index(&self) -> &JavaExternalDeclarationIndex {
+    pub(crate) fn external_declaration_index(&self) -> &JvmExternalDeclarationIndex {
         self.external_index.get_or_init(|| {
-            JavaExternalDeclarationIndex::build_for_project(&self.java_config, self.inner.project())
+            JvmExternalDeclarationIndex::build_for_project(&self.java_config, self.inner.project())
         })
     }
 
@@ -643,7 +643,7 @@ impl ScalaAnalyzer {
         progress: Option<BuildProgress>,
     ) -> Result<Self, crate::analyzer::store::StoreError> {
         let memo_budget = config.memo_cache_budget_bytes();
-        let java_config = config.java.clone();
+        let java_config = config.jvm.clone();
         let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             project,
             ScalaAdapter,
@@ -987,7 +987,7 @@ impl IAnalyzer for ScalaAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        let external_index = if changed_files.iter().any(is_java_dependency_input) {
+        let external_index = if changed_files.iter().any(is_jvm_dependency_input) {
             Arc::new(OnceLock::new())
         } else {
             self.external_index.clone()

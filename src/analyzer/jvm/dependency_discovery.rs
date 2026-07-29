@@ -1,6 +1,6 @@
 use crate::analyzer::{
-    JavaDependencyDiscoveryConfig, JavaExternalArtifact, JavaExternalDependencies,
-    JavaMavenCoordinate, Project, ProjectFile,
+    JvmDependencyDiscoveryConfig, JvmExternalArtifact, JvmExternalDependencies, JvmMavenCoordinate,
+    Project, ProjectFile,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::process::{BoundedProcessRequest, read_limited, run_bounded_process};
@@ -55,25 +55,25 @@ gradle.projectsEvaluated {
 "#;
 
 #[derive(Debug, Default)]
-pub(crate) struct DiscoveredJavaDependencies {
-    pub(super) artifact_paths: Vec<JavaExternalArtifact>,
-    pub(super) coordinates: Vec<JavaMavenCoordinate>,
+pub(crate) struct DiscoveredJvmDependencies {
+    pub(super) artifact_paths: Vec<JvmExternalArtifact>,
+    pub(super) coordinates: Vec<JvmMavenCoordinate>,
 }
 
-impl DiscoveredJavaDependencies {
-    pub(crate) fn merge_into(self, dependencies: &mut JavaExternalDependencies) {
+impl DiscoveredJvmDependencies {
+    pub(crate) fn merge_into(self, dependencies: &mut JvmExternalDependencies) {
         dependencies.artifact_paths.extend(self.artifact_paths);
         dependencies.coordinates.extend(self.coordinates);
         deduplicate_dependencies(dependencies);
     }
 }
 
-pub(crate) fn discover_metadata(project: &dyn Project) -> DiscoveredJavaDependencies {
+pub(crate) fn discover_metadata(project: &dyn Project) -> DiscoveredJvmDependencies {
     let Ok(files) = project.all_files() else {
-        return DiscoveredJavaDependencies::default();
+        return DiscoveredJvmDependencies::default();
     };
     let files: Vec<_> = files.into_iter().collect();
-    let mut discovered = DiscoveredJavaDependencies::default();
+    let mut discovered = DiscoveredJvmDependencies::default();
     for file in files {
         if is_maven_pom(&file) {
             discover_maven_pom(project, &file, &mut discovered);
@@ -87,8 +87,8 @@ pub(crate) fn discover_metadata(project: &dyn Project) -> DiscoveredJavaDependen
 
 pub(crate) fn discover_build_tools(
     project: &dyn Project,
-    config: &JavaDependencyDiscoveryConfig,
-) -> DiscoveredJavaDependencies {
+    config: &JvmDependencyDiscoveryConfig,
+) -> DiscoveredJvmDependencies {
     discover_build_tools_with_executor(project, config, &SystemDependencyCommandExecutor)
 }
 
@@ -97,14 +97,14 @@ trait DependencyCommandExecutor {
         &self,
         root: &Path,
         executable: &Path,
-        config: &JavaDependencyDiscoveryConfig,
+        config: &JvmDependencyDiscoveryConfig,
     ) -> Result<Vec<u8>, String>;
 
     fn gradle_report(
         &self,
         root: &Path,
         executable: &Path,
-        config: &JavaDependencyDiscoveryConfig,
+        config: &JvmDependencyDiscoveryConfig,
     ) -> Result<Vec<u8>, String>;
 }
 
@@ -115,7 +115,7 @@ impl DependencyCommandExecutor for SystemDependencyCommandExecutor {
         &self,
         root: &Path,
         executable: &Path,
-        config: &JavaDependencyDiscoveryConfig,
+        config: &JvmDependencyDiscoveryConfig,
     ) -> Result<Vec<u8>, String> {
         let temporary = tempfile::tempdir().map_err(|err| err.to_string())?;
         let report_path = temporary.path().join("maven-dependencies.txt");
@@ -135,7 +135,7 @@ impl DependencyCommandExecutor for SystemDependencyCommandExecutor {
         &self,
         root: &Path,
         executable: &Path,
-        config: &JavaDependencyDiscoveryConfig,
+        config: &JvmDependencyDiscoveryConfig,
     ) -> Result<Vec<u8>, String> {
         let temporary = tempfile::tempdir().map_err(|err| err.to_string())?;
         let init_path = temporary.path().join("bifrost.init.gradle");
@@ -191,14 +191,14 @@ fn run_dependency_process(
 
 fn discover_build_tools_with_executor(
     project: &dyn Project,
-    config: &JavaDependencyDiscoveryConfig,
+    config: &JvmDependencyDiscoveryConfig,
     executor: &dyn DependencyCommandExecutor,
-) -> DiscoveredJavaDependencies {
+) -> DiscoveredJvmDependencies {
     let Ok(files) = project.all_files() else {
-        return DiscoveredJavaDependencies::default();
+        return DiscoveredJvmDependencies::default();
     };
     let files: Vec<_> = files.into_iter().collect();
-    let mut discovered = DiscoveredJavaDependencies::default();
+    let mut discovered = DiscoveredJvmDependencies::default();
     let maven_executable = config
         .maven_executable
         .clone()
@@ -224,7 +224,7 @@ fn discover_build_tools_with_executor(
     discovered
 }
 
-pub(crate) fn is_java_dependency_input(file: &ProjectFile) -> bool {
+pub(crate) fn is_jvm_dependency_input(file: &ProjectFile) -> bool {
     let path = file.rel_path();
     let file_name = path
         .file_name()
@@ -260,7 +260,7 @@ pub(crate) fn is_java_dependency_input(file: &ProjectFile) -> bool {
 fn discover_maven_pom(
     project: &dyn Project,
     file: &ProjectFile,
-    discovered: &mut DiscoveredJavaDependencies,
+    discovered: &mut DiscoveredJvmDependencies,
 ) {
     let Some(source) = read_bounded_source(project, file) else {
         return;
@@ -315,7 +315,7 @@ fn discover_maven_pom(
         }
         discovered
             .coordinates
-            .push(JavaMavenCoordinate::new(group_id, artifact_id, version));
+            .push(JvmMavenCoordinate::new(group_id, artifact_id, version));
     }
 }
 
@@ -355,7 +355,7 @@ fn maven_project_properties(project_node: &XmlNode) -> HashMap<String, String> {
 fn discover_gradle_lockfile(
     project: &dyn Project,
     file: &ProjectFile,
-    discovered: &mut DiscoveredJavaDependencies,
+    discovered: &mut DiscoveredJvmDependencies,
 ) {
     let Some(source) = read_bounded_source(project, file) else {
         return;
@@ -365,7 +365,7 @@ fn discover_gradle_lockfile(
         .extend(parse_gradle_lockfile(&source));
 }
 
-fn parse_gradle_lockfile(source: &str) -> Vec<JavaMavenCoordinate> {
+fn parse_gradle_lockfile(source: &str) -> Vec<JvmMavenCoordinate> {
     source
         .lines()
         .filter_map(|line| {
@@ -385,7 +385,7 @@ fn parse_gradle_lockfile(source: &str) -> Vec<JavaMavenCoordinate> {
             {
                 return None;
             }
-            Some(JavaMavenCoordinate::new(group_id, artifact_id, version))
+            Some(JvmMavenCoordinate::new(group_id, artifact_id, version))
         })
         .collect()
 }
@@ -405,7 +405,7 @@ fn maven_dependency_list_args(report_path: &Path) -> Vec<String> {
 
 #[derive(Debug, PartialEq, Eq)]
 struct ToolArtifactRecord {
-    coordinate: JavaMavenCoordinate,
+    coordinate: JvmMavenCoordinate,
     artifact_path: PathBuf,
 }
 
@@ -439,7 +439,7 @@ fn parse_maven_dependency_line(line: &str) -> Option<ToolArtifactRecord> {
         return None;
     }
     Some(ToolArtifactRecord {
-        coordinate: JavaMavenCoordinate::new(group_id, artifact_id, version),
+        coordinate: JvmMavenCoordinate::new(group_id, artifact_id, version),
         artifact_path: PathBuf::from(artifact_path.trim()),
     })
 }
@@ -465,7 +465,7 @@ fn parse_gradle_dependency_jsonl(report: &[u8]) -> Vec<ToolArtifactRecord> {
                 return None;
             }
             Some(ToolArtifactRecord {
-                coordinate: JavaMavenCoordinate::new(
+                coordinate: JvmMavenCoordinate::new(
                     record.group.trim(),
                     record.name.trim(),
                     record.version.trim(),
@@ -476,7 +476,7 @@ fn parse_gradle_dependency_jsonl(report: &[u8]) -> Vec<ToolArtifactRecord> {
         .collect()
 }
 
-fn add_tool_records(records: Vec<ToolArtifactRecord>, discovered: &mut DiscoveredJavaDependencies) {
+fn add_tool_records(records: Vec<ToolArtifactRecord>, discovered: &mut DiscoveredJvmDependencies) {
     for record in records {
         if !record.artifact_path.is_absolute()
             || !record.artifact_path.is_file()
@@ -489,7 +489,7 @@ fn add_tool_records(records: Vec<ToolArtifactRecord>, discovered: &mut Discovere
             continue;
         }
         discovered.coordinates.push(record.coordinate);
-        discovered.artifact_paths.push(JavaExternalArtifact {
+        discovered.artifact_paths.push(JvmExternalArtifact {
             artifact_path: record.artifact_path,
             source_artifact_path: None,
         });
@@ -692,7 +692,7 @@ fn is_gradle_lockfile(file: &ProjectFile) -> bool {
             })
 }
 
-fn deduplicate_discovered(discovered: &mut DiscoveredJavaDependencies) {
+fn deduplicate_discovered(discovered: &mut DiscoveredJvmDependencies) {
     let mut coordinates = HashSet::default();
     discovered
         .coordinates
@@ -717,8 +717,8 @@ fn deduplicate_discovered(discovered: &mut DiscoveredJavaDependencies) {
         .sort_by(|left, right| left.artifact_path.cmp(&right.artifact_path));
 }
 
-fn deduplicate_dependencies(dependencies: &mut JavaExternalDependencies) {
-    let mut discovered = DiscoveredJavaDependencies {
+fn deduplicate_dependencies(dependencies: &mut JvmExternalDependencies) {
+    let mut discovered = DiscoveredJvmDependencies {
         artifact_paths: std::mem::take(&mut dependencies.artifact_paths),
         coordinates: std::mem::take(&mut dependencies.coordinates),
     };
@@ -861,7 +861,7 @@ mod tests {
         let project = project(&[("pom.xml", pom), ("src/App.java", "class App {}")]);
         let discovered = discover_metadata(&project);
         assert_eq!(
-            vec![JavaMavenCoordinate::new("org.example", "library", "2.3.4")],
+            vec![JvmMavenCoordinate::new("org.example", "library", "2.3.4")],
             discovered.coordinates
         );
     }
@@ -950,8 +950,8 @@ mod tests {
         let discovered = discover_metadata(&project);
         assert_eq!(
             vec![
-                JavaMavenCoordinate::new("org.example", "alpha", "1.0"),
-                JavaMavenCoordinate::new("org.example", "beta", "2.0"),
+                JvmMavenCoordinate::new("org.example", "alpha", "1.0"),
+                JvmMavenCoordinate::new("org.example", "beta", "2.0"),
             ],
             discovered.coordinates
         );
@@ -970,7 +970,7 @@ mod tests {
             ("README.md", false),
         ] {
             let file = ProjectFile::new(root.path().to_path_buf(), PathBuf::from(path));
-            assert_eq!(expected, is_java_dependency_input(&file), "{path}");
+            assert_eq!(expected, is_jvm_dependency_input(&file), "{path}");
         }
     }
 
@@ -986,12 +986,12 @@ mod tests {
         let records = parse_maven_dependency_list(report);
         assert_eq!(3, records.len());
         assert_eq!(
-            JavaMavenCoordinate::new("org.example", "direct", "1.0"),
+            JvmMavenCoordinate::new("org.example", "direct", "1.0"),
             records[0].coordinate
         );
         assert_eq!(PathBuf::from("/tmp/direct.jar"), records[0].artifact_path);
         assert_eq!(
-            JavaMavenCoordinate::new("org.example", "transitive", "2.0"),
+            JvmMavenCoordinate::new("org.example", "transitive", "2.0"),
             records[1].coordinate
         );
         assert_eq!(
@@ -1011,7 +1011,7 @@ malformed
         let records = parse_gradle_dependency_jsonl(report);
         assert_eq!(3, records.len());
         assert_eq!(
-            JavaMavenCoordinate::new("org.example", "classified", "2.0"),
+            JvmMavenCoordinate::new("org.example", "classified", "2.0"),
             records[1].coordinate
         );
         assert_eq!(
@@ -1066,17 +1066,17 @@ malformed
                 (standalone_root, Err("timed out".to_string())),
             ],
         );
-        let config = JavaDependencyDiscoveryConfig {
+        let config = JvmDependencyDiscoveryConfig {
             maven_executable: Some(PathBuf::from("trusted-mvn")),
             gradle_executable: Some(PathBuf::from("trusted-gradle")),
-            ..JavaDependencyDiscoveryConfig::default()
+            ..JvmDependencyDiscoveryConfig::default()
         };
 
         let discovered = discover_build_tools_with_executor(&project, &config, &executor);
         assert_eq!(
             vec![
-                JavaMavenCoordinate::new("org.example", "gradle", "2.0"),
-                JavaMavenCoordinate::new("org.example", "maven", "1.0"),
+                JvmMavenCoordinate::new("org.example", "gradle", "2.0"),
+                JvmMavenCoordinate::new("org.example", "maven", "1.0"),
             ],
             discovered.coordinates
         );
@@ -1105,7 +1105,7 @@ malformed
         );
         let discovered = discover_build_tools_with_executor(
             &project,
-            &JavaDependencyDiscoveryConfig::default(),
+            &JvmDependencyDiscoveryConfig::default(),
             &executor,
         );
         assert!(discovered.coordinates.is_empty());
@@ -1143,7 +1143,7 @@ malformed
             &self,
             root: &Path,
             executable: &Path,
-            _config: &JavaDependencyDiscoveryConfig,
+            _config: &JvmDependencyDiscoveryConfig,
         ) -> Result<Vec<u8>, String> {
             assert_eq!(self.expected_maven, executable);
             self.calls
@@ -1160,7 +1160,7 @@ malformed
             &self,
             root: &Path,
             executable: &Path,
-            _config: &JavaDependencyDiscoveryConfig,
+            _config: &JvmDependencyDiscoveryConfig,
         ) -> Result<Vec<u8>, String> {
             assert_eq!(self.expected_gradle, executable);
             self.calls

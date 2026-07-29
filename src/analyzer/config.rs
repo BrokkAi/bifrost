@@ -5,7 +5,7 @@ use std::time::Duration;
 pub struct AnalyzerConfig {
     pub parallelism: Option<usize>,
     pub memo_cache_budget_bytes: Option<u64>,
-    pub java: JavaAnalyzerConfig,
+    pub jvm: JvmAnalyzerConfig,
     pub csharp: CSharpAnalyzerConfig,
 }
 
@@ -16,21 +16,21 @@ pub struct CSharpAnalyzerConfig {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct JavaAnalyzerConfig {
-    pub external_dependencies: JavaExternalDependencies,
-    pub dependency_discovery: JavaDependencyDiscoveryConfig,
+pub struct JvmAnalyzerConfig {
+    pub external_dependencies: JvmExternalDependencies,
+    pub dependency_discovery: JvmDependencyDiscoveryConfig,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct JavaExternalDependencies {
-    pub artifact_paths: Vec<JavaExternalArtifact>,
-    pub coordinates: Vec<JavaMavenCoordinate>,
+pub struct JvmExternalDependencies {
+    pub artifact_paths: Vec<JvmExternalArtifact>,
+    pub coordinates: Vec<JvmMavenCoordinate>,
     pub repository_roots: Vec<PathBuf>,
     pub gradle_cache_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum JavaDependencyDiscoveryMode {
+pub enum JvmDependencyDiscoveryMode {
     Disabled,
     #[default]
     Metadata,
@@ -38,17 +38,17 @@ pub enum JavaDependencyDiscoveryMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JavaDependencyDiscoveryConfig {
-    pub mode: JavaDependencyDiscoveryMode,
+pub struct JvmDependencyDiscoveryConfig {
+    pub mode: JvmDependencyDiscoveryMode,
     pub maven_executable: Option<PathBuf>,
     pub gradle_executable: Option<PathBuf>,
     pub timeout: Duration,
 }
 
-impl Default for JavaDependencyDiscoveryConfig {
+impl Default for JvmDependencyDiscoveryConfig {
     fn default() -> Self {
         Self {
-            mode: JavaDependencyDiscoveryMode::Metadata,
+            mode: JvmDependencyDiscoveryMode::Metadata,
             maven_executable: None,
             gradle_executable: None,
             timeout: Duration::from_secs(30),
@@ -57,19 +57,19 @@ impl Default for JavaDependencyDiscoveryConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JavaExternalArtifact {
+pub struct JvmExternalArtifact {
     pub artifact_path: PathBuf,
     pub source_artifact_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct JavaMavenCoordinate {
+pub struct JvmMavenCoordinate {
     pub group_id: String,
     pub artifact_id: String,
     pub version: String,
 }
 
-impl JavaMavenCoordinate {
+impl JvmMavenCoordinate {
     pub fn new(
         group_id: impl Into<String>,
         artifact_id: impl Into<String>,
@@ -103,7 +103,7 @@ impl Default for AnalyzerConfig {
         Self {
             parallelism: Some(default_parallelism()),
             memo_cache_budget_bytes: Some(256 * 1024 * 1024),
-            java: JavaAnalyzerConfig::default(),
+            jvm: JvmAnalyzerConfig::default(),
             csharp: CSharpAnalyzerConfig::default(),
         }
     }
