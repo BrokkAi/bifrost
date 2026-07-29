@@ -44,9 +44,10 @@ use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
 use crate::analyzer::pool_memo::PoolSafeMemo;
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer, JvmAnalyzerConfig,
-    Language, Project, ProjectFile, SemanticDiagnostic, SignatureMetadata, TreeSitterAnalyzer,
-    TypeAliasProvider, TypeHierarchyProvider, UsageFactsIndex,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer,
+    ImportAnalysisProvider, JvmAnalyzerConfig, Language, Project, ProjectFile, SemanticDiagnostic,
+    SignatureMetadata, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
+    UsageFactsIndex,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -353,6 +354,10 @@ impl IAnalyzer for KotlinAnalyzer {
 
     fn project(&self) -> &dyn Project {
         self.inner.project()
+    }
+
+    fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
+        Some(self)
     }
 
     fn type_alias_provider(&self) -> Option<&dyn TypeAliasProvider> {
