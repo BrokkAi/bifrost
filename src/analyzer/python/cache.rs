@@ -2,6 +2,21 @@ use super::*;
 use std::mem::size_of;
 use std::sync::Arc;
 
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub(super) struct PythonUsageEdgesKey {
+    caller_nodes: Arc<[String]>,
+    callee_targets: Arc<[String]>,
+}
+
+impl PythonUsageEdgesKey {
+    pub(super) fn new(nodes: &HashSet<String>, targets: &HashSet<String>) -> Self {
+        Self {
+            caller_nodes: sorted_names(nodes),
+            callee_targets: sorted_names(targets),
+        }
+    }
+}
+
 pub(super) fn weight_project_file_set(
     _key: &ProjectFile,
     value: &Arc<HashSet<ProjectFile>>,
@@ -57,4 +72,47 @@ pub(super) fn weight_export_index(_key: &ProjectFile, value: &Arc<ExportIndex>) 
         .map(|star| star.module_specifier.len() + size_of::<ReexportStar>())
         .sum::<usize>();
     (exports_size + reexport_stars_size + size_of::<ExportIndex>()).min(u32::MAX as usize) as u32
+}
+
+pub(super) fn weight_python_usage_edges(
+    key: &PythonUsageEdgesKey,
+    edges: &Arc<crate::analyzer::usages::inverted_edges::UsageEdges>,
+) -> u32 {
+    let key_bytes = names_weight(&key.caller_nodes) + names_weight(&key.callee_targets);
+    let edge_bytes = edges
+        .edges
+        .iter()
+        .map(|((caller, callee), sites)| {
+            caller.len()
+                + callee.len()
+                + sites
+                    .iter()
+                    .map(|site| {
+                        size_of::<crate::analyzer::usages::inverted_edges::CallSite>()
+                            + site.path.len()
+                    })
+                    .sum::<usize>()
+        })
+        .sum::<usize>();
+    let summary_bytes = edges
+        .truncated
+        .keys()
+        .chain(edges.unproven_inbound.keys())
+        .map(|name| size_of::<String>() + name.len() + size_of::<usize>())
+        .sum::<usize>();
+    (key_bytes + edge_bytes + summary_bytes).clamp(1, u32::MAX as usize) as u32
+}
+
+fn sorted_names(names: &HashSet<String>) -> Arc<[String]> {
+    let mut sorted_names = names.iter().cloned().collect::<Vec<_>>();
+    sorted_names.sort_unstable();
+    sorted_names.into()
+}
+
+fn names_weight(names: &Arc<[String]>) -> usize {
+    size_of::<Arc<[String]>>()
+        + names
+            .iter()
+            .map(|item| size_of::<String>() + item.len())
+            .sum::<usize>()
 }
