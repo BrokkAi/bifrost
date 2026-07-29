@@ -173,7 +173,10 @@ pub(crate) fn rust_focused_use_path<'tree>(
 ) -> Option<RustFocusedUsePath<'tree>> {
     let mut prefix = focused;
     while let Some(parent) = prefix.parent() {
-        if parent.kind() != "scoped_identifier" {
+        if !matches!(
+            parent.kind(),
+            "scoped_identifier" | "scoped_type_identifier"
+        ) {
             break;
         }
         if parent
@@ -238,7 +241,7 @@ fn node_contains(container: Node<'_>, node: Node<'_>) -> bool {
 }
 
 fn rust_use_path_root(mut node: Node<'_>) -> Node<'_> {
-    while node.kind() == "scoped_identifier" {
+    while matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier") {
         let Some(path) = node.child_by_field_name("path") else {
             break;
         };
@@ -447,7 +450,7 @@ fn rust_use_path_segments(node: Node<'_>, source: &str) -> Vec<String> {
     let mut pending = vec![node];
     while let Some(node) = pending.pop() {
         match node.kind() {
-            "scoped_identifier" => {
+            "scoped_identifier" | "scoped_type_identifier" => {
                 if let Some(name) = node.child_by_field_name("name") {
                     pending.push(name);
                 }
@@ -455,7 +458,7 @@ fn rust_use_path_segments(node: Node<'_>, source: &str) -> Vec<String> {
                     pending.push(path);
                 }
             }
-            "crate" | "identifier" | "metavariable" | "self" | "super" => {
+            "crate" | "identifier" | "type_identifier" | "metavariable" | "self" | "super" => {
                 let segment = rust_node_text(node, source).trim();
                 if !segment.is_empty() {
                     segments.push(segment.to_string());

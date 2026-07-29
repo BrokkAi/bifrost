@@ -645,6 +645,31 @@ fn record_use_import_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             if matches!(current.kind(), "identifier" | "type_identifier")
                 && is_local_use_binding_node(current)
             {
+                if use_as_clause_original_terminal(current)
+                    && let Some(path) =
+                        crate::analyzer::rust::rust_focused_use_path(current, ctx.source)
+                {
+                    let segments = path.segments.iter().map(String::as_str).collect::<Vec<_>>();
+                    let root_name = path
+                        .root
+                        .utf8_text(ctx.source.as_bytes())
+                        .ok()
+                        .map(str::trim)
+                        .map(|name| if name == "$crate" { "crate" } else { name })
+                        .unwrap_or_default();
+                    if ctx.matches_path(
+                        &segments,
+                        current.start_byte(),
+                        rust_reference_namespace(current),
+                        ctx.path_root_shadowed_at(root_name, path.root.start_byte()),
+                        crate::analyzer::usages::rust_graph::hits::rust_path_is_leading_absolute(
+                            path.root,
+                        ),
+                    ) {
+                        record_import_hit(current, ctx);
+                        return TreeWalkAction::Descend;
+                    }
+                }
                 let text = current
                     .utf8_text(ctx.source.as_bytes())
                     .ok()
@@ -664,16 +689,62 @@ fn is_local_use_binding_node(node: Node<'_>) -> bool {
     let mut current = node.parent();
     while let Some(parent) = current {
         if parent.kind() == "use_declaration" {
-            return true;
+            return !use_path_leaf_is_prefix(node);
+        }
+        if parent.kind() == "scoped_use_list"
+            && parent
+                .child_by_field_name("path")
+                .is_some_and(|path| same_node(path, node))
+        {
+            return false;
+        }
+        if parent.kind() == "use_list" {
+            return !use_path_leaf_is_prefix(node);
+        }
+        if matches!(
+            parent.kind(),
+            "scoped_identifier" | "scoped_type_identifier"
+        ) && parent
+            .child_by_field_name("path")
+            .is_some_and(|path| same_node(path, node))
+        {
+            return false;
         }
         if parent.kind() == "use_as_clause" {
-            return parent
-                .child_by_field_name("alias")
-                .is_some_and(|alias| same_node(alias, node));
+            return true;
         }
         current = parent.parent();
     }
     true
+}
+
+fn use_as_clause_original_terminal(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "use_as_clause"
+            && parent
+                .child_by_field_name("path")
+                .and_then(use_path_terminal_node)
+                .is_some_and(|terminal| same_node(terminal, node))
+    })
+}
+
+fn use_path_leaf_is_prefix(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "scoped_identifier" | "scoped_type_identifier"
+        ) && parent
+            .child_by_field_name("path")
+            .is_some_and(|path| same_node(path, node))
+    })
+}
+
+fn use_path_terminal_node(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "scoped_identifier" | "scoped_type_identifier" => node.child_by_field_name("name"),
+        "identifier" | "type_identifier" | "self" | "super" | "crate" => Some(node),
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2003,11 +2074,20 @@ struct SelfLikeConstructor {
 }
 
 fn field_expression_is_called(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
+    let mut expression = node;
+    while let Some(parent) = expression.parent()
+        && parent.kind() == "generic_function"
+        && parent
+            .child_by_field_name("function")
+            .is_some_and(|function| same_node(function, expression))
+    {
+        expression = parent;
+    }
+    expression.parent().is_some_and(|parent| {
         parent.kind() == "call_expression"
             && parent
                 .child_by_field_name("function")
-                .is_some_and(|function| same_node(function, node))
+                .is_some_and(|function| same_node(function, expression))
     })
 }
 

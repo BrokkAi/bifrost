@@ -10499,6 +10499,32 @@ function callLocal() {
 }
 
 #[test]
+fn javascript_same_file_top_level_assignment_resolves_top_level_read() {
+    let source = r#"
+member.status = "ready";
+
+const current = member.status;
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("app.js", source)
+        .build();
+
+    let line = "const current = member.status;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":4,"column":{}}}]}}"#,
+            column_of(line, "status")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "member.status", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 2, "{value}");
+}
+
+#[test]
 fn typescript_local_bindings_and_uncontextual_object_keys_block_indexed_fallback() {
     let source = r#"
 class Record { value = 1 }
@@ -10718,6 +10744,59 @@ const message = greeter.greet({ name: "Ada" });
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "Greeter.greet", "{value}");
     assert_eq!(result["definitions"][0]["path"], "components.js", "{value}");
+}
+
+#[test]
+fn javascript_imported_named_receiver_member_stays_scoped_to_the_imported_file() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "state.js",
+            r#"
+export const state = {};
+state.foo = function foo() {
+  return "imported";
+};
+"#,
+        )
+        .file(
+            "other.js",
+            r#"
+const state = {};
+state.foo = function foo() {
+  return "unrelated";
+};
+"#,
+        )
+        .file(
+            "app.js",
+            r#"
+import { state } from "./state.js";
+
+function render() {
+  return state.foo();
+}
+"#,
+        )
+        .build();
+
+    let line = "  return state.foo();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":5,"column":{}}}]}}"#,
+            column_of(line, "foo")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "state.foo", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "state.js", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "{value}"
+    );
 }
 
 #[test]
@@ -10992,6 +11071,37 @@ function render(query) {
 }
 
 #[test]
+fn javascript_unproven_same_file_receiver_does_not_resolve_assignment_created_property() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "app.js",
+            r#"
+function update() {
+  task.status = "indexed";
+}
+
+function render() {
+  return task.status;
+}
+"#,
+        )
+        .build();
+
+    let line = "  return task.status;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":6,"column":{}}}]}}"#,
+            column_of(line, "status")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"].is_null(), "{value}");
+}
+
+#[test]
 fn javascript_local_receiver_member_does_not_resolve_unrelated_file_scoped_property() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
@@ -11022,6 +11132,41 @@ function render() {
         &format!(
             r#"{{"references":[{{"path":"app.js","line":8,"column":{}}}]}}"#,
             column_of(line, "textContent")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"].is_null(), "{value}");
+}
+
+#[test]
+fn javascript_local_receiver_member_does_not_resolve_unrelated_cross_file_assignment_property() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "defs.js",
+            r#"
+function update(task) {
+  task.status = "indexed";
+}
+"#,
+        )
+        .file(
+            "app.js",
+            r#"
+function render(task) {
+  return task.status;
+}
+"#,
+        )
+        .build();
+
+    let line = "  return task.status;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":3,"column":{}}}]}}"#,
+            column_of(line, "status")
         ),
     );
 
