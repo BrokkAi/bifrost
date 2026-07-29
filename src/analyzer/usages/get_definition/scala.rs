@@ -6654,7 +6654,7 @@ fn resolve_scala_field(
                 }
                 ScalaExactMemberResolution::NoMatch => {
                     let stable_members =
-                        scala_stable_term_member_candidate_units(ctx, &owner_fqn, member);
+                        scala_exact_stable_term_member_candidate_units(ctx, exact_owner, member);
                     if !stable_members.is_empty() {
                         return candidates_outcome(stable_members);
                     }
@@ -6698,7 +6698,12 @@ fn resolve_scala_field(
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
         }
-        let stable_members = scala_stable_term_member_candidate_units(ctx, &owner_fqn, member);
+        let stable_members = scala_filter_stable_term_member_candidate_units(
+            ctx.scala,
+            scala_stable_term_member_candidate_units(ctx, &owner_fqn, member),
+            call_shape.as_ref(),
+            ScalaCallableSiteRole::Ordinary,
+        );
         if !stable_members.is_empty() {
             return candidates_outcome(stable_members);
         }
@@ -6872,6 +6877,61 @@ fn scala_stable_term_member_candidate_units(
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
+}
+
+/// Stable singleton terminals for an exact receiver must remain in the
+/// receiver's physical declaration tree. A logical FQN lookup here can match
+/// an identically named sibling source after exact member resolution has
+/// already established that this receiver has no such member.
+fn scala_exact_stable_term_member_candidate_units(
+    ctx: ScalaLookupCtx<'_>,
+    owner: &CodeUnit,
+    member: &str,
+) -> Vec<CodeUnit> {
+    let singleton_fqn = format!("{}.{}$", owner.fq_name(), member);
+    let mut candidates = ctx
+        .support
+        .fqn(&singleton_fqn)
+        .into_iter()
+        .filter(|candidate| {
+            candidate.is_class()
+                && candidate.fq_name() == singleton_fqn
+                && candidate.source() == owner.source()
+                && ctx.scala.structural_parent_of(candidate).as_ref() == Some(owner)
+        })
+        .collect::<Vec<_>>();
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
+}
+
+/// Stable-term fallback is also used for ordinary members when the receiver
+/// is only known by logical FQN. Keep singleton terminals and fields available
+/// as stable values, but do not let a function bypass the call-shape filtering
+/// that rejected it in ordinary member lookup.
+fn scala_filter_stable_term_member_candidate_units(
+    scala: &ScalaAnalyzer,
+    candidates: Vec<CodeUnit>,
+    call_shape: Option<&ScalaCallSiteShape>,
+    site_role: ScalaCallableSiteRole,
+) -> Vec<CodeUnit> {
+    let mut stable = candidates
+        .iter()
+        .filter(|candidate| !candidate.is_function())
+        .cloned()
+        .collect::<Vec<_>>();
+    stable.extend(scala_filter_callable_units(
+        scala,
+        candidates
+            .into_iter()
+            .filter(CodeUnit::is_function)
+            .collect(),
+        call_shape,
+        site_role,
+    ));
+    sort_units(&mut stable);
+    stable.dedup();
+    stable
 }
 
 fn scala_stable_term_member_candidate_units_without_ancestors(
