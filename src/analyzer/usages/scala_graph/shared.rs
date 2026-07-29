@@ -571,6 +571,21 @@ struct ScalaQueryHitSink<'a> {
 }
 
 impl ScalaQueryHitSink<'_> {
+    fn target_is_physically_unique(&self, target_id: usize) -> bool {
+        let target = &self.catalog.targets[target_id];
+        let target_is_singleton = target.is_class() && target.short_name().ends_with('$');
+        self.analyzer
+            .global_usage_definition_index()
+            .by_normalized_fqn(&scala_normalized_fq_name(&target.fq_name()))
+            .iter()
+            .filter(|candidate| candidate.kind() == target.kind())
+            .filter(|candidate| {
+                !target.is_class() || (candidate.short_name().ends_with('$') == target_is_singleton)
+            })
+            .count()
+            == 1
+    }
+
     fn wildcard_import_owner_target_ids(
         &mut self,
         import: &crate::analyzer::ImportInfo,
@@ -648,8 +663,17 @@ impl ScalaQueryHitSink<'_> {
             else {
                 continue;
             };
-            if !matches.iter().any(|existing| existing == target_ids) {
-                matches.push(target_ids.clone());
+            let unique_target_ids = target_ids
+                .iter()
+                .copied()
+                .filter(|target_id| self.target_is_physically_unique(*target_id))
+                .collect::<Vec<_>>();
+            if !unique_target_ids.is_empty()
+                && !matches
+                    .iter()
+                    .any(|existing| existing == &unique_target_ids)
+            {
+                matches.push(unique_target_ids);
             }
         }
         matches
@@ -854,7 +878,12 @@ impl ScalaReferenceSink for ScalaQueryHitSink<'_> {
                     .get(&scala_normalized_fq_name(&candidate))
                 {
                     self.relevant_names.insert(name.to_string());
-                    matches.extend(target_ids.iter().copied());
+                    matches.extend(
+                        target_ids
+                            .iter()
+                            .copied()
+                            .filter(|target_id| self.target_is_physically_unique(*target_id)),
+                    );
                 }
             }
         }

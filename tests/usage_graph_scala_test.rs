@@ -1113,6 +1113,129 @@ object Use {
 }
 
 #[test]
+fn scala_inverted_records_named_and_hidden_selector_import_references() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/Tokens.scala",
+            r#"package model
+object Tokens {
+  case object Right
+  case object Image
+  def sourceField(value: String): String = value.reverse
+}
+class Right
+class Image
+"#,
+        )
+        .file(
+            "decoy/Tokens.scala",
+            r#"package decoy
+object Tokens {
+  case object Right
+}
+"#,
+        )
+        .file(
+            "replica/left/Tokens.scala",
+            r#"package replica
+object Tokens {
+  case object Right
+}
+"#,
+        )
+        .file(
+            "replica/right/Tokens.scala",
+            r#"package replica
+object Tokens {
+  case object Right
+}
+"#,
+        )
+        .file(
+            "app/Use.scala",
+            r#"package app
+object Use {
+  def hiddenSelectors(): Unit = {
+    import model.Tokens.{Right => _, Image => _}
+    ()
+  }
+
+  def renamedSelector(): Unit = {
+    import model.Tokens.{Right => AliasRight}
+    ()
+  }
+
+  def memberSelector(): Unit = {
+    import model.Tokens.{sourceField => importedSourceField}
+    ()
+  }
+
+  def wrongOwner(): Unit = {
+    import decoy.Tokens.{Right => AliasRight}
+    ()
+  }
+
+  def ambiguousAlias(): Unit = {
+    import model._
+    import decoy._
+    import Tokens.{Right => AliasRight}
+    ()
+  }
+
+  def replicaAlias(): Unit = {
+    import replica.{Tokens => AliasTokens}
+    ()
+  }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    for caller in ["app.Use$.hiddenSelectors", "app.Use$.renamedSelector"] {
+        assert!(
+            has_edge(&value, caller, "model.Tokens$.Right$"),
+            "{caller} should edge to the exact selector-imported singleton: {}",
+            value["edges"]
+        );
+        assert!(
+            !has_edge(&value, caller, "model.Right"),
+            "{caller} must not edge to the same-name class decoy: {}",
+            value["edges"]
+        );
+    }
+    assert!(
+        has_edge(&value, "app.Use$.hiddenSelectors", "model.Tokens$.Image$"),
+        "hidden selector should edge to the exact imported singleton: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(
+            &value,
+            "app.Use$.memberSelector",
+            "model.Tokens$.sourceField"
+        ),
+        "member selector should edge to the exact imported function: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Use$.wrongOwner", "model.Tokens$.Right$"),
+        "wrong-owner selector import must stay excluded from the target singleton: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Use$.ambiguousAlias", "model.Tokens$.Right$"),
+        "ambiguous visible selector roots must fail closed: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Use$.replicaAlias", "replica.Tokens$"),
+        "same-FQN physical import replicas must fail closed: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn resolves_instance_object_and_unqualified_calls() {
     let value = usage_graph();
 

@@ -113,6 +113,10 @@ impl JsTsLexicalBindingIndex {
             .min_by_key(|scope| scope.end_byte - scope.start_byte)
     }
 
+    pub(crate) fn is_program_binding_at(&self, name: &str, byte: usize, root: Node<'_>) -> bool {
+        self.binding_scope_at(name, byte) == Some(node_scope(root))
+    }
+
     fn insert_parameters(&mut self, function: Node<'_>, source: &str) {
         let Some(parameters) = function.child_by_field_name("parameters") else {
             return;

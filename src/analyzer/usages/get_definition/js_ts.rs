@@ -1,7 +1,8 @@
 use super::*;
 use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::js_ts::syntax::{
-    JsTsLexicalBindingIndex, is_declaration_identifier, is_explicit_object_literal_key,
+    JsTsLexicalBindingIndex, direct_property_definitions, is_declaration_identifier,
+    is_explicit_object_literal_key, slice,
 };
 use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::typescript::ts_is_global_internal_module;
@@ -117,6 +118,7 @@ pub(super) fn resolve_js_ts(
     let value_position = jsts_reference_is_value_position(tree, site);
     let imports = &batch.imports;
     let aliases = batch.aliases.as_ref();
+    let lexical_bindings = JsTsLexicalBindingIndex::build(tree.root_node(), source);
     let focused =
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte);
 
@@ -204,12 +206,16 @@ pub(super) fn resolve_js_ts(
     }
 
     if let Some((qualifier, name)) = reference.split_once('.') {
-        if let Some(binding) = imports.bindings.get(qualifier)
-            && matches!(
-                binding.kind,
-                ImportKind::Namespace | ImportKind::CommonJsRequire
-            )
-        {
+        if let Some(binding) = jsts_visible_import_binding(
+            imports,
+            &lexical_bindings,
+            tree.root_node(),
+            qualifier,
+            site.focus_start_byte,
+        ) && matches!(
+            binding.kind,
+            ImportKind::Namespace | ImportKind::CommonJsRequire
+        ) {
             return resolve_js_ts_module_binding(
                 file,
                 language,
@@ -221,10 +227,14 @@ pub(super) fn resolve_js_ts(
                 value_position,
             );
         }
-        let imported_receiver_binding = imports
-            .bindings
-            .get(qualifier)
-            .filter(|binding| matches!(binding.kind, ImportKind::Named | ImportKind::Default));
+        let imported_receiver_binding = jsts_visible_import_binding(
+            imports,
+            &lexical_bindings,
+            tree.root_node(),
+            qualifier,
+            site.focus_start_byte,
+        )
+        .filter(|binding| matches!(binding.kind, ImportKind::Named | ImportKind::Default));
         let receiver_candidates = if let Some(binding) = imported_receiver_binding
             && matches!(binding.kind, ImportKind::Named | ImportKind::Default)
         {
@@ -340,24 +350,21 @@ pub(super) fn resolve_js_ts(
             value_position,
             before_byte: site.range.start_byte,
         };
-        let local_receiver_binding = (language == Language::JavaScript)
-            .then(|| {
-                jsts_visible_receiver_binding_scope(
-                    dotted_lookup.root,
-                    dotted_lookup.source,
-                    dotted_lookup.receiver,
-                    dotted_lookup.before_byte,
-                )
+        if language == Language::JavaScript
+            && jsts_visible_import_binding(
+                imports,
+                &lexical_bindings,
+                tree.root_node(),
+                qualifier,
+                site.focus_start_byte,
+            )
+            .is_none()
+            && let Some(local_candidates) = focused.and_then(|node| {
+                jsts_exact_local_dotted_candidates(dotted_lookup, &lexical_bindings, node)
             })
-            .flatten();
-        if let Some(binding_scope) = local_receiver_binding {
-            let scoped_lookup = JstsScopedDottedLookup {
-                lookup: dotted_lookup,
-                binding_scope,
-            };
-            let scoped = jsts_exact_scoped_dotted_candidates(scoped_lookup);
-            if !scoped.is_empty() {
-                return js_ts_candidates_outcome(analyzer, scoped);
+        {
+            if !local_candidates.is_empty() {
+                return js_ts_candidates_outcome(analyzer, local_candidates);
             }
             return no_definition(
                 "no_indexed_definition",
@@ -422,7 +429,13 @@ pub(super) fn resolve_js_ts(
         );
     }
 
-    if let Some(binding) = imports.bindings.get(reference) {
+    if let Some(binding) = jsts_visible_import_binding(
+        imports,
+        &lexical_bindings,
+        tree.root_node(),
+        reference,
+        site.focus_start_byte,
+    ) {
         let exported_name = match binding.kind {
             ImportKind::Named => binding.imported_name.as_deref().unwrap_or(reference),
             ImportKind::Default => "default",
@@ -907,37 +920,79 @@ impl JstsDottedLookup<'_, '_> {
     }
 }
 
-#[derive(Clone, Copy)]
-struct JstsScopedDottedLookup<'a, 'tree> {
-    lookup: JstsDottedLookup<'a, 'tree>,
-    binding_scope: JstsReceiverBindingScope,
+fn jsts_exact_local_dotted_candidates(
+    ctx: JstsDottedLookup<'_, '_>,
+    lexical_bindings: &JsTsLexicalBindingIndex,
+    focused: Node<'_>,
+) -> Option<Vec<CodeUnit>> {
+    let binding_scope = lexical_bindings.binding_scope_at(ctx.receiver, ctx.before_byte)?;
+    let (reference_receiver, property) =
+        jsts_focused_reference_receiver_property(focused, ctx.source)?;
+    let target_member = slice(property, ctx.source);
+    if target_member.is_empty() || slice(reference_receiver.root, ctx.source) != ctx.receiver {
+        return None;
+    }
+
+    let mut candidates = ctx.same_file_candidates();
+    candidates.retain(|candidate| {
+        direct_property_definitions(
+            ctx.root,
+            ctx.source,
+            &ctx.analyzer.ranges(candidate),
+            target_member,
+        )
+        .into_iter()
+        .any(|definition| {
+            slice(definition.receiver.root, ctx.source) == ctx.receiver
+                && definition.receiver.members.len() == reference_receiver.members.len()
+                && definition
+                    .receiver
+                    .members
+                    .iter()
+                    .zip(&reference_receiver.members)
+                    .all(|(actual, expected)| {
+                        slice(*actual, ctx.source) == slice(*expected, ctx.source)
+                    })
+                && lexical_bindings
+                    .binding_scope_at(ctx.receiver, definition.receiver.root.start_byte())
+                    == Some(binding_scope)
+                && definition.property_range.end_byte <= ctx.before_byte
+        })
+    });
+    Some(candidates)
 }
 
-fn jsts_exact_scoped_dotted_candidates(ctx: JstsScopedDottedLookup<'_, '_>) -> Vec<CodeUnit> {
-    let lookup = ctx.lookup;
-    let mut candidates: Vec<_> = lookup
-        .support
-        .fqn(lookup.reference)
-        .into_iter()
-        .filter(|unit| unit.source() == lookup.file)
-        .filter(|unit| {
-            lookup.analyzer.ranges(unit).iter().any(|range| {
-                range.start_byte < lookup.before_byte
-                    && jsts_visible_receiver_binding_scope(
-                        lookup.root,
-                        lookup.source,
-                        lookup.receiver,
-                        range.start_byte,
-                    ) == Some(ctx.binding_scope)
-            })
-        })
-        .collect();
-    if lookup.value_position {
-        candidates = jsts_value_space_candidates(lookup.analyzer, candidates);
-    } else {
-        candidates = jsts_type_space_candidates(lookup.analyzer, candidates);
-    }
-    candidates
+fn jsts_visible_import_binding<'a>(
+    imports: &'a ImportBinder,
+    lexical_bindings: &JsTsLexicalBindingIndex,
+    root: Node<'_>,
+    name: &str,
+    byte: usize,
+) -> Option<&'a crate::analyzer::usages::ImportBinding> {
+    let binding = imports.bindings.get(name)?;
+    lexical_bindings
+        .is_program_binding_at(name, byte, root)
+        .then_some(binding)
+}
+
+fn jsts_focused_reference_receiver_property<'tree>(
+    focused: Node<'tree>,
+    source: &str,
+) -> Option<(
+    crate::analyzer::js_ts::syntax::JsTsStaticMemberReceiver<'tree>,
+    Node<'tree>,
+)> {
+    let member_expression = match focused.kind() {
+        "member_expression" => focused,
+        "property_identifier" => focused
+            .parent()
+            .filter(|parent| parent.kind() == "member_expression")?,
+        _ => return None,
+    };
+    let object = member_expression.child_by_field_name("object")?;
+    let property = member_expression.child_by_field_name("property")?;
+    let receiver = crate::analyzer::js_ts::syntax::static_member_receiver(object, source)?;
+    Some((receiver, property))
 }
 
 fn jsts_exact_dotted_candidates(

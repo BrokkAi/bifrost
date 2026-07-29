@@ -63,8 +63,8 @@ use crate::analyzer::scala::{
     ScalaSupertypeLookupPath, ScalaWildcardOwnerFacts, resolve_scala_explicit_import_tier,
     resolve_scala_wildcard_import_environment, scala_class_parameter_field_keyword,
     scala_enclosing_package_root_candidates, scala_import_path, scala_import_path_candidates,
-    scala_normalize_full_name, scala_simple_type_name, scala_supertype_lookup_nodes,
-    scala_type_lookup_segments,
+    scala_nested_type_candidates, scala_normalize_full_name, scala_simple_type_name,
+    scala_supertype_lookup_nodes, scala_type_lookup_segments,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usage_facts::CallableFacts;
@@ -6155,8 +6155,8 @@ impl NameResolver {
                     .cloned(),
             );
         }
-        methods.sort_by(|left, right| left.fqn.cmp(&right.fqn));
-        methods.dedup_by(|left, right| left.fqn == right.fqn);
+        methods.sort_by(|left, right| left.declaration.cmp(&right.declaration));
+        methods.dedup_by(|left, right| left.declaration == right.declaration);
         methods
     }
 
@@ -6417,7 +6417,7 @@ impl ScalaReferenceSink for ScalaEdgeSink<'_, '_> {
             let normalized = scala_normalized_fq_name(&owner.fqn);
             let Some(target) = self
                 .types
-                .object_by_normalized_fqn(self.scala, &normalized)
+                .unique_object_by_normalized_fqn(self.scala, &normalized)
                 .cloned()
             else {
                 continue;
@@ -7036,6 +7036,17 @@ impl ScalaScan<'_, '_> {
         );
     }
 
+    fn record_exact_import(&mut self, callee: CodeUnit, role: ScalaReferenceRole, node: Node<'_>) {
+        self.sink.record(
+            ScalaResolvedReference::Exact(callee),
+            role,
+            classify_reference_node(node),
+            UsageHitKind::Import,
+            node.start_byte(),
+            node.end_byte(),
+        );
+    }
+
     fn record_exact_owner_member(
         &mut self,
         owner: CodeUnit,
@@ -7291,6 +7302,7 @@ fn seed_parent_scope_declaration(
 
 fn record_import_declaration(node: Node<'_>, ctx: &mut ScalaScan<'_, '_>) {
     let imports = scala_import_infos_from_node(node, ctx.source);
+    record_exact_import_references(node, ctx);
     if imports.is_empty() {
         return;
     }
@@ -7314,6 +7326,200 @@ fn record_import_declaration(node: Node<'_>, ctx: &mut ScalaScan<'_, '_>) {
             }
         }
     }
+}
+
+fn record_exact_import_references(node: Node<'_>, ctx: &mut ScalaScan<'_, '_>) {
+    let mut path_cursor = node.walk();
+    let path_nodes = node
+        .children_by_field_name("path", &mut path_cursor)
+        .filter(Node::is_named)
+        .collect::<Vec<_>>();
+    if path_nodes.is_empty() {
+        return;
+    }
+    let base_path = path_nodes
+        .iter()
+        .map(|segment| node_text(*segment, ctx.source).trim().to_string())
+        .collect::<Vec<_>>();
+    if base_path.iter().any(|segment| segment.is_empty()) {
+        return;
+    }
+
+    let mut cursor = node.walk();
+    let direct_children = node.named_children(&mut cursor).collect::<Vec<_>>();
+    if let Some(selectors) = direct_children
+        .iter()
+        .find(|child| child.kind() == "namespace_selectors")
+    {
+        let mut selector_cursor = selectors.walk();
+        let base_name_node = path_nodes.last().copied();
+        for selector in selectors.named_children(&mut selector_cursor) {
+            record_exact_import_selector_reference(
+                selector,
+                base_name_node,
+                &base_path,
+                node.start_byte(),
+                ctx,
+            );
+        }
+        return;
+    }
+
+    if let Some(selector) = direct_children.iter().find(|child| {
+        matches!(
+            child.kind(),
+            "namespace_wildcard" | "as_renamed_identifier" | "arrow_renamed_identifier"
+        )
+    }) {
+        record_exact_import_selector_reference(
+            *selector,
+            path_nodes.last().copied(),
+            &base_path,
+            node.start_byte(),
+            ctx,
+        );
+        return;
+    }
+
+    if let Some(name_node) = path_nodes.last().copied() {
+        record_exact_import_path_reference(name_node, &base_path, node.start_byte(), ctx);
+    }
+}
+
+fn record_exact_import_selector_reference(
+    selector: Node<'_>,
+    base_name_node: Option<Node<'_>>,
+    base_path: &[String],
+    declaration_start_byte: usize,
+    ctx: &mut ScalaScan<'_, '_>,
+) {
+    match selector.kind() {
+        "namespace_wildcard" => {
+            let Some(name_node) = base_name_node else {
+                return;
+            };
+            record_exact_import_path_reference(name_node, base_path, declaration_start_byte, ctx);
+        }
+        "identifier" | "operator_identifier" => {
+            let mut path = base_path.to_vec();
+            path.push(node_text(selector, ctx.source).trim().to_string());
+            record_exact_import_path_reference(selector, &path, declaration_start_byte, ctx);
+        }
+        "as_renamed_identifier" | "arrow_renamed_identifier" => {
+            let Some(name_node) = selector.child_by_field_name("name") else {
+                return;
+            };
+            let name = node_text(name_node, ctx.source).trim();
+            if name.is_empty() {
+                return;
+            }
+            let mut path = base_path.to_vec();
+            path.push(name.to_string());
+            record_exact_import_path_reference(name_node, &path, declaration_start_byte, ctx);
+        }
+        _ => {}
+    }
+}
+
+fn record_exact_import_path_reference(
+    name_node: Node<'_>,
+    path_segments: &[String],
+    declaration_start_byte: usize,
+    ctx: &mut ScalaScan<'_, '_>,
+) {
+    let Some(target) =
+        resolve_exact_import_path_reference(path_segments, declaration_start_byte, ctx)
+    else {
+        return;
+    };
+    let role = if target.is_function() {
+        ScalaReferenceRole::Callable
+    } else if ctx.types.has_term_field_declaration(&target) {
+        ScalaReferenceRole::Field
+    } else if target.is_class()
+        && (target.short_name().ends_with('$')
+            || ctx.types.type_accepts_object_roles(ctx.scala, &target))
+    {
+        ScalaReferenceRole::StableObject
+    } else {
+        ScalaReferenceRole::Type
+    };
+    ctx.record_exact_import(target, role, name_node);
+}
+
+fn resolve_exact_import_path_reference(
+    path_segments: &[String],
+    declaration_start_byte: usize,
+    ctx: &ScalaScan<'_, '_>,
+) -> Option<CodeUnit> {
+    if path_segments.is_empty() {
+        return None;
+    }
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::default();
+    if let Some(owners) = ctx.import_owner_scopes.get(&declaration_start_byte) {
+        for owner in owners {
+            for candidate in scala_nested_type_candidates(
+                owner.trim_end_matches('$').to_string(),
+                path_segments,
+                true,
+            ) {
+                if seen.insert(candidate.clone()) {
+                    candidates.push(candidate);
+                }
+            }
+        }
+    }
+    let relative_path = path_segments.join(".");
+    let package_prefixes = ctx
+        .active_resolver_key
+        .as_ref()
+        .map(|(packages, _)| packages.clone())
+        .filter(|packages| !packages.is_empty())
+        .unwrap_or_else(|| {
+            if ctx.active_package.is_empty() {
+                Vec::new()
+            } else {
+                vec![ctx.active_package.clone()]
+            }
+        });
+    for candidate in scala_import_path_candidates(&relative_path, &package_prefixes) {
+        if seen.insert(candidate.clone()) {
+            candidates.push(candidate);
+        }
+    }
+    let mut exact = HashSet::default();
+    for candidate in candidates {
+        exact.extend(exact_import_targets_for_candidate(&candidate, ctx));
+    }
+    match exact.into_iter().collect::<Vec<_>>().as_slice() {
+        [target] => Some(target.clone()),
+        _ => None,
+    }
+}
+
+fn exact_import_targets_for_candidate(
+    candidate: &str,
+    ctx: &ScalaScan<'_, '_>,
+) -> HashSet<CodeUnit> {
+    let normalized = scala_normalized_fq_name(candidate);
+    let mut exact = HashSet::default();
+    if let Some(member) =
+        ctx.types
+            .importable_member_by_normalized_fqn(ctx.scala, &normalized, Some(ctx.source_file))
+    {
+        exact.insert(member.clone());
+    }
+
+    if let Some(object) = ctx.types.object_by_normalized_fqn(ctx.scala, &normalized) {
+        exact.insert(object.clone());
+    }
+    let (type_declarations, object_declarations) =
+        ctx.types.explicit_import_type_declarations(candidate);
+    for declaration in type_declarations.into_iter().chain(object_declarations) {
+        exact.insert(declaration);
+    }
+    exact
 }
 
 /// The receiver value node of a `recv.method` call when `node` is the `field`
@@ -9449,6 +9655,9 @@ fn record_lexically_visible_parameterless_method(
     {
         return false;
     }
+    if record_extension_scope_parameterless_method(node, member, ctx) {
+        return true;
+    }
     for declaration in enclosing_template_declarations(node) {
         match ordinary_class_member_declarations_for_template(declaration, member, None, ctx) {
             BareMemberResolution::Resolved(methods) => {
@@ -9468,6 +9677,110 @@ fn record_lexically_visible_parameterless_method(
         }
     }
     false
+}
+
+fn record_extension_scope_parameterless_method(
+    node: Node<'_>,
+    member: &str,
+    ctx: &mut ScalaScan<'_, '_>,
+) -> bool {
+    for extension in enclosing_extension_definitions(node) {
+        let Some(receiver_type) =
+            scala_extension_receiver_type_node_local(extension.child_by_field_name("parameters"))
+        else {
+            continue;
+        };
+        let Some(receiver_owner) = resolve_receiver_type_node(receiver_type, ctx) else {
+            return true;
+        };
+        let mut methods = ctx
+            .types
+            .index
+            .identifier(member)
+            .iter()
+            .filter(|declaration| {
+                declaration.is_function() && declaration.source() == ctx.source_file
+            })
+            .filter_map(|declaration| ctx.types.extension_method_for_unit(ctx.scala, declaration))
+            .filter(|method| declaration_within_node(ctx, &method.declaration, extension))
+            .collect::<Vec<_>>();
+        methods.sort_by(|left, right| left.declaration.cmp(&right.declaration));
+        methods.dedup_by(|left, right| left.declaration == right.declaration);
+        let callable_count = methods
+            .iter()
+            .flat_map(|method| method.alternatives.iter())
+            .filter(|alternative| {
+                alternative.role == ScalaCallableRole::Ordinary
+                    && extension_alternative_receiver_matches(
+                        &ctx.resolver,
+                        alternative,
+                        Some(&receiver_owner),
+                    )
+            })
+            .count();
+        let unique_callable = callable_count == 1;
+        methods.retain(|method| {
+            method.alternatives.iter().any(|alternative| {
+                alternative.role == ScalaCallableRole::Ordinary
+                    && extension_alternative_receiver_matches(
+                        &ctx.resolver,
+                        alternative,
+                        Some(&receiver_owner),
+                    )
+                    && ordinary_callable_shape_matches(&alternative.shape, None, unique_callable)
+            })
+        });
+        match methods.as_slice() {
+            [] => {}
+            [method] => {
+                ctx.record_exact(
+                    method.declaration.clone(),
+                    ScalaReferenceRole::Callable,
+                    node,
+                );
+                return true;
+            }
+            _ => return true,
+        }
+    }
+    false
+}
+
+fn enclosing_extension_definitions(mut node: Node<'_>) -> Vec<Node<'_>> {
+    let mut definitions = Vec::new();
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "extension_definition" {
+            definitions.push(parent);
+        }
+        node = parent;
+    }
+    definitions
+}
+
+fn scala_extension_receiver_type_node_local(
+    receiver_parameters: Option<Node<'_>>,
+) -> Option<Node<'_>> {
+    let receiver_parameters = receiver_parameters?;
+    let mut cursor = receiver_parameters.walk();
+    let mut receivers = receiver_parameters
+        .named_children(&mut cursor)
+        .filter(|parameter| matches!(parameter.kind(), "parameter" | "class_parameter"));
+    let receiver = receivers.next()?;
+    if receivers.next().is_some() {
+        return None;
+    }
+    receiver.child_by_field_name("type")
+}
+
+fn declaration_within_node(
+    ctx: &ScalaScan<'_, '_>,
+    declaration: &CodeUnit,
+    node: Node<'_>,
+) -> bool {
+    ctx.scala
+        .ranges(declaration)
+        .iter()
+        .any(|range| range.start_byte >= node.start_byte() && range.end_byte <= node.end_byte())
 }
 
 fn ordinary_class_member_declarations_for_template(

@@ -5126,6 +5126,658 @@ object Owner {
 }
 
 #[test]
+fn scala_inverse_records_selector_import_token_references_exactly() {
+    let consumer_source = r#"package app
+object Use {
+  def hiddenSelectors(): Unit = {
+    import model.Tokens.{Right => _, Image => _} // positive-hidden-selectors
+    ()
+  }
+
+  def renamedSelector(): Unit = {
+    import model.Tokens.{Right => AliasRight} // positive-renamed-selector
+    ()
+  }
+
+  def memberSelector(): Unit = {
+    import model.Tokens.{sourceField => importedSourceField} // positive-member-selector
+    ()
+  }
+
+  def wrongOwner(): Unit = {
+    import decoy.Tokens.{Right => AliasRight} // negative-other-owner-right
+    ()
+  }
+
+  def ambiguousAlias(): Unit = {
+    import model._
+    import decoy._
+    import Tokens.{Right => AliasRight} // negative-ambiguous-selector-root
+    ()
+  }
+
+  def replicaAlias(): Unit = {
+    import replica.{Tokens => AliasTokens} // negative-physical-replica-root
+    ()
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Tokens.scala",
+            r#"package model
+object Tokens {
+  case object Right
+  case object Image
+  def sourceField(value: String): String = value.reverse
+}
+class Right
+class Image
+"#,
+        ),
+        (
+            "decoy/Tokens.scala",
+            r#"package decoy
+object Tokens {
+  case object Right
+}
+"#,
+        ),
+        (
+            "replica/left/Tokens.scala",
+            r#"package replica
+object Tokens {
+  case object Right
+}
+"#,
+        ),
+        (
+            "replica/right/Tokens.scala",
+            r#"package replica
+object Tokens {
+  case object Right
+}
+"#,
+        ),
+        ("app/Use.scala", consumer_source),
+    ]);
+    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let inverse = ScalaUsageGraphStrategy::new();
+
+    for (target_fqn, positives, negative) in [
+        (
+            "model.Tokens$.Right$",
+            vec![
+                (
+                    "positive-hidden-selectors",
+                    exact_segment(
+                        consumer_source,
+                        "    import model.Tokens.{Right => _, Image => _} // positive-hidden-selectors",
+                        "Right",
+                    ),
+                ),
+                (
+                    "positive-renamed-selector",
+                    exact_segment(
+                        consumer_source,
+                        "    import model.Tokens.{Right => AliasRight} // positive-renamed-selector",
+                        "Right",
+                    ),
+                ),
+            ],
+            "negative-other-owner-right",
+        ),
+        (
+            "model.Tokens$.Image$",
+            vec![(
+                "positive-hidden-selectors",
+                exact_segment(
+                    consumer_source,
+                    "    import model.Tokens.{Right => _, Image => _} // positive-hidden-selectors",
+                    "Image",
+                ),
+            )],
+            "negative-other-owner-right",
+        ),
+        (
+            "model.Tokens$.sourceField",
+            vec![(
+                "positive-member-selector",
+                exact_segment(
+                    consumer_source,
+                    "    import model.Tokens.{sourceField => importedSourceField} // positive-member-selector",
+                    "sourceField",
+                ),
+            )],
+            "negative-other-owner-right",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        let inverse_hits = reference_surface_hits(inverse.find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        for (marker, range) in positives {
+            for bucket in [&targeted_hits, &inverse_hits] {
+                assert_hit_contains(bucket, marker);
+                assert!(
+                    bucket.iter().any(|hit| {
+                        hit.kind == UsageHitKind::Import
+                            && hit.start_offset == range.0
+                            && hit.end_offset == range.1
+                    }),
+                    "expected exact selector-token range {range:?} for {target_fqn}: {bucket:#?}"
+                );
+            }
+        }
+        assert_no_hit_contains(&targeted_hits, negative);
+        assert_no_hit_contains(&inverse_hits, negative);
+        if target_fqn == "model.Tokens$.Right$" {
+            assert_no_hit_contains(&targeted_hits, "negative-ambiguous-selector-root");
+            assert_no_hit_contains(&inverse_hits, "negative-ambiguous-selector-root");
+        }
+    }
+
+    let replica_target = definition(&analyzer, "replica.Tokens$");
+    let replica_targeted_hits = authoritative_scala_reference_hits(&analyzer, &replica_target);
+    let replica_inverse_hits = reference_surface_hits(inverse.find_usages(
+        &analyzer,
+        std::slice::from_ref(&replica_target),
+        &candidates,
+        1000,
+    ));
+    for bucket in [&replica_targeted_hits, &replica_inverse_hits] {
+        assert_no_hit_contains(bucket, "negative-physical-replica-root");
+    }
+}
+
+#[test]
+fn scala_inverse_records_wildcard_owner_import_token_references_exactly() {
+    let consumer_source = r#"package app
+object DirectUse {
+  import model.Request._ // positive-direct-request
+}
+
+object WrongOwner {
+  import decoy.Request._ // negative-other-owner-request
+}
+
+object Ambiguous {
+  import left._
+  import right._
+  import Shared._ // negative-ambiguous-shared-owner
+}
+
+object Replica {
+  import replica.Request._ // negative-physical-replica-request
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Request.scala",
+            "package model\nobject Request { val Method: String = \"GET\" }\n",
+        ),
+        (
+            "decoy/Request.scala",
+            "package decoy\nobject Request { val Method: String = \"POST\" }\n",
+        ),
+        (
+            "left/Shared.scala",
+            "package left\nobject Shared { val Method: String = \"left\" }\n",
+        ),
+        (
+            "right/Shared.scala",
+            "package right\nobject Shared { val Method: String = \"right\" }\n",
+        ),
+        (
+            "replica/left/Request.scala",
+            "package replica\nobject Request { val Method: String = \"left\" }\n",
+        ),
+        (
+            "replica/right/Request.scala",
+            "package replica\nobject Request { val Method: String = \"right\" }\n",
+        ),
+        ("app/Use.scala", consumer_source),
+    ]);
+    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let inverse = ScalaUsageGraphStrategy::new();
+
+    let request = definition(&analyzer, "model.Request$");
+    let request_targeted_hits = authoritative_scala_reference_hits(&analyzer, &request);
+    let request_inverse_hits = reference_surface_hits(inverse.find_usages(
+        &analyzer,
+        std::slice::from_ref(&request),
+        &candidates,
+        1000,
+    ));
+    let request_range = exact_segment(
+        consumer_source,
+        "  import model.Request._ // positive-direct-request",
+        "Request",
+    );
+    for bucket in [&request_targeted_hits, &request_inverse_hits] {
+        assert_hit_contains(bucket, "positive-direct-request");
+        assert!(
+            bucket.iter().any(|hit| {
+                hit.kind == UsageHitKind::Import
+                    && hit.start_offset == request_range.0
+                    && hit.end_offset == request_range.1
+            }),
+            "expected exact wildcard-owner token for model.Request$: {bucket:#?}"
+        );
+        assert_no_hit_contains(bucket, "negative-other-owner-request");
+    }
+
+    let left_shared = definition(&analyzer, "left.Shared$");
+    let left_shared_targeted_hits = authoritative_scala_reference_hits(&analyzer, &left_shared);
+    let left_shared_inverse_hits = reference_surface_hits(inverse.find_usages(
+        &analyzer,
+        std::slice::from_ref(&left_shared),
+        &candidates,
+        1000,
+    ));
+    for bucket in [&left_shared_targeted_hits, &left_shared_inverse_hits] {
+        assert_no_hit_contains(bucket, "negative-ambiguous-shared-owner");
+    }
+
+    let replica_request = definition(&analyzer, "replica.Request$");
+    let replica_request_targeted_hits =
+        authoritative_scala_reference_hits(&analyzer, &replica_request);
+    let replica_request_inverse_hits = reference_surface_hits(inverse.find_usages(
+        &analyzer,
+        std::slice::from_ref(&replica_request),
+        &candidates,
+        1000,
+    ));
+    for bucket in [
+        &replica_request_targeted_hits,
+        &replica_request_inverse_hits,
+    ] {
+        assert_no_hit_contains(bucket, "negative-physical-replica-request");
+    }
+}
+
+#[test]
+fn scala_inverse_replay_records_companion_apply_shapes() {
+    let consumer_source = r#"package app
+import model.{Forwarded, Tournament, Uci}
+
+object Use {
+  val forwarded = Forwarded.apply("x") // positive-forwarded-apply-replay
+  val uci = Uci(1) // positive-uci-apply-replay
+  val tournament = Tournament(2) // positive-tournament-apply-replay
+}
+
+object WrongOwners {
+  val forwarded = decoy.Forwarded.apply(1) // negative-other-owner-forwarded
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Replay.scala",
+            r#"package model
+object Forwarded {
+  def apply(value: String): String = value
+}
+object Uci {
+  def apply(value: Int): Int = value
+}
+object Tournament {
+  def apply(value: Int): Int = value
+}
+"#,
+        ),
+        (
+            "decoy/Replay.scala",
+            r#"package decoy
+object Forwarded {
+  def apply(value: Int): Int = value + 1
+}
+"#,
+        ),
+        ("app/Use.scala", consumer_source),
+    ]);
+    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let inverse = ScalaUsageGraphStrategy::new();
+
+    for (target_fqn, positive) in [
+        ("model.Forwarded$.apply", "positive-forwarded-apply-replay"),
+        ("model.Uci$.apply", "positive-uci-apply-replay"),
+        (
+            "model.Tournament$.apply",
+            "positive-tournament-apply-replay",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        let inverse_hits = reference_surface_hits(inverse.find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        for bucket in [&targeted_hits, &inverse_hits] {
+            assert_hit_contains(bucket, positive);
+            assert_no_hit_contains(bucket, "negative-other-owner-forwarded");
+        }
+    }
+}
+
+#[test]
+fn scala_inverse_replay_records_bare_stable_members() {
+    let source = r#"package app
+
+object Castles {
+  val blackQueenSide: String = "bqs"
+
+  def direct(): String = blackQueenSide // positive-bare-black-queen-side-replay
+
+  def shadowed(): String = {
+    val blackQueenSide = "shadow"
+    blackQueenSide // negative-shadow-black-queen-side
+  }
+}
+
+object Config {
+  def fromConfig: Int = 1
+  def awsCredentials: String = "creds"
+}
+
+object Use {
+  import Config.{awsCredentials, fromConfig}
+
+  val loaded = fromConfig // positive-bare-from-config-replay
+  val creds = awsCredentials // positive-bare-aws-credentials-replay
+
+  def shadowed(): (Int, String) = {
+    val fromConfig = 99
+    val awsCredentials = "shadow"
+    (
+      fromConfig, // negative-shadow-from-config
+      awsCredentials, // negative-shadow-aws-credentials
+    )
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/Replay.scala", source)]);
+    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let inverse = ScalaUsageGraphStrategy::new();
+
+    for (target_fqn, positive, negative) in [
+        (
+            "app.Castles$.blackQueenSide",
+            "positive-bare-black-queen-side-replay",
+            "negative-shadow-black-queen-side",
+        ),
+        (
+            "app.Config$.fromConfig",
+            "positive-bare-from-config-replay",
+            "negative-shadow-from-config",
+        ),
+        (
+            "app.Config$.awsCredentials",
+            "positive-bare-aws-credentials-replay",
+            "negative-shadow-aws-credentials",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        let inverse_hits = reference_surface_hits(inverse.find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        for bucket in [&targeted_hits, &inverse_hits] {
+            assert_hit_contains(bucket, positive);
+            assert_no_hit_contains(bucket, negative);
+        }
+    }
+}
+
+#[test]
+fn scala_inverse_replay_records_singleton_terminals() {
+    let consumer_source = r#"package app
+import auth.AuthType
+import model.Method
+
+object Use {
+  val head: Method.HEAD.type = Method.HEAD // positive-singleton-head-replay
+  val none = AuthType.None // positive-qualified-none-replay
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Method.scala",
+            r#"package model
+sealed trait MethodValue
+object Method {
+  case object HEAD extends MethodValue
+}
+"#,
+        ),
+        (
+            "auth/Auth.scala",
+            r#"package auth
+sealed trait AuthKind
+object AuthType {
+  case object None extends AuthKind
+}
+"#,
+        ),
+        (
+            "decoy/Types.scala",
+            r#"package decoy
+object Method {
+  class HEAD
+}
+object AuthType {
+  class None
+}
+object Use {
+  val head: Method.HEAD = null // negative-type-decoy-head
+  val none: AuthType.None = null // negative-type-decoy-none
+}
+"#,
+        ),
+        ("app/Use.scala", consumer_source),
+    ]);
+    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let inverse = ScalaUsageGraphStrategy::new();
+
+    for (target_fqn, positive, negative, line, token) in [
+        (
+            "model.Method$.HEAD",
+            "positive-singleton-head-replay",
+            "negative-type-decoy-head",
+            "  val head: Method.HEAD.type = Method.HEAD // positive-singleton-head-replay",
+            "HEAD",
+        ),
+        (
+            "auth.AuthType$.None$",
+            "positive-qualified-none-replay",
+            "negative-type-decoy-none",
+            "  val none = AuthType.None // positive-qualified-none-replay",
+            "None",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        let inverse_hits = reference_surface_hits(inverse.find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        let range = exact_segment(consumer_source, line, token);
+        for bucket in [&targeted_hits, &inverse_hits] {
+            assert_hit_contains(bucket, positive);
+            assert_no_hit_contains(bucket, negative);
+            assert!(
+                bucket.iter().any(|hit| {
+                    hit.kind == UsageHitKind::Reference
+                        && hit.start_offset == range.0
+                        && hit.end_offset == range.1
+                }),
+                "expected exact singleton-terminal range {range:?} for {target_fqn}: {bucket:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn scala_inverse_replay_records_extension_scope_parameterless_members() {
+    let source = r#"package app
+
+final case class Role(name: String)
+
+object Syntax:
+  extension (value: Role)
+    def isEmpty: Boolean = value.name.isEmpty
+    def isLichess: Boolean = value.name == "lichess"
+    def invert: Boolean = !isEmpty
+    def enabled: Boolean = isLichess // positive-extension-scope-is-lichess
+    def flipped: Boolean = invert // positive-extension-scope-invert
+
+object OtherSyntax:
+  extension (value: String)
+    def isLichess: Boolean = value.isEmpty // negative-other-receiver-is-lichess
+    def invert: Boolean = value.nonEmpty // negative-other-receiver-invert
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/Syntax.scala", source)]);
+    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let inverse = ScalaUsageGraphStrategy::new();
+
+    for (target, positive, negative, line, token) in [
+        (
+            definition_by(&analyzer, |unit| {
+                unit.is_function()
+                    && unit.fq_name() == "app.Syntax$.isLichess"
+                    && analyzer.ranges(unit).iter().any(|range| {
+                        range.start_line
+                            == line_of(
+                                source,
+                                "    def isLichess: Boolean = value.name == \"lichess\"",
+                            )
+                    })
+            }),
+            "positive-extension-scope-is-lichess",
+            "negative-other-receiver-is-lichess",
+            "    def enabled: Boolean = isLichess // positive-extension-scope-is-lichess",
+            "isLichess",
+        ),
+        (
+            definition_by(&analyzer, |unit| {
+                unit.is_function()
+                    && unit.fq_name() == "app.Syntax$.invert"
+                    && analyzer.ranges(unit).iter().any(|range| {
+                        range.start_line == line_of(source, "    def invert: Boolean = !isEmpty")
+                    })
+            }),
+            "positive-extension-scope-invert",
+            "negative-other-receiver-invert",
+            "    def flipped: Boolean = invert // positive-extension-scope-invert",
+            "invert",
+        ),
+    ] {
+        let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        let inverse_hits = reference_surface_hits(inverse.find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        let range = exact_segment(source, line, token);
+        for bucket in [&targeted_hits, &inverse_hits] {
+            assert_hit_contains(bucket, positive);
+            assert_no_hit_contains(bucket, negative);
+            assert!(
+                bucket.iter().any(|hit| {
+                    hit.kind == UsageHitKind::Reference
+                        && hit.start_offset == range.0
+                        && hit.end_offset == range.1
+                }),
+                "expected exact extension-scope range {range:?} for {}: {bucket:#?}",
+                target.fq_name()
+            );
+        }
+    }
+}
+
+#[test]
+fn scala_inverse_replay_records_imported_function_values_under_higher_order_calls() {
+    let consumer_source = r#"package app
+import model.MatchFields.{editsField, metadataField, sourceField}
+
+object Use {
+  val source = List("mime").map(sourceField) // positive-source-field-replay
+  val metadata = List("mime").map(metadataField) // positive-metadata-field-replay
+  val edits = List("mime").map(editsField) // positive-edits-field-replay
+
+  def shadowed(): (List[Int], List[Int], List[Int]) = {
+    def sourceField(value: Int): Int = value + 1
+    def metadataField(value: Int): Int = value + 2
+    def editsField(value: Int): Int = value + 3
+    (
+      List(1).map(sourceField), // negative-local-shadow-source-field
+      List(1).map(metadataField), // negative-local-shadow-metadata-field
+      List(1).map(editsField), // negative-local-shadow-edits-field
+    )
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/MatchFields.scala",
+            r#"package model
+object MatchFields {
+  def sourceField(value: String): String = value.reverse
+  def metadataField(value: String): String = value.toUpperCase
+  def editsField(value: String): String = value + "!"
+}
+"#,
+        ),
+        ("app/Use.scala", consumer_source),
+    ]);
+    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let inverse = ScalaUsageGraphStrategy::new();
+
+    for (target_fqn, positive, negative) in [
+        (
+            "model.MatchFields$.sourceField",
+            "positive-source-field-replay",
+            "negative-local-shadow-source-field",
+        ),
+        (
+            "model.MatchFields$.metadataField",
+            "positive-metadata-field-replay",
+            "negative-local-shadow-metadata-field",
+        ),
+        (
+            "model.MatchFields$.editsField",
+            "positive-edits-field-replay",
+            "negative-local-shadow-edits-field",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        let inverse_hits = reference_surface_hits(inverse.find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        for bucket in [&targeted_hits, &inverse_hits] {
+            assert_hit_contains(bucket, positive);
+            assert_no_hit_contains(bucket, negative);
+        }
+    }
+}
+
+#[test]
 fn scala_nested_wildcard_member_imports_use_enclosing_owner_roots_in_scala2_and_3() {
     let scala2_source = r#"package app
 object Status2 {

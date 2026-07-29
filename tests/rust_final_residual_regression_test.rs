@@ -262,6 +262,117 @@ fn inverse_rust_macro_export_crosses_own_library_example_boundary() {
 }
 
 #[test]
+fn inverse_rust_grouped_same_crate_module_prefix_stays_exact_in_default_scope() {
+    let source = r#"
+mod error {
+    pub struct ApiResult;
+}
+mod other {
+    pub struct ApiResult;
+}
+
+use crate::{error::ApiResult, other::ApiResult as OtherApiResult};
+
+fn consume(_: ApiResult, _: OtherApiResult) {}
+"#;
+    let (_project, analyzer) = analyzer_for(source);
+    let target = analyzer
+        .get_definitions("error")
+        .into_iter()
+        .find(CodeUnit::is_module)
+        .expect("error module");
+    let found = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .all_hits_including_imports();
+    let expected = source
+        .find("error::ApiResult")
+        .expect("grouped same-crate prefix");
+    let unrelated = source
+        .find("other::ApiResult")
+        .expect("unrelated grouped prefix");
+
+    assert!(
+        found.iter().any(|hit| {
+            (hit.start_offset, hit.end_offset) == (expected, expected + "error".len())
+        }),
+        "default inverse lookup must retain the grouped module prefix: {found:#?}"
+    );
+    assert!(
+        found.iter().all(|hit| {
+            (hit.start_offset, hit.end_offset) != (unrelated, unrelated + "other".len())
+        }),
+        "an unrelated grouped module prefix must stay unmatched: {found:#?}"
+    );
+}
+
+#[test]
+fn inverse_rust_default_scope_keeps_grouped_reexport_type_terminal_exact() {
+    let source = r#"
+mod commit_activity {
+    pub struct CommitActivityDraft;
+    pub fn CommitActivityDraft() {}
+}
+
+pub use commit_activity::{
+    CommitActivityDraft,
+};
+"#;
+    let (_project, analyzer) = analyzer_for(source);
+    let target = analyzer
+        .get_definitions("commit_activity.CommitActivityDraft")
+        .into_iter()
+        .find(CodeUnit::is_class)
+        .expect("CommitActivityDraft type");
+    let found = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .all_hits_including_imports();
+    let expected = source
+        .rfind("CommitActivityDraft,")
+        .expect("grouped reexport terminal");
+
+    assert!(
+        found.iter().any(|hit| {
+            (hit.start_offset, hit.end_offset) == (expected, expected + "CommitActivityDraft".len())
+        }),
+        "default inverse lookup must keep the grouped re-export terminal exact: {found:#?}"
+    );
+}
+
+#[test]
+fn inverse_rust_default_scope_keeps_imported_owner_qualifier_exact() {
+    let source = r#"
+mod retry {
+    pub enum RetryClass { Never }
+}
+
+use crate::retry::RetryClass;
+
+fn classify() {
+    let _ = RetryClass::Never;
+}
+"#;
+    let (_project, analyzer) = analyzer_for(source);
+    let target = analyzer
+        .get_definitions("retry.RetryClass")
+        .into_iter()
+        .find(CodeUnit::is_class)
+        .expect("RetryClass type");
+    let found = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .all_hits_including_imports();
+    let expected = source
+        .rfind("RetryClass::Never")
+        .expect("associated owner qualifier");
+
+    assert!(
+        found.iter().any(|hit| {
+            (hit.start_offset, hit.end_offset) == (expected, expected + "RetryClass".len())
+        }),
+        "default inverse lookup must retain the imported owner qualifier: {found:#?}"
+    );
+}
+
+#[test]
 fn inverse_rust_usages_find_unqualified_tuple_pattern_variants() {
     let source = r#"
 enum ExpectedValue { I64(i64), Other }

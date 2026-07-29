@@ -266,6 +266,17 @@ impl ScanCtx<'_> {
         }
     }
 
+    fn target_has_type_value_namespace_collision(&self) -> bool {
+        let candidates = self.support.fqn(&self.target.fq_name());
+        let has_type = candidates
+            .iter()
+            .any(|candidate| candidate.is_class() || self.rust.is_type_alias(candidate));
+        let has_value = candidates
+            .iter()
+            .any(|candidate| candidate.is_function() || candidate.is_field());
+        has_type && has_value
+    }
+
     pub(super) fn matches_unique_resolved_fqn(&self, fqn: &str) -> bool {
         if self.target.fq_name() != fqn {
             return false;
@@ -722,7 +733,31 @@ fn record_use_import_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     .ok()
                     .map(str::trim)
                     .unwrap_or_default();
-                if ctx.matches_identifier(text, current.start_byte(), RustReferenceNamespace::Any) {
+                let matches_target_namespace = ctx.target_has_type_value_namespace_collision()
+                    && crate::analyzer::rust::rust_focused_use_path(current, ctx.source)
+                        .is_some_and(|path| {
+                            let segments =
+                                path.segments.iter().map(String::as_str).collect::<Vec<_>>();
+                            let root_name = path
+                                .root
+                                .utf8_text(ctx.source.as_bytes())
+                                .ok()
+                                .map(str::trim)
+                                .map(|name| if name == "$crate" { "crate" } else { name })
+                                .unwrap_or_default();
+                            ctx.matches_path(
+                                &segments,
+                                current.start_byte(),
+                                ctx.target_reference_namespace(),
+                                ctx.path_root_shadowed_at(root_name, path.root.start_byte()),
+                                crate::analyzer::usages::rust_graph::hits::rust_path_is_leading_absolute(
+                                    path.root,
+                                ),
+                            )
+                        });
+                if ctx.matches_identifier(text, current.start_byte(), RustReferenceNamespace::Any)
+                    || matches_target_namespace
+                {
                     record_import_hit(current, ctx);
                 }
             }

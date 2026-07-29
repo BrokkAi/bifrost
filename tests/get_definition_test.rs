@@ -11029,6 +11029,139 @@ function render() {
 }
 
 #[test]
+fn javascript_same_scope_local_property_resolves_but_shadowed_receiver_does_not() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "app.js",
+            r#"
+function configure(d) {
+  d.shade = true;
+  return d.shade;
+}
+
+function unrelated(d) {
+  return d.shade;
+}
+"#,
+        )
+        .build();
+
+    let positive_line = "  return d.shade;";
+    let positive_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":4,"column":{}}}]}}"#,
+            column_of(positive_line, "shade")
+        ),
+    );
+    let positive = &positive_value["results"][0];
+    assert_eq!(positive["status"], "resolved", "{positive_value}");
+    assert_eq!(
+        positive["definitions"][0]["fqn"], "d.shade",
+        "{positive_value}"
+    );
+    assert_eq!(
+        positive["definitions"][0]["start_line"], 3,
+        "{positive_value}"
+    );
+
+    let negative_line = "  return d.shade;";
+    let negative_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":8,"column":{}}}]}}"#,
+            column_of(negative_line, "shade")
+        ),
+    );
+    let negative = &negative_value["results"][0];
+    assert_eq!(negative["status"], "no_definition", "{negative_value}");
+    assert!(negative["definitions"].is_null(), "{negative_value}");
+}
+
+#[test]
+fn javascript_imported_singleton_member_stays_on_exported_object_under_alias_and_shadowing() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "state.js",
+            r#"
+export const state = {};
+state.imgWidth = 0;
+
+export function local() {
+  return state.imgWidth;
+}
+"#,
+        )
+        .file(
+            "consumer.js",
+            r#"
+import { state as editorState } from "./state.js";
+
+export function direct() {
+  return editorState.imgWidth;
+}
+
+export function shadow(editorState) {
+  return editorState.imgWidth;
+}
+"#,
+        )
+        .build();
+
+    let local_line = "  return state.imgWidth;";
+    let local_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"state.js","line":6,"column":{}}}]}}"#,
+            column_of(local_line, "imgWidth")
+        ),
+    );
+    let local = &local_value["results"][0];
+    assert_eq!(local["status"], "resolved", "{local_value}");
+    assert_eq!(
+        local["definitions"][0]["fqn"], "state.imgWidth",
+        "{local_value}"
+    );
+    assert_eq!(local["definitions"][0]["path"], "state.js", "{local_value}");
+
+    let imported_line = "  return editorState.imgWidth;";
+    let imported_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"consumer.js","line":5,"column":{}}}]}}"#,
+            column_of(imported_line, "imgWidth")
+        ),
+    );
+    let imported = &imported_value["results"][0];
+    assert_eq!(imported["status"], "resolved", "{imported_value}");
+    assert_eq!(
+        imported["definitions"][0]["fqn"], "state.imgWidth",
+        "{imported_value}"
+    );
+    assert_eq!(
+        imported["definitions"][0]["path"], "state.js",
+        "{imported_value}"
+    );
+    assert_eq!(
+        imported["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "{imported_value}"
+    );
+
+    let shadow_line = "  return editorState.imgWidth;";
+    let shadow_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"consumer.js","line":9,"column":{}}}]}}"#,
+            column_of(shadow_line, "imgWidth")
+        ),
+    );
+    let shadow = &shadow_value["results"][0];
+    assert_eq!(shadow["status"], "no_definition", "{shadow_value}");
+    assert!(shadow["definitions"].is_null(), "{shadow_value}");
+}
+
+#[test]
 fn javascript_new_initialized_local_method_resolves_to_class_member() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
@@ -24380,6 +24513,58 @@ object App:
         assert_eq!(result["status"], "resolved", "{value}");
         assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
     }
+}
+
+#[test]
+fn scala_local_import_terminal_stays_on_exact_bound_singleton_owner() {
+    let shared = r#"
+package app
+
+class Renderer { def render(value: String): String = value }
+
+object Outer {
+  object Factory { def default: Renderer = new Renderer }
+
+  object App:
+    val Factory = Outer.Factory
+    import Factory.default
+    val direct = default.render("ok")
+}
+"#;
+    let cross_build = shared.replace("new Renderer", "{ val marker = 2; new Renderer }");
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("shared/src/main/scala/app/Outer.scala", shared)
+        .file("shared/src/main/scala-2/app/Outer.scala", &cross_build)
+        .build();
+
+    let default_start = shared
+        .find("Factory.default")
+        .expect("local import terminal")
+        + "Factory.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "shared/src/main/scala/app/Outer.scala",
+            shared,
+            default_start,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Outer$.Factory$.default",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "shared/src/main/scala/app/Outer.scala",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "{value}"
+    );
 }
 
 #[test]
