@@ -487,6 +487,92 @@ impl<'a> KotlinVisitor<'a> {
     }
 }
 
+/// The tree-sitter node kinds that declare a Kotlin class-like type.
+pub(crate) const KOTLIN_CLASS_LIKE_KINDS: &[&str] = &[
+    "class_declaration",
+    "object_declaration",
+    "companion_object",
+];
+
+/// What a Kotlin class-like declaration actually declares.
+///
+/// Kotlin spells all of these with one of three node kinds, so the distinction
+/// lives in the tokens inside the node (`interface`, `enum class`) or in a
+/// `class_modifier` (`annotation class`), never in the node kind alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KotlinClassLikeKind {
+    Class,
+    Interface,
+    Enum,
+    Annotation,
+    Object,
+}
+
+/// Classify a class-like declaration node, or `None` when the node does not
+/// declare a type.
+pub(crate) fn kotlin_class_like_kind(node: Node<'_>) -> Option<KotlinClassLikeKind> {
+    match node.kind() {
+        "object_declaration" | "companion_object" => Some(KotlinClassLikeKind::Object),
+        "class_declaration" => {
+            if has_token_child(node, "interface") {
+                return Some(KotlinClassLikeKind::Interface);
+            }
+            if has_token_child(node, "enum") {
+                return Some(KotlinClassLikeKind::Enum);
+            }
+            if kotlin_has_modifier(node, "annotation") {
+                return Some(KotlinClassLikeKind::Annotation);
+            }
+            Some(KotlinClassLikeKind::Class)
+        }
+        _ => None,
+    }
+}
+
+/// The visibility a Kotlin declaration declares, defaulting to `public`.
+///
+/// Kotlin has no package-private tier: an unmarked declaration is visible
+/// everywhere its containing declaration is, and `internal` restricts a
+/// declaration to its own compilation module — which, from the perspective of
+/// anything consuming a published artifact, is as invisible as `private`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KotlinDeclaredVisibility {
+    Public,
+    Protected,
+    Internal,
+    Private,
+}
+
+pub(crate) fn kotlin_declared_visibility(node: Node<'_>, source: &str) -> KotlinDeclaredVisibility {
+    let Some(modifiers) = first_named_child(node, "modifiers") else {
+        return KotlinDeclaredVisibility::Public;
+    };
+    for modifier in named_children_of(modifiers) {
+        if modifier.kind() != "visibility_modifier" {
+            continue;
+        }
+        return match node_text_trimmed(modifier, source) {
+            "private" => KotlinDeclaredVisibility::Private,
+            "internal" => KotlinDeclaredVisibility::Internal,
+            "protected" => KotlinDeclaredVisibility::Protected,
+            _ => KotlinDeclaredVisibility::Public,
+        };
+    }
+    KotlinDeclaredVisibility::Public
+}
+
+/// Whether the declaration's `modifiers` list contains `keyword` as a modifier
+/// node (not as an annotation argument or an identifier that merely spells the
+/// same soft keyword elsewhere in the header).
+fn kotlin_has_modifier(node: Node<'_>, keyword: &str) -> bool {
+    let Some(modifiers) = first_named_child(node, "modifiers") else {
+        return false;
+    };
+    named_children_of(modifiers)
+        .into_iter()
+        .any(|modifier| has_token_child(modifier, keyword))
+}
+
 /// The `val`/`var` binding keyword of a property-like node.
 ///
 /// `binding_pattern_kind` is mandatory on `property_declaration` and optional

@@ -23,7 +23,7 @@ How to see it working: the tests in `tests/kotlin_imports_and_hierarchy.rs` and 
 
 - [x] (2026-07-29) Research pass over the existing Java, Scala, and Kotlin analyzers, the JVM external-declaration index, and the workspace usage graph.
 - [x] (2026-07-29) ExecPlan authored.
-- [ ] M1: Generalize the JVM external declaration index and dependency plumbing to cover Kotlin.
+- [x] (2026-07-29) M1: Generalize the JVM external declaration index and dependency plumbing to cover Kotlin.
 - [ ] M2: Kotlin structured imports and `ImportAnalysisProvider`.
 - [ ] M3: Kotlin supertypes, type-name resolution, and `TypeHierarchyProvider`.
 - [ ] M4: Shared JVM usage-candidate realm (`UsageEcosystem::Jvm`).
@@ -39,6 +39,9 @@ Use timestamps to measure rates of progress.
 
 - Observation: The per-language edge builders in the workspace usage graph only ever scan files of their own language (`JavaEdgeResolver::try_new` calls `project.analyzable_files(Language::Java)`), so merging Java and Scala into one `UsageEcosystem` cannot double-count edges: the two builders write into one node space from disjoint file sets.
   Evidence: `src/analyzer/usages/java_graph/shared.rs:123-137`.
+
+- Observation: `cargo clippy` cannot be run bare in this environment. Two rustc 1.96.0 installs exist (rustup under `~/.cargo/bin`, Homebrew under `/opt/homebrew/bin`); `cargo` resolves to rustup's but `cargo-clippy` resolves to Homebrew's, and the mismatch fails the build script. A clean target directory does not help, including via `scripts/with-isolated-cargo-target.sh`.
+  Evidence: `error[E0514]: found crate 'cc' compiled by an incompatible version of rustc`. The working invocation is `PATH="$HOME/.cargo/bin:$PATH" cargo clippy --all-targets --all-features -- -D warnings`.
 
 - Observation: Passing a larger candidate-fqn set to an existing builder is inert rather than dangerous, because each language's resolver can only resolve names through its own declaration index. Merging the ecosystems therefore preserves today's edges exactly while establishing the shared node space that #1239 will fill in.
   Evidence: `JavaAnalyzer::source_type_by_fqn` reads `self.inner.global_usage_definition_index()`, which is scoped to the Java delegate's own files.

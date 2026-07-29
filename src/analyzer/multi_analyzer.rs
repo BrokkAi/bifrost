@@ -215,7 +215,7 @@ impl AnalyzerDelegate {
 
     fn needs_config_update_for(&self, file: &ProjectFile) -> bool {
         match self {
-            Self::Java(_) | Self::Scala(_) => {
+            Self::Java(_) | Self::Scala(_) | Self::Kotlin(_) => {
                 crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input(file)
             }
             Self::CSharp(_) => crate::analyzer::csharp::is_csharp_dependency_input(file),

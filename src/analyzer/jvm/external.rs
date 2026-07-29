@@ -20,12 +20,12 @@ use zip::ZipArchive;
 const MAX_ARCHIVE_ENTRIES: usize = 10_000;
 const MAX_INDEX_ARTIFACTS: usize = 128;
 const MAX_SOURCE_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_SCALA_SOURCE_ENTRY_BYTES: u64 = 1024 * 1024;
+const MAX_ANALYZER_SOURCE_ENTRY_BYTES: u64 = 1024 * 1024;
 const MAX_CLASS_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TOTAL_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_TOTAL_INDEX_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_SCALA_SOURCE_TYPES: usize = 4_096;
+const MAX_ANALYZER_SOURCE_TYPES: usize = 4_096;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct JvmExternalDeclarationIndex {
@@ -230,17 +230,10 @@ impl JvmExternalDeclarationIndex {
             let Ok(entry) = archive.by_index(index) else {
                 continue;
             };
-            let language = if entry.name().ends_with(".java") {
-                SourceJarLanguage::Java
-            } else if entry.name().ends_with(".scala") {
-                SourceJarLanguage::Scala
-            } else {
+            let Some(language) = SourceJarLanguage::for_entry(entry.name()) else {
                 continue;
             };
-            let max_entry_bytes = match language {
-                SourceJarLanguage::Java => MAX_SOURCE_ENTRY_BYTES,
-                SourceJarLanguage::Scala => MAX_SCALA_SOURCE_ENTRY_BYTES,
-            };
+            let max_entry_bytes = language.max_entry_bytes();
             if !can_read_entry(
                 entry.size(),
                 max_entry_bytes,
@@ -259,12 +252,7 @@ impl JvmExternalDeclarationIndex {
             {
                 continue;
             }
-            let external_types = match language {
-                SourceJarLanguage::Java => source_types(artifact_path, &source_path, &source),
-                SourceJarLanguage::Scala => {
-                    scala_source_types(artifact_path, &source_path, &source)
-                }
-            };
+            let external_types = language.source_types(artifact_path, &source_path, &source);
             for external_type in external_types {
                 self.insert(external_type);
             }
@@ -314,10 +302,55 @@ impl JvmExternalDeclarationIndex {
     }
 }
 
+/// A source language Bifrost can read out of a published `-sources.jar`.
+///
+/// All three compile to the same classpath, so one archive walk feeds one
+/// index. They differ only in how much budget an entry gets and which parser
+/// turns it into declarations.
 #[derive(Clone, Copy)]
 enum SourceJarLanguage {
     Java,
     Scala,
+    Kotlin,
+}
+
+impl SourceJarLanguage {
+    fn for_entry(entry_name: &str) -> Option<Self> {
+        if entry_name.ends_with(".java") {
+            Some(Self::Java)
+        } else if entry_name.ends_with(".scala") {
+            Some(Self::Scala)
+        } else if entry_name.ends_with(".kt") {
+            Some(Self::Kotlin)
+        } else {
+            // `.kts` build scripts are packaged into some source jars but
+            // declare no library API, so they are deliberately skipped.
+            None
+        }
+    }
+
+    fn max_entry_bytes(self) -> u64 {
+        match self {
+            Self::Java => MAX_SOURCE_ENTRY_BYTES,
+            // Scala and Kotlin entries run the language's whole declaration
+            // walk rather than Java's targeted class-like scan, so they get a
+            // tighter per-entry budget.
+            Self::Scala | Self::Kotlin => MAX_ANALYZER_SOURCE_ENTRY_BYTES,
+        }
+    }
+
+    fn source_types(
+        self,
+        artifact_path: &Path,
+        source_path: &str,
+        source: &str,
+    ) -> Vec<JvmExternalType> {
+        match self {
+            Self::Java => source_types(artifact_path, source_path, source),
+            Self::Scala => scala_source_types(artifact_path, source_path, source),
+            Self::Kotlin => kotlin_source_types(artifact_path, source_path, source),
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -756,7 +789,7 @@ fn scala_source_types(
         // Source JARs are untrusted input. The index is deliberately
         // best-effort, so stopping at a bounded number of public Scala types
         // is preferable to retaining an arbitrarily large declaration set.
-        .take(MAX_SCALA_SOURCE_TYPES)
+        .take(MAX_ANALYZER_SOURCE_TYPES)
         .collect()
 }
 
@@ -778,6 +811,115 @@ fn scala_source_declaration_node<'tree>(
         }
         node = node.parent()?;
     }
+}
+
+/// Public Kotlin types declared by one `.kt` entry of a source jar.
+///
+/// Kotlin identities are already source-level (issue #1236): no `FooKt` file
+/// facade, no `$` encoding, companions spelled by their declared name. The
+/// declaration walk therefore yields exactly the names a consumer would write,
+/// and no normalization step is needed the way Scala's `$`-suffixed object
+/// identities require one.
+///
+/// A file whose tree contains a parse error is skipped entirely, matching the
+/// Scala path: a source jar is untrusted input, and a partially-recovered tree
+/// can name types the library does not actually export, which would make an
+/// unknown name look resolvable.
+fn kotlin_source_types(
+    artifact_path: &Path,
+    source_path: &str,
+    source: &str,
+) -> Vec<JvmExternalType> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&crate::analyzer::kotlin::language::LANGUAGE.into())
+        .expect("tree-sitter Kotlin language must load");
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    if tree.root_node().has_error() {
+        return Vec::new();
+    }
+
+    let synthetic_file = ProjectFile::new(std::env::temp_dir(), "external.kt");
+    let parsed =
+        crate::analyzer::kotlin::declarations::parse_kotlin_file(&synthetic_file, source, &tree);
+    parsed
+        .declarations()
+        .iter()
+        .filter(|declaration| declaration.is_class() && !declaration.is_synthetic())
+        .filter_map(|declaration| {
+            let node = kotlin_source_declaration_node(&tree, &parsed, declaration)?;
+            let visibility = kotlin_external_visibility(node, source)?;
+            let kind = kotlin_external_kind(node)?;
+            let short_name = declaration.short_name().to_string();
+            (!short_name.is_empty()).then(|| JvmExternalType {
+                fqn: declaration.fq_name(),
+                package_name: declaration.package_name().to_string(),
+                short_name,
+                kind,
+                visibility,
+                source: JvmExternalDeclarationSource::SourceJar {
+                    artifact_path: artifact_path.to_path_buf(),
+                    source_path: source_path.to_string(),
+                },
+            })
+        })
+        // Source JARs are untrusted input. The index is deliberately
+        // best-effort, so stopping at a bounded number of public Kotlin types
+        // is preferable to retaining an arbitrarily large declaration set.
+        .take(MAX_ANALYZER_SOURCE_TYPES)
+        .collect()
+}
+
+fn kotlin_source_declaration_node<'tree>(
+    tree: &'tree tree_sitter::Tree,
+    parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    declaration: &crate::analyzer::CodeUnit,
+) -> Option<tree_sitter::Node<'tree>> {
+    let range = parsed.declaration_ranges(declaration).first()?;
+    let mut node = tree
+        .root_node()
+        .descendant_for_byte_range(range.start_byte, range.end_byte)?;
+    loop {
+        if crate::analyzer::kotlin::declarations::KOTLIN_CLASS_LIKE_KINDS.contains(&node.kind()) {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+/// The visibility a Kotlin declaration contributes to the shared index, or
+/// `None` when it contributes nothing.
+///
+/// `internal` restricts a declaration to its own compilation module, so from
+/// the perspective of code consuming a published artifact it is exactly as
+/// invisible as `private` — neither belongs in the index at all.
+fn kotlin_external_visibility(node: tree_sitter::Node<'_>, source: &str) -> Option<JvmVisibility> {
+    use crate::analyzer::kotlin::declarations::KotlinDeclaredVisibility;
+    match crate::analyzer::kotlin::declarations::kotlin_declared_visibility(node, source) {
+        KotlinDeclaredVisibility::Public => Some(JvmVisibility::Public),
+        // Kotlin has no package-private tier; `protected` is modelled with the
+        // index's nearest same-package-only tier so a consumer in another
+        // package cannot resolve it.
+        KotlinDeclaredVisibility::Protected => Some(JvmVisibility::Protected),
+        KotlinDeclaredVisibility::Internal | KotlinDeclaredVisibility::Private => None,
+    }
+}
+
+fn kotlin_external_kind(node: tree_sitter::Node<'_>) -> Option<JvmExternalTypeKind> {
+    use crate::analyzer::kotlin::declarations::KotlinClassLikeKind;
+    Some(
+        match crate::analyzer::kotlin::declarations::kotlin_class_like_kind(node)? {
+            KotlinClassLikeKind::Interface => JvmExternalTypeKind::Interface,
+            KotlinClassLikeKind::Enum => JvmExternalTypeKind::Enum,
+            KotlinClassLikeKind::Annotation => JvmExternalTypeKind::Annotation,
+            // An `object` is a class with exactly one instance; the index only
+            // answers "does this type name exist", so the distinction between
+            // an object and a class carries no information here.
+            KotlinClassLikeKind::Class | KotlinClassLikeKind::Object => JvmExternalTypeKind::Class,
+        },
+    )
 }
 
 fn source_visibility(
@@ -1431,6 +1573,159 @@ mod tests {
             ));
         }
         assert!(index.get("scala.example.Hidden").is_none());
+    }
+
+    const KOTLIN_DEPENDENCY_SOURCE: &str = "package kotlin.example\n\
+         \n\
+         class Dependency {\n\
+             class Nested\n\
+             private class Hidden\n\
+             companion object Factory\n\
+         }\n\
+         \n\
+         interface Contract\n\
+         \n\
+         object Defaults\n\
+         \n\
+         enum class Mode { FAST, SLOW }\n\
+         \n\
+         annotation class Marked\n\
+         \n\
+         internal class ModulePrivate\n\
+         \n\
+         private class FilePrivate\n\
+         \n\
+         fun topLevelHelper(): Int = 1\n";
+
+    fn kotlin_source_jar_index(root: &Path) -> JvmExternalDeclarationIndex {
+        let source_jar = root.join("kotlin-library-sources.jar");
+        write_zip_entry(
+            &source_jar,
+            "kotlin/example/Dependency.kt",
+            KOTLIN_DEPENDENCY_SOURCE.as_bytes(),
+        );
+        JvmExternalDeclarationIndex::build(
+            &JvmExternalDependencies {
+                artifact_paths: vec![JvmExternalArtifact {
+                    artifact_path: source_jar,
+                    source_artifact_path: None,
+                }],
+                ..JvmExternalDependencies::default()
+            },
+            root,
+        )
+    }
+
+    #[test]
+    fn jvm_external_declaration_indexes_kotlin_source_jar() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let index = kotlin_source_jar_index(&root);
+
+        for name in [
+            "kotlin.example.Dependency",
+            "kotlin.example.Dependency.Nested",
+            "kotlin.example.Dependency.Factory",
+            "kotlin.example.Contract",
+            "kotlin.example.Defaults",
+            "kotlin.example.Mode",
+            "kotlin.example.Marked",
+        ] {
+            assert!(
+                matches!(
+                    index.get(name).map(JvmExternalType::source),
+                    Some(JvmExternalDeclarationSource::SourceJar { source_path, .. })
+                        if source_path == "kotlin/example/Dependency.kt"
+                ),
+                "expected {name} to be indexed from the Kotlin source jar"
+            );
+        }
+
+        assert_eq!(
+            Some(JvmExternalTypeKind::Interface),
+            index
+                .get("kotlin.example.Contract")
+                .map(JvmExternalType::kind)
+        );
+        assert_eq!(
+            Some(JvmExternalTypeKind::Enum),
+            index.get("kotlin.example.Mode").map(JvmExternalType::kind)
+        );
+        assert_eq!(
+            Some(JvmExternalTypeKind::Annotation),
+            index
+                .get("kotlin.example.Marked")
+                .map(JvmExternalType::kind)
+        );
+    }
+
+    #[test]
+    fn jvm_external_declaration_omits_kotlin_types_a_consumer_cannot_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let index = kotlin_source_jar_index(&root);
+
+        // `internal` is module-scoped and `private` is file-scoped, so neither
+        // is nameable from a different artifact.
+        assert!(index.get("kotlin.example.ModulePrivate").is_none());
+        assert!(index.get("kotlin.example.FilePrivate").is_none());
+        assert!(index.get("kotlin.example.Dependency.Hidden").is_none());
+
+        // The index answers "does this *type* exist"; top-level callables are
+        // not types, and the JVM facade Kotlin generates for them
+        // (`DependencyKt`) is a compiler artifact that never appears in a
+        // Kotlin identity.
+        assert!(index.get("kotlin.example.topLevelHelper").is_none());
+        assert!(index.get("kotlin.example.DependencyKt").is_none());
+    }
+
+    #[test]
+    fn kotlin_analyzer_shares_the_jvm_dependency_realm() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let workspace_root = root.join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let source_jar = root.join("kotlin-library-sources.jar");
+        write_zip_entry(
+            &source_jar,
+            "kotlin/example/Dependency.kt",
+            KOTLIN_DEPENDENCY_SOURCE.as_bytes(),
+        );
+
+        ProjectFile::new(workspace_root.clone(), "src/App.kt")
+            .write("package app\n\nimport kotlin.example.Dependency\n\nclass App\n")
+            .unwrap();
+
+        let config = AnalyzerConfig {
+            jvm: JvmAnalyzerConfig {
+                external_dependencies: JvmExternalDependencies {
+                    artifact_paths: vec![JvmExternalArtifact {
+                        artifact_path: source_jar,
+                        source_artifact_path: None,
+                    }],
+                    ..JvmExternalDependencies::default()
+                },
+                ..JvmAnalyzerConfig::default()
+            },
+            ..AnalyzerConfig::default()
+        };
+        let analyzer = crate::analyzer::KotlinAnalyzer::new_with_config(
+            Arc::new(TestProject::new(workspace_root, Language::Kotlin)),
+            config,
+        );
+
+        let index = analyzer.external_declaration_index();
+        assert!(
+            index
+                .resolve_explicit_import("kotlin.example.Dependency", "app")
+                .is_some(),
+            "the Kotlin analyzer must read the same jar-backed index Java and Scala use"
+        );
+        assert!(
+            index
+                .resolve_explicit_import("kotlin.example.ModulePrivate", "app")
+                .is_none()
+        );
     }
 
     #[test]

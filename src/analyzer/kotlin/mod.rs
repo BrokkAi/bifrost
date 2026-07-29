@@ -17,19 +17,27 @@ mod adapter;
 pub(crate) mod declarations;
 pub(crate) mod language;
 
+use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
+use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer, Language, Project,
-    ProjectFile, SemanticDiagnostic, SignatureMetadata, TreeSitterAnalyzer, TypeAliasProvider,
-    UsageFactsIndex,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer, JvmAnalyzerConfig,
+    Language, Project, ProjectFile, SemanticDiagnostic, SignatureMetadata, TreeSitterAnalyzer,
+    TypeAliasProvider, UsageFactsIndex,
 };
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub(crate) use adapter::KotlinAdapter;
 
 #[derive(Clone)]
 pub struct KotlinAnalyzer {
     inner: TreeSitterAnalyzer<KotlinAdapter>,
+    /// Kotlin's share of the JVM dependency realm: the same jar-backed index
+    /// Java and Scala consult, built from the same discovered Maven/Gradle
+    /// artifacts. Built lazily because opening jars is expensive and many
+    /// workspaces never ask a question that needs it.
+    jvm_config: JvmAnalyzerConfig,
+    external_index: Arc<OnceLock<JvmExternalDeclarationIndex>>,
 }
 
 crate::analyzer::impl_forward_query_provider!(KotlinAnalyzer);
@@ -40,8 +48,11 @@ impl KotlinAnalyzer {
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
+        let jvm_config = config.jvm.clone();
         Self {
             inner: TreeSitterAnalyzer::new_with_config(project, KotlinAdapter, config),
+            jvm_config,
+            external_index: Arc::new(OnceLock::new()),
         }
     }
 
@@ -58,6 +69,7 @@ impl KotlinAnalyzer {
         store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
     ) -> Result<Self, crate::analyzer::store::StoreError> {
+        let jvm_config = config.jvm.clone();
         Ok(Self {
             inner: TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
                 project,
@@ -66,13 +78,30 @@ impl KotlinAnalyzer {
                 store_context,
                 progress,
             )?,
+            jvm_config,
+            external_index: Arc::new(OnceLock::new()),
         })
     }
 
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         Self {
             inner: self.inner.clone_with_project(project),
+            jvm_config: self.jvm_config.clone(),
+            // A different project root means a different classpath, so the
+            // jar-backed index must be rebuilt rather than carried over.
+            external_index: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Kotlin's view of the shared JVM dependency realm.
+    // Exercised by `analyzer::jvm::external`'s tests today; the resolution
+    // ladder that reads it in normal operation lands with Kotlin type-name
+    // resolution, at which point this attribute goes away.
+    #[allow(dead_code)]
+    pub(crate) fn external_declaration_index(&self) -> &JvmExternalDeclarationIndex {
+        self.external_index.get_or_init(|| {
+            JvmExternalDeclarationIndex::build_for_project(&self.jvm_config, self.inner.project())
+        })
     }
 }
 
@@ -237,14 +266,26 @@ impl IAnalyzer for KotlinAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+        // A touched build manifest can add or drop dependencies, so the
+        // jar-backed index is discarded and rebuilt on demand; every other
+        // edit leaves the classpath alone.
+        let external_index = if changed_files.iter().any(is_jvm_dependency_input) {
+            Arc::new(OnceLock::new())
+        } else {
+            Arc::clone(&self.external_index)
+        };
         Self {
             inner: self.inner.update(changed_files),
+            jvm_config: self.jvm_config.clone(),
+            external_index,
         }
     }
 
     fn update_all(&self) -> Self {
         Self {
             inner: self.inner.update_all(),
+            jvm_config: self.jvm_config.clone(),
+            external_index: Arc::new(OnceLock::new()),
         }
     }
 
