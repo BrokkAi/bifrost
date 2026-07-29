@@ -56,8 +56,7 @@ fn direct_analyzers_match_brokk_capability_matrix() {
     assert!(csharp.import_analysis_provider().is_some());
     assert!(php.import_analysis_provider().is_none());
     assert!(scala.import_analysis_provider().is_some());
-    // Kotlin structured import analysis is issue #1237.
-    assert!(kotlin.import_analysis_provider().is_none());
+    assert!(kotlin.import_analysis_provider().is_some());
 
     assert!(java.type_hierarchy_provider().is_some());
     assert!(python.type_hierarchy_provider().is_some());
@@ -69,8 +68,7 @@ fn direct_analyzers_match_brokk_capability_matrix() {
     assert!(csharp.type_hierarchy_provider().is_some());
     assert!(php.type_hierarchy_provider().is_some());
     assert!(scala.type_hierarchy_provider().is_some());
-    // Kotlin type-hierarchy modeling is issue #1237.
-    assert!(kotlin.type_hierarchy_provider().is_none());
+    assert!(kotlin.type_hierarchy_provider().is_some());
     assert!(kotlin.type_alias_provider().is_some());
 }
 

@@ -1,8 +1,8 @@
 mod common;
 
 use brokk_bifrost::{
-    AnalyzerConfig, IAnalyzer, ImportAnalysisProvider, JavaAnalyzer, JavaAnalyzerConfig,
-    JavaExternalDependencies, JavaMavenCoordinate, Language, ProjectFile, TestProject,
+    AnalyzerConfig, IAnalyzer, ImportAnalysisProvider, JavaAnalyzer, JvmAnalyzerConfig,
+    JvmExternalDependencies, JvmMavenCoordinate, Language, ProjectFile, TestProject,
     TypeHierarchyProvider,
 };
 use common::InlineTestProject;
@@ -69,17 +69,17 @@ fn java_external_type_resolution_uses_exact_maven_coordinate_without_workspace_d
     }
 
     let config = AnalyzerConfig {
-        java: JavaAnalyzerConfig {
-            external_dependencies: JavaExternalDependencies {
-                coordinates: vec![JavaMavenCoordinate::new(
+        jvm: JvmAnalyzerConfig {
+            external_dependencies: JvmExternalDependencies {
+                coordinates: vec![JvmMavenCoordinate::new(
                     "com.example",
                     "external-lib",
                     "1.2.3",
                 )],
                 repository_roots: vec![root.join("m2")],
-                ..JavaExternalDependencies::default()
+                ..JvmExternalDependencies::default()
             },
-            ..JavaAnalyzerConfig::default()
+            ..JvmAnalyzerConfig::default()
         },
         ..AnalyzerConfig::default()
     };

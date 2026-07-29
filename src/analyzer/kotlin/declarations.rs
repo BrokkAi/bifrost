@@ -11,10 +11,14 @@
 //! joined with an ordinary dot. `.kts` scripts are indexed through the same
 //! walk; top-level script *statements* are not declarations and are skipped.
 //!
-//! Boundaries owned by sibling issues: structured imports and supertype
-//! hierarchy (#1237), navigation (#1238), usage graphs (#1239), RQL (#1240),
-//! CFG (#1241). Local functions, lambdas, and anonymous objects inside bodies
-//! are deliberately not indexed as declarations in this tier.
+//! Name-resolution facts this walk records for issue #1237 live alongside the
+//! declarations: structured imports (see `super::imports`) and the dotted
+//! supertype paths of each class-like declaration (see `super::supertypes`).
+//!
+//! Boundaries owned by sibling issues: navigation (#1238), usage graphs
+//! (#1239), RQL (#1240), CFG (#1241). Local functions, lambdas, and anonymous
+//! objects inside bodies are deliberately not indexed as declarations in this
+//! tier.
 
 use crate::analyzer::common::{
     collapse_whitespace, node_source_text as node_text,
@@ -42,7 +46,7 @@ fn kotlin_segment(text: &str, kind: SegmentKind) -> SegmentId {
 /// test method names). The backticks are quoting syntax, not part of the name,
 /// so they must not reach an interned segment — otherwise the declaration is
 /// unreachable by its real spelling.
-fn kotlin_identifier_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+pub(crate) fn kotlin_identifier_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     let text = node_text_trimmed(node, source);
     text.strip_prefix('`')
         .and_then(|text| text.strip_suffix('`'))
@@ -76,6 +80,7 @@ pub(crate) fn parse_kotlin_file(file: &ProjectFile, source: &str, tree: &Tree) -
     let package_name = kotlin_package_name(root, source);
     let mut parsed = ParsedFile::new(package_name.clone());
     collect_kotlin_imports(root, source, &mut parsed);
+    collect_kotlin_type_identifiers(root, source, &mut parsed);
 
     let mut visitor = KotlinVisitor {
         file,
@@ -101,8 +106,6 @@ fn kotlin_package_name(root: Node<'_>, source: &str) -> String {
 }
 
 fn collect_kotlin_imports(root: Node<'_>, source: &str, parsed: &mut ParsedFile) {
-    // Structured `ImportInfo` modeling belongs to issue #1237; this tier
-    // records the raw statements for `import_statements()` display only.
     for import_list in named_children_of(root)
         .into_iter()
         .filter(|child| child.kind() == "import_list")
@@ -111,11 +114,55 @@ fn collect_kotlin_imports(root: Node<'_>, source: &str, parsed: &mut ParsedFile)
             .into_iter()
             .filter(|child| child.kind() == "import_header")
         {
+            // The display string keeps the source's own spelling for
+            // `import_statements()`; the structured fact is what resolution
+            // reads, so neither has to be recovered from the other.
             let raw = collapse_whitespace(node_text(import, source));
             if !raw.is_empty() {
                 parsed.import_statements.push(raw);
             }
+            if let Some(info) = super::imports::kotlin_import_info_from_node(import, source) {
+                parsed.imports.push(info);
+            }
         }
+    }
+}
+
+/// Record every name this file spells that could name a type or an object.
+///
+/// This feeds the same-package reference index, which asks "could this file be
+/// talking about a declaration in its own package?" — a question that must not
+/// miss, so it collects two node shapes:
+///
+/// * every `type_identifier`, which the grammar uses for all type positions
+///   and for declared type names; and
+/// * the receiver of a qualified reference (`Registry` in
+///   `Registry.register()`), which is a `simple_identifier` and never a
+///   `type_identifier`, yet is the only way to name a Kotlin `object`,
+///   companion, or enum class in value position.
+fn collect_kotlin_type_identifiers(root: Node<'_>, source: &str, parsed: &mut ParsedFile) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "type_identifier" => {
+                let text = kotlin_identifier_text(node, source);
+                if !text.is_empty() {
+                    parsed.type_identifiers.insert(text.to_string());
+                }
+            }
+            "navigation_expression" => {
+                if let Some(receiver) = node.named_child(0)
+                    && receiver.kind() == "simple_identifier"
+                {
+                    let text = kotlin_identifier_text(receiver, source);
+                    if !text.is_empty() {
+                        parsed.type_identifiers.insert(text.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+        stack.extend(named_children_of(node));
     }
 }
 
@@ -214,6 +261,7 @@ impl<'a> KotlinVisitor<'a> {
         let code_unit = self.declare(CodeUnitType::Class, SegmentKind::Type, name, node, parent);
         self.parsed
             .add_signature(code_unit.clone(), kotlin_class_signature(node, self.source));
+        self.record_supertypes(&code_unit, node);
 
         if let Some(primary) = first_named_child(node, "primary_constructor") {
             self.visit_primary_constructor(primary, name, &code_unit);
@@ -254,12 +302,24 @@ impl<'a> KotlinVisitor<'a> {
         // name-resolution rule and must not leak into rendered source text.
         self.parsed
             .add_signature(code_unit.clone(), kotlin_class_signature(node, self.source));
+        self.record_supertypes(&code_unit, node);
 
         if let Some(body) = first_named_child(node, "class_body") {
             stack.push(KotlinWork {
                 node: body,
                 parent: Some(code_unit),
             });
+        }
+    }
+
+    /// Record the dotted paths of what a class-like declaration extends or
+    /// implements. The full header text is already the declaration's rendered
+    /// signature, so only the resolvable paths are stored here.
+    fn record_supertypes(&mut self, code_unit: &CodeUnit, node: Node<'_>) {
+        let supertypes = super::supertypes::extract_kotlin_supertypes(node, self.source);
+        if !supertypes.is_empty() {
+            self.parsed
+                .set_raw_supertypes(code_unit.clone(), supertypes);
         }
     }
 
@@ -485,6 +545,92 @@ impl<'a> KotlinVisitor<'a> {
             });
         }
     }
+}
+
+/// The tree-sitter node kinds that declare a Kotlin class-like type.
+pub(crate) const KOTLIN_CLASS_LIKE_KINDS: &[&str] = &[
+    "class_declaration",
+    "object_declaration",
+    "companion_object",
+];
+
+/// What a Kotlin class-like declaration actually declares.
+///
+/// Kotlin spells all of these with one of three node kinds, so the distinction
+/// lives in the tokens inside the node (`interface`, `enum class`) or in a
+/// `class_modifier` (`annotation class`), never in the node kind alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KotlinClassLikeKind {
+    Class,
+    Interface,
+    Enum,
+    Annotation,
+    Object,
+}
+
+/// Classify a class-like declaration node, or `None` when the node does not
+/// declare a type.
+pub(crate) fn kotlin_class_like_kind(node: Node<'_>) -> Option<KotlinClassLikeKind> {
+    match node.kind() {
+        "object_declaration" | "companion_object" => Some(KotlinClassLikeKind::Object),
+        "class_declaration" => {
+            if has_token_child(node, "interface") {
+                return Some(KotlinClassLikeKind::Interface);
+            }
+            if has_token_child(node, "enum") {
+                return Some(KotlinClassLikeKind::Enum);
+            }
+            if kotlin_has_modifier(node, "annotation") {
+                return Some(KotlinClassLikeKind::Annotation);
+            }
+            Some(KotlinClassLikeKind::Class)
+        }
+        _ => None,
+    }
+}
+
+/// The visibility a Kotlin declaration declares, defaulting to `public`.
+///
+/// Kotlin has no package-private tier: an unmarked declaration is visible
+/// everywhere its containing declaration is, and `internal` restricts a
+/// declaration to its own compilation module — which, from the perspective of
+/// anything consuming a published artifact, is as invisible as `private`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KotlinDeclaredVisibility {
+    Public,
+    Protected,
+    Internal,
+    Private,
+}
+
+pub(crate) fn kotlin_declared_visibility(node: Node<'_>, source: &str) -> KotlinDeclaredVisibility {
+    let Some(modifiers) = first_named_child(node, "modifiers") else {
+        return KotlinDeclaredVisibility::Public;
+    };
+    for modifier in named_children_of(modifiers) {
+        if modifier.kind() != "visibility_modifier" {
+            continue;
+        }
+        return match node_text_trimmed(modifier, source) {
+            "private" => KotlinDeclaredVisibility::Private,
+            "internal" => KotlinDeclaredVisibility::Internal,
+            "protected" => KotlinDeclaredVisibility::Protected,
+            _ => KotlinDeclaredVisibility::Public,
+        };
+    }
+    KotlinDeclaredVisibility::Public
+}
+
+/// Whether the declaration's `modifiers` list contains `keyword` as a modifier
+/// node (not as an annotation argument or an identifier that merely spells the
+/// same soft keyword elsewhere in the header).
+fn kotlin_has_modifier(node: Node<'_>, keyword: &str) -> bool {
+    let Some(modifiers) = first_named_child(node, "modifiers") else {
+        return false;
+    };
+    named_children_of(modifiers)
+        .into_iter()
+        .any(|modifier| has_token_child(modifier, keyword))
 }
 
 /// The `val`/`var` binding keyword of a property-like node.
