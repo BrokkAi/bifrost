@@ -3,10 +3,10 @@ use crate::analyzer::{
     CSharpAnalyzer, CloneSmell, CloneSmellWeights, CodeUnit, CommentDensityStats, CppAnalyzer,
     DeclarationInfo, ExceptionHandlingSmell, ExceptionSmellWeights, GlobalUsageDefinitionIndex,
     GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer,
-    Language, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer,
-    ScalaAnalyzer, SearchSymbolCandidates, SearchSymbolPatternBatch, SemanticDiagnostic,
-    SignatureMetadata, SummaryFileProjection, TestDetectionProvider, TypeAliasProvider,
-    TypeHierarchyProvider, TypescriptAnalyzer,
+    KotlinAnalyzer, Language, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range,
+    RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, SearchSymbolCandidates, SearchSymbolPatternBatch,
+    SemanticDiagnostic, SignatureMetadata, SummaryFileProjection, TestDetectionProvider,
+    TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use rayon::prelude::*;
@@ -43,6 +43,7 @@ pub enum AnalyzerDelegate {
     Rust(RustAnalyzer),
     Scala(ScalaAnalyzer),
     Ruby(RubyAnalyzer),
+    Kotlin(KotlinAnalyzer),
 }
 
 impl AnalyzerDelegate {
@@ -59,6 +60,7 @@ impl AnalyzerDelegate {
             Self::Rust(analyzer) => analyzer,
             Self::Scala(analyzer) => analyzer,
             Self::Ruby(analyzer) => analyzer,
+            Self::Kotlin(analyzer) => analyzer,
         }
     }
 
@@ -75,6 +77,7 @@ impl AnalyzerDelegate {
             Self::Rust(_) => Language::Rust,
             Self::Scala(_) => Language::Scala,
             Self::Ruby(_) => Language::Ruby,
+            Self::Kotlin(_) => Language::Kotlin,
         }
     }
 
@@ -93,6 +96,9 @@ impl AnalyzerDelegate {
             Self::Rust(analyzer) => analyzer,
             Self::Scala(analyzer) => analyzer,
             Self::Ruby(analyzer) => analyzer,
+            // Kotlin lowering is issue #1241; until then every capability is
+            // explicitly unsupported rather than absent.
+            Self::Kotlin(_) => &crate::analyzer::semantic::UNSUPPORTED_PROGRAM_SEMANTICS,
         }
     }
 
@@ -109,6 +115,7 @@ impl AnalyzerDelegate {
             Self::Rust(analyzer) => Self::Rust(analyzer.clone_with_project(project)),
             Self::Scala(analyzer) => Self::Scala(analyzer.clone_with_project(project)),
             Self::Ruby(analyzer) => Self::Ruby(analyzer.clone_with_project(project)),
+            Self::Kotlin(analyzer) => Self::Kotlin(analyzer.clone_with_project(project)),
         }
     }
 
@@ -125,6 +132,8 @@ impl AnalyzerDelegate {
             Self::Rust(analyzer) => Some(analyzer),
             Self::Scala(analyzer) => analyzer.import_analysis_provider(),
             Self::Ruby(analyzer) => Some(analyzer),
+            // Kotlin structured import analysis is issue #1237.
+            Self::Kotlin(_) => None,
         }
     }
 
@@ -141,6 +150,8 @@ impl AnalyzerDelegate {
             Self::Rust(analyzer) => analyzer.type_hierarchy_provider(),
             Self::Scala(analyzer) => analyzer.type_hierarchy_provider(),
             Self::Ruby(analyzer) => Some(analyzer),
+            // Kotlin type-hierarchy modeling is issue #1237.
+            Self::Kotlin(_) => None,
         }
     }
 
@@ -157,6 +168,7 @@ impl AnalyzerDelegate {
             Self::Rust(analyzer) => analyzer.type_alias_provider(),
             Self::Scala(analyzer) => analyzer.type_alias_provider(),
             Self::Ruby(analyzer) => analyzer.type_alias_provider(),
+            Self::Kotlin(analyzer) => analyzer.type_alias_provider(),
         }
     }
 
@@ -173,6 +185,8 @@ impl AnalyzerDelegate {
             Self::Rust(analyzer) => Some(analyzer),
             Self::Scala(analyzer) => Some(analyzer),
             Self::Ruby(analyzer) => Some(analyzer),
+            // Kotlin AST-backed test detection is issue #1243.
+            Self::Kotlin(analyzer) => analyzer.test_detection_provider(),
         }
     }
 
@@ -189,6 +203,7 @@ impl AnalyzerDelegate {
             Self::Rust(analyzer) => Self::Rust(analyzer.update(changed_files)),
             Self::Scala(analyzer) => Self::Scala(analyzer.update(changed_files)),
             Self::Ruby(analyzer) => Self::Ruby(analyzer.update(changed_files)),
+            Self::Kotlin(analyzer) => Self::Kotlin(analyzer.update(changed_files)),
         }
     }
 
@@ -220,6 +235,7 @@ impl AnalyzerDelegate {
             Self::Rust(analyzer) => Self::Rust(analyzer.update_all()),
             Self::Scala(analyzer) => Self::Scala(analyzer.update_all()),
             Self::Ruby(analyzer) => Self::Ruby(analyzer.update_all()),
+            Self::Kotlin(analyzer) => Self::Kotlin(analyzer.update_all()),
         }
     }
 }

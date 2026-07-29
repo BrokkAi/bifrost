@@ -1,7 +1,7 @@
 use brokk_bifrost::{
     AnalyzerDelegate, CSharpAnalyzer, CppAnalyzer, GoAnalyzer, IAnalyzer, JavaAnalyzer,
-    JavascriptAnalyzer, Language, MultiAnalyzer, PhpAnalyzer, PythonAnalyzer, RustAnalyzer,
-    ScalaAnalyzer, TestProject, TypescriptAnalyzer,
+    JavascriptAnalyzer, KotlinAnalyzer, Language, MultiAnalyzer, PhpAnalyzer, PythonAnalyzer,
+    RustAnalyzer, ScalaAnalyzer, TestProject, TypescriptAnalyzer,
 };
 use std::collections::BTreeMap;
 use tempfile::tempdir;
@@ -20,6 +20,7 @@ fn fixture_project() -> TestProject {
         ("a.cs", "class A {}\n"),
         ("a.php", "<?php function a() {}\n"),
         ("A.scala", "class A\n"),
+        ("A.kt", "package a\n\nclass A\n"),
     ];
 
     for (path, contents) in files {
@@ -43,6 +44,7 @@ fn direct_analyzers_match_brokk_capability_matrix() {
     let csharp = CSharpAnalyzer::from_project(project.clone());
     let php = PhpAnalyzer::from_project(project.clone());
     let scala = ScalaAnalyzer::from_project(project.clone());
+    let kotlin = KotlinAnalyzer::from_project(project.clone());
 
     assert!(java.import_analysis_provider().is_some());
     assert!(python.import_analysis_provider().is_some());
@@ -54,6 +56,8 @@ fn direct_analyzers_match_brokk_capability_matrix() {
     assert!(csharp.import_analysis_provider().is_some());
     assert!(php.import_analysis_provider().is_none());
     assert!(scala.import_analysis_provider().is_some());
+    // Kotlin structured import analysis is issue #1237.
+    assert!(kotlin.import_analysis_provider().is_none());
 
     assert!(java.type_hierarchy_provider().is_some());
     assert!(python.type_hierarchy_provider().is_some());
@@ -65,6 +69,9 @@ fn direct_analyzers_match_brokk_capability_matrix() {
     assert!(csharp.type_hierarchy_provider().is_some());
     assert!(php.type_hierarchy_provider().is_some());
     assert!(scala.type_hierarchy_provider().is_some());
+    // Kotlin type-hierarchy modeling is issue #1237.
+    assert!(kotlin.type_hierarchy_provider().is_none());
+    assert!(kotlin.type_alias_provider().is_some());
 }
 
 #[test]
@@ -109,7 +116,11 @@ fn multi_analyzer_matches_brokk_capability_matrix() {
         ),
         (
             Language::Scala,
-            AnalyzerDelegate::Scala(ScalaAnalyzer::from_project(project)),
+            AnalyzerDelegate::Scala(ScalaAnalyzer::from_project(project.clone())),
+        ),
+        (
+            Language::Kotlin,
+            AnalyzerDelegate::Kotlin(KotlinAnalyzer::from_project(project)),
         ),
     ]));
 

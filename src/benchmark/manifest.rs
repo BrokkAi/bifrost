@@ -1304,6 +1304,7 @@ fn manifest_language_from_analyzer(language: Language) -> Option<ManifestLanguag
         Language::Php => Some(ManifestLanguage::Php),
         Language::Scala => Some(ManifestLanguage::Scala),
         Language::CSharp => Some(ManifestLanguage::CSharp),
-        Language::Ruby | Language::None => None,
+        // Kotlin benchmark manifests are issue #1244.
+        Language::Ruby | Language::Kotlin | Language::None => None,
     }
 }

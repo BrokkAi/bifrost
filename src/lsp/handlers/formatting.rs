@@ -295,6 +295,7 @@ fn discover_builtin_formatter(context: &FormatContext<'_>) -> Option<FormatterCo
         | Language::Scala
         | Language::CSharp
         | Language::Ruby
+        | Language::Kotlin
         | Language::None => None,
     }
 }

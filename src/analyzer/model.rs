@@ -29,6 +29,7 @@ pub enum Language {
     Scala,
     CSharp,
     Ruby,
+    Kotlin,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -39,7 +40,7 @@ pub enum RubyMethodDispatchMode {
 }
 
 impl Language {
-    pub const ANALYZABLE: [Self; 11] = [
+    pub const ANALYZABLE: [Self; 12] = [
         Language::Java,
         Language::Go,
         Language::Cpp,
@@ -51,6 +52,7 @@ impl Language {
         Language::Scala,
         Language::CSharp,
         Language::Ruby,
+        Language::Kotlin,
     ];
 
     pub fn config_label(self) -> &'static str {
@@ -67,6 +69,7 @@ impl Language {
             Language::Scala => "scala",
             Language::CSharp => "csharp",
             Language::Ruby => "ruby",
+            Language::Kotlin => "kotlin",
         }
     }
 
@@ -93,6 +96,7 @@ impl Language {
             Language::Scala => &["scala"],
             Language::CSharp => &["cs"],
             Language::Ruby => &["rb"],
+            Language::Kotlin => &["kt", "kts"],
         }
     }
 

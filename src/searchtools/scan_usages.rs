@@ -979,6 +979,7 @@ pub(super) fn scan_usages_language_name(language: Language) -> &'static str {
         Language::Scala => "Scala",
         Language::CSharp => "C#",
         Language::Ruby => "Ruby",
+        Language::Kotlin => "Kotlin",
     }
 }
 

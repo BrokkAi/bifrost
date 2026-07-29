@@ -757,6 +757,40 @@ pub trait ProgramSemanticsProvider: Send + Sync {
     ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError>;
 }
 
+/// A [`ProgramSemanticsProvider`] for languages whose lowering is not
+/// implemented yet.
+///
+/// Every capability is reported as explicitly [`SemanticOutcome::Unsupported`]
+/// rather than left absent, so callers can distinguish "this language cannot do
+/// it" from "nothing was materialized". Zero-sized, so a language delegate can
+/// hand out `&UNSUPPORTED_PROGRAM_SEMANTICS` without owning a value.
+pub struct UnsupportedProgramSemantics;
+
+/// The shared [`UnsupportedProgramSemantics`] instance.
+pub static UNSUPPORTED_PROGRAM_SEMANTICS: UnsupportedProgramSemantics = UnsupportedProgramSemantics;
+
+impl ProgramSemanticsProvider for UnsupportedProgramSemantics {
+    fn current_artifact_source(
+        &self,
+        _file: &ProjectFile,
+        _max_source_bytes: usize,
+    ) -> Result<Option<SemanticArtifactSourceSnapshot>, SemanticProviderError> {
+        Ok(None)
+    }
+
+    fn materialize(
+        &self,
+        _file: &ProjectFile,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError> {
+        Ok(SemanticOutcome::Unsupported {
+            capability: SemanticCapability::Procedures,
+            partial: None,
+            work: SemanticWork::default(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

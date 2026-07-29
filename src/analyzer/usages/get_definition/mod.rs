@@ -1168,6 +1168,11 @@ fn resolve_one<'a>(
             tree.as_ref(),
             &site,
         ),
+        // Kotlin definition navigation is issue #1238.
+        Language::Kotlin => no_definition(
+            "kotlin_navigation_unsupported",
+            "Kotlin definition navigation is not supported yet",
+        ),
         Language::None => {
             unreachable!("unsupported language handled before source extraction")
         }
@@ -1246,6 +1251,13 @@ pub(crate) fn parse_tree_for_language(
         Language::Rust => rust::parse_rust_tree(source),
         Language::Go => go::parse_go_tree(source),
         Language::Ruby => crate::analyzer::ruby::parse_ruby_tree(source),
+        Language::Kotlin => {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&crate::analyzer::kotlin::language::LANGUAGE.into())
+                .ok()?;
+            parser.parse(source.as_bytes(), None)
+        }
         Language::None => None,
     }
 }

@@ -202,6 +202,9 @@ fn analyzer_for_language(
         Language::Rust => resolve_analyzer::<RustAnalyzer>(analyzer).map(|value| value as _),
         Language::Scala => resolve_analyzer::<ScalaAnalyzer>(analyzer).map(|value| value as _),
         Language::Ruby => resolve_analyzer::<RubyAnalyzer>(analyzer).map(|value| value as _),
+        Language::Kotlin => {
+            resolve_analyzer::<crate::analyzer::KotlinAnalyzer>(analyzer).map(|value| value as _)
+        }
         Language::None => None,
     }
 }

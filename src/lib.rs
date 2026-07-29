@@ -3,6 +3,7 @@ pub mod benchmark;
 pub mod cache_db;
 pub mod cache_gc;
 mod cancellation;
+pub mod code_intelligence;
 pub mod code_quality;
 mod compact_graph;
 pub mod diff_analysis;
@@ -67,10 +68,10 @@ pub use analyzer::{
     DeclarationKind, EmptyAnalyzer, FileSetProject, FilesystemProject, GoAnalyzer, IAnalyzer,
     ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavaAnalyzerConfig,
     JavaDependencyDiscoveryConfig, JavaDependencyDiscoveryMode, JavaExternalArtifact,
-    JavaExternalDependencies, JavaMavenCoordinate, JavascriptAnalyzer, Language, MultiAnalyzer,
-    MultiRootProject, OverlayProject, ParseError, ParseErrorKind, PhpAnalyzer, Project,
-    ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, SourceContent,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TestProject,
+    JavaExternalDependencies, JavaMavenCoordinate, JavascriptAnalyzer, KotlinAnalyzer, Language,
+    MultiAnalyzer, MultiRootProject, OverlayProject, ParseError, ParseErrorKind, PhpAnalyzer,
+    Project, ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer,
+    SourceContent, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TestProject,
     TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
     WorkspaceAnalyzer, collect_workspace_files, reset_rust_tree_parse_counters_for_test,
     rust_tree_parse_count_for_test, rust_tree_parse_request_count_for_test,
