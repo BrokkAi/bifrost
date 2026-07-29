@@ -271,9 +271,7 @@ jobs:
           toolchain: 1.96.0
 
       - name: Run LSP contract tests
-        run: >-
-          node scripts/ci-timing.mjs --label lsp-contract -- cargo test --features nlp,python
-          --test suite_mcp_cli -- bifrost_lsp_server::
+        run: node scripts/ci-timing.mjs --label lsp-contract -- cargo test -p brokk-bifrost-lsp --all-features
 
   policy-pack:
     name: policy pack

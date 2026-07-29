@@ -9,7 +9,7 @@
 
 #![allow(dead_code)]
 
-use brokk_bifrost::lsp::conversion::path_to_uri_string;
+use brokk_bifrost_lsp::lsp::conversion::path_to_uri_string;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -511,13 +511,19 @@ impl LspServer {
 
 fn lsp_command(root: &Path) -> (Command, TempDir) {
     let cache_dir = TempDir::new().expect("create isolated LSP cache directory");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_bifrost"));
+    let binary = option_env!("CARGO_BIN_EXE_bifrost-lsp-test-server")
+        .or(option_env!("CARGO_BIN_EXE_bifrost"))
+        .expect("Cargo did not provide an LSP server binary");
+    let mut command = Command::new(binary);
     command
         .arg("--root")
         .arg(root)
         .arg("--server")
         .arg("lsp")
-        .env(brokk_bifrost::gitblob::CACHE_DIR_ENV, cache_dir.path());
+        .env(
+            brokk_bifrost_analysis::gitblob::CACHE_DIR_ENV,
+            cache_dir.path(),
+        );
     (command, cache_dir)
 }
 

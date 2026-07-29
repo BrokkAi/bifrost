@@ -16,3 +16,12 @@ mod server;
 mod text_sync;
 
 pub use server::run_lsp_stdio_server;
+
+/// Typed hierarchy handlers used by the repository's benchmark application.
+///
+/// These remain outside the stable facade API; the benchmark sits above both
+/// protocol hosts and intentionally measures the same handler path as LSP.
+#[doc(hidden)]
+pub mod benchmark_api {
+    pub use super::handlers::{call_hierarchy, type_hierarchy};
+}

@@ -241,6 +241,7 @@ version = "0.8.12"
 dependencies = [
  "bincode",
  "brokk-bifrost-analysis",
+ "brokk-bifrost-lsp",
  "brokk-bifrost-runtime",
  "cap-fs-ext",
  "cap-std",
@@ -263,7 +264,6 @@ dependencies = [
  "json-spanned-value",
  "jsonschema",
  "libc",
- "lsp-server",
  "lsp-types",
  "moka",
  "notify",
@@ -386,6 +386,16 @@ version = "0.8.12"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-runtime",
+ "glob",
+ "libc",
+ "lsp-server",
+ "lsp-types",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "tree-sitter",
 ]
 
 [[package]]

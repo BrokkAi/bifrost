@@ -1,9 +1,10 @@
-use crate::common::lsp_client::{LspServer, uri_for};
-use brokk_bifrost::Language;
-use brokk_bifrost::analyzer::policy::{
+mod common;
+
+use brokk_bifrost_analysis::Language;
+use brokk_bifrost_analysis::analyzer::policy::{
     PolicyFormatOptions, format_rqlp_source, format_rqlp_source_with_options,
 };
-use brokk_bifrost::analyzer::structural::{
+use brokk_bifrost_analysis::analyzer::structural::{
     RuneIrLanguage, RuneIrLimits, RuneIrSelection, render_source_rune_ir,
 };
 use serde_json::{Value, json};
@@ -11,6 +12,12 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+fn repository_fixture_root(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures")
+        .join(name)
+}
 
 /// Java fixture used by the completion-handler integration tests. `gree` on
 /// line 3 is a stand-alone identifier prefix — tree-sitter still extracts the
@@ -180,10 +187,7 @@ fn write_jvm_type_context_fixtures(root: &Path, prefix: &str) -> JvmTypeContextF
 
 #[test]
 fn bifrost_lsp_server_handles_initialize_and_shutdown() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
 
     let mut server = LspServer::spawn(&fixture_root);
 
@@ -269,10 +273,7 @@ fn bifrost_lsp_server_handles_initialize_and_shutdown() {
 
 #[test]
 fn bifrost_lsp_server_semantic_tokens_advertises_stable_full_legend() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
     let mut server = LspServer::spawn(&fixture_root);
 
     server.notify_value(json!({
@@ -491,10 +492,7 @@ fn bifrost_lsp_server_semantic_tokens_cancel_without_blocking_rune_ir() {
 
 #[test]
 fn bifrost_lsp_server_malformed_initialize_returns_error_response() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
 
     let mut server = LspServer::spawn(&fixture_root);
 
@@ -528,10 +526,7 @@ fn bifrost_lsp_server_malformed_initialize_returns_error_response() {
 
 #[test]
 fn lsp_server_drop_cleanup_exits_cleanly_after_initialize() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
 
     let status = LspServer::start(&fixture_root)
         .drop_cleanup_status_for_test()
@@ -543,10 +538,7 @@ fn lsp_server_drop_cleanup_exits_cleanly_after_initialize() {
 #[cfg(unix)]
 #[test]
 fn lsp_server_drop_reaps_child_process() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
 
     let child_id = {
         let server = LspServer::spawn(&fixture_root);
@@ -3716,10 +3708,7 @@ fn bifrost_lsp_server_disables_startup_progress_when_token_create_fails() {
 
 #[test]
 fn bifrost_lsp_server_returns_document_symbols_for_a_java() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
 
     let mut server = LspServer::spawn(&fixture_root);
 
@@ -3794,10 +3783,7 @@ fn bifrost_lsp_server_returns_document_symbols_for_a_java() {
 
 #[test]
 fn bifrost_lsp_server_workspace_symbol_finds_method() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
 
     let mut server = LspServer::spawn(&fixture_root);
 
@@ -4021,10 +4007,7 @@ fn bifrost_lsp_server_completion_empty_prefix_returns_null() {
 
 #[test]
 fn bifrost_lsp_server_goto_definition_finds_class_a_from_b() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
 
     let mut server = LspServer::spawn(&fixture_root);
 
@@ -5448,10 +5431,7 @@ fn bifrost_lsp_server_type_definition_uses_did_open_overlay() {
 
 #[test]
 fn bifrost_lsp_server_hover_returns_signature_for_class_a() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
 
     let mut server = LspServer::spawn(&fixture_root);
 
@@ -5509,10 +5489,7 @@ fn bifrost_lsp_server_hover_returns_signature_for_class_a() {
 
 #[test]
 fn bifrost_lsp_server_references_finds_class_a_usages() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
 
     let mut server = LspServer::spawn(&fixture_root);
 
@@ -5589,10 +5566,7 @@ fn bifrost_lsp_server_references_finds_class_a_usages() {
 
 #[test]
 fn bifrost_lsp_server_references_reports_client_owned_work_done_progress() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
     let canonical_root = fixture_root.canonicalize().expect("canon fixture");
     let root_uri = uri_for(&canonical_root);
     let a_uri = uri_for(&canonical_root.join("A.java"));
@@ -6521,10 +6495,7 @@ fn bifrost_lsp_server_broad_endpoints_fail_closed_on_ambiguous_csharp_attribute(
 
 #[test]
 fn bifrost_lsp_server_prepare_rename_returns_identifier_range() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
     let canonical_root = fixture_root.canonicalize().expect("canon fixture");
     let a_uri = uri_for(&canonical_root.join("A.java"));
 
@@ -6565,10 +6536,7 @@ fn bifrost_lsp_server_prepare_rename_returns_identifier_range() {
 
 #[test]
 fn bifrost_lsp_server_rename_returns_workspace_edit_for_java_method() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
     let canonical_root = fixture_root.canonicalize().expect("canon fixture");
     let a_path = canonical_root.join("A.java");
     let a_uri = uri_for(&a_path);
@@ -6626,10 +6594,7 @@ fn bifrost_lsp_server_rename_returns_workspace_edit_for_java_method() {
 
 #[test]
 fn bifrost_lsp_server_rename_rejects_file_coupled_java_class_without_file_edit() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
     let canonical_root = fixture_root.canonicalize().expect("canon fixture");
     let a_uri = uri_for(&canonical_root.join("A.java"));
 
@@ -7281,10 +7246,7 @@ fn bifrost_lsp_server_call_hierarchy_does_not_include_nested_type_calls() {
 
 #[test]
 fn bifrost_lsp_server_document_highlight_filters_to_current_file() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
 
     let mut server = LspServer::spawn(&fixture_root);
 
@@ -8599,10 +8561,7 @@ fn bifrost_lsp_server_did_save_triggers_reindex() {
 
 #[test]
 fn bifrost_lsp_server_hover_uses_python_language_tag_for_py_file() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-py");
+    let fixture_root = repository_fixture_root("testcode-py");
 
     let mut server = LspServer::spawn(&fixture_root);
 
@@ -8653,10 +8612,7 @@ fn bifrost_lsp_server_hover_uses_python_language_tag_for_py_file() {
 
 #[test]
 fn bifrost_lsp_server_unknown_request_returns_method_not_found() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
 
     let mut server = LspServer::spawn(&fixture_root);
 
@@ -8896,10 +8852,7 @@ fn bifrost_lsp_server_did_save_suppresses_js_ts_semantic_diagnostics() {
 
 #[test]
 fn bifrost_lsp_server_returns_folding_ranges_for_a_java() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = repository_fixture_root("testcode-java");
 
     let mut server = LspServer::spawn(&fixture_root);
 

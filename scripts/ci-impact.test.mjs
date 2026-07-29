@@ -43,7 +43,12 @@ test("runtime and individual host paths select their contracts", () => {
     ["mcp_contract", "rql_runtime"],
   );
   assert.deepEqual(
-    selected(classifyChangeSet({ eventName: "pull_request", changedPaths: ["src/lsp/server.rs"] })),
+    selected(
+      classifyChangeSet({
+        eventName: "pull_request",
+        changedPaths: ["crates/bifrost-lsp/src/lsp/server.rs"],
+      }),
+    ),
     ["lsp_contract", "rql_runtime"],
   );
 });

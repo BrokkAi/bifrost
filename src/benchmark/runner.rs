@@ -13,8 +13,8 @@ use crate::benchmark::{
     BenchmarkLocationSelector, BenchmarkManifest, BenchmarkRepoTarget, BenchmarkScenario,
     HierarchyQueryTarget, InteractiveQueryBenchmarkCase, McpFairnessBenchmarkCase,
 };
+use crate::lsp::benchmark_api::{call_hierarchy, type_hierarchy};
 use crate::lsp::conversion::path_to_uri_string;
-use crate::lsp::handlers::{call_hierarchy, type_hierarchy};
 use crate::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
 use chrono::Utc;
 use lsp_types::{

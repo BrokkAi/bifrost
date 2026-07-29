@@ -45,7 +45,7 @@ function isRqlPath(path) {
       "crates/bifrost-analysis/src/analyzer/policy/",
       "crates/bifrost-analysis/policy-packs/",
     ]) ||
-    path === "tests/code_intelligence_runtime.rs" ||
+    path === "crates/bifrost-runtime/tests/code_intelligence_runtime.rs" ||
     /^(tests\/(structural_search_|policy_|builtin_policy_pack\.rs|bifrost_policy_cli\.rs)|editors\/vscode\/(src\/rql|test\/rql|syntaxes\/bifrost-rql))/u.test(
       path,
     )
@@ -71,7 +71,7 @@ function isMcpPath(path) {
 }
 
 function isLspPath(path) {
-  return startsWithAny(path, ["src/lsp/"]) || path === "tests/bifrost_lsp_server.rs";
+  return startsWithAny(path, ["crates/bifrost-lsp/"]);
 }
 
 function isPluginPath(path) {

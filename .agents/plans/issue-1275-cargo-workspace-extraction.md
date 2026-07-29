@@ -16,7 +16,7 @@ A developer will be able to run `cargo test -p brokk-bifrost-mcp` or `cargo test
 - [x] (2026-07-29 09:52Z) Authored this initial ExecPlan for issue #1275.
 - [x] (2026-07-29 10:05Z) Established workspace metadata, four compiling package skeletons, an executable dependency-boundary check, and a package-neutral percent-decoder without moving protocol behavior.
 - [x] (2026-07-29 11:44Z) Extracted analysis and the typed runtime into independently compiling packages, preserved the root Rust API, and passed 1,781 analysis unit tests plus runtime/facade contract tests.
-- [ ] Extract and independently validate the LSP host package.
+- [x] (2026-07-29 12:38Z) Extracted the LSP host and its 193-test subprocess contract, preserved root/benchmark callers, and passed 297 independent package tests.
 - [ ] Extract and independently validate the MCP host package, then reconnect the CLI and Python facade.
 - [ ] Move component tests and CI impact mappings onto the proven package boundaries.
 - [ ] Make crate packaging, notices, wheels, and the release-promotion DAG workspace-aware.
@@ -60,6 +60,15 @@ A developer will be able to run `cargo test -p brokk-bifrost-mcp` or `cargo test
 - Observation: The analysis package archive verifies independently and includes its native grammar/resource inputs.
   Evidence: `cargo package -p brokk-bifrost-analysis --allow-dirty --locked` verified a 577-file archive (6.3 MiB compressed). Ordinary runtime verification cannot yet resolve unpublished `brokk-bifrost-analysis = 0.8.12`; Milestone 5's unpacked package-set patches are required for that pre-publication proof.
 
+- Observation: The root benchmark is the sole non-LSP caller of concrete hierarchy handlers.
+  Evidence: After extraction, root compilation found only `src/benchmark/runner.rs` importing call- and type-hierarchy handlers. The LSP package now exposes those two modules through a documented-hidden `benchmark_api` rather than making the whole handler tree public.
+
+- Observation: The subprocess LSP contract needs an executable owned by the package under test.
+  Evidence: Cargo does not provide the root facade's `CARGO_BIN_EXE_bifrost` to another package's integration tests. A tiny `bifrost-lsp-test-server` binary accepts the compatibility `--root ... --server lsp` arguments and invokes the real package entry point, so the 193 protocol tests compile and run without selecting the root package.
+
+- Observation: This workstation's default `rustdoc` and `rustc` are different builds of Rust 1.96.0.
+  Evidence: executable tests passed, but the automatic doctest phase rejected artifacts built by the rustup Rustc because PATH selected Homebrew Rustdoc (LLVM 22.1.6 versus 22.1.2). `RUSTDOC=/Users/dave/.cargo/bin/rustdoc cargo test -p brokk-bifrost-lsp --doc --all-features` passed. This is a local toolchain-path issue, not an LSP failure.
+
 ## Decision Log
 
 - Decision: Keep the repository-root package named `brokk-bifrost`, with library name `brokk_bifrost`, as the only compatibility facade promised to existing users.
@@ -98,11 +107,17 @@ A developer will be able to run `cargo test -p brokk-bifrost-mcp` or `cargo test
   Rationale: These facilities directly depend on analysis types or are called below the runtime layer. Co-locating them preserves a one-way package graph and avoids wrapper types or illegal inherent implementations while keeping host transport concerns out of analysis.
   Date/Author: 2026-07-29 / Codex
 
+- Decision: Keep LSP internals private and provide only a hidden benchmark adapter for the two hierarchy modules measured by the root benchmark.
+  Rationale: Root sits above both hosts and legitimately benchmarks real handler paths, but broad public handler visibility would turn former same-crate implementation details into an accidental API.
+  Date/Author: 2026-07-29 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 is complete. The repository is now a non-virtual Cargo workspace with the root facade as its default member and four version-matched implementation package skeletons. The checked-in graph validator rejects reverse dependencies, cross-host dependencies, host-only external dependencies below their layer, unexpected members, and version drift. Search tooling no longer imports the LSP module for percent decoding; the shared utility retains Unicode behavior and adds malformed-escape coverage. No production module has moved yet, so public behavior and root packaging remain unchanged.
 
 Milestone 2 is complete. Analyzer, policy/query, search, storage, optional NLP, resource, vendored grammar, and reference-differential code now build in `brokk-bifrost-analysis`; `CodeIntelligenceRuntime` builds in `brokk-bifrost-runtime` with only analysis beneath it. The root crate is a compatibility facade for the moved API, proven by a real inline-project query. The runtime integration contract passes in its package, the full analysis library suite passes 1,781 tests with six intentional ignores, and the runtime dependency tree contains no LSP, MCP, or PyO3 dependency. The analysis `.crate` also verifies independently from its packaged contents.
+
+Milestone 3 is complete. LSP transport, overlays, request lifecycle, progress, conversion, and handlers now compile in `brokk-bifrost-lsp`, and root preserves `brokk_bifrost::lsp` through a dependency re-export. The real subprocess contract and shared client harness moved with the host; the package's own test server keeps those tests independent of the facade. The package passed 104 unit tests and 193 subprocess tests, its tree contains analysis/runtime and LSP transport but no MCP package, and every remaining root integration test compile-checks against the relocated shared client. CI now runs the LSP package directly for LSP-selected changes.
 
 ## Context and Orientation
 
@@ -315,6 +330,24 @@ Milestone 2 evidence:
     $ cargo package -p brokk-bifrost-analysis --allow-dirty --locked
     Packaged 577 files, 84.1MiB (6.3MiB compressed); verification succeeded
 
+Milestone 3 evidence:
+
+    $ cargo test -p brokk-bifrost-lsp --all-features --lib --bins --test bifrost_lsp_server --quiet
+    test result: ok. 104 passed; 1 ignored (library)
+    test result: ok. 193 passed (subprocess contract)
+
+    $ RUSTDOC=/Users/dave/.cargo/bin/rustdoc cargo test -p brokk-bifrost-lsp --doc --all-features
+    test result: ok. 0 passed; doctest compilation succeeded
+
+    $ cargo check -p brokk-bifrost --tests
+    Finished `dev` profile successfully
+
+    $ cargo tree -p brokk-bifrost-lsp -e normal | rg 'brokk-bifrost-(analysis|runtime|mcp)|lsp-(server|types)'
+    brokk-bifrost-analysis, brokk-bifrost-runtime, lsp-server, and lsp-types are present; brokk-bifrost-mcp is absent
+
+    $ node --test scripts/ci-impact.test.mjs scripts/ci-impact-workflow.test.mjs scripts/check-workspace-dependencies.test.mjs
+    tests 21; pass 21; fail 0
+
 ## Interfaces and Dependencies
 
 `crates/bifrost-analysis` owns analyzer and typed search/policy/query data. It exposes only the types and functions required by runtime and hosts. It has no dependency on any other Bifrost workspace package.
@@ -377,3 +410,5 @@ Revision note (2026-07-29): Created the initial issue #1275 ExecPlan after live 
 Revision note (2026-07-29): Completed Milestone 1 with a green workspace skeleton, dependency-graph validator, neutral percent-decoder, root package check, and existing quick-policy Node suite. Version-source consolidation is deliberately deferred to the package/release milestone so the current release contract stays green at every checkpoint.
 
 Revision note (2026-07-29): Completed Milestone 2 by physically extracting analysis/resources/native grammars and the typed runtime, preserving the root API through re-exports, and validating the complete analysis suite, runtime contract, root facade, optional NLP compile, dependency graph, notices, and independent analysis archive.
+
+Revision note (2026-07-29): Completed Milestone 3 by extracting LSP production code and its real-process contract into an independently testable package, retaining only a narrow hidden benchmark seam, updating CI selection/execution, and verifying all remaining root test targets compile with the relocated client harness.

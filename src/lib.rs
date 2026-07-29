@@ -1,7 +1,6 @@
 //! Stable CLI and Python facade for the Bifrost workspace packages.
 
 pub mod benchmark;
-pub mod lsp;
 pub mod mcp_cli;
 pub mod mcp_common;
 pub mod mcp_core;
@@ -50,6 +49,7 @@ pub use brokk_bifrost_analysis::{
     policy, process, profiling, reference_differential, relevance, schema_version, searchtools,
     searchtools_render, sexp, summary, symbol_rename, text_utils, usages, util, workspace_document,
 };
+pub use brokk_bifrost_lsp::lsp;
 pub use brokk_bifrost_runtime::{CodeIntelligenceRuntime, code_intelligence};
 
 /// Exact source revision embedded into every binary from this Cargo build.
