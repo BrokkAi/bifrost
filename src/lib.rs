@@ -3,6 +3,7 @@ pub mod benchmark;
 pub mod cache_db;
 pub mod cache_gc;
 mod cancellation;
+pub mod code_intelligence;
 pub mod code_quality;
 mod compact_graph;
 pub mod diff_analysis;
