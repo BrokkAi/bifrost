@@ -2453,7 +2453,7 @@ fn csharp_nested_generic_member_spellings_stay_resolvable() {
 /// Autofac's `MetadataConfiguration<TMetadata>` plus an unrelated
 /// `Properties` member elsewhere, so the bare terminal name is ambiguous
 /// exactly as it is in the real workspace.
-fn autofac_metadata_configuration_project() -> common::BuiltInlineTestProject {
+fn autofac_metadata_configuration_project() -> crate::common::BuiltInlineTestProject {
     InlineTestProject::with_language(Language::CSharp)
         .file(
             "src/Autofac/Builder/MetadataConfiguration.cs",
