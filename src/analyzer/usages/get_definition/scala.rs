@@ -3640,7 +3640,7 @@ fn resolve_scala_with_context(
     // mixin operands like `new Base with Trait`, as bare identifiers rather
     // than `type_identifier` nodes. Resolve those through the type namespace
     // before the generic identifier branch can select a same-named companion.
-    if is_scala_class_reference(node, source) {
+    if node.kind() == "identifier" && is_scala_class_reference(node, source) {
         return resolve_scala_type(ctx, &resolver, root, qualified_type_root);
     }
     if let Some(outcome) = resolve_scala_bare_apply_fast_path(
