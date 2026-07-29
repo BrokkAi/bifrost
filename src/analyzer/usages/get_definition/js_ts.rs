@@ -329,28 +329,31 @@ pub(super) fn resolve_js_ts(
         if !new_receiver_member_candidates.is_empty() {
             return js_ts_candidates_outcome(analyzer, new_receiver_member_candidates);
         }
+        let dotted_lookup = JstsDottedLookup {
+            analyzer,
+            support,
+            file,
+            root: tree.root_node(),
+            source,
+            reference,
+            receiver: qualifier,
+            value_position,
+            before_byte: site.range.start_byte,
+        };
         let local_receiver_binding = (language == Language::JavaScript)
             .then(|| {
                 jsts_visible_receiver_binding_scope(
-                    tree.root_node(),
-                    source,
-                    qualifier,
-                    site.range.start_byte,
+                    dotted_lookup.root,
+                    dotted_lookup.source,
+                    dotted_lookup.receiver,
+                    dotted_lookup.before_byte,
                 )
             })
             .flatten();
         if let Some(binding_scope) = local_receiver_binding {
             let scoped_lookup = JstsScopedDottedLookup {
-                analyzer,
-                support,
-                file,
-                root: tree.root_node(),
-                source,
-                reference,
-                receiver: qualifier,
-                value_position,
+                lookup: dotted_lookup,
                 binding_scope,
-                before_byte: site.range.start_byte,
             };
             let scoped = jsts_exact_scoped_dotted_candidates(scoped_lookup);
             if !scoped.is_empty() {
@@ -361,17 +364,7 @@ pub(super) fn resolve_js_ts(
                 format!("`{reference}` did not resolve to an indexed JS/TS definition"),
             );
         }
-        let exact_same_file = jsts_unproven_same_file_dotted_candidates(
-            analyzer,
-            support,
-            file,
-            reference,
-            qualifier,
-            tree.root_node(),
-            source,
-            site.range.start_byte,
-            value_position,
-        );
+        let exact_same_file = jsts_unproven_same_file_dotted_candidates(dotted_lookup);
         if !exact_same_file.is_empty() {
             return js_ts_candidates_outcome(analyzer, exact_same_file);
         }
@@ -805,29 +798,20 @@ fn jsts_file_scoped_dotted_candidates(
     candidates
 }
 
-fn jsts_unproven_same_file_dotted_candidates(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    reference: &str,
-    qualifier: &str,
-    root: Node<'_>,
-    source: &str,
-    before_byte: usize,
-    value_position: bool,
-) -> Vec<CodeUnit> {
-    let mut candidates =
-        jsts_file_scoped_dotted_candidates(analyzer, support, file, reference, value_position);
+fn jsts_unproven_same_file_dotted_candidates(ctx: JstsDottedLookup<'_, '_>) -> Vec<CodeUnit> {
+    let mut candidates = ctx.same_file_candidates();
     candidates.retain(|unit| {
         !jsts_js_unbound_assigned_property_candidate_requires_exact_receiver(
-            analyzer, unit, qualifier,
-        ) || jsts_same_file_unbound_assignment_matches_reference_scope(
-            analyzer,
+            ctx.analyzer,
             unit,
-            qualifier,
-            root,
-            source,
-            before_byte,
+            ctx.receiver,
+        ) || jsts_same_file_unbound_assignment_matches_reference_scope(
+            ctx.analyzer,
+            unit,
+            ctx.receiver,
+            ctx.root,
+            ctx.source,
+            ctx.before_byte,
         )
     });
     candidates
@@ -899,7 +883,7 @@ fn jsts_nearest_reference_fallback_scope(node: Node<'_>) -> Option<JstsReceiverB
 }
 
 #[derive(Clone, Copy)]
-struct JstsScopedDottedLookup<'a, 'tree> {
+struct JstsDottedLookup<'a, 'tree> {
     analyzer: &'a dyn IAnalyzer,
     support: &'a dyn BoundedDefinitionLookup,
     file: &'a ProjectFile,
@@ -908,32 +892,50 @@ struct JstsScopedDottedLookup<'a, 'tree> {
     reference: &'a str,
     receiver: &'a str,
     value_position: bool,
-    binding_scope: JstsReceiverBindingScope,
     before_byte: usize,
 }
 
+impl JstsDottedLookup<'_, '_> {
+    fn same_file_candidates(self) -> Vec<CodeUnit> {
+        jsts_file_scoped_dotted_candidates(
+            self.analyzer,
+            self.support,
+            self.file,
+            self.reference,
+            self.value_position,
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct JstsScopedDottedLookup<'a, 'tree> {
+    lookup: JstsDottedLookup<'a, 'tree>,
+    binding_scope: JstsReceiverBindingScope,
+}
+
 fn jsts_exact_scoped_dotted_candidates(ctx: JstsScopedDottedLookup<'_, '_>) -> Vec<CodeUnit> {
-    let mut candidates: Vec<_> = ctx
+    let lookup = ctx.lookup;
+    let mut candidates: Vec<_> = lookup
         .support
-        .fqn(ctx.reference)
+        .fqn(lookup.reference)
         .into_iter()
-        .filter(|unit| unit.source() == ctx.file)
+        .filter(|unit| unit.source() == lookup.file)
         .filter(|unit| {
-            ctx.analyzer.ranges(unit).iter().any(|range| {
-                range.start_byte < ctx.before_byte
+            lookup.analyzer.ranges(unit).iter().any(|range| {
+                range.start_byte < lookup.before_byte
                     && jsts_visible_receiver_binding_scope(
-                        ctx.root,
-                        ctx.source,
-                        ctx.receiver,
+                        lookup.root,
+                        lookup.source,
+                        lookup.receiver,
                         range.start_byte,
                     ) == Some(ctx.binding_scope)
             })
         })
         .collect();
-    if ctx.value_position {
-        candidates = jsts_value_space_candidates(ctx.analyzer, candidates);
+    if lookup.value_position {
+        candidates = jsts_value_space_candidates(lookup.analyzer, candidates);
     } else {
-        candidates = jsts_type_space_candidates(ctx.analyzer, candidates);
+        candidates = jsts_type_space_candidates(lookup.analyzer, candidates);
     }
     candidates
 }
