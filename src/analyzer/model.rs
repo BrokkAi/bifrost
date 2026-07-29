@@ -2006,10 +2006,11 @@ impl CodeUnit {
     // so languages like Scala can render idiomatic names without changing the
     // matching semantics encoded here.
     pub fn identifier(&self) -> &str {
-        // Structured field segments may contain literal dots (for example a
-        // Scala backticked media type). Prefer that exact leaf when present;
-        // cache/legacy units with no structured name retain the old fallback.
+        // Scala field segments may contain literal dots inside backticks.
+        // Prefer that exact structured leaf when present; other languages and
+        // cache/legacy units retain their established identifier semantics.
         if self.0.kind == CodeUnitType::Field
+            && crate::analyzer::common::language_for_file(&self.0.source) == Language::Scala
             && let Some(last) = self.0.fq.last()
         {
             return crate::analyzer::fq_name::segment_interner().resolve(last).0;
