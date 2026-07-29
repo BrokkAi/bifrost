@@ -1,6 +1,6 @@
 use crate::analyzer::usages::inverted_edges::UsageReferenceCounts;
 use crate::analyzer::usages::workspace_graph::{
-    WorkspaceUsageCatalog, WorkspaceUsageGraph, WorkspaceUsageGraphBuildOutcome,
+    UsageEcosystem, WorkspaceUsageCatalog, WorkspaceUsageGraph, WorkspaceUsageGraphBuildOutcome,
     build_workspace_usage_graph_with_cancellation,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
@@ -275,10 +275,11 @@ fn related_files_by_usage(
         return Cancellable::Complete(Vec::new());
     }
 
-    let ranking_graph = match build_usage_ranking_graph_with_cancellation(analyzer, cancellation) {
-        Cancellable::Complete(graph) => graph,
-        Cancellable::Cancelled => return Cancellable::Cancelled,
-    };
+    let ranking_graph =
+        match build_usage_ranking_graph_with_cancellation(analyzer, seed_weights, cancellation) {
+            Cancellable::Complete(graph) => graph,
+            Cancellable::Cancelled => return Cancellable::Cancelled,
+        };
     related_files_by_usage_graph_with_cancellation(
         &ranking_graph,
         seed_weights,
@@ -290,7 +291,14 @@ fn related_files_by_usage(
 
 #[cfg(test)]
 fn build_usage_ranking_graph(analyzer: &dyn IAnalyzer) -> UsageRankingGraph {
-    match build_usage_ranking_graph_with_cancellation(analyzer, &CancellationToken::default()) {
+    let catalog = WorkspaceUsageCatalog::build(analyzer);
+    let selected_ecosystems = catalog.ecosystems();
+    match build_usage_ranking_graph_for_ecosystems_with_cancellation(
+        analyzer,
+        catalog,
+        &selected_ecosystems,
+        &CancellationToken::default(),
+    ) {
         Cancellable::Complete(graph) => graph,
         Cancellable::Cancelled => {
             unreachable!("default cancellation token cannot cancel usage graph construction")
@@ -300,6 +308,7 @@ fn build_usage_ranking_graph(analyzer: &dyn IAnalyzer) -> UsageRankingGraph {
 
 fn build_usage_ranking_graph_with_cancellation(
     analyzer: &dyn IAnalyzer,
+    seed_weights: &HashMap<ProjectFile, f64>,
     cancellation: &CancellationToken,
 ) -> Cancellable<UsageRankingGraph> {
     let Some(catalog) = ({
@@ -308,6 +317,31 @@ fn build_usage_ranking_graph_with_cancellation(
     }) else {
         return Cancellable::Cancelled;
     };
+    let selected_ecosystems = catalog.ecosystems_for_files(seed_weights.keys());
+    if profiling::enabled() {
+        profiling::note(format!(
+            "usage-graph selected_ecosystems={}",
+            selected_ecosystems
+                .iter()
+                .map(|ecosystem| ecosystem.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    build_usage_ranking_graph_for_ecosystems_with_cancellation(
+        analyzer,
+        catalog,
+        &selected_ecosystems,
+        cancellation,
+    )
+}
+
+fn build_usage_ranking_graph_for_ecosystems_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    catalog: WorkspaceUsageCatalog,
+    selected_ecosystems: &BTreeSet<UsageEcosystem>,
+    cancellation: &CancellationToken,
+) -> Cancellable<UsageRankingGraph> {
     let mut node_indices_by_file: HashMap<ProjectFile, Vec<usize>> = HashMap::default();
     for (index, node) in catalog.nodes.iter().enumerate() {
         if cancellation.is_cancelled() {
@@ -323,7 +357,12 @@ fn build_usage_ranking_graph_with_cancellation(
 
     let graph = match {
         let _scope = profiling::scope("relevance::usage_graph_construction");
-        build_workspace_usage_graph_with_cancellation(analyzer, catalog, cancellation)
+        build_workspace_usage_graph_with_cancellation(
+            analyzer,
+            catalog,
+            selected_ecosystems,
+            cancellation,
+        )
     } {
         WorkspaceUsageGraphBuildOutcome::Complete(graph) => graph,
         WorkspaceUsageGraphBuildOutcome::Cancelled => return Cancellable::Cancelled,
@@ -1939,7 +1978,7 @@ mod tests {
     use crate::analyzer::usages::inverted_edges::UsageReferenceCounts;
     use crate::analyzer::{
         AnalyzerDelegate, JavaAnalyzer, Language, MultiAnalyzer, ProjectFile, PythonAnalyzer,
-        TestProject,
+        RustAnalyzer, TestProject,
     };
     use crate::hash::HashMap;
     use git2::{Repository, Signature};
@@ -2311,6 +2350,82 @@ mod tests {
             outcome,
             super::MostRelevantProjectFilesOutcome::Cancelled
         ));
+    }
+
+    #[test]
+    fn issue_1304_seed_ecosystem_pruning_preserves_exact_ranking() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let rust_seed = write_file(
+            root,
+            "src/caller.rs",
+            "use crate::target::target;\npub fn seed() { target(); }\n",
+        );
+        write_file(root, "src/lib.rs", "pub mod caller;\npub mod target;\n");
+        let rust_target = write_file(
+            root,
+            "src/target.rs",
+            "pub fn target() { leaf(); }\npub fn leaf() {}\n",
+        );
+        write_file(
+            root,
+            "py_source.py",
+            "from py_target import target\n\ndef source():\n    target()\n",
+        );
+        write_file(root, "py_target.py", "def target():\n    pass\n");
+
+        let project = TestProject::new(root.to_path_buf(), Language::Rust);
+        let analyzer = MultiAnalyzer::new(BTreeMap::from([
+            (
+                Language::Python,
+                AnalyzerDelegate::Python(PythonAnalyzer::from_project(project.clone())),
+            ),
+            (
+                Language::Rust,
+                AnalyzerDelegate::Rust(RustAnalyzer::from_project(project)),
+            ),
+        ]));
+        let seed_weights = hash_map([(rust_seed.clone(), 1.0)]);
+
+        let selected_graph = match super::build_usage_ranking_graph_with_cancellation(
+            &analyzer,
+            &seed_weights,
+            &crate::CancellationToken::default(),
+        ) {
+            super::Cancellable::Complete(graph) => graph,
+            super::Cancellable::Cancelled => panic!("uncancelled selected graph build"),
+        };
+        let all_graph = super::build_usage_ranking_graph(&analyzer);
+
+        assert_eq!(
+            vec![crate::analyzer::usages::workspace_graph::UsageEcosystem::Rust],
+            selected_graph.graph.resolved_ecosystems
+        );
+        assert!(
+            all_graph
+                .graph
+                .resolved_ecosystems
+                .contains(&crate::analyzer::usages::workspace_graph::UsageEcosystem::Python)
+        );
+        let selected = super::related_files_by_usage_graph(
+            &selected_graph,
+            &seed_weights,
+            10,
+            UsageReferenceWeights::CALIBRATED,
+        );
+        let all = super::related_files_by_usage_graph(
+            &all_graph,
+            &seed_weights,
+            10,
+            UsageReferenceWeights::CALIBRATED,
+        );
+
+        assert_eq!(all, selected);
+        assert!(
+            selected
+                .iter()
+                .any(|candidate| candidate.file == rust_target)
+        );
     }
 
     #[test]

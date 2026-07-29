@@ -27,7 +27,7 @@ The work is intentionally incremental. Each milestone is independently tested an
 - [x] (2026-07-29 08:34Z) Profiled the current behavior: the installed 0.8.12 release exceeded 156 seconds, while the history/import mode completed in about 0.64 seconds; detailed timing localized the dominant work to Rust usage resolution.
 - [x] (2026-07-29 08:51Z) Milestone 1: propagated cooperative cancellation through `most_relevant_files`, catalog and usage-graph construction, Rust reference-context construction and AST traversal, and PageRank; cancelled graphs are typed outcomes and are discarded.
 - [x] (2026-07-29 09:19Z) Milestone 2: added explicit completion, effective-ranking, and incomplete-reason metadata; in-flight usage cancellation now returns deterministic history/import results while pre-dispatch cancellation remains an error.
-- [ ] Milestone 3: identify seed ecosystems and build only graph partitions reachable from those seeds, with parity tests against the previous all-ecosystem result.
+- [x] (2026-07-29 09:34Z) Milestone 3: map seed declarations to exact ecosystems and skip every unrelated edge builder; a mixed Rust/Python test proves the selected Rust graph ranks a real target identically to the former all-ecosystem build.
 - [ ] Milestone 4: cache complete immutable usage-ranking graph partitions per analyzer snapshot using generation-safe, byte-bounded, single-flight infrastructure.
 - [ ] Decision gate: benchmark the exact issue request cold and warm, and decide whether milestones 5 and 6 are still justified.
 - [ ] Milestone 5, conditional: stage and retain Rust export indexes and reference contexts so one graph build does not repeat or evict expensive materialization.
@@ -54,6 +54,9 @@ The work is intentionally incremental. Each milestone is independently tested an
 - Observation: the service had a second cancellation check after tool dispatch that discarded the newly structured fallback even though ranking had already returned it successfully.
   Evidence: the first milestone 2 service test received an internal cancellation error after `most_relevant_files_with_cancellation` produced the fallback. `most_relevant_files` is now exempt from that post-dispatch conversion, while its pre-dispatch cancelled request still returns an error.
 
+- Observation: ecosystem pruning does not require deleting unrelated catalog nodes to preserve exact results; skipping their edge builders is sufficient because personalized teleport mass is zero outside the selected ecosystem and usage edges never cross ecosystem identities.
+  Evidence: a mixed Rust/Python unit test produced identical ordered `FileRelevance` values for the selected Rust-only edge graph and the former all-ecosystem graph. Builder instrumentation reported only Rust for the selected graph and both Python and Rust for the reference graph.
+
 ## Decision Log
 
 - Decision: preserve the current issue branch and do not rebase onto the newly fetched master.
@@ -74,7 +77,7 @@ The work is intentionally incremental. Each milestone is independently tested an
 
 ## Outcomes & Retrospective
 
-Milestones 1 and 2 are complete. The MCP service passes its request token into `most_relevant_files`; cooperative checkpoints cover catalog construction, ecosystem builders, Rust context and AST work, PageRank, and aggregation. Partial graphs remain typed cancelled outcomes and are discarded. If cancellation happens after dispatch, the result now contains deterministic history/import files plus `complete: false`, `ranking_mode_used: "history_imports"`, and either `cancelled` or `time_budget`. Cancellation before dispatch still returns an error because no tool work has begun. Rust rendering and the checked-in Python client expose the same diagnostic. Six issue-specific Rust tests, two Python model tests, and all 27 ranking integration tests passed. Milestone 3 now owns exact seed-ecosystem pruning.
+Milestones 1 through 3 are complete. The MCP service passes its request token into `most_relevant_files`; cooperative checkpoints cover catalog construction, selected ecosystem builders, Rust context and AST work, PageRank, and aggregation. Partial graphs remain typed cancelled outcomes and are discarded. In-flight cancellation returns deterministic history/import files plus explicit incomplete metadata. Exact seed-ecosystem selection now prevents the issue's Rust seeds from first constructing Go, Python, and every other language edge layer. A mixed-language parity test proves the selected graph still ranks a real Rust target identically, and all 27 ranking integration tests remain green. Milestone 4 now owns reuse of a completed immutable graph across requests.
 
 ## Context and Orientation
 
@@ -189,6 +192,14 @@ Milestone 2 validation evidence:
     scripts/with-isolated-cargo-target.sh cargo test --test most_relevant_files --no-default-features
       27 passed; 0 failed
 
+Milestone 3 validation evidence:
+
+    cargo fmt --check
+    scripts/with-isolated-cargo-target.sh cargo test --lib issue_1304_seed_ecosystem_pruning_preserves_exact_ranking --no-default-features
+      1 passed; 0 failed
+    scripts/with-isolated-cargo-target.sh cargo test --test most_relevant_files --no-default-features
+      27 passed; 0 failed
+
 Verbose per-file profiling changes the absolute Rust time, but the ordinary request and lower-noise history/import comparison establish the product failure and fallback viability independently.
 
 ## Interfaces and Dependencies
@@ -213,3 +224,5 @@ Milestone 5 may extend Rust resolver APIs with progress callbacks and staged imm
 Plan revision note (2026-07-29 08:51Z): Completed milestone 1 and recorded its cancellation boundaries, tests, Bifrost code-reading latency observation, and current limitation. The milestone deliberately returns an error on cancellation; milestone 2 owns the user-visible deterministic fallback contract.
 
 Plan revision note (2026-07-29 09:19Z): Completed milestone 2 and recorded the public Rust/Python fallback contract, the service post-dispatch cancellation interaction, and focused validation. The plan continues to milestone 3 because exact pruning should reduce cold work before the snapshot-cache decision gate.
+
+Plan revision note (2026-07-29 09:34Z): Completed milestone 3 and recorded the exact seed-ecosystem selection representation, mixed-language parity evidence, builder instrumentation, and focused validation. Unrelated catalog nodes remain deterministic zero-mass nodes; only their expensive edge construction is skipped.
