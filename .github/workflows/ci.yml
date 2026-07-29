@@ -239,7 +239,9 @@ jobs:
           toolchain: 1.96.0
 
       - name: Run MCP contract tests
-        run: node scripts/ci-timing.mjs --label mcp-contract -- cargo test --features nlp,python --test suite_mcp_cli -- bifrost_mcp_server::
+        run: >-
+          node scripts/ci-timing.mjs --label mcp-contract -- cargo test --features nlp,python
+          --test suite_mcp_cli -- bifrost_mcp_server::
 
   lsp-contract:
     name: LSP contract
@@ -269,7 +271,9 @@ jobs:
           toolchain: 1.96.0
 
       - name: Run LSP contract tests
-        run: node scripts/ci-timing.mjs --label lsp-contract -- cargo test --features nlp,python --test suite_mcp_cli -- bifrost_lsp_server::
+        run: >-
+          node scripts/ci-timing.mjs --label lsp-contract -- cargo test --features nlp,python
+          --test suite_mcp_cli -- bifrost_lsp_server::
 
   policy-pack:
     name: policy pack
