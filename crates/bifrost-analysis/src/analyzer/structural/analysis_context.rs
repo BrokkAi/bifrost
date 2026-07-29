@@ -1324,12 +1324,10 @@ impl QueryAnalysisContext {
             return Err(QueryAnalysisContextError::StaleHandle);
         }
         if workspace_generation != self.workspace_generation {
-            return Err(value_flow_registration_error(
-                QueryAnalysisContextError::WorkspaceGenerationMismatch {
-                    registered: self.workspace_generation,
-                    current: workspace_generation,
-                },
-            ));
+            return Err(QueryAnalysisContextError::WorkspaceGenerationMismatch {
+                registered: self.workspace_generation,
+                current: workspace_generation,
+            });
         }
         let registration = self
             .registrations
