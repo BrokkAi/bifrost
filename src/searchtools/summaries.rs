@@ -1,6 +1,7 @@
 use super::navigation::deserialize_symbol_lookup_names;
 use super::selectors::*;
 use super::*;
+use std::cell::OnceCell;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilePatternsParams {
@@ -173,7 +174,15 @@ fn route_summary_targets_with_cancellation(
 ) -> SummaryTargets {
     let _scope = profiling::scope("searchtools::route_summary_targets");
     let resolver = WorkspaceFileResolver::new(analyzer.project());
-    let workspace_files = analyzer.project().all_files().unwrap_or_default();
+    // Materialized only for targets that actually name a container. Summary
+    // routing used to build the whole workspace file set up front purely to ask
+    // "is this target a directory?", so every `get_summaries` request — the
+    // overwhelmingly common shape being a plain file path — paid a full
+    // ignore-aware traversal of the repository (#1325: ~4-9s per call on a
+    // 2,700-file C# tree, half the fuzzer census's tool time). The directory
+    // question is now answered by a `stat` and the listing is built only when
+    // that says yes.
+    let workspace_files: OnceCell<BTreeSet<ProjectFile>> = OnceCell::new();
     let mut file_targets = BTreeSet::new();
     let mut listings = Vec::new();
     let mut listed_containers = HashSet::default();
@@ -207,7 +216,13 @@ fn route_summary_targets_with_cancellation(
         // path cannot itself collide with a directory (a path cannot be both
         // on a real filesystem), so this reordering cannot regress plain file
         // targets.
-        if let Some(listing) = directory_listing(&workspace_files, target) {
+        if let Some(directory) = directory_listing_root(target)
+            && analyzer.project().has_directory(&directory)
+            && let Some(listing) = directory_listing(
+                workspace_files.get_or_init(|| analyzer.project().all_files().unwrap_or_default()),
+                target,
+            )
+        {
             let key = (listing.kind, listing.target.clone());
             if listed_containers.insert(key) {
                 listings.push(listing);
@@ -264,17 +279,27 @@ fn route_summary_targets_with_cancellation(
     }
 }
 
+/// The workspace-relative directory `target` would list, if any: the empty
+/// path for the workspace root, `None` for spellings that cannot name a
+/// workspace directory at all (absolute, root-anchored, or `..`-escaping).
+///
+/// Split out of [`directory_listing`] so the cheap "is this even a directory?"
+/// pre-check and the listing itself normalize the target identically.
+pub(super) fn directory_listing_root(target: &str) -> Option<PathBuf> {
+    let normalized = normalize_pattern(target.trim());
+    let normalized = normalized.trim_end_matches('/');
+    if normalized.is_empty() || normalized == "." {
+        Some(PathBuf::new())
+    } else {
+        workspace_rel_path(normalized)
+    }
+}
+
 pub(super) fn directory_listing(
     files: &BTreeSet<ProjectFile>,
     target: &str,
 ) -> Option<ContainerListing> {
-    let normalized = normalize_pattern(target.trim());
-    let normalized = normalized.trim_end_matches('/');
-    let directory = if normalized.is_empty() || normalized == "." {
-        PathBuf::new()
-    } else {
-        workspace_rel_path(normalized)?
-    };
+    let directory = directory_listing_root(target)?;
 
     let mut entries_by_path = HashMap::default();
     for file in files {

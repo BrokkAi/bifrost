@@ -6,7 +6,7 @@ use ignore::{WalkBuilder, WalkState};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
@@ -110,6 +110,30 @@ pub trait Project: Send + Sync {
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>>;
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>>;
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile>;
+
+    /// Whether the workspace could hold a directory at `rel_path` (the empty
+    /// path meaning the workspace root itself).
+    ///
+    /// This exists so callers that only need "is this target a container?" can
+    /// ask it without materializing the whole workspace file set. The answer is
+    /// allowed to be conservative in one direction only: `false` is
+    /// authoritative — no workspace file lives beneath `rel_path` — while
+    /// `true` merely means a listing is worth computing. Callers must therefore
+    /// still treat an empty listing as "not a directory", exactly as they do
+    /// when they filter the file set themselves.
+    ///
+    /// The default answers by scanning `all_files()`, which is the semantics
+    /// every caller had before the pre-check existed; filesystem-backed
+    /// projects override it with a single `stat` (#1325).
+    fn has_directory(&self, rel_path: &Path) -> bool {
+        self.all_files().is_ok_and(|files| {
+            files.iter().any(|file| {
+                file.rel_path()
+                    .strip_prefix(rel_path)
+                    .is_ok_and(|remainder| remainder.components().next().is_some())
+            })
+        })
+    }
 
     fn file_by_abs_path(&self, abs_path: &Path) -> Option<ProjectFile> {
         let abs_path = abs_path.to_path_buf().normalize();
@@ -258,6 +282,7 @@ impl Project for TestProject {
     }
 
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+        note_workspace_file_listing();
         let mut files = BTreeSet::new();
 
         for entry in WalkDir::new(&self.root) {
@@ -274,6 +299,10 @@ impl Project for TestProject {
         }
 
         Ok(files)
+    }
+
+    fn has_directory(&self, rel_path: &Path) -> bool {
+        self.root.join(rel_path).is_dir()
     }
 
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
@@ -337,6 +366,15 @@ impl Project for FilesystemProject {
 
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
         collect_workspace_files(&self.root)
+    }
+
+    /// A `stat` instead of a whole-tree walk. Every file this project reports
+    /// comes from walking the real tree under `root`, so "no directory on disk"
+    /// implies "no workspace file beneath it"; the reverse over-approximates
+    /// only for directories whose contents are entirely ignored, which the
+    /// caller's listing then filters out exactly as before.
+    fn has_directory(&self, rel_path: &Path) -> bool {
+        self.root.join(rel_path).is_dir()
     }
 
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
@@ -582,10 +620,33 @@ fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
     Some(ancestor)
 }
 
+/// Whole-workspace file listings performed since the last reset — the
+/// complexity signal pinned by the issue #1325 regression tests. Each one is a
+/// full ignore-aware traversal of the project tree, spread across
+/// `available_parallelism` walker threads; a request that asks a
+/// per-target question by materializing this set answers it at the cost of the
+/// entire repository.
+static WORKSPACE_FILE_LISTINGS: AtomicUsize = AtomicUsize::new(0);
+
+fn note_workspace_file_listing() {
+    WORKSPACE_FILE_LISTINGS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[doc(hidden)]
+pub fn workspace_file_listing_count_for_test() -> usize {
+    WORKSPACE_FILE_LISTINGS.load(Ordering::Relaxed)
+}
+
+#[doc(hidden)]
+pub fn reset_workspace_file_listing_count_for_test() {
+    WORKSPACE_FILE_LISTINGS.store(0, Ordering::Relaxed);
+}
+
 /// Collect every file under `root` that belongs to the analyzer's view of the
 /// workspace. The walk is ignore-aware, skips `.git/`, and keeps other dotted
 /// directories in scope.
 pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>> {
+    note_workspace_file_listing();
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .ignore(false)
@@ -834,6 +895,10 @@ impl Project for OverlayProject {
 
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
         self.delegate.all_files()
+    }
+
+    fn has_directory(&self, rel_path: &Path) -> bool {
+        self.delegate.has_directory(rel_path)
     }
 
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {

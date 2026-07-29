@@ -206,7 +206,7 @@ fn parse_args(args: &[String]) -> Result<FuzzerArgs, String> {
                     take_positive_usize(args, &mut index, "--max-service-symbols")?
             }
             "--max-scan-probes" => {
-                max_scan_probes = take_positive_usize(args, &mut index, "--max-scan-probes")?
+                max_scan_probes = take_usize(args, &mut index, "--max-scan-probes")?
             }
             "--symbol-filter" => {
                 symbol_filter = Some(take_value(args, &mut index, "--symbol-filter")?)
@@ -319,6 +319,16 @@ fn take_positive_usize(args: &[String], index: &mut usize, option: &str) -> Resu
         return Err(format!("{option} must be greater than zero"));
     }
     Ok(parsed)
+}
+
+/// Like [`take_positive_usize`] but accepts `0`, for caps whose "none at all"
+/// setting is meaningful — `--max-scan-probes 0` isolates the service-symbol
+/// census from the scan-probe path when triaging a perf explosion (#1325).
+fn take_usize(args: &[String], index: &mut usize, option: &str) -> Result<usize, String> {
+    let value = take_value(args, index, option)?;
+    value
+        .parse::<usize>()
+        .map_err(|_| format!("{option} expects a non-negative integer, got `{value}`"))
 }
 
 fn normalize_language(value: &str) -> Result<String, String> {
