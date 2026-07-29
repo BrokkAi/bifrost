@@ -1382,6 +1382,14 @@ struct RepoCommitChangeCache {
 struct CachedRecentOids {
     head: Oid,
     oids: Arc<Vec<Oid>>,
+    /// True once `oids` is known to hold every first-parent commit reachable from `head` (the
+    /// fill that produced it asked `git rev-list` for `limit` commits and got back fewer than
+    /// that, so there is nothing left to discover for this HEAD no matter what `limit` is
+    /// requested next). Repos with fewer than `COMMITS_TO_PROCESS` total first-parent commits can
+    /// never reach `oids.len() >= limit` for the constant the MCP path requests, so without this
+    /// flag they were permanently cold on that path (issue #1333) even though a single fill had
+    /// already captured all of their history.
+    exhausted: bool,
 }
 
 impl RepoCommitChangeCache {
@@ -1534,6 +1542,13 @@ impl GitProjectContext {
     /// warm. Interactive cancellable queries use this path so ranking never
     /// starts an uninterruptible Git subprocess; a cold cache is a truthful
     /// incomplete ranking rather than a latency-budget violation.
+    ///
+    /// "Warm" means the cached OID list either already covers `limit` commits, or (issue #1333)
+    /// is known to hold every first-parent commit reachable from `head` because a prior fill
+    /// asked for at least `limit` and got back fewer — i.e. the effective warm threshold is
+    /// `min(total_commits, limit)`, not `limit` itself. Without the second clause, any repo with
+    /// fewer than `limit` total first-parent commits could never satisfy `oids.len() >= limit`
+    /// and would report cold forever, even after a fill had captured its entire history.
     fn cached_recent_commit_changes(
         &self,
         limit: usize,
@@ -1544,13 +1559,12 @@ impl GitProjectContext {
         };
         let ordered_oids = {
             let guard = cache.recent_oids.lock().expect("recent oids mutex");
-            let Some(cached) = guard
-                .as_ref()
-                .filter(|cached| cached.head == head && cached.oids.len() >= limit)
-            else {
+            let Some(cached) = guard.as_ref().filter(|cached| {
+                cached.head == head && (cached.oids.len() >= limit || cached.exhausted)
+            }) else {
                 return Ok(None);
             };
-            cached.oids[..limit].to_vec()
+            cached.oids[..cached.oids.len().min(limit)].to_vec()
         };
         match self.collect_cached_commit_changes(&ordered_oids, &cache) {
             Ok(changes) => Ok(Some(changes)),
@@ -1598,17 +1612,23 @@ impl GitProjectContext {
             let guard = cache.recent_oids.lock().expect("recent oids mutex");
             if let Some(cached) = guard.as_ref()
                 && cached.head == head_oid
-                && cached.oids.len() >= limit
+                && (cached.oids.len() >= limit || cached.exhausted)
             {
-                return Ok(cached.oids[..limit].to_vec());
+                return Ok(cached.oids[..cached.oids.len().min(limit)].to_vec());
             }
         }
 
         cache.recent_oid_fills.fetch_add(1, Ordering::Relaxed);
-        let refilled = Arc::new(self.recent_commit_oids(limit)?);
+        let refilled_oids = self.recent_commit_oids(limit)?;
+        // Fewer OIDs came back than were asked for: `git rev-list` walked first-parent history to
+        // its root and stopped there, so this list is known-complete for `head_oid` regardless of
+        // what `limit` a later caller requests (see `CachedRecentOids::exhausted`, issue #1333).
+        let exhausted = refilled_oids.len() < limit;
+        let refilled = Arc::new(refilled_oids);
         *cache.recent_oids.lock().expect("recent oids mutex") = Some(CachedRecentOids {
             head: head_oid,
             oids: Arc::clone(&refilled),
+            exhausted,
         });
         Ok((*refilled).clone())
     }
