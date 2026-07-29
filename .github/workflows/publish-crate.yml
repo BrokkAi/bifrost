@@ -28,6 +28,10 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_COMMIT: ${{ inputs.commit }}
     steps:
       - name: Checkout validated source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -41,9 +45,9 @@ jobs:
       - name: Confirm validated release identity
         shell: bash
         run: |
-          test "$(git rev-parse HEAD)" = "${{ inputs.commit }}"
-          bash scripts/verify-release-tag-commit.sh "${{ inputs.tag }}" "${{ inputs.commit }}"
-          echo "Publishing ${{ inputs.tag }} (${{ inputs.version }}) from ${{ inputs.commit }}"
+          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          bash scripts/verify-release-tag-commit.sh "$RELEASE_TAG" "$RELEASE_COMMIT"
+          echo "Publishing $RELEASE_TAG ($RELEASE_VERSION) from $RELEASE_COMMIT"
 
       - name: Authenticate to crates.io (trusted publishing)
         id: auth

@@ -80,6 +80,15 @@ test("publish actions fail closed if the remote tag no longer selects the valida
   assert.match(wheelPublisher, /scripts\/verify-release-tag-commit\.sh/u);
 });
 
+test("reusable workflow inputs are environment-bound before shell execution", () => {
+  for (const publisher of [cratePublisher, wheelPublisher]) {
+    assert.match(publisher, /RELEASE_TAG: \$\{\{ inputs\.tag \}\}/u);
+    assert.match(publisher, /RELEASE_VERSION: \$\{\{ inputs\.version \}\}/u);
+    assert.match(publisher, /RELEASE_COMMIT: \$\{\{ inputs\.commit \}\}/u);
+    assert.doesNotMatch(publisher, /(?:bash|echo).*\$\{\{ inputs\./u);
+  }
+});
+
 test("promotion evidence covers validation before every external publisher", () => {
   const evidence = jobBlock(release, "promotion-evidence");
   for (const prerequisite of [

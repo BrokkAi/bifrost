@@ -14,6 +14,7 @@ A `vX.Y.Z` tag currently starts three independent GitHub Actions workflow runs. 
 - [x] (2026-07-29 08:50Z) Split build/validation jobs from publication, added the promotion-evidence gate, and made crate/wheel publishers reusable.
 - [x] (2026-07-29 08:50Z) Added ordering fixture, CI invocation, release summary, and contributor documentation.
 - [x] (2026-07-29 09:45Z) Ran focused and full quick-policy Node tests, release metadata validation, YAML parsing, whitespace validation, and the live tag guard against `origin`. The required Bifrost code-smell scan completed but is unreliable because five repository-wide performance rules exhausted their discovery budget; it reported no findings in this change's files.
+- [x] (2026-07-29 10:25Z) Repaired the PR Quick Policy `zizmor` template-injection findings by environment-binding reusable-workflow inputs before shell execution. The local Actions audit reported no findings and the full quick-policy Node suite passed 41/41.
 
 ## Surprises & Discoveries
 
@@ -27,6 +28,8 @@ A `vX.Y.Z` tag currently starts three independent GitHub Actions workflow runs. 
   Evidence: post-implementation security review identified that a `vX.Y.Z` branch could otherwise become the exported release commit; the workflow now uses `refs/tags/<tag>` and compares `HEAD` to that tag's commit.
 - Observation: a workflow-text fixture that searches the whole file can mistake the release-summary fan-in for the promotion gate.
   Evidence: architecture review showed that the first fixture would still pass if a prerequisite moved from `promotion-evidence` to `release-summary`; the fixture now extracts the exact job block.
+- Observation: `zizmor` treats reusable-workflow inputs interpolated directly into `run:` as attacker-controllable code.
+  Evidence: PR #1308 Quick Policy reported 11 code-injection findings in `.github/workflows/publish-crate.yml` and `.github/workflows/publish-wheels.yml`; moving the values into job environment variables made the repository audit clean.
 
 ## Decision Log
 
@@ -54,10 +57,13 @@ A `vX.Y.Z` tag currently starts three independent GitHub Actions workflow runs. 
 - Decision: Split VS Code release-asset attachment from Marketplace publication.
   Rationale: one job result cannot report whether a partial failure occurred before or after the asset upload. Separate gated jobs make retry instructions and the release summary accurate.
   Date/Author: 2026-07-29 / Codex
+- Decision: Bind `tag`, `version`, and `commit` reusable-workflow inputs into job-level environment variables and reference only quoted shell variables from `run:` scripts.
+  Rationale: GitHub expression expansion occurs before the shell parses a script. The environment boundary avoids interpreting an input as shell syntax while preserving the validated immutable identity.
+  Date/Author: 2026-07-29 / Codex
 
 ## Outcomes & Retrospective
 
-The workflow now has one package-release entrypoint, captures an immutable tag commit, and waits for common build/package/smoke evidence before every scoped external publication. Security and intent reviews found and the implementation fixed tag shadowing/retargeting and ambiguous VS Code partial-publication reporting. The focused release fixture passed 6/6 tests; the full quick-policy selection passed 40/40 tests; `node scripts/release-version.mjs check`, Ruby YAML parsing, `git diff --check`, and a live `v0.8.7` remote-tag guard passed. `run_policy` remains unreliable because five repository-wide performance checks exhausted their discovery budgets, but it reported no findings in changed files; no clean policy result is claimed.
+The workflow now has one package-release entrypoint, captures an immutable tag commit, and waits for common build/package/smoke evidence before every scoped external publication. Security and intent reviews found and the implementation fixed tag shadowing/retargeting, unsafe reusable-input shell interpolation, and ambiguous VS Code partial-publication reporting. The focused release fixture passed 7/7 tests; the full quick-policy selection passed 41/41 tests; the local `zizmor` Actions audit reported no findings; `node scripts/release-version.mjs check`, Ruby YAML parsing, `git diff --check`, and a live `v0.8.7` remote-tag guard passed. The Bifrost policy MCP tools were not registered in the final task after the fix, so a fresh full-pack result could not be obtained; the earlier run was already unreliable from five repository-wide performance checks exhausting discovery budgets.
 
 ## Context and Orientation
 
@@ -106,3 +112,5 @@ At completion, `release-context.yml` exposes string outputs `tag`, `version`, an
 Plan revision 2026-07-29: created from issue #1274 diagnosis before implementation so the workflow topology, retry model, and validation proof remain explicit.
 
 Plan revision 2026-07-29: recorded the final review fixes, validation evidence, and incomplete policy result so a future contributor does not mistake the full-pack limitation for a pass.
+
+Plan revision 2026-07-29: recorded the Quick Policy template-injection repair and its clean local Actions audit, plus the final-task Bifrost MCP registration failure.
