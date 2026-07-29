@@ -20,7 +20,7 @@ A developer will be able to run `cargo test -p brokk-bifrost-mcp` or `cargo test
 - [x] (2026-07-29 13:19Z) Extracted and independently validated the MCP host package, then reconnected the CLI, Python facade, and root build identity.
 - [x] (2026-07-29 13:19Z) Moved both protocol subprocess contracts and CI impact mappings onto the proven package boundaries.
 - [x] (2026-07-29 13:35Z) Made lockstep versioning, package archives, notices, wheel inputs, and the release-promotion DAG workspace-aware.
-- [ ] Run the complete local validation, policy gate, packaged-consumer smoke, and cross-platform CI matrix.
+- [x] (2026-07-29 14:30Z) Ran the complete local validation set: package archives/consumer, formatter, Clippy, Node/workflow checks, host and facade contracts, and the feature-complete workspace suite. Recorded the unrelated Scala baseline failures in issue #1330 and the policy pack's discovery-budget `unreliable` result in issue #1296; cross-platform execution remains the CI matrix's responsibility when this branch is pushed.
 
 ## Surprises & Discoveries
 
@@ -84,6 +84,21 @@ A developer will be able to run `cargo test -p brokk-bifrost-mcp` or `cargo test
 - Observation: The root dependency graph remains the correct union for binary/wheel Rust notices after extraction, but cargo-about also reports path-based first-party workspace members.
   Evidence: Filtering used-by entries without a registry source removes all five Bifrost packages while retaining third-party dependencies; the generated HTML contains `serde` and no `brokk-bifrost` entry.
 
+- Observation: The architecture guard for stringly qualified-name parsing silently scanned zero files after analysis moved out of the root `src` directory.
+  Evidence: The feature-complete workspace suite failed `guard_scans_a_meaningful_number_of_analyzer_files`; updating the root to `crates/bifrost-analysis/src/analyzer` restores all seven guard tests and keeps the intended analyzer-wide coverage.
+
+- Observation: Three benchmark TCP tests cannot bind loopback inside the filesystem sandbox, but their exact test binaries pass with loopback access.
+  Evidence: The isolated workspace run reported `Operation not permitted` for the benchmark listeners; rerunning the five affected stderr/benchmark tests with the required sandbox permission passed.
+
+- Observation: Two Scala forward-definition tests fail deterministically on the synchronized baseline and are unrelated to this package extraction.
+  Evidence: Six neighboring `scala_forward_` cases pass and two fail in `scala_definition_precedence_test`; the extraction diff shows the Scala analyzer sources as 100% renames with no content or test changes. Issue #1330 owns the semantic failure.
+
+- Observation: The required code-smell policy request now completes instead of cancelling, but remains unreliable at repository scope.
+  Evidence: `bifrost.code-smells` reported complete results for eight rules and discovery-budget exhaustion for four broad performance rules (`expensive-operation-in-nested-loop`, `file-read-in-loop`, `parsing-in-loop`, and `sort-in-loop`), producing overall status `unreliable`. The findings on extracted paths are inherited moved code rather than new behavior; issue #1296 owns the policy-run reliability path.
+
+- Observation: This workstation also selected a Homebrew `clippy-driver` that was incompatible with the rustup compiler when PATH was not pinned as a unit.
+  Evidence: The first run failed with Rust metadata error E0514. With `/Users/dave/.cargo/bin` first in PATH, the all-workspace/all-target/all-feature Clippy gate completed cleanly in an isolated target.
+
 ## Decision Log
 
 - Decision: Keep the repository-root package named `brokk-bifrost`, with library name `brokk_bifrost`, as the only compatibility facade promised to existing users.
@@ -142,6 +157,10 @@ A developer will be able to run `cargo test -p brokk-bifrost-mcp` or `cargo test
   Rationale: This is the Cargo dependency order, avoids unresolved registry dependencies, and turns registry propagation into a bounded evidence check rather than an arbitrary delay.
   Date/Author: 2026-07-29 / Codex
 
+- Decision: Keep the Scala definition-precedence failure out of issue #1275 and preserve the extraction as content-neutral for that analyzer.
+  Rationale: Changing Scala semantics in an architecture-only package move would obscure causality. The exact baseline failure is independently reproducible and tracked by issue #1330.
+  Date/Author: 2026-07-29 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 is complete. The repository is now a non-virtual Cargo workspace with the root facade as its default member and four version-matched implementation package skeletons. The checked-in graph validator rejects reverse dependencies, cross-host dependencies, host-only external dependencies below their layer, unexpected members, and version drift. Search tooling no longer imports the LSP module for percent decoding; the shared utility retains Unicode behavior and adds malformed-escape coverage. No production module has moved yet, so public behavior and root packaging remain unchanged.
@@ -153,6 +172,8 @@ Milestone 3 is complete. LSP transport, overlays, request lifecycle, progress, c
 Milestone 4 is complete. MCP descriptors, registry, transport, service lifecycle, watcher/scoped-project support, structured outputs, and tool argument handling now compile in `brokk-bifrost-mcp`. Root preserves the existing Rust paths, owns PyO3 and the public binary, and injects its build identity through the typed host entry point. The independent package passed 101 unit tests, 26 subprocess protocol tests, and its doctest compile; its dependency tree contains analysis/runtime but no LSP transport. The root facade query/MCP contract, broad integration-test compile, exact build-identity test, and all 59 Python tests pass. CI now selects the MCP package directly for MCP-only changes while shared changes still select both hosts.
 
 Milestone 5 is complete. All five packages inherit `0.8.12` from `[workspace.package]`, while exact dependency requirements and the package graph remain enforced. The package-set validator creates archives with command-local unpublished-dependency patches, rejects test/development leakage, unpacks every archive, and builds a facade consumer with default and `nlp,python` features. The verified compressed sizes are 6,584,756 bytes (analysis), 27,955 bytes (runtime), 116,807 bytes (MCP), 106,533 bytes (LSP), and 291,488 bytes (facade). Release publication now follows the dependency DAG and validates exact registry checksums; all 45 Node script/workflow tests pass. Notice generation covers the root release dependency union without listing first-party workspace crates, and Maturin continues to build the same root package/version from the same immutable commit.
+
+Milestone 6 is complete with explicit external-gate qualifications. `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `git diff --check`, all 45 Node script/workflow tests, the five-archive packaged consumer, and the independent analysis/runtime/MCP/LSP/facade contracts pass. The final workspace suite also caught and repaired a stale architecture-guard path. It runs through the repository's remaining suites but is not wholly green because two deterministic Scala forward-definition assertions fail unchanged from the synchronized source baseline; issue #1330 records the reproducer. The required `bifrost.code-smells` request completed, but four repository-wide rules exhausted their discovery budgets and therefore returned `unreliable`; issue #1296 remains the reliability owner. No release, registry publication, push, or cross-platform CI run was performed.
 
 ## Context and Orientation
 
@@ -451,3 +472,5 @@ Revision note (2026-07-29): Completed Milestone 3 by extracting LSP production c
 Revision note (2026-07-29): Completed Milestone 4 by extracting the MCP host and real-process contract, reconnecting the root CLI/Python facade through one-way APIs, preserving exact build identity, and validating independent MCP, root facade, broad compile, CI-impact, and Python behavior.
 
 Revision note (2026-07-29): Completed Milestone 5 with workspace-owned versioning, five archive-content checks, an unpacked full-feature consumer, first-party-free notice generation, and a checksum-gated dependency-order crates.io publication DAG.
+
+Revision note (2026-07-29): Completed Milestone 6 validation, fixed the analyzer guard's relocated scan root, satisfied the canonical formatter/Clippy/package/script gates, and documented the independently reproduced Scala baseline failures and policy discovery-budget limitation rather than mixing semantic or policy-engine changes into the architecture refactor.

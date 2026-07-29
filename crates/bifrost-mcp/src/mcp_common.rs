@@ -929,6 +929,7 @@ fn file_uri_to_path(uri: &str) -> Result<PathBuf, String> {
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_request(
     service: &SearchToolsService,
     connection: &mut McpConnectionState,
