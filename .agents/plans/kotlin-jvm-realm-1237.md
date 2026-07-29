@@ -46,6 +46,12 @@ Use timestamps to measure rates of progress.
 - Observation: `--features nlp,python` cannot link on this machine. The `python` feature builds `pyo3` in extension-module-less mode and the link step fails with hundreds of undefined `_Py*` symbols. This is an environment gap (no linkable `libpython`), unrelated to any change in this plan, and it also predates it. `--features nlp` builds and runs every integration suite this plan adds or touches, because those suites are gated on `nlp` only.
   Evidence: `ld: symbol(s) not found for architecture arm64` listing `_PyUnicode_AsUTF8AndSize`, `_Py_InitializeEx`, and similar, from `libpyo3-*.rlib`. CI, which has a linkable Python, still needs the documented `--features nlp,python` gate.
 
+- Observation: The full-suite gate ran out of disk twice before completing. The machine's data volume was at 100% (121 MiB free) with 74 GB in this worktree's `target/`, 216 GB in a sibling worktree's, and 47 GB in two intentionally-retained isolated targets under `/private/tmp`. Deleting this worktree's `target/debug/incremental` (34 GB, pure regenerable cargo cache) was enough to finish; nothing outside this worktree was touched.
+  Evidence: `error: failed to build archive ...: No space left on device (os error 28)`. `scripts/cleanup-bifrost-tmp.sh` reported only "skip retained" and "skip unmanaged" candidates, so it could not help without an explicit review of those directories.
+
+- Observation: Editing any file under `src/` while a `cargo test` build is in flight silently invalidates the run — the build restarts and the earlier output is lost. Two full-suite attempts were wasted this way before the tree was frozen for the final run.
+  Evidence: a `cargo test` background task that had been compiling for minutes exited without producing a single `test result:` line after an unrelated doc-comment edit landed mid-build.
+
 - Observation: Passing a larger candidate-fqn set to an existing builder is inert rather than dangerous, because each language's resolver can only resolve names through its own declaration index. Merging the ecosystems therefore preserves today's edges exactly while establishing the shared node space that #1239 will fill in.
   Evidence: `JavaAnalyzer::source_type_by_fqn` reads `self.inner.global_usage_definition_index()`, which is scoped to the Java delegate's own files.
 
@@ -431,38 +437,73 @@ In `src/analyzer/kotlin/imports.rs`:
     pub(crate) const KOTLIN_DEFAULT_IMPORT_PACKAGES: &[&str];
     impl ImportAnalysisProvider for KotlinAnalyzer { /* … */ }
 
-In `src/analyzer/kotlin/supertypes.rs`:
+In `src/analyzer/kotlin/supertypes.rs`. The plan originally proposed a
+`KotlinSupertypeFact` carrying both display text and a separately serialized
+lookup path, mirroring Scala. That was dropped during implementation: the
+dotted lookup path goes straight into the language-neutral
+`ParsedFile::raw_supertypes` slot that Java and Go already use, which is what
+lets Kotlin's descendant index reuse the shared batched declaration-facts path,
+and the display text a reader wants is already the declaration's rendered
+signature.
 
-    pub(crate) struct KotlinSupertypeFact { pub(crate) raw: String, pub(crate) lookup_path: KotlinSupertypeLookupPath }
-    pub(crate) struct KotlinSupertypeLookupPath { /* segments */ }
-    impl KotlinSupertypeLookupPath {
-        pub(crate) fn segments(&self) -> &[String];
-        pub(crate) fn encode(&self) -> String;
-        pub(crate) fn decode(value: &str) -> Option<Self>;
+    pub(crate) fn extract_kotlin_supertypes(declaration: Node<'_>, source: &str) -> Vec<String>;
+    pub(crate) fn kotlin_user_type_segments(user_type: Node<'_>, source: &str) -> Vec<String>;
+
+In `src/analyzer/kotlin/types.rs`. `KotlinTypeName` is the ladder's own result
+type; it exists so `Ambiguous` is a distinct answer from `Unresolved` rather
+than both collapsing to `None`.
+
+    pub(crate) enum KotlinTypeName { Resolved(String), Ambiguous, Unresolved }
+    pub(crate) struct KotlinNameScope<'a> {
+        pub(crate) package_name: &'a str,
+        pub(crate) imports: &'a [ImportInfo],
+        pub(crate) scope_owners: Vec<String>,
     }
-    pub(crate) fn extract_kotlin_supertypes(declaration: Node<'_>, source: &str) -> Vec<KotlinSupertypeFact>;
-
-In `src/analyzer/kotlin/types.rs`:
+    pub(crate) fn resolve_kotlin_type_name(
+        name: &str,
+        scope: &KotlinNameScope<'_>,
+        exists: impl FnMut(&str) -> bool,
+    ) -> KotlinTypeName;
 
     pub(crate) enum KotlinTypeResolution { Source(CodeUnit), External(JvmExternalType) }
     impl KotlinAnalyzer {
         pub fn resolve_type_name_in_file(&self, file: &ProjectFile, raw_name: &str) -> Option<CodeUnit>;
         pub fn is_known_type_name_in_file(&self, file: &ProjectFile, raw_name: &str) -> bool;
+        pub(crate) fn scope_owners_for(&self, owner: &CodeUnit) -> Vec<String>;
+        pub(crate) fn realm_type_by_fqn(&self, fqn: &str, realm: Option<&JvmSourceRealm<'_>>) -> Option<CodeUnit>;
     }
 
-In `src/analyzer/jvm/realm.rs`:
+In `src/analyzer/kotlin/hierarchy.rs`:
+
+    impl TypeHierarchyProvider for KotlinAnalyzer { /* … */ }
+    impl KotlinAnalyzer {
+        pub(crate) fn direct_ancestors_in_realm(&self, unit: &CodeUnit, realm: Option<&JvmSourceRealm<'_>>) -> Vec<CodeUnit>;
+        pub(crate) fn direct_descendants_in_realm(&self, unit: &CodeUnit, realm: Option<&JvmSourceRealm<'_>>) -> HashSet<CodeUnit>;
+    }
+
+In `src/analyzer/jvm/realm.rs`. The realm answers per *peer*: the calling
+analyzer has already answered for itself through its own indexes and caches
+before it consults the realm, so including it again would only duplicate work.
 
     pub(crate) struct JvmSourceRealm<'a> { /* … */ }
     impl<'a> JvmSourceRealm<'a> {
         pub(crate) fn of(analyzer: &'a dyn IAnalyzer) -> Self;
-        pub(crate) fn types_by_fqn(&self, fqn: &str) -> Vec<CodeUnit>;
-        pub(crate) fn package_exists(&self, package: &str) -> bool;
+        pub(crate) fn has_peers_of(&self, language: Language) -> bool;
+        pub(crate) fn peer_types_by_fqn(&self, fqn: &str, language: Language) -> Vec<CodeUnit>;
+        pub(crate) fn peer_declarations_by_fqn(&self, fqn: &str, language: Language) -> Vec<CodeUnit>;
     }
 
 In `src/analyzer/usages/workspace_graph.rs`:
 
     pub(crate) enum UsageEcosystem { JavaScriptTypeScript, Python, Go, Rust, Jvm, CSharp, Cpp, Php, Ruby, Unknown }
 
+    impl WorkspaceUsageNode {
+        pub(crate) fn source_language(&self) -> Language;
+        pub(crate) fn language_label(&self) -> &'static str;
+    }
+
 ## Revision Notes
+
+* 2026-07-29 — Revised at completion. `Interfaces and Dependencies` now reflects what was actually built; the two places it drifted are called out inline with the reason. `Progress` shows all six milestones done. `Decision Log` gained three entries made during implementation: the Kotlin realm-aware descendant union at the `MultiAnalyzer` boundary, the separate realm-aware cache slots, and why `referencing_files_of` stays Kotlin-to-Kotlin. `Surprises & Discoveries` gained the two environment findings that shaped validation (clippy needs the rustup `PATH`; `--features nlp,python` cannot link here) and the two that cost real time (a full disk, and editing `src/` mid-build silently discarding a test run). `Outcomes & Retrospective` is filled in.
 
 * 2026-07-29 — Initial authoring. Structured as six milestones so each is independently verifiable: the dependency realm (M1) is provable without any Kotlin analysis change; imports (M2) and hierarchy (M3) are the user-visible Kotlin capabilities; the candidate realm (M4) and source realm (M5) are the cross-language obligations; M6 makes the deliberate gaps explicit. The Decision Log records why Java's and Scala's own resolvers stay untouched, so a future reader does not mistake that boundary for an oversight.
