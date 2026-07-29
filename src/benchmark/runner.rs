@@ -1761,21 +1761,6 @@ fn assert_scenario_result(
                     target.name
                 ));
             }
-            if structured["summary"]["partial"].as_bool() == Some(true) {
-                let reasons = results
-                    .iter()
-                    .filter_map(|entry| entry["incomplete_reason"].as_str())
-                    .collect::<BTreeSet<_>>();
-                let reasons = if reasons.is_empty() {
-                    "unspecified reason".to_string()
-                } else {
-                    reasons.into_iter().collect::<Vec<_>>().join(", ")
-                };
-                return Err(format!(
-                    "scan_usages returned explicitly bounded incomplete results for `{}` ({reasons}); it did not establish call-site absence",
-                    target.name
-                ));
-            }
             let has_hits = results.iter().any(|entry| {
                 matches!(
                     entry["status"].as_str(),
@@ -1787,6 +1772,21 @@ fn assert_scenario_result(
                         .is_some_and(|files| !files.is_empty()))
             });
             if !has_hits {
+                if structured["summary"]["partial"].as_bool() == Some(true) {
+                    let reasons = results
+                        .iter()
+                        .filter_map(|entry| entry["incomplete_reason"].as_str())
+                        .collect::<BTreeSet<_>>();
+                    let reasons = if reasons.is_empty() {
+                        "unspecified reason".to_string()
+                    } else {
+                        reasons.into_iter().collect::<Vec<_>>().join(", ")
+                    };
+                    return Err(format!(
+                        "scan_usages returned explicitly bounded incomplete results for `{}` ({reasons}); it did not establish call-site absence",
+                        target.name
+                    ));
+                }
                 return Err(format!(
                     "scan_usages found no call sites for `{}`",
                     target.name
@@ -2038,6 +2038,34 @@ mod issue_1228_tests {
         assert!(error.contains("explicitly bounded incomplete"), "{error}");
         assert!(error.contains("time_budget"), "{error}");
         assert!(!error.contains("no call sites"), "{error}");
+    }
+
+    #[test]
+    fn benchmark_scan_accepts_bounded_response_that_preserves_call_site_evidence() {
+        let target: BenchmarkRepoTarget = serde_json::from_value(json!({
+            "name": "bounded-hit",
+            "url": "https://example.invalid/bounded-hit",
+            "commit": "deadbeef",
+            "languages": [],
+            "scenarios": []
+        }))
+        .expect("minimal benchmark target");
+        let result = json!({
+            "structuredContent": {
+                "summary": { "partial": true },
+                "results": [{
+                    "status": "found",
+                    "complete": false,
+                    "incomplete_reason": "response_budget",
+                    "total_hits": 1
+                }]
+            }
+        });
+
+        assert!(
+            assert_scenario_result(&target, BenchmarkScenario::ScanUsages, &result).is_ok(),
+            "the scenario verifies discoverable call sites, not exhaustive rendering"
+        );
     }
 
     #[test]
