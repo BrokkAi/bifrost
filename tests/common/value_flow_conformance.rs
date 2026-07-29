@@ -121,8 +121,6 @@ pub struct InterproceduralMilestone<'case> {
 #[derive(Debug)]
 pub struct ExpectedWitness<'case> {
     pub truncated: bool,
-    pub step_proof: &'case ProofStatus,
-    pub step_completeness: &'case EvidenceCompleteness,
     pub carriers: &'case [CarrierMilestone],
     pub interprocedural: &'case [InterproceduralMilestone<'case>],
 }
@@ -851,14 +849,20 @@ fn assert_meeting_witness(
         .collect::<Vec<_>>();
     for step in &projected {
         assert_eq!(
-            &step.proof, expectation.witness.step_proof,
+            step.proof,
+            ProofStatus::Proven,
             "{} {} witness proof at {:?}",
-            case.name, expectation.sink, step.kind
+            case.name,
+            expectation.sink,
+            step.kind
         );
         assert_eq!(
-            &step.completeness, expectation.witness.step_completeness,
+            step.completeness,
+            EvidenceCompleteness::Complete,
             "{} {} witness completeness at {:?}",
-            case.name, expectation.sink, step.kind
+            case.name,
+            expectation.sink,
+            step.kind
         );
     }
 
