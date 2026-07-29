@@ -1069,7 +1069,7 @@ fn resolve_rust_unscoped(
                     if !local.is_empty() {
                         return candidates_outcome(local);
                     }
-                    if let Some(unit) = rust_enclosing_scope_member_fallback(
+                    if let Some(unit) = rust_enclosing_scope_type_fallback(
                         analyzer,
                         file,
                         reference,
@@ -1143,7 +1143,7 @@ fn resolve_rust_unscoped(
         // a future upstream regression — a genuinely-external `::` path yields
         // `None` here and still draws the boundary.
         if let Some(unit) =
-            rust_enclosing_scope_member_fallback(analyzer, file, reference, site.focus_start_byte)
+            rust_enclosing_scope_type_fallback(analyzer, file, reference, site.focus_start_byte)
         {
             return candidates_outcome(vec![unit]);
         }
@@ -3076,7 +3076,7 @@ fn rust_focused_prefix_resolution_outcome(
                 if !local.is_empty() {
                     return candidates_outcome(local);
                 }
-                if let Some(unit) = rust_enclosing_scope_member_fallback(
+                if let Some(unit) = rust_enclosing_scope_type_fallback(
                     analyzer,
                     file,
                     focused_text,
@@ -3237,12 +3237,9 @@ fn rust_focused_prefix_resolution_outcome(
         // the associated type `Connection::TransactionManager`, which shares its
         // spelling with an imported trait but is a distinct namespace and lives
         // in this file (issue #1126 diesel `TransactionManager`).
-        if let Some(unit) = rust_enclosing_scope_member_fallback(
-            analyzer,
-            file,
-            focused_text,
-            site.focus_start_byte,
-        ) {
+        if let Some(unit) =
+            rust_enclosing_scope_type_fallback(analyzer, file, focused_text, site.focus_start_byte)
+        {
             return candidates_outcome(vec![unit]);
         }
         // Only for a *bound* alias root (`use forc_pkg as pkg; pkg::Item`) do we
@@ -5863,27 +5860,24 @@ fn rust_reference_looks_external(reference: &str) -> bool {
         })
 }
 
-/// Resolve a name to a workspace-internal declaration that lives in an
-/// *enclosing type/trait/impl/enum* scope of the reference — an enum variant,
+/// Resolve a type-shaped name to a workspace-internal declaration that lives
+/// in an *enclosing type/trait/impl/enum* scope of the reference — an
 /// associated type, nested type, or the enclosing type itself.
 ///
 /// An explicit `use` binds a bare name in the *module* namespace only; Rust
-/// keeps enum-variant, associated-item, and type namespaces separate, so such a
-/// path segment (`Error::Variant`, `Self::AssocType`, a variant declaration
-/// name) is never shadowed by a same-named import. Consulting this before any
-/// "explicitly imported across an unindexed boundary" claim upholds the
-/// invariant that a confident non-indexing claim is never emitted for a name the
-/// workspace actually declares (issue #1126: diesel `Expression`/
-/// `TransactionManager`, meilisearch `Error`, nushell `SqliteError`).
-fn rust_enclosing_scope_member_fallback(
+/// keeps associated types and imported types distinct. A field/enum variant is
+/// deliberately not eligible here: bare `PTR::read` cannot use an enclosing
+/// `RData::PTR` variant as a path owner, and an explicitly imported but
+/// unindexed `PTR` must remain a boundary instead of being stolen by that
+/// variant (#1283). Consulting enclosing classes before a boundary still
+/// preserves the #1126 safety net for workspace traits and associated types.
+fn rust_enclosing_scope_type_fallback(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     name: &str,
     byte: usize,
 ) -> Option<CodeUnit> {
-    resolve_in_enclosing_scopes(analyzer, file, name, byte, |candidate| {
-        candidate.is_field() || candidate.is_class()
-    })
+    resolve_in_enclosing_scopes(analyzer, file, name, byte, CodeUnit::is_class)
 }
 
 /// True when the focused owner/qualifier resolves to a Rust crate or module that

@@ -35,14 +35,14 @@ pub(crate) fn resolve_reference_site_with_line_starts(
     source: &str,
     line_starts: &[usize],
 ) -> Result<ResolvedReferenceSite, String> {
-    let allow_at_ident = language_for_file(&request.file) == Language::Ruby;
+    let language = language_for_file(&request.file);
     // A Rust raw identifier (`r#type`) is one token whose `r#` escape prefix
     // is not made of ordinary identifier characters, so the generic
     // ident-byte token scanner below needs to special-case it (#1128) --
     // otherwise a `self.r#type` reference site is seen as the bare one-byte
     // token `r`, and a caller-supplied `[start, end)` spanning the whole
     // `r#type` text is rejected as "not a single reference token".
-    let raw_identifier_aware = language_for_file(&request.file) == Language::Rust;
+    let raw_identifier_aware = language == Language::Rust;
     let (selection_start, selection_end) = match (
         request.start_byte,
         request.end_byte,
@@ -61,9 +61,7 @@ pub(crate) fn resolve_reference_site_with_line_starts(
                     "byte range [{start}, {end}) does not align to UTF-8 character boundaries"
                 ));
             }
-            if let Some(token) =
-                token_bounds_at(source, start, allow_at_ident, raw_identifier_aware)
-            {
+            if let Some(token) = token_bounds_at(source, start, language, raw_identifier_aware) {
                 if end > token.1 {
                     return Err(
                         "byte range must identify a single reference token; use start_byte inside the token for qualified expressions"
@@ -87,7 +85,7 @@ pub(crate) fn resolve_reference_site_with_line_starts(
                     "start_byte {start} does not align to a UTF-8 character boundary"
                 ));
             }
-            token_bounds_at(source, start, allow_at_ident, raw_identifier_aware)
+            token_bounds_at(source, start, language, raw_identifier_aware)
                 .ok_or_else(|| format!("no reference token at byte {start}"))?
         }
         (_, _, Some(line), column) => {
@@ -106,7 +104,7 @@ pub(crate) fn resolve_reference_site_with_line_starts(
             let point =
                 byte_offset_for_character_column(source, line_start, line_end, line, column)?;
             let point = point.min(source.len().saturating_sub(1));
-            token_bounds_at(source, point, allow_at_ident, raw_identifier_aware)
+            token_bounds_at(source, point, language, raw_identifier_aware)
                 .or_else(|| single_non_whitespace_character_at(source, point))
                 .ok_or_else(|| format!("no reference token at line {line}, column {column}"))?
         }
@@ -114,7 +112,7 @@ pub(crate) fn resolve_reference_site_with_line_starts(
     };
 
     let (start, end) =
-        expand_reference_expression(source, selection_start, selection_end, allow_at_ident);
+        expand_reference_expression(source, selection_start, selection_end, language);
     if start >= end {
         return Err("reference selection is empty".to_string());
     }
@@ -182,12 +180,12 @@ fn rust_raw_identifier_bounds(
     bytes: &[u8],
     start: usize,
     end: usize,
-    allow_at_ident: bool,
+    language: Language,
 ) -> Option<(usize, usize)> {
     if start >= 2
         && bytes[start - 1] == b'#'
         && bytes[start - 2] == b'r'
-        && (start == 2 || !is_ident_byte(bytes[start - 3], allow_at_ident))
+        && (start == 2 || !is_ident_byte(bytes[start - 3], language))
     {
         return Some((start - 2, end));
     }
@@ -196,10 +194,10 @@ fn rust_raw_identifier_bounds(
         && bytes.get(end) == Some(&b'#')
         && bytes
             .get(end + 1)
-            .is_some_and(|&byte| is_ident_byte(byte, allow_at_ident))
+            .is_some_and(|&byte| is_ident_byte(byte, language))
     {
         let mut extended_end = end + 1;
-        while extended_end < bytes.len() && is_ident_byte(bytes[extended_end], allow_at_ident) {
+        while extended_end < bytes.len() && is_ident_byte(bytes[extended_end], language) {
             extended_end += 1;
         }
         return Some((start, extended_end));
@@ -210,7 +208,7 @@ fn rust_raw_identifier_bounds(
 fn token_bounds_at(
     source: &str,
     byte: usize,
-    allow_at_ident: bool,
+    language: Language,
     raw_identifier_aware: bool,
 ) -> Option<(usize, usize)> {
     if source.is_empty() {
@@ -218,25 +216,22 @@ fn token_bounds_at(
     }
     let bytes = source.as_bytes();
     let mut idx = byte.min(bytes.len().saturating_sub(1));
-    if !is_ident_byte(bytes[idx], allow_at_ident)
-        && idx > 0
-        && is_ident_byte(bytes[idx - 1], allow_at_ident)
-    {
+    if !is_ident_byte(bytes[idx], language) && idx > 0 && is_ident_byte(bytes[idx - 1], language) {
         idx -= 1;
     }
-    if !is_ident_byte(bytes[idx], allow_at_ident) {
+    if !is_ident_byte(bytes[idx], language) {
         return None;
     }
     let mut start = idx;
-    while start > 0 && is_ident_byte(bytes[start - 1], allow_at_ident) {
+    while start > 0 && is_ident_byte(bytes[start - 1], language) {
         start -= 1;
     }
     let mut end = idx + 1;
-    while end < bytes.len() && is_ident_byte(bytes[end], allow_at_ident) {
+    while end < bytes.len() && is_ident_byte(bytes[end], language) {
         end += 1;
     }
     if raw_identifier_aware
-        && let Some(extended) = rust_raw_identifier_bounds(bytes, start, end, allow_at_ident)
+        && let Some(extended) = rust_raw_identifier_bounds(bytes, start, end, language)
     {
         return Some(extended);
     }
@@ -248,23 +243,20 @@ pub(crate) fn reference_target_match_offsets<'a>(
     target: &'a str,
     language: Language,
 ) -> impl Iterator<Item = usize> + 'a {
-    let allow_at_ident = language == Language::Ruby;
     let raw_identifier_aware = language == Language::Rust;
     // A target that is itself a raw identifier (`r#type`) is not made of
     // ordinary identifier bytes (the `#` fails `is_ident_byte`), but it is
     // still exactly one reference token in Rust source, so it must take the
     // same strict token-boundary check below as any other identifier target
     // rather than falling back to unchecked substring matching (#1128).
-    let target_is_identifier = target
-        .bytes()
-        .all(|byte| is_ident_byte(byte, allow_at_ident))
+    let target_is_identifier = target.bytes().all(|byte| is_ident_byte(byte, language))
         || (raw_identifier_aware
             && target.strip_prefix("r#").is_some_and(|rest| {
-                !rest.is_empty() && rest.bytes().all(|byte| is_ident_byte(byte, allow_at_ident))
+                !rest.is_empty() && rest.bytes().all(|byte| is_ident_byte(byte, language))
             }));
     source.match_indices(target).filter_map(move |(offset, _)| {
         if !target_is_identifier
-            || token_bounds_at(source, offset, allow_at_ident, raw_identifier_aware)
+            || token_bounds_at(source, offset, language, raw_identifier_aware)
                 .is_some_and(|(start, end)| start == offset && end == offset + target.len())
         {
             Some(offset)
@@ -278,7 +270,7 @@ fn expand_reference_expression(
     source: &str,
     start: usize,
     end: usize,
-    allow_at_ident: bool,
+    language: Language,
 ) -> (usize, usize) {
     let bytes = source.as_bytes();
     let mut left = start;
@@ -286,14 +278,14 @@ fn expand_reference_expression(
     loop {
         if left >= 2 && &bytes[left - 2..left] == b"::" {
             left -= 2;
-            while left > 0 && is_ident_byte(bytes[left - 1], allow_at_ident) {
+            while left > 0 && is_ident_byte(bytes[left - 1], language) {
                 left -= 1;
             }
             continue;
         }
         if left >= 1 && bytes[left - 1] == b'.' {
             left -= 1;
-            while left > 0 && is_ident_byte(bytes[left - 1], allow_at_ident) {
+            while left > 0 && is_ident_byte(bytes[left - 1], language) {
                 left -= 1;
             }
             continue;
@@ -303,18 +295,18 @@ fn expand_reference_expression(
     loop {
         if right + 2 < bytes.len()
             && &bytes[right..right + 2] == b"::"
-            && (is_ident_byte(bytes[right + 2], allow_at_ident)
+            && (is_ident_byte(bytes[right + 2], language)
                 || matches!(bytes[right + 2], b'{' | b'*'))
         {
             right += 2;
-            while right < bytes.len() && is_ident_byte(bytes[right], allow_at_ident) {
+            while right < bytes.len() && is_ident_byte(bytes[right], language) {
                 right += 1;
             }
             continue;
         }
         if right < bytes.len() && bytes[right] == b'.' {
             right += 1;
-            while right < bytes.len() && is_ident_byte(bytes[right], allow_at_ident) {
+            while right < bytes.len() && is_ident_byte(bytes[right], language) {
                 right += 1;
             }
             continue;
@@ -324,8 +316,11 @@ fn expand_reference_expression(
     (left, right)
 }
 
-fn is_ident_byte(byte: u8, allow_at_ident: bool) -> bool {
-    byte == b'_' || (allow_at_ident && byte == b'@') || byte.is_ascii_alphanumeric()
+fn is_ident_byte(byte: u8, language: Language) -> bool {
+    byte == b'_'
+        || (language == Language::Ruby && byte == b'@')
+        || (matches!(language, Language::JavaScript | Language::TypeScript) && byte == b'$')
+        || byte.is_ascii_alphanumeric()
 }
 
 pub(crate) fn smallest_named_node_covering<'tree>(
@@ -355,7 +350,7 @@ pub(crate) fn smallest_named_node_covering<'tree>(
 #[cfg(test)]
 mod tests {
     use super::{SourceLocationRequest, expand_reference_expression, resolve_reference_site};
-    use crate::analyzer::ProjectFile;
+    use crate::analyzer::{Language, ProjectFile};
     use std::env;
 
     #[test]
@@ -365,7 +360,7 @@ mod tests {
         let end = start + "helper".len();
 
         assert_eq!(
-            expand_reference_expression(source, start, end, false),
+            expand_reference_expression(source, start, end, Language::Java),
             (start - 1, end)
         );
 
@@ -374,8 +369,20 @@ mod tests {
         let end = start + "helper".len();
 
         assert_eq!(
-            expand_reference_expression(source, start, end, false),
+            expand_reference_expression(source, start, end, Language::Java),
             (start, end)
+        );
+    }
+
+    #[test]
+    fn javascript_reference_expression_preserves_dollar_identifier_root() {
+        let source = "$scope.count";
+        let start = source.find("count").expect("property");
+        let end = start + "count".len();
+
+        assert_eq!(
+            expand_reference_expression(source, start, end, Language::JavaScript),
+            (0, source.len())
         );
     }
 
@@ -386,7 +393,7 @@ mod tests {
         let end = start + "leaf".len();
 
         assert_eq!(
-            expand_reference_expression(source, start, end, false),
+            expand_reference_expression(source, start, end, Language::Rust),
             (start, end)
         );
 
@@ -396,7 +403,7 @@ mod tests {
 
         assert_eq!(
             &source[{
-                let (start, end) = expand_reference_expression(source, start, end, false);
+                let (start, end) = expand_reference_expression(source, start, end, Language::Rust);
                 start..end
             }],
             "Type::make"
@@ -409,7 +416,7 @@ mod tests {
             let start = source.find("workflow").expect("path prefix");
             let end = start + "workflow".len();
             let (expanded_start, expanded_end) =
-                expand_reference_expression(source, start, end, false);
+                expand_reference_expression(source, start, end, Language::Rust);
             assert_eq!(&source[expanded_start..expanded_end], "workflow::");
         }
     }
