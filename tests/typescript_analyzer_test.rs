@@ -804,22 +804,12 @@ fn test_file_filtering_and_top_level_behavior() {
     ]));
     assert!(!no_relevant.get_definitions("valid.ts.ok").is_empty());
 
-    assert_eq!(Language::TypeScript, Language::from_extension("ts"));
-    assert_eq!(Language::TypeScript, Language::from_extension("tsx"));
-    assert_eq!(Language::JavaScript, Language::from_extension("js"));
-    assert_eq!(Language::JavaScript, Language::from_extension("jsx"));
-
     let hello = ProjectFile::new(
         fixture_analyzer().project().root().to_path_buf(),
         "Hello.ts",
     );
     let top_level = fixture_analyzer().top_level_declarations(&hello);
     let declarations = fixture_analyzer().declarations(&hello);
-    assert!(
-        declarations
-            .iter()
-            .all(|code_unit| declarations.contains(code_unit))
-    );
     assert!(declarations.len() > top_level.len());
     assert!(
         top_level

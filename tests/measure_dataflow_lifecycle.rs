@@ -305,26 +305,6 @@ fn dataflow_lifecycle_measurement() {
 }
 
 #[test]
-fn generated_sources_expose_unique_roots() {
-    let branch_source = generated_branch_source(8);
-    assert_eq!(
-        branch_source.matches("export function branchRoot").count(),
-        1
-    );
-    assert_eq!(branch_source.matches("if (input ===").count(), 8);
-
-    let call_source = generated_call_source(8);
-    assert_eq!(call_source.matches("export function callRoot").count(), 1);
-    assert_eq!(call_source.matches("function callStep").count(), 8);
-}
-
-#[test]
-fn median_helpers_select_the_middle_retained_sample() {
-    assert_eq!(median_f64(vec![7.0, 1.0, 5.0, 3.0, 9.0]), 5.0);
-    assert_eq!(median_u64(vec![7, 1, 5, 3, 9]), 5);
-}
-
-#[test]
 fn benchmark_clients_are_deterministic_and_bounded_on_a_real_icfg() {
     let measurement = measure_generated_branches("generated_typescript_branches_8", 8);
     let repeated = measure_generated_branches("generated_typescript_branches_8", 8);

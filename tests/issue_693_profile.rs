@@ -1,4 +1,4 @@
-//! Manual profiler for GitHub issue #693's external LGTM checkout.
+//! Regression pin for GitHub issue #693: definition and hover stay interactive on large Rust files.
 
 mod common;
 
@@ -6,8 +6,6 @@ use brokk_bifrost::Language;
 use common::InlineTestProject;
 use common::lsp_client::{LspServer, uri_for};
 use serde_json::json;
-use std::fs;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 #[test]
@@ -72,52 +70,4 @@ fn large_rust_file_definition_and_hover_stay_interactive() {
         "expected mono_family hover, got {hover}"
     );
     server.shutdown();
-}
-
-#[test]
-#[ignore = "requires BIFROST_ISSUE_693_ROOT pointing at the LGTM PR checkout"]
-fn profile_lgtm_large_rust_definition_and_hover() {
-    let root = PathBuf::from(
-        std::env::var_os("BIFROST_ISSUE_693_ROOT")
-            .expect("BIFROST_ISSUE_693_ROOT must name the LGTM checkout"),
-    );
-    let started = Instant::now();
-    let mut server = LspServer::start(&root);
-    eprintln!(
-        "issue693 initialize_ms={:.1}",
-        started.elapsed().as_secs_f64() * 1000.0
-    );
-
-    let uri = uri_for(&root.join("crates/app/src/main.rs"));
-    let source = fs::read_to_string(root.join("crates/app/src/main.rs"))
-        .expect("read LGTM main.rs for didOpen overlay");
-    server.notify(
-        "textDocument/didOpen",
-        json!({
-            "textDocument": {
-                "uri": uri,
-                "languageId": "rust",
-                "version": 1,
-                "text": source,
-            }
-        }),
-    );
-    let _ = server.read_notification("textDocument/publishDiagnostics");
-    for (method, line, character) in [
-        ("textDocument/definition", 42, 12),
-        ("textDocument/definition", 42, 17),
-        ("textDocument/hover", 42, 12),
-        ("textDocument/hover", 42, 17),
-    ] {
-        let started = Instant::now();
-        let response = server.text_document_position_response(method, &uri, line, character);
-        eprintln!(
-            "issue693 method={method} line={line} character={character} elapsed_ms={:.1} result={}",
-            started.elapsed().as_secs_f64() * 1000.0,
-            response["result"]
-        );
-    }
-
-    let stderr = server.shutdown_with_stderr();
-    eprintln!("{stderr}");
 }

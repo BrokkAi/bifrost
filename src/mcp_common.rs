@@ -2870,10 +2870,13 @@ mod uri_tests {
             SearchToolsService::new_manual_without_semantic_index(dir.path().to_path_buf())
                 .expect("service");
         let prepared = service
-            .prepare_run_policy(json!({
-                "policy_files": ["policies/dynamic-eval.rqlp"],
-                "evaluation_date": "2026-07-27"
-            }))
+            .prepare_run_policy_with_cancellation(
+                json!({
+                    "policy_files": ["policies/dynamic-eval.rqlp"],
+                    "evaluation_date": "2026-07-27"
+                }),
+                None,
+            )
             .expect("prepare policy request");
         let cancellation = CancellationToken::default();
         cancellation.cancel();

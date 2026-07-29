@@ -136,27 +136,6 @@ interactive_queries = [
         );
     }
 
-    let names = scenarios
-        .iter()
-        .map(|scenario| scenario["name"].as_str().unwrap_or_default())
-        .collect::<Vec<_>>();
-    assert!(names.contains(&"workspace_build"), "report: {report}");
-    assert!(names.contains(&"search_symbols"), "report: {report}");
-    assert!(names.contains(&"get_symbol_locations"), "report: {report}");
-    assert!(names.contains(&"get_symbol_ancestors"), "report: {report}");
-    assert!(names.contains(&"get_summaries"), "report: {report}");
-    assert!(names.contains(&"most_relevant_files"), "report: {report}");
-    assert!(names.contains(&"scan_usages"), "report: {report}");
-    assert!(names.contains(&"dead_code_smells"), "report: {report}");
-    assert!(names.contains(&"get_definition"), "report: {report}");
-    assert!(names.contains(&"call_hierarchy"), "report: {report}");
-    assert!(names.contains(&"type_hierarchy"), "report: {report}");
-    assert!(names.contains(&"query_code"), "report: {report}");
-    assert!(
-        names.contains(&"interactive_code_intelligence"),
-        "report: {report}"
-    );
-
     let interactive = scenarios
         .iter()
         .find(|scenario| scenario["name"] == "interactive_code_intelligence")

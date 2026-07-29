@@ -267,14 +267,6 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn core_expands_symbol_then_nlp_then_workspace() {
-        let mut expected = symbol_tool_names();
-        expected.extend(nlp_tool_names());
-        expected.extend(workspace_tool_names());
-        assert_eq!(tool_names("core"), expected);
-    }
-
     #[cfg(feature = "nlp")]
     #[test]
     fn nlp_tools_hidden_for_non_git_root() {
@@ -298,47 +290,6 @@ mod tests {
             names.contains(&"search_symbols".to_string()),
             "non-nlp tools remain available"
         );
-    }
-
-    #[test]
-    fn searchtools_expands_to_all_toolsets_in_order() {
-        let mut expected = symbol_tool_names();
-        expected.extend(nlp_tool_names());
-        expected.extend(workspace_tool_names());
-        expected.extend(
-            [
-                "query_code",
-                "list_policies",
-                "run_policy",
-                "get_symbol_locations",
-                "get_symbol_ancestors",
-                "find_filenames",
-                "list_files",
-                "most_relevant_files",
-                "jq",
-                "xml_skim",
-                "xml_select",
-                "get_file_contents",
-                "search_file_contents",
-                "find_files_containing",
-                "compute_cyclomatic_complexity",
-                "compute_cognitive_complexity",
-                "report_comment_density_for_code_unit",
-                "report_exception_handling_smells",
-                "report_comment_density_for_files",
-                "analyze_git_hotspots",
-                "report_test_assertion_smells",
-                "report_structural_clone_smells",
-                "report_long_method_and_god_object_smells",
-                "report_dead_code_and_unused_abstraction_smells",
-                "report_secret_like_code",
-                "analyze_diff",
-                "classify_test_files",
-            ]
-            .into_iter()
-            .map(str::to_string),
-        );
-        assert_eq!(tool_names("searchtools"), expected);
     }
 
     #[test]

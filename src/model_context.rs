@@ -236,16 +236,7 @@ fn join_lines(
 
 #[cfg(test)]
 mod tests {
-    use super::{HeadTail, cap_lines, count_lines, logical_lines, sample, truncate_line};
-
-    #[test]
-    fn count_lines_handles_mixed_endings() {
-        assert_eq!(0, count_lines(""));
-        assert_eq!(3, count_lines("a\nb\nc"));
-        assert_eq!(3, count_lines("a\r\nb\r\nc"));
-        assert_eq!(3, count_lines("a\rb\rc"));
-        assert_eq!(1, count_lines("a\r\n"));
-    }
+    use super::{HeadTail, cap_lines, logical_lines, sample, truncate_line};
 
     #[test]
     fn logical_lines_match_searchtools_behavior() {

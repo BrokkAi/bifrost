@@ -577,3 +577,40 @@ fn test_signature_metadata_keeps_rust_pattern_parameters() {
         .collect();
     assert_eq!(vec!["(left, right)", "_"], labels);
 }
+
+#[test]
+fn rust_type_aliases_are_marked() {
+    let project = rust_project(&[(
+        "src/main.rs",
+        r#"
+        type MyResult<T> = Result<T, Error>;
+        struct MyStruct;
+        fn my_func() {}
+        "#,
+    )]);
+    let analyzer = RustAnalyzer::from_project(project.clone());
+    let file = ProjectFile::new(project.root().to_path_buf(), "src/main.rs");
+    let declarations = analyzer.declarations(&file);
+
+    let alias = declarations
+        .iter()
+        .find(|code_unit| code_unit.identifier() == "MyResult")
+        .unwrap();
+    let structure = declarations
+        .iter()
+        .find(|code_unit| code_unit.identifier() == "MyStruct")
+        .unwrap();
+    let function = declarations
+        .iter()
+        .find(|code_unit| code_unit.identifier() == "my_func")
+        .unwrap();
+
+    assert!(analyzer.is_type_alias(alias));
+    assert!(!analyzer.is_type_alias(structure));
+    assert!(!analyzer.is_type_alias(function));
+    assert!(
+        analyzer
+            .type_alias_provider()
+            .is_some_and(|provider| provider.is_type_alias(alias))
+    );
+}

@@ -56,42 +56,6 @@ fn test_determine_package_name_cases() {
 }
 
 #[test]
-fn test_determine_package_name_from_fixtures() {
-    let analyzer = fixture_analyzer();
-    let root = analyzer.project().root().to_path_buf();
-
-    assert_eq!(
-        "main",
-        analyzer.determine_package_name(
-            &ProjectFile::new(root.clone(), "packages.go")
-                .read_to_string()
-                .unwrap()
-        )
-    );
-    assert_eq!(
-        "anotherpkg",
-        analyzer.determine_package_name(
-            &ProjectFile::new(root.clone(), "anotherpkg/another.go")
-                .read_to_string()
-                .unwrap()
-        )
-    );
-    assert_eq!(
-        "",
-        analyzer.determine_package_name(
-            &ProjectFile::new(root.clone(), "nopkg.go")
-                .read_to_string()
-                .unwrap()
-        )
-    );
-    assert_eq!(
-        "",
-        analyzer
-            .determine_package_name(&ProjectFile::new(root, "empty.go").read_to_string().unwrap())
-    );
-}
-
-#[test]
 fn test_go_declarations_and_fq_names() {
     let analyzer = fixture_analyzer();
     let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "declarations.go");

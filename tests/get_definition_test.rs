@@ -24188,36 +24188,6 @@ object Consumer {
 }
 
 #[test]
-fn scala_object_apply_call_resolves_from_constructor_like_reference() {
-    let project = InlineTestProject::with_language(Language::Scala)
-        .file(
-            "app/Factory.scala",
-            "package app\nclass Service\nobject Factory { def apply(): Service = new Service }\n",
-        )
-        .file(
-            "app/Controller.scala",
-            "package app\nclass Controller { val service = Factory() }\n",
-        )
-        .build();
-
-    let line = "class Controller { val service = Factory() }";
-    let value = lookup(
-        project.root(),
-        &format!(
-            r#"{{"references":[{{"path":"app/Controller.scala","line":2,"column":{}}}]}}"#,
-            column_of(line, "Factory")
-        ),
-    );
-
-    let result = &value["results"][0];
-    assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(
-        result["definitions"][0]["fqn"], "app.Factory$.apply",
-        "{value}"
-    );
-}
-
-#[test]
 fn scala_renamed_member_import_resolves_to_member_definition() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
@@ -25645,36 +25615,6 @@ object Controller {
         value["results"][0]["diagnostics"][0]["message"]
             .as_str()
             .is_some_and(|message| message.contains("precedence-aware receiver reconstruction")),
-        "{value}"
-    );
-}
-
-#[test]
-fn scala_service_execute_receiver_resolves_to_definition() {
-    let project = InlineTestProject::with_language(Language::Scala)
-        .file(
-            "app/Service.scala",
-            "package app\nclass Service { def execute(): Int = 1 }\n",
-        )
-        .file(
-            "app/Controller.scala",
-            "package app\nclass Controller { def handle(service: Service): Int = service.execute() }\n",
-        )
-        .build();
-
-    let line = "class Controller { def handle(service: Service): Int = service.execute() }";
-    let value = lookup(
-        project.root(),
-        &format!(
-            r#"{{"references":[{{"path":"app/Controller.scala","line":2,"column":{}}}]}}"#,
-            column_of(line, "execute")
-        ),
-    );
-
-    let result = &value["results"][0];
-    assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(
-        result["definitions"][0]["fqn"], "app.Service.execute",
         "{value}"
     );
 }

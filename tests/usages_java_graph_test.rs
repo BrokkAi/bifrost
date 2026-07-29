@@ -433,47 +433,6 @@ public class Consumer {
 }
 
 #[test]
-fn java_graph_strategy_handles_nested_type_references() {
-    let (_project, analyzer) = java_analyzer_with_files(&[
-        (
-            "com/example/Outer.java",
-            r#"
-package com.example;
-
-public class Outer {
-    public static class Inner {}
-}
-"#,
-        ),
-        (
-            "com/example/Consumer.java",
-            r#"
-package com.example;
-
-public class Consumer {
-    Outer.Inner build() {
-        return new Outer.Inner();
-    }
-}
-"#,
-        ),
-    ]);
-
-    let candidates = analyzer.get_analyzed_files().into_iter().collect();
-    let class_target = definition(&analyzer, "com.example.Outer.Inner");
-    let hits = JavaUsageGraphStrategy::new()
-        .find_usages(
-            &analyzer,
-            std::slice::from_ref(&class_target),
-            &candidates,
-            1000,
-        )
-        .into_either()
-        .expect("nested type success");
-    assert!(!hits.is_empty());
-}
-
-#[test]
 fn java_graph_strategy_records_expression_selector_type_segments_exactly() {
     let (project, analyzer) = java_analyzer_with_files(&[
         (

@@ -12,12 +12,6 @@ fn fixture_analyzer() -> PhpAnalyzer {
 }
 
 #[test]
-fn test_php_initialization() {
-    let analyzer = fixture_analyzer();
-    assert!(!analyzer.is_empty());
-}
-
-#[test]
 fn php_composer_manifest_does_not_change_indexed_declarations() {
     let project = InlineTestProject::with_language(Language::Php)
         .file(

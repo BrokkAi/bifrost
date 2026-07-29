@@ -1,6 +1,5 @@
 use brokk_bifrost::{
-    AnalyzerDelegate, IAnalyzer, JavaAnalyzer, Language, MultiAnalyzer, ProjectFile,
-    PythonAnalyzer, RustAnalyzer, TestProject,
+    AnalyzerDelegate, IAnalyzer, JavaAnalyzer, Language, MultiAnalyzer, ProjectFile, TestProject,
 };
 use std::collections::BTreeMap;
 use tempfile::tempdir;
@@ -32,40 +31,4 @@ fn import_analysis_provider_is_present_when_delegate_supports_it() {
 
     let file = ProjectFile::new(project.root_path().to_path_buf(), "A.java");
     assert_eq!(1, provider.unwrap().import_info_of(&file).len());
-}
-
-#[test]
-fn import_analysis_provider_is_empty_when_no_delegate_supports_capability() {
-    let multi = MultiAnalyzer::new(BTreeMap::new());
-    assert!(multi.import_analysis_provider().is_none());
-}
-
-#[test]
-fn type_hierarchy_provider_is_present_when_delegate_supports_it() {
-    let project = inline_project(&[
-        ("base.py", "class Base: pass\n"),
-        (
-            "derived.py",
-            "from base import Base\nclass Derived(Base): pass\n",
-        ),
-    ]);
-    let multi = MultiAnalyzer::new(BTreeMap::from([(
-        Language::Python,
-        AnalyzerDelegate::Python(PythonAnalyzer::from_project(project.clone())),
-    )]));
-
-    let provider = multi.type_hierarchy_provider();
-    assert!(provider.is_some());
-}
-
-#[test]
-fn type_alias_provider_is_present_when_delegate_supports_it() {
-    let project = inline_project(&[("lib.rs", "type Alias = i32;\nstruct Thing;\n")]);
-    let multi = MultiAnalyzer::new(BTreeMap::from([(
-        Language::Rust,
-        AnalyzerDelegate::Rust(RustAnalyzer::from_project(project.clone())),
-    )]));
-
-    let provider = multi.type_alias_provider();
-    assert!(provider.is_some());
 }

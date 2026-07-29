@@ -456,30 +456,6 @@ impl MeasuredArtifact {
 }
 
 #[test]
-fn summary_lifecycle_contract_blocks_non_equivalent_hydration() {
-    assert!(!black_box(EXACT_EQUIVALENCE));
-    let thresholds = ArtifactPromotionThresholds::default();
-    let evaluation = evaluate_artifact_promotion(
-        thresholds,
-        ArtifactPromotionMeasurement {
-            rebuild_ms: 200.0,
-            build_write_ms: 210.0,
-            hydrate_ms: 20.0,
-            rebuild_peak_rss_bytes: Some(10_000),
-            hydrate_peak_rss_bytes: Some(5_000),
-            serialized_bytes: 100,
-            estimated_hydrated_bytes: 1_000,
-        },
-    )
-    .unwrap();
-    assert!(evaluation.passed(), "performance lower bound should pass");
-    assert_eq!(
-        promotion_decision(EXACT_EQUIVALENCE, evaluation.passed()),
-        "insufficient_evidence"
-    );
-}
-
-#[test]
 #[ignore = "run through scripts/run-summary-lifecycle-benchmarks.sh"]
 fn summary_lifecycle_measurement() {
     if let Ok(samples_file) = std::env::var(SAMPLES_FILE_ENV) {

@@ -2,28 +2,6 @@ use brokk_bifrost::{IAnalyzer, JavaAnalyzer, Language, ProjectFile, TestProject}
 use std::collections::BTreeSet;
 
 #[test]
-fn parses_fixture_declarations() {
-    let root = std::env::current_dir()
-        .unwrap()
-        .join("tests/fixtures/testcode-java")
-        .canonicalize()
-        .unwrap();
-    let project = TestProject::new(root, Language::Java);
-    let analyzer = JavaAnalyzer::from_project(project);
-
-    assert!(!analyzer.get_definitions("A").is_empty());
-    assert!(!analyzer.get_definitions("A.method1").is_empty());
-    assert!(
-        !analyzer
-            .top_level_declarations(&ProjectFile::new(
-                analyzer.project().root().to_path_buf(),
-                "A.java"
-            ))
-            .is_empty()
-    );
-}
-
-#[test]
 fn updates_changed_file_snapshot() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();

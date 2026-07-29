@@ -82,8 +82,6 @@ use scan_usages::{
 #[cfg(test)]
 use selectors::{DefinitionCandidateRenderCache, definition_candidate_from_range};
 #[cfg(test)]
-use sources::split_logical_lines;
-#[cfg(test)]
 use summaries::{route_summary_targets, trim_summary_signature};
 
 // Re-export the exact previous public/pub(crate) surface of `searchtools.rs`

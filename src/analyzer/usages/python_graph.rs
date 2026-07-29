@@ -17,6 +17,7 @@ use crate::analyzer::{
 };
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 pub(in crate::analyzer::usages) use extractor::{
     collect_assigned_identifiers, collect_module_binding_timeline,
@@ -49,23 +50,21 @@ where
 /// Build caller nodes for the whole Python graph while resolving only the
 /// requested callee targets. Dead-code analysis needs every declaration as a
 /// possible caller, but only inbound edges for its bounded candidate set.
-pub(crate) fn build_python_usage_edges_for_targets<F>(
+/// Build and retain the exact Python inverse graph for a stable caller domain
+/// and bounded callee target set. Bulk consumers can repeat the same query
+/// without reparsing the workspace while retaining target-gated resolution.
+pub(crate) fn build_cached_python_usage_edges_for_targets(
     analyzer: &dyn IAnalyzer,
     nodes: &HashSet<String>,
     targets: &HashSet<String>,
-    keep_file: F,
-) -> Option<UsageEdges>
-where
-    F: Fn(&ProjectFile) -> bool + Sync,
-{
-    let resolver = PythonEdgeResolver::try_new(analyzer)?;
-    Some(inverted::build_python_edges(
-        analyzer,
-        resolver.py,
-        nodes,
-        targets,
-        keep_file,
-    ))
+) -> Option<Arc<UsageEdges>> {
+    let py = resolve_analyzer::<PythonAnalyzer>(analyzer)?;
+    let edges = py.usage_edges_for_targets(nodes, targets, || {
+        let resolver = PythonEdgeResolver::try_new(analyzer)
+            .expect("resolved Python analyzer must construct a Python edge resolver");
+        inverted::build_python_edges(analyzer, resolver.py, nodes, targets, |_| true)
+    });
+    Some(edges)
 }
 
 pub(crate) fn build_python_usage_edge_weights<F>(

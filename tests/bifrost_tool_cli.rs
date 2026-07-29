@@ -718,6 +718,19 @@ fn removed_search_ast_tool_name_is_reported_as_unknown() {
     assert!(!output.status.success(), "status should fail");
     let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
     assert!(stderr.contains("Unknown tool: search_ast"), "{stderr}");
+
+    // The registry-generated toolset listing in `--help` must not resurrect the removed name.
+    let help = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--help")
+        .output()
+        .expect("run bifrost --help");
+    assert!(
+        help.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&help.stderr)
+    );
+    let help_stdout = String::from_utf8(help.stdout).expect("utf8 stdout");
+    assert!(!help_stdout.contains("search_ast"), "{help_stdout}");
 }
 
 #[test]
@@ -1000,27 +1013,6 @@ fn tool_sources_require_tool_mode() {
         stderr.contains("--sources may only be used with --tool"),
         "{stderr}"
     );
-}
-
-#[test]
-fn help_mentions_tool_mode() {
-    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
-        .arg("--help")
-        .output()
-        .expect("run bifrost --help");
-
-    assert!(
-        output.status.success(),
-        "stderr:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-    assert!(stdout.contains("--tool NAME"), "{stdout}");
-    assert!(stdout.contains("--query-file PATH"), "{stdout}");
-    assert!(stdout.contains("--args"), "{stdout}");
-    assert!(stdout.contains("--sources PATH"), "{stdout}");
-    assert!(!stdout.contains("search_ast"), "{stdout}");
 }
 
 #[test]

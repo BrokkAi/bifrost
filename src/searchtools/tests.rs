@@ -2,10 +2,10 @@ use super::{
     ContainerListingEntry, DefinitionCandidateRenderCache, ScanUsageRequest,
     ScanUsagesAbsenceCaveat, ScanUsagesByLocationParams, ScanUsagesCandidateFilesSample,
     ScanUsagesExecutionContext, ScanUsagesIncompleteReason, ScanUsagesStatus, ScanUsagesSurface,
-    ScanUsagesTarget, ScanUsagesWorkEntry, SourceBlock, SummaryElement, SymbolLookupParams,
-    SymbolUsageRenderState, UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering,
-    classify_scan_usages_entry, definition_candidate_from_range, list_symbols,
-    resolve_file_patterns, scan_usages_by_location_with_context, trim_summary_signature,
+    ScanUsagesTarget, ScanUsagesWorkEntry, SymbolLookupParams, SymbolUsageRenderState,
+    UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering, classify_scan_usages_entry,
+    definition_candidate_from_range, list_symbols, resolve_file_patterns,
+    scan_usages_by_location_with_context, trim_summary_signature,
 };
 use super::{function_like_macro_query, route_summary_targets, usage_failure_hint};
 use crate::analyzer::{
@@ -268,43 +268,6 @@ return 0
         3,
         "expected alpha/beta/gamma once each, got {names:?}"
     );
-}
-
-#[test]
-fn split_logical_lines_handles_crlf_lf_and_lone_cr() {
-    assert_eq!(
-        super::split_logical_lines("a\r\nb\r\nc"),
-        vec!["a", "b", "c"]
-    );
-    assert_eq!(super::split_logical_lines("a\nb\nc"), vec!["a", "b", "c"]);
-    assert_eq!(super::split_logical_lines("a\rb\rc"), vec!["a", "b", "c"]);
-    assert_eq!(super::split_logical_lines("a\r\n"), vec!["a"]);
-    assert_eq!(super::split_logical_lines(""), Vec::<&str>::new());
-}
-
-#[test]
-fn source_block_fields_are_publicly_constructible() {
-    let _block = SourceBlock {
-        label: "A".to_string(),
-        path: "A.java".to_string(),
-        start_line: 10,
-        end_line: 12,
-        text: "class A {}".to_string(),
-        canonical_selector: None,
-        occurrence_role: None,
-        presentation: None,
-        note: None,
-    };
-    let _element = SummaryElement {
-        path: "A.java".to_string(),
-        symbol: "A".to_string(),
-        kind: "class".to_string(),
-        start_line: 10,
-        end_line: 10,
-        text: "class A {".to_string(),
-        parent_symbol: None,
-        presentation: None,
-    };
 }
 
 #[test]

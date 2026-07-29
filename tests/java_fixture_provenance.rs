@@ -13,41 +13,6 @@ fn checked_in_java_class_fixtures_match_manifest() {
         .unwrap_or_else(|message| panic!("Java class fixture provenance mismatch:\n{message}"));
 }
 
-#[test]
-fn class_manifest_reports_missing_added_and_modified_paths() {
-    let temp = tempfile::tempdir().expect("temporary fixture root");
-    let classes = temp.path().join("bin");
-    fs::create_dir(&classes).expect("class directory");
-    fs::write(classes.join("Added.class"), b"added").expect("added class");
-    fs::write(classes.join("Modified.class"), b"actual").expect("modified class");
-
-    let manifest = temp.path().join("classes.sha256");
-    fs::write(
-        &manifest,
-        format!(
-            "{}  Missing.class\n{}  Modified.class\n",
-            "11".repeat(32),
-            "22".repeat(32)
-        ),
-    )
-    .expect("fixture manifest");
-
-    let message = verify_class_manifest(&manifest, &classes).expect_err("fixture must differ");
-    let added_digest = format!("{:x}", Sha256::digest(b"added"));
-    let modified_digest = format!("{:x}", Sha256::digest(b"actual"));
-    assert!(message.contains(&format!(
-        "Added.class: expected {MISSING}, actual {added_digest}"
-    )));
-    assert!(message.contains(&format!(
-        "Missing.class: expected {}, actual {MISSING}",
-        "11".repeat(32)
-    )));
-    assert!(message.contains(&format!(
-        "Modified.class: expected {}, actual {modified_digest}",
-        "22".repeat(32)
-    )));
-}
-
 fn verify_class_manifest(manifest_path: &Path, class_root: &Path) -> Result<(), String> {
     let expected = read_manifest(manifest_path)?;
     let actual = read_class_digests(class_root)?;

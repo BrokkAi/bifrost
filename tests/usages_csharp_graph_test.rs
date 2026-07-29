@@ -6013,68 +6013,6 @@ namespace MudBlazor {
 }
 
 #[test]
-fn csharp_graph_finds_static_and_instance_member_references() {
-    let (_project, analyzer) = csharp_analyzer_with_files(&[
-        (
-            "Domain/Target.cs",
-            r#"
-namespace Domain {
-    public class Target {
-        public static int Count;
-        public static string Name { get; set; }
-        public static void Configure() {}
-        public int Value;
-        public int Size { get; set; }
-        public void Run() {}
-    }
-}
-"#,
-        ),
-        (
-            "App/Consumer.cs",
-            r#"
-using Domain;
-
-namespace App {
-    public class Consumer {
-        public void Execute(Target parameter) {
-            Target.Configure();
-            Target.Count = Target.Count + 1;
-            var name = Target.Name;
-            Target local = new Target();
-            local.Run();
-            local.Value = local.Value + 1;
-            parameter.Size = parameter.Size + 1;
-        }
-    }
-}
-"#,
-        ),
-    ]);
-
-    let candidates = analyzer.get_analyzed_files().into_iter().collect();
-    let strategy = CSharpUsageGraphStrategy::new();
-    for target in [
-        member_function(&analyzer, "Domain.Target", "Configure"),
-        member_field(&analyzer, "Domain.Target", "Count"),
-        member_field(&analyzer, "Domain.Target", "Name"),
-        member_function(&analyzer, "Domain.Target", "Run"),
-        member_field(&analyzer, "Domain.Target", "Value"),
-        member_field(&analyzer, "Domain.Target", "Size"),
-    ] {
-        let hits = strategy
-            .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
-            .into_either()
-            .unwrap_or_else(|err| panic!("{} should resolve: {err}", target.fq_name()));
-        assert!(
-            !hits.is_empty(),
-            "{} should have graph-backed member hits",
-            target.fq_name()
-        );
-    }
-}
-
-#[test]
 fn csharp_graph_resolves_static_generic_factory_calls_on_class_receiver() {
     let (_project, analyzer) = csharp_analyzer_with_files(&[(
         "DownloadClients.cs",

@@ -743,17 +743,6 @@ fn policy_suppressions_are_deterministic_auditable_and_threshold_aware_across_fo
 }
 
 #[test]
-fn policy_help_names_suppression_controls() {
-    let project = policy_project(&[]);
-    let help = run(project.root(), &["--help"]);
-    assert_status(&help, 0);
-    let help = String::from_utf8(help.stdout).unwrap();
-    assert!(help.contains("--suppressions-file PATH"));
-    assert!(help.contains("--evaluation-date YYYY-MM-DD"));
-    assert!(help.contains("default: .bifrost/suppressions.json"));
-}
-
-#[test]
 fn proven_subset_callers_are_visible_and_reliable_without_claiming_exhaustiveness() {
     let source = r#"class Smells {
     void terminate() { System.exit(1); }

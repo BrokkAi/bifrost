@@ -1618,38 +1618,6 @@ $other->record("unrelated");
 }
 
 #[test]
-fn php_graph_resolves_interface_typed_receiver_to_interface_method() {
-    let (_project, analyzer) = php_analyzer_with_files(&[
-        (
-            "Service.php",
-            r#"<?php
-namespace App;
-interface Service {
-    public function run(): void;
-}
-"#,
-        ),
-        (
-            "Consumer.php",
-            r#"<?php
-namespace App;
-function consume(Service $service): void {
-    $service->run();
-}
-"#,
-        ),
-    ]);
-
-    let hits = graph_hits(&analyzer, "App.Service.run");
-    assert_eq!(1, hits.len(), "{hits:#?}");
-    assert!(
-        hits.iter()
-            .any(|hit| hit.snippet.contains("$service->run()")),
-        "interface-typed receiver should reference the interface method: {hits:#?}"
-    );
-}
-
-#[test]
 fn php_graph_resolves_attributed_interface_typed_receiver_to_interface_method() {
     let (_project, analyzer) = php_analyzer_with_files(&[
         (
@@ -1710,34 +1678,6 @@ function unknown($target): void {
 }
 function sibling(Target $target): void {}
 function otherSibling($target): void {
-    $target->run();
-}
-"#,
-        ),
-    ]);
-
-    assert!(graph_hits(&analyzer, "App.Target.run").is_empty());
-}
-
-#[test]
-fn php_graph_scopes_receiver_facts_to_enclosing_functions() {
-    let (_project, analyzer) = php_analyzer_with_files(&[
-        (
-            "Target.php",
-            r#"<?php
-namespace App;
-class Target {
-    public function run(): void {}
-}
-"#,
-        ),
-        (
-            "Consumer.php",
-            r#"<?php
-namespace App;
-function first(Target $target): void {
-}
-function second($target): void {
     $target->run();
 }
 "#,

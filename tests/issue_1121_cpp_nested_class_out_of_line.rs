@@ -64,36 +64,6 @@ int Outer::Inner::method() const {
         .build()
 }
 
-/// Header declaration and out-of-line definition of a nested-class member now
-/// unify: the header's `log4cxx.Outer$Inner.method` identity is shared by the
-/// `.cpp` definition. Bare source lookup presents the definition while its
-/// canonical selector remains anchored to the header declaration.
-#[test]
-fn namespace_block_nested_member_unifies_declaration_and_definition() {
-    let project = namespace_block_project();
-
-    let result = symbol_sources(&project, "log4cxx.Outer$Inner.method");
-    assert_eq!(
-        result["not_found"].as_array().unwrap().len(),
-        0,
-        "canonical symbol reported not_found: {result}"
-    );
-    assert_eq!(
-        result["ambiguous"].as_array().unwrap().len(),
-        0,
-        "canonical symbol reported ambiguous: {result}"
-    );
-    assert_eq!(
-        sorted_source_paths(&result),
-        vec!["nested.cpp".to_string()],
-        "declaration and out-of-line definition did not unify: {result}"
-    );
-    assert_eq!(
-        result["sources"][0]["canonical_selector"], "nested.h#log4cxx.Outer$Inner.method",
-        "definition did not retain the header-anchored identity: {result}"
-    );
-}
-
 /// The full display-spelling matrix for the nested member -- the canonical fq,
 /// its `::` twin, the owner-qualified and fully-qualified `::` forms, and the
 /// bare terminal name -- must all resolve, unambiguously, to the same

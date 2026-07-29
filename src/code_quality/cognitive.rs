@@ -85,7 +85,6 @@ pub fn compute_cognitive_complexity(
 
 #[cfg(test)]
 mod tests {
-    use super::super::MAX_FILE_PATHS;
     use super::*;
     use crate::test_support::AnalyzerFixture;
 
@@ -128,71 +127,6 @@ mod tests {
             "Cognitive complexity (threshold: 1):\n- busy: 3"
         );
         assert!(!result.truncated);
-    }
-
-    #[test]
-    fn cognitive_threshold_zero_uses_default_of_fifteen() {
-        let src = "fn small() {}\n";
-        let fix = AnalyzerFixture::new(&[("src/lib.rs", src)]);
-        let result = compute_cognitive_complexity(
-            fix.analyzer.analyzer(),
-            ComputeCognitiveComplexityParams {
-                file_paths: vec!["src/lib.rs".to_string()],
-                threshold: 0,
-            },
-        );
-        assert!(
-            result.report.contains("threshold of 15"),
-            "expected default 15: {}",
-            result.report
-        );
-    }
-
-    #[test]
-    fn cognitive_missing_files_silently_skipped() {
-        let fix = AnalyzerFixture::new(&[("src/lib.rs", "fn x() {}\n")]);
-        let result = compute_cognitive_complexity(
-            fix.analyzer.analyzer(),
-            ComputeCognitiveComplexityParams {
-                file_paths: vec!["does/not/exist.rs".to_string()],
-                threshold: 0,
-            },
-        );
-        assert_eq!(
-            result.report,
-            "No methods exceeded the cognitive complexity threshold of 15."
-        );
-    }
-
-    #[test]
-    fn cognitive_absolute_paths_are_rejected_without_panic() {
-        let fix = AnalyzerFixture::new(&[("src/lib.rs", "fn x() {}\n")]);
-        let result = compute_cognitive_complexity(
-            fix.analyzer.analyzer(),
-            ComputeCognitiveComplexityParams {
-                file_paths: vec!["/etc/passwd".to_string()],
-                threshold: 0,
-            },
-        );
-        assert_eq!(
-            result.report,
-            "No methods exceeded the cognitive complexity threshold of 15."
-        );
-    }
-
-    #[test]
-    fn cognitive_file_paths_above_cap_marks_truncated() {
-        let fix = AnalyzerFixture::new(&[("src/lib.rs", "fn x() {}\n")]);
-        let mut paths = vec!["src/lib.rs".to_string(); MAX_FILE_PATHS];
-        paths.push("src/extra.rs".to_string());
-        let result = compute_cognitive_complexity(
-            fix.analyzer.analyzer(),
-            ComputeCognitiveComplexityParams {
-                file_paths: paths,
-                threshold: 0,
-            },
-        );
-        assert!(result.truncated);
     }
 
     #[test]

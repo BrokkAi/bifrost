@@ -6,7 +6,7 @@ use brokk_bifrost::usages::{
     UsageFinder,
 };
 use brokk_bifrost::{CodeUnit, IAnalyzer, PythonAnalyzer};
-use common::py_fixture_project;
+use common::{InlineTestProject, py_fixture_project};
 
 fn fixture_analyzer() -> PythonAnalyzer {
     PythonAnalyzer::from_project(py_fixture_project())
@@ -87,4 +87,32 @@ fn empty_overloads_yields_empty_success() {
         }
         other => panic!("expected empty Success, got {other:?}"),
     }
+}
+
+#[test]
+fn usage_finder_finds_cross_package_python_method_importers() {
+    let project = InlineTestProject::with_language(brokk_bifrost::Language::Python)
+        .file("pkg/__init__.py", "")
+        .file(
+            "pkg/api.py",
+            "class Command:\n    def main(self):\n        return 0\n",
+        )
+        .file(
+            "app.py",
+            "from pkg.api import Command\n\ncommand = Command()\ncommand.main()\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::new(project.project_dyn());
+    let target = definition(&analyzer, "pkg.api.Command.main");
+
+    let hits = analyzer
+        .find_usages(&[target])
+        .into_either()
+        .expect("Python usage query should succeed");
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file.rel_path() == std::path::Path::new("app.py")),
+        "structured Python importer candidates must retain the cross-package method call"
+    );
 }

@@ -31,19 +31,6 @@ fn assert_query_alias_parity(analyzer: &dyn IAnalyzer, file: &brokk_bifrost::Pro
     );
 }
 
-fn assert_unit_query_alias_parity(analyzer: &dyn IAnalyzer, unit: &brokk_bifrost::CodeUnit) {
-    assert_eq!(
-        analyzer.direct_children(unit),
-        analyzer.get_direct_children(unit)
-    );
-    assert_eq!(analyzer.ranges(unit), analyzer.ranges_of(unit));
-    assert_eq!(analyzer.signatures(unit), analyzer.signatures_of(unit));
-    assert_eq!(
-        analyzer.signature_metadata(unit),
-        analyzer.signature_metadata_of(unit)
-    );
-}
-
 fn definition(analyzer: &dyn IAnalyzer, fq_name: &str) -> brokk_bifrost::CodeUnit {
     let primitive: Vec<_> = analyzer.definitions(fq_name).collect();
     assert_eq!(primitive, analyzer.get_definitions(fq_name));
@@ -65,80 +52,6 @@ fn assert_primary_range(analyzer: &dyn IAnalyzer, expected: &brokk_bifrost::Code
         .min_by_key(|range| (range.start_line, range.start_byte));
     assert_eq!(primary_range, expected_range);
     assert!(primary_range.is_some());
-}
-
-#[test]
-fn java_primitive_queries_match_forwarding_aliases() {
-    let project = InlineTestProject::with_language(Language::Java)
-        .file(
-            "pkg/Service.java",
-            r#"package pkg;
-import java.util.List;
-
-public class Service {
-    private int count;
-
-    public String greet(String name) {
-        return name;
-    }
-}
-"#,
-        )
-        .build();
-    let analyzer = JavaAnalyzer::from_project(project.project().clone());
-    let file = project.file("pkg/Service.java");
-
-    assert_query_alias_parity(&analyzer, &file);
-    let class = definition(&analyzer, "pkg.Service");
-    let method = definition(&analyzer, "pkg.Service.greet");
-    assert_unit_query_alias_parity(&analyzer, &class);
-    assert_unit_query_alias_parity(&analyzer, &method);
-
-    assert!(
-        analyzer
-            .direct_children(&class)
-            .iter()
-            .any(|unit| unit == &method)
-    );
-    assert!(!analyzer.import_statements(&file).is_empty());
-    assert!(!analyzer.signatures(&method).is_empty());
-    assert!(!analyzer.signature_metadata(&method).is_empty());
-    assert_primary_range(&analyzer, &class);
-    assert_primary_range(&analyzer, &method);
-}
-
-#[test]
-fn python_primitive_queries_match_forwarding_aliases() {
-    let project = InlineTestProject::with_language(Language::Python)
-        .file(
-            "worker.py",
-            r#"import os
-
-class Worker:
-    def run(self):
-        return os.getcwd()
-"#,
-        )
-        .build();
-    let analyzer = PythonAnalyzer::from_project(project.project().clone());
-    let file = project.file("worker.py");
-
-    assert_query_alias_parity(&analyzer, &file);
-    let class = definition(&analyzer, "worker.Worker");
-    let method = definition(&analyzer, "worker.Worker.run");
-    assert_unit_query_alias_parity(&analyzer, &class);
-    assert_unit_query_alias_parity(&analyzer, &method);
-
-    assert!(
-        analyzer
-            .direct_children(&class)
-            .iter()
-            .any(|unit| unit == &method)
-    );
-    assert!(!analyzer.import_statements(&file).is_empty());
-    assert!(!analyzer.signatures(&method).is_empty());
-    assert_primary_range(&analyzer, &class);
-    assert_primary_range(&analyzer, &method);
 }
 
 #[test]

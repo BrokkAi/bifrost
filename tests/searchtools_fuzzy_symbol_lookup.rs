@@ -211,46 +211,6 @@ fn scala_case_class_and_companion_in_object_index_under_the_object() {
 }
 
 #[test]
-fn javascript_double_sigil_names_are_searchable() {
-    // http4s Message.EntityStreamException shape: case class + companion
-    // inside an object — the import path `org.http4s.Message.EntityStreamException`
-    // must find the case class.
-    let project = InlineTestProject::with_language(Language::Scala)
-        .file(
-            "src/Message.scala",
-            "package org.http4s\n\ntrait Message\n\nobject Message {\n  final case class EntityStreamException(msg: String) extends Exception(msg)\n\n  object EntityStreamException {\n    def createWithDefaultMsg(maxBytes: Long): EntityStreamException = ???\n  }\n}\n",
-        )
-        .build();
-    let analyzer = ScalaAnalyzer::from_project(project.project().clone());
-
-    let search = search_symbols(
-        &analyzer,
-        SearchSymbolsParams {
-            patterns: vec!["EntityStreamException".to_string()],
-            include_tests: true,
-            limit: 20,
-        },
-    );
-    let symbols: Vec<String> = search
-        .files
-        .iter()
-        .flat_map(|file| {
-            file.classes
-                .iter()
-                .chain(file.functions.iter())
-                .chain(file.fields.iter())
-                .map(|hit| hit.symbol.clone())
-        })
-        .collect();
-    assert!(
-        symbols
-            .iter()
-            .any(|symbol| symbol == "org.http4s.Message.EntityStreamException"),
-        "case class must be indexed under the natural import path: {symbols:?}"
-    );
-}
-
-#[test]
 fn typescript_constructor_assigned_field_is_indexed_and_searchable() {
     // Mirrors the JavaScript constructor-field pass: without it, TS
     // constructor-assigned properties resolve in scan_usages but are
@@ -1705,6 +1665,103 @@ const char* ffDetectBootmgr(FFBootmgrResult* result) {
             .contains("return \"iBoot\";"),
         "{function_source:#?}"
     );
+}
+
+#[test]
+fn cpp_macro_opened_namespace_keeps_vformat_overloads_selectable_by_short_name() {
+    // fmt opens its public namespace through this macro in every header. The
+    // parser deliberately indexes the declarations without preprocessing, so
+    // their identity must still preserve the distinct structured signatures.
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "include/fmt/base.h",
+            r#"#define FMT_BEGIN_NAMESPACE namespace fmt { inline namespace v12 {
+#define FMT_END_NAMESPACE } }
+FMT_BEGIN_NAMESPACE
+namespace detail {
+void vformat_to(int&, int, int);
+}
+FMT_END_NAMESPACE
+"#,
+        )
+        .file(
+            "include/fmt/format.h",
+            r#"#include "base.h"
+FMT_BEGIN_NAMESPACE
+inline auto vformat(int locale, int format, int args) -> int { return locale + format + args; }
+int vformat(int format, int args);
+FMT_END_NAMESPACE
+"#,
+        )
+        .file(
+            "include/fmt/color.h",
+            r#"#include "base.h"
+FMT_BEGIN_NAMESPACE
+inline auto vformat(int style, int format, int args, int color) -> int {
+  return style + format + args + color;
+}
+FMT_END_NAMESPACE
+"#,
+        )
+        .file(
+            "include/fmt/format-inl.h",
+            r#"#include "base.h"
+FMT_BEGIN_NAMESPACE
+int vformat(int format, int args) { return format + args; }
+FMT_END_NAMESPACE
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+
+    let locations = get_symbol_locations(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["vformat".to_string()],
+        },
+    );
+    assert!(locations.not_found.is_empty(), "{locations:#?}");
+    assert!(
+        locations
+            .locations
+            .iter()
+            .any(|location| location.path == "include/fmt/format.h"),
+        "{locations:#?}"
+    );
+    assert!(
+        locations
+            .locations
+            .iter()
+            .any(|location| location.path == "include/fmt/color.h"),
+        "{locations:#?}"
+    );
+    let namespace_near_miss = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "src/namespaces.cpp",
+            r#"namespace alpha { int vformat(int value) { return value; } }
+namespace beta { int vformat(int value) { return value + 1; } }
+"#,
+        )
+        .build();
+    let namespace_analyzer = CppAnalyzer::from_project(namespace_near_miss.project().clone());
+    let bare_near_miss = get_symbol_locations(
+        &namespace_analyzer,
+        SymbolLookupParams {
+            symbols: vec!["vformat".to_string()],
+        },
+    );
+    assert!(bare_near_miss.locations.is_empty(), "{bare_near_miss:#?}");
+    assert_eq!(1, bare_near_miss.not_found.len(), "{bare_near_miss:#?}");
+
+    let alpha = get_symbol_locations(
+        &namespace_analyzer,
+        SymbolLookupParams {
+            symbols: vec!["alpha::vformat".to_string()],
+        },
+    );
+    assert!(alpha.not_found.is_empty(), "{alpha:#?}");
+    assert_eq!(1, alpha.locations.len(), "{alpha:#?}");
+    assert_eq!("src/namespaces.cpp", alpha.locations[0].path);
 }
 
 #[test]
