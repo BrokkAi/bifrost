@@ -62,12 +62,13 @@ where
     let files: Vec<ProjectFile> = rust.get_analyzed_files().into_iter().collect();
     let support = analyzer.global_usage_definition_index();
     let language = tree_sitter_rust::LANGUAGE.into();
+    let keep_file = &keep_file;
     build_edge_output(&files, keep_file, |file| {
+        let refs = rust.reference_context_of_with_progress(file, &|| keep_file(file))?;
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             // One shared, cached per-file resolution context. Both this inverted
             // builder and (from Phase 1b) the forward scan resolve references
             // through it, so the two paths can't drift.
-            let refs = rust.reference_context_of(file);
             let factory_returns = collect_factory_return_types(
                 parsed.tree.root_node(),
                 parsed.source.as_str(),
@@ -98,7 +99,9 @@ where
                 collector,
             };
             let mut scopes: Vec<ScopeFacts> = Vec::new();
-            walk(parsed.tree.root_node(), &mut ctx, &mut scopes);
+            walk(parsed.tree.root_node(), &mut ctx, &mut scopes, &|| {
+                keep_file(file)
+            });
         })
     })
 }
@@ -564,49 +567,63 @@ struct ScopeFacts {
     receiver_types: HashMap<String, String>,
 }
 
-fn walk(node: Node<'_>, ctx: &mut RustScan<'_, '_>, scopes: &mut Vec<ScopeFacts>) {
-    let mut state = RustWalkState { ctx, scopes };
+fn walk(
+    node: Node<'_>,
+    ctx: &mut RustScan<'_, '_>,
+    scopes: &mut Vec<ScopeFacts>,
+    progress: &dyn Fn() -> bool,
+) {
+    let mut state = RustWalkState {
+        ctx,
+        scopes,
+        progress,
+    };
     walk_tree_iterative(
         node,
         &mut state,
-        |node, state| match node.kind() {
-            "use_declaration" => {
-                handle_use_declaration(node, state.ctx);
-                TreeWalkAction::Skip
+        |node, state| {
+            if !(state.progress)() {
+                return TreeWalkAction::Stop;
             }
-            // A function or closure opens a parameter scope. `let` bindings
-            // are seeded incrementally when traversal reaches them so later
-            // shadowing cannot type earlier receiver calls.
-            "function_item" | "closure_expression" => {
-                let facts = collect_parameter_scope_facts(node, state.ctx);
-                state.scopes.push(facts);
-                TreeWalkAction::DescendWithExit
+            match node.kind() {
+                "use_declaration" => {
+                    handle_use_declaration(node, state.ctx);
+                    TreeWalkAction::Skip
+                }
+                // A function or closure opens a parameter scope. `let` bindings
+                // are seeded incrementally when traversal reaches them so later
+                // shadowing cannot type earlier receiver calls.
+                "function_item" | "closure_expression" => {
+                    let facts = collect_parameter_scope_facts(node, state.ctx);
+                    state.scopes.push(facts);
+                    TreeWalkAction::DescendWithExit
+                }
+                "block" => {
+                    state.scopes.push(ScopeFacts::default());
+                    TreeWalkAction::DescendWithExit
+                }
+                "let_declaration" => {
+                    handle_let_declaration(node, state.ctx, state.scopes);
+                    TreeWalkAction::Descend
+                }
+                "call_expression" => {
+                    handle_method_call(node, state.ctx, state.scopes);
+                    TreeWalkAction::Descend
+                }
+                "token_tree" => {
+                    handle_token_tree_paths(node, state.ctx);
+                    TreeWalkAction::Descend
+                }
+                "identifier" | "type_identifier" => {
+                    handle_identifier(node, state.ctx, state.scopes);
+                    TreeWalkAction::Descend
+                }
+                "scoped_identifier" | "scoped_type_identifier" => {
+                    handle_scoped(node, state.ctx, state.scopes);
+                    TreeWalkAction::Descend
+                }
+                _ => TreeWalkAction::Descend,
             }
-            "block" => {
-                state.scopes.push(ScopeFacts::default());
-                TreeWalkAction::DescendWithExit
-            }
-            "let_declaration" => {
-                handle_let_declaration(node, state.ctx, state.scopes);
-                TreeWalkAction::Descend
-            }
-            "call_expression" => {
-                handle_method_call(node, state.ctx, state.scopes);
-                TreeWalkAction::Descend
-            }
-            "token_tree" => {
-                handle_token_tree_paths(node, state.ctx);
-                TreeWalkAction::Descend
-            }
-            "identifier" | "type_identifier" => {
-                handle_identifier(node, state.ctx, state.scopes);
-                TreeWalkAction::Descend
-            }
-            "scoped_identifier" | "scoped_type_identifier" => {
-                handle_scoped(node, state.ctx, state.scopes);
-                TreeWalkAction::Descend
-            }
-            _ => TreeWalkAction::Descend,
         },
         |state| {
             state.scopes.pop();
@@ -614,9 +631,10 @@ fn walk(node: Node<'_>, ctx: &mut RustScan<'_, '_>, scopes: &mut Vec<ScopeFacts>
     );
 }
 
-struct RustWalkState<'a, 'b, 'c> {
+struct RustWalkState<'a, 'b, 'c, 'd> {
     ctx: &'a mut RustScan<'b, 'c>,
     scopes: &'a mut Vec<ScopeFacts>,
+    progress: &'d dyn Fn() -> bool,
 }
 
 fn is_shadowed(scopes: &[ScopeFacts], name: &str) -> bool {

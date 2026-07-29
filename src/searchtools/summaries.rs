@@ -764,8 +764,19 @@ pub fn most_relevant_files(
     analyzer: &dyn IAnalyzer,
     params: MostRelevantFilesParams,
 ) -> Result<MostRelevantFilesResult, String> {
+    most_relevant_files_with_cancellation(analyzer, params, &crate::CancellationToken::default())
+}
+
+pub(crate) fn most_relevant_files_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    params: MostRelevantFilesParams,
+    cancellation: &crate::CancellationToken,
+) -> Result<MostRelevantFilesResult, String> {
     let _scope = profiling::scope("searchtools::most_relevant_files");
     validate_most_relevant_files_params(&params)?;
+    if cancellation.is_cancelled() {
+        return Err(most_relevant_files_cancellation_message(cancellation));
+    }
     let resolver = WorkspaceFileResolver::new(analyzer.project());
     let mut seeds = Vec::new();
     let mut not_found = Vec::new();
@@ -781,6 +792,9 @@ pub fn most_relevant_files(
     {
         let _scope = profiling::scope("searchtools::most_relevant_files.resolve_seeds");
         for (input, weight) in params.seed_file_paths.into_iter().zip(seed_weights) {
+            if cancellation.is_cancelled() {
+                return Err(most_relevant_files_cancellation_message(cancellation));
+            }
             let trimmed = input.trim();
             if trimmed.is_empty() {
                 continue;
@@ -817,15 +831,25 @@ pub fn most_relevant_files(
         let ranked = if ranking_mode == MostRelevantFilesRankingMode::HistoryImports
             && recency_half_life == Some(DEFAULT_RECENCY_HALF_LIFE)
         {
-            most_relevant_project_files(analyzer, &seeds, params.limit)
+            let files = most_relevant_project_files(analyzer, &seeds, params.limit);
+            if cancellation.is_cancelled() {
+                return Err(most_relevant_files_cancellation_message(cancellation));
+            }
+            files
         } else {
-            most_relevant_project_files_with_ranking_mode(
+            match most_relevant_project_files_with_ranking_mode_and_cancellation(
                 analyzer,
                 &seeds,
                 params.limit,
                 recency_half_life,
                 ranking_mode,
-            )
+                cancellation,
+            ) {
+                MostRelevantProjectFilesOutcome::Complete(files) => files,
+                MostRelevantProjectFilesOutcome::Cancelled => {
+                    return Err(most_relevant_files_cancellation_message(cancellation));
+                }
+            }
         };
         ranked
             .into_iter()
@@ -839,6 +863,14 @@ pub fn most_relevant_files(
         ambiguous_paths,
         duplicates,
     })
+}
+
+fn most_relevant_files_cancellation_message(cancellation: &crate::CancellationToken) -> String {
+    if cancellation.is_timed_out() {
+        "most_relevant_files exceeded its request-wide time budget".to_string()
+    } else {
+        "most_relevant_files was cancelled".to_string()
+    }
 }
 
 pub(super) fn validate_most_relevant_files_params(
