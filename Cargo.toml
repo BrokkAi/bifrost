@@ -6,6 +6,11 @@ members = [
     "crates/bifrost-runtime",
 ]
 default-members = ["."]
+# Nested agent worktrees (.claude/worktrees/*) check out arbitrary commits --
+# including pre-workspace-split ones whose root Cargo.toml declares no
+# [workspace] and would otherwise be claimed by THIS workspace and rejected as
+# a non-member. Excluding them keeps cargo working inside every worktree.
+exclude = [".claude/worktrees/*"]
 resolver = "3"
 
 [workspace.package]
