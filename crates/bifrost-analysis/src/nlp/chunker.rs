@@ -222,14 +222,27 @@ mod tests {
     use super::*;
     use crate::analyzer::{JavaAnalyzer, Language, TestProject};
 
-    fn fixture_analyzer() -> JavaAnalyzer {
-        let root = std::env::current_dir()
-            .unwrap()
-            .join("tests/fixtures/testcode-java")
-            .canonicalize()
-            .unwrap();
-        let project = TestProject::new(root, Language::Java);
-        JavaAnalyzer::from_project(project)
+    fn fixture_analyzer() -> (tempfile::TempDir, JavaAnalyzer) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = ProjectFile::new(root.clone(), std::path::PathBuf::from("A.java"));
+        file.write(
+            r#"public class A {
+    void method1() {}
+
+    public String method2(String input) {
+        return input;
+    }
+
+    public String method2(String input, int otherInput) {
+        return input + otherInput;
+    }
+}
+"#,
+        )
+        .unwrap();
+        let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
+        (temp, analyzer)
     }
 
     fn word_count(text: &str) -> usize {
@@ -247,7 +260,7 @@ mod tests {
 
     #[test]
     fn extracts_summary_and_function_chunks() {
-        let analyzer = fixture_analyzer();
+        let (_temp, analyzer) = fixture_analyzer();
         let result = chunks_for(&analyzer, "A.java");
 
         let summary = &result.chunks[0];
@@ -275,7 +288,7 @@ mod tests {
 
     #[test]
     fn function_chunks_are_ordered_and_deduped() {
-        let analyzer = fixture_analyzer();
+        let (_temp, analyzer) = fixture_analyzer();
         let result = chunks_for(&analyzer, "A.java");
         let lines: Vec<i64> = result
             .chunks
