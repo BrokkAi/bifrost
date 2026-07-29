@@ -1024,7 +1024,7 @@ pub(crate) fn is_infix_type_operator_reference(node: Node<'_>) -> bool {
 pub(crate) fn is_scala_object_reference(node: Node<'_>) -> bool {
     is_singleton_type_reference(node)
         || is_stable_type_qualifier(node)
-        || qualified_stable_type_expression_role(node).is_some_and(|(_, _, role)| {
+        || qualified_stable_type_expression_shape_role(node).is_some_and(|role| {
             matches!(
                 role,
                 ScalaQualifiedStableTypeRole::Apply | ScalaQualifiedStableTypeRole::Extractor
@@ -1034,6 +1034,58 @@ pub(crate) fn is_scala_object_reference(node: Node<'_>) -> bool {
         || is_infix_pattern_operator(node)
         || is_field_expression_value(node)
         || is_bare_term_reference(node)
+}
+
+fn qualified_stable_type_expression_shape_role(
+    node: Node<'_>,
+) -> Option<ScalaQualifiedStableTypeRole> {
+    let mut stable = node.parent()?;
+    if stable.kind() != "stable_type_identifier" {
+        return None;
+    }
+    let mut cursor = stable.walk();
+    if stable.named_children(&mut cursor).last() != Some(node) {
+        return None;
+    }
+    while let Some(parent) = stable
+        .parent()
+        .filter(|parent| parent.kind() == "stable_type_identifier")
+    {
+        let mut cursor = parent.walk();
+        if parent.named_children(&mut cursor).last() != Some(stable) {
+            break;
+        }
+        stable = parent;
+    }
+    let mut expression = stable;
+    while let Some(parent) = expression.parent().filter(|parent| {
+        matches!(
+            parent.kind(),
+            "generic_type" | "applied_constructor_type" | "annotated_type" | "type"
+        )
+    }) {
+        expression = parent;
+    }
+    Some(
+        expression
+            .parent()
+            .map(|parent| {
+                if parent.kind() == "call_expression"
+                    && parent.child_by_field_name("function") == Some(expression)
+                {
+                    ScalaQualifiedStableTypeRole::Apply
+                } else if parent.kind() == "case_class_pattern"
+                    && parent.child_by_field_name("type") == Some(expression)
+                {
+                    ScalaQualifiedStableTypeRole::Extractor
+                } else if parent.kind() == "instance_expression" {
+                    ScalaQualifiedStableTypeRole::Constructor
+                } else {
+                    ScalaQualifiedStableTypeRole::Type
+                }
+            })
+            .unwrap_or(ScalaQualifiedStableTypeRole::Type),
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1054,12 +1106,13 @@ pub(crate) fn qualified_stable_type_reference<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<ScalaQualifiedStableTypeReference<'tree>> {
-    let (expression, role, segments) =
-        if let Some((stable, expression, role)) = qualified_stable_type_expression_role(node) {
-            (expression, role, scala_type_lookup_segments(stable, source))
-        } else {
-            qualified_stable_term_application(node, source)?
-        };
+    let (expression, role, segments) = if let Some((expression, role, segments)) =
+        qualified_stable_type_expression_role(node, source)
+    {
+        (expression, role, segments)
+    } else {
+        qualified_stable_term_application(node, source)?
+    };
     if segments.len() <= 1 {
         return None;
     }
@@ -1115,28 +1168,39 @@ fn qualified_stable_term_application<'tree>(
     Some((expression, ScalaQualifiedStableTypeRole::Apply, segments))
 }
 
-fn qualified_stable_type_expression_role(
-    node: Node<'_>,
-) -> Option<(Node<'_>, Node<'_>, ScalaQualifiedStableTypeRole)> {
-    let mut stable = node.parent()?;
-    if stable.kind() != "stable_type_identifier" {
-        return None;
-    }
-    let mut cursor = stable.walk();
-    if stable.named_children(&mut cursor).last() != Some(node) {
-        return None;
-    }
-    while let Some(parent) = stable
+fn qualified_stable_type_expression_role<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<(Node<'tree>, ScalaQualifiedStableTypeRole, Vec<String>)> {
+    let mut expression;
+    let segments = if let Some(mut stable) = node
         .parent()
         .filter(|parent| parent.kind() == "stable_type_identifier")
     {
-        let mut cursor = parent.walk();
-        if parent.named_children(&mut cursor).last() != Some(stable) {
-            break;
+        let mut cursor = stable.walk();
+        if stable.named_children(&mut cursor).last() != Some(node) {
+            return None;
         }
-        stable = parent;
-    }
-    let mut expression = stable;
+        while let Some(parent) = stable
+            .parent()
+            .filter(|parent| parent.kind() == "stable_type_identifier")
+        {
+            let mut cursor = parent.walk();
+            if parent.named_children(&mut cursor).last() != Some(stable) {
+                break;
+            }
+            stable = parent;
+        }
+        expression = stable;
+        scala_type_lookup_segments(stable, source)
+    } else {
+        let stable = node
+            .parent()
+            .filter(|parent| parent.kind() == "stable_identifier")?;
+        let reference = stable_identifier_reference(node, source)?;
+        expression = stable;
+        reference.segments
+    };
     while let Some(parent) = expression.parent().filter(|parent| {
         matches!(
             parent.kind(),
@@ -1163,7 +1227,7 @@ fn qualified_stable_type_expression_role(
             }
         })
         .unwrap_or(ScalaQualifiedStableTypeRole::Type);
-    Some((stable, expression, role))
+    Some((expression, role, segments))
 }
 
 pub(crate) fn is_scala_class_reference(node: Node<'_>, source: &str) -> bool {

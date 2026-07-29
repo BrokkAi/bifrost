@@ -2226,18 +2226,24 @@ object Method {
 
 import model.Method
 
-object Methods {
-  val head: Method.HEAD.type = Method.HEAD // positive-singleton-head
+trait Methods {
+  val HEAD: Method.HEAD.type = Method.HEAD // positive-singleton-head
 }
 "#;
     let route_source = r#"package app
 
 import model.Method
 
-object Route {
-  def select(method: Method, optionsRoot: AnyRef): Method = method match {
-    case Method.OPTIONS if optionsRoot != null => Method.OPTIONS // positive-qualified-options
-    case _ => Method.PATCH // positive-qualified-patch
+sealed trait RoutePattern
+object RoutePattern {
+  def fromMethod(method: Method): RoutePattern = Tree(method)
+  val OPTIONS: RoutePattern = fromMethod(Method.OPTIONS)
+
+  private final case class Tree(method: Method) extends RoutePattern {
+    def select(optionsRoot: AnyRef): Method = method match {
+      case Method.OPTIONS if optionsRoot != null => Method.OPTIONS // positive-qualified-options
+      case _ => Method.PATCH // positive-qualified-patch
+    }
   }
 }
 "#;
@@ -2292,7 +2298,7 @@ object Use {
             "positive-singleton-head",
             "negative-type-decoy-head",
             "dsl/Methods.scala",
-            exact_segment(dsl_source, "Method.HEAD.type", "HEAD"),
+            exact_segment(dsl_source, "Method.HEAD.type = Method.HEAD", "HEAD"),
         ),
         (
             "model.Method$.OPTIONS$",
@@ -2329,14 +2335,10 @@ object Use {
         ),
     ] {
         let target = definition(&analyzer, target_fqn);
-        let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        let targeted_hits = authoritative_scala_hits(&analyzer, &target);
         let candidates = std::iter::once(project.file(rel_path)).collect();
-        let inverse_hits = reference_surface_hits(inverse.find_usages(
-            &analyzer,
-            std::slice::from_ref(&target),
-            &candidates,
-            1000,
-        ));
+        let inverse_hits =
+            hits(inverse.find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000));
 
         for bucket in [&targeted_hits, &inverse_hits] {
             assert_hit_contains(bucket, positive);

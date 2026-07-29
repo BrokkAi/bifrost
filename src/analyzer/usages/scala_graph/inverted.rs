@@ -7751,7 +7751,19 @@ fn record_reference(
                 record_local_stable_imported_member(node, name, ctx, bindings);
                 return;
             }
-            if is_declaration_name(node) || is_scala_case_pattern_binder(node) {
+            if is_declaration_name(node) {
+                return;
+            }
+            if qualified_stable_type_reference(node, ctx.source).is_some_and(|reference| {
+                reference.role == ScalaQualifiedStableTypeRole::Type
+                    && reference.segments.first().is_none_or(|root| {
+                        bindings.resolve_symbol(root).is_unknown() && !bindings.is_shadowed(root)
+                    })
+            }) && record_qualified_stable_reference(node, ctx, bindings)
+            {
+                return;
+            }
+            if is_scala_case_pattern_binder(node) {
                 return;
             }
             if let Some(owner_node) =
@@ -8681,15 +8693,17 @@ fn record_qualified_stable_reference(
                 ScalaReferenceRole::Field
             };
             ctx.record_exact(field.declaration, role, node);
+            return true;
         }
-        return true;
     }
     if reference.role == ScalaQualifiedStableTypeRole::Type {
         if class_lookup_blocked {
             return true;
         }
-        if let Some(target) = class_unit.or(object_unit) {
+        if let Some(target) = class_unit {
             ctx.record_exact(target, ScalaReferenceRole::Type, node);
+        } else if let Some(target) = object_unit {
+            ctx.record_exact(target, ScalaReferenceRole::StableObject, node);
         }
         return true;
     }
