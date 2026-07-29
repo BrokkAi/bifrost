@@ -2997,6 +2997,7 @@ mod watcher_startup_tests {
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(0),
             query_protocols: RwLock::new(Default::default()),
+            query_value_flows: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
