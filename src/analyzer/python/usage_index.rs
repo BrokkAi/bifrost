@@ -477,6 +477,7 @@ mod tests {
     use super::*;
     use crate::analyzer::usages::inverted_edges::UsageEdges;
     use crate::analyzer::{IAnalyzer, TestProject};
+    use crate::hash::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
