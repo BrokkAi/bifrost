@@ -16,7 +16,8 @@ After this work, a contributor can run one integration target and see each enabl
 - [x] (2026-07-29 07:32Z) Add the smallest source-backed helper-flow fixture for every remaining adapter, with the Java/TypeScript `PROVEN_COMPLETE` witness contract required uniformly for every case. The initial strict run passed Java, TypeScript, JavaScript, Go, PHP, and Ruby and failed C#, C, C++, Python, Rust, and Scala.
 - [x] (2026-07-29 07:32Z) Mark only the six failed strict cases `#[ignore = "..."]`, preserving their exact expected meetings, complete evidence requirement, canonical carriers, and call/return milestones as runnable readiness probes.
 - [x] Fix the Go semantic-lowering defect exposed by the minimized fixture and retain its regression in the cross-language conformance target.
-- [x] Run formatting, the focused 16-test target (also with `nlp,python` enabled), the 174 adjacent value-flow/semantic-language tests, and strict all-feature Clippy with a consistent Rustup toolchain.
+- [x] (2026-07-29 07:32Z) Run `cargo fmt --all -- --check`, the enabled 10-pass/6-ignored language-conformance target, and the 174 adjacent value-flow/semantic-language tests after tightening the witness contract.
+- [ ] Reconfirm strict all-feature Clippy after tightening the witness contract. The isolated run compiled the all-feature crate and cleaned its managed target, but the terminal bridge detached before returning an exit status; this is not recorded as a passing lint result.
 - [ ] Complete the monolithic `nlp,python` gate and a reliable complete code-smells policy evaluation. The first is blocked by host disk exhaustion during linking; the latter exhausts the repository-wide policy execution budget and is explicitly unreliable.
 
 ## Surprises & Discoveries
@@ -89,7 +90,7 @@ After this work, a contributor can run one integration target and see each enabl
 
 The implementation covers every currently analyzable adapter except Kotlin, as requested. Complete source-backed witnesses pass for Java, TypeScript, JavaScript, Go, PHP, and Ruby. C#, C, C++, Python, Rust, and Scala remain explicitly ignored strict readiness tests because they fail the same exact witness contract; they are not counted as conformance support. The Go return-expression-list lowering defect was fixed at its structured source and its adapter epoch was bumped.
 
-Validation passed formatting, the 16-test language-conformance target both normally and with `nlp,python` enabled, 174 adjacent language/value-flow tests, and strict all-feature Clippy. The monolithic `nlp,python` gate is blocked by host linker disk exhaustion, and the mandatory full code-smells run is unreliable because multiple repository-wide rules exhaust their execution budget. Neither is reported as a passing validation result.
+After the strict-contract correction, formatting passed, the language-conformance target reported 10 passed and 6 ignored, and 174 adjacent language/value-flow tests passed. The full all-feature Clippy process compiled and cleaned its isolated target, but the terminal bridge did not return its exit status; it remains unconfirmed rather than passing. The monolithic `nlp,python` gate is blocked by host linker disk exhaustion, and the mandatory full code-smells run is unreliable because multiple repository-wide rules exhaust their execution budget. None of those three is reported as a passing validation result.
 
 ## Context and Orientation
 
@@ -166,3 +167,5 @@ The implementation may add small test-data helpers to the owning integration tar
 Plan revision note (2026-07-29): Created to continue issue #1205 beyond the intentionally complete Java/TypeScript baseline, after live branch/issue verification and explicit exclusion of Kotlin.
 
 Plan revision note (2026-07-29 07:32Z): Replaced passing partial/inconclusive rows with ignored strict readiness tests after the user clarified that #1205 must assert complete exact paths for every target language.
+
+Plan revision note (2026-07-29 07:47Z): Recorded the post-tightening validation outcome precisely: focused tests passed, while the isolated full-Clippy terminal session did not return an exit status after its managed target was cleaned.
