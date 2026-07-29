@@ -620,6 +620,37 @@ pub struct CodeQueryFlowWitness {
     pub retention_truncated: bool,
 }
 
+/// One bounded source occurrence contributing to an aggregated taint sink.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryTaintOrigin {
+    pub id: String,
+    pub event_id: String,
+    pub labels: Vec<String>,
+    pub site: CodeQuerySourceSite,
+}
+
+/// Diagnostic-neutral public projection of one retained taint finding.
+///
+/// Flow witness steps deliberately reuse [`CodeQueryFlowWitness`]; this
+/// envelope adds only taint-specific aggregation that a flow endpoint cannot
+/// represent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryTaintFinding {
+    pub id: String,
+    pub sink_event_id: String,
+    pub sink: CodeQuerySourceSite,
+    pub reached_labels: Vec<String>,
+    pub origins: Vec<CodeQueryTaintOrigin>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub origins_truncated: bool,
+    pub witnesses: Vec<CodeQueryFlowWitness>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub witnesses_truncated: bool,
+    pub evidence: CodeQuerySemanticEvidence,
+    #[serde(skip_serializing_if = "is_false")]
+    pub ambiguous: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CodeQueryProgramPointRef {
     pub id: String,

@@ -46,6 +46,7 @@ use super::suppression::{
     PolicySuppressionPolicyHashState, PolicySuppressionReview, PolicySuppressionTemporalState,
     load_policy_suppressions_from_root,
 };
+use super::taint_policy::ProductionTaintPolicyEvaluator;
 use super::typestate_policy::ProductionTypestatePolicyEvaluator;
 use super::{PolicyBatchBudget, PolicyBudget};
 
@@ -552,10 +553,22 @@ fn evaluate_prepared_policy_inputs(
     };
     check_policy_cancellation(cancellation)?;
 
-    let typestate = ProductionTypestatePolicyEvaluator::default();
-    let evaluator = DefaultPolicyEvaluator::new().with_typestate(&typestate);
     let mut runs = HashMap::with_capacity(runnable_ids.len());
     let workspace = supplied_workspace.or(owned_analyzer.as_ref());
+    let taint = workspace.map_or_else(ProductionTaintPolicyEvaluator::default, |workspace| {
+        ProductionTaintPolicyEvaluator::prepare(
+            registry
+                .policies()
+                .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id)),
+            workspace,
+            cancellation,
+            batch_budget.per_policy(),
+        )
+    });
+    let typestate = ProductionTypestatePolicyEvaluator::default();
+    let evaluator = DefaultPolicyEvaluator::new()
+        .with_taint(&taint)
+        .with_typestate(&typestate);
     for policy in registry
         .policies()
         .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id))

@@ -1172,7 +1172,7 @@ fn certainty_reasons(finding: &TypestateFinding) -> Result<Vec<CertaintyReason>,
     Ok(reasons)
 }
 
-fn policy_location(
+pub(super) fn policy_location(
     workspace: &WorkspaceAnalyzer,
     locator: &crate::analyzer::semantic::SemanticLocator,
 ) -> Result<PolicySourceLocation, String> {
@@ -1214,7 +1214,7 @@ fn policy_location(
     ))
 }
 
-fn program_point_locator(
+pub(super) fn program_point_locator(
     point: &ProgramPointHandle,
 ) -> &crate::analyzer::semantic::SemanticLocator {
     let row = point
@@ -1230,7 +1230,7 @@ fn program_point_locator(
         .locator
 }
 
-fn semantic_root_key(root: &ProcedureHandle) -> String {
+pub(super) fn semantic_root_key(root: &ProcedureHandle) -> String {
     let mut bytes = Vec::new();
     let locator = root.semantics().locator();
     bytes.extend_from_slice(locator.path().as_str().as_bytes());
@@ -1248,7 +1248,7 @@ fn semantic_root_key(root: &ProcedureHandle) -> String {
     stable_hex(&bytes)
 }
 
-fn semantic_site_key(
+pub(super) fn semantic_site_key(
     workspace: &WorkspaceAnalyzer,
     locator: &crate::analyzer::semantic::SemanticLocator,
 ) -> String {
@@ -1282,7 +1282,7 @@ fn semantic_root_key_from_locator(locator: &crate::analyzer::semantic::SemanticL
     stable_hex(&bytes)
 }
 
-fn stable_hex(bytes: &[u8]) -> String {
+pub(super) fn stable_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut encoded = String::with_capacity(digest.len() * 2);
     for byte in digest {

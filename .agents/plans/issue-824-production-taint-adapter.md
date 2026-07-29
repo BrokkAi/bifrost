@@ -16,12 +16,12 @@ The observable proof is an inline multi-source/multi-sink fixture. Its selectors
 - [x] (2026-07-29 20:24Z) Read issue #824, child #1297, PR #1329, `.agents/PLANS.md`, the production typestate adapter, and the current taint plan/finding/policy projection seams.
 - [x] (2026-07-29 20:24Z) Confirmed that the current coordinator installs only `ProductionTypestatePolicyEvaluator`; the taint evaluator seam has no production implementation.
 - [x] (2026-07-29 20:24Z) Confirmed that the Bifrost code-intelligence and policy MCP tools are not registered in this task even though their skills are installed.
-- [ ] Finish the independent guided-issue diagnosis and incorporate any materially different code-path findings into this plan.
-- [ ] Milestone 1: factor or add the smallest shared structured selector-to-semantic binding support and implement `TaintPolicyCompiler`.
-- [ ] Milestone 2: compile all runnable taint policies before evaluation, partition compatible plans, execute one solve per batch, and retain `TaintFindingReport` values.
-- [ ] Milestone 3: implement `ProductionTaintPolicyEvaluator`, project retained reports into the existing sealed taint evidence contracts, and install it in the coordinator.
-- [ ] Milestone 4: add the minimal diagnostic-neutral public taint envelope and reuse the landed flow witness step/projection representation without adding a duplicate witness-step type.
-- [ ] Milestone 5: add behavior-focused batching, partitioning, public/policy parity, broad-classification, incompleteness, and renderer/transport tests.
+- [x] (2026-07-29 20:27Z) Finished the independent guided-issue diagnosis; it confirmed the coordinator-wide architecture and identified endpoint-set equality plus discarded per-origin class/witness associations as prerequisites.
+- [x] (2026-07-29 21:11Z) Milestone 1: implemented `TaintPolicyCompiler` over stored structured CodeQuery selectors, exact source-backed semantic call/value bindings, bounded semantic discovery, and set-oriented per-root source/sink plans.
+- [x] (2026-07-29 21:11Z) Milestone 2: added coordinator-wide taint preparation, exact `TaintBatchPlanner` partitioning, one existing-client solve and one `collect_taint_findings` call per batch, plus observable solve/shared-membership work metrics.
+- [x] (2026-07-29 21:11Z) Milestone 3: implemented and installed `ProductionTaintPolicyEvaluator`; it projects the retained report into the sealed pair-local taint DTOs while leaving classification, CVSS, evidence validation, and renderers authoritative.
+- [x] (2026-07-29 21:11Z) Milestone 4: added the bounded sink-level `CodeQueryTaintFinding`/`CodeQueryTaintOrigin` envelope and reused `CodeQueryFlowWitness` plus the landed source-backed witness-step projection helper.
+- [x] (2026-07-29 21:11Z) Milestone 5: extended retained-origin tests and added an inline two-source/two-sink, two-policy integration test proving one shared solve, broad fallback classification, and human/JSON/SARIF parity.
 - [ ] Run focused Rust validation, formatting, strict task-scoped Clippy, policy validation if the MCP registration becomes available, and guided specialist review; resolve confirmed findings.
 
 ## Surprises & Discoveries
@@ -29,11 +29,14 @@ The observable proof is an inline multi-source/multi-sink fixture. Its selectors
 - Observation: the production source tree now lives under `crates/bifrost-analysis/src/`, while PR #1329's historical diff still names the pre-split `src/` paths.
   Evidence: the requested seams resolve under `crates/bifrost-analysis/src/analyzer/...` at `HEAD`, and `git show 24fb9291` shows their earlier `src/analyzer/...` names.
 
-- Observation: `TaintBatchPlanner` already unions source and sink bindings, but it requires equal `ValueFlowPlan`, sanitizer, transform, and universe semantics inside a compatibility partition.
-  Evidence: `crates/bifrost-analysis/src/analyzer/taint/plan.rs` calls `ensure_same_semantics` before `merge_sources` and `merge_sinks`.
+- Observation: `TaintBatchPlanner` unions class bindings only after requiring equal value-flow event domains and propagation semantics.
+  Evidence: `crates/bifrost-analysis/src/analyzer/taint/plan.rs` calls `ensure_same_semantics` before `merge_sources` and `merge_sinks`. The production compiler therefore fingerprints the complete `ValueFlowPlan` in its runtime compatibility key: identical endpoint domains share, while access-path, proof/completeness, call/oracle, external-summary, or endpoint-domain changes partition safely instead of poisoning a batch.
 
 - Observation: `TaintFindingReport` retains both the diagnostic-neutral findings and the owning `TaintSummaryResult`, so witness projection can reconstruct bounded witnesses without another propagation run.
   Evidence: `crates/bifrost-analysis/src/analyzer/taint/finding.rs` stores `result` and `findings`, and `collect_taint_findings` reconstructs origins from retained summary witnesses.
+
+- Observation: current origin reconstruction computes the exact class contribution for each source/witness and then discards that association.
+  Evidence: `collect_taint_findings` calls `TaintFlowProblem::source_contribution(...).intersects(classes)` while retaining only `SourceEventKey` values and aggregate truncation flags. Projection must retain the contributed class set and witness association at collection time or it would need to re-derive evidence later.
 
 - Observation: the existing policy layer already owns pair-local source facts, sink aggregation, finding-combination selection, broad/refined classification, CVSS reduction, evidence validation, and all renderers.
   Evidence: `TaintProjectionAuthority`, `TaintPolicyProjectionFacts`, `TaintPairProjection`, and `assemble_taint_projection_batch` reject incomplete adapter envelopes and perform the existing reducers after validation.
@@ -63,6 +66,18 @@ The observable proof is an inline multi-source/multi-sink fixture. Its selectors
   Rationale: this directly proves no second solver or policy-specific rerun exists. The report already owns the exact branded result needed for bounded origin and witness reconstruction.
   Date/Author: 2026-07-29 / Codex
 
+- Decision: compile every policy/root as one set-oriented endpoint domain and include the full hashed `ValueFlowPlan` in its runtime compatibility key.
+  Rationale: one plan already propagates every selected source and sink without a pair matrix. Equal domains can share and union class bindings through the existing planner; differing access paths, event sets, completeness, oracle/call, and external-summary semantics must partition safely rather than enter a group that later fails equality validation.
+  Date/Author: 2026-07-29 / Codex
+
+- Decision: return an explicit capability-incomplete policy result for authored sanitizer, transform, external-model, or named-formal binding semantics not yet representable by the production lowering.
+  Rationale: silently omitting these semantics could turn partial propagation into a complete clean negative. The current adapter either compiles exact structured support or misses safely; it does not substitute source-text matching or a weaker model.
+  Date/Author: 2026-07-29 / Codex
+
+- Decision: enrich retained internal origin evidence with the exact contributed class set and witness association during `collect_taint_findings`.
+  Rationale: transforms can change which label an origin contributes at a sink. Recomputing or intersecting authored source labels downstream is incorrect, and rerunning witness analysis would violate the retained-result boundary.
+  Date/Author: 2026-07-29 / Codex
+
 - Decision: introduce only one taint-specific public finding envelope and reuse `CodeQueryFlowWitness`, `CodeQueryFlowWitnessStep`, and the landed witness projection helper for witness bodies.
   Rationale: taint adds sink aggregation, reached labels/classes, bounded origins, finding identity, and possibly multiple witness references; it does not add a new kind of source-backed witness step.
   Date/Author: 2026-07-29 / Codex
@@ -73,7 +88,11 @@ The observable proof is an inline multi-source/multi-sink fixture. Its selectors
 
 ## Outcomes & Retrospective
 
-No implementation milestone is complete yet. The repository and live issue state are verified, the existing ownership boundaries are mapped, and the implementation is constrained to the missing compiler/batch/evaluator/public-projection bridge.
+The production coordinator now prepares all runnable taint policies together, compiles exact structured endpoint matches into one set-oriented plan per root, partitions by the existing batch planner, invokes the existing taint client once per batch, and calls `collect_taint_findings` once on that result. Each participating policy consumes a retained projection from the same report. Work metrics make the shared solve observable in the canonical report.
+
+`collect_taint_findings` now retains the exact per-origin contributing class set and its already-reconstructed bounded witnesses. The policy adapter aggregates sink fact rows conservatively, bounds origin and witness output, constructs the existing sealed projection DTOs, and leaves the existing broad/refined classification and CVSS reducers untouched. The public projection likewise aggregates by sink, exposes reached labels and bounded origins, and reuses `CodeQueryFlowWitness` and `CodeQueryFlowWitnessStep`.
+
+Focused validation is green: `cargo check -p brokk-bifrost-analysis --lib`, all 23 `suite_semantic::taint_client` tests, and the new end-to-end `suite_bench_policy::taint_policy_adapter` test. The remaining work is strict Clippy, final diff/policy validation, and checkpoint review.
 
 ## Context and Orientation
 
@@ -219,3 +238,5 @@ must implement `policy::projection::sealed::TaintAdapter` and `policy::evaluator
 At the end of Milestone 4, `CodeQueryTaintFinding` is the sole taint-specific public envelope. It reuses `CodeQueryFlowWitness` and `CodeQueryFlowWitnessStep`; no `CodeQueryTaintWitnessStep` exists.
 
 Revision note (2026-07-29): Created the initial self-contained execution plan after verifying current origin/master and mapping the landed value-flow, taint, policy, and witness seams. The plan chooses coordinator-wide preparation so the existing per-policy evaluator can consume shared retained propagation results.
+
+Revision note (2026-07-29): Incorporated the independent diagnosis. It made endpoint-neutral value-flow union/rebinding and retention of per-origin contributed classes plus witness associations explicit prerequisites rather than leaving them as adapter implementation details.

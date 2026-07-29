@@ -12,7 +12,7 @@ pub use client::{
 };
 pub use finding::{
     TaintFinding, TaintFindingEntry, TaintFindingError, TaintFindingKey, TaintFindingReport,
-    TaintOriginStatus, collect_taint_findings,
+    TaintOriginFindingEvidence, TaintOriginStatus, collect_taint_findings,
 };
 pub use model::{
     MAX_TAINT_CLASSES, SourceClassId, SourceEventKey, TaintClassSet, TaintModelError,

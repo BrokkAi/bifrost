@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, error::Error, fmt, sync::Arc};
 
 use crate::analyzer::dataflow::{
-    PathQualityFrontier, SummaryWitnessError, WitnessReconstructionLimits,
+    PathQualityFrontier, SummaryWitness, SummaryWitnessError, WitnessReconstructionLimits,
 };
 use crate::analyzer::semantic::{
     ProcedureHandle, ProgramPointHandle, SemanticArtifactKey, SemanticLocator,
@@ -37,9 +37,37 @@ impl TaintFindingKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaintOriginStatus {
     origins: Box<[SourceEventKey]>,
+    evidence: Box<[TaintOriginFindingEvidence]>,
     origin_truncated: bool,
     witness_truncated: bool,
     witness_unavailable: bool,
+}
+
+/// Exact retained evidence for one source occurrence contributing to a finding.
+///
+/// The class set is computed at the source step by the taint problem rather
+/// than reconstructed later from policy labels. Witnesses are the bounded
+/// values already reconstructed while collecting the finding; consumers must
+/// not invoke the solver again to project them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaintOriginFindingEvidence {
+    origin: SourceEventKey,
+    classes: TaintClassSet,
+    witnesses: Box<[SummaryWitness]>,
+}
+
+impl TaintOriginFindingEvidence {
+    pub const fn origin(&self) -> &SourceEventKey {
+        &self.origin
+    }
+
+    pub const fn classes(&self) -> &TaintClassSet {
+        &self.classes
+    }
+
+    pub const fn witnesses(&self) -> &[SummaryWitness] {
+        &self.witnesses
+    }
 }
 
 /// Stable semantic entry attached to one finding.
@@ -71,6 +99,10 @@ impl TaintFindingEntry {
 impl TaintOriginStatus {
     pub const fn origins(&self) -> &[SourceEventKey] {
         &self.origins
+    }
+
+    pub const fn evidence(&self) -> &[TaintOriginFindingEvidence] {
+        &self.evidence
     }
 
     pub const fn origin_truncated(&self) -> bool {
@@ -277,6 +309,7 @@ fn reconstruct_origins(
         })
         .ok_or(TaintFindingError::InvalidResult)?;
     let mut origins = BTreeSet::new();
+    let mut evidence = Vec::<(SourceEventKey, TaintClassSet, Vec<SummaryWitness>)>::new();
     let mut origin_truncated = false;
     let mut witness_unavailable = false;
     let mut witness_truncated = false;
@@ -309,15 +342,34 @@ fn reconstruct_origins(
                             .source(source.source())
                             .is_some_and(|spec| spec.point() == step.source())
                     }) {
-                        if !problem
+                        let contribution = problem
                             .source_contribution(source.source(), output, step)
-                            .intersects(classes)
-                        {
+                            .intersection(classes);
+                        if contribution.is_empty() {
                             continue;
                         }
                         origins.insert(source.origin().clone());
+                        match evidence
+                            .iter_mut()
+                            .find(|(origin, _, _)| origin == source.origin())
+                        {
+                            Some((_, retained_classes, retained_witnesses)) => {
+                                *retained_classes = retained_classes.union(&contribution);
+                                if !retained_witnesses.contains(&witness) {
+                                    retained_witnesses.push(witness.clone());
+                                }
+                            }
+                            None => evidence.push((
+                                source.origin().clone(),
+                                contribution,
+                                vec![witness.clone()],
+                            )),
+                        }
                         if origins.len() > limit {
-                            origins.pop_last();
+                            let removed = origins
+                                .pop_last()
+                                .expect("an over-limit origin set is nonempty");
+                            evidence.retain(|(origin, _, _)| origin != &removed);
                             origin_truncated = true;
                         }
                     }
@@ -328,8 +380,18 @@ fn reconstruct_origins(
             Err(error) => return Err(TaintFindingError::Witness(error)),
         }
     }
+    evidence.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(TaintOriginStatus {
         origins: origins.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+        evidence: evidence
+            .into_iter()
+            .map(|(origin, classes, witnesses)| TaintOriginFindingEvidence {
+                origin,
+                classes,
+                witnesses: witnesses.into_boxed_slice(),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
         origin_truncated,
         witness_truncated,
         witness_unavailable,

@@ -13,6 +13,7 @@ use brokk_bifrost::analyzer::semantic::{
     ProcedureKind, ProofStatus, SemanticBudget, SemanticRequest, ValueFlowOracle,
     ValueFlowRelationKind, ValueFlowSnapshot,
 };
+use brokk_bifrost::analyzer::structural::project_taint_finding_report;
 use brokk_bifrost::analyzer::taint::{
     CompleteTaintTransferSummaryRepository, SourceClassId, SourceEventKey, TaintAnalysisPlan,
     TaintBatchCompatibilityKey, TaintBatchPlanner, TaintClassSet, TaintEdgeFunction,
@@ -1761,8 +1762,41 @@ fn three_sources_and_four_sinks_share_one_set_oriented_ide_solve() {
         assert_eq!(finding.classes(), &fixture.all_classes);
         assert!(finding.is_proven());
         assert_eq!(finding.origins().origins().len(), 3);
+        assert_eq!(finding.origins().evidence().len(), 3);
+        let contributed = finding
+            .origins()
+            .evidence()
+            .iter()
+            .fold(fixture.plan.universe().empty_set(), |classes, origin| {
+                classes.union(origin.classes())
+            });
+        assert_eq!(&contributed, finding.classes());
+        assert!(
+            finding
+                .origins()
+                .evidence()
+                .iter()
+                .all(|origin| !origin.witnesses().is_empty())
+        );
         assert!(finding.origins().is_complete());
     }
+    let public = project_taint_finding_report(
+        &fixture.analyzer,
+        &fixture.plan,
+        &report,
+        8,
+        8,
+        128,
+        1024 * 1024,
+    )
+    .unwrap();
+    assert_eq!(public.len(), 4);
+    assert!(public.iter().all(|finding| {
+        finding.reached_labels.len() == 3
+            && finding.origins.len() == 3
+            && !finding.witnesses.is_empty()
+            && !finding.ambiguous
+    }));
 }
 
 #[test]
@@ -1801,6 +1835,14 @@ fn transformed_classes_retain_their_actual_source_origin() {
     for finding in report.findings() {
         assert_eq!(finding.classes().len(), 2);
         assert_eq!(finding.origins().origins().len(), 3);
+        let contributed = finding
+            .origins()
+            .evidence()
+            .iter()
+            .fold(fixture.plan.universe().empty_set(), |classes, origin| {
+                classes.union(origin.classes())
+            });
+        assert_eq!(&contributed, finding.classes());
         assert!(finding.origins().is_complete());
     }
 }

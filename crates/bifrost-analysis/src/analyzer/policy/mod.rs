@@ -26,6 +26,7 @@ mod retained;
 pub mod schema;
 mod source;
 mod suppression;
+mod taint_policy;
 mod typestate_policy;
 
 #[cfg(test)]

@@ -1,10 +1,18 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use super::{
-    CodeQueryRange, CodeQuerySemanticCompleteness, CodeQuerySemanticEvidence,
-    CodeQuerySemanticProof,
+    CodeQueryFlowWitness, CodeQueryRange, CodeQuerySemanticCompleteness, CodeQuerySemanticEvidence,
+    CodeQuerySemanticProof, CodeQuerySourceSite, CodeQueryTaintFinding, CodeQueryTaintOrigin,
+    public_witness_step,
 };
+use crate::analyzer::dataflow::{PathQuality, SummaryWitness};
 use crate::analyzer::semantic::{
     EvidenceCompleteness, LengthDelimitedDigest, ProofStatus, SemanticLocator,
 };
+use crate::analyzer::taint::{
+    SourceEventKey, TaintAnalysisPlan, TaintFinding, TaintFindingReport, TaintModelError,
+};
+use crate::analyzer::value_flow::ValueFlowEventKey;
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::text_utils::{compute_line_starts, line_column_for_offset};
 
@@ -115,6 +123,253 @@ pub(super) fn hash_public_locator(digest: &mut LengthDelimitedDigest, locator: &
 
 pub(super) fn saturating_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// Project one retained diagnostic-neutral report into the public taint query
+/// envelope without invoking propagation or witness reconstruction.
+pub fn project_taint_finding_report(
+    workspace: &WorkspaceAnalyzer,
+    plan: &TaintAnalysisPlan,
+    report: &TaintFindingReport,
+    max_origins_per_finding: usize,
+    max_witnesses_per_finding: usize,
+    max_steps_per_witness: usize,
+    max_witness_bytes: usize,
+) -> Result<Vec<CodeQueryTaintFinding>, TaintModelError> {
+    let plan_ref = plan.universe().hash().to_string();
+    let mut by_sink = BTreeMap::<ValueFlowEventKey, Vec<&TaintFinding>>::new();
+    for finding in report.findings() {
+        by_sink
+            .entry(finding.key().sink().clone())
+            .or_default()
+            .push(finding);
+    }
+
+    let mut projected = Vec::with_capacity(by_sink.len());
+    for (sink, findings) in by_sink {
+        let mut reached_labels = BTreeSet::new();
+        let mut origin_evidence =
+            BTreeMap::<SourceEventKey, (BTreeSet<String>, Vec<&SummaryWitness>)>::new();
+        let mut proven = true;
+        let mut complete = report.is_complete();
+        let mut origins_truncated = false;
+        let mut witnesses_truncated = false;
+
+        for finding in findings {
+            reached_labels.extend(
+                plan.universe()
+                    .stable_classes(finding.classes())?
+                    .into_iter()
+                    .map(|class| class.as_str().to_owned()),
+            );
+            proven &= finding.is_proven();
+            complete &= finding.is_complete() && finding.origins().is_complete();
+            origins_truncated |= finding.origins().origin_truncated();
+            witnesses_truncated |=
+                finding.origins().witness_truncated() || finding.origins().witness_unavailable();
+            for origin in finding.origins().evidence() {
+                let (labels, witnesses) =
+                    origin_evidence.entry(origin.origin().clone()).or_default();
+                labels.extend(
+                    plan.universe()
+                        .stable_classes(origin.classes())?
+                        .into_iter()
+                        .map(|class| class.as_str().to_owned()),
+                );
+                for witness in origin.witnesses() {
+                    if !witnesses.contains(&witness) {
+                        witnesses.push(witness);
+                    }
+                }
+            }
+        }
+
+        let reached_labels = reached_labels.into_iter().collect::<Vec<_>>();
+        let sink_event_id = public_taint_event_id(&plan_ref, "sink", &sink);
+        let origin_event_ids = origin_evidence
+            .keys()
+            .map(|origin| public_taint_event_id(&plan_ref, "source", origin.value_flow_key()))
+            .collect::<Vec<_>>();
+        let finding_id = public_taint_finding_id(
+            &plan_ref,
+            &sink_event_id,
+            &reached_labels,
+            &origin_event_ids,
+        );
+        let omitted_origins = origin_evidence
+            .len()
+            .saturating_sub(max_origins_per_finding);
+        origins_truncated |= omitted_origins > 0;
+
+        let mut origins = Vec::new();
+        let mut retained_witnesses = Vec::new();
+        for (origin, (labels, witnesses)) in origin_evidence.iter().take(max_origins_per_finding) {
+            let event = origin.value_flow_key();
+            let event_id = public_taint_event_id(&plan_ref, "source", event);
+            let labels = labels.iter().cloned().collect::<Vec<_>>();
+            origins.push(CodeQueryTaintOrigin {
+                id: public_taint_origin_id(&finding_id, &event_id, &labels),
+                event_id,
+                labels,
+                site: public_source_site(workspace, event.site()),
+            });
+            for witness in witnesses {
+                if !retained_witnesses.contains(witness) {
+                    retained_witnesses.push(*witness);
+                }
+            }
+        }
+        origins.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let omitted_witnesses = retained_witnesses
+            .len()
+            .saturating_sub(max_witnesses_per_finding);
+        witnesses_truncated |= omitted_witnesses > 0;
+        let witnesses = retained_witnesses
+            .into_iter()
+            .take(max_witnesses_per_finding)
+            .enumerate()
+            .map(|(index, witness)| {
+                let (steps, retained_bytes, omitted_steps) = retain_prefix_by_bytes(
+                    witness
+                        .steps()
+                        .iter()
+                        .map(|step| public_witness_step(workspace, step)),
+                    max_steps_per_witness,
+                    max_witness_bytes,
+                    |step| serde_json::to_vec(step).map_or(usize::MAX, |bytes| bytes.len()),
+                );
+                let truncated = witness.truncated()
+                    || witness.alternatives_truncated()
+                    || witness.retention_truncated()
+                    || omitted_steps > 0;
+                witnesses_truncated |= truncated;
+                CodeQueryFlowWitness {
+                    id: public_taint_witness_id(&finding_id, index, witness.quality()),
+                    endpoint_id: finding_id.clone(),
+                    plan_ref: plan_ref.clone(),
+                    witness_index: index,
+                    path: sink.site().path().as_str().to_owned(),
+                    language: sink.site().language().config_label(),
+                    range: locator_range(workspace, sink.site()),
+                    quality: public_taint_quality(witness.quality(), truncated),
+                    steps,
+                    retained_bytes,
+                    truncated,
+                    omitted_steps_lower_bound: witness
+                        .omitted_steps_lower_bound()
+                        .saturating_add(omitted_steps),
+                    alternatives_truncated: witness.alternatives_truncated(),
+                    retention_truncated: witness.retention_truncated(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        complete &= !origins_truncated && !witnesses_truncated;
+        projected.push(CodeQueryTaintFinding {
+            id: finding_id,
+            sink_event_id,
+            sink: public_source_site(workspace, sink.site()),
+            reached_labels,
+            origins,
+            origins_truncated,
+            witnesses,
+            witnesses_truncated,
+            evidence: CodeQuerySemanticEvidence {
+                proof: if proven {
+                    CodeQuerySemanticProof::Proven
+                } else {
+                    CodeQuerySemanticProof::Unproven
+                },
+                proof_reason: None,
+                completeness: if complete {
+                    CodeQuerySemanticCompleteness::Complete
+                } else {
+                    CodeQuerySemanticCompleteness::Partial
+                },
+                completeness_reason: (!complete)
+                    .then(|| "taint finding or retained origin evidence is incomplete".to_owned()),
+            },
+            ambiguous: !proven,
+        });
+    }
+    Ok(projected)
+}
+
+fn public_source_site(
+    workspace: &WorkspaceAnalyzer,
+    locator: &SemanticLocator,
+) -> CodeQuerySourceSite {
+    CodeQuerySourceSite {
+        path: locator.path().as_str().to_owned(),
+        range: locator_range(workspace, locator),
+    }
+}
+
+fn public_taint_event_id(
+    plan_ref: &str,
+    role: &str,
+    event: &crate::analyzer::value_flow::ValueFlowEventKey,
+) -> String {
+    let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.taint_event.v1");
+    digest.push(plan_ref.as_bytes());
+    digest.push(role.as_bytes());
+    hash_public_locator(&mut digest, event.site());
+    digest.push(&event.ordinal().to_le_bytes());
+    digest.finish().to_string()
+}
+
+fn public_taint_finding_id(
+    plan_ref: &str,
+    sink_event_id: &str,
+    reached_labels: &[String],
+    origin_event_ids: &[String],
+) -> String {
+    let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.taint_finding.v1");
+    digest.push(plan_ref.as_bytes());
+    digest.push(sink_event_id.as_bytes());
+    for label in reached_labels {
+        digest.push(label.as_bytes());
+    }
+    for origin_event_id in origin_event_ids {
+        digest.push(origin_event_id.as_bytes());
+    }
+    digest.finish().to_string()
+}
+
+fn public_taint_origin_id(finding_id: &str, event_id: &str, labels: &[String]) -> String {
+    let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.taint_origin.v1");
+    digest.push(finding_id.as_bytes());
+    digest.push(event_id.as_bytes());
+    for label in labels {
+        digest.push(label.as_bytes());
+    }
+    digest.finish().to_string()
+}
+
+fn public_taint_witness_id(finding_id: &str, index: usize, quality: PathQuality) -> String {
+    let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.taint_witness.v1");
+    digest.push(finding_id.as_bytes());
+    digest.push(&(index as u64).to_le_bytes());
+    digest.push(&(quality.ordinal() as u64).to_le_bytes());
+    digest.finish().to_string()
+}
+
+fn public_taint_quality(quality: PathQuality, truncated: bool) -> CodeQuerySemanticEvidence {
+    CodeQuerySemanticEvidence {
+        proof: if quality.is_proven() {
+            CodeQuerySemanticProof::Proven
+        } else {
+            CodeQuerySemanticProof::Unproven
+        },
+        proof_reason: None,
+        completeness: if quality.is_complete() && !truncated {
+            CodeQuerySemanticCompleteness::Complete
+        } else {
+            CodeQuerySemanticCompleteness::Partial
+        },
+        completeness_reason: truncated.then(|| "taint witness evidence is truncated".to_owned()),
+    }
 }
 
 #[cfg(test)]
