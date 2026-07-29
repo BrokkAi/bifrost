@@ -154,9 +154,7 @@ pub(crate) fn symbol_source_candidate_files(
         .filter(|symbol| !symbol.is_empty())
     {
         let (mut anchor, mut lookup) =
-            match split_definition_selector_with_resolver(symbol, |anchor| {
-                matches!(resolver.resolve_literal(anchor), ResolvedFileInput::File(_))
-            }) {
+            match split_definition_selector_with_workspace_files(&resolver, symbol) {
                 DefinitionSelector::Name(name) => (None, name),
                 DefinitionSelector::FileAnchored { anchor, lookup } => {
                     if let ResolvedFileInput::File(file) = resolver.resolve_literal(&anchor) {
@@ -272,12 +270,7 @@ pub fn get_symbol_sources(
         .enumerate()
         .map(|(index, symbol)| {
             let file_anchored = matches!(
-                split_definition_selector_with_resolver(&symbol, |anchor| {
-                    matches!(
-                        WorkspaceFileResolver::new(analyzer.project()).resolve_literal(anchor),
-                        ResolvedFileInput::File(_)
-                    )
-                }),
+                split_workspace_definition_selector(analyzer, &symbol),
                 DefinitionSelector::FileAnchored { .. }
             );
             // Exact fully-qualified lookup wins before file patterns, so a
@@ -305,13 +298,7 @@ pub fn get_symbol_sources(
                 }
                 SelectableDefinitionResolution::NotFound(_) => {
                     if let DefinitionSelector::FileAnchored { anchor, lookup } =
-                        split_definition_selector_with_resolver(&symbol, |anchor| {
-                            matches!(
-                                WorkspaceFileResolver::new(analyzer.project())
-                                    .resolve_literal(anchor),
-                                ResolvedFileInput::File(_)
-                            )
-                        })
+                        split_workspace_definition_selector(analyzer, &symbol)
                     {
                         let generated =
                             java_generated_accessor_source_blocks(analyzer, lookup, Some(&anchor));

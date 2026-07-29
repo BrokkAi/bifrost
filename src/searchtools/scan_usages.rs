@@ -1108,7 +1108,7 @@ pub(super) fn resolve_scan_usages_target(
 
     let selector = match target.symbol.as_deref() {
         None => None,
-        Some(symbol) => match split_definition_selector(symbol) {
+        Some(symbol) => match split_definition_selector_with_workspace_files(resolver, symbol) {
             DefinitionSelector::Name(name) => Some(name),
             DefinitionSelector::FileAnchored { anchor, lookup } => {
                 let anchor_file = match resolver.resolve_literal(&anchor) {
@@ -1714,7 +1714,7 @@ pub(super) fn scan_usages_backend(
             });
             continue;
         }
-        let (anchor, lookup) = match split_definition_selector(&symbol) {
+        let (anchor, lookup) = match split_workspace_definition_selector(analyzer, &symbol) {
             DefinitionSelector::Name(name) => (None, name),
             DefinitionSelector::FileAnchored { anchor, lookup } => (Some(anchor), lookup),
         };

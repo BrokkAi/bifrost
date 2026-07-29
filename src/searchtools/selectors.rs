@@ -618,12 +618,7 @@ pub(super) fn resolve_selectable_definitions(
     input: &str,
     resolve: impl Fn(&dyn IAnalyzer, &str) -> CodeUnitResolution,
 ) -> SelectableDefinitionResolution {
-    let selector = split_definition_selector_with_resolver(input, |anchor| {
-        matches!(
-            WorkspaceFileResolver::new(analyzer.project()).resolve_literal(anchor),
-            ResolvedFileInput::File(_)
-        )
-    });
+    let selector = split_workspace_definition_selector(analyzer, input);
     let (mut anchor, mut lookup) = match selector {
         DefinitionSelector::Name(name) => (None, name),
         DefinitionSelector::FileAnchored { anchor, lookup } => (Some(anchor), lookup),
@@ -739,19 +734,50 @@ pub(super) fn capped_ambiguous_symbol(target: &str, mut matches: Vec<String>) ->
 }
 
 /// Split a definition selector into an optional file anchor and the name to
-/// resolve. A plain input (`Anchor`) has no anchor; a file-anchored selector
+/// resolve, checking candidate anchors against the real workspace file set. A
+/// plain input (`Anchor`) has no anchor; a file-anchored selector
 /// (`charts/Anchor.ts#Anchor`), returned in a prior ambiguity result, picks one
 /// of several same-named definitions.
-pub(super) fn split_definition_selector(input: &str) -> DefinitionSelector<'_> {
-    split_definition_selector_with_resolver(input, looks_like_path_selector_anchor)
+///
+/// Every caller must split against the workspace, never against a
+/// shape heuristic: the heuristic accepts an extensionless directory-shaped
+/// prefix as an anchor, so a `#`-bearing *filename* (Autofac's
+/// `…VerifyGeneratedCode#01.verified.cs`) truncated at its first `#` produced a
+/// plausible-looking anchor that names nothing and the real file was never
+/// tried (#1198).
+pub(super) fn split_workspace_definition_selector<'a>(
+    analyzer: &dyn IAnalyzer,
+    input: &'a str,
+) -> DefinitionSelector<'a> {
+    split_definition_selector_with_workspace_files(
+        &WorkspaceFileResolver::new(analyzer.project()),
+        input,
+    )
+}
+
+/// [`split_workspace_definition_selector`] for callers that already hold a
+/// [`WorkspaceFileResolver`] (its basename index is built once per instance).
+pub(super) fn split_definition_selector_with_workspace_files<'a>(
+    resolver: &WorkspaceFileResolver<'_>,
+    input: &'a str,
+) -> DefinitionSelector<'a> {
+    split_definition_selector_with_resolver(input, |anchor| {
+        matches!(resolver.resolve_literal(anchor), ResolvedFileInput::File(_))
+    })
 }
 
 /// File-aware split: `#`-bearing paths (marked's fixture
 /// `bin-config#hash.js`) mean the first `#` is not always the anchor
-/// boundary. Walk every split point and prefer the first whose anchor is a
+/// boundary. Walk every split point and keep the *longest* anchor that names a
 /// real file; fall back to the plain parse when none checks out (the
 /// `file.rs#r#type` raw-identifier case keeps its first-`#` split because
-/// `file.rs` resolves).
+/// `file.rs#r` is not a file while `file.rs` is).
+///
+/// Longest-first matches the rule #1216 settled on for historical
+/// `REV:path#symbol` selectors against the revision tree: when both the short
+/// prefix and the longer `#`-bearing path exist (`a.cs` and `a.cs#x.cs`), the
+/// deeper filename is the one the user spelled out, and the shorter one stays
+/// addressable by simply not typing the extra segment.
 ///
 /// The single-`#` fallback below only re-checks `anchor_is_file` for a
 /// slash-free anchor. A slash (or backslash) is an unambiguous, intentional
@@ -781,12 +807,12 @@ pub(super) fn split_definition_selector(input: &str) -> DefinitionSelector<'_> {
 /// correctly (`DbColumn.r` is not a file), so the heuristic is not yet
 /// redundant. The #1128/#1131 anchor canaries pin this behavior unchanged. See
 /// the M2 Decision Log in `.agents/plans/fqname-interned-segments.md`.
-pub(super) fn split_definition_selector_with_resolver<'a>(
+fn split_definition_selector_with_resolver<'a>(
     input: &'a str,
     anchor_is_file: impl Fn(&str) -> bool,
 ) -> DefinitionSelector<'a> {
     if input.matches('#').count() > 1 {
-        for (index, _) in input.match_indices('#') {
+        for (index, _) in input.match_indices('#').rev() {
             let (anchor, name) = input.split_at(index);
             let name = &name[1..];
             if !anchor.is_empty()

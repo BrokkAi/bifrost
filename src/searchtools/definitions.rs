@@ -187,7 +187,7 @@ pub(super) fn resolve_definition_context_symbol(
         }
     }
 
-    let anchored = match split_definition_selector(symbol) {
+    let anchored = match split_workspace_definition_selector(analyzer, symbol) {
         DefinitionSelector::FileAnchored { anchor, lookup } => Some((anchor, lookup)),
         DefinitionSelector::Name(_) => {
             match split_path_qualified_definition_selector(analyzer, symbol) {

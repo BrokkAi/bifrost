@@ -191,7 +191,7 @@ fn route_summary_targets_with_cancellation(
             break;
         }
         if matches!(
-            split_definition_selector(target),
+            split_definition_selector_with_workspace_files(&resolver, target),
             DefinitionSelector::FileAnchored { .. }
         ) {
             symbol_targets.push(target.to_string());
