@@ -63,17 +63,22 @@ impl CancellationToken {
                 self.cancel();
             }
         }
-        // An explicit caller cancellation that arrived before the deadline
-        // remains distinguishable from a timeout in the public response.
-        if self.cancelled.load(Ordering::Acquire) {
-            return true;
-        }
+        // Check the deadline before the shared explicit-cancellation flag.
+        // An MCP client can send `notifications/cancelled` at the same moment
+        // its request-wide deadline expires. If the explicit flag wins this
+        // race, the timeout is never recorded and policy evaluation turns a
+        // canonical incomplete report into a transport error.
         if self
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
             self.timed_out.store(true, Ordering::Release);
             self.cancelled.store(true, Ordering::Release);
+            return true;
+        }
+        // An explicit caller cancellation that arrived before the deadline
+        // remains distinguishable from a timeout in the public response.
+        if self.cancelled.load(Ordering::Acquire) {
             return true;
         }
         false
