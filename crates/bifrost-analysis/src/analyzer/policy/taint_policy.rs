@@ -1434,6 +1434,7 @@ fn project_taint_origins(
     Ok((origins, omitted))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn project_taint_report(
     workspace: &WorkspaceAnalyzer,
     group: &ProjectedSourceGroup<'_>,
@@ -1541,7 +1542,7 @@ fn project_taint_witnesses(
 ) -> Result<(Vec<BoundedWitness>, Vec<WitnessId>, usize), String> {
     let mut retained = Vec::<&SummaryWitness>::new();
     for witness in group.origins.iter().flat_map(|origin| origin.witnesses()) {
-        if !retained.iter().any(|candidate| *candidate == witness) {
+        if !retained.contains(&witness) {
             retained.push(witness);
         }
     }

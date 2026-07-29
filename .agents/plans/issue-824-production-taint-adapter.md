@@ -22,7 +22,7 @@ The observable proof is an inline multi-source/multi-sink fixture. Its selectors
 - [x] (2026-07-29 21:11Z) Milestone 3: implemented and installed `ProductionTaintPolicyEvaluator`; it projects the retained report into the sealed pair-local taint DTOs while leaving classification, CVSS, evidence validation, and renderers authoritative.
 - [x] (2026-07-29 21:11Z) Milestone 4: added the bounded sink-level `CodeQueryTaintFinding`/`CodeQueryTaintOrigin` envelope and reused `CodeQueryFlowWitness` plus the landed source-backed witness-step projection helper.
 - [x] (2026-07-29 21:11Z) Milestone 5: extended retained-origin tests and added an inline two-source/two-sink, two-policy integration test proving one shared solve, broad fallback classification, and human/JSON/SARIF parity.
-- [ ] Run focused Rust validation, formatting, strict task-scoped Clippy, policy validation if the MCP registration becomes available, and guided specialist review; resolve confirmed findings.
+- [x] (2026-07-29 21:18Z) Completed formatting, strict featureless Clippy, the full policy and semantic integration binaries, and final diff review. Policy validation remains unavailable because tool discovery still exposes neither `list_policies` nor `run_policy`; no substitute result is claimed.
 
 ## Surprises & Discoveries
 
@@ -43,6 +43,9 @@ The observable proof is an inline multi-source/multi-sink fixture. Its selectors
 
 - Observation: the installed Bifrost navigation/policy skills do not prove their MCP tools are registered.
   Evidence: tool discovery did not expose `search_symbols`, `get_summaries`, `list_policies`, or `run_policy`; repository-local `rg` and Rust source inspection are the current fallback, and a final policy result must not be claimed unless `run_policy` becomes callable.
+
+- Observation: unqualified `cargo clippy` selected Homebrew's `clippy-driver` while Cargo/rustc came from rustup; both report Rust 1.96.0 but use different LLVM patch releases and reject each other's crate metadata.
+  Evidence: the initial shared and isolated-target runs failed with E0514. `/Users/dave/.cargo/bin/cargo-clippy clippy ...` selected rustup's matching driver and completed cleanly with `-D warnings`.
 
 ## Decision Log
 
@@ -92,7 +95,9 @@ The production coordinator now prepares all runnable taint policies together, co
 
 `collect_taint_findings` now retains the exact per-origin contributing class set and its already-reconstructed bounded witnesses. The policy adapter aggregates sink fact rows conservatively, bounds origin and witness output, constructs the existing sealed projection DTOs, and leaves the existing broad/refined classification and CVSS reducers untouched. The public projection likewise aggregates by sink, exposes reached labels and bounded origins, and reuses `CodeQueryFlowWitness` and `CodeQueryFlowWitnessStep`.
 
-Focused validation is green: `cargo check -p brokk-bifrost-analysis --lib`, all 23 `suite_semantic::taint_client` tests, and the new end-to-end `suite_bench_policy::taint_policy_adapter` test. The remaining work is strict Clippy, final diff/policy validation, and checkpoint review.
+Validation is green: `cargo check -p brokk-bifrost-analysis --lib`; `cargo fmt --all -- --check`; strict featureless `/Users/dave/.cargo/bin/cargo-clippy clippy -p brokk-bifrost --all-targets -- -D warnings`; all 193 policy integration tests (192 passed, one ignored); and all 522 semantic integration tests (499 passed, 23 intentionally ignored). The focused taint suite contributed 23 passing tests, and the new end-to-end adapter test proves two compatible policies report `taint.propagation_solves = 1` and `taint.propagation_shared_memberships = 1`.
+
+The only unavailable gate is the repository policy pack: the installed policy skill has no registered `list_policies` or `run_policy` tool in this task. This is recorded as a validation-environment limitation, not a clean policy result.
 
 ## Context and Orientation
 
