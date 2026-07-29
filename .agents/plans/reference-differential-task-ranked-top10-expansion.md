@@ -601,6 +601,33 @@ local gate, but is not the focus.
   whole-workspace Rust graph target passes 21/21 and the target-specific Rust
   usage suite passes 210/210 with all features. Repository-wide Clippy and the
   full matrix remain to be repeated on the committed follow-up.
+- [x] (2026-07-29) Committed the C# pattern-role and Rust associated-path
+  follow-ups, then passed `cargo fmt --all -- --check`, `git diff --check`,
+  strict all-target/all-feature Clippy, and the complete
+  `cargo test --features nlp,python` matrix at niceness 10. Pushed clean head
+  `05b11b6c` to `origin/master` and built its release differential runner using
+  normal Cargo storage outside the sandbox.
+- [x] (2026-07-29) Independently regenerated the live ranks-six-through-ten
+  selector and preflighted all 40 unfinished clones and corpus inputs. Every
+  clone has a readable tracked-clean pinned head; every scan, testsome/status
+  sidecar, task reference, and generated prompt exists. This confirms that the
+  distinct expansion still contains exactly 55 new envelopes rather than
+  reusing any ranks-one-through-five record.
+- [x] (2026-07-29) Clean acceptance replays at pushed head `05b11b6c`
+  completed Go, Java, TypeScript, and PHP: 20 completed clean envelopes,
+  200,000 accounted sampled sites, zero file or candidate-limit errors, and
+  zero missing rows. Closed assigned Go issues #1269 through #1271 with the
+  clean replay evidence; Java, TypeScript, and PHP required no expansion issue.
+- [x] (2026-07-29) The clean C# replay proved #1261 and #1263 through #1267
+  absent and those assigned issues were closed, but exposed six Neo
+  declaration-pattern type operands that resolve forward and disappear from
+  inverse lookup. Created and assigned #1293 before implementation; C# remains
+  open pending its structured fix and a new clean five-repository replay.
+- [x] (2026-07-29) JavaScript replay completed all five envelopes but retained
+  68 wrong-forward rows already exhaustively mapped to the still-open assigned
+  receiver-identity issue #1276 and namespace-assignment issue #1277. The
+  language remains open pending their completed structured fixes and a new
+  clean five-repository replay.
 - [x] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [x] Complete C++ and publish its evidence and user summary.
