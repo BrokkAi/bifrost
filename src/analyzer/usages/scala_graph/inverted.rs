@@ -1600,7 +1600,8 @@ impl ProjectTypes {
         BareMemberResolution::NoMatch
     }
 
-    /// Resolve only ordinary methods declared by a class or object owner.
+    /// Resolve only ordinary methods declared by a class, trait, or stable
+    /// object owner.
     ///
     /// This intentionally does not broaden trait-default or extension-method
     /// handling.  Each breadth level is one semantic tier: fields, trait
@@ -1628,7 +1629,7 @@ impl ProjectTypes {
         member: &str,
         call: ScalaCallMatch<'_>,
     ) -> BareMemberResolution {
-        if !owner.is_class() {
+        if !self.owner_supports_ordinary_member_lookup(scala, owner) {
             return BareMemberResolution::NoMatch;
         }
         self.ordinary_class_member_declarations_for_owners_matching(
@@ -1825,7 +1826,7 @@ impl ProjectTypes {
             .index
             .by_fqn(owner_fqn)
             .iter()
-            .filter(|owner| owner.is_class());
+            .filter(|owner| self.owner_supports_ordinary_member_lookup(scala, owner));
         let Some(owner) = declarations.next() else {
             return BareMemberResolution::NoMatch;
         };
@@ -1873,7 +1874,7 @@ impl ProjectTypes {
         member: &str,
         call: ScalaCallMatch<'_>,
     ) -> BareMemberResolution {
-        if !owner.is_class() {
+        if !self.owner_supports_ordinary_member_lookup(scala, owner) {
             return BareMemberResolution::NoMatch;
         }
 
@@ -1954,6 +1955,16 @@ impl ProjectTypes {
             BareMemberResolution::NoMatch,
             BareMemberResolution::Resolved,
         )
+    }
+
+    fn owner_supports_ordinary_member_lookup(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+    ) -> bool {
+        owner.is_class()
+            || self.is_scala_trait_declaration(scala, owner)
+            || self.type_is_stable_owner(scala, owner)
     }
 
     /// Compute Scala's duplicate-eliding parent linearization without Rust
@@ -8095,7 +8106,24 @@ fn record_reference(
                     .parent()
                     .and_then(|expression| expression.child_by_field_name("value"))
             {
-                let call_shape = call_site_shape_for_reference(node);
+                let method_value_shape = match companion_method_value_context(node, ctx, bindings) {
+                    ScalaMethodValueContext::Function(shape) => Some(shape),
+                    ScalaMethodValueContext::Unknown | ScalaMethodValueContext::Incompatible => {
+                        None
+                    }
+                };
+                let call_shape = call_site_shape_for_reference(node)
+                    .map(|shape| shape.with_method_value_shape(method_value_shape.clone()))
+                    .or_else(|| {
+                        method_value_shape.map(|shape| ScalaCallSiteShape {
+                            lists: Vec::new(),
+                            method_value_arity: Some(shape.arity),
+                            method_value_parameter_types: shape.parameter_types,
+                            method_value_parameter_types_authoritative: shape
+                                .parameter_types_authoritative,
+                            type_arguments_only: false,
+                        })
+                    });
                 if record_union_receiver_parameterless_methods(qualifier, name, node, ctx, bindings)
                 {
                     return;
@@ -9186,39 +9214,79 @@ fn call_parameter_method_value_context(
         };
         function = inner;
     }
-    if !matches!(function.kind(), "identifier" | "operator_identifier") {
-        return ScalaMethodValueContext::Unknown;
-    }
-    let function_name = node_text(function, ctx.source).trim();
-    if function_name.is_empty() {
-        return ScalaMethodValueContext::Unknown;
-    }
-    if bindings.is_shadowed(function_name) {
-        return ScalaMethodValueContext::Incompatible;
-    }
     let Some(call_arities) = call_arities_for_reference(function) else {
         return ScalaMethodValueContext::Unknown;
     };
-    let Some(owner) = ctx.enclosing_class_unit(function.start_byte()) else {
-        return ScalaMethodValueContext::Unknown;
-    };
-    let methods = match ctx.types.bare_member_declarations_for_owner(
-        ctx.scala,
-        owner,
-        function_name,
-        Some(&call_arities),
-    ) {
-        BareMemberResolution::Resolved(methods) => methods,
-        BareMemberResolution::NoMatch => {
-            let Some(imported) = ctx.resolver.resolve_member(function_name) else {
+    let methods = match function.kind() {
+        "identifier" | "operator_identifier" => {
+            let function_name = node_text(function, ctx.source).trim();
+            if function_name.is_empty() {
+                return ScalaMethodValueContext::Unknown;
+            }
+            if bindings.is_shadowed(function_name) {
+                return ScalaMethodValueContext::Incompatible;
+            }
+            let Some(owner) = ctx.enclosing_class_unit(function.start_byte()) else {
                 return ScalaMethodValueContext::Unknown;
             };
-            ctx.scala
-                .definitions(&imported)
-                .filter(CodeUnit::is_function)
-                .collect()
+            match ctx.types.bare_member_declarations_for_owner(
+                ctx.scala,
+                owner,
+                function_name,
+                Some(&call_arities),
+            ) {
+                BareMemberResolution::Resolved(methods) => methods,
+                BareMemberResolution::NoMatch => {
+                    let Some(imported) = ctx.resolver.resolve_member(function_name) else {
+                        return ScalaMethodValueContext::Unknown;
+                    };
+                    ctx.scala
+                        .definitions(&imported)
+                        .filter(CodeUnit::is_function)
+                        .collect()
+                }
+                BareMemberResolution::Unresolved => return ScalaMethodValueContext::Incompatible,
+            }
         }
-        BareMemberResolution::Unresolved => return ScalaMethodValueContext::Incompatible,
+        "field_expression" => {
+            let (Some(receiver), Some(field)) = (
+                function.child_by_field_name("value"),
+                function.child_by_field_name("field"),
+            ) else {
+                return ScalaMethodValueContext::Unknown;
+            };
+            let function_name = node_text(field, ctx.source).trim();
+            if function_name.is_empty() {
+                return ScalaMethodValueContext::Unknown;
+            }
+            let Some(owner) = receiver_type_fqn(receiver, ctx, bindings) else {
+                return ScalaMethodValueContext::Unknown;
+            };
+            let exact_owner = receiver_type_declaration(receiver, ctx, bindings);
+            match exact_owner.as_ref().map_or_else(
+                || {
+                    ctx.types.effective_method_declarations_for_owner(
+                        ctx.scala,
+                        &owner,
+                        function_name,
+                        Some(&call_arities),
+                    )
+                },
+                |exact_owner| {
+                    ctx.types.effective_method_declarations_for_exact_owner(
+                        ctx.scala,
+                        exact_owner,
+                        function_name,
+                        Some(&call_arities),
+                    )
+                },
+            ) {
+                BareMemberResolution::Resolved(methods) => methods,
+                BareMemberResolution::NoMatch => return ScalaMethodValueContext::Unknown,
+                BareMemberResolution::Unresolved => return ScalaMethodValueContext::Incompatible,
+            }
+        }
+        _ => return ScalaMethodValueContext::Unknown,
     };
     if methods.is_empty() {
         return ScalaMethodValueContext::Incompatible;
@@ -9258,7 +9326,10 @@ fn record_ordinary_class_methods(
         .index
         .by_fqn(owner_fq_name)
         .iter()
-        .filter(|owner| owner.is_class());
+        .filter(|owner| {
+            ctx.types
+                .owner_supports_ordinary_member_lookup(ctx.scala, owner)
+        });
     let Some(owner) = owners.next() else {
         return false;
     };
