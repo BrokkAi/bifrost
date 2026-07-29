@@ -1,4 +1,6 @@
-//! Protocol-neutral code-intelligence runtime for the `brokk-bifrost` facade.
-//!
-//! The typed runtime moves into this package after the analysis boundary is
-//! available as a dependency.
+//! Protocol-neutral code-intelligence runtime for Bifrost hosts.
+
+pub mod code_intelligence;
+
+pub use brokk_bifrost_analysis::{CancellationToken, analyzer};
+pub use code_intelligence::CodeIntelligenceRuntime;

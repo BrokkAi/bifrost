@@ -240,15 +240,15 @@ name = "brokk-bifrost"
 version = "0.8.12"
 dependencies = [
  "bincode",
+ "brokk-bifrost-analysis",
+ "brokk-bifrost-runtime",
  "cap-fs-ext",
  "cap-std",
- "cc",
  "chrono",
  "csv",
  "cvss",
  "fastrq",
  "filetime",
- "flate2",
  "git2",
  "glob",
  "goblin",
@@ -274,6 +274,74 @@ dependencies = [
  "quick-xml",
  "rayon",
  "reedline",
+ "regex",
+ "rusqlite",
+ "rusqlite_migration",
+ "rustc-hash",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shlex",
+ "smallvec",
+ "strsim",
+ "tempfile",
+ "tokenizers",
+ "toml",
+ "tree-sitter",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
+ "tree-sitter-go",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-language",
+ "tree-sitter-php",
+ "tree-sitter-python",
+ "tree-sitter-ruby",
+ "tree-sitter-rust",
+ "tree-sitter-scala",
+ "tree-sitter-typescript",
+ "url",
+ "walkdir",
+ "windows-sys 0.61.2",
+ "xee-xpath",
+ "xot",
+ "zip",
+]
+
+[[package]]
+name = "brokk-bifrost-analysis"
+version = "0.8.12"
+dependencies = [
+ "bincode",
+ "cap-fs-ext",
+ "cap-std",
+ "cc",
+ "chrono",
+ "csv",
+ "cvss",
+ "fastrq",
+ "filetime",
+ "flate2",
+ "git2",
+ "glob",
+ "goblin",
+ "growable-bloom-filter",
+ "hf-hub",
+ "ignore",
+ "jaq-core",
+ "jaq-json",
+ "jaq-std",
+ "jclassfile",
+ "json-spanned-value",
+ "jsonschema",
+ "libc",
+ "moka",
+ "nu-ansi-term",
+ "once_cell",
+ "pretty_assertions",
+ "quick-xml",
+ "rayon",
  "regex",
  "rusqlite",
  "rusqlite_migration",
@@ -313,10 +381,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "brokk-bifrost-analysis"
-version = "0.8.12"
-
-[[package]]
 name = "brokk-bifrost-lsp"
 version = "0.8.12"
 dependencies = [
@@ -337,6 +401,8 @@ name = "brokk-bifrost-runtime"
 version = "0.8.12"
 dependencies = [
  "brokk-bifrost-analysis",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

@@ -40,7 +40,11 @@ function startsWithAny(path, prefixes) {
 
 function isRqlPath(path) {
   return (
-    startsWithAny(path, ["src/analyzer/structural/", "src/analyzer/policy/", "policy-packs/"]) ||
+    startsWithAny(path, [
+      "crates/bifrost-analysis/src/analyzer/structural/",
+      "crates/bifrost-analysis/src/analyzer/policy/",
+      "crates/bifrost-analysis/policy-packs/",
+    ]) ||
     path === "tests/code_intelligence_runtime.rs" ||
     /^(tests\/(structural_search_|policy_|builtin_policy_pack\.rs|bifrost_policy_cli\.rs)|editors\/vscode\/(src\/rql|test\/rql|syntaxes\/bifrost-rql))/u.test(
       path,
@@ -50,7 +54,7 @@ function isRqlPath(path) {
 
 function isMcpPath(path) {
   return (
-    startsWithAny(path, ["src/mcp_", "src/searchtools/"]) ||
+    startsWithAny(path, ["src/mcp_", "crates/bifrost-analysis/src/searchtools/"]) ||
     [
       "src/mcp_cli.rs",
       "src/mcp_common.rs",
@@ -85,7 +89,7 @@ function classifyPath(path) {
   if (isRqlPath(path)) {
     return { components: RQL_COMPONENTS, reason: "RQL, structural-query, or policy surface" };
   }
-  if (path === "src/code_intelligence.rs") {
+  if (path === "crates/bifrost-runtime/src/code_intelligence.rs") {
     return { components: RUNTIME_COMPONENTS, reason: "shared code-intelligence runtime" };
   }
   if (isMcpPath(path)) {

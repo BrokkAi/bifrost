@@ -15,7 +15,7 @@ A developer will be able to run `cargo test -p brokk-bifrost-mcp` or `cargo test
 - [x] (2026-07-29 09:52Z) Chose package identities, dependency direction, facade compatibility strategy, and pre-publication package-set validation strategy.
 - [x] (2026-07-29 09:52Z) Authored this initial ExecPlan for issue #1275.
 - [x] (2026-07-29 10:05Z) Established workspace metadata, four compiling package skeletons, an executable dependency-boundary check, and a package-neutral percent-decoder without moving protocol behavior.
-- [ ] Extract the analysis and code-intelligence runtime packages while preserving the root Rust API.
+- [x] (2026-07-29 11:44Z) Extracted analysis and the typed runtime into independently compiling packages, preserved the root Rust API, and passed 1,781 analysis unit tests plus runtime/facade contract tests.
 - [ ] Extract and independently validate the LSP host package.
 - [ ] Extract and independently validate the MCP host package, then reconnect the CLI and Python facade.
 - [ ] Move component tests and CI impact mappings onto the proven package boundaries.
@@ -47,6 +47,18 @@ A developer will be able to run `cargo test -p brokk-bifrost-mcp` or `cargo test
 
 - Observation: Moving the root version into `[workspace.package]` during the skeleton milestone would break the existing release-version parser before package publication is otherwise changing.
   Evidence: `scripts/release-version.test.mjs` asserts that the single source of truth is the root `[package]` version. Milestone 1 therefore shares non-version package metadata and uses the dependency-boundary check to enforce temporary member-version equality; Milestone 5 moves the version source and release tooling together.
+
+- Observation: Cancellation is an analysis execution primitive rather than runtime-owned state.
+  Evidence: Analyzer traversal, search tooling, and work budgets consume `CancellationToken` directly. The analysis package therefore owns it and the runtime and root facade re-export the same type, avoiding a reverse dependency from analysis to runtime.
+
+- Observation: Search result rendering must remain beside the analysis result types under Rust's orphan rules.
+  Evidence: `searchtools_render.rs` defines inherent methods on `SearchSymbolsResult`, `SymbolSourcesResult`, and related analysis-owned types. Moving those implementations to MCP would make them illegal cross-crate inherent implementations, so analysis owns the protocol-neutral Markdown rendering while MCP will own transport envelopes and descriptors.
+
+- Observation: Reference differential testing is protocol-neutral analysis audit machinery, not a root-host concern.
+  Evidence: The module exercises analyzer resolution, usage graphs, syntax preparation, and persisted query scopes without importing LSP, MCP, CLI, or Python types, so it moved with analysis.
+
+- Observation: The analysis package archive verifies independently and includes its native grammar/resource inputs.
+  Evidence: `cargo package -p brokk-bifrost-analysis --allow-dirty --locked` verified a 577-file archive (6.3 MiB compressed). Ordinary runtime verification cannot yet resolve unpublished `brokk-bifrost-analysis = 0.8.12`; Milestone 5's unpacked package-set patches are required for that pre-publication proof.
 
 ## Decision Log
 
@@ -82,9 +94,15 @@ A developer will be able to run `cargo test -p brokk-bifrost-mcp` or `cargo test
   Rationale: This keeps every milestone green and avoids changing release parsing twice. The final lockstep `[workspace.package]` version remains required and will land atomically with its consumers and tests.
   Date/Author: 2026-07-29 / Codex
 
+- Decision: Let analysis own cancellation, protocol-neutral search-result rendering, model-context sampling, and reference-differential audits; let runtime re-export cancellation and own only typed orchestration.
+  Rationale: These facilities directly depend on analysis types or are called below the runtime layer. Co-locating them preserves a one-way package graph and avoids wrapper types or illegal inherent implementations while keeping host transport concerns out of analysis.
+  Date/Author: 2026-07-29 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 is complete. The repository is now a non-virtual Cargo workspace with the root facade as its default member and four version-matched implementation package skeletons. The checked-in graph validator rejects reverse dependencies, cross-host dependencies, host-only external dependencies below their layer, unexpected members, and version drift. Search tooling no longer imports the LSP module for percent decoding; the shared utility retains Unicode behavior and adds malformed-escape coverage. No production module has moved yet, so public behavior and root packaging remain unchanged.
+
+Milestone 2 is complete. Analyzer, policy/query, search, storage, optional NLP, resource, vendored grammar, and reference-differential code now build in `brokk-bifrost-analysis`; `CodeIntelligenceRuntime` builds in `brokk-bifrost-runtime` with only analysis beneath it. The root crate is a compatibility facade for the moved API, proven by a real inline-project query. The runtime integration contract passes in its package, the full analysis library suite passes 1,781 tests with six intentional ignores, and the runtime dependency tree contains no LSP, MCP, or PyO3 dependency. The analysis `.crate` also verifies independently from its packaged contents.
 
 ## Context and Orientation
 
@@ -116,11 +134,11 @@ This milestone is complete when the workspace metadata test passes, the lockfile
 
 ### Milestone 2: Extract analysis and the typed runtime
 
-Move analyzer-owned modules from `src/` into `crates/bifrost-analysis/src/` while preserving their internal module relationships. This includes `analyzer`, analyzer storage/cache support, code quality, compact graphs, project and watcher abstractions, navigation/search algorithms, policy and structural-query code, protocol-neutral path/text/hash helpers, and optional NLP indexing. Use `git mv` so history remains readable. Do not move `searchtools_service`, renderers, LSP, MCP descriptors, Python, CLI, benchmarks, or fuzzers into analysis.
+Move analyzer-owned modules from `src/` into `crates/bifrost-analysis/src/` while preserving their internal module relationships. This includes `analyzer`, analyzer storage/cache support, code quality, compact graphs, navigation/search algorithms, policy and structural-query code, protocol-neutral path/text/hash helpers, model-context sampling, protocol-neutral result rendering, reference-differential audits, and optional NLP indexing. Use `git mv` so history remains readable. Keep the project watcher with the MCP workspace-lifecycle host, and do not move `searchtools_service`, LSP, MCP descriptors, Python, CLI, benchmarks, or fuzzers into analysis.
 
 Move the vendored Scala and Kotlin sources and any analyzer `include_str!` resources under `crates/bifrost-analysis/`. Split the current root `build.rs`: the analysis package’s build script compiles the vendored grammars using paths contained in its own package; the root build script retains only facade build-identity generation. Extend the root dirty fingerprint to cover all workspace member source and manifest paths so the binary’s build identity still changes for dirty host or runtime edits.
 
-Move `CodeIntelligenceRuntime` and cancellation ownership into `crates/bifrost-runtime/src/`. The runtime package depends on analysis and exposes typed methods equivalent to the current query and policy methods. It must not depend on `serde_json::Value`, `lsp-server`, `lsp-types`, MCP descriptors/rendering, PyO3, or host request lifecycle types.
+Move `CodeIntelligenceRuntime` into `crates/bifrost-runtime/src/`. Cancellation remains an analysis-owned execution primitive and is re-exported by runtime. The runtime package depends on analysis and exposes typed methods equivalent to the current query and policy methods. It must not depend on `serde_json::Value`, `lsp-server`, `lsp-types`, MCP descriptors/rendering, PyO3, or host request lifecycle types.
 
 Replace the root implementations with compatibility re-exports. `src/lib.rs` must continue exposing `analyzer`, `code_intelligence`, `searchtools`, `policy`, `usages`, the existing root analyzer types, `CancellationToken`, and `NavigationOperation` at their current paths. Add `tests/public_facade_compat.rs` to compile representative existing imports and execute a small `InlineTestProject` query through the root facade.
 
@@ -141,7 +159,7 @@ The first command must run the LSP host tests without selecting the MCP package 
 
 ### Milestone 4: Extract MCP and reconnect CLI/Python
 
-Move `src/searchtools_service.rs`, `src/searchtools_render.rs`, `src/model_context.rs`, `src/tool_arguments.rs`, the relevant structured-output helpers, and `src/mcp_common.rs` plus the `src/mcp_*.rs` tool descriptor/registry modules into `crates/bifrost-mcp/src/`. Keep typed analyzer search algorithms in analysis. Move the run-policy selector/path byte limits beside `SearchToolsService`’s typed MCP preparation contract so the service no longer imports a descriptor module for validation constants.
+Move `src/searchtools_service.rs`, `src/tool_arguments.rs`, the relevant structured-output helpers, and `src/mcp_common.rs` plus the `src/mcp_*.rs` tool descriptor/registry modules into `crates/bifrost-mcp/src/`. Keep typed analyzer search algorithms, model-context sampling, and result rendering in analysis. Move the run-policy selector/path byte limits beside `SearchToolsService`’s typed MCP preparation contract so the service no longer imports a descriptor module for validation constants.
 
 Move `tests/bifrost_mcp_server.rs` and focused service/registry contract tests into the MCP package. Preserve exact tool names, JSON schemas, error codes, rendering, registration behavior, cancellation, workspace binding, and session refresh behavior. Define the MCP package’s `nlp` feature as a forwarding feature to analysis; it must remain optional and tests must construct services without real models or indexer threads.
 
@@ -277,6 +295,26 @@ Milestone 1 evidence:
     $ scripts/check-crate-package.sh
     exit status 0
 
+Milestone 2 evidence:
+
+    $ cargo test -p brokk-bifrost-analysis --lib --quiet
+    test result: ok. 1781 passed; 0 failed; 6 ignored
+
+    $ cargo test -p brokk-bifrost-runtime --test code_intelligence_runtime
+    test result: ok. 1 passed
+
+    $ cargo test -p brokk-bifrost --test public_facade_compat
+    test result: ok. 1 passed
+
+    $ node scripts/check-workspace-dependencies.mjs
+    workspace dependency graph is valid
+
+    $ cargo check -p brokk-bifrost --lib --features nlp
+    Finished `dev` profile successfully
+
+    $ cargo package -p brokk-bifrost-analysis --allow-dirty --locked
+    Packaged 577 files, 84.1MiB (6.3MiB compressed); verification succeeded
+
 ## Interfaces and Dependencies
 
 `crates/bifrost-analysis` owns analyzer and typed search/policy/query data. It exposes only the types and functions required by runtime and hosts. It has no dependency on any other Bifrost workspace package.
@@ -337,3 +375,5 @@ During implementation, express the numeric version through supported workspace i
 Revision note (2026-07-29): Created the initial issue #1275 ExecPlan after live issue review, current-master synchronization, source/dependency inspection, Cargo packaging verification, and release-surface review. It fixes the package graph and publication strategy up front because those constraints determine whether the stable facade can survive the extraction.
 
 Revision note (2026-07-29): Completed Milestone 1 with a green workspace skeleton, dependency-graph validator, neutral percent-decoder, root package check, and existing quick-policy Node suite. Version-source consolidation is deliberately deferred to the package/release milestone so the current release contract stays green at every checkpoint.
+
+Revision note (2026-07-29): Completed Milestone 2 by physically extracting analysis/resources/native grammars and the typed runtime, preserving the root API through re-exports, and validating the complete analysis suite, runtime contract, root facade, optional NLP compile, dependency graph, notices, and independent analysis archive.
