@@ -565,6 +565,20 @@ local gate, but is not the focus.
   objects), and #1292 (members inherited by extending objects) to `jbellis`
   before implementation. These dirty/dynamic-head envelopes remain triage
   evidence and require clean acceptance replay.
+- [x] (2026-07-28) Implemented and committed the C#, Go, JavaScript, Rust, and
+  Scala issue families #1261 through #1292 (excluding the closed duplicate
+  #1272) as focused structured resolver/graph fixes. Rust's `self.field`
+  contract now deliberately preserves the symbols API's no-definition result
+  while LSP navigation resolves the receiver parameter; both exact surfaces
+  pass their focused regressions.
+- [x] (2026-07-28) Completed the focused Scala repair proofs for #1290, #1291,
+  and #1292. Anonymous mixin parents resolve in the type namespace, stable
+  singleton and qualified case-object paths retain their exact terminals, and
+  inherited overloaded generic object members use call-site shape. The full
+  Scala direct-usage suite passes 57/57 and graph-usage suite passes 155/155.
+  Fresh exact replays on committed head `ea66ce09` resolve
+  `org.http4s.Method$.HEAD` and `zio.http.Method$.OPTIONS$` with zero
+  actionable rows. Clean five-repository acceptance replay is still required.
 - [x] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [x] Complete C++ and publish its evidence and user summary.
