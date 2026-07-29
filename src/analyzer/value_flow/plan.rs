@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, error::Error, fmt, mem::size_of_val, sync::Arc};
+use std::{cmp::Ordering, error::Error, fmt, hash::Hash, mem::size_of_val, sync::Arc};
 
 use crate::analyzer::dataflow::{
     CuratedCallModel, CuratedCallModelFingerprint, ExternalSemanticSummarySet,
@@ -11,8 +11,8 @@ use crate::analyzer::semantic::{
     CallBindings, CallSiteHandle, CallSiteId, CallableTarget, CallableTargetResolution,
     CandidateCoverage, DeclarationLocator, DispatchBoundaryKind, EvidenceCompleteness,
     IcfgEdgeKind, MemoryLocationKind, ObjectCardinality, ProcedureHandle, ProgramPointHandle,
-    ProgramPointId, ProofStatus, SemanticArtifactKey, SemanticEffect, ValueFlowRelationKind,
-    ValueFlowSnapshot,
+    ProgramPointId, ProofStatus, SemanticArtifact, SemanticArtifactKey, SemanticEffect,
+    ValueFlowRelationKind, ValueFlowSnapshot,
 };
 use crate::hash::HashMap;
 
@@ -98,7 +98,7 @@ impl<T> ValueFlowInput<T> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct LocalFlowRule {
     pub point: ProgramPointHandle,
     pub event_index: u32,
@@ -278,7 +278,7 @@ fn summary_evidence_is_proven_complete(evidence: &SummaryEvidence) -> bool {
         .any(|alternative| alternative.quality().is_proven() && alternative.quality().is_complete())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CallFlowRule {
     pub call: CallSiteHandle,
     pub callee: ProcedureHandle,
@@ -289,7 +289,7 @@ pub(crate) struct CallFlowRule {
     pub completeness: EvidenceCompleteness,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CallFallbackProfile {
     call: CallSiteHandle,
     inputs: Box<[ValueFlowCarrierId]>,
@@ -338,7 +338,7 @@ impl ValueFlowSummaryLocationBinding {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct BoundSummaryLocationBinding {
     call: CallSiteHandle,
     port: SummaryPort,
@@ -359,14 +359,14 @@ impl ValueFlowCuratedCallModel {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct BoundValueFlowSource {
     pub id: ValueFlowSourceId,
     pub spec: ValueFlowSourceSpec,
     pub carrier: ValueFlowCarrierId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct BoundValueFlowSink {
     pub id: ValueFlowSinkId,
     pub spec: ValueFlowSinkSpec,
@@ -423,6 +423,31 @@ impl PartialEq for ValueFlowPlan {
 }
 
 impl Eq for ValueFlowPlan {}
+
+impl Hash for ValueFlowPlan {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.root.hash(state);
+        self.unmodeled_call_behavior.hash(state);
+        self.external_summaries.fingerprint().hash(state);
+        self.curated_call_models.len().hash(state);
+        for model in &self.curated_call_models {
+            model.call.hash(state);
+            model.model.fingerprint().hash(state);
+        }
+        self.carrier_keys.hash(state);
+        self.local_rules.hash(state);
+        self.call_rules.hash(state);
+        self.fallback_profiles.hash(state);
+        self.summary_location_bindings.hash(state);
+        self.sources.hash(state);
+        self.sinks.hash(state);
+        self.snapshot_procedures.hash(state);
+        self.binding_pairs.hash(state);
+        self.discovery_status.hash(state);
+        self.discovery_complete.hash(state);
+        self.structural_discovery_complete.hash(state);
+    }
+}
 
 impl ValueFlowPlan {
     pub fn try_new(
@@ -689,6 +714,142 @@ impl ValueFlowPlan {
 
     pub fn root(&self) -> &ProcedureHandle {
         &self.root
+    }
+
+    /// Visit every concrete semantic artifact allocation retained by handles
+    /// in this immutable plan. Duplicate allocations are intentional: bounded
+    /// host registries deduplicate them while accounting and validating.
+    pub(crate) fn for_each_retained_artifact(&self, mut visit: impl FnMut(&Arc<SemanticArtifact>)) {
+        let mut visit_procedure = |procedure: &ProcedureHandle| visit(procedure.artifact());
+        visit_procedure(&self.root);
+        for procedure in &self.snapshot_procedures {
+            visit_procedure(procedure);
+        }
+        for (call, callee) in &self.binding_pairs {
+            visit_procedure(call.procedure());
+            visit_procedure(callee);
+        }
+        for carrier in &self.carriers {
+            if let Some(procedure) = carrier.procedure() {
+                visit_procedure(procedure);
+            }
+        }
+        for rule in &self.local_rules {
+            visit_procedure(rule.point.procedure());
+        }
+        for rule in &self.call_rules {
+            visit_procedure(rule.call.procedure());
+            visit_procedure(&rule.callee);
+        }
+        for profile in &self.fallback_profiles {
+            visit_procedure(profile.call.procedure());
+        }
+        for model in &self.curated_call_models {
+            visit_procedure(model.call.procedure());
+        }
+        for binding in &self.summary_location_bindings {
+            visit_procedure(binding.call.procedure());
+        }
+        for source in &self.sources {
+            visit_procedure(source.spec.point().procedure());
+        }
+        for sink in &self.sinks {
+            visit_procedure(sink.spec.point().procedure());
+        }
+    }
+
+    /// Visit every semantic artifact identity retained by this plan.
+    pub fn for_each_retained_artifact_key(&self, mut visit: impl FnMut(&SemanticArtifactKey)) {
+        self.for_each_retained_artifact(|artifact| visit(artifact.key()));
+    }
+
+    /// Conservative retained size of plan-owned metadata, excluding semantic
+    /// artifact allocations which host registries account separately.
+    pub fn retained_bytes(&self) -> usize {
+        let carrier_key_bytes = self
+            .carrier_keys
+            .iter()
+            .map(ValueFlowCarrierKey::retained_bytes)
+            .fold(0usize, usize::saturating_add);
+        let local_rule_heap = self.local_rules.iter().fold(0usize, |total, rule| {
+            total
+                .saturating_add(proof_heap_bytes(&rule.proof))
+                .saturating_add(completeness_heap_bytes(&rule.completeness))
+        });
+        let call_rule_heap = self.call_rules.iter().fold(0usize, |total, rule| {
+            total
+                .saturating_add(proof_heap_bytes(&rule.proof))
+                .saturating_add(completeness_heap_bytes(&rule.completeness))
+        });
+        let source_heap = self.sources.iter().fold(0usize, |total, source| {
+            total
+                .saturating_add(source.spec.key().retained_bytes())
+                .saturating_add(self.carrier_keys[source.carrier.index()].retained_bytes())
+                .saturating_add(proof_heap_bytes(source.spec.proof()))
+                .saturating_add(completeness_heap_bytes(source.spec.completeness()))
+        });
+        let sink_heap = self.sinks.iter().fold(0usize, |total, sink| {
+            total
+                .saturating_add(sink.spec.key().retained_bytes())
+                .saturating_add(self.carrier_keys[sink.carrier.index()].retained_bytes())
+                .saturating_add(proof_heap_bytes(sink.spec.proof()))
+                .saturating_add(completeness_heap_bytes(sink.spec.completeness()))
+        });
+
+        std::mem::size_of::<Self>()
+            .saturating_add(self.external_summaries.retained_heap_bytes())
+            .saturating_add(size_of_val(self.curated_call_models.as_ref()))
+            .saturating_add(
+                self.curated_call_models
+                    .iter()
+                    .map(|model| model.model.retained_heap_bytes())
+                    .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(size_of_val(self.carriers.as_ref()))
+            // Locations own an access path in addition to the carrier enum.
+            // Its stable key is a conservative structural estimate of that path.
+            .saturating_add(carrier_key_bytes)
+            .saturating_add(size_of_val(self.carrier_keys.as_ref()))
+            .saturating_add(carrier_key_bytes)
+            .saturating_add(
+                self.carrier_ids
+                    .capacity()
+                    .saturating_mul(
+                        std::mem::size_of::<(ValueFlowCarrier, ValueFlowCarrierId)>()
+                            .saturating_add(1),
+                    )
+                    // The map clones every carrier; charge the structural keys
+                    // again to conservatively cover cloned locations.
+                    .saturating_add(carrier_key_bytes),
+            )
+            .saturating_add(size_of_val(self.local_rules.as_ref()))
+            .saturating_add(local_rule_heap)
+            .saturating_add(size_of_val(self.call_rules.as_ref()))
+            .saturating_add(call_rule_heap)
+            .saturating_add(size_of_val(self.fallback_profiles.as_ref()))
+            .saturating_add(
+                self.fallback_profiles
+                    .iter()
+                    .map(|profile| {
+                        size_of_val(profile.inputs.as_ref())
+                            .saturating_add(size_of_val(profile.reachable_components.as_ref()))
+                    })
+                    .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(self.fallback_locations.retained_heap_bytes())
+            .saturating_add(size_of_val(self.summary_location_bindings.as_ref()))
+            .saturating_add(size_of_val(self.sources.as_ref()))
+            .saturating_add(source_heap)
+            .saturating_add(size_of_val(self.sinks.as_ref()))
+            .saturating_add(sink_heap)
+            .saturating_add(size_of_val(self.snapshot_procedures.as_ref()))
+            .saturating_add(size_of_val(self.binding_pairs.as_ref()))
+            // Account for the plan-ownership Arc allocation and reference counts.
+            .saturating_add(
+                std::mem::size_of::<usize>()
+                    .saturating_mul(2)
+                    .saturating_add(1),
+            )
     }
 
     pub const fn unmodeled_call_behavior(&self) -> UnmodeledCallBehavior {
@@ -1807,6 +1968,38 @@ struct FallbackLocationIndex {
     by_component: HashMap<usize, Vec<ValueFlowCarrierId>>,
     bounded_globals: Vec<ValueFlowCarrierId>,
     location_components: HashMap<ValueFlowCarrierId, usize>,
+}
+
+impl FallbackLocationIndex {
+    fn retained_heap_bytes(&self) -> usize {
+        let by_component = self
+            .by_component
+            .capacity()
+            .saturating_mul(
+                std::mem::size_of::<(usize, Vec<ValueFlowCarrierId>)>().saturating_add(1),
+            )
+            .saturating_add(
+                self.by_component
+                    .values()
+                    .map(|carriers| {
+                        carriers
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<ValueFlowCarrierId>())
+                    })
+                    .fold(0usize, usize::saturating_add),
+            );
+        let bounded_globals = self
+            .bounded_globals
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ValueFlowCarrierId>());
+        let location_components = self
+            .location_components
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(ValueFlowCarrierId, usize)>().saturating_add(1));
+        by_component
+            .saturating_add(bounded_globals)
+            .saturating_add(location_components)
+    }
 }
 
 fn build_fallback_location_index(

@@ -831,6 +831,55 @@ fn validate_wrapper(
                 }
             }
         }
+        RqlForm::ValueFlow => {
+            let option = args
+                .first()
+                .and_then(Expr::as_symbol)
+                .and_then(|label| QueryStepOp::ValueFlow.option_for_rql_label(label));
+            if args.len() != 3
+                || option.is_none_or(|option| option.field() != QueryStepField::PlanRef)
+            {
+                analysis.error(
+                    head_range.clone(),
+                    "wrong-value-shape",
+                    "value-flow expects :plan-ref namespace:name followed by a query",
+                );
+            } else {
+                analysis.add_help(
+                    args[0].range.clone(),
+                    ":plan-ref namespace:name",
+                    option
+                        .expect("validated value-flow option")
+                        .field()
+                        .description(),
+                );
+                let steps = query_to_json(query)
+                    .ok()
+                    .and_then(|value| value.get("steps").and_then(Value::as_array).map(Vec::len))
+                    .unwrap_or(0);
+                let field_path =
+                    format!("{}[{steps}].plan_ref", rql_query_child_path(path, "steps"));
+                analysis.path(&field_path, args[1].range.clone());
+                match args[1].as_symbol().or_else(|| args[1].as_string()) {
+                    Some(value) => {
+                        if let Err(error) =
+                            value.parse::<super::super::analysis_context::ValueFlowPlanRef>()
+                        {
+                            analysis.error(
+                                args[1].range.clone(),
+                                "wrong-value-shape",
+                                error.to_string(),
+                            );
+                        }
+                    }
+                    None => analysis.error(
+                        args[1].range.clone(),
+                        "wrong-value-shape",
+                        "plan_ref must be a symbol or string",
+                    ),
+                }
+            }
+        }
         RqlForm::Witness => {
             let options = &args[..args.len().saturating_sub(1)];
             if !options.len().is_multiple_of(2) {
@@ -1512,6 +1561,7 @@ fn validate_property_value(
         | super::schema::ValueShape::UsageSurface
         | super::schema::ValueShape::CallTraversalCompleteness
         | super::schema::ValueShape::ProtocolRef
+        | super::schema::ValueShape::ValueFlowPlanRef
         | super::schema::ValueShape::TrueBoolean => {
             unreachable!("unsupported value shape for an RQL pattern property")
         }
@@ -2586,6 +2636,7 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
             Some("receiver_targets" | "points_to" | "member_targets")
         );
         let typestate_step = op_label == Some("typestate");
+        let value_flow_step = op_label == Some("value_flow");
         let witness_step = op_label == Some("witness");
         let mut seen_op = false;
         let mut seen_depth = false;
@@ -2598,6 +2649,7 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
         let mut seen_parameter_name = false;
         let mut seen_capture = false;
         let mut seen_protocol_ref = false;
+        let mut seen_plan_ref = false;
         let mut seen_max_steps = false;
         let mut seen_max_bytes = false;
         let mut transitive_range = None;
@@ -2817,6 +2869,32 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                 }
                 continue;
             }
+            if field == Some(QueryStepField::PlanRef) && value_flow_step {
+                analysis.add_help(
+                    key.range(),
+                    QueryStepField::PlanRef.signature(),
+                    QueryStepField::PlanRef.description(),
+                );
+                if seen_plan_ref {
+                    analysis.error(
+                        key.range(),
+                        "duplicate-property",
+                        "duplicate property 'plan_ref'",
+                    );
+                }
+                seen_plan_ref = true;
+                match child.as_string() {
+                    Some(value) => {
+                        if let Err(error) =
+                            value.parse::<super::super::analysis_context::ValueFlowPlanRef>()
+                        {
+                            analysis.error(child.range(), "wrong-value-shape", error.to_string());
+                        }
+                    }
+                    None => require_json_string(child, analysis),
+                }
+                continue;
+            }
             if matches!(
                 field,
                 Some(QueryStepField::MaxSteps | QueryStepField::MaxBytes)
@@ -2879,6 +2957,7 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                                 ))
                             || (receiver_step && **candidate == QueryStepField::Capture)
                             || (typestate_step && **candidate == QueryStepField::ProtocolRef)
+                            || (value_flow_step && **candidate == QueryStepField::PlanRef)
                             || (witness_step
                                 && matches!(
                                     candidate,
@@ -2957,6 +3036,13 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                 step.range(),
                 "invalid-query-step",
                 "typestate requires protocol_ref",
+            );
+        }
+        if value_flow_step && !seen_plan_ref {
+            analysis.error(
+                step.range(),
+                "invalid-query-step",
+                "value_flow requires plan_ref",
             );
         }
     }
@@ -3628,6 +3714,43 @@ mod tests {
             .into_iter()
             .find(|diagnostic| diagnostic.message.contains("namespace:name"))
             .expect("protocol-ref diagnostic");
+        assert_eq!(&invalid_ref[diagnostic.range], r#""missing-separator""#);
+    }
+
+    #[test]
+    fn value_flow_help_and_diagnostics_are_range_precise() {
+        let rql =
+            "(witness :max-steps 8 (value-flow :plan-ref test:flow (procedure-of (function))))";
+        for token in ["witness", "value-flow", ":plan-ref"] {
+            let offset = rql.find(token).unwrap();
+            let help = query_source_help_at(rql, offset)
+                .unwrap_or_else(|| panic!("no value-flow help for {token}"));
+            assert_eq!(&rql[help.range], token);
+            assert!(!help.description.is_empty());
+        }
+        assert!(validate_query_source(rql).is_empty());
+
+        let json = r#"{"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"value_flow","plan_ref":"test:flow"},{"op":"witness","max_steps":8}]}"#;
+        for token in ["value_flow", "plan_ref", "witness", "max_steps"] {
+            let offset = json.find(token).unwrap();
+            let help = query_source_help_at(json, offset)
+                .unwrap_or_else(|| panic!("no JSON value-flow help for {token}"));
+            assert!(!help.description.is_empty());
+        }
+        assert!(validate_query_source(json).is_empty());
+
+        let version_five = r#"{"schema_version":5,"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"value_flow","plan_ref":"test:flow"}]}"#;
+        let diagnostic = validate_query_source(version_five)
+            .into_iter()
+            .find(|diagnostic| diagnostic.message.contains("requires schema version 6"))
+            .expect("schema-version diagnostic");
+        assert_eq!(&version_five[diagnostic.range], r#""value_flow""#);
+
+        let invalid_ref = r#"{"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"value_flow","plan_ref":"missing-separator"}]}"#;
+        let diagnostic = validate_query_source(invalid_ref)
+            .into_iter()
+            .find(|diagnostic| diagnostic.message.contains("namespace:name"))
+            .expect("plan-ref diagnostic");
         assert_eq!(&invalid_ref[diagnostic.range], r#""missing-separator""#);
     }
 

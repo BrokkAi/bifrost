@@ -1466,6 +1466,28 @@ impl ExternalSemanticSummarySet {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Conservative retained heap estimate for the set's boxed entries and
+    /// their owned target and summary metadata.
+    pub(crate) fn retained_heap_bytes(&self) -> usize {
+        size_of_val(self.entries.as_ref()).saturating_add(
+            self.entries
+                .iter()
+                .map(|(target, summary)| {
+                    target
+                        .path
+                        .as_str()
+                        .len()
+                        .saturating_add(declaration_locator_heap_bytes(&target.declaration))
+                        .saturating_add(
+                            summary
+                                .retained_bytes()
+                                .saturating_sub(size_of::<SemanticProcedureSummary>()),
+                        )
+                })
+                .fold(0_usize, usize::saturating_add),
+        )
+    }
 }
 
 /// A curated, selector-bound call model using the same stable ports and
@@ -1522,6 +1544,19 @@ impl CuratedCallModel {
 
     pub fn transfers(&self) -> &[SummaryTransfer] {
         &self.transfers
+    }
+
+    /// Conservative retained heap estimate for the model identifier and
+    /// transfer evidence owned by this model.
+    pub(crate) fn retained_heap_bytes(&self) -> usize {
+        self.model.as_str().len().saturating_add(
+            size_of_val(self.transfers()).saturating_add(
+                self.transfers
+                    .iter()
+                    .map(|transfer| evidence_heap_bytes(transfer.evidence()))
+                    .fold(0_usize, usize::saturating_add),
+            ),
+        )
     }
 }
 
@@ -2443,6 +2478,17 @@ fn effect_reference_count(effect: &SummaryEffectKey) -> usize {
 
 fn procedure_key_heap_bytes(key: &ProcedureSummaryKey) -> usize {
     identity_heap_bytes(key.identity())
+}
+
+fn declaration_locator_heap_bytes(declaration: &DeclarationLocator) -> usize {
+    size_of_val(declaration.segments()).saturating_add(
+        declaration
+            .segments()
+            .iter()
+            .filter_map(|segment| segment.name())
+            .map(str::len)
+            .fold(0_usize, usize::saturating_add),
+    )
 }
 
 fn identity_heap_bytes(identity: &ProcedureSummaryIdentity) -> usize {

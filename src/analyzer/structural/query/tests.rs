@@ -612,6 +612,68 @@ fn typestate_step_options_are_required_bounded_and_operation_specific() {
 }
 
 #[test]
+fn schema_version_six_adds_registered_value_flow_endpoints_and_witnesses() {
+    let query = parse_ok(json!({
+        "schema_version": 6,
+        "match": { "kind": "function", "name": "run" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "value_flow", "plan_ref": "test:request-to-sink" },
+            { "op": "witness", "max_steps": 24, "max_bytes": 8192 },
+            { "op": "file_of" }
+        ]
+    }));
+    assert!(matches!(
+        &query.plan.steps[1],
+        QueryStep::ValueFlow(ValueFlowTraversal { plan_ref })
+            if plan_ref.to_string() == "test:request-to-sink"
+    ));
+    assert_eq!(query.validate_steps().unwrap(), QueryValueKind::File);
+
+    let rql = CodeQuery::from_sexp(
+        "(file-of (witness :max-steps 24 :max-bytes 8192 (value-flow :plan-ref test:request-to-sink (procedure-of (function :name \"run\")))))",
+    )
+    .expect("schema-six value-flow RQL should lower");
+    assert_eq!(rql.schema_version, SCHEMA_VERSION);
+    assert_eq!(rql.plan.steps, query.plan.steps);
+
+    let error = error_of(json!({
+        "schema_version": 5,
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "value_flow", "plan_ref": "test:request-to-sink" }
+        ]
+    }));
+    assert_eq!(error.path, "steps[1].op");
+    assert!(error.message.contains("requires schema version 6"));
+}
+
+#[test]
+fn value_flow_plan_ref_is_required_and_operation_specific() {
+    let missing = error_of(json!({
+        "match": { "kind": "function" },
+        "steps": [{ "op": "procedure_of" }, { "op": "value_flow" }]
+    }));
+    assert_eq!(missing.path, "steps[1].plan_ref");
+
+    let invalid = error_of(json!({
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "value_flow", "plan_ref": "missing-separator" }
+        ]
+    }));
+    assert_eq!(invalid.path, "steps[1].plan_ref");
+
+    let wrong_operation = error_of(json!({
+        "match": { "kind": "function" },
+        "steps": [{ "op": "procedure_of", "plan_ref": "test:flow" }]
+    }));
+    assert_eq!(wrong_operation.path, "steps[0].plan_ref");
+}
+
+#[test]
 fn typed_cfg_algebra_validates_each_domain_transition() {
     for (steps, expected) in [
         (

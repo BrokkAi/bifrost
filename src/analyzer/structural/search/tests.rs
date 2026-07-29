@@ -28,6 +28,27 @@ fn language_analyzer(language: Language, project: TestProject) -> Box<dyn IAnaly
 }
 
 #[test]
+fn value_flow_registration_failures_keep_their_domain_in_mixed_queries() {
+    let error = QueryAnalysisContextError::ValueFlowRegistrationInvalid {
+        detail: Box::new(QueryAnalysisContextError::StaleArtifact {
+            path: "src/Flow.java".into(),
+        }),
+    };
+    let result = query_analysis_context_error_result(error);
+
+    assert_eq!(result.diagnostics.len(), 1);
+    assert_eq!(
+        result.diagnostics[0].code,
+        CodeQueryDiagnosticCode::ValueFlowRegistrationStale
+    );
+    assert!(
+        result.diagnostics[0]
+            .message
+            .contains("value-flow registration")
+    );
+}
+
+#[test]
 fn semantic_projection_rejects_a_newer_source_than_the_retained_scan_seed() {
     let original = "function target() { const first = 1; }\n";
     let changed = "function target() { const other = 2; }\n";

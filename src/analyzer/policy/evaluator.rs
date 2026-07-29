@@ -2295,7 +2295,9 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::ProgramPoint
             | QueryValueKind::ControlEdge
             | QueryValueKind::TypestateFinding
-            | QueryValueKind::TypestateWitness,
+            | QueryValueKind::TypestateWitness
+            | QueryValueKind::FlowEndpoint
+            | QueryValueKind::FlowWitness,
         ) => {
             return failed_before_execution(
                 PolicyFailureReason::InvalidExecutionPlan,
@@ -2777,6 +2779,8 @@ fn terminal_presentation(
         | CodeQueryResultValue::ControlEdge { .. }
         | CodeQueryResultValue::TypestateFinding { .. }
         | CodeQueryResultValue::TypestateWitness { .. }
+        | CodeQueryResultValue::FlowEndpoint { .. }
+        | CodeQueryResultValue::FlowWitness { .. }
         | CodeQueryResultValue::ReceiverAnalysis { .. } => return Err(()),
     };
     if actual_domain != expected_domain || path != expected_path.as_str() {
@@ -3322,6 +3326,8 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::ControlEdge { .. } => "control_edge",
         CodeQueryResultRef::TypestateFinding { .. } => "typestate_finding",
         CodeQueryResultRef::TypestateWitness { .. } => "typestate_witness",
+        CodeQueryResultRef::FlowEndpoint { .. } => "flow_endpoint",
+        CodeQueryResultRef::FlowWitness { .. } => "flow_witness",
         CodeQueryResultRef::File { .. } => "file",
         CodeQueryResultRef::ReferenceSite { .. } => "reference_site",
         CodeQueryResultRef::CallSite { .. } => "call_site",
@@ -3339,6 +3345,8 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::ControlEdge { path, .. }
         | CodeQueryResultRef::TypestateFinding { path, .. }
         | CodeQueryResultRef::TypestateWitness { path, .. }
+        | CodeQueryResultRef::FlowEndpoint { path, .. }
+        | CodeQueryResultRef::FlowWitness { path, .. }
         | CodeQueryResultRef::File { path }
         | CodeQueryResultRef::ReferenceSite { path, .. }
         | CodeQueryResultRef::CallSite { path, .. }
@@ -3375,6 +3383,8 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         | DetailedCodeQueryDomain::ControlEdge
         | DetailedCodeQueryDomain::TypestateFinding
         | DetailedCodeQueryDomain::TypestateWitness
+        | DetailedCodeQueryDomain::FlowEndpoint
+        | DetailedCodeQueryDomain::FlowWitness
         | DetailedCodeQueryDomain::ReceiverAnalysis => None,
     }
 }
@@ -3419,6 +3429,13 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
         DetailedCodeQueryKey::TypestateWitness { id, finding_id } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, finding_id.as_bytes());
+        }
+        DetailedCodeQueryKey::FlowEndpoint { id } => {
+            update_hash(&mut hasher, id.as_bytes());
+        }
+        DetailedCodeQueryKey::FlowWitness { id, endpoint_id } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, endpoint_id.as_bytes());
         }
         DetailedCodeQueryKey::File => {}
         DetailedCodeQueryKey::ReferenceSite {
@@ -3498,6 +3515,8 @@ fn domain_label(domain: DetailedCodeQueryDomain) -> &'static str {
         DetailedCodeQueryDomain::ControlEdge => "control_edge",
         DetailedCodeQueryDomain::TypestateFinding => "typestate_finding",
         DetailedCodeQueryDomain::TypestateWitness => "typestate_witness",
+        DetailedCodeQueryDomain::FlowEndpoint => "flow_endpoint",
+        DetailedCodeQueryDomain::FlowWitness => "flow_witness",
         DetailedCodeQueryDomain::ReferenceSite => "reference_site",
         DetailedCodeQueryDomain::CallSite => "call_site",
         DetailedCodeQueryDomain::ExpressionSite => "expression_site",
@@ -3576,6 +3595,7 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         | CodeQueryDiagnosticCode::SemanticWorkspaceRequired
         | CodeQueryDiagnosticCode::SemanticCapabilityUnsupported
         | CodeQueryDiagnosticCode::TypestateCapabilityUnsupported
+        | CodeQueryDiagnosticCode::ValueFlowCapabilityUnsupported
         | CodeQueryDiagnosticCode::ReceiverAnalysisPartial
         | CodeQueryDiagnosticCode::UsesParserUnsupported => {
             PolicyIncompleteReason::CapabilityIncomplete
@@ -3614,6 +3634,14 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         | CodeQueryDiagnosticCode::TypestateSolverBudgetExhausted
         | CodeQueryDiagnosticCode::TypestateFindingBudgetExhausted
         | CodeQueryDiagnosticCode::TypestateWitnessTruncated
+        | CodeQueryDiagnosticCode::UnresolvedValueFlowPlanReference
+        | CodeQueryDiagnosticCode::ValueFlowRegistrationStale
+        | CodeQueryDiagnosticCode::ValueFlowHandleStale
+        | CodeQueryDiagnosticCode::ValueFlowRootMismatch
+        | CodeQueryDiagnosticCode::ValueFlowAnalysisPartial
+        | CodeQueryDiagnosticCode::ValueFlowProviderFailed
+        | CodeQueryDiagnosticCode::ValueFlowSolverBudgetExhausted
+        | CodeQueryDiagnosticCode::ValueFlowWitnessTruncated
         | CodeQueryDiagnosticCode::NoEnclosingProcedure
         | CodeQueryDiagnosticCode::ReceiverAnalysisFailed
         | CodeQueryDiagnosticCode::CallRelationParseFailed

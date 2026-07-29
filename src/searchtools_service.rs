@@ -243,6 +243,7 @@ pub struct SearchToolsService {
     session: RwLock<Option<WorkspaceSession>>,
     workspace_generation: AtomicU64,
     query_protocols: RwLock<crate::analyzer::structural::ProtocolRegistrationSet>,
+    query_value_flows: RwLock<crate::analyzer::structural::ValueFlowPlanRegistrationSet>,
     typestate_summaries:
         RwLock<Arc<crate::analyzer::typestate::ProductionTypestateSummaryRepository>>,
     /// A deferred workspace build (file discovery + parse) runs on a background
@@ -289,6 +290,7 @@ pub(crate) struct PreparedQueryCode {
     arguments: Value,
     workspace_generation: u64,
     query_protocols: crate::analyzer::structural::ProtocolRegistrationSet,
+    query_value_flows: crate::analyzer::structural::ValueFlowPlanRegistrationSet,
     typestate_summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
 }
 
@@ -545,6 +547,7 @@ impl SearchToolsService {
             session: RwLock::new(Some(session)),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            query_value_flows: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -605,6 +608,7 @@ impl SearchToolsService {
             session: RwLock::new(Some(session)),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            query_value_flows: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -674,6 +678,51 @@ impl SearchToolsService {
             .write()
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
             .unregister(protocol_ref))
+    }
+
+    /// Register one already-compiled value-flow plan for in-process CodeQuery callers.
+    pub fn register_query_value_flow_plan(
+        &self,
+        plan_ref: crate::analyzer::structural::ValueFlowPlanRef,
+        plan: Arc<crate::analyzer::value_flow::ValueFlowPlan>,
+    ) -> Result<
+        crate::analyzer::structural::ValueFlowPlanRegistrationOutcome,
+        SearchToolsServiceError,
+    > {
+        let workspace_generation = {
+            let session = self.read_session()?;
+            session.as_ref().ok_or_else(Self::closed_error)?;
+            self.workspace_generation()
+        };
+        let registration =
+            crate::analyzer::structural::ValueFlowPlanRegistration::new(workspace_generation, plan);
+        let session = self.read_session()?;
+        session.as_ref().ok_or_else(Self::closed_error)?;
+        if self.workspace_generation() != workspace_generation {
+            return Err(SearchToolsServiceError::invalid_params(
+                "workspace generation changed while preparing the value-flow registration",
+            ));
+        }
+        let outcome = self
+            .query_value_flows
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
+            .register(plan_ref, registration)
+            .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
+        drop(session);
+        Ok(outcome)
+    }
+
+    /// Remove one host-defined value-flow plan alias.
+    pub fn unregister_query_value_flow_plan(
+        &self,
+        plan_ref: &crate::analyzer::structural::ValueFlowPlanRef,
+    ) -> Result<bool, SearchToolsServiceError> {
+        Ok(self
+            .query_value_flows
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
+            .unregister(plan_ref))
     }
 
     /// Construct with no file watcher and no semantic indexer: the caller drives
@@ -1061,6 +1110,7 @@ impl SearchToolsService {
             arguments,
             workspace_generation,
             query_protocols,
+            query_value_flows,
             typestate_summary_lease,
         } = self.prepare_query_code(arguments)?;
         let result = self.query_code_result_for_snapshot(
@@ -1069,6 +1119,7 @@ impl SearchToolsService {
             None,
             workspace_generation,
             &query_protocols,
+            &query_value_flows,
             typestate_summary_lease,
         );
         snapshot.finish("query_code", result)
@@ -1091,6 +1142,7 @@ impl SearchToolsService {
             };
             let snapshot = self.snapshot_for_query()?;
             let query_protocols = self.query_protocol_snapshot()?;
+            let query_value_flows = self.query_value_flow_snapshot()?;
             if generation != self.workspace_generation() {
                 continue;
             }
@@ -1106,6 +1158,7 @@ impl SearchToolsService {
                 arguments,
                 workspace_generation: generation,
                 query_protocols,
+                query_value_flows,
                 typestate_summary_lease,
             });
         }
@@ -1121,6 +1174,7 @@ impl SearchToolsService {
             arguments,
             workspace_generation,
             query_protocols,
+            query_value_flows,
             typestate_summary_lease,
         } = prepared;
         let result = (|| {
@@ -1130,6 +1184,7 @@ impl SearchToolsService {
                 cancellation,
                 workspace_generation,
                 &query_protocols,
+                &query_value_flows,
                 typestate_summary_lease,
             )?;
             let rendered_text = output.render_text();
@@ -1144,6 +1199,7 @@ impl SearchToolsService {
         snapshot.finish("query_code", result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn query_code_result_for_snapshot(
         &self,
         snapshot: &WorkspaceQueryScope,
@@ -1151,13 +1207,15 @@ impl SearchToolsService {
         cancellation: Option<&CancellationToken>,
         workspace_generation: u64,
         query_protocols: &crate::analyzer::structural::ProtocolRegistrationSet,
+        query_value_flows: &crate::analyzer::structural::ValueFlowPlanRegistrationSet,
         typestate_summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
     ) -> Result<crate::analyzer::structural::CodeQueryResponse, SearchToolsServiceError> {
         let query = Self::decode_query_code_input(snapshot, arguments)?;
         Ok(CodeIntelligenceRuntime::new(snapshot, cancellation)
-            .execute_query_with_registration_lease(
+            .execute_query_with_analysis_registration_lease(
                 workspace_generation,
                 query_protocols,
+                query_value_flows,
                 &query,
                 crate::analyzer::structural::CodeQueryExecutionLimits::default(),
                 typestate_summary_lease,
@@ -1281,12 +1339,26 @@ impl SearchToolsService {
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))
     }
 
+    fn query_value_flow_snapshot(
+        &self,
+    ) -> Result<crate::analyzer::structural::ValueFlowPlanRegistrationSet, SearchToolsServiceError>
+    {
+        self.query_value_flows
+            .read()
+            .map(|registrations| registrations.clone())
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))
+    }
+
     fn advance_workspace_generation(&self) {
         let mut summaries = self
             .typestate_summaries
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.query_protocols
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.query_value_flows
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
@@ -1338,6 +1410,7 @@ impl SearchToolsService {
             session: RwLock::new(Some(session)),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            query_value_flows: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -1383,6 +1456,7 @@ impl SearchToolsService {
             session: RwLock::new(Some(session)),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            query_value_flows: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -1428,6 +1502,7 @@ impl SearchToolsService {
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            query_value_flows: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -1488,6 +1563,7 @@ impl SearchToolsService {
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(0),
             query_protocols: RwLock::new(Default::default()),
+            query_value_flows: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -1679,6 +1755,7 @@ impl SearchToolsService {
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            query_value_flows: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -2920,6 +2997,7 @@ mod watcher_startup_tests {
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(0),
             query_protocols: RwLock::new(Default::default()),
+            query_value_flows: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -3500,6 +3578,7 @@ public partial class MudDialogContainer
             })),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            query_value_flows: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -3739,6 +3818,7 @@ mod client_roots_tests {
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(0),
             query_protocols: RwLock::new(Default::default()),
+            query_value_flows: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -4228,6 +4308,7 @@ mod tests {
             })),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            query_value_flows: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),

@@ -74,6 +74,7 @@ impl Default for PolicyBudget {
                 max_pipeline_rows: MAX_PIPELINE_ROWS,
                 semantic: CodeQuerySemanticLimits::default(),
                 typestate: CodeQueryTypestateLimits::default(),
+                value_flow: Default::default(),
             },
             max_findings: MAX_FINDINGS,
             max_diagnostics: MAX_DIAGNOSTICS,
@@ -636,6 +637,7 @@ mod tests {
                 max_pipeline_rows: 0,
                 semantic: CodeQuerySemanticLimits::default(),
                 typestate: CodeQueryTypestateLimits::default(),
+                value_flow: Default::default(),
             })
             .unwrap()
             .with_max_findings(0)

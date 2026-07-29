@@ -47,7 +47,7 @@ use crate::analyzer::reference_candidates::{
 };
 use crate::analyzer::structural::analysis_context::{
     ProtocolRef, ProtocolRegistrationSet, QueryAnalysisContext, QueryAnalysisContextError,
-    QueryAnalysisValidationLimits,
+    QueryAnalysisValidationLimits, ValueFlowPlanRef, ValueFlowPlanRegistrationSet,
 };
 use crate::analyzer::structural::capabilities::QueryFeature;
 #[cfg(test)]
@@ -88,6 +88,8 @@ mod semantic;
 #[cfg(test)]
 mod tests;
 mod typestate;
+mod value_flow;
+mod witness_projection;
 
 // `apply_pipeline_step` below (this engine's own per-step dispatch) reaches
 // into `expansions` for its three graph-traversal entry points.
@@ -99,6 +101,7 @@ use semantic::{
     SemanticQueryContext,
 };
 use typestate::{SemanticTypestateFindingValue, SemanticTypestateWitnessValue};
+use value_flow::{SemanticFlowEndpointValue, SemanticFlowWitnessValue};
 
 // Internal wiring: hoist the handful of `expansions`-child items the moved
 // test module (tests.rs) still reaches via a bare `super::name` path, exactly
@@ -125,6 +128,16 @@ pub use results::CodeQueryExecutionLimits;
 pub use results::CodeQueryExecutionWork;
 pub use results::CodeQueryExpressionSite;
 pub use results::CodeQueryFile;
+pub use results::CodeQueryFlowCertainty;
+pub use results::CodeQueryFlowCompletion;
+pub use results::CodeQueryFlowEndpoint;
+pub use results::CodeQueryFlowEvent;
+pub use results::CodeQueryFlowMustStatus;
+pub use results::CodeQueryFlowReachability;
+pub use results::CodeQueryFlowSolverTermination;
+pub use results::CodeQueryFlowWitness;
+pub use results::CodeQueryFlowWitnessStep;
+pub use results::CodeQueryFlowWitnessStepKind;
 pub use results::CodeQueryMatch;
 pub use results::CodeQueryProcedure;
 pub use results::CodeQueryProgramPoint;
@@ -159,6 +172,8 @@ pub use results::CodeQueryTypestateWitness;
 pub use results::CodeQueryTypestateWitnessStep;
 pub use results::CodeQueryTypestateWitnessStepKind;
 pub use results::CodeQueryTypestateWork;
+pub use results::CodeQueryValueFlowLimits;
+pub use results::CodeQueryValueFlowWork;
 pub(crate) use results::DetailedCodeQueryDomain;
 pub(crate) use results::DetailedCodeQueryEvidence;
 pub(crate) use results::DetailedCodeQueryIdentityCandidate;
@@ -401,6 +416,8 @@ enum SemanticPipelineValue {
     ControlEdge(SemanticControlEdgeValue),
     TypestateFinding(SemanticTypestateFindingValue),
     TypestateWitness(SemanticTypestateWitnessValue),
+    FlowEndpoint(Box<SemanticFlowEndpointValue>),
+    FlowWitness(SemanticFlowWitnessValue),
 }
 
 struct DetailedSemanticProjection<'a> {
@@ -432,6 +449,8 @@ enum SemanticPipelineKey {
     ControlEdge(crate::analyzer::semantic::ControlEdgeHandle),
     TypestateFinding(String),
     TypestateWitness(String),
+    FlowEndpoint(String),
+    FlowWitness(String),
 }
 
 impl PipelineValue {
@@ -467,6 +486,12 @@ impl SemanticPipelineValue {
             Self::TypestateWitness(witness) => {
                 SemanticPipelineKey::TypestateWitness(witness.key().to_string())
             }
+            Self::FlowEndpoint(endpoint) => {
+                SemanticPipelineKey::FlowEndpoint(endpoint.key().to_string())
+            }
+            Self::FlowWitness(witness) => {
+                SemanticPipelineKey::FlowWitness(witness.key().to_string())
+            }
         }
     }
 
@@ -477,6 +502,8 @@ impl SemanticPipelineValue {
             Self::ControlEdge(value) => value.file(),
             Self::TypestateFinding(value) => value.file(),
             Self::TypestateWitness(value) => value.file(),
+            Self::FlowEndpoint(value) => value.file(),
+            Self::FlowWitness(value) => value.file(),
         }
     }
 
@@ -497,6 +524,12 @@ impl SemanticPipelineValue {
             Self::TypestateWitness(value) => CodeQueryResultValue::TypestateWitness {
                 value: Box::new(value.public),
             },
+            Self::FlowEndpoint(value) => CodeQueryResultValue::FlowEndpoint {
+                value: Box::new(value.public),
+            },
+            Self::FlowWitness(value) => CodeQueryResultValue::FlowWitness {
+                value: Box::new(value.public),
+            },
         }
     }
 
@@ -507,6 +540,8 @@ impl SemanticPipelineValue {
             Self::ControlEdge(value) => value.public_ref(),
             Self::TypestateFinding(value) => value.public_ref(),
             Self::TypestateWitness(value) => value.public_ref(),
+            Self::FlowEndpoint(value) => value.public_ref(),
+            Self::FlowWitness(value) => value.public_ref(),
         }
     }
 
@@ -572,6 +607,29 @@ impl SemanticPipelineValue {
                 key: DetailedCodeQueryKey::TypestateWitness {
                     id: value.public.id.clone(),
                     finding_id: value.public.finding_id.clone(),
+                },
+                file: value.file(),
+                byte_span: value.byte_span(),
+                display_range: value.public.range,
+                language: value.public.language,
+                stable_id: value.public.id.clone(),
+            },
+            Self::FlowEndpoint(value) => DetailedSemanticProjection {
+                domain: DetailedCodeQueryDomain::FlowEndpoint,
+                key: DetailedCodeQueryKey::FlowEndpoint {
+                    id: value.public.id.clone(),
+                },
+                file: value.file(),
+                byte_span: value.byte_span(),
+                display_range: value.public.range,
+                language: value.public.language,
+                stable_id: value.public.id.clone(),
+            },
+            Self::FlowWitness(value) => DetailedSemanticProjection {
+                domain: DetailedCodeQueryDomain::FlowWitness,
+                key: DetailedCodeQueryKey::FlowWitness {
+                    id: value.public.id.clone(),
+                    endpoint_id: value.public.endpoint_id.clone(),
                 },
                 file: value.file(),
                 byte_span: value.byte_span(),
@@ -848,13 +906,18 @@ pub fn execute_workspace_request_with_registration_limits(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResponse {
+    let value_flow_registrations = ValueFlowPlanRegistrationSet::default();
     execute_request_internal(
         workspace.analyzer(),
         Some(workspace),
         query,
         limits,
         None,
-        Some((workspace_generation, registrations)),
+        Some((
+            workspace_generation,
+            registrations,
+            &value_flow_registrations,
+        )),
         None,
     )
 }
@@ -1330,13 +1393,18 @@ pub fn execute_workspace_request_with_registration_cancellation(
     limits: CodeQueryExecutionLimits,
     cancellation: &CancellationToken,
 ) -> CodeQueryResponse {
+    let value_flow_registrations = ValueFlowPlanRegistrationSet::default();
     execute_request_internal(
         workspace.analyzer(),
         Some(workspace),
         query,
         limits,
         Some(cancellation),
-        Some((workspace_generation, registrations)),
+        Some((
+            workspace_generation,
+            registrations,
+            &value_flow_registrations,
+        )),
         None,
     )
 }
@@ -1354,13 +1422,41 @@ pub fn execute_workspace_request_with_registration_lease(
     cancellation: Option<&CancellationToken>,
     summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
 ) -> CodeQueryResponse {
+    let value_flow_registrations = ValueFlowPlanRegistrationSet::default();
+    execute_workspace_request_with_analysis_registration_lease(
+        workspace,
+        workspace_generation,
+        registrations,
+        &value_flow_registrations,
+        query,
+        limits,
+        cancellation,
+        summary_lease,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn execute_workspace_request_with_analysis_registration_lease(
+    workspace: &WorkspaceAnalyzer,
+    workspace_generation: u64,
+    registrations: &ProtocolRegistrationSet,
+    value_flow_registrations: &ValueFlowPlanRegistrationSet,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
+) -> CodeQueryResponse {
     execute_request_internal(
         workspace.analyzer(),
         Some(workspace),
         query,
         limits,
         cancellation,
-        Some((workspace_generation, registrations)),
+        Some((
+            workspace_generation,
+            registrations,
+            value_flow_registrations,
+        )),
         Some(summary_lease),
     )
 }
@@ -1371,7 +1467,7 @@ fn execute_request_internal(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
-    registrations: Option<(u64, &ProtocolRegistrationSet)>,
+    registrations: Option<(u64, &ProtocolRegistrationSet, &ValueFlowPlanRegistrationSet)>,
     summary_lease: Option<crate::analyzer::typestate::ProductionTypestateSummaryLease>,
 ) -> CodeQueryResponse {
     if query_plan_requires_typestate(&query.plan) && !limits.typestate.is_valid() {
@@ -1379,12 +1475,20 @@ fn execute_request_internal(
             "typestate execution limits must be positive and no greater than their hard maxima",
         ));
     }
+    if query_plan_requires_value_flow(&query.plan) && !limits.value_flow.is_valid() {
+        return CodeQueryResponse::Results(invalid_plan_result(
+            "value-flow execution limits must be positive and no greater than their hard maxima",
+        ));
+    }
     let analysis_context = if query.execution_mode == CodeQueryExecutionMode::Explain {
         None
-    } else if let (Some(workspace), Some((workspace_generation, registrations))) =
-        (workspace, registrations)
+    } else if let (
+        Some(workspace),
+        Some((workspace_generation, registrations, value_flow_registrations)),
+    ) = (workspace, registrations)
     {
         let requested = requested_protocol_refs(&query.plan);
+        let requested_value_flows = requested_value_flow_refs(&query.plan);
         let summary_lease = match summary_lease {
             Some(summary_lease) => summary_lease,
             None => {
@@ -1399,11 +1503,13 @@ fn execute_request_internal(
                 }
             }
         };
-        match QueryAnalysisContext::new_with_validation_and_summaries(
+        match QueryAnalysisContext::new_with_all_registrations_and_summaries(
             workspace,
             workspace_generation,
             registrations,
             &requested,
+            value_flow_registrations,
+            &requested_value_flows,
             QueryAnalysisValidationLimits::new(
                 limits.semantic.max_materialized_files,
                 limits.semantic.max_source_bytes,
@@ -1419,7 +1525,7 @@ fn execute_request_internal(
     } else {
         None
     };
-    let workspace_generation = registrations.map_or(0, |(generation, _)| generation);
+    let workspace_generation = registrations.map_or(0, |(generation, _, _)| generation);
     match query.execution_mode {
         CodeQueryExecutionMode::Results => CodeQueryResponse::Results(
             execute_internal_with_analysis(
@@ -1730,6 +1836,14 @@ fn execute_internal_with_analysis_strategy(
             CodeQueryExecutionBudget::default(),
         );
     }
+    if query_plan_requires_value_flow(&query.plan) && !limits.value_flow.is_valid() {
+        return detailed_result_without_evidence(
+            invalid_plan_result(
+                "value-flow execution limits must be positive and no greater than their hard maxima",
+            ),
+            CodeQueryExecutionBudget::default(),
+        );
+    }
     let planning_ns = planning_started.map(elapsed_ns).unwrap_or(0);
     let mut diagnostics = Vec::new();
     let mut state = QueryExecutionState {
@@ -1749,6 +1863,7 @@ fn execute_internal_with_analysis_strategy(
                 cancellation,
                 limits.semantic,
                 limits.typestate,
+                limits.value_flow,
                 workspace_generation,
                 analysis_context,
             )
@@ -3501,7 +3616,9 @@ fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::SemanticBudgetExhausted
             | CodeQueryDiagnosticCode::TypestateSolverBudgetExhausted
             | CodeQueryDiagnosticCode::TypestateFindingBudgetExhausted
-            | CodeQueryDiagnosticCode::TypestateWitnessTruncated => {
+            | CodeQueryDiagnosticCode::TypestateWitnessTruncated
+            | CodeQueryDiagnosticCode::ValueFlowSolverBudgetExhausted
+            | CodeQueryDiagnosticCode::ValueFlowWitnessTruncated => {
                 Some(QueryOperatorTermination::AnalysisLimit)
             }
             CodeQueryDiagnosticCode::UnsupportedStructuralFeature
@@ -3510,7 +3627,8 @@ fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::UsesParserUnsupported
             | CodeQueryDiagnosticCode::SemanticWorkspaceRequired
             | CodeQueryDiagnosticCode::SemanticCapabilityUnsupported
-            | CodeQueryDiagnosticCode::TypestateCapabilityUnsupported => {
+            | CodeQueryDiagnosticCode::TypestateCapabilityUnsupported
+            | CodeQueryDiagnosticCode::ValueFlowCapabilityUnsupported => {
                 Some(QueryOperatorTermination::UnsupportedAnalysis)
             }
             CodeQueryDiagnosticCode::SemanticResultsOmitted
@@ -3522,6 +3640,12 @@ fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::TypestateRootMismatch
             | CodeQueryDiagnosticCode::TypestateAnalysisPartial
             | CodeQueryDiagnosticCode::TypestateProviderFailed
+            | CodeQueryDiagnosticCode::UnresolvedValueFlowPlanReference
+            | CodeQueryDiagnosticCode::ValueFlowRegistrationStale
+            | CodeQueryDiagnosticCode::ValueFlowHandleStale
+            | CodeQueryDiagnosticCode::ValueFlowRootMismatch
+            | CodeQueryDiagnosticCode::ValueFlowAnalysisPartial
+            | CodeQueryDiagnosticCode::ValueFlowProviderFailed
             | CodeQueryDiagnosticCode::ReceiverAnalysisPartial
             | CodeQueryDiagnosticCode::ReceiverAnalysisFailed
             | CodeQueryDiagnosticCode::CallRelationParseFailed
@@ -5138,6 +5262,7 @@ fn fair_branch_limits(
         // divided among independently scheduled structural seed branches.
         semantic: parent.semantic,
         typestate: parent.typestate,
+        value_flow: parent.value_flow,
     }
 }
 
@@ -5333,6 +5458,23 @@ fn query_plan_requires_typestate(plan: &CodeQueryPlan) -> bool {
     false
 }
 
+fn query_plan_requires_value_flow(plan: &CodeQueryPlan) -> bool {
+    let mut pending = vec![plan];
+    while let Some(plan) = pending.pop() {
+        if plan
+            .steps
+            .iter()
+            .any(|step| matches!(step, QueryStep::ValueFlow(_)))
+        {
+            return true;
+        }
+        if let CodeQueryPlanSource::Set { branches, .. } = &plan.source {
+            pending.extend(branches);
+        }
+    }
+    false
+}
+
 fn requested_protocol_refs(plan: &CodeQueryPlan) -> Vec<ProtocolRef> {
     let mut pending = vec![plan];
     let mut requested = Vec::new();
@@ -5351,6 +5493,24 @@ fn requested_protocol_refs(plan: &CodeQueryPlan) -> Vec<ProtocolRef> {
     requested
 }
 
+fn requested_value_flow_refs(plan: &CodeQueryPlan) -> Vec<ValueFlowPlanRef> {
+    let mut pending = vec![plan];
+    let mut requested = Vec::new();
+    while let Some(plan) = pending.pop() {
+        for step in &plan.steps {
+            if let QueryStep::ValueFlow(traversal) = step
+                && !requested.contains(&traversal.plan_ref)
+            {
+                requested.push(traversal.plan_ref.clone());
+            }
+        }
+        if let CodeQueryPlanSource::Set { branches, .. } = &plan.source {
+            pending.extend(branches.iter().rev());
+        }
+    }
+    requested
+}
+
 fn query_analysis_context_error_result(error: QueryAnalysisContextError) -> CodeQueryResult {
     let code = match error {
         QueryAnalysisContextError::UnresolvedReference { .. } => {
@@ -5360,12 +5520,25 @@ fn query_analysis_context_error_result(error: QueryAnalysisContextError) -> Code
             CodeQueryDiagnosticCode::TypestateRootMismatch
         }
         QueryAnalysisContextError::StaleHandle => CodeQueryDiagnosticCode::TypestateHandleStale,
+        QueryAnalysisContextError::UnresolvedValueFlowPlanReference { .. } => {
+            CodeQueryDiagnosticCode::UnresolvedValueFlowPlanReference
+        }
+        QueryAnalysisContextError::ValueFlowRootMismatch => {
+            CodeQueryDiagnosticCode::ValueFlowRootMismatch
+        }
+        QueryAnalysisContextError::StaleValueFlowPlanHandle => {
+            CodeQueryDiagnosticCode::ValueFlowHandleStale
+        }
+        QueryAnalysisContextError::ValueFlowRegistrationInvalid { .. } => {
+            CodeQueryDiagnosticCode::ValueFlowRegistrationStale
+        }
         QueryAnalysisContextError::Cancelled => CodeQueryDiagnosticCode::Cancelled,
         QueryAnalysisContextError::ValidationBudgetExceeded { .. } => {
             CodeQueryDiagnosticCode::SemanticBudgetExhausted
         }
         QueryAnalysisContextError::GenerationExhausted
         | QueryAnalysisContextError::TooManyResolvedProtocols
+        | QueryAnalysisContextError::TooManyResolvedValueFlowPlans
         | QueryAnalysisContextError::WorkspaceGenerationMismatch { .. }
         | QueryAnalysisContextError::StaleArtifact { .. }
         | QueryAnalysisContextError::ArtifactIdentityUnavailable { .. }
@@ -5661,6 +5834,22 @@ fn apply_pipeline_step(
                 .map(pipeline_expansion)
                 .collect(),
             (
+                PipelineValue::Semantic(SemanticPipelineValue::Procedure(procedure)),
+                QueryStep::ValueFlow(traversal),
+            ) => semantic
+                .as_mut()
+                .expect("value-flow query service exists for semantic steps")
+                .value_flow_endpoints(
+                    procedure,
+                    &traversal.plan_ref,
+                    max_step_outputs.saturating_sub(output.len()),
+                )
+                .into_iter()
+                .map(|endpoint| SemanticPipelineValue::FlowEndpoint(Box::new(endpoint)))
+                .map(PipelineValue::Semantic)
+                .map(pipeline_expansion)
+                .collect(),
+            (
                 PipelineValue::Semantic(SemanticPipelineValue::TypestateFinding(finding)),
                 QueryStep::Witness(traversal),
             ) => {
@@ -5680,6 +5869,18 @@ fn apply_pipeline_step(
                     .map(pipeline_expansion)
                     .collect()
             }
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::FlowEndpoint(endpoint)),
+                QueryStep::Witness(traversal),
+            ) => semantic
+                .as_mut()
+                .expect("value-flow witness projection retains its semantic context")
+                .value_flow_witnesses(endpoint, traversal)
+                .into_iter()
+                .map(SemanticPipelineValue::FlowWitness)
+                .map(PipelineValue::Semantic)
+                .map(pipeline_expansion)
+                .collect(),
             (PipelineValue::StructuralMatch(seed), QueryStep::EnclosingDecl) => {
                 let (enclosing, projection_omitted) =
                     enclosing_declaration_value(analyzer, seed, &mut enclosing_declarations);
@@ -5743,6 +5944,18 @@ fn apply_pipeline_step(
                     witness.file().clone(),
                 ))]
             }
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::FlowEndpoint(endpoint)),
+                QueryStep::FileOf,
+            ) => vec![pipeline_expansion(PipelineValue::File(
+                endpoint.file().clone(),
+            ))],
+            (
+                PipelineValue::Semantic(SemanticPipelineValue::FlowWitness(witness)),
+                QueryStep::FileOf,
+            ) => vec![pipeline_expansion(PipelineValue::File(
+                witness.file().clone(),
+            ))],
             (PipelineValue::ReferenceSite(site), QueryStep::FileOf) => {
                 vec![pipeline_expansion(PipelineValue::File(site.file.clone()))]
             }
