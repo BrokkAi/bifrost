@@ -1586,6 +1586,30 @@ mod tests {
     }
 
     #[test]
+    fn issue_1306_deadline_racing_client_cancellation_keeps_the_canonical_report() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("app.ts"), "export const value = 1;\n")
+            .expect("source fixture");
+        let project = FilesystemProject::new(workspace.path().to_path_buf()).expect("project");
+        let project: Arc<dyn Project> = Arc::new(project);
+        let analyzer = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let cancellation = CancellationToken::default().with_timeout(std::time::Duration::ZERO);
+        cancellation.cancel();
+
+        let outcome = evaluate_policy_source(
+            workspace.path(),
+            PolicySourceIdentity::new("policies/live.rqlp"),
+            &match_policy("test.deadline-race", "Deadline race"),
+            &analyzer,
+            &evaluation_options(),
+            Some(&cancellation),
+        )
+        .expect("an expired deadline must not become a cancellation error");
+
+        assert_eq!(outcome.exit_status(), POLICY_EXIT_UNRELIABLE);
+    }
+
+    #[test]
     fn maximum_duplicate_group_is_bounded_complete_and_argument_order_independent() {
         let workspace = tempfile::tempdir().expect("workspace");
         let source = match_policy("test.duplicate", "Duplicate");
