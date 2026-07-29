@@ -160,21 +160,24 @@ To cut a release:
    git push origin refs/tags/v0.6.4
    ```
 
-A single `vX.Y.Z` tag fans out to three workflows:
+A single `vX.Y.Z` tag starts the **Release** workflow. It resolves the tagged
+commit once, then builds and validates CLI archives, crate contents, wheels/sdist,
+agent-plugin packages, Pi packages, and the VS Code extension before opening the
+promotion gate. The GitHub Release, crates.io, PyPI, VS Code Marketplace, and
+agent-plugin release assets only run after that common evidence is green.
 
-- `release.yml` — builds platform archives + SHA-256 checksums and publishes a
-  GitHub Release, then prepares and publishes the VS Code, bundled-agent, and Pi
-  package artifacts.
-- `publish-crate.yml` — publishes the crate to crates.io.
-- `publish-wheels.yml` — builds all platform wheels + sdist and publishes to PyPI.
+`publish-crate.yml`, `build-wheels.yml`, and `publish-wheels.yml` are reusable
+children of that parent workflow; they are not independently dispatchable. Each
+receives the same tag, version, and immutable source commit. Wheel/sdist filenames
+are checked against the validated version before the gate, and the crate package
+contents are checked before trusted crates.io publication.
 
-Each publish workflow refuses to run if the tag does not match `Cargo.toml`, and
-`publish-wheels.yml` additionally fails if `pyproject.toml` ever re-introduces a
-hardcoded `version` (which would break the single-source invariant) or if a built
-artifact does not carry the tagged version.
-
-All three can also be triggered manually from the GitHub Actions UI with a `tag`
-input.
+Use the **Release** workflow's unqualified `vX.Y.Z` `tag` input for a manual release. If a target fails,
+use GitHub Actions' **Re-run failed jobs** for that workflow run to reuse its
+validated artifacts. If a new run is necessary, dispatch the same tag again; never
+recover a partial release from a different branch, commit, or tag. The release
+summary records completed and pending publication targets, including the VS Code
+release attachment and Marketplace publication separately.
 
 To announce a published GitHub Release in Discord, set the
 `DISCORD_RELEASE_WEBHOOK_URL` repository Actions secret to the target channel's
