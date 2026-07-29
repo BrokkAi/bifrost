@@ -2,11 +2,11 @@ use crate::model_context;
 use crate::path_utils::AmbiguousPathInput;
 use crate::searchtools::{
     AmbiguousSymbol, ContainerKind, ContainerListing, ContainerListingEntry,
-    MostRelevantFilesResult, NotFoundInput, ScanUsagesEntry, ScanUsagesInput, ScanUsagesResult,
-    ScanUsagesStatus, SearchSymbolHit, SearchSymbolsFile, SearchSymbolsResult, SkimFile,
-    SkimFilesResult, SourceBlock, SummaryBlock, SummaryElement, SummaryResult, SymbolAncestors,
-    SymbolAncestorsResult, SymbolLocation, SymbolLocationsResult, SymbolSourcesResult,
-    UsageFileGroup, UsageGraphResult, UsageLocation, scan_usages_target_label,
+    MostRelevantFilesIncompleteReason, MostRelevantFilesResult, NotFoundInput, ScanUsagesEntry,
+    ScanUsagesInput, ScanUsagesResult, ScanUsagesStatus, SearchSymbolHit, SearchSymbolsFile,
+    SearchSymbolsResult, SkimFile, SkimFilesResult, SourceBlock, SummaryBlock, SummaryElement,
+    SummaryResult, SymbolAncestors, SymbolAncestorsResult, SymbolLocation, SymbolLocationsResult,
+    SymbolSourcesResult, UsageFileGroup, UsageGraphResult, UsageLocation, scan_usages_target_label,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,6 +336,7 @@ impl RenderText for MostRelevantFilesResult {
             && self.not_found.is_empty()
             && self.duplicates.is_empty()
             && self.ambiguous_paths.is_empty()
+            && self.complete
         {
             return "No related files found.".to_string();
         }
@@ -353,6 +354,21 @@ impl RenderText for MostRelevantFilesResult {
         if !self.ambiguous_paths.is_empty() {
             lines.push(String::new());
             lines.push(render_ambiguous_paths(&self.ambiguous_paths));
+        }
+        if !self.complete {
+            lines.push(String::new());
+            let reason = match self.incomplete_reason {
+                Some(MostRelevantFilesIncompleteReason::TimeBudget) => {
+                    "the usage-graph ranking exceeded its time budget"
+                }
+                Some(MostRelevantFilesIncompleteReason::Cancelled) => {
+                    "the usage-graph ranking was cancelled"
+                }
+                None => "the requested ranking did not complete",
+            };
+            lines.push(format!(
+                "Incomplete: {reason}; returned deterministic history/import ranking instead."
+            ));
         }
         lines.join("\n")
     }

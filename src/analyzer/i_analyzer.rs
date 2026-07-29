@@ -200,6 +200,7 @@ pub struct AnalyzerQueryContext {
 #[derive(Default)]
 pub struct AnalyzerSnapshotCaches {
     derived_layers: crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache,
+    usage_graphs: crate::analyzer::usages::workspace_graph_cache::SnapshotWorkspaceUsageGraphCache,
 }
 
 impl AnalyzerSnapshotCaches {
@@ -209,6 +210,9 @@ impl AnalyzerSnapshotCaches {
                 crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache::new(
                     derived_layer_budget_bytes,
                 ),
+            usage_graphs: crate::analyzer::usages::workspace_graph_cache::SnapshotWorkspaceUsageGraphCache::new(
+                derived_layer_budget_bytes,
+            ),
         }
     }
 
@@ -216,6 +220,12 @@ impl AnalyzerSnapshotCaches {
         &self,
     ) -> &crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache {
         &self.derived_layers
+    }
+
+    pub(crate) fn usage_graphs(
+        &self,
+    ) -> &crate::analyzer::usages::workspace_graph_cache::SnapshotWorkspaceUsageGraphCache {
+        &self.usage_graphs
     }
 }
 

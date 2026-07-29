@@ -254,6 +254,18 @@ impl ScanCtx<'_> {
         self.target.identifier()
     }
 
+    fn target_reference_namespace(&self) -> RustReferenceNamespace {
+        if self.target.is_module() {
+            RustReferenceNamespace::PathPrefix
+        } else if self.target.is_macro() {
+            RustReferenceNamespace::Macro
+        } else if self.target.is_class() || self.rust.is_type_alias(self.target) {
+            RustReferenceNamespace::Type
+        } else {
+            RustReferenceNamespace::Value
+        }
+    }
+
     pub(super) fn matches_unique_resolved_fqn(&self, fqn: &str) -> bool {
         if self.target.fq_name() != fqn {
             return false;
@@ -292,6 +304,41 @@ impl ScanCtx<'_> {
                         || self.rust.is_type_alias(candidate)
                 }
                 RustReferenceNamespace::Any => true,
+            })
+            .collect::<Vec<_>>();
+        declarations.sort();
+        declarations.dedup();
+        declarations.len() == 1 && declarations.first() == Some(self.target)
+    }
+
+    pub(super) fn matches_unique_visible_candidate_in_namespace(
+        &self,
+        candidates: impl IntoIterator<Item = CodeUnit>,
+        byte: usize,
+        namespace: RustReferenceNamespace,
+    ) -> bool {
+        let mut declarations = candidates
+            .into_iter()
+            .filter(|candidate| match namespace {
+                RustReferenceNamespace::Type => {
+                    candidate.is_class() || self.rust.is_type_alias(candidate)
+                }
+                RustReferenceNamespace::Value => {
+                    candidate.is_function()
+                        || candidate.is_field()
+                        || self.rust.has_rust_value_constructor(candidate)
+                }
+                RustReferenceNamespace::Macro => candidate.is_macro(),
+                RustReferenceNamespace::PathPrefix => {
+                    candidate.is_module()
+                        || candidate.is_class()
+                        || self.rust.is_type_alias(candidate)
+                }
+                RustReferenceNamespace::Any => true,
+            })
+            .filter(|candidate| {
+                self.rust
+                    .usage_declaration_visible_at(candidate, self.file, byte)
             })
             .collect::<Vec<_>>();
         declarations.sort();
@@ -660,7 +707,7 @@ fn record_use_import_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     if ctx.matches_path(
                         &segments,
                         current.start_byte(),
-                        rust_reference_namespace(current),
+                        ctx.target_reference_namespace(),
                         ctx.path_root_shadowed_at(root_name, path.root.start_byte()),
                         crate::analyzer::usages::rust_graph::hits::rust_path_is_leading_absolute(
                             path.root,
@@ -719,13 +766,24 @@ fn is_local_use_binding_node(node: Node<'_>) -> bool {
 }
 
 fn use_as_clause_original_terminal(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        parent.kind() == "use_as_clause"
-            && parent
-                .child_by_field_name("path")
-                .and_then(use_path_terminal_node)
-                .is_some_and(|terminal| same_node(terminal, node))
-    })
+    let Some(path) = node.parent() else {
+        return false;
+    };
+    let clause = if path.kind() == "use_as_clause" {
+        path
+    } else {
+        let Some(clause) = path.parent() else {
+            return false;
+        };
+        if clause.kind() != "use_as_clause" {
+            return false;
+        }
+        clause
+    };
+    clause
+        .child_by_field_name("path")
+        .and_then(use_path_terminal_node)
+        .is_some_and(|terminal| same_node(terminal, node))
 }
 
 fn use_path_leaf_is_prefix(node: Node<'_>) -> bool {

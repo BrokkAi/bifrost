@@ -1,7 +1,10 @@
+mod common;
+
+use brokk_bifrost::Language;
+use brokk_bifrost::benchmark::mcp_session::McpSession;
+use common::InlineTestProject;
 use git2::Repository;
-use serde_json::Value;
-#[cfg(unix)]
-use serde_json::json;
+use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -420,6 +423,142 @@ definition_queries = [
         assert!(
             !combined_traces.contains(forbidden),
             "forward definition profile unexpectedly entered `{forbidden}`:\n{combined_traces}"
+        );
+    }
+}
+
+#[test]
+fn interactive_session_prewarm_keeps_workspace_build_out_of_timed_profile_samples() {
+    let temp = TempDir::new().expect("temp dir");
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Example.java",
+            "public class Example { public void execute() {} }\n",
+        )
+        .build();
+    let repo_root = project.root();
+    init_git_repo(repo_root);
+
+    let mut session = McpSession::start(repo_root, false, true).expect("start profiled session");
+    session.initialize().expect("initialize session");
+    let prewarm_cursor = session.stderr_cursor();
+    session
+        .call_tool(
+            "search_symbols",
+            json!({
+                "patterns": ["__bifrost_benchmark_prewarm__"],
+                "limit": 1,
+            }),
+        )
+        .expect("prewarm session");
+    session.profile_boundary().expect("seal prewarm stderr");
+    let prewarm_stderr = session.stderr_since(prewarm_cursor);
+    assert!(
+        prewarm_stderr.text.contains("WorkspaceAnalyzer::build"),
+        "prewarm must materialize the lazy workspace before timed sampling:\n{}",
+        prewarm_stderr.text
+    );
+
+    let timed_cursor = session.stderr_cursor();
+    session
+        .call_tool("get_symbol_sources", json!({ "symbols": ["Example"] }))
+        .expect("run first timed request");
+    session.profile_boundary().expect("seal timed response");
+    session.profile_boundary().expect("seal timed stderr");
+    let timed_stderr = session.stderr_since(timed_cursor);
+    assert!(
+        !timed_stderr.text.contains("WorkspaceAnalyzer::build"),
+        "the first timed request must not build the workspace:\n{}",
+        timed_stderr.text
+    );
+    drop(session);
+
+    let manifest_dir = temp.path().join("manifest");
+    fs::create_dir_all(&manifest_dir).expect("manifest dir");
+    let manifest_path = manifest_dir.join("benchmark.toml");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"
+warmup_iterations = 1
+measured_iterations = 1
+output_dir = "out"
+repo_cache_dir = "cache"
+required_languages = ["java"]
+required_scenarios = ["interactive_code_intelligence"]
+
+[[repos]]
+name = "inline-java"
+url = "{}"
+commit = "{}"
+languages = ["java"]
+extensions = ["java"]
+scenarios = ["interactive_code_intelligence"]
+interactive_queries = [
+  {{ id = "source-example", tool = "get_symbol_sources", arguments_json = '{{"symbols":["Example"]}}', expected_json_pointer = "/structuredContent/sources/0/path", expected_json_value = "Example.java", max_p95_ms = 60000.0 }},
+]
+"#,
+            toml_basic_string(&repo_root.display().to_string()),
+            head_commit(repo_root)
+        ),
+    )
+    .expect("write manifest");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost_benchmark"))
+        .arg("run")
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--profile")
+        .env(
+            "BIFROST_BENCHMARK_BIFROST_BIN",
+            env!("CARGO_BIN_EXE_bifrost"),
+        )
+        .output()
+        .expect("run profiled interactive benchmark");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output_dir = manifest_dir.join("out");
+    let report_path = single_json_file(&output_dir);
+    let report: Value =
+        serde_json::from_str(&fs::read_to_string(report_path).expect("read report"))
+            .expect("parse report");
+    let scenario = &report["repos"][0]["scenarios"][0];
+    assert_eq!(
+        scenario["name"], "interactive_code_intelligence",
+        "report: {report}"
+    );
+    assert_eq!(scenario["success"], true, "report: {report}");
+    assert_eq!(
+        scenario["warmup_durations_ms"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        scenario["measured_durations_ms"].as_array().map(Vec::len),
+        Some(1)
+    );
+
+    let artifacts = scenario["profile_artifacts"]
+        .as_array()
+        .expect("profile artifact array");
+    assert_eq!(
+        artifacts.len(),
+        2,
+        "prewarm must not create a timing sample: {report}"
+    );
+    for (index, artifact) in artifacts.iter().enumerate() {
+        let relative = artifact.as_str().expect("artifact path");
+        let trace = fs::read_to_string(output_dir.join(relative)).expect("read profile trace");
+        let phase = if index == 0 { "warmup" } else { "measured" };
+        assert!(trace.contains(&format!("phase={phase}")), "trace: {trace}");
+        assert!(
+            !trace.contains("WorkspaceAnalyzer::build"),
+            "the {phase} request rebuilt the lazy workspace instead of using the prewarmed session:\n{trace}"
         );
     }
 }
