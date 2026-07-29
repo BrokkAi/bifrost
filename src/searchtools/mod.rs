@@ -41,6 +41,7 @@ pub use crate::relevance::MostRelevantFilesRankingMode;
 use crate::relevance::{
     DEFAULT_RECENCY_HALF_LIFE, MostRelevantProjectFilesOutcome, most_important_project_files,
     most_important_project_files_with_cancellation, most_relevant_project_files,
+    most_relevant_project_files_with_half_life,
     most_relevant_project_files_with_ranking_mode_and_cancellation,
 };
 use crate::text_utils::{
@@ -184,6 +185,7 @@ pub use summaries::ContainerKind;
 pub use summaries::ContainerListing;
 pub use summaries::ContainerListingEntry;
 pub use summaries::FilePatternsParams;
+pub use summaries::MostRelevantFilesIncompleteReason;
 pub use summaries::MostRelevantFilesParams;
 pub use summaries::MostRelevantFilesResult;
 pub use summaries::SkimFile;

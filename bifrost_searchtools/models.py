@@ -6,7 +6,11 @@ from typing import Any, ClassVar, Literal, cast, get_args
 
 
 CodeQueryExecutionMode = Literal["results", "explain", "profile"]
+MostRelevantFilesRankingModeValue = Literal["history_imports", "usage_graph"]
+MostRelevantFilesIncompleteReasonValue = Literal["cancelled", "time_budget"]
 _CODE_QUERY_EXECUTION_MODES = get_args(CodeQueryExecutionMode)
+_MOST_RELEVANT_FILES_RANKING_MODES = get_args(MostRelevantFilesRankingModeValue)
+_MOST_RELEVANT_FILES_INCOMPLETE_REASONS = get_args(MostRelevantFilesIncompleteReasonValue)
 _MISSING = object()
 
 
@@ -45,6 +49,26 @@ def _code_query_execution_mode(value: Any) -> CodeQueryExecutionMode | None:
         expected = ", ".join(repr(mode) for mode in _CODE_QUERY_EXECUTION_MODES)
         raise ValueError(f"execution_mode must be one of {expected}, got {value!r}")
     return cast(CodeQueryExecutionMode, value)
+
+
+def _most_relevant_files_ranking_mode(value: Any) -> MostRelevantFilesRankingModeValue:
+    if value not in _MOST_RELEVANT_FILES_RANKING_MODES:
+        expected = ", ".join(repr(mode) for mode in _MOST_RELEVANT_FILES_RANKING_MODES)
+        raise ValueError(f"ranking_mode_used must be one of {expected}, got {value!r}")
+    return cast(MostRelevantFilesRankingModeValue, value)
+
+
+def _most_relevant_files_incomplete_reason(
+    value: Any,
+) -> MostRelevantFilesIncompleteReasonValue | None:
+    if value is None:
+        return None
+    if value not in _MOST_RELEVANT_FILES_INCOMPLETE_REASONS:
+        expected = ", ".join(
+            repr(reason) for reason in _MOST_RELEVANT_FILES_INCOMPLETE_REASONS
+        )
+        raise ValueError(f"incomplete_reason must be one of {expected}, got {value!r}")
+    return cast(MostRelevantFilesIncompleteReasonValue, value)
 
 
 def _render_numbered_block(text: str, start_line: int) -> str:
@@ -3408,6 +3432,9 @@ class MostRelevantFilesResult:
     files: list[str]
     not_found: list[str]
     duplicates: list[str]
+    complete: bool = True
+    ranking_mode_used: MostRelevantFilesRankingModeValue = "history_imports"
+    incomplete_reason: MostRelevantFilesIncompleteReasonValue | None = None
     render_line_numbers: bool = True
     rendered_text: str | None = None
 
@@ -3419,6 +3446,13 @@ class MostRelevantFilesResult:
             files=list(data["files"]),
             not_found=list(data["not_found"]),
             duplicates=list(data.get("duplicates", [])),
+            complete=_strict_bool(data, "complete", True),
+            ranking_mode_used=_most_relevant_files_ranking_mode(
+                data.get("ranking_mode_used", "history_imports")
+            ),
+            incomplete_reason=_most_relevant_files_incomplete_reason(
+                data.get("incomplete_reason")
+            ),
             render_line_numbers=render_line_numbers,
             rendered_text=rendered_text,
         )
@@ -3438,6 +3472,17 @@ class MostRelevantFilesResult:
             lines.append(f"Not found: {', '.join(self.not_found)}")
         if self.duplicates:
             lines.append(f"Duplicate seeds: {', '.join(self.duplicates)}")
+        if not self.complete:
+            reason = {
+                "time_budget": "the usage-graph ranking exceeded its time budget",
+                "cancelled": "the usage-graph ranking was cancelled",
+            }.get(self.incomplete_reason, "the requested ranking did not complete")
+            lines.extend(
+                [
+                    "",
+                    f"Incomplete: {reason}; returned deterministic history/import ranking instead.",
+                ]
+            )
         return "\n".join(lines)
 
 

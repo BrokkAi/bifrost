@@ -26,7 +26,7 @@ The work is intentionally incremental. Each milestone is independently tested an
 - [x] (2026-07-29 08:34Z) Fetched remote state, confirmed the issue branch is clean, and recorded that it is two commits behind `origin/master` without rebasing because repository instructions forbid an unrequested rebase.
 - [x] (2026-07-29 08:34Z) Profiled the current behavior: the installed 0.8.12 release exceeded 156 seconds, while the history/import mode completed in about 0.64 seconds; detailed timing localized the dominant work to Rust usage resolution.
 - [x] (2026-07-29 08:51Z) Milestone 1: propagated cooperative cancellation through `most_relevant_files`, catalog and usage-graph construction, Rust reference-context construction and AST traversal, and PageRank; cancelled graphs are typed outcomes and are discarded.
-- [ ] Milestone 2: return deterministic history/import results with explicit completeness and fallback diagnostics when usage ranking is cancelled or times out.
+- [x] (2026-07-29 09:19Z) Milestone 2: added explicit completion, effective-ranking, and incomplete-reason metadata; in-flight usage cancellation now returns deterministic history/import results while pre-dispatch cancellation remains an error.
 - [ ] Milestone 3: identify seed ecosystems and build only graph partitions reachable from those seeds, with parity tests against the previous all-ecosystem result.
 - [ ] Milestone 4: cache complete immutable usage-ranking graph partitions per analyzer snapshot using generation-safe, byte-bounded, single-flight infrastructure.
 - [ ] Decision gate: benchmark the exact issue request cold and warm, and decide whether milestones 5 and 6 are still justified.
@@ -51,6 +51,9 @@ The work is intentionally incremental. Each milestone is independently tested an
 - Observation: Bifrost code-reading itself exceeded the five-second MCP budget while requesting five relevant symbol bodies during milestone 1 research.
   Evidence: `get_symbol_sources` returned MCP error `-32603` with `get_symbol_sources was cancelled or exceeded its request-wide time budget`. Narrow shell reads were immediate. Issue #1304 remains the active latency owner for this workspace investigation.
 
+- Observation: the service had a second cancellation check after tool dispatch that discarded the newly structured fallback even though ranking had already returned it successfully.
+  Evidence: the first milestone 2 service test received an internal cancellation error after `most_relevant_files_with_cancellation` produced the fallback. `most_relevant_files` is now exempt from that post-dispatch conversion, while its pre-dispatch cancelled request still returns an error.
+
 ## Decision Log
 
 - Decision: preserve the current issue branch and do not rebase onto the newly fetched master.
@@ -71,7 +74,7 @@ The work is intentionally incremental. Each milestone is independently tested an
 
 ## Outcomes & Retrospective
 
-Milestone 1 is complete. The MCP service now passes its request token into `most_relevant_files`. Cancellation checkpoints cover seed resolution, declaration catalog construction, ecosystem boundaries, per-file filters, Rust reference-context construction, Rust AST traversal, edge projection, PageRank, and file aggregation. A cancelled graph has a typed `Cancelled` outcome, so partial Rayon results cannot reach PageRank or a later cache. Four new issue-specific unit tests passed, and all 27 `tests/most_relevant_files.rs` integration tests passed. Milestone 2 still needs to replace the current cancellation error with a deterministic history/import response carrying explicit incompleteness metadata.
+Milestones 1 and 2 are complete. The MCP service passes its request token into `most_relevant_files`; cooperative checkpoints cover catalog construction, ecosystem builders, Rust context and AST work, PageRank, and aggregation. Partial graphs remain typed cancelled outcomes and are discarded. If cancellation happens after dispatch, the result now contains deterministic history/import files plus `complete: false`, `ranking_mode_used: "history_imports"`, and either `cancelled` or `time_budget`. Cancellation before dispatch still returns an error because no tool work has begun. Rust rendering and the checked-in Python client expose the same diagnostic. Six issue-specific Rust tests, two Python model tests, and all 27 ranking integration tests passed. Milestone 3 now owns exact seed-ecosystem pruning.
 
 ## Context and Orientation
 
@@ -176,6 +179,16 @@ Milestone 1 validation evidence:
     scripts/with-isolated-cargo-target.sh cargo test --test most_relevant_files --no-default-features
       27 passed; 0 failed
 
+Milestone 2 validation evidence:
+
+    cargo fmt --check
+    scripts/with-isolated-cargo-target.sh cargo test --lib issue_1304 --no-default-features
+      6 passed; 0 failed
+    /opt/homebrew/bin/python3.13 -m unittest python_tests.test_searchtools_client.MostRelevantFilesModelTest
+      2 passed; 0 failed
+    scripts/with-isolated-cargo-target.sh cargo test --test most_relevant_files --no-default-features
+      27 passed; 0 failed
+
 Verbose per-file profiling changes the absolute Rust time, but the ordinary request and lower-noise history/import comparison establish the product failure and fallback viability independently.
 
 ## Interfaces and Dependencies
@@ -198,3 +211,5 @@ Milestone 4 stores immutable `Arc` graph values through a snapshot-owned byte-bo
 Milestone 5 may extend Rust resolver APIs with progress callbacks and staged immutable support, but must not parse Rust syntax using strings or regexes. Milestone 6 may use the existing bounded execution scheduler; it must preserve deterministic node and edge ordering regardless of completion order.
 
 Plan revision note (2026-07-29 08:51Z): Completed milestone 1 and recorded its cancellation boundaries, tests, Bifrost code-reading latency observation, and current limitation. The milestone deliberately returns an error on cancellation; milestone 2 owns the user-visible deterministic fallback contract.
+
+Plan revision note (2026-07-29 09:19Z): Completed milestone 2 and recorded the public Rust/Python fallback contract, the service post-dispatch cancellation interaction, and focused validation. The plan continues to milestone 3 because exact pruning should reduce cold work before the snapshot-cache decision gate.
