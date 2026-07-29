@@ -126,7 +126,7 @@ jobs:
 
   dependency-licenses:
     name: dependency licenses
-    needs: [ci-impact, quick-policy]
+    needs: [ci-impact, quick-policy, lint]
     if: needs.ci-impact.outputs.dependency_licenses == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -160,7 +160,7 @@ jobs:
 
   crate-package:
     name: crate package
-    needs: [ci-impact, quick-policy]
+    needs: [ci-impact, quick-policy, lint]
     if: needs.ci-impact.outputs.crate_package == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -179,7 +179,7 @@ jobs:
 
   rql-runtime:
     name: RQL runtime
-    needs: [ci-impact, quick-policy]
+    needs: [ci-impact, quick-policy, lint]
     if: needs.ci-impact.outputs.rql_runtime == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -212,7 +212,7 @@ jobs:
 
   mcp-contract:
     name: MCP contract
-    needs: [ci-impact, quick-policy]
+    needs: [ci-impact, quick-policy, lint]
     if: needs.ci-impact.outputs.mcp_contract == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -242,7 +242,7 @@ jobs:
 
   lsp-contract:
     name: LSP contract
-    needs: [ci-impact, quick-policy]
+    needs: [ci-impact, quick-policy, lint]
     if: needs.ci-impact.outputs.lsp_contract == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -272,7 +272,7 @@ jobs:
 
   policy-pack:
     name: policy pack
-    needs: [ci-impact, quick-policy]
+    needs: [ci-impact, quick-policy, lint]
     if: needs.ci-impact.outputs.policy_pack == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -326,7 +326,7 @@ jobs:
 
   external-fixture:
     name: ${{ matrix.name }} fixture provenance
-    needs: [ci-impact, quick-policy]
+    needs: [ci-impact, quick-policy, lint]
     if: needs.ci-impact.outputs.external_fixture == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -440,7 +440,7 @@ jobs:
 
   rust:
     name: rust (${{ matrix.target }})
-    needs: [ci-impact, quick-policy]
+    needs: [ci-impact, quick-policy, lint]
     if: needs.ci-impact.outputs.rust == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -554,7 +554,7 @@ jobs:
 
   python:
     name: python (${{ matrix.target }})
-    needs: [ci-impact, quick-policy]
+    needs: [ci-impact, quick-policy, lint]
     if: needs.ci-impact.outputs.python == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60

@@ -14,6 +14,7 @@ Pull requests currently wait for the same cross-platform test matrix regardless 
 - [x] (2026-07-29 06:10Z) Restructured CI around `ci-impact`, canonical all-feature Linux linting, selected host/policy jobs, merge-queue full selection, and `PR verification` aggregation.
 - [x] (2026-07-29 06:10Z) Passed the Node policy suite, locked Actions security scan, YAML parsing, pinned actionlint, JavaScript syntax checks, Rust formatting, and whitespace validation.
 - [x] (2026-07-29 06:10Z) Attempted the required built-in policy-pack MCP validation; the installed server exposes `run_policy` only and does not expose the required `list_policies` discovery tool, so this cannot be reported as a policy-pack pass.
+- [x] (2026-07-29 06:20Z) Gated Rust-dependent and matrix-heavy selected jobs on lint while retaining direct Node-only feedback after `quick-policy`; the combined workflow suite passed 34 tests.
 
 ## Surprises & Discoveries
 
@@ -47,9 +48,13 @@ Pull requests currently wait for the same cross-platform test matrix regardless 
   Rationale: A deletion of an RQL, host, editor, or plugin file has the same ownership as its modification, while unmapped deletions still force full validation.
   Date/Author: 2026-07-29 / Codex.
 
+- Decision: Make canonical all-feature linting a prerequisite for Rust-dependent and matrix-heavy jobs, but not editor or agent-plugin Node checks.
+  Rationale: A Clippy failure must stop expensive matrix allocation, while editor and plugin authors should retain feedback that does not depend on Rust linting.
+  Date/Author: 2026-07-29 / Codex and user.
+
 ## Outcomes & Retrospective
 
-The implementation adds a versioned, fixture-tested impact classifier and a timing wrapper, then uses them to make the CI fast lane observable and safe. The final combined Node suite passed 33 tests, locked zizmor reported no findings, and pinned actionlint reported no workflow diagnostics. YAML parsing, Rust formatting, JavaScript syntax checks, and whitespace validation also passed. The only incomplete validation surface is the built-in policy pack because this task’s MCP server registration lacks `list_policies`; no clean policy result is claimed. A normal pushed PR is still needed to observe the GitHub-hosted timing summaries and a merge-queue run is needed to observe GitHub’s merge-group event.
+The implementation adds a versioned, fixture-tested impact classifier and a timing wrapper, then uses them to make the CI fast lane observable and safe. The final combined Node suite passed 34 tests, locked zizmor reported no findings, and pinned actionlint reported no workflow diagnostics. YAML parsing, Rust formatting, JavaScript syntax checks, and whitespace validation also passed. Canonical all-feature lint now fails before any Rust-dependent or matrix-heavy selected job starts, while VS Code and agent-plugin checks retain direct quick-policy feedback. The only incomplete validation surface is the built-in policy pack because this task’s MCP server registration lacks `list_policies`; no clean policy result is claimed. A normal pushed PR is still needed to observe the GitHub-hosted timing summaries and a merge-queue run is needed to observe GitHub’s merge-group event.
 
 ## Context and Orientation
 
@@ -103,3 +108,5 @@ Revision note (2026-07-29): Created the implementation plan from the accepted #1
 Revision note (2026-07-29): Recorded the implemented classifier/workflow design, passing local validation, and the unavailable `list_policies` MCP validation surface.
 
 Revision note (2026-07-29): Recorded final 33-test, zizmor, YAML, actionlint, formatting, and whitespace evidence after adding deleted-path coverage.
+
+Revision note (2026-07-29): Added the lint dependency boundary requested during implementation and recorded 34-test, zizmor, YAML, actionlint, and whitespace validation.

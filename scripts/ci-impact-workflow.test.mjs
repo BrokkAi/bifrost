@@ -24,6 +24,31 @@ test("selected component jobs are gated only by the classifier outputs", () => {
   }
 });
 
+test("lint fast-fails before Rust-dependent and matrix-heavy validation", () => {
+  for (const job of [
+    "dependency-licenses",
+    "crate-package",
+    "rql-runtime",
+    "mcp-contract",
+    "lsp-contract",
+    "policy-pack",
+    "external-fixture",
+    "rust",
+    "python",
+  ]) {
+    assert.match(
+      workflow,
+      new RegExp(`^  ${job}:\\n(?:    .*\\n)*?    needs: \\[ci-impact, quick-policy, lint\\]$`, "mu"),
+    );
+  }
+  for (const job of ["agent-plugin", "vscode", "pi-package"]) {
+    assert.match(
+      workflow,
+      new RegExp(`^  ${job}:\\n(?:    .*\\n)*?    needs: \\[ci-impact, quick-policy\\]$`, "mu"),
+    );
+  }
+});
+
 test("the classifier includes deletions when it computes a pull-request diff", () => {
   const classifier = readFileSync(new URL("./ci-impact.mjs", import.meta.url), "utf8");
   assert.match(classifier, /--diff-filter=ACMRD/u);
