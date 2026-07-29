@@ -136,6 +136,7 @@ pub(super) trait ScalaReferenceSink {
         end: usize,
     );
 
+    #[allow(clippy::too_many_arguments)]
     fn record_callable(
         &mut self,
         target: ScalaResolvedReference,

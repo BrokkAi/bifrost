@@ -2865,6 +2865,7 @@ enum RustOwnerRootAvailability {
     Unbound,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rust_owner_root_availability(
     analyzer: &dyn IAnalyzer,
     rust: &RustAnalyzer,
