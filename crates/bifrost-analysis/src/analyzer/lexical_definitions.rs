@@ -757,6 +757,31 @@ fn collect_binding_leaves_with_step<'tree>(
             continue;
         }
 
+        // A Kotlin local `val`/`var` is a `property_declaration` whose bound
+        // names live in a nested `variable_declaration`. Only those children may
+        // be descended into: the initializer is a sibling of them, so a general
+        // walk would collect the identifiers *inside* the initializer as if
+        // they were bound names (`val x = someName` would declare `someName`).
+        if language == Language::Kotlin && node.kind() == "property_declaration" {
+            let mut cursor = node.walk();
+            let bound: Vec<_> = node
+                .named_children(&mut cursor)
+                .filter(|child| {
+                    matches!(
+                        child.kind(),
+                        "variable_declaration" | "multi_variable_declaration"
+                    )
+                })
+                .collect();
+            for child in bound {
+                if !scope_step() {
+                    return None;
+                }
+                stack.push(child);
+            }
+            continue;
+        }
+
         if language == Language::Rust && node.kind() == "field_pattern" {
             let mut pattern = Vec::new();
             if !push_field_children_with_step(node, "pattern", &mut pattern, scope_step) {

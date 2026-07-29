@@ -29398,3 +29398,95 @@ fun use(base: Base) {
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "lib.Base.greet", "{value}");
 }
+
+/// The abstention contract in one place (issue #1238).
+///
+/// Kotlin navigation must say *why* it cannot answer rather than returning a
+/// same-named declaration from elsewhere in the workspace. Collecting every
+/// abstention here means a future change that quietly turns one of them into a
+/// guess fails one obvious test instead of silently widening the answers.
+#[test]
+fn kotlin_unresolvable_references_abstain_with_specific_diagnostics() {
+    let source = r#"package app
+
+import first.*
+import second.*
+import unindexed.Unknown
+
+class Declared {
+    val label: String = ""
+}
+
+fun use(declared: Declared) {
+    val shadowed = 1
+    val handler = { 1 }
+    handler.member()
+    declared.missing()
+    missingFunction()
+    println(shadowed)
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("first/Shared.kt", "package first\n\nclass Shared\n")
+        .file("second/Shared.kt", "package second\n\nclass Shared\n")
+        .file("app/App.kt", source)
+        .build();
+
+    // Each case is (marker, offset into the marker, expected diagnostic kind).
+    let cases = [
+        ("class Declared", 6, "declaration_site"),
+        ("import first", 7, "package_reference"),
+        ("println(shadowed)", 8, "local_binding"),
+        ("handler.member()", 8, "receiver_type_unknown"),
+        ("declared.missing()", 9, "no_indexed_definition"),
+        ("missingFunction()", 0, "no_indexed_definition"),
+    ];
+    for (marker, offset, expected) in cases {
+        let start = source.find(marker).unwrap_or_else(|| panic!("{marker}")) + offset;
+        let value = lookup(
+            project.root(),
+            &location_reference("app/App.kt", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "no_definition", "{marker}: {value}");
+        assert_eq!(
+            result["diagnostics"][0]["kind"], expected,
+            "{marker}: {value}"
+        );
+        assert!(
+            result["definitions"]
+                .as_array()
+                .is_none_or(|units| units.is_empty()),
+            "{marker} must return no definitions: {value}"
+        );
+    }
+
+    // Ambiguity is its own answer, not a failure to look hard enough.
+    let ambiguous = r#"package app
+
+import first.*
+import second.*
+
+fun use(value: Shared) {
+}
+"#;
+    let ambiguous_project = InlineTestProject::with_language(Language::Kotlin)
+        .file("first/Shared.kt", "package first\n\nclass Shared\n")
+        .file("second/Shared.kt", "package second\n\nclass Shared\n")
+        .file("app/Ambiguous.kt", ambiguous)
+        .build();
+    let value = lookup(
+        ambiguous_project.root(),
+        &location_reference(
+            "app/Ambiguous.kt",
+            ambiguous,
+            ambiguous.find(": Shared").expect("use") + 2,
+        ),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "ambiguous_kotlin_type",
+        "{value}"
+    );
+}
