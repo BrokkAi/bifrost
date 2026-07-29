@@ -24,7 +24,7 @@ How to see it working: the tests in `tests/kotlin_imports_and_hierarchy.rs` and 
 - [x] (2026-07-29) Research pass over the existing Java, Scala, and Kotlin analyzers, the JVM external-declaration index, and the workspace usage graph.
 - [x] (2026-07-29) ExecPlan authored.
 - [x] (2026-07-29) M1: Generalize the JVM external declaration index and dependency plumbing to cover Kotlin.
-- [ ] M2: Kotlin structured imports and `ImportAnalysisProvider`.
+- [x] (2026-07-29) M2: Kotlin structured imports and `ImportAnalysisProvider`.
 - [ ] M3: Kotlin supertypes, type-name resolution, and `TypeHierarchyProvider`.
 - [ ] M4: Shared JVM usage-candidate realm (`UsageEcosystem::Jvm`).
 - [ ] M5: Cross-language JVM source realm resolution.
@@ -42,6 +42,9 @@ Use timestamps to measure rates of progress.
 
 - Observation: `cargo clippy` cannot be run bare in this environment. Two rustc 1.96.0 installs exist (rustup under `~/.cargo/bin`, Homebrew under `/opt/homebrew/bin`); `cargo` resolves to rustup's but `cargo-clippy` resolves to Homebrew's, and the mismatch fails the build script. A clean target directory does not help, including via `scripts/with-isolated-cargo-target.sh`.
   Evidence: `error[E0514]: found crate 'cc' compiled by an incompatible version of rustc`. The working invocation is `PATH="$HOME/.cargo/bin:$PATH" cargo clippy --all-targets --all-features -- -D warnings`.
+
+- Observation: `--features nlp,python` cannot link on this machine. The `python` feature builds `pyo3` in extension-module-less mode and the link step fails with hundreds of undefined `_Py*` symbols. This is an environment gap (no linkable `libpython`), unrelated to any change in this plan, and it also predates it. `--features nlp` builds and runs every integration suite this plan adds or touches, because those suites are gated on `nlp` only.
+  Evidence: `ld: symbol(s) not found for architecture arm64` listing `_PyUnicode_AsUTF8AndSize`, `_Py_InitializeEx`, and similar, from `libpyo3-*.rlib`. CI, which has a linkable Python, still needs the documented `--features nlp,python` gate.
 
 - Observation: Passing a larger candidate-fqn set to an existing builder is inert rather than dangerous, because each language's resolver can only resolve names through its own declaration index. Merging the ecosystems therefore preserves today's edges exactly while establishing the shared node space that #1239 will fill in.
   Evidence: `JavaAnalyzer::source_type_by_fqn` reads `self.inner.global_usage_definition_index()`, which is scoped to the Java delegate's own files.
@@ -273,10 +276,14 @@ Note: the `clippy-no-cuda` cargo alias is broken inside nested worktrees under `
 
 Per-milestone tests:
 
-    cargo test --features nlp,python --test jvm_external_index
     cargo test --features nlp,python --test kotlin_imports_and_hierarchy
     cargo test --features nlp,python --test jvm_shared_realm
     cargo test --features nlp,python --test kotlin_analyzer_test
+    cargo test --features nlp,python --lib analyzer::jvm::external
+
+On a machine without a linkable `libpython`, drop `,python`: every suite this
+plan adds is gated on `nlp` only, and the `python` feature contributes nothing
+to them. See `Surprises & Discoveries`.
 
 Regression sweep over the JVM languages this plan renames or re-keys:
 

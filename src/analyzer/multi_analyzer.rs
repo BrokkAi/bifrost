@@ -132,8 +132,7 @@ impl AnalyzerDelegate {
             Self::Rust(analyzer) => Some(analyzer),
             Self::Scala(analyzer) => analyzer.import_analysis_provider(),
             Self::Ruby(analyzer) => Some(analyzer),
-            // Kotlin structured import analysis is issue #1237.
-            Self::Kotlin(_) => None,
+            Self::Kotlin(analyzer) => Some(analyzer),
         }
     }
 

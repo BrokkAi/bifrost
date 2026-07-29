@@ -42,7 +42,7 @@ fn kotlin_segment(text: &str, kind: SegmentKind) -> SegmentId {
 /// test method names). The backticks are quoting syntax, not part of the name,
 /// so they must not reach an interned segment — otherwise the declaration is
 /// unreachable by its real spelling.
-fn kotlin_identifier_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+pub(crate) fn kotlin_identifier_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     let text = node_text_trimmed(node, source);
     text.strip_prefix('`')
         .and_then(|text| text.strip_suffix('`'))
@@ -76,6 +76,7 @@ pub(crate) fn parse_kotlin_file(file: &ProjectFile, source: &str, tree: &Tree) -
     let package_name = kotlin_package_name(root, source);
     let mut parsed = ParsedFile::new(package_name.clone());
     collect_kotlin_imports(root, source, &mut parsed);
+    collect_kotlin_type_identifiers(root, source, &mut parsed);
 
     let mut visitor = KotlinVisitor {
         file,
@@ -101,8 +102,6 @@ fn kotlin_package_name(root: Node<'_>, source: &str) -> String {
 }
 
 fn collect_kotlin_imports(root: Node<'_>, source: &str, parsed: &mut ParsedFile) {
-    // Structured `ImportInfo` modeling belongs to issue #1237; this tier
-    // records the raw statements for `import_statements()` display only.
     for import_list in named_children_of(root)
         .into_iter()
         .filter(|child| child.kind() == "import_list")
@@ -111,11 +110,55 @@ fn collect_kotlin_imports(root: Node<'_>, source: &str, parsed: &mut ParsedFile)
             .into_iter()
             .filter(|child| child.kind() == "import_header")
         {
+            // The display string keeps the source's own spelling for
+            // `import_statements()`; the structured fact is what resolution
+            // reads, so neither has to be recovered from the other.
             let raw = collapse_whitespace(node_text(import, source));
             if !raw.is_empty() {
                 parsed.import_statements.push(raw);
             }
+            if let Some(info) = super::imports::kotlin_import_info_from_node(import, source) {
+                parsed.imports.push(info);
+            }
         }
+    }
+}
+
+/// Record every name this file spells that could name a type or an object.
+///
+/// This feeds the same-package reference index, which asks "could this file be
+/// talking about a declaration in its own package?" — a question that must not
+/// miss, so it collects two node shapes:
+///
+/// * every `type_identifier`, which the grammar uses for all type positions
+///   and for declared type names; and
+/// * the receiver of a qualified reference (`Registry` in
+///   `Registry.register()`), which is a `simple_identifier` and never a
+///   `type_identifier`, yet is the only way to name a Kotlin `object`,
+///   companion, or enum class in value position.
+fn collect_kotlin_type_identifiers(root: Node<'_>, source: &str, parsed: &mut ParsedFile) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "type_identifier" => {
+                let text = kotlin_identifier_text(node, source);
+                if !text.is_empty() {
+                    parsed.type_identifiers.insert(text.to_string());
+                }
+            }
+            "navigation_expression" => {
+                if let Some(receiver) = node.named_child(0)
+                    && receiver.kind() == "simple_identifier"
+                {
+                    let text = kotlin_identifier_text(receiver, source);
+                    if !text.is_empty() {
+                        parsed.type_identifiers.insert(text.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+        stack.extend(named_children_of(node));
     }
 }
 
