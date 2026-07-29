@@ -60,13 +60,20 @@ analyzer's indexed declarations.
       `tests/suite_symbols/get_definition_test.rs`, all green; `cargo clippy --all-targets` clean.
 - [x] (2026-07-29 11:40Z) Milestone 2: calls, constructors, arity-steered overload selection, named arguments,
       callable references, bare value references. 24 `kotlin_*` tests green; clippy clean.
-- [ ] Milestone 3: navigation expressions, receiver typing, inherited/companion/extension members, safe calls,
-      call-result chains.
+- [x] (2026-07-29 12:40Z) Milestone 3: navigation expressions, receiver typing, inherited/companion/extension
+      members, safe calls, `!!`, call-result chains, enum entries, `this`/`super`. 42 `kotlin_*` tests green;
+      clippy clean.
 - [ ] Milestone 4: `get_type` Kotlin arm, call-site syntax enablement for signature help, and the
       hover/type-definition/rename surface checks.
 - [ ] Milestone 5: abstention matrix, capability documentation, and full validation.
 
 ## Surprises & Discoveries
+
+- Observation: a declaration's syntax node is not always the *smallest* node covering its recorded range. An
+  `enum_entry` spans exactly its own name, so its `simple_identifier` child covers the same bytes and wins the
+  smallest-covering walk. Declaration lookup has to climb back out to the outermost node with that span.
+  Evidence: `kotlin_enum_entry_and_its_member_resolve` failed with `receiver_type_unknown` for `Color.RED.label()`
+  until `kotlin_declaration_node` was introduced.
 
 - Observation: Kotlin overloads collapse into one indexed identity. Two functions with the same fully-qualified name
   become a single `CodeUnit` carrying several signatures, so "pick the right overload" is only expressible across
