@@ -2013,20 +2013,33 @@ mod tests {
     }
 
     /// Opening the cache inside a git working tree must leave the cache
-    /// directory *ignored*, so tree walks never see the live database. This is
-    /// the property that keeps `analyze_diff` from trying to read
-    /// `bifrost_cache.db-wal` as untracked content while SQLite is writing it
-    /// (`file changed before we could read it; class=Filesystem (30)`).
+    /// directory *ignored* while project-owned `.bifrost` configuration remains
+    /// visible to Git. This is the property that keeps `analyze_diff` from
+    /// trying to read `bifrost_cache.db-wal` as untracked content while SQLite
+    /// is writing it (`file changed before we could read it; class=Filesystem
+    /// (30)`) without hiding policies or reviewed suppressions from version
+    /// control.
     #[test]
-    fn cache_directory_is_ignored_by_git_after_open() {
+    fn cache_is_ignored_while_project_configuration_remains_trackable() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let repo = git2::Repository::init(root).unwrap();
         std::fs::write(root.join("lib.go"), "package sample\n").unwrap();
 
-        let cache_dir = root
-            .join(crate::gitblob::PROJECT_DIR_NAME)
-            .join(crate::gitblob::CACHE_SUBDIR_NAME);
+        let project_dir = root.join(crate::gitblob::PROJECT_DIR_NAME);
+        std::fs::create_dir_all(project_dir.join("policies")).unwrap();
+        std::fs::write(
+            project_dir.join("policies/example.rqlp"),
+            "(policy :schema-version 1)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project_dir.join("suppressions.json"),
+            "{\"schema_version\":1}\n",
+        )
+        .unwrap();
+
+        let cache_dir = project_dir.join(crate::gitblob::CACHE_SUBDIR_NAME);
         let _conn = open_unified_connection(&cache_dir.join(CACHE_DB_FILE_NAME)).unwrap();
 
         // Workdir-relative: on macOS the temp root is a `/var` symlink to
@@ -2062,6 +2075,15 @@ mod tests {
             untracked.iter().any(|path| path == "lib.go"),
             "real sources must still be visible: {untracked:?}"
         );
+        for tracked_input in [
+            ".bifrost/policies/example.rqlp",
+            ".bifrost/suppressions.json",
+        ] {
+            assert!(
+                untracked.iter().any(|path| path == tracked_input),
+                "project-owned Bifrost input must remain visible to Git: {untracked:?}"
+            );
+        }
         assert!(
             !untracked
                 .iter()
