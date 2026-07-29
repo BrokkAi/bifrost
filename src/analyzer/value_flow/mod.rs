@@ -16,7 +16,10 @@ pub use model::{
     ValueFlowSourceId, ValueFlowSourceSpec,
 };
 pub(crate) use plan::ValueFlowCarrierSummaryIdentity;
-pub use plan::{ValueFlowInput, ValueFlowPlan, ValueFlowPlanError, ValueFlowPlanLimits};
+pub use plan::{
+    ValueFlowCuratedCallModel, ValueFlowInput, ValueFlowPlan, ValueFlowPlanError,
+    ValueFlowPlanLimits, ValueFlowSummaryLocationBinding,
+};
 pub use result::{
     ValueFlowMayStatus, ValueFlowMeeting, ValueFlowMustStatus, ValueFlowSinkOutcome,
     ValueFlowSummaryResult,

@@ -1,6 +1,6 @@
 use super::super::analysis_context::ProtocolRef;
 use super::super::kinds::{NormalizedKind, Role};
-use super::schema::{CodeQueryExecutionMode, QueryStepOp};
+use super::schema::{CallTraversalCompleteness, CodeQueryExecutionMode, QueryStepOp};
 use crate::analyzer::Language;
 use crate::analyzer::usages::{ReferenceKind, UsageHitSurface, UsageProof};
 use regex::Regex;
@@ -24,7 +24,8 @@ pub const MAX_QUERY_STEPS: usize = 16;
 pub const MAX_QUERY_BRANCHES: usize = 16;
 pub const MAX_QUERY_PLAN_DEPTH: usize = 16;
 pub const MAX_QUERY_PLAN_NODES: usize = 64;
-pub const SCHEMA_VERSION: u64 = 4;
+pub const SCHEMA_VERSION: u64 = 5;
+pub const DECLARATION_CONTAINMENT_SCHEMA_VERSION: u64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryValueKind {
@@ -72,6 +73,7 @@ pub struct ReferenceTraversalFilter {
 pub struct CallTraversalFilter {
     pub depth: NonZeroUsize,
     pub proof: Option<UsageProof>,
+    pub completeness: CallTraversalCompleteness,
 }
 
 impl Default for CallTraversalFilter {
@@ -79,6 +81,7 @@ impl Default for CallTraversalFilter {
         Self {
             depth: NonZeroUsize::MIN,
             proof: None,
+            completeness: CallTraversalCompleteness::Exhaustive,
         }
     }
 }
@@ -323,6 +326,22 @@ pub(super) fn validate_query_steps(
     let mut value_kind = input;
     for (index, step) in steps.iter().enumerate() {
         let step_path = format!("{path}[{index}]");
+        if let QueryStep::Callers(filter) | QueryStep::Callees(filter) = step
+            && filter.completeness == CallTraversalCompleteness::ProvenSubset
+        {
+            if !matches!(step, QueryStep::Callers(_)) {
+                return Err(QueryError::new(
+                    format!("{step_path}.completeness"),
+                    "proven_subset is currently supported only for callers",
+                ));
+            }
+            if filter.proof != Some(UsageProof::Proven) {
+                return Err(QueryError::new(
+                    format!("{step_path}.completeness"),
+                    "proven_subset requires proof to be proven",
+                ));
+            }
+        }
         let minimum_schema_version = step.op().minimum_schema_version();
         if schema_version < minimum_schema_version {
             return Err(QueryError::new(
@@ -442,6 +461,9 @@ pub struct CodeQuerySeed {
     pub root: Pattern,
     /// The root match must be lexically contained in a node matching this.
     pub inside: Option<Pattern>,
+    /// The root match must be inside a matching ancestor without crossing an
+    /// intervening callable declaration.
+    pub inside_decl: Option<Pattern>,
     /// Verifier-only negative containment: never used for candidate pruning.
     pub not_inside: Option<Pattern>,
 }
@@ -518,10 +540,21 @@ fn validate_plan(
     }
 
     let mut domain = match &plan.source {
-        CodeQueryPlanSource::Seed(seed) => ValidatedDomain {
-            kind: QueryValueKind::StructuralMatch,
-            captures: Some(seed.positive_capture_names()),
-        },
+        CodeQueryPlanSource::Seed(seed) => {
+            if seed.inside_decl.is_some() && schema_version < DECLARATION_CONTAINMENT_SCHEMA_VERSION
+            {
+                return Err(QueryError::new(
+                    child_query_path(path, "inside_decl"),
+                    format!(
+                        "inside_decl requires schema version {DECLARATION_CONTAINMENT_SCHEMA_VERSION}, but this query uses schema version {schema_version}"
+                    ),
+                ));
+            }
+            ValidatedDomain {
+                kind: QueryValueKind::StructuralMatch,
+                captures: Some(seed.positive_capture_names()),
+            }
+        }
         CodeQueryPlanSource::Set { op, branches } => {
             let op_path = child_query_path(path, op.label());
             if branches.len() < 2 {
@@ -657,6 +690,9 @@ impl CodeQuerySeed {
         let mut stack = vec![&self.root];
         if let Some(inside) = &self.inside {
             stack.push(inside);
+        }
+        if let Some(inside_decl) = &self.inside_decl {
+            stack.push(inside_decl);
         }
         while let Some(pattern) = stack.pop() {
             if let Some(capture) = pattern.capture.as_deref() {

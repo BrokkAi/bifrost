@@ -194,6 +194,15 @@ impl RustAnalyzer {
         self.cargo_routes().file_uses_rust_2015_edition(file)
     }
 
+    pub(crate) fn has_available_declared_cargo_dependency(
+        &self,
+        file: &ProjectFile,
+        route: &str,
+    ) -> bool {
+        self.cargo_routes()
+            .has_available_declared_dependency(file, route)
+    }
+
     pub(crate) fn files_share_cargo_target(
         &self,
         left: &ProjectFile,
@@ -214,6 +223,14 @@ impl RustAnalyzer {
     ) -> Option<Vec<CodeUnit>> {
         self.cargo_routes()
             .candidates_in_library_route(file, route, candidates)
+    }
+
+    pub(crate) fn resolve_cargo_crate_root_file(
+        &self,
+        file: &ProjectFile,
+        route: &str,
+    ) -> Option<ProjectFile> {
+        self.cargo_routes().resolve_crate_root_file(file, route)
     }
 
     pub fn new(project: Arc<dyn Project>) -> Self {

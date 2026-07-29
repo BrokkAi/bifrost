@@ -294,6 +294,7 @@ fn scan_usages_resolves_canonical_and_flags_bare_ambiguity() {
             include_tests: true,
             paths: None,
             include_same_owner: false,
+            max_duration_secs: None,
         },
     );
     assert_eq!(1, canonical.results.len(), "{canonical:#?}");
@@ -313,6 +314,7 @@ fn scan_usages_resolves_canonical_and_flags_bare_ambiguity() {
             include_tests: true,
             paths: None,
             include_same_owner: false,
+            max_duration_secs: None,
         },
     );
     assert_eq!(1, bare.results.len(), "{bare:#?}");

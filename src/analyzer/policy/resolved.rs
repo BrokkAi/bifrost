@@ -675,6 +675,7 @@ impl ResolvedFindingCombination {
 #[derive(Debug, Clone)]
 pub struct ResolvedTaintPolicySpec {
     pub mode: MayMode,
+    pub call_modeling: CallModelingSpec,
     pub sources: Vec<ResolvedTaintEndpoint<ResolvedTaintSourceDefinition>>,
     pub sinks: Vec<ResolvedTaintEndpoint<ResolvedTaintSinkDefinition>>,
     pub sanitizers: Vec<ResolvedTaintAuxiliary<ResolvedTaintSanitizerDefinition>>,
@@ -689,6 +690,7 @@ impl ResolvedTaintPolicySpec {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         mode: MayMode,
+        call_modeling: CallModelingSpec,
         mut sources: Vec<ResolvedTaintEndpoint<ResolvedTaintSourceDefinition>>,
         mut sinks: Vec<ResolvedTaintEndpoint<ResolvedTaintSinkDefinition>>,
         mut sanitizers: Vec<ResolvedTaintAuxiliary<ResolvedTaintSanitizerDefinition>>,
@@ -709,6 +711,7 @@ impl ResolvedTaintPolicySpec {
         finding_combinations.sort_by(|left, right| left.id.cmp(&right.id));
         Self {
             mode,
+            call_modeling,
             sources,
             sinks,
             sanitizers,
@@ -724,6 +727,7 @@ impl ResolvedTaintPolicySpec {
 #[derive(Debug, Clone)]
 pub struct ResolvedTypestatePolicySpec {
     pub mode: MayMode,
+    pub call_modeling: CallModelingSpec,
     pub subjects: Vec<ResolvedTypestateSubject>,
     pub uncertainty: TypestateUncertaintySpec,
     pub automaton: ResolvedTypestateAutomatonSpec,
@@ -735,6 +739,7 @@ pub struct ResolvedTypestatePolicySpec {
 impl ResolvedTypestatePolicySpec {
     pub fn try_new(
         mode: MayMode,
+        call_modeling: CallModelingSpec,
         mut subjects: Vec<ResolvedTypestateSubject>,
         uncertainty: TypestateUncertaintySpec,
         mut automaton: ResolvedTypestateAutomatonSpec,
@@ -747,6 +752,7 @@ impl ResolvedTypestatePolicySpec {
         automaton.normalize();
         let mut result = Self {
             mode,
+            call_modeling,
             subjects,
             uncertainty,
             automaton,
@@ -1464,8 +1470,8 @@ fn validate_resolved_taint(
     dependencies: &[ResolvedEndpointDependency],
     manifests: &[ResolvedMatchDirectoryManifest],
 ) -> Result<(), LoadedModelError> {
-    if authored.mode != resolved.mode {
-        return invalid("resolved taint mode differs from the authored policy");
+    if authored.mode != resolved.mode || authored.call_modeling != resolved.call_modeling {
+        return invalid("resolved taint mode/call modeling differs from the authored policy");
     }
     if resolved.sources.is_empty() || resolved.sinks.is_empty() {
         return invalid("resolved taint policy requires non-empty source and sink sets");
@@ -1851,8 +1857,13 @@ fn validate_resolved_typestate(
     manifests: &[ResolvedMatchDirectoryManifest],
     selectors: &[ResolvedPolicySelector],
 ) -> Result<(), LoadedModelError> {
-    if resolved.mode != authored.mode || resolved.uncertainty != authored.uncertainty {
-        return invalid("resolved typestate mode/uncertainty differs from the authored policy");
+    if resolved.mode != authored.mode
+        || resolved.call_modeling != authored.call_modeling
+        || resolved.uncertainty != authored.uncertainty
+    {
+        return invalid(
+            "resolved typestate mode/call modeling/uncertainty differs from the authored policy",
+        );
     }
     if resolved.subjects.is_empty() {
         return invalid("resolved typestate policy requires at least one subject");
@@ -3058,6 +3069,7 @@ mod tests {
         );
         let spec = ResolvedTaintPolicySpec::new(
             MayMode::May,
+            CallModelingSpec::default(),
             Vec::new(),
             Vec::new(),
             vec![sanitizer],

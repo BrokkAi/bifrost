@@ -414,6 +414,27 @@ fn parameter_roots_with_step<'tree>(
             }
         }
     }
+    // Kotlin's grammar exposes no `parameters` field, so the field-based
+    // lookup above finds nothing. A callable's list is an ordinary named child
+    // (`function_value_parameters`, `lambda_parameters`); a
+    // `primary_constructor` is itself the container of its `class_parameter`s;
+    // and a `setter` holds its single parameter directly.
+    if language == Language::Kotlin {
+        if is_parameter_container(language, owner.kind()) || owner.kind() == "setter" {
+            ordinary_roots.push(owner);
+        } else {
+            let mut cursor = owner.walk();
+            for child in owner.named_children(&mut cursor) {
+                if !scope_step() {
+                    return None;
+                }
+                if is_parameter_container(language, child.kind()) {
+                    ordinary_roots.push(child);
+                }
+            }
+        }
+    }
+
     let mut receiver_roots = Vec::new();
     if !push_field_children_with_step(owner, "receiver", &mut receiver_roots, scope_step) {
         return None;
@@ -464,7 +485,11 @@ fn is_variadic_parameter(language: Language, parameter: Node<'_>) -> Option<Form
             "hash_splat_parameter" => Some(Keyword),
             _ => None,
         },
-        Language::Cpp | Language::Scala | Language::CSharp | Language::None => None,
+        // Kotlin spells varargs as a `vararg` parameter modifier rather than a
+        // distinct parameter node kind, so no kind maps to a variadic slot.
+        Language::Cpp | Language::Scala | Language::CSharp | Language::Kotlin | Language::None => {
+            None
+        }
     }
 }
 
@@ -892,6 +917,15 @@ fn is_parameter_owner(language: Language, kind: &str) -> bool {
                 | "record_struct_declaration"
         ),
         Language::Ruby => matches!(kind, "method" | "singleton_method" | "lambda" | "block"),
+        Language::Kotlin => matches!(
+            kind,
+            "function_declaration"
+                | "secondary_constructor"
+                | "primary_constructor"
+                | "anonymous_function"
+                | "lambda_literal"
+                | "setter"
+        ),
         Language::None => false,
     }
 }
@@ -910,6 +944,7 @@ fn is_lambda_owner(language: Language, kind: &str) -> bool {
         Language::Scala => kind == "lambda_expression",
         Language::CSharp => matches!(kind, "lambda_expression" | "anonymous_method_expression"),
         Language::Ruby => matches!(kind, "lambda" | "block"),
+        Language::Kotlin => matches!(kind, "lambda_literal" | "anonymous_function"),
         Language::None => false,
     }
 }
@@ -957,6 +992,10 @@ fn is_parameter_declaration(language: Language, kind: &str) -> bool {
                 | "block_parameter"
                 | "destructured_parameter"
         ),
+        Language::Kotlin => matches!(
+            kind,
+            "parameter" | "class_parameter" | "parameter_with_optional_type"
+        ),
         Language::None => false,
     }
 }
@@ -976,6 +1015,10 @@ fn is_parameter_container(language: Language, kind: &str) -> bool {
             kind,
             "method_parameters" | "lambda_parameters" | "block_parameters"
         ),
+        Language::Kotlin => matches!(
+            kind,
+            "function_value_parameters" | "lambda_parameters" | "primary_constructor"
+        ),
         Language::None => false,
     }
 }
@@ -991,6 +1034,7 @@ fn is_direct_parameter_binding(language: Language, kind: &str) -> bool {
         | Language::Ruby => {
             matches!(kind, "identifier" | "operator_identifier")
         }
+        Language::Kotlin => kind == "simple_identifier",
         Language::JavaScript | Language::TypeScript => {
             is_binding_leaf(language, kind) || binding_container(language, kind)
         }
@@ -1009,6 +1053,10 @@ fn is_binding_leaf(language: Language, kind: &str) -> bool {
         Language::JavaScript | Language::TypeScript => {
             matches!(kind, "identifier" | "shorthand_property_identifier_pattern")
         }
+        // Kotlin spells every binding name `simple_identifier`; it has no
+        // plain `identifier` leaf (that kind is the dotted qualified name used
+        // by package and import headers).
+        Language::Kotlin => kind == "simple_identifier",
         _ => kind == "identifier",
     }
 }
@@ -1045,6 +1093,18 @@ fn binding_container(language: Language, kind: &str) -> bool {
                 | "self_parameter"
         ),
         Language::Ruby => kind == "destructured_parameter",
+        // Kotlin parameter and binding nodes carry no name field, so the leaf
+        // walk has to descend through them to reach the `simple_identifier`.
+        // `multi_variable_declaration` is a destructuring binding and holds
+        // several.
+        Language::Kotlin => matches!(
+            kind,
+            "parameter"
+                | "class_parameter"
+                | "parameter_with_optional_type"
+                | "variable_declaration"
+                | "multi_variable_declaration"
+        ),
         Language::Php => kind == "variable_name",
         Language::Go => kind == "expression_list",
         Language::Cpp => matches!(
@@ -1073,6 +1133,10 @@ fn is_lexical_scope(language: Language, kind: &str) -> bool {
         Language::Scala => matches!(kind, "block" | "indented_block"),
         Language::CSharp => matches!(kind, "block" | "switch_body"),
         Language::Ruby => matches!(kind, "body_statement" | "do_block" | "block"),
+        Language::Kotlin => matches!(
+            kind,
+            "function_body" | "statements" | "control_structure_body"
+        ),
         Language::None => false,
     }
 }
@@ -1088,6 +1152,7 @@ fn is_nested_scope(language: Language, kind: &str) -> bool {
             Language::Scala => matches!(kind, "template_body" | "case_block"),
             Language::CSharp => matches!(kind, "declaration_list"),
             Language::Ruby => matches!(kind, "class" | "module"),
+            Language::Kotlin => matches!(kind, "class_body" | "enum_class_body"),
             _ => false,
         }
 }
@@ -1124,6 +1189,17 @@ fn is_local_declaration(language: Language, kind: &str) -> bool {
                 | "catch_declaration"
                 | "declaration_expression"
         ),
+        // A local `val`/`var` in Kotlin reuses `property_declaration`; its
+        // bound name lives in the nested `variable_declaration` node, and
+        // `catch_block`/`for_statement` introduce their own bindings.
+        Language::Kotlin => matches!(
+            kind,
+            "property_declaration"
+                | "variable_declaration"
+                | "multi_variable_declaration"
+                | "catch_block"
+                | "for_statement"
+        ),
         Language::None => false,
     }
 }
@@ -1143,6 +1219,63 @@ mod tests {
             stack.extend(node.named_children(&mut cursor));
         }
         panic!("missing `{kind}` node");
+    }
+
+    fn kotlin_root(source: &str) -> (Parser, tree_sitter::Tree) {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&crate::analyzer::kotlin::language::LANGUAGE.into())
+            .expect("load Kotlin grammar");
+        let tree = parser.parse(source, None).expect("parse Kotlin source");
+        (parser, tree)
+    }
+
+    /// Kotlin's registry entries (parameter owners, containers, and bindings)
+    /// are consumed by lexical binding resolution, so they must actually
+    /// recover a callable's formal parameters rather than merely compile.
+    #[test]
+    fn kotlin_function_parameters_resolve_to_formal_slots() {
+        let source = "package sample\n\nfun render(prefix: String, count: Int): String = prefix\n";
+        let (_parser, tree) = kotlin_root(source);
+        let owner = first_named_kind(tree.root_node(), "function_declaration");
+        let declaration_range = Range {
+            start_byte: owner.start_byte(),
+            end_byte: owner.end_byte(),
+            start_line: owner.start_position().row,
+            end_line: owner.end_position().row,
+        };
+        let layout =
+            formal_parameter_slots_for_owner(Language::Kotlin, owner, source, &declaration_range)
+                .expect("Kotlin function must expose formal parameter slots");
+        let names: Vec<&str> = layout
+            .slots
+            .iter()
+            .flat_map(|slot| slot.names.iter().map(String::as_str))
+            .collect();
+        assert_eq!(names, vec!["prefix", "count"]);
+        assert!(layout.slots.iter().all(|slot| slot.variadic.is_none()));
+    }
+
+    #[test]
+    fn kotlin_primary_constructor_parameters_resolve_to_formal_slots() {
+        let source = "package sample\n\nclass Holder(val seed: Int, label: String)\n";
+        let (_parser, tree) = kotlin_root(source);
+        let owner = first_named_kind(tree.root_node(), "primary_constructor");
+        let declaration_range = Range {
+            start_byte: owner.start_byte(),
+            end_byte: owner.end_byte(),
+            start_line: owner.start_position().row,
+            end_line: owner.end_position().row,
+        };
+        let layout =
+            formal_parameter_slots_for_owner(Language::Kotlin, owner, source, &declaration_range)
+                .expect("Kotlin primary constructor must expose formal parameter slots");
+        let names: Vec<&str> = layout
+            .slots
+            .iter()
+            .flat_map(|slot| slot.names.iter().map(String::as_str))
+            .collect();
+        assert_eq!(names, vec!["seed", "label"]);
     }
 
     #[test]

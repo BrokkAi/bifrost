@@ -1,6 +1,6 @@
 {
   "name": "@brokk/bifrost-agent",
-  "version": "0.8.11",
+  "version": "0.8.12",
   "description": "Bifrost code intelligence tools and skills for Pi",
   "keywords": [
     "pi-package",
@@ -26,6 +26,7 @@
     "skills/bifrost-code-navigation/SKILL.md",
     "skills/bifrost-code-reading/SKILL.md",
     "skills/bifrost-codebase-search/SKILL.md",
+    "skills/bifrost-policy-checking/SKILL.md",
     "README.md",
     "LICENSE.md",
     "GPL-3.0.md",
@@ -38,7 +39,8 @@
     "skills": [
       "./skills/bifrost-code-navigation",
       "./skills/bifrost-code-reading",
-      "./skills/bifrost-codebase-search"
+      "./skills/bifrost-codebase-search",
+      "./skills/bifrost-policy-checking"
     ]
   },
   "scripts": {

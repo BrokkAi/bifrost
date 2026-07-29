@@ -44,6 +44,7 @@ pub(crate) mod scala_graph;
 pub(crate) mod target_kind;
 mod traits;
 pub(crate) mod workspace_graph;
+pub(crate) mod workspace_graph_cache;
 
 #[cfg(test)]
 pub(crate) use call_relations::CallArgument;
@@ -59,7 +60,9 @@ pub use candidates::{
 };
 pub use cpp_graph::CppUsageGraphStrategy;
 pub use csharp_graph::CSharpUsageGraphStrategy;
-pub use finder::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, QueryResult, UsageFinder};
+pub use finder::{
+    DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, QueryResult, UsageFinder, UsageQueryCompletion,
+};
 pub use go_graph::GoUsageGraphStrategy;
 pub(crate) use graph_core::{ImportEdge, ImportEdgeKind};
 pub use java_graph::JavaUsageGraphStrategy;

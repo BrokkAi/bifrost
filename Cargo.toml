@@ -3,7 +3,7 @@ name = "brokk-bifrost"
 # Single source of truth for both the crate and the Python wheel. The Python
 # package (`brokk-bifrost-searchtools`) inherits this version via maturin's
 # `dynamic = ["version"]` in pyproject.toml — keep it here, nowhere else.
-version = "0.8.11"
+version = "0.8.12"
 edition = "2024"
 description = "Tree-sitter-backed multi-language code analyzer with bundled LSP and MCP search-tool servers. Powers Brokk's `bifrost` binary."
 license = "LGPL-3.0-or-later"
@@ -12,13 +12,82 @@ homepage = "https://github.com/BrokkAi/bifrost"
 readme = "README.md"
 keywords = ["analyzer", "tree-sitter", "lsp", "mcp", "code-analysis"]
 categories = ["development-tools", "parser-implementations", "command-line-utilities"]
+# Order matters: gitignore semantics, last match wins. A "!" negation only
+# re-includes a file if it appears AFTER the broad pattern it carves out
+# of. Do not sort this list. scripts/check-crate-package.sh guards both
+# directions (excluded content staying out, negated files staying in).
 exclude = [
     ".agents/**",
+    # Repository/process metadata that Cargo includes by default but crate
+    # consumers never need.
+    ".cargo/config.toml",
+    ".claude-plugin/**",
+    ".cursor-plugin/**",
+    ".gitattributes",
+    ".github/**",
+    ".gitignore",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    # Repository test targets run from source checkouts and CI, not from the
+    # published crate. Retain non-Rust fixtures used by inline library tests.
+    "/tests/**/*.rs",
+    "/tests/common/**",
+    "/python_tests/**",
+    # Fixtures consumed only by the excluded integration-test targets. Inline
+    # #[cfg(test)] modules keep csharp-external (with its source provenance),
+    # two policies/*.rqlp files, policy-cli/project, typestate, and the
+    # testcode-java sources below.
+    "tests/fixtures/mcp/**",
+    "tests/fixtures/policies/**",
+    "!tests/fixtures/policies/dynamic-eval.rqlp",
+    "!tests/fixtures/policies/endpoints/http-request-parameter.rqlp",
+    "tests/fixtures/policy-cli/overrides/**",
+    "tests/fixtures/proxygroup_test_regression.go",
+    "tests/fixtures/sarif/**",
+    "tests/fixtures/scala-issue-1016/**",
+    "tests/fixtures/scala-issue-1068/**",
+    "tests/fixtures/semantic-model-packs/**",
+    "!tests/fixtures/semantic-model-packs/declarations-v1.json",
+    "tests/fixtures/testcode-cpp/**",
+    "tests/fixtures/testcode-cs/**",
+    "tests/fixtures/testcode-git-rank-java/**",
+    "tests/fixtures/testcode-go/**",
+    "tests/fixtures/testcode-java/bin/**",
+    # The documentation site is published separately; none of it is a crate
+    # build or runtime input.
+    "docs/**",
+    # Benchmark baselines and runner tooling are development-only.
+    "benchmark/**",
+    # Editor extension sources ship through the VS Code marketplace. The
+    # Rune IR TextMate grammar stays: an inline test include_str!'s it.
+    "editors/**",
+    "!editors/vscode/syntaxes/bifrost-rune-ir.tmLanguage.json",
+    # Agent plugin manifests/tests ship through plugin marketplaces. Only
+    # the SKILL.md files embedded into the binary via include_str! stay;
+    # anything else placed under skills/ must not ship.
+    "plugins/**",
+    "!plugins/bifrost-agent/skills/*/SKILL.md",
+    # Development tooling. The voyage sidecar script is a runtime input for
+    # the nlp feature and stays. The mcp property fuzzer's repo-rank helper
+    # (scripts/mcp-fuzzer-repo-rank.py) is deliberately dropped: the fuzzer
+    # binary is a development tool that already needs a source checkout.
+    "scripts/**",
+    "!scripts/voyage_sidecar.py",
+    "examples/**",
     "vendor/tree-sitter-scala/README.md",
     "vendor/tree-sitter-scala/queries/**",
     "vendor/tree-sitter-scala/src/grammar.json",
     "vendor/tree-sitter-scala/src/node-types.json",
     "vendor/tree-sitter-scala/tree-sitter.json",
+    # Retained upstream query references are not analyzer/runtime inputs yet.
+    "resources/treesitter/kotlin/highlights.scm",
+    "resources/treesitter/kotlin/tags.scm",
+    "vendor/tree-sitter-kotlin/src/grammar.json",
+    "vendor/tree-sitter-kotlin/src/node-types.json",
+    "vendor/tree-sitter-kotlin/tree-sitter.json",
 ]
 
 [lib]
@@ -58,19 +127,23 @@ moka = { version = "0.12.11", features = ["sync"] }
 notify = "6.1.1"
 nu-ansi-term = "0.50"
 once_cell = "1.21.3"
-pyo3 = { version = "0.23.5", features = ["abi3-py312", "extension-module"], optional = true }
+pyo3 = { version = "0.23.5", features = ["abi3-py312"], optional = true }
 rayon = "1.10.0"
 reedline = "0.49"
 regex = "1.12.2"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 rustc-hash = "2"
+schemars = "1.2.1"
 semver = "1.0.28"
 smallvec = "1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+serde-saphyr = { version = "0.0.29", default-features = false, features = ["deserialize"] }
+spdx = "0.13.4"
 strsim = "0.11.1"
 json-spanned-value = "0.2.2"
 sha2 = "0.10.8"
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 shlex = "2.0.1"
 toml = "0.8.23"
 tempfile = "3.23.0"
@@ -87,9 +160,10 @@ tree-sitter = "0.25.10"
 tree-sitter-go = "0.25.0"
 tree-sitter-javascript = "0.25.0"
 tree-sitter-python = "0.25.0"
-# Scala's generated parser is compiled from vendor/tree-sitter-scala because
-# its Bifrost fixes are not available together in a published grammar crate.
-# See vendor/tree-sitter-scala/BIFROST_PATCH.md for provenance and regeneration.
+# Scala and Kotlin generated parsers are compiled from vendor/. Scala carries
+# Bifrost fixes not available together in a published crate; Kotlin's active
+# upstream source is ahead of its published crate. Their provenance files name
+# exact revisions and regeneration commands.
 tree-sitter-language = "0.1"
 
 # Grammars that still need older published releases for this port.
@@ -123,6 +197,14 @@ nlp = ["dep:hf-hub", "dep:tokenizers", "dep:fastrq"]
 # Maturin turns this on automatically via pyproject.toml; the `bifrost` CLI
 # binary builds without it on every platform.
 python = ["dep:pyo3"]
+# Suppresses libpython linkage, which a Python extension needs (the host
+# interpreter supplies `Py*` at load time) and an executable cannot tolerate
+# (the symbols stay undefined and the link fails). Kept out of `python` so
+# `cargo test --features python` can link its test binaries; maturin turns it
+# on for the cdylib via pyproject.toml. Building the cdylib without maturin
+# still fails to link, exactly as before -- maturin supplies the
+# `-undefined dynamic_lookup` that a bare `cargo build` does not.
+extension-module = ["pyo3/extension-module"]
 
 [dev-dependencies]
 filetime = "0.2"

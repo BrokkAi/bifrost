@@ -277,6 +277,8 @@ function completionIcon(run: PolicyRun): string {
   switch (run.completion.type) {
     case "complete":
       return activeFindings(run).length > 0 ? "issues" : "pass";
+    case "proven_subset":
+      return "warning";
     case "inconclusive":
       return "question";
     case "unsupported":

@@ -18,7 +18,7 @@ impl<T: Any> CapabilityProvider for T {
     }
 }
 
-pub trait ImportAnalysisProvider: CapabilityProvider {
+pub trait ImportAnalysisProvider: CapabilityProvider + Send + Sync {
     fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit>;
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile>;
 

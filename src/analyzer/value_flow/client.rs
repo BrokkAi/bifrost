@@ -10,8 +10,7 @@ use crate::analyzer::semantic::{
 
 use super::plan::CallFlowRuleKind;
 use super::{
-    ValueFlowCarrier, ValueFlowCarrierId, ValueFlowPlan, ValueFlowSinkId, ValueFlowSourceId,
-    ValueFlowSummaryResult,
+    ValueFlowCarrierId, ValueFlowPlan, ValueFlowSinkId, ValueFlowSourceId, ValueFlowSummaryResult,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -334,31 +333,49 @@ impl<'plan> ValueFlowProblem<'plan> {
             self.emit_all(active, meetings, out);
             return;
         };
-        let mut propagated = active.clone();
-        let call_row = call
-            .procedure()
-            .semantics()
-            .call_site(call.id())
-            .expect("call handles are validated");
-        let result = match edge.kind() {
-            IcfgEdgeKind::CallToNormalContinuation => call_row.result,
-            IcfgEdgeKind::CallToExceptionalContinuation => call_row.thrown,
-            _ => None,
-        }
-        .and_then(|value| call.procedure().value_handle(value))
-        .and_then(|value| self.plan.carrier_id(&ValueFlowCarrier::Value(value)));
-        if let Some(result) = result {
-            for flow in active {
-                if self.plan.is_call_input(call, flow.carrier) {
-                    propagated.push(ActiveFlow {
-                        carrier: result,
-                        uncertainty: flow.uncertainty.with_semantic(),
-                        ..flow
-                    });
-                }
+        meetings.sort_unstable();
+        meetings.dedup();
+        for meeting in meetings {
+            if !out.emit(meeting) {
+                return;
             }
         }
-        self.emit_all(propagated, meetings, out);
+        for flow in active {
+            let mut emitting = true;
+            let application = self.plan.visit_boundary_transfers(
+                call,
+                edge.boundary(),
+                edge.kind(),
+                flow.carrier,
+                |transfer| {
+                    let transferred = ActiveFlow {
+                        carrier: transfer.target,
+                        uncertainty: if transfer.proven_complete {
+                            flow.uncertainty
+                        } else {
+                            flow.uncertainty.with_semantic()
+                        },
+                        ..flow
+                    };
+                    emitting = out.emit(transferred.fact());
+                    emitting
+                },
+            );
+            if !emitting {
+                return;
+            }
+            let preserved = if application.abstained {
+                ActiveFlow {
+                    uncertainty: flow.uncertainty.with_semantic(),
+                    ..flow
+                }
+            } else {
+                flow
+            };
+            if !out.emit(preserved.fact()) {
+                return;
+            }
+        }
     }
 }
 

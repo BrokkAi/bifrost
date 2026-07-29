@@ -1,0 +1,2 @@
+src/analyzer/structural/query/schema.rs
+policy-packs/bifrost.code-smells/policies/slow-loop.rqlp

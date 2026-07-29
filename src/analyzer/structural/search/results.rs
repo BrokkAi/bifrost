@@ -137,6 +137,7 @@ impl CodeQueryResponse {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CodeQueryCompletion {
     Complete,
+    ProvenSubset { codes: Vec<CodeQueryDiagnosticCode> },
     Incomplete { codes: Vec<CodeQueryDiagnosticCode> },
     Cancelled,
     Invalid { codes: Vec<CodeQueryDiagnosticCode> },
@@ -163,6 +164,13 @@ impl CodeQueryResult {
         let incomplete = self.diagnostic_codes_with_impact(CodeQueryDiagnosticImpact::Incomplete);
         if self.truncated || !incomplete.is_empty() {
             return CodeQueryCompletion::Incomplete { codes: incomplete };
+        }
+        let declared_non_exhaustive =
+            self.diagnostic_codes_with_impact(CodeQueryDiagnosticImpact::DeclaredNonExhaustive);
+        if !declared_non_exhaustive.is_empty() {
+            return CodeQueryCompletion::ProvenSubset {
+                codes: declared_non_exhaustive,
+            };
         }
         CodeQueryCompletion::Complete
     }
@@ -981,6 +989,7 @@ impl CodeQueryDiagnosticCode {
 #[serde(rename_all = "snake_case")]
 pub enum CodeQueryDiagnosticImpact {
     Advisory,
+    DeclaredNonExhaustive,
     Incomplete,
     Invalid,
 }
@@ -989,6 +998,7 @@ impl CodeQueryDiagnosticImpact {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Advisory => "advisory",
+            Self::DeclaredNonExhaustive => "declared_non_exhaustive",
             Self::Incomplete => "incomplete",
             Self::Invalid => "invalid",
         }
@@ -1215,6 +1225,11 @@ impl CodeQuerySemanticWork {
 pub struct CodeQueryTypestateWork {
     pub solves: u64,
     pub cache_hits: u64,
+    pub summary_hits: u64,
+    pub summary_misses: u64,
+    pub summary_rejections: u64,
+    pub summary_evictions: u64,
+    pub summary_recomputations: u64,
     pub reached_rows: u64,
     pub findings: u64,
     pub omitted_findings: u64,
@@ -1233,6 +1248,11 @@ impl CodeQueryTypestateWork {
     pub const fn is_empty(&self) -> bool {
         self.solves == 0
             && self.cache_hits == 0
+            && self.summary_hits == 0
+            && self.summary_misses == 0
+            && self.summary_rejections == 0
+            && self.summary_evictions == 0
+            && self.summary_recomputations == 0
             && self.reached_rows == 0
             && self.findings == 0
             && self.omitted_findings == 0
@@ -1251,6 +1271,17 @@ impl CodeQueryTypestateWork {
         Self {
             solves: self.solves.saturating_sub(earlier.solves),
             cache_hits: self.cache_hits.saturating_sub(earlier.cache_hits),
+            summary_hits: self.summary_hits.saturating_sub(earlier.summary_hits),
+            summary_misses: self.summary_misses.saturating_sub(earlier.summary_misses),
+            summary_rejections: self
+                .summary_rejections
+                .saturating_sub(earlier.summary_rejections),
+            summary_evictions: self
+                .summary_evictions
+                .saturating_sub(earlier.summary_evictions),
+            summary_recomputations: self
+                .summary_recomputations
+                .saturating_sub(earlier.summary_recomputations),
             reached_rows: self.reached_rows.saturating_sub(earlier.reached_rows),
             findings: self.findings.saturating_sub(earlier.findings),
             omitted_findings: self
@@ -1281,6 +1312,17 @@ impl CodeQueryTypestateWork {
         Self {
             solves: self.solves.saturating_add(other.solves),
             cache_hits: self.cache_hits.saturating_add(other.cache_hits),
+            summary_hits: self.summary_hits.saturating_add(other.summary_hits),
+            summary_misses: self.summary_misses.saturating_add(other.summary_misses),
+            summary_rejections: self
+                .summary_rejections
+                .saturating_add(other.summary_rejections),
+            summary_evictions: self
+                .summary_evictions
+                .saturating_add(other.summary_evictions),
+            summary_recomputations: self
+                .summary_recomputations
+                .saturating_add(other.summary_recomputations),
             reached_rows: self.reached_rows.saturating_add(other.reached_rows),
             findings: self.findings.saturating_add(other.findings),
             omitted_findings: self.omitted_findings.saturating_add(other.omitted_findings),

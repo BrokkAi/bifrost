@@ -450,6 +450,8 @@ pub(crate) struct PathSymbolRow {
     pub(crate) normalized_fqn: String,
 }
 
+type PathSymbolRowsResult = Result<Vec<(String, PathSymbolRow)>>;
+
 fn decode_path_symbol_row(
     row: &rusqlite::Row<'_>,
     offset: usize,
@@ -479,6 +481,53 @@ fn decode_path_symbol_row(
         exact_fqn: row.get(offset + 5)?,
         normalized_fqn: row.get(offset + 6)?,
     })
+}
+
+/// Shared row-fetch body of `path_symbol_rows_by_fqn_for_langs` and its batched sibling: runs entirely
+/// within a caller-supplied transaction so the batch path can resolve many FQN pairs per transaction.
+fn path_symbol_rows_by_fqn_in_tx(
+    tx: &Transaction,
+    langs: &[String],
+    exact_fqn: &str,
+    normalized_fqn: &str,
+) -> Result<Vec<(String, PathSymbolRow)>> {
+    let mut out = Vec::new();
+    let sql = format!(
+        "SELECT lang, rel_path, blob_oid, kind, package_name, short_name,
+                exact_fqn, normalized_fqn
+         FROM path_symbol_units AS units
+         WHERE lang = ?1 AND (exact_fqn = ?2 OR normalized_fqn = ?3)
+           AND units.generation = COALESCE(
+             (SELECT generation FROM analysis_epochs WHERE lang = units.lang), 0
+           )
+           AND (
+             lang NOT IN ('javascript', 'typescript:ts', 'typescript:tsx')
+             OR EXISTS(
+               SELECT 1 FROM import_details AS imports
+               JOIN blob_meta AS meta
+                 ON meta.blob_oid = imports.blob_oid AND meta.lang = imports.lang
+               WHERE imports.blob_oid = units.blob_oid AND imports.lang = units.lang
+                 AND {PARSED_BLOB_COMPLETE_CONDITION}
+             )
+           )
+         ORDER BY rel_path, exact_fqn"
+    );
+    for lang in langs {
+        if lang == "python" && exact_fqn == normalized_fqn {
+            let mut stmt = tx.prepare_cached(EXACT_PATH_SYMBOL_FQN_SQL)?;
+            let mapped = stmt.query_map(params![lang, exact_fqn], |row| {
+                Ok((row.get(0)?, decode_path_symbol_row(row, 1)?))
+            })?;
+            out.extend(mapped.collect::<std::result::Result<Vec<_>, _>>()?);
+        } else {
+            let mut stmt = tx.prepare_cached(&sql)?;
+            let mapped = stmt.query_map(params![lang, exact_fqn, normalized_fqn], |row| {
+                Ok((row.get(0)?, decode_path_symbol_row(row, 1)?))
+            })?;
+            out.extend(mapped.collect::<std::result::Result<Vec<_>, _>>()?);
+        }
+    }
+    Ok(out)
 }
 
 fn path_symbol_fingerprint(rows: &[PathSymbolRow]) -> String {
@@ -632,44 +681,35 @@ impl AnalyzerStore {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        let mut out = Vec::new();
-        let sql = format!(
-            "SELECT lang, rel_path, blob_oid, kind, package_name, short_name,
-                    exact_fqn, normalized_fqn
-             FROM path_symbol_units AS units
-             WHERE lang = ?1 AND (exact_fqn = ?2 OR normalized_fqn = ?3)
-               AND units.generation = COALESCE(
-                 (SELECT generation FROM analysis_epochs WHERE lang = units.lang), 0
-               )
-               AND (
-                 lang NOT IN ('javascript', 'typescript:ts', 'typescript:tsx')
-                 OR EXISTS(
-                   SELECT 1 FROM import_details AS imports
-                   JOIN blob_meta AS meta
-                     ON meta.blob_oid = imports.blob_oid AND meta.lang = imports.lang
-                   WHERE imports.blob_oid = units.blob_oid AND imports.lang = units.lang
-                     AND {PARSED_BLOB_COMPLETE_CONDITION}
-                 )
-               )
-             ORDER BY rel_path, exact_fqn"
-        );
-        for lang in langs {
-            if lang == "python" && exact_fqn == normalized_fqn {
-                let mut stmt = tx.prepare(EXACT_PATH_SYMBOL_FQN_SQL)?;
-                let mapped = stmt.query_map(params![lang, exact_fqn], |row| {
-                    Ok((row.get(0)?, decode_path_symbol_row(row, 1)?))
-                })?;
-                out.extend(mapped.collect::<std::result::Result<Vec<_>, _>>()?);
-            } else {
-                let mut stmt = tx.prepare(&sql)?;
-                let mapped = stmt.query_map(params![lang, exact_fqn, normalized_fqn], |row| {
-                    Ok((row.get(0)?, decode_path_symbol_row(row, 1)?))
-                })?;
-                out.extend(mapped.collect::<std::result::Result<Vec<_>, _>>()?);
-            }
-        }
+        let out = path_symbol_rows_by_fqn_in_tx(&tx, langs, exact_fqn, normalized_fqn)?;
         tx.commit()?;
         Ok(out)
+    }
+
+    /// Batched sibling of `path_symbol_rows_by_fqn_for_langs`: resolves many (exact_fqn,
+    /// normalized_fqn) pairs in one transaction instead of one transaction per pair. Used by the
+    /// Python import resolver so a file with many imports doesn't open one transaction per import.
+    ///
+    /// The outer `Result` covers setup failures (can't open the transaction at all); each item's own
+    /// `Result` is independent, so one FQN's query/decode error doesn't discard the rest of the
+    /// batch's already-successful results the way propagating a single `?` through the loop would.
+    pub(crate) fn path_symbol_rows_by_fqns_for_langs_batch(
+        &self,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+        fqns: &[(String, String)],
+    ) -> Result<Vec<PathSymbolRowsResult>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        let results = fqns
+            .iter()
+            .map(|(exact_fqn, normalized_fqn)| {
+                path_symbol_rows_by_fqn_in_tx(&tx, langs, exact_fqn, normalized_fqn)
+            })
+            .collect();
+        tx.commit()?;
+        Ok(results)
     }
 
     pub(crate) fn replace_path_symbol_unit(

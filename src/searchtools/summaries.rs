@@ -1,3 +1,4 @@
+use super::navigation::deserialize_symbol_lookup_names;
 use super::selectors::*;
 use super::*;
 
@@ -8,6 +9,7 @@ pub struct FilePatternsParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummariesParams {
+    #[serde(deserialize_with = "deserialize_symbol_lookup_names")]
     pub targets: Vec<String>,
 }
 
@@ -124,6 +126,17 @@ pub struct MostRelevantFilesResult {
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub duplicates: Vec<String>,
+    pub complete: bool,
+    pub ranking_mode_used: MostRelevantFilesRankingMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<MostRelevantFilesIncompleteReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MostRelevantFilesIncompleteReason {
+    Cancelled,
+    TimeBudget,
 }
 
 pub(super) fn default_recency_half_life() -> Option<f64> {
@@ -146,9 +159,18 @@ pub(super) struct SummaryTargets {
     pub(super) ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
+#[cfg(test)]
 pub(super) fn route_summary_targets(
     analyzer: &dyn IAnalyzer,
     targets: &[String],
+) -> SummaryTargets {
+    route_summary_targets_with_cancellation(analyzer, targets, None)
+}
+
+fn route_summary_targets_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    targets: &[String],
+    cancellation: Option<&crate::CancellationToken>,
 ) -> SummaryTargets {
     let _scope = profiling::scope("searchtools::route_summary_targets");
     let resolver = WorkspaceFileResolver::new(analyzer.project());
@@ -165,6 +187,9 @@ pub(super) fn route_summary_targets(
         .map(|target| target.trim())
         .filter(|target| !target.is_empty())
     {
+        if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+            break;
+        }
         if matches!(
             split_definition_selector(target),
             DefinitionSelector::FileAnchored { .. }
@@ -398,15 +423,19 @@ pub(super) fn container_entry_sort_key(entry: &ContainerListingEntry) -> (u8, &s
     }
 }
 
-pub(super) fn summarize_symbol_targets(
+fn summarize_symbol_targets_with_cancellation(
     analyzer: &dyn IAnalyzer,
     targets: Vec<String>,
+    cancellation: Option<&crate::CancellationToken>,
 ) -> SummaryResult {
     let mut summaries = Vec::new();
     let mut not_found = Vec::new();
     let mut ambiguous = Vec::new();
 
     for target in targets {
+        if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+            break;
+        }
         match resolve_selectable_definitions(analyzer, &target, resolve_codeunit_fuzzy) {
             SelectableDefinitionResolution::Resolved(code_units) => {
                 let start_len = summaries.len();
@@ -434,9 +463,17 @@ pub(super) fn summarize_symbol_targets(
 }
 
 pub fn get_summaries(analyzer: &dyn IAnalyzer, params: SummariesParams) -> SummaryResult {
+    get_summaries_with_cancellation(analyzer, params, None)
+}
+
+pub(crate) fn get_summaries_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    params: SummariesParams,
+    cancellation: Option<&crate::CancellationToken>,
+) -> SummaryResult {
     let _scope = profiling::scope("searchtools::get_summaries");
-    let targets = route_summary_targets(analyzer, &params.targets);
-    summarize_routed_targets(analyzer, &targets)
+    let targets = route_summary_targets_with_cancellation(analyzer, &params.targets, cancellation);
+    summarize_routed_targets_with_cancellation(analyzer, &targets, cancellation)
 }
 
 pub(super) fn skim_files_for_files(
@@ -485,11 +522,23 @@ pub(super) fn skim_files_note(truncated: bool, shown: usize, total: usize) -> Op
     })
 }
 
+#[cfg(any(test, feature = "nlp"))]
 pub(crate) fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> SummaryResult {
+    summarize_files_with_cancellation(analyzer, files, None)
+}
+
+fn summarize_files_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    files: Vec<ProjectFile>,
+    cancellation: Option<&crate::CancellationToken>,
+) -> SummaryResult {
     let _scope = profiling::scope("searchtools::summarize_files");
     let mut summaries: Vec<_> = files
         .into_par_iter()
         .filter_map(|file| {
+            if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+                return None;
+            }
             let mut elements = analyzer
                 .summary_file_projection(&file)
                 .map(|projection| summary_elements_from_file_projection(&projection, &file))
@@ -674,12 +723,21 @@ pub(super) fn extract_include_target(statement: &str) -> String {
     rest.to_string()
 }
 
-pub(super) fn summarize_routed_targets(
+fn summarize_routed_targets_with_cancellation(
     analyzer: &dyn IAnalyzer,
     summary_targets: &SummaryTargets,
+    cancellation: Option<&crate::CancellationToken>,
 ) -> SummaryResult {
-    let mut file_output = summarize_files(analyzer, summary_targets.file_targets.clone());
-    let symbol_output = summarize_symbol_targets(analyzer, summary_targets.symbol_targets.clone());
+    let mut file_output = summarize_files_with_cancellation(
+        analyzer,
+        summary_targets.file_targets.clone(),
+        cancellation,
+    );
+    let symbol_output = summarize_symbol_targets_with_cancellation(
+        analyzer,
+        summary_targets.symbol_targets.clone(),
+        cancellation,
+    );
 
     file_output.summaries.extend(symbol_output.summaries);
     file_output.listings = summary_targets.listings.clone();
@@ -717,8 +775,19 @@ pub fn most_relevant_files(
     analyzer: &dyn IAnalyzer,
     params: MostRelevantFilesParams,
 ) -> Result<MostRelevantFilesResult, String> {
+    most_relevant_files_with_cancellation(analyzer, params, &crate::CancellationToken::default())
+}
+
+pub(crate) fn most_relevant_files_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    params: MostRelevantFilesParams,
+    cancellation: &crate::CancellationToken,
+) -> Result<MostRelevantFilesResult, String> {
     let _scope = profiling::scope("searchtools::most_relevant_files");
     validate_most_relevant_files_params(&params)?;
+    if cancellation.is_cancelled() {
+        return Err(most_relevant_files_cancellation_message(cancellation));
+    }
     let resolver = WorkspaceFileResolver::new(analyzer.project());
     let mut seeds = Vec::new();
     let mut not_found = Vec::new();
@@ -734,6 +803,9 @@ pub fn most_relevant_files(
     {
         let _scope = profiling::scope("searchtools::most_relevant_files.resolve_seeds");
         for (input, weight) in params.seed_file_paths.into_iter().zip(seed_weights) {
+            if cancellation.is_cancelled() {
+                return Err(most_relevant_files_cancellation_message(cancellation));
+            }
             let trimmed = input.trim();
             if trimmed.is_empty() {
                 continue;
@@ -762,28 +834,65 @@ pub fn most_relevant_files(
             not_found,
             ambiguous_paths,
             duplicates,
+            complete: true,
+            ranking_mode_used: ranking_mode,
+            incomplete_reason: None,
         });
     }
 
-    let files = {
+    let (files, complete, ranking_mode_used, incomplete_reason) = {
         let _scope = profiling::scope("searchtools::most_relevant_files.rank");
-        let ranked = if ranking_mode == MostRelevantFilesRankingMode::HistoryImports
+        let (ranked, complete, ranking_mode_used, incomplete_reason) = if ranking_mode
+            == MostRelevantFilesRankingMode::HistoryImports
             && recency_half_life == Some(DEFAULT_RECENCY_HALF_LIFE)
         {
-            most_relevant_project_files(analyzer, &seeds, params.limit)
+            let files = most_relevant_project_files(analyzer, &seeds, params.limit);
+            if cancellation.is_cancelled() {
+                return Err(most_relevant_files_cancellation_message(cancellation));
+            }
+            (
+                files,
+                true,
+                MostRelevantFilesRankingMode::HistoryImports,
+                None,
+            )
         } else {
-            most_relevant_project_files_with_ranking_mode(
+            match most_relevant_project_files_with_ranking_mode_and_cancellation(
                 analyzer,
                 &seeds,
                 params.limit,
                 recency_half_life,
                 ranking_mode,
-            )
+                cancellation,
+            ) {
+                MostRelevantProjectFilesOutcome::Complete(files) => {
+                    (files, true, ranking_mode, None)
+                }
+                MostRelevantProjectFilesOutcome::Cancelled => {
+                    let reason = most_relevant_files_incomplete_reason(cancellation);
+                    (
+                        most_relevant_project_files_with_half_life(
+                            analyzer,
+                            &seeds,
+                            params.limit,
+                            recency_half_life,
+                        ),
+                        false,
+                        MostRelevantFilesRankingMode::HistoryImports,
+                        Some(reason),
+                    )
+                }
+            }
         };
-        ranked
-            .into_iter()
-            .map(|file| rel_path_string(&file))
-            .collect()
+        (
+            ranked
+                .into_iter()
+                .map(|file| rel_path_string(&file))
+                .collect(),
+            complete,
+            ranking_mode_used,
+            incomplete_reason,
+        )
     };
 
     Ok(MostRelevantFilesResult {
@@ -791,7 +900,28 @@ pub fn most_relevant_files(
         not_found,
         ambiguous_paths,
         duplicates,
+        complete,
+        ranking_mode_used,
+        incomplete_reason,
     })
+}
+
+fn most_relevant_files_cancellation_message(cancellation: &crate::CancellationToken) -> String {
+    if cancellation.is_timed_out() {
+        "most_relevant_files exceeded its request-wide time budget".to_string()
+    } else {
+        "most_relevant_files was cancelled".to_string()
+    }
+}
+
+fn most_relevant_files_incomplete_reason(
+    cancellation: &crate::CancellationToken,
+) -> MostRelevantFilesIncompleteReason {
+    if cancellation.is_timed_out() {
+        MostRelevantFilesIncompleteReason::TimeBudget
+    } else {
+        MostRelevantFilesIncompleteReason::Cancelled
+    }
 }
 
 pub(super) fn validate_most_relevant_files_params(
@@ -1091,4 +1221,27 @@ pub(super) fn trim_summary_signature(signature: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod issue_1304_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn timeout_and_explicit_cancellation_have_distinct_reasons() {
+        let timed_out = crate::CancellationToken::default().with_timeout(Duration::ZERO);
+        assert!(timed_out.is_cancelled());
+        assert_eq!(
+            most_relevant_files_incomplete_reason(&timed_out),
+            MostRelevantFilesIncompleteReason::TimeBudget
+        );
+
+        let cancelled = crate::CancellationToken::default();
+        cancelled.cancel();
+        assert_eq!(
+            most_relevant_files_incomplete_reason(&cancelled),
+            MostRelevantFilesIncompleteReason::Cancelled
+        );
+    }
 }

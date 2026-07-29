@@ -1926,7 +1926,9 @@ pub(super) fn type_identity_matches(left: &str, right: &str) -> bool {
         })
 }
 
-fn canonical_builtin_type_identity(reference: &str) -> Option<&'static str> {
+pub(in crate::analyzer::usages) fn canonical_builtin_type_identity(
+    reference: &str,
+) -> Option<&'static str> {
     match reference.strip_prefix("global::").unwrap_or(reference) {
         "bool" | "System.Boolean" => Some("System.Boolean"),
         "byte" | "System.Byte" => Some("System.Byte"),
@@ -2034,13 +2036,9 @@ fn extension_method_receiver_type_inner(
                 .find_map(|metadata| metadata.extension_receiver_type())?;
             let resolved =
                 resolve_member_type_fq_name(csharp, unit.source(), &owner, receiver_type, usage);
-            if usage {
-                resolved.map(CSharpExtensionReceiver::Exact)
-            } else {
-                resolved
-                    .or_else(|| Some(normalize_type_text(receiver_type)))
-                    .map(CSharpExtensionReceiver::Exact)
-            }
+            resolved
+                .or_else(|| Some(normalize_type_text(receiver_type)))
+                .map(CSharpExtensionReceiver::Exact)
         }
     }
 }
@@ -2857,6 +2855,26 @@ pub(super) fn usage_class_field_receiver_type(
     } else {
         SymbolResolution::Ambiguous
     }
+}
+
+/// Whether an unqualified identifier binds to a value member on the enclosing
+/// type or its nearest declaring ancestor. This is deliberately independent of
+/// declared-type inference: constants and other value members still shadow a
+/// visible type with the same name even when their type cannot be resolved.
+pub(super) fn usage_unqualified_value_member_shadows_type(
+    node: Node<'_>,
+    name: &str,
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+) -> bool {
+    let Some(enclosing) = enclosing_declared_type(node, csharp, file, source) else {
+        return false;
+    };
+    nearest_member_candidates_for_owner(analyzer, csharp, &enclosing, name, None)
+        .iter()
+        .any(CodeUnit::is_field)
 }
 
 /// Whether an unqualified `member_name` is bound by a local (parameter or local

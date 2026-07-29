@@ -65,8 +65,9 @@ assert.deepStrictEqual(
     "./skills/bifrost-code-navigation",
     "./skills/bifrost-code-reading",
     "./skills/bifrost-codebase-search",
+    "./skills/bifrost-policy-checking",
   ],
-  `${piManifestPath} should expose exactly the three canonical code-intelligence skills`,
+  `${piManifestPath} should expose exactly the four canonical Bifrost agent skills`,
 );
 assert.deepStrictEqual(
   piManifest.dependencies?.["@modelcontextprotocol/sdk"],
@@ -256,6 +257,7 @@ const expectedSkills = [
   ["bifrost-code-navigation", "bifrost-code-navigation", "search_symbols", "scan_usages_by_location", "get_symbol_locations"],
   ["bifrost-code-reading", "bifrost-code-reading", "get_summaries", "get_symbol_sources"],
   ["bifrost-codebase-search", "bifrost-codebase-search", "search_symbols", "query_code", "find_filenames", "list_files"],
+  ["bifrost-policy-checking", "bifrost-policy-checking", "list_policies", "run_policy", "policy_categories", "unreliable"],
   ["git-exploration", "brokk-git-exploration", "git log", "git diff", "gh pr view"],
   ["guided-issue", "brokk-guided-issue", "Guided Issue Resolution", "brokk:issue-diagnostician"],
   ["guided-review", "brokk-guided-review", "Guided Code Review", "brokk:security-reviewer"],
@@ -342,7 +344,14 @@ assert.deepStrictEqual(
   ["--root", ".", "--mcp", "symbol|extended"],
   `${AMP_SKILL_BUNDLE_ROOT}/mcp.json should launch Bifrost against Amp's current workspace`,
 );
-for (const tool of ["search_symbols", "get_summaries", "scan_usages_by_location", "find_filenames"]) {
+for (const tool of [
+  "search_symbols",
+  "get_summaries",
+  "scan_usages_by_location",
+  "find_filenames",
+  "list_policies",
+  "run_policy",
+]) {
   if (!ampMcpConfig.bifrost.includeTools?.includes(tool)) {
     throw new Error(`${AMP_SKILL_BUNDLE_ROOT}/mcp.json should include ${tool}`);
   }

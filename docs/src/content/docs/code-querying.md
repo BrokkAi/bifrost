@@ -3,9 +3,9 @@ title: Code Querying
 description: Understand Bifrost's structural code-querying model and its query representations.
 ---
 
-Bifrost's composable code-query engine is `query_code`. The compatible head is schema version 4: it retains version 3's source-backed procedure-local CFG and version 2's structural/declaration/reference/call/import/hierarchy/receiver steps, then adds host-registered diagnostic-neutral typestate findings and bounded witnesses. It answers questions such as “find calls to this callee,” “which declarations call this function,” “what enters this sensitive formal parameter,” “which exact control edge leaves this entry?”, and “does this registered resource protocol reach an error transition?” across the active workspace.
+Bifrost's composable code-query engine is `query_code`. The compatible head is schema version 5: it retains version 3's source-backed procedure-local CFG and version 2's structural/declaration/reference/call/import/hierarchy/receiver steps, adds host-registered diagnostic-neutral typestate findings and bounded witnesses, and adds declaration-bounded containment. It answers questions such as “find calls to this callee,” “which declarations call this function,” “what enters this sensitive formal parameter,” “which exact control edge leaves this entry?”, and “does this registered resource protocol reach an error transition?” across the active workspace.
 
-Version 3's CFG surface remains deliberately procedure-local. Version 4 adds a narrow adapter from an exact procedure to an in-memory protocol/binding pair registered by the host, followed by a pure retained-witness projection. A query cannot load a protocol or endpoint file, change binding roles or may/must mode, compile policy severity, persist summaries, or invoke value-flow/taint through this first slice. `call_input` still projects only the expression written directly at the call site. Explicit version-2 and version-3 pins remain supported and reject newer operations.
+Version 3's CFG surface remains deliberately procedure-local. Version 4 adds a narrow adapter from an exact procedure to an in-memory protocol/binding pair registered by the host, followed by a pure retained-witness projection. Version 5 adds `inside-decl` / `inside_decl`: containment that cannot cross a nested function, method, constructor, or lambda. A query cannot load a protocol or endpoint file, change binding roles or may/must mode, compile policy severity, persist summaries, or invoke value-flow/taint through this first slice. `call_input` still projects only the expression written directly at the call site. Explicit version pins remain supported and reject later operations.
 
 ## Choose The Right Tool
 
@@ -28,7 +28,7 @@ Language adapters map grammar-specific tree-sitter nodes and fields into **Rune 
 
 See [Rune IR](/rune-ir/) for the representation, `.rune` files and VS Code previews, query-by-example workflow, limits, and the complete per-language adapter mapping.
 
-## Version 4 Typed Pipelines
+## Typed Pipelines and Declaration-Bounded Containment
 
 `query_code` validates the structural seed query, lowers it to a shared logical dependency graph, selects physical operators, and then applies an ordered typed pipeline. Queries without steps return tagged structural matches. Complete compatible pipelines can be combined with `union`, `intersect`, and `except`, then passed through another common typed suffix. `enclosing_decl` returns exact indexed declarations; `procedure_of` enters the source-backed semantic domain; `cfg_*` traverses procedure-local boundaries and edges; `typestate` consumes one registered solver capability; and `witness` projects its retained evidence. Derived results retain seed-and-edge provenance, including the contributing branch path after composition.
 

@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::env;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 thread_local! {
     static DEPTH: Cell<usize> = const { Cell::new(0) };
@@ -67,5 +67,19 @@ pub fn note(label: impl AsRef<str>) {
     DEPTH.with(|depth| {
         let indent = "  ".repeat(depth.get());
         eprintln!("[bifrost-timing] {indent}NOTE {}", label.as_ref());
+    });
+}
+
+pub fn duration(label: impl AsRef<str>, duration: Duration) {
+    if !enabled() {
+        return;
+    }
+    let elapsed_ms = duration.as_secs_f64() * 1000.0;
+    DEPTH.with(|depth| {
+        let indent = "  ".repeat(depth.get());
+        eprintln!(
+            "[bifrost-timing] {indent}DURATION {} ({elapsed_ms:.1} ms)",
+            label.as_ref()
+        );
     });
 }

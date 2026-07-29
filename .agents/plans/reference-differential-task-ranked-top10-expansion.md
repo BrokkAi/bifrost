@@ -1,4 +1,4 @@
-# Expand the task-ranked reference differential to ten repositories per language
+# Expand the task-ranked reference differential with repositories six through ten
 
 This ExecPlan is a living document. Keep `Progress`, `Surprises & Discoveries`,
 `Decision Log`, and `Outcomes & Retrospective` current while work proceeds.
@@ -9,29 +9,33 @@ Maintain it in accordance with `.agents/PLANS.md`.
 Bifrost's public MCP `symbols` toolset and associated Rust and Python APIs
 support both forward definition lookup and inverse reference lookup. When a
 source reference resolves forward to a workspace declaration group, a complete
-inverse query for that declaration should recover the same source range. This
-campaign tests that contract on the ten repositories with the most eligible
-tasks in each of the eleven languages recognized by
-`/home/jonathan/Projects/brokkbench/tasks.py`.
+inverse query for that declaration should recover the same source range. The
+preceding campaign already accepted ranks one through five for all eleven
+languages. This distinct expansion tests ranks six through ten, producing five
+new repository envelopes per language and extending the combined evidence to
+the ten repositories with the most eligible tasks in each language recognized
+by `/home/jonathan/Projects/brokkbench/tasks.py`.
 
 Repository membership is selected only by calling
 `tasks.task_repos(tasks.SFT_PREDICATES, langs=[LANG])`, sorting the returned
 records by descending `task_count` while preserving selector order for ties,
-and retaining ten. `SFT_PREDICATES` is the required selector because it
+and taking slice `[5:10]`. `SFT_PREDICATES` is the required selector because it
 excludes `large-repos.csv` entries and applies the task corpus eligibility
-gates. The differential runner receives the ten slugs as explicit repeated
+gates. The differential runner receives the five new slugs as explicit repeated
 `--repo` arguments. Its `--repos-per-language` option ranks by code size and is
 not valid for this objective.
 
-The observable result is 110 completed repository envelopes, ten per language,
-with every raw `missing` row exhaustively dispositioned. Every legitimate
-defect must have a GitHub issue whose title starts `FIRD:` and which is assigned
-to `jbellis` before product code changes begin. If a matching issue is assigned
-to somebody else, record it and skip that issue. Owned fixes receive structured
-behavior tests, exact production proof, formatting, all-feature Clippy, the
-complete `cargo test --features nlp,python` gate, direct publication to
-`origin/master`, and issue closure. LSP shares much of the implementation and
-comes through the local gate, but is not the focus.
+The observable result is 55 new completed repository envelopes, five per
+language, with every raw `missing` row exhaustively dispositioned. Combined
+with the already accepted top five, those records establish top-ten coverage
+without rerunning ranks one through five. Every legitimate defect must have a
+GitHub issue whose title starts `FIRD:` and which is assigned to `jbellis`
+before product code changes begin. If a matching issue is assigned to somebody
+else, record it and skip that issue. Owned fixes receive structured behavior
+tests, exact production proof, formatting, all-feature Clippy, the complete
+`cargo test --features nlp,python` gate, direct publication to `origin/master`,
+and issue closure. LSP shares much of the implementation and comes through the
+local gate, but is not the focus.
 
 ## Progress
 
@@ -461,36 +465,202 @@ comes through the local gate, but is not the focus.
   complete `cargo test --features nlp,python` matrix pass at niceness 10 with
   normal Cargo storage. Commit `3235743d` is on `origin/master`, and #1229 is
   closed.
-- [x] (2026-07-28) Verified the accepted eleven-language set comprises all 110
-  task-selected repository envelopes, every campaign fixing commit is an
-  ancestor of remote `origin/master`, and local HEAD, the remote-tracking ref,
-  and the hosted master agree after publication. Removed 38 GB of disposable
-  corpus reports, logs, ledgers, caches, and exact diagnostics from the exact
-  campaign scratch directory plus the three named Qpid files in `/tmp`; the
-  compact checked-in summaries retain the final provenance and checksums.
+- [x] (2026-07-28) Performed an administrative close-out that incorrectly
+  treated the user's prior “finished” language status as top-ten rather than
+  top-five status. The publication, issue, test, and 38 GB scratch-cleanup
+  checks were real, but the claimed 110-envelope acceptance was not. This
+  conclusion is superseded by the 2026-07-28 20:02Z scope correction below.
+- [x] (2026-07-28) Re-audited selector membership, issue state, commit
+  ancestry, tests, publication, and scratch cleanup after hosted master
+  advanced to `53cc729d`. Those checks remain useful infrastructure evidence,
+  but they did not inspect absent ranks-six-through-ten artifacts and therefore
+  do not prove completion for C#, Go, Java, JavaScript, TypeScript, PHP, Rust,
+  or Scala.
+- [x] (2026-07-28 20:02Z) Corrected the campaign scope after the user clarified
+  that the previously completed work was ranks one through five and this is a
+  distinct ranks-six-through-ten task. Durable new-rank evidence exists only
+  for C, C++, and Python: 15 of the required 55 new repository envelopes.
+  C#, Go, Java, JavaScript, TypeScript, PHP, Rust, and Scala still require 40
+  new envelopes. Delegated independent evidence and live-selector preflight
+  audits to Oldskool while root corrected this plan.
+- [x] (2026-07-28 20:04Z) Oldskool independently reproduced the 40 active
+  ranks-six-through-ten selections, readable clone heads, corpus JSONL,
+  `.testsome.jsonl`, and `.status.json` sidecars, and confirmed none of the
+  slugs belongs to the current 544-entry `large-repos.csv` set. Six clones are
+  already tracked-clean; the other 34 show only generated `.bifrost/` or
+  `.brokk/` directories and need local Git excludes before acceptance runs.
+  There are no missing-clone or missing-corpus blockers.
+- [x] (2026-07-28 20:14Z) Published the scope correction on integrated
+  `origin/master` head `31875c49`, applied a reversible local generated-cache
+  exclude to the 40 selected clones, and verified every clone is tracked-clean.
+  Built the clean release runner at niceness 10 with SHA-256
+  `f28bdeaba5624d13801fca0430adf8de8aff85839e3d42df3a53d5e9afd9363b`.
+  Its C# dry-run selected exactly ranks six through ten.
+- [x] (2026-07-28 20:35Z) C# ranks six through ten completed a clean-runner
+  triage baseline from source head `31875c49` in 2m15s. The five envelopes
+  contain 130 raw missing rows,
+  dominated by 125 extension-method sites. Exact reproduction confirmed the
+  generic/external extension-receiver inverse gap; filed and assigned
+  `FIRD: C# inverse misses forward-resolved extension-method calls` as #1261.
+  The worktree changed while the immutable runner was executing, so the
+  envelopes report the later dynamic checkout head and dirty flag and are not
+  acceptance evidence. Exhaustive triage subsequently reduced the rows to six
+  assigned roots: #1261, #1263, #1264, #1265, #1266, and #1267.
+- [x] (2026-07-28 20:48Z) Go ranks six through ten completed as a fast
+  triage baseline in 24s: `gobl` and `helm` have zero raw missing, while
+  `rclone`, `opa`, and `mdsmith` contribute 38 rows now under exhaustive
+  review. Because the progress plan was modified during this overlapping run,
+  its envelopes correctly record `bifrost_dirty=true`; this baseline is not
+  acceptance evidence and will be rerun from the next clean integrated head.
+- [x] (2026-07-28 21:07Z) Exhaustive Go triage reduced all 38 rows to four
+  assigned roots: promoted methods through embedded interfaces (#1269), keyed
+  composite labels bypassing exact owner resolution (#1270), package/import
+  declaration sampling (#1271), and an initially suspected field access
+  (#1272). Exact source review showed the last sampled span was the legitimate
+  call `o.Fs()` through an embedded interface, making it another #1269 witness;
+  #1272 was closed as a duplicate without product edits. The focused #1269
+  embedded-interface regression passes with all features at niceness 10.
+- [x] (2026-07-28 21:07Z) Java, TypeScript, and PHP each completed five-repo
+  triage baselines with 50,000 accepted sampled sites and zero raw missing
+  rows. Java took 6m08s, TypeScript 19s, and PHP 31s. These overlapping
+  envelopes carry the dirty/dynamic checkout caveat and will be rerun for
+  acceptance from a clean integrated pushed head.
+- [x] (2026-07-28 21:07Z) JavaScript completed its five-repo triage baseline
+  in 1m55s with 79 raw rows. Independent exhaustive review found no genuine
+  inverse omission, but classified every row as a forward/candidate artifact
+  across runtime DOM/object properties, duplicate mirrored state declarations,
+  generated globals, declaration-site leakage, and one minified vendor
+  self-property. Representative exact reproduction and product-root grouping
+  remain in progress; wrong-forward rows are legitimate defects rather than
+  accepted residuals.
+- [x] (2026-07-28) Exact JavaScript probes reproduced the runtime-property,
+  mirrored-state, generated-global, and minified-vendor families without
+  truncation or file errors. No existing owner matched. Created and assigned
+  receiver-identity issue #1276 and namespace/global-assignment issue #1277 to
+  `jbellis` before implementation.
+- [x] (2026-07-28) Rust completed all five ranks-six-through-ten triage
+  envelopes in 13m00s with zero file errors. QWED and nmstate have zero raw
+  missing rows; Burn has 40, Wealthfolio 29, and Hickory DNS 23. Three
+  repositories reached the deliberate 1,000-target cap, so their sampled-site
+  partitions and all 92 raw rows require exhaustive disposition before the
+  clean acceptance replay.
+- [x] (2026-07-28) Independent source review dispositioned all 92 Rust rows:
+  61 genuine inverse gaps and 31 forward/candidate/qualifier artifacts. No
+  existing `FIRD: Rust` issue matched. Created and assigned #1278 (call edges),
+  #1279 (namespace/import/re-export edges), #1280 (type/associated qualifiers),
+  #1281 (`self` receiver mapped to its owner type), #1282 (associated-type
+  declaration heads), and #1283 (wrong qualified namespace) to `jbellis`
+  before implementation.
+- [x] (2026-07-28) Scala completed all five ranks-six-through-ten triage
+  envelopes in 26m53s with zero file errors or truncation and 293 raw missing
+  rows: stream-reactor 26, http4s 134, Guardian Grid 18, scalachess 47, and
+  zio-http 68. Independent exhaustive review accounted for every row and
+  separated deliberate same-owner/unproven evidence from genuine inverse gaps
+  and wrong-forward artifacts. No existing `FIRD: Scala` issue matched.
+  Created and assigned #1284 (qualified/import terminal selection), #1285
+  (companion application and type-term forward namespaces), #1286 (bare stable
+  fields), #1287 (wildcard/local imported members), #1288 (wildcard import
+  owner hits), #1289 (companion application inverse edges), #1290 (anonymous
+  template parent types), #1291 (singleton types and qualified stable case
+  objects), and #1292 (members inherited by extending objects) to `jbellis`
+  before implementation. These dirty/dynamic-head envelopes remain triage
+  evidence and require clean acceptance replay.
+- [x] (2026-07-28) Implemented and committed the C#, Go, JavaScript, Rust, and
+  Scala issue families #1261 through #1292 (excluding the closed duplicate
+  #1272) as focused structured resolver/graph fixes. Rust's `self.field`
+  contract now deliberately preserves the symbols API's no-definition result
+  while LSP navigation resolves the receiver parameter; both exact surfaces
+  pass their focused regressions.
+- [x] (2026-07-28) Completed the focused Scala repair proofs for #1290, #1291,
+  and #1292. Anonymous mixin parents resolve in the type namespace, stable
+  singleton and qualified case-object paths retain their exact terminals, and
+  inherited overloaded generic object members use call-site shape. The full
+  Scala direct-usage suite passes 57/57 and graph-usage suite passes 155/155.
+  Fresh exact replays on committed head `ea66ce09` resolve
+  `org.http4s.Method$.HEAD` and `zio.http.Method$.OPTIONS$` with zero
+  actionable rows. Clean five-repository acceptance replay is still required.
+- [x] (2026-07-28) The complete all-feature gate exposed a C# inverted-graph
+  parity regression in #1267's pattern-role expansion. `constant_pattern`
+  already receives a guarded type-or-value interpretation, but the enclosing
+  `is_pattern_expression` was independently classified as an ordinary type
+  operand and recorded inherited constants and parameter shadows as visible
+  types. Restricted that shared classification to genuinely type-bearing
+  pattern wrappers and strengthened both C# scan paths to treat any nearest
+  field/property/constant as a value shadow without requiring declared-type
+  inference. Both focused #1267 target-specific and inverted-graph regressions
+  pass with all features; repository-wide Clippy and test gates remain to be
+  repeated on the committed follow-up.
+- [x] (2026-07-28) The next complete-gate attempt reached four Rust
+  whole-workspace graph regressions introduced by #1280's exact associated-path
+  authorization. Owner proof received the terminal member segment, macro token
+  paths sent members through the nonmember validator, and undeclared syntactic
+  `Owner.member` placeholders prevented same-file owner and trait fallback.
+  Corrected all three at their structured boundaries: owner-only AST slices,
+  declaration-parent routing for token-tree members, and exact same-file owner
+  selection before the existing associated-item resolver. The complete
+  whole-workspace Rust graph target passes 21/21 and the target-specific Rust
+  usage suite passes 210/210 with all features. Repository-wide Clippy and the
+  full matrix remain to be repeated on the committed follow-up.
+- [x] (2026-07-29) Committed the C# pattern-role and Rust associated-path
+  follow-ups, then passed `cargo fmt --all -- --check`, `git diff --check`,
+  strict all-target/all-feature Clippy, and the complete
+  `cargo test --features nlp,python` matrix at niceness 10. Pushed clean head
+  `05b11b6c` to `origin/master` and built its release differential runner using
+  normal Cargo storage outside the sandbox.
+- [x] (2026-07-29) Independently regenerated the live ranks-six-through-ten
+  selector and preflighted all 40 unfinished clones and corpus inputs. Every
+  clone has a readable tracked-clean pinned head; every scan, testsome/status
+  sidecar, task reference, and generated prompt exists. This confirms that the
+  distinct expansion still contains exactly 55 new envelopes rather than
+  reusing any ranks-one-through-five record.
+- [x] (2026-07-29) Clean acceptance replays at pushed head `05b11b6c`
+  completed Go, Java, TypeScript, and PHP: 20 completed clean envelopes,
+  200,000 accounted sampled sites, zero file or candidate-limit errors, and
+  zero missing rows. Closed assigned Go issues #1269 through #1271 with the
+  clean replay evidence; Java, TypeScript, and PHP required no expansion issue.
+- [x] (2026-07-29) The clean C# replay proved #1261 and #1263 through #1267
+  absent and those assigned issues were closed, but exposed six Neo
+  declaration-pattern type operands that resolve forward and disappear from
+  inverse lookup. Created and assigned #1293 before implementation; C# remains
+  open pending its structured fix and a new clean five-repository replay.
+- [x] (2026-07-29) JavaScript replay completed all five envelopes but retained
+  68 wrong-forward rows already exhaustively mapped to the still-open assigned
+  receiver-identity issue #1276 and namespace-assignment issue #1277. The
+  language remains open pending their completed structured fixes and a new
+  clean five-repository replay.
 - [x] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [x] Complete C++ and publish its evidence and user summary.
-- [x] Complete C# and publish its evidence and user summary.
-- [x] Complete Go and publish its evidence and user summary.
-- [x] Complete Java and publish its evidence and user summary.
-- [x] Complete JavaScript and publish its evidence and user summary.
-- [x] Complete TypeScript and publish its evidence and user summary.
-- [x] Complete PHP and publish its evidence and user summary.
-- [x] Complete Rust and publish its evidence and user summary.
-- [x] Complete Scala and publish its evidence and user summary.
+- [ ] Complete C# ranks six through ten and publish its evidence and user
+  summary.
+- [ ] Complete Go ranks six through ten and publish its evidence and user
+  summary.
+- [ ] Complete Java ranks six through ten and publish its evidence and user
+  summary.
+- [ ] Complete JavaScript ranks six through ten and publish its evidence and
+  user summary.
+- [ ] Complete TypeScript ranks six through ten and publish its evidence and
+  user summary.
+- [ ] Complete PHP ranks six through ten and publish its evidence and user
+  summary.
+- [ ] Complete Rust ranks six through ten and publish its evidence and user
+  summary.
+- [ ] Complete Scala ranks six through ten and publish its evidence and user
+  summary.
 - [x] Complete Python and publish its evidence and user summary.
-- [x] Prove all 110 accepted envelopes and every fixing head are present on
-  final `origin/master`, run the final local gate, and remove temporary
-  diagnostics while retaining the compact checked-in evidence.
+- [ ] Prove all 55 new ranks-six-through-ten envelopes and every fixing head
+  are present on final `origin/master`, run the final local gate, and remove
+  temporary diagnostics while retaining the compact checked-in evidence.
 
 ## Surprises & Discoveries
 
 - The live selector changed membership relative to the completed top-five
   campaign. C now ranks Pillow first; PHP now ranks Skipper second and Passbolt
   fifth; and the C++ 32-task tie places `ljharb__qs` before `PJK__libcbor`.
-  Therefore the final top-ten proof must rerun all ten repositories at one head
-  rather than concatenate five old and five new records.
+  The original plan concluded that the final proof must rerun all ten at one
+  head. The user's later scope clarification supersedes that conclusion:
+  ranks one through five retain their accepted evidence, while this task adds
+  ranks six through ten from the live selector.
 
 - `task_repos` returns eligible records in corpus order, not task-count order.
   The campaign must apply a stable descending `task_count` sort explicitly.
@@ -619,17 +789,28 @@ comes through the local gate, but is not the focus.
   `large-repos.csv` exclusion, rather than by a frozen hand-copied list.
   Date/Author: 2026-07-23 / Codex
 
+- Decision: Treat ranks one through five as already accepted and run only
+  stable selector slice `[5:10]` for this expansion.
+  Rationale: On 2026-07-28 the user explicitly clarified that the earlier
+  top-five campaign and the new ranks-six-through-ten request are different
+  tasks. This supersedes the earlier plan decisions to rerun all ten and to
+  reject the top-five artifacts as part of combined top-ten acceptance.
+  Date/Author: 2026-07-28 / Codex
+
 - Decision: Run exactly one language per runner process with ten explicit
   `--repo` arguments.
-  Rationale: Repository filters are global across repeated languages, while
-  `--repos-per-language` ranks by LOC. Separate processes are the only command
-  shape that directly proves the requested membership.
+  Rationale: Historical decision, superseded on 2026-07-28 by five explicit
+  rank-six-through-ten `--repo` arguments. Repository filters are global across
+  repeated languages, while `--repos-per-language` ranks by LOC, so separate
+  language processes remain required.
   Date/Author: 2026-07-23 / Codex
 
 - Decision: Treat every earlier top-five result as regression evidence, not as
   an accepted half of a top-ten result.
-  Rationale: Live membership changed, and an accepted language must have all
-  ten envelopes produced by one immutable pushed Bifrost head.
+  Rationale: Historical decision, explicitly superseded by the user's
+  2026-07-28 clarification. The earlier top-five records are accepted for ranks
+  one through five; this plan must add ranks six through ten without silently
+  requiring their rerun.
   Date/Author: 2026-07-23 / Codex
 
 - Decision: Prefix every newly created defect title with `FIRD:` and assign it
@@ -704,25 +885,27 @@ comes through the local gate, but is not the focus.
 
 ## Outcomes & Retrospective
 
-The top-ten expansion is complete. All eleven user-confirmed language
-boundaries cover their ten live `SFT_PREDICATES` task-selected repositories,
-for 110 accepted repository envelopes. C++ closed with 72,177 classified
-sites, 58 exhaustively audited non-actionable raw rows, and no new or
-actionable residual; Python closed with 87,254 sites, 377 previously audited
-non-actionable module/import-collision rows, and no new identity. The durable
-C++, Python, and earlier language evidence records the exact selections,
-immutable heads, accounting, checksums, and residual dispositions.
+The ranks-six-through-ten expansion is in progress. C, C++, and Python have
+durable top-ten evidence, so 15 of the required 55 new repository envelopes
+are complete. C# through Scala, excluding Python, currently have only their
+accepted historical top-five evidence; their 40 rank-six-through-ten
+repositories remain to be run and audited.
 
-Every legitimate defect found during the expansion was assigned to `jbellis`
-before implementation, fixed with structured behavior coverage, published
-directly to `origin/master`, and closed. The final integration-only discovery,
-#1229, corrected the Python inverted graph's indexed-versus-structural lexical
-scope boundary and passed the complete feature-enabled local matrix. Final
-local HEAD, local `origin/master`, and hosted master agreed at `3235743d`
-before this closing evidence commit. Disposable campaign storage was removed
-only after compact provenance had been checked in: 38 GB under
-`/mnt/optane/tmp/bifrost-fird/` and three named Qpid scratch reports under
-`/tmp` are gone and cannot be recovered.
+The earlier statement that all 110 combined envelopes were complete was a
+scope error: it treated the user's “finished” status for the prior task as
+evidence for the new task. The selector, issue, publication, test, and cleanup
+audits performed during that close-out remain valid within their actual scope,
+but cannot substitute for missing corpus envelopes. This plan now uses the
+user's explicit boundary: preserve ranks one through five, add ranks six
+through ten, and claim completion only after all 55 new records have durable
+evidence.
+
+C++ closed its new ranks with 72,177 sites across its full top-ten run, 58
+exhaustively audited non-actionable raw rows, and no actionable residual.
+Python closed with 87,254 sites, 377 previously audited nonactionable
+module/import-collision rows, and no new identity. C also has a clean full
+top-ten manifest. Their checked-in summaries remain accepted and do not need
+reruns.
 
 ## Context and Orientation
 
@@ -825,12 +1008,13 @@ The authoritative selections at plan creation are:
 
 Immediately before a language begins, regenerate its live selection through
 `tasks.py`, compare it with this plan, and update the plan if the live selector
-has changed. Record the ten clone heads and tracked cleanliness. Rebuild and
+has changed. Take only ranks six through ten and record those five clone heads
+and tracked cleanliness. Rebuild and
 fingerprint a release runner from an immutable clean Bifrost checkpoint.
 
-Run one language at a time with ten explicit slugs, one repository job, eight
+Run one language at a time with five explicit slugs, one repository job, eight
 inner workers, persisted cache mode, strict classification, and the established
-bounds. Verify ten completed envelopes, exact Bifrost and repository heads,
+bounds. Verify five completed envelopes, exact Bifrost and repository heads,
 clean flags, semantic fingerprints, JSON integrity, configured limits, and file
 errors. Extract every raw `missing` site to a checksummed ledger.
 
@@ -855,7 +1039,8 @@ proportionate gates, and push the integrated current branch directly to
 `origin/master` without waiting for CI.
 
 Rebuild the runner from the exact pushed head. Replay every fixed exact witness
-and all ten authoritative repositories into new head-scoped artifacts.
+and all five authoritative rank-six-through-ten repositories into new
+head-scoped artifacts.
 Exhaustively audit residuals. Only then comment on and close owned issues,
 commit compact evidence, verify local/remote agreement, summarize the completed
 language to the user, and continue immediately to the next language.
@@ -867,7 +1052,7 @@ canonical language key:
 
     cd /mnt/optane/bifrost-fird
     PYTHONDONTWRITEBYTECODE=1 python3 -c \
-      'import sys; sys.path.insert(0,"/home/jonathan/Projects/brokkbench"); import tasks; rows=tasks.task_repos(tasks.SFT_PREDICATES, langs=["c"]); print(sorted(rows, key=lambda r: -r.task_count)[:10])'
+      'import sys; sys.path.insert(0,"/home/jonathan/Projects/brokkbench"); import tasks; rows=tasks.task_repos(tasks.SFT_PREDICATES, langs=["csharp"]); print(sorted(rows, key=lambda r: -r.task_count)[5:10])'
 
 Build and fingerprint the runner from a clean checkpoint:
 
@@ -875,35 +1060,30 @@ Build and fingerprint the runner from a clean checkpoint:
     git rev-parse HEAD
     sha256sum target/release/bifrost_reference_differential
 
-The C command shape is:
+The next C# command shape is:
 
     set -o pipefail
     /usr/bin/time -v nice -n 10 \
       target/release/bifrost_reference_differential run-corpus \
       --clones-root /home/jonathan/Projects/brokkbench/clones \
       --commits-root /home/jonathan/Projects/brokkbench/sft-tools-commits \
-      --language c \
-      --repo python-pillow__Pillow \
-      --repo roseteromeo56-cb-id__go-ethereum \
-      --repo rui314__chibicc \
-      --repo libgit2__libgit2 \
-      --repo bernardladenthin__BitcoinAddressFinder \
-      --repo jerryscript-project__jerryscript \
-      --repo aws__s2n-tls \
-      --repo nanomsg__nng \
-      --repo CESNET__libyang \
-      --repo dovecot__core \
+      --language csharp \
+      --repo vkhorikov__CSharpFunctionalExtensions \
+      --repo ScottPlot__ScottPlot \
+      --repo neo-project__neo \
+      --repo Radarr__Radarr \
+      --repo Cysharp__R3 \
       --repo-jobs 1 --jobs 8 --cache-mode persisted --strict \
       --max-files 1000 --max-sites 10000 \
       --max-candidates-per-file 50000 --max-source-bytes 4194304 \
       --max-targets 1000 --max-usage-files 1000 --max-usages 100000 \
       --seed 0 \
-      --output /mnt/optane/tmp/bifrost-fird/c-task-top10-HEAD8.jsonl \
-      2>&1 | tee -a /mnt/optane/tmp/bifrost-fird/c-task-top10-HEAD8.log
+      --output /mnt/optane/tmp/bifrost-fird/csharp-task-ranks6-10-HEAD8.jsonl \
+      2>&1 | tee -a /mnt/optane/tmp/bifrost-fird/csharp-task-ranks6-10-HEAD8.log
 
-Repeat with each exact language list above and the matching canonical language
-key (`c`, `cpp`, `csharp`, `go`, `java`, `js`, `ts`, `php`, `rust`, `scala`,
-`py`). Never combine languages in one process. Do not use
+Repeat for the remaining canonical language keys (`go`, `java`, `js`, `ts`,
+`php`, `rust`, and `scala`) with only each list's ranks six through ten. Never
+combine languages in one process. Do not use
 `--repos-per-language`, `--include-tests`, or routine `--force`. Resume an
 interrupted run by confirming the old process is gone and repeating its
 identical command and output path.
@@ -918,8 +1098,9 @@ Before pushing Rust changes, run:
 
 ## Validation and Acceptance
 
-A language is complete only when exactly its ten live task-selected
-repositories have completed records on one clean pushed Bifrost head, every
+A language is complete in this expansion only when exactly its five live
+rank-six-through-ten task-selected repositories have completed records on one
+clean pushed Bifrost head, every
 repository head is pinned and clean, the configuration is uniform, every error
 and limit is accounted for, and every raw missing row has a reviewed
 disposition. Each owned legitimate defect must have a preassigned `FIRD:`
@@ -927,11 +1108,12 @@ issue, structured regression, fixing commit on `origin/master`, clean exact
 witness, clean final corpus proof, and closed issue. An issue assigned to
 another user is an explicit documented skip and is not modified.
 
-The campaign is complete only when all eleven language boundaries pass, the
-compact evidence is committed, every accepted fixing head is an ancestor of
-final `origin/master`, the complete local gate passes after final integration,
-and local HEAD, local `origin/master`, and the remote master agree. GitHub CI is
-not a blocking gate.
+The campaign is complete only when all 55 new ranks-six-through-ten envelopes
+pass and combine with the already accepted top-five evidence, the compact
+evidence is committed, every accepted fixing head is an ancestor of final
+`origin/master`, the complete local gate passes after final integration, and
+local HEAD, local `origin/master`, and the remote master agree. GitHub CI is not
+a blocking gate.
 
 ## Idempotence and Recovery
 
@@ -953,7 +1135,8 @@ head-scoped evidence required by the checked-in summaries.
 Keep raw JSONL, logs, exact records, ledgers, and checksums under
 `/mnt/optane/tmp/bifrost-fird/`. Check in only compact manifests and narrative
 summaries under `.agents/docs/reference-differential/`. Every artifact name
-must include the language, `task-top10`, and the eight-character source head.
+must include the language, `task-ranks6-10`, and the eight-character source
+head.
 
 ## Interfaces and Dependencies
 
@@ -976,3 +1159,10 @@ LSP, and MCP gates, the linked-primary schema drift that requires merging
 current master before the final integration pass, and the user's direct
 instruction to run normal Cargo/Bifrost work at niceness 10 without temporary
 Cargo targets.
+
+Revision note (2026-07-28): Corrected a material scope error after the user
+clarified that the prior task accepted ranks one through five and this distinct
+task asks only for ranks six through ten. Reopened eight language boundaries,
+changed acceptance from 110 rerun envelopes to 55 new envelopes, preserved the
+valid C/C++/Python top-ten evidence, and recorded the independently preflighted
+40 remaining repositories.

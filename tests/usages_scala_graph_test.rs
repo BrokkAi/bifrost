@@ -505,6 +505,15 @@ fn definition(analyzer: &ScalaAnalyzer, fq_name: &str) -> CodeUnit {
         .unwrap_or_else(|| panic!("missing definition for {fq_name}"))
 }
 
+fn definition_by(analyzer: &ScalaAnalyzer, predicate: impl Fn(&CodeUnit) -> bool) -> CodeUnit {
+    analyzer
+        .get_analyzed_files()
+        .into_iter()
+        .flat_map(|file| analyzer.get_declarations(&file))
+        .find(|unit| predicate(unit))
+        .unwrap_or_else(|| panic!("missing Scala definition matching predicate"))
+}
+
 fn hit_snippets(result: FuzzyResult) -> Vec<String> {
     result
         .into_either()
@@ -1007,6 +1016,53 @@ object Owner {
 }
 
 #[test]
+fn scala_usage_finder_finds_anonymous_template_mixin_parent_with_constructor_args() {
+    let source = r#"package app
+sealed abstract class Glyph(label: String)
+object Glyph {
+  sealed trait Assessment extends Glyph
+  object Assessment {
+    val exact = new Glyph("x") with Assessment // positive-anonymous-template-parent
+  }
+
+  sealed trait AssessmentDecoy extends Glyph
+  object AssessmentDecoy {
+    val decoy = new Glyph("y") with AssessmentDecoy // negative-anonymous-template-parent
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/Use.scala", source)]);
+
+    let target = definition(&analyzer, "app.Glyph$.Assessment");
+    let target_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+    assert_hit_line(
+        &target_hits,
+        line_of(source, "positive-anonymous-template-parent"),
+    );
+    assert_no_hit_line(
+        &target_hits,
+        line_of(source, "negative-anonymous-template-parent"),
+    );
+
+    let companion = definition(&analyzer, "app.Glyph$.Assessment$");
+    let companion_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&companion)));
+    assert_no_hit_line(
+        &companion_hits,
+        line_of(source, "positive-anonymous-template-parent"),
+    );
+
+    let decoy = definition(&analyzer, "app.Glyph$.AssessmentDecoy");
+    let decoy_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&decoy)));
+    assert_no_hit_line(
+        &decoy_hits,
+        line_of(source, "positive-anonymous-template-parent"),
+    );
+}
+
+#[test]
 fn scala_type_roles_cover_anonymous_mixins_and_infix_type_operators() {
     let use_source = r#"package app
 
@@ -1324,6 +1380,192 @@ object Use {
             .all(|hit| hit.file.rel_path() != "decoy/Use.scala"),
         "multi-level stable type leaked to decoy: {leaf_hits:#?}"
     );
+}
+
+#[test]
+fn scala_graph_preserves_exact_companion_apply_edges() {
+    let source = r#"package app
+
+final class TextConverter private (val value: String)
+object TextConverter {
+  def apply(value: String): TextConverter = new TextConverter(value)
+}
+
+object Header {
+  final class Raw(val name: String, val value: String)
+  object Raw {
+    def apply(name: String, value: String): Raw = new Raw(name, value)
+  }
+}
+
+object Uci {
+  final class Move(val value: Int)
+  object Move {
+    def apply(value: Int): Move = new Move(value)
+  }
+}
+
+object Use {
+  val bare = TextConverter("plain") // positive-bare-apply
+  val qualified = Header.Raw("Name", "Value") // positive-qualified-apply
+  val nested = Uci.Move(1) // positive-nested-apply
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/Use.scala", source)]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    for (target_fqn, marker) in [
+        ("app.TextConverter$.apply", "positive-bare-apply"),
+        ("app.Header$.Raw$.apply", "positive-qualified-apply"),
+        ("app.Uci$.Move$.apply", "positive-nested-apply"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        assert_hit_contains(&hits, marker);
+    }
+}
+
+#[test]
+fn scala_graph_resolves_wildcard_imported_nested_companion_apply() {
+    let consumer_source = r#"package app
+
+import cloud.common.formats.reader._
+
+object Use {
+  val exact = converters.TextConverter("value") // positive-wildcard-imported-apply
+  val other = decoy.common.formats.reader.converters.TextConverter("value") // negative-wrong-owner
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "cloud/common/formats/reader/converters/TextConverter.scala",
+            r#"package cloud.common.formats.reader.converters
+
+class TextConverter private (input: String)
+object TextConverter {
+  def apply(input: String): TextConverter = new TextConverter(input)
+}
+"#,
+        ),
+        (
+            "decoy/common/formats/reader/converters/TextConverter.scala",
+            r#"package decoy.common.formats.reader.converters
+
+class TextConverter private (input: String)
+object TextConverter {
+  def apply(input: String): TextConverter = new TextConverter(input)
+}
+"#,
+        ),
+        ("app/Use.scala", consumer_source),
+    ]);
+    let target = definition(
+        &analyzer,
+        "cloud.common.formats.reader.converters$.TextConverter$.apply",
+    );
+    let hits = scala_reference_hits(&analyzer, &target, &["app/Use.scala"]);
+
+    assert_reference_hit_contains(&hits, "positive-wildcard-imported-apply");
+    assert_no_hit_contains(&hits, "negative-wrong-owner");
+}
+
+#[test]
+fn scala_graph_resolves_same_file_nested_companion_apply_overload_exactly() {
+    let source = r#"package app
+
+object Uri {
+  case class UserInfo(user: String, password: Option[String])
+  object UserInfo {
+    def apply(user: String, password: Option[String], strict: Boolean): UserInfo =
+      new UserInfo(user, password)
+    def apply(user: String, password: Option[String]): UserInfo =
+      new UserInfo(user, password)
+  }
+
+  object Parser {
+    val exact = Uri.UserInfo("user", None) // positive-exact-overload
+    val other = Uri.UserInfo("user", None, true) // negative-other-overload
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/Uri.scala", source)]);
+    let target = definition_by(&analyzer, |unit| {
+        unit.is_function()
+            && unit.fq_name() == "app.Uri$.UserInfo$.apply"
+            && analyzer.ranges(unit).iter().any(|range| {
+                range.start_line
+                    == line_of(
+                        source,
+                        "def apply(user: String, password: Option[String]): UserInfo =",
+                    )
+            })
+    });
+    let hits = scala_reference_hits(&analyzer, &target, &["app/Uri.scala"]);
+
+    assert_reference_hit_contains(&hits, "positive-exact-overload");
+}
+
+#[test]
+fn scala_graph_resolves_nested_case_class_companion_apply_with_overloads_exactly() {
+    let source = r#"package app
+
+object Uci {
+  case class Move(orig: String, dest: String, promotion: Option[String])
+  object Move {
+    def apply(move: String): Move = new Move(move, move, None)
+  }
+
+  val exact = Uci.Move("a", "b", None) // positive-generated-overload
+  val other = Uci.Move("a") // secondary-explicit-overload
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/Uci.scala", source)]);
+    let target = definition_by(&analyzer, |unit| {
+        unit.is_function()
+            && unit.fq_name() == "app.Uci$.Move$.apply"
+            && analyzer.ranges(unit).iter().any(|range| {
+                range.start_line
+                    == line_of(
+                        source,
+                        "    def apply(move: String): Move = new Move(move, move, None)",
+                    )
+            })
+    });
+    let hits = scala_reference_hits(&analyzer, &target, &["app/Uci.scala"]);
+
+    assert_reference_hit_contains(&hits, "positive-generated-overload");
+}
+
+#[test]
+fn scala_graph_resolves_explicit_apply_member_exactly() {
+    let source = r#"package app
+
+object Forwarded {
+  def apply(value: String): String = value
+  def apply(value: Int): String = value.toString
+}
+
+object Use {
+  val exact = Forwarded.apply("x") // positive-explicit-apply
+  val other = Forwarded.apply(1) // negative-other-explicit-apply
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/Forwarded.scala", source)]);
+    let target = definition_by(&analyzer, |unit| {
+        unit.is_function()
+            && unit.fq_name() == "app.Forwarded$.apply"
+            && analyzer.ranges(unit).iter().any(|range| {
+                range.start_line == line_of(source, "  def apply(value: String): String = value")
+            })
+    });
+    let hits = scala_reference_hits(&analyzer, &target, &["app/Forwarded.scala"]);
+
+    assert_reference_hit_contains(&hits, "positive-explicit-apply");
 }
 
 #[test]
@@ -1757,6 +1999,70 @@ class Container {
 }
 
 #[test]
+fn scala_inverse_resolves_bare_stable_list_entries_for_backticked_fields_and_objects() {
+    let source = r#"package app
+
+sealed trait UsageRightsSpec
+case object StaffPhotographer extends UsageRightsSpec
+case object ContractPhotographer extends UsageRightsSpec
+
+trait MediaType
+
+object MimeDb {
+  lazy val `vnd.example+json`: MediaType = new MediaType {}
+  lazy val all: List[MediaType] = List(
+    `vnd.example+json` // positive-backticked-field-list-entry
+  )
+}
+
+object UsageRights {
+  val photographer: List[UsageRightsSpec] = List(
+    StaffPhotographer, // positive-stable-object-list-entry
+    ContractPhotographer
+  )
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/Witness.scala", source)]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = ScalaUsageGraphStrategy::new();
+    for (target, positive, token) in [
+        (
+            definition(&analyzer, "app.MimeDb$.`vnd.example+json`"),
+            "positive-backticked-field-list-entry",
+            "`vnd.example+json`",
+        ),
+        (
+            definition(&analyzer, "app.StaffPhotographer$"),
+            "positive-stable-object-list-entry",
+            "StaffPhotographer",
+        ),
+    ] {
+        let inverse_hits = reference_surface_hits(strategy.find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        assert_hit_contains(&targeted_hits, positive);
+        assert_hit_contains(&inverse_hits, positive);
+        let line = source
+            .lines()
+            .find(|line| line.contains(positive))
+            .expect("positive line");
+        let line_start = source.find(line).expect("line offset");
+        let token_start = line.find(token).expect("token start");
+        assert!(
+            inverse_hits.iter().any(|hit| {
+                hit.start_offset == line_start + token_start
+                    && hit.end_offset == line_start + token_start + token.len()
+            }),
+            "inverse query missed exact token {token:?}: {inverse_hits:#?}"
+        );
+    }
+}
+
+#[test]
 fn scala_inverse_classifies_parameter_default_identifiers_as_terms() {
     let source = r#"package app
 
@@ -2047,6 +2353,153 @@ class Consumer {
     );
     assert_no_hit_contains(&inverse_checkbox_hits, "negative-parameter-field-shadow");
     assert_no_hit_contains(&inverse_checkbox_hits, "negative-local-field-shadow");
+}
+
+#[test]
+fn scala_inverse_preserves_singleton_type_and_qualified_case_object_identity() {
+    let method_source = r#"package model
+
+sealed abstract class Method
+object Method {
+  private def safe(name: String): Method = new Method {
+    override def toString: String = name
+  }
+  val HEAD: Method = safe("HEAD")
+  case object OPTIONS extends Method
+  case object PATCH extends Method
+}
+"#;
+    let dsl_source = r#"package dsl
+
+import model.Method
+
+trait Methods {
+  val HEAD: Method.HEAD.type = Method.HEAD // positive-singleton-head
+}
+"#;
+    let route_source = r#"package app
+
+import model.Method
+
+sealed trait RoutePattern
+object RoutePattern {
+  def fromMethod(method: Method): RoutePattern = Tree(method)
+  val OPTIONS: RoutePattern = fromMethod(Method.OPTIONS)
+
+  private final case class Tree(method: Method) extends RoutePattern {
+    def select(optionsRoot: AnyRef): Method = method match {
+      case Method.OPTIONS if optionsRoot != null => Method.OPTIONS // positive-qualified-options
+      case _ => Method.PATCH // positive-qualified-patch
+    }
+  }
+}
+"#;
+    let auth_source = r#"package auth
+
+sealed trait AuthType
+object AuthType {
+  case object None extends AuthType
+}
+
+object Use {
+  val none = AuthType.None // positive-qualified-none
+}
+"#;
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        ("model/Method.scala", method_source),
+        ("dsl/Methods.scala", dsl_source),
+        ("app/Route.scala", route_source),
+        ("auth/Auth.scala", auth_source),
+        (
+            "decoy/Types.scala",
+            r#"package decoy
+object Method {
+  class HEAD
+  class OPTIONS
+  class PATCH
+}
+object Methods {
+  val head: Method.HEAD = null // negative-type-decoy-head
+}
+object Route {
+  def select(method: AnyRef, optionsRoot: AnyRef): AnyRef = method match {
+    case Method.OPTIONS if optionsRoot != null => Method.OPTIONS // negative-type-decoy-options
+    case _ => null
+  }
+  val patch: Method.PATCH = null // negative-type-decoy-patch
+}
+object AuthType {
+  class None
+}
+object Use {
+  val none: AuthType.None = null // negative-type-decoy-none
+}
+"#,
+        ),
+    ]);
+
+    let inverse = ScalaUsageGraphStrategy::new();
+    for (target_fqn, positive, negative, rel_path, range) in [
+        (
+            "model.Method$.HEAD",
+            "positive-singleton-head",
+            "negative-type-decoy-head",
+            "dsl/Methods.scala",
+            exact_segment(dsl_source, "Method.HEAD.type = Method.HEAD", "HEAD"),
+        ),
+        (
+            "model.Method$.OPTIONS$",
+            "positive-qualified-options",
+            "negative-type-decoy-options",
+            "app/Route.scala",
+            exact_segment(
+                route_source,
+                "case Method.OPTIONS if optionsRoot != null =>",
+                "OPTIONS",
+            ),
+        ),
+        (
+            "model.Method$.PATCH$",
+            "positive-qualified-patch",
+            "negative-type-decoy-patch",
+            "app/Route.scala",
+            exact_segment(
+                route_source,
+                "Method.PATCH // positive-qualified-patch",
+                "PATCH",
+            ),
+        ),
+        (
+            "auth.AuthType$.None$",
+            "positive-qualified-none",
+            "negative-type-decoy-none",
+            "auth/Auth.scala",
+            exact_segment(
+                auth_source,
+                "AuthType.None // positive-qualified-none",
+                "None",
+            ),
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let targeted_hits = authoritative_scala_hits(&analyzer, &target);
+        let candidates = std::iter::once(project.file(rel_path)).collect();
+        let inverse_hits =
+            hits(inverse.find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000));
+
+        for bucket in [&targeted_hits, &inverse_hits] {
+            assert_hit_contains(bucket, positive);
+            assert_no_hit_contains(bucket, negative);
+            assert!(
+                bucket.iter().any(|hit| {
+                    hit.file.rel_path() == rel_path
+                        && hit.start_offset == range.0
+                        && hit.end_offset == range.1
+                }),
+                "expected exact range {range:?} for {target_fqn}, got {bucket:#?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -3584,6 +4037,71 @@ class SenderOverride extends ActorBase {
 }
 
 #[test]
+fn scala_qualified_inherited_object_members_preserve_exact_overloads_with_implicit_suffixes() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "zio/http/codec/ContentCodecs.scala",
+            r#"package zio.http.codec
+
+trait BinaryCodec[A]
+trait Schema[A]
+trait Tag[A]
+trait Trace[A]
+
+private[codec] trait ContentCodecs {
+  def content[A](implicit schema: Schema[A]): String = "implicit-only"
+  def content[A](codec: BinaryCodec[A])(implicit tag: Tag[A]): String = "codec"
+  def content[A](name: String)(implicit schema: Schema[A]): String = "named"
+  def content[A](codec: BinaryCodec[A], name: String)(implicit trace: Trace[A]): String = "codec-named"
+}
+"#,
+        ),
+        (
+            "zio/http/HttpCodec.scala",
+            r#"package zio.http
+import zio.http.codec._
+
+object HttpCodec extends ContentCodecs
+
+object OtherCodec {
+  def content[A](codec: BinaryCodec[A])(implicit tag: Tag[A]): String = "other"
+}
+"#,
+        ),
+        (
+            "zio/http/endpoint/Endpoint.scala",
+            r#"package zio.http.endpoint
+import zio.http.HttpCodec
+import zio.http.OtherCodec
+import zio.http.codec._
+
+object Endpoint {
+  implicit val schema: Schema[String] = new Schema[String] {}
+  implicit val tag: Tag[String] = new Tag[String] {}
+  implicit val trace: Trace[String] = new Trace[String] {}
+  val codec: BinaryCodec[String] = new BinaryCodec[String] {}
+
+  val inheritedImplicitOnly = HttpCodec.content[String] // positive-implicit-only
+  val inheritedCodec = HttpCodec.content[String](codec) // positive-codec
+  val inheritedNamed = HttpCodec.content[String]("json") // positive-named
+  val inheritedCodecNamed = HttpCodec.content[String](codec, "json") // positive-codec-named
+  val unrelated = OtherCodec.content[String](codec) // negative-unrelated
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "zio.http.codec.ContentCodecs.content");
+    let hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+    assert_hit_contains(&hits, "positive-implicit-only");
+    assert_hit_contains(&hits, "positive-codec");
+    assert_hit_contains(&hits, "positive-named");
+    assert_hit_contains(&hits, "positive-codec-named");
+    assert_no_hit_contains(&hits, "negative-unrelated");
+}
+
+#[test]
 fn scala_usage_scan_is_stack_safe_for_deep_lexical_scopes() {
     std::thread::Builder::new()
         .name("scala-deep-usage-scan".to_string())
@@ -4604,6 +5122,112 @@ object Owner {
             mcp_hits.contains(&(line_of(consumer_source, marker) as u64)),
             "MCP result omitted {marker}: {mcp}"
         );
+    }
+}
+
+#[test]
+fn scala_nested_wildcard_member_imports_use_enclosing_owner_roots_in_scala2_and_3() {
+    let scala2_source = r#"package app
+object Status2 {
+  import Registry._
+  def call(): Int = register(1) // positive-scala2-call
+  def field: String = OK // positive-scala2-field
+  object Inner {
+    import Registry._
+    def nested: String = OK // positive-scala2-nested
+  }
+  def ambiguous(): Int = {
+    import other.Imported._
+    register(2) // negative-scala2-ambiguous
+  }
+  def unindexed: String = {
+    import cats.syntax.all._
+    OK // negative-scala2-unindexed
+  }
+  private object Registry {
+    def register(value: Int): Int = value
+    val OK: String = "scala2"
+  }
+}
+"#;
+    let scala3_source = r#"package app
+object Status3:
+  import Registry.*
+  def call(): Int = register(3) // positive-scala3-call
+  def field: String = OK // positive-scala3-field
+  object Inner:
+    import Registry.*
+    def nested: String = OK // positive-scala3-nested
+  def ambiguous(): Int =
+    import other.Imported.*
+    register(4) // negative-scala3-ambiguous
+  def unindexed: String =
+    import cats.syntax.all.*
+    OK // negative-scala3-unindexed
+  private object Registry:
+    def register(value: Int): Int = value
+    val OK: String = "scala3"
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "other/Imported.scala",
+            r#"package other
+object Imported {
+  def register(value: Int): Int = value + 1
+  val OK: String = "other"
+}
+"#,
+        ),
+        ("app/Scala2.scala", scala2_source),
+        ("app/Scala3.scala", scala3_source),
+    ]);
+
+    let scala2_register = definition(&analyzer, "app.Status2$.Registry$.register");
+    let scala2_register_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&scala2_register)),
+    );
+    assert_hit_line(
+        &scala2_register_hits,
+        line_of(scala2_source, "positive-scala2-call"),
+    );
+    assert_no_hit_line(
+        &scala2_register_hits,
+        line_of(scala2_source, "negative-scala2-ambiguous"),
+    );
+    assert_no_hit_line(
+        &scala2_register_hits,
+        line_of(scala2_source, "negative-scala2-unindexed"),
+    );
+
+    let scala3_register = definition(&analyzer, "app.Status3$.Registry$.register");
+    let scala3_register_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&scala3_register)),
+    );
+    assert_hit_line(
+        &scala3_register_hits,
+        line_of(scala3_source, "positive-scala3-call"),
+    );
+    assert_no_hit_line(
+        &scala3_register_hits,
+        line_of(scala3_source, "negative-scala3-ambiguous"),
+    );
+    assert_no_hit_line(
+        &scala3_register_hits,
+        line_of(scala3_source, "negative-scala3-unindexed"),
+    );
+
+    let scala2_ok = definition(&analyzer, "app.Status2$.Registry$.OK");
+    let scala2_ok_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&scala2_ok)));
+    for marker in ["positive-scala2-field", "positive-scala2-nested"] {
+        assert_hit_line(&scala2_ok_hits, line_of(scala2_source, marker));
+    }
+
+    let scala3_ok = definition(&analyzer, "app.Status3$.Registry$.OK");
+    let scala3_ok_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&scala3_ok)));
+    for marker in ["positive-scala3-field", "positive-scala3-nested"] {
+        assert_hit_line(&scala3_ok_hits, line_of(scala3_source, marker));
     }
 }
 
@@ -6424,10 +7048,27 @@ fn authoritative_scala_hits(analyzer: &ScalaAnalyzer, target: &CodeUnit) -> Vec<
     )
 }
 
+fn exact_segment(source: &str, line: &str, token: &str) -> (usize, usize) {
+    let line_start = source.find(line).expect("fixture line");
+    let token_start = line.find(token).expect("fixture token");
+    (
+        line_start + token_start,
+        line_start + token_start + token.len(),
+    )
+}
+
 fn assert_hit_contains(hits: &[UsageHit], needle: &str) {
     assert!(
         hits.iter().any(|hit| hit.snippet.contains(needle)),
         "expected hit containing {needle:?}, got {hits:#?}"
+    );
+}
+
+fn assert_reference_hit_contains(hits: &[UsageHit], needle: &str) {
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains(needle) && hit.kind == UsageHitKind::Reference),
+        "expected reference hit containing {needle:?}, got {hits:#?}"
     );
 }
 
@@ -6485,6 +7126,27 @@ fn scala_hits(analyzer: &ScalaAnalyzer, target: &CodeUnit, candidates: &[&str]) 
         })
         .collect();
     hits(ScalaUsageGraphStrategy::new().find_usages(
+        analyzer,
+        std::slice::from_ref(target),
+        &candidate_files,
+        1000,
+    ))
+}
+
+fn scala_reference_hits(
+    analyzer: &ScalaAnalyzer,
+    target: &CodeUnit,
+    candidates: &[&str],
+) -> Vec<UsageHit> {
+    let candidate_files = analyzer
+        .get_analyzed_files()
+        .into_iter()
+        .filter(|file| {
+            let rel_path = rel_path_string(file);
+            candidates.iter().any(|candidate| rel_path == *candidate)
+        })
+        .collect();
+    reference_surface_hits(ScalaUsageGraphStrategy::new().find_usages(
         analyzer,
         std::slice::from_ref(target),
         &candidate_files,
@@ -7765,6 +8427,118 @@ object Scala3Use:
                 .iter()
                 .all(|hit| !hit.snippet.contains("import other.")),
             "unrelated renamed import leaked into {fqn}: {import_hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn scala_nested_wildcard_owner_import_tokens_are_exact_without_member_import_duplicates() {
+    let scala2 = r#"package app
+object Status2 {
+  import Registry._
+  import Registry.Sub._
+  def call(): Int = register(1)
+  def nested: Int = X
+  private object Registry {
+    def register(value: Int): Int = value
+    object Sub { val X: Int = 1 }
+  }
+}
+"#;
+    let scala3 = r#"package app
+object Status3:
+  import Registry.*
+  import Registry.Sub.*
+  def call(): Int = register(2)
+  def nested: Int = X
+  private object Registry:
+    def register(value: Int): Int = value
+    object Sub:
+      val X: Int = 1
+"#;
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        ("app/Scala2Use.scala", scala2),
+        ("app/Scala3Use.scala", scala3),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = ScalaUsageGraphStrategy::new();
+
+    for (fqn, path, source, import_line, token) in [
+        (
+            "app.Status2$.Registry$",
+            "app/Scala2Use.scala",
+            scala2,
+            "  import Registry._",
+            "Registry",
+        ),
+        (
+            "app.Status2$.Registry$.Sub$",
+            "app/Scala2Use.scala",
+            scala2,
+            "  import Registry.Sub._",
+            "Sub",
+        ),
+        (
+            "app.Status3$.Registry$",
+            "app/Scala3Use.scala",
+            scala3,
+            "  import Registry.*",
+            "Registry",
+        ),
+        (
+            "app.Status3$.Registry$.Sub$",
+            "app/Scala3Use.scala",
+            scala3,
+            "  import Registry.Sub.*",
+            "Sub",
+        ),
+    ] {
+        let target = definition(&analyzer, fqn);
+        let result =
+            strategy.find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000);
+        let import_hits = result
+            .all_hits_including_imports()
+            .into_iter()
+            .filter(|hit| hit.kind == UsageHitKind::Import)
+            .collect::<Vec<_>>();
+        let line_start = source.find(import_line).expect("import line offset");
+        let token_start = import_line.find(token).expect("import token");
+        assert!(
+            import_hits.iter().any(|hit| {
+                hit.file == project.file(path)
+                    && hit.start_offset == line_start + token_start
+                    && hit.end_offset == line_start + token_start + token.len()
+            }),
+            "missing wildcard owner import token {token:?} for {fqn}: {import_hits:#?}"
+        );
+    }
+
+    for (fqn, path, source, import_line) in [
+        (
+            "app.Status2$.Registry$.register",
+            "app/Scala2Use.scala",
+            scala2,
+            "  import Registry._",
+        ),
+        (
+            "app.Status3$.Registry$.register",
+            "app/Scala3Use.scala",
+            scala3,
+            "  import Registry.*",
+        ),
+    ] {
+        let target = definition(&analyzer, fqn);
+        let result =
+            strategy.find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000);
+        let import_line_number = line_of(source, import_line);
+        let import_hits = result
+            .all_hits_including_imports()
+            .into_iter()
+            .filter(|hit| hit.kind == UsageHitKind::Import && hit.file == project.file(path))
+            .collect::<Vec<_>>();
+        assert!(
+            import_hits.iter().all(|hit| hit.line != import_line_number),
+            "wildcard owner import must not add a member import hit for {fqn}: {import_hits:#?}"
         );
     }
 }

@@ -44,6 +44,9 @@ const MAX_WORK_METRICS: usize = 256;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PolicyRunCompletion {
     Complete,
+    ProvenSubset {
+        codes: Vec<CodeQueryDiagnosticCode>,
+    },
     Inconclusive {
         reasons: Vec<PolicyIncompleteReason>,
     },
@@ -68,13 +71,38 @@ impl PolicyRunCompletion {
         Ok(Self::Failed { reasons })
     }
 
+    pub fn proven_subset(
+        mut codes: Vec<CodeQueryDiagnosticCode>,
+    ) -> Result<Self, CompletionReasonError> {
+        normalize_nonempty(&mut codes)?;
+        Ok(Self::ProvenSubset { codes })
+    }
+
     pub const fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete)
+    }
+
+    /// Whether this run is reliable enough for the policy batch exit status.
+    pub const fn is_reliable(&self) -> bool {
+        matches!(self, Self::Complete | Self::ProvenSubset { .. })
+    }
+
+    /// Whether a negative result proves that all applicable matches were found.
+    pub const fn is_exhaustive(&self) -> bool {
         matches!(self, Self::Complete)
     }
 
     fn validate(&self) -> Result<(), CompletionReasonError> {
         match self {
             Self::Complete => Ok(()),
+            Self::ProvenSubset { codes } => {
+                let mut normalized = codes.clone();
+                normalize_nonempty(&mut normalized)?;
+                if &normalized != codes {
+                    return Err(CompletionReasonError::NonCanonical);
+                }
+                Ok(())
+            }
             Self::Inconclusive { reasons } => {
                 let mut normalized = reasons.clone();
                 normalize_nonempty(&mut normalized)?;
@@ -321,6 +349,7 @@ pub enum FindingIncompleteReason {
     TypestateScenariosTruncated,
     WitnessTruncated,
     EvidenceTruncated,
+    DeclaredNonExhaustive,
     ProofPartial,
     StableAnchorWeak,
 }
@@ -1541,6 +1570,7 @@ pub enum PolicyDiagnosticCode {
 #[serde(rename_all = "snake_case")]
 pub enum PolicyDiagnosticImpact {
     Advisory,
+    DeclaredNonExhaustive,
     FindingPartial,
     RunIncomplete,
     RunUnsupported,
@@ -2238,11 +2268,11 @@ impl PolicyRun {
         }
         tighten_vec(&mut diagnostics);
 
-        if diagnostics_truncated && completion.is_complete() {
+        if diagnostics_truncated && completion.is_reliable() {
             return Err(PolicyRunError::CompletionDoesNotReflectDiagnostics);
         }
         for diagnostic in &diagnostics {
-            if !completion_allows_impact(&completion, diagnostic.impact) {
+            if !completion_allows_diagnostic_impact(&completion, diagnostic.impact) {
                 return Err(PolicyRunError::CompletionDoesNotReflectDiagnostics);
             }
         }
@@ -2256,7 +2286,7 @@ impl PolicyRun {
         {
             return Err(PolicyRunError::WeakFindingRequiresIncompleteRun);
         }
-        if work.omitted_findings_lower_bound > 0 && completion.is_complete() {
+        if work.omitted_findings_lower_bound > 0 && completion.is_reliable() {
             return Err(PolicyRunError::OmittedFindingsRequireIncompleteRun);
         }
         work.set_retention(
@@ -2334,7 +2364,7 @@ impl PolicyRun {
                 max: budget.max_diagnostics(),
             });
         }
-        if self.diagnostics_truncated && self.completion.is_complete() {
+        if self.diagnostics_truncated && self.completion.is_reliable() {
             return Err(PolicyRunError::CompletionDoesNotReflectDiagnostics);
         }
         for finding in &self.findings {
@@ -2361,7 +2391,7 @@ impl PolicyRun {
         reason: PolicyIncompleteReason,
     ) -> Result<(), CompletionReasonError> {
         match &mut self.completion {
-            PolicyRunCompletion::Complete => {
+            PolicyRunCompletion::Complete | PolicyRunCompletion::ProvenSubset { .. } => {
                 self.completion = PolicyRunCompletion::inconclusive(vec![reason])?;
             }
             PolicyRunCompletion::Inconclusive { reasons } => {
@@ -2787,12 +2817,18 @@ fn compare_policy_diagnostics(
         ))
 }
 
-fn completion_allows_impact(
+pub(crate) fn completion_allows_diagnostic_impact(
     completion: &PolicyRunCompletion,
     impact: PolicyDiagnosticImpact,
 ) -> bool {
     match impact {
         PolicyDiagnosticImpact::Advisory | PolicyDiagnosticImpact::FindingPartial => true,
+        PolicyDiagnosticImpact::DeclaredNonExhaustive => {
+            matches!(
+                completion,
+                PolicyRunCompletion::ProvenSubset { .. } | PolicyRunCompletion::Inconclusive { .. }
+            )
+        }
         PolicyDiagnosticImpact::RunIncomplete => {
             matches!(completion, PolicyRunCompletion::Inconclusive { .. })
         }
@@ -2965,6 +3001,9 @@ impl RetainedSize for PolicyRunCompletion {
     fn retained_size(&self) -> usize {
         size_of::<Self>().saturating_add(match self {
             Self::Complete => 0,
+            Self::ProvenSubset { codes } => codes
+                .capacity()
+                .saturating_mul(size_of::<CodeQueryDiagnosticCode>()),
             Self::Inconclusive { reasons } => retained_extra(reasons),
             Self::Unsupported { capability } => retained_extra(capability),
             Self::Failed { reasons } => retained_extra(reasons),
@@ -3317,6 +3356,11 @@ mod tests {
             serde_json::to_value(PolicyRunCompletion::Complete).unwrap(),
             json!({ "type": "complete" })
         );
+        assert!(completion_allows_diagnostic_impact(
+            &PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PipelineRowBudget])
+                .unwrap(),
+            PolicyDiagnosticImpact::DeclaredNonExhaustive,
+        ));
     }
 
     #[test]

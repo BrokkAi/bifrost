@@ -257,6 +257,11 @@ fn scan_usages_by_reference_descriptor() -> Value {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Optional project-relative paths or globs used to narrow where usages are searched."
+                },
+                "max_duration_secs": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Override the default wall-clock budget for this call. Leave unset for interactive use; a batch/background caller scanning a large workspace can request more time (capped server-side)."
                 }
             },
             "required": ["symbols"]
@@ -315,6 +320,11 @@ fn scan_usages_by_location_descriptor() -> Value {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Optional project-relative paths or globs used to narrow where usages are searched."
+                },
+                "max_duration_secs": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Override the default wall-clock budget for this call. Leave unset for interactive use; a batch/background caller scanning a large workspace can request more time (capped server-side)."
                 }
             },
             "required": ["targets"]

@@ -400,6 +400,14 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
         providers::import_infos_for_files(self, files)
     }
 
+    fn imported_code_units_from_infos(
+        &self,
+        file: &ProjectFile,
+        imports: &[ImportInfo],
+    ) -> Option<HashSet<CodeUnit>> {
+        providers::imported_code_units_from_infos(self, file, imports)
+    }
+
     fn imported_files_from_infos(
         &self,
         file: &ProjectFile,

@@ -221,7 +221,11 @@ pub(super) fn resolve_js_ts(
                 value_position,
             );
         }
-        let receiver_candidates = if let Some(binding) = imports.bindings.get(qualifier)
+        let imported_receiver_binding = imports
+            .bindings
+            .get(qualifier)
+            .filter(|binding| matches!(binding.kind, ImportKind::Named | ImportKind::Default));
+        let receiver_candidates = if let Some(binding) = imported_receiver_binding
             && matches!(binding.kind, ImportKind::Named | ImportKind::Default)
         {
             let exported_name = match binding.kind {
@@ -248,11 +252,20 @@ pub(super) fn resolve_js_ts(
             }
             same_file
         };
-        let member_candidates = if language == Language::TypeScript {
-            ts_member_candidates(analyzer, support, receiver_candidates, name, value_position)
-        } else {
-            jsts_member_candidates(analyzer, support, receiver_candidates, name, value_position)
-        };
+        let member_candidates =
+            if language == Language::JavaScript && imported_receiver_binding.is_some() {
+                jsts_file_scoped_member_candidates(
+                    analyzer,
+                    support,
+                    receiver_candidates,
+                    name,
+                    value_position,
+                )
+            } else if language == Language::TypeScript {
+                ts_member_candidates(analyzer, support, receiver_candidates, name, value_position)
+            } else {
+                jsts_member_candidates(analyzer, support, receiver_candidates, name, value_position)
+            };
         if !member_candidates.is_empty() {
             return js_ts_candidates_outcome(analyzer, member_candidates);
         }
@@ -316,28 +329,31 @@ pub(super) fn resolve_js_ts(
         if !new_receiver_member_candidates.is_empty() {
             return js_ts_candidates_outcome(analyzer, new_receiver_member_candidates);
         }
+        let dotted_lookup = JstsDottedLookup {
+            analyzer,
+            support,
+            file,
+            root: tree.root_node(),
+            source,
+            reference,
+            receiver: qualifier,
+            value_position,
+            before_byte: site.range.start_byte,
+        };
         let local_receiver_binding = (language == Language::JavaScript)
             .then(|| {
                 jsts_visible_receiver_binding_scope(
-                    tree.root_node(),
-                    source,
-                    qualifier,
-                    site.range.start_byte,
+                    dotted_lookup.root,
+                    dotted_lookup.source,
+                    dotted_lookup.receiver,
+                    dotted_lookup.before_byte,
                 )
             })
             .flatten();
         if let Some(binding_scope) = local_receiver_binding {
             let scoped_lookup = JstsScopedDottedLookup {
-                analyzer,
-                support,
-                file,
-                root: tree.root_node(),
-                source,
-                reference,
-                receiver: qualifier,
-                value_position,
+                lookup: dotted_lookup,
                 binding_scope,
-                before_byte: site.range.start_byte,
             };
             let scoped = jsts_exact_scoped_dotted_candidates(scoped_lookup);
             if !scoped.is_empty() {
@@ -348,8 +364,7 @@ pub(super) fn resolve_js_ts(
                 format!("`{reference}` did not resolve to an indexed JS/TS definition"),
             );
         }
-        let exact_same_file =
-            jsts_file_scoped_dotted_candidates(analyzer, support, file, reference, value_position);
+        let exact_same_file = jsts_unproven_same_file_dotted_candidates(dotted_lookup);
         if !exact_same_file.is_empty() {
             return js_ts_candidates_outcome(analyzer, exact_same_file);
         }
@@ -783,8 +798,92 @@ fn jsts_file_scoped_dotted_candidates(
     candidates
 }
 
+fn jsts_unproven_same_file_dotted_candidates(ctx: JstsDottedLookup<'_, '_>) -> Vec<CodeUnit> {
+    let mut candidates = ctx.same_file_candidates();
+    candidates.retain(|unit| {
+        !jsts_js_unbound_assigned_property_candidate_requires_exact_receiver(
+            ctx.analyzer,
+            unit,
+            ctx.receiver,
+        ) || jsts_same_file_unbound_assignment_matches_reference_scope(
+            ctx.analyzer,
+            unit,
+            ctx.receiver,
+            ctx.root,
+            ctx.source,
+            ctx.before_byte,
+        )
+    });
+    candidates
+}
+
+fn jsts_same_file_unbound_assignment_matches_reference_scope(
+    analyzer: &dyn IAnalyzer,
+    target: &CodeUnit,
+    qualifier: &str,
+    root: Node<'_>,
+    source: &str,
+    before_byte: usize,
+) -> bool {
+    let Some((object_name, property_name)) = jsts_unbound_assigned_property_shape(analyzer, target)
+    else {
+        return false;
+    };
+    if object_name != qualifier {
+        return false;
+    }
+    let target_ranges = analyzer.ranges(target);
+    let reference_scope = smallest_named_node_covering(root, before_byte, before_byte)
+        .and_then(jsts_nearest_reference_fallback_scope)
+        .unwrap_or(JstsReceiverBindingScope {
+            start_byte: root.start_byte(),
+            end_byte: root.end_byte(),
+        });
+
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "member_expression"
+            && node.parent().is_some_and(|parent| {
+                parent.kind() == "assignment_expression"
+                    && parent
+                        .child_by_field_name("left")
+                        .is_some_and(|left| left.id() == node.id())
+            })
+            && let (Some(object), Some(property)) = (
+                node.child_by_field_name("object"),
+                node.child_by_field_name("property"),
+            )
+            && node_text(object, source) == object_name
+            && node_text(property, source) == property_name
+            && property.start_byte() < before_byte
+            && target_ranges.iter().any(|range| {
+                range.start_byte <= property.start_byte() && property.end_byte() <= range.end_byte
+            })
+        {
+            let assignment_scope =
+                jsts_nearest_reference_fallback_scope(node).unwrap_or(JstsReceiverBindingScope {
+                    start_byte: root.start_byte(),
+                    end_byte: root.end_byte(),
+                });
+            if assignment_scope == reference_scope {
+                return true;
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    false
+}
+
+fn jsts_nearest_reference_fallback_scope(node: Node<'_>) -> Option<JstsReceiverBindingScope> {
+    jsts_nearest_lexical_scope(node).or_else(|| jsts_nearest_var_scope(node))
+}
+
 #[derive(Clone, Copy)]
-struct JstsScopedDottedLookup<'a, 'tree> {
+struct JstsDottedLookup<'a, 'tree> {
     analyzer: &'a dyn IAnalyzer,
     support: &'a dyn BoundedDefinitionLookup,
     file: &'a ProjectFile,
@@ -793,32 +892,50 @@ struct JstsScopedDottedLookup<'a, 'tree> {
     reference: &'a str,
     receiver: &'a str,
     value_position: bool,
-    binding_scope: JstsReceiverBindingScope,
     before_byte: usize,
 }
 
+impl JstsDottedLookup<'_, '_> {
+    fn same_file_candidates(self) -> Vec<CodeUnit> {
+        jsts_file_scoped_dotted_candidates(
+            self.analyzer,
+            self.support,
+            self.file,
+            self.reference,
+            self.value_position,
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct JstsScopedDottedLookup<'a, 'tree> {
+    lookup: JstsDottedLookup<'a, 'tree>,
+    binding_scope: JstsReceiverBindingScope,
+}
+
 fn jsts_exact_scoped_dotted_candidates(ctx: JstsScopedDottedLookup<'_, '_>) -> Vec<CodeUnit> {
-    let mut candidates: Vec<_> = ctx
+    let lookup = ctx.lookup;
+    let mut candidates: Vec<_> = lookup
         .support
-        .fqn(ctx.reference)
+        .fqn(lookup.reference)
         .into_iter()
-        .filter(|unit| unit.source() == ctx.file)
+        .filter(|unit| unit.source() == lookup.file)
         .filter(|unit| {
-            ctx.analyzer.ranges(unit).iter().any(|range| {
-                range.start_byte < ctx.before_byte
+            lookup.analyzer.ranges(unit).iter().any(|range| {
+                range.start_byte < lookup.before_byte
                     && jsts_visible_receiver_binding_scope(
-                        ctx.root,
-                        ctx.source,
-                        ctx.receiver,
+                        lookup.root,
+                        lookup.source,
+                        lookup.receiver,
                         range.start_byte,
                     ) == Some(ctx.binding_scope)
             })
         })
         .collect();
-    if ctx.value_position {
-        candidates = jsts_value_space_candidates(ctx.analyzer, candidates);
+    if lookup.value_position {
+        candidates = jsts_value_space_candidates(lookup.analyzer, candidates);
     } else {
-        candidates = jsts_type_space_candidates(ctx.analyzer, candidates);
+        candidates = jsts_type_space_candidates(lookup.analyzer, candidates);
     }
     candidates
 }
@@ -830,6 +947,7 @@ fn jsts_exact_dotted_candidates(
     reference: &str,
     value_position: bool,
 ) -> Vec<CodeUnit> {
+    let qualifier = reference.split_once('.').map(|(qualifier, _)| qualifier);
     let mut candidates = support.fqn(reference);
     if let Some(top_level) = jsts_top_level_path_component(file) {
         let preferred: Vec<_> = candidates
@@ -841,12 +959,79 @@ fn jsts_exact_dotted_candidates(
             candidates = preferred;
         }
     }
+    if let Some(qualifier) = qualifier {
+        candidates.retain(|unit| {
+            (unit.source() == file
+                || jsts_cross_file_dotted_receiver_has_global_identity(analyzer, unit, qualifier))
+                && !jsts_js_unbound_assigned_property_candidate_requires_exact_receiver(
+                    analyzer, unit, qualifier,
+                )
+        });
+    }
     if value_position {
         candidates = jsts_value_space_candidates(analyzer, candidates);
     } else {
         candidates = jsts_type_space_candidates(analyzer, candidates);
     }
     candidates
+}
+
+fn jsts_cross_file_dotted_receiver_has_global_identity(
+    analyzer: &dyn IAnalyzer,
+    candidate: &CodeUnit,
+    receiver: &str,
+) -> bool {
+    let language = crate::analyzer::common::language_for_file(candidate.source());
+    if !matches!(language, Language::JavaScript | Language::TypeScript) {
+        return false;
+    }
+    let Ok(source) = candidate.source().read_to_string() else {
+        return false;
+    };
+    let Some(tree) = parse_js_ts_tree(candidate.source(), &source, language) else {
+        return false;
+    };
+    let root = tree.root_node();
+    if jsts_program_is_external_module(root, &source) {
+        return false;
+    }
+    analyzer.ranges(candidate).iter().any(|range| {
+        jsts_visible_receiver_binding_scope(root, &source, receiver, range.start_byte)
+            == Some(JstsReceiverBindingScope {
+                start_byte: root.start_byte(),
+                end_byte: root.end_byte(),
+            })
+    })
+}
+
+fn jsts_program_is_external_module(root: Node<'_>, source: &str) -> bool {
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor).any(|statement| {
+        matches!(statement.kind(), "import_statement" | "export_statement")
+            || subtree_contains(statement, |node| {
+                (node.kind() == "call_expression"
+                    && node.child_by_field_name("function").is_some_and(|callee| {
+                        callee.kind() == "identifier" && node_text(callee, source) == "require"
+                    }))
+                    || (node.kind() == "assignment_expression"
+                        && node
+                            .child_by_field_name("left")
+                            .and_then(jsts_static_member_root)
+                            .is_some_and(|root| {
+                                matches!(node_text(root, source), "exports" | "module")
+                            }))
+            })
+    })
+}
+
+fn jsts_static_member_root(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match node.kind() {
+            "identifier" => return Some(node),
+            "member_expression" => node = node.child_by_field_name("object")?,
+            _ => return None,
+        }
+    }
 }
 
 fn ts_exact_global_dotted_candidates(
@@ -972,6 +1157,10 @@ fn jsts_lexical_scope_kind(kind: &str) -> bool {
         kind,
         "program"
             | "statement_block"
+            | "for_statement"
+            | "for_in_statement"
+            | "switch_statement"
+            | "catch_clause"
             | "function_declaration"
             | "function_expression"
             | "arrow_function"
@@ -1141,6 +1330,83 @@ fn jsts_top_level_path_component(file: &ProjectFile) -> Option<&str> {
         .components()
         .next()
         .and_then(|component| component.as_os_str().to_str())
+}
+
+fn jsts_js_unbound_assigned_property_candidate_requires_exact_receiver(
+    analyzer: &dyn IAnalyzer,
+    candidate: &CodeUnit,
+    qualifier: &str,
+) -> bool {
+    let Some((object_name, _property_name)) =
+        jsts_unbound_assigned_property_shape(analyzer, candidate)
+    else {
+        return false;
+    };
+    object_name == qualifier && object_name != "window"
+}
+
+fn jsts_unbound_assigned_property_shape<'a>(
+    analyzer: &dyn IAnalyzer,
+    target: &'a CodeUnit,
+) -> Option<(&'a str, &'a str)> {
+    if !target.is_field() && !target.is_function() {
+        return None;
+    }
+    let [object_id, property_id] = target.fq().segments() else {
+        return None;
+    };
+    let interner = crate::analyzer::fq_name::segment_interner();
+    let (object_name, _) = interner.resolve(*object_id);
+    let (property_name, _) = interner.resolve(*property_id);
+    if object_name.is_empty() || property_name.is_empty() {
+        return None;
+    }
+
+    let language = crate::analyzer::common::language_for_file(target.source());
+    if !matches!(language, Language::JavaScript | Language::TypeScript) {
+        return None;
+    }
+    let Ok(source) = target.source().read_to_string() else {
+        return None;
+    };
+    let tree = parse_js_ts_tree(target.source(), &source, language)?;
+    let root = tree.root_node();
+    let lexical_bindings = JsTsLexicalBindingIndex::build(root, &source);
+    let target_ranges = analyzer.ranges(target);
+
+    let mut found = false;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "member_expression"
+            && node.parent().is_some_and(|parent| {
+                parent.kind() == "assignment_expression"
+                    && parent
+                        .child_by_field_name("left")
+                        .is_some_and(|left| left.id() == node.id())
+            })
+            && let (Some(object), Some(property)) = (
+                node.child_by_field_name("object"),
+                node.child_by_field_name("property"),
+            )
+            && node_text(object, &source) == object_name
+            && node_text(property, &source) == property_name
+            && target_ranges.iter().any(|range| {
+                range.start_byte <= property.start_byte() && property.end_byte() <= range.end_byte
+            })
+        {
+            found = true;
+            if lexical_bindings.is_bound_at(object_name, object.start_byte()) {
+                return None;
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+
+    found.then_some((object_name, property_name))
 }
 
 fn jsts_module_export_candidates(
@@ -2236,7 +2502,7 @@ fn ts_expression_property_owners(
                     depth + 1,
                     resolution,
                 );
-                ts_expand_property_owners(analyzer, support, callees, depth + 1)
+                ts_expand_call_return_property_owners(analyzer, support, callees, depth + 1)
             })
             .unwrap_or_default(),
         "await_expression" => {
@@ -2487,7 +2753,7 @@ fn jsts_local_receiver_value_owner_candidates(
                 let callees = jsts_call_expression_callees(
                     analyzer, support, file, language, source, imports, aliases, function,
                 );
-                ts_expand_property_owners(analyzer, support, callees, depth + 1)
+                ts_expand_call_return_property_owners(analyzer, support, callees, depth + 1)
             })
             .unwrap_or_default(),
         "identifier" | "type_identifier" => source
@@ -2914,6 +3180,112 @@ fn ts_expand_property_owners(
     sort_units(&mut owners);
     owners.dedup();
     owners
+}
+
+fn ts_expand_call_return_property_owners(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    callees: Vec<CodeUnit>,
+    depth: usize,
+) -> Vec<CodeUnit> {
+    if depth > 8 {
+        return Vec::new();
+    }
+    let mut owners = Vec::new();
+    for callee in callees.into_iter().filter(|callee| callee.is_function()) {
+        if jsts_function_returns_direct_object_literal(analyzer, &callee) {
+            owners.push(callee.clone());
+        }
+        owners.extend(ts_function_return_property_owners(
+            analyzer,
+            support,
+            &callee,
+            depth + 1,
+        ));
+    }
+    sort_units(&mut owners);
+    owners.dedup();
+    owners
+}
+
+fn jsts_function_returns_direct_object_literal(
+    analyzer: &dyn IAnalyzer,
+    function: &CodeUnit,
+) -> bool {
+    let Ok(source) = function.source().read_to_string() else {
+        return false;
+    };
+    let language = crate::analyzer::common::language_for_file(function.source());
+    let Some(tree) = parse_js_ts_tree(function.source(), &source, language) else {
+        return false;
+    };
+    for indexed_node in ts_nodes_for_code_unit(analyzer, function, tree.root_node()) {
+        let function_node = jsts_indexed_callable_node(indexed_node).unwrap_or(indexed_node);
+        if function_node.kind() == "arrow_function"
+            && function_node
+                .child_by_field_name("body")
+                .and_then(ts_direct_object_literal_value)
+                .is_some()
+        {
+            return true;
+        }
+        let mut stack = vec![function_node];
+        while let Some(node) = stack.pop() {
+            if node.id() != function_node.id()
+                && matches!(
+                    node.kind(),
+                    "function_declaration"
+                        | "function_expression"
+                        | "arrow_function"
+                        | "method_definition"
+                        | "class_declaration"
+                        | "abstract_class_declaration"
+                        | "interface_declaration"
+                )
+            {
+                continue;
+            }
+            if node.kind() == "return_statement" {
+                let mut cursor = node.walk();
+                if node
+                    .named_children(&mut cursor)
+                    .next()
+                    .and_then(ts_direct_object_literal_value)
+                    .is_some()
+                {
+                    return true;
+                }
+                continue;
+            }
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+    false
+}
+
+fn jsts_indexed_callable_node(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        if matches!(
+            node.kind(),
+            "function_declaration" | "function_expression" | "arrow_function" | "method_definition"
+        ) {
+            return Some(node);
+        }
+        node = match node.kind() {
+            "export_statement" => node.child_by_field_name("declaration")?,
+            "lexical_declaration" | "variable_declaration" => {
+                let mut cursor = node.walk();
+                node.named_children(&mut cursor)
+                    .find(|child| child.kind() == "variable_declarator")?
+            }
+            "variable_declarator" => node.child_by_field_name("value")?,
+            _ => return None,
+        };
+    }
 }
 
 fn ts_resolve_type_from_unit_context(

@@ -28,8 +28,9 @@ use super::resolver::{
     node_text, object_initializer_for_label, object_initializer_owner_type_node,
     reference_type_text, resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner,
     same_node, unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
-    usage_class_field_receiver_type, usage_direct_base, usage_member_declared_type_fq_name,
-    usage_method_return_type_fq_name_for_arity, usage_visible_extension_method_candidates,
+    usage_direct_base, usage_member_declared_type_fq_name,
+    usage_method_return_type_fq_name_for_arity, usage_unqualified_value_member_shadows_type,
+    usage_visible_extension_method_candidates,
 };
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
@@ -483,19 +484,7 @@ fn record_structured_type_candidate(
         let Some(leftmost) = csharp_type_leftmost_identifier(candidate) else {
             return false;
         };
-        let name = node_text(leftmost, ctx.source);
-        if !bindings.resolve_symbol(name).is_unknown()
-            || unqualified_member_has_structured_shadow(leftmost, ctx.source)
-            || !usage_class_field_receiver_type(
-                leftmost,
-                name,
-                ctx.analyzer,
-                ctx.csharp,
-                ctx.file,
-                ctx.source,
-            )
-            .is_unknown()
-        {
+        if unqualified_value_shadows_type(leftmost, ctx, bindings) {
             return false;
         }
     }
@@ -506,6 +495,24 @@ fn record_structured_type_candidate(
     } else {
         false
     }
+}
+
+fn unqualified_value_shadows_type(
+    node: Node<'_>,
+    ctx: &CsScan<'_, '_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> bool {
+    let name = node_text(node, ctx.source);
+    !bindings.resolve_symbol(name).is_unknown()
+        || unqualified_member_has_structured_shadow(node, ctx.source)
+        || usage_unqualified_value_member_shadows_type(
+            node,
+            name,
+            ctx.analyzer,
+            ctx.csharp,
+            ctx.file,
+            ctx.source,
+        )
 }
 
 /// Whether a member-access receiver is a same-owner receiver: an explicit `this`

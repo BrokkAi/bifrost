@@ -1456,7 +1456,7 @@ fn cancellation_during_edge_function_algebra_discards_the_ide_overlay() {
 }
 
 #[test]
-fn exceptional_return_uses_its_exact_continuation_and_function_family() {
+fn exceptional_return_meets_exact_and_boundary_continuations() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
             "src/returns.ts",
@@ -1503,7 +1503,7 @@ fn exceptional_return_uses_its_exact_continuation_and_function_family() {
     assert_eq!(result.termination(), SolverTermination::FixedPoint);
     assert_eq!(
         value_at(&result, &continuation, QualifierFact::Tracked),
-        Qualifier::Clean,
+        Qualifier::Dirty,
     );
     assert_matches_reference(&root, &analyzer.icfg_provider(), &result);
     assert!(result.metrics().summary_relations > 0);

@@ -51,7 +51,7 @@ pub enum CallToReturnModel {
 pub struct CallBoundary {
     pub origin: CallSiteHandle,
     pub dispatch: DispatchBoundary,
-    pub model: Option<CallToReturnModel>,
+    pub model: CallToReturnModel,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -902,7 +902,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                 .map(|dispatch| CallBoundary {
                     origin: origin.clone(),
                     dispatch,
-                    model: None,
+                    model: CallToReturnModel::NormalAndExceptional,
                 })
                 .collect::<Vec<_>>();
             for candidate in candidates.into_vec() {
@@ -936,7 +936,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                         // Creating the suspended object normally returns to the
                         // caller, while argument binding or language call
                         // mechanics can still fail synchronously.
-                        model: Some(CallToReturnModel::NormalAndExceptional),
+                        model: CallToReturnModel::NormalAndExceptional,
                     });
                     // The candidate row was already charged by dispatch. The
                     // transfer projection additionally owns its cloned locator,
@@ -1886,9 +1886,7 @@ pub(crate) fn project_call_boundary(
     semantic_call: &SemanticCallSite,
     boundary: &CallBoundary,
 ) -> Result<CallToReturnProjection, SemanticProviderError> {
-    let Some(model) = boundary.model else {
-        return Ok(CallToReturnProjection::default());
-    };
+    let model = boundary.model;
     if boundary.origin.procedure() != caller {
         return Err(SemanticProviderError::internal(
             "call-to-return boundary belongs to a different caller",

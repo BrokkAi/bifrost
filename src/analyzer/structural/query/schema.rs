@@ -17,6 +17,7 @@ use super::ir::{MAX_CAPTURE_LENGTH, MAX_KWARG_NAME_LENGTH, SCHEMA_VERSION};
 
 const RQL_INITIAL_SCHEMA_VERSION: u32 = 2;
 const RQL_CFG_SCHEMA_VERSION: u32 = 3;
+const RQL_TYPESTATE_SCHEMA_VERSION: u32 = 4;
 const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
     SchemaVersionDescriptor::new(RQL_INITIAL_SCHEMA_VERSION, None, true),
     SchemaVersionDescriptor::new(
@@ -24,7 +25,16 @@ const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
         Some(RQL_INITIAL_SCHEMA_VERSION),
         true,
     ),
-    SchemaVersionDescriptor::new(SCHEMA_VERSION as u32, Some(RQL_CFG_SCHEMA_VERSION), true),
+    SchemaVersionDescriptor::new(
+        RQL_TYPESTATE_SCHEMA_VERSION,
+        Some(RQL_CFG_SCHEMA_VERSION),
+        true,
+    ),
+    SchemaVersionDescriptor::new(
+        SCHEMA_VERSION as u32,
+        Some(RQL_TYPESTATE_SCHEMA_VERSION),
+        true,
+    ),
 ];
 
 static RQL_SCHEMA_VERSION_REGISTRY: OnceLock<SchemaVersionRegistry> = OnceLock::new();
@@ -79,6 +89,7 @@ pub enum ValueShape {
     ReferenceKindList,
     UsageProof,
     UsageSurface,
+    CallTraversalCompleteness,
     ProtocolRef,
 }
 
@@ -109,6 +120,7 @@ impl ValueShape {
             Self::ReferenceKindList => "one or more structured reference kinds",
             Self::UsageProof => "proven or unproven",
             Self::UsageSurface => "external_usages or lsp_references",
+            Self::CallTraversalCompleteness => "exhaustive or proven_subset",
             Self::ProtocolRef => "a bounded protocol reference in namespace:name form",
         }
     }
@@ -125,6 +137,28 @@ impl ValueShape {
     pub fn accepts_string(self, value: &str) -> bool {
         self.string_length_bounds()
             .is_none_or(|(minimum, maximum)| value.len() >= minimum && value.len() <= maximum)
+    }
+}
+
+/// The guarantee an author requests from one call-graph traversal.
+///
+/// An exhaustive traversal supports a negative conclusion. A proven subset
+/// intentionally reports only resolvable proven caller edges and therefore
+/// supports positive findings but never the assertion that all callers were
+/// found.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CallTraversalCompleteness {
+    #[default]
+    Exhaustive,
+    ProvenSubset,
+}
+
+impl CallTraversalCompleteness {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Exhaustive => "exhaustive",
+            Self::ProvenSubset => "proven_subset",
+        }
     }
 }
 
@@ -432,6 +466,7 @@ macro_rules! rql_forms {
                     | Self::Explain
                     | Self::Profile
                     | Self::Inside
+                    | Self::InsideDecl
                     | Self::NotInside
                     | Self::Union
                     | Self::Intersect
@@ -526,6 +561,14 @@ rql_forms! {
         shape: Pattern,
         signature: "(inside container-pattern query)",
         description: "Require the root match to be lexically inside a matching container.",
+    }
+    InsideDecl {
+        labels: ["inside-decl", "inside_decl"],
+        class: Wrapper,
+        shape: Pattern,
+        signature: "(inside-decl container-pattern query)",
+        description: "Require the root match to be inside a matching container without crossing a callable declaration.",
+        since: 5,
     }
     NotInside {
         labels: ["not-inside"],
@@ -993,6 +1036,7 @@ json_fields! {
     Intersect { label: "intersect", shape: QueryList, signature: "\"intersect\": [{ query }, { query }, ...]", description: "Keep compatible typed endpoints reached by every branch." }
     Except { label: "except", shape: QueryList, signature: "\"except\": [{ query }, { query }, ...]", description: "Keep first-branch endpoints absent from every later branch." }
     Inside { label: "inside", shape: Pattern, signature: "\"inside\": { pattern }", description: "Require the root match to be inside a matching container." }
+    InsideDecl { label: "inside_decl", shape: Pattern, signature: "\"inside_decl\": { pattern }", description: "Require the root match to be inside a matching container without crossing a callable declaration." }
     NotInside { label: "not_inside", shape: Pattern, signature: "\"not_inside\": { pattern }", description: "Exclude root matches inside a matching container." }
     Steps { label: "steps", shape: QuerySteps, signature: "\"steps\": [{ \"op\": \"file_of\" }, ...]", description: "Apply ordered typed transformations to structural matches." }
     Limit { label: "limit", shape: PositiveInteger, signature: "\"limit\": positive integer", description: "Set the maximum number of matches returned." }
@@ -1009,6 +1053,7 @@ json_fields! {
     Transitive { label: "transitive", shape: TrueBoolean, signature: "\"transitive\": true", description: "Traverse the complete indexed hierarchy under the execution budget." }
     ReferenceKinds { label: "reference_kinds", shape: ReferenceKindList, signature: "\"reference_kinds\": [\"field_write\", ...]", description: "Restrict traversal to structured source-reference kinds." }
     Proof { label: "proof", shape: UsageProof, signature: "\"proof\": \"proven\" | \"unproven\"", description: "Restrict traversal to one usage-proof tier." }
+    Completeness { label: "completeness", shape: CallTraversalCompleteness, signature: "\"completeness\": \"exhaustive\" | \"proven_subset\"", description: "Require exhaustive call discovery or intentionally report only resolved proven callers." }
     Surface { label: "surface", shape: UsageSurface, signature: "\"surface\": \"external_usages\" | \"lsp_references\"", description: "Choose the external-usage or editor-visible reference surface." }
     Receiver { label: "receiver", shape: TrueBoolean, signature: "\"receiver\": true", description: "Select the explicit base or receiver expression of a call site." }
     ParameterIndex { label: "parameter_index", shape: NonNegativeInteger, signature: "\"parameter_index\": non-negative integer", description: "Select a zero-based formal parameter slot, excluding receiver-bound parameters." }
@@ -1136,6 +1181,14 @@ pub fn usage_proof_from_label(label: &str) -> Option<UsageProof> {
     }
 }
 
+pub fn call_traversal_completeness_from_label(label: &str) -> Option<CallTraversalCompleteness> {
+    match label {
+        "exhaustive" => Some(CallTraversalCompleteness::Exhaustive),
+        "proven_subset" => Some(CallTraversalCompleteness::ProvenSubset),
+        _ => None,
+    }
+}
+
 pub fn usage_surface_label(surface: UsageHitSurface) -> &'static str {
     match surface {
         UsageHitSurface::ExternalUsages => "external_usages",
@@ -1176,11 +1229,11 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn rql_schema_lineage_defaults_to_version_four_and_accepts_exact_pins() {
+    fn rql_schema_lineage_defaults_to_version_five_and_accepts_exact_pins() {
         assert_eq!(
             resolve_rql_schema_version(None).unwrap(),
             SchemaVersionResolution {
-                version: 4,
+                version: 5,
                 origin: SchemaVersionOrigin::ImplicitCompatible,
             }
         );
@@ -1205,10 +1258,17 @@ mod tests {
                 origin: SchemaVersionOrigin::Explicit,
             }
         );
+        assert_eq!(
+            resolve_rql_schema_version(Some(5)).unwrap(),
+            SchemaVersionResolution {
+                version: 5,
+                origin: SchemaVersionOrigin::Explicit,
+            }
+        );
 
         let error = resolve_rql_schema_version(Some(1)).unwrap_err();
         assert_eq!(error.requested, 1);
-        assert_eq!(error.supported, vec![2, 3, 4]);
+        assert_eq!(error.supported, vec![2, 3, 4, 5]);
     }
 
     #[test]

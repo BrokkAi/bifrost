@@ -730,7 +730,7 @@ pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 }
 
 pub(super) fn normalize_whitespace(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    crate::analyzer::common::collapse_whitespace(text)
 }
 
 pub(crate) fn parse_tree(source: &str) -> Option<Tree> {

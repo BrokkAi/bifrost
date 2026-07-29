@@ -8,6 +8,9 @@ impl CodeQuerySeed {
         if let Some(pattern) = &self.inside {
             collect_referenced_kinds(pattern, &mut kinds);
         }
+        if let Some(pattern) = &self.inside_decl {
+            collect_referenced_kinds(pattern, &mut kinds);
+        }
         if let Some(pattern) = &self.not_inside {
             collect_referenced_kinds(pattern, &mut kinds);
         }
@@ -20,6 +23,9 @@ impl CodeQuerySeed {
         let mut roles = Vec::new();
         collect_used_roles(&self.root, &mut roles);
         if let Some(pattern) = &self.inside {
+            collect_used_roles(pattern, &mut roles);
+        }
+        if let Some(pattern) = &self.inside_decl {
             collect_used_roles(pattern, &mut roles);
         }
         if let Some(pattern) = &self.not_inside {

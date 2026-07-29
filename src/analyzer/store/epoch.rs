@@ -45,6 +45,7 @@ pub(crate) fn epoch_for(language: Language, ts_language: &TsLanguage) -> &'stati
         Language::Scala => epoch_cell::<Scala>(ts_language),
         Language::CSharp => epoch_cell::<CSharp>(ts_language),
         Language::Ruby => epoch_cell::<Ruby>(ts_language),
+        Language::Kotlin => epoch_cell::<Kotlin>(ts_language),
         Language::None => "",
     }
 }
@@ -305,7 +306,7 @@ lang_epoch!(
     Go,
     "go",
     "treesitter/go/",
-    "go-canonical-import-path-fqn-2026-06;synthetic-file-scope-code-units-2026-07;raw-package-qualifier-2026-07;fq-interned-segments-2026-07"
+    "go-canonical-import-path-fqn-2026-06;synthetic-file-scope-code-units-2026-07;raw-package-qualifier-2026-07;fq-interned-segments-2026-07;return-expression-list-value-identity-2026-07"
 );
 // Salt bumped: out-of-line member definitions whose owner class is named with
 // no namespace segment of its own (`Class::method` under an in-effect `using
@@ -416,6 +417,15 @@ lang_epoch!(
     "ruby",
     "treesitter/ruby/",
     "synthetic-file-scope-code-units-2026-07;attr-macro-accessor-identities-2026-07;fq-interned-segments-2026-07"
+);
+// The live grammar fingerprint does not include parser tables. Keep the
+// vendored Kotlin revision in the salt so conflict-resolution-only grammar
+// changes cannot reuse analysis produced by an older parser.
+lang_epoch!(
+    Kotlin,
+    "kotlin",
+    "treesitter/kotlin/",
+    "tree-sitter-kotlin-fwcd-c8ac3d26-2026-07;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07"
 );
 
 #[cfg(test)]

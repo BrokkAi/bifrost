@@ -1,9 +1,11 @@
 use super::{
     ContainerListingEntry, DefinitionCandidateRenderCache, ScanUsageRequest,
-    ScanUsagesAbsenceCaveat, ScanUsagesCandidateFilesSample, ScanUsagesStatus, ScanUsagesSurface,
-    ScanUsagesWorkEntry, SourceBlock, SummaryElement, SymbolUsageRenderState, UsageFailureInfo,
-    UsageHitKind, UsageHitRow, UsageRendering, classify_scan_usages_entry,
-    definition_candidate_from_range, list_symbols, resolve_file_patterns, trim_summary_signature,
+    ScanUsagesAbsenceCaveat, ScanUsagesByLocationParams, ScanUsagesCandidateFilesSample,
+    ScanUsagesExecutionContext, ScanUsagesIncompleteReason, ScanUsagesStatus, ScanUsagesSurface,
+    ScanUsagesTarget, ScanUsagesWorkEntry, SourceBlock, SummaryElement, SymbolLookupParams,
+    SymbolUsageRenderState, UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering,
+    classify_scan_usages_entry, definition_candidate_from_range, list_symbols,
+    resolve_file_patterns, scan_usages_by_location_with_context, trim_summary_signature,
 };
 use super::{function_like_macro_query, route_summary_targets, usage_failure_hint};
 use crate::analyzer::{
@@ -13,6 +15,7 @@ use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 #[derive(Debug)]
 struct CountingProject {
@@ -518,6 +521,8 @@ fn usage_work_entry(
             omitted_count: 1,
         }),
         target_is_method: false,
+        incomplete_reason: candidate_files_truncated
+            .then_some(ScanUsagesIncompleteReason::CandidateFiles),
     }
 }
 
@@ -544,6 +549,10 @@ fn scan_usages_classification_matrix_keeps_status_and_completeness_separate() {
     ));
     assert_eq!(ScanUsagesStatus::Found, found_truncated.status);
     assert!(!found_truncated.complete);
+    assert_eq!(
+        Some(ScanUsagesIncompleteReason::CandidateFiles),
+        found_truncated.incomplete_reason
+    );
     assert!(found_truncated.absence_caveats.is_empty());
     assert!(found_truncated.candidate_files_sample.is_some());
 
@@ -611,6 +620,10 @@ fn scan_usages_classification_matrix_keeps_status_and_completeness_separate() {
     ));
     assert_eq!(ScanUsagesStatus::UnverifiedAbsent, truncated_absent.status);
     assert!(!truncated_absent.complete);
+    assert_eq!(
+        Some(ScanUsagesIncompleteReason::CandidateFiles),
+        truncated_absent.incomplete_reason
+    );
     assert!(
         truncated_absent
             .absence_caveats
@@ -708,6 +721,10 @@ fn scan_usages_classifies_callsite_cap_and_graph_failure_rows() {
     });
     assert_eq!(ScanUsagesStatus::TooManyCallsites, too_many.status);
     assert!(!too_many.complete);
+    assert_eq!(
+        Some(ScanUsagesIncompleteReason::Callsites),
+        too_many.incomplete_reason
+    );
     assert_eq!(Some(1001), too_many.total_callsites);
 
     let failure = classify_scan_usages_entry(&ScanUsagesWorkEntry::Failure {
@@ -721,10 +738,121 @@ fn scan_usages_classifies_callsite_cap_and_graph_failure_rows() {
             candidate_files_sample: None,
             hint: None,
         },
+        incomplete_reason: Some(ScanUsagesIncompleteReason::CandidateFiles),
     });
     assert_eq!(ScanUsagesStatus::Failure, failure.status);
     assert!(!failure.complete);
     assert_eq!(Some("no_graph_seed"), failure.reason_kind.as_deref());
+}
+
+#[test]
+fn issue_1228_source_budget_never_reports_verified_absence() {
+    use crate::analyzer::{RustAnalyzer, TestProject};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    ProjectFile::new(root.clone(), "lib.rs")
+        .write("pub fn target() {}\npub fn caller() { target(); }\n")
+        .unwrap();
+    let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
+    let context = ScanUsagesExecutionContext::with_limits(
+        crate::CancellationToken::default(),
+        1_000,
+        10_000,
+        0,
+        1_000,
+    );
+
+    let result = scan_usages_by_location_with_context(
+        &analyzer,
+        ScanUsagesByLocationParams {
+            targets: vec![ScanUsagesTarget {
+                path: "lib.rs".to_string(),
+                line: 1,
+                column: None,
+                symbol: None,
+            }],
+            include_tests: true,
+            paths: None,
+            include_same_owner: true,
+            max_duration_secs: None,
+        },
+        &context,
+    );
+
+    assert!(result.summary.partial, "{result:#?}");
+    assert_eq!(result.summary.verified_absent, 0, "{result:#?}");
+    assert_eq!(result.results.len(), 1, "{result:#?}");
+    assert!(!result.results[0].complete, "{result:#?}");
+    assert_eq!(
+        result.results[0].incomplete_reason,
+        Some(ScanUsagesIncompleteReason::SourceBytes),
+        "{result:#?}"
+    );
+    assert_ne!(
+        result.results[0].status,
+        ScanUsagesStatus::VerifiedAbsent,
+        "{result:#?}"
+    );
+}
+
+#[test]
+fn issue_1228_time_budget_is_explicit_and_never_reports_verified_absence() {
+    use crate::analyzer::{RustAnalyzer, TestProject};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    ProjectFile::new(root.clone(), "lib.rs")
+        .write("pub fn target() {}\npub fn caller() { target(); }\n")
+        .unwrap();
+    let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
+    let context = ScanUsagesExecutionContext::with_limits(
+        crate::CancellationToken::default().with_timeout(Duration::ZERO),
+        1_000,
+        10_000,
+        usize::MAX,
+        1_000,
+    );
+
+    let result = scan_usages_by_location_with_context(
+        &analyzer,
+        ScanUsagesByLocationParams {
+            targets: vec![ScanUsagesTarget {
+                path: "lib.rs".to_string(),
+                line: 1,
+                column: None,
+                symbol: None,
+            }],
+            include_tests: true,
+            paths: None,
+            include_same_owner: true,
+            max_duration_secs: None,
+        },
+        &context,
+    );
+
+    assert!(result.summary.partial, "{result:#?}");
+    assert_eq!(result.summary.verified_absent, 0, "{result:#?}");
+    assert_eq!(result.results.len(), 1, "{result:#?}");
+    assert!(!result.results[0].complete, "{result:#?}");
+    assert_eq!(
+        result.results[0].incomplete_reason,
+        Some(ScanUsagesIncompleteReason::TimeBudget),
+        "{result:#?}"
+    );
+    assert_eq!(
+        result.results[0].reason_kind.as_deref(),
+        Some("time_budget"),
+        "{result:#?}"
+    );
+    assert_ne!(
+        result.results[0].status,
+        ScanUsagesStatus::VerifiedAbsent,
+        "{result:#?}"
+    );
+    let json = serde_json::to_value(&result).unwrap();
+    assert_eq!(json["results"][0]["incomplete_reason"], "time_budget");
+    assert_eq!(json["results"][0]["reason_kind"], "time_budget");
 }
 
 /// #1100: `excluded_test_files` decides membership from paths alone instead of
@@ -780,4 +908,306 @@ fn excluded_test_files_path_predicate_matches_full_classification() {
         !by_path.is_empty(),
         "fixture must actually produce excluded files or the equivalence is vacuous"
     );
+}
+
+#[test]
+fn issue_1228_symbol_lookup_batches_have_count_and_byte_limits() {
+    let too_many = serde_json::json!({
+        "symbols": vec!["symbol"; super::SYMBOL_LOOKUP_MAX_SYMBOLS + 1]
+    });
+    let error = serde_json::from_value::<SymbolLookupParams>(too_many)
+        .expect_err("oversized symbol batch must be rejected");
+    assert!(error.to_string().contains("at most"), "{error}");
+
+    let oversized_symbol = serde_json::json!({
+        "symbols": ["x".repeat(super::SYMBOL_LOOKUP_MAX_SYMBOL_BYTES + 1)]
+    });
+    let error = serde_json::from_value::<SymbolLookupParams>(oversized_symbol)
+        .expect_err("oversized symbol selector must be rejected");
+    assert!(error.to_string().contains("each symbol"), "{error}");
+}
+
+#[test]
+fn issue_1228_navigation_cancellation_reaches_rust_resolution() {
+    use crate::analyzer::{RustAnalyzer, TestProject};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    ProjectFile::new(root.clone(), "lib.rs")
+        .write("pub fn target() {}\npub fn caller() { target(); }\n")
+        .unwrap();
+    let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
+    let cancellation = crate::CancellationToken::cancel_after_checks_for_test(5);
+
+    let result = super::get_definitions_by_location_with_cancellation(
+        &analyzer,
+        super::GetDefinitionParams {
+            references: vec![super::DefinitionReferenceQuery {
+                path: "lib.rs".to_string(),
+                line: Some(2),
+                column: Some(19),
+            }],
+        },
+        Some(&cancellation),
+    );
+
+    assert!(cancellation.is_cancelled());
+    assert_eq!(result.results.len(), 1, "{result:#?}");
+    assert!(
+        result.results[0]
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == "cancelled"),
+        "{result:#?}"
+    );
+}
+
+#[test]
+fn issue_1228_uncancelled_mcp_rust_navigation_matches_direct_semantics() {
+    use crate::analyzer::Language;
+    use crate::test_support::AnalyzerFixture;
+
+    fn query_at(
+        source: &str,
+        path: &str,
+        snippet: &str,
+        focus: &str,
+    ) -> super::DefinitionReferenceQuery {
+        let snippet_start = source
+            .find(snippet)
+            .unwrap_or_else(|| panic!("missing `{snippet}`"));
+        let focus_start = snippet
+            .find(focus)
+            .unwrap_or_else(|| panic!("missing `{focus}` in `{snippet}`"));
+        let byte = snippet_start + focus_start;
+        let line_start = source[..byte].rfind('\n').map_or(0, |newline| newline + 1);
+        super::DefinitionReferenceQuery {
+            path: path.to_string(),
+            line: Some(
+                source[..byte]
+                    .bytes()
+                    .filter(|value| *value == b'\n')
+                    .count()
+                    + 1,
+            ),
+            column: Some(byte - line_start + 1),
+        }
+    }
+
+    let main = r#"
+use crate::api::{helper as aliased_helper, Runner, Service};
+use crate::prelude::*;
+
+macro_rules! local_macro {
+    () => {};
+}
+
+fn same_file() {}
+
+struct Local {
+    field: i32,
+}
+
+impl Local {
+    fn associated() {}
+
+    fn exercise(&self) {
+        Self::associated();
+        let _ = self.field;
+    }
+}
+
+fn caller(service: Service, local: Local) {
+    same_file();
+    aliased_helper();
+    globbed();
+    Service::new();
+    service.run();
+    let _: Service = Service::new();
+    crate::api::helper();
+    let _ = local.field;
+    local_macro!();
+    let shadowed = 1;
+    let _ = shadowed;
+}
+
+type ResultType = <Service as Runner>::Output;
+"#;
+    let fixture = AnalyzerFixture::new_for_language(
+        Language::Rust,
+        &[
+            (
+                "src/lib.rs",
+                "pub mod api;\npub mod prelude;\npub mod main;\n",
+            ),
+            (
+                "src/api.rs",
+                r#"
+pub trait Runner {
+    type Output;
+    fn run(&self);
+}
+
+pub struct Service {
+    pub value: i32,
+}
+
+impl Runner for Service {
+    type Output = i32;
+    fn run(&self) {}
+}
+
+impl Service {
+    pub fn new() -> Self {
+        Self { value: 0 }
+    }
+}
+
+pub fn helper() {}
+"#,
+            ),
+            ("src/prelude.rs", "pub fn globbed() {}\n"),
+            ("src/main.rs", main),
+        ],
+    );
+    let analyzer = fixture.analyzer.analyzer();
+    let references = vec![
+        (
+            "same-file call",
+            query_at(main, "src/main.rs", "same_file();", "same_file"),
+            "resolved",
+            None,
+        ),
+        (
+            "aliased import",
+            query_at(main, "src/main.rs", "aliased_helper();", "aliased_helper"),
+            "resolved",
+            None,
+        ),
+        (
+            "glob import",
+            query_at(main, "src/main.rs", "globbed();", "globbed"),
+            "no_definition",
+            Some("no_indexed_definition"),
+        ),
+        (
+            "scoped constructor",
+            query_at(main, "src/main.rs", "Service::new();", "new"),
+            "resolved",
+            None,
+        ),
+        (
+            "trait receiver method",
+            query_at(main, "src/main.rs", "service.run();", "run"),
+            "resolved",
+            None,
+        ),
+        (
+            "type reference",
+            query_at(
+                main,
+                "src/main.rs",
+                "let _: Service = Service::new();",
+                "Service",
+            ),
+            "resolved",
+            None,
+        ),
+        (
+            "crate scoped call",
+            query_at(main, "src/main.rs", "crate::api::helper();", "helper"),
+            "resolved",
+            None,
+        ),
+        (
+            "field",
+            query_at(main, "src/main.rs", "let _ = local.field;", "field"),
+            "resolved",
+            None,
+        ),
+        (
+            "Self associated call",
+            query_at(main, "src/main.rs", "Self::associated();", "associated"),
+            "resolved",
+            None,
+        ),
+        (
+            "macro",
+            query_at(main, "src/main.rs", "local_macro!();", "local_macro"),
+            "resolved",
+            None,
+        ),
+        (
+            "local binding",
+            query_at(main, "src/main.rs", "let _ = shadowed;", "shadowed"),
+            "no_definition",
+            Some("local_binding"),
+        ),
+        (
+            "associated type",
+            query_at(main, "src/main.rs", "<Service as Runner>::Output", "Output"),
+            "resolved",
+            None,
+        ),
+    ];
+    let params = super::GetDefinitionParams {
+        references: references
+            .iter()
+            .map(|(_, query, _, _)| query.clone())
+            .collect(),
+    };
+    let cancellation = crate::CancellationToken::new();
+
+    let direct_definitions = super::get_definitions_by_location(analyzer, params.clone());
+    let cancellable_definitions = super::get_definitions_by_location_with_cancellation(
+        analyzer,
+        params.clone(),
+        Some(&cancellation),
+    );
+    assert_eq!(
+        serde_json::to_value(&direct_definitions).unwrap(),
+        serde_json::to_value(&cancellable_definitions).unwrap(),
+        "an uncancelled MCP token must not select reduced Rust definition semantics"
+    );
+
+    let direct_declarations = super::get_declarations_by_location(analyzer, params.clone());
+    let cancellable_declarations = super::get_declarations_by_location_with_cancellation(
+        analyzer,
+        params,
+        Some(&cancellation),
+    );
+    assert_eq!(
+        serde_json::to_value(&direct_declarations).unwrap(),
+        serde_json::to_value(&cancellable_declarations).unwrap(),
+        "an uncancelled MCP token must not select reduced Rust declaration semantics"
+    );
+
+    let mut expectation_failures = Vec::new();
+    for ((label, _, expected_status, expected_diagnostic), result) in
+        references.iter().zip(&direct_definitions.results)
+    {
+        if result.status != *expected_status {
+            expectation_failures.push(format!(
+                "{label}: expected status {expected_status}, got {}",
+                result.status
+            ));
+        }
+        if *expected_status == "resolved" && result.definitions.is_empty() {
+            expectation_failures.push(format!("{label}: resolved without a definition"));
+        }
+        if let Some(expected_diagnostic) = expected_diagnostic
+            && !result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == *expected_diagnostic)
+        {
+            expectation_failures.push(format!("{label}: missing diagnostic {expected_diagnostic}"));
+        }
+    }
+    assert!(
+        expectation_failures.is_empty(),
+        "{}\n{direct_definitions:#?}",
+        expectation_failures.join("\n")
+    );
+    assert!(!cancellation.is_cancelled());
 }

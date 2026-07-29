@@ -25,7 +25,8 @@ use std::sync::atomic::Ordering;
 pub(crate) use adapter::GoAdapter;
 use cache::GoMemoCaches;
 pub(crate) use declarations::{
-    collect_go_import_infos, determine_go_package_name, go_structured_type_identity_bounded,
+    collect_go_import_infos, determine_go_package_name, go_embedded_type_nodes,
+    go_structured_type_identity_bounded,
 };
 use tests::detect_go_test_assertion_smells;
 use tree_sitter::Node;

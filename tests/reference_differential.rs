@@ -58,6 +58,32 @@ fn cpp_differential(
     .expect("run inline C++ reference differential")
 }
 
+fn go_differential(
+    files: &[(&str, &str)],
+) -> brokk_bifrost::reference_differential::ReferenceDifferentialReport {
+    let mut project = InlineTestProject::with_language(Language::Go);
+    for (path, source) in files {
+        project = project.file(path, *source);
+    }
+    let project = project.build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    run_reference_differential(
+        workspace.analyzer(),
+        &ReferenceDifferentialConfig {
+            corpus_language: "go".to_string(),
+            max_files: 20,
+            max_sites: 1_000,
+            max_candidates_per_file: 1_000,
+            max_source_bytes: 100_000,
+            max_targets: 1_000,
+            max_usage_files: 20,
+            max_usages: 1_000,
+            ..ReferenceDifferentialConfig::default()
+        },
+    )
+    .expect("run inline Go reference differential")
+}
+
 #[test]
 fn cpp_inherited_scoped_enum_qualifier_round_trips_to_lexical_owner() {
     let source = r#"
@@ -217,6 +243,49 @@ export { createListItemWithValidation as createListItem };
         "export bindings remain visible to editor navigation: {export_value:#?}"
     );
     assert_eq!(report.summary.classifications.missing, 0, "{report:#?}");
+}
+
+#[test]
+fn go_package_and_import_declaration_names_are_excluded_as_declaration_sites() {
+    let source = r#"package main
+
+import sub "example.com/app/sub"
+
+func Run() {
+    sub.Helper()
+}
+"#;
+    let report = go_differential(&[
+        ("go.mod", "module example.com/app\n"),
+        ("main.go", source),
+        ("sub/sub.go", "package sub\n\nfunc Helper() {}\n"),
+    ]);
+    let package_name = source.find("main").expect("package name");
+    let import_alias = source.find("sub").expect("import alias");
+    let helper_call = source.rfind("Helper").expect("helper call");
+
+    assert!(
+        report
+            .sites
+            .iter()
+            .all(|site| site.start_byte != package_name && site.start_byte != import_alias),
+        "Go package/import declaration names are not reference sites: {report:#?}"
+    );
+    assert!(
+        report.summary.declaration_sites_excluded >= 2,
+        "Go package and import declaration names should count as excluded declaration sites: {report:#?}"
+    );
+    let helper_site = report
+        .sites
+        .iter()
+        .find(|site| site.start_byte == helper_call)
+        .expect("qualified helper call remains sampled");
+    assert_eq!(helper_site.forward_status, "resolved", "{helper_site:#?}");
+    assert_eq!(
+        helper_site.classification,
+        ReferenceClassification::Consistent,
+        "{helper_site:#?}"
+    );
 }
 
 #[test]
@@ -449,9 +518,13 @@ pub fn park(_: SignalHandle) {}
         .find(|site| site.path == "src/lib.rs" && site.start_byte == decoy_start)
         .expect("opaque nested-wrapper reference site");
     assert_eq!(
+        decoy.forward_status, "unresolvable_import_boundary",
+        "an unproven wrapper must not turn a same-named physical file into a local declaration route: {decoy:#?}"
+    );
+    assert_eq!(
         decoy.classification,
-        ReferenceClassification::Missing,
-        "the forward index may see the same-named file, but an unproven wrapper must not give it a physical inverse route: {decoy:#?}"
+        ReferenceClassification::Inconclusive,
+        "a forward boundary is not a proven target and therefore cannot be an inverse omission: {decoy:#?}"
     );
     assert!(decoy.inverse_hit.is_none(), "{decoy:#?}");
 }

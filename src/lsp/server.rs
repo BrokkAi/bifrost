@@ -44,13 +44,12 @@ use crate::NavigationOperation;
 use crate::analyzer::policy::{
     PolicyEvaluationOptions, PolicyReportDocument, PolicySourceDiagnosticSeverity,
     PolicySourceIdentity, PolicySuppressionOptions, PolicySuppressionSource,
-    evaluate_policy_source, rqlp_source_completion_at, rqlp_source_help_at, validate_rqlp_source,
+    rqlp_source_completion_at, rqlp_source_help_at, validate_rqlp_source,
 };
 use crate::analyzer::semantic::WorkspaceRelativePath;
 use crate::analyzer::structural::query::{
     QuerySourceEdit, query_source_help_at, validate_query_source,
 };
-use crate::analyzer::structural::search::execute_workspace_request_with_cancellation;
 use crate::analyzer::structural::{
     CodeQuery, CodeQueryExecutionLimits, CodeQueryResponse, CodeQueryResultItem,
     CodeQueryResultValue,
@@ -60,6 +59,7 @@ use crate::analyzer::{
     MultiRootProject, OverlayProject, Project, ProjectFile, WorkspaceAnalyzer,
 };
 use crate::cancellation::CancellationToken;
+use crate::code_intelligence::CodeIntelligenceRuntime;
 use crate::lsp::capabilities::server_capabilities;
 use crate::lsp::conversion::{
     byte_offset_to_position, path_to_uri_string, position_to_byte_offset, uri_to_path,
@@ -1145,12 +1145,8 @@ fn handle_run_rql_query_request(
             success_message: "Query ready",
         },
         move |workspace, _project, _context, cancellation| {
-            let response = execute_workspace_request_with_cancellation(
-                workspace,
-                &query,
-                CodeQueryExecutionLimits::default(),
-                cancellation,
-            );
+            let response = CodeIntelligenceRuntime::new(workspace, Some(cancellation))
+                .execute_query(&query, CodeQueryExecutionLimits::default());
             // Avoid rendering and serializing a potentially large response
             // after execution has already observed cancellation. The common
             // request guard remains responsible for the race after this check.
@@ -1245,23 +1241,17 @@ fn handle_run_rql_policy_request(
         },
         move |workspace, _project, context, cancellation| {
             context.report("Evaluating policy");
-            let outcome = evaluate_policy_source(
-                &workspace_root,
-                source_identity,
-                &source,
-                workspace,
-                &options,
-                Some(cancellation),
-            )
-            .map_err(|error| {
-                if cancellation.is_cancelled() {
-                    CancellableWorkerError::Cancelled
-                } else {
-                    CancellableWorkerError::Failed(format!(
-                        "Failed to evaluate RQL policy: {error}"
-                    ))
-                }
-            })?;
+            let outcome = CodeIntelligenceRuntime::new(workspace, Some(cancellation))
+                .evaluate_policy_source(&workspace_root, source_identity, &source, &options)
+                .map_err(|error| {
+                    if cancellation.is_cancelled() {
+                        CancellableWorkerError::Cancelled
+                    } else {
+                        CancellableWorkerError::Failed(format!(
+                            "Failed to evaluate RQL policy: {error}"
+                        ))
+                    }
+                })?;
             if cancellation.is_cancelled() {
                 return Err(CancellableWorkerError::Cancelled);
             }

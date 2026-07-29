@@ -209,6 +209,63 @@ struct SemanticExecutionBudgetState {
     exhausted: bool,
 }
 
+/// Exact in-process identity of the provider work already charged to one
+/// request-scoped execution budget.
+///
+/// The materialized file identities are retained instead of being collapsed
+/// to a count: files already admitted can be revisited without consuming
+/// another slot, so two ledgers with equal remaining counts are not
+/// behaviorally interchangeable.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct SemanticExecutionBudgetSnapshot {
+    max_materialized_files: usize,
+    max_traversal_steps: usize,
+    materialized_files: Box<[ProjectFile]>,
+    externally_materialized_files: usize,
+    traversal_steps: usize,
+    exhausted: bool,
+}
+
+impl SemanticExecutionBudgetSnapshot {
+    fn from_state(state: &SemanticExecutionBudgetState) -> Self {
+        let mut materialized_files = state.materialized_files.iter().cloned().collect::<Vec<_>>();
+        materialized_files.sort_unstable_by(|left, right| {
+            left.root()
+                .cmp(right.root())
+                .then_with(|| left.rel_path().cmp(right.rel_path()))
+        });
+        Self {
+            max_materialized_files: state.max_materialized_files,
+            max_traversal_steps: state.max_traversal_steps,
+            materialized_files: materialized_files.into_boxed_slice(),
+            externally_materialized_files: state.externally_materialized_files,
+            traversal_steps: state.traversal_steps,
+            exhausted: state.exhausted,
+        }
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(std::mem::size_of_val(self.materialized_files.as_ref()))
+    }
+}
+
+/// Provider-execution work that an exact cached result must replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SemanticExecutionBudgetCharge {
+    materialized_files: Box<[ProjectFile]>,
+    externally_materialized_files: usize,
+    traversal_steps: usize,
+    exhausted: bool,
+}
+
+impl SemanticExecutionBudgetCharge {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(std::mem::size_of_val(self.materialized_files.as_ref()))
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SemanticExecutionWork {
     pub materialized_files: usize,
@@ -239,6 +296,89 @@ impl SemanticExecutionBudget {
             traversal_steps: state.traversal_steps,
             exhausted: state.exhausted,
         }
+    }
+
+    pub(crate) fn snapshot(&self) -> SemanticExecutionBudgetSnapshot {
+        let state = self.state.lock().expect("semantic execution budget lock");
+        SemanticExecutionBudgetSnapshot::from_state(&state)
+    }
+
+    pub(crate) fn charge_since(
+        &self,
+        before: &SemanticExecutionBudgetSnapshot,
+    ) -> Option<SemanticExecutionBudgetCharge> {
+        let state = self.state.lock().expect("semantic execution budget lock");
+        if state.max_materialized_files != before.max_materialized_files
+            || state.max_traversal_steps != before.max_traversal_steps
+            || state.externally_materialized_files < before.externally_materialized_files
+            || state.traversal_steps < before.traversal_steps
+            || before
+                .materialized_files
+                .iter()
+                .any(|file| !state.materialized_files.contains(file))
+        {
+            return None;
+        }
+        let before_files = before
+            .materialized_files
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut materialized_files = state
+            .materialized_files
+            .difference(&before_files)
+            .cloned()
+            .collect::<Vec<_>>();
+        materialized_files.sort_unstable_by(|left, right| {
+            left.root()
+                .cmp(right.root())
+                .then_with(|| left.rel_path().cmp(right.rel_path()))
+        });
+        Some(SemanticExecutionBudgetCharge {
+            materialized_files: materialized_files.into_boxed_slice(),
+            externally_materialized_files: state
+                .externally_materialized_files
+                .saturating_sub(before.externally_materialized_files),
+            traversal_steps: state.traversal_steps.saturating_sub(before.traversal_steps),
+            exhausted: state.exhausted && !before.exhausted,
+        })
+    }
+
+    /// Atomically reproduce provider work from an exact cached solve.
+    pub(crate) fn replay_charge(
+        &self,
+        expected_before: &SemanticExecutionBudgetSnapshot,
+        charge: &SemanticExecutionBudgetCharge,
+    ) -> bool {
+        let mut state = self.state.lock().expect("semantic execution budget lock");
+        if SemanticExecutionBudgetSnapshot::from_state(&state) != *expected_before
+            || charge
+                .materialized_files
+                .iter()
+                .any(|file| state.materialized_files.contains(file))
+        {
+            return false;
+        }
+        let attempted_files = state
+            .externally_materialized_files
+            .saturating_add(state.materialized_files.len())
+            .saturating_add(charge.externally_materialized_files)
+            .saturating_add(charge.materialized_files.len());
+        let attempted_traversal = state.traversal_steps.saturating_add(charge.traversal_steps);
+        if attempted_files > state.max_materialized_files
+            || attempted_traversal > state.max_traversal_steps
+        {
+            return false;
+        }
+        state
+            .materialized_files
+            .extend(charge.materialized_files.iter().cloned());
+        state.externally_materialized_files = state
+            .externally_materialized_files
+            .saturating_add(charge.externally_materialized_files);
+        state.traversal_steps = attempted_traversal;
+        state.exhausted |= charge.exhausted;
+        true
     }
 
     pub fn remaining_materialized_files(&self) -> usize {
@@ -617,6 +757,40 @@ pub trait ProgramSemanticsProvider: Send + Sync {
     ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError>;
 }
 
+/// A [`ProgramSemanticsProvider`] for languages whose lowering is not
+/// implemented yet.
+///
+/// Every capability is reported as explicitly [`SemanticOutcome::Unsupported`]
+/// rather than left absent, so callers can distinguish "this language cannot do
+/// it" from "nothing was materialized". Zero-sized, so a language delegate can
+/// hand out `&UNSUPPORTED_PROGRAM_SEMANTICS` without owning a value.
+pub struct UnsupportedProgramSemantics;
+
+/// The shared [`UnsupportedProgramSemantics`] instance.
+pub static UNSUPPORTED_PROGRAM_SEMANTICS: UnsupportedProgramSemantics = UnsupportedProgramSemantics;
+
+impl ProgramSemanticsProvider for UnsupportedProgramSemantics {
+    fn current_artifact_source(
+        &self,
+        _file: &ProjectFile,
+        _max_source_bytes: usize,
+    ) -> Result<Option<SemanticArtifactSourceSnapshot>, SemanticProviderError> {
+        Ok(None)
+    }
+
+    fn materialize(
+        &self,
+        _file: &ProjectFile,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError> {
+        Ok(SemanticOutcome::Unsupported {
+            capability: SemanticCapability::Procedures,
+            partial: None,
+            work: SemanticWork::default(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -868,5 +1042,30 @@ mod tests {
         assert_eq!(mapped.budget_exceeded(), Some(exceeded));
         assert_eq!(mapped.work(), work);
         assert_eq!(mapped.available_value().map(String::as_str), Some("21"));
+    }
+
+    #[test]
+    fn execution_budget_snapshot_replays_exact_file_and_traversal_work() {
+        let first = mock_file();
+        let second = ProjectFile::new(first.root(), "src/second.rs");
+        let source = SemanticExecutionBudget::new(4, 10);
+        assert!(source.admit_materialization(&first));
+        assert!(source.charge_external_work(1, 2));
+        let before = source.snapshot();
+        assert!(source.admit_materialization(&second));
+        assert!(source.charge_external_work(1, 3));
+        let after = source.snapshot();
+        let charge = source.charge_since(&before).expect("monotonic charge");
+
+        let replay = SemanticExecutionBudget::new(4, 10);
+        assert!(replay.admit_materialization(&first));
+        assert!(replay.charge_external_work(1, 2));
+        assert_eq!(replay.snapshot(), before);
+        assert!(replay.replay_charge(&before, &charge));
+        assert_eq!(replay.snapshot(), after);
+
+        let already_replayed = replay.snapshot();
+        assert!(!replay.replay_charge(&before, &charge));
+        assert_eq!(replay.snapshot(), already_replayed);
     }
 }

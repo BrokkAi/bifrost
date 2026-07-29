@@ -4,11 +4,13 @@ use crate::{
     AnalyzerConfig, CancellationToken, FilesystemProject, Project, ProjectChangeWatcher,
     ProjectFile, WorkspaceAnalyzer,
     analyzer::policy::{
-        POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE, PolicyEvaluationDate,
-        PolicyEvaluationOptions, PolicyFailOn, PolicyReportDocument, PolicySuppressionOptions,
-        PolicySuppressionSource, evaluate_policy_files_with_analyzer,
+        BuiltInPolicySelection, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE,
+        PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyFailOn,
+        PolicyReportDocument, PolicySuppressionOptions, PolicySuppressionSource,
+        built_in_policy_catalog,
     },
     analyzer::semantic::WorkspaceRelativePath,
+    code_intelligence::CodeIntelligenceRuntime,
     code_quality::{
         analyze_git_hotspots, compute_cognitive_complexity, compute_cyclomatic_complexity,
         report_comment_density_for_code_unit, report_comment_density_for_files,
@@ -24,10 +26,12 @@ use crate::{
     searchtools::{
         ActivateWorkspaceParams, ActiveWorkspaceResult, GetActiveWorkspaceParams,
         MostRelevantFilesParams, RefreshParams, SymbolLookupParams, SymbolSourcesResult,
-        classify_test_files, get_declarations_by_location, get_definitions_by_location,
-        get_definitions_by_reference, get_summaries, get_symbol_ancestors, get_symbol_locations,
-        get_symbol_sources, get_type_by_location, list_symbols, most_relevant_files,
-        refresh_result, rename_symbol, scan_usages_by_location, scan_usages_by_reference,
+        classify_test_files, get_declarations_by_location_with_cancellation,
+        get_definitions_by_location_with_cancellation, get_definitions_by_reference,
+        get_summaries_with_cancellation, get_symbol_ancestors,
+        get_symbol_locations_with_cancellation, get_symbol_sources, get_type_by_location,
+        list_symbols, most_relevant_files_with_cancellation, refresh_result, rename_symbol,
+        scan_usages_by_location_with_cancellation, scan_usages_by_reference_with_cancellation,
         search_symbols_with_cancellation, symbol_source_candidate_files, usage_graph,
     },
     searchtools_render::{RenderOptions, RenderText},
@@ -52,12 +56,56 @@ pub enum SearchToolsServiceErrorCode {
     Internal,
 }
 
+#[cfg(test)]
+mod issue_1228_response_budget_tests {
+    use super::*;
+    use crate::searchtools::{SourceBlock, SymbolSourcesResult};
+
+    #[test]
+    fn oversized_symbol_source_response_is_rejected_before_rendering() {
+        let result = SymbolSourcesResult {
+            sources: vec![SourceBlock {
+                label: "large".to_string(),
+                path: "large.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                text: "x".repeat(GET_SYMBOL_SOURCES_RESPONSE_BUDGET_BYTES + 1),
+                canonical_selector: None,
+                occurrence_role: None,
+                presentation: None,
+                note: None,
+            }],
+            not_found: Vec::new(),
+            ambiguous: Vec::new(),
+            ambiguous_paths: Vec::new(),
+        };
+
+        let error = SearchToolsService::symbol_sources_output(result, RenderOptions::default())
+            .expect_err("oversized response must be rejected");
+
+        assert_eq!(error.code, SearchToolsServiceErrorCode::InvalidParams);
+        assert!(
+            error.message.contains("response budget"),
+            "{}",
+            error.message
+        );
+    }
+}
+
 const MAX_QUERY_FILE_BYTES: u64 = 64 * 1024;
+const GET_SYMBOL_SOURCES_RESPONSE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RunPolicyParams {
+    #[serde(default)]
     policy_files: Vec<String>,
+    #[serde(default)]
+    policy_packs: Vec<String>,
+    #[serde(default)]
+    policy_categories: Vec<String>,
+    #[serde(default)]
+    policy_ids: Vec<String>,
     suppression_file: Option<String>,
     evaluation_date: PolicyEvaluationDate,
     #[serde(default)]
@@ -193,6 +241,8 @@ pub struct SearchToolsService {
     session: RwLock<Option<WorkspaceSession>>,
     workspace_generation: AtomicU64,
     query_protocols: RwLock<crate::analyzer::structural::ProtocolRegistrationSet>,
+    typestate_summaries:
+        RwLock<Arc<crate::analyzer::typestate::ProductionTypestateSummaryRepository>>,
     /// When constructed via `new_deferred`, the initial workspace build (file
     /// discovery + parse) runs on a background thread and lands here.
     /// `ensure_ready` joins it and installs the resulting session into `session`
@@ -236,9 +286,11 @@ pub(crate) struct PreparedQueryCode {
     arguments: Value,
     workspace_generation: u64,
     query_protocols: crate::analyzer::structural::ProtocolRegistrationSet,
+    typestate_summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
 }
 
 impl PreparedQueryCode {
+    #[cfg(test)]
     pub(crate) const fn workspace_generation(&self) -> u64 {
         self.workspace_generation
     }
@@ -247,12 +299,14 @@ impl PreparedQueryCode {
 pub(crate) struct PreparedRunPolicy {
     snapshot: WorkspaceQueryScope,
     root: PathBuf,
-    policy_files: Vec<PathBuf>,
+    policy_inputs: Vec<PolicyEvaluationInput>,
     options: PolicyEvaluationOptions,
+    #[cfg(test)]
     workspace_generation: u64,
 }
 
 impl PreparedRunPolicy {
+    #[cfg(test)]
     pub(crate) const fn workspace_generation(&self) -> u64 {
         self.workspace_generation
     }
@@ -488,6 +542,9 @@ impl SearchToolsService {
             session: RwLock::new(Some(session)),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            typestate_summaries: RwLock::new(Arc::new(
+                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::Manual,
@@ -545,6 +602,9 @@ impl SearchToolsService {
             session: RwLock::new(Some(session)),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            typestate_summaries: RwLock::new(Arc::new(
+                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::Manual,
@@ -706,6 +766,14 @@ impl SearchToolsService {
             let prepared = self.prepare_query_code(arguments)?;
             return self.execute_prepared_query_code(prepared, cancellation);
         }
+        if name == "list_policies" {
+            let catalog = built_in_policy_catalog().map_err(|error| {
+                SearchToolsServiceError::internal(format!(
+                    "failed to load built-in policy catalog: {error}"
+                ))
+            })?;
+            return Self::structured_only(catalog.manifest());
+        }
         if name == "run_policy" {
             let prepared = self.prepare_run_policy(arguments)?;
             return self.execute_prepared_run_policy(prepared, cancellation);
@@ -713,13 +781,29 @@ impl SearchToolsService {
 
         let arguments = self.normalize_arguments_for_current_workspace(name, arguments)?;
         if name == "get_symbol_sources" {
-            return self
-                .handle_get_symbol_sources(strip_legacy_kind_filter(arguments), render_options);
+            return self.handle_get_symbol_sources(
+                strip_legacy_kind_filter(arguments),
+                render_options,
+                cancellation,
+            );
         }
         let snapshot = {
             let _scope = profiling::scope("SearchToolsService::snapshot_for_query");
             self.snapshot_for_query()?
         };
+        if cancellation.is_some_and(CancellationToken::is_cancelled)
+            && !matches!(
+                name,
+                "search_symbols"
+                    | "most_relevant_files"
+                    | "scan_usages_by_reference"
+                    | "scan_usages_by_location"
+            )
+        {
+            return Err(SearchToolsServiceError::internal(
+                "analyzer request was cancelled or exceeded its request-wide time budget",
+            ));
+        }
         let result = (|| match name {
             "search_symbols" => Self::decode_render_and_run(
                 &snapshot,
@@ -733,7 +817,13 @@ impl SearchToolsService {
                 &snapshot,
                 strip_legacy_kind_filter(arguments),
                 render_options,
-                |workspace, params| get_symbol_locations(workspace.analyzer(), params),
+                |workspace, params| {
+                    get_symbol_locations_with_cancellation(
+                        workspace.analyzer(),
+                        params,
+                        cancellation,
+                    )
+                },
             ),
             "get_symbol_ancestors" => Self::decode_render_and_run(
                 &snapshot,
@@ -745,7 +835,9 @@ impl SearchToolsService {
                 &snapshot,
                 arguments,
                 render_options,
-                |workspace, params| get_summaries(workspace.analyzer(), params),
+                |workspace, params| {
+                    get_summaries_with_cancellation(workspace.analyzer(), params, cancellation)
+                },
             ),
             "list_symbols" => Self::decode_render_and_run(
                 &snapshot,
@@ -763,16 +855,38 @@ impl SearchToolsService {
                 arguments,
                 render_options,
                 |workspace, params: MostRelevantFilesParams| {
-                    most_relevant_files(workspace.analyzer(), params)
+                    let uncancelled = CancellationToken::default();
+                    most_relevant_files_with_cancellation(
+                        workspace.analyzer(),
+                        params,
+                        cancellation.unwrap_or(&uncancelled),
+                    )
                 },
-            ),
+            )
+            .map_err(|error| {
+                if cancellation.is_some_and(CancellationToken::is_cancelled)
+                    && error.code == SearchToolsServiceErrorCode::InvalidParams
+                {
+                    SearchToolsServiceError::internal(error.message)
+                } else {
+                    error
+                }
+            }),
             "scan_usages_by_reference" => {
                 Self::validate_scan_usages_by_reference_arguments(&arguments)?;
                 Self::decode_render_and_run(
                     &snapshot,
                     arguments,
                     render_options,
-                    |workspace, params| scan_usages_by_reference(workspace.analyzer(), params),
+                    |workspace, params| {
+                        let _scan_scope =
+                            crate::profiling::scope("searchtools.scan_usages_backend");
+                        scan_usages_by_reference_with_cancellation(
+                            workspace.analyzer(),
+                            params,
+                            cancellation.cloned().unwrap_or_default(),
+                        )
+                    },
                 )
             }
             "scan_usages_by_location" => {
@@ -781,17 +895,33 @@ impl SearchToolsService {
                     &snapshot,
                     arguments,
                     render_options,
-                    |workspace, params| scan_usages_by_location(workspace.analyzer(), params),
+                    |workspace, params| {
+                        let _scan_scope =
+                            crate::profiling::scope("searchtools.scan_usages_backend");
+                        scan_usages_by_location_with_cancellation(
+                            workspace.analyzer(),
+                            params,
+                            cancellation.cloned().unwrap_or_default(),
+                        )
+                    },
                 )
             }
             "get_definitions_by_location" => {
                 Self::decode_and_run(&snapshot, arguments, |workspace, params| {
-                    get_definitions_by_location(workspace.analyzer(), params)
+                    get_definitions_by_location_with_cancellation(
+                        workspace.analyzer(),
+                        params,
+                        cancellation,
+                    )
                 })
             }
             "get_declarations_by_location" => {
                 Self::decode_and_run(&snapshot, arguments, |workspace, params| {
-                    get_declarations_by_location(workspace.analyzer(), params)
+                    get_declarations_by_location_with_cancellation(
+                        workspace.analyzer(),
+                        params,
+                        cancellation,
+                    )
                 })
             }
             "get_definitions_by_reference" => {
@@ -902,6 +1032,20 @@ impl SearchToolsService {
                 "Unknown tool: {name}"
             ))),
         })();
+        let result = if cancellation.is_some_and(CancellationToken::is_cancelled)
+            && !matches!(
+                name,
+                "search_symbols"
+                    | "most_relevant_files"
+                    | "scan_usages_by_reference"
+                    | "scan_usages_by_location"
+            ) {
+            Err(SearchToolsServiceError::internal(format!(
+                "{name} was cancelled or exceeded its request-wide time budget"
+            )))
+        } else {
+            result
+        };
         snapshot.finish(name, result)
     }
 
@@ -914,13 +1058,15 @@ impl SearchToolsService {
             arguments,
             workspace_generation,
             query_protocols,
+            typestate_summary_lease,
         } = self.prepare_query_code(arguments)?;
-        let result = Self::query_code_result_for_snapshot(
+        let result = self.query_code_result_for_snapshot(
             &snapshot,
             arguments,
             None,
             workspace_generation,
             &query_protocols,
+            typestate_summary_lease,
         );
         snapshot.finish("query_code", result)
     }
@@ -930,12 +1076,24 @@ impl SearchToolsService {
         arguments: Value,
     ) -> Result<PreparedQueryCode, SearchToolsServiceError> {
         loop {
-            let generation = self.workspace_generation();
+            let (generation, typestate_summaries) = {
+                let typestate_summaries = self
+                    .typestate_summaries
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (
+                    self.workspace_generation(),
+                    Arc::clone(&typestate_summaries),
+                )
+            };
             let snapshot = self.snapshot_for_query()?;
             let query_protocols = self.query_protocol_snapshot()?;
             if generation != self.workspace_generation() {
                 continue;
             }
+            let typestate_summary_lease = typestate_summaries
+                .lease(generation)
+                .map_err(|error| SearchToolsServiceError::internal(error.to_string()))?;
             let root = snapshot.analyzer().project().root();
             let arguments =
                 crate::tool_arguments::normalize_tool_arguments("query_code", arguments, root)
@@ -945,6 +1103,7 @@ impl SearchToolsService {
                 arguments,
                 workspace_generation: generation,
                 query_protocols,
+                typestate_summary_lease,
             });
         }
     }
@@ -959,14 +1118,16 @@ impl SearchToolsService {
             arguments,
             workspace_generation,
             query_protocols,
+            typestate_summary_lease,
         } = prepared;
         let result = (|| {
-            let output = Self::query_code_result_for_snapshot(
+            let output = self.query_code_result_for_snapshot(
                 &snapshot,
                 arguments,
                 cancellation,
                 workspace_generation,
                 &query_protocols,
+                typestate_summary_lease,
             )?;
             let rendered_text = output.render_text();
             let structured = serde_json::to_value(&output).map_err(|err| {
@@ -981,33 +1142,23 @@ impl SearchToolsService {
     }
 
     fn query_code_result_for_snapshot(
+        &self,
         snapshot: &WorkspaceQueryScope,
         arguments: Value,
         cancellation: Option<&CancellationToken>,
         workspace_generation: u64,
         query_protocols: &crate::analyzer::structural::ProtocolRegistrationSet,
+        typestate_summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
     ) -> Result<crate::analyzer::structural::CodeQueryResponse, SearchToolsServiceError> {
         let query = Self::decode_query_code_input(snapshot, arguments)?;
-        Ok(cancellation.map_or_else(
-            || {
-                crate::analyzer::structural::execute_workspace_request_with_registrations(
-                    snapshot,
-                    workspace_generation,
-                    query_protocols,
-                    &query,
-                )
-            },
-            |cancellation| {
-                crate::analyzer::structural::execute_workspace_request_with_registration_cancellation(
-                    snapshot,
-                    workspace_generation,
-                    query_protocols,
-                    &query,
-                    crate::analyzer::structural::CodeQueryExecutionLimits::default(),
-                    cancellation,
-                )
-            },
-        ))
+        Ok(CodeIntelligenceRuntime::new(snapshot, cancellation)
+            .execute_query_with_registration_lease(
+                workspace_generation,
+                query_protocols,
+                &query,
+                crate::analyzer::structural::CodeQueryExecutionLimits::default(),
+                typestate_summary_lease,
+            ))
     }
 
     fn decode_query_code_input(
@@ -1128,11 +1279,18 @@ impl SearchToolsService {
     }
 
     fn advance_workspace_generation(&self) {
+        let mut summaries = self
+            .typestate_summaries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.query_protocols
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
-        self.workspace_generation.fetch_add(1, Ordering::AcqRel);
+        let previous = self.workspace_generation.fetch_add(1, Ordering::AcqRel);
+        let generation = previous.wrapping_add(1);
+        let successor = summaries.successor_generation(generation);
+        *summaries = Arc::new(successor);
     }
 
     // Note: `--root` and `new_for_python` take the path as-given (canonicalized
@@ -1177,6 +1335,9 @@ impl SearchToolsService {
             session: RwLock::new(Some(session)),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            typestate_summaries: RwLock::new(Arc::new(
+                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy,
@@ -1219,6 +1380,9 @@ impl SearchToolsService {
             session: RwLock::new(Some(session)),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            typestate_summaries: RwLock::new(Arc::new(
+                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy,
@@ -1260,6 +1424,9 @@ impl SearchToolsService {
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            typestate_summaries: RwLock::new(Arc::new(
+                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy,
@@ -1317,6 +1484,9 @@ impl SearchToolsService {
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(0),
             query_protocols: RwLock::new(Default::default()),
+            typestate_summaries: RwLock::new(Arc::new(
+                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy,
@@ -1471,6 +1641,9 @@ impl SearchToolsService {
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            typestate_summaries: RwLock::new(Arc::new(
+                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+            )),
             pending_build: Mutex::new(Some(handle)),
             build_error: Mutex::new(None),
             update_strategy,
@@ -1788,12 +1961,23 @@ impl SearchToolsService {
         &self,
         arguments: Value,
         render_options: RenderOptions,
+        cancellation: Option<&CancellationToken>,
     ) -> Result<ToolOutput, SearchToolsServiceError> {
         let params = serde_json::from_value::<SymbolLookupParams>(arguments).map_err(|err| {
             SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
         })?;
         let initial_snapshot = self.snapshot_for_query()?;
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(SearchToolsServiceError::internal(
+                "get_symbol_sources was cancelled or exceeded its request-wide time budget",
+            ));
+        }
         let mut result = get_symbol_sources(initial_snapshot.analyzer(), params.clone());
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(SearchToolsServiceError::internal(
+                "get_symbol_sources was cancelled or exceeded its request-wide time budget",
+            ));
+        }
         if self.update_strategy == UpdateStrategy::WatchFiles {
             let candidate_files =
                 symbol_source_candidate_files(initial_snapshot.analyzer(), &result);
@@ -1808,6 +1992,11 @@ impl SearchToolsService {
                 Arc::clone(&session.snapshot)
             };
             let stale_files = stale_symbol_source_files(peek_snapshot.analyzer(), candidate_files)?;
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(SearchToolsServiceError::internal(
+                    "get_symbol_sources was cancelled or exceeded its request-wide time budget",
+                ));
+            }
 
             let final_snapshot = if stale_files.is_empty() {
                 Arc::clone(initial_snapshot.arc())
@@ -1841,6 +2030,16 @@ impl SearchToolsService {
         result: SymbolSourcesResult,
         render_options: RenderOptions,
     ) -> Result<ToolOutput, SearchToolsServiceError> {
+        let source_bytes = result
+            .sources
+            .iter()
+            .map(|source| source.text.len())
+            .sum::<usize>();
+        if source_bytes > GET_SYMBOL_SOURCES_RESPONSE_BUDGET_BYTES {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "get_symbol_sources resolved {source_bytes} bytes of source, exceeding the {GET_SYMBOL_SOURCES_RESPONSE_BUDGET_BYTES}-byte response budget; re-call with fewer or narrower symbols"
+            )));
+        }
         let rendered_text = result.render_text(render_options);
         let structured = serde_json::to_value(result).map_err(|err| {
             SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
@@ -2068,6 +2267,14 @@ impl SearchToolsService {
                 "{tool_name} requires `paths` to be an array of strings"
             )));
         }
+        if arguments
+            .get("max_duration_secs")
+            .is_some_and(|value| !value.is_u64())
+        {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "{tool_name} requires `max_duration_secs` to be a non-negative integer"
+            )));
+        }
         Ok(())
     }
 
@@ -2189,14 +2396,50 @@ impl SearchToolsService {
             ))
         })?;
         let max_policy_files = crate::analyzer::policy::PolicyBatchBudget::default().max_policies();
-        if params.policy_files.is_empty() || params.policy_files.len() > max_policy_files {
+        if params.policy_files.len() > max_policy_files {
             return Err(SearchToolsServiceError::invalid_params(format!(
-                "run_policy requires between 1 and {max_policy_files} policy_files"
+                "run_policy accepts at most {max_policy_files} policy_files entries"
             )));
+        }
+        for (label, values) in [
+            ("policy_packs", &params.policy_packs),
+            ("policy_categories", &params.policy_categories),
+            ("policy_ids", &params.policy_ids),
+        ] {
+            if values.len() > max_policy_files {
+                return Err(SearchToolsServiceError::invalid_params(format!(
+                    "run_policy accepts at most {max_policy_files} {label} entries"
+                )));
+            }
+            let mut unique = BTreeSet::new();
+            for value in values {
+                if value.is_empty()
+                    || value.len() > crate::mcp_extended::MAX_RUN_POLICY_SELECTOR_BYTES
+                {
+                    return Err(SearchToolsServiceError::invalid_params(format!(
+                        "run_policy {label} entries must contain between 1 and {} bytes",
+                        crate::mcp_extended::MAX_RUN_POLICY_SELECTOR_BYTES
+                    )));
+                }
+                if !unique.insert(value.as_str()) {
+                    return Err(SearchToolsServiceError::invalid_params(format!(
+                        "run_policy {label} entry `{value}` is duplicated"
+                    )));
+                }
+            }
+        }
+        if params.policy_files.is_empty()
+            && params.policy_packs.is_empty()
+            && params.policy_categories.is_empty()
+            && params.policy_ids.is_empty()
+        {
+            return Err(SearchToolsServiceError::invalid_params(
+                "run_policy requires at least one policy file or built-in selector".to_string(),
+            ));
         }
 
         let mut unique_paths = BTreeSet::new();
-        let mut policy_files = Vec::with_capacity(params.policy_files.len());
+        let mut policy_inputs = Vec::with_capacity(params.policy_files.len());
         for raw_path in params.policy_files {
             if raw_path.len() > crate::mcp_extended::MAX_RUN_POLICY_PATH_BYTES {
                 return Err(SearchToolsServiceError::invalid_params(format!(
@@ -2225,7 +2468,35 @@ impl SearchToolsService {
                     path.as_str()
                 )));
             }
-            policy_files.push(PathBuf::from(path.as_str()));
+            policy_inputs.push(PolicyEvaluationInput::workspace_file(path.as_str()));
+        }
+
+        let selection = BuiltInPolicySelection {
+            packs: params.policy_packs,
+            categories: params.policy_categories,
+            policy_ids: params.policy_ids,
+        };
+        let selected = built_in_policy_catalog()
+            .map_err(|error| {
+                SearchToolsServiceError::internal(format!(
+                    "failed to load built-in policy catalog: {error}"
+                ))
+            })?
+            .select(&selection)
+            .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
+        let mut built_in_inputs = selected
+            .into_iter()
+            .map(|policy| {
+                PolicyEvaluationInput::embedded(policy.source_identity(), policy.source())
+            })
+            .collect::<Vec<_>>();
+        built_in_inputs.append(&mut policy_inputs);
+        let policy_inputs = built_in_inputs;
+        if policy_inputs.len() > max_policy_files {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "run_policy resolves to {} policies but accepts at most {max_policy_files}",
+                policy_inputs.len()
+            )));
         }
 
         let suppressions = params
@@ -2256,8 +2527,9 @@ impl SearchToolsService {
             return Ok(PreparedRunPolicy {
                 snapshot,
                 root,
-                policy_files,
+                policy_inputs,
                 options,
+                #[cfg(test)]
                 workspace_generation,
             });
         }
@@ -2271,21 +2543,18 @@ impl SearchToolsService {
         let PreparedRunPolicy {
             snapshot,
             root,
-            policy_files,
+            policy_inputs,
             options,
-            workspace_generation: _,
+            ..
         } = prepared;
         let result = (|| {
-            let outcome = evaluate_policy_files_with_analyzer(
-                &root,
-                &policy_files,
-                &snapshot,
-                &options,
-                cancellation,
-            )
-            .map_err(|error| {
-                SearchToolsServiceError::internal(format!("run_policy evaluation failed: {error}"))
-            })?;
+            let outcome = CodeIntelligenceRuntime::new(&snapshot, cancellation)
+                .evaluate_policy_inputs(&root, &policy_inputs, &options)
+                .map_err(|error| {
+                    SearchToolsServiceError::internal(format!(
+                        "run_policy evaluation failed: {error}"
+                    ))
+                })?;
             let exit_status = outcome.exit_status();
             let status = match exit_status {
                 POLICY_EXIT_CLEAN => "clean",
@@ -2979,6 +3248,9 @@ public partial class MudDialogContainer
             })),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            typestate_summaries: RwLock::new(Arc::new(
+                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::WatchFiles,
@@ -3215,6 +3487,9 @@ mod client_roots_tests {
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(0),
             query_protocols: RwLock::new(Default::default()),
+            typestate_summaries: RwLock::new(Arc::new(
+                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::Manual,
@@ -3280,6 +3555,151 @@ mod search_symbols_cancellation_tests {
                 .is_some_and(|note| note.contains("cancelled") && note.contains("partial")),
             "{result:#}"
         );
+    }
+
+    #[test]
+    fn issue_1304_service_forwards_cancellation_to_most_relevant_files() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "pub fn target() {}\n").unwrap();
+        let service =
+            SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
+                .unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = service
+            .call_tool_output_with_cancellation(
+                "most_relevant_files",
+                json!({
+                    "seed_file_paths": ["lib.rs"],
+                    "ranking_mode": "usage_graph",
+                    "limit": 10
+                }),
+                RenderOptions::default(),
+                Some(&cancellation),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, SearchToolsServiceErrorCode::Internal);
+        assert!(error.message.contains("most_relevant_files was cancelled"));
+    }
+
+    #[test]
+    fn issue_1304_cancelled_graph_returns_explicit_history_import_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("A.java"),
+            "import local.B; public class A { B value; }\n",
+        )
+        .unwrap();
+        std::fs::create_dir(temp.path().join("local")).unwrap();
+        std::fs::write(
+            temp.path().join("local/B.java"),
+            "package local; public class B {}\n",
+        )
+        .unwrap();
+        let service =
+            SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
+                .unwrap();
+        let cancellation = CancellationToken::cancel_after_checks_for_test(4);
+
+        let output = service
+            .call_tool_output_with_cancellation(
+                "most_relevant_files",
+                json!({
+                    "seed_file_paths": ["A.java"],
+                    "ranking_mode": "usage_graph",
+                    "limit": 10
+                }),
+                RenderOptions::default(),
+                Some(&cancellation),
+            )
+            .unwrap();
+        let (result, rendered) = match output {
+            ToolOutput::Structured {
+                structured,
+                rendered_text,
+            } => (structured, rendered_text.unwrap_or_default()),
+            ToolOutput::Text(text) => panic!("expected structured fallback, got {text}"),
+        };
+
+        assert_eq!(result["complete"], false, "{result:#}");
+        assert_eq!(result["ranking_mode_used"], "history_imports", "{result:#}");
+        assert_eq!(result["incomplete_reason"], "cancelled", "{result:#}");
+        assert!(
+            rendered.contains("returned deterministic history/import ranking instead"),
+            "{rendered}"
+        );
+    }
+
+    fn assert_cancelled_scan_result(
+        result: &Value,
+        expected_input_kind: &str,
+        expected_count: usize,
+    ) {
+        assert_eq!(result["summary"]["partial"], true, "{result:#}");
+        assert_eq!(result["summary"]["verified_absent"], 0, "{result:#}");
+        assert_eq!(result["summary"]["failure"], expected_count, "{result:#}");
+        let entries = result["results"].as_array().expect("scan results array");
+        assert_eq!(entries.len(), expected_count, "{result:#}");
+        for entry in entries {
+            assert_eq!(entry["input_kind"], expected_input_kind);
+            assert_eq!(entry["complete"], false, "{result:#}");
+            assert_eq!(entry["incomplete_reason"], "cancelled", "{result:#}");
+            assert_eq!(entry["reason_kind"], "cancelled", "{result:#}");
+        }
+    }
+
+    #[test]
+    fn issue_1228_service_forwards_cancellation_to_scan_usages_by_reference() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "pub fn target() {}\n").unwrap();
+        let service =
+            SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
+                .unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let result = service
+            .call_tool_output_with_cancellation(
+                "scan_usages_by_reference",
+                json!({
+                    "symbols": ["target", "other"],
+                    "include_tests": true
+                }),
+                RenderOptions::default(),
+                Some(&cancellation),
+            )
+            .unwrap()
+            .into_value();
+
+        assert_cancelled_scan_result(&result, "symbol", 2);
+    }
+
+    #[test]
+    fn issue_1228_service_forwards_cancellation_to_scan_usages_by_location() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "pub fn target() {}\n").unwrap();
+        let service =
+            SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
+                .unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let result = service
+            .call_tool_output_with_cancellation(
+                "scan_usages_by_location",
+                json!({
+                    "targets": [{"path": "lib.rs", "line": 1}],
+                    "include_tests": true
+                }),
+                RenderOptions::default(),
+                Some(&cancellation),
+            )
+            .unwrap()
+            .into_value();
+
+        assert_cancelled_scan_result(&result, "target", 1);
     }
 
     #[test]
@@ -3422,8 +3842,17 @@ mod query_protocol_tests {
     fn workspace_generation_advance_clears_live_registrations_but_not_prepared_snapshots() {
         let (_temp, service, protocol_ref) = protocol_service();
         let prepared = service.prepare_query_code(query(&protocol_ref)).unwrap();
+        let prepared_summaries = prepared.typestate_summary_lease.clone();
 
         service.advance_workspace_generation();
+        let current_summaries = Arc::clone(
+            &service
+                .typestate_summaries
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        assert_eq!(prepared_summaries.generation(), 1);
+        assert_eq!(current_summaries.generation(), Some(2));
 
         let live = service.query_protocol_snapshot().unwrap();
         assert_eq!(live.reference_count(), 0);
@@ -3438,12 +3867,77 @@ mod query_protocol_tests {
             prepared_value.get("diagnostics").is_none(),
             "prepared requests own their generation-consistent registration snapshot"
         );
+        assert_eq!(prepared_summaries.generation(), 1);
+        assert_eq!(current_summaries.generation(), Some(2));
 
         let current = service.query_code_result(query(&protocol_ref)).unwrap();
         assert_eq!(
             current.result().unwrap().diagnostics[0].code,
             CodeQueryDiagnosticCode::UnresolvedProtocolReference
         );
+    }
+
+    #[test]
+    fn repeated_queries_hit_generation_scoped_typestate_results_and_rotation_evicts_them() {
+        let (temp, service, protocol_ref) = protocol_service();
+        let mut request = query(&protocol_ref);
+        request["execution_mode"] = json!("profile");
+
+        let first = service.query_code_result(request.clone()).unwrap();
+        let second = service.query_code_result(request).unwrap();
+        let first = serde_json::to_value(first).unwrap();
+        let second = serde_json::to_value(second).unwrap();
+        assert_eq!(first.pointer("/results"), second.pointer("/results"),);
+        assert_eq!(
+            first.pointer("/diagnostics"),
+            second.pointer("/diagnostics"),
+        );
+        assert_eq!(
+            first.pointer("/work/semantic/typestate/summary_misses"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            first.pointer("/work/semantic/typestate/summary_recomputations"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            second.pointer("/work/semantic/typestate/summary_hits"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            second.pointer("/work/semantic/typestate/summary_recomputations"),
+            Some(&json!(0))
+        );
+
+        std::fs::write(
+            temp.path().join("lifecycle.rql"),
+            format!(
+                "(profile (typestate :protocol-ref \"{protocol_ref}\" (procedure-of (function :name \"lifecycle\"))))"
+            ),
+        )
+        .unwrap();
+        let rql = serde_json::to_value(
+            service
+                .query_code_result(json!({"query_file": "lifecycle.rql"}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rql.pointer("/results"), first.pointer("/results"));
+        assert_eq!(rql.pointer("/diagnostics"), first.pointer("/diagnostics"));
+        assert_eq!(
+            rql.pointer("/work/semantic/typestate/summary_hits"),
+            Some(&json!(1))
+        );
+
+        service.advance_workspace_generation();
+        let summaries = Arc::clone(
+            &service
+                .typestate_summaries
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let counters = summaries.counters();
+        assert!(counters.evictions > 0);
     }
 }
 
@@ -3481,6 +3975,9 @@ mod tests {
             })),
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
+            typestate_summaries: RwLock::new(Arc::new(
+                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
+            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::WatchFiles,

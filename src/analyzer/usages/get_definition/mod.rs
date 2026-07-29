@@ -420,13 +420,15 @@ pub(crate) fn resolve_definition_batch(
         profiling::note(format!("request_count={}", requests.len()));
     }
     let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
-    resolve_definition_requests(analyzer, &mut context, requests, None, None)
+    resolve_definition_requests(analyzer, &mut context, requests, None, None, true)
 }
 
 pub(crate) fn resolve_navigation_batch(
     analyzer: &dyn IAnalyzer,
     requests: Vec<DefinitionLookupRequest>,
     operation: NavigationOperation,
+    cancellation: Option<&CancellationToken>,
+    allow_rust_field_receiver_lexical: bool,
 ) -> Vec<NavigationLookupOutcome> {
     let _scope = profiling::scope("get_definition::resolve_navigation_batch");
     if profiling::enabled() {
@@ -436,7 +438,14 @@ pub(crate) fn resolve_navigation_batch(
         ));
     }
     let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
-    resolve_navigation_requests(analyzer, &mut context, requests, operation)
+    resolve_navigation_requests(
+        analyzer,
+        &mut context,
+        requests,
+        operation,
+        cancellation,
+        allow_rust_field_receiver_lexical,
+    )
 }
 
 fn resolve_navigation_requests<'a>(
@@ -444,6 +453,8 @@ fn resolve_navigation_requests<'a>(
     context: &mut DefinitionBatchContext<'a>,
     requests: Vec<DefinitionLookupRequest>,
     operation: NavigationOperation,
+    cancellation: Option<&CancellationToken>,
+    allow_rust_field_receiver_lexical: bool,
 ) -> Vec<NavigationLookupOutcome> {
     const MAX_NAVIGATION_TARGETS_PER_RESULT: usize = 256;
     const MAX_NAVIGATION_TARGETS_PER_BATCH: usize = 1024;
@@ -453,7 +464,14 @@ fn resolve_navigation_requests<'a>(
         .iter()
         .map(|request| language_for_file(&request.file))
         .collect();
-    let outcomes = resolve_definition_requests(analyzer, context, requests, None, Some(operation));
+    let outcomes = resolve_definition_requests(
+        analyzer,
+        context,
+        requests,
+        cancellation,
+        Some(operation),
+        allow_rust_field_receiver_lexical,
+    );
     languages
         .into_iter()
         .zip(outcomes)
@@ -469,6 +487,7 @@ fn resolve_definition_requests<'a>(
     requests: Vec<DefinitionLookupRequest>,
     cancellation: Option<&CancellationToken>,
     operation: Option<NavigationOperation>,
+    allow_rust_field_receiver_lexical: bool,
 ) -> Vec<DefinitionLookupOutcome> {
     let _query_scope = AnalyzerQueryScope::new(analyzer);
     let mut remaining_python_requests: HashMap<ProjectFile, usize> = HashMap::default();
@@ -486,7 +505,14 @@ fn resolve_definition_requests<'a>(
         .map(|request| {
             let is_python = language_for_file(&request.file) == Language::Python;
             let file = request.file.clone();
-            let outcome = resolve_one(analyzer, context, request, operation);
+            let outcome = resolve_one(
+                analyzer,
+                context,
+                request,
+                operation,
+                cancellation,
+                allow_rust_field_receiver_lexical,
+            );
             if is_python && let Some(remaining) = remaining_python_requests.get_mut(&file) {
                 *remaining -= 1;
                 if *remaining == 0 {
@@ -506,7 +532,7 @@ pub(crate) fn resolve_definition_batch_with_source(
 ) -> Vec<DefinitionLookupOutcome> {
     let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
     context.sources.insert(file, Ok(source));
-    resolve_definition_requests(analyzer, &mut context, requests, None, None)
+    resolve_definition_requests(analyzer, &mut context, requests, None, None, true)
 }
 
 pub(crate) fn resolve_navigation_batch_with_source(
@@ -518,7 +544,7 @@ pub(crate) fn resolve_navigation_batch_with_source(
 ) -> Vec<NavigationLookupOutcome> {
     let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
     context.sources.insert(file, Ok(source));
-    resolve_navigation_requests(analyzer, &mut context, requests, operation)
+    resolve_navigation_requests(analyzer, &mut context, requests, operation, None, true)
 }
 
 pub(crate) fn navigation_declaration_site_targets(
@@ -555,7 +581,14 @@ pub(crate) fn resolve_definition_batch_with_source_and_cancellation(
 ) -> Vec<DefinitionLookupOutcome> {
     let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
     context.sources.insert(file, Ok(source));
-    resolve_definition_requests(analyzer, &mut context, requests, Some(cancellation), None)
+    resolve_definition_requests(
+        analyzer,
+        &mut context,
+        requests,
+        Some(cancellation),
+        None,
+        true,
+    )
 }
 
 pub(crate) fn resolve_call_reference_definition_with_source(
@@ -582,7 +615,14 @@ pub(crate) fn resolve_call_reference_definition_with_source(
         return None;
     }
 
-    Some(resolve_one(analyzer, &mut context, request, None))
+    Some(resolve_one(
+        analyzer,
+        &mut context,
+        request,
+        None,
+        None,
+        true,
+    ))
 }
 
 #[derive(Clone)]
@@ -889,6 +929,8 @@ fn resolve_one<'a>(
     context: &mut DefinitionBatchContext<'a>,
     request: DefinitionLookupRequest,
     operation: Option<NavigationOperation>,
+    cancellation: Option<&CancellationToken>,
+    allow_rust_field_receiver_lexical: bool,
 ) -> DefinitionLookupOutcome {
     let _scope = profiling::scope("get_definition::resolve_one");
     let language = language_for_file(&request.file);
@@ -947,6 +989,9 @@ fn resolve_one<'a>(
         context.tree(&request.file, language, &source)
     };
     if let Some(tree) = tree.as_ref()
+        && !(!allow_rust_field_receiver_lexical
+            && language == Language::Rust
+            && rust::focused_site_is_field_receiver(tree.root_node(), &site))
         && let Some(identifier) = source.get(site.focus_start_byte..site.focus_end_byte)
     {
         match resolve_lexical_binding(
@@ -975,23 +1020,49 @@ fn resolve_one<'a>(
     let _dispatch_scope = profiling::scope("get_definition::language_dispatch");
     let resolved = match language {
         Language::Rust => {
-            let (rust_support, rust_type_cache) =
-                (&context.rust_support, &mut context.rust_type_cache);
-            rust_support.as_ref().map_or_else(
-                || no_definition("rust_analyzer_unavailable", "Rust analyzer is unavailable"),
-                |support| {
-                    rust::resolve_rust(
-                        analyzer,
-                        support,
-                        &request.file,
-                        &source,
-                        tree.as_ref(),
-                        &site,
-                        rust_type_cache,
-                        operation,
-                    )
-                },
-            )
+            if let Some(cancellation) = cancellation {
+                match rust::resolve_rust_cancellable(
+                    analyzer,
+                    &request.file,
+                    &source,
+                    tree.as_ref(),
+                    &site,
+                    &mut context.rust_type_cache,
+                    operation,
+                    ReceiverAnalysisBudget::default(),
+                    cancellation,
+                ) {
+                    resolution_session::BoundedResolution::Complete { value, .. } => value,
+                    resolution_session::BoundedResolution::Exceeded { limit, .. } => no_definition(
+                        "resolution_budget_exceeded",
+                        format!(
+                            "Rust definition resolution exceeded its {} budget",
+                            limit.as_str()
+                        ),
+                    ),
+                    resolution_session::BoundedResolution::Cancelled { .. } => {
+                        no_definition("cancelled", "Rust definition resolution was cancelled")
+                    }
+                }
+            } else {
+                let (rust_support, rust_type_cache) =
+                    (&context.rust_support, &mut context.rust_type_cache);
+                rust_support.as_ref().map_or_else(
+                    || no_definition("rust_analyzer_unavailable", "Rust analyzer is unavailable"),
+                    |support| {
+                        rust::resolve_rust(
+                            analyzer,
+                            support,
+                            &request.file,
+                            &source,
+                            tree.as_ref(),
+                            &site,
+                            rust_type_cache,
+                            operation,
+                        )
+                    },
+                )
+            }
         }
         Language::JavaScript | Language::TypeScript => js_ts::resolve_js_ts(
             analyzer,
@@ -1097,6 +1168,11 @@ fn resolve_one<'a>(
             tree.as_ref(),
             &site,
         ),
+        // Kotlin definition navigation is issue #1238.
+        Language::Kotlin => no_definition(
+            "kotlin_navigation_unsupported",
+            "Kotlin definition navigation is not supported yet",
+        ),
         Language::None => {
             unreachable!("unsupported language handled before source extraction")
         }
@@ -1175,6 +1251,13 @@ pub(crate) fn parse_tree_for_language(
         Language::Rust => rust::parse_rust_tree(source),
         Language::Go => go::parse_go_tree(source),
         Language::Ruby => crate::analyzer::ruby::parse_ruby_tree(source),
+        Language::Kotlin => {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&crate::analyzer::kotlin::language::LANGUAGE.into())
+                .ok()?;
+            parser.parse(source.as_bytes(), None)
+        }
         Language::None => None,
     }
 }
@@ -1581,7 +1664,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None, None);
+        let outcomes =
+            resolve_definition_requests(analyzer, &mut context, requests, None, None, false);
 
         assert!(outcomes.iter().all(|outcome| {
             outcome.status == DefinitionLookupStatus::Resolved
@@ -1617,7 +1701,8 @@ mod tests {
             })
             .collect();
 
-        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None, None);
+        let outcomes =
+            resolve_definition_requests(analyzer, &mut context, requests, None, None, false);
 
         assert!(outcomes.iter().all(|outcome| {
             outcome.status == DefinitionLookupStatus::Resolved
@@ -1741,6 +1826,7 @@ mod tests {
             }],
             None,
             None,
+            false,
         );
 
         assert_eq!(outcomes[0].status, DefinitionLookupStatus::Resolved);
@@ -1795,7 +1881,8 @@ mod tests {
             })
             .collect();
 
-        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None, None);
+        let outcomes =
+            resolve_definition_requests(analyzer, &mut context, requests, None, None, false);
 
         assert_eq!(
             outcomes[0].definitions[0].fq_name(),
@@ -1848,7 +1935,8 @@ mod tests {
             })
             .collect();
 
-        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None, None);
+        let outcomes =
+            resolve_definition_requests(analyzer, &mut context, requests, None, None, false);
 
         assert_eq!(
             outcomes[0].definitions[0].fq_name(),
@@ -1908,7 +1996,8 @@ mod tests {
             })
             .collect();
 
-        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None, None);
+        let outcomes =
+            resolve_definition_requests(analyzer, &mut context, requests, None, None, false);
 
         assert_eq!(outcomes[0].definitions[0].fq_name(), "service.Service.run");
         assert_eq!(outcomes[1].definitions[0].fq_name(), "other.Other.stop");
@@ -1949,7 +2038,8 @@ mod tests {
             .collect::<Vec<_>>();
         let mut context = DefinitionBatchContext::new(&analyzer, true);
 
-        let outcomes = resolve_definition_requests(&analyzer, &mut context, requests, None, None);
+        let outcomes =
+            resolve_definition_requests(&analyzer, &mut context, requests, None, None, false);
 
         assert_eq!(outcomes.len(), REFERENCE_COUNT);
         assert!(outcomes.iter().all(|outcome| {

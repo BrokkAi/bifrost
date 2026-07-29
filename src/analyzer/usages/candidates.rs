@@ -52,9 +52,17 @@ fn find_import_graph_candidates(
     let mut all_targets: HashSet<CodeUnit> = set_with_capacity(4);
     all_targets.insert(target.clone());
 
+    // A top-level function's `parent_of` is its enclosing MODULE (a plain FQN-segment pop, not a
+    // type-hierarchy relationship) -- only a class parent means "this function is a method that
+    // could be polymorphically overridden," which is the only case `get_descendants` needs to
+    // answer. Skipping the module case avoids triggering `get_descendants`' full workspace-wide
+    // class-hierarchy index build (`build_direct_descendant_index`, `OnceLock`-cached but tens of
+    // seconds on a large codebase) for a query -- "what are a module's subclasses" -- that would
+    // always return nothing anyway.
     if let Some(provider) = analyzer.type_hierarchy_provider()
         && target.is_function()
         && let Some(parent) = analyzer.parent_of(target)
+        && parent.is_class()
     {
         for descendant in provider.get_descendants(&parent) {
             if is_cancelled(cancellation) {
@@ -193,43 +201,55 @@ fn find_direct_importers_with_cancellation(
     let mut files: Vec<_> = files.into_iter().collect();
     files.sort();
     let import_infos = import_provider.import_infos_for_files(&files);
-    let mut importers = HashSet::default();
-    for candidate in files {
+    // Each candidate's resolution is independent (own cache entries, own store-reader-pool
+    // checkout) and the pool is sized for `num_cpus` concurrent readers -- running this
+    // workspace-wide loop on a single thread leaves that capacity idle. `ImportAnalysisProvider:
+    // Sync` is what makes sharing `import_provider` across the pool sound.
+    let importers: Mutex<HashSet<ProjectFile>> = Mutex::new(HashSet::default());
+    // `try_for_each` (not `for_each`): returning `Err` on cancellation lets rayon stop dispatching
+    // new work across the pool instead of still visiting every remaining file -- with `for_each` a
+    // cancelled scan degrades from an immediate `break` to an O(files) pass that just skips work per
+    // item, so cancel latency would scale with workspace size instead of staying near-instant.
+    let _ = files.par_iter().try_for_each(|candidate| {
         if cancellation.is_cancelled() {
-            break;
+            return Err(());
         }
-        if source_files.contains(&candidate) {
-            continue;
+        if source_files.contains(candidate) {
+            return Ok(());
         }
         let imports = import_infos
             .as_ref()
-            .and_then(|infos| infos.get(&candidate))
+            .and_then(|infos| infos.get(candidate))
             .cloned()
-            .unwrap_or_else(|| import_provider.import_info_of(&candidate));
+            .unwrap_or_else(|| import_provider.import_info_of(candidate));
         let could_import_target = source_files
             .iter()
-            .any(|target| import_provider.could_import_file(&candidate, &imports, target));
+            .any(|target| import_provider.could_import_file(candidate, &imports, target));
         if cancellation.is_cancelled() {
-            break;
+            return Err(());
         }
         if could_import_target {
-            importers.insert(candidate);
-            continue;
+            if let Ok(mut sink) = importers.lock() {
+                sink.insert(candidate.clone());
+            }
+            return Ok(());
         }
         let imported = import_provider
-            .imported_code_units_from_infos(&candidate, &imports)
-            .unwrap_or_else(|| import_provider.imported_code_units_of(&candidate));
+            .imported_code_units_from_infos(candidate, &imports)
+            .unwrap_or_else(|| import_provider.imported_code_units_of(candidate));
         if cancellation.is_cancelled() {
-            break;
+            return Err(());
         }
         if imported
             .iter()
             .any(|unit| source_files.contains(unit.source()))
+            && let Ok(mut sink) = importers.lock()
         {
-            importers.insert(candidate);
+            sink.insert(candidate.clone());
         }
-    }
-    importers
+        Ok(())
+    });
+    importers.into_inner().expect("importers set poisoned")
 }
 
 fn find_transitive_importers_with_cancellation(
@@ -746,6 +766,50 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::Acquire), 1);
         assert!(importers.is_empty());
+    }
+
+    /// The single-file test above can't exercise real concurrency. This runs enough files through
+    /// the now-parallel `par_iter().try_for_each(..)` that many are genuinely in flight at once, and
+    /// checks the same cancellation invariant still holds when multiple worker threads can observe
+    /// (and race on) the same cancellation flag and the same shared `importers` sink.
+    #[test]
+    fn cancellable_importer_scan_stops_early_without_recording_partial_work_under_concurrency() {
+        let root = std::env::temp_dir();
+        let target_file = ProjectFile::new(root.clone(), "Target.java");
+        let file_count = 200;
+        let importers_input: Vec<ProjectFile> = (0..file_count)
+            .map(|i| ProjectFile::new(root.clone(), format!("Importer{i}.java")))
+            .collect();
+        let cancellation = CancellationToken::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = CancellingImportProvider {
+            cancellation: cancellation.clone(),
+            calls: Arc::clone(&calls),
+            imported: CodeUnit::new(target_file.clone(), CodeUnitType::Class, "pkg", "Target"),
+        };
+
+        let importers = find_direct_importers_with_cancellation(
+            importers_input,
+            &provider,
+            &[target_file].into_iter().collect(),
+            &cancellation,
+        );
+
+        assert!(
+            importers.is_empty(),
+            "a cancelled scan must not record partial matches, even with many files racing \
+             concurrently on the same cancellation flag and the same shared sink"
+        );
+        let observed_calls = calls.load(Ordering::Acquire);
+        assert!(
+            observed_calls >= 1,
+            "at least the file that triggered cancellation should have run"
+        );
+        assert!(
+            observed_calls < file_count,
+            "cancellation should stop the scan short of visiting every one of the {file_count} \
+             files, got {observed_calls}"
+        );
     }
 
     #[test]

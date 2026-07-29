@@ -5,6 +5,7 @@ use std::{
     error::Error,
     fmt,
     hash::{Hash, Hasher},
+    mem::{size_of, size_of_val},
     sync::Arc,
 };
 
@@ -132,6 +133,10 @@ impl SummaryReachedFact {
     pub const fn path_qualities(&self) -> PathQualityFrontier {
         self.path_qualities
     }
+
+    fn retained_bytes(&self) -> usize {
+        self.witnesses.retained_bytes()
+    }
 }
 
 /// One query-local entry-to-exit summary used for matched-return replay.
@@ -211,6 +216,10 @@ impl TabulationEndSummary {
     pub const fn path_qualities(&self) -> PathQualityFrontier {
         self.path_qualities
     }
+
+    fn retained_bytes(&self) -> usize {
+        self.witnesses.retained_bytes()
+    }
 }
 
 /// One reachable semantic transfer whose evidence is unproven or incomplete.
@@ -273,6 +282,12 @@ impl SummaryEdge {
 
     pub const fn completeness(&self) -> &EvidenceCompleteness {
         &self.completeness
+    }
+
+    fn retained_heap_bytes(&self) -> usize {
+        self.proof
+            .retained_heap_bytes()
+            .saturating_add(self.completeness.retained_heap_bytes())
     }
 }
 
@@ -376,6 +391,51 @@ impl SummaryBoundary {
     pub fn provenance(&self) -> &[OracleRelationHandle] {
         &self.provenance
     }
+
+    fn retained_heap_bytes(&self) -> usize {
+        self.proof
+            .as_ref()
+            .map_or(0, ProofStatus::retained_heap_bytes)
+            .saturating_add(
+                self.completeness
+                    .as_ref()
+                    .map_or(0, EvidenceCompleteness::retained_heap_bytes),
+            )
+            .saturating_add(size_of_val(self.provenance()))
+            .saturating_add(summary_boundary_kind_heap_bytes(&self.kind))
+    }
+}
+
+fn summary_boundary_kind_heap_bytes(kind: &SummaryBoundaryKind) -> usize {
+    let locator = match kind {
+        SummaryBoundaryKind::Dispatch(DispatchBoundaryKind::External(locator)) => locator.as_ref(),
+        SummaryBoundaryKind::Dispatch(DispatchBoundaryKind::Unmaterialized(locator))
+        | SummaryBoundaryKind::Dispatch(DispatchBoundaryKind::Deferred {
+            target: locator, ..
+        }) => Some(locator),
+        SummaryBoundaryKind::Semantic(_)
+        | SummaryBoundaryKind::Dispatch(
+            DispatchBoundaryKind::Unresolved | DispatchBoundaryKind::Truncated,
+        )
+        | SummaryBoundaryKind::Limit(_)
+        | SummaryBoundaryKind::Continuation { .. } => None,
+    };
+    locator.map_or(0, |locator| {
+        locator
+            .path()
+            .as_str()
+            .len()
+            .saturating_add(size_of_val(locator.declaration().segments()))
+            .saturating_add(
+                locator
+                    .declaration()
+                    .segments()
+                    .iter()
+                    .filter_map(|segment| segment.name())
+                    .map(str::len)
+                    .fold(0_usize, usize::saturating_add),
+            )
+    })
 }
 
 /// Global semantic and reachable-edge coverage observed by a summary solve.
@@ -561,6 +621,46 @@ impl<Fact> SummaryDataflowResult<Fact> {
 
     pub const fn witness_retention_truncated(&self) -> bool {
         self.witness_retention_truncated
+    }
+
+    /// Conservative bytes owned directly by this immutable result snapshot.
+    /// Shared semantic artifacts behind handles and `Arc`s are intentionally excluded.
+    pub fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(size_of_val(self.facts()))
+            .saturating_add(size_of_val(self.reached()))
+            .saturating_add(size_of_val(self.end_summaries()))
+            .saturating_add(size_of_val(self.coverage.unproven_edges()))
+            .saturating_add(size_of_val(self.coverage.partial_edges()))
+            .saturating_add(size_of_val(self.coverage.boundaries()))
+            .saturating_add(
+                self.coverage
+                    .unproven_edges()
+                    .iter()
+                    .chain(self.coverage.partial_edges())
+                    .map(SummaryEdge::retained_heap_bytes)
+                    .fold(0_usize, usize::saturating_add),
+            )
+            .saturating_add(
+                self.coverage
+                    .boundaries()
+                    .iter()
+                    .map(SummaryBoundary::retained_heap_bytes)
+                    .fold(0_usize, usize::saturating_add),
+            )
+            .saturating_add(
+                self.reached
+                    .iter()
+                    .map(SummaryReachedFact::retained_bytes)
+                    .fold(0_usize, usize::saturating_add),
+            )
+            .saturating_add(
+                self.end_summaries
+                    .iter()
+                    .map(TabulationEndSummary::retained_bytes)
+                    .fold(0_usize, usize::saturating_add),
+            )
+            .saturating_add(self.witness_store.retained_bytes())
     }
 
     pub fn is_complete(&self) -> bool {

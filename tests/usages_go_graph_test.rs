@@ -1572,6 +1572,75 @@ func Run(m ExtensionManager, args []string, streams IOStreams) error {
 }
 
 #[test]
+fn go_graph_strategy_finds_promoted_interface_method_calls_through_embedded_interfaces() {
+    let (project, analyzer) = go_analyzer_with_files(&[
+        (
+            "pkg/config/config.go",
+            r#"
+package config
+
+type Getter interface {
+    Get(key string) string
+}
+
+type Mapper interface {
+    Getter
+}
+
+func Read(m Mapper) string {
+    return m.Get("token")
+}
+"#,
+        ),
+        (
+            "pkg/use/use.go",
+            r#"
+package use
+
+import cfg "example.com/app/pkg/config"
+
+func ReadRemote(m cfg.Mapper) string {
+    return m.Get("remote")
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "example.com/app/pkg/config.Getter.Get");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("promoted embedded interface calls should resolve");
+
+    assert_eq!(
+        2,
+        hits.len(),
+        "expected both Mapper.Get call sites: {hits:?}"
+    );
+    assert_eq!(
+        std::collections::BTreeSet::from([
+            (project.file("pkg/config/config.go"), 13),
+            (project.file("pkg/use/use.go"), 7),
+        ]),
+        hits.iter()
+            .map(|hit| (hit.file.clone(), hit.line))
+            .collect::<std::collections::BTreeSet<_>>(),
+        "only embedded-interface promoted calls should count: {hits:?}",
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("m.Get(\"token\")")),
+        "same-package embedded-interface call missing: {hits:?}",
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("m.Get(\"remote\")")),
+        "imported embedded-interface call missing: {hits:?}",
+    );
+}
+
+#[test]
 fn go_graph_strategy_excludes_concrete_receivers_from_interface_method_usages() {
     let (project, analyzer) = go_analyzer_with_files(&[
         (

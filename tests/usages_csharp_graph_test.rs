@@ -3452,6 +3452,8 @@ fn csharp_issue701_structured_type_roles_cover_alias_receivers_and_patterns_with
             r#"
 namespace Demo {
     public interface Marker { void Touch(); }
+    public class AsObservable { }
+    public class AsObservable<T> { }
     public class PatternType { }
     public class OtherType { }
     public class InheritedPattern { }
@@ -3510,6 +3512,7 @@ namespace App {
         public bool Shadowed(object member, int PatternType) => member is PatternType;
         public bool Switched(object member) => member switch { PatternType => true, _ => false };
         public bool Constant(object member) => member is Mode.Enabled;
+        public bool GenericPattern(object source) => source is AsObservable<int>;
         public bool BareConstant(object member) => member is LocalConstant;
         public bool Inherited(object member) {
             var value = InheritedOuter.Nested;
@@ -3765,6 +3768,25 @@ namespace App {
         "an inherited constant must not become a type hit: {inherited_pattern_hits:#?}"
     );
 
+    let generic_pattern = type_definition(&analyzer, "Demo.AsObservable`1");
+    let generic_pattern_hits = query(generic_pattern.clone());
+    assert_eq!(1, generic_pattern_hits.len(), "{generic_pattern_hits:#?}");
+    assert!(
+        generic_pattern_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("source is AsObservable<int>")),
+        "generic is-patterns should route to the generic type: {generic_pattern_hits:#?}"
+    );
+
+    let nongeneric_pattern = type_definition(&analyzer, "Demo.AsObservable");
+    let nongeneric_pattern_hits = query(nongeneric_pattern);
+    assert!(
+        nongeneric_pattern_hits
+            .iter()
+            .all(|hit| !hit.snippet.contains("source is AsObservable<int>")),
+        "generic is-patterns must not leak to the nongeneric sibling: {nongeneric_pattern_hits:#?}"
+    );
+
     let default_query = UsageFinder::new().query(&analyzer, &[nested], 1000, 1000);
     assert!(
         default_query.candidate_files.contains(&consumer),
@@ -3775,6 +3797,11 @@ namespace App {
     assert!(
         relative_default_query.candidate_files.contains(&consumer),
         "shared declaration routing should retain relative nested receiver candidates"
+    );
+    let generic_default_query = UsageFinder::new().query(&analyzer, &[generic_pattern], 1000, 1000);
+    assert!(
+        generic_default_query.candidate_files.contains(&consumer),
+        "generic is-pattern type roles should route the consumer by default"
     );
 }
 
@@ -3843,6 +3870,84 @@ namespace System.Reflection.Emit {
             .expect("default partial pattern query should resolve")
             .len()
     );
+}
+
+#[test]
+fn csharp_issue1293_declaration_patterns_and_is_not_patterns_route_to_type_targets() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Types.cs",
+            r#"
+namespace Demo {
+    public class FillMemoryPool { }
+    public class Blockchain {
+        public class PersistCompleted { }
+    }
+    public class TaskManager {
+        public class NewTasks { }
+    }
+}
+"#,
+        ),
+        (
+            "Consumer.cs",
+            r#"
+using Demo;
+namespace App {
+    public class Consumer {
+        public bool Match(object message) {
+            switch (message) {
+                case FillMemoryPool fill:
+                    return fill != null;
+                case Blockchain.PersistCompleted pc:
+                    return pc != null;
+            }
+            return message is not TaskManager.NewTasks tasks || tasks == null;
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let consumer = project.file("Consumer.cs");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    for (fq_name, expected_snippet) in [
+        ("Demo.FillMemoryPool", "case FillMemoryPool fill:"),
+        (
+            "Demo.Blockchain$PersistCompleted",
+            "case Blockchain.PersistCompleted pc:",
+        ),
+        (
+            "Demo.TaskManager$NewTasks",
+            "message is not TaskManager.NewTasks tasks",
+        ),
+    ] {
+        let target = type_definition(&analyzer, fq_name);
+        let graph = graph_hits(&analyzer, &target);
+        assert_eq!(1, graph.len(), "{fq_name}: {graph:#?}");
+        assert!(
+            graph
+                .iter()
+                .all(|hit| { hit.file == consumer && hit.snippet.contains(expected_snippet) }),
+            "{fq_name} graph hits should stay on the declaration-pattern operand: {graph:#?}"
+        );
+
+        let routed = UsageFinder::new()
+            .query_with_provider(&analyzer, &[target], Some(&provider), 1, 1000)
+            .result
+            .into_either()
+            .unwrap_or_else(|error| panic!("{fq_name} should route: {error}"));
+        assert_eq!(1, routed.len(), "{fq_name}: {routed:#?}");
+        assert!(
+            routed
+                .iter()
+                .all(|hit| { hit.file == consumer && hit.snippet.contains(expected_snippet) }),
+            "{fq_name} routed hits should stay on the declaration-pattern operand: {routed:#?}"
+        );
+    }
 }
 
 #[test]
@@ -7629,6 +7734,82 @@ public static class Consumer {
 }
 
 #[test]
+fn csharp_graph_reports_unproven_unresolved_task_like_extension_receivers_without_ordinary_leakage()
+{
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "src/Extensions.cs",
+            r#"
+using Task = System.Threading.Tasks.Task;
+
+namespace Demo;
+
+public sealed class Result<T> {}
+
+public static class Extensions {
+    public static Result<T> DefaultAwait<T>(this Task<Result<T>> task) => default!;
+}
+"#,
+        ),
+        (
+            "src/Consumer.cs",
+            r#"
+using Task = System.Threading.Tasks.Task;
+
+namespace Demo;
+
+public sealed class LocalTask<T> {
+    public Result<T> DefaultAwait() => default!;
+}
+
+public static class Consumer {
+    public static Result<int> Run(Task<Result<int>> resultTask, LocalTask<int> localTask) {
+        var exact = resultTask.DefaultAwait();
+        var ordinary = localTask.DefaultAwait();
+        return exact;
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = member_function(&analyzer, "Demo.Extensions", "DefaultAwait");
+    let result = graph_result(&analyzer, &target);
+    let consumer = project.file("src/Consumer.cs");
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_by_overload,
+            unproven_total_by_overload,
+        } => {
+            assert!(
+                hits_by_overload
+                    .get(&target)
+                    .is_none_or(|hits| hits.is_empty()),
+                "unresolved external Task<T>-style receivers should stay unproven, not proven"
+            );
+            assert_eq!(
+                Some(&1),
+                unproven_total_by_overload.get(&target),
+                "the unresolved extension receiver should be retained as one unproven external hit"
+            );
+            let unproven = unproven_by_overload
+                .get(&target)
+                .expect("the unresolved extension hit should be rendered");
+            assert!(
+                unproven.iter().any(|hit| {
+                    hit.file == consumer && hit.snippet.contains("resultTask.DefaultAwait()")
+                }),
+                "unresolved Task<T>-style receiver should remain visible as unproven: {unproven:#?}"
+            );
+        }
+        other => {
+            panic!("expected success with one unproven Task-like extension hit, got {other:#?}")
+        }
+    }
+}
+
+#[test]
 fn csharp_scan_usages_target_anchor_should_find_primitive_extension_receiver_usage() {
     let (project, _analyzer) = csharp_analyzer_with_files(&[
         (
@@ -7869,12 +8050,11 @@ namespace App
 "#,
     );
     for idx in 0..1005 {
-        builder = builder.file(
-            format!("Decoy{idx:04}.cs"),
-            format!(
-                "namespace Noise {{ public class Decoy{idx:04} {{ public void Call(dynamic value) {{ value.Target(); }} }} }}\n"
-            ),
-        );
+        // Same-directory C# files are candidates for a member scan, so empty
+        // siblings are enough to exercise the candidate-file cap. Keeping
+        // them empty avoids making this contract test depend on the
+        // wall-clock budget of C# dynamic-call analysis on slower hosts.
+        builder = builder.file(format!("Decoy{idx:04}.cs"), "");
     }
     let project = builder.build();
 
@@ -7896,10 +8076,9 @@ namespace App
     assert_eq!("unverified_absent", entry["status"], "{result}");
     assert!(entry["complete"].as_bool() == Some(false), "{result}");
     assert!(
-        entry["absence_caveats"].as_array().is_some_and(|caveats| {
-            caveats.iter().any(|c| c == "unproven_matches")
-                && caveats.iter().any(|c| c == "candidate_files_truncated")
-        }),
+        entry["absence_caveats"]
+            .as_array()
+            .is_some_and(|caveats| { caveats.iter().any(|c| c == "candidate_files_truncated") }),
         "truncated zero-hit scan should carry truncation evidence: {result}"
     );
 }

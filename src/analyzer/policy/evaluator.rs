@@ -939,6 +939,15 @@ fn finding_completeness_with_evidence_omission(
     FindingCompleteness::partial(reasons).expect("one typed finding-incomplete reason is canonical")
 }
 
+fn finding_completeness_with_declared_non_exhaustiveness(
+    completeness: FindingCompleteness,
+) -> FindingCompleteness {
+    let mut reasons = completeness.reasons().to_vec();
+    reasons.push(FindingIncompleteReason::DeclaredNonExhaustive);
+    FindingCompleteness::partial(reasons)
+        .expect("declared non-exhaustiveness is a bounded typed finding reason")
+}
+
 fn finding_completeness_with_source_scenario_omission(
     completeness: FindingCompleteness,
     omitted_source_scenarios_lower_bound: u64,
@@ -1185,7 +1194,7 @@ fn record_run_incomplete(
     budget: &PolicyBudget,
 ) {
     match completion {
-        PolicyRunCompletion::Complete => {
+        PolicyRunCompletion::Complete | PolicyRunCompletion::ProvenSubset { .. } => {
             *completion = PolicyRunCompletion::inconclusive(vec![reason])
                 .expect("one typed incomplete reason is canonical");
         }
@@ -2352,7 +2361,14 @@ fn evaluate_match_query_candidates(
         detailed.evidence,
         &detailed.result.diagnostics,
     );
-    let candidates = adapted_candidates.candidates;
+    let mut candidates = adapted_candidates.candidates;
+    if matches!(query_completion, CodeQueryCompletion::ProvenSubset { .. }) {
+        for candidate in &mut candidates {
+            candidate.completeness = finding_completeness_with_declared_non_exhaustiveness(
+                std::mem::replace(&mut candidate.completeness, FindingCompleteness::Complete),
+            );
+        }
+    }
     for candidate in &candidates {
         if matches!(candidate.evidence.anchor(), MatchFindingAnchor::Weak(_)) {
             incomplete_reasons.push(PolicyIncompleteReason::StableAnchorUnavailable);
@@ -2403,6 +2419,9 @@ fn evaluate_match_query_candidates(
     } else if !incomplete_reasons.is_empty() {
         PolicyRunCompletion::inconclusive(incomplete_reasons)
             .expect("incomplete reasons are known to be non-empty and bounded")
+    } else if let CodeQueryCompletion::ProvenSubset { codes } = query_completion {
+        PolicyRunCompletion::proven_subset(codes)
+            .expect("the detailed query declared at least one non-exhaustive omission")
     } else {
         PolicyRunCompletion::Complete
     };
@@ -3527,7 +3546,9 @@ pub(super) fn incomplete_reasons(
             codes.iter().map(incomplete_reason_for_code).collect()
         }
         CodeQueryCompletion::Cancelled => vec![PolicyIncompleteReason::Cancelled],
-        CodeQueryCompletion::Complete | CodeQueryCompletion::Invalid { .. } => Vec::new(),
+        CodeQueryCompletion::Complete
+        | CodeQueryCompletion::ProvenSubset { .. }
+        | CodeQueryCompletion::Invalid { .. } => Vec::new(),
     };
     if truncated && reasons.is_empty() && !matches!(completion, CodeQueryCompletion::Invalid { .. })
     {
@@ -3540,6 +3561,7 @@ fn failure_reasons(completion: &CodeQueryCompletion) -> Vec<PolicyFailureReason>
     match completion {
         CodeQueryCompletion::Invalid { .. } => vec![PolicyFailureReason::InvalidExecutionPlan],
         CodeQueryCompletion::Complete
+        | CodeQueryCompletion::ProvenSubset { .. }
         | CodeQueryCompletion::Incomplete { .. }
         | CodeQueryCompletion::Cancelled => Vec::new(),
     }
@@ -3616,6 +3638,10 @@ fn adapt_query_diagnostic(
         CodeQueryDiagnosticImpact::Advisory => (
             PolicyDiagnosticSeverity::Note,
             PolicyDiagnosticImpact::Advisory,
+        ),
+        CodeQueryDiagnosticImpact::DeclaredNonExhaustive => (
+            PolicyDiagnosticSeverity::Warning,
+            PolicyDiagnosticImpact::DeclaredNonExhaustive,
         ),
         CodeQueryDiagnosticImpact::Incomplete => (
             PolicyDiagnosticSeverity::Warning,
@@ -3873,7 +3899,7 @@ mod tests {
             :subjects (subject-set :entries [
               (subject :id resource :selector (rql (name "resource"))
                 :subject return-value)])
-            :uncertainty (uncertainty :unknown-call inconclusive :escape inconclusive)
+            :uncertainty (uncertainty :escape inconclusive)
             :automaton (automaton
               :states [open closed violated]
               :initial open

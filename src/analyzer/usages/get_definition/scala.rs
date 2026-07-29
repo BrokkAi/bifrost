@@ -24,7 +24,7 @@ use crate::analyzer::usages::scala_graph::syntax::{
     ScalaParameterListKind, ScalaParameterTypeIdentity, ScalaQualifiedStableTypeRole,
     applied_expression_for_reference, call_arities_for_reference, call_site_shape_for_reference,
     is_extractor_reference, is_infix_type_operator_reference, is_scala_case_pattern_binder,
-    is_scala_named_argument_assignment, qualified_stable_type_reference,
+    is_scala_class_reference, is_scala_named_argument_assignment, qualified_stable_type_reference,
     scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
     scala_pattern_binder_names, scala_source_facts,
 };
@@ -3636,6 +3636,13 @@ fn resolve_scala_with_context(
     if is_infix_type_operator_reference(node) {
         return resolve_scala_type(ctx, &resolver, root, node);
     }
+    // Tree-sitter exposes some parser-proven type roles, including anonymous
+    // mixin operands like `new Base with Trait`, as bare identifiers rather
+    // than `type_identifier` nodes. Resolve those through the type namespace
+    // before the generic identifier branch can select a same-named companion.
+    if node.kind() == "identifier" && is_scala_class_reference(node, source) {
+        return resolve_scala_type(ctx, &resolver, root, qualified_type_root);
+    }
     if let Some(outcome) = resolve_scala_bare_apply_fast_path(
         scala, analyzer, support, file, source, root, node, &resolver, session,
     ) {
@@ -3838,6 +3845,18 @@ fn scala_import_reference_outcome(
     for info in relevant {
         saw_relevant = true;
         if let Some(structured_path) = info.path.as_ref() {
+            let focused_terminal_segment =
+                scala_direct_import_segment_index(import, focus_start_byte, focus_end_byte)
+                    .is_some_and(|focus_index| {
+                        focus_index + 1 == structured_path.segments.len()
+                            && structured_path.segments[focus_index] == name
+                    });
+            if (selected_name || focused_terminal_segment)
+                && let Some(outcome) =
+                    scala_import_member_outcome(scala, support, &resolver, structured_path)
+            {
+                return Some(outcome);
+            }
             if let Some(focus_index) =
                 scala_direct_import_segment_index(import, focus_start_byte, focus_end_byte)
                 && focus_index + 1 < structured_path.segments.len()
@@ -3914,6 +3933,41 @@ fn scala_import_reference_outcome(
             "`{name}` is part of a Scala import whose declaration is not indexed in this workspace"
         ))
     })
+}
+
+fn scala_import_member_outcome(
+    scala: &ScalaAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    resolver: &ScalaNameResolver<'_>,
+    structured_path: &StructuredImportPath,
+) -> Option<DefinitionLookupOutcome> {
+    let (member, owner_segments) = structured_path.segments.split_last()?;
+    if owner_segments.is_empty() {
+        return None;
+    }
+
+    let mut candidates = Vec::new();
+    for kind in [ScalaOwnerKind::SingletonObject, ScalaOwnerKind::Class] {
+        let ScalaNameResolution::Resolved(owner) =
+            resolver.resolve_owner_segments(owner_segments, kind)
+        else {
+            continue;
+        };
+        candidates.extend(
+            support
+                .fqn_direct_children(&owner.fqn)
+                .into_iter()
+                .filter(|unit| unit.identifier() == member.as_str())
+                .filter(|unit| unit.is_function() || unit.is_field())
+                .filter(|unit| !scala.is_type_alias(unit))
+                .filter(|unit| {
+                    scala.structural_parent_of(unit).as_ref() == Some(&owner._declaration)
+                }),
+        );
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    (!candidates.is_empty()).then(|| candidates_outcome(candidates))
 }
 
 /// Candidate spellings of `segments` qualified by each enclosing owner in
@@ -6599,6 +6653,11 @@ fn resolve_scala_field(
                     );
                 }
                 ScalaExactMemberResolution::NoMatch => {
+                    let stable_members =
+                        scala_stable_term_member_candidate_units(ctx, &owner_fqn, member);
+                    if !stable_members.is_empty() {
+                        return candidates_outcome(stable_members);
+                    }
                     let extensions = scala_extension_candidate_units(
                         ctx,
                         resolver,
@@ -6638,6 +6697,10 @@ fn resolve_scala_field(
         );
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
+        }
+        let stable_members = scala_stable_term_member_candidate_units(ctx, &owner_fqn, member);
+        if !stable_members.is_empty() {
+            return candidates_outcome(stable_members);
         }
         return scala_extension_candidates(
             ctx,

@@ -395,6 +395,7 @@ class NoCandidate {
             include_tests: true,
             paths: Some(vec!["tests/Consumer.php".to_string()]),
             include_same_owner: false,
+            max_duration_secs: None,
         },
     );
     assert_eq!(1, scoped.results.len(), "scoped usages: {scoped:?}");
@@ -878,6 +879,7 @@ $count = Mailer::$sent;
             paths: None,
             include_tests: true,
             include_same_owner: false,
+            max_duration_secs: None,
         },
     );
     assert!(

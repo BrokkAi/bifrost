@@ -24,6 +24,7 @@ mod java;
 mod javascript;
 mod js_ts;
 pub(crate) mod jvm;
+mod kotlin;
 pub(crate) mod lexical_definitions;
 mod model;
 mod multi_analyzer;
@@ -38,6 +39,7 @@ mod rust;
 mod scala;
 pub mod semantic;
 pub(crate) mod semantic_diagnostics;
+pub mod semantic_model;
 mod source_content;
 pub mod store;
 pub mod structural;
@@ -111,6 +113,7 @@ pub(crate) use i_analyzer::{AnalyzerQueryScope, default_parent_fq_name};
 pub use java::JavaAnalyzer;
 pub use javascript::JavascriptAnalyzer;
 pub(crate) use js_ts::{AliasResolver, resolve_js_ts_module_specifier};
+pub use kotlin::KotlinAnalyzer;
 pub use model::{
     CallableArity, CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType,
     CommentDensityStats, DeclarationInfo, DeclarationKind, DispatchExtensibility,
@@ -287,6 +290,7 @@ pub(crate) fn parser_language_for_flavor(
         Language::Scala => crate::analyzer::scala::language::LANGUAGE.into(),
         Language::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
         Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+        Language::Kotlin => crate::analyzer::kotlin::language::LANGUAGE.into(),
         Language::None => return None,
     })
 }
@@ -329,6 +333,8 @@ pub(crate) fn structural_spec_for(
         Language::Scala => &scala::structural::SCALA_STRUCTURAL_SPEC,
         Language::CSharp => &csharp::structural::CSHARP_STRUCTURAL_SPEC,
         Language::Ruby => &ruby::structural::RUBY_STRUCTURAL_SPEC,
+        // Kotlin structural CodeQuery/RQL support is issue #1240.
+        Language::Kotlin => return None,
         Language::None => return None,
     })
 }

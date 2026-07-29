@@ -12,7 +12,7 @@ use crate::analyzer::usages::csharp_graph::resolver::{
     resolves_to_target, resolves_to_target_at, same_node, seed_visible_bindings_at,
     type_identity_matches, unqualified_member_has_local_binding,
     unqualified_member_has_structured_shadow, unqualified_member_resolves_to_owner,
-    usage_class_field_receiver_type, usage_visible_extension_method_candidates,
+    usage_unqualified_value_member_shadows_type, usage_visible_extension_method_candidates,
 };
 use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::local_inference::SymbolResolution;
@@ -229,7 +229,7 @@ fn scan_structured_type_candidate(
         );
         if member_name_is_locally_bound(&left_name, &bindings)
             || unqualified_member_has_structured_shadow(leftmost, ctx.source)
-            || !usage_class_field_receiver_type(
+            || usage_unqualified_value_member_shadows_type(
                 leftmost,
                 &left_name,
                 ctx.analyzer,
@@ -237,7 +237,6 @@ fn scan_structured_type_candidate(
                 ctx.file,
                 ctx.source,
             )
-            .is_unknown()
         {
             return false;
         }
@@ -744,6 +743,10 @@ fn containing_method_group_value_context(node: Node<'_>) -> bool {
                     && parent
                         .child_by_field_name("operator")
                         .is_some_and(|operator| matches!(operator.kind(), "=" | "+=" | "-="));
+            }
+            "switch_expression_arm" => {
+                return parent.named_child(parent.named_child_count().saturating_sub(1))
+                    == Some(current);
             }
             "variable_declarator" => {
                 return parent.child_by_field_name("name") != Some(current)

@@ -3445,6 +3445,53 @@ fn run() {
 }
 
 #[test]
+fn rust_graph_strategy_resolves_structured_scoped_associated_terminals() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
+pub trait Trait {
+    type Handle;
+}
+
+pub struct Owner;
+impl Trait for Owner {
+    type Handle = usize;
+}
+
+pub enum Status {
+    Ready,
+}
+
+pub struct Foo;
+impl Foo {
+    pub const CONST: usize = 1;
+}
+
+fn run(_: Owner::Handle) {
+    let _ = Status::Ready;
+    let _ = Foo::CONST;
+}
+"#,
+    )]);
+
+    let assoc_type_hits = rust_graph_hits(&analyzer, "Trait.Handle");
+    assert_eq!(
+        1,
+        assoc_type_hits.len(),
+        "associated type hits: {assoc_type_hits:?}"
+    );
+    assert!(assoc_type_hits[0].snippet.contains("Owner::Handle"));
+
+    let variant_hits = rust_graph_hits(&analyzer, "Status.Ready");
+    assert_eq!(1, variant_hits.len(), "enum variant hits: {variant_hits:?}");
+    assert!(variant_hits[0].snippet.contains("Status::Ready"));
+
+    let const_hits = rust_graph_hits(&analyzer, "Foo.CONST");
+    assert_eq!(1, const_hits.len(), "associated const hits: {const_hits:?}");
+    assert!(const_hits[0].snippet.contains("Foo::CONST"));
+}
+
+#[test]
 fn rust_graph_strategy_resolves_ufcs_trait_method_through_implementer() {
     let (project, analyzer) = rust_analyzer_with_files(&[
         (
@@ -7536,6 +7583,158 @@ fn rust_graph_strategy_finds_reexported_free_function_call() {
 }
 
 #[test]
+fn rust_graph_strategy_resolves_imported_uppercase_free_function_calls() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/api.rs",
+            r#"
+pub struct FQDN {
+    raw: String,
+}
+
+pub fn FQDN(input: &str) -> FQDN {
+    FQDN {
+        raw: input.to_string(),
+    }
+}
+"#,
+        ),
+        (
+            "src/lib.rs",
+            r#"
+mod api;
+
+use crate::api::FQDN;
+
+pub fn run() {
+    let _ = FQDN("example.testing.");
+}
+"#,
+        ),
+    ]);
+
+    let function_target = analyzer
+        .get_definitions("api.FQDN")
+        .into_iter()
+        .find(CodeUnit::is_function)
+        .expect("expected imported uppercase function target");
+    let type_target = analyzer
+        .get_definitions("api.FQDN")
+        .into_iter()
+        .find(CodeUnit::is_class)
+        .expect("expected same-named type target");
+
+    let function_hits = rust_graph_hits_for_target(&analyzer, function_target);
+    assert_eq!(
+        1,
+        function_hits.len(),
+        "expected the imported uppercase free-function call: {function_hits:?}"
+    );
+    assert!(
+        function_hits[0]
+            .snippet
+            .contains("FQDN(\"example.testing.\")"),
+        "hit should be the call site: {function_hits:?}",
+    );
+
+    let type_hits = rust_graph_hits_for_target(&analyzer, type_target);
+    assert_eq!(
+        2,
+        type_hits.len(),
+        "the return annotation and struct literal remain legitimate type references: {type_hits:?}"
+    );
+    assert!(
+        type_hits
+            .iter()
+            .all(|hit| hit.file == project.file("src/api.rs")),
+        "the lib.rs call must not be attributed to the same-named type: {type_hits:?}"
+    );
+}
+
+#[test]
+fn rust_graph_strategy_prefers_same_module_function_over_imported_module_name() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
+mod tests {
+    use std::cmp;
+
+    fn cmp(a: i32, b: i32) -> cmp::Ordering {
+        a.cmp(&b)
+    }
+
+    pub fn run() {
+        let _ = cmp(1, 2);
+    }
+}
+
+mod other {
+    pub fn cmp(_: i32, _: i32) {}
+}
+"#,
+    )]);
+
+    let local_target = definition(&analyzer, "tests.cmp");
+    let other_target = definition(&analyzer, "other.cmp");
+
+    let local_hits = rust_graph_hits_for_target(&analyzer, local_target);
+    assert_eq!(
+        1,
+        local_hits.len(),
+        "expected the same-module cmp() call to resolve locally: {local_hits:?}"
+    );
+    assert!(
+        local_hits[0].snippet.contains("cmp(1, 2)"),
+        "hit should be the local cmp() call: {local_hits:?}",
+    );
+
+    let other_hits = rust_graph_hits_for_target(&analyzer, other_target);
+    assert!(
+        other_hits.is_empty(),
+        "same-named function in another module must stay unmatched: {other_hits:?}"
+    );
+}
+
+#[test]
+fn rust_graph_strategy_resolves_scoped_module_function_calls_without_cross_matching() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/common.rs", "pub fn try_setup() {}\n"),
+        ("src/other.rs", "pub fn try_setup() {}\n"),
+        (
+            "src/lib.rs",
+            r#"
+mod common;
+mod other;
+
+pub fn run() {
+    common::try_setup();
+}
+"#,
+        ),
+    ]);
+
+    let common_target = definition(&analyzer, "common.try_setup");
+    let other_target = definition(&analyzer, "other.try_setup");
+
+    let common_hits = rust_graph_hits_for_target(&analyzer, common_target);
+    assert_eq!(
+        1,
+        common_hits.len(),
+        "expected the scoped common::try_setup() call: {common_hits:?}"
+    );
+    assert!(
+        common_hits[0].snippet.contains("common::try_setup()"),
+        "hit should be the scoped call: {common_hits:?}",
+    );
+
+    let other_hits = rust_graph_hits_for_target(&analyzer, other_target);
+    assert!(
+        other_hits.is_empty(),
+        "same-named function in another module must not be cross-matched: {other_hits:?}"
+    );
+}
+
+#[test]
 fn rust_graph_strategy_finds_method_call_on_constructor_returned_local() {
     let (project, analyzer) = build_233_reexport_project();
     let hits = rust_graph_hits(&analyzer, "service.Service.execute");
@@ -8929,6 +9128,208 @@ fn rust_rooted_module_qualifier_inside_use_path_is_exact() {
 }
 
 #[test]
+fn rust_super_glob_import_prefix_keeps_module_namespace_exact() {
+    let source = r#"
+mod parent {
+    pub struct Item;
+
+    mod child {
+        use super::*;
+
+        fn consume(_: Item) {}
+    }
+}
+
+fn parent() {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let module_target = analyzer
+        .get_definitions("parent")
+        .into_iter()
+        .find(CodeUnit::is_module)
+        .expect("parent module");
+    let value_target = analyzer
+        .get_definitions("parent")
+        .into_iter()
+        .find(CodeUnit::is_function)
+        .expect("parent function");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[module_target])
+        .all_hits_including_imports();
+    let expected = source.find("use super::*").expect("super glob import") + "use ".len();
+    let value_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[value_target])
+        .all_hits_including_imports();
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/lib.rs")
+                && hit.start_offset == expected
+                && hit.end_offset == expected + "super".len()
+                && hit.kind == UsageHitKind::Import
+        }),
+        "expected exact super::* module import hit: {hits:#?}"
+    );
+    assert!(
+        value_hits
+            .iter()
+            .all(|hit| hit.file != project.file("src/lib.rs") || hit.start_offset != expected),
+        "same-spelled value namespace must not capture super::*: {value_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_grouped_self_import_keeps_module_namespace_exact() {
+    let source = r#"
+mod quic_stream {
+    pub struct QuicStream;
+}
+
+fn quic_stream() {}
+
+use crate::quic_stream::{self, QuicStream};
+
+fn consume(_: QuicStream) {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let module_target = analyzer
+        .get_definitions("quic_stream")
+        .into_iter()
+        .find(CodeUnit::is_module)
+        .expect("quic_stream module");
+    let value_target = analyzer
+        .get_definitions("quic_stream")
+        .into_iter()
+        .find(CodeUnit::is_function)
+        .expect("quic_stream function");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[module_target])
+        .all_hits_including_imports();
+    let expected = source
+        .find("quic_stream::{self")
+        .expect("grouped self import module path");
+    let value_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[value_target])
+        .all_hits_including_imports();
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/lib.rs")
+                && hit.start_offset == expected
+                && hit.end_offset == expected + "quic_stream".len()
+                && hit.kind == UsageHitKind::Import
+        }),
+        "expected exact grouped self module-prefix import hit: {hits:#?}"
+    );
+    assert!(
+        value_hits
+            .iter()
+            .all(|hit| hit.file != project.file("src/lib.rs") || hit.start_offset != expected),
+        "same-spelled value namespace must not capture grouped self import: {value_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_named_type_import_alias_keeps_type_namespace_exact() {
+    let source = r#"
+mod defs {
+    pub struct TsigAlgorithm;
+    pub fn TsigAlgorithm() {}
+}
+
+use crate::defs::TsigAlgorithm as ImportedAlgorithm;
+
+fn consume(_: ImportedAlgorithm) {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let type_target = analyzer
+        .get_definitions("defs.TsigAlgorithm")
+        .into_iter()
+        .find(CodeUnit::is_class)
+        .expect("TsigAlgorithm type");
+    let value_target = analyzer
+        .get_definitions("defs.TsigAlgorithm")
+        .into_iter()
+        .find(CodeUnit::is_function)
+        .expect("TsigAlgorithm function");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[type_target])
+        .all_hits_including_imports();
+    let expected = source
+        .find("TsigAlgorithm as ImportedAlgorithm")
+        .expect("named type import");
+    let value_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[value_target])
+        .all_hits_including_imports();
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/lib.rs")
+                && hit.start_offset == expected
+                && hit.end_offset == expected + "TsigAlgorithm".len()
+                && hit.kind == UsageHitKind::Import
+        }),
+        "expected exact named type import hit: {hits:#?}"
+    );
+    assert!(
+        value_hits
+            .iter()
+            .all(|hit| hit.file != project.file("src/lib.rs") || hit.start_offset != expected),
+        "same-spelled value namespace must not capture the type import: {value_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_pub_use_reexport_keeps_type_namespace_exact() {
+    let source = r#"
+mod tools {
+    pub struct CommitActivityDraft;
+    pub fn CommitActivityDraft() {}
+}
+
+pub use crate::tools::CommitActivityDraft;
+
+fn consume(_: CommitActivityDraft) {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let type_target = analyzer
+        .get_definitions("tools.CommitActivityDraft")
+        .into_iter()
+        .find(CodeUnit::is_class)
+        .expect("CommitActivityDraft type");
+    let value_target = analyzer
+        .get_definitions("tools.CommitActivityDraft")
+        .into_iter()
+        .find(CodeUnit::is_function)
+        .expect("CommitActivityDraft function");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[type_target])
+        .all_hits_including_imports();
+    let expected = source
+        .find("use crate::tools::CommitActivityDraft;")
+        .expect("pub use reexport");
+    let value_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[value_target])
+        .all_hits_including_imports();
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/lib.rs")
+                && hit.start_offset == expected + "use crate::tools::".len()
+                && hit.end_offset == expected + "use crate::tools::CommitActivityDraft".len()
+                && hit.kind == UsageHitKind::Import
+        }),
+        "expected exact pub use re-export hit: {hits:#?}"
+    );
+    assert!(
+        value_hits
+            .iter()
+            .all(|hit| hit.file != project.file("src/lib.rs") || hit.start_offset != expected),
+        "same-spelled value namespace must not capture the re-export: {value_hits:#?}"
+    );
+}
+
+#[test]
 fn rust_grouped_use_module_qualifier_reconstructs_outer_dependency_path() {
     let consumer = "use toml_parser::{parser::Event};\nuse other_parser::{parser::Other};\npub fn consume(_: Event) {}\n";
     let (project, analyzer) = rust_analyzer_with_files(&[
@@ -9814,6 +10215,389 @@ fn rust_authoritative_dependency_reexport_resolves_associated_call_owner() {
     assert!(
         hidden_hits.is_empty(),
         "a private dependency trait must not become callable through its public impl owner: {hidden_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_graph_grouped_dependency_import_keeps_original_terminal_with_aliased_sibling() {
+    let consumer = r#"
+use dns_test::tsig::{TsigAlgorithm as TestTsigAlgorithm, TsigKey, TsigSecretKey};
+use dns_alt::tsig::{TsigAlgorithm as AltTsigAlgorithm};
+
+fn build(_: TestTsigAlgorithm, _: AltTsigAlgorithm, _: TsigKey, _: TsigSecretKey) {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"dns-test\", \"dns-alt\", \"compatibility-tests\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "dns-test/Cargo.toml",
+            "[package]\nname = \"dns-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("dns-test/src/lib.rs", "pub mod tsig;\n"),
+        (
+            "dns-test/src/tsig.rs",
+            "pub struct TsigAlgorithm;\npub struct TsigKey;\npub struct TsigSecretKey;\n",
+        ),
+        (
+            "dns-alt/Cargo.toml",
+            "[package]\nname = \"dns-alt\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("dns-alt/src/lib.rs", "pub mod tsig;\n"),
+        ("dns-alt/src/tsig.rs", "pub struct TsigAlgorithm;\n"),
+        (
+            "compatibility-tests/Cargo.toml",
+            "[package]\nname = \"compatibility-tests\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ndns_test = { package = \"dns-test\", path = \"../dns-test\" }\ndns_alt = { package = \"dns-alt\", path = \"../dns-alt\" }\n",
+        ),
+        ("compatibility-tests/src/lib.rs", consumer),
+    ]);
+    let candidate = project.file("compatibility-tests/src/lib.rs");
+    let target = definition(&analyzer, "dns-test.src.tsig.TsigAlgorithm");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .all_hits_including_imports();
+    let expected = consumer
+        .find("TsigAlgorithm as TestTsigAlgorithm")
+        .expect("grouped dependency import");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == candidate
+                && (hit.start_offset, hit.end_offset)
+                    == (expected, expected + "TsigAlgorithm".len())
+                && hit.kind == UsageHitKind::Import
+        }),
+        "grouped dependency import must keep the original terminal even when a sibling alias is present: {hits:#?}"
+    );
+    assert_eq!(
+        1,
+        hits.iter()
+            .filter(|hit| {
+                hit.file == candidate
+                    && (hit.start_offset, hit.end_offset)
+                        == (expected, expected + "TsigAlgorithm".len())
+                    && hit.kind == UsageHitKind::Import
+            })
+            .count(),
+        "grouped dependency import should record exactly one import hit at the original terminal: {hits:#?}"
+    );
+    let sibling = consumer
+        .find("TsigAlgorithm as AltTsigAlgorithm")
+        .expect("sibling grouped import");
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != candidate
+                || (hit.start_offset, hit.end_offset) != (sibling, sibling + "TsigAlgorithm".len())
+        }),
+        "the same terminal imported from a sibling module must not be attributed to dns_test: {hits:#?}"
+    );
+    let same_prefix_sibling = consumer
+        .find("TsigKey")
+        .expect("same-prefix sibling import");
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != candidate
+                || (hit.start_offset, hit.end_offset)
+                    != (same_prefix_sibling, same_prefix_sibling + "TsigKey".len())
+        }),
+        "a sibling terminal under the same owner prefix must not be attributed to TsigAlgorithm: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_graph_dependency_imported_bare_function_call_stays_exact() {
+    let consumer = r#"
+use wealthfolio_ai::live_evals::runner::{is_blocking, run_case, AssertionFailure};
+
+fn execute() {
+    if !is_blocking() {
+        run_case();
+    }
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"wealthfolio-ai\", \"wealthfolio-app\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "wealthfolio-ai/Cargo.toml",
+            "[package]\nname = \"wealthfolio-ai\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("wealthfolio-ai/src/lib.rs", "pub mod live_evals;\n"),
+        ("wealthfolio-ai/src/live_evals/mod.rs", "pub mod runner;\n"),
+        (
+            "wealthfolio-ai/src/live_evals/runner.rs",
+            "pub fn is_blocking() -> bool { false }\npub fn run_case() {}\npub struct AssertionFailure;\n",
+        ),
+        (
+            "wealthfolio-app/Cargo.toml",
+            "[package]\nname = \"wealthfolio-app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nwealthfolio_ai = { package = \"wealthfolio-ai\", path = \"../wealthfolio-ai\" }\n",
+        ),
+        ("wealthfolio-app/src/lib.rs", consumer),
+    ]);
+    let candidate = project.file("wealthfolio-app/src/lib.rs");
+    let target = definition(&analyzer, "wealthfolio-ai.src.live_evals.runner.run_case");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .all_hits();
+    let expected = consumer.find("run_case();").expect("imported bare call");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == candidate
+                && (hit.start_offset, hit.end_offset) == (expected, expected + "run_case".len())
+                && hit.kind == UsageHitKind::Reference
+        }),
+        "a dependency function imported through a grouped use must keep its exact bare call edge: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_graph_imported_receiver_method_call_keeps_exact_owner() {
+    let consumer = r#"
+use crate::checkpoint::base::Checkpointer;
+
+fn backward(checkpointer: &mut Checkpointer, state: usize) {
+    checkpointer.retrieve_node_output::<u8>(state);
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod checkpoint;\npub mod ops;\n"),
+        ("src/checkpoint/mod.rs", "pub mod base;\n"),
+        (
+            "src/checkpoint/base.rs",
+            "pub struct Checkpointer;\nimpl Checkpointer { pub fn retrieve_node_output<T>(&mut self, _: usize) -> T where T: Default { T::default() } }\n",
+        ),
+        ("src/ops.rs", consumer),
+    ]);
+    let candidate = project.file("src/ops.rs");
+    let target = member(
+        &analyzer,
+        &project.file("src/checkpoint/base.rs"),
+        "Checkpointer",
+        "retrieve_node_output",
+    );
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .all_hits();
+    let expected = consumer
+        .find("retrieve_node_output::<u8>")
+        .expect("typed receiver method call");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == candidate
+                && (hit.start_offset, hit.end_offset)
+                    == (expected, expected + "retrieve_node_output".len())
+                && hit.kind == UsageHitKind::Reference
+        }),
+        "an imported receiver type on a parameter must keep the exact method-call edge: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_graph_associated_paths_keep_owner_type_hits() {
+    let consumer = r#"
+use burn_std::distribution::Distribution;
+use hickory_proto::op::ResponseCode;
+
+fn build() {
+    let _ = Distribution::Default;
+    let _ = ResponseCode::NXDomain;
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"burn-std\", \"hickory-proto\", \"app\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "burn-std/Cargo.toml",
+            "[package]\nname = \"burn-std\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("burn-std/src/lib.rs", "pub mod distribution;\n"),
+        (
+            "burn-std/src/distribution.rs",
+            "pub enum Distribution { Default }\n",
+        ),
+        (
+            "hickory-proto/Cargo.toml",
+            "[package]\nname = \"hickory-proto\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("hickory-proto/src/lib.rs", "pub mod op;\n"),
+        (
+            "hickory-proto/src/op.rs",
+            "pub enum ResponseCode { NXDomain }\n",
+        ),
+        (
+            "app/Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nburn_std = { package = \"burn-std\", path = \"../burn-std\" }\nhickory_proto = { package = \"hickory-proto\", path = \"../hickory-proto\" }\n",
+        ),
+        ("app/src/lib.rs", consumer),
+    ]);
+    let candidate = project.file("app/src/lib.rs");
+    for (target_fqn, marker, owner_len) in [
+        (
+            "burn-std.src.distribution.Distribution",
+            "Distribution::Default",
+            "Distribution".len(),
+        ),
+        (
+            "hickory-proto.src.op.ResponseCode",
+            "ResponseCode::NXDomain",
+            "ResponseCode".len(),
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let hits = UsageFinder::new()
+            .find_usages_default(&analyzer, &[target])
+            .all_hits();
+        let expected = consumer.find(marker).expect("associated owner path");
+
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == candidate
+                    && (hit.start_offset, hit.end_offset) == (expected, expected + owner_len)
+                    && hit.kind == UsageHitKind::Reference
+            }),
+            "associated value paths must retain an owner-type hit for {target_fqn}: {hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn rust_graph_scoped_paths_keep_owner_hits_for_class_and_module_roots() {
+    let consumer = r#"
+mod activities { pub fn table() {} }
+mod server {
+    pub struct DnsServer;
+    impl DnsServer { pub fn parse() -> Self { Self } }
+    pub struct DnsClient;
+    impl DnsClient { pub fn parse() -> Self { Self } }
+}
+
+fn run() {
+    let _ = crate::server::DnsServer::parse();
+    let _ = crate::server::DnsClient::parse();
+    let _ = crate::activities::table();
+    let _ = server::DnsServer::parse();
+    let _ = activities::table();
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            "pub mod activities;\npub mod server;\npub mod app;\n",
+        ),
+        ("src/activities.rs", "pub fn table() {}\n"),
+        (
+            "src/server.rs",
+            "pub struct DnsServer;\nimpl DnsServer { pub fn parse() -> Self { Self } }\npub struct DnsClient;\nimpl DnsClient { pub fn parse() -> Self { Self } }\n",
+        ),
+        ("src/app.rs", consumer),
+    ]);
+    let candidate = project.file("src/app.rs");
+
+    for (target_fqn, marker, owner_prefix_len, owner_len) in [
+        (
+            "server.DnsServer",
+            "crate::server::DnsServer::parse",
+            "crate::server::".len(),
+            "DnsServer".len(),
+        ),
+        (
+            "activities",
+            "crate::activities::table",
+            "crate::".len(),
+            "activities".len(),
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let hits = UsageFinder::new()
+            .find_usages_default(&analyzer, &[target])
+            .all_hits();
+        let expected = consumer.rfind(marker).expect("scoped owner path");
+
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == candidate
+                    && (hit.start_offset, hit.end_offset)
+                        == (
+                            expected + owner_prefix_len,
+                            expected + owner_prefix_len + owner_len,
+                        )
+                    && hit.kind == UsageHitKind::Reference
+            }),
+            "scoped path must retain the owner hit for {target_fqn}: {hits:#?}"
+        );
+    }
+
+    let dns_target = definition(&analyzer, "server.DnsServer");
+    let dns_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[dns_target])
+        .all_hits();
+    let sibling_dns = consumer
+        .find("DnsClient::parse")
+        .expect("same-prefix sibling owner path");
+    assert!(
+        dns_hits.iter().all(|hit| {
+            hit.file != candidate
+                || (hit.start_offset, hit.end_offset)
+                    != (sibling_dns, sibling_dns + "DnsClient".len())
+        }),
+        "a sibling terminal under the same module prefix must not be attributed to DnsServer: {dns_hits:#?}"
+    );
+    let local_dns = consumer
+        .rfind("server::DnsServer::parse")
+        .expect("local shadowed server path");
+    assert!(
+        dns_hits.iter().all(|hit| {
+            hit.file != candidate
+                || (hit.start_offset, hit.end_offset)
+                    != (
+                        local_dns + "server::".len(),
+                        local_dns + "server::".len() + "DnsServer".len(),
+                    )
+        }),
+        "a local shadowing server module must not be authorized as the crate::server owner: {dns_hits:#?}"
+    );
+
+    let server_target = definition(&analyzer, "server");
+    let server_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[server_target])
+        .all_hits();
+    let intermediate_server = consumer
+        .find("crate::server::DnsServer::parse")
+        .expect("intermediate server prefix");
+    assert!(
+        server_hits.iter().any(|hit| {
+            hit.file == candidate
+                && (hit.start_offset, hit.end_offset)
+                    == (
+                        intermediate_server + "crate::".len(),
+                        intermediate_server + "crate::".len() + "server".len(),
+                    )
+                && hit.kind == UsageHitKind::Reference
+        }),
+        "an intermediate module prefix should remain a legitimate module hit: {server_hits:#?}"
+    );
+
+    let activities_target = definition(&analyzer, "activities");
+    let activities_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[activities_target])
+        .all_hits();
+    let local_activities = consumer
+        .rfind("activities::table")
+        .expect("local shadowed activities path");
+    assert!(
+        activities_hits.iter().all(|hit| {
+            hit.file != candidate
+                || (hit.start_offset, hit.end_offset)
+                    != (local_activities, local_activities + "activities".len())
+        }),
+        "a local shadowing activities module must not be authorized as the crate::activities owner: {activities_hits:#?}"
     );
 }
 

@@ -119,6 +119,7 @@ export default defineConfig({
             { label: 'Overview', slug: 'code-querying' },
             { label: 'Build a Rule', slug: 'build-static-analysis-rule' },
             { label: 'Static-Analysis Policies', slug: 'static-analysis-policies' },
+            { label: 'Semantic-Model Packs', slug: 'semantic-model-packs' },
             { label: 'Agent Result Safety', slug: 'agent-result-safety' },
             { label: 'Semantic Search', slug: 'semantic-search' },
             { label: 'JSON CodeQuery', slug: 'code-query-json' },

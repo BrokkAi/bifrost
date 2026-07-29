@@ -738,10 +738,9 @@ fn scala_source_types(
         })
         .filter_map(|declaration| {
             let fqn = crate::analyzer::scala::scala_normalize_full_name(&declaration.fq_name());
-            let (package_name, short_name) = fqn.rsplit_once('.').map_or_else(
-                || (String::new(), fqn.clone()),
-                |(package_name, short_name)| (package_name.to_string(), short_name.to_string()),
-            );
+            let package_name = declaration.package_name().to_string();
+            let short_name =
+                crate::analyzer::scala::scala_normalize_full_name(declaration.short_name());
             (!short_name.is_empty()).then(|| JavaExternalType {
                 fqn,
                 package_name,

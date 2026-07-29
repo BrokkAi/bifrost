@@ -49,6 +49,17 @@ Milestone 1 validation fails when any of these drift:
 
 The initial corpus is kept small on purpose. It is meant to be stable enough for daily CI, not a clone of Brokk's much larger baseline suite.
 
+`interactive-latency.toml` is a separate release-mode gate for common
+code-intelligence requests against a pinned Bifrost checkout. Every case has a
+5,000 ms warm-p95 budget and a correctness oracle. It covers batched symbol
+search, exact source lookup, definition lookup, summaries, the exact and
+line-only `SemanticProcedureSummary` usage scans from issue #1228, and an MCP
+fairness case that overlaps a heavy scan with a lightweight source request.
+Reports include p50 and p95 for every scenario and explicitly count measured
+scan iterations that met the latency contract by returning a truthful bounded
+incomplete result. `--profile` preserves the per-request queue, execution,
+response-queue, and writer-delivery timing traces.
+
 ## Layout
 
 Benchmark-local runtime artifacts stay under ignored directories:
@@ -60,6 +71,7 @@ Benchmark-local runtime artifacts stay under ignored directories:
 The important checked-in files in this directory are:
 
 - `targets.toml`: pinned corpus, per-repo probes, and default local paths
+- `interactive-latency.toml`: pinned Bifrost self-corpus with absolute latency budgets
 - `README.md`: operator documentation for the harness and the planned daily workflow
 - `get_definition_observations.md`: manually inspected definition-lookup probe results and follow-up notes
 - `baselines/`: blessed compare targets and promotion notes for the scheduled workflow
@@ -77,6 +89,13 @@ Run one repo against the full pinned checkout:
 ```bash
 cargo build --bin bifrost --bin bifrost_benchmark
 ./target/debug/bifrost_benchmark run --manifest benchmark/targets.toml --repo gin-go
+```
+
+Run the interactive latency gate in the same release configuration as CI:
+
+```bash
+scripts/with-isolated-cargo-target.sh \
+  scripts/run-interactive-latency.sh --profile
 ```
 
 The harness verifies the MCP server's embedded build identity during
@@ -121,6 +140,11 @@ The intended daily workflow contract is:
 3. Upload the JSON report artifact from `benchmark/benchmark-output`.
 4. Compare that report against `benchmark/baselines/ubuntu-latest.json` when that blessed baseline exists.
 5. Publish a short human-readable summary, with optional Slack notification, after the compare step.
+
+The same workflow also runs the independent `interactive-latency` job. It
+builds release binaries, executes the pinned Bifrost self-corpus with profiling
+enabled, publishes a p50/p95 table, uploads all raw timing traces, and fails on
+either an oracle failure or a warm-p95 budget violation.
 
 The harness already guarantees two useful operator properties for that workflow:
 

@@ -15,9 +15,16 @@ use crate::analyzer::{RustReferenceContext, SignatureMetadata, StructuredTypeIde
 use crate::hash::{HashMap, HashSet};
 use std::cell::RefCell;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RustResolutionSemantics {
+    Full,
+    Bounded,
+}
+
 pub(crate) struct AnalyzerRustDefinitionProvider<'a> {
     rust: &'a RustAnalyzer,
     session: Option<&'a ResolutionSession>,
+    semantics: RustResolutionSemantics,
     cache_lookups: bool,
     fqns: RefCell<HashMap<String, Vec<CodeUnit>>>,
     file_identifiers: RefCell<HashMap<(ProjectFile, String), Vec<CodeUnit>>>,
@@ -28,6 +35,7 @@ impl<'a> AnalyzerRustDefinitionProvider<'a> {
         Self {
             rust,
             session: None,
+            semantics: RustResolutionSemantics::Full,
             cache_lookups,
             fqns: RefCell::new(HashMap::default()),
             file_identifiers: RefCell::new(HashMap::default()),
@@ -38,6 +46,18 @@ impl<'a> AnalyzerRustDefinitionProvider<'a> {
         Self {
             rust,
             session: Some(session),
+            semantics: RustResolutionSemantics::Bounded,
+            cache_lookups: true,
+            fqns: RefCell::new(HashMap::default()),
+            file_identifiers: RefCell::new(HashMap::default()),
+        }
+    }
+
+    fn cancellable_full(rust: &'a RustAnalyzer, session: &'a ResolutionSession) -> Self {
+        Self {
+            rust,
+            session: Some(session),
+            semantics: RustResolutionSemantics::Full,
             cache_lookups: true,
             fqns: RefCell::new(HashMap::default()),
             file_identifiers: RefCell::new(HashMap::default()),
@@ -47,7 +67,7 @@ impl<'a> AnalyzerRustDefinitionProvider<'a> {
 
 impl RustDefinitionProvider for AnalyzerRustDefinitionProvider<'_> {
     fn is_bounded(&self) -> bool {
-        self.session.is_some()
+        self.semantics == RustResolutionSemantics::Bounded
     }
 
     fn scope_step(&self) -> bool {
@@ -57,6 +77,19 @@ impl RustDefinitionProvider for AnalyzerRustDefinitionProvider<'_> {
     fn observe_cancellation(&self) -> bool {
         self.session
             .is_none_or(ResolutionSession::observe_cancellation)
+    }
+
+    fn forward_reference_context(
+        &self,
+        rust: &RustAnalyzer,
+        file: &ProjectFile,
+    ) -> Option<std::sync::Arc<RustReferenceContext>> {
+        match self.session {
+            Some(session) => rust.forward_reference_context_of_with_progress(file, &|| {
+                session.observe_cancellation()
+            }),
+            None => Some(rust.forward_reference_context_of(file)),
+        }
     }
 
     fn ranges(&self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Vec<Range> {
@@ -171,9 +204,15 @@ pub(super) fn resolve_rust(
     cache: &mut RustTypeLookupCache,
     operation: Option<NavigationOperation>,
 ) -> DefinitionLookupOutcome {
+    if !support.observe_cancellation() {
+        return no_definition("cancelled", "Rust definition resolution was cancelled");
+    }
     let outcome = resolve_rust_unscoped(
         analyzer, support, file, source, tree, site, cache, operation,
     );
+    if !support.observe_cancellation() {
+        return outcome;
+    }
     let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
         return outcome;
     };
@@ -190,6 +229,32 @@ pub(super) fn resolve_rust(
         direct_crate_reference,
         outcome,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_rust_cancellable(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    cache: &mut RustTypeLookupCache,
+    operation: Option<NavigationOperation>,
+    budget: ReceiverAnalysisBudget,
+    cancellation: &CancellationToken,
+) -> BoundedResolution<DefinitionLookupOutcome> {
+    let session = ResolutionSession::bounded(budget, Some(cancellation));
+    let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
+        return session.finish(no_definition(
+            "rust_analyzer_unavailable",
+            "Rust analyzer is unavailable",
+        ));
+    };
+    let support = AnalyzerRustDefinitionProvider::cancellable_full(rust, &session);
+    let outcome = resolve_rust(
+        analyzer, &support, file, source, tree, site, cache, operation,
+    );
+    session.finish(outcome)
 }
 
 pub(crate) fn resolve_rust_bounded(
@@ -241,6 +306,13 @@ fn resolve_rust_bounded_in_session(
 
     if let Some(outcome) = resolve_rust_field(analyzer, support, file, source, tree, site, cache) {
         return outcome;
+    }
+
+    if node.kind() == "self" && focused_rust_field_receiver(node, site.focus_start_byte) {
+        return no_definition(
+            "local_receiver",
+            "the focused Rust receiver is a local expression, which is not indexed",
+        );
     }
 
     if node.kind() == "self"
@@ -703,10 +775,9 @@ fn resolve_rust_unscoped(
     // Preserve the exact focused segment of structured Rust paths before
     // whole-expression member handling can collapse an owner focus such as
     // `EventInfo` in `vec![EventInfo::default()]` to the terminal method.
-    let refs = rust.forward_reference_context_of(file);
     if let Some(tree) = tree
         && let Some(outcome) = rust_focused_token_tree_prefix_outcome(
-            analyzer, rust, support, file, source, tree, site, &refs,
+            analyzer, rust, support, file, source, tree, site,
         )
     {
         return outcome;
@@ -810,7 +881,12 @@ fn resolve_rust_unscoped(
                     // The enclosing impl's type may get the associated item from an
                     // implemented trait; the owner fqn is already resolved, so this
                     // enters the shared resolver past its scoped-path step.
-                    let refs = rust.forward_reference_context_of(file);
+                    let Some(refs) = support.forward_reference_context(rust, file) else {
+                        return no_definition(
+                            "cancelled",
+                            "Rust definition resolution was cancelled",
+                        );
+                    };
                     let matches_kind: fn(&CodeUnit) -> bool = match member_kind {
                         RustMemberKind::Field => CodeUnit::is_field,
                         RustMemberKind::Function => CodeUnit::is_function,
@@ -852,20 +928,19 @@ fn resolve_rust_unscoped(
     }
     if let Some(tree) = tree
         && let Some(outcome) =
-            rust_focused_use_path_outcome(analyzer, rust, support, file, source, tree, site, &refs)
+            rust_focused_use_path_outcome(analyzer, rust, support, file, source, tree, site)
     {
         return outcome;
     }
     if let Some(tree) = tree
-        && let Some(outcome) = rust_focused_scoped_prefix_outcome(
-            analyzer, rust, support, file, source, tree, site, &refs,
-        )
+        && let Some(outcome) =
+            rust_focused_scoped_prefix_outcome(analyzer, rust, support, file, source, tree, site)
     {
         return outcome;
     }
     if let Some(tree) = tree
         && let Some(candidates) = rust_focused_terminal_scoped_type_candidates(
-            analyzer, rust, support, file, source, tree, site, &refs,
+            analyzer, rust, support, file, source, tree, site,
         )
     {
         return candidates_outcome(candidates);
@@ -882,10 +957,13 @@ fn resolve_rust_unscoped(
     // associated-item resolver chain carries segments end-to-end.
     let (candidates, scoped_lookup_failed) = if let Some((path, name)) = reference.rsplit_once("::")
     {
+        let Some(refs) = support.forward_reference_context(rust, file) else {
+            return no_definition("cancelled", "Rust definition resolution was cancelled");
+        };
         let role = tree
             .and_then(|tree| rust_bare_reference_role(tree, site, source))
             .unwrap_or(RustBareReferenceRole::Callable);
-        let resolved =
+        let mut resolved =
             match crate::analyzer::usages::rust_graph::resolve_scoped_associated_item_matching(
                 rust,
                 support,
@@ -905,6 +983,14 @@ fn resolve_rust_unscoped(
                 | ReceiverAnalysisOutcome::Unsupported { .. }
                 | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
             };
+        if resolved.is_empty()
+            && let Some(tree) = tree
+            && let Some(local) = rust_local_scoped_owner_member_candidates(
+                analyzer, rust, support, file, source, tree, site, name, role,
+            )
+        {
+            resolved = local;
+        }
         (resolved, true)
     } else {
         let resolved = if let Some(tree) = tree
@@ -983,7 +1069,7 @@ fn resolve_rust_unscoped(
                     if !local.is_empty() {
                         return candidates_outcome(local);
                     }
-                    if let Some(unit) = rust_enclosing_scope_member_fallback(
+                    if let Some(unit) = rust_enclosing_scope_type_fallback(
                         analyzer,
                         file,
                         reference,
@@ -1032,6 +1118,9 @@ fn resolve_rust_unscoped(
                 }
             }
         } else {
+            let Some(refs) = support.forward_reference_context(rust, file) else {
+                return no_definition("cancelled", "Rust definition resolution was cancelled");
+            };
             refs.resolve_bare(reference)
                 .map(|fqn| support.fqn(fqn))
                 .unwrap_or_default()
@@ -1054,7 +1143,7 @@ fn resolve_rust_unscoped(
         // a future upstream regression — a genuinely-external `::` path yields
         // `None` here and still draws the boundary.
         if let Some(unit) =
-            rust_enclosing_scope_member_fallback(analyzer, file, reference, site.focus_start_byte)
+            rust_enclosing_scope_type_fallback(analyzer, file, reference, site.focus_start_byte)
         {
             return candidates_outcome(vec![unit]);
         }
@@ -1259,6 +1348,12 @@ fn rust_exact_reference_role_outcome(
             "Rust lifetime parameters are lexical bindings and are not indexed definitions",
         ));
     }
+    if focused.kind() == "self" && focused_rust_field_receiver(focused, site.focus_start_byte) {
+        return Some(no_definition(
+            "local_receiver",
+            "the focused Rust receiver is a local expression, which is not indexed",
+        ));
+    }
 
     let focused_name = rust_node_text(focused, source).trim();
     if focused.kind() == "type_identifier"
@@ -1454,7 +1549,7 @@ fn rust_macro_name_outcome(
         return None;
     }
     let rust = resolve_analyzer::<RustAnalyzer>(analyzer)?;
-    let refs = rust.forward_reference_context_of(file);
+    let refs = support.forward_reference_context(rust, file)?;
     let name_node = macro_name.child_by_field_name("name").unwrap_or(macro_name);
     let name = rust_node_text(name_node, source).trim();
     let candidates = if let Some(path) = macro_name.child_by_field_name("path") {
@@ -1622,6 +1717,19 @@ fn rust_visible_import_resolution(
             }
         }
         let mut targets = rust_forward_import_targets(rust, file, &binder, reference);
+        if !explicitly_bound {
+            let scoped_glob_targets = rust_scoped_glob_forward_import_targets(
+                rust,
+                file,
+                source,
+                scope_start,
+                &binder,
+                reference,
+            );
+            if !scoped_glob_targets.is_empty() {
+                targets = scoped_glob_targets;
+            }
+        }
         // `self`/`super` imports that resolve within the current file: the
         // standard target resolution looks in the file's parent package and
         // misses them, so steer them to the current file directly.
@@ -1688,6 +1796,46 @@ fn rust_visible_import_resolution(
         }
     }
     RustVisibleImportResolution::Unbound
+}
+
+fn rust_scoped_glob_forward_import_targets(
+    rust: &RustAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    scope_start: usize,
+    binder: &ImportBinder,
+    reference: &str,
+) -> Vec<(ProjectFile, String)> {
+    let mut targets = Vec::new();
+    for binding in binder.bindings.values() {
+        let segments = crate::analyzer::symbol_lookup::parse_symbol_path(
+            Language::Rust,
+            &binding.module_specifier,
+        );
+        if binding.kind != ImportKind::Glob
+            || !matches!(segments.first().map(String::as_str), Some("self" | "super"))
+        {
+            continue;
+        }
+        let Some(package) = resolve_import_package_scoped(
+            rust,
+            file,
+            source,
+            scope_start,
+            &binding.module_specifier,
+        ) else {
+            continue;
+        };
+        targets.extend(
+            rust.get_analyzed_files()
+                .into_iter()
+                .filter(|candidate| rust_package_name(candidate) == package)
+                .map(|candidate| (candidate, reference.to_string())),
+        );
+    }
+    targets.sort();
+    targets.dedup();
+    targets
 }
 
 /// Resolve an import's module specifier to its package, scope-aware:
@@ -2320,6 +2468,76 @@ fn rust_enclosing_scoped_type_identifier_name(
     None
 }
 
+fn rust_enclosing_scoped_terminal_name(
+    node: Node<'_>,
+    focus_start_byte: usize,
+    focus_end_byte: usize,
+) -> Option<Node<'_>> {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if matches!(
+            candidate.kind(),
+            "scoped_identifier" | "scoped_type_identifier"
+        ) && let Some(name) = candidate.child_by_field_name("name")
+            && name.start_byte() <= focus_start_byte
+            && focus_end_byte <= name.end_byte()
+        {
+            return Some(candidate);
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rust_local_scoped_owner_member_candidates(
+    analyzer: &dyn IAnalyzer,
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    member: &str,
+    role: RustBareReferenceRole,
+) -> Option<Vec<CodeUnit>> {
+    let focused =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
+    let scoped =
+        rust_enclosing_scoped_terminal_name(focused, site.focus_start_byte, site.focus_end_byte)?;
+    let path = scoped.child_by_field_name("path")?;
+    if !matches!(path.kind(), "identifier" | "type_identifier") {
+        return None;
+    }
+    let owner_text = rust_node_text(path, source).trim();
+    if owner_text.is_empty() {
+        return None;
+    }
+    let owners = rust_current_module_candidates(
+        analyzer,
+        rust,
+        support,
+        file,
+        tree.root_node(),
+        path.start_byte(),
+        path.end_byte(),
+        owner_text,
+        RustBareReferenceRole::Owner,
+    );
+    let mut candidates = owners
+        .into_iter()
+        .flat_map(|owner| support.members_for_owner_name(&owner.fq_name(), member))
+        .filter(|candidate| rust_role_accepts_scoped(rust, role, candidate))
+        .collect::<Vec<_>>();
+    candidates.extend(rust_cargo_root_member_candidates(
+        rust, support, file, source, path, member,
+    ));
+    candidates.retain(|candidate| rust_role_accepts_scoped(rust, role, candidate));
+    sort_units(&mut candidates);
+    candidates.dedup();
+    (!candidates.is_empty()).then_some(candidates)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rust_focused_terminal_scoped_type_candidates(
     analyzer: &dyn IAnalyzer,
@@ -2329,7 +2547,6 @@ fn rust_focused_terminal_scoped_type_candidates(
     source: &str,
     tree: &Tree,
     site: &ResolvedReferenceSite,
-    refs: &RustReferenceContext,
 ) -> Option<Vec<CodeUnit>> {
     let focused =
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
@@ -2338,14 +2555,127 @@ fn rust_focused_terminal_scoped_type_candidates(
         site.focus_start_byte,
         site.focus_end_byte,
     )?;
-    let full_path = rust_node_text(scoped, source).trim();
-    let fqn =
-        crate::analyzer::usages::rust_graph::resolve_rust_path_fqn(rust, refs, file, full_path)?;
-    let mut candidates = support
-        .fqn(&fqn)
+    let path = scoped.child_by_field_name("path")?;
+    let name = scoped.child_by_field_name("name")?;
+    let member = rust_node_text(name, source).trim();
+    if member.is_empty() {
+        return None;
+    }
+    let refs = support.forward_reference_context(rust, file)?;
+    let owners =
+        rust_scoped_owner_candidates_from_path(analyzer, rust, support, file, source, path, &refs)?;
+    let mut candidates = owners
         .into_iter()
-        .filter(|candidate| rust_is_type_definition(analyzer, candidate))
+        .flat_map(|owner| {
+            support
+                .members_for_owner_name(&owner.fq_name(), member)
+                .into_iter()
+                .filter(|candidate| rust_is_type_definition(analyzer, candidate))
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
+    candidates.extend(
+        rust_cargo_root_member_candidates(rust, support, file, source, path, member)
+            .into_iter()
+            .filter(|candidate| rust_is_type_definition(analyzer, candidate)),
+    );
+    sort_units(&mut candidates);
+    candidates.dedup();
+    (!candidates.is_empty()).then_some(candidates)
+}
+
+fn rust_cargo_root_member_candidates(
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    path: Node<'_>,
+    member: &str,
+) -> Vec<CodeUnit> {
+    if !matches!(path.kind(), "identifier" | "type_identifier") {
+        return Vec::new();
+    }
+    let route = rust_node_text(path, source).trim();
+    if route.is_empty() {
+        return Vec::new();
+    }
+    let Some(root_file) = rust.resolve_cargo_crate_root_file(file, route) else {
+        return Vec::new();
+    };
+    support
+        .file_identifier(&root_file, member)
+        .into_iter()
+        .filter(|candidate| candidate.source() == &root_file)
+        .collect()
+}
+
+fn rust_scoped_owner_candidates_from_path(
+    analyzer: &dyn IAnalyzer,
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    path: Node<'_>,
+    refs: &RustReferenceContext,
+) -> Option<Vec<CodeUnit>> {
+    let owner_text = rust_node_text(path, source).trim();
+    if owner_text.is_empty() {
+        return None;
+    }
+
+    let mut candidates = Vec::new();
+    if owner_text == "Self" {
+        if let Some(owner) = rust_enclosing_impl_type_fqn(analyzer, support, file, source, path) {
+            candidates.extend(support.fqn(&owner));
+        }
+    } else if let Some(fqn) = rust_scoped_prefix_fqn(rust, file, refs, path, source) {
+        candidates.extend(support.fqn(&fqn).into_iter().filter(|candidate| {
+            rust_role_accepts_imported(rust, RustBareReferenceRole::Owner, candidate)
+        }));
+    }
+
+    if matches!(path.kind(), "identifier" | "type_identifier") {
+        if candidates.is_empty()
+            && let Some(root) = rust_root_node(support, path)
+        {
+            candidates.extend(rust_current_module_candidates(
+                analyzer,
+                rust,
+                support,
+                file,
+                root,
+                path.start_byte(),
+                path.end_byte(),
+                owner_text,
+                RustBareReferenceRole::Owner,
+            ));
+        }
+        let rust_2015 = rust.file_uses_rust_2015_edition(file);
+        let explicit_extern_route = rust_2015
+            .then(|| rust_visible_extern_crate_binding(path, source, owner_text))
+            .flatten();
+        let cargo_root_in_scope = !rust_2015 || explicit_extern_route.is_some();
+        let cargo_route = explicit_extern_route.as_deref().unwrap_or(owner_text);
+        let external = cargo_root_in_scope
+            .then(|| rust.resolve_module_package(file, cargo_route))
+            .flatten()
+            .into_iter()
+            .flat_map(|package| support.fqn(&package))
+            .filter(|candidate| {
+                rust_role_accepts_imported(rust, RustBareReferenceRole::Owner, candidate)
+            })
+            .collect::<Vec<_>>();
+        if let Some(routed) = rust.candidates_in_cargo_library_route(file, cargo_route, external) {
+            candidates.extend(routed);
+        }
+        if let Some(fqn) = rust.resolve_module_package(file, owner_text) {
+            candidates.extend(support.fqn(&fqn));
+        }
+    }
+
+    candidates.retain(|candidate| {
+        rust_role_accepts_imported(rust, RustBareReferenceRole::Owner, candidate)
+    });
     sort_units(&mut candidates);
     candidates.dedup();
     (!candidates.is_empty()).then_some(candidates)
@@ -2370,7 +2700,6 @@ fn rust_focused_use_path_outcome(
     source: &str,
     tree: &Tree,
     site: &ResolvedReferenceSite,
-    refs: &RustReferenceContext,
 ) -> Option<DefinitionLookupOutcome> {
     let focused =
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
@@ -2381,9 +2710,10 @@ fn rust_focused_use_path_outcome(
     } else {
         RustFocusedPathRole::Declaration
     };
+    let refs = support.forward_reference_context(rust, file)?;
     let resolved_fqn = crate::analyzer::usages::rust_graph::resolve_rust_path_fqn(
         rust,
-        refs,
+        &refs,
         file,
         &focused_path.full_path,
     );
@@ -2394,12 +2724,13 @@ fn rust_focused_use_path_outcome(
         file,
         source,
         site,
-        refs,
+        &refs,
         focused_path.root,
         focused_text,
         &focused_path.full_path,
         role,
         resolved_fqn.as_deref(),
+        false,
     ))
 }
 
@@ -2416,7 +2747,6 @@ fn rust_focused_scoped_prefix_outcome(
     source: &str,
     tree: &Tree,
     site: &ResolvedReferenceSite,
-    refs: &RustReferenceContext,
 ) -> Option<DefinitionLookupOutcome> {
     let focused =
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
@@ -2430,7 +2760,10 @@ fn rust_focused_scoped_prefix_outcome(
         ));
     }
 
-    let resolved_fqn = rust_scoped_prefix_fqn(rust, file, refs, prefix, source);
+    let refs = support.forward_reference_context(rust, file)?;
+    let uses_module_package_fallback =
+        rust_scoped_prefix_uses_module_package_fallback(rust, file, &refs, prefix, source);
+    let resolved_fqn = rust_scoped_prefix_fqn(rust, file, &refs, prefix, source);
     let root = rust_scoped_path_root(prefix);
     Some(rust_focused_prefix_resolution_outcome(
         analyzer,
@@ -2439,12 +2772,13 @@ fn rust_focused_scoped_prefix_outcome(
         file,
         source,
         site,
-        refs,
+        &refs,
         root,
         focused_text,
         prefix_text,
         RustFocusedPathRole::Owner,
         resolved_fqn.as_deref(),
+        uses_module_package_fallback,
     ))
 }
 
@@ -2457,7 +2791,6 @@ fn rust_focused_token_tree_prefix_outcome(
     source: &str,
     tree: &Tree,
     site: &ResolvedReferenceSite,
-    refs: &RustReferenceContext,
 ) -> Option<DefinitionLookupOutcome> {
     let focused =
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
@@ -2482,8 +2815,9 @@ fn rust_focused_token_tree_prefix_outcome(
         }
         root = segment;
     }
+    let refs = support.forward_reference_context(rust, file)?;
     let resolved_fqn = crate::analyzer::usages::rust_graph::resolve_rust_token_tree_paths(
-        rust, support, refs, file, source, token_tree,
+        rust, support, &refs, file, source, token_tree,
     )
     .into_iter()
     .find(|segment| {
@@ -2507,12 +2841,13 @@ fn rust_focused_token_tree_prefix_outcome(
         file,
         source,
         site,
-        refs,
+        &refs,
         root,
         focused_text,
         prefix,
         RustFocusedPathRole::Owner,
         resolved_fqn.as_deref(),
+        false,
     ))
 }
 
@@ -2520,6 +2855,125 @@ fn rust_focused_token_tree_prefix_outcome(
 enum RustFocusedPathRole {
     Owner,
     Declaration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustOwnerRootAvailability {
+    Indexed,
+    Boundary,
+    CargoBoundary,
+    Unbound,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rust_owner_root_availability(
+    analyzer: &dyn IAnalyzer,
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    site: &ResolvedReferenceSite,
+    root: Node<'_>,
+    root_name: &str,
+) -> RustOwnerRootAvailability {
+    if matches!(root.kind(), "crate" | "self" | "super") {
+        return RustOwnerRootAvailability::Indexed;
+    }
+
+    match rust_visible_import_resolution(
+        rust,
+        support,
+        file,
+        source,
+        site.focus_start_byte,
+        root_name,
+        RustBareReferenceRole::Owner,
+    ) {
+        RustVisibleImportResolution::Resolved(candidates)
+        | RustVisibleImportResolution::GlobResolved(candidates)
+            if !candidates.is_empty() =>
+        {
+            return RustOwnerRootAvailability::Indexed;
+        }
+        RustVisibleImportResolution::BoundButUnindexed => {
+            return RustOwnerRootAvailability::Boundary;
+        }
+        RustVisibleImportResolution::Resolved(_)
+        | RustVisibleImportResolution::GlobResolved(_)
+        | RustVisibleImportResolution::Unbound => {}
+    }
+
+    let mut syntax_root = root;
+    while let Some(parent) = syntax_root.parent() {
+        syntax_root = parent;
+    }
+    if !rust_current_module_candidates(
+        analyzer,
+        rust,
+        support,
+        file,
+        syntax_root,
+        site.focus_start_byte,
+        site.focus_end_byte,
+        root_name,
+        RustBareReferenceRole::Owner,
+    )
+    .is_empty()
+    {
+        return RustOwnerRootAvailability::Indexed;
+    }
+
+    let rust_2015 = rust.file_uses_rust_2015_edition(file);
+    let explicit_extern_route = rust_2015
+        .then(|| rust_visible_extern_crate_binding(root, source, root_name))
+        .flatten();
+    let cargo_root_in_scope = !rust_2015 || explicit_extern_route.is_some();
+    let cargo_route = explicit_extern_route.as_deref().unwrap_or(root_name);
+    if let Some(root_file) = rust.resolve_cargo_crate_root_file(file, cargo_route) {
+        if !cargo_root_in_scope {
+            return RustOwnerRootAvailability::Boundary;
+        }
+        let external = support
+            .fqn(&rust_package_name(&root_file))
+            .into_iter()
+            .filter(|candidate| {
+                rust_role_accepts_imported(rust, RustBareReferenceRole::Owner, candidate)
+            })
+            .collect();
+        return match rust.candidates_in_cargo_library_route(file, cargo_route, external) {
+            Some(candidates) if !candidates.is_empty() => RustOwnerRootAvailability::Indexed,
+            Some(_) | None => RustOwnerRootAvailability::Boundary,
+        };
+    }
+    if cargo_root_in_scope && rust.has_available_declared_cargo_dependency(file, cargo_route) {
+        return RustOwnerRootAvailability::CargoBoundary;
+    }
+
+    RustOwnerRootAvailability::Unbound
+}
+
+fn rust_scoped_prefix_uses_module_package_fallback(
+    rust: &RustAnalyzer,
+    file: &ProjectFile,
+    refs: &RustReferenceContext,
+    prefix: Node<'_>,
+    source: &str,
+) -> bool {
+    let ("scoped_identifier" | "scoped_type_identifier") = prefix.kind() else {
+        return false;
+    };
+    let Some(path) = prefix.child_by_field_name("path") else {
+        return false;
+    };
+    let Some(name) = prefix.child_by_field_name("name") else {
+        return false;
+    };
+    let path = rust_node_text(path, source).trim();
+    let name = rust_node_text(name, source).trim();
+    refs.resolve_scoped(path, name).is_none()
+        && rust
+            .resolve_module_package(file, rust_node_text(prefix, source).trim())
+            .is_some()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2536,8 +2990,12 @@ fn rust_focused_prefix_resolution_outcome(
     focused_path: &str,
     role: RustFocusedPathRole,
     resolved_fqn: Option<&str>,
+    uses_module_package_fallback: bool,
 ) -> DefinitionLookupOutcome {
     let root_name = rust_node_text(root, source).trim();
+    let root_availability = (role == RustFocusedPathRole::Owner).then(|| {
+        rust_owner_root_availability(analyzer, rust, support, file, source, site, root, root_name)
+    });
     if role == RustFocusedPathRole::Owner && focused_path == focused_text && root_name == "self" {
         let lexical_module =
             rust_enclosing_inline_module_candidates(analyzer, support, file, source, root);
@@ -2618,7 +3076,7 @@ fn rust_focused_prefix_resolution_outcome(
                 if !local.is_empty() {
                     return candidates_outcome(local);
                 }
-                if let Some(unit) = rust_enclosing_scope_member_fallback(
+                if let Some(unit) = rust_enclosing_scope_type_fallback(
                     analyzer,
                     file,
                     focused_text,
@@ -2704,6 +3162,10 @@ fn rust_focused_prefix_resolution_outcome(
     }
 
     if let Some(fqn) = resolved_fqn
+        && !(role == RustFocusedPathRole::Owner
+            && focused_path != focused_text
+            && uses_module_package_fallback
+            && root_availability != Some(RustOwnerRootAvailability::Indexed))
         && !enclosing_module_self_root
     {
         let mut candidates: Vec<_> = support
@@ -2726,7 +3188,10 @@ fn rust_focused_prefix_resolution_outcome(
     }
 
     if role == RustFocusedPathRole::Owner {
-        let mut candidates = if enclosing_module_self_root {
+        let skip_unavailable_scoped_fallback = focused_path != focused_text
+            && uses_module_package_fallback
+            && root_availability != Some(RustOwnerRootAvailability::Indexed);
+        let mut candidates = if enclosing_module_self_root || skip_unavailable_scoped_fallback {
             Vec::new()
         } else {
             rust.resolve_module_package(file, focused_path)
@@ -2756,19 +3221,25 @@ fn rust_focused_prefix_resolution_outcome(
 
     if enclosing_module_self_root
         || rust_binder_has_external_binding(&binder, root_name)
+        || matches!(
+            root_availability,
+            Some(RustOwnerRootAvailability::Boundary | RustOwnerRootAvailability::CargoBoundary)
+        )
         || rust_extern_prelude_root(rust, support, file, refs, root, root_name)
     {
+        if root_availability == Some(RustOwnerRootAvailability::CargoBoundary) {
+            return boundary_unchecked(format!(
+                "focused Rust path segment `{focused_text}` resolves through a declared Cargo dependency whose crate root is not indexed"
+            ));
+        }
         // Before a confident boundary claim, resolve the focused segment against
         // the enclosing type/trait scope: `Self::TransactionManager::run` names
         // the associated type `Connection::TransactionManager`, which shares its
         // spelling with an imported trait but is a distinct namespace and lives
         // in this file (issue #1126 diesel `TransactionManager`).
-        if let Some(unit) = rust_enclosing_scope_member_fallback(
-            analyzer,
-            file,
-            focused_text,
-            site.focus_start_byte,
-        ) {
+        if let Some(unit) =
+            rust_enclosing_scope_type_fallback(analyzer, file, focused_text, site.focus_start_byte)
+        {
             return candidates_outcome(vec![unit]);
         }
         // Only for a *bound* alias root (`use forc_pkg as pkg; pkg::Item`) do we
@@ -3030,23 +3501,17 @@ fn resolve_rust_field(
         }
         let receiver = field_expression.child_by_field_name("value")?;
         if receiver.start_byte() <= site.focus_start_byte
-            && site.focus_end_byte <= receiver.end_byte()
+            && site.focus_start_byte < receiver.end_byte()
         {
-            if rust_node_text(receiver, source).trim() == "self"
-                && let Some(owner) =
-                    rust_enclosing_impl_type_fqn(analyzer, support, file, source, node)
-            {
-                let candidates = support.fqn(&owner);
-                if !candidates.is_empty() {
-                    return Some(candidates_outcome(candidates));
-                }
-            }
-            return Some(no_definition(
-                "local_receiver",
-                "the focused Rust receiver is a local expression, which is not indexed",
-            ));
+            return (receiver.kind() == "self").then(|| {
+                no_definition(
+                    "local_receiver",
+                    "the focused Rust receiver is a local expression, which is not indexed",
+                )
+            });
         }
-        if !(field.start_byte() <= site.focus_start_byte && site.focus_end_byte <= field.end_byte())
+        if !(field.start_byte() <= site.focus_start_byte
+            && site.focus_start_byte < field.end_byte())
         {
             return None;
         }
@@ -3081,7 +3546,7 @@ fn resolve_rust_field(
             && member_kind == RustMemberKind::Function
             && let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer)
         {
-            let refs = rust.forward_reference_context_of(file);
+            let refs = support.forward_reference_context(rust, file)?;
             let trait_candidates =
                 match crate::analyzer::usages::rust_graph::resolve_trait_associated_item(
                     rust,
@@ -3247,7 +3712,7 @@ fn rust_token_tree_dotted_member_outcome(
         rust_member_candidates(support.fqn(&format!("{owner}.{member}")), member_kind);
     if candidates.is_empty() && member_kind == RustMemberKind::Function {
         let rust = resolve_analyzer::<RustAnalyzer>(analyzer)?;
-        let refs = rust.forward_reference_context_of(file);
+        let refs = support.forward_reference_context(rust, file)?;
         candidates =
             match crate::analyzer::usages::rust_graph::resolve_trait_associated_item_matching(
                 rust,
@@ -3318,6 +3783,20 @@ fn rust_enclosing_field_expression(mut node: Node<'_>) -> Option<Node<'_>> {
         }
         node = node.parent()?;
     }
+}
+
+fn focused_rust_field_receiver(node: Node<'_>, focus_start: usize) -> bool {
+    rust_enclosing_field_expression(node)
+        .and_then(|field_expression| field_expression.child_by_field_name("value"))
+        .is_some_and(|receiver| {
+            receiver.start_byte() <= focus_start && focus_start < receiver.end_byte()
+        })
+}
+
+pub(super) fn focused_site_is_field_receiver(root: Node<'_>, site: &ResolvedReferenceSite) -> bool {
+    smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte).is_some_and(
+        |node| node.kind() == "self" && focused_rust_field_receiver(node, site.focus_start_byte),
+    )
 }
 
 fn rust_enclosing_field_expression_bounded<'tree>(
@@ -4178,7 +4657,9 @@ fn rust_callable_definition_candidates(
         let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
             return Vec::new();
         };
-        let refs = rust.forward_reference_context_of(file);
+        let Some(refs) = support.forward_reference_context(rust, file) else {
+            return Vec::new();
+        };
         return match crate::analyzer::usages::rust_graph::resolve_scoped_associated_item(
             rust,
             support,
@@ -4586,7 +5067,7 @@ pub(crate) fn rust_resolve_type_node_fqn(
         return rust_enclosing_impl_type_fqn(analyzer, support, file, source, type_node);
     }
     if let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) {
-        let refs = rust.forward_reference_context_of(file);
+        let refs = support.forward_reference_context(rust, file)?;
         if let Some(path) = type_ref.path.as_deref() {
             if let Some(resolved) = refs.resolve_scoped(path, name).filter(|resolved| {
                 support
@@ -5257,6 +5738,13 @@ fn rust_callable_candidates(
                     reference_byte,
                 )
         });
+        if candidates.is_empty()
+            && support.observe_cancellation()
+            && let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer)
+        {
+            candidates =
+                rust_imported_export_candidates(rust, support, file, name, Some(reference_byte));
+        }
         return candidates;
     }
     if candidates.is_empty()
@@ -5372,27 +5860,24 @@ fn rust_reference_looks_external(reference: &str) -> bool {
         })
 }
 
-/// Resolve a name to a workspace-internal declaration that lives in an
-/// *enclosing type/trait/impl/enum* scope of the reference — an enum variant,
+/// Resolve a type-shaped name to a workspace-internal declaration that lives
+/// in an *enclosing type/trait/impl/enum* scope of the reference — an
 /// associated type, nested type, or the enclosing type itself.
 ///
 /// An explicit `use` binds a bare name in the *module* namespace only; Rust
-/// keeps enum-variant, associated-item, and type namespaces separate, so such a
-/// path segment (`Error::Variant`, `Self::AssocType`, a variant declaration
-/// name) is never shadowed by a same-named import. Consulting this before any
-/// "explicitly imported across an unindexed boundary" claim upholds the
-/// invariant that a confident non-indexing claim is never emitted for a name the
-/// workspace actually declares (issue #1126: diesel `Expression`/
-/// `TransactionManager`, meilisearch `Error`, nushell `SqliteError`).
-fn rust_enclosing_scope_member_fallback(
+/// keeps associated types and imported types distinct. A field/enum variant is
+/// deliberately not eligible here: bare `PTR::read` cannot use an enclosing
+/// `RData::PTR` variant as a path owner, and an explicitly imported but
+/// unindexed `PTR` must remain a boundary instead of being stolen by that
+/// variant (#1283). Consulting enclosing classes before a boundary still
+/// preserves the #1126 safety net for workspace traits and associated types.
+fn rust_enclosing_scope_type_fallback(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     name: &str,
     byte: usize,
 ) -> Option<CodeUnit> {
-    resolve_in_enclosing_scopes(analyzer, file, name, byte, |candidate| {
-        candidate.is_field() || candidate.is_class()
-    })
+    resolve_in_enclosing_scopes(analyzer, file, name, byte, CodeUnit::is_class)
 }
 
 /// True when the focused owner/qualifier resolves to a Rust crate or module that
@@ -5579,6 +6064,56 @@ fn use_service(service: Service) {
             matches!(
                 value.definitions.as_slice(),
                 [definition] if definition.fq_name() == "Service.run"
+            ),
+            "{value:#?}"
+        );
+    }
+
+    #[test]
+    fn issue_1228_bounded_definition_lookup_resolves_imported_bare_call() {
+        let source = r#"
+use crate::navigation::get_definitions_by_location;
+
+pub fn dispatch() {
+    get_definitions_by_location();
+}
+"#
+        .to_string();
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Rust,
+            &[
+                ("src/lib.rs", "mod navigation;\nmod service;\n"),
+                (
+                    "src/navigation.rs",
+                    "pub fn get_definitions_by_location() {}\n",
+                ),
+                ("src/service.rs", &source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "src/service.rs");
+        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let site = site_for_last(&source, &file, "get_definitions_by_location");
+
+        let outcome = resolve_rust_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+
+        let BoundedResolution::Complete { value, .. } = outcome else {
+            panic!("imported call lookup should complete");
+        };
+        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
+        assert!(
+            matches!(
+                value.definitions.as_slice(),
+                [definition]
+                    if definition.identifier() == "get_definitions_by_location"
+                        && rel_path_string(definition.source()) == "src/navigation.rs"
             ),
             "{value:#?}"
         );

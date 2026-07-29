@@ -76,19 +76,21 @@ use crate::analyzer::structural::{
     CodeQuerySemanticWork,
 };
 use crate::analyzer::typestate::{
-    BoundTypestateSubjectSpec, CompiledProtocol, PROTOCOL_SCHEMA_VERSION, ProtocolAnalysisMode,
-    ProtocolEventKey, ProtocolEventOccurrence, ProtocolEventSpec, ProtocolExpectationKey,
-    ProtocolGuardSpec, ProtocolObservationPhase, ProtocolObservationSpec,
-    ProtocolProcedureExitKind, ProtocolSemantics, ProtocolSpec, ProtocolStateKey,
-    ProtocolTerminalExpectationSpec, ProtocolTerminalObservationSpec, ProtocolTransitionSpec,
-    ProtocolUncertaintyBehavior, ProtocolUncertaintySemantics, ProtocolUnmatchedEventBehavior,
-    TypestateBindingContext, TypestateBindingMultiplicity, TypestateBindingPlan,
-    TypestateBindingQuality, TypestateEventBindingId, TypestateEventBindingSpec, TypestateFinding,
+    BoundTypestateSubjectSpec, CompiledProtocol, PROTOCOL_SCHEMA_VERSION,
+    ProductionSummaryLifecycleCounters, ProductionTypestateExecutionContext,
+    ProductionTypestateSummaryRepository, ProtocolAnalysisMode, ProtocolEventKey,
+    ProtocolEventOccurrence, ProtocolEventSpec, ProtocolExpectationKey, ProtocolGuardSpec,
+    ProtocolObservationPhase, ProtocolObservationSpec, ProtocolProcedureExitKind,
+    ProtocolSemantics, ProtocolSpec, ProtocolStateKey, ProtocolTerminalExpectationSpec,
+    ProtocolTerminalObservationSpec, ProtocolTransitionSpec, ProtocolUncertaintyBehavior,
+    ProtocolUncertaintySemantics, ProtocolUnmatchedEventBehavior, TypestateBindingContext,
+    TypestateBindingMultiplicity, TypestateBindingPlan, TypestateBindingQuality,
+    TypestateEventBindingId, TypestateEventBindingSpec, TypestateFinding,
     TypestateFindingCertainty, TypestateFindingKind, TypestateFindingLimits,
     TypestateFlowProblemError, TypestateInitialSeedSpec, TypestateObjectRole,
     TypestateObservationSite, TypestateSubjectClassKey, TypestateSubjectKey,
     TypestateTerminalBindingId, TypestateTerminalBindingSpec, TypestateUncertainty,
-    collect_summary_findings_with_limits, solve_typestate_with_summaries,
+    collect_summary_findings_with_limits, solve_typestate_with_production_summaries,
 };
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
 use crate::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
@@ -320,6 +322,7 @@ impl IcfgProvider for PolicyIcfgProvider<'_> {
 #[derive(Default)]
 pub(crate) struct ProductionTypestatePolicyEvaluator {
     prepared: RefCell<Option<CompiledTypestatePolicy>>,
+    summaries: Arc<ProductionTypestateSummaryRepository>,
 }
 
 impl super::projection::sealed::TypestateAdapter for ProductionTypestatePolicyEvaluator {}
@@ -367,6 +370,10 @@ impl TypestatePolicyEvaluator for ProductionTypestatePolicyEvaluator {
                 "typestate policy evaluation lost its workspace semantic snapshot",
             );
         };
+        let summary_lease = match self.summaries.lease(0) {
+            Ok(summary_lease) => summary_lease,
+            Err(error) => return failed_projection_payload(&error.to_string()),
+        };
         match evaluate_compiled_typestate(
             authority,
             policy,
@@ -375,6 +382,7 @@ impl TypestatePolicyEvaluator for ProductionTypestatePolicyEvaluator {
             context.cancellation,
             budget,
             &compiled,
+            &summary_lease,
         ) {
             Ok(payload) => payload,
             Err(error) => failed_projection_payload(&error),
@@ -382,6 +390,7 @@ impl TypestatePolicyEvaluator for ProductionTypestatePolicyEvaluator {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_compiled_typestate(
     authority: &TypestateProjectionAuthority<'_>,
     policy: &LoadedPolicy,
@@ -390,7 +399,9 @@ fn evaluate_compiled_typestate(
     cancellation: Option<&CancellationToken>,
     budget: &PolicyBudget,
     compiled: &CompiledTypestatePolicy,
+    summary_lease: &crate::analyzer::typestate::ProductionTypestateSummaryLease,
 ) -> Result<TypestateProjectionPayload, String> {
+    let mut cache_work = ProductionSummaryLifecycleCounters::default();
     let uncancelled = CancellationToken::default();
     let cancellation = cancellation.unwrap_or(&uncancelled);
     let limits = budget.query_limits().typestate;
@@ -415,10 +426,13 @@ fn evaluate_compiled_typestate(
 
     for root in &compiled.roots {
         let mut request = DataflowRequest::new(&mut solver_budget, cancellation);
-        let solved = solve_typestate_with_summaries(
+        let production = solve_typestate_with_production_summaries(
+            summary_lease,
             root,
             &[],
             &icfg_provider,
+            &icfg_provider.inner,
+            ProductionTypestateExecutionContext::Policy(&icfg_provider.execution_budget),
             &compiled.protocol,
             &compiled.bindings,
             semantic_budget
@@ -427,6 +441,8 @@ fn evaluate_compiled_typestate(
             &mut request,
         )
         .map_err(|error| error.to_string())?;
+        cache_work.saturating_add_assign(production.lifecycle());
+        let solved = production.result();
         let fixed_point = match solved.result().termination() {
             SolverTermination::FixedPoint => true,
             SolverTermination::Cancelled => {
@@ -481,7 +497,7 @@ fn evaluate_compiled_typestate(
         let findings = match collect_summary_findings_with_limits(
             &compiled.protocol,
             &compiled.bindings,
-            &solved,
+            solved,
             finding_limits,
             cancellation,
         ) {
@@ -575,6 +591,36 @@ fn evaluate_compiled_typestate(
             "typestate.analysis_findings",
             PolicyWorkUnit::Count,
             retained_analysis_findings,
+        )
+        .map_err(|error| error.to_string()),
+        PolicyWorkMetric::try_new(
+            "typestate.summary_hits",
+            PolicyWorkUnit::Count,
+            u64::try_from(cache_work.hits).unwrap_or(u64::MAX),
+        )
+        .map_err(|error| error.to_string()),
+        PolicyWorkMetric::try_new(
+            "typestate.summary_misses",
+            PolicyWorkUnit::Count,
+            u64::try_from(cache_work.misses).unwrap_or(u64::MAX),
+        )
+        .map_err(|error| error.to_string()),
+        PolicyWorkMetric::try_new(
+            "typestate.summary_rejections",
+            PolicyWorkUnit::Count,
+            u64::try_from(cache_work.rejections).unwrap_or(u64::MAX),
+        )
+        .map_err(|error| error.to_string()),
+        PolicyWorkMetric::try_new(
+            "typestate.summary_evictions",
+            PolicyWorkUnit::Count,
+            u64::try_from(cache_work.evictions).unwrap_or(u64::MAX),
+        )
+        .map_err(|error| error.to_string()),
+        PolicyWorkMetric::try_new(
+            "typestate.summary_recomputations",
+            PolicyWorkUnit::Count,
+            u64::try_from(cache_work.recomputations).unwrap_or(u64::MAX),
         )
         .map_err(|error| error.to_string()),
         PolicyWorkMetric::try_new(
@@ -863,19 +909,30 @@ fn policy_violations(
                 }
             };
             let expected = resolved.expected_states.clone();
-            actual_states
-                .iter()
-                .map(|state| {
+            let mut violations = Vec::with_capacity(actual_states.len());
+            for state in actual_states {
+                let actual = policy_state(protocol, *state)?;
+                if expected.contains(&actual) {
+                    continue;
+                }
+                violations.push(
                     TypestateViolationEvidence::try_terminal_expectation(
                         PolicyTypestateExpectationId::new(key.as_str())
                             .map_err(|error| error.to_string())?,
                         terminal.clone(),
-                        policy_state(protocol, *state)?,
+                        actual,
                         expected.clone(),
                     )
-                    .map_err(|error| error.to_string())
-                })
-                .collect()
+                    .map_err(|error| error.to_string())?,
+                );
+            }
+            if violations.is_empty() {
+                return Err(
+                    "typestate terminal finding contains no state outside the expectation"
+                        .to_owned(),
+                );
+            }
+            Ok(violations)
         }
     }
 }
@@ -1269,6 +1326,10 @@ fn compile_failure(failure: TypestatePolicyCompileFailure) -> TypestateCompilati
         ),
         TypestatePolicyCompileError::QueryIncomplete {
             completion: completion @ CodeQueryCompletion::Incomplete { .. },
+            ..
+        }
+        | TypestatePolicyCompileError::QueryIncomplete {
+            completion: completion @ CodeQueryCompletion::ProvenSubset { .. },
             ..
         } => {
             let mut reasons = super::evaluator::incomplete_reasons(&completion, false);
@@ -3310,7 +3371,8 @@ pub(crate) fn compile_protocol(
                 external_call: ProtocolUncertaintyBehavior::PreserveUncertainty,
                 escape: ProtocolUncertaintyBehavior::PreserveUncertainty,
                 incomplete_analysis: ProtocolUncertaintyBehavior::PreserveUncertainty,
-            },
+            }
+            .with_unmodeled_call_behavior(spec.call_modeling.unmodeled),
         },
     };
     protocol
@@ -3378,6 +3440,64 @@ const fn procedure_exit_kind(event: PolicySemanticEvent) -> ProtocolProcedureExi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::dataflow::UnmodeledCallBehavior;
+    use crate::analyzer::policy::definition::{
+        CallModelingSpec, InconclusivePolicy, TypestateUncertaintySpec,
+    };
+    use crate::analyzer::policy::resolved::ResolvedTypestateAutomatonSpec;
+
+    fn minimal_resolved_spec(behavior: UnmodeledCallBehavior) -> ResolvedTypestatePolicySpec {
+        let open = PolicyTypestateStateId::new("open").unwrap();
+        ResolvedTypestatePolicySpec::try_new(
+            MayMode::May,
+            CallModelingSpec {
+                unmodeled: behavior,
+            },
+            Vec::new(),
+            TypestateUncertaintySpec {
+                escape: InconclusivePolicy::Inconclusive,
+            },
+            ResolvedTypestateAutomatonSpec {
+                states: vec![open.clone()],
+                initial: open.clone(),
+                accepting_states: vec![open],
+                error_states: Vec::new(),
+                events: Vec::new(),
+                transitions: Vec::new(),
+                terminal_expectations: Vec::new(),
+            },
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn public_call_modeling_modes_compile_to_protocol_uncertainty() {
+        for (profile, expected) in [
+            (
+                UnmodeledCallBehavior::Paranoid,
+                ProtocolUncertaintyBehavior::ConservativeTransition,
+            ),
+            (
+                UnmodeledCallBehavior::Optimistic,
+                ProtocolUncertaintyBehavior::PreserveUncertainty,
+            ),
+            (
+                UnmodeledCallBehavior::RequireModel,
+                ProtocolUncertaintyBehavior::Abstain,
+            ),
+        ] {
+            let protocol = compile_protocol(&minimal_resolved_spec(profile)).unwrap();
+            let uncertainty = protocol.semantics().uncertainty;
+            assert_eq!(uncertainty.unknown_call, expected);
+            assert_eq!(uncertainty.external_call, expected);
+            assert_eq!(
+                uncertainty.escape,
+                ProtocolUncertaintyBehavior::PreserveUncertainty
+            );
+        }
+    }
 
     #[test]
     fn semantic_interruption_is_not_flattened_into_partial_data() {

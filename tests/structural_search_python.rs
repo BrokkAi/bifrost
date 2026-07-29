@@ -51,6 +51,20 @@ fn run_query(query: serde_json::Value) -> CodeQueryResult {
     execute(workspace.analyzer(), &query)
 }
 
+fn run_query_for_source(
+    language: Language,
+    path: &str,
+    source: &str,
+    query: serde_json::Value,
+) -> CodeQueryResult {
+    let project = InlineTestProject::with_language(language)
+        .file(path, source)
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&query).expect("query should parse");
+    execute(workspace.analyzer(), &query)
+}
+
 #[test]
 fn finds_eval_calls_with_argument_capture() {
     let output = run_query(json!({
@@ -208,6 +222,80 @@ fn containment_and_negation_scope_matches() {
             .as_deref(),
         Some("src.app.handle_request")
     );
+}
+
+#[test]
+fn declaration_bounded_containment_stops_at_nested_callables() {
+    let source = r#"
+def outer(items):
+    for item in items:
+        open(item)
+        def later():
+            open(item)
+        callback = lambda: open(item)
+"#;
+    let bounded = json!({
+        "schema_version": 5,
+        "match": { "kind": "call", "callee": { "name": "open" } },
+        "inside_decl": { "kind": "loop" }
+    });
+    let lexical = json!({
+        "schema_version": 5,
+        "match": { "kind": "call", "callee": { "name": "open" } },
+        "inside": { "kind": "loop" }
+    });
+
+    assert_eq!(
+        run_query_for_source(Language::Python, "nested.py", source, bounded)
+            .structural_matches()
+            .len(),
+        1,
+        "only direct loop work is declaration-bounded"
+    );
+    let captures = run_query_for_source(
+        Language::Python,
+        "nested.py",
+        source,
+        json!({
+            "schema_version": 5,
+            "match": { "kind": "call", "callee": { "name": "open" } },
+            "inside_decl": { "kind": "loop", "capture": "loop" }
+        }),
+    );
+    let loop_capture = captures.structural_matches()[0]
+        .captures
+        .iter()
+        .find(|capture| capture.name == "loop")
+        .expect("direct loop match retains its declaration-bounded capture");
+    assert!(loop_capture.text.starts_with("for item in items:"));
+    assert_eq!(
+        run_query_for_source(Language::Python, "nested.py", source, lexical)
+            .structural_matches()
+            .len(),
+        3,
+        "ordinary lexical containment remains unchanged"
+    );
+}
+
+#[test]
+fn declaration_bounded_containment_keeps_the_nearest_callable_and_is_stack_safe() {
+    let mut source = String::from("def outer(items):\n");
+    for depth in 0..96 {
+        source.push_str(&format!("{}if True:\n", "    ".repeat(depth + 1)));
+    }
+    source.push_str(&format!("{}open(items[0])\n", "    ".repeat(97)));
+
+    let output = run_query_for_source(
+        Language::Python,
+        "deep.py",
+        &source,
+        json!({
+            "schema_version": 5,
+            "match": { "kind": "call", "callee": { "name": "open" } },
+            "inside_decl": { "kind": "function", "name": "outer" }
+        }),
+    );
+    assert_eq!(output.structural_matches().len(), 1);
 }
 
 #[test]

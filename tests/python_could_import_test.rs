@@ -96,3 +96,46 @@ fn test_could_import_file_negative_match() {
     );
     assert!(!analyzer.could_import_file(&source, &[import], &target));
 }
+
+/// `imported_code_units_from_infos` must not lose a target when two of a file's imports bind the
+/// same local name (a try/except fallback import is the common real-world shape). Its result used to
+/// be built by delegating to `imported_code_units_of`, which is keyed by binding name and silently
+/// drops one target on a name collision -- fixed to resolve from the batched-but-uncollapsed path
+/// instead. This pins that both targets survive.
+#[test]
+fn test_imported_code_units_from_infos_keeps_both_targets_for_shared_binding_name() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "consumer.py",
+            "try:\n    import first_lib as lib\nexcept ImportError:\n    import second_lib as lib\n",
+        )
+        .file("first_lib.py", "VALUE = 1\n")
+        .file("second_lib.py", "VALUE = 2\n")
+        .build();
+    let consumer = project.file("consumer.py");
+    let first_lib = project.file("first_lib.py");
+    let second_lib = project.file("second_lib.py");
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+
+    let imports = analyzer.import_info_of(&consumer);
+    assert_eq!(
+        imports.len(),
+        2,
+        "both try/except branches should parse as separate imports: {imports:#?}"
+    );
+
+    let resolved = analyzer
+        .imported_code_units_from_infos(&consumer, &imports)
+        .expect("Python always answers this hook");
+    let resolved_sources: std::collections::HashSet<_> =
+        resolved.iter().map(|unit| unit.source().clone()).collect();
+
+    assert!(
+        resolved_sources.contains(&first_lib),
+        "first_lib should still resolve even though `lib` is also bound by second_lib: {resolved_sources:?}"
+    );
+    assert!(
+        resolved_sources.contains(&second_lib),
+        "second_lib should still resolve even though `lib` is also bound by first_lib: {resolved_sources:?}"
+    );
+}

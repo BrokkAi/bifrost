@@ -7158,6 +7158,52 @@ impl Provider {
 }
 
 #[test]
+fn rust_self_field_receiver_focus_reports_local_receiver_instead_of_owner_or_field_type() {
+    let source = r#"
+pub struct Model;
+
+pub struct Provider {
+    model: Model,
+}
+
+impl Provider {
+    fn run(&self) {
+        let _ = &self.model;
+        let _receiver = self;
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", source)
+        .build();
+
+    let start = source.find("self.model").expect("self field receiver");
+    let value = lookup(project.root(), &location_reference("lib.rs", source, start));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "local_receiver",
+        "{value}"
+    );
+
+    let standalone = source.rfind("self;").expect("standalone self reference");
+    let standalone_value = lookup(
+        project.root(),
+        &location_reference("lib.rs", source, standalone),
+    );
+    let standalone_result = &standalone_value["results"][0];
+    assert_eq!(
+        standalone_result["status"], "resolved",
+        "{standalone_value}"
+    );
+    assert_eq!(
+        standalone_result["definitions"][0]["kind"], "receiver_parameter",
+        "{standalone_value}"
+    );
+}
+
+#[test]
 fn go_selector_chain_resolves_promoted_embedded_fields_and_range_elements() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.com/app\n\ngo 1.22\n")
@@ -8046,6 +8092,422 @@ fn consume() {
         assert_eq!(result["status"], "resolved", "{value}");
         assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
     }
+}
+
+#[test]
+fn rust_scoped_type_path_prefers_exact_module_owner_and_terminal_type() {
+    let source = r#"
+mod http {
+    pub struct Version;
+}
+
+const http: () = ();
+
+fn run(_: http::Version) {}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    let owner = source.find("http::Version").expect("scoped owner");
+    let terminal = owner + "http::".len();
+
+    let owner_value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, owner),
+    );
+    let owner_result = &owner_value["results"][0];
+    assert_eq!(owner_result["status"], "resolved", "{owner_value}");
+    assert_eq!(
+        owner_result["definitions"][0]["fqn"], "http",
+        "{owner_value}"
+    );
+
+    let terminal_value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, terminal),
+    );
+    let terminal_result = &terminal_value["results"][0];
+    assert_eq!(terminal_result["status"], "resolved", "{terminal_value}");
+    assert_eq!(
+        terminal_result["definitions"][0]["fqn"], "http.Version",
+        "{terminal_value}"
+    );
+}
+
+#[test]
+fn rust_scoped_path_distinguishes_module_owner_from_terminal_type_alias() {
+    let source = r#"
+mod error {
+    pub type ApiResult = ();
+}
+
+const error: () = ();
+
+fn run(_: error::ApiResult) {}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    let owner = source
+        .find("error::ApiResult")
+        .expect("scoped module owner");
+    let terminal = owner + "error::".len();
+
+    let owner_value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, owner),
+    );
+    let owner_result = &owner_value["results"][0];
+    assert_eq!(owner_result["status"], "resolved", "{owner_value}");
+    assert_eq!(
+        owner_result["definitions"][0]["fqn"], "error",
+        "{owner_value}"
+    );
+
+    let terminal_value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, terminal),
+    );
+    let terminal_result = &terminal_value["results"][0];
+    assert_eq!(terminal_result["status"], "resolved", "{terminal_value}");
+    assert_eq!(
+        terminal_result["definitions"][0]["fqn"], "error.ApiResult",
+        "{terminal_value}"
+    );
+}
+
+#[test]
+fn rust_scoped_path_owner_prefers_type_namespace_over_imported_enum_variant() {
+    let source = r#"
+enum Token {
+    PTR,
+}
+
+use Token::PTR;
+
+pub struct PTR;
+
+impl PTR {
+    pub fn read() {}
+}
+
+fn run() {
+    PTR::read();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    let owner = source.find("PTR::read").expect("scoped type owner");
+    let terminal = owner + "PTR::".len();
+
+    let owner_value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, owner),
+    );
+    let owner_result = &owner_value["results"][0];
+    assert_eq!(owner_result["status"], "resolved", "{owner_value}");
+    assert_eq!(
+        owner_result["definitions"][0]["fqn"], "PTR",
+        "{owner_value}"
+    );
+    assert_eq!(
+        owner_result["definitions"][0]["kind"], "class",
+        "{owner_value}"
+    );
+
+    let terminal_value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, terminal),
+    );
+    let terminal_result = &terminal_value["results"][0];
+    assert_eq!(terminal_result["status"], "resolved", "{terminal_value}");
+    assert_eq!(
+        terminal_result["definitions"][0]["fqn"], "PTR.read",
+        "{terminal_value}"
+    );
+}
+
+#[test]
+fn rust_imported_types_beat_same_named_enclosing_enum_variants() {
+    let source = r#"
+mod types;
+use types::{NetError, PTR, ResponseCode};
+
+enum RData {
+    PTR(PTR),
+}
+
+impl RData {
+    fn read() {
+        PTR::read();
+        let _ = RData::PTR(PTR(1));
+    }
+}
+
+enum LookupError {
+    ResponseCode(ResponseCode),
+    NetError(NetError),
+}
+
+impl LookupError {
+    fn inspect() {
+        let _ = ResponseCode::NXDomain;
+        let _ = NetError::from(1);
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .file(
+            "src/types.rs",
+            r#"
+pub struct PTR(pub u8);
+impl PTR { pub fn read() {} }
+pub enum ResponseCode { NXDomain }
+pub struct NetError;
+impl From<u8> for NetError {
+    fn from(_: u8) -> Self { Self }
+}
+"#,
+        )
+        .build();
+
+    for (marker, expected) in [
+        ("PTR::read", "types.PTR"),
+        ("PTR(1)", "types.PTR"),
+        ("ResponseCode::NXDomain", "types.ResponseCode"),
+        ("NetError::from", "types.NetError"),
+    ] {
+        let start = source.rfind(marker).expect("imported type reference");
+        let value = lookup(
+            project.root(),
+            &location_reference("src/lib.rs", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{marker}: {value}");
+        assert_eq!(
+            result["definitions"][0]["fqn"], expected,
+            "{marker}: {value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["kind"], "class",
+            "{marker}: {value}"
+        );
+    }
+}
+
+#[test]
+fn rust_unindexed_imports_are_not_stolen_by_enclosing_enum_variants() {
+    let source = r#"
+use external_crate::{NetError, PTR, ResponseCode};
+
+enum RData {
+    PTR(u8),
+}
+
+impl RData {
+    fn read() {
+        PTR::read();
+        let _ = PTR(1);
+    }
+}
+
+enum LookupError {
+    ResponseCode(u8),
+    NetError(u8),
+}
+
+impl LookupError {
+    fn inspect() {
+        let _ = ResponseCode::NXDomain;
+        let _ = NetError::from(1);
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    for marker in [
+        "PTR::read",
+        "PTR(1)",
+        "ResponseCode::NXDomain",
+        "NetError::from",
+    ] {
+        let start = source.rfind(marker).expect("unindexed imported reference");
+        let value = lookup(
+            project.root(),
+            &location_reference("src/lib.rs", source, start),
+        );
+        let result = &value["results"][0];
+        assert_ne!(result["status"], "resolved", "{marker}: {value}");
+        assert!(result["definitions"].is_null(), "{marker}: {value}");
+    }
+}
+
+#[test]
+fn rust_http_version_owner_prefers_external_crate_over_same_file_type() {
+    let http_source = r#"
+pub enum Version {
+    Http2,
+}
+
+impl Version {
+    fn to_http(self) -> http::Version {
+        match self {
+            Self::Http2 => http::Version::HTTP_2,
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nhttp = \"1\"\n",
+        )
+        .file("src/lib.rs", "pub mod http;\n")
+        .file("src/http.rs", http_source)
+        .build();
+
+    let start = http_source
+        .find("Version::HTTP_2")
+        .expect("http::Version use");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/http.rs", http_source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
+    assert!(result["definitions"][0].is_null(), "{value}");
+}
+
+#[test]
+fn rust_http_version_owner_without_dependency_reports_no_definition() {
+    let http_source = r#"
+pub enum Version {
+    Http2,
+}
+
+impl Version {
+    fn to_http(self) -> http::Version {
+        match self {
+            Self::Http2 => http::Version::HTTP_2,
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file("src/lib.rs", "pub mod http;\n")
+        .file("src/http.rs", http_source)
+        .build();
+
+    let start = http_source
+        .find("Version::HTTP_2")
+        .expect("http::Version use");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/http.rs", http_source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"][0].is_null(), "{value}");
+}
+
+#[test]
+fn rust_builtin_result_beats_crate_reexport_in_nested_test_module() {
+    let engine_source = r#"
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct ReconcileTestPorts {
+        sync_state: Result<SyncState, String>,
+    }
+}
+
+pub struct SyncState;
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "pub mod engine;\nmod error;\npub use error::Result;\n",
+        )
+        .file("src/error.rs", "pub type Result<T> = std::result::Result<T, DeviceSyncError>;\npub struct DeviceSyncError;\n")
+        .file("src/engine/mod.rs", engine_source)
+        .build();
+
+    let start = engine_source
+        .find("Result<SyncState, String>")
+        .expect("builtin Result");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/engine/mod.rs", engine_source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"][0].is_null(), "{value}");
+}
+
+#[test]
+fn rust_bare_same_file_type_still_resolves_after_cross_file_filter() {
+    let source = r#"
+pub struct Result;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ReconcileTestPorts {
+        sync_state: Result,
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    let start = source.find("Result,\n").expect("same-file Result type");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Result", "{value}");
+}
+
+#[test]
+fn rust_bound_same_name_module_root_is_not_suppressed() {
+    let http_source = r#"
+use crate::client as http;
+
+fn run(_: http::Version) {}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "pub mod client;\npub mod http;\n")
+        .file("src/client.rs", "pub struct Version;\n")
+        .file("src/http.rs", http_source)
+        .build();
+
+    let start = http_source
+        .find("http::Version")
+        .expect("bound http::Version");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/http.rs", http_source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "client", "{value}");
 }
 
 #[test]
@@ -10207,6 +10669,221 @@ function shadowed(Promise) { return Promise; }
 }
 
 #[test]
+fn javascript_unbound_namespace_assignments_do_not_become_exact_dotted_definitions() {
+    let defs = r#"
+goog.LOCALE = "en";
+goog.getMsg = function getMsg() {
+  return "ok";
+};
+"#;
+    let app = r#"
+goog.VERSION = "1";
+
+const googLocal = {
+  LOCALE: "local",
+  getMsg() {
+    return this.LOCALE;
+  },
+};
+
+function readCrossFile() {
+  return goog.LOCALE;
+}
+
+function callCrossFile() {
+  return goog.getMsg();
+}
+
+function readSameFile() {
+  return goog.VERSION;
+}
+
+function readLocal() {
+  return googLocal.LOCALE;
+}
+
+function callLocal() {
+  return googLocal.getMsg();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("defs.js", defs)
+        .file("app.js", app)
+        .build();
+
+    for (line, needle) in [
+        ("  return goog.LOCALE;", "LOCALE"),
+        ("  return goog.getMsg();", "getMsg"),
+    ] {
+        let value = lookup(
+            project.root(),
+            &format!(
+                r#"{{"references":[{{"path":"app.js","line":{},"column":{}}}]}}"#,
+                app.lines()
+                    .position(|candidate| candidate == line)
+                    .expect("line present")
+                    + 1,
+                column_of(line, needle)
+            ),
+        );
+        assert_eq!(
+            value["results"][0]["status"], "no_definition",
+            "{needle}: {value}"
+        );
+        assert!(
+            value["results"][0]["definitions"].is_null(),
+            "{needle}: {value}"
+        );
+    }
+
+    let local_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":{},"column":{}}}]}}"#,
+            app.lines()
+                .position(|candidate| candidate == "  return googLocal.LOCALE;")
+                .expect("local field line")
+                + 1,
+            column_of("  return googLocal.LOCALE;", "LOCALE")
+        ),
+    );
+    assert_eq!(
+        local_value["results"][0]["status"], "resolved",
+        "{local_value}"
+    );
+    assert_eq!(
+        local_value["results"][0]["definitions"][0]["fqn"], "app.js.googLocal.LOCALE",
+        "{local_value}"
+    );
+
+    let local_call = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":{},"column":{}}}]}}"#,
+            app.lines()
+                .position(|candidate| candidate == "  return googLocal.getMsg();")
+                .expect("local method line")
+                + 1,
+            column_of("  return googLocal.getMsg();", "getMsg")
+        ),
+    );
+    assert_eq!(
+        local_call["results"][0]["status"], "resolved",
+        "{local_call}"
+    );
+    assert_eq!(
+        local_call["results"][0]["definitions"][0]["fqn"], "app.js.googLocal.getMsg",
+        "{local_call}"
+    );
+}
+
+#[test]
+fn javascript_commonjs_local_namespace_does_not_define_classic_script_global() {
+    let defs = r#"
+const helper = require("./helper.js");
+exports.run = run;
+var goog = {};
+
+function run(locale) {
+  goog.LOCALE = locale;
+  return helper(locale);
+}
+"#;
+    let app = r#"
+function selectedLocale() {
+  return goog.LOCALE;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("defs.js", defs)
+        .file("app.js", app)
+        .build();
+
+    let locale = app.find("LOCALE").expect("global namespace property");
+    let value = lookup(project.root(), &location_reference("app.js", app, locale));
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    assert!(value["results"][0]["definitions"].is_null(), "{value}");
+}
+
+#[test]
+fn javascript_dollar_prefixed_receiver_does_not_alias_plain_receiver() {
+    let consumer = r#"
+function render($scope) {
+  return $scope.count;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "defs.js",
+            r#"
+function update(scope) {
+  scope.count = 10000;
+}
+"#,
+        )
+        .file("consumer.js", consumer)
+        .build();
+
+    let count = consumer.find("count").expect("dollar receiver property");
+    let value = lookup(
+        project.root(),
+        &location_reference("consumer.js", consumer, count),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    assert!(value["results"][0]["definitions"].is_null(), "{value}");
+}
+
+#[test]
+fn javascript_dollar_prefixed_local_member_keeps_exact_identity() {
+    let source = r#"
+function makeLogger() {
+  var $log = {};
+  $log.reset = function() {};
+  $log.reset();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("logger.js", source)
+        .build();
+
+    let reset = source.rfind("reset").expect("local member call");
+    let value = lookup(
+        project.root(),
+        &location_reference("logger.js", source, reset),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "$log.reset", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 4, "{value}");
+}
+
+#[test]
+fn javascript_same_file_top_level_assignment_resolves_top_level_read() {
+    let source = r#"
+member.status = "ready";
+
+const current = member.status;
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("app.js", source)
+        .build();
+
+    let line = "const current = member.status;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":4,"column":{}}}]}}"#,
+            column_of(line, "status")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "member.status", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 2, "{value}");
+}
+
+#[test]
 fn typescript_local_bindings_and_uncontextual_object_keys_block_indexed_fallback() {
     let source = r#"
 class Record { value = 1 }
@@ -10426,6 +11103,59 @@ const message = greeter.greet({ name: "Ada" });
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "Greeter.greet", "{value}");
     assert_eq!(result["definitions"][0]["path"], "components.js", "{value}");
+}
+
+#[test]
+fn javascript_imported_named_receiver_member_stays_scoped_to_the_imported_file() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "state.js",
+            r#"
+export const state = {};
+state.foo = function foo() {
+  return "imported";
+};
+"#,
+        )
+        .file(
+            "other.js",
+            r#"
+const state = {};
+state.foo = function foo() {
+  return "unrelated";
+};
+"#,
+        )
+        .file(
+            "app.js",
+            r#"
+import { state } from "./state.js";
+
+function render() {
+  return state.foo();
+}
+"#,
+        )
+        .build();
+
+    let line = "  return state.foo();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":5,"column":{}}}]}}"#,
+            column_of(line, "foo")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "state.foo", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "state.js", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "{value}"
+    );
 }
 
 #[test]
@@ -10697,6 +11427,158 @@ function render(query) {
     );
 
     assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn javascript_member_assignment_does_not_cross_for_of_binding_scope() {
+    let source = r#"
+function render(primary, secondary) {
+  for (const task of primary) {
+    task.status = "ready";
+    consume(task.status);
+  }
+  for (const task of secondary) {
+    consume(task.status);
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("app.js", source)
+        .build();
+
+    let reads: Vec<_> = source
+        .match_indices("task.status")
+        .map(|(start, _)| start + "task.".len())
+        .collect();
+    assert_eq!(reads.len(), 3);
+
+    let local = lookup(
+        project.root(),
+        &location_reference("app.js", source, reads[1]),
+    );
+    assert_eq!(local["results"][0]["status"], "resolved", "{local}");
+    assert_eq!(
+        local["results"][0]["definitions"][0]["start_line"], 4,
+        "{local}"
+    );
+
+    let unrelated = lookup(
+        project.root(),
+        &location_reference("app.js", source, reads[2]),
+    );
+    assert_eq!(
+        unrelated["results"][0]["status"], "no_definition",
+        "{unrelated}"
+    );
+    assert!(
+        unrelated["results"][0]["definitions"].is_null(),
+        "{unrelated}"
+    );
+}
+
+#[test]
+fn javascript_unproven_same_file_receiver_does_not_resolve_assignment_created_property() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "app.js",
+            r#"
+function update() {
+  task.status = "indexed";
+}
+
+function render() {
+  return task.status;
+}
+"#,
+        )
+        .build();
+
+    let line = "  return task.status;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":6,"column":{}}}]}}"#,
+            column_of(line, "status")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"].is_null(), "{value}");
+}
+
+#[test]
+fn javascript_local_receiver_member_does_not_resolve_unrelated_file_scoped_property() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "defs.js",
+            r#"
+const el = {};
+el.textContent = "indexed";
+"#,
+        )
+        .file(
+            "app.js",
+            r#"
+function el(id) {
+  return document.getElementById(id);
+}
+
+function render() {
+  const msg = el("status");
+  return msg.textContent;
+}
+"#,
+        )
+        .build();
+
+    let line = "  return msg.textContent;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":8,"column":{}}}]}}"#,
+            column_of(line, "textContent")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"].is_null(), "{value}");
+}
+
+#[test]
+fn javascript_local_receiver_member_does_not_resolve_unrelated_cross_file_assignment_property() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "defs.js",
+            r#"
+function update(task) {
+  task.status = "indexed";
+}
+"#,
+        )
+        .file(
+            "app.js",
+            r#"
+function render(task) {
+  return task.status;
+}
+"#,
+        )
+        .build();
+
+    let line = "  return task.status;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":3,"column":{}}}]}}"#,
+            column_of(line, "status")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"].is_null(), "{value}");
 }
 
 #[test]
@@ -11431,6 +12313,24 @@ type Options struct {
     ResolvedRegion string
 }
 
+type Value struct{}
+
+type NestedLabel struct {
+    Value string
+}
+
+type NestedHolder struct {
+    Label NestedLabel
+}
+
+type NestedSliceHolder struct {
+    Items []NestedLabel
+}
+
+type NestedMapHolder struct {
+    Items map[string]NestedLabel
+}
+
 type Outside struct {
     Field string
 }
@@ -11444,6 +12344,9 @@ var arrayValues = [1]model.Imported{{ImportedOnly: "array"}}
 var nestedArrays = [1][1]model.Imported{{{ImportedOnly: "nested-array"}}}
 var mapValues = map[string]model.Imported{"value": {ImportedOnly: "map"}}
 var vendoredAliasCollision = main.Options{ResolvedRegion: "imported-vendor"}
+var nestedStructValue = NestedHolder{Label: {Value: "nested"}}
+var nestedSliceFieldValue = NestedSliceHolder{Items: {{Value: "nested-slice"}}}
+var nestedMapFieldValue = NestedMapHolder{Items: {"nested": {Value: "nested-map"}}}
 var unresolvedQualifiedOwner = main.Outside{Field: "must not fall back to local Outside.Field"}
 var invalidOwner = MissingFieldOwner{Shared: "must not guess Distractor.Shared"}
 var keyedMap = map[string]int{LocalMapKey: 1}
@@ -11515,6 +12418,24 @@ type Options struct {
             "ResolvedRegion",
             "example.com/app/vendor/example.com/dependency/endpoints.Options.ResolvedRegion",
             "vendor/example.com/dependency/endpoints/endpoints.go",
+        ),
+        (
+            "NestedHolder{Label: {Value: \"nested\"}}",
+            "Value",
+            "example.com/app.NestedLabel.Value",
+            "main.go",
+        ),
+        (
+            "NestedSliceHolder{Items: {{Value: \"nested-slice\"}}}",
+            "Value",
+            "example.com/app.NestedLabel.Value",
+            "main.go",
+        ),
+        (
+            "NestedMapHolder{Items: {\"nested\": {Value: \"nested-map\"}}}",
+            "Value",
+            "example.com/app.NestedLabel.Value",
+            "main.go",
         ),
     ] {
         let marker_start = source.find(marker).expect("composite marker");
@@ -16453,10 +17374,9 @@ public static class Extensions {
         project.root(),
         &location_reference("Model.Json.cs", source, format_start),
     );
-    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
     assert_eq!(
-        value["results"][0]["definitions"][0]["fqn"], "Example.Extensions.Format",
-        "the explicit object cast should retain the matching builtin extension receiver: {value}"
+        value["results"][0]["status"], "no_definition",
+        "an unindexed builtin receiver cannot prove that an external instance member does not take precedence over the workspace extension: {value}"
     );
 }
 
@@ -17072,13 +17992,12 @@ fn csharp_chained_extension_method_call_resolves_forward() {
     );
 }
 
-// The canonical usagebench `csharp-parity-extension-method-call` shape uses an
-// unindexed BCL receiver: a property and an interface method both produce
-// `string`, then invoke the same `Tag(this string)` extension. Keep the
-// incompatible `Tag(this int)` overload so this proves we retained precise type
-// evidence rather than treating an unindexed receiver as a wildcard.
+// Exact receiver syntax is not enough to prove an extension call when the
+// receiver type itself is outside the indexed workspace: an applicable
+// external instance member would take precedence. Keep both direct and chained
+// receiver shapes, plus the Radarr-style `string.TrimEnd` collision.
 #[test]
-fn csharp_bcl_extension_receivers_resolve_forward() {
+fn csharp_unindexed_receiver_extensions_do_not_overclaim_external_instance_members() {
     let handlers = r#"namespace Example.Parity {
     public interface IHandler {
         string Handle(string name);
@@ -17089,9 +18008,7 @@ fn csharp_bcl_extension_receivers_resolve_forward() {
     }
     public static class StringExtensions {
         public static string Tag(this string value) { return $"tag:{value}"; }
-    }
-    public static class IntExtensions {
-        public static string Tag(this int value) { return value.ToString(); }
+        public static string TrimEnd(this string value, char first, char second) { return value; }
     }
 }
 "#;
@@ -17104,6 +18021,9 @@ fn csharp_bcl_extension_receivers_resolve_forward() {
     public static class ParityConsumer {
         public static string Run(IHandler handler) {
             return handler.Handle("Ada").Tag();
+        }
+        public static string Trim(string value) {
+            return value.TrimEnd('a', 'b');
         }
     }
 }
@@ -17118,22 +18038,24 @@ fn csharp_bcl_extension_receivers_resolve_forward() {
         .find("handler.Handle(\"Ada\").Tag()")
         .expect("chained extension call")
         + "handler.Handle(\"Ada\").".len();
-    for (label, offset) in [("direct", direct), ("chained", chained)] {
+    let trim = consumers
+        .find("value.TrimEnd('a', 'b')")
+        .expect("external instance collision")
+        + "value.".len();
+    for (label, offset) in [("direct", direct), ("chained", chained), ("trim", trim)] {
         let value = lookup(
             project.root(),
             &location_reference("src/Consumers.cs", consumers, offset),
         );
-        let definitions = value["results"][0]["definitions"]
-            .as_array()
-            .expect("resolved result should include definitions");
         assert_eq!(
-            value["results"][0]["status"], "resolved",
+            value["results"][0]["status"], "no_definition",
             "{label}: {value}"
         );
-        assert_eq!(definitions.len(), 1, "{label}: {value}");
-        assert_eq!(
-            definitions[0]["fqn"], "Example.Parity.StringExtensions.Tag",
-            "{label}: {value}"
+        assert!(
+            value["results"][0]["definitions"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "an unindexed receiver must not borrow a workspace extension: {label}: {value}"
         );
     }
 
@@ -17159,9 +18081,9 @@ fn csharp_bcl_extension_receivers_resolve_forward() {
         ("direct reference", &value["results"][0]),
         ("chained reference", &value["results"][1]),
     ] {
-        assert_eq!(result["status"], "resolved", "{label}: {value}");
-        assert_eq!(
-            result["definitions"][0]["fqn"], "Example.Parity.StringExtensions.Tag",
+        assert_eq!(result["status"], "no_definition", "{label}: {value}");
+        assert!(
+            result["definitions"].as_array().is_none_or(Vec::is_empty),
             "{label}: {value}"
         );
     }
@@ -17452,21 +18374,21 @@ fn csharp_extension_lookup_uses_visibility_indexes_without_unrelated_hydration()
     let mut project = InlineTestProject::with_language(Language::CSharp)
         .file(
             "Visible/Extensions.cs",
-            "namespace Visible { public static class Extensions { public static int Convert(this string value) => 0; public static int Convert(this string value, int radix) => 0; public static int Convert(string value, int radix, bool ordinary) => 0; } }\n",
+            "using System.Data;\nnamespace Visible { public static class Extensions { public static int Convert(this IDbConnection value) => 0; public static int Convert(this IDbConnection value, int radix) => 0; public static int Convert(IDbConnection value, int radix, bool ordinary) => 0; } }\n",
         )
         .file(
             "Hidden/Extensions.cs",
-            "namespace Hidden { public static class Extensions { public static int Convert(this string value, int radix) => 1; } }\n",
+            "using System.Data;\nnamespace Hidden { public static class Extensions { public static int Convert(this IDbConnection value, int radix) => 1; } }\n",
         )
         .file(
             "App/Runner.cs",
-            "using static Visible.Extensions;\nnamespace App { public class Runner { public int Run(string value) { return value.Convert(10); } } }\n",
+            "using System.Data;\nusing static Visible.Extensions;\nnamespace App { public class Runner { public int Run(IDbConnection value) { return value.Convert(10); } } }\n",
         );
     for index in 0..256 {
         project = project.file(
             format!("Noise{index}/Extensions.cs"),
             format!(
-                "namespace Noise{index} {{ public static class Extensions {{ public static int Convert(this string value, int radix) => {index}; }} }}\n"
+                "using System.Data;\nnamespace Noise{index} {{ public static class Extensions {{ public static int Convert(this IDbConnection value, int radix) => {index}; }} }}\n"
             ),
         );
     }
@@ -17482,14 +18404,14 @@ fn csharp_extension_lookup_uses_visibility_indexes_without_unrelated_hydration()
     assert_eq!(owner.fq_name(), "Visible.Extensions");
     analyzer.reset_full_declaration_scan_count_for_test();
     analyzer.reset_full_hydration_count_for_test();
-    let line = "namespace App { public class Runner { public int Run(string value) { return value.Convert(10); } } }";
+    let line = "namespace App { public class Runner { public int Run(IDbConnection value) { return value.Convert(10); } } }";
 
     let value = brokk_bifrost::searchtools::get_definitions_by_location(
         &analyzer,
         brokk_bifrost::searchtools::GetDefinitionParams {
             references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
                 path: "App/Runner.cs".to_string(),
-                line: Some(2),
+                line: Some(3),
                 column: Some(column_of(line, "Convert")),
             }],
         },
@@ -17508,7 +18430,7 @@ fn csharp_extension_lookup_uses_visibility_indexes_without_unrelated_hydration()
     );
     assert_eq!(
         result.definitions[0].signature.as_deref(),
-        Some("(string, int)")
+        Some("(IDbConnection, int)")
     );
     assert_eq!(
         analyzer.full_declaration_scan_count_for_test(),
@@ -17796,6 +18718,77 @@ fn csharp_explicit_constructor_call_resolves_to_constructor_definition() {
         result["definitions"][0]["fqn"], "Lib.Service.Service",
         "{value}"
     );
+}
+
+#[test]
+fn csharp_implicit_struct_parameterless_construction_avoids_explicit_overload() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Lib/Types.cs",
+            r#"namespace Lib {
+public readonly struct Pixel {}
+public struct PixelRect {
+    public PixelRect(System.Collections.Generic.IEnumerable<Pixel> pixels) {}
+}
+public struct ExplicitZero {
+    public ExplicitZero() {}
+    public ExplicitZero(int value) {}
+}
+public class Service {
+    public Service(string name) {}
+}
+}
+"#,
+        )
+        .file(
+            "App/Controller.cs",
+            r#"using System.Collections.Generic;
+using Lib;
+
+namespace App {
+    public class Controller {
+        public void Handle(IEnumerable<Pixel> pixels) {
+            var implicitRect = new PixelRect();
+            var explicitRect = new PixelRect(pixels);
+            var zero = new ExplicitZero();
+            var service = new Service();
+        }
+    }
+}
+"#,
+        )
+        .build();
+
+    let source = r#"using System.Collections.Generic;
+using Lib;
+
+namespace App {
+    public class Controller {
+        public void Handle(IEnumerable<Pixel> pixels) {
+            var implicitRect = new PixelRect();
+            var explicitRect = new PixelRect(pixels);
+            var zero = new ExplicitZero();
+            var service = new Service();
+        }
+    }
+}
+"#;
+
+    for (needle, expected) in [
+        ("new PixelRect()", "Lib.PixelRect"),
+        ("new PixelRect(pixels)", "Lib.PixelRect.PixelRect"),
+        ("new ExplicitZero()", "Lib.ExplicitZero.ExplicitZero"),
+        ("new Service()", "Lib.Service.Service"),
+    ] {
+        let start = source.find(needle).expect("constructor site") + "new ".len();
+        let value = lookup(
+            project.root(),
+            &location_reference("App/Controller.cs", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
 }
 
 #[test]
@@ -18155,6 +19148,49 @@ namespace Terminal.Gui {
     assert_eq!(
         result["definitions"][0]["fqn"], "Terminal.Gui.View.KeyBindings",
         "an inherited value member must precede a same-named visible type: {value}"
+    );
+}
+
+#[test]
+fn csharp_unqualified_external_inherited_member_does_not_become_same_named_visible_type() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "MauiApp1/App.xaml.cs",
+            r#"namespace MauiApp1;
+
+public partial class App : Application
+{
+    public App()
+    {
+        MainPage = new AppShell();
+    }
+}
+"#,
+        )
+        .file(
+            "MauiApp1/AppShell.cs",
+            "namespace MauiApp1; public class AppShell : Shell {}\n",
+        )
+        .file(
+            "MauiApp1/MainPage.cs",
+            "namespace MauiApp1; public class MainPage {}\n",
+        )
+        .build();
+
+    let line = "        MainPage = new AppShell();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"MauiApp1/App.xaml.cs","line":7,"column":{}}}]}}"#,
+            column_of(line, "MainPage")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(
+        result["definitions"].as_array().is_none_or(Vec::is_empty),
+        "an external inherited value member must not resolve to a same-named workspace type: {value}"
     );
 }
 
@@ -23088,6 +24124,70 @@ fn scala_companion_method_call_resolves_from_type_receiver() {
 }
 
 #[test]
+fn scala_term_call_beats_same_named_type_alias_in_same_scope() {
+    let source = r#"package app
+
+object Dual {
+  type Factory = Int
+  val Factory: Int => Int = value => value + 1
+  val made = Factory(0)
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Dual.scala", source)
+        .build();
+
+    let factory_start = source.find("made = Factory").expect("dual term call") + "made = ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Dual.scala", source, factory_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Dual$.Factory",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_qualified_term_apply_beats_same_named_type_member() {
+    let source = r#"package app
+
+object Result {
+  opaque type Success[+A] = A
+  object Success {
+    def apply[A](value: A): Success[A] = value
+  }
+}
+
+object Consumer {
+  val success = Result.Success(1)
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Result.scala", source)
+        .build();
+
+    let success_start = source
+        .find("Result.Success(1)")
+        .expect("qualified stable apply")
+        + "Result.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Result.scala", source, success_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Result$.Success$.apply",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_object_apply_call_resolves_from_constructor_like_reference() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
@@ -23176,6 +24276,72 @@ object App:
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
         result["definitions"][0]["fqn"], "app.ConsoleRenderer.render",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_qualified_member_import_terminal_resolves_to_member_definition() {
+    let source = r#"
+package app
+
+class Renderer { def render(value: String): String = value }
+object Factory { def default: Renderer = new Renderer }
+
+object App:
+  import app.Factory.default
+  val direct = default.render("ok")
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/App.scala", source)
+        .build();
+
+    let default_start = source
+        .find("Factory.default")
+        .expect("qualified import terminal")
+        + "Factory.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/App.scala", source, default_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Factory$.default",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_import_selector_source_name_resolves_to_member_definition() {
+    let source = r#"
+package app
+
+class Renderer { def render(value: String): String = value }
+object Factory { def default: Renderer = new Renderer }
+
+object App:
+  import app.Factory.{default => renderer}
+  val direct = renderer.render("ok")
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/App.scala", source)
+        .build();
+
+    let default_start = source
+        .find("{default => renderer}")
+        .expect("selector source name")
+        + "{".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/App.scala", source, default_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Factory$.default",
         "{value}"
     );
 }
@@ -23769,6 +24935,48 @@ fn scala_trait_method_overridden_by_val_prefers_concrete_receiver_definition() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "app.Service.id", "{value}");
+}
+
+#[test]
+fn scala_anonymous_mixin_type_prefers_trait_over_same_named_companion_object() {
+    let source = r#"package app
+sealed abstract class Glyph(label: String)
+object Glyph {
+  sealed trait MoveAssessment extends Glyph
+  object MoveAssessment {
+    val exact = new Glyph("x") with MoveAssessment
+  }
+
+  sealed trait MoveAssessmentDecoy extends Glyph
+  object MoveAssessmentDecoy {
+    val decoy = new Glyph("y") with MoveAssessmentDecoy
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Use.scala", source)
+        .build();
+
+    let mixin_start = source.find("with MoveAssessment").expect("anonymous mixin") + "with ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Use.scala", source, mixin_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Glyph$.MoveAssessment",
+        "{value}"
+    );
+    assert_ne!(
+        result["definitions"][0]["fqn"], "app.Glyph$.MoveAssessment$",
+        "{value}"
+    );
+    assert_ne!(
+        result["definitions"][0]["fqn"], "app.Glyph$.MoveAssessmentDecoy",
+        "{value}"
+    );
 }
 
 #[test]
@@ -26054,6 +27262,23 @@ object Consumer {
         result["definitions"][0]["fqn"], "javaish.Builder.append",
         "{value}"
     );
+
+    let builder_start = scala_source
+        .find("javaish.Builder")
+        .expect("qualified Java constructor terminal")
+        + "javaish.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Consumer.scala", scala_source, builder_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["language"], "java", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "javaish.Builder",
+        "{value}"
+    );
 }
 
 #[test]
@@ -26075,6 +27300,17 @@ object Consumer {
     let value = lookup(
         project.root(),
         &location_reference("app/Consumer.scala", source, append_start),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+
+    let builder_start = source
+        .find("java.lang.StringBuilder")
+        .expect("qualified constructor terminal")
+        + "java.lang.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Consumer.scala", source, builder_start),
     );
 
     assert_eq!(value["results"][0]["status"], "no_definition", "{value}");

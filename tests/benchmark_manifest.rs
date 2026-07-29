@@ -9,6 +9,12 @@ fn checked_in_manifest_path() -> PathBuf {
         .join("targets.toml")
 }
 
+fn checked_in_interactive_manifest_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("benchmark")
+        .join("interactive-latency.toml")
+}
+
 #[test]
 fn checked_in_targets_manifest_loads_and_validates() {
     let manifest = BenchmarkManifest::load_from_path(checked_in_manifest_path())
@@ -108,6 +114,102 @@ fn checked_in_targets_manifest_loads_and_validates() {
         .flat_map(|case| case.workloads.iter().copied())
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(workloads, QueryCodeWorkload::ALL.into_iter().collect());
+}
+
+#[test]
+fn issue_1228_checked_in_interactive_latency_manifest_is_pinned_and_bounded() {
+    let manifest = BenchmarkManifest::load_from_path(checked_in_interactive_manifest_path())
+        .expect("checked-in interactive latency manifest should validate");
+
+    assert_eq!(manifest.warmup_iterations, 2);
+    assert_eq!(manifest.measured_iterations, 20);
+    assert_eq!(manifest.repos.len(), 1);
+    let target = &manifest.repos[0];
+    assert_eq!(target.name, "bifrost-self");
+    assert_eq!(target.commit, "45841f1a9e665a056380eb7c0a1b8485389cb48c");
+    assert_eq!(target.interactive_queries.len(), 9);
+    assert!(target.mcp_fairness.is_some());
+    let search_case = target
+        .interactive_queries
+        .iter()
+        .find(|case| case.id == "search-common-symbols")
+        .expect("issue search_symbols reproduction");
+    let search_arguments: serde_json::Value =
+        serde_json::from_str(&search_case.arguments_json).expect("search arguments");
+    assert_eq!(
+        search_arguments,
+        serde_json::json!({
+            "patterns": [
+                "solve_typestate.*summary",
+                "solve_taint.*summary",
+                "ProtocolSemanticSummarySet",
+                "TaintSemanticSummarySet"
+            ],
+            "include_tests": true,
+            "limit": 100
+        }),
+        "the release gate must preserve the exact issue #1228 search reproduction"
+    );
+    assert!(
+        target
+            .interactive_queries
+            .iter()
+            .all(|case| case.max_p95_ms == 5000.0)
+    );
+    assert_eq!(
+        target
+            .interactive_queries
+            .iter()
+            .filter(|case| case.allow_bounded_incomplete)
+            .count(),
+        2
+    );
+    assert_eq!(target.mcp_fairness.as_ref().unwrap().max_p95_ms, 5000.0);
+}
+
+#[test]
+fn issue_1228_manifest_validation_rejects_vacuous_interactive_latency_cases() {
+    let manifest = r#"
+warmup_iterations = 1
+measured_iterations = 1
+required_languages = ["rust"]
+required_scenarios = ["interactive_code_intelligence", "mcp_fairness"]
+
+[[repos]]
+name = "fixture"
+url = "https://example.com/fixture"
+commit = "deadbeef"
+languages = ["rust"]
+extensions = ["rs"]
+scenarios = ["interactive_code_intelligence", "mcp_fairness"]
+interactive_queries = [
+  { id = "bad id", tool = "search_symbols", arguments_json = '[]', expected_json_pointer = "", allow_bounded_incomplete = true, max_p95_ms = -1.0 },
+  { id = "duplicate", tool = "get_summaries", arguments_json = '{}', expected_json_pointer = "/structuredContent/summaries", max_p95_ms = 5000.0 },
+  { id = "duplicate", tool = "get_summaries", arguments_json = '{}', expected_json_pointer = "/structuredContent/summaries", max_p95_ms = 5000.0 },
+]
+mcp_fairness = { id = "", scan_arguments_json = '{', source_arguments_json = '[]', expected_source_path = "", max_p95_ms = 0.0 }
+"#;
+
+    let err = BenchmarkManifest::from_toml_str(manifest).expect_err("manifest should fail");
+    let ManifestLoadError::Validation(validation) = err else {
+        panic!("expected validation error");
+    };
+    let messages = validation.messages().join("\n");
+    for expected in [
+        "id must be at most",
+        "arguments JSON must be an object",
+        "expected_json_pointer must be a non-empty JSON pointer",
+        "max_p95_ms must be finite and positive",
+        "allow_bounded_incomplete is only valid for scan_usages_by_location",
+        "duplicate interactive query id `duplicate`",
+        "has invalid arguments JSON",
+        "expected_source_path must not be blank",
+    ] {
+        assert!(
+            messages.contains(expected),
+            "missing `{expected}` in {messages}"
+        );
+    }
 }
 
 #[test]

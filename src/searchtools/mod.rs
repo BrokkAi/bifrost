@@ -21,6 +21,7 @@ use crate::analyzer::usages::workspace_graph::{UsageEcosystem, WorkspaceUsageCat
 use crate::analyzer::usages::{
     CONFIDENCE_THRESHOLD, CandidateFileProvider, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES,
     ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit, UsageHitKind, UsageHitSurface,
+    UsageQueryCompletion,
 };
 use crate::analyzer::{
     AnalyzerDefinitionLookup, AnalyzerQueryScope, BoundedDefinitionLookup, CodeUnit, CodeUnitType,
@@ -38,8 +39,10 @@ use crate::path_utils::{
 use crate::profiling;
 pub use crate::relevance::MostRelevantFilesRankingMode;
 use crate::relevance::{
-    DEFAULT_RECENCY_HALF_LIFE, most_important_project_files, most_relevant_project_files,
-    most_relevant_project_files_with_ranking_mode,
+    DEFAULT_RECENCY_HALF_LIFE, MostRelevantProjectFilesOutcome, most_important_project_files,
+    most_important_project_files_with_cancellation, most_relevant_project_files,
+    most_relevant_project_files_with_half_life,
+    most_relevant_project_files_with_ranking_mode_and_cancellation,
 };
 use crate::text_utils::{
     compute_line_starts, find_line_index_for_offset, render_location_diagnostic,
@@ -72,9 +75,9 @@ use selectors::{language_name, likely_file_target_extension};
 // external crate/pub surface below) and only referenced under `#[cfg(test)]`.
 #[cfg(test)]
 use scan_usages::{
-    ScanUsageRequest, ScanUsagesWorkEntry, SymbolUsageRenderState, UsageHitRow,
-    build_scan_usages_summary, classify_scan_usages_entry, function_like_macro_query,
-    usage_failure_hint,
+    ScanUsageRequest, ScanUsagesExecutionContext, ScanUsagesWorkEntry, SymbolUsageRenderState,
+    UsageHitRow, build_scan_usages_summary, classify_scan_usages_entry, function_like_macro_query,
+    scan_usages_by_location_with_context, usage_failure_hint,
 };
 #[cfg(test)]
 use selectors::{DefinitionCandidateRenderCache, definition_candidate_from_range};
@@ -126,6 +129,10 @@ pub use navigation::get_type_by_location;
 pub use navigation::rename_symbol;
 pub use navigation::search_symbols;
 pub use navigation::search_symbols_with_cancellation;
+pub(crate) use navigation::{
+    get_declarations_by_location_with_cancellation, get_definitions_by_location_with_cancellation,
+    get_symbol_locations_with_cancellation,
+};
 pub use scan_usages::AmbiguousUsageCandidate;
 pub use scan_usages::AmbiguousUsageCandidateDetail;
 pub use scan_usages::AmbiguousUsageSymbol;
@@ -136,6 +143,7 @@ pub use scan_usages::ScanUsagesByLocationParams;
 pub use scan_usages::ScanUsagesByReferenceParams;
 pub use scan_usages::ScanUsagesCandidateFilesSample;
 pub use scan_usages::ScanUsagesEntry;
+pub use scan_usages::ScanUsagesIncompleteReason;
 pub use scan_usages::ScanUsagesInput;
 pub use scan_usages::ScanUsagesInputKind;
 pub use scan_usages::ScanUsagesResult;
@@ -163,6 +171,9 @@ pub use scan_usages::classify_test_files;
 pub use scan_usages::scan_usages_by_location;
 pub use scan_usages::scan_usages_by_reference;
 pub use scan_usages::usage_graph;
+pub(crate) use scan_usages::{
+    scan_usages_by_location_with_cancellation, scan_usages_by_reference_with_cancellation,
+};
 pub use selectors::AmbiguousSymbol;
 pub use selectors::DefinitionCandidate;
 pub use selectors::DefinitionDiagnostic;
@@ -174,6 +185,7 @@ pub use summaries::ContainerKind;
 pub use summaries::ContainerListing;
 pub use summaries::ContainerListingEntry;
 pub use summaries::FilePatternsParams;
+pub use summaries::MostRelevantFilesIncompleteReason;
 pub use summaries::MostRelevantFilesParams;
 pub use summaries::MostRelevantFilesResult;
 pub use summaries::SkimFile;
@@ -183,8 +195,10 @@ pub use summaries::SummaryBlock;
 pub use summaries::SummaryElement;
 pub use summaries::SummaryResult;
 pub use summaries::get_summaries;
+pub(crate) use summaries::get_summaries_with_cancellation;
 pub use summaries::list_symbols;
 pub use summaries::most_relevant_files;
+pub(crate) use summaries::most_relevant_files_with_cancellation;
 
 // Only the moved `#[cfg(test)]` test module reaches this name through the
 // `crate::searchtools::` path today; without a non-test crate consumer, a
@@ -207,6 +221,9 @@ const FILE_SEARCH_LIMIT: usize = 100;
 pub(crate) const SEARCH_SYMBOL_MAX_PATTERNS: usize = 64;
 pub(crate) const SEARCH_SYMBOL_MAX_PATTERN_BYTES: usize = 4_096;
 pub(crate) const SEARCH_SYMBOL_MAX_TOTAL_PATTERN_BYTES: usize = 65_536;
+pub(crate) const SYMBOL_LOOKUP_MAX_SYMBOLS: usize = 64;
+pub(crate) const SYMBOL_LOOKUP_MAX_SYMBOL_BYTES: usize = 4_096;
+pub(crate) const SYMBOL_LOOKUP_MAX_TOTAL_BYTES: usize = 65_536;
 
 const FILE_SKIM_LIMIT: usize = 20;
 
@@ -217,6 +234,8 @@ pub const SCAN_USAGES_RESPONSE_BUDGET_BYTES: usize = 8_192;
 const SCAN_USAGES_MAX_CALLSITES: usize = DEFAULT_MAX_USAGES;
 
 const SCAN_USAGES_PATH_SCOPED_MAX_FILES: usize = 10_000;
+
+const SCAN_USAGES_MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 
 const SCAN_USAGES_SUMMARY_FILE_LIMIT: usize = 20;
 

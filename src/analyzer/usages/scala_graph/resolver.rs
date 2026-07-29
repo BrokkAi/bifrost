@@ -32,7 +32,6 @@ pub(super) struct TargetSpec {
     pub(super) is_object_type: bool,
     pub(super) accepts_apply_role: bool,
     pub(super) accepts_term_field_role: bool,
-    pub(super) type_parent: Option<CodeUnit>,
     pub(super) accepts_companion_apply_syntax: bool,
 }
 
@@ -63,7 +62,6 @@ impl TargetSpec {
                 is_object_type,
                 accepts_apply_role,
                 accepts_term_field_role,
-                type_parent: scala.structural_parent_of(target),
                 accepts_companion_apply_syntax: false,
             });
         }
@@ -138,7 +136,6 @@ impl TargetSpec {
             is_object_type: false,
             accepts_apply_role: false,
             accepts_term_field_role: false,
-            type_parent: None,
             accepts_companion_apply_syntax,
         })
     }

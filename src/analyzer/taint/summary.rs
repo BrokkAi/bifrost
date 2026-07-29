@@ -9,8 +9,9 @@ use crate::analyzer::dataflow::{
     DataflowRequest, PathQuality, PathQualityFrontier, ProcedureSummaryIdentity,
     ProcedureSummaryKey, ReusableIdeEndSummary, ReusableIdeProcedureSummary,
     ReusableIdeReachedFact, ReusableIdeSummaryProvider, SemanticProcedureSummary,
-    SolverTermination, SolverWork, SummaryDependencyKey, SummaryEntry, SummaryExitKind,
-    SummaryRecursiveGroupKey, validate_recursive_summary_batch,
+    SemanticSummarySetValidationError, SolverTermination, SolverWork, SummaryDependencyKey,
+    SummaryEntry, SummaryExitKind, SummaryRecursiveGroupKey, canonicalize_semantic_summary_items,
+    validate_recursive_summary_batch,
 };
 use crate::analyzer::semantic::{
     DeclarationLocator, IcfgProvider, ProcedureHandle, ProgramPointId, ReturnTransferKind,
@@ -704,21 +705,17 @@ pub struct TaintSemanticSummarySet<'summary> {
 
 impl<'summary> TaintSemanticSummarySet<'summary> {
     pub fn try_new(
-        mut summaries: Vec<&'summary SemanticProcedureSummary>,
+        summaries: Vec<&'summary SemanticProcedureSummary>,
     ) -> Result<Self, TaintTransferSummaryError> {
-        if summaries
-            .iter()
-            .any(|summary| !summary.completeness().is_complete())
-        {
-            return Err(TaintTransferSummaryError::IncompleteSemanticSummary);
-        }
-        summaries.sort_unstable_by(|left, right| left.key().cmp(right.key()));
-        if summaries
-            .windows(2)
-            .any(|pair| pair[0].key() == pair[1].key())
-        {
-            return Err(TaintTransferSummaryError::AmbiguousSemanticSummary);
-        }
+        let summaries = canonicalize_semantic_summary_items(summaries, |summary| *summary, true)
+            .map_err(|error| match error {
+                SemanticSummarySetValidationError::Incomplete => {
+                    TaintTransferSummaryError::IncompleteSemanticSummary
+                }
+                SemanticSummarySetValidationError::AmbiguousKey => {
+                    TaintTransferSummaryError::AmbiguousSemanticSummary
+                }
+            })?;
         let mut by_artifact =
             HashMap::<SemanticArtifactKey, HashMap<DeclarationLocator, usize>>::new();
         let mut by_identity = HashMap::new();
@@ -754,7 +751,7 @@ impl<'summary> TaintSemanticSummarySet<'summary> {
             }
         }
         Ok(Self {
-            summaries: summaries.into_boxed_slice(),
+            summaries,
             by_artifact,
             by_identity,
             eligible,

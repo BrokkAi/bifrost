@@ -23,7 +23,9 @@
       "get_type_by_location",
       "usage_graph",
       "get_symbol_ancestors",
-      "query_code"
+      "query_code",
+      "list_policies",
+      "run_policy"
     ]
   }
 }

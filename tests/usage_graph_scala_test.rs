@@ -1079,6 +1079,40 @@ object Use { def click: Int = BrowserEval.clickAtActionable }
 }
 
 #[test]
+fn scala_inverted_records_wildcard_import_owner_edges() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Request.scala",
+            r#"package app
+class Request
+object Request {
+  val Method: String = "GET"
+}
+"#,
+        )
+        .file(
+            "app/Use.scala",
+            r#"package app
+object Use {
+  import Request._
+}
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "app.Use$", "app.Request$"),
+        "wildcard import owner span should edge to the exact stable object owner: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Use$", "app.Request"),
+        "wildcard import owner span must not edge to the class namespace: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn resolves_instance_object_and_unqualified_calls() {
     let value = usage_graph();
 
@@ -2120,6 +2154,97 @@ class Consumer {
 }
 
 #[test]
+fn scala_inverted_graph_resolves_nested_wildcard_imported_members_in_scala2_and_3() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "other/Imported.scala",
+            r#"package other
+object Imported {
+  def register(value: Int): Int = value + 1
+  val OK: String = "other"
+}
+"#,
+        )
+        .file(
+            "app/Scala2.scala",
+            r#"package app
+object Status2 {
+  import Registry._
+  def call(): Int = register(1)
+  def field: String = OK
+  object Inner {
+    import Registry._
+    def nested: String = OK
+  }
+  def ambiguous(): Int = {
+    import other.Imported._
+    register(2)
+  }
+  def unindexed: String = {
+    import cats.syntax.all._
+    OK
+  }
+  private object Registry {
+    def register(value: Int): Int = value
+    val OK: String = "scala2"
+  }
+}
+"#,
+        )
+        .file(
+            "app/Scala3.scala",
+            r#"package app
+object Status3:
+  import Registry.*
+  def call(): Int = register(3)
+  def field: String = OK
+  object Inner:
+    import Registry.*
+    def nested: String = OK
+  def ambiguous(): Int =
+    import other.Imported.*
+    register(4)
+  def unindexed: String =
+    import cats.syntax.all.*
+    OK
+  private object Registry:
+    def register(value: Int): Int = value
+    val OK: String = "scala3"
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+
+    for (caller, callee) in [
+        ("app.Status2$.call", "app.Status2$.Registry$.register"),
+        ("app.Status3$.call", "app.Status3$.Registry$.register"),
+    ] {
+        assert!(
+            has_edge(&value, caller, callee),
+            "expected {caller} -> {callee}: {}",
+            value["edges"]
+        );
+    }
+    for caller in [
+        "app.Status2$.ambiguous",
+        "app.Status2$.unindexed",
+        "app.Status3$.ambiguous",
+        "app.Status3$.unindexed",
+    ] {
+        for callee in [
+            "app.Status2$.Registry$.register",
+            "app.Status3$.Registry$.register",
+        ] {
+            assert!(
+                !has_edge(&value, caller, callee),
+                "unexpected {caller} -> {callee}: {}",
+                value["edges"]
+            );
+        }
+    }
+}
+
+#[test]
 fn scala_inverted_uses_parser_active_enclosing_package_for_constructors() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
@@ -2971,6 +3096,109 @@ object App {
             "example.Renderer.render"
         ),
         "overloads and unrelated same-name methods must not edge to the trait method: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn object_qualified_inherited_member_calls_resolve_to_trait_owner() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "zio/http/codec/ContentCodecs.scala",
+            r#"package zio.http.codec
+
+trait BinaryCodec[A]
+trait Schema[A]
+trait Tag[A]
+trait Trace[A]
+
+private[codec] trait ContentCodecs {
+  def content[A](implicit schema: Schema[A]): String = "implicit-only"
+  def content[A](codec: BinaryCodec[A])(implicit tag: Tag[A]): String = "codec"
+  def content[A](name: String)(implicit schema: Schema[A]): String = "named"
+  def content[A](codec: BinaryCodec[A], name: String)(implicit trace: Trace[A]): String = "codec-named"
+}
+"#,
+        )
+        .file(
+            "zio/http/HttpCodec.scala",
+            r#"package zio.http
+import zio.http.codec._
+
+object HttpCodec extends ContentCodecs
+
+object OtherCodec {
+  def content[A](codec: BinaryCodec[A])(implicit tag: Tag[A]): String = "other"
+}
+"#,
+        )
+        .file(
+            "zio/http/endpoint/Endpoint.scala",
+            r#"package zio.http.endpoint
+import zio.http.HttpCodec
+import zio.http.OtherCodec
+import zio.http.codec._
+
+object Endpoint {
+  implicit val schema: Schema[String] = new Schema[String] {}
+  implicit val tag: Tag[String] = new Tag[String] {}
+  implicit val trace: Trace[String] = new Trace[String] {}
+  val codec: BinaryCodec[String] = new BinaryCodec[String] {}
+
+  def inheritedImplicitOnly(): String = HttpCodec.content[String]
+  def inheritedCodec(): String = HttpCodec.content[String](codec)
+  def inheritedNamed(): String = HttpCodec.content[String]("json")
+  def inheritedCodecNamed(): String = HttpCodec.content[String](codec, "json")
+  def unrelated(): String = OtherCodec.content[String](codec)
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(
+            &value,
+            "zio.http.endpoint.Endpoint$.inheritedImplicitOnly",
+            "zio.http.codec.ContentCodecs.content"
+        ),
+        "qualified inherited implicit-only object member should edge to the trait owner: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(
+            &value,
+            "zio.http.endpoint.Endpoint$.inheritedCodec",
+            "zio.http.codec.ContentCodecs.content"
+        ),
+        "qualified inherited object member with an omitted implicit list should edge to the trait owner: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(
+            &value,
+            "zio.http.endpoint.Endpoint$.inheritedNamed",
+            "zio.http.codec.ContentCodecs.content"
+        ),
+        "qualified inherited named overload should edge to the trait owner: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(
+            &value,
+            "zio.http.endpoint.Endpoint$.inheritedCodecNamed",
+            "zio.http.codec.ContentCodecs.content"
+        ),
+        "qualified inherited multi-argument overload should edge to the trait owner: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(
+            &value,
+            "zio.http.endpoint.Endpoint$.unrelated",
+            "zio.http.codec.ContentCodecs.content"
+        ),
+        "unrelated same-name receiver must not edge to the trait member: {}",
         value["edges"]
     );
 }

@@ -84,6 +84,7 @@ pub(crate) fn compose_typestate_policy(
     };
     let resolved = ResolvedTypestatePolicySpec::try_new(
         spec.mode,
+        spec.call_modeling,
         subjects.subjects,
         spec.uncertainty.clone(),
         automaton,
@@ -1005,12 +1006,12 @@ mod tests {
         let expectation = TypestateExpectationId::new("close-reaches-closed").unwrap();
         let spec = TypestatePolicySpec {
             mode: MayMode::May,
+            call_modeling: CallModelingSpec::default(),
             subjects: TypestateSubjectSet {
                 include_matches: vec![exact("resource-open")],
                 entries: vec![],
             },
             uncertainty: TypestateUncertaintySpec {
-                unknown_call: InconclusivePolicy::Inconclusive,
                 escape: InconclusivePolicy::Inconclusive,
             },
             automaton: TypestateAutomatonSpec {

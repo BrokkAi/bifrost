@@ -19,6 +19,8 @@ pub(crate) enum TreeWalkAction {
     DescendWithExit,
     /// Do not descend into this node's children.
     Skip,
+    /// Stop the entire traversal immediately without firing pending exits.
+    Stop,
 }
 
 enum TreeWalkFrame<'tree> {
@@ -49,6 +51,7 @@ pub(crate) fn walk_tree_iterative<State>(
                     push_named_children(node, &mut stack);
                 }
                 TreeWalkAction::Skip => {}
+                TreeWalkAction::Stop => break,
             },
             TreeWalkFrame::Exit => exit(state),
         }
@@ -108,6 +111,31 @@ pub(crate) fn descendants_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<N
 pub(crate) fn named_children<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).collect()
+}
+
+/// The first direct named child of `node` whose kind is `kind`.
+///
+/// Distinct from a bare "first named child": this selects by kind, which is how
+/// declaration walks reach a specific grammar slot (a `class_body`, a
+/// `type_identifier`) without assuming child order.
+pub(crate) fn first_named_child_of_kind<'tree>(
+    node: Node<'tree>,
+    kind: &str,
+) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == kind)
+}
+
+/// Whether `node` has an anonymous (token) child spelled `token`.
+///
+/// Restricted to anonymous children on purpose: grammars can spell the same
+/// text as either a keyword token or a named node, and callers asking this
+/// question want the keyword.
+pub(crate) fn has_token_child(node: Node<'_>, token: &str) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| !child.is_named() && child.kind() == token)
 }
 
 #[cfg(test)]
@@ -173,6 +201,30 @@ mod tests {
         );
         assert!(visited.iter().any(|k| k == "block"));
         assert!(!visited.iter().any(|k| k == "let_declaration"));
+    }
+
+    #[test]
+    fn issue_1228_walk_tree_iterative_can_stop_cooperatively() {
+        let source = "fn first() {} fn stop() {} fn never() {}";
+        let tree = parse(source);
+        let root = tree.root_node();
+        let mut visited: Vec<String> = Vec::new();
+        walk_tree_iterative(
+            root,
+            &mut visited,
+            |node, visited| {
+                let text = node.utf8_text(source.as_bytes()).unwrap_or_default();
+                visited.push(text.to_string());
+                if text.starts_with("fn stop") {
+                    TreeWalkAction::Stop
+                } else {
+                    TreeWalkAction::Descend
+                }
+            },
+            |_| {},
+        );
+        assert!(visited.iter().any(|text| text.starts_with("fn stop")));
+        assert!(!visited.iter().any(|text| text.starts_with("fn never")));
     }
 
     #[test]

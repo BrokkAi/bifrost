@@ -31,6 +31,36 @@ Every `.rqlp` file contains exactly one top-level document:
 Passing an endpoint to `--policy-file` is an error; Bifrost does not turn it
 into a match policy behind the author's back.
 
+### Built-in code-smell pack
+
+The installed binary embeds `bifrost.code-smells`, an initial catalog of twelve
+structured match policies. It covers dynamic evaluation, unsafe Python object
+deserialization, and review prompts for sorting, regular-expression compilation,
+file reads, serialization, parsing, database calls, network calls, subprocesses,
+sleep, and expensive operations beneath nested loops. Every rule is an ordinary
+checked-in `.rqlp` source with a stable ID and semantic hash; the manifest also
+records its category, claimed languages, required capabilities, severity
+rationale, and remediation.
+
+Pack version 1.1 adds Rust coverage to eight performance policies. The Rust
+selectors recognize the standard slice `sort*` family, `Regex::new`,
+`fs::read` / `fs::read_to_string`, `serde_json::{to_string, to_vec, from_str,
+from_slice}`, `bincode::{serialize, deserialize}`, `toml::from_str`, direct
+`reqwest::get` and `ureq::{get, post}` requests, and `thread::sleep`. These are
+language- and API-specific normalized call shapes, not source-text matches. The
+pack does not claim Rust database or
+subprocess coverage yet: common APIs expose generic instance methods whose
+resolved receiver type is not available to structural match policies, so a
+name-only rule would be too broad. Dynamic evaluation and unsafe object
+deserialization also remain scoped to languages with a defensible equivalent.
+
+Use `bifrost --list-policies` or MCP `list_policies` to inspect the exact catalog
+in the running build. Select it with `--policy-pack bifrost.code-smells`, a
+`--policy-category`, or a stable `--policy-id`; MCP `run_policy` exposes the same
+pack/category/ID selectors. These are deliberately review-oriented structural
+matches. A call name or lexical location is evidence of the parsed shape, not
+proof of runtime dispatch, loop invariance, or measured cost.
+
 ### A runnable match policy
 
 This complete checked fixture selects direct Python call syntax whose callee is
@@ -78,7 +108,7 @@ With `--fail-on never`, the complete human report is:
 
 <!-- policy-doc-test:human:dynamic-eval -->
 ```text
-note: policy bifrost.security.dynamic-eval inferred policy schema 1 and RQL schema 4
+note: policy bifrost.security.dynamic-eval inferred policy schema 1 and RQL schema 5
 [warning]  app.py:2:12
     Dynamic evaluation is forbidden
 
@@ -283,6 +313,7 @@ and phase-specific API observations, then add a protocol automaton:
     (analysis
       :type typestate
       :mode may
+      :call-modeling (call-modeling :unmodeled paranoid)
       :subjects
         (subject-set
           :include-matches [
@@ -293,7 +324,6 @@ and phase-specific API observations, then add a protocol automaton:
           :entries [])
       :uncertainty
         (uncertainty
-          :unknown-call inconclusive
           :escape inconclusive)
       :automaton
         (automaton
@@ -335,6 +365,13 @@ events can transition away from them. Normal and exceptional **analysis-root**
 exits can require that an accepting state was already reached; helper returns
 remain interprocedural transfers, not implicit terminals. A terminal-expectation
 violation is distinct from a transition into an error state.
+
+`:call-modeling` is shared by taint and typestate policies. `paranoid` is the
+default when the record is omitted and conservatively models transfers that are
+justified by the structured call site. `optimistic` preserves existing facts
+without introducing unseen-body transfers, while `require-model` abstains when
+no applicable model exists. Every fallback retains incomplete call-boundary
+evidence; none of these settings turns an unresolved call into proof of safety.
 
 Endpoint categories and display/report text remain outside automaton and
 interprocedural-summary keys; the protocol analysis consumes resolved endpoint

@@ -25,7 +25,16 @@ type FileFilter = Box<dyn Fn(&ProjectFile) -> bool + Send + Sync>;
 pub const DEFAULT_MAX_FILES: usize = 1000;
 pub const DEFAULT_MAX_USAGES: usize = 1000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageQueryCompletion {
+    Complete,
+    Cancelled,
+    CandidateFilesBudgetExhausted,
+    SourceBytesBudgetExhausted,
+}
+
 pub struct QueryResult {
+    pub completion: UsageQueryCompletion,
     pub candidate_files: HashSet<ProjectFile>,
     pub candidate_files_truncated: bool,
     pub source_bytes_truncated: bool,
@@ -133,7 +142,7 @@ impl UsageFinder {
         )
     }
 
-    fn query_with_provider_and_source_budget(
+    pub(crate) fn query_with_provider_and_source_budget(
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
@@ -143,8 +152,9 @@ impl UsageFinder {
         max_source_bytes: Option<usize>,
     ) -> QueryResult {
         let _query_scope = AnalyzerQueryScope::new(analyzer);
-        if overloads.is_empty() || self.cancellation.is_cancelled() {
+        if overloads.is_empty() {
             return QueryResult {
+                completion: UsageQueryCompletion::Complete,
                 candidate_files: HashSet::default(),
                 candidate_files_truncated: false,
                 source_bytes_truncated: false,
@@ -153,6 +163,9 @@ impl UsageFinder {
                 result: FuzzyResult::empty_success(),
                 graph_failure: None,
             };
+        }
+        if self.cancellation.is_cancelled() {
+            return cancelled_query_result();
         }
 
         let target = &overloads[0];
@@ -196,16 +209,21 @@ impl UsageFinder {
         }
 
         let all_candidates = candidates.clone();
-        if candidates.len() > max_files {
+        let candidate_files_budget_exhausted = candidates.len() > max_files;
+        if candidate_files_budget_exhausted {
             candidates = truncate_candidates(candidates, &protected_candidates, max_files);
         }
-        let (admitted, scanned_source_bytes, source_bytes_truncated) =
+        let (admitted, scanned_source_bytes, source_bytes_truncated, source_admission_cancelled) =
             admit_candidates_by_source_bytes(
                 analyzer,
                 candidates,
                 &protected_candidates,
                 max_source_bytes,
+                &self.cancellation,
             );
+        if source_admission_cancelled {
+            return cancelled_query_result();
+        }
         candidates = admitted;
         let candidate_files_truncated = candidates.len() < all_candidates.len();
         let candidate_files_sample =
@@ -249,6 +267,13 @@ impl UsageFinder {
         }
 
         QueryResult {
+            completion: if source_bytes_truncated {
+                UsageQueryCompletion::SourceBytesBudgetExhausted
+            } else if candidate_files_budget_exhausted {
+                UsageQueryCompletion::CandidateFilesBudgetExhausted
+            } else {
+                UsageQueryCompletion::Complete
+            },
             candidate_files: candidates,
             candidate_files_truncated,
             source_bytes_truncated,
@@ -281,6 +306,7 @@ impl UsageFinder {
 
 fn cancelled_query_result() -> QueryResult {
     QueryResult {
+        completion: UsageQueryCompletion::Cancelled,
         candidate_files: HashSet::default(),
         candidate_files_truncated: false,
         source_bytes_truncated: false,
@@ -296,9 +322,10 @@ fn admit_candidates_by_source_bytes(
     candidates: HashSet<ProjectFile>,
     protected_candidates: &HashSet<ProjectFile>,
     max_source_bytes: Option<usize>,
-) -> (HashSet<ProjectFile>, usize, bool) {
+    cancellation: &CancellationToken,
+) -> (HashSet<ProjectFile>, usize, bool, bool) {
     let Some(max_source_bytes) = max_source_bytes else {
-        return (candidates, 0, false);
+        return (candidates, 0, false, false);
     };
 
     let mut ordered = candidates.iter().cloned().collect::<Vec<_>>();
@@ -306,6 +333,9 @@ fn admit_candidates_by_source_bytes(
     let mut admitted = HashSet::default();
     let mut scanned_source_bytes = 0usize;
     for file in ordered {
+        if cancellation.is_cancelled() {
+            return (HashSet::default(), 0, false, true);
+        }
         let Some(source_bytes) = analyzer.indexed_source(&file).map(|source| source.len()) else {
             continue;
         };
@@ -315,7 +345,7 @@ fn admit_candidates_by_source_bytes(
         }
     }
     let truncated = admitted.len() < candidates.len();
-    (admitted, scanned_source_bytes, truncated)
+    (admitted, scanned_source_bytes, truncated, false)
 }
 
 impl Default for UsageFinder {
@@ -488,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_cancelled_query_skips_candidate_discovery() {
+    fn issue_1228_pre_cancelled_query_skips_candidate_discovery() {
         let root = std::env::temp_dir();
         let project: Arc<dyn Project> = Arc::new(FileSetProject::new(
             root.clone(),
@@ -514,6 +544,50 @@ mod tests {
                 DEFAULT_MAX_USAGES,
             );
 
+        assert!(result.candidate_files.is_empty());
+        assert!(result.result.all_hits_including_imports().is_empty());
+        assert_eq!(result.completion, UsageQueryCompletion::Cancelled);
+    }
+
+    struct SingleCandidateProvider {
+        candidate: ProjectFile,
+    }
+
+    impl CandidateFileProvider for SingleCandidateProvider {
+        fn find_candidates(
+            &self,
+            _target: &CodeUnit,
+            _analyzer: &dyn IAnalyzer,
+        ) -> HashSet<ProjectFile> {
+            HashSet::from_iter([self.candidate.clone()])
+        }
+    }
+
+    #[test]
+    fn issue_1228_cancellation_after_candidate_discovery_is_not_reported_as_empty_success() {
+        let root = std::env::temp_dir();
+        let project: Arc<dyn Project> = Arc::new(FileSetProject::new(
+            root.clone(),
+            std::iter::empty::<PathBuf>(),
+        ));
+        let analyzer = EmptyAnalyzer::new(project);
+        let target_file = ProjectFile::new(root.clone(), PathBuf::from("Target.java"));
+        let target = CodeUnit::new(target_file.clone(), CodeUnitType::Class, "pkg", "Target");
+        let cancellation = CancellationToken::cancel_after_checks_for_test(2);
+
+        let result = UsageFinder::new()
+            .with_cancellation(cancellation)
+            .query_with_provider(
+                &analyzer,
+                &[target],
+                Some(&SingleCandidateProvider {
+                    candidate: target_file,
+                }),
+                DEFAULT_MAX_FILES,
+                DEFAULT_MAX_USAGES,
+            );
+
+        assert_eq!(result.completion, UsageQueryCompletion::Cancelled);
         assert!(result.candidate_files.is_empty());
         assert!(result.result.all_hits_including_imports().is_empty());
     }
@@ -634,7 +708,8 @@ fn graph_find_usages(
             scan_scope,
             max_usages,
         ),
-        Language::None => GraphUsageOutcome::terminal_failure(
+        // Kotlin usage graphs are issue #1239.
+        Language::Kotlin | Language::None => GraphUsageOutcome::terminal_failure(
             overloads[0].fq_name(),
             GraphFailureReason::UnsupportedTargetLanguage(
                 "no graph usage strategy is available for this target language",

@@ -478,13 +478,6 @@ impl<Node: Copy> StronglyConnectedComponents<Node> {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "issue 819 keeps SCC derivation available on demand"
-    )
-)]
 pub(crate) fn strongly_connected_components<G>(
     graph: &G,
     request: &mut CfgAlgorithmRequest<'_>,

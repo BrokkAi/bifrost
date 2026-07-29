@@ -20,9 +20,10 @@ use brokk_bifrost::analyzer::semantic::{
 };
 use brokk_bifrost::analyzer::value_flow::{
     ValueFlowCarrier, ValueFlowCarrierKey, ValueFlowEventKey, ValueFlowEventKind, ValueFlowInput,
-    ValueFlowMayStatus, ValueFlowMustStatus, ValueFlowObservationPhase, ValueFlowPlan,
-    ValueFlowScopedRootKind, ValueFlowSelectorKey, ValueFlowSinkOutcome, ValueFlowSinkSpec,
-    ValueFlowSourceSpec, ValueFlowSummaryResult, solve_value_flow_with_witnesses,
+    ValueFlowMayStatus, ValueFlowMeeting, ValueFlowMustStatus, ValueFlowObservationPhase,
+    ValueFlowPlan, ValueFlowScopedRootKind, ValueFlowSelectorKey, ValueFlowSinkOutcome,
+    ValueFlowSinkSpec, ValueFlowSourceSpec, ValueFlowSummaryResult,
+    solve_value_flow_with_witnesses,
 };
 use brokk_bifrost::{AnalyzerConfig, Language, WorkspaceAnalyzer};
 use pretty_assertions::assert_eq;
@@ -60,6 +61,7 @@ pub struct ParameterSource<'case> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpectedSinkOutcome {
     Reached,
+    NotReached,
     Inconclusive,
 }
 
@@ -119,8 +121,6 @@ pub struct InterproceduralMilestone<'case> {
 #[derive(Debug)]
 pub struct ExpectedWitness<'case> {
     pub truncated: bool,
-    pub step_proof: &'case ProofStatus,
-    pub step_completeness: &'case EvidenceCompleteness,
     pub carriers: &'case [CarrierMilestone],
     pub interprocedural: &'case [InterproceduralMilestone<'case>],
 }
@@ -128,6 +128,7 @@ pub struct ExpectedWitness<'case> {
 #[derive(Debug)]
 pub struct ExpectedMeeting<'case> {
     pub sink: &'case str,
+    pub meeting_count: usize,
     pub may_status: ValueFlowMayStatus,
     pub must_status: ValueFlowMustStatus,
     pub uncertain: bool,
@@ -735,29 +736,21 @@ fn assert_sink_outcomes(
                     });
                 assert_eq!(
                     meetings.len(),
-                    1,
+                    expectation.meeting_count,
                     "{} {} meeting count",
                     case.name,
                     expected.alias
                 );
-                let meeting = meetings[0];
-                assert_eq!(meeting.may_status(), expectation.may_status);
-                assert_eq!(meeting.must_status(), expectation.must_status);
-                assert_eq!(
-                    meeting.is_uncertain(),
-                    expectation.uncertain,
-                    "{} {} uncertainty",
+                assert!(
+                    meetings
+                        .iter()
+                        .any(|meeting| meeting_matches(meeting, expectation)),
+                    "{} {} has no meeting matching the expected status and path quality",
                     case.name,
-                    expected.alias
-                );
-                assert_eq!(
-                    meeting.path_qualities().iter().collect::<Vec<_>>(),
-                    expectation.path_qualities,
-                    "{} {} path qualities",
-                    case.name,
-                    expected.alias
+                    expected.alias,
                 );
             }
+            (ExpectedSinkOutcome::NotReached, ValueFlowSinkOutcome::NotReached) => {}
             (ExpectedSinkOutcome::Inconclusive, ValueFlowSinkOutcome::Inconclusive) => {}
             (_, actual) => panic!(
                 "{} sink {} had unexpected outcome {actual:?}",
@@ -783,6 +776,13 @@ fn assert_sink_outcomes(
         "{} every meeting expectation names a reached sink",
         case.name
     );
+}
+
+fn meeting_matches(meeting: &ValueFlowMeeting, expectation: &ExpectedMeeting<'_>) -> bool {
+    meeting.may_status() == expectation.may_status
+        && meeting.must_status() == expectation.must_status
+        && meeting.is_uncertain() == expectation.uncertain
+        && meeting.path_qualities().iter().collect::<Vec<_>>() == expectation.path_qualities
 }
 
 fn assert_witness(case: &ValueFlowConformanceCase<'_>, resolved: &ResolvedCase) {
@@ -819,7 +819,7 @@ fn assert_meeting_witness(
     let meeting = result
         .meetings()
         .iter()
-        .find(|meeting| meeting.sink() == sink_id)
+        .find(|meeting| meeting.sink() == sink_id && meeting_matches(meeting, expectation))
         .expect("positive meeting");
     let quality = *expectation
         .path_qualities
@@ -849,14 +849,20 @@ fn assert_meeting_witness(
         .collect::<Vec<_>>();
     for step in &projected {
         assert_eq!(
-            &step.proof, expectation.witness.step_proof,
+            step.proof,
+            ProofStatus::Proven,
             "{} {} witness proof at {:?}",
-            case.name, expectation.sink, step.kind
+            case.name,
+            expectation.sink,
+            step.kind
         );
         assert_eq!(
-            &step.completeness, expectation.witness.step_completeness,
+            step.completeness,
+            EvidenceCompleteness::Complete,
             "{} {} witness completeness at {:?}",
-            case.name, expectation.sink, step.kind
+            case.name,
+            expectation.sink,
+            step.kind
         );
     }
 

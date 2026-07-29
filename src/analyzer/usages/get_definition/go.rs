@@ -460,13 +460,21 @@ fn go_keyed_composite_label_outcome(
     let key = keyed.child_by_field_name("key")?;
     let label_node = go_simple_composite_key_identifier(support, key, selected)?;
 
-    let owner_type = go_composite_label_owner_type(support, keyed)?;
-    if matches!(owner_type.kind(), "map_type" | "array_type" | "slice_type") {
+    let direct_literal = keyed
+        .parent()
+        .filter(|parent| parent.kind() == "literal_value")?;
+    if direct_literal
+        .parent()
+        .filter(|parent| parent.kind() == "composite_literal")
+        .and_then(|literal| literal.child_by_field_name("type"))
+        .is_some_and(|owner| matches!(owner.kind(), "map_type" | "array_type" | "slice_type"))
+    {
         return None;
     }
 
     let label = go_node_text(label_node, source);
-    let Some(owner_fqn) = go_resolve_type_fqn(analyzer, support, file, source, owner_type) else {
+    let Some(owner_fqn) = go_composite_label_owner_fqn(analyzer, support, file, source, keyed)
+    else {
         return Some(no_definition(
             "go_literal_owner_unresolved",
             format!(
@@ -486,6 +494,44 @@ fn go_keyed_composite_label_outcome(
         ));
     }
     Some(candidates_outcome(candidates))
+}
+
+enum GoCompositeOwnerStep {
+    ContainerElementOrValue,
+    KeyedValue(Option<String>),
+}
+
+enum GoCompositeOwnerRef<'tree> {
+    Syntax(Node<'tree>),
+    IndexedType {
+        file: ProjectFile,
+        package: String,
+        identity: StructuredTypeIdentity,
+    },
+}
+
+fn go_composite_key_identifier_name(
+    support: &dyn GoDefinitionProvider,
+    key: Node<'_>,
+    source: &str,
+) -> Option<String> {
+    if !support.scope_step() {
+        return None;
+    }
+    if matches!(key.kind(), "identifier" | "field_identifier") {
+        return Some(go_node_text(key, source).to_string());
+    }
+    if key.kind() != "literal_element" {
+        return None;
+    }
+    let mut cursor = key.walk();
+    let mut children = key.named_children(&mut cursor);
+    let child = children.next()?;
+    if !support.scope_step() || children.next().is_some() {
+        return None;
+    }
+    matches!(child.kind(), "identifier" | "field_identifier")
+        .then(|| go_node_text(child, source).to_string())
 }
 
 fn go_keyed_element_containing_key<'tree>(
@@ -540,21 +586,21 @@ fn go_simple_composite_key_identifier<'tree>(
     .then_some(identifier)
 }
 
-fn go_composite_label_owner_type<'tree>(
+fn go_composite_label_owner_fqn(
+    analyzer: &dyn IAnalyzer,
     support: &dyn GoDefinitionProvider,
-    keyed: Node<'tree>,
-) -> Option<Node<'tree>> {
+    file: &ProjectFile,
+    source: &str,
+    keyed: Node<'_>,
+) -> Option<String> {
     if !support.scope_step() {
         return None;
     }
     let mut literal = keyed
         .parent()
         .filter(|parent| parent.kind() == "literal_value")?;
-    if !support.scope_step() {
-        return None;
-    }
-    let mut elided_depth = 0usize;
-    loop {
+    let mut steps = Vec::new();
+    let owner = loop {
         if !support.scope_step() {
             return None;
         }
@@ -564,28 +610,24 @@ fn go_composite_label_owner_type<'tree>(
         }
         match parent.kind() {
             "composite_literal" => {
-                let mut owner = parent.child_by_field_name("type")?;
-                for _ in 0..elided_depth {
-                    owner = go_composite_container_element_or_value_type(support, owner)?;
-                }
-                return Some(owner);
+                break GoCompositeOwnerRef::Syntax(parent.child_by_field_name("type")?);
             }
             "keyed_element" => {
                 let value = parent.child_by_field_name("value")?;
                 if value.id() != literal.id() {
                     return None;
                 }
+                let key = parent.child_by_field_name("key")?;
+                steps.push(GoCompositeOwnerStep::KeyedValue(
+                    go_composite_key_identifier_name(support, key, source),
+                ));
                 literal = parent
                     .parent()
                     .filter(|ancestor| ancestor.kind() == "literal_value")?;
-                if !support.scope_step() {
-                    return None;
-                }
-                elided_depth += 1;
             }
             "literal_value" => {
+                steps.push(GoCompositeOwnerStep::ContainerElementOrValue);
                 literal = parent;
-                elided_depth += 1;
             }
             "literal_element" => {
                 let container = parent.parent()?;
@@ -598,20 +640,171 @@ fn go_composite_label_owner_type<'tree>(
                         if value.id() != parent.id() {
                             return None;
                         }
+                        let key = container.child_by_field_name("key")?;
+                        steps.push(GoCompositeOwnerStep::KeyedValue(
+                            go_composite_key_identifier_name(support, key, source),
+                        ));
                         container
                             .parent()
                             .filter(|ancestor| ancestor.kind() == "literal_value")?
                     }
-                    "literal_value" => container,
+                    "literal_value" => {
+                        steps.push(GoCompositeOwnerStep::ContainerElementOrValue);
+                        container
+                    }
                     _ => return None,
                 };
-                if !support.scope_step() {
-                    return None;
-                }
-                elided_depth += 1;
             }
             _ => return None,
         }
+    };
+
+    let mut owner = owner;
+    for step in steps.into_iter().rev() {
+        if !support.scope_step() {
+            return None;
+        }
+        owner = match step {
+            GoCompositeOwnerStep::ContainerElementOrValue => {
+                go_composite_owner_container_step(analyzer, support, owner)?
+            }
+            GoCompositeOwnerStep::KeyedValue(field) => go_composite_owner_keyed_value_step(
+                analyzer,
+                support,
+                file,
+                source,
+                owner,
+                field.as_deref(),
+            )?,
+        };
+    }
+
+    match owner {
+        GoCompositeOwnerRef::Syntax(owner_type) => {
+            if matches!(owner_type.kind(), "map_type" | "array_type" | "slice_type") {
+                return None;
+            }
+            go_resolve_type_fqn(analyzer, support, file, source, owner_type)
+        }
+        GoCompositeOwnerRef::IndexedType {
+            file,
+            package,
+            identity,
+        } => go_resolve_structured_type_fqn(
+            support,
+            resolve_analyzer::<GoAnalyzer>(analyzer)?,
+            &file,
+            &package,
+            &identity,
+        ),
+    }
+}
+
+fn go_composite_owner_container_step<'tree>(
+    _analyzer: &dyn IAnalyzer,
+    support: &dyn GoDefinitionProvider,
+    owner: GoCompositeOwnerRef<'tree>,
+) -> Option<GoCompositeOwnerRef<'tree>> {
+    match owner {
+        GoCompositeOwnerRef::Syntax(owner_type) => Some(GoCompositeOwnerRef::Syntax(
+            go_composite_container_element_or_value_type(support, owner_type)?,
+        )),
+        GoCompositeOwnerRef::IndexedType {
+            file,
+            package,
+            identity,
+        } => identity
+            .into_container_element_with(|| support.scope_step())
+            .map(|identity| GoCompositeOwnerRef::IndexedType {
+                file,
+                package,
+                identity,
+            }),
+    }
+}
+
+fn go_composite_owner_keyed_value_step<'tree>(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn GoDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    owner: GoCompositeOwnerRef<'tree>,
+    field: Option<&str>,
+) -> Option<GoCompositeOwnerRef<'tree>> {
+    let owner = match owner {
+        GoCompositeOwnerRef::Syntax(owner_type) => {
+            if matches!(owner_type.kind(), "map_type" | "array_type" | "slice_type") {
+                return Some(GoCompositeOwnerRef::Syntax(
+                    go_composite_container_element_or_value_type(support, owner_type)?,
+                ));
+            }
+            let identity = crate::analyzer::go::go_structured_type_identity_bounded(
+                owner_type,
+                source,
+                || support.scope_step(),
+            )?;
+            GoCompositeOwnerRef::IndexedType {
+                file: file.clone(),
+                package: go_package_name(
+                    support,
+                    file,
+                    source,
+                    Some(go_syntax_root(support, owner_type)?),
+                )?,
+                identity,
+            }
+        }
+        GoCompositeOwnerRef::IndexedType {
+            file,
+            package,
+            identity,
+        } => GoCompositeOwnerRef::IndexedType {
+            file,
+            package,
+            identity,
+        },
+    };
+
+    let owner_fqn = match &owner {
+        GoCompositeOwnerRef::Syntax(_) => return None,
+        GoCompositeOwnerRef::IndexedType {
+            file,
+            package,
+            identity,
+        } => go_resolve_structured_type_fqn(
+            support,
+            resolve_analyzer::<GoAnalyzer>(analyzer)?,
+            file,
+            package,
+            identity,
+        ),
+    };
+
+    if let Some(field) = field
+        && let Some((field_unit, identity)) = owner_fqn.as_deref().and_then(|owner_fqn| {
+            go_indexed_field_type_identity(analyzer, support, owner_fqn, field)
+        })
+    {
+        return Some(GoCompositeOwnerRef::IndexedType {
+            file: field_unit.source().clone(),
+            package: field_unit.package_name().to_string(),
+            identity,
+        });
+    }
+
+    match owner {
+        GoCompositeOwnerRef::IndexedType {
+            file,
+            package,
+            identity,
+        } => identity
+            .into_container_element_with(|| support.scope_step())
+            .map(|identity| GoCompositeOwnerRef::IndexedType {
+                file,
+                package,
+                identity,
+            }),
+        GoCompositeOwnerRef::Syntax(_) => None,
     }
 }
 

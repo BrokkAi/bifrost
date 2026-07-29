@@ -16,13 +16,15 @@ pub use artifact_lifecycle::{
 };
 pub use manifest::{
     BenchmarkLocationSelector, BenchmarkManifest, BenchmarkRepoTarget, BenchmarkScenario,
-    DefinitionQueryTarget, HierarchyQueryTarget, ManifestLanguage, ManifestLoadError,
-    ManifestValidationError, QueryCodeBenchmarkCase, QueryCodeWorkload, ScanUsageQueryTarget,
+    DefinitionQueryTarget, HierarchyQueryTarget, InteractiveQueryBenchmarkCase,
+    InteractiveQueryTool, ManifestLanguage, ManifestLoadError, ManifestValidationError,
+    McpFairnessBenchmarkCase, QueryCodeBenchmarkCase, QueryCodeWorkload, ScanUsageQueryTarget,
 };
 pub use report::{
     BenchmarkCompareReport, BenchmarkRepoReport, BenchmarkRunReport, CompareThresholds,
-    EnvironmentVarianceReport, QueryCodeAccessPathMetrics, QueryCodeBenchmarkMetrics,
-    QueryCodeDerivedLayerMetrics, QueryCodeFactsCacheMetrics, QueryCodeProfileMetrics,
-    ScenarioCompareOutcome, ScenarioCompareReport, ScenarioReport, ScenarioTransport,
+    EnvironmentVarianceReport, McpFairnessTimingReport, McpTransportPhaseReport,
+    QueryCodeAccessPathMetrics, QueryCodeBenchmarkMetrics, QueryCodeDerivedLayerMetrics,
+    QueryCodeFactsCacheMetrics, QueryCodeProfileMetrics, ScenarioCompareOutcome,
+    ScenarioCompareReport, ScenarioReport, ScenarioTransport,
 };
 pub use runner::{BenchmarkProfile, RunRequest, run_benchmark};

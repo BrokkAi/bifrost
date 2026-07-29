@@ -180,10 +180,39 @@ pub(crate) fn csharp_as_expression_type_operand(parent: Node<'_>, node: Node<'_>
 }
 
 pub(crate) fn csharp_is_expression_type_operand(parent: Node<'_>, node: Node<'_>) -> bool {
-    parent.kind() == "is_expression"
-        && parent.child_by_field_name("right").is_some_and(|right| {
+    match parent.kind() {
+        "is_expression" => parent.child_by_field_name("right").is_some_and(|right| {
             right.start_byte() == node.start_byte() && right.end_byte() == node.end_byte()
-        })
+        }),
+        "is_pattern_expression" => parent
+            .child_by_field_name("pattern")
+            .is_some_and(|pattern| {
+                pattern.start_byte() == node.start_byte()
+                    && pattern.end_byte() == node.end_byte()
+                    && csharp_pattern_has_structured_type(pattern)
+            }),
+        "switch_expression_arm" | "switch_section" => {
+            parent.named_child(0).is_some_and(|pattern| {
+                pattern.start_byte() == node.start_byte()
+                    && pattern.end_byte() == node.end_byte()
+                    && csharp_pattern_has_structured_type(pattern)
+            })
+        }
+        _ => false,
+    }
+}
+
+fn csharp_pattern_has_structured_type(mut pattern: Node<'_>) -> bool {
+    while matches!(pattern.kind(), "parenthesized_pattern" | "negated_pattern") {
+        let Some(inner) = pattern.named_child(0) else {
+            return false;
+        };
+        pattern = inner;
+    }
+    matches!(
+        pattern.kind(),
+        "type_pattern" | "declaration_pattern" | "recursive_pattern"
+    )
 }
 
 #[derive(Clone)]
@@ -1233,11 +1262,19 @@ fn csharp_type_node_identity_with_terminal_suffix(
             | "pointer_type"
             | "type"
             | "simple_base_type"
-            | "primary_constructor_base_type" => {
+            | "primary_constructor_base_type"
+            | "type_pattern"
+            | "declaration_pattern"
+            | "recursive_pattern" => {
                 if let Some(inner) = current
                     .child_by_field_name("type")
                     .or_else(|| current.named_child(0))
                 {
+                    stack.push(inner);
+                }
+            }
+            "parenthesized_pattern" | "negated_pattern" => {
+                if let Some(inner) = current.named_child(0) {
                     stack.push(inner);
                 }
             }
@@ -1277,6 +1314,10 @@ fn csharp_type_node_identity_with_terminal_suffix(
 pub(crate) fn csharp_type_reference_root(mut node: Node<'_>) -> Option<Node<'_>> {
     loop {
         let parent = node.parent()?;
+        if let Some(wrapper) = csharp_pattern_type_wrapper(parent, node) {
+            node = wrapper;
+            continue;
+        }
         if matches!(
             parent.kind(),
             "qualified_name"
@@ -1328,6 +1369,23 @@ pub(crate) fn csharp_type_reference_root(mut node: Node<'_>) -> Option<Node<'_>>
             return Some(node);
         }
         return None;
+    }
+}
+
+fn csharp_pattern_type_wrapper<'tree>(
+    parent: Node<'tree>,
+    node: Node<'tree>,
+) -> Option<Node<'tree>> {
+    match parent.kind() {
+        "type_pattern" | "declaration_pattern" | "recursive_pattern" => parent
+            .child_by_field_name("type")
+            .filter(|candidate| same_csharp_node(*candidate, node))
+            .map(|_| parent),
+        "parenthesized_pattern" | "negated_pattern" => parent
+            .named_child(0)
+            .filter(|candidate| same_csharp_node(*candidate, node))
+            .map(|_| parent),
+        _ => None,
     }
 }
 
@@ -1466,11 +1524,15 @@ pub(crate) fn csharp_type_terminal_identifier(mut node: Node<'_>) -> Option<Node
             | "pointer_type"
             | "type"
             | "simple_base_type"
-            | "primary_constructor_base_type" => {
+            | "primary_constructor_base_type"
+            | "type_pattern"
+            | "declaration_pattern"
+            | "recursive_pattern" => {
                 node = node
                     .child_by_field_name("type")
                     .or_else(|| node.named_child(0))?;
             }
+            "parenthesized_pattern" | "negated_pattern" => node = node.named_child(0)?,
             _ => return None,
         }
     }
@@ -1497,11 +1559,15 @@ pub(crate) fn csharp_type_leftmost_identifier(mut node: Node<'_>) -> Option<Node
             | "pointer_type"
             | "type"
             | "simple_base_type"
-            | "primary_constructor_base_type" => {
+            | "primary_constructor_base_type"
+            | "type_pattern"
+            | "declaration_pattern"
+            | "recursive_pattern" => {
                 node = node
                     .child_by_field_name("type")
                     .or_else(|| node.named_child(0))?;
             }
+            "parenthesized_pattern" | "negated_pattern" => node = node.named_child(0)?,
             _ => return None,
         }
     }
