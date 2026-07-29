@@ -1023,18 +1023,18 @@ fn cpp_canonical_selectors(
     analyzer: &dyn IAnalyzer,
     units: &[CodeUnit],
 ) -> HashMap<CodeUnit, String> {
-    let mut by_fqn_signature: HashMap<(String, Option<String>), Vec<CodeUnit>> = HashMap::default();
+    let mut by_fqn_signature: HashMap<(String, Vec<String>), Vec<CodeUnit>> = HashMap::default();
     for unit in units {
         if language_for_target(unit) == Language::Cpp && unit.is_callable() {
             by_fqn_signature
-                .entry((unit.fq_name(), unit.signature().map(str::to_string)))
+                .entry((unit.fq_name(), cpp_callable_signature_key(analyzer, unit)))
                 .or_default()
                 .push(unit.clone());
         }
     }
 
     let mut family_by_unit = HashMap::default();
-    let mut families_by_fqn_signature: HashMap<(String, Option<String>), HashSet<String>> =
+    let mut families_by_fqn_signature: HashMap<(String, Vec<String>), HashSet<String>> =
         HashMap::default();
     for ((fqn, signature), members) in &by_fqn_signature {
         for (member, family) in cpp_callable_family_selectors(analyzer, members) {
@@ -1098,6 +1098,21 @@ fn cpp_canonical_selectors(
     out
 }
 
+/// Use the persisted, parameter-bearing signature inventory to distinguish C++
+/// overloads. `CodeUnit::signature` is optional and is absent for declarations
+/// headed by project macros (for example fmt's `FMT_BEGIN_NAMESPACE` headers),
+/// even though the structured index has their signatures. Falling back to the
+/// unit field only preserves the older shapes whose metadata is genuinely
+/// unavailable.
+fn cpp_callable_signature_key(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Vec<String> {
+    let signatures = analyzer.signatures(unit);
+    if signatures.is_empty() {
+        unit.signature().map(str::to_string).into_iter().collect()
+    } else {
+        signatures
+    }
+}
+
 /// Partition resolved overloads into distinct selectable definitions, preserving
 /// first-seen order. Overloads of one symbol share a selector and scan together.
 /// An FQN present in multiple language/file domains is file-anchored in every
@@ -1122,10 +1137,9 @@ pub(super) fn distinct_definitions(
     //     scan_usages) keeps merging their call sites under one selector.
     //
     // The signature key is `IAnalyzer::signatures(unit)` (the parameter-bearing
-    // overload label list), NOT `CodeUnit::signature()`: the latter is `None`
-    // for the top-level functions and classes that reach this grouping, so it
-    // cannot tell an arity overload apart from a twin. `signatures(unit)`
-    // returns distinct labels for overloads (`compute(value: Int)` vs
+    // overload label list), NOT `CodeUnit::signature()`: the latter is absent
+    // for some macro-headed C++ declarations. The structured inventory returns
+    // distinct labels for overloads (`compute(value: Int)` vs
     // `compute(left: Int, right: Int)`) and an identical label (or empty list)
     // for twins/partial parts, which is exactly the discriminator we need.
     //
@@ -1147,9 +1161,7 @@ pub(super) fn distinct_definitions(
             .or_default()
             .insert((language, module_path));
         let signature = if language == Language::Cpp && unit.is_callable() {
-            unit.signature()
-                .map(|signature| vec![signature.to_string()])
-                .unwrap_or_default()
+            cpp_callable_signature_key(analyzer, unit)
         } else {
             analyzer.signatures(unit)
         };
