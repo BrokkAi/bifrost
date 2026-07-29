@@ -751,6 +751,7 @@ fn get_navigation_by_location_with_cancellation(
             requests,
             operation,
             cancellation,
+            false,
         );
         for ((index, query, request), outcome) in chunk.iter().zip(outcomes) {
             results[*index] = Some(render_definition_lookup(
