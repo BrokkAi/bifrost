@@ -1668,6 +1668,103 @@ const char* ffDetectBootmgr(FFBootmgrResult* result) {
 }
 
 #[test]
+fn cpp_macro_opened_namespace_keeps_vformat_overloads_selectable_by_short_name() {
+    // fmt opens its public namespace through this macro in every header. The
+    // parser deliberately indexes the declarations without preprocessing, so
+    // their identity must still preserve the distinct structured signatures.
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "include/fmt/base.h",
+            r#"#define FMT_BEGIN_NAMESPACE namespace fmt { inline namespace v12 {
+#define FMT_END_NAMESPACE } }
+FMT_BEGIN_NAMESPACE
+namespace detail {
+void vformat_to(int&, int, int);
+}
+FMT_END_NAMESPACE
+"#,
+        )
+        .file(
+            "include/fmt/format.h",
+            r#"#include "base.h"
+FMT_BEGIN_NAMESPACE
+inline auto vformat(int locale, int format, int args) -> int { return locale + format + args; }
+int vformat(int format, int args);
+FMT_END_NAMESPACE
+"#,
+        )
+        .file(
+            "include/fmt/color.h",
+            r#"#include "base.h"
+FMT_BEGIN_NAMESPACE
+inline auto vformat(int style, int format, int args, int color) -> int {
+  return style + format + args + color;
+}
+FMT_END_NAMESPACE
+"#,
+        )
+        .file(
+            "include/fmt/format-inl.h",
+            r#"#include "base.h"
+FMT_BEGIN_NAMESPACE
+int vformat(int format, int args) { return format + args; }
+FMT_END_NAMESPACE
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+
+    let locations = get_symbol_locations(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["vformat".to_string()],
+        },
+    );
+    assert!(locations.not_found.is_empty(), "{locations:#?}");
+    assert!(
+        locations
+            .locations
+            .iter()
+            .any(|location| location.path == "include/fmt/format.h"),
+        "{locations:#?}"
+    );
+    assert!(
+        locations
+            .locations
+            .iter()
+            .any(|location| location.path == "include/fmt/color.h"),
+        "{locations:#?}"
+    );
+    let namespace_near_miss = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "src/namespaces.cpp",
+            r#"namespace alpha { int vformat(int value) { return value; } }
+namespace beta { int vformat(int value) { return value + 1; } }
+"#,
+        )
+        .build();
+    let namespace_analyzer = CppAnalyzer::from_project(namespace_near_miss.project().clone());
+    let bare_near_miss = get_symbol_locations(
+        &namespace_analyzer,
+        SymbolLookupParams {
+            symbols: vec!["vformat".to_string()],
+        },
+    );
+    assert!(bare_near_miss.locations.is_empty(), "{bare_near_miss:#?}");
+    assert_eq!(1, bare_near_miss.not_found.len(), "{bare_near_miss:#?}");
+
+    let alpha = get_symbol_locations(
+        &namespace_analyzer,
+        SymbolLookupParams {
+            symbols: vec!["alpha::vformat".to_string()],
+        },
+    );
+    assert!(alpha.not_found.is_empty(), "{alpha:#?}");
+    assert_eq!(1, alpha.locations.len(), "{alpha:#?}");
+    assert_eq!("src/namespaces.cpp", alpha.locations[0].path);
+}
+
+#[test]
 fn rust_wrapped_macro_rules_lookup_supports_sources_search_and_file_outline() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(

@@ -35,7 +35,8 @@ use std::sync::{Arc, OnceLock};
 
 pub(crate) use adapter::PythonAdapter;
 use cache::{
-    weight_code_unit_set, weight_code_unit_vec, weight_export_index, weight_project_file_set,
+    PythonUsageEdgesKey, weight_code_unit_set, weight_code_unit_vec, weight_export_index,
+    weight_project_file_set, weight_python_usage_edges,
 };
 use clones::{build_clone_candidate_data, refine_python_clone_similarity};
 pub(crate) use declarations::python_package_prefix_fq;
@@ -73,6 +74,11 @@ pub struct PythonAnalyzer {
     // cost once that walk was fixed and parallelized (#1257).
     export_index: Cache<ProjectFile, Arc<ExportIndex>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
+    // Dead-code analysis scans the stable caller domain but resolves a bounded
+    // callee target set. Cache that exact pair for warm requests so repeated
+    // queries do not reparse the entire Python workspace.
+    usage_edges:
+        Cache<PythonUsageEdgesKey, Arc<crate::analyzer::usages::inverted_edges::UsageEdges>>,
     direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     usage_index: Arc<OnceLock<PythonUsageIndex>>,
@@ -153,6 +159,7 @@ impl PythonAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
+        clone.usage_edges = build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges);
         clone
     }
 
@@ -192,6 +199,7 @@ impl PythonAnalyzer {
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             export_index: build_weighted_cache(memo_budget / 8, weight_export_index),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec),
+            usage_edges: build_weighted_cache(memo_budget / 8, weight_python_usage_edges),
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(OnceLock::new()),
@@ -203,6 +211,16 @@ impl PythonAnalyzer {
         P: Project + 'static,
     {
         Self::new(Arc::new(project))
+    }
+
+    pub(crate) fn usage_edges_for_targets(
+        &self,
+        nodes: &HashSet<String>,
+        targets: &HashSet<String>,
+        build: impl FnOnce() -> crate::analyzer::usages::inverted_edges::UsageEdges,
+    ) -> Arc<crate::analyzer::usages::inverted_edges::UsageEdges> {
+        let key = PythonUsageEdgesKey::new(nodes, targets);
+        self.usage_edges.get_with(key, || Arc::new(build()))
     }
 
     #[doc(hidden)]
@@ -887,6 +905,7 @@ impl IAnalyzer for PythonAnalyzer {
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
             export_index: build_weighted_cache(self.memo_budget / 8, weight_export_index),
             direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
+            usage_edges: build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges),
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(OnceLock::new()),
@@ -906,6 +925,7 @@ impl IAnalyzer for PythonAnalyzer {
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
             export_index: build_weighted_cache(self.memo_budget / 8, weight_export_index),
             direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
+            usage_edges: build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges),
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(OnceLock::new()),
