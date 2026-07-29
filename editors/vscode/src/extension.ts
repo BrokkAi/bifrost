@@ -15,11 +15,14 @@ import type {
   LaunchMode
 } from "./lifecycle";
 import {
+  BIFROST_GITIGNORE_ASK_AGAIN_LATER,
+  BIFROST_GITIGNORE_DONT_ASK_AGAIN,
   bifrostConfigurationChangeRequiresRestart,
   buildBifrostInitializationOptions,
   buildLaunchConfig,
   buildMcpConfig,
   buildMcpHostCommands,
+  decideBifrostGitignorePrompt,
   formatError,
   appendBifrostGitignoreEntry,
   inspectWorkspaceBifrostGitignore,
@@ -782,15 +785,23 @@ async function promptAppendBifrostGitignore(
   }
 
   const legacy = state === "legacy-whole-directory";
+  const acceptedChoice = legacy ? "Replace" : "Add";
   const choice = await vscode.window.showInformationMessage(
     legacy
       ? "Bifrost now tracks project configuration in .bifrost. Replace the legacy .bifrost ignore rule with .bifrost/cache/?"
       : "Bifrost stores generated workspace state in .bifrost/cache. Add .bifrost/cache/ to .gitignore?",
-    legacy ? "Replace" : "Add",
-    "No"
+    acceptedChoice,
+    BIFROST_GITIGNORE_ASK_AGAIN_LATER,
+    BIFROST_GITIGNORE_DONT_ASK_AGAIN
   );
-  const acceptedChoice = legacy ? "Replace" : "Add";
-  if (choice !== acceptedChoice) {
+  const decision = decideBifrostGitignorePrompt(choice, acceptedChoice);
+  if (decision === "defer") {
+    log(
+      `User deferred ${legacy ? "replacing the legacy .bifrost ignore" : "adding .bifrost/cache to .gitignore"}.`
+    );
+    return;
+  }
+  if (decision === "decline") {
     await context.workspaceState.update(declinedKey, true);
     log(
       `User declined ${legacy ? "replacing the legacy .bifrost ignore" : "adding .bifrost/cache to .gitignore"}.`

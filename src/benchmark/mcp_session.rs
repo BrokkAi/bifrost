@@ -10,6 +10,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::mcp_common::{
+    BENCHMARK_MCP_REQUEST_BUDGET_SECS, BENCHMARK_MCP_REQUEST_BUDGET_SECS_ENV,
     BENCHMARK_PROFILE_BOUNDARY_MARKER, BENCHMARK_PROFILE_BOUNDARY_METHOD, MCP_FILE_WATCHER_ENV,
 };
 
@@ -480,7 +481,15 @@ impl McpSession {
         // Pinned benchmark checkouts are immutable for the lifetime of a run.
         // Watching them lets delayed VCS/cache events invalidate analyzer caches
         // between samples and measures rebuild jitter rather than warm queries.
-        command.env(MCP_FILE_WATCHER_ENV, "off");
+        command
+            .env(MCP_FILE_WATCHER_ENV, "off")
+            // The compatibility harness and its explicit prewarm must be able
+            // to observe complete results. Interactive cases still enforce
+            // their own five-second p95 budget in the runner.
+            .env(
+                BENCHMARK_MCP_REQUEST_BUDGET_SECS_ENV,
+                BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string(),
+            );
         if no_line_numbers {
             command.arg("--no-line-numbers");
         }
