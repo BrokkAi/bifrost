@@ -5,10 +5,8 @@
 //! what that membership does and does not mean: one candidate space, but never
 //! a collapsed source-language identity.
 
-mod common;
-
-use common::InlineTestProject;
-use common::usage_graph::usage_graph_at;
+use crate::common::InlineTestProject;
+use crate::common::usage_graph::usage_graph_at;
 use serde_json::Value;
 
 const JAVA_API: &str = "package app;\n\
@@ -29,7 +27,7 @@ const KOTLIN_IMPL: &str = "package app\n\
          fun help(): String = \"help\"\n\
      }\n";
 
-fn mixed_jvm_graph() -> (common::BuiltInlineTestProject, Value) {
+fn mixed_jvm_graph() -> (crate::common::BuiltInlineTestProject, Value) {
     let built = InlineTestProject::new()
         .file("src/app/Api.java", JAVA_API)
         .file("src/app/Service.scala", SCALA_SERVICE)
@@ -145,11 +143,11 @@ fn java_only_workspace_still_reports_java_nodes_and_edges() {
         Some("java")
     );
     assert!(
-        common::usage_graph::has_edge(&graph, "app.Caller.call", "app.Greeter.greet"),
+        crate::common::usage_graph::has_edge(&graph, "app.Caller.call", "app.Greeter.greet"),
         "the existing Java call edge must survive the realm merge: {}",
         serde_json::to_string_pretty(&graph["edges"]).unwrap()
     );
-    common::usage_graph::assert_every_edge_endpoint_is_a_node(&graph);
+    crate::common::usage_graph::assert_every_edge_endpoint_is_a_node(&graph);
 }
 
 // ---------------------------------------------------------------------------
@@ -164,7 +162,7 @@ use std::collections::BTreeMap;
 
 /// A multi-language analyzer over an inline workspace, with one delegate per
 /// JVM language the fixture actually uses.
-fn jvm_workspace(files: &[(&str, &str)]) -> (common::BuiltInlineTestProject, MultiAnalyzer) {
+fn jvm_workspace(files: &[(&str, &str)]) -> (crate::common::BuiltInlineTestProject, MultiAnalyzer) {
     let mut project = InlineTestProject::new();
     for (path, contents) in files {
         project = project.file(*path, *contents);

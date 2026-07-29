@@ -45,7 +45,9 @@ mod java_update_regressions;
 mod javascript_analyzer_test;
 mod javascript_arrow_function_test;
 mod javascript_import_test;
+mod jvm_shared_realm;
 mod kotlin_analyzer_test;
+mod kotlin_imports_and_hierarchy;
 #[cfg(feature = "nlp")]
 mod nlp_voyage_parity;
 mod php_analyzer_test;

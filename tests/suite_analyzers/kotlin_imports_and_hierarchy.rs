@@ -2,17 +2,17 @@
 //! imports, the file relationships they create, supertype hierarchy, and the
 //! shared JVM dependency realm.
 
-mod common;
-
+use crate::common::InlineTestProject;
 use brokk_bifrost::{
     AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, JvmAnalyzerConfig,
     JvmExternalArtifact, JvmExternalDependencies, KotlinAnalyzer, Language, ProjectFile,
     TypeHierarchyProvider,
 };
-use common::InlineTestProject;
 use std::io::Write;
 
-fn kotlin_analyzer(files: &[(&str, &str)]) -> (common::BuiltInlineTestProject, KotlinAnalyzer) {
+fn kotlin_analyzer(
+    files: &[(&str, &str)],
+) -> (crate::common::BuiltInlineTestProject, KotlinAnalyzer) {
     let mut project = InlineTestProject::with_language(Language::Kotlin);
     for (path, contents) in files {
         project = project.file(*path, *contents);
@@ -615,7 +615,7 @@ fn write_kotlin_source_jar(path: &std::path::Path, entry: &str, contents: &str) 
 fn analyzer_with_kotlin_dependency(
     files: &[(&str, &str)],
 ) -> (
-    common::BuiltInlineTestProject,
+    crate::common::BuiltInlineTestProject,
     tempfile::TempDir,
     KotlinAnalyzer,
 ) {

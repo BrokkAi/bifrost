@@ -21,10 +21,8 @@
 //! never tries the real file. The walk also now runs longest-anchor-first, so
 //! a genuine prefix collision resolves like #1216's historical rule.
 
-mod common;
-
+use crate::common::{BuiltInlineTestProject, InlineTestProject, call_tool};
 use brokk_bifrost::Language;
-use common::{BuiltInlineTestProject, InlineTestProject, call_tool};
 use serde_json::Value;
 
 const SNAPSHOT_PATH: &str = "test/Autofac.Test.CodeGen/Snapshots/DelegateRegisterGeneratorTests.VerifyGeneratedCode#01.verified.cs";

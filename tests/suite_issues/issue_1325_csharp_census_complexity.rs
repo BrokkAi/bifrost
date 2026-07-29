@@ -27,26 +27,14 @@
 //! shape are unchanged; only the number of traversals differs.
 //!
 //! These are perf pins in the shape of `issue_1194_csharp_scan_complexity.rs`:
-//! they assert a deterministic *count* of work rather than wall time.
+//! they assert a deterministic *count* of work rather than wall time. The
+//! walk counter is per-project-instance (not process-global), so these tests
+//! are immune to background threads from other tests' analyzers and safe to
+//! run inside a shared harness binary.
 
-mod common;
-
+use crate::common::InlineTestProject;
 use brokk_bifrost::searchtools::{SummariesParams, get_summaries};
-use brokk_bifrost::{
-    CSharpAnalyzer, Language, reset_workspace_file_listing_count_for_test,
-    workspace_file_listing_count_for_test,
-};
-use common::InlineTestProject;
-use std::sync::{Mutex, MutexGuard};
-
-/// The walk counter is process-global, so the counting tests take turns.
-static COUNTER: Mutex<()> = Mutex::new(());
-
-fn counter_guard() -> MutexGuard<'static, ()> {
-    COUNTER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
+use brokk_bifrost::{CSharpAnalyzer, Language, Project};
 
 /// A C# workspace with one interesting file and `bystanders` unrelated ones.
 ///
@@ -54,7 +42,9 @@ fn counter_guard() -> MutexGuard<'static, ()> {
 /// but each one is an entry a whole-workspace traversal has to visit. A pin
 /// that holds while their number grows tenfold is a pin on "the request does
 /// not pay for the repository".
-fn bystander_heavy_project(bystanders: usize) -> (common::BuiltInlineTestProject, CSharpAnalyzer) {
+fn bystander_heavy_project(
+    bystanders: usize,
+) -> (crate::common::BuiltInlineTestProject, CSharpAnalyzer) {
     let mut builder = InlineTestProject::with_language(Language::CSharp).file(
         "Lib/Widget.cs",
         "namespace Lib;\n\npublic class Widget\n{\n    public int Size() => 1;\n}\n",
@@ -86,12 +76,13 @@ fn summarize(analyzer: &CSharpAnalyzer, target: &str) -> brokk_bifrost::searchto
 /// made the census's per-file `get_summaries` probes cost the repository.
 #[test]
 fn file_summaries_do_not_walk_the_workspace() {
-    let _guard = counter_guard();
     for bystanders in [4_usize, 40] {
-        let (_project, analyzer) = bystander_heavy_project(bystanders);
+        let (built, analyzer) = bystander_heavy_project(bystanders);
+        let project = built.project().clone();
         // Analyzer construction legitimately enumerates the workspace; the pin
-        // is about what a *request* costs, so count from here.
-        reset_workspace_file_listing_count_for_test();
+        // is about what a *request* costs, so baseline from here. The counter
+        // is per-project-instance, so concurrent tests cannot perturb it.
+        let baseline = project.workspace_file_listing_count();
 
         let result = summarize(&analyzer, "Lib/Widget.cs");
         assert_eq!(
@@ -101,7 +92,7 @@ fn file_summaries_do_not_walk_the_workspace() {
         );
 
         assert_eq!(
-            workspace_file_listing_count_for_test(),
+            project.workspace_file_listing_count() - baseline,
             0,
             "summarizing one file must not traverse the workspace \
              (bystanders={bystanders})"
@@ -113,9 +104,9 @@ fn file_summaries_do_not_walk_the_workspace() {
 /// nothing, not ten whole-workspace traversals.
 #[test]
 fn repeated_file_summaries_do_not_accumulate_workspace_walks() {
-    let _guard = counter_guard();
-    let (_project, analyzer) = bystander_heavy_project(8);
-    reset_workspace_file_listing_count_for_test();
+    let (built, analyzer) = bystander_heavy_project(8);
+    let project = built.project().clone();
+    let baseline = project.workspace_file_listing_count();
 
     for index in 0..10 {
         let target = format!("Noise/Bystander{}.cs", index % 8);
@@ -128,7 +119,7 @@ fn repeated_file_summaries_do_not_accumulate_workspace_walks() {
     }
 
     assert_eq!(
-        workspace_file_listing_count_for_test(),
+        project.workspace_file_listing_count() - baseline,
         0,
         "repeated file summaries must not each traverse the workspace"
     );

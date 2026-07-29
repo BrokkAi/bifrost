@@ -28,7 +28,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 
 ## Groups
 
-### `suite_analyzers` (80 modules)
+### `suite_analyzers` (82 modules)
 
 - `cpp_analyzer_test`
 - `cpp_macro_call_arity`
@@ -66,7 +66,9 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `javascript_analyzer_test`
 - `javascript_arrow_function_test`
 - `javascript_import_test`
+- `jvm_shared_realm`
 - `kotlin_analyzer_test`
+- `kotlin_imports_and_hierarchy`
 - `nlp_voyage_parity`
 - `php_analyzer_test`
 - `php_analyzer_update_test`
@@ -151,7 +153,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `structural_search_planner`
 - `structural_search_python`
 
-### `suite_issues` (16 modules)
+### `suite_issues` (19 modules)
 
 - `issue_1089_crate_name_directory_mapping`
 - `issue_1092_cpp_header_source_identity`
@@ -166,7 +168,10 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `issue_1174_python_cross_language_claims`
 - `issue_1184_cpp_file_local_globals`
 - `issue_1185_cpp_member_calls`
+- `issue_1198_hash_anchor_selectors`
+- `issue_1218_boundary_candidate_honesty`
 - `issue_1225_python_annotation_inverse`
+- `issue_1325_csharp_census_complexity, issue_1332_search_notes_honesty`
 - `issue_693_profile`
 - `issue_csharp_verbatim_identifiers`
 
@@ -356,6 +361,7 @@ Process isolation is load-bearing for these; they were deliberately not merged.
 - **`issue_1175_scan_usages_reparse`** - asserts on process-global scan counters via `reset_*_for_test` hooks; merging exposes the counters to other modules' analyzer work.
 - **`issue_1194_csharp_scan_complexity`** - same process-global scan-counter pattern.
 - **`issue_1219_location_scan_target`** - asserts the process-global Rust tree-parse counters (`RUST_TREE_PARSES`/`RUST_TREE_PARSE_REQUESTS`/`RUST_TREE_PARSED_BYTES` statics in `src/analyzer/rust/lexical_scope.rs`), which any other Rust-parsing module in the same binary would perturb.
+- `issue_1325_csharp_census_complexity` was briefly kept standalone here for its process-global walk counter; the counter was then converted to a per-project-instance field (`Project::workspace_file_listing_count`, the #1099 per-instance-counter lesson), which removed the interference class entirely, and the module now lives in `suite_issues`.
 - **`jsts_usage_graph_deadlock`** - **found by merging, not by inspection**: passes standalone (12.3s) but FAILS inside `suite_usages` alongside the other 1,321 tests. It is the regression pin for the JS/TS OnceLock+rayon pool deadlock (`.agents/plans/jsts-usage-graph-oncelock-rayon-deadlock.md`) and depends on a pristine global rayon pool, so concurrent analyzer work in the same process perturbs it. Pulled back out and left standalone rather than debugged, per the migration brief.
 - **`mcp_property_fuzzer`** - fuzzer harness driven specially by its own runner.
 - **`mcp_property_fuzzer_service`** - fuzzer harness driven specially by its own runner.

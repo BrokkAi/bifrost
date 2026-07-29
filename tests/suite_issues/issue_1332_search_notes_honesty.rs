@@ -16,13 +16,11 @@
 //! (unchanged "cancelled ... partial" wording, `truncated: true`), and a warm history cache (no note
 //! at all) as a control proving the disclaimer does not fire when ranking data really is available.
 
-mod common;
-
+use crate::common::InlineTestProject;
 use brokk_bifrost::{
     CancellationToken, IAnalyzer, Language, RustAnalyzer,
     searchtools::{SearchSymbolsParams, search_symbols, search_symbols_with_cancellation},
 };
-use common::InlineTestProject;
 use git2::{Oid, Repository, Signature};
 use std::path::Path;
 
@@ -33,7 +31,7 @@ use std::path::Path;
 /// public API. If `COMMITS_TO_PROCESS` ever changes, this constant must move with it.
 const COMMITS_TO_PROCESS: usize = 1000;
 
-fn rust_symbol_project() -> common::BuiltInlineTestProject {
+fn rust_symbol_project() -> crate::common::BuiltInlineTestProject {
     InlineTestProject::with_language(Language::Rust)
         .file("src/lib.rs", "pub fn tracked_target_symbol() {}\n")
         .build()

@@ -21,14 +21,12 @@
 //! workspace, and a control where the type reference is itself a real,
 //! resolvable workspace type.
 
-mod common;
-
+use crate::common::{InlineTestProject, definition_reference_status};
 use brokk_bifrost::Language;
-use common::{InlineTestProject, definition_reference_status};
 
 const JSON_SERIALIZER_SHAPE: &str = "using System.Runtime.Serialization;\n\nnamespace Newtonsoft.Json\n{\n    public class JsonSerializer\n    {\n        public SerializationBinder Binder { get; set; }\n\n        public object SerializationBinder { get; set; }\n\n        public StreamingContext Context { get; set; }\n\n        public CustomBinder Custom { get; set; }\n    }\n\n    public class CustomBinder\n    {\n    }\n}\n";
 
-fn project() -> common::BuiltInlineTestProject {
+fn project() -> crate::common::BuiltInlineTestProject {
     InlineTestProject::with_language(Language::CSharp)
         .file(
             "Src/Newtonsoft.Json/JsonSerializer.cs",
@@ -38,7 +36,7 @@ fn project() -> common::BuiltInlineTestProject {
 }
 
 fn status_and_message(
-    project: &common::BuiltInlineTestProject,
+    project: &crate::common::BuiltInlineTestProject,
     symbol: &str,
     context: &str,
     target: &str,
@@ -47,7 +45,7 @@ fn status_and_message(
         "references": [{ "symbol": symbol, "context": context, "target": target }]
     })
     .to_string();
-    let result = common::call_tool(project, "get_definitions_by_reference", &args);
+    let result = crate::common::call_tool(project, "get_definitions_by_reference", &args);
     let status = result["results"][0]["status"]
         .as_str()
         .unwrap_or_else(|| panic!("expected a status string, got {result}"))

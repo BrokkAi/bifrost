@@ -108,6 +108,15 @@ pub trait Project: Send + Sync {
     }
     fn analyzer_languages(&self) -> BTreeSet<Language>;
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>>;
+    /// Whole-workspace file listings this project instance has performed --
+    /// the per-instance complexity signal pinned by the issue #1325 regression
+    /// tests. Per-instance rather than process-global so a test measures only
+    /// its own project's walks: background threads from other analyzers in the
+    /// same process (watchers, GC) cannot bleed into the window (the #1099
+    /// lesson applied to walk counting).
+    fn workspace_file_listing_count(&self) -> usize {
+        0
+    }
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>>;
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile>;
 
@@ -229,6 +238,7 @@ pub trait Project: Send + Sync {
 pub struct TestProject {
     root: PathBuf,
     languages: BTreeSet<Language>,
+    listing_count: Arc<AtomicUsize>,
 }
 
 impl TestProject {
@@ -245,7 +255,11 @@ impl TestProject {
             "test project must contain at least one analyzer language"
         );
 
-        Self { root, languages }
+        Self {
+            root,
+            languages,
+            listing_count: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     pub fn from_root_with_inferred_languages(root: impl Into<PathBuf>) -> io::Result<Self> {
@@ -264,7 +278,11 @@ impl TestProject {
             ));
         }
 
-        Ok(Self { root, languages })
+        Ok(Self {
+            root,
+            languages,
+            listing_count: Arc::new(AtomicUsize::new(0)),
+        })
     }
 
     pub fn root_path(&self) -> &Path {
@@ -281,8 +299,12 @@ impl Project for TestProject {
         self.languages.clone()
     }
 
+    fn workspace_file_listing_count(&self) -> usize {
+        self.listing_count.load(Ordering::Relaxed)
+    }
+
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
-        note_workspace_file_listing();
+        self.listing_count.fetch_add(1, Ordering::Relaxed);
         let mut files = BTreeSet::new();
 
         for entry in WalkDir::new(&self.root) {
@@ -334,6 +356,7 @@ impl Project for TestProject {
 pub struct FilesystemProject {
     root: PathBuf,
     languages: BTreeSet<Language>,
+    listing_count: Arc<AtomicUsize>,
 }
 
 impl FilesystemProject {
@@ -347,7 +370,11 @@ impl FilesystemProject {
         }
 
         let languages = detect_languages(&root)?;
-        Ok(Self { root, languages })
+        Ok(Self {
+            root,
+            languages,
+            listing_count: Arc::new(AtomicUsize::new(0)),
+        })
     }
 
     pub fn root_path(&self) -> &Path {
@@ -364,7 +391,12 @@ impl Project for FilesystemProject {
         self.languages.clone()
     }
 
+    fn workspace_file_listing_count(&self) -> usize {
+        self.listing_count.load(Ordering::Relaxed)
+    }
+
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+        self.listing_count.fetch_add(1, Ordering::Relaxed);
         collect_workspace_files(&self.root)
     }
 
@@ -620,33 +652,10 @@ fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
     Some(ancestor)
 }
 
-/// Whole-workspace file listings performed since the last reset — the
-/// complexity signal pinned by the issue #1325 regression tests. Each one is a
-/// full ignore-aware traversal of the project tree, spread across
-/// `available_parallelism` walker threads; a request that asks a
-/// per-target question by materializing this set answers it at the cost of the
-/// entire repository.
-static WORKSPACE_FILE_LISTINGS: AtomicUsize = AtomicUsize::new(0);
-
-fn note_workspace_file_listing() {
-    WORKSPACE_FILE_LISTINGS.fetch_add(1, Ordering::Relaxed);
-}
-
-#[doc(hidden)]
-pub fn workspace_file_listing_count_for_test() -> usize {
-    WORKSPACE_FILE_LISTINGS.load(Ordering::Relaxed)
-}
-
-#[doc(hidden)]
-pub fn reset_workspace_file_listing_count_for_test() {
-    WORKSPACE_FILE_LISTINGS.store(0, Ordering::Relaxed);
-}
-
 /// Collect every file under `root` that belongs to the analyzer's view of the
 /// workspace. The walk is ignore-aware, skips `.git/`, and keeps other dotted
 /// directories in scope.
 pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>> {
-    note_workspace_file_listing();
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .ignore(false)
@@ -881,6 +890,10 @@ impl OverlayProject {
 }
 
 impl Project for OverlayProject {
+    fn workspace_file_listing_count(&self) -> usize {
+        self.delegate.workspace_file_listing_count()
+    }
+
     fn root(&self) -> &Path {
         self.delegate.root()
     }
