@@ -1,7 +1,7 @@
 mod common;
 
 use brokk_bifrost::{
-    AnalyzerConfig, IAnalyzer, JavaAnalyzerConfig, JavaExternalArtifact, JavaExternalDependencies,
+    AnalyzerConfig, IAnalyzer, JvmAnalyzerConfig, JvmExternalArtifact, JvmExternalDependencies,
     Language, ScalaAnalyzer,
 };
 use common::InlineTestProject;
@@ -121,15 +121,15 @@ fn scala_semantic_diagnostics_suppress_same_package_external_source_jar_type() {
     let analyzer = ScalaAnalyzer::new_with_config(
         project.project_arc(),
         AnalyzerConfig {
-            java: JavaAnalyzerConfig {
-                external_dependencies: JavaExternalDependencies {
-                    artifact_paths: vec![JavaExternalArtifact {
+            jvm: JvmAnalyzerConfig {
+                external_dependencies: JvmExternalDependencies {
+                    artifact_paths: vec![JvmExternalArtifact {
                         artifact_path: artifact,
                         source_artifact_path: None,
                     }],
-                    ..JavaExternalDependencies::default()
+                    ..JvmExternalDependencies::default()
                 },
-                ..JavaAnalyzerConfig::default()
+                ..JvmAnalyzerConfig::default()
             },
             ..AnalyzerConfig::default()
         },

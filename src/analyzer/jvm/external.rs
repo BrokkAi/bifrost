@@ -2,10 +2,10 @@ use crate::analyzer::java::declarations::{
     class_like_body_children_rev, determine_package_name, is_class_like_declaration_kind,
     node_text, normalize_java_full_name, parse_tree,
 };
-use crate::analyzer::java::dependency_discovery::{discover_build_tools, discover_metadata};
+use crate::analyzer::jvm::dependency_discovery::{discover_build_tools, discover_metadata};
 use crate::analyzer::{
-    JavaAnalyzerConfig, JavaDependencyDiscoveryMode, JavaExternalArtifact,
-    JavaExternalDependencies, JavaMavenCoordinate, Project, ProjectFile,
+    JvmAnalyzerConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalDependencies,
+    JvmMavenCoordinate, Project, ProjectFile,
 };
 use crate::hash::HashMap;
 use jclassfile::attributes::{Attribute, NestedClassFlags};
@@ -28,22 +28,22 @@ const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SCALA_SOURCE_TYPES: usize = 4_096;
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct JavaExternalDeclarationIndex {
-    types_by_fqn: HashMap<String, JavaExternalType>,
+pub(crate) struct JvmExternalDeclarationIndex {
+    types_by_fqn: HashMap<String, JvmExternalType>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct JavaExternalType {
+pub(crate) struct JvmExternalType {
     fqn: String,
     package_name: String,
     short_name: String,
-    kind: JavaExternalTypeKind,
-    visibility: JavaVisibility,
-    source: JavaExternalDeclarationSource,
+    kind: JvmExternalTypeKind,
+    visibility: JvmVisibility,
+    source: JvmExternalDeclarationSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum JavaExternalTypeKind {
+pub(crate) enum JvmExternalTypeKind {
     Class,
     Interface,
     Enum,
@@ -52,7 +52,7 @@ pub(crate) enum JavaExternalTypeKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum JavaVisibility {
+pub(crate) enum JvmVisibility {
     Public,
     Protected,
     PackagePrivate,
@@ -60,7 +60,7 @@ pub(crate) enum JavaVisibility {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum JavaExternalDeclarationSource {
+pub(crate) enum JvmExternalDeclarationSource {
     SourceJar {
         artifact_path: PathBuf,
         source_path: String,
@@ -72,24 +72,24 @@ pub(crate) enum JavaExternalDeclarationSource {
 }
 
 #[derive(Debug, Clone)]
-struct ResolvedJavaArtifact {
+struct ResolvedJvmArtifact {
     artifact_path: PathBuf,
     source_artifact_path: Option<PathBuf>,
 }
 
-impl JavaExternalDeclarationIndex {
+impl JvmExternalDeclarationIndex {
     #[cfg(test)]
-    pub(crate) fn build(config: &JavaExternalDependencies, project_root: &Path) -> Self {
+    pub(crate) fn build(config: &JvmExternalDependencies, project_root: &Path) -> Self {
         let artifacts = resolve_configured_artifacts(config, project_root);
         Self::build_from_artifacts(artifacts)
     }
 
-    pub(crate) fn build_for_project(config: &JavaAnalyzerConfig, project: &dyn Project) -> Self {
+    pub(crate) fn build_for_project(config: &JvmAnalyzerConfig, project: &dyn Project) -> Self {
         let mut dependencies = config.external_dependencies.clone();
-        if config.dependency_discovery.mode != JavaDependencyDiscoveryMode::Disabled {
+        if config.dependency_discovery.mode != JvmDependencyDiscoveryMode::Disabled {
             discover_metadata(project).merge_into(&mut dependencies);
         }
-        if config.dependency_discovery.mode == JavaDependencyDiscoveryMode::OfflineBuildTools {
+        if config.dependency_discovery.mode == JvmDependencyDiscoveryMode::OfflineBuildTools {
             discover_build_tools(project, &config.dependency_discovery)
                 .merge_into(&mut dependencies);
         }
@@ -97,7 +97,7 @@ impl JavaExternalDeclarationIndex {
         Self::build_from_artifacts(artifacts)
     }
 
-    fn build_from_artifacts(artifacts: Vec<ResolvedJavaArtifact>) -> Self {
+    fn build_from_artifacts(artifacts: Vec<ResolvedJvmArtifact>) -> Self {
         let mut index = Self::default();
         let mut remaining_index_bytes = MAX_TOTAL_INDEX_BYTES;
         for artifact in artifacts.into_iter().take(MAX_INDEX_ARTIFACTS) {
@@ -130,7 +130,7 @@ impl JavaExternalDeclarationIndex {
         self.types_by_fqn.is_empty()
     }
 
-    pub(crate) fn get(&self, fqn: &str) -> Option<&JavaExternalType> {
+    pub(crate) fn get(&self, fqn: &str) -> Option<&JvmExternalType> {
         self.types_by_fqn.get(fqn)
     }
 
@@ -138,7 +138,7 @@ impl JavaExternalDeclarationIndex {
         &self,
         import_path: &str,
         access_package: &str,
-    ) -> Option<&JavaExternalType> {
+    ) -> Option<&JvmExternalType> {
         self.get(import_path)
             .filter(|ty| ty.is_accessible_from_package(access_package))
     }
@@ -148,7 +148,7 @@ impl JavaExternalDeclarationIndex {
         package_name: &str,
         short_name: &str,
         access_package: &str,
-    ) -> Option<&JavaExternalType> {
+    ) -> Option<&JvmExternalType> {
         self.get(&qualified_name(package_name, short_name))
             .filter(|ty| ty.is_accessible_from_package(access_package))
     }
@@ -157,31 +157,31 @@ impl JavaExternalDeclarationIndex {
         &self,
         package_name: &str,
         short_name: &str,
-    ) -> Option<&JavaExternalType> {
+    ) -> Option<&JvmExternalType> {
         self.get(&qualified_name(package_name, short_name))
             .filter(|ty| ty.is_accessible_from_package(package_name))
     }
 
-    pub(crate) fn resolve_java_lang(&self, short_name: &str) -> Option<&JavaExternalType> {
+    pub(crate) fn resolve_java_lang(&self, short_name: &str) -> Option<&JvmExternalType> {
         self.get(&qualified_name("java.lang", short_name))
-            .filter(|ty| ty.visibility == JavaVisibility::Public)
+            .filter(|ty| ty.visibility == JvmVisibility::Public)
     }
 
     pub(crate) fn resolve_qualified_name(
         &self,
         fqn: &str,
         access_package: &str,
-    ) -> Option<&JavaExternalType> {
+    ) -> Option<&JvmExternalType> {
         self.get(fqn)
             .filter(|ty| ty.is_accessible_from_package(access_package))
     }
 
-    fn insert(&mut self, external_type: JavaExternalType) {
+    fn insert(&mut self, external_type: JvmExternalType) {
         match self.types_by_fqn.get(&external_type.fqn) {
             Some(existing)
                 if matches!(
                     existing.source,
-                    JavaExternalDeclarationSource::SourceJar { .. }
+                    JvmExternalDeclarationSource::SourceJar { .. }
                 ) =>
             {
                 return;
@@ -321,7 +321,7 @@ enum SourceJarLanguage {
 }
 
 #[allow(dead_code)]
-impl JavaExternalType {
+impl JvmExternalType {
     pub(crate) fn package_name(&self) -> &str {
         &self.package_name
     }
@@ -330,15 +330,15 @@ impl JavaExternalType {
         &self.short_name
     }
 
-    pub(crate) fn kind(&self) -> JavaExternalTypeKind {
+    pub(crate) fn kind(&self) -> JvmExternalTypeKind {
         self.kind
     }
 
-    pub(crate) fn visibility(&self) -> JavaVisibility {
+    pub(crate) fn visibility(&self) -> JvmVisibility {
         self.visibility
     }
 
-    pub(crate) fn source(&self) -> &JavaExternalDeclarationSource {
+    pub(crate) fn source(&self) -> &JvmExternalDeclarationSource {
         &self.source
     }
 
@@ -347,10 +347,10 @@ impl JavaExternalType {
     }
 
     fn is_accessible_from_package(&self, package_name: &str) -> bool {
-        self.visibility == JavaVisibility::Public
+        self.visibility == JvmVisibility::Public
             || (matches!(
                 self.visibility,
-                JavaVisibility::Protected | JavaVisibility::PackagePrivate
+                JvmVisibility::Protected | JvmVisibility::PackagePrivate
             ) && self.package_name == package_name)
     }
 }
@@ -383,9 +383,9 @@ fn can_read_entry(
 }
 
 fn resolve_configured_artifacts(
-    config: &JavaExternalDependencies,
+    config: &JvmExternalDependencies,
     project_root: &Path,
-) -> Vec<ResolvedJavaArtifact> {
+) -> Vec<ResolvedJvmArtifact> {
     let mut artifacts = Vec::new();
     for artifact in &config.artifact_paths {
         artifacts.push(resolve_explicit_artifact(artifact, project_root));
@@ -424,10 +424,10 @@ fn resolve_configured_artifacts(
 }
 
 fn resolve_explicit_artifact(
-    artifact: &JavaExternalArtifact,
+    artifact: &JvmExternalArtifact,
     project_root: &Path,
-) -> ResolvedJavaArtifact {
-    ResolvedJavaArtifact {
+) -> ResolvedJvmArtifact {
+    ResolvedJvmArtifact {
         artifact_path: resolve_path(project_root, &artifact.artifact_path),
         source_artifact_path: artifact
             .source_artifact_path
@@ -438,8 +438,8 @@ fn resolve_explicit_artifact(
 
 fn resolve_coordinate(
     repository_root: &Path,
-    coordinate: &JavaMavenCoordinate,
-) -> Option<ResolvedJavaArtifact> {
+    coordinate: &JvmMavenCoordinate,
+) -> Option<ResolvedJvmArtifact> {
     if !is_safe_maven_coordinate(coordinate) {
         return None;
     }
@@ -463,13 +463,13 @@ fn resolve_coordinate(
     }
     let source_artifact_path =
         canonical_file_under(&repository_root, &directory.join(sources_name));
-    Some(ResolvedJavaArtifact {
+    Some(ResolvedJvmArtifact {
         artifact_path,
         source_artifact_path,
     })
 }
 
-fn is_safe_maven_coordinate(coordinate: &JavaMavenCoordinate) -> bool {
+fn is_safe_maven_coordinate(coordinate: &JvmMavenCoordinate) -> bool {
     !coordinate.group_id.is_empty()
         && coordinate
             .group_id
@@ -498,7 +498,7 @@ fn is_source_jar(path: &Path) -> bool {
         .is_some_and(|name| name.ends_with("-sources.jar"))
 }
 
-fn repository_roots(config: &JavaExternalDependencies) -> Vec<PathBuf> {
+fn repository_roots(config: &JvmExternalDependencies) -> Vec<PathBuf> {
     if !config.repository_roots.is_empty() {
         return config.repository_roots.clone();
     }
@@ -508,7 +508,7 @@ fn repository_roots(config: &JavaExternalDependencies) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-fn gradle_cache_roots(config: &JavaExternalDependencies) -> Vec<PathBuf> {
+fn gradle_cache_roots(config: &JvmExternalDependencies) -> Vec<PathBuf> {
     if !config.gradle_cache_roots.is_empty() {
         return config.gradle_cache_roots.clone();
     }
@@ -531,8 +531,8 @@ fn gradle_cache_roots(config: &JavaExternalDependencies) -> Vec<PathBuf> {
 
 fn resolve_gradle_coordinate(
     cache_root: &Path,
-    coordinate: &JavaMavenCoordinate,
-) -> Vec<ResolvedJavaArtifact> {
+    coordinate: &JvmMavenCoordinate,
+) -> Vec<ResolvedJvmArtifact> {
     if !is_safe_maven_coordinate(coordinate) {
         return Vec::new();
     }
@@ -598,7 +598,7 @@ fn resolve_gradle_coordinate(
     if binaries.is_empty() {
         return sources
             .into_iter()
-            .map(|artifact_path| ResolvedJavaArtifact {
+            .map(|artifact_path| ResolvedJvmArtifact {
                 artifact_path,
                 source_artifact_path: None,
             })
@@ -606,7 +606,7 @@ fn resolve_gradle_coordinate(
     }
     binaries
         .into_iter()
-        .map(|artifact_path| ResolvedJavaArtifact {
+        .map(|artifact_path| ResolvedJvmArtifact {
             artifact_path,
             source_artifact_path: sources.clone(),
         })
@@ -632,7 +632,7 @@ fn resolve_path(project_root: &Path, path: &Path) -> PathBuf {
     }
 }
 
-fn source_types(artifact_path: &Path, source_path: &str, source: &str) -> Vec<JavaExternalType> {
+fn source_types(artifact_path: &Path, source_path: &str, source: &str) -> Vec<JvmExternalType> {
     let Some(tree) = parse_tree(source) else {
         return Vec::new();
     };
@@ -648,8 +648,8 @@ fn source_types(artifact_path: &Path, source_path: &str, source: &str) -> Vec<Ja
             stack.push((
                 child,
                 None::<String>,
-                None::<JavaVisibility>,
-                JavaVisibility::PackagePrivate,
+                None::<JvmVisibility>,
+                JvmVisibility::PackagePrivate,
             ));
         }
     }
@@ -671,14 +671,14 @@ fn source_types(artifact_path: &Path, source_path: &str, source: &str) -> Vec<Ja
         let visibility = parent_visibility
             .map(|parent| restrict_visibility(declared_visibility, parent))
             .unwrap_or(declared_visibility);
-        if visibility != JavaVisibility::Private {
-            result.push(JavaExternalType {
+        if visibility != JvmVisibility::Private {
+            result.push(JvmExternalType {
                 fqn: qualified_name(&package_name, &short_name),
                 package_name: package_name.clone(),
                 short_name: short_name.clone(),
                 kind: source_kind(node.kind()),
                 visibility,
-                source: JavaExternalDeclarationSource::SourceJar {
+                source: JvmExternalDeclarationSource::SourceJar {
                     artifact_path: artifact_path.to_path_buf(),
                     source_path: source_path.to_string(),
                 },
@@ -686,9 +686,9 @@ fn source_types(artifact_path: &Path, source_path: &str, source: &str) -> Vec<Ja
         }
 
         let child_default_visibility = if is_interface_like_node(node.kind()) {
-            JavaVisibility::Public
+            JvmVisibility::Public
         } else {
-            JavaVisibility::PackagePrivate
+            JvmVisibility::PackagePrivate
         };
         let Some(body) = node.child_by_field_name("body") else {
             continue;
@@ -712,7 +712,7 @@ fn scala_source_types(
     artifact_path: &Path,
     source_path: &str,
     source: &str,
-) -> Vec<JavaExternalType> {
+) -> Vec<JvmExternalType> {
     let mut parser = Parser::new();
     parser
         .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
@@ -741,13 +741,13 @@ fn scala_source_types(
             let package_name = declaration.package_name().to_string();
             let short_name =
                 crate::analyzer::scala::scala_normalize_full_name(declaration.short_name());
-            (!short_name.is_empty()).then(|| JavaExternalType {
+            (!short_name.is_empty()).then(|| JvmExternalType {
                 fqn,
                 package_name,
                 short_name,
-                kind: JavaExternalTypeKind::Class,
-                visibility: JavaVisibility::Public,
-                source: JavaExternalDeclarationSource::SourceJar {
+                kind: JvmExternalTypeKind::Class,
+                visibility: JvmVisibility::Public,
+                source: JvmExternalDeclarationSource::SourceJar {
                     artifact_path: artifact_path.to_path_buf(),
                     source_path: source_path.to_string(),
                 },
@@ -783,8 +783,8 @@ fn scala_source_declaration_node<'tree>(
 fn source_visibility(
     node: tree_sitter::Node<'_>,
     source: &str,
-    default_visibility: JavaVisibility,
-) -> JavaVisibility {
+    default_visibility: JvmVisibility,
+) -> JvmVisibility {
     for index in 0..node.named_child_count() {
         let Some(child) = node.named_child(index) else {
             continue;
@@ -794,13 +794,13 @@ fn source_visibility(
         }
         let modifiers = node_text(child, source);
         if modifier_present(modifiers, "public") {
-            return JavaVisibility::Public;
+            return JvmVisibility::Public;
         }
         if modifier_present(modifiers, "protected") {
-            return JavaVisibility::Protected;
+            return JvmVisibility::Protected;
         }
         if modifier_present(modifiers, "private") {
-            return JavaVisibility::Private;
+            return JvmVisibility::Private;
         }
     }
     default_visibility
@@ -812,7 +812,7 @@ fn modifier_present(modifiers: &str, expected: &str) -> bool {
         .any(|token| token == expected)
 }
 
-fn class_type(artifact_path: &Path, class_entry: &str, bytes: &[u8]) -> Option<JavaExternalType> {
+fn class_type(artifact_path: &Path, class_entry: &str, bytes: &[u8]) -> Option<JvmExternalType> {
     let class_file = jclassfile::class_file::parse(bytes).ok()?;
     let flags = class_file.access_flags();
     if flags.contains(ClassFlags::ACC_MODULE) {
@@ -825,16 +825,16 @@ fn class_type(artifact_path: &Path, class_entry: &str, bytes: &[u8]) -> Option<J
     }
     let fqn = qualified_name(&package_name, &short_name);
     let visibility = class_visibility(&class_file, &internal_name);
-    if visibility == JavaVisibility::Private {
+    if visibility == JvmVisibility::Private {
         return None;
     }
-    Some(JavaExternalType {
+    Some(JvmExternalType {
         fqn,
         package_name,
         short_name,
         kind: class_kind(flags),
         visibility,
-        source: JavaExternalDeclarationSource::ClassFile {
+        source: JvmExternalDeclarationSource::ClassFile {
             artifact_path: artifact_path.to_path_buf(),
             class_entry: class_entry.to_string(),
         },
@@ -857,7 +857,7 @@ fn class_name_at_class_index(class_file: &ClassFile, class_index: usize) -> Opti
     Some(value.clone())
 }
 
-fn class_visibility(class_file: &ClassFile, internal_name: &str) -> JavaVisibility {
+fn class_visibility(class_file: &ClassFile, internal_name: &str) -> JvmVisibility {
     let mut own_visibility = None;
     for attribute in class_file.attributes() {
         let Attribute::InnerClasses { classes } = attribute else {
@@ -871,9 +871,9 @@ fn class_visibility(class_file: &ClassFile, internal_name: &str) -> JavaVisibili
             };
             if internal_name.starts_with(&format!("{inner_name}$"))
                 && nested_class_visibility(class.inner_class_access_flags())
-                    == JavaVisibility::Private
+                    == JvmVisibility::Private
             {
-                return JavaVisibility::Private;
+                return JvmVisibility::Private;
             }
             if inner_name == internal_name {
                 own_visibility = Some(nested_class_visibility(class.inner_class_access_flags()));
@@ -885,22 +885,20 @@ fn class_visibility(class_file: &ClassFile, internal_name: &str) -> JavaVisibili
     }
 
     if class_file.access_flags().contains(ClassFlags::ACC_PUBLIC) {
-        JavaVisibility::Public
+        JvmVisibility::Public
     } else {
-        JavaVisibility::PackagePrivate
+        JvmVisibility::PackagePrivate
     }
 }
 
-fn restrict_visibility(declared: JavaVisibility, enclosing: JavaVisibility) -> JavaVisibility {
+fn restrict_visibility(declared: JvmVisibility, enclosing: JvmVisibility) -> JvmVisibility {
     match (declared, enclosing) {
-        (JavaVisibility::Private, _) | (_, JavaVisibility::Private) => JavaVisibility::Private,
-        (JavaVisibility::PackagePrivate, _) | (_, JavaVisibility::PackagePrivate) => {
-            JavaVisibility::PackagePrivate
+        (JvmVisibility::Private, _) | (_, JvmVisibility::Private) => JvmVisibility::Private,
+        (JvmVisibility::PackagePrivate, _) | (_, JvmVisibility::PackagePrivate) => {
+            JvmVisibility::PackagePrivate
         }
-        (JavaVisibility::Protected, _) | (_, JavaVisibility::Protected) => {
-            JavaVisibility::Protected
-        }
-        _ => JavaVisibility::Public,
+        (JvmVisibility::Protected, _) | (_, JvmVisibility::Protected) => JvmVisibility::Protected,
+        _ => JvmVisibility::Public,
     }
 }
 
@@ -911,37 +909,37 @@ fn is_interface_like_node(kind: &str) -> bool {
     )
 }
 
-fn nested_class_visibility(flags: &NestedClassFlags) -> JavaVisibility {
+fn nested_class_visibility(flags: &NestedClassFlags) -> JvmVisibility {
     if flags.contains(NestedClassFlags::ACC_PUBLIC) {
-        JavaVisibility::Public
+        JvmVisibility::Public
     } else if flags.contains(NestedClassFlags::ACC_PROTECTED) {
-        JavaVisibility::Protected
+        JvmVisibility::Protected
     } else if flags.contains(NestedClassFlags::ACC_PRIVATE) {
-        JavaVisibility::Private
+        JvmVisibility::Private
     } else {
-        JavaVisibility::PackagePrivate
+        JvmVisibility::PackagePrivate
     }
 }
 
-fn class_kind(flags: &ClassFlags) -> JavaExternalTypeKind {
+fn class_kind(flags: &ClassFlags) -> JvmExternalTypeKind {
     if flags.contains(ClassFlags::ACC_ANNOTATION) {
-        JavaExternalTypeKind::Annotation
+        JvmExternalTypeKind::Annotation
     } else if flags.contains(ClassFlags::ACC_ENUM) {
-        JavaExternalTypeKind::Enum
+        JvmExternalTypeKind::Enum
     } else if flags.contains(ClassFlags::ACC_INTERFACE) {
-        JavaExternalTypeKind::Interface
+        JvmExternalTypeKind::Interface
     } else {
-        JavaExternalTypeKind::Class
+        JvmExternalTypeKind::Class
     }
 }
 
-fn source_kind(kind: &str) -> JavaExternalTypeKind {
+fn source_kind(kind: &str) -> JvmExternalTypeKind {
     match kind {
-        "interface_declaration" => JavaExternalTypeKind::Interface,
-        "enum_declaration" => JavaExternalTypeKind::Enum,
-        "annotation_type_declaration" => JavaExternalTypeKind::Annotation,
-        "record_declaration" => JavaExternalTypeKind::Record,
-        _ => JavaExternalTypeKind::Class,
+        "interface_declaration" => JvmExternalTypeKind::Interface,
+        "enum_declaration" => JvmExternalTypeKind::Enum,
+        "annotation_type_declaration" => JvmExternalTypeKind::Annotation,
+        "record_declaration" => JvmExternalTypeKind::Record,
+        _ => JvmExternalTypeKind::Class,
     }
 }
 
@@ -963,7 +961,7 @@ fn qualified_name(package_name: &str, short_name: &str) -> String {
     }
 }
 
-fn enclosing_type_fqns(external_type: &JavaExternalType) -> Vec<String> {
+fn enclosing_type_fqns(external_type: &JvmExternalType) -> Vec<String> {
     let mut result = Vec::new();
     let mut current = external_type.short_name.as_str();
     while let Some((owner, _)) = current.rsplit_once('.') {
@@ -977,9 +975,9 @@ fn enclosing_type_fqns(external_type: &JavaExternalType) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::analyzer::{
-        AnalyzerConfig, AnalyzerDelegate, IAnalyzer, JavaAnalyzer, JavaExternalArtifact,
-        JavaExternalDependencies, JavaMavenCoordinate, Language, MultiAnalyzer, Project,
-        ProjectFile, PythonAnalyzer, TestProject, resolve_analyzer,
+        AnalyzerConfig, AnalyzerDelegate, IAnalyzer, JavaAnalyzer, JvmExternalArtifact,
+        JvmExternalDependencies, JvmMavenCoordinate, Language, MultiAnalyzer, Project, ProjectFile,
+        PythonAnalyzer, TestProject, resolve_analyzer,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
@@ -998,17 +996,17 @@ mod tests {
             return;
         };
         let config = fixture.coordinate_config();
-        let index = JavaExternalDeclarationIndex::build(&config, fixture.project_root());
+        let index = JvmExternalDeclarationIndex::build(&config, fixture.project_root());
 
         let service = index.get("com.example.dep.ExternalService").unwrap();
         assert_eq!("com.example.dep", service.package_name());
         assert_eq!("ExternalService", service.short_name());
-        assert_eq!(JavaExternalTypeKind::Class, service.kind());
-        assert_eq!(JavaVisibility::Public, service.visibility());
+        assert_eq!(JvmExternalTypeKind::Class, service.kind());
+        assert_eq!(JvmVisibility::Public, service.visibility());
         assert!(
             matches!(
                 service.source(),
-                JavaExternalDeclarationSource::SourceJar { source_path, .. }
+                JvmExternalDeclarationSource::SourceJar { source_path, .. }
                     if source_path == "com/example/dep/ExternalService.java"
             ),
             "{service:#?}"
@@ -1023,16 +1021,16 @@ mod tests {
             matches!(
                 index
                     .get("com.example.dep.ExternalService.Nested")
-                    .map(JavaExternalType::source),
-                Some(JavaExternalDeclarationSource::SourceJar { .. })
+                    .map(JvmExternalType::source),
+                Some(JvmExternalDeclarationSource::SourceJar { .. })
             ),
             "nested source declarations should retain source-JAR provenance"
         );
         assert_eq!(
-            Some(JavaVisibility::Protected),
+            Some(JvmVisibility::Protected),
             index
                 .get("com.example.dep.ExternalService.ProtectedNested")
-                .map(JavaExternalType::visibility)
+                .map(JvmExternalType::visibility)
         );
         assert!(
             index
@@ -1047,22 +1045,22 @@ mod tests {
             "nested classes under a private parent should not be indexed as externally visible"
         );
         assert_eq!(
-            Some(JavaVisibility::PackagePrivate),
+            Some(JvmVisibility::PackagePrivate),
             index
                 .get("com.example.dep.PackageHelper")
-                .map(JavaExternalType::visibility)
+                .map(JvmExternalType::visibility)
         );
         assert_eq!(
-            Some(JavaVisibility::PackagePrivate),
+            Some(JvmVisibility::PackagePrivate),
             index
                 .get("com.example.dep.PackageOuter.Nested")
-                .map(JavaExternalType::visibility)
+                .map(JvmExternalType::visibility)
         );
         assert_eq!(
-            Some(JavaVisibility::Public),
+            Some(JvmVisibility::Public),
             index
                 .get("com.example.dep.PublicApi.Callback")
-                .map(JavaExternalType::visibility)
+                .map(JvmExternalType::visibility)
         );
         assert!(
             index
@@ -1077,40 +1075,40 @@ mod tests {
             return;
         };
         let config = fixture.coordinate_config();
-        let index = JavaExternalDeclarationIndex::build(&config, fixture.project_root());
+        let index = JvmExternalDeclarationIndex::build(&config, fixture.project_root());
 
         let service = index.get("com.example.dep.ExternalService").unwrap();
         assert!(
             matches!(
                 service.source(),
-                JavaExternalDeclarationSource::ClassFile { class_entry, .. }
+                JvmExternalDeclarationSource::ClassFile { class_entry, .. }
                     if class_entry == "com/example/dep/ExternalService.class"
             ),
             "{service:#?}"
         );
         assert_eq!(
-            Some(JavaVisibility::Protected),
+            Some(JvmVisibility::Protected),
             index
                 .get("com.example.dep.ExternalService.ProtectedNested")
-                .map(JavaExternalType::visibility)
+                .map(JvmExternalType::visibility)
         );
         assert_eq!(
-            Some(JavaVisibility::PackagePrivate),
+            Some(JvmVisibility::PackagePrivate),
             index
                 .get("com.example.dep.PackageHelper")
-                .map(JavaExternalType::visibility)
+                .map(JvmExternalType::visibility)
         );
         let package_nested = index
             .get("com.example.dep.ExternalService.PackageNested")
             .unwrap();
         assert_eq!("com.example.dep", package_nested.package_name());
         assert_eq!("ExternalService.PackageNested", package_nested.short_name());
-        assert_eq!(JavaVisibility::PackagePrivate, package_nested.visibility());
+        assert_eq!(JvmVisibility::PackagePrivate, package_nested.visibility());
         assert_eq!(
-            Some(JavaVisibility::PackagePrivate),
+            Some(JvmVisibility::PackagePrivate),
             index
                 .get("com.example.dep.PackageOuter.Nested")
-                .map(JavaExternalType::visibility)
+                .map(JvmExternalType::visibility)
         );
         assert!(
             index
@@ -1136,12 +1134,12 @@ mod tests {
             )
             .unwrap();
         let config = AnalyzerConfig {
-            java: JavaAnalyzerConfig {
-                external_dependencies: JavaExternalDependencies {
+            jvm: JvmAnalyzerConfig {
+                external_dependencies: JvmExternalDependencies {
                     repository_roots: vec![fixture.maven_repository_root()],
-                    ..JavaExternalDependencies::default()
+                    ..JvmExternalDependencies::default()
                 },
-                ..JavaAnalyzerConfig::default()
+                ..JvmAnalyzerConfig::default()
             },
             ..AnalyzerConfig::default()
         };
@@ -1181,13 +1179,13 @@ mod tests {
             .write("com.example:external-lib:1.2.3=compileClasspath\n")
             .unwrap();
         let config = AnalyzerConfig {
-            java: JavaAnalyzerConfig {
-                external_dependencies: JavaExternalDependencies {
+            jvm: JvmAnalyzerConfig {
+                external_dependencies: JvmExternalDependencies {
                     repository_roots: vec![fixture.root.join("empty-maven")],
                     gradle_cache_roots: vec![gradle_cache],
-                    ..JavaExternalDependencies::default()
+                    ..JvmExternalDependencies::default()
                 },
-                ..JavaAnalyzerConfig::default()
+                ..JvmAnalyzerConfig::default()
             },
             ..AnalyzerConfig::default()
         };
@@ -1204,7 +1202,7 @@ mod tests {
         };
         assert!(matches!(
             external.source(),
-            JavaExternalDeclarationSource::SourceJar { .. }
+            JvmExternalDeclarationSource::SourceJar { .. }
         ));
     }
 
@@ -1222,16 +1220,16 @@ mod tests {
         )
         .unwrap();
 
-        let config = JavaExternalDependencies {
-            coordinates: vec![JavaMavenCoordinate::new(
+        let config = JvmExternalDependencies {
+            coordinates: vec![JvmMavenCoordinate::new(
                 "com.example",
                 "external-lib",
                 "1.2.3",
             )],
             gradle_cache_roots: vec![gradle_cache],
-            ..JavaExternalDependencies::default()
+            ..JvmExternalDependencies::default()
         };
-        let index = JavaExternalDeclarationIndex::build(&config, fixture.project_root());
+        let index = JvmExternalDeclarationIndex::build(&config, fixture.project_root());
         assert!(index.is_empty());
     }
 
@@ -1251,14 +1249,14 @@ mod tests {
             )
             .unwrap();
         let config = AnalyzerConfig {
-            java: JavaAnalyzerConfig {
-                external_dependencies: JavaExternalDependencies {
+            jvm: JvmAnalyzerConfig {
+                external_dependencies: JvmExternalDependencies {
                     repository_roots: vec![fixture.maven_repository_root()],
-                    ..JavaExternalDependencies::default()
+                    ..JvmExternalDependencies::default()
                 },
-                dependency_discovery: crate::analyzer::JavaDependencyDiscoveryConfig {
-                    mode: crate::analyzer::JavaDependencyDiscoveryMode::Disabled,
-                    ..crate::analyzer::JavaDependencyDiscoveryConfig::default()
+                dependency_discovery: crate::analyzer::JvmDependencyDiscoveryConfig {
+                    mode: crate::analyzer::JvmDependencyDiscoveryMode::Disabled,
+                    ..crate::analyzer::JvmDependencyDiscoveryConfig::default()
                 },
             },
             ..AnalyzerConfig::default()
@@ -1284,12 +1282,12 @@ mod tests {
         pom.write("<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId></dependency></dependencies></project>")
             .unwrap();
         let config = AnalyzerConfig {
-            java: JavaAnalyzerConfig {
-                external_dependencies: JavaExternalDependencies {
+            jvm: JvmAnalyzerConfig {
+                external_dependencies: JvmExternalDependencies {
                     repository_roots: vec![fixture.maven_repository_root()],
-                    ..JavaExternalDependencies::default()
+                    ..JvmExternalDependencies::default()
                 },
-                ..JavaAnalyzerConfig::default()
+                ..JvmAnalyzerConfig::default()
             },
             ..AnalyzerConfig::default()
         };
@@ -1342,12 +1340,12 @@ mod tests {
             BTreeSet::from([Language::Java, Language::Python]),
         );
         let config = AnalyzerConfig {
-            java: JavaAnalyzerConfig {
-                external_dependencies: JavaExternalDependencies {
+            jvm: JvmAnalyzerConfig {
+                external_dependencies: JvmExternalDependencies {
                     repository_roots: vec![fixture.maven_repository_root()],
-                    ..JavaExternalDependencies::default()
+                    ..JvmExternalDependencies::default()
                 },
-                ..JavaAnalyzerConfig::default()
+                ..JvmAnalyzerConfig::default()
             },
             ..AnalyzerConfig::default()
         };
@@ -1379,20 +1377,20 @@ mod tests {
         let Some(fixture) = ExternalJarFixture::new(true) else {
             return;
         };
-        let config = JavaExternalDependencies {
-            artifact_paths: vec![JavaExternalArtifact {
+        let config = JvmExternalDependencies {
+            artifact_paths: vec![JvmExternalArtifact {
                 artifact_path: fixture.source_jar_path(),
                 source_artifact_path: None,
             }],
-            ..JavaExternalDependencies::default()
+            ..JvmExternalDependencies::default()
         };
-        let index = JavaExternalDeclarationIndex::build(&config, fixture.project_root());
+        let index = JvmExternalDeclarationIndex::build(&config, fixture.project_root());
 
         let service = index.get("com.example.dep.ExternalService").unwrap();
         assert!(
             matches!(
                 service.source(),
-                JavaExternalDeclarationSource::SourceJar { source_path, .. }
+                JvmExternalDeclarationSource::SourceJar { source_path, .. }
                     if source_path == "com/example/dep/ExternalService.java"
             ),
             "{service:#?}"
@@ -1410,13 +1408,13 @@ mod tests {
             b"package scala.example\nclass Dependency\ntrait Contract\nobject Defaults\nprivate class Hidden\n",
         );
 
-        let index = JavaExternalDeclarationIndex::build(
-            &JavaExternalDependencies {
-                artifact_paths: vec![JavaExternalArtifact {
+        let index = JvmExternalDeclarationIndex::build(
+            &JvmExternalDependencies {
+                artifact_paths: vec![JvmExternalArtifact {
                     artifact_path: source_jar,
                     source_artifact_path: None,
                 }],
-                ..JavaExternalDependencies::default()
+                ..JvmExternalDependencies::default()
             },
             &root,
         );
@@ -1427,8 +1425,8 @@ mod tests {
             "scala.example.Defaults",
         ] {
             assert!(matches!(
-                index.get(name).map(JavaExternalType::source),
-                Some(JavaExternalDeclarationSource::SourceJar { source_path, .. })
+                index.get(name).map(JvmExternalType::source),
+                Some(JvmExternalDeclarationSource::SourceJar { source_path, .. })
                     if source_path == "scala/example/Dependency.scala"
             ));
         }
@@ -1442,21 +1440,21 @@ mod tests {
         let malformed = root.join("bad.jar");
         fs::write(&malformed, b"not a zip").unwrap();
 
-        let config = JavaExternalDependencies {
+        let config = JvmExternalDependencies {
             artifact_paths: vec![
-                JavaExternalArtifact {
+                JvmExternalArtifact {
                     artifact_path: malformed,
                     source_artifact_path: None,
                 },
-                JavaExternalArtifact {
+                JvmExternalArtifact {
                     artifact_path: root.join("missing.jar"),
                     source_artifact_path: None,
                 },
             ],
-            ..JavaExternalDependencies::default()
+            ..JvmExternalDependencies::default()
         };
 
-        let index = JavaExternalDeclarationIndex::build(&config, &root);
+        let index = JvmExternalDeclarationIndex::build(&config, &root);
         assert!(index.is_empty());
     }
 
@@ -1465,10 +1463,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let unsafe_coordinates = [
-            JavaMavenCoordinate::new("..", "external-lib", "1.2.3"),
-            JavaMavenCoordinate::new("com.example", "../external-lib", "1.2.3"),
-            JavaMavenCoordinate::new("com.example", "external-lib", "../1.2.3"),
-            JavaMavenCoordinate::new("com..example", "external-lib", "1.2.3"),
+            JvmMavenCoordinate::new("..", "external-lib", "1.2.3"),
+            JvmMavenCoordinate::new("com.example", "../external-lib", "1.2.3"),
+            JvmMavenCoordinate::new("com.example", "external-lib", "../1.2.3"),
+            JvmMavenCoordinate::new("com..example", "external-lib", "1.2.3"),
         ];
 
         for coordinate in unsafe_coordinates {
@@ -1489,15 +1487,15 @@ mod tests {
             "com/example/dep/Oversized.java",
             &vec![b' '; MAX_SOURCE_ENTRY_BYTES as usize + 1],
         );
-        let config = JavaExternalDependencies {
-            artifact_paths: vec![JavaExternalArtifact {
+        let config = JvmExternalDependencies {
+            artifact_paths: vec![JvmExternalArtifact {
                 artifact_path: oversized_source_jar,
                 source_artifact_path: None,
             }],
-            ..JavaExternalDependencies::default()
+            ..JvmExternalDependencies::default()
         };
 
-        let index = JavaExternalDeclarationIndex::build(&config, &root);
+        let index = JvmExternalDeclarationIndex::build(&config, &root);
         assert!(index.is_empty());
     }
 
@@ -1510,15 +1508,15 @@ mod tests {
             .unwrap()
             .set_len(MAX_ARTIFACT_BYTES + 1)
             .unwrap();
-        let config = JavaExternalDependencies {
-            artifact_paths: vec![JavaExternalArtifact {
+        let config = JvmExternalDependencies {
+            artifact_paths: vec![JvmExternalArtifact {
                 artifact_path: oversized_jar,
                 source_artifact_path: None,
             }],
-            ..JavaExternalDependencies::default()
+            ..JvmExternalDependencies::default()
         };
 
-        let index = JavaExternalDeclarationIndex::build(&config, &root);
+        let index = JvmExternalDeclarationIndex::build(&config, &root);
         assert!(index.is_empty());
     }
 
@@ -1528,9 +1526,9 @@ mod tests {
             return;
         };
         let config = AnalyzerConfig {
-            java: crate::analyzer::JavaAnalyzerConfig {
+            jvm: crate::analyzer::JvmAnalyzerConfig {
                 external_dependencies: fixture.coordinate_config(),
-                ..crate::analyzer::JavaAnalyzerConfig::default()
+                ..crate::analyzer::JvmAnalyzerConfig::default()
             },
             ..AnalyzerConfig::default()
         };
@@ -1745,15 +1743,15 @@ mod tests {
             self.root.join("m2")
         }
 
-        fn coordinate_config(&self) -> JavaExternalDependencies {
-            JavaExternalDependencies {
-                coordinates: vec![JavaMavenCoordinate::new(
+        fn coordinate_config(&self) -> JvmExternalDependencies {
+            JvmExternalDependencies {
+                coordinates: vec![JvmMavenCoordinate::new(
                     "com.example",
                     "external-lib",
                     "1.2.3",
                 )],
                 repository_roots: vec![self.root.join("m2")],
-                ..JavaExternalDependencies::default()
+                ..JvmExternalDependencies::default()
             }
         }
     }
