@@ -8232,6 +8232,124 @@ fn run() {
 }
 
 #[test]
+fn rust_imported_types_beat_same_named_enclosing_enum_variants() {
+    let source = r#"
+mod types;
+use types::{NetError, PTR, ResponseCode};
+
+enum RData {
+    PTR(PTR),
+}
+
+impl RData {
+    fn read() {
+        PTR::read();
+        let _ = RData::PTR(PTR(1));
+    }
+}
+
+enum LookupError {
+    ResponseCode(ResponseCode),
+    NetError(NetError),
+}
+
+impl LookupError {
+    fn inspect() {
+        let _ = ResponseCode::NXDomain;
+        let _ = NetError::from(1);
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .file(
+            "src/types.rs",
+            r#"
+pub struct PTR(pub u8);
+impl PTR { pub fn read() {} }
+pub enum ResponseCode { NXDomain }
+pub struct NetError;
+impl From<u8> for NetError {
+    fn from(_: u8) -> Self { Self }
+}
+"#,
+        )
+        .build();
+
+    for (marker, expected) in [
+        ("PTR::read", "types.PTR"),
+        ("PTR(1)", "types.PTR"),
+        ("ResponseCode::NXDomain", "types.ResponseCode"),
+        ("NetError::from", "types.NetError"),
+    ] {
+        let start = source.rfind(marker).expect("imported type reference");
+        let value = lookup(
+            project.root(),
+            &location_reference("src/lib.rs", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{marker}: {value}");
+        assert_eq!(
+            result["definitions"][0]["fqn"], expected,
+            "{marker}: {value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["kind"], "class",
+            "{marker}: {value}"
+        );
+    }
+}
+
+#[test]
+fn rust_unindexed_imports_are_not_stolen_by_enclosing_enum_variants() {
+    let source = r#"
+use external_crate::{NetError, PTR, ResponseCode};
+
+enum RData {
+    PTR(u8),
+}
+
+impl RData {
+    fn read() {
+        PTR::read();
+        let _ = PTR(1);
+    }
+}
+
+enum LookupError {
+    ResponseCode(u8),
+    NetError(u8),
+}
+
+impl LookupError {
+    fn inspect() {
+        let _ = ResponseCode::NXDomain;
+        let _ = NetError::from(1);
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    for marker in [
+        "PTR::read",
+        "PTR(1)",
+        "ResponseCode::NXDomain",
+        "NetError::from",
+    ] {
+        let start = source.rfind(marker).expect("unindexed imported reference");
+        let value = lookup(
+            project.root(),
+            &location_reference("src/lib.rs", source, start),
+        );
+        let result = &value["results"][0];
+        assert_ne!(result["status"], "resolved", "{marker}: {value}");
+        assert!(result["definitions"].is_null(), "{marker}: {value}");
+    }
+}
+
+#[test]
 fn rust_http_version_owner_prefers_external_crate_over_same_file_type() {
     let http_source = r#"
 pub enum Version {
@@ -10660,6 +10778,86 @@ function callLocal() {
 }
 
 #[test]
+fn javascript_commonjs_local_namespace_does_not_define_classic_script_global() {
+    let defs = r#"
+const helper = require("./helper.js");
+exports.run = run;
+var goog = {};
+
+function run(locale) {
+  goog.LOCALE = locale;
+  return helper(locale);
+}
+"#;
+    let app = r#"
+function selectedLocale() {
+  return goog.LOCALE;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("defs.js", defs)
+        .file("app.js", app)
+        .build();
+
+    let locale = app.find("LOCALE").expect("global namespace property");
+    let value = lookup(project.root(), &location_reference("app.js", app, locale));
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    assert!(value["results"][0]["definitions"].is_null(), "{value}");
+}
+
+#[test]
+fn javascript_dollar_prefixed_receiver_does_not_alias_plain_receiver() {
+    let consumer = r#"
+function render($scope) {
+  return $scope.count;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "defs.js",
+            r#"
+function update(scope) {
+  scope.count = 10000;
+}
+"#,
+        )
+        .file("consumer.js", consumer)
+        .build();
+
+    let count = consumer.find("count").expect("dollar receiver property");
+    let value = lookup(
+        project.root(),
+        &location_reference("consumer.js", consumer, count),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    assert!(value["results"][0]["definitions"].is_null(), "{value}");
+}
+
+#[test]
+fn javascript_dollar_prefixed_local_member_keeps_exact_identity() {
+    let source = r#"
+function makeLogger() {
+  var $log = {};
+  $log.reset = function() {};
+  $log.reset();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("logger.js", source)
+        .build();
+
+    let reset = source.rfind("reset").expect("local member call");
+    let value = lookup(
+        project.root(),
+        &location_reference("logger.js", source, reset),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "$log.reset", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 4, "{value}");
+}
+
+#[test]
 fn javascript_same_file_top_level_assignment_resolves_top_level_read() {
     let source = r#"
 member.status = "ready";
@@ -11229,6 +11427,53 @@ function render(query) {
     );
 
     assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn javascript_member_assignment_does_not_cross_for_of_binding_scope() {
+    let source = r#"
+function render(primary, secondary) {
+  for (const task of primary) {
+    task.status = "ready";
+    consume(task.status);
+  }
+  for (const task of secondary) {
+    consume(task.status);
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("app.js", source)
+        .build();
+
+    let reads: Vec<_> = source
+        .match_indices("task.status")
+        .map(|(start, _)| start + "task.".len())
+        .collect();
+    assert_eq!(reads.len(), 3);
+
+    let local = lookup(
+        project.root(),
+        &location_reference("app.js", source, reads[1]),
+    );
+    assert_eq!(local["results"][0]["status"], "resolved", "{local}");
+    assert_eq!(
+        local["results"][0]["definitions"][0]["start_line"], 4,
+        "{local}"
+    );
+
+    let unrelated = lookup(
+        project.root(),
+        &location_reference("app.js", source, reads[2]),
+    );
+    assert_eq!(
+        unrelated["results"][0]["status"], "no_definition",
+        "{unrelated}"
+    );
+    assert!(
+        unrelated["results"][0]["definitions"].is_null(),
+        "{unrelated}"
+    );
 }
 
 #[test]

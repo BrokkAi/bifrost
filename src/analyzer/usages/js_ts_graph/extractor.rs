@@ -125,6 +125,13 @@ pub(super) fn scan_files_for_seeds(
                 binding_engine.seed_symbol(edge.local_name.clone(), TARGET_BINDING);
             }
         }
+        if exported_local_property_root.is_some() {
+            for edge in &edges {
+                if edge_binds_bare_identifier(edge) {
+                    binding_engine.seed_symbol(edge.local_name.clone(), TARGET_OBJECT_BINDING);
+                }
+            }
+        }
         if target_self_file {
             binding_engine.seed_symbol(target_short.clone(), TARGET_BINDING);
         }
@@ -377,6 +384,14 @@ impl ScanCtx<'_> {
             .resolve_symbol(ident)
             .as_precise()
             .is_some_and(|targets| targets.contains(TARGET_OBJECT_BINDING))
+    }
+
+    fn shadows_import_binding(&self, ident: &str) -> bool {
+        self.binding_engine.is_shadowed_in_non_root_scope(ident)
+            && self
+                .edges
+                .iter()
+                .any(|edge| edge.local_name == ident && edge_binds_bare_identifier(edge))
     }
 }
 
@@ -1385,8 +1400,19 @@ fn member_object_match_status(
         return match binding {
             LocalBinding::TargetReceiver => ReceiverMatchStatus::Proven,
             LocalBinding::KnownUnrelated => ReceiverMatchStatus::NoMatch,
+            LocalBinding::Other
+                if simple_identifier_text(node, ctx.source)
+                    .is_some_and(|name| ctx.shadows_import_binding(name)) =>
+            {
+                ReceiverMatchStatus::NoMatch
+            }
             LocalBinding::Other => receiver_fact_match_status(node, ctx),
         };
+    }
+
+    if simple_identifier_text(node, ctx.source).is_some_and(|name| ctx.shadows_import_binding(name))
+    {
+        return ReceiverMatchStatus::NoMatch;
     }
 
     receiver_fact_match_status(node, ctx)

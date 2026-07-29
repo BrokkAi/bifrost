@@ -961,9 +961,11 @@ fn jsts_exact_dotted_candidates(
     }
     if let Some(qualifier) = qualifier {
         candidates.retain(|unit| {
-            !jsts_js_unbound_assigned_property_candidate_requires_exact_receiver(
-                analyzer, unit, qualifier,
-            )
+            (unit.source() == file
+                || jsts_cross_file_dotted_receiver_has_global_identity(analyzer, unit, qualifier))
+                && !jsts_js_unbound_assigned_property_candidate_requires_exact_receiver(
+                    analyzer, unit, qualifier,
+                )
         });
     }
     if value_position {
@@ -972,6 +974,64 @@ fn jsts_exact_dotted_candidates(
         candidates = jsts_type_space_candidates(analyzer, candidates);
     }
     candidates
+}
+
+fn jsts_cross_file_dotted_receiver_has_global_identity(
+    analyzer: &dyn IAnalyzer,
+    candidate: &CodeUnit,
+    receiver: &str,
+) -> bool {
+    let language = crate::analyzer::common::language_for_file(candidate.source());
+    if !matches!(language, Language::JavaScript | Language::TypeScript) {
+        return false;
+    }
+    let Ok(source) = candidate.source().read_to_string() else {
+        return false;
+    };
+    let Some(tree) = parse_js_ts_tree(candidate.source(), &source, language) else {
+        return false;
+    };
+    let root = tree.root_node();
+    if jsts_program_is_external_module(root, &source) {
+        return false;
+    }
+    analyzer.ranges(candidate).iter().any(|range| {
+        jsts_visible_receiver_binding_scope(root, &source, receiver, range.start_byte)
+            == Some(JstsReceiverBindingScope {
+                start_byte: root.start_byte(),
+                end_byte: root.end_byte(),
+            })
+    })
+}
+
+fn jsts_program_is_external_module(root: Node<'_>, source: &str) -> bool {
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor).any(|statement| {
+        matches!(statement.kind(), "import_statement" | "export_statement")
+            || subtree_contains(statement, |node| {
+                (node.kind() == "call_expression"
+                    && node.child_by_field_name("function").is_some_and(|callee| {
+                        callee.kind() == "identifier" && node_text(callee, source) == "require"
+                    }))
+                    || (node.kind() == "assignment_expression"
+                        && node
+                            .child_by_field_name("left")
+                            .and_then(jsts_static_member_root)
+                            .is_some_and(|root| {
+                                matches!(node_text(root, source), "exports" | "module")
+                            }))
+            })
+    })
+}
+
+fn jsts_static_member_root(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match node.kind() {
+            "identifier" => return Some(node),
+            "member_expression" => node = node.child_by_field_name("object")?,
+            _ => return None,
+        }
+    }
 }
 
 fn ts_exact_global_dotted_candidates(
@@ -1097,6 +1157,10 @@ fn jsts_lexical_scope_kind(kind: &str) -> bool {
         kind,
         "program"
             | "statement_block"
+            | "for_statement"
+            | "for_in_statement"
+            | "switch_statement"
+            | "catch_clause"
             | "function_declaration"
             | "function_expression"
             | "arrow_function"
