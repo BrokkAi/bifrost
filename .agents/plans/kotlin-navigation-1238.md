@@ -55,9 +55,11 @@ analyzer's indexed declarations.
       the Java and Scala definition resolvers, the definition/type lookup dispatch, and the Kotlin tree-sitter grammar's
       actual node shapes (dumped s-expressions from the vendored grammar).
 - [x] (2026-07-29 09:20Z) Wrote this ExecPlan.
-- [ ] Milestone 1: reference-site classification, declaration-site and import handling, type references. Kotlin arm
-      added to the `get_definition` dispatch.
-- [ ] Milestone 2: calls, constructors, overload arity filtering, named arguments.
+- [x] (2026-07-29 10:30Z) Milestone 1: reference-site classification, declaration-site and import handling, type
+      references. Kotlin arm added to the `get_definition` dispatch. 11 new `kotlin_*` tests in
+      `tests/suite_symbols/get_definition_test.rs`, all green; `cargo clippy --all-targets` clean.
+- [x] (2026-07-29 11:40Z) Milestone 2: calls, constructors, arity-steered overload selection, named arguments,
+      callable references, bare value references. 24 `kotlin_*` tests green; clippy clean.
 - [ ] Milestone 3: navigation expressions, receiver typing, inherited/companion/extension members, safe calls,
       call-result chains.
 - [ ] Milestone 4: `get_type` Kotlin arm, call-site syntax enablement for signature help, and the
@@ -65,6 +67,13 @@ analyzer's indexed declarations.
 - [ ] Milestone 5: abstention matrix, capability documentation, and full validation.
 
 ## Surprises & Discoveries
+
+- Observation: Kotlin overloads collapse into one indexed identity. Two functions with the same fully-qualified name
+  become a single `CodeUnit` carrying several signatures, so "pick the right overload" is only expressible across
+  *owners*, never within one name.
+  Evidence: the first draft of `kotlin_overloaded_call_selects_by_arity` asserted one `CodeUnit` per overload and
+  failed with a single `app.render` definition carrying the first declaration's signature. The test was rewritten as
+  `kotlin_call_arity_reaches_an_inherited_overload_past_a_nearer_one`, which is the behaviour that actually matters.
 
 - Observation: the vendored Kotlin grammar exposes almost no tree-sitter *fields*. Only `function_declaration` and
   `property_declaration` carry a field (`receiver`), and `if_expression` carries `condition`/`consequence`. Everything
@@ -118,6 +127,30 @@ analyzer's indexed declarations.
   Evidence: `crates/bifrost-analysis/src/analyzer/multi_analyzer.rs`, `fn kotlin_realm` and its two call sites.
 
 ## Decision Log
+
+- Decision: named-argument labels resolve to the *callable* that declares the parameter, not to the parameter itself.
+  Rationale: Kotlin parameters are not indexed as `CodeUnit`s, and the alternative channel — `LexicalDefinition` — is
+  rendered by `crates/bifrost-analysis/src/searchtools/selectors.rs::lexical_definition_candidate` against the
+  *request's* file, so it cannot address a parameter declared in another file. Answering with the callable is the
+  finest identity that stays correct across files. Proving the parameter exists (by reading its name from the
+  declaring file's syntax at the byte range the indexer recorded) is what keeps the answer honest: an unknown label
+  abstains with `unknown_named_argument`.
+  Date/Author: 2026-07-29, David Baker Effendi (agent).
+
+- Decision: call arity participates in the name-resolution ladder's existence predicate rather than filtering the
+  ladder's result, with a second arity-blind pass behind it.
+  Rationale: Kotlin picks the overload that can accept the call even when a nearer scope declares the same name with
+  a different shape. Post-filtering cannot express that, because the ladder would already have stopped at the nearer
+  scope and returned its non-matching declaration.
+  Date/Author: 2026-07-29, David Baker Effendi (agent).
+
+- Decision: whether a nested class is a companion object is answered by re-reading the declaration's own syntax
+  through a per-request file-syntax cache, not by a persisted flag or by inspecting the rendered signature string.
+  Rationale: the index cannot distinguish `companion object` from a nested `object` — both are nested classes — and
+  adding a persisted flag means a store schema column and migration for one language's navigation. Parsing the
+  declaring file (cached per request) is an AST check, mirroring how the Java resolver inspects a declaration's
+  annotations for Lombok, and the same cache also answers parameter-name and declared-type questions.
+  Date/Author: 2026-07-29, David Baker Effendi (agent).
 
 - Decision: model the Kotlin resolver on `usages/get_definition/java.rs` rather than on `scala.rs`.
   Rationale: Kotlin and Java share the JVM identity model (packages, classes, dotted fully-qualified names,
