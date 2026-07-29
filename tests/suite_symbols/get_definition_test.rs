@@ -28687,3 +28687,559 @@ fun use(): Int = helper()
         "an unimported same-named function must not be returned: {value}"
     );
 }
+
+#[test]
+fn kotlin_member_call_on_typed_local_resolves_exactly() {
+    let source = r#"package app
+
+import lib.Base
+
+fun use() {
+    val base: Base = Base()
+    base.greet("world")
+}
+"#;
+    let project = kotlin_base_and_app(source);
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("base.greet").expect("call") + 5,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "lib.Base.greet", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "lib/Base.kt", "{value}");
+}
+
+#[test]
+fn kotlin_member_call_on_constructor_initialized_local_resolves_exactly() {
+    let source = r#"package app
+
+import lib.Base
+
+fun use() {
+    val base = Base()
+    base.greet("world")
+}
+"#;
+    let project = kotlin_base_and_app(source);
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("base.greet").expect("call") + 5,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "lib.Base.greet", "{value}");
+}
+
+#[test]
+fn kotlin_member_call_on_parameter_resolves_exactly() {
+    let source = r#"package app
+
+import lib.Base
+
+fun use(base: Base) {
+    base.greet("world")
+}
+"#;
+    let project = kotlin_base_and_app(source);
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("base.greet").expect("call") + 5,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "lib.Base.greet", "{value}");
+}
+
+#[test]
+fn kotlin_safe_call_and_not_null_assertion_resolve_like_a_plain_call() {
+    let source = r#"package app
+
+import lib.Base
+
+fun use(base: Base?) {
+    base?.greet("a")
+    base!!.greet("b")
+}
+"#;
+    let project = kotlin_base_and_app(source);
+
+    for marker in ["base?.greet", "base!!.greet"] {
+        let offset = source.find(marker).expect("call") + marker.len() - "greet".len();
+        let value = lookup(
+            project.root(),
+            &location_reference("app/App.kt", source, offset),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{marker}: {value}");
+        assert_eq!(
+            result["definitions"][0]["fqn"], "lib.Base.greet",
+            "{marker}: {value}"
+        );
+    }
+}
+
+#[test]
+fn kotlin_inherited_member_resolves_to_base_declaration() {
+    let source = r#"package app
+
+import lib.Base
+
+class Derived : Base()
+
+fun use(derived: Derived) {
+    derived.greet("world")
+}
+"#;
+    let project = kotlin_base_and_app(source);
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("derived.greet").expect("call") + 8,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "lib.Base.greet", "{value}");
+}
+
+#[test]
+fn kotlin_companion_member_call_resolves_through_the_class_name() {
+    let source = r#"package app
+
+class Factory {
+    companion object {
+        fun create(): Factory = Factory()
+    }
+}
+
+fun use(): Factory = Factory.create()
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("Factory.create()").expect("call") + 8,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Factory.Companion.create",
+        "{value}"
+    );
+}
+
+#[test]
+fn kotlin_object_member_resolves_to_object_declaration_member() {
+    let source = r#"package app
+
+object Registry {
+    fun register(): Int = 1
+}
+
+fun use(): Int = Registry.register()
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("Registry.register()").expect("call") + 9,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Registry.register",
+        "{value}"
+    );
+}
+
+#[test]
+fn kotlin_enum_entry_and_its_member_resolve() {
+    let source = r#"package app
+
+enum class Color {
+    RED,
+    GREEN;
+
+    fun label(): String = ""
+}
+
+fun use(): String = Color.RED.label()
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/App.kt", source)
+        .build();
+
+    let entry = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("Color.RED.label").expect("use") + 6,
+        ),
+    );
+    let result = &entry["results"][0];
+    assert_eq!(result["status"], "resolved", "{entry}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.Color.RED", "{entry}");
+
+    let member = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("Color.RED.label").expect("use") + 10,
+        ),
+    );
+    let result = &member["results"][0];
+    assert_eq!(result["status"], "resolved", "{member}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Color.label",
+        "{member}"
+    );
+}
+
+#[test]
+fn kotlin_call_result_chain_resolves_the_second_member() {
+    let source = r#"package app
+
+class Inner {
+    fun tail(): Int = 1
+}
+
+class Outer {
+    fun inner(): Inner = Inner()
+}
+
+fun use(outer: Outer): Int = outer.inner().tail()
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find(".tail()").expect("chain") + 1,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.Inner.tail", "{value}");
+}
+
+#[test]
+fn kotlin_property_access_resolves_to_property_declaration() {
+    let source = r#"package app
+
+class Holder {
+    val label: String = ""
+}
+
+fun use(holder: Holder): String = holder.label
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("holder.label").expect("access") + 7,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Holder.label",
+        "{value}"
+    );
+}
+
+#[test]
+fn kotlin_this_receiver_resolves_to_enclosing_class_member() {
+    let source = r#"package app
+
+class Holder {
+    fun label(): String = ""
+
+    fun use(): String = this.label()
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("this.label()").expect("call") + 5,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Holder.label",
+        "{value}"
+    );
+}
+
+#[test]
+fn kotlin_super_receiver_resolves_to_base_member() {
+    let source = r#"package app
+
+import lib.Base
+
+class Derived : Base() {
+    fun use(): String = super.greet("world")
+}
+"#;
+    let project = kotlin_base_and_app(source);
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("super.greet").expect("call") + 6,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "lib.Base.greet", "{value}");
+}
+
+#[test]
+fn kotlin_extension_function_call_resolves_to_extension_declaration() {
+    let source = r#"package app
+
+import lib.Base
+
+fun Base.shout(): String = ""
+
+fun use(base: Base): String = base.shout()
+"#;
+    let project = kotlin_base_and_app(source);
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("base.shout()").expect("call") + 5,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.shout", "{value}");
+}
+
+/// An extension declared for an unrelated type must not answer for a receiver
+/// that does not conform to it.
+#[test]
+fn kotlin_extension_for_another_type_is_not_returned() {
+    let source = r#"package app
+
+import lib.Base
+import lib.Other
+
+fun Other.shout(): String = ""
+
+fun use(base: Base): String = base.shout()
+"#;
+    let project = kotlin_base_and_app(source);
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("base.shout()").expect("call") + 5,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_ne!(result["status"], "resolved", "{value}");
+    assert!(
+        result["definitions"]
+            .as_array()
+            .is_none_or(|units| units.is_empty()),
+        "an extension of an unrelated type must not answer: {value}"
+    );
+}
+
+#[test]
+fn kotlin_member_on_untyped_lambda_receiver_abstains() {
+    let source = r#"package app
+
+fun use() {
+    val handler = { 1 }
+    handler.greet("x")
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("handler.greet").expect("call") + 8,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "receiver_type_unknown",
+        "{value}"
+    );
+}
+
+/// Kotlin's smart casts need flow analysis, which belongs to the semantic
+/// lowering issue. Until then a narrowed receiver must abstain, not guess.
+#[test]
+fn kotlin_smart_cast_receiver_abstains() {
+    let source = r#"package app
+
+import lib.Base
+
+fun use(value: Any) {
+    if (value is Base) {
+        value.greet("x")
+    }
+}
+"#;
+    let project = kotlin_base_and_app(source);
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("value.greet").expect("call") + 6,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_ne!(result["status"], "resolved", "{value}");
+    assert!(
+        result["definitions"]
+            .as_array()
+            .is_none_or(|units| units.is_empty()),
+        "a smart-cast receiver must not be guessed: {value}"
+    );
+}
+
+/// The exactness criterion: a member spelled the same on an unrelated class
+/// must never answer for this receiver.
+#[test]
+fn kotlin_same_named_member_of_another_class_is_not_returned() {
+    let source = r#"package app
+
+class Holder {
+    val label: String = ""
+}
+
+class Decoy {
+    val label: String = ""
+}
+
+fun use(holder: Holder): String = holder.label
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("holder.label").expect("access") + 7,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    let definitions = result["definitions"].as_array().expect("definitions");
+    assert_eq!(definitions.len(), 1, "{value}");
+    assert_eq!(definitions[0]["fqn"], "app.Holder.label", "{value}");
+}
+
+#[test]
+fn kotlin_member_not_on_receiver_type_reports_no_indexed_definition() {
+    let source = r#"package app
+
+import lib.Base
+
+fun use(base: Base) {
+    base.missing()
+}
+"#;
+    let project = kotlin_base_and_app(source);
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("base.missing").expect("call") + 5,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "no_indexed_definition",
+        "{value}"
+    );
+}

@@ -99,7 +99,7 @@ pub(crate) fn resolve_kotlin(
 
     match node.kind() {
         "type_identifier" => kotlin_type_reference_outcome(&ctx, node),
-        "simple_identifier" => kotlin_identifier_reference_outcome(&ctx, node, site),
+        "simple_identifier" => kotlin_identifier_reference_outcome(&ctx, node),
         kind => no_definition(
             "unsupported_kotlin_reference_shape",
             format!(
@@ -118,7 +118,6 @@ pub(crate) fn resolve_kotlin(
 fn kotlin_identifier_reference_outcome(
     ctx: &KotlinCtx<'_>,
     node: Node<'_>,
-    site: &ResolvedReferenceSite,
 ) -> DefinitionLookupOutcome {
     let name = ctx.text(node);
     if name.is_empty() {
@@ -140,13 +139,7 @@ fn kotlin_identifier_reference_outcome(
         return kotlin_bare_call_outcome(ctx, node, name, None);
     }
     if parent.kind() == "navigation_suffix" {
-        return no_definition(
-            "unsupported_kotlin_reference_shape",
-            format!(
-                "`{}` is a Kotlin member access that get_definition does not resolve yet",
-                site.text
-            ),
-        );
+        return kotlin_member_outcome(ctx, parent, name);
     }
     kotlin_bare_value_outcome(ctx, node, name)
 }
@@ -160,8 +153,6 @@ struct KotlinCtx<'a> {
     support: &'a dyn BoundedDefinitionLookup,
     file: &'a ProjectFile,
     source: &'a str,
-    package_name: String,
-    imports: Vec<ImportInfo>,
     /// Parsed syntax of the files this request has had to look inside, keyed by
     /// file. Resolving a reference regularly needs a fact that lives in another
     /// file's *syntax* rather than in its index — whether a nested object is a
@@ -169,6 +160,35 @@ struct KotlinCtx<'a> {
     /// declares — and re-reading and re-parsing the same file for each of those
     /// questions would be quadratic in a chained expression.
     file_syntax: RefCell<HashMap<ProjectFile, Option<Rc<KotlinFileSyntax>>>>,
+    /// Package name and imports per file. A declaration's own file decides what
+    /// its spelled types mean, so resolving the return type of a function in
+    /// another file needs *that* file's scope, not the requesting file's.
+    file_facts: RefCell<HashMap<ProjectFile, Rc<KotlinFileFacts>>>,
+}
+
+/// The file-level half of a Kotlin name scope.
+struct KotlinFileFacts {
+    package_name: String,
+    imports: Vec<ImportInfo>,
+}
+
+/// A complete Kotlin name scope, owned so it can be built for any file.
+///
+/// [`KotlinNameScope`] borrows its file-level parts, which a per-file cache
+/// cannot hand out; this owns them and lends a `KotlinNameScope` on demand.
+struct KotlinScope {
+    facts: Rc<KotlinFileFacts>,
+    owners: Vec<String>,
+}
+
+impl KotlinScope {
+    fn as_name_scope(&self) -> KotlinNameScope<'_> {
+        KotlinNameScope {
+            package_name: &self.facts.package_name,
+            imports: &self.facts.imports,
+            scope_owners: self.owners.clone(),
+        }
+    }
 }
 
 /// One file's source together with its parse, owned so a caller can hold nodes
@@ -190,20 +210,46 @@ impl<'a> KotlinCtx<'a> {
         // declaration: a file whose only content is a reference, or whose
         // declarations were dropped by parse recovery, still has a package
         // header, and the same-package tier of the ladder needs it.
-        let package_name = kotlin_package_name(root, source);
-        let imports = analyzer
-            .import_analysis_provider()
-            .map(|provider| provider.import_info_of(file))
-            .unwrap_or_default();
+        let facts = Rc::new(KotlinFileFacts {
+            package_name: kotlin_package_name(root, source),
+            imports: analyzer
+                .import_analysis_provider()
+                .map(|provider| provider.import_info_of(file))
+                .unwrap_or_default(),
+        });
+        let mut file_facts = HashMap::default();
+        file_facts.insert(file.clone(), facts);
         Self {
             analyzer,
             support,
             file,
             source,
-            package_name,
-            imports,
             file_syntax: RefCell::new(HashMap::default()),
+            file_facts: RefCell::new(file_facts),
         }
+    }
+
+    /// The package and imports of `file`.
+    fn file_facts(&self, file: &ProjectFile) -> Rc<KotlinFileFacts> {
+        if let Some(cached) = self.file_facts.borrow().get(file) {
+            return Rc::clone(cached);
+        }
+        let package_name = self
+            .file_syntax(file)
+            .map(|syntax| kotlin_package_name(syntax.tree.root_node(), &syntax.source))
+            .unwrap_or_default();
+        let facts = Rc::new(KotlinFileFacts {
+            package_name,
+            imports: self
+                .analyzer
+                .import_analysis_provider()
+                .map(|provider| provider.import_info_of(file))
+                .unwrap_or_default(),
+        });
+        self.file_facts
+            .borrow_mut()
+            .insert(file.clone(), Rc::clone(&facts));
+        facts
     }
 
     /// The parsed syntax of `file`, read from the analyzer's indexed content so
@@ -244,19 +290,33 @@ impl<'a> KotlinCtx<'a> {
         node.utf8_text(self.source.as_bytes()).unwrap_or_default()
     }
 
-    /// The names visible at `byte`: the file's package and imports, plus the
-    /// enclosing declarations and the scopes they inherit.
-    fn scope_at(&self, byte: usize) -> KotlinNameScope<'_> {
-        KotlinNameScope {
-            package_name: &self.package_name,
-            imports: &self.imports,
-            scope_owners: self.scope_owners_at(byte),
+    /// The names visible at `byte` of the requesting file.
+    fn scope_at(&self, byte: usize) -> KotlinScope {
+        self.scope_in(self.file, byte)
+    }
+
+    /// The names visible at `byte` of `file`: that file's package and imports,
+    /// plus the declarations enclosing the position and the scopes they inherit.
+    fn scope_in(&self, file: &ProjectFile, byte: usize) -> KotlinScope {
+        KotlinScope {
+            facts: self.file_facts(file),
+            owners: self.scope_owners_at(file, byte),
         }
     }
 
     /// Resolve a spelled Kotlin name to the fully-qualified name it denotes.
-    fn resolve_name(&self, spelled: &str, scope: &KotlinNameScope<'_>) -> KotlinTypeName {
-        resolve_kotlin_type_name(spelled, scope, |candidate| self.type_exists(candidate))
+    fn resolve_name(&self, spelled: &str, scope: &KotlinScope) -> KotlinTypeName {
+        resolve_kotlin_type_name(spelled, &scope.as_name_scope(), |candidate| {
+            self.type_exists(candidate)
+        })
+    }
+
+    /// The type declaration a spelled name denotes in `scope`, if exactly one
+    /// indexed declaration answers to it.
+    fn resolve_type_unit(&self, spelled: &str, scope: &KotlinScope) -> Option<CodeUnit> {
+        let fqn = self.resolve_name(spelled, scope).resolved()?;
+        let mut units = self.types_named(&fqn);
+        (units.len() == 1).then(|| units.remove(0))
     }
 
     fn types_named(&self, fqn: &str) -> Vec<CodeUnit> {
@@ -328,10 +388,14 @@ impl<'a> KotlinCtx<'a> {
             .iter()
             .flat_map(|entry| entry.parameters().to_vec())
             .any(|parameter| {
-                smallest_named_node_covering(
+                kotlin_declaration_node(
                     syntax.tree.root_node(),
-                    parameter.start_byte(),
-                    parameter.end_byte(),
+                    &Range {
+                        start_byte: parameter.start_byte(),
+                        end_byte: parameter.end_byte(),
+                        start_line: 0,
+                        end_line: 0,
+                    },
                 )
                 .and_then(|node| first_named_child_of_kind(node, "simple_identifier"))
                 .and_then(|name| name.utf8_text(syntax.source.as_bytes()).ok())
@@ -355,11 +419,153 @@ impl<'a> KotlinCtx<'a> {
             .collect()
     }
 
+    /// Members declared at `fqn` that can answer a reference, optionally
+    /// restricted to those that accept a call of `arity`.
+    fn members_named(&self, fqn: &str, arity: Option<usize>) -> Vec<CodeUnit> {
+        self.support
+            .fqn_in_any_language(fqn)
+            .into_iter()
+            .filter(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field()))
+            .filter(|unit| {
+                arity.is_none_or(|arity| !unit.is_function() || self.accepts_arity(unit, arity))
+            })
+            .collect()
+    }
+
+    /// The innermost class-like declaration enclosing `byte` in the requesting
+    /// file.
+    fn enclosing_class_at(&self, byte: usize) -> Option<CodeUnit> {
+        let start = self.analyzer.enclosing_code_unit(
+            self.file,
+            &Range {
+                start_byte: byte,
+                end_byte: byte.saturating_add(1),
+                start_line: 0,
+                end_line: 0,
+            },
+        )?;
+        let mut current = Some(start);
+        while let Some(unit) = current {
+            if unit.is_class() {
+                return Some(unit);
+            }
+            current = self.analyzer.parent_of(&unit);
+        }
+        None
+    }
+
+    /// The type a declaration carries: a property's or parameter's written
+    /// type, an enum entry's own enum, or a function's declared return type.
+    ///
+    /// Read from the declaring file's syntax and resolved in *that* file's
+    /// scope, because a spelled type means whatever the file that wrote it says
+    /// it means.
+    fn declared_type_of(&self, unit: &CodeUnit, depth: usize) -> Option<CodeUnit> {
+        let (syntax, range) = self.declaration_syntax(unit)?;
+        let node = kotlin_declaration_node(syntax.tree.root_node(), &range)?;
+        // An enum entry has no written type: it is an instance of its own enum.
+        if node.kind() == "enum_entry" {
+            return self.analyzer.parent_of(unit).filter(CodeUnit::is_class);
+        }
+
+        let declaring = KotlinCtx {
+            analyzer: self.analyzer,
+            support: self.support,
+            file: unit.source(),
+            source: &syntax.source,
+            file_syntax: RefCell::new(HashMap::default()),
+            file_facts: RefCell::new(HashMap::default()),
+        };
+        let type_node = match node.kind() {
+            "property_declaration" => named_children(node)
+                .into_iter()
+                .find(|child| child.kind() == "variable_declaration")
+                .and_then(|variable| {
+                    named_children(variable)
+                        .into_iter()
+                        .find_map(|child| kotlin_type_node_spelling(&declaring, child))
+                }),
+            "function_declaration" => kotlin_declared_return_type_spelling(&declaring, node),
+            _ => named_children(node)
+                .into_iter()
+                .find_map(|child| kotlin_type_node_spelling(&declaring, child)),
+        };
+        if let Some(spelled) = type_node {
+            let scope = declaring.scope_in(unit.source(), range.start_byte);
+            if let Some(resolved) = declaring.resolve_type_unit(&spelled, &scope) {
+                return Some(resolved);
+            }
+        }
+        if node.kind() != "property_declaration" {
+            return None;
+        }
+        // A property with no written type is only typed when its initializer
+        // proves one.
+        let initializer = named_children(node)
+            .into_iter()
+            .rev()
+            .find(|child| kotlin_is_expression_kind(child.kind()))?;
+        kotlin_expression_type(&declaring, initializer, depth + 1)
+    }
+
+    /// The type an extension function extends, or `None` when the callable is
+    /// not an extension.
+    fn extension_receiver_unit(&self, unit: &CodeUnit) -> Option<CodeUnit> {
+        let (syntax, range) = self.declaration_syntax(unit)?;
+        let node = kotlin_declaration_node(syntax.tree.root_node(), &range)?;
+        let receiver = node.child_by_field_name("receiver")?;
+        let declaring = KotlinCtx {
+            analyzer: self.analyzer,
+            support: self.support,
+            file: unit.source(),
+            source: &syntax.source,
+            file_syntax: RefCell::new(HashMap::default()),
+            file_facts: RefCell::new(HashMap::default()),
+        };
+        let spelled = kotlin_type_node_spelling(&declaring, receiver)?;
+        let scope = declaring.scope_in(unit.source(), range.start_byte);
+        declaring.resolve_type_unit(&spelled, &scope)
+    }
+
+    /// Whether `subtype` is `supertype` or inherits from it.
+    fn type_conforms_to(&self, subtype: &CodeUnit, supertype: &CodeUnit) -> bool {
+        if subtype.fq_name() == supertype.fq_name() {
+            return true;
+        }
+        let Some(provider) = self.analyzer.type_hierarchy_provider() else {
+            return false;
+        };
+        let target = supertype.fq_name();
+        let mut seen = Vec::new();
+        let mut frontier = vec![subtype.clone()];
+        for _ in 0..MAX_MEMBER_HIERARCHY_DEPTH {
+            let mut next = Vec::new();
+            for unit in &frontier {
+                for ancestor in provider.get_direct_ancestors(unit) {
+                    let fqn = ancestor.fq_name();
+                    if fqn == target {
+                        return true;
+                    }
+                    if seen.contains(&fqn) {
+                        continue;
+                    }
+                    seen.push(fqn);
+                    next.push(ancestor);
+                }
+            }
+            if next.is_empty() {
+                return false;
+            }
+            frontier = next;
+        }
+        false
+    }
+
     fn is_companion_object(&self, unit: &CodeUnit) -> bool {
         let Some((syntax, range)) = self.declaration_syntax(unit) else {
             return false;
         };
-        smallest_named_node_covering(syntax.tree.root_node(), range.start_byte, range.end_byte)
+        kotlin_declaration_node(syntax.tree.root_node(), &range)
             .is_some_and(|node| node.kind() == "companion_object")
     }
 
@@ -371,9 +577,9 @@ impl<'a> KotlinCtx<'a> {
     /// ladder. Ancestors are expanded through the analyzer's hierarchy
     /// provider, which is realm-aware: a Kotlin class extending a Java class in
     /// the same workspace inherits that class's scope too.
-    fn scope_owners_at(&self, byte: usize) -> Vec<String> {
+    fn scope_owners_at(&self, file: &ProjectFile, byte: usize) -> Vec<String> {
         let Some(start) = self.analyzer.enclosing_code_unit(
-            self.file,
+            file,
             &Range {
                 start_byte: byte,
                 end_byte: byte.saturating_add(1),
@@ -672,7 +878,7 @@ fn kotlin_bare_call_outcome(
 ) -> DefinitionLookupOutcome {
     let scope = ctx.scope_at(node.start_byte());
     for required_arity in [arity, None] {
-        match resolve_kotlin_type_name(name, &scope, |candidate| {
+        match resolve_kotlin_type_name(name, &scope.as_name_scope(), |candidate| {
             ctx.callables_named(candidate)
                 .iter()
                 .any(|unit| required_arity.is_none_or(|arity| ctx.accepts_arity(unit, arity)))
@@ -753,7 +959,7 @@ fn kotlin_bare_value_outcome(
     name: &str,
 ) -> DefinitionLookupOutcome {
     let scope = ctx.scope_at(node.start_byte());
-    match resolve_kotlin_type_name(name, &scope, |candidate| {
+    match resolve_kotlin_type_name(name, &scope.as_name_scope(), |candidate| {
         !ctx.values_named(candidate).is_empty()
     }) {
         KotlinTypeName::Resolved(fqn) => candidates_outcome(ctx.values_named(&fqn)),
@@ -835,4 +1041,509 @@ fn kotlin_enclosing_call(argument: Node<'_>) -> Option<Node<'_>> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Member access: typing a receiver, then finding the member on that type.
+// ---------------------------------------------------------------------------
+
+/// How many receiver hops a chained expression is followed for.
+///
+/// `a.b().c().d` needs three; a cap keeps a pathological or cyclic chain from
+/// turning one request into an unbounded walk, and an exceeded cap abstains
+/// rather than guessing.
+const MAX_RECEIVER_DEPTH: usize = 8;
+
+/// How many levels of supertype a member lookup walks.
+const MAX_MEMBER_HIERARCHY_DEPTH: usize = 8;
+
+/// A typed receiver: the declaration the member must be looked up on, and
+/// whether it was named as a type rather than produced as a value.
+///
+/// The distinction matters because Kotlin exposes a class's companion members
+/// through the class name (`Factory.create()`) but not through an instance of
+/// it, so only a static qualifier may search the companion.
+struct KotlinReceiver {
+    owner: CodeUnit,
+    static_qualifier: bool,
+}
+
+/// Resolve the member of `a.member` / `a?.member` / `a!!.member`.
+fn kotlin_member_outcome(
+    ctx: &KotlinCtx<'_>,
+    suffix: Node<'_>,
+    member: &str,
+) -> DefinitionLookupOutcome {
+    let Some(navigation) = suffix
+        .parent()
+        .filter(|parent| parent.kind() == "navigation_expression")
+    else {
+        return no_definition(
+            "unsupported_kotlin_reference_shape",
+            format!("`{member}` is a Kotlin member access with no receiver expression"),
+        );
+    };
+    let Some(receiver_node) = named_children(navigation).into_iter().next() else {
+        return no_definition(
+            "unsupported_kotlin_reference_shape",
+            format!("`{member}` is a Kotlin member access with no receiver expression"),
+        );
+    };
+    let Some(receiver) = kotlin_receiver(ctx, receiver_node, 0) else {
+        return no_definition(
+            "receiver_type_unknown",
+            format!(
+                "the receiver of `{member}` is a Kotlin `{}` expression whose type is not proven",
+                receiver_node.kind()
+            ),
+        );
+    };
+
+    // A member access is a call only when the navigation is itself the callee
+    // of a call; `a.b` as a value proves no arity.
+    let arity = navigation
+        .parent()
+        .filter(|parent| parent.kind() == "call_expression")
+        .filter(|call| kotlin_callee(*call).is_some_and(|callee| callee.id() == navigation.id()))
+        .map(kotlin_call_arity);
+
+    let candidates = kotlin_member_candidates(ctx, &receiver, member, arity, suffix.start_byte());
+    if candidates.is_empty() {
+        return no_definition(
+            "no_indexed_definition",
+            format!(
+                "`{member}` is not a member of `{}` or anything it inherits",
+                receiver.owner.fq_name()
+            ),
+        );
+    }
+    candidates_outcome(candidates)
+}
+
+/// Members named `member` reachable through `receiver`.
+///
+/// The search order is Kotlin's: the receiver's own members, the companion when
+/// the receiver was named as a type, then supertypes breadth-first, then
+/// extension functions visible at the reference site. Arity steers the search
+/// the same way it steers a bare call, with an arity-blind second pass so a
+/// missing arity record cannot turn a present declaration into "not found".
+fn kotlin_member_candidates(
+    ctx: &KotlinCtx<'_>,
+    receiver: &KotlinReceiver,
+    member: &str,
+    arity: Option<usize>,
+    site_byte: usize,
+) -> Vec<CodeUnit> {
+    for required_arity in [arity, None] {
+        let mut seen = Vec::new();
+        let mut frontier = vec![receiver.owner.clone()];
+        for _ in 0..MAX_MEMBER_HIERARCHY_DEPTH {
+            let mut next = Vec::new();
+            for owner in &frontier {
+                let owner_fqn = owner.fq_name();
+                if seen.contains(&owner_fqn) {
+                    continue;
+                }
+                seen.push(owner_fqn.clone());
+
+                let mut owners = vec![owner_fqn.clone()];
+                if receiver.static_qualifier {
+                    owners.extend(ctx.companion_fqns(&owner_fqn));
+                }
+                for scope in owners {
+                    let found = ctx.members_named(&format!("{scope}.{member}"), required_arity);
+                    if !found.is_empty() {
+                        return found;
+                    }
+                }
+
+                if let Some(provider) = ctx.analyzer.type_hierarchy_provider() {
+                    next.extend(provider.get_direct_ancestors(owner));
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+
+        let extensions =
+            kotlin_extension_candidates(ctx, receiver, member, required_arity, site_byte);
+        if !extensions.is_empty() {
+            return extensions;
+        }
+        if required_arity.is_none() {
+            break;
+        }
+    }
+    Vec::new()
+}
+
+/// Extension functions named `member` that are in scope at the reference and
+/// whose declared receiver type is the receiver's type or one of its supertypes.
+///
+/// Visibility runs through the ordinary name-resolution ladder, so an extension
+/// is found exactly when Kotlin would find it: declared in an enclosing scope,
+/// imported, declared in the same package, or star-imported.
+fn kotlin_extension_candidates(
+    ctx: &KotlinCtx<'_>,
+    receiver: &KotlinReceiver,
+    member: &str,
+    arity: Option<usize>,
+    site_byte: usize,
+) -> Vec<CodeUnit> {
+    let scope = ctx.scope_at(site_byte);
+    let conforming = |unit: &CodeUnit| {
+        arity.is_none_or(|arity| ctx.accepts_arity(unit, arity))
+            && ctx
+                .extension_receiver_unit(unit)
+                .is_some_and(|declared| ctx.type_conforms_to(&receiver.owner, &declared))
+    };
+    let resolution = resolve_kotlin_type_name(member, &scope.as_name_scope(), |candidate| {
+        ctx.callables_named(candidate).iter().any(conforming)
+    });
+    let Some(fqn) = resolution.resolved() else {
+        return Vec::new();
+    };
+    ctx.callables_named(&fqn)
+        .into_iter()
+        .filter(|unit| conforming(unit))
+        .collect()
+}
+
+/// Type the expression a member is selected from.
+fn kotlin_receiver(ctx: &KotlinCtx<'_>, node: Node<'_>, depth: usize) -> Option<KotlinReceiver> {
+    if depth > MAX_RECEIVER_DEPTH {
+        return None;
+    }
+    match node.kind() {
+        // `a!!.b` and `(a).b` select from the same thing `a` does.
+        "postfix_expression" | "parenthesized_expression" => {
+            kotlin_receiver(ctx, named_children(node).into_iter().next()?, depth + 1)
+        }
+        "this_expression" => Some(KotlinReceiver {
+            owner: kotlin_this_owner(ctx, node)?,
+            static_qualifier: false,
+        }),
+        "super_expression" => Some(KotlinReceiver {
+            owner: kotlin_super_owner(ctx, node)?,
+            static_qualifier: false,
+        }),
+        "as_expression" => {
+            let asserted = named_children(node).into_iter().next_back()?;
+            Some(KotlinReceiver {
+                owner: ctx.resolve_type_unit(
+                    &kotlin_type_node_spelling(ctx, asserted)?,
+                    &ctx.scope_at(node.start_byte()),
+                )?,
+                static_qualifier: false,
+            })
+        }
+        "simple_identifier" => kotlin_identifier_receiver(ctx, node, depth),
+        "call_expression" | "navigation_expression" => Some(KotlinReceiver {
+            owner: kotlin_expression_type(ctx, node, depth)?,
+            static_qualifier: false,
+        }),
+        _ => None,
+    }
+}
+
+/// Type a bare name used as a receiver: a local binding, a property in scope,
+/// or a type named as a static qualifier.
+fn kotlin_identifier_receiver(
+    ctx: &KotlinCtx<'_>,
+    node: Node<'_>,
+    depth: usize,
+) -> Option<KotlinReceiver> {
+    let name = ctx.text(node);
+    if let Some(binding) = kotlin_local_binding(node, ctx.source, name) {
+        return Some(KotlinReceiver {
+            owner: kotlin_binding_type(ctx, binding, depth)?,
+            static_qualifier: false,
+        });
+    }
+
+    let scope = ctx.scope_at(node.start_byte());
+    if let Some(owner) = ctx.resolve_type_unit(name, &scope) {
+        return Some(KotlinReceiver {
+            owner,
+            static_qualifier: true,
+        });
+    }
+
+    // A property of an enclosing declaration, or a top-level/imported one.
+    let fqn = resolve_kotlin_type_name(name, &scope.as_name_scope(), |candidate| {
+        ctx.support
+            .fqn_in_any_language(candidate)
+            .iter()
+            .any(CodeUnit::is_field)
+    })
+    .resolved()?;
+    let property = ctx
+        .support
+        .fqn_in_any_language(&fqn)
+        .into_iter()
+        .find(CodeUnit::is_field)?;
+    Some(KotlinReceiver {
+        owner: ctx.declared_type_of(&property, depth)?,
+        static_qualifier: false,
+    })
+}
+
+/// The class a `this` expression denotes.
+///
+/// A label (`this@Outer`) picks the named enclosing declaration; an unlabelled
+/// `this` is the innermost one.
+fn kotlin_this_owner(ctx: &KotlinCtx<'_>, node: Node<'_>) -> Option<CodeUnit> {
+    let label = first_named_child_of_kind(node, "label").map(|label| {
+        ctx.text(label)
+            .trim_start_matches('@')
+            .trim_end_matches('@')
+            .to_string()
+    });
+    let mut current = ctx.enclosing_class_at(node.start_byte());
+    while let Some(unit) = current {
+        match label.as_deref() {
+            Some(label) if unit.identifier() != label => {
+                current = ctx.analyzer.parent_of(&unit).filter(CodeUnit::is_class);
+            }
+            _ => return Some(unit),
+        }
+    }
+    None
+}
+
+/// The class a `super` expression denotes: the first direct ancestor of the
+/// enclosing class, or the named one in `super<Base>`.
+fn kotlin_super_owner(ctx: &KotlinCtx<'_>, node: Node<'_>) -> Option<CodeUnit> {
+    let enclosing = ctx.enclosing_class_at(node.start_byte())?;
+    let named = first_named_child_of_kind(node, "user_type")
+        .and_then(|user_type| kotlin_type_node_spelling(ctx, user_type));
+    let ancestors = ctx
+        .analyzer
+        .type_hierarchy_provider()?
+        .get_direct_ancestors(&enclosing);
+    match named {
+        Some(named) => ancestors
+            .into_iter()
+            .find(|ancestor| ancestor.identifier() == named || ancestor.fq_name() == named),
+        None => ancestors.into_iter().next(),
+    }
+}
+
+/// The type an expression evaluates to, as an indexed declaration.
+fn kotlin_expression_type(ctx: &KotlinCtx<'_>, node: Node<'_>, depth: usize) -> Option<CodeUnit> {
+    if depth > MAX_RECEIVER_DEPTH {
+        return None;
+    }
+    match node.kind() {
+        "postfix_expression" | "parenthesized_expression" => {
+            kotlin_expression_type(ctx, named_children(node).into_iter().next()?, depth + 1)
+        }
+        "call_expression" => {
+            let callee = kotlin_callee(node)?;
+            let target = kotlin_call_target(ctx, node, callee, depth)?;
+            // A constructor call evaluates to the class it constructs; any
+            // other call evaluates to its declared return type.
+            if target.is_class() {
+                return Some(target);
+            }
+            ctx.declared_type_of(&target, depth)
+        }
+        "navigation_expression" => {
+            let suffix = named_children(node)
+                .into_iter()
+                .find(|child| child.kind() == "navigation_suffix")?;
+            let member = first_named_child_of_kind(suffix, "simple_identifier")?;
+            let receiver =
+                kotlin_receiver(ctx, named_children(node).into_iter().next()?, depth + 1)?;
+            let target = kotlin_member_candidates(
+                ctx,
+                &receiver,
+                ctx.text(member),
+                None,
+                suffix.start_byte(),
+            )
+            .into_iter()
+            .next()?;
+            ctx.declared_type_of(&target, depth)
+        }
+        "simple_identifier" => kotlin_receiver(ctx, node, depth + 1).map(|receiver| receiver.owner),
+        "as_expression" => {
+            let asserted = named_children(node).into_iter().next_back()?;
+            ctx.resolve_type_unit(
+                &kotlin_type_node_spelling(ctx, asserted)?,
+                &ctx.scope_at(node.start_byte()),
+            )
+        }
+        "object_literal" => None,
+        _ => None,
+    }
+}
+
+/// The single declaration a call resolves to, when it resolves to exactly one.
+fn kotlin_call_target(
+    ctx: &KotlinCtx<'_>,
+    call: Node<'_>,
+    callee: Node<'_>,
+    depth: usize,
+) -> Option<CodeUnit> {
+    let outcome = match callee.kind() {
+        "simple_identifier" => {
+            kotlin_bare_call_outcome(ctx, callee, ctx.text(callee), Some(kotlin_call_arity(call)))
+        }
+        "navigation_expression" => {
+            let suffix = named_children(callee)
+                .into_iter()
+                .find(|child| child.kind() == "navigation_suffix")?;
+            let member = first_named_child_of_kind(suffix, "simple_identifier")?;
+            let receiver =
+                kotlin_receiver(ctx, named_children(callee).into_iter().next()?, depth + 1)?;
+            return kotlin_member_candidates(
+                ctx,
+                &receiver,
+                ctx.text(member),
+                Some(kotlin_call_arity(call)),
+                suffix.start_byte(),
+            )
+            .into_iter()
+            .next();
+        }
+        _ => return None,
+    };
+    let mut definitions = outcome.definitions;
+    (definitions.len() == 1).then(|| definitions.remove(0))
+}
+
+/// The declaration a `variable_declaration`, `parameter`, or `class_parameter`
+/// node binds a type to.
+fn kotlin_binding_type(ctx: &KotlinCtx<'_>, binding: Node<'_>, depth: usize) -> Option<CodeUnit> {
+    let scope = ctx.scope_at(binding.start_byte());
+    if let Some(spelled) = kotlin_declared_type_spelling(ctx, binding)
+        && let Some(unit) = ctx.resolve_type_unit(&spelled, &scope)
+    {
+        return Some(unit);
+    }
+    // No written type: the initializer of the enclosing property is the only
+    // other proof. Kotlin's full inference is not modelled, so anything that is
+    // not a call or a cast stays unknown rather than being guessed.
+    let property = binding
+        .parent()
+        .filter(|parent| parent.kind() == "property_declaration")?;
+    let initializer = named_children(property)
+        .into_iter()
+        .rev()
+        .find(|child| kotlin_is_expression_kind(child.kind()))?;
+    kotlin_expression_type(ctx, initializer, depth + 1)
+}
+
+/// The `variable_declaration`, `parameter`, or `class_parameter` node that binds
+/// `name` at `node`, searching enclosing scopes innermost first.
+///
+/// Only bindings that begin before the reference are considered, which is what
+/// keeps a later same-named local from answering for an earlier reference.
+fn kotlin_local_binding<'tree>(node: Node<'tree>, source: &str, name: &str) -> Option<Node<'tree>> {
+    let reference_start = node.start_byte();
+    let mut current = node.parent();
+    while let Some(scope) = current {
+        let mut stack = named_children(scope);
+        while let Some(candidate) = stack.pop() {
+            if candidate.start_byte() > reference_start {
+                continue;
+            }
+            match candidate.kind() {
+                "variable_declaration" | "parameter" | "class_parameter" => {
+                    if kotlin_binding_name(candidate, source) == Some(name) {
+                        return Some(candidate);
+                    }
+                }
+                // Do not descend into a nested declaration: its locals are not
+                // in scope here, and a same-named one there must not answer.
+                "class_declaration"
+                | "object_declaration"
+                | "companion_object"
+                | "function_declaration" => continue,
+                _ => stack.extend(named_children(candidate)),
+            }
+        }
+        current = scope.parent();
+    }
+    None
+}
+
+fn kotlin_binding_name<'a>(binding: Node<'_>, source: &'a str) -> Option<&'a str> {
+    first_named_child_of_kind(binding, "simple_identifier")?
+        .utf8_text(source.as_bytes())
+        .ok()
+}
+
+/// Whether a node kind can appear as the value half of a property declaration.
+fn kotlin_is_expression_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "call_expression"
+            | "navigation_expression"
+            | "as_expression"
+            | "simple_identifier"
+            | "parenthesized_expression"
+            | "postfix_expression"
+            | "object_literal"
+    )
+}
+
+/// The declaration node covering `range`.
+///
+/// The smallest covering node is not always the declaration: an `enum_entry`
+/// spans exactly its own name, so its `simple_identifier` child covers the same
+/// bytes and would win. Climbing back out to the outermost node with the same
+/// span picks the declaration rather than the name inside it.
+fn kotlin_declaration_node<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {
+    let mut node = smallest_named_node_covering(root, range.start_byte, range.end_byte)?;
+    while let Some(parent) = node.parent() {
+        if parent.start_byte() != node.start_byte() || parent.end_byte() != node.end_byte() {
+            break;
+        }
+        node = parent;
+    }
+    Some(node)
+}
+
+/// The return type a function declaration writes, if it wrote one.
+///
+/// The grammar gives the return type no field, but it is the only bare type
+/// node among a `function_declaration`'s children: the parameters live inside
+/// `function_value_parameters` and the receiver behind the `receiver` field.
+fn kotlin_declared_return_type_spelling(ctx: &KotlinCtx<'_>, node: Node<'_>) -> Option<String> {
+    let receiver = node.child_by_field_name("receiver").map(|node| node.id());
+    named_children(node)
+        .into_iter()
+        .filter(|child| Some(child.id()) != receiver)
+        .find_map(|child| kotlin_type_node_spelling(ctx, child))
+}
+
+/// The dotted name a type node spells, or `None` for a shape that names no
+/// nominal type (a function type, a star projection).
+fn kotlin_type_node_spelling(ctx: &KotlinCtx<'_>, node: Node<'_>) -> Option<String> {
+    match node.kind() {
+        "user_type" => {
+            let segments = named_children(node)
+                .into_iter()
+                .filter(|child| child.kind() == "type_identifier")
+                .map(|child| ctx.text(child))
+                .collect::<Vec<_>>();
+            (!segments.is_empty()).then(|| segments.join("."))
+        }
+        "nullable_type" | "not_nullable_type" | "parenthesized_type" | "receiver_type"
+        | "type_projection" => named_children(node)
+            .into_iter()
+            .find_map(|child| kotlin_type_node_spelling(ctx, child)),
+        _ => None,
+    }
+}
+
+/// The type written on a binding, if it was written at all.
+fn kotlin_declared_type_spelling(ctx: &KotlinCtx<'_>, binding: Node<'_>) -> Option<String> {
+    named_children(binding)
+        .into_iter()
+        .find_map(|child| kotlin_type_node_spelling(ctx, child))
 }
