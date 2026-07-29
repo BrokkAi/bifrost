@@ -52,6 +52,12 @@ Use timestamps to measure rates of progress.
 - Observation: Editing any file under `src/` while a `cargo test` build is in flight silently invalidates the run — the build restarts and the earlier output is lost. Two full-suite attempts were wasted this way before the tree was frozen for the final run.
   Evidence: a `cargo test` background task that had been compiling for minutes exited without producing a single `test result:` line after an unrelated doc-comment edit landed mid-build.
 
+- Observation: The full suite caught two real defects that every targeted suite had missed. First, `ImportAnalysisProvider` was implemented for `KotlinAnalyzer` and wired into `AnalyzerDelegate`, but `IAnalyzer::import_analysis_provider` was left at its default `None` — so a Kotlin analyzer reached through `&dyn IAnalyzer` reported having no import analysis, and the capability worked only via the concrete type or `MultiAnalyzer`. Second, the new module docs illustrated Kotlin syntax with indented blocks, which rustdoc compiles as Rust doctests.
+  Evidence: `assertion failed: kotlin.import_analysis_provider().is_some()` in `analyzer_capability_parity`, and `expected one of ! or ::` on `class Child : Base(seed), Contract, Logged by logger` in the `--doc` target. The capability-parity matrix exists precisely to catch the first shape; the fix for the second is a `text` fence.
+
+- Observation: A `cargo test` summary that counts `test result:` lines can report a clean run that actually failed. A doctest failure emits no such line, so a run showing `ok targets: 306, FAILED targets: 0` still exited 101 with `--doc` broken. Always check the process exit code and grep for target-level `error:` lines as well.
+  Evidence: `EXIT=101` alongside `FAILED targets: 0`, resolved only by reading the log tail down to `error: 1 target failed: --doc`.
+
 - Observation: Passing a larger candidate-fqn set to an existing builder is inert rather than dangerous, because each language's resolver can only resolve names through its own declaration index. Merging the ecosystems therefore preserves today's edges exactly while establishing the shared node space that #1239 will fill in.
   Evidence: `JavaAnalyzer::source_type_by_fqn` reads `self.inner.global_usage_definition_index()`, which is scoped to the Java delegate's own files.
 
@@ -130,6 +136,14 @@ not resolve (#1239). `referencing_files_of` stays Kotlin-to-Kotlin for the
 reason in the Decision Log (#1239). Kotlin/JS and Kotlin/Native default imports
 are not modelled, and `expect`/`actual` pairs are indexed with no link asserted
 between them — both are tested as explicit outcomes rather than left to chance.
+
+Two lessons about validation, both learned the expensive way. Targeted suites
+proved every capability this plan set out to add and still missed two real
+defects, because neither lived in the feature's own behaviour: one was a
+capability the analyzer had but did not *advertise* through its trait object,
+and one was a doc comment. Only the whole-suite run reaches those. And a
+whole-suite run has to be judged by its exit code, not by counting passing
+targets — the doctest failure produced no `test result` line at all.
 
 Lesson worth carrying forward: writing the "what this deliberately does not do"
 tests at the same time as the capability tests was what kept the boundaries
