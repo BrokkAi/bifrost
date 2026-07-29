@@ -24387,6 +24387,48 @@ fn scala_trait_method_overridden_by_val_prefers_concrete_receiver_definition() {
 }
 
 #[test]
+fn scala_anonymous_mixin_type_prefers_trait_over_same_named_companion_object() {
+    let source = r#"package app
+sealed abstract class Glyph(label: String)
+object Glyph {
+  sealed trait MoveAssessment extends Glyph
+  object MoveAssessment {
+    val exact = new Glyph("x") with MoveAssessment
+  }
+
+  sealed trait MoveAssessmentDecoy extends Glyph
+  object MoveAssessmentDecoy {
+    val decoy = new Glyph("y") with MoveAssessmentDecoy
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Use.scala", source)
+        .build();
+
+    let mixin_start = source.find("with MoveAssessment").expect("anonymous mixin") + "with ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Use.scala", source, mixin_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Glyph$.MoveAssessment",
+        "{value}"
+    );
+    assert_ne!(
+        result["definitions"][0]["fqn"], "app.Glyph$.MoveAssessment$",
+        "{value}"
+    );
+    assert_ne!(
+        result["definitions"][0]["fqn"], "app.Glyph$.MoveAssessmentDecoy",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_instance_member_prefers_inherited_member_over_companion_object() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

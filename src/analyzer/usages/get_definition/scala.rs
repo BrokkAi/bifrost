@@ -24,7 +24,7 @@ use crate::analyzer::usages::scala_graph::syntax::{
     ScalaParameterListKind, ScalaParameterTypeIdentity, ScalaQualifiedStableTypeRole,
     applied_expression_for_reference, call_arities_for_reference, call_site_shape_for_reference,
     is_extractor_reference, is_infix_type_operator_reference, is_scala_case_pattern_binder,
-    is_scala_named_argument_assignment, qualified_stable_type_reference,
+    is_scala_class_reference, is_scala_named_argument_assignment, qualified_stable_type_reference,
     scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
     scala_pattern_binder_names, scala_source_facts,
 };
@@ -3635,6 +3635,13 @@ fn resolve_scala_with_context(
     // namespace and select a same-named companion object.
     if is_infix_type_operator_reference(node) {
         return resolve_scala_type(ctx, &resolver, root, node);
+    }
+    // Tree-sitter exposes some parser-proven type roles, including anonymous
+    // mixin operands like `new Base with Trait`, as bare identifiers rather
+    // than `type_identifier` nodes. Resolve those through the type namespace
+    // before the generic identifier branch can select a same-named companion.
+    if is_scala_class_reference(node, source) {
+        return resolve_scala_type(ctx, &resolver, root, qualified_type_root);
     }
     if let Some(outcome) = resolve_scala_bare_apply_fast_path(
         scala, analyzer, support, file, source, root, node, &resolver, session,
