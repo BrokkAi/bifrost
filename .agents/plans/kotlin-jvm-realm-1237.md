@@ -43,8 +43,8 @@ Use timestamps to measure rates of progress.
 - Observation: `cargo clippy` cannot be run bare in this environment. Two rustc 1.96.0 installs exist (rustup under `~/.cargo/bin`, Homebrew under `/opt/homebrew/bin`); `cargo` resolves to rustup's but `cargo-clippy` resolves to Homebrew's, and the mismatch fails the build script. A clean target directory does not help, including via `scripts/with-isolated-cargo-target.sh`.
   Evidence: `error[E0514]: found crate 'cc' compiled by an incompatible version of rustc`. The working invocation is `PATH="$HOME/.cargo/bin:$PATH" cargo clippy --all-targets --all-features -- -D warnings`.
 
-- Observation: `--features nlp,python` cannot link on this machine. The `python` feature builds `pyo3` in extension-module-less mode and the link step fails with hundreds of undefined `_Py*` symbols. This is an environment gap (no linkable `libpython`), unrelated to any change in this plan, and it also predates it. `--features nlp` builds and runs every integration suite this plan adds or touches, because those suites are gated on `nlp` only.
-  Evidence: `ld: symbol(s) not found for architecture arm64` listing `_PyUnicode_AsUTF8AndSize`, `_Py_InitializeEx`, and similar, from `libpyo3-*.rlib`. CI, which has a linkable Python, still needs the documented `--features nlp,python` gate.
+- Observation: `--features nlp,python` could not link during most of this work, so validation ran on `--features nlp` (which gates every suite this plan touches). Merging `origin/master` fixed it: #1295 stopped enabling `extension-module` for test builds, which was suppressing libpython linkage and producing hundreds of undefined `_Py*` symbols. The merge also introduced an `abi3-py312` floor, so pyo3's build script now rejects the macOS system `python3` (3.9) that wins the `PATH` lookup. The full gate therefore runs as `PYO3_PYTHON=$(brew --prefix python@3.13)/bin/python3.13 cargo test --features nlp,python`, exactly as the merged `CLAUDE.md` documents.
+  Evidence: before the merge, `ld: symbol(s) not found for architecture arm64` on `_Py_InitializeEx`; after it, `cannot set a minimum Python version 3.12 higher than the interpreter version 3.9` until `PYO3_PYTHON` is set. Note this also applies to `cargo clippy --all-features`, which enables `python` and hits the same build script.
 
 - Observation: The full-suite gate ran out of disk twice before completing. The machine's data volume was at 100% (121 MiB free) with 74 GB in this worktree's `target/`, 216 GB in a sibling worktree's, and 47 GB in two intentionally-retained isolated targets under `/private/tmp`. Deleting this worktree's `target/debug/incremental` (34 GB, pure regenerable cargo cache) was enough to finish; nothing outside this worktree was touched.
   Evidence: `error: failed to build archive ...: No space left on device (os error 28)`. `scripts/cleanup-bifrost-tmp.sh` reported only "skip retained" and "skip unmanaged" candidates, so it could not help without an explicit review of those directories.
@@ -358,9 +358,14 @@ Per-milestone tests:
     cargo test --features nlp,python --test kotlin_analyzer_test
     cargo test --features nlp,python --lib analyzer::jvm::external
 
-On a machine without a linkable `libpython`, drop `,python`: every suite this
-plan adds is gated on `nlp` only, and the `python` feature contributes nothing
-to them. See `Surprises & Discoveries`.
+On macOS, prefix every `python`-enabled command with an interpreter at or above
+the `abi3-py312` floor, because pyo3's build script resolves `python3` through
+`PATH` and `/usr/bin/python3` (3.9) usually wins:
+
+    PYO3_PYTHON=$(brew --prefix python@3.13)/bin/python3.13 cargo test --features nlp,python
+
+This applies to `cargo clippy --all-features` too, since `--all-features`
+enables `python`. See `Surprises & Discoveries`.
 
 Regression sweep over the JVM languages this plan renames or re-keys:
 
