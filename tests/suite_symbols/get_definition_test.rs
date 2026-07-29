@@ -27963,3 +27963,338 @@ fn scala_wildcard_imported_member_from_unindexed_import_still_fails_honestly() {
     let result = &value["results"][0];
     assert_ne!(result["status"], "resolved", "{value}");
 }
+
+// ---------------------------------------------------------------------------
+// Kotlin definition navigation (issue #1238).
+//
+// Fixtures are written multi-line with blank lines between declarations, the
+// way real Kotlin is written: the vendored grammar emits `MISSING
+// _automatic_semicolon` recovery nodes for single-line declaration bodies, so a
+// compressed fixture would exercise recovery rather than the shape under test.
+// ---------------------------------------------------------------------------
+
+/// Two files: a library declaring `lib.Base`, and an app importing and using it.
+/// The shared fixture for most Kotlin navigation tests.
+fn kotlin_base_and_app(app_source: &str) -> crate::common::BuiltInlineTestProject {
+    InlineTestProject::with_language(Language::Kotlin)
+        .file(
+            "lib/Base.kt",
+            r#"package lib
+
+open class Base {
+    fun greet(name: String): String = "hello " + name
+}
+
+class Other
+"#,
+        )
+        .file("app/App.kt", app_source)
+        .build()
+}
+
+#[test]
+fn kotlin_import_resolves_to_imported_class() {
+    let source = r#"package app
+
+import lib.Base
+
+fun use(base: Base) {
+}
+"#;
+    let project = kotlin_base_and_app(source);
+
+    let value = lookup(
+        project.root(),
+        &location_reference("app/App.kt", source, source.find("Base").expect("import")),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "lib.Base", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "lib/Base.kt", "{value}");
+}
+
+#[test]
+fn kotlin_import_package_segment_reports_a_package_reference() {
+    let source = r#"package app
+
+import lib.Base
+
+fun use(base: Base) {
+}
+"#;
+    let project = kotlin_base_and_app(source);
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("lib.Base").expect("import"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "package_reference",
+        "{value}"
+    );
+}
+
+#[test]
+fn kotlin_import_alias_resolves_to_the_aliased_class() {
+    let source = r#"package app
+
+import lib.Base as Parent
+
+fun use(parent: Parent) {
+}
+"#;
+    let project = kotlin_base_and_app(source);
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("as Parent").expect("alias") + 3,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "lib.Base", "{value}");
+}
+
+#[test]
+fn kotlin_aliased_type_annotation_resolves_to_the_aliased_class() {
+    let source = r#"package app
+
+import lib.Base as Parent
+
+fun use(parent: Parent) {
+}
+"#;
+    let project = kotlin_base_and_app(source);
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find(": Parent").expect("use") + 2,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "lib.Base", "{value}");
+}
+
+#[test]
+fn kotlin_type_annotation_resolves_to_class() {
+    let source = r#"package app
+
+import lib.Base
+
+fun use(base: Base) {
+}
+"#;
+    let project = kotlin_base_and_app(source);
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find(": Base").expect("annotation") + 2,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "lib.Base", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "lib/Base.kt", "{value}");
+}
+
+#[test]
+fn kotlin_supertype_reference_resolves_to_base_class() {
+    let source = r#"package app
+
+import lib.Base
+
+class Derived : Base()
+"#;
+    let project = kotlin_base_and_app(source);
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find(": Base()").expect("supertype") + 2,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "lib.Base", "{value}");
+}
+
+#[test]
+fn kotlin_nested_type_annotation_resolves_each_segment_exactly() {
+    let source = r#"package app
+
+class Outer {
+    class Inner
+}
+
+fun use(value: Outer.Inner) {
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/App.kt", source)
+        .build();
+
+    let qualified = source.find("Outer.Inner)").expect("qualified type");
+    for (offset, expected) in [(0usize, "app.Outer"), (6usize, "app.Outer.Inner")] {
+        let value = lookup(
+            project.root(),
+            &location_reference("app/App.kt", source, qualified + offset),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{expected}: {value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
+fn kotlin_enclosing_scope_resolves_a_nested_type_unqualified() {
+    let source = r#"package app
+
+class Outer {
+    class Inner
+
+    fun use(value: Inner) {
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find(": Inner").expect("use") + 2,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Outer.Inner",
+        "{value}"
+    );
+}
+
+#[test]
+fn kotlin_class_declaration_name_is_not_a_reference_site() {
+    let source = r#"package app
+
+class Declared
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference("app/App.kt", source, source.find("Declared").expect("name")),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "declaration_site",
+        "{value}"
+    );
+}
+
+#[test]
+fn kotlin_star_import_collision_reports_ambiguous() {
+    let source = r#"package app
+
+import first.*
+import second.*
+
+fun use(value: Shared) {
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("first/Shared.kt", "package first\n\nclass Shared\n")
+        .file("second/Shared.kt", "package second\n\nclass Shared\n")
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find(": Shared").expect("use") + 2,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "ambiguous_kotlin_type",
+        "{value}"
+    );
+    assert!(
+        result["definitions"]
+            .as_array()
+            .is_none_or(|units| units.is_empty()),
+        "an ambiguous star-import collision must not pick a winner: {value}"
+    );
+}
+
+/// Kotlin's explicit-import tier is terminal: `import other.Base` binds the
+/// name `Base` whether or not the target is indexed, so the reference must not
+/// silently fall through to a same-package class of the same name.
+#[test]
+fn kotlin_explicit_import_of_unknown_type_does_not_fall_through_to_same_package() {
+    let source = r#"package app
+
+import unindexed.Base
+
+fun use(base: Base) {
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/Base.kt", "package app\n\nclass Base\n")
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find(": Base").expect("use") + 2,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_ne!(result["status"], "resolved", "{value}");
+    assert!(
+        result["definitions"]
+            .as_array()
+            .is_none_or(|units| units.is_empty()),
+        "an explicitly imported unknown type must not resolve to a same-package namesake: {value}"
+    );
+}
