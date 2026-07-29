@@ -844,3 +844,28 @@ fn i1_silent_on_python_nested_class_fixture() {
         report.violations
     );
 }
+
+// An unnamed Kotlin companion object displays as `Companion`, but its
+// declaration text carries only the lowercase keyword (`companion object {`)
+// — never the capitalized token. The name-token check must accept the keyword
+// form (the react-native ×160 shape, reproduced on a tier-6 rerun).
+#[test]
+fn i1_silent_on_kotlin_companion_object_fixture() {
+    let project = InlineTestProject::new()
+        .file(
+            "src/HeadlessJsTaskService.kt",
+            "package com.example.service\n\nclass HeadlessJsTaskService {\n    public companion object {\n        private var wakeLock: Int = 0\n\n        @JvmStatic\n        fun acquire(): Int {\n            return wakeLock\n        }\n    }\n}\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let report =
+        run_invariants(workspace.analyzer(), &fuzzer_config("cpp")).expect("run invariants");
+    assert!(
+        report
+            .violations
+            .iter()
+            .all(|violation| violation.shape != "range-name-token-absent"),
+        "{:?}",
+        report.violations
+    );
+}
