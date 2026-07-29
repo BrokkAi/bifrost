@@ -3,8 +3,9 @@
 use super::common::language_for_target;
 use super::inverted_edges::{UsageEdgeWeights, UsageNodeKey, UsageReferenceCounts};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
+use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum UsageEcosystem {
@@ -105,9 +106,20 @@ pub(crate) struct WorkspaceUsageCatalog {
 
 impl WorkspaceUsageCatalog {
     pub(crate) fn build(analyzer: &dyn IAnalyzer) -> Self {
+        Self::build_with_cancellation(analyzer, &CancellationToken::default())
+            .expect("uncancelled workspace usage catalog construction")
+    }
+
+    pub(crate) fn build_with_cancellation(
+        analyzer: &dyn IAnalyzer,
+        cancellation: &CancellationToken,
+    ) -> Option<Self> {
         let mut declarations: BTreeMap<WorkspaceUsageNodeKey, Vec<(CodeUnit, Option<Range>)>> =
             BTreeMap::new();
         for (unit, range) in analyzer.all_declarations_with_primary_ranges() {
+            if cancellation.is_cancelled() {
+                return None;
+            }
             if unit.is_synthetic() || !(unit.is_class() || unit.is_callable()) {
                 continue;
             }
@@ -121,6 +133,9 @@ impl WorkspaceUsageCatalog {
         let mut indices = HashMap::default();
         let mut fqns_by_ecosystem: HashMap<UsageEcosystem, HashSet<String>> = HashMap::default();
         for (key, mut declarations) in declarations {
+            if cancellation.is_cancelled() {
+                return None;
+            }
             declarations.sort_by(|(left, left_range), (right, right_range)| {
                 left.source()
                     .cmp(right.source())
@@ -156,11 +171,11 @@ impl WorkspaceUsageCatalog {
                 unproven_inbound: 0,
             });
         }
-        Self {
+        Some(Self {
             nodes,
             indices,
             fqns_by_ecosystem,
-        }
+        })
     }
 
     pub(crate) fn fqns(&self, ecosystem: UsageEcosystem) -> &HashSet<String> {
@@ -168,6 +183,27 @@ impl WorkspaceUsageCatalog {
         self.fqns_by_ecosystem
             .get(&ecosystem)
             .unwrap_or_else(|| EMPTY.get_or_init(HashSet::default))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ecosystems(&self) -> BTreeSet<UsageEcosystem> {
+        self.nodes.iter().map(|node| node.key.ecosystem).collect()
+    }
+
+    pub(crate) fn ecosystems_for_files<'a>(
+        &self,
+        files: impl IntoIterator<Item = &'a ProjectFile>,
+    ) -> BTreeSet<UsageEcosystem> {
+        let files: HashSet<_> = files.into_iter().collect();
+        self.nodes
+            .iter()
+            .filter(|node| {
+                node.declaration_files
+                    .iter()
+                    .any(|file| files.contains(file))
+            })
+            .map(|node| node.key.ecosystem)
+            .collect()
     }
 
     fn index_of(&self, key: &WorkspaceUsageNodeKey) -> Option<usize> {
@@ -185,23 +221,118 @@ pub(crate) struct WorkspaceUsageEdge {
 pub(crate) struct WorkspaceUsageGraph {
     pub(crate) nodes: Vec<WorkspaceUsageNode>,
     pub(crate) edges: Vec<WorkspaceUsageEdge>,
+    #[cfg(test)]
+    pub(crate) resolved_ecosystems: Vec<UsageEcosystem>,
 }
 
-pub(crate) fn build_workspace_usage_graph(
+pub(crate) struct WorkspaceUsageRankingGraph {
+    pub(crate) graph: WorkspaceUsageGraph,
+    pub(crate) node_indices_by_file: HashMap<ProjectFile, Vec<usize>>,
+}
+
+impl WorkspaceUsageRankingGraph {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let mut retained = std::mem::size_of::<Self>()
+            .saturating_add(
+                self.graph
+                    .nodes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<WorkspaceUsageNode>()),
+            )
+            .saturating_add(
+                self.graph
+                    .edges
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<WorkspaceUsageEdge>()),
+            )
+            .saturating_add(
+                self.node_indices_by_file
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(ProjectFile, Vec<usize>)>()),
+            );
+        for node in &self.graph.nodes {
+            retained = retained
+                .saturating_add(node.key.fqn.capacity())
+                .saturating_add(
+                    node.key
+                        .defining_file
+                        .as_ref()
+                        .map(project_file_retained_bytes)
+                        .unwrap_or_default(),
+                )
+                .saturating_add(code_unit_retained_bytes(&node.primary))
+                .saturating_add(
+                    node.declaration_files
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<ProjectFile>()),
+                );
+            for file in &node.declaration_files {
+                retained = retained.saturating_add(project_file_retained_bytes(file));
+            }
+        }
+        for (file, indices) in &self.node_indices_by_file {
+            retained = retained
+                .saturating_add(project_file_retained_bytes(file))
+                .saturating_add(
+                    indices
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<usize>()),
+                );
+        }
+        retained
+    }
+}
+
+fn project_file_retained_bytes(file: &ProjectFile) -> usize {
+    std::mem::size_of::<ProjectFile>()
+        .saturating_add(file.root().as_os_str().len())
+        .saturating_add(file.rel_path().as_os_str().len())
+}
+
+fn code_unit_retained_bytes(unit: &CodeUnit) -> usize {
+    std::mem::size_of::<CodeUnit>()
+        .saturating_add(project_file_retained_bytes(unit.source()))
+        .saturating_add(unit.package_name().len())
+        .saturating_add(unit.short_name().len())
+        .saturating_add(unit.signature().map(str::len).unwrap_or_default())
+        .saturating_add(unit.fq_name().len())
+}
+
+pub(crate) enum WorkspaceUsageGraphBuildOutcome {
+    Complete(WorkspaceUsageGraph),
+    Cancelled,
+}
+
+pub(crate) fn build_workspace_usage_graph_with_cancellation(
     analyzer: &dyn IAnalyzer,
     catalog: WorkspaceUsageCatalog,
-) -> WorkspaceUsageGraph {
+    selected_ecosystems: &BTreeSet<UsageEcosystem>,
+    cancellation: &CancellationToken,
+) -> WorkspaceUsageGraphBuildOutcome {
     let mut nodes = catalog.nodes.clone();
     let mut edges = Vec::new();
+    #[cfg(test)]
+    let mut resolved_ecosystems = Vec::new();
 
     macro_rules! record_package_edges {
         ($scope:literal, $ecosystem:expr, $builder:path) => {{
-            let _scope = crate::profiling::scope($scope);
-            let fqns = catalog.fqns($ecosystem);
-            if !fqns.is_empty()
-                && let Some(result) = $builder(analyzer, fqns, |_| true)
-            {
-                record_weighted_edges($ecosystem, result, &catalog, &mut nodes, &mut edges);
+            if selected_ecosystems.contains(&$ecosystem) {
+                if cancellation.is_cancelled() {
+                    return WorkspaceUsageGraphBuildOutcome::Cancelled;
+                }
+                let _scope = crate::profiling::scope($scope);
+                let fqns = catalog.fqns($ecosystem);
+                if !fqns.is_empty() {
+                    #[cfg(test)]
+                    resolved_ecosystems.push($ecosystem);
+                    if let Some(result) = $builder(analyzer, fqns, |_| !cancellation.is_cancelled())
+                    {
+                        record_weighted_edges($ecosystem, result, &catalog, &mut nodes, &mut edges);
+                    }
+                }
+                if cancellation.is_cancelled() {
+                    return WorkspaceUsageGraphBuildOutcome::Cancelled;
+                }
             }
         }};
     }
@@ -252,53 +383,76 @@ pub(crate) fn build_workspace_usage_graph(
         super::scala_graph::build_scala_usage_edge_weights
     );
 
-    let _jsts_scope = crate::profiling::scope("workspace_usage_graph::resolve_jsts");
-    let scoped_nodes: HashSet<_> = catalog
-        .nodes
-        .iter()
-        .filter(|node| node.key.ecosystem == UsageEcosystem::JavaScriptTypeScript)
-        .map(|node| {
-            UsageNodeKey::new(
-                node.key
-                    .defining_file
-                    .clone()
-                    .expect("JS/TS catalog keys are file scoped"),
-                node.key.fqn.clone(),
-            )
-        })
-        .collect();
-    if !scoped_nodes.is_empty()
-        && let Some(result) =
-            super::js_ts_graph::build_jsts_scoped_usage_edges(analyzer, &scoped_nodes, |_| true)
-    {
-        let convert = |key: UsageNodeKey| WorkspaceUsageNodeKey {
-            ecosystem: UsageEcosystem::JavaScriptTypeScript,
-            fqn: key.fqn,
-            defining_file: Some(key.file),
-        };
-        for ((from, to), counts) in result.edges.edges {
-            let (Some(from), Some(to)) = (
-                catalog.index_of(&convert(from)),
-                catalog.index_of(&convert(to)),
-            ) else {
-                continue;
-            };
-            edges.push(WorkspaceUsageEdge { from, to, counts });
+    if selected_ecosystems.contains(&UsageEcosystem::JavaScriptTypeScript) {
+        let _jsts_scope = crate::profiling::scope("workspace_usage_graph::resolve_jsts");
+        if cancellation.is_cancelled() {
+            return WorkspaceUsageGraphBuildOutcome::Cancelled;
         }
-        for (key, total) in result.edges.truncated {
-            if let Some(index) = catalog.index_of(&convert(key)) {
-                nodes[index].truncated_inbound = Some(total);
+        let scoped_nodes: HashSet<_> = catalog
+            .nodes
+            .iter()
+            .filter(|node| node.key.ecosystem == UsageEcosystem::JavaScriptTypeScript)
+            .map(|node| {
+                UsageNodeKey::new(
+                    node.key
+                        .defining_file
+                        .clone()
+                        .expect("JS/TS catalog keys are file scoped"),
+                    node.key.fqn.clone(),
+                )
+            })
+            .collect();
+        if !scoped_nodes.is_empty() {
+            #[cfg(test)]
+            resolved_ecosystems.push(UsageEcosystem::JavaScriptTypeScript);
+            if let Some(result) =
+                super::js_ts_graph::build_jsts_scoped_usage_edges(analyzer, &scoped_nodes, |_| {
+                    !cancellation.is_cancelled()
+                })
+            {
+                let convert = |key: UsageNodeKey| WorkspaceUsageNodeKey {
+                    ecosystem: UsageEcosystem::JavaScriptTypeScript,
+                    fqn: key.fqn,
+                    defining_file: Some(key.file),
+                };
+                for ((from, to), counts) in result.edges.edges {
+                    let (Some(from), Some(to)) = (
+                        catalog.index_of(&convert(from)),
+                        catalog.index_of(&convert(to)),
+                    ) else {
+                        continue;
+                    };
+                    edges.push(WorkspaceUsageEdge { from, to, counts });
+                }
+                for (key, total) in result.edges.truncated {
+                    if let Some(index) = catalog.index_of(&convert(key)) {
+                        nodes[index].truncated_inbound = Some(total);
+                    }
+                }
+                for (key, total) in result.edges.unproven_inbound {
+                    if let Some(index) = catalog.index_of(&convert(key)) {
+                        nodes[index].unproven_inbound += total;
+                    }
+                }
             }
         }
-        for (key, total) in result.edges.unproven_inbound {
-            if let Some(index) = catalog.index_of(&convert(key)) {
-                nodes[index].unproven_inbound += total;
-            }
+
+        if cancellation.is_cancelled() {
+            return WorkspaceUsageGraphBuildOutcome::Cancelled;
         }
     }
 
+    if cancellation.is_cancelled() {
+        return WorkspaceUsageGraphBuildOutcome::Cancelled;
+    }
+
     edges.sort_by_key(|edge| (edge.from, edge.to));
-    WorkspaceUsageGraph { nodes, edges }
+    WorkspaceUsageGraphBuildOutcome::Complete(WorkspaceUsageGraph {
+        nodes,
+        edges,
+        #[cfg(test)]
+        resolved_ecosystems,
+    })
 }
 
 fn record_weighted_edges(
