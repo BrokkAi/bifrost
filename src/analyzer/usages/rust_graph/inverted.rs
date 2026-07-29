@@ -692,6 +692,33 @@ fn handle_use_declaration(node: Node<'_>, ctx: &mut RustScan<'_, '_>) {
                     ctx.record(callee, focused.unwrap_or(path));
                 }
             }
+            "scoped_identifier" | "scoped_type_identifier" => {
+                if let Some(path) = current.child_by_field_name("path")
+                    && let Some(callee) =
+                        ctx.use_path_callee(path, Some(RustReferenceNamespace::PathPrefix))
+                {
+                    let focused = rust_path_segments(path).and_then(|path| path.last().copied());
+                    ctx.record(callee, focused.unwrap_or(path));
+                }
+                if let Some(callee) = ctx.use_path_callee(current, None)
+                    && let Some(name) = current.child_by_field_name("name")
+                {
+                    ctx.record(callee, name);
+                }
+            }
+            "use_as_clause" => {
+                let Some(path) = current.child_by_field_name("path") else {
+                    continue;
+                };
+                if let Some(callee) = ctx.use_path_callee(path, None) {
+                    let focused = path
+                        .child_by_field_name("name")
+                        .or_else(|| rust_path_segments(path).and_then(|path| path.last().copied()))
+                        .unwrap_or(path);
+                    ctx.record(callee, focused);
+                }
+                continue;
+            }
             "identifier" | "type_identifier" | "self" => {
                 if !use_path_leaf_is_prefix(current)
                     && let Some(callee) = ctx.use_path_callee(current, None)
@@ -770,6 +797,17 @@ fn handle_scoped(node: Node<'_>, ctx: &mut RustScan<'_, '_>, _scopes: &[ScopeFac
     if path_text.is_empty() || name_text.is_empty() {
         return;
     }
+    if let Some(owner_segments) = rust_path_segments(path)
+        && let Some(owner) = ctx.refs.resolve_scoped_owner(path_text)
+        && let Some(owner_callee) = ctx.authorize_nonmember_candidate(
+            owner,
+            &owner_segments,
+            RustReferenceNamespace::PathPrefix,
+        )
+        && let Some(owner_terminal) = owner_segments.last().copied()
+    {
+        ctx.record(owner_callee, owner_terminal);
+    }
     if let Some(callee) = ctx.scoped_callee(node, path_text, name_text) {
         ctx.record(callee, name);
     }
@@ -778,6 +816,14 @@ fn handle_scoped(node: Node<'_>, ctx: &mut RustScan<'_, '_>, _scopes: &[ScopeFac
 fn handle_method_call(node: Node<'_>, ctx: &mut RustScan<'_, '_>, scopes: &[ScopeFacts]) {
     let Some(function) = node.child_by_field_name("function") else {
         return;
+    };
+    let function = if function.kind() == "generic_function" {
+        match function.child_by_field_name("function") {
+            Some(inner) => inner,
+            None => return,
+        }
+    } else {
+        function
     };
     if function.kind() != "field_expression" {
         return;

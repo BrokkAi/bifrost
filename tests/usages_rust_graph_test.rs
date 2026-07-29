@@ -10219,6 +10219,389 @@ fn rust_authoritative_dependency_reexport_resolves_associated_call_owner() {
 }
 
 #[test]
+fn rust_graph_grouped_dependency_import_keeps_original_terminal_with_aliased_sibling() {
+    let consumer = r#"
+use dns_test::tsig::{TsigAlgorithm as TestTsigAlgorithm, TsigKey, TsigSecretKey};
+use dns_alt::tsig::{TsigAlgorithm as AltTsigAlgorithm};
+
+fn build(_: TestTsigAlgorithm, _: AltTsigAlgorithm, _: TsigKey, _: TsigSecretKey) {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"dns-test\", \"dns-alt\", \"compatibility-tests\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "dns-test/Cargo.toml",
+            "[package]\nname = \"dns-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("dns-test/src/lib.rs", "pub mod tsig;\n"),
+        (
+            "dns-test/src/tsig.rs",
+            "pub struct TsigAlgorithm;\npub struct TsigKey;\npub struct TsigSecretKey;\n",
+        ),
+        (
+            "dns-alt/Cargo.toml",
+            "[package]\nname = \"dns-alt\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("dns-alt/src/lib.rs", "pub mod tsig;\n"),
+        ("dns-alt/src/tsig.rs", "pub struct TsigAlgorithm;\n"),
+        (
+            "compatibility-tests/Cargo.toml",
+            "[package]\nname = \"compatibility-tests\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ndns_test = { package = \"dns-test\", path = \"../dns-test\" }\ndns_alt = { package = \"dns-alt\", path = \"../dns-alt\" }\n",
+        ),
+        ("compatibility-tests/src/lib.rs", consumer),
+    ]);
+    let candidate = project.file("compatibility-tests/src/lib.rs");
+    let target = definition(&analyzer, "dns-test.src.tsig.TsigAlgorithm");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .all_hits_including_imports();
+    let expected = consumer
+        .find("TsigAlgorithm as TestTsigAlgorithm")
+        .expect("grouped dependency import");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == candidate
+                && (hit.start_offset, hit.end_offset)
+                    == (expected, expected + "TsigAlgorithm".len())
+                && hit.kind == UsageHitKind::Import
+        }),
+        "grouped dependency import must keep the original terminal even when a sibling alias is present: {hits:#?}"
+    );
+    assert_eq!(
+        1,
+        hits.iter()
+            .filter(|hit| {
+                hit.file == candidate
+                    && (hit.start_offset, hit.end_offset)
+                        == (expected, expected + "TsigAlgorithm".len())
+                    && hit.kind == UsageHitKind::Import
+            })
+            .count(),
+        "grouped dependency import should record exactly one import hit at the original terminal: {hits:#?}"
+    );
+    let sibling = consumer
+        .find("TsigAlgorithm as AltTsigAlgorithm")
+        .expect("sibling grouped import");
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != candidate
+                || (hit.start_offset, hit.end_offset) != (sibling, sibling + "TsigAlgorithm".len())
+        }),
+        "the same terminal imported from a sibling module must not be attributed to dns_test: {hits:#?}"
+    );
+    let same_prefix_sibling = consumer
+        .find("TsigKey")
+        .expect("same-prefix sibling import");
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != candidate
+                || (hit.start_offset, hit.end_offset)
+                    != (same_prefix_sibling, same_prefix_sibling + "TsigKey".len())
+        }),
+        "a sibling terminal under the same owner prefix must not be attributed to TsigAlgorithm: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_graph_dependency_imported_bare_function_call_stays_exact() {
+    let consumer = r#"
+use wealthfolio_ai::live_evals::runner::{is_blocking, run_case, AssertionFailure};
+
+fn execute() {
+    if !is_blocking() {
+        run_case();
+    }
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"wealthfolio-ai\", \"wealthfolio-app\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "wealthfolio-ai/Cargo.toml",
+            "[package]\nname = \"wealthfolio-ai\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("wealthfolio-ai/src/lib.rs", "pub mod live_evals;\n"),
+        ("wealthfolio-ai/src/live_evals/mod.rs", "pub mod runner;\n"),
+        (
+            "wealthfolio-ai/src/live_evals/runner.rs",
+            "pub fn is_blocking() -> bool { false }\npub fn run_case() {}\npub struct AssertionFailure;\n",
+        ),
+        (
+            "wealthfolio-app/Cargo.toml",
+            "[package]\nname = \"wealthfolio-app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nwealthfolio_ai = { package = \"wealthfolio-ai\", path = \"../wealthfolio-ai\" }\n",
+        ),
+        ("wealthfolio-app/src/lib.rs", consumer),
+    ]);
+    let candidate = project.file("wealthfolio-app/src/lib.rs");
+    let target = definition(&analyzer, "wealthfolio-ai.src.live_evals.runner.run_case");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .all_hits();
+    let expected = consumer.find("run_case();").expect("imported bare call");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == candidate
+                && (hit.start_offset, hit.end_offset) == (expected, expected + "run_case".len())
+                && hit.kind == UsageHitKind::Reference
+        }),
+        "a dependency function imported through a grouped use must keep its exact bare call edge: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_graph_imported_receiver_method_call_keeps_exact_owner() {
+    let consumer = r#"
+use crate::checkpoint::base::Checkpointer;
+
+fn backward(checkpointer: &mut Checkpointer, state: usize) {
+    checkpointer.retrieve_node_output::<u8>(state);
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod checkpoint;\npub mod ops;\n"),
+        ("src/checkpoint/mod.rs", "pub mod base;\n"),
+        (
+            "src/checkpoint/base.rs",
+            "pub struct Checkpointer;\nimpl Checkpointer { pub fn retrieve_node_output<T>(&mut self, _: usize) -> T where T: Default { T::default() } }\n",
+        ),
+        ("src/ops.rs", consumer),
+    ]);
+    let candidate = project.file("src/ops.rs");
+    let target = member(
+        &analyzer,
+        &project.file("src/checkpoint/base.rs"),
+        "Checkpointer",
+        "retrieve_node_output",
+    );
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .all_hits();
+    let expected = consumer
+        .find("retrieve_node_output::<u8>")
+        .expect("typed receiver method call");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == candidate
+                && (hit.start_offset, hit.end_offset)
+                    == (expected, expected + "retrieve_node_output".len())
+                && hit.kind == UsageHitKind::Reference
+        }),
+        "an imported receiver type on a parameter must keep the exact method-call edge: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_graph_associated_paths_keep_owner_type_hits() {
+    let consumer = r#"
+use burn_std::distribution::Distribution;
+use hickory_proto::op::ResponseCode;
+
+fn build() {
+    let _ = Distribution::Default;
+    let _ = ResponseCode::NXDomain;
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"burn-std\", \"hickory-proto\", \"app\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "burn-std/Cargo.toml",
+            "[package]\nname = \"burn-std\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("burn-std/src/lib.rs", "pub mod distribution;\n"),
+        (
+            "burn-std/src/distribution.rs",
+            "pub enum Distribution { Default }\n",
+        ),
+        (
+            "hickory-proto/Cargo.toml",
+            "[package]\nname = \"hickory-proto\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("hickory-proto/src/lib.rs", "pub mod op;\n"),
+        (
+            "hickory-proto/src/op.rs",
+            "pub enum ResponseCode { NXDomain }\n",
+        ),
+        (
+            "app/Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nburn_std = { package = \"burn-std\", path = \"../burn-std\" }\nhickory_proto = { package = \"hickory-proto\", path = \"../hickory-proto\" }\n",
+        ),
+        ("app/src/lib.rs", consumer),
+    ]);
+    let candidate = project.file("app/src/lib.rs");
+    for (target_fqn, marker, owner_len) in [
+        (
+            "burn-std.src.distribution.Distribution",
+            "Distribution::Default",
+            "Distribution".len(),
+        ),
+        (
+            "hickory-proto.src.op.ResponseCode",
+            "ResponseCode::NXDomain",
+            "ResponseCode".len(),
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let hits = UsageFinder::new()
+            .find_usages_default(&analyzer, &[target])
+            .all_hits();
+        let expected = consumer.find(marker).expect("associated owner path");
+
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == candidate
+                    && (hit.start_offset, hit.end_offset) == (expected, expected + owner_len)
+                    && hit.kind == UsageHitKind::Reference
+            }),
+            "associated value paths must retain an owner-type hit for {target_fqn}: {hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn rust_graph_scoped_paths_keep_owner_hits_for_class_and_module_roots() {
+    let consumer = r#"
+mod activities { pub fn table() {} }
+mod server {
+    pub struct DnsServer;
+    impl DnsServer { pub fn parse() -> Self { Self } }
+    pub struct DnsClient;
+    impl DnsClient { pub fn parse() -> Self { Self } }
+}
+
+fn run() {
+    let _ = crate::server::DnsServer::parse();
+    let _ = crate::server::DnsClient::parse();
+    let _ = crate::activities::table();
+    let _ = server::DnsServer::parse();
+    let _ = activities::table();
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            "pub mod activities;\npub mod server;\npub mod app;\n",
+        ),
+        ("src/activities.rs", "pub fn table() {}\n"),
+        (
+            "src/server.rs",
+            "pub struct DnsServer;\nimpl DnsServer { pub fn parse() -> Self { Self } }\npub struct DnsClient;\nimpl DnsClient { pub fn parse() -> Self { Self } }\n",
+        ),
+        ("src/app.rs", consumer),
+    ]);
+    let candidate = project.file("src/app.rs");
+
+    for (target_fqn, marker, owner_prefix_len, owner_len) in [
+        (
+            "server.DnsServer",
+            "crate::server::DnsServer::parse",
+            "crate::server::".len(),
+            "DnsServer".len(),
+        ),
+        (
+            "activities",
+            "crate::activities::table",
+            "crate::".len(),
+            "activities".len(),
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let hits = UsageFinder::new()
+            .find_usages_default(&analyzer, &[target])
+            .all_hits();
+        let expected = consumer.rfind(marker).expect("scoped owner path");
+
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == candidate
+                    && (hit.start_offset, hit.end_offset)
+                        == (
+                            expected + owner_prefix_len,
+                            expected + owner_prefix_len + owner_len,
+                        )
+                    && hit.kind == UsageHitKind::Reference
+            }),
+            "scoped path must retain the owner hit for {target_fqn}: {hits:#?}"
+        );
+    }
+
+    let dns_target = definition(&analyzer, "server.DnsServer");
+    let dns_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[dns_target])
+        .all_hits();
+    let sibling_dns = consumer
+        .find("DnsClient::parse")
+        .expect("same-prefix sibling owner path");
+    assert!(
+        dns_hits.iter().all(|hit| {
+            hit.file != candidate
+                || (hit.start_offset, hit.end_offset)
+                    != (sibling_dns, sibling_dns + "DnsClient".len())
+        }),
+        "a sibling terminal under the same module prefix must not be attributed to DnsServer: {dns_hits:#?}"
+    );
+    let local_dns = consumer
+        .rfind("server::DnsServer::parse")
+        .expect("local shadowed server path");
+    assert!(
+        dns_hits.iter().all(|hit| {
+            hit.file != candidate
+                || (hit.start_offset, hit.end_offset)
+                    != (
+                        local_dns + "server::".len(),
+                        local_dns + "server::".len() + "DnsServer".len(),
+                    )
+        }),
+        "a local shadowing server module must not be authorized as the crate::server owner: {dns_hits:#?}"
+    );
+
+    let server_target = definition(&analyzer, "server");
+    let server_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[server_target])
+        .all_hits();
+    let intermediate_server = consumer
+        .find("crate::server::DnsServer::parse")
+        .expect("intermediate server prefix");
+    assert!(
+        server_hits.iter().any(|hit| {
+            hit.file == candidate
+                && (hit.start_offset, hit.end_offset)
+                    == (
+                        intermediate_server + "crate::".len(),
+                        intermediate_server + "crate::".len() + "server".len(),
+                    )
+                && hit.kind == UsageHitKind::Reference
+        }),
+        "an intermediate module prefix should remain a legitimate module hit: {server_hits:#?}"
+    );
+
+    let activities_target = definition(&analyzer, "activities");
+    let activities_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[activities_target])
+        .all_hits();
+    let local_activities = consumer
+        .rfind("activities::table")
+        .expect("local shadowed activities path");
+    assert!(
+        activities_hits.iter().all(|hit| {
+            hit.file != candidate
+                || (hit.start_offset, hit.end_offset)
+                    != (local_activities, local_activities + "activities".len())
+        }),
+        "a local shadowing activities module must not be authorized as the crate::activities owner: {activities_hits:#?}"
+    );
+}
+
+#[test]
 fn rust_authoritative_associated_member_declared_on_type_alias_is_scanned_as_member() {
     let source = r#"
 pub enum EitherWriter<A, B> { A(A), B(B) }
