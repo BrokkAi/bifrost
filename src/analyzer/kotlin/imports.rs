@@ -314,6 +314,17 @@ impl ImportAnalysisProvider for KotlinAnalyzer {
         Some(self.resolve_import_infos(imports, None))
     }
 
+    /// Kotlin files that reference `file`.
+    ///
+    /// Deliberately Kotlin-to-Kotlin, even under a multi-language analyzer.
+    /// Answering "which Kotlin files reference this *Java* file" needs both
+    /// halves of this index to cross the realm, and only one of them can:
+    /// the import half could consult the realm view, but the same-package half
+    /// needs each JVM member's files and top-level declarations, which the
+    /// realm's forward-query surface does not expose. A half-crossing answer —
+    /// imports counted, same-package references silently dropped — would be
+    /// worse than a clearly bounded one, so the whole question stays with the
+    /// usage-graph work in #1239.
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
         if let Some(cached) = self.referencing_files.get(file) {
             return (*cached).clone();

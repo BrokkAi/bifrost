@@ -727,3 +727,116 @@ fn kotlin_without_a_classpath_leaves_dependency_names_unknown() {
          never silently known"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Explicitly unsupported outcomes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn kotlin_multiplatform_source_sets_index_but_do_not_gain_platform_default_imports() {
+    // Kotlin/JVM is this tier's target. A multiplatform layout is still
+    // indexed — declarations, imports, and hierarchy all work — but a name that
+    // would only be visible through a Kotlin/JS or Kotlin/Native default import
+    // is not claimed as resolvable.
+    let (built, analyzer) = kotlin_analyzer(&[
+        (
+            "src/commonMain/kotlin/app/Shared.kt",
+            "package app\n\nopen class Shared\n",
+        ),
+        (
+            "src/jvmMain/kotlin/app/JvmImpl.kt",
+            "package app\n\nclass JvmImpl : Shared()\n",
+        ),
+        (
+            "src/jsMain/kotlin/app/JsImpl.kt",
+            "package app\n\nclass JsImpl : Shared()\n",
+        ),
+    ]);
+
+    // Every source set is indexed, and same-package resolution works across
+    // them because they declare the same package.
+    assert_eq!(ancestor_names(&analyzer, "app.JvmImpl"), vec!["app.Shared"]);
+    assert_eq!(ancestor_names(&analyzer, "app.JsImpl"), vec!["app.Shared"]);
+
+    // `Promise` is a Kotlin/JS default import (`kotlin.js.*`), which this tier
+    // deliberately does not model.
+    assert!(
+        !analyzer
+            .is_known_type_name_in_file(&built.file("src/jsMain/kotlin/app/JsImpl.kt"), "Promise"),
+        "a Kotlin/JS default import is not claimed on a Kotlin/JVM analyzer"
+    );
+}
+
+#[test]
+fn kotlin_expect_and_actual_declarations_index_without_a_claimed_link() {
+    // `expect`/`actual` is a multiplatform compiler relationship, not a
+    // supertype relationship. Both sides are ordinary declarations here and no
+    // link between them is asserted.
+    let (_built, analyzer) = kotlin_analyzer(&[
+        (
+            "src/commonMain/kotlin/app/Clock.kt",
+            "package app\n\nexpect class Clock {\n    fun now(): Long\n}\n",
+        ),
+        (
+            "src/jvmMain/kotlin/app/Clock.kt",
+            "package app\n\nactual class Clock {\n    actual fun now(): Long = 0L\n}\n",
+        ),
+    ]);
+
+    let declarations: Vec<String> = analyzer
+        .get_definitions("app.Clock")
+        .iter()
+        .map(CodeUnit::fq_name)
+        .collect();
+    assert!(
+        declarations.len() >= 2,
+        "both the expect and the actual declaration are indexed: {declarations:?}"
+    );
+    assert!(
+        ancestor_names(&analyzer, "app.Clock").is_empty(),
+        "expect/actual is not inheritance and must not be reported as such"
+    );
+}
+
+#[test]
+fn kotlin_generated_jvm_surfaces_never_appear_in_an_identity() {
+    let (built, analyzer) = kotlin_analyzer(&[(
+        "app/Facade.kt",
+        "package app\n\
+         \n\
+         interface Contract\n\
+         \n\
+         class Owner : Contract {\n\
+             companion object {\n\
+                 fun create(): Owner = Owner()\n\
+             }\n\
+         }\n\
+         \n\
+         fun topLevel(): Int = 1\n",
+    )]);
+
+    let names: Vec<String> = analyzer
+        .get_all_declarations()
+        .iter()
+        .map(CodeUnit::fq_name)
+        .collect();
+    assert!(
+        names.iter().any(|name| name == "app.Owner.Companion"),
+        "an anonymous companion is named by its Kotlin spelling: {names:?}"
+    );
+    assert!(
+        names.iter().all(|name| !name.contains('$')),
+        "no `$` encoding may reach an identity: {names:?}"
+    );
+    assert!(
+        names.iter().all(|name| !name.contains("FacadeKt")),
+        "the generated file facade is not a declaration: {names:?}"
+    );
+
+    // The same holds on the resolution paths this issue adds.
+    assert_eq!(ancestor_names(&analyzer, "app.Owner"), vec!["app.Contract"]);
+    assert!(
+        !analyzer.is_known_type_name_in_file(&built.file("app/Facade.kt"), "FacadeKt"),
+        "a name that only exists as a compiler artifact must not resolve"
+    );
+}

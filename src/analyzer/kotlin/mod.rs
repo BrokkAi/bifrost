@@ -1,19 +1,32 @@
-//! Kotlin analyzer: core parsing, declaration indexing, and persistence
-//! (issue #1236).
+//! Kotlin analyzer: parsing, declaration indexing, persistence, and name
+//! resolution.
 //!
 //! `KotlinAnalyzer` is a thin wrapper over the shared
 //! [`TreeSitterAnalyzer`] engine: file enumeration, incremental updates,
 //! persisted store round-trips, and every declaration-oriented query delegate
 //! to the engine, with Kotlin-specific behavior isolated in
-//! [`adapter::KotlinAdapter`] and [`declarations`].
+//! [`adapter::KotlinAdapter`] and [`declarations`] (issue #1236).
 //!
-//! Name resolution — structured imports, supertypes, and the shared JVM
-//! dependency realm — lands in [`imports`] (issue #1237).
+//! Name resolution is split across [`imports`] (structured import facts and
+//! the file relationships they create), [`supertypes`] (what a class-like
+//! declaration extends), [`types`] (the resolution ladder), and [`hierarchy`]
+//! (ancestors and descendants). Kotlin also joins the shared JVM realm here:
+//! it reads the same jar-backed dependency index Java and Scala use, and
+//! `MultiAnalyzer` widens its import and hierarchy resolution across Java and
+//! Scala sources through `crate::analyzer::jvm::realm` (issue #1237).
+//!
+//! Deliberate boundaries within Kotlin/JVM name resolution: Kotlin/JS and
+//! Kotlin/Native default imports are not modelled, `expect`/`actual` pairs are
+//! indexed as ordinary declarations with no link asserted between them, and a
+//! type reachable only through an unconfigured classpath stays explicitly
+//! unknown.
 //!
 //! Capabilities owned by sibling issues stay explicitly unsupported here:
-//! definition navigation (#1238), usage graphs (#1239), structural RQL
-//! (#1240), and CFG/semantic lowering (#1241 — the analyzer delegate hands out
-//! the shared `UnsupportedProgramSemantics` provider instead of lowering).
+//! definition navigation (#1238), usage graphs (#1239 — Kotlin is a member of
+//! the shared JVM usage-candidate realm but has no edge builder yet),
+//! structural RQL (#1240), and CFG/semantic lowering (#1241 — the analyzer
+//! delegate hands out the shared `UnsupportedProgramSemantics` provider
+//! instead of lowering).
 
 mod adapter;
 pub(crate) mod declarations;

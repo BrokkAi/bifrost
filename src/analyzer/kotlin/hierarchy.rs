@@ -78,24 +78,15 @@ impl KotlinAnalyzer {
         if !code_unit.is_class() {
             return Vec::new();
         }
-        let mut ancestors = Vec::new();
-        let mut seen = HashSet::default();
-        for spelled in self.inner.raw_supertypes_of(code_unit) {
-            let Some(resolution) = self.resolve_type_name_for_owner(code_unit, &spelled, realm)
-            else {
-                // An unresolvable supertype yields no ancestor. Kotlin code
-                // routinely extends types from dependencies that are not on the
-                // configured classpath, and inventing a declaration for one
-                // would put a name in the hierarchy that no query can open.
-                continue;
-            };
-            if let super::types::KotlinTypeResolution::Source(unit) = resolution
-                && seen.insert(unit.fq_name())
-            {
-                ancestors.push(unit);
-            }
+        let raw_supertypes = self.inner.raw_supertypes_of(code_unit);
+        if raw_supertypes.is_empty() {
+            // Most classes declare nothing, and the scope below is the
+            // expensive part — it walks the owner chain and every inherited
+            // nested scope — so it is never built for them.
+            return Vec::new();
         }
-        ancestors
+        let imports = self.inner.import_info_of(code_unit.source());
+        self.resolve_ancestors_from_facts(code_unit, &raw_supertypes, &imports, realm)
     }
 
     fn build_direct_descendant_index(
@@ -109,10 +100,10 @@ impl KotlinAnalyzer {
             .unwrap_or_default();
         candidates.sort_by(|left, right| left.declaration.cmp(&right.declaration));
 
-        // Resolving a supertype needs the whole candidate set as its existence
-        // oracle, so the fq-name view is built first and the batched hydration
-        // below only supplies each candidate's own spelled supertypes and
-        // imports.
+        // Hydration is batched because each candidate needs two facts that are
+        // not in the candidate row itself — the supertypes it spells and the
+        // file's imports — and fetching those one declaration at a time would
+        // be a store round-trip per class.
         let mut ancestors_by_owner: HashMap<CodeUnit, Vec<CodeUnit>> = HashMap::default();
         for batch_start in (0..candidates.len()).step_by(HIERARCHY_FACT_BATCH_SIZE) {
             let batch_end = (batch_start + HIERARCHY_FACT_BATCH_SIZE).min(candidates.len());
@@ -151,8 +142,12 @@ impl KotlinAnalyzer {
         )
     }
 
-    /// Resolve one declaration's ancestors from facts already in hand, without
-    /// re-reading its file.
+    /// Resolve one declaration's ancestors from facts already in hand.
+    ///
+    /// A supertype that does not resolve yields no ancestor. Kotlin code
+    /// routinely extends types from dependencies that are not on the configured
+    /// classpath, and inventing a declaration for one would put a name in the
+    /// hierarchy that no query can open.
     fn resolve_ancestors_from_facts(
         &self,
         owner: &CodeUnit,

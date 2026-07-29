@@ -384,20 +384,4 @@ impl KotlinAnalyzer {
             })
             .collect()
     }
-
-    /// Resolve a type name as written inside `owner`'s body.
-    pub(crate) fn resolve_type_name_for_owner(
-        &self,
-        owner: &CodeUnit,
-        raw_name: &str,
-        realm: Option<&JvmSourceRealm<'_>>,
-    ) -> Option<KotlinTypeResolution> {
-        let imports = self.inner.import_info_of(owner.source());
-        let scope = KotlinNameScope {
-            package_name: owner.package_name(),
-            imports: &imports,
-            scope_owners: self.scope_owners_for(owner),
-        };
-        self.resolve_type_name_in_scope(raw_name, &scope, realm)
-    }
 }

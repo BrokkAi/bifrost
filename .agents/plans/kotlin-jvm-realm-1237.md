@@ -28,7 +28,7 @@ How to see it working: the tests in `tests/kotlin_imports_and_hierarchy.rs` and 
 - [x] (2026-07-29) M3: Kotlin supertypes, type-name resolution, and `TypeHierarchyProvider`.
 - [x] (2026-07-29) M4: Shared JVM usage-candidate realm (`UsageEcosystem::Jvm`).
 - [x] (2026-07-29) M5: Cross-language JVM source realm resolution.
-- [ ] M6: Explicit unsupported outcomes, epoch bump, and full validation.
+- [x] (2026-07-29) M6: Explicit unsupported outcomes, epoch bump, and full validation.
 
 Use timestamps to measure rates of progress.
 
@@ -67,6 +67,10 @@ Use timestamps to measure rates of progress.
   Rationale: `MultiAnalyzer` owns the per-language delegates; storing sibling analyzers inside each delegate would create `Arc` cycles between Java, Scala, and Kotlin (`CLAUDE.md` warns against naive reference counting). A view constructed from `&dyn IAnalyzer` at the `MultiAnalyzer` boundary — the same `resolve_analyzer::<T>` precedent `src/analyzer/usages/java_graph/jvm_scala.rs` already uses — has no ownership at all.
   Date/Author: 2026-07-29, David Baker Effendi (via agent).
 
+- Decision: `KotlinAnalyzer::referencing_files_of` stays Kotlin-to-Kotlin even under a multi-language analyzer, rather than becoming half realm-aware.
+  Rationale: the index has two halves. The import half could consult the realm view, but the same-package half needs each JVM member's files and top-level declarations, which the realm's forward-query surface does not expose. Counting imports while silently dropping same-package references would be a worse answer than a clearly bounded one, so the whole question goes to #1239 with the rest of the usage-graph work. The boundary is stated on the method itself so a reader does not mistake it for an omission.
+  Date/Author: 2026-07-29, David Baker Effendi (via agent).
+
 - Decision: `MultiAnalyzer::get_direct_descendants` unions the owning language's answer with Kotlin's realm-aware descendant index, so a Java interface reports its Kotlin implementors.
   Rationale: this was the one cross-language direction reachable without touching Java's or Scala's resolvers, because Kotlin's own index already resolves across the realm — only the *query entry point* needed widening. The reverse direction (Java or Scala subclasses of a Kotlin type) does need those resolvers to become realm-aware, and stays with #1239.
   Date/Author: 2026-07-29, David Baker Effendi (via agent).
@@ -81,7 +85,52 @@ Use timestamps to measure rates of progress.
 
 ## Outcomes & Retrospective
 
-To be completed at each milestone.
+### 2026-07-29 — all six milestones complete
+
+What now works that did not before. A Kotlin file's imports are structured
+facts that resolve to declarations, in every form Kotlin has (explicit,
+aliased, star over a package, star over an object-like owner, and paths
+reaching nested types or object members). A Kotlin class's supertypes resolve
+through the full ladder: same package, explicit import, alias, star import,
+fully-qualified, nested owner path, lexically enclosing scope, and inherited
+nested scope. Descendants invert all of it. A Kotlin file can tell whether a
+name from a Maven or Gradle artifact exists, reading the same jar-backed index
+Java and Scala use, which now indexes `.kt` entries in source jars. Java,
+Scala, and Kotlin share one `UsageEcosystem::Jvm` candidate space while each
+node keeps its own source language. And across languages, a Kotlin class
+resolves a Java interface or a Scala trait declared next door, while a Java
+interface reports its Kotlin implementors.
+
+What the shape of the work turned out to be. Three of the six milestones were
+mostly *removal of a special case* rather than addition: `SourceJarLanguage`
+already had the "one archive, several languages" shape, `raw_supertypes` was
+already the language-neutral slot Java and Go used, and the per-language edge
+builders were already scoped to their own files, which is what made merging the
+ecosystems safe. The genuinely new pieces were Kotlin's resolution ladder and
+the realm view.
+
+The one design question that took real thought was how a Kotlin analyzer could
+see Java and Scala declarations without owning them. Storing sibling handles
+would have made the three JVM analyzers mutually reference-counted and every
+cycle would leak. Building the view per query from `&dyn IAnalyzer` owns
+nothing and follows a precedent the Java↔Scala usage scan had already set. The
+cost is that realm-aware and realm-less answers need separate cache slots,
+which is cheap and, once written down, obvious.
+
+What remains, all owned by named issues. Kotlin has no usage-edge builder, so
+it is a realm member with no outbound edges (#1239). Java's and Scala's own
+resolvers are not realm-aware, so Java and Scala subclasses of a Kotlin type do
+not resolve (#1239). `referencing_files_of` stays Kotlin-to-Kotlin for the
+reason in the Decision Log (#1239). Kotlin/JS and Kotlin/Native default imports
+are not modelled, and `expect`/`actual` pairs are indexed with no link asserted
+between them — both are tested as explicit outcomes rather than left to chance.
+
+Lesson worth carrying forward: writing the "what this deliberately does not do"
+tests at the same time as the capability tests was what kept the boundaries
+honest. Three of them (ambiguous star imports, an unconfigured classpath, a
+supertype from a jar) turned out to describe behaviour that is easy to get
+subtly wrong in the direction of over-claiming, and having them as assertions
+rather than comments is what makes that stick.
 
 ## Context and Orientation
 
