@@ -28,7 +28,7 @@ The work is intentionally incremental. Each milestone is independently tested an
 - [x] (2026-07-29 08:51Z) Milestone 1: propagated cooperative cancellation through `most_relevant_files`, catalog and usage-graph construction, Rust reference-context construction and AST traversal, and PageRank; cancelled graphs are typed outcomes and are discarded.
 - [x] (2026-07-29 09:19Z) Milestone 2: added explicit completion, effective-ranking, and incomplete-reason metadata; in-flight usage cancellation now returns deterministic history/import results while pre-dispatch cancellation remains an error.
 - [x] (2026-07-29 09:34Z) Milestone 3: map seed declarations to exact ecosystems and skip every unrelated edge builder; a mixed Rust/Python test proves the selected Rust graph ranks a real target identically to the former all-ecosystem build.
-- [ ] Milestone 4: cache complete immutable usage-ranking graph partitions per analyzer snapshot using generation-safe, byte-bounded, single-flight infrastructure.
+- [x] (2026-07-29 09:51Z) Milestone 4: added a snapshot-owned, generation-keyed, representation-versioned, byte-bounded complete-value cache with cooperative same-key single-flight and warm `Arc` reuse.
 - [ ] Decision gate: benchmark the exact issue request cold and warm, and decide whether milestones 5 and 6 are still justified.
 - [ ] Milestone 5, conditional: stage and retain Rust export indexes and reference contexts so one graph build does not repeat or evict expensive materialization.
 - [ ] Milestone 6, conditional: build independent selected ecosystem partitions concurrently under a bounded scheduler, but only if profiling shows useful residual multi-ecosystem latency.
@@ -57,6 +57,9 @@ The work is intentionally incremental. Each milestone is independently tested an
 - Observation: ecosystem pruning does not require deleting unrelated catalog nodes to preserve exact results; skipping their edge builders is sufficient because personalized teleport mass is zero outside the selected ecosystem and usage edges never cross ecosystem identities.
   Evidence: a mixed Rust/Python unit test produced identical ordered `FileRelevance` values for the selected Rust-only edge graph and the former all-ecosystem graph. Builder instrumentation reported only Rust for the selected graph and both Python and Rust for the reference graph.
 
+- Observation: RQL's structural postings cannot answer caller-to-callee relevance, but its `CompleteValueCache` is already the correct low-level concurrency primitive for immutable, cancellation-safe publication.
+  Evidence: milestone 4 reuses `CompleteValueCache` under a separate neutral `SnapshotWorkspaceUsageGraphCache`; twelve issue-specific tests cover warm reuse, cancelled non-publication, generation identity, generation races, and concurrent single-flight without adding usage values to RQL's `DerivedLayer` enum.
+
 ## Decision Log
 
 - Decision: preserve the current issue branch and do not rebase onto the newly fetched master.
@@ -75,9 +78,13 @@ The work is intentionally incremental. Each milestone is independently tested an
   Rationale: workspace usage node identities include a `UsageEcosystem`, and builders only create edges within the same ecosystem. A Rust seed cannot transfer PageRank mass into another ecosystem, so excluding unrelated partitions preserves exact results. A bounded caller/callee neighborhood would change PageRank semantics and would require a separate approximate mode.
   Date/Author: 2026-07-29 / Codex
 
+- Decision: cache the exact sorted selected-ecosystem set as one immutable ranking graph rather than deep-cloning and merging separately cached ecosystem graphs on every request.
+  Rationale: current node indices are global to the deterministic catalog. A selected-set key preserves an `Arc` fast path for the common single-ecosystem request and avoids reindexing nodes and edges on every warm hit. The representation version and full source-generation vector bind validity; if future multi-ecosystem profiles justify partition merging, the cache representation version can change.
+  Date/Author: 2026-07-29 / Codex
+
 ## Outcomes & Retrospective
 
-Milestones 1 through 3 are complete. The MCP service passes its request token into `most_relevant_files`; cooperative checkpoints cover catalog construction, selected ecosystem builders, Rust context and AST work, PageRank, and aggregation. Partial graphs remain typed cancelled outcomes and are discarded. In-flight cancellation returns deterministic history/import files plus explicit incomplete metadata. Exact seed-ecosystem selection now prevents the issue's Rust seeds from first constructing Go, Python, and every other language edge layer. A mixed-language parity test proves the selected graph still ranks a real Rust target identically, and all 27 ranking integration tests remain green. Milestone 4 now owns reuse of a completed immutable graph across requests.
+Milestones 1 through 4 are complete. The MCP service cooperatively cancels slow graph work and returns explicit deterministic fallback results. Rust-only seeds skip every unrelated ecosystem builder. A complete graph is now retained in the analyzer snapshot as a byte-accounted `Arc`, keyed by selected ecosystems, representation version, and the entire ordered source-generation vector. Same-key callers elect one builder and wait cooperatively; cancelled or generation-stale leaders publish nothing. The product wiring test receives the identical `Arc` on a warm request, five cache lifecycle tests pass, all twelve issue-specific tests pass, and all 27 ranking integration tests remain green. The exact cold/warm decision benchmark is next.
 
 ## Context and Orientation
 
@@ -200,6 +207,14 @@ Milestone 3 validation evidence:
     scripts/with-isolated-cargo-target.sh cargo test --test most_relevant_files --no-default-features
       27 passed; 0 failed
 
+Milestone 4 validation evidence:
+
+    cargo fmt --check
+    scripts/with-isolated-cargo-target.sh cargo test --lib issue_1304 --no-default-features
+      12 passed; 0 failed
+    scripts/with-isolated-cargo-target.sh cargo test --test most_relevant_files --no-default-features
+      27 passed; 0 failed
+
 Verbose per-file profiling changes the absolute Rust time, but the ordinary request and lower-noise history/import comparison establish the product failure and fallback viability independently.
 
 ## Interfaces and Dependencies
@@ -226,3 +241,5 @@ Plan revision note (2026-07-29 08:51Z): Completed milestone 1 and recorded its c
 Plan revision note (2026-07-29 09:19Z): Completed milestone 2 and recorded the public Rust/Python fallback contract, the service post-dispatch cancellation interaction, and focused validation. The plan continues to milestone 3 because exact pruning should reduce cold work before the snapshot-cache decision gate.
 
 Plan revision note (2026-07-29 09:34Z): Completed milestone 3 and recorded the exact seed-ecosystem selection representation, mixed-language parity evidence, builder instrumentation, and focused validation. Unrelated catalog nodes remain deterministic zero-mass nodes; only their expensive edge construction is skipped.
+
+Plan revision note (2026-07-29 09:51Z): Completed milestone 4 and recorded the neutral snapshot-cache boundary, selected-set cache representation, byte accounting, same-key behavior, generation validity, warm product wiring, and focused validation. The implementation deliberately reuses RQL's low-level complete-value cache without treating structural postings as usage edges.

@@ -225,6 +225,79 @@ pub(crate) struct WorkspaceUsageGraph {
     pub(crate) resolved_ecosystems: Vec<UsageEcosystem>,
 }
 
+pub(crate) struct WorkspaceUsageRankingGraph {
+    pub(crate) graph: WorkspaceUsageGraph,
+    pub(crate) node_indices_by_file: HashMap<ProjectFile, Vec<usize>>,
+}
+
+impl WorkspaceUsageRankingGraph {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let mut retained = std::mem::size_of::<Self>()
+            .saturating_add(
+                self.graph
+                    .nodes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<WorkspaceUsageNode>()),
+            )
+            .saturating_add(
+                self.graph
+                    .edges
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<WorkspaceUsageEdge>()),
+            )
+            .saturating_add(
+                self.node_indices_by_file
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(ProjectFile, Vec<usize>)>()),
+            );
+        for node in &self.graph.nodes {
+            retained = retained
+                .saturating_add(node.key.fqn.capacity())
+                .saturating_add(
+                    node.key
+                        .defining_file
+                        .as_ref()
+                        .map(project_file_retained_bytes)
+                        .unwrap_or_default(),
+                )
+                .saturating_add(code_unit_retained_bytes(&node.primary))
+                .saturating_add(
+                    node.declaration_files
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<ProjectFile>()),
+                );
+            for file in &node.declaration_files {
+                retained = retained.saturating_add(project_file_retained_bytes(file));
+            }
+        }
+        for (file, indices) in &self.node_indices_by_file {
+            retained = retained
+                .saturating_add(project_file_retained_bytes(file))
+                .saturating_add(
+                    indices
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<usize>()),
+                );
+        }
+        retained
+    }
+}
+
+fn project_file_retained_bytes(file: &ProjectFile) -> usize {
+    std::mem::size_of::<ProjectFile>()
+        .saturating_add(file.root().as_os_str().len())
+        .saturating_add(file.rel_path().as_os_str().len())
+}
+
+fn code_unit_retained_bytes(unit: &CodeUnit) -> usize {
+    std::mem::size_of::<CodeUnit>()
+        .saturating_add(project_file_retained_bytes(unit.source()))
+        .saturating_add(unit.package_name().len())
+        .saturating_add(unit.short_name().len())
+        .saturating_add(unit.signature().map(str::len).unwrap_or_default())
+        .saturating_add(unit.fq_name().len())
+}
+
 pub(crate) enum WorkspaceUsageGraphBuildOutcome {
     Complete(WorkspaceUsageGraph),
     Cancelled,
