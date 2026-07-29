@@ -63,11 +63,34 @@ analyzer's indexed declarations.
 - [x] (2026-07-29 12:40Z) Milestone 3: navigation expressions, receiver typing, inherited/companion/extension
       members, safe calls, `!!`, call-result chains, enum entries, `this`/`super`. 42 `kotlin_*` tests green;
       clippy clean.
-- [ ] Milestone 4: `get_type` Kotlin arm, call-site syntax enablement for signature help, and the
-      hover/type-definition/rename surface checks.
-- [ ] Milestone 5: abstention matrix, capability documentation, and full validation.
+- [x] (2026-07-29 13:20Z) Milestone 4: `get_type` Kotlin arm, Kotlin arms for the shared call-site callee/argument
+      lookup so signature help finds a Kotlin call, and LSP tests for hover, definition, type definition, signature
+      help, and prepare-rename.
+- [x] (2026-07-29 14:00Z) Milestone 5: abstention-matrix test, the Kotlin local-binding fix it exposed, and
+      capability notes. Full validation: `suite_symbols` 1110 passed, `suite_analyzers` 671 passed,
+      `bifrost_lsp_server` 196 passed, `cargo clippy --all-targets --all-features -- -D warnings` clean.
+- [ ] Remaining, owned by sibling issues: find-references and reference-rewriting rename for Kotlin (#1239),
+      structural RQL (#1240), CFG/semantic lowering including smart casts (#1241).
 
 ## Surprises & Discoveries
+
+- Observation: a Kotlin local `val`/`var` never resolved as a local binding, even though the lexical resolver's
+  Kotlin arms name every part involved. `is_local_declaration` matches `property_declaration`, but the binding-leaf
+  walk stops there and never descends to the nested `variable_declaration` that actually holds the name, so every
+  local fell through to the language resolver and came back as "not indexed".
+  Evidence: `kotlin_unresolvable_references_abstain_with_specific_diagnostics` expected `local_binding` for
+  `println(shadowed)` and got `no_indexed_definition`. Fixed at the source in
+  `crates/bifrost-analysis/src/analyzer/lexical_definitions.rs` by descending into the
+  `variable_declaration`/`multi_variable_declaration` children only — a general descent would collect the
+  identifiers inside the *initializer* as bound names, making `val x = someName` declare `someName`.
+
+- Observation: the shared call-site machinery could not find any part of a Kotlin call. The argument list is
+  `value_arguments` nested inside `call_suffix`, which neither the `arguments` field lookup nor the shared
+  child-kind list reaches, and the callee is simply "the child that is not the suffix", which no field names.
+  Signature help therefore returned `null` for Kotlin even after definition resolution worked.
+  Evidence: `bifrost_lsp_server_signature_help_returns_kotlin_function_signature` failed with
+  `expected signatureHelp result object, got {"result":null}` until `callee_node_for_call` and
+  `argument_nodes_for_call` grew Kotlin arms.
 
 - Observation: a declaration's syntax node is not always the *smallest* node covering its recorded range. An
   `enum_entry` spans exactly its own name, so its `simple_identifier` child covers the same bytes and wins the
@@ -134,6 +157,14 @@ analyzer's indexed declarations.
   Evidence: `crates/bifrost-analysis/src/analyzer/multi_analyzer.rs`, `fn kotlin_realm` and its two call sites.
 
 ## Decision Log
+
+- Decision: fix the Kotlin local-binding gap in `lexical_definitions.rs` rather than handling locals inside the new
+  Kotlin resolver.
+  Rationale: "a reference to a local is a local binding, not a workspace declaration" is a language-agnostic rule
+  that runs before the per-language dispatch for every other language. Duplicating it in the Kotlin resolver would
+  have left the shared path still broken for any future caller, and would have made Kotlin the one language whose
+  locals are decided somewhere else.
+  Date/Author: 2026-07-29, David Baker Effendi (agent).
 
 - Decision: named-argument labels resolve to the *callable* that declares the parameter, not to the parameter itself.
   Rationale: Kotlin parameters are not indexed as `CodeUnit`s, and the alternative channel — `LexicalDefinition` — is
@@ -209,7 +240,27 @@ analyzer's indexed declarations.
 
 ## Outcomes & Retrospective
 
-To be completed as milestones land.
+The goal was met. A Kotlin reference now resolves to its physical declaration across imports and aliases, type
+annotations and supertypes, constructor and function calls, member accesses through typed receivers, inherited and
+companion and extension members, enum entries, named arguments, and `this`/`super`. Those answers reach every
+surface built on them: the MCP definition/declaration/type tools and the LSP hover, definition, declaration, type
+definition, signature help, and prepare-rename handlers, none of which needed a change of their own.
+
+What the work actually cost, against the original plan: roughly two thirds of it was the resolver, and the
+remaining third was three structural facts the plan did not anticipate — that Kotlin overloads share one indexed
+identity (so arity has to steer the name-resolution ladder rather than filter its result), that a declaration's
+syntax node is not always the smallest node covering its recorded range, and that the shared call-site helpers were
+blind to Kotlin's grammar. Each is recorded above with the failing test that exposed it.
+
+Two limits are deliberate and tested rather than hidden. Smart casts (`if (v is Base) v.greet()`) abstain, because
+narrowing needs the flow analysis that belongs to #1241; and a named-argument label answers with the callable that
+declares the parameter rather than the parameter itself, because parameters are not indexed and the
+lexical-definition channel cannot address another file. Find-references and reference-rewriting rename still abstain
+until #1239 builds the Kotlin usage graph.
+
+What remains for a follow-up: Kotlin's `SignatureMetadata` still records no return type or extension receiver, so
+both are recovered by re-reading the declaring file's syntax through a per-request cache. That is correct and cheap
+at this scale, but publishing them at index time would let #1239 and #1240 reuse the facts without reparsing.
 
 ## Context and Orientation
 
