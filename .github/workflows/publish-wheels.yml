@@ -1,13 +1,18 @@
 name: Publish wheels
 
 on:
-  push:
-    tags:
-      - 'v*.*.*'
-  workflow_dispatch:
+  workflow_call:
     inputs:
       tag:
-        description: 'Tag to build and publish (e.g. v0.6.4). Must already exist.'
+        description: Validated release tag
+        required: true
+        type: string
+      version:
+        description: Validated package version
+        required: true
+        type: string
+      commit:
+        description: Immutable commit selected by the validated release tag
         required: true
         type: string
 
@@ -15,121 +20,28 @@ permissions:
   contents: read
 
 jobs:
-  release-context:
-    name: validate release context
-    uses: ./.github/workflows/release-context.yml
-    with:
-      tag: ${{ inputs.tag || github.ref_name }}
-    permissions:
-      contents: read
-
-  notices:
-    name: generate Rust notices
-    needs: release-context
-    uses: ./.github/workflows/rust-notices.yml
-    with:
-      ref: ${{ needs.release-context.outputs.tag }}
-    permissions:
-      contents: read
-
-  build:
-    name: build (${{ matrix.target }})
-    needs: [release-context, notices]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-            kind: linux
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-            kind: linux
-          - target: x86_64-apple-darwin
-            # macos-latest is arm64; build the x86_64 wheel natively on the last
-            # Intel image. macos-13 was retired (Dec 2025); macos-15-intel is the
-            # final native x86_64 macOS runner, available until ~Aug 2027. After
-            # that, cross-compile this target from an arm64 runner instead.
-            runner: macos-15-intel
-            kind: macos
-          - target: aarch64-apple-darwin
-            runner: macos-latest
-            kind: macos
-          - target: x86_64-pc-windows-msvc
-            runner: windows-latest
-            kind: windows
-    steps:
-      - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.release-context.outputs.tag }}
-
-      - name: Download Rust notice report
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: rust-third-party-licenses
-          path: licenses
-
-      - name: Build wheels
-        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
-        with:
-          target: ${{ matrix.target }}
-          # manylinux2014 only applies on Linux; ignored elsewhere.
-          manylinux: ${{ matrix.kind == 'linux' && '2014' || 'auto' }}
-          args: --release --locked --out dist
-          # Pin Rust to match the rest of the repo's workflows (rust-toolchain.toml is 1.96.0).
-          rust-toolchain: '1.96.0'
-
-      - name: Upload wheel artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: wheels-${{ matrix.target }}
-          path: dist/*.whl
-          if-no-files-found: error
-
-  sdist:
-    name: build sdist
-    needs: [release-context, notices]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.release-context.outputs.tag }}
-
-      - name: Download Rust notice report
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: rust-third-party-licenses
-          path: licenses
-
-      - name: Build sdist
-        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
-        with:
-          command: sdist
-          args: --out dist
-
-      - name: Upload sdist artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: sdist
-          path: dist/*.tar.gz
-          if-no-files-found: error
-
   publish:
     name: publish to PyPI
-    needs: [release-context, build, sdist]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     environment: release
     permissions:
+      contents: read
       id-token: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_COMMIT: ${{ inputs.commit }}
     steps:
+      - name: Checkout validated source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.commit }}
+
+      - name: Verify release tag still selects the validated commit
+        run: bash scripts/verify-release-tag-commit.sh "$RELEASE_TAG" "$RELEASE_COMMIT"
+
       - name: Download wheel artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
@@ -143,28 +55,8 @@ jobs:
           name: sdist
           path: dist
 
-      - name: Verify built artifacts carry the tagged version
-        shell: bash
-        env:
-          EXPECTED_VERSION: ${{ needs.release-context.outputs.version }}
-        run: |
-          # Last line of defence: confirm every wheel/sdist about to hit PyPI
-          # actually carries the tagged version, whatever maturin resolved.
-          shopt -s nullglob
-          artifacts=(dist/*.whl dist/*.tar.gz)
-          if [ ${#artifacts[@]} -eq 0 ]; then
-            echo "No artifacts found in dist/" >&2
-            exit 1
-          fi
-          bad=0
-          for f in "${artifacts[@]}"; do
-            case "$(basename "$f")" in
-              *-"${EXPECTED_VERSION}"-*|*-"${EXPECTED_VERSION}".tar.gz) ;;
-              *) echo "Artifact $(basename "$f") does not carry version $EXPECTED_VERSION" >&2; bad=1 ;;
-            esac
-          done
-          [ "$bad" -eq 0 ] || exit 1
-          echo "All ${#artifacts[@]} artifacts carry version $EXPECTED_VERSION"
+      - name: Confirm validated release identity
+        run: echo "Publishing $RELEASE_TAG ($RELEASE_VERSION) from $RELEASE_COMMIT"
 
       - name: Publish to PyPI (trusted publishing)
         uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
