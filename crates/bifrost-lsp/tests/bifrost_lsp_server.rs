@@ -10766,3 +10766,159 @@ fn implementation_response(
 ) -> Value {
     server.implementation_response(file_uri, line, character)
 }
+
+/// Kotlin definition navigation (issue #1238) reaching the LSP surfaces built
+/// on top of it: hover, go-to-definition, go-to-type-definition, signature
+/// help, and prepare-rename. Before #1238 every one of these returned nothing
+/// for a `.kt` file, because the underlying resolver answered
+/// `kotlin_navigation_unsupported`.
+fn kotlin_workspace(root: &std::path::Path) -> (std::path::PathBuf, &'static str) {
+    let lib_path = root.join("Base.kt");
+    fs::write(
+        &lib_path,
+        "package lib\n\n/** Greets a caller. */\nopen class Base {\n    fun greet(name: String, punctuation: String): String = name + punctuation\n}\n",
+    )
+    .expect("write Base.kt");
+
+    let app_source = "package lib\n\nfun use(base: Base): String {\n    val local: Base = base\n    return local.greet(\"world\", \"!\")\n}\n";
+    let app_path = root.join("App.kt");
+    fs::write(&app_path, app_source).expect("write App.kt");
+    (app_path, app_source)
+}
+
+#[test]
+fn bifrost_lsp_server_goto_definition_resolves_kotlin_member_call() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let (app_path, app_source) = kotlin_workspace(&root);
+
+    let mut server = LspServer::start(&root);
+    let app_uri = uri_for(&app_path);
+    let (line, character) = position_after(app_source, "local.gre");
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 20,
+        "method": "textDocument/definition",
+        "params": {
+            "textDocument": {"uri": app_uri},
+            "position": {"line": line, "character": character}
+        }
+    }));
+    let response = server.read_response_for_id(20);
+    let locations = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected location array, got {response}"));
+    assert_eq!(locations.len(), 1, "expected one definition: {response}");
+    assert!(
+        locations[0]["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.ends_with("Base.kt")),
+        "expected Base.kt, got {response}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_hover_returns_kotlin_declaration_skeleton() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let (app_path, app_source) = kotlin_workspace(&root);
+
+    let mut server = LspServer::start(&root);
+    let app_uri = uri_for(&app_path);
+    let (line, character) = position_after(app_source, "local.gre");
+
+    let response = server.hover_response(&app_uri, line, character);
+    let value = response["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected hover markdown, got {response}"));
+    assert!(
+        value.contains("```kotlin") && value.contains("greet"),
+        "expected a Kotlin-tagged greet skeleton, got {value}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_type_definition_resolves_kotlin_explicit_local_type() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let (app_path, app_source) = kotlin_workspace(&root);
+
+    let mut server = LspServer::start(&root);
+    let app_uri = uri_for(&app_path);
+    let (line, character) = position_after(app_source, "val loc");
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 21,
+        "method": "textDocument/typeDefinition",
+        "params": {
+            "textDocument": {"uri": app_uri},
+            "position": {"line": line, "character": character}
+        }
+    }));
+    let response = server.read_response_for_id(21);
+    let locations = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected location array, got {response}"));
+    assert_eq!(
+        locations.len(),
+        1,
+        "expected one type definition: {response}"
+    );
+    assert!(
+        locations[0]["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.ends_with("Base.kt")),
+        "expected Base.kt, got {response}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_signature_help_returns_kotlin_function_signature() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let (app_path, app_source) = kotlin_workspace(&root);
+
+    let mut server = LspServer::start(&root);
+    let app_uri = uri_for(&app_path);
+    let (line, character) = position_after(app_source, "greet(\"world\", ");
+
+    let result = signature_help(&mut server, &app_uri, line, character);
+    assert_eq!(
+        result["activeParameter"], 1,
+        "unexpected signature help: {result}"
+    );
+    assert!(
+        result["signatures"][0]["label"]
+            .as_str()
+            .is_some_and(|label| label.contains("greet") && label.contains("punctuation")),
+        "expected the greet signature, got {result}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_prepare_rename_returns_kotlin_identifier_range() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let base_path = root.join("Base.kt");
+    let (_, _) = kotlin_workspace(&root);
+
+    let mut server = LspServer::start(&root);
+    let base_uri = uri_for(&base_path);
+    // Line 4 (0-based), character 8: the `greet` in `fun greet(...)`.
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 22,
+        "method": "textDocument/prepareRename",
+        "params": {
+            "textDocument": {"uri": base_uri},
+            "position": {"line": 4, "character": 8}
+        }
+    }));
+    let response = server.read_response_for_id(22);
+    assert_eq!(
+        response["result"]["placeholder"], "greet",
+        "prepare result: {response}"
+    );
+}

@@ -416,6 +416,7 @@ fn callee_node_for_call<'tree>(node: Node<'tree>, language: Language) -> Option<
             _ => None,
         },
         Language::Scala => scala_callee_node_for_call(node),
+        Language::Kotlin => super::kotlin::kotlin_callee(node),
         Language::Ruby => node.child_by_field_name("method"),
         _ => node
             .child_by_field_name("function")
@@ -430,6 +431,14 @@ fn arguments_node_for_call(node: Node<'_>, language: Language) -> Option<Node<'_
 }
 
 fn argument_nodes_for_call(node: Node<'_>, language: Language) -> Vec<Node<'_>> {
+    // Kotlin's argument list is `value_arguments`, and an ordinary call nests it
+    // one level down inside `call_suffix`, so neither the field lookup nor the
+    // shared child-kind list below reaches it.
+    if language == Language::Kotlin {
+        return super::kotlin::kotlin_value_arguments(node)
+            .into_iter()
+            .collect();
+    }
     let mut nodes = Vec::new();
     if let Some(arguments) = node
         .child_by_field_name("arguments")
@@ -772,8 +781,7 @@ fn is_call_reference_candidate(node: Node<'_>, language: Language) -> bool {
         Language::Scala => scala_call_reference_candidate(node),
         Language::CSharp => csharp_call_reference_candidate(node),
         Language::Ruby => ruby_call_reference_candidate(node),
-        // Kotlin call-site reference resolution is issue #1238.
-        Language::Kotlin => false,
+        Language::Kotlin => super::kotlin::kotlin_call_reference_candidate(node),
         Language::None => false,
     }
 }

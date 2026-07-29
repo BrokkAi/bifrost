@@ -29243,3 +29243,158 @@ fun use(base: Base) {
         "{value}"
     );
 }
+
+#[test]
+fn kotlin_type_lookup_resolves_explicit_local_type() {
+    let source = r#"package app
+
+import lib.Base
+
+fun use() {
+    val base: Base = Base()
+}
+"#;
+    let project = kotlin_base_and_app(source);
+
+    let value = lookup_type(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("val base").expect("local") + 4,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "lib.Base", "{value}");
+}
+
+#[test]
+fn kotlin_type_lookup_resolves_constructor_initialized_local() {
+    let source = r#"package app
+
+import lib.Base
+
+fun use() {
+    val base = Base()
+}
+"#;
+    let project = kotlin_base_and_app(source);
+
+    let value = lookup_type(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("val base").expect("local") + 4,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "lib.Base", "{value}");
+}
+
+#[test]
+fn kotlin_type_lookup_resolves_a_type_annotation_as_a_type_reference() {
+    let source = r#"package app
+
+import lib.Base
+
+fun use(base: Base) {
+}
+"#;
+    let project = kotlin_base_and_app(source);
+
+    let value = lookup_type(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find(": Base)").expect("annotation") + 2,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "lib.Base", "{value}");
+}
+
+#[test]
+fn kotlin_type_lookup_reports_no_type_for_an_inferred_lambda_local() {
+    let source = r#"package app
+
+fun use() {
+    val handler = { 1 }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup_type(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("val handler").expect("local") + 4,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_type", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "no_explicit_type",
+        "{value}"
+    );
+}
+
+#[test]
+fn kotlin_type_lookup_reports_inappropriate_context_for_a_function_declaration_name() {
+    let source = r#"package app
+
+fun helper(): Int = 1
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup_type(
+        project.root(),
+        &location_reference("app/App.kt", source, source.find("helper").expect("name")),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_type", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "inappropriate_symbol_context",
+        "{value}"
+    );
+}
+
+#[test]
+fn kotlin_declaration_navigation_resolves_a_member_call() {
+    let source = r#"package app
+
+import lib.Base
+
+fun use(base: Base) {
+    base.greet("world")
+}
+"#;
+    let project = kotlin_base_and_app(source);
+
+    let value = lookup_declaration_with_definition_key(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("base.greet").expect("call") + 5,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "lib.Base.greet", "{value}");
+}

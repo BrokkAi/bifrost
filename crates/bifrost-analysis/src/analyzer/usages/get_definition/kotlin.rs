@@ -41,6 +41,7 @@ use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::kotlin::declarations::kotlin_package_name;
 use crate::analyzer::kotlin::types::{KotlinNameScope, KotlinTypeName, resolve_kotlin_type_name};
 use crate::analyzer::tree_walk::{first_named_child_of_kind, named_children};
+use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -815,10 +816,25 @@ fn kotlin_call_with_callee(node: Node<'_>) -> Option<Node<'_>> {
     (kotlin_callee(call)?.id() == node.id()).then_some(call)
 }
 
-fn kotlin_callee(call: Node<'_>) -> Option<Node<'_>> {
+pub(super) fn kotlin_callee(call: Node<'_>) -> Option<Node<'_>> {
+    // A `constructor_invocation` (a supertype list entry such as `: Base(1)`)
+    // spells its callee as the `user_type` it constructs; an ordinary call
+    // spells it as the child that is not the argument suffix.
     named_children(call)
         .into_iter()
-        .find(|child| child.kind() != "call_suffix")
+        .find(|child| !matches!(child.kind(), "call_suffix" | "value_arguments"))
+}
+
+/// The `value_arguments` node a Kotlin call passes its arguments in.
+///
+/// An ordinary call nests it inside `call_suffix`; a `constructor_invocation`
+/// holds it directly.
+pub(super) fn kotlin_value_arguments(call: Node<'_>) -> Option<Node<'_>> {
+    if let Some(arguments) = first_named_child_of_kind(call, "value_arguments") {
+        return Some(arguments);
+    }
+    first_named_child_of_kind(call, "call_suffix")
+        .and_then(|suffix| first_named_child_of_kind(suffix, "value_arguments"))
 }
 
 /// How many arguments a call passes.
@@ -1546,4 +1562,107 @@ fn kotlin_declared_type_spelling(ctx: &KotlinCtx<'_>, binding: Node<'_>) -> Opti
     named_children(binding)
         .into_iter()
         .find_map(|child| kotlin_type_node_spelling(ctx, child))
+}
+
+// ---------------------------------------------------------------------------
+// Type lookup: what type does the expression at this location have?
+// ---------------------------------------------------------------------------
+
+/// What `get_type_by_location` found at a Kotlin location.
+pub(crate) enum KotlinTypeLookupResolution {
+    Type {
+        fqn: String,
+        target_kind: TypeLookupTargetKind,
+    },
+    /// The location names a callable, which has no type in the sense the caller
+    /// is asking about. Distinguished from "no type found" so the caller can say
+    /// why rather than implying the lookup failed.
+    InappropriateSymbolContext,
+}
+
+pub(crate) fn kotlin_type_lookup_resolution(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    site: &ResolvedReferenceSite,
+) -> Option<KotlinTypeLookupResolution> {
+    let node = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
+    let ctx = KotlinCtx::new(analyzer, support, file, source, root);
+
+    if node.kind() == "type_identifier" {
+        if kotlin_enclosing_import_header(node).is_some() {
+            return None;
+        }
+        let spelled = kotlin_type_spelling_through(&ctx, node);
+        let scope = ctx.scope_at(node.start_byte());
+        let fqn = ctx.resolve_name(&spelled, &scope).resolved()?;
+        return Some(KotlinTypeLookupResolution::Type {
+            fqn,
+            target_kind: TypeLookupTargetKind::TypeReference,
+        });
+    }
+
+    if node.kind() != "simple_identifier" || kotlin_enclosing_import_header(node).is_some() {
+        return None;
+    }
+
+    let parent = node.parent()?;
+    // A callable's own name is not a typed expression.
+    if parent.kind() == "function_declaration"
+        && first_named_child_of_kind(parent, "simple_identifier")
+            .is_some_and(|name| name.id() == node.id())
+    {
+        return Some(KotlinTypeLookupResolution::InappropriateSymbolContext);
+    }
+
+    // The name a binding introduces has the binding's type.
+    let unit = if matches!(
+        parent.kind(),
+        "variable_declaration" | "parameter" | "class_parameter"
+    ) && first_named_child_of_kind(parent, "simple_identifier")
+        .is_some_and(|name| name.id() == node.id())
+    {
+        kotlin_binding_type(&ctx, parent, 0)?
+    } else if parent.kind() == "navigation_suffix" {
+        let navigation = parent.parent()?;
+        let receiver = kotlin_receiver(&ctx, named_children(navigation).into_iter().next()?, 0)?;
+        let member =
+            kotlin_member_candidates(&ctx, &receiver, ctx.text(node), None, parent.start_byte())
+                .into_iter()
+                .next()?;
+        ctx.declared_type_of(&member, 0)?
+    } else {
+        kotlin_receiver(&ctx, node, 0)?.owner
+    };
+
+    Some(KotlinTypeLookupResolution::Type {
+        fqn: unit.fq_name(),
+        target_kind: TypeLookupTargetKind::ValueExpression,
+    })
+}
+
+/// Whether `node` is the callee token of a Kotlin call, which is what
+/// signature help anchors a call site on.
+pub(super) fn kotlin_call_reference_candidate(node: Node<'_>) -> bool {
+    if let Some(parent) = node.parent()
+        && parent.kind() == "navigation_suffix"
+        && let Some(navigation) = parent.parent()
+    {
+        return navigation
+            .parent()
+            .filter(|call| call.kind() == "call_expression")
+            .and_then(kotlin_callee)
+            .is_some_and(|callee| callee.id() == navigation.id());
+    }
+    if kotlin_call_with_callee(node).is_some() {
+        return true;
+    }
+    // `Base(...)` in a supertype list is spelled as a `constructor_invocation`
+    // over a `user_type` rather than as a call expression.
+    node.parent()
+        .filter(|parent| parent.kind() == "user_type")
+        .and_then(|user_type| user_type.parent())
+        .is_some_and(|parent| parent.kind() == "constructor_invocation")
 }
