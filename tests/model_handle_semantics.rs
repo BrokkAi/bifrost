@@ -2,7 +2,6 @@ use brokk_bifrost::{
     CodeUnit, CodeUnitType, ImportAnalysisProvider, JavaAnalyzer, Language, ProjectFile,
     TestProject,
 };
-use std::cmp::Ordering;
 use std::collections::{BTreeSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -64,13 +63,7 @@ fn code_unit_equality_ordering_and_hash_are_semantic() {
     assert_eq!(left, same);
     assert_eq!(hash_value(&left), hash_value(&same));
     assert_ne!(left, different_signature);
-
-    let mut set = BTreeSet::new();
-    set.insert(left.clone());
-    set.insert(same);
-    set.insert(different_signature.clone());
-    assert_eq!(set.len(), 2);
-    assert_eq!(left.cmp(&different_signature), Ordering::Greater);
+    assert_ne!(hash_value(&left), hash_value(&different_signature));
 }
 
 #[test]

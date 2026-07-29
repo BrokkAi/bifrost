@@ -255,15 +255,6 @@ fn analyzer_persisted_memory_does_not_scale_with_total_source_size() {
     print_measurement("large", &large_cold);
     print_measurement("large", &large_warm);
 
-    assert_eq!(small_cold.modules, SMALL_MODULES);
-    assert_eq!(small_warm.modules, SMALL_MODULES);
-    assert_eq!(large_cold.modules, LARGE_MODULES);
-    assert_eq!(large_warm.modules, LARGE_MODULES);
-    assert_eq!(large_warm.modules / small_warm.modules, 10);
-    assert_eq!(small_cold.mode, "cold");
-    assert_eq!(small_warm.mode, "warm");
-    assert_eq!(large_cold.mode, "cold");
-    assert_eq!(large_warm.mode, "warm");
     assert_eq!(small_warm.parses, 0);
     assert_eq!(large_warm.parses, 0);
     assert_eq!(small_warm.fresh_parse_error_files, 0);

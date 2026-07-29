@@ -7181,8 +7181,9 @@ class Consumer {
     ]);
 
     let target = definition(&analyzer, "pkg.Target.run");
-    let hits =
-        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
+    assert!(query.graph_failure.is_none(), "query: {:?}", query.result);
+    let hits = hits(query.result);
 
     assert_eq!(1, hits.len());
     assert_hit_contains(&hits, "target.run()");

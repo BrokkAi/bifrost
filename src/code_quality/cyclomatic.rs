@@ -232,18 +232,46 @@ mod tests {
     }
 
     #[test]
-    fn absolute_paths_are_rejected_without_panic() {
+    fn absolute_paths_outside_the_workspace_are_not_read() {
+        // Source complex enough to be reported: 1 base + 1 `if` + 2 `&&` = 4.
+        const COMPLEX: &str = "fn outside(a: bool, b: bool, c: bool) -> i32 {\n    if a && b && c { 1 } else { 0 }\n}\n";
+
+        // Control: the same bytes inside the workspace *are* flagged, so an empty
+        // report below can only mean the outside path was refused -- not that
+        // there was nothing to find. The old `/etc/passwd` input could not tell
+        // "rejected" apart from "read and found no functions".
+        let control = AnalyzerFixture::new(&[("src/lib.rs", COMPLEX)]);
+        let flagged = compute_cyclomatic_complexity(
+            control.analyzer.analyzer(),
+            ComputeCyclomaticComplexityParams {
+                file_paths: vec!["src/lib.rs".to_string()],
+                threshold: 2,
+            },
+        );
+        assert_eq!(
+            flagged.report,
+            "Cyclomatic complexity (threshold: 2):\n- outside: 4 (in src/lib.rs)"
+        );
+
+        let outside = tempfile::TempDir::new().expect("outside tempdir");
+        let outside_path = outside.path().join("outside.rs");
+        std::fs::write(&outside_path, COMPLEX).expect("write outside source");
+        assert!(
+            outside_path.exists(),
+            "fixture must be a real readable file"
+        );
+
         let fix = AnalyzerFixture::new(&[("src/lib.rs", "fn x() {}\n")]);
         let result = compute_cyclomatic_complexity(
             fix.analyzer.analyzer(),
             ComputeCyclomaticComplexityParams {
-                file_paths: vec!["/etc/passwd".to_string()],
-                threshold: 0,
+                file_paths: vec![outside_path.to_string_lossy().into_owned()],
+                threshold: 2,
             },
         );
         assert_eq!(
             result.report,
-            "No methods exceeded the complexity threshold of 10."
+            "No methods exceeded the complexity threshold of 2."
         );
     }
 

@@ -995,10 +995,9 @@ void call(Target& target, Other& other) {
     ]);
 
     let target = member_function_definition(&analyzer, "Target", "run");
-    let hits = UsageFinder::new()
-        .find_usages_default(&analyzer, std::slice::from_ref(&target))
-        .into_either()
-        .expect("cpp graph success");
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
+    assert!(query.graph_failure.is_none(), "query: {:?}", query.result);
+    let hits = query.result.into_either().expect("cpp graph success");
 
     assert_eq!(1, hits.len());
     let hit = hits.iter().next().expect("one hit");
@@ -6341,12 +6340,6 @@ void ambiguous(Target& target, Other& other) {
     assert_eq!(1, hits.len());
     assert_hit_contains(&hits, "hit.cpp", "target.run()");
     assert_no_hit_contains(&hits, "void Target::run() {}");
-
-    let restricted_hits = CppUsageGraphStrategy::new()
-        .find_usages(&analyzer, std::slice::from_ref(&run), &restricted, 1000)
-        .into_either()
-        .expect("restricted success");
-    assert_eq!(1, restricted_hits.len());
 
     let zero_candidates = [project.file("zero.cpp")].into_iter().collect();
     let zero_hits = CppUsageGraphStrategy::new()

@@ -90,10 +90,9 @@ function build(): Target {
     ]);
 
     let target = definition(&analyzer, "App.Target");
-    let hits = UsageFinder::new()
-        .find_usages_default(&analyzer, std::slice::from_ref(&target))
-        .into_either()
-        .expect("php graph success");
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
+    assert!(query.graph_failure.is_none(), "query: {:?}", query.result);
+    let hits = query.result.into_either().expect("php graph success");
     assert_eq!(2, hits.len());
 }
 

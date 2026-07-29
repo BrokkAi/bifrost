@@ -122,8 +122,9 @@ fn usage_finder_routes_jsts_targets_to_graph_strategy() {
     });
 
     let finder = UsageFinder::new();
-    let result = finder.find_usages_default(&analyzer, std::slice::from_ref(&target));
-    let hits = result.into_either().expect("expected Ok hits");
+    let query = finder.query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
+    assert!(query.graph_failure.is_none(), "query: {:?}", query.result);
+    let hits = query.result.into_either().expect("expected Ok hits");
     assert!(
         !hits.is_empty(),
         "UsageFinder should resolve at least one reference for BaseClass via the graph strategy"

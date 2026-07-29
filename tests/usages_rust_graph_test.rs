@@ -49,10 +49,12 @@ fn run() {
     ]);
 
     let target = definition(&analyzer, "service.Service");
-    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
-    let hits = result
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
+    assert!(query.graph_failure.is_none(), "query: {:?}", query.result);
+    let hits = query
+        .result
         .into_either()
-        .expect("expected Rust graph or fallback success");
+        .expect("expected Rust graph success");
     assert_eq!(1, hits.len());
     assert!(
         hits.iter()
@@ -1611,8 +1613,10 @@ fn run() {
         .into_iter()
         .next()
         .expect("missing multi-analyzer target");
-    let hits = UsageFinder::new()
-        .find_usages_default(&analyzer, std::slice::from_ref(&target))
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
+    assert!(query.graph_failure.is_none(), "query: {:?}", query.result);
+    let hits = query
+        .result
         .into_either()
         .expect("expected Rust graph success via MultiAnalyzer");
 
@@ -2871,8 +2875,10 @@ fn main() {
     ]);
 
     let target = member(&analyzer, &project.file("src/service.rs"), "Service", "run");
-    let hits = UsageFinder::new()
-        .find_usages_default(&analyzer, std::slice::from_ref(&target))
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
+    assert!(query.graph_failure.is_none(), "query: {:?}", query.result);
+    let hits = query
+        .result
         .into_either()
         .expect("expected member graph success");
     assert_eq!(1, hits.len());

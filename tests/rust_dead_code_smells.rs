@@ -437,8 +437,21 @@ fn entry() {
         },
     );
 
-    assert_eq!(
-        "## Dead code and unused abstraction smells\n\n- Min score: 100\n- Input files analyzed cap: 25\n- Candidate symbol cap: 200\n- Usage candidate file cap: 1000\n- Usage cap per symbol: 100\n- Analysis mode: graph-backed tree-sitter usage analysis (best-effort).\n- Candidate symbols analyzed: 1\n- Findings shown: 0 of 0\n\nNo dead code or unused abstraction smells met minScore 100.",
-        report
+    // The behavioral claim is suppression, not the report preamble: the same
+    // fixture and target *is* reported at the default threshold by
+    // `rust_dead_code_smell_reports_one_call_wrapper`. Asserting the whole
+    // verbatim header (including every default cap) made this a snapshot pin
+    // that any default change breaks as a pure text edit, so it is narrowed to
+    // the behavioral tail plus the two lines that distinguish "analyzed and
+    // suppressed" from "never looked at".
+    assert!(
+        report.contains("- Candidate symbols analyzed: 1"),
+        "{report}"
     );
+    assert!(report.contains("- Findings shown: 0 of 0"), "{report}");
+    assert!(
+        report.ends_with("No dead code or unused abstraction smells met minScore 100."),
+        "{report}"
+    );
+    assert!(!report.contains("helpers.wrapper"), "{report}");
 }

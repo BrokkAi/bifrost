@@ -267,12 +267,18 @@ fn shared_call_query_matches_every_analyzable_language_without_adapter_diagnosti
     // from STRUCTURAL_ADAPTER_PENDING rather than relaxing this.
     assert_eq!(actual_languages, expected_languages);
 
-    let expected_rows: BTreeSet<_> = cases
+    // Rows are compared as an ordered `Vec`, not a set: cross-language result
+    // order is itself part of the contract (matches arrive grouped by language in
+    // ascending config-label order). `BTreeSet` collection below supplies that
+    // expected order, and Vec equality subsumes the set-equality check.
+    let expected_rows: Vec<_> = cases
         .iter()
         .filter(|(language, _, _, _)| !pending.contains(language))
         .map(|(language, path, _, text)| (*language, *path, *text))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect();
-    let rows: BTreeSet<_> = output
+    let rows: Vec<_> = output
         .structural_matches()
         .iter()
         .map(|mat| (mat.language, mat.path.as_str(), mat.text.as_str()))

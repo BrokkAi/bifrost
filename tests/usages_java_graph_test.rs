@@ -163,10 +163,9 @@ public class Consumer {
     ]);
 
     let target = definition(&analyzer, "com.example.Target.run");
-    let hits = UsageFinder::new()
-        .find_usages_default(&analyzer, std::slice::from_ref(&target))
-        .into_either()
-        .expect("java graph success");
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
+    assert!(query.graph_failure.is_none(), "query: {:?}", query.result);
+    let hits = query.result.into_either().expect("java graph success");
     assert_eq!(1, hits.len());
 }
 

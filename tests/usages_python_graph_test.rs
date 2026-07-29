@@ -1692,8 +1692,10 @@ def run():
     let analyzer = PythonAnalyzer::from_project(project.project().clone());
     let target = definition(&analyzer, "service.Service");
 
-    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
-    let hits = result
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
+    assert!(query.graph_failure.is_none(), "query: {:?}", query.result);
+    let hits = query
+        .result
         .into_either()
         .expect("UsageFinder should find Python graph usages");
     assert_eq!(hits.len(), 1);
@@ -1726,8 +1728,10 @@ def run():
     )]));
     let target = definition(&python, "service.Service");
 
-    let result = UsageFinder::new().find_usages_default(&multi, std::slice::from_ref(&target));
-    let hits = result
+    let query = UsageFinder::new().query(&multi, std::slice::from_ref(&target), 1000, 1000);
+    assert!(query.graph_failure.is_none(), "query: {:?}", query.result);
+    let hits = query
+        .result
         .into_either()
         .expect("UsageFinder should find Python graph usages through MultiAnalyzer");
     assert_eq!(hits.len(), 1);

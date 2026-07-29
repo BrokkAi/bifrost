@@ -37,10 +37,9 @@ func run() {
     ]);
 
     let target = definition(&analyzer, "example.com/app/util.Helper");
-    let hits = UsageFinder::new()
-        .find_usages_default(&analyzer, std::slice::from_ref(&target))
-        .into_either()
-        .expect("go graph success");
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
+    assert!(query.graph_failure.is_none(), "query: {:?}", query.result);
+    let hits = query.result.into_either().expect("go graph success");
 
     assert_eq!(1, hits.len());
     assert!(hits.iter().all(|hit| hit.file == project.file("main.go")));
