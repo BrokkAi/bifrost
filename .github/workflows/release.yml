@@ -340,7 +340,6 @@ jobs:
       - build
       - agent-plugin-package
       - agent-plugin-prepublish-smoke
-      - agent-plugin-release-smoke
       - pi-package
       - vscode-package
     runs-on: ubuntu-latest
@@ -722,7 +721,7 @@ jobs:
 
   agent-plugin-release-smoke:
     name: packaged agent plugin smoke
-    needs: [release-context, agent-plugin-package]
+    needs: [release-context, agent-plugin-package, release]
     runs-on: macos-latest
     timeout-minutes: 60
     permissions:
@@ -761,7 +760,7 @@ jobs:
 
   publish-agent-plugin:
     name: publish validated agent plugin
-    needs: [release-context, promotion-evidence, release]
+    needs: [release-context, promotion-evidence, release, agent-plugin-release-smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
