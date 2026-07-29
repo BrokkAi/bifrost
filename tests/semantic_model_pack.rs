@@ -458,8 +458,10 @@ fn manifest_and_shard_decoders_reject_corruption_and_caps() {
         ArtifactError::DigestMismatch("stored")
     );
 
-    let mut limits = DecodeLimits::default();
-    limits.max_raw_shard_bytes = 1;
+    let limits = DecodeLimits {
+        max_raw_shard_bytes: 1,
+        ..DecodeLimits::default()
+    };
     assert_eq!(
         decode_shard(&artifact.descriptor, &artifact.bytes, &limits).unwrap_err(),
         ArtifactError::LimitExceeded("raw shard byte limit")

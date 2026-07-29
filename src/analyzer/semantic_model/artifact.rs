@@ -983,8 +983,10 @@ mod tests {
             ArtifactError::DigestMismatch("manifest content")
         );
 
-        let mut limits = DecodeLimits::default();
-        limits.max_total_records = 2;
+        let limits = DecodeLimits {
+            max_total_records: 2,
+            ..DecodeLimits::default()
+        };
         assert_eq!(
             decode_manifest(&compiled.manifest_bytes, &limits).unwrap_err(),
             ArtifactError::LimitExceeded("total record limit")

@@ -17,7 +17,7 @@ This issue stops at the schema/compiler boundary. The produced pack is not insta
 - [x] (2026-07-29 08:13Z) Added declaration and generator fixtures plus behavior-focused integration and unit tests for equivalence, invalid inputs, corruption, non-canonical bytes, cross-shard references, and resource caps.
 - [x] (2026-07-29 08:13Z) Added public semantic-model-pack documentation, sidebar navigation, and exact fixture-backed documentation checks.
 - [x] (2026-07-29 10:16Z) Ran architecture, security, intent, duplication, and DevOps reviews; addressed the confirmed schema, vocabulary, capture-binding, integrity, decoder-validation, cross-shard-reference, and compiler-limit findings.
-- [ ] Execute the complete Rust/docs/package/policy validation matrix and record outcomes.
+- [x] (2026-07-29 09:43Z) Completed the Rust, docs, and package validation matrix; recorded the policy-checking service as unavailable rather than treating tool visibility as a successful policy run.
 
 ## Surprises & Discoveries
 
@@ -27,12 +27,16 @@ This issue stops at the schema/compiler boundary. The produced pack is not insta
   Evidence: the active tool inventory contained no `search_symbols`, `get_symbol_sources`, or `get_summaries` entry, so repository-local `rg` and focused file reads are the available fallback.
 - Observation: Declaration references must be collected across the whole pack before individual shards can be validated, because a member or relation may point into a later shard.
   Evidence: the focused `cross_shard_references_are_resolved_after_global_collection` test moves the owning type to a later shard and compiles successfully after validation became two-pass.
-- Observation: The shared default Cargo target contains an incompatible build-script artifact even though both diagnostics print the same Rust version; isolated targets are unaffected.
-  Evidence: `cargo clippy --lib --tests -- -D warnings` failed with E0514 for `cc`, while the managed isolated `cargo check --lib` and all focused test binaries compiled successfully. Final validation will use the required isolated-target helper rather than cleaning shared user artifacts.
+- Observation: This host exposes same-version Rust tools from both Homebrew and rustup, but their compiler metadata is incompatible; explicitly selecting only Cargo is insufficient because Cargo resolves `cargo-clippy` and `rustdoc` separately.
+  Evidence: strict Clippy passed through `/Users/dave/.cargo/bin/cargo-clippy`; the all-feature test matrix reached doctests after every runnable Rust target passed, then Homebrew `rustdoc` rejected rustup-built dependencies with E0514. The isolated doctest gate passed after setting `RUSTDOC=/Users/dave/.cargo/bin/rustdoc`.
 - Observation: A syntactically strict compiled struct is not a sufficient trust boundary: compact JSON can still contain semantically invalid values or non-normalized semantic-set ordering after an attacker recomputes byte hashes.
   Evidence: Specialist review produced both cases; the decoder now reconstructs an authored pack, runs bounded semantic validation, compares shared normalization, and adversarial tests rehash both invalid forms.
 - Observation: Cross-shard references cannot be fully validated by an independently decoded shard.
   Evidence: descriptors now carry compiler-derived sorted definition/reference inventories, allowing manifest decoding to prove pack-wide uniqueness and reference closure before individual shards are loaded.
+- Observation: Three process-spawning MCP session tests cannot run inside the filesystem sandbox even though they pass with ordinary host permissions.
+  Evidence: the sandboxed all-feature run reported `PermissionDenied` only for the three `benchmark::mcp_session` cases; the elevated exact rerun passed all 2,071 runnable library tests, with seven ignored, and continued through every runnable integration target without a failure.
+- Observation: The installed policy skill does not imply that its runtime service is callable.
+  Evidence: the active tool inventory contains neither `list_policies` nor `run_policy`, so the required combined `bifrost.code-smells` and repository-policy run could not be executed or represented as clean.
 
 ## Decision Log
 
@@ -72,7 +76,9 @@ This issue stops at the schema/compiler boundary. The produced pack is not insta
 
 ## Outcomes & Retrospective
 
-The version-one authoring and artifact contract is implemented and its focused checks are green: 13 integration tests cover schema/source/compiler behavior, three unit tests cover internally consistent adversarial compressed artifacts, and one docs test ties both published examples to checked fixtures. Specialist review and the full release-validation matrix remain before completion.
+The version-one authoring and artifact contract is implemented for both typed machine producers and strict YAML/JSON authors. Nineteen focused integration tests and seven artifact unit tests cover source equivalence, schema drift, deterministic lowering, digest boundaries, compression, semantic canonicality, cross-shard references, corrupt artifacts, and resource limits. Architecture, security, intent, duplication, and DevOps reviews were completed and all confirmed findings were addressed.
+
+Release validation is green for formatting, strict all-target/all-feature Clippy, the all-feature Rust test matrix, the matching-toolchain doctest stage, docs checks/build, and crate packaging. The all-feature library suite reported 2,071 passed and seven ignored before all runnable integration targets completed without failure. The docs build produced 58 pages and checked 5,555 links. The packaged crate was 7,093,389 bytes and included the public schema while excluding development fixtures. The sole unexecuted gate is the repository policy run because the session exposes neither policy-listing nor policy-execution tools; that environmental limitation is explicit rather than reported as success.
 
 ## Context and Orientation
 
@@ -188,3 +194,5 @@ Plan revision note (2026-07-29 07:21Z): Created the initial self-contained imple
 Plan revision note (2026-07-29 08:13Z): Marked the authoring, artifact, fixture, and documentation milestones complete after focused tests passed; recorded the two-pass cross-shard reference requirement, separate stable-ID/language-name template validation, and the shared-target compiler contamination that makes isolated final checks mandatory.
 
 Plan revision note (2026-07-29 10:16Z): Recorded and resolved specialist-review findings by tightening schema version/variant closure, adding trigger-bound captures and missing declaration vocabulary, separating the validated compiled boundary, covering full manifest integrity and envelope agreement, validating semantic canonicality on decode, carrying cross-shard reference inventories, and aligning compiler output limits with decoder defaults.
+
+Plan revision note (2026-07-29 09:43Z): Completed final Rust, docs, and packaging validation; documented the host's mixed Homebrew/rustup toolchain and sandbox-only process-test failures; verified the affected stages with a consistent rustup toolchain and host permissions; and recorded the unavailable policy service as the only remaining environmental validation limitation.
