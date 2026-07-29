@@ -28298,3 +28298,392 @@ fun use(base: Base) {
         "an explicitly imported unknown type must not resolve to a same-package namesake: {value}"
     );
 }
+
+#[test]
+fn kotlin_constructor_call_resolves_to_primary_constructor() {
+    let source = r#"package app
+
+class Widget(val label: String)
+
+fun build(): Widget = Widget("x")
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("Widget(\"x\")").expect("call"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Widget.Widget",
+        "{value}"
+    );
+}
+
+#[test]
+fn kotlin_constructor_call_of_parameterless_class_resolves_to_the_class() {
+    let source = r#"package app
+
+import lib.Other
+
+fun build(): Other = Other()
+"#;
+    let project = kotlin_base_and_app(source);
+
+    let value = lookup(
+        project.root(),
+        &location_reference("app/App.kt", source, source.find("Other()").expect("call")),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "lib.Other", "{value}");
+}
+
+#[test]
+fn kotlin_top_level_function_call_resolves_in_same_package() {
+    let source = r#"package app
+
+fun helper(): Int = 1
+
+fun use(): Int = helper()
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("= helper()").expect("call") + 2,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.helper", "{value}");
+}
+
+#[test]
+fn kotlin_imported_function_call_resolves_to_declaration() {
+    let source = r#"package app
+
+import lib.helper
+
+fun use(): Int = helper()
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("lib/Helpers.kt", "package lib\n\nfun helper(): Int = 1\n")
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("= helper()").expect("call") + 2,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "lib.helper", "{value}");
+    assert_eq!(
+        result["definitions"][0]["path"], "lib/Helpers.kt",
+        "{value}"
+    );
+}
+
+#[test]
+fn kotlin_companion_member_call_resolves_from_the_enclosing_class_body() {
+    let source = r#"package app
+
+class Factory {
+    companion object {
+        fun create(): Factory = Factory()
+    }
+
+    fun again(): Factory = create()
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("= create()").expect("call") + 2,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Factory.Companion.create",
+        "{value}"
+    );
+}
+
+/// Kotlin picks the overload that can accept the call even when a nearer scope
+/// declares the same name with a different shape, so arity has to steer the
+/// scope ladder rather than filter its result.
+#[test]
+fn kotlin_call_arity_reaches_an_inherited_overload_past_a_nearer_one() {
+    let source = r#"package app
+
+open class Base {
+    fun render(value: Int, extra: String): String = extra
+}
+
+class Derived : Base() {
+    fun render(value: Int): String = ""
+
+    fun use(): String = render(1, "x")
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("render(1,").expect("call"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Base.render",
+        "{value}"
+    );
+}
+
+/// The mirror of the test above: the one-argument call stops at the nearer
+/// declaration instead of continuing to the inherited two-argument one.
+#[test]
+fn kotlin_call_arity_stops_at_the_nearer_matching_overload() {
+    let source = r#"package app
+
+open class Base {
+    fun render(value: Int, extra: String): String = extra
+}
+
+class Derived : Base() {
+    fun render(value: Int): String = ""
+
+    fun use(): String = render(1)
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("render(1)").expect("call"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Derived.render",
+        "{value}"
+    );
+}
+
+#[test]
+fn kotlin_default_parameter_overload_accepts_shorter_call() {
+    let source = r#"package app
+
+fun greet(name: String, punctuation: String = "!"): String = name + punctuation
+
+fun use(): String = greet("world")
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("greet(\"world\")").expect("call"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.greet", "{value}");
+}
+
+/// A trailing lambda is an argument even though it sits outside the
+/// parentheses, so `run(1) { }` must reach the two-parameter declaration.
+#[test]
+fn kotlin_trailing_lambda_counts_as_an_argument() {
+    let source = r#"package app
+
+open class Base {
+    fun run(times: Int, body: () -> Unit) {
+    }
+}
+
+class Derived : Base() {
+    fun run(times: Int) {
+    }
+
+    fun use() {
+        run(1) {
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference("app/App.kt", source, source.find("run(1)").expect("call")),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.Base.run", "{value}");
+}
+
+#[test]
+fn kotlin_named_argument_resolves_to_the_declaring_callable() {
+    let source = r#"package app
+
+fun greet(name: String, punctuation: String): String = name + punctuation
+
+fun use(): String = greet(name = "world", punctuation = "!")
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("name = \"world\"").expect("label"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.greet", "{value}");
+}
+
+#[test]
+fn kotlin_unknown_named_argument_abstains() {
+    let source = r#"package app
+
+fun greet(name: String): String = name
+
+fun use(): String = greet(missing = "world")
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("missing =").expect("label"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "unknown_named_argument",
+        "{value}"
+    );
+}
+
+#[test]
+fn kotlin_call_to_unknown_function_reports_no_indexed_definition() {
+    let source = r#"package app
+
+fun use(): Int = missing()
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("missing()").expect("call"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "no_indexed_definition",
+        "{value}"
+    );
+}
+
+/// A call whose spelling exists in another package that this file neither
+/// imports nor shares must not resolve to that same-named declaration.
+#[test]
+fn kotlin_call_does_not_reach_an_unimported_same_named_function() {
+    let source = r#"package app
+
+fun use(): Int = helper()
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("lib/Helpers.kt", "package lib\n\nfun helper(): Int = 1\n")
+        .file("app/App.kt", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/App.kt",
+            source,
+            source.find("= helper()").expect("call") + 2,
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_ne!(result["status"], "resolved", "{value}");
+    assert!(
+        result["definitions"]
+            .as_array()
+            .is_none_or(|units| units.is_empty()),
+        "an unimported same-named function must not be returned: {value}"
+    );
+}
