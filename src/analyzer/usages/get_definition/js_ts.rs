@@ -805,7 +805,6 @@ fn jsts_file_scoped_dotted_candidates(
     candidates
 }
 
-#[allow(clippy::too_many_arguments)]
 fn jsts_unproven_same_file_dotted_candidates(
     analyzer: &dyn IAnalyzer,
     support: &dyn BoundedDefinitionLookup,
