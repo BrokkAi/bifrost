@@ -14,7 +14,7 @@ exclude = [".claude/worktrees/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.8.12"
+version = "0.8.13"
 edition = "2024"
 license = "LGPL-3.0-or-later"
 repository = "https://github.com/BrokkAi/bifrost"
