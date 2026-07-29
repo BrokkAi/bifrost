@@ -126,6 +126,17 @@ pub struct MostRelevantFilesResult {
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub duplicates: Vec<String>,
+    pub complete: bool,
+    pub ranking_mode_used: MostRelevantFilesRankingMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<MostRelevantFilesIncompleteReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MostRelevantFilesIncompleteReason {
+    Cancelled,
+    TimeBudget,
 }
 
 pub(super) fn default_recency_half_life() -> Option<f64> {
@@ -764,8 +775,19 @@ pub fn most_relevant_files(
     analyzer: &dyn IAnalyzer,
     params: MostRelevantFilesParams,
 ) -> Result<MostRelevantFilesResult, String> {
+    most_relevant_files_with_cancellation(analyzer, params, &crate::CancellationToken::default())
+}
+
+pub(crate) fn most_relevant_files_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    params: MostRelevantFilesParams,
+    cancellation: &crate::CancellationToken,
+) -> Result<MostRelevantFilesResult, String> {
     let _scope = profiling::scope("searchtools::most_relevant_files");
     validate_most_relevant_files_params(&params)?;
+    if cancellation.is_cancelled() {
+        return Err(most_relevant_files_cancellation_message(cancellation));
+    }
     let resolver = WorkspaceFileResolver::new(analyzer.project());
     let mut seeds = Vec::new();
     let mut not_found = Vec::new();
@@ -781,6 +803,9 @@ pub fn most_relevant_files(
     {
         let _scope = profiling::scope("searchtools::most_relevant_files.resolve_seeds");
         for (input, weight) in params.seed_file_paths.into_iter().zip(seed_weights) {
+            if cancellation.is_cancelled() {
+                return Err(most_relevant_files_cancellation_message(cancellation));
+            }
             let trimmed = input.trim();
             if trimmed.is_empty() {
                 continue;
@@ -809,28 +834,65 @@ pub fn most_relevant_files(
             not_found,
             ambiguous_paths,
             duplicates,
+            complete: true,
+            ranking_mode_used: ranking_mode,
+            incomplete_reason: None,
         });
     }
 
-    let files = {
+    let (files, complete, ranking_mode_used, incomplete_reason) = {
         let _scope = profiling::scope("searchtools::most_relevant_files.rank");
-        let ranked = if ranking_mode == MostRelevantFilesRankingMode::HistoryImports
+        let (ranked, complete, ranking_mode_used, incomplete_reason) = if ranking_mode
+            == MostRelevantFilesRankingMode::HistoryImports
             && recency_half_life == Some(DEFAULT_RECENCY_HALF_LIFE)
         {
-            most_relevant_project_files(analyzer, &seeds, params.limit)
+            let files = most_relevant_project_files(analyzer, &seeds, params.limit);
+            if cancellation.is_cancelled() {
+                return Err(most_relevant_files_cancellation_message(cancellation));
+            }
+            (
+                files,
+                true,
+                MostRelevantFilesRankingMode::HistoryImports,
+                None,
+            )
         } else {
-            most_relevant_project_files_with_ranking_mode(
+            match most_relevant_project_files_with_ranking_mode_and_cancellation(
                 analyzer,
                 &seeds,
                 params.limit,
                 recency_half_life,
                 ranking_mode,
-            )
+                cancellation,
+            ) {
+                MostRelevantProjectFilesOutcome::Complete(files) => {
+                    (files, true, ranking_mode, None)
+                }
+                MostRelevantProjectFilesOutcome::Cancelled => {
+                    let reason = most_relevant_files_incomplete_reason(cancellation);
+                    (
+                        most_relevant_project_files_with_half_life(
+                            analyzer,
+                            &seeds,
+                            params.limit,
+                            recency_half_life,
+                        ),
+                        false,
+                        MostRelevantFilesRankingMode::HistoryImports,
+                        Some(reason),
+                    )
+                }
+            }
         };
-        ranked
-            .into_iter()
-            .map(|file| rel_path_string(&file))
-            .collect()
+        (
+            ranked
+                .into_iter()
+                .map(|file| rel_path_string(&file))
+                .collect(),
+            complete,
+            ranking_mode_used,
+            incomplete_reason,
+        )
     };
 
     Ok(MostRelevantFilesResult {
@@ -838,7 +900,28 @@ pub fn most_relevant_files(
         not_found,
         ambiguous_paths,
         duplicates,
+        complete,
+        ranking_mode_used,
+        incomplete_reason,
     })
+}
+
+fn most_relevant_files_cancellation_message(cancellation: &crate::CancellationToken) -> String {
+    if cancellation.is_timed_out() {
+        "most_relevant_files exceeded its request-wide time budget".to_string()
+    } else {
+        "most_relevant_files was cancelled".to_string()
+    }
+}
+
+fn most_relevant_files_incomplete_reason(
+    cancellation: &crate::CancellationToken,
+) -> MostRelevantFilesIncompleteReason {
+    if cancellation.is_timed_out() {
+        MostRelevantFilesIncompleteReason::TimeBudget
+    } else {
+        MostRelevantFilesIncompleteReason::Cancelled
+    }
 }
 
 pub(super) fn validate_most_relevant_files_params(
@@ -1138,4 +1221,27 @@ pub(super) fn trim_summary_signature(signature: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod issue_1304_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn timeout_and_explicit_cancellation_have_distinct_reasons() {
+        let timed_out = crate::CancellationToken::default().with_timeout(Duration::ZERO);
+        assert!(timed_out.is_cancelled());
+        assert_eq!(
+            most_relevant_files_incomplete_reason(&timed_out),
+            MostRelevantFilesIncompleteReason::TimeBudget
+        );
+
+        let cancelled = crate::CancellationToken::default();
+        cancelled.cancel();
+        assert_eq!(
+            most_relevant_files_incomplete_reason(&cancelled),
+            MostRelevantFilesIncompleteReason::Cancelled
+        );
+    }
 }

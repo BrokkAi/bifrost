@@ -439,13 +439,27 @@ impl RustAnalyzer {
     /// declarations; the cache is dropped on `update`/`update_all`, so a changed
     /// file rebuilds it.
     pub fn reference_context_of(&self, file: &ProjectFile) -> Arc<RustReferenceContext> {
+        self.reference_context_of_with_progress(file, &|| true)
+            .expect("uninterrupted Rust reference-context construction")
+    }
+
+    pub(crate) fn reference_context_of_with_progress(
+        &self,
+        file: &ProjectFile,
+        progress: &dyn Fn() -> bool,
+    ) -> Option<Arc<RustReferenceContext>> {
+        reference_context_checkpoint(progress).ok()?;
         if let Some(cached) = self.reference_contexts.get(file) {
-            return cached;
+            return Some(cached);
         }
-        let context = Arc::new(self.build_reference_context(file, false));
+        let context = Arc::new(
+            self.build_reference_context_with_progress(file, false, progress)
+                .ok()?,
+        );
+        reference_context_checkpoint(progress).ok()?;
         self.reference_contexts
             .insert(file.clone(), context.clone());
-        context
+        Some(context)
     }
 
     pub(crate) fn forward_reference_context_of(
@@ -473,11 +487,6 @@ impl RustAnalyzer {
         self.forward_reference_contexts
             .insert(file.clone(), context.clone());
         Some(context)
-    }
-
-    fn build_reference_context(&self, file: &ProjectFile, forward: bool) -> RustReferenceContext {
-        self.build_reference_context_with_progress(file, forward, &|| true)
-            .expect("uninterrupted Rust reference-context construction")
     }
 
     fn build_reference_context_with_progress(
@@ -1734,6 +1743,49 @@ mod tests {
             .expect("subsequent request should build a complete context");
         let cached = analyzer
             .forward_reference_context_of_with_progress(&file, &|| true)
+            .expect("complete context should be cached");
+
+        assert!(Arc::ptr_eq(&complete, &cached));
+        assert_eq!(complete.resolve_bare("Alias"), Some("exports.Alias"));
+        assert_eq!(complete.resolve_bare("helper"), Some("exports.helper"));
+    }
+
+    #[test]
+    fn issue_1304_interrupted_inverted_reference_context_is_not_cached() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Rust,
+            &[
+                (
+                    "src/lib.rs",
+                    "pub mod exports;\nuse exports::{Alias, helper};\npub fn call(value: Alias) { helper(value); }\n",
+                ),
+                (
+                    "src/exports.rs",
+                    "pub struct Alias;\npub fn helper(_: Alias) {}\n",
+                ),
+            ],
+        );
+        let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
+        let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
+        let checks = Cell::new(0usize);
+
+        let interrupted = analyzer.reference_context_of_with_progress(&file, &|| {
+            let next = checks.get() + 1;
+            checks.set(next);
+            next < 4
+        });
+
+        assert!(interrupted.is_none());
+        assert!(
+            analyzer.reference_contexts.get(&file).is_none(),
+            "an interrupted inverted context must not be published"
+        );
+
+        let complete = analyzer
+            .reference_context_of_with_progress(&file, &|| true)
+            .expect("subsequent request should build a complete context");
+        let cached = analyzer
+            .reference_context_of_with_progress(&file, &|| true)
             .expect("complete context should be cached");
 
         assert!(Arc::ptr_eq(&complete, &cached));

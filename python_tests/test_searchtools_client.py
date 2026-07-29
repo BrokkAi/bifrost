@@ -64,6 +64,7 @@ from bifrost_searchtools.client import (
 )
 from bifrost_searchtools.models import (
     CodeQueryExecutionMode as ModelCodeQueryExecutionMode,
+    MostRelevantFilesResult,
     SemanticSearchResult,
     SemanticSearchStatus,
 )
@@ -950,6 +951,39 @@ class CodeQueryModelTest(unittest.TestCase):
             }
         )
         self.assertIs(cancelled.completion.kind, CodeQueryCompletionKind.CANCELLED)
+
+
+class MostRelevantFilesModelTest(unittest.TestCase):
+    def test_result_renders_explicit_fallback(self) -> None:
+        result = MostRelevantFilesResult.from_dict(
+            {
+                "files": ["B.java"],
+                "not_found": [],
+                "duplicates": [],
+                "complete": False,
+                "ranking_mode_used": "history_imports",
+                "incomplete_reason": "time_budget",
+            }
+        )
+
+        self.assertFalse(result.complete)
+        self.assertEqual("history_imports", result.ranking_mode_used)
+        self.assertEqual("time_budget", result.incomplete_reason)
+        self.assertIn("exceeded its time budget", result.render_text())
+        self.assertIn("returned deterministic history/import ranking", result.render_text())
+
+    def test_result_rejects_unknown_fallback_reason(self) -> None:
+        with self.assertRaisesRegex(ValueError, "incomplete_reason must be one of"):
+            MostRelevantFilesResult.from_dict(
+                {
+                    "files": [],
+                    "not_found": [],
+                    "duplicates": [],
+                    "complete": False,
+                    "ranking_mode_used": "history_imports",
+                    "incomplete_reason": "mystery",
+                }
+            )
 
 
 class SearchToolsClientTest(unittest.TestCase):

@@ -1,8 +1,14 @@
 use crate::analyzer::usages::inverted_edges::UsageReferenceCounts;
 use crate::analyzer::usages::workspace_graph::{
-    WorkspaceUsageCatalog, WorkspaceUsageGraph, build_workspace_usage_graph,
+    UsageEcosystem, WorkspaceUsageCatalog, WorkspaceUsageGraphBuildOutcome,
+    WorkspaceUsageRankingGraph as UsageRankingGraph, build_workspace_usage_graph_with_cancellation,
+};
+use crate::analyzer::usages::workspace_graph_cache::{
+    WorkspaceUsageGraphCacheAcquisition, WorkspaceUsageGraphCacheBuildOutcome,
+    WorkspaceUsageGraphCacheKey,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
+use crate::cancellation::CancellationToken;
 use crate::compact_graph::CompactDirectedGraph;
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
@@ -102,9 +108,14 @@ struct UsageReferenceWeights {
     other: f64,
 }
 
-struct UsageRankingGraph {
-    graph: WorkspaceUsageGraph,
-    node_indices_by_file: HashMap<ProjectFile, Vec<usize>>,
+pub(crate) enum MostRelevantProjectFilesOutcome {
+    Complete(Vec<ProjectFile>),
+    Cancelled,
+}
+
+enum Cancellable<T> {
+    Complete(T),
+    Cancelled,
 }
 
 impl UsageReferenceWeights {
@@ -191,69 +202,228 @@ pub(crate) fn most_relevant_project_files_with_half_life(
     results
 }
 
-pub(crate) fn most_relevant_project_files_with_ranking_mode(
+pub(crate) fn most_relevant_project_files_with_ranking_mode_and_cancellation(
     analyzer: &dyn IAnalyzer,
     seeds: &[(ProjectFile, f64)],
     top_k: usize,
     half_life: Option<f64>,
     ranking_mode: MostRelevantFilesRankingMode,
-) -> Vec<ProjectFile> {
+    cancellation: &CancellationToken,
+) -> MostRelevantProjectFilesOutcome {
     let _scope = profiling::scope("relevance::most_relevant_project_files_with_ranking_mode");
+    if cancellation.is_cancelled() {
+        return MostRelevantProjectFilesOutcome::Cancelled;
+    }
     if ranking_mode == MostRelevantFilesRankingMode::HistoryImports {
-        return most_relevant_project_files_with_half_life(analyzer, seeds, top_k, half_life);
+        let files = most_relevant_project_files_with_half_life(analyzer, seeds, top_k, half_life);
+        return if cancellation.is_cancelled() {
+            MostRelevantProjectFilesOutcome::Cancelled
+        } else {
+            MostRelevantProjectFilesOutcome::Complete(files)
+        };
     }
     if top_k == 0 {
-        return Vec::new();
+        return MostRelevantProjectFilesOutcome::Complete(Vec::new());
     }
 
     let seed_weights = seed_weight_map(seeds);
     if seed_weights.is_empty() {
-        return Vec::new();
+        return MostRelevantProjectFilesOutcome::Complete(Vec::new());
     }
     let excluded: HashSet<_> = seed_weights.keys().cloned().collect();
     let mut results = Vec::new();
     let mut seen = HashSet::default();
 
-    for candidate in related_files_by_usage(analyzer, &seed_weights, top_k) {
+    let usage_candidates =
+        match related_files_by_usage(analyzer, &seed_weights, top_k, cancellation) {
+            Cancellable::Complete(candidates) => candidates,
+            Cancellable::Cancelled => return MostRelevantProjectFilesOutcome::Cancelled,
+        };
+    for candidate in usage_candidates {
         if append_candidate(&mut results, &mut seen, &excluded, candidate.file, top_k) {
-            return results;
+            return MostRelevantProjectFilesOutcome::Complete(results);
         }
     }
 
+    if cancellation.is_cancelled() {
+        return MostRelevantProjectFilesOutcome::Cancelled;
+    }
     for candidate in most_relevant_project_files_with_half_life(analyzer, seeds, top_k, half_life) {
+        if cancellation.is_cancelled() {
+            return MostRelevantProjectFilesOutcome::Cancelled;
+        }
         if append_candidate(&mut results, &mut seen, &excluded, candidate, top_k) {
             break;
         }
     }
-    results
+    if cancellation.is_cancelled() {
+        MostRelevantProjectFilesOutcome::Cancelled
+    } else {
+        MostRelevantProjectFilesOutcome::Complete(results)
+    }
 }
 
 fn related_files_by_usage(
     analyzer: &dyn IAnalyzer,
     seed_weights: &HashMap<ProjectFile, f64>,
     k: usize,
-) -> Vec<FileRelevance> {
+    cancellation: &CancellationToken,
+) -> Cancellable<Vec<FileRelevance>> {
     let _scope = profiling::scope("relevance::related_files_by_usage");
     if k == 0 {
-        return Vec::new();
+        return Cancellable::Complete(Vec::new());
     }
 
-    let ranking_graph = build_usage_ranking_graph(analyzer);
-    related_files_by_usage_graph(
+    let ranking_graph =
+        match build_usage_ranking_graph_with_cancellation(analyzer, seed_weights, cancellation) {
+            Cancellable::Complete(graph) => graph,
+            Cancellable::Cancelled => return Cancellable::Cancelled,
+        };
+    related_files_by_usage_graph_with_cancellation(
         &ranking_graph,
         seed_weights,
         k,
         UsageReferenceWeights::CALIBRATED,
+        cancellation,
     )
 }
 
-fn build_usage_ranking_graph(analyzer: &dyn IAnalyzer) -> UsageRankingGraph {
-    let catalog = {
-        let _scope = profiling::scope("relevance::usage_graph_catalog");
-        WorkspaceUsageCatalog::build(analyzer)
+#[cfg(test)]
+fn build_usage_ranking_graph(analyzer: &dyn IAnalyzer) -> Arc<UsageRankingGraph> {
+    let catalog = WorkspaceUsageCatalog::build(analyzer);
+    let selected_ecosystems = catalog.ecosystems();
+    match build_usage_ranking_graph_for_ecosystems_with_cancellation(
+        analyzer,
+        catalog,
+        &selected_ecosystems,
+        &CancellationToken::default(),
+    ) {
+        Cancellable::Complete(graph) => Arc::new(graph),
+        Cancellable::Cancelled => {
+            unreachable!("default cancellation token cannot cancel usage graph construction")
+        }
+    }
+}
+
+fn build_usage_ranking_graph_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    seed_weights: &HashMap<ProjectFile, f64>,
+    cancellation: &CancellationToken,
+) -> Cancellable<Arc<UsageRankingGraph>> {
+    let selected_ecosystems: BTreeSet<_> = seed_weights
+        .keys()
+        .map(|file| UsageEcosystem::of(crate::analyzer::common::language_for_file(file)))
+        .collect();
+    if profiling::enabled() {
+        profiling::note(format!(
+            "usage-graph selected_ecosystems={}",
+            selected_ecosystems
+                .iter()
+                .map(|ecosystem| ecosystem.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+
+    let Some(cache) = analyzer
+        .snapshot_caches()
+        .map(|caches| caches.usage_graphs())
+    else {
+        return build_usage_ranking_graph_uncached(
+            analyzer,
+            seed_weights,
+            &selected_ecosystems,
+            cancellation,
+        )
+        .map(Arc::new);
     };
+
+    for _ in 0..2 {
+        let source_generations = analyzer.snapshot_source_generations();
+        let key = WorkspaceUsageGraphCacheKey::new(
+            selected_ecosystems.iter().copied(),
+            source_generations.clone(),
+        );
+        let acquisition = cache.acquire(
+            key,
+            cancellation,
+            || match build_usage_ranking_graph_uncached(
+                analyzer,
+                seed_weights,
+                &selected_ecosystems,
+                cancellation,
+            ) {
+                Cancellable::Complete(graph) => {
+                    WorkspaceUsageGraphCacheBuildOutcome::Complete(graph)
+                }
+                Cancellable::Cancelled => WorkspaceUsageGraphCacheBuildOutcome::Cancelled,
+            },
+            || analyzer.snapshot_generations_match(&source_generations),
+        );
+        match acquisition {
+            WorkspaceUsageGraphCacheAcquisition::Ready {
+                graph,
+                lifecycle,
+                wait,
+            } => {
+                if profiling::enabled() {
+                    profiling::note(format!(
+                        "usage-graph cache={lifecycle:?} waits={} wait_ms={:.1}",
+                        wait.waits,
+                        wait.wait_ns as f64 / 1_000_000.0
+                    ));
+                }
+                return Cancellable::Complete(graph);
+            }
+            WorkspaceUsageGraphCacheAcquisition::Cancelled => return Cancellable::Cancelled,
+            WorkspaceUsageGraphCacheAcquisition::Stale => continue,
+        }
+    }
+    Cancellable::Cancelled
+}
+
+impl<T> Cancellable<T> {
+    fn map<U>(self, map: impl FnOnce(T) -> U) -> Cancellable<U> {
+        match self {
+            Self::Complete(value) => Cancellable::Complete(map(value)),
+            Self::Cancelled => Cancellable::Cancelled,
+        }
+    }
+}
+
+fn build_usage_ranking_graph_uncached(
+    analyzer: &dyn IAnalyzer,
+    seed_weights: &HashMap<ProjectFile, f64>,
+    selected_ecosystems: &BTreeSet<UsageEcosystem>,
+    cancellation: &CancellationToken,
+) -> Cancellable<UsageRankingGraph> {
+    let Some(catalog) = ({
+        let _scope = profiling::scope("relevance::usage_graph_catalog");
+        WorkspaceUsageCatalog::build_with_cancellation(analyzer, cancellation)
+    }) else {
+        return Cancellable::Cancelled;
+    };
+    let catalog_ecosystems = catalog.ecosystems_for_files(seed_weights.keys());
+    debug_assert!(catalog_ecosystems.is_subset(selected_ecosystems));
+    build_usage_ranking_graph_for_ecosystems_with_cancellation(
+        analyzer,
+        catalog,
+        &catalog_ecosystems,
+        cancellation,
+    )
+}
+
+fn build_usage_ranking_graph_for_ecosystems_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    catalog: WorkspaceUsageCatalog,
+    selected_ecosystems: &BTreeSet<UsageEcosystem>,
+    cancellation: &CancellationToken,
+) -> Cancellable<UsageRankingGraph> {
     let mut node_indices_by_file: HashMap<ProjectFile, Vec<usize>> = HashMap::default();
     for (index, node) in catalog.nodes.iter().enumerate() {
+        if cancellation.is_cancelled() {
+            return Cancellable::Cancelled;
+        }
         for file in &node.declaration_files {
             node_indices_by_file
                 .entry(file.clone())
@@ -262,28 +432,62 @@ fn build_usage_ranking_graph(analyzer: &dyn IAnalyzer) -> UsageRankingGraph {
         }
     }
 
-    let graph = {
+    let graph_outcome = {
         let _scope = profiling::scope("relevance::usage_graph_construction");
-        build_workspace_usage_graph(analyzer, catalog)
+        build_workspace_usage_graph_with_cancellation(
+            analyzer,
+            catalog,
+            selected_ecosystems,
+            cancellation,
+        )
     };
-    UsageRankingGraph {
+    let graph = match graph_outcome {
+        WorkspaceUsageGraphBuildOutcome::Complete(graph) => graph,
+        WorkspaceUsageGraphBuildOutcome::Cancelled => return Cancellable::Cancelled,
+    };
+    Cancellable::Complete(UsageRankingGraph {
         graph,
         node_indices_by_file,
-    }
+    })
 }
 
+#[cfg(test)]
 fn related_files_by_usage_graph(
     ranking_graph: &UsageRankingGraph,
     seed_weights: &HashMap<ProjectFile, f64>,
     k: usize,
     weights: UsageReferenceWeights,
 ) -> Vec<FileRelevance> {
+    match related_files_by_usage_graph_with_cancellation(
+        ranking_graph,
+        seed_weights,
+        k,
+        weights,
+        &CancellationToken::default(),
+    ) {
+        Cancellable::Complete(files) => files,
+        Cancellable::Cancelled => {
+            unreachable!("default cancellation token cannot cancel usage ranking")
+        }
+    }
+}
+
+fn related_files_by_usage_graph_with_cancellation(
+    ranking_graph: &UsageRankingGraph,
+    seed_weights: &HashMap<ProjectFile, f64>,
+    k: usize,
+    weights: UsageReferenceWeights,
+    cancellation: &CancellationToken,
+) -> Cancellable<Vec<FileRelevance>> {
     if k == 0 {
-        return Vec::new();
+        return Cancellable::Complete(Vec::new());
     }
     let graph = &ranking_graph.graph;
     let mut teleport = vec![0.0; graph.nodes.len()];
     for (file, weight) in seed_weights.iter().filter(|(_, weight)| **weight > 0.0) {
+        if cancellation.is_cancelled() {
+            return Cancellable::Cancelled;
+        }
         let Some(indices) = ranking_graph.node_indices_by_file.get(file) else {
             continue;
         };
@@ -296,11 +500,11 @@ fn related_files_by_usage_graph(
         }
     }
     if teleport.iter().all(|weight| *weight <= 0.0) {
-        return Vec::new();
+        return Cancellable::Complete(Vec::new());
     }
 
     if graph.edges.is_empty() {
-        return Vec::new();
+        return Cancellable::Complete(Vec::new());
     }
     if profiling::enabled() {
         let unproven_inbound: usize = graph.nodes.iter().map(|node| node.unproven_inbound).sum();
@@ -312,21 +516,29 @@ fn related_files_by_usage_graph(
     }
     let mut outgoing = vec![Vec::new(); graph.nodes.len()];
     for edge in &graph.edges {
+        if cancellation.is_cancelled() {
+            return Cancellable::Cancelled;
+        }
         outgoing[edge.from].push((edge.to, weights.combine(edge.counts)));
     }
     for neighbors in &mut outgoing {
         neighbors.sort_by_key(|(target, _)| *target);
     }
 
-    let scores = {
+    let Some(scores) = ({
         let _scope = profiling::scope("relevance::usage_graph_page_rank");
-        weighted_page_rank(&outgoing, &teleport)
+        weighted_page_rank_with_cancellation(&outgoing, &teleport, cancellation)
+    }) else {
+        return Cancellable::Cancelled;
     };
     let excluded: HashSet<_> = seed_weights.keys().collect();
     let mut file_scores: HashMap<ProjectFile, f64> = HashMap::default();
     {
         let _scope = profiling::scope("relevance::usage_graph_file_aggregation");
         for (node, score) in graph.nodes.iter().zip(scores) {
+            if cancellation.is_cancelled() {
+                return Cancellable::Cancelled;
+            }
             if node.truncated_inbound.is_some() || excluded.contains(node.primary.source()) {
                 continue;
             }
@@ -343,7 +555,7 @@ fn related_files_by_usage_graph(
         .collect();
     ranked.sort_by(compare_file_relevance);
     ranked.truncate(k);
-    ranked
+    Cancellable::Complete(ranked)
 }
 
 pub(crate) fn most_important_project_files(
@@ -664,9 +876,21 @@ fn weighted_page_rank<G>(outgoing: &G, teleport: &[f64]) -> Vec<f64>
 where
     G: WeightedAdjacency + ?Sized,
 {
+    weighted_page_rank_with_cancellation(outgoing, teleport, &CancellationToken::default())
+        .expect("default cancellation token cannot cancel PageRank")
+}
+
+fn weighted_page_rank_with_cancellation<G>(
+    outgoing: &G,
+    teleport: &[f64],
+    cancellation: &CancellationToken,
+) -> Option<Vec<f64>>
+where
+    G: WeightedAdjacency + ?Sized,
+{
     let node_count = outgoing.node_count();
     if node_count == 0 {
-        return Vec::new();
+        return Some(Vec::new());
     }
     assert!(
         teleport.is_empty() || teleport.len() == node_count,
@@ -702,23 +926,32 @@ where
     let mut next = vec![0.0; node_count];
     let outgoing_weight = (0..node_count)
         .map(|source| {
+            if cancellation.is_cancelled() {
+                return None;
+            }
             let mut total = 0.0;
             outgoing.for_each_edge(source, |_, weight| {
                 if weight.is_finite() && weight > 0.0 {
                     total += weight;
                 }
             });
-            total
+            Some(total)
         })
-        .collect::<Vec<_>>();
+        .collect::<Option<Vec<_>>>()?;
 
     for _ in 0..MAX_ITERS {
+        if cancellation.is_cancelled() {
+            return None;
+        }
         for (index, teleport_weight) in normalized_teleport.iter().enumerate() {
             next[index] = (1.0 - ALPHA) * teleport_weight;
         }
 
         let mut dangling_mass = 0.0;
         for source in 0..node_count {
+            if cancellation.is_cancelled() {
+                return None;
+            }
             let total_weight = outgoing_weight[source];
             if total_weight <= 0.0 {
                 dangling_mass += rank[source];
@@ -751,7 +984,7 @@ where
         }
     }
 
-    rank
+    Some(rank)
 }
 
 fn build_import_graph(
@@ -1823,7 +2056,7 @@ mod tests {
     use crate::analyzer::usages::inverted_edges::UsageReferenceCounts;
     use crate::analyzer::{
         AnalyzerDelegate, JavaAnalyzer, Language, MultiAnalyzer, ProjectFile, PythonAnalyzer,
-        TestProject,
+        RustAnalyzer, TestProject,
     };
     use crate::hash::HashMap;
     use git2::{Repository, Signature};
@@ -2150,6 +2383,136 @@ mod tests {
 
         assert!(scores[2] > scores[1], "scores: {scores:?}");
         assert!((scores.iter().sum::<f64>() - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn issue_1304_weighted_page_rank_stops_on_cancellation() {
+        let cancellation = crate::CancellationToken::cancel_after_checks_for_test(2);
+
+        let scores = super::weighted_page_rank_with_cancellation(
+            &[vec![(1, 1.0)], vec![(0, 1.0)]],
+            &[1.0, 0.0],
+            &cancellation,
+        );
+
+        assert!(scores.is_none());
+    }
+
+    #[test]
+    fn issue_1304_cancelled_usage_graph_is_a_typed_outcome() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let seed = write_file(
+            root,
+            "test/Seed.java",
+            "package test; public class Seed { void run() { Target.work(); } }",
+        );
+        write_file(
+            root,
+            "test/Target.java",
+            "package test; public class Target { static void work() {} }",
+        );
+        let analyzer = java_analyzer(root);
+        let cancellation = crate::CancellationToken::cancel_after_checks_for_test(3);
+
+        let outcome = super::most_relevant_project_files_with_ranking_mode_and_cancellation(
+            &analyzer,
+            &[(seed, 1.0)],
+            1,
+            Some(DEFAULT_RECENCY_HALF_LIFE),
+            super::MostRelevantFilesRankingMode::UsageGraph,
+            &cancellation,
+        );
+
+        assert!(matches!(
+            outcome,
+            super::MostRelevantProjectFilesOutcome::Cancelled
+        ));
+    }
+
+    #[test]
+    fn issue_1304_seed_ecosystem_pruning_preserves_exact_ranking() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let rust_seed = write_file(
+            root,
+            "src/caller.rs",
+            "use crate::target::target;\npub fn seed() { target(); }\n",
+        );
+        write_file(root, "src/lib.rs", "pub mod caller;\npub mod target;\n");
+        let rust_target = write_file(
+            root,
+            "src/target.rs",
+            "pub fn target() { leaf(); }\npub fn leaf() {}\n",
+        );
+        write_file(
+            root,
+            "py_source.py",
+            "from py_target import target\n\ndef source():\n    target()\n",
+        );
+        write_file(root, "py_target.py", "def target():\n    pass\n");
+
+        let project = TestProject::new(root.to_path_buf(), Language::Rust);
+        let analyzer = MultiAnalyzer::new(BTreeMap::from([
+            (
+                Language::Python,
+                AnalyzerDelegate::Python(PythonAnalyzer::from_project(project.clone())),
+            ),
+            (
+                Language::Rust,
+                AnalyzerDelegate::Rust(RustAnalyzer::from_project(project)),
+            ),
+        ]));
+        let seed_weights = hash_map([(rust_seed.clone(), 1.0)]);
+
+        let selected_graph = match super::build_usage_ranking_graph_with_cancellation(
+            &analyzer,
+            &seed_weights,
+            &crate::CancellationToken::default(),
+        ) {
+            super::Cancellable::Complete(graph) => graph,
+            super::Cancellable::Cancelled => panic!("uncancelled selected graph build"),
+        };
+        let warm_graph = match super::build_usage_ranking_graph_with_cancellation(
+            &analyzer,
+            &seed_weights,
+            &crate::CancellationToken::default(),
+        ) {
+            super::Cancellable::Complete(graph) => graph,
+            super::Cancellable::Cancelled => panic!("uncancelled warm graph acquisition"),
+        };
+        assert!(Arc::ptr_eq(&selected_graph, &warm_graph));
+        let all_graph = super::build_usage_ranking_graph(&analyzer);
+
+        assert_eq!(
+            vec![crate::analyzer::usages::workspace_graph::UsageEcosystem::Rust],
+            selected_graph.graph.resolved_ecosystems
+        );
+        assert!(
+            all_graph
+                .graph
+                .resolved_ecosystems
+                .contains(&crate::analyzer::usages::workspace_graph::UsageEcosystem::Python)
+        );
+        let selected = super::related_files_by_usage_graph(
+            &selected_graph,
+            &seed_weights,
+            10,
+            UsageReferenceWeights::CALIBRATED,
+        );
+        let all = super::related_files_by_usage_graph(
+            &all_graph,
+            &seed_weights,
+            10,
+            UsageReferenceWeights::CALIBRATED,
+        );
+
+        assert_eq!(all, selected);
+        assert!(
+            selected
+                .iter()
+                .any(|candidate| candidate.file == rust_target)
+        );
     }
 
     #[test]

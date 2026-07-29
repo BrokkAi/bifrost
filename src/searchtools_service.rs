@@ -30,7 +30,7 @@ use crate::{
         get_definitions_by_location_with_cancellation, get_definitions_by_reference,
         get_summaries_with_cancellation, get_symbol_ancestors,
         get_symbol_locations_with_cancellation, get_symbol_sources, get_type_by_location,
-        list_symbols, most_relevant_files, refresh_result, rename_symbol,
+        list_symbols, most_relevant_files_with_cancellation, refresh_result, rename_symbol,
         scan_usages_by_location_with_cancellation, scan_usages_by_reference_with_cancellation,
         search_symbols_with_cancellation, symbol_source_candidate_files, usage_graph,
     },
@@ -794,7 +794,10 @@ impl SearchToolsService {
         if cancellation.is_some_and(CancellationToken::is_cancelled)
             && !matches!(
                 name,
-                "search_symbols" | "scan_usages_by_reference" | "scan_usages_by_location"
+                "search_symbols"
+                    | "most_relevant_files"
+                    | "scan_usages_by_reference"
+                    | "scan_usages_by_location"
             )
         {
             return Err(SearchToolsServiceError::internal(
@@ -852,9 +855,23 @@ impl SearchToolsService {
                 arguments,
                 render_options,
                 |workspace, params: MostRelevantFilesParams| {
-                    most_relevant_files(workspace.analyzer(), params)
+                    let uncancelled = CancellationToken::default();
+                    most_relevant_files_with_cancellation(
+                        workspace.analyzer(),
+                        params,
+                        cancellation.unwrap_or(&uncancelled),
+                    )
                 },
-            ),
+            )
+            .map_err(|error| {
+                if cancellation.is_some_and(CancellationToken::is_cancelled)
+                    && error.code == SearchToolsServiceErrorCode::InvalidParams
+                {
+                    SearchToolsServiceError::internal(error.message)
+                } else {
+                    error
+                }
+            }),
             "scan_usages_by_reference" => {
                 Self::validate_scan_usages_by_reference_arguments(&arguments)?;
                 Self::decode_render_and_run(
@@ -1018,7 +1035,10 @@ impl SearchToolsService {
         let result = if cancellation.is_some_and(CancellationToken::is_cancelled)
             && !matches!(
                 name,
-                "search_symbols" | "scan_usages_by_reference" | "scan_usages_by_location"
+                "search_symbols"
+                    | "most_relevant_files"
+                    | "scan_usages_by_reference"
+                    | "scan_usages_by_location"
             ) {
             Err(SearchToolsServiceError::internal(format!(
                 "{name} was cancelled or exceeded its request-wide time budget"
@@ -3534,6 +3554,81 @@ mod search_symbols_cancellation_tests {
                 .as_str()
                 .is_some_and(|note| note.contains("cancelled") && note.contains("partial")),
             "{result:#}"
+        );
+    }
+
+    #[test]
+    fn issue_1304_service_forwards_cancellation_to_most_relevant_files() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "pub fn target() {}\n").unwrap();
+        let service =
+            SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
+                .unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = service
+            .call_tool_output_with_cancellation(
+                "most_relevant_files",
+                json!({
+                    "seed_file_paths": ["lib.rs"],
+                    "ranking_mode": "usage_graph",
+                    "limit": 10
+                }),
+                RenderOptions::default(),
+                Some(&cancellation),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, SearchToolsServiceErrorCode::Internal);
+        assert!(error.message.contains("most_relevant_files was cancelled"));
+    }
+
+    #[test]
+    fn issue_1304_cancelled_graph_returns_explicit_history_import_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("A.java"),
+            "import local.B; public class A { B value; }\n",
+        )
+        .unwrap();
+        std::fs::create_dir(temp.path().join("local")).unwrap();
+        std::fs::write(
+            temp.path().join("local/B.java"),
+            "package local; public class B {}\n",
+        )
+        .unwrap();
+        let service =
+            SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
+                .unwrap();
+        let cancellation = CancellationToken::cancel_after_checks_for_test(4);
+
+        let output = service
+            .call_tool_output_with_cancellation(
+                "most_relevant_files",
+                json!({
+                    "seed_file_paths": ["A.java"],
+                    "ranking_mode": "usage_graph",
+                    "limit": 10
+                }),
+                RenderOptions::default(),
+                Some(&cancellation),
+            )
+            .unwrap();
+        let (result, rendered) = match output {
+            ToolOutput::Structured {
+                structured,
+                rendered_text,
+            } => (structured, rendered_text.unwrap_or_default()),
+            ToolOutput::Text(text) => panic!("expected structured fallback, got {text}"),
+        };
+
+        assert_eq!(result["complete"], false, "{result:#}");
+        assert_eq!(result["ranking_mode_used"], "history_imports", "{result:#}");
+        assert_eq!(result["incomplete_reason"], "cancelled", "{result:#}");
+        assert!(
+            rendered.contains("returned deterministic history/import ranking instead"),
+            "{rendered}"
         );
     }
 

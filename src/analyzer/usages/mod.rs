@@ -44,6 +44,7 @@ pub(crate) mod scala_graph;
 pub(crate) mod target_kind;
 mod traits;
 pub(crate) mod workspace_graph;
+pub(crate) mod workspace_graph_cache;
 
 #[cfg(test)]
 pub(crate) use call_relations::CallArgument;

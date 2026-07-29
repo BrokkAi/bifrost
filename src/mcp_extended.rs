@@ -632,7 +632,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "type": "string",
                         "enum": ["history_imports", "usage_graph"],
                         "default": "history_imports",
-                        "description": "Ranking source. history_imports preserves git-first/import-fill behavior; usage_graph ranks resolved caller-to-callee relationships first and uses the legacy ranking to fill remaining slots."
+                        "description": "Ranking source. history_imports preserves git-first/import-fill behavior; usage_graph ranks resolved caller-to-callee relationships first and uses the legacy ranking to fill remaining slots. If usage-graph construction is cancelled or exceeds the interactive budget, the response is marked incomplete and returns deterministic history/import ranking instead."
                     },
                     "limit": {
                         "type": "integer",

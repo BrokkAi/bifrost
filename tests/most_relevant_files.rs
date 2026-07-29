@@ -1046,6 +1046,12 @@ fn usage_mode_prefers_resolved_calls_and_respects_edge_weights() {
     )
     .unwrap();
 
+    assert!(results.complete);
+    assert_eq!(
+        MostRelevantFilesRankingMode::UsageGraph,
+        results.ranking_mode_used
+    );
+    assert_eq!(None, results.incomplete_reason);
     assert_eq!("test/WeightedUse.java", results.files[0]);
     assert_eq!("test/SingleUse.java", results.files[1]);
     assert_eq!("test/ImportOnly.java", results.files[2]);

@@ -176,6 +176,31 @@ Backwards compatibility is not yet a concern. Clean up APIs instead when our req
   when these are genuinely the best option, just be intentional rather than reaching for these
   out of habit.
 
+# Coding conventions
+
+- Use asserts to validate assumptions: prefer reasonable assumptions backed by `assert!` (or `debug_assert!` on hot
+  paths) to defensive `if` checks, and never return `Result`/`Option` for can't-happen states. The FqName round-trip
+  debug assert catching #1189 is the model: fail loudly at the construction site instead of propagating corrupt state.
+- DRY, but flag parameters are a design smell: if factoring out shared code would require adding a `mode`-style
+  boolean/enum parameter, write separate functions instead.
+- Parsimony: when a general case also produces correct results for the special cases (empty input, maximum size,
+  single element), write only the general case. Don't write special cases unless they are necessary.
+- YAGNI: implement the simplest solution that meets the requirements unless you have specific knowledge that a more
+  robust solution is needed for near-future requirements.
+- Keep related code together: don't split a short computation into a separate function, module, or file unless it is
+  self-contained and either significantly complex or called from multiple sites. Declare small single-use structs and
+  enums next to the code that produces or returns them, not in standalone modules.
+- No mocking frameworks, no dependency-injection scaffolding: test doubles are hand-rolled fakes
+  (`FakeEngineProvider`, `new_without_semantic_index`) and traits with default implementations
+  (`unimplemented!()` is fine) to keep test boilerplate minimal.
+- No overcautious error handling: don't match/catch an error unless you have context-specific handling to apply;
+  propagate with `?` and let the caller's logging surface it. Never `let _ = fallible()`. Results and panics from
+  spawned threads or rayon tasks must be surfaced, never silently dropped.
+- When logging or formatting diagnostics, include the full collections (trust the Debug impls), not just counts.
+- Plain ASCII in code and comments: no fancy quotes, dashes, or spaces.
+- Before adding a local helper that interprets strings, paths, or common shapes, look for an existing shared helper
+  first; add to the shared location if one is needed in more than one place.
+
 # Semantic search (nlp toolset)
 
 The `nlp` cargo feature (opt-in; `default = []`) adds `semantic_search`, with voyage-4-nano embeddings served by the
