@@ -301,11 +301,34 @@ fn run_interactive_query_scenarios(
 ) -> Vec<ScenarioReport> {
     let session = start_initialized_session(workspace_path, false, profile.is_some());
     match session {
-        Ok(mut session) => target
-            .interactive_queries
-            .iter()
-            .map(|case| run_interactive_query_case(target, manifest, &mut session, case, profile))
-            .collect(),
+        Ok(mut session) => match prewarm_interactive_session(&mut session) {
+            Ok(()) => target
+                .interactive_queries
+                .iter()
+                .map(|case| {
+                    run_interactive_query_case(target, manifest, &mut session, case, profile)
+                })
+                .collect(),
+            Err(error) => target
+                .interactive_queries
+                .iter()
+                .map(|case| {
+                    ScenarioReport::from_timings(
+                        BenchmarkScenario::InteractiveCodeIntelligence,
+                        ScenarioTransport::Mcp,
+                        false,
+                        Vec::new(),
+                        Vec::new(),
+                        Some(format!(
+                            "failed to prewarm interactive MCP session for `{}`: {error}",
+                            target.name
+                        )),
+                    )
+                    .with_case_id(case.id.clone())
+                    .with_latency_budget(case.max_p95_ms)
+                })
+                .collect(),
+        },
         Err(error) => target
             .interactive_queries
             .iter()
@@ -326,6 +349,22 @@ fn run_interactive_query_scenarios(
             })
             .collect(),
     }
+}
+
+fn prewarm_interactive_session(session: &mut McpSession) -> Result<(), String> {
+    // Search is deliberately a guaranteed-miss: it forces the lazy workspace
+    // snapshot to materialize without making a scenario-specific assertion or
+    // contributing a timing sample. The next request is therefore genuinely
+    // warm while retaining the same MCP process and caches.
+    session
+        .call_tool(
+            "search_symbols",
+            json!({
+                "patterns": ["__bifrost_benchmark_prewarm__"],
+                "limit": 1,
+            }),
+        )
+        .map(|_| ())
 }
 
 fn run_interactive_query_case(
@@ -1535,7 +1574,11 @@ fn tool_arguments(target: &BenchmarkRepoTarget, scenario: BenchmarkScenario) -> 
         }),
         BenchmarkScenario::ScanUsages => {
             let mut args = json!({
-                "include_tests": true
+                "include_tests": true,
+                // The regular benchmark is a compatibility and performance
+                // comparison, not an interactive request. It needs a complete
+                // result so it can compare semantics with the blessed baseline.
+                "max_duration_secs": crate::mcp_common::BENCHMARK_MCP_REQUEST_BUDGET_SECS,
             });
             if !target.usage_symbols.is_empty() {
                 args["symbols"] = json!(target.usage_symbols);
@@ -1715,6 +1758,21 @@ fn assert_scenario_result(
             if results.is_empty() {
                 return Err(format!(
                     "scan_usages returned no result entries for `{}`",
+                    target.name
+                ));
+            }
+            if structured["summary"]["partial"].as_bool() == Some(true) {
+                let reasons = results
+                    .iter()
+                    .filter_map(|entry| entry["incomplete_reason"].as_str())
+                    .collect::<BTreeSet<_>>();
+                let reasons = if reasons.is_empty() {
+                    "unspecified reason".to_string()
+                } else {
+                    reasons.into_iter().collect::<Vec<_>>().join(", ")
+                };
+                return Err(format!(
+                    "scan_usages returned explicitly bounded incomplete results for `{}` ({reasons}); it did not establish call-site absence",
                     target.name
                 ));
             }
@@ -1951,6 +2009,35 @@ mod issue_1228_tests {
             assert_interactive_result(&bounded_scan_case(), &arbitrary_partial).is_err(),
             "a partial result must preserve input identity and actionable recovery guidance"
         );
+    }
+
+    #[test]
+    fn benchmark_scan_reports_bounded_incompleteness_without_claiming_absence() {
+        let target: BenchmarkRepoTarget = serde_json::from_value(json!({
+            "name": "bounded-scan",
+            "url": "https://example.invalid/bounded-scan",
+            "commit": "deadbeef",
+            "languages": [],
+            "scenarios": []
+        }))
+        .expect("minimal benchmark target");
+        let result = json!({
+            "structuredContent": {
+                "summary": { "partial": true },
+                "results": [{
+                    "status": "failure",
+                    "complete": false,
+                    "incomplete_reason": "time_budget"
+                }]
+            }
+        });
+
+        let error = assert_scenario_result(&target, BenchmarkScenario::ScanUsages, &result)
+            .expect_err("a bounded scan is not a complete compatibility result");
+
+        assert!(error.contains("explicitly bounded incomplete"), "{error}");
+        assert!(error.contains("time_budget"), "{error}");
+        assert!(!error.contains("no call sites"), "{error}");
     }
 
     #[test]
