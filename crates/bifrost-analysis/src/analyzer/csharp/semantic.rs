@@ -579,7 +579,7 @@ fn has_modifier(source: &str, node: Node<'_>, modifier: &str) -> bool {
     })
 }
 
-fn has_direct_token(node: Node<'_>, kind: &str) -> bool {
+pub(super) fn has_direct_token(node: Node<'_>, kind: &str) -> bool {
     let mut cursor = node.walk();
     node.children(&mut cursor).any(|child| child.kind() == kind)
 }

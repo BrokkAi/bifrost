@@ -1,13 +1,60 @@
+use crate::analyzer::cognitive_complexity;
 use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
 use crate::analyzer::{CodeUnit, Language, LanguageAdapter, ProjectFile, SignatureMetadata};
+use std::sync::LazyLock;
+use tree_sitter::Node;
 use tree_sitter::Tree;
 
 use super::declarations::parse_csharp_file;
+use super::semantic::has_direct_token;
 use super::tests::csharp_contains_tests;
 use super::{
     csharp_normalize_full_name, csharp_signature_arity, csharp_signature_return_type,
     csharp_source_identifier, strip_csharp_generic_arity,
 };
+
+static CSHARP_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
+    LazyLock::new(|| cognitive_complexity::Config {
+        if_types: &["if_statement"],
+        loop_types: &[
+            "for_statement",
+            "foreach_statement",
+            "while_statement",
+            "do_statement",
+        ],
+        catch_types: &["catch_clause"],
+        conditional_types: &["conditional_expression"],
+        case_types: &["switch_section", "switch_expression_arm"],
+        binary_types: &["binary_expression"],
+        logical_operators: &["&&", "||"],
+        jump_types: &["break_statement", "continue_statement"],
+        named_function_boundary_types: &[
+            "method_declaration",
+            "constructor_declaration",
+            "local_function_statement",
+        ],
+        anonymous_function_types: &["lambda_expression", "anonymous_method_expression"],
+        default_case_predicate: Some(csharp_is_default_case),
+        ..cognitive_complexity::Config::empty()
+    });
+
+fn csharp_is_default_case(node: Node<'_>, _source: &str) -> bool {
+    if has_direct_token(node, "default") {
+        return true;
+    }
+    let mut work = vec![node];
+    while let Some(current) = work.pop() {
+        if current.kind() == "discard" {
+            return true;
+        }
+        for index in (0..current.named_child_count()).rev() {
+            if let Some(child) = current.named_child(index) {
+                work.push(child);
+            }
+        }
+    }
+    false
+}
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct CSharpAdapter;
@@ -110,6 +157,10 @@ impl LanguageAdapter for CSharpAdapter {
         tree: &Tree,
     ) -> crate::analyzer::tree_sitter_analyzer::ParsedFile {
         parse_csharp_file(file, source, tree)
+    }
+
+    fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
+        Some(&CSHARP_COGNITIVE_CONFIG)
     }
 }
 

@@ -11,7 +11,7 @@ After this change, callers of the `compute_cognitive_complexity` MCP tool can an
 - [x] (2026-07-30 17:55Z) Diagnosed the empty-result path, verified the issue branch and current remote state, inspected the current language adapters and grammar metadata, and ran the 31-test cognitive-complexity baseline successfully.
 - [x] (2026-07-30 17:55Z) Located Brokk's reference configurations and fixtures for Go, C/C++, JavaScript/TypeScript, PHP, and Scala; confirmed that Brokk does not contain a C# cognitive-complexity implementation.
 - [x] (2026-07-30 18:08Z) Ported the Brokk-backed language configurations and added focused positive and near-miss tests for Go, C/C++, JavaScript/JSX, TypeScript/TSX, PHP, and Scala; formatting and all 50 focused cognitive-complexity tests pass.
-- [ ] Derive and validate the C# configuration from its tree-sitter grammar with parser-backed tests for statements, switch forms, logical sequences, defaults, and callable boundaries.
+- [x] (2026-07-30 18:22Z) Derived and validated the C# configuration from its tree-sitter grammar with nine focused tests for nesting, loops, catch, conditional expressions, switch forms, logical sequences, defaults, jumps, lambdas, and local-function boundaries; all 59 focused tests pass.
 - [ ] Add a mixed-language MCP call test and update the tool description to state the supported language boundary.
 - [ ] Run formatting, focused and broader featureless tests, repository policy checks, and adversarial review; resolve all correctness findings.
 
@@ -43,13 +43,17 @@ After this change, callers of the `compute_cognitive_complexity` MCP tool can an
   Rationale: Brokk has no C# implementation, and repository policy requires structured analyzer support. A language-local AST predicate can distinguish `default` switch sections and discard-pattern switch arms without adding a string scanner.
   Date/Author: 2026-07-30 / Codex
 
+- Decision: Count C# `&&` and `||` logical runs, but not null coalescing, and preserve Bifrost's existing cross-language case-based switch model.
+  Rationale: SonarSource's C# implementation confirms that only logical-and and logical-or binary expressions form cognitive logical sequences. Bifrost's public tool and shared scorer count non-default switch cases across languages, so C# uses `switch_section` and `switch_expression_arm` rather than introducing incompatible C#-only switch scoring.
+  Date/Author: 2026-07-30 / Codex
+
 - Decision: Put language scoring tests in the existing `crates/bifrost-analysis/src/analyzer/cognitive_complexity_tests.rs` module and the mixed transport test in the existing `crates/bifrost-mcp/tests/bifrost_mcp_server.rs` integration binary.
   Rationale: These are the established behavior-test locations; no new root-level integration test binary is justified.
   Date/Author: 2026-07-30 / Codex
 
 ## Outcomes & Retrospective
 
-The first implementation milestone is complete. Six reference-backed language families, including their C/JSX/TSX dialect routes, now return scores through explicit adapter configurations. No shared-scorer change was needed. C#, MCP transport coverage, documentation, and final validation remain.
+The first two implementation milestones are complete. Six reference-backed language families, their C/JSX/TSX dialect routes, and grammar-backed C# now return scores through explicit adapter configurations. No shared-scorer change was needed. MCP transport coverage, documentation, and final validation remain.
 
 ## Context and Orientation
 
@@ -138,3 +142,5 @@ The `source` parameter may be named `_source` because the implementation must de
 Plan revision note (2026-07-30): Created the initial self-contained plan after issue diagnosis, Brokk reference inspection, grammar inspection, and a clean focused baseline.
 
 Plan revision note (2026-07-30): Recorded completion of the reference-backed milestone and the tree-sitter-cpp default-case grammar difference discovered by focused tests.
+
+Plan revision note (2026-07-30): Recorded the completed C# milestone, including AST-only default/discard recognition and the logical/switch semantic decisions.

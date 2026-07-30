@@ -570,3 +570,128 @@ fn scala_repeated_logical_operator_and_wildcard_are_near_misses() {
 "#;
     assert_eq!(score(&[("Main.scala", src)], "Main.scala", "method"), 2);
 }
+
+// ===== C# =====
+
+#[test]
+fn csharp_nested_if_and_else_if_are_scored() {
+    let src = r#"class Service {
+    int method(int a, int b) {
+        if (a > 0) {
+            if (b > 0) return 1;
+        } else if (a < 0) {
+            return -1;
+        }
+        return 0;
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 4);
+}
+
+#[test]
+fn csharp_nested_loop_and_logical_operator_sequences_are_scored() {
+    let src = r#"class Service {
+    void method(bool a, bool b, bool c, int x) {
+        for (var i = 0; i < x; i++) {
+            if (a && b || c) continue;
+        }
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 5);
+}
+
+#[test]
+fn csharp_loops_and_catch_are_scored() {
+    let src = r#"class Service {
+    int method(bool ready, int x) {
+        for (var i = 0; i < x; i++) {}
+        while (ready) break;
+        do { x--; } while (ready);
+        try { risky(); } catch (System.Exception) { recover(); }
+        return x;
+    }
+    void risky() {}
+    void recover() {}
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 4);
+}
+
+#[test]
+fn csharp_switch_statement_counts_case_but_not_default() {
+    let src = r#"class Service {
+    int method(int x) {
+        switch (x) { case 1: x++; break; default: x--; break; }
+        return x;
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 1);
+}
+
+#[test]
+fn csharp_conditional_expression_is_scored() {
+    let src = r#"class Service {
+    int method(bool ready) {
+        return ready ? 1 : 0;
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 1);
+}
+
+#[test]
+fn csharp_defaults_repeated_operator_and_unlabeled_jumps_are_near_misses() {
+    let src = r#"class Service {
+    int method(bool a, bool b, bool c, int x) {
+        while (a) {
+            if (a && b && c) break;
+            continue;
+        }
+        switch (x) { default: return x + 1; }
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 4);
+}
+
+#[test]
+fn csharp_switch_expression_discard_arm_is_a_default_near_miss() {
+    let src = r#"class Service {
+    int method(int x) {
+        return x switch { 1 => 1, _ => 0 };
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 1);
+}
+
+#[test]
+fn csharp_lambda_adds_nesting_inside_enclosing_method() {
+    let src = r#"using System;
+class Service {
+    int method(bool ready) {
+        Func<int> nested = () => { if (ready) return 1; return 0; };
+        return nested();
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 2);
+}
+
+#[test]
+fn csharp_nested_local_function_body_is_not_counted() {
+    let src = r#"class Service {
+    int outer(bool a, bool b) {
+        int helper() {
+            if (a) { if (b) return 1; }
+            return 0;
+        }
+        return helper();
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "outer"), 0);
+}
