@@ -3029,6 +3029,7 @@ mod watcher_startup_tests {
             update_strategy: UpdateStrategy::WatchFiles,
             semantic_indexing: false,
             watcher_starter: starter,
+            diff_snapshot_object_dir: None,
         }
     }
 

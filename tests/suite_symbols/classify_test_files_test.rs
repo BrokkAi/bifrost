@@ -105,6 +105,20 @@ func TestFoo(t *testing.T) {
 }
 "#,
         )
+        .file(
+            "src/test/kotlin/x/FooTest.kt",
+            r#"
+package x
+
+import org.junit.jupiter.api.Test
+
+class FooTest {
+    @Test
+    fun works() {
+    }
+}
+"#,
+        )
         .build();
 
     let value = classify(
@@ -116,6 +130,7 @@ func TestFoo(t *testing.T) {
             "src/main/java/x/MainProject.java",
             "src/lib.rs",
             "pkg/foo_test.go",
+            "src/test/kotlin/x/FooTest.kt",
         ],
     );
 
@@ -140,5 +155,6 @@ func TestFoo(t *testing.T) {
     );
     assert_classification(&value, "src/lib.rs", "ambiguous", true);
     assert_classification(&value, "pkg/foo_test.go", "test", true);
+    assert_classification(&value, "src/test/kotlin/x/FooTest.kt", "test", true);
     assert_eq!(value["unresolved"], json!([]), "{value}");
 }

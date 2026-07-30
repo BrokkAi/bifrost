@@ -64,6 +64,17 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     )
     .expect("write java fixture");
     fs::write(
+        fixture_root.path().join("sample_spec.rb"),
+        r#"
+        RSpec.describe Widget do
+          it "compares itself" do
+            expect(value).to eq(value)
+          end
+        end
+        "#,
+    )
+    .expect("write ruby fixture");
+    fs::write(
         fixture_root.path().join("SampleClone.java"),
         r#"
         public class SampleClone {
@@ -398,7 +409,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "params": {
                 "name": "report_test_assertion_smells",
                 "arguments": {
-                    "file_paths": ["SampleTest.java"]
+                    "file_paths": ["SampleTest.java", "sample_spec.rb"]
                 }
             }
         }),
@@ -409,6 +420,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     assert!(report.starts_with("## Test assertion smells"), "{report}");
     assert!(report.contains("self-comparison"), "{report}");
     assert!(report.contains("SampleTest.java"), "{report}");
+    assert!(report.contains("sample_spec.rb"), "{report}");
 
     let symbol_sources = round_trip(
         &mut stdin,

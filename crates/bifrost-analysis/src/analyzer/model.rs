@@ -2291,6 +2291,15 @@ pub struct TestAssertionSmell {
     pub start_byte: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestAssertionAnalysis {
+    pub findings: Vec<TestAssertionSmell>,
+    /// Candidates consumed from an explicit work budget. `None` means the
+    /// analyzer preserves its legacy unbounded implementation.
+    pub inspected_candidates: Option<usize>,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloneSmellWeights {
     pub min_normalized_tokens: i32,
@@ -2383,6 +2392,16 @@ pub struct ExceptionHandlingSmell {
     /// Not surfaced in the markdown report — kept here so callers ranking or
     /// deduping can stay stable.
     pub start_byte: usize,
+}
+
+/// Capability-honest result of analyzing one file for exception-handling
+/// smells. An empty [`Self::Analyzed`] result is authoritative; unsupported
+/// semantics and analysis failures must never be represented as clean files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExceptionHandlingAnalysis {
+    Analyzed(Vec<ExceptionHandlingSmell>),
+    Unsupported { reason: String },
+    Failed { message: String },
 }
 
 impl Range {

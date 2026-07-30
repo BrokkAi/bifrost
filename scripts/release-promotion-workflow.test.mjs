@@ -22,6 +22,10 @@ const tagVerifier = readFileSync(
   new URL("./verify-release-tag-commit.sh", import.meta.url),
   "utf8",
 );
+const agentPluginSmoke = readFileSync(
+  new URL("./smoke-agent-plugin-release.mjs", import.meta.url),
+  "utf8",
+);
 
 function jobBlock(workflow, job) {
   const jobStart = new RegExp(`^  ${job}:\\n`, "mu");
@@ -148,6 +152,20 @@ test("promotion evidence covers validation before every external publisher", () 
     /^    needs: \[release-context, publish-crate-mcp, publish-crate-lsp\]$/mu,
   );
   assert.match(cratePublisher, /^      package:/mu);
+});
+
+test("agent plugin release smoke follows the packaged Codex manifest and release assets stay immutable", () => {
+  const releaseJob = jobBlock(release, "release");
+  assert.match(releaseJob, /overwrite_files: false/u);
+
+  assert.match(agentPluginSmoke, /\.codex-plugin", "plugin\.json"/u);
+  assert.match(agentPluginSmoke, /const mcpConfigPath = path\.resolve\(pluginRoot, manifest\.mcpServers\)/u);
+  assert.match(agentPluginSmoke, /const command = path\.resolve\(mcpConfigDir, server\.command\)/u);
+  assert.match(agentPluginSmoke, /const cwd = path\.resolve\(mcpConfigDir, server\.cwd\)/u);
+  assert.match(agentPluginSmoke, /server\.args, \["--mcp", "symbol\|extended"\]/u);
+  for (const tool of ["search_symbols", "list_policies", "run_policy"]) {
+    assert.ok(agentPluginSmoke.includes(`tool.name === "${tool}"`));
+  }
 });
 
 test("publishers preserve their platform, environment, and OIDC protections", () => {

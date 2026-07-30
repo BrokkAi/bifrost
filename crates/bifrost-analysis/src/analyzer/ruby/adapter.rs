@@ -1,5 +1,5 @@
 use super::declarations::{RubyVisitor, collect_ruby_identifiers};
-use super::tests::ruby_source_contains_tests;
+use super::tests::ruby_contains_tests;
 use super::*;
 use crate::analyzer::LanguageAdapter;
 use crate::analyzer::cognitive_complexity;
@@ -47,10 +47,10 @@ impl LanguageAdapter for RubyAdapter {
         &self,
         _file: &ProjectFile,
         source: &str,
-        _tree: &Tree,
+        tree: &Tree,
         _parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
     ) -> bool {
-        ruby_source_contains_tests(source)
+        ruby_contains_tests(tree.root_node(), source)
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
