@@ -17,7 +17,7 @@ The implementation uses the current Brokk Java analyzers and their tests as the 
 - [x] (2026-07-30 20:28Z) Milestone 1: made the analyzer/result/report boundary distinguish analyzed-clean, unsupported, and failed inputs; extracted shared stack-safe scoring and preserved all seven focused Java/report tests.
 - [x] (2026-07-30 21:04Z) Milestone 2: ported Brokk behavior for C/C++, JavaScript/JSX, TypeScript/TSX, Python, PHP, Scala, C#, Go, and Rust; nine focused cross-language tests pass with positive and propagation/rethrow near-miss coverage.
 - [x] (2026-07-30 21:24Z) Milestone 3: added structured Ruby `rescue`/`rescue_modifier` and Kotlin `catch_block` semantics; all eleven focused language tests pass, including meaningful rethrow near misses.
-- [ ] Milestone 4: complete mixed-language MCP/report integration, validation, policy checking, and review.
+- [x] (2026-07-30 23:18Z) Milestone 4: completed mixed-language MCP/report integration, capability documentation, focused and full executable-test validation, and five-role specialist review; resolved the substantive semantic findings and recorded the unavailable policy tools and doc-test cache issue.
 
 ## Surprises & Discoveries
 
@@ -38,6 +38,12 @@ The implementation uses the current Brokk Java analyzers and their tests as the 
 
 - Observation: Kotlin's grammar places the catch parameter identifier and `user_type` directly under `catch_block`, and omits `statements` for an empty handler.
   Evidence: inspecting the parsed S-expression showed `(catch_block (simple_identifier) (user_type (type_identifier)))` for an empty catch and an additional `(statements ... (jump_expression ...))` for a rethrowing catch.
+
+- Observation: `.c` and `.C` share the C++ analyzer family but do not mean the same language conventionally.
+  Evidence: the final capability boundary reports lowercase `.c` as unsupported because native C return-code/errno semantics are not implemented, while uppercase `.C` remains available to the C++ parser profile.
+
+- Observation: the shared target directory contained artifacts that rustc described as incompatible despite displaying the same compiler version.
+  Evidence: all 1,836 executable analysis tests passed, after which doc tests and the first Clippy attempt failed with E0514 for cached dependencies. The required Clippy retry uses `scripts/with-isolated-cargo-target.sh` to avoid the contaminated shared target.
 
 ## Decision Log
 
@@ -61,9 +67,13 @@ The implementation uses the current Brokk Java analyzers and their tests as the 
   Rationale: every analyzer already reaches the same object-safe trait default, and the extractors share one parser lifecycle, result boundary, scorer, and handler builder. Separate functions retain language-specific syntax without adding repetitive facade wiring or mode flags.
   Date/Author: 2026-07-30 / Codex
 
+- Decision: treat lowercase C inputs as explicitly unsupported instead of authoritative clean.
+  Rationale: C has no catch syntax and the issue's capability-honesty criterion forbids silently applying the C++ catch detector to C return-code/errno handling. The MCP description states this boundary.
+  Date/Author: 2026-07-30 / Codex
+
 ## Outcomes & Retrospective
 
-Milestones 1 through 3 are complete. Unsupported input is explicit, Java behavior remains green, and every language named by the issue now uses structured parser nodes. The focused suite proves C/C++, JS/JSX, TS/TSX, Python, PHP, Scala, C#, Go, Rust, Ruby, and Kotlin positives plus realistic rethrow or propagation near misses.
+All four milestones are complete. Java, Go, C++, JS/JSX, TS/TSX, Python, Rust, PHP, Scala, C#, Ruby, and Kotlin use structured parser nodes; lowercase C is explicit unsupported until native return-code/errno semantics exist. The final focused suite covers fifteen cases, including canonical Go/Rust propagation, nested Go ownership, exact broad-type classification, non-logging similarly named identifiers, C++ nested statement credit, mixed findings plus unsupported/failure notes, and malformed syntax. The final full smell suite passed 276 tests, the MCP server suite passed 24 tests, and all 1,836 executable analysis tests passed. Policy validation could not run because the installed skill's `list_policies` and `run_policy` tools were not registered. The shared-target doc-test phase hit E0514 cache incompatibility after the executable suite; task-scoped Clippy passed after pinning `PATH` to the repository's rustup toolchain so Cargo and Clippy did not mix Homebrew's LLVM-distinct binaries.
 
 ## Context and Orientation
 
@@ -135,3 +145,5 @@ Revision note (2026-07-30): Marked Milestone 1 complete, recorded the validated 
 Revision note (2026-07-30): Marked Milestone 2 complete and recorded the decision to colocate the language-specific extractors behind the shared trait default.
 
 Revision note (2026-07-30): Marked Milestone 3 complete and recorded the Kotlin grammar shape that determined empty-body and rethrow handling.
+
+Revision note (2026-07-30): Marked Milestone 4 complete after mixed-language integration, specialist review fixes, full executable-test validation, and explicit recording of unavailable policy tools and shared-target E0514 failures.

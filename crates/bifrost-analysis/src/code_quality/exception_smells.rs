@@ -1,9 +1,9 @@
 //! MCP `report_exception_handling_smells` handler. Runs the analyzer's
 //! per-language exception-handling smell heuristic across the given files,
 //! applies `min_score` and `max_findings` caps, and renders a markdown
-//! report whose layout (header, weights line, table columns, sanitization,
-//! truncation note) matches brokk-core `CodeQualityToolsMcp
-//! .reportExceptionHandlingSmells` byte-for-byte.
+//! report whose finding table and scoring controls remain compatible with
+//! brokk-core `CodeQualityToolsMcp.reportExceptionHandlingSmells`. Bifrost
+//! additionally reports unsupported inputs and analysis failures explicitly.
 
 use super::{
     ReportLines, append_ambiguous_path_notes, pick_weight, resolve_project_files,

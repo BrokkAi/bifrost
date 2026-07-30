@@ -35,6 +35,9 @@ pub(super) fn detect_exception_handling_smells_java(
     weights: &ExceptionSmellWeights,
 ) -> Option<Vec<ExceptionHandlingSmell>> {
     let tree = parse_tree(source)?;
+    if tree.root_node().has_error() {
+        return None;
+    }
     let catches = collect_nodes_by_kind(tree.root_node(), "catch_clause");
 
     let mut findings: Vec<ExceptionHandlingSmell> = catches

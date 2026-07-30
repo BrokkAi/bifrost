@@ -28,6 +28,16 @@ pub(crate) fn analyze_for_file(
             ),
         };
     }
+    if language == Language::Cpp
+        && file
+            .rel_path()
+            .extension()
+            .is_some_and(|extension| extension == "c")
+    {
+        return ExceptionHandlingAnalysis::Unsupported {
+            reason: "C return-code and errno handling semantics are not implemented".to_string(),
+        };
+    }
     let source = match analyzer.project().read_source(file) {
         Ok(source) => source,
         Err(error) => {
@@ -55,6 +65,11 @@ pub(crate) fn analyze_for_file(
             message: format!("failed to parse {}", file.rel_path().display()),
         };
     };
+    if tree.root_node().has_error() {
+        return ExceptionHandlingAnalysis::Failed {
+            message: format!("failed to parse {}", file.rel_path().display()),
+        };
+    }
 
     let findings = match language {
         Language::Cpp => analyze_cpp(analyzer, file, &source, tree.root_node(), &weights),
@@ -107,19 +122,19 @@ pub(crate) fn score_handler(
     };
 
     if empty_body {
-        score += weights.empty_body_weight;
+        score = score.saturating_add(weights.empty_body_weight);
         reasons.push("empty-body".to_string());
     }
     if comment_only_body {
-        score += weights.comment_only_body_weight;
+        score = score.saturating_add(weights.comment_only_body_weight);
         reasons.push("comment-only-body".to_string());
     }
     if small_body {
-        score += weights.small_body_weight;
+        score = score.saturating_add(weights.small_body_weight);
         reasons.push(format!("small-body:{}", input.body_statement_count));
     }
     if input.log_only {
-        score += weights.log_only_weight;
+        score = score.saturating_add(weights.log_only_weight);
         reasons.push("log-only-body".to_string());
     }
 
@@ -130,7 +145,7 @@ pub(crate) fn score_handler(
         .max(0)
         .saturating_mul(credit_statements as i32);
     if body_credit > 0 {
-        score -= body_credit;
+        score = score.saturating_sub(body_credit);
         reasons.push(format!("meaningful-body-credit:{body_credit}"));
     }
 
@@ -256,6 +271,7 @@ fn analyze_cpp(
                 classify_cpp_type(&catch_type, weights),
             ))
         },
+        cpp_statement_count,
         &["throw_statement"],
     )
 }
@@ -275,9 +291,8 @@ fn analyze_js_ts(
         weights,
         |node, source| {
             let body = node.child_by_field_name("body")?;
-            let catch_type = node
-                .child_by_field_name("type")
-                .and_then(first_named_child)
+            let type_node = node.child_by_field_name("type").and_then(first_named_child);
+            let catch_type = type_node
                 .and_then(|kind| node_text(kind, source))
                 .unwrap_or_else(|| "<untyped>".to_string());
             let broad = if matches!(catch_type.as_str(), "<untyped>" | "any" | "unknown") {
@@ -285,7 +300,10 @@ fn analyze_js_ts(
                     weights.generic_exception_weight,
                     format!("generic-catch:{catch_type}"),
                 ))
-            } else if catch_type.contains("Error") || catch_type.contains("Exception") {
+            } else if type_node.is_some_and(|node| {
+                contains_identifier(node, source, "Error")
+                    || contains_identifier(node, source, "Exception")
+            }) {
                 Some((
                     weights.generic_runtime_exception_weight,
                     format!("generic-catch:{catch_type}"),
@@ -295,6 +313,7 @@ fn analyze_js_ts(
             };
             Some((body, catch_type, broad))
         },
+        js_ts_statement_count,
         &["throw_statement"],
     )
 }
@@ -324,12 +343,19 @@ fn analyze_python(
                     .collect::<Vec<_>>()
                     .join(" | ")
             };
-            let broad = if catch_type == "<bare>" || catch_type.contains("BaseException") {
+            let broad = if catch_type == "<bare>"
+                || values
+                    .iter()
+                    .any(|value| contains_identifier(*value, source, "BaseException"))
+            {
                 Some((
                     weights.generic_throwable_weight,
                     format!("generic-catch:{catch_type}"),
                 ))
-            } else if catch_type.contains("Exception") {
+            } else if values
+                .iter()
+                .any(|value| contains_identifier(*value, source, "Exception"))
+            {
                 Some((
                     weights.generic_exception_weight,
                     format!("generic-catch:{catch_type}"),
@@ -339,6 +365,7 @@ fn analyze_python(
             };
             Some((body, catch_type, broad))
         },
+        python_statement_count,
         &["raise_statement"],
     )
 }
@@ -359,6 +386,9 @@ fn analyze_go(
             continue;
         };
         for if_node in collect_nodes_by_kind(function_body, "if_statement") {
+            if nearest_ancestor_of_kind(if_node, "func_literal") != Some(function) {
+                continue;
+            }
             if let Some(body) = if_node.child_by_field_name("consequence")
                 && contains_call_named_before(if_node, source, "recover", body.start_byte())
             {
@@ -381,6 +411,9 @@ fn analyze_go(
         if go_condition_is_err_not_nil(condition, source)
             && let Some(body) = if_node.child_by_field_name("consequence")
         {
+            if go_body_is_error_propagation(body, source) {
+                continue;
+            }
             handlers.push((
                 if_node,
                 body,
@@ -406,7 +439,9 @@ fn analyze_rust(
 ) -> Vec<ExceptionHandlingSmell> {
     let mut handlers = Vec::new();
     for match_node in collect_nodes_by_kind(root, "match_expression") {
-        let catches_unwind = contains_call_named(match_node, source, "catch_unwind");
+        let catches_unwind = match_node
+            .child_by_field_name("value")
+            .is_some_and(|value| contains_call_named(value, source, "catch_unwind"));
         for arm in collect_nodes_by_kind(match_node, "match_arm") {
             if nearest_ancestor_of_kind(arm, "match_expression") != Some(match_node) {
                 continue;
@@ -423,6 +458,9 @@ fn analyze_rust(
             let Some(body) = body else {
                 continue;
             };
+            if rust_body_is_result_propagation(body, source) {
+                continue;
+            }
             let (catch_type, score, reason) = if catches_unwind {
                 (
                     "catch_unwind",
@@ -447,6 +485,9 @@ fn analyze_rust(
         if contains_identifier(condition, source, "Err")
             && let Some(body) = if_node.child_by_field_name("consequence")
         {
+            if rust_body_is_result_propagation(body, source) {
+                continue;
+            }
             handlers.push((
                 if_node,
                 body,
@@ -481,9 +522,10 @@ fn analyze_php(
             let body = node.child_by_field_name("body")?;
             let type_node = node.child_by_field_name("type")?;
             let catch_type = node_text(type_node, source)?;
-            let broad = classify_java_family(&catch_type, weights);
+            let broad = classify_exact_java_family(type_node, source, weights);
             Some((body, catch_type, broad))
         },
+        handler_statement_count,
         &["throw_expression"],
     )
 }
@@ -507,17 +549,20 @@ fn analyze_csharp(
             let catch_type = declaration
                 .and_then(|value| value.child_by_field_name("type"))
                 .and_then(|value| node_text(value, source))
-                .unwrap_or_else(|| "<catch-all>".to_string());
-            let broad = if catch_type == "<catch-all>" {
-                Some((
-                    weights.generic_throwable_weight,
-                    "generic-catch:catch-all".to_string(),
-                ))
+                .unwrap_or_else(|| "Exception".to_string());
+            let broad = if let Some(type_node) =
+                declaration.and_then(|value| value.child_by_field_name("type"))
+            {
+                classify_exact_java_family(type_node, source, weights)
             } else {
-                classify_java_family(&catch_type, weights)
+                Some((
+                    weights.generic_exception_weight,
+                    "generic-catch:Exception".to_string(),
+                ))
             };
             Some((body, catch_type, broad))
         },
+        handler_statement_count,
         &["throw_statement"],
     )
 }
@@ -546,9 +591,10 @@ fn analyze_scala(
         |node, source| {
             let pattern = node.child_by_field_name("pattern")?;
             let catch_type = node_text(pattern, source)?;
-            let broad = classify_java_family(&catch_type, weights);
+            let broad = classify_exact_java_family(pattern, source, weights);
             Some((node, catch_type, broad))
         },
+        handler_statement_count,
         &["throw_expression"],
     )
 }
@@ -569,7 +615,10 @@ fn analyze_ruby(
             .child_by_field_name("exceptions")
             .and_then(|node| node_text(node, source))
             .unwrap_or_else(|| "StandardError".to_string());
-        let broad = classify_ruby_type(&catch_type, weights);
+        let broad = rescue
+            .child_by_field_name("exceptions")
+            .map(|node| classify_ruby_type(node, source, weights))
+            .unwrap_or_else(|| classify_ruby_name("StandardError", weights));
         handlers.push((rescue, rescue, catch_type, broad));
     }
     for rescue in collect_nodes_by_kind(root, "rescue_modifier") {
@@ -580,7 +629,7 @@ fn analyze_ruby(
             rescue,
             handler,
             "StandardError".to_string(),
-            classify_ruby_type("StandardError", weights),
+            classify_ruby_name("StandardError", weights),
         ));
     }
     analyze_preextracted_handlers(analyzer, file, source, handlers, weights, |body| {
@@ -602,7 +651,7 @@ fn analyze_kotlin(
         collect_nodes_by_kind(root, "catch_block"),
         weights,
         |node, source| {
-            let catch_type = direct_named_child_matching(node, |kind| {
+            let type_node = direct_named_child_matching(node, |kind| {
                 matches!(
                     kind,
                     "user_type"
@@ -611,15 +660,17 @@ fn analyze_kotlin(
                         | "parenthesized_type"
                         | "function_type"
                 )
-            })
-            .and_then(|type_node| node_text(type_node, source))?;
-            let broad = classify_java_family(&catch_type, weights);
+            })?;
+            let catch_type = node_text(type_node, source)?;
+            let broad = classify_exact_java_family(type_node, source, weights);
             Some((node, catch_type, broad))
         },
+        handler_statement_count,
         &["jump_expression"],
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn analyze_handler_nodes<'tree>(
     analyzer: &(impl IAnalyzer + ?Sized),
     file: &ProjectFile,
@@ -627,6 +678,7 @@ fn analyze_handler_nodes<'tree>(
     nodes: Vec<Node<'tree>>,
     weights: &ExceptionSmellWeights,
     mut extract: impl FnMut(Node<'tree>, &str) -> Option<(Node<'tree>, String, Option<(i32, String)>)>,
+    statement_count: impl Fn(Node<'tree>) -> u32,
     rethrow_kinds: &[&str],
 ) -> Vec<ExceptionHandlingSmell> {
     let mut findings = Vec::new();
@@ -634,13 +686,13 @@ fn analyze_handler_nodes<'tree>(
         let Some((body, catch_type, broad_handler)) = extract(handler, source) else {
             continue;
         };
-        let body_statement_count = handler_statement_count(body);
+        let body_statement_count = statement_count(body);
         let has_comment = contains_comment(body);
         let rethrow_present = rethrow_kinds
             .iter()
             .any(|kind| has_descendant_of_kind(body, kind));
         let log_only =
-            body_statement_count == 1 && !rethrow_present && contains_log_identifier(body, source);
+            body_statement_count == 1 && !rethrow_present && contains_logging_call(body, source);
         let Some(scored) = score_handler(
             weights,
             HandlerScoreInput {
@@ -677,11 +729,13 @@ fn analyze_handler_nodes<'tree>(
     findings
 }
 
+type PreextractedHandler<'tree> = (Node<'tree>, Node<'tree>, String, Option<(i32, String)>);
+
 fn analyze_preextracted_handlers<'tree>(
     analyzer: &(impl IAnalyzer + ?Sized),
     file: &ProjectFile,
     source: &str,
-    handlers: Vec<(Node<'tree>, Node<'tree>, String, Option<(i32, String)>)>,
+    handlers: Vec<PreextractedHandler<'tree>>,
     weights: &ExceptionSmellWeights,
     mut is_rethrow: impl FnMut(Node<'tree>) -> bool,
 ) -> Vec<ExceptionHandlingSmell> {
@@ -690,7 +744,7 @@ fn analyze_preextracted_handlers<'tree>(
         let body_statement_count = handler_statement_count(body);
         let has_comment = contains_comment(body);
         let log_only =
-            body_statement_count == 1 && !is_rethrow(body) && contains_log_identifier(body, source);
+            body_statement_count == 1 && !is_rethrow(body) && contains_logging_call(body, source);
         let Some(scored) = score_handler(
             weights,
             HandlerScoreInput {
@@ -726,21 +780,22 @@ fn analyze_preextracted_handlers<'tree>(
     findings
 }
 
-fn classify_java_family(
-    catch_type: &str,
+fn classify_exact_java_family(
+    type_node: Node<'_>,
+    source: &str,
     weights: &ExceptionSmellWeights,
 ) -> Option<(i32, String)> {
-    if catch_type.contains("Throwable") {
+    if contains_identifier(type_node, source, "Throwable") {
         Some((
             weights.generic_throwable_weight,
             "generic-catch:Throwable".to_string(),
         ))
-    } else if catch_type.contains("RuntimeException") {
+    } else if contains_identifier(type_node, source, "RuntimeException") {
         Some((
             weights.generic_runtime_exception_weight,
             "generic-catch:RuntimeException".to_string(),
         ))
-    } else if catch_type.contains("Exception") {
+    } else if contains_identifier(type_node, source, "Exception") {
         Some((
             weights.generic_exception_weight,
             "generic-catch:Exception".to_string(),
@@ -772,24 +827,46 @@ fn classify_cpp_type(catch_type: &str, weights: &ExceptionSmellWeights) -> Optio
     }
 }
 
-fn classify_ruby_type(catch_type: &str, weights: &ExceptionSmellWeights) -> Option<(i32, String)> {
-    if catch_type.contains("Exception") && !catch_type.contains("StandardError") {
+fn classify_ruby_type(
+    type_node: Node<'_>,
+    source: &str,
+    weights: &ExceptionSmellWeights,
+) -> Option<(i32, String)> {
+    if contains_identifier(type_node, source, "Exception") {
         Some((
             weights.generic_throwable_weight,
             "generic-catch:Exception".to_string(),
         ))
-    } else if catch_type.contains("RuntimeError") {
+    } else if contains_identifier(type_node, source, "RuntimeError") {
         Some((
             weights.generic_runtime_exception_weight,
             "generic-catch:RuntimeError".to_string(),
         ))
-    } else if catch_type.contains("StandardError") {
+    } else if contains_identifier(type_node, source, "StandardError") {
         Some((
             weights.generic_exception_weight,
             "generic-catch:StandardError".to_string(),
         ))
     } else {
         None
+    }
+}
+
+fn classify_ruby_name(catch_type: &str, weights: &ExceptionSmellWeights) -> Option<(i32, String)> {
+    match catch_type {
+        "Exception" => Some((
+            weights.generic_throwable_weight,
+            "generic-catch:Exception".to_string(),
+        )),
+        "RuntimeError" => Some((
+            weights.generic_runtime_exception_weight,
+            "generic-catch:RuntimeError".to_string(),
+        )),
+        "StandardError" => Some((
+            weights.generic_exception_weight,
+            "generic-catch:StandardError".to_string(),
+        )),
+        _ => None,
     }
 }
 
@@ -841,6 +918,76 @@ fn handler_statement_count(body: Node<'_>) -> u32 {
         .count() as u32
 }
 
+fn cpp_statement_count(body: Node<'_>) -> u32 {
+    let mut statements = 0_u32;
+    let mut pending = vec![body];
+    while let Some(node) = pending.pop() {
+        let kind = node.kind();
+        let is_wrapper = matches!(
+            kind,
+            "compound_statement"
+                | "if_statement"
+                | "for_statement"
+                | "while_statement"
+                | "do_statement"
+                | "switch_statement"
+                | "try_statement"
+                | "labeled_statement"
+        );
+        if kind == "declaration" || (kind.ends_with("_statement") && !is_wrapper) {
+            statements = statements.saturating_add(1);
+        }
+        pending.extend((0..node.named_child_count()).filter_map(|index| node.named_child(index)));
+    }
+    statements
+}
+
+fn js_ts_statement_count(body: Node<'_>) -> u32 {
+    direct_statement_count(
+        body,
+        &[
+            "expression_statement",
+            "throw_statement",
+            "return_statement",
+            "break_statement",
+            "continue_statement",
+            "if_statement",
+            "for_statement",
+            "for_in_statement",
+            "while_statement",
+            "do_statement",
+            "switch_statement",
+            "try_statement",
+            "ternary_expression",
+        ],
+    )
+}
+
+fn python_statement_count(body: Node<'_>) -> u32 {
+    direct_statement_count(
+        body,
+        &[
+            "expression_statement",
+            "raise_statement",
+            "return_statement",
+            "break_statement",
+            "continue_statement",
+            "if_statement",
+            "for_statement",
+            "while_statement",
+            "try_statement",
+            "match_statement",
+        ],
+    )
+}
+
+fn direct_statement_count(body: Node<'_>, kinds: &[&str]) -> u32 {
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .filter(|child| kinds.contains(&child.kind()))
+        .count() as u32
+}
+
 fn contains_comment(root: Node<'_>) -> bool {
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
@@ -852,23 +999,99 @@ fn contains_comment(root: Node<'_>) -> bool {
     false
 }
 
-fn contains_log_identifier(root: Node<'_>, source: &str) -> bool {
+fn contains_logging_call(root: Node<'_>, source: &str) -> bool {
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
+        if node != root
+            && matches!(
+                node.kind(),
+                "function_definition"
+                    | "function_declaration"
+                    | "func_literal"
+                    | "lambda"
+                    | "lambda_expression"
+                    | "lambda_literal"
+                    | "arrow_function"
+                    | "closure_expression"
+            )
+        {
+            continue;
+        }
         if matches!(
             node.kind(),
-            "identifier" | "field_identifier" | "name" | "simple_identifier"
-        ) && let Some(text) = node_text(node, source)
-            && matches!(
-                text.to_ascii_lowercase().as_str(),
-                "log" | "logger" | "logging" | "error" | "warn" | "warning" | "severe"
-            )
+            "call_expression"
+                | "call"
+                | "invocation_expression"
+                | "method_invocation"
+                | "function_call_expression"
+                | "member_call_expression"
+                | "scoped_call_expression"
+                | "method_call"
+        ) && call_target_is_logging(node, source)
         {
             return true;
         }
         pending.extend((0..node.child_count()).filter_map(|index| node.child(index)));
     }
     false
+}
+
+fn call_target_is_logging(call: Node<'_>, source: &str) -> bool {
+    let target = ["function", "expression", "method", "name"]
+        .into_iter()
+        .find_map(|field| call.child_by_field_name(field))
+        .or_else(|| {
+            let mut cursor = call.walk();
+            call.named_children(&mut cursor).find(|child| {
+                !matches!(
+                    child.kind(),
+                    "arguments" | "argument_list" | "type_arguments" | "block"
+                )
+            })
+        });
+    let Some(target) = target else {
+        return false;
+    };
+    let mut identifiers = Vec::new();
+    let mut pending = vec![target];
+    while let Some(node) = pending.pop() {
+        if matches!(
+            node.kind(),
+            "identifier" | "field_identifier" | "name" | "simple_identifier"
+        ) && let Some(name) = node_text_ref(node, source)
+        {
+            identifiers.push((node.start_byte(), name));
+        }
+        pending.extend((0..node.child_count()).filter_map(|index| node.child(index)));
+    }
+    identifiers.sort_unstable_by_key(|(start, _)| *start);
+    identifiers
+        .first()
+        .is_some_and(|(_, name)| is_logging_receiver(name))
+        || identifiers
+            .last()
+            .is_some_and(|(_, name)| is_logging_method(name))
+}
+
+fn is_logging_receiver(name: &str) -> bool {
+    ["log", "logger", "logging"]
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
+fn is_logging_method(name: &str) -> bool {
+    [
+        "error",
+        "warn",
+        "warning",
+        "severe",
+        "info",
+        "debug",
+        "trace",
+        "error_log",
+    ]
+    .iter()
+    .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
 fn contains_call_named(root: Node<'_>, source: &str, target: &str) -> bool {
@@ -913,7 +1136,7 @@ fn contains_identifier(root: Node<'_>, source: &str, target: &str) -> bool {
         if matches!(
             node.kind(),
             "identifier" | "field_identifier" | "name" | "simple_identifier" | "type_identifier"
-        ) && node_text(node, source).as_deref() == Some(target)
+        ) && node_text_ref(node, source) == Some(target)
         {
             return true;
         }
@@ -930,7 +1153,7 @@ fn go_condition_is_err_not_nil(condition: Node<'_>, source: &str) -> bool {
         let Some(right) = binary.child_by_field_name("right") else {
             continue;
         };
-        if node_text(left, source).as_deref() == Some("err")
+        if node_text_ref(left, source) == Some("err")
             && right.kind() == "nil"
             && has_direct_child_kind(binary, "!=")
         {
@@ -940,16 +1163,59 @@ fn go_condition_is_err_not_nil(condition: Node<'_>, source: &str) -> bool {
     false
 }
 
+fn go_body_is_error_propagation(body: Node<'_>, source: &str) -> bool {
+    single_statement_through_wrappers(body).is_some_and(|statement| {
+        statement.kind() == "return_statement" && contains_identifier(statement, source, "err")
+    })
+}
+
+fn rust_body_is_result_propagation(body: Node<'_>, source: &str) -> bool {
+    let statement = if body.kind() == "return_expression" {
+        Some(body)
+    } else {
+        single_statement_through_wrappers(body)
+    };
+    statement.is_some_and(|statement| {
+        statement.kind() == "return_expression" && contains_identifier(statement, source, "Err")
+    })
+}
+
+fn single_statement_through_wrappers(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        let child = single_non_comment_named_child(node)?;
+        if matches!(
+            child.kind(),
+            "block" | "statement_list" | "block_expression" | "statements"
+        ) {
+            node = child;
+        } else {
+            return Some(child);
+        }
+    }
+}
+
+fn single_non_comment_named_child(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    let mut children = node
+        .named_children(&mut cursor)
+        .filter(|child| !child.kind().ends_with("comment") && child.kind() != "comment");
+    let only = children.next()?;
+    children.next().is_none().then_some(only)
+}
+
 fn has_direct_child_kind(node: Node<'_>, kind: &str) -> bool {
     (0..node.child_count()).any(|index| node.child(index).is_some_and(|child| child.kind() == kind))
 }
 
 fn node_text(node: Node<'_>, source: &str) -> Option<String> {
+    node_text_ref(node, source).map(str::to_string)
+}
+
+fn node_text_ref<'source>(node: Node<'_>, source: &'source str) -> Option<&'source str> {
     source
         .get(node.start_byte()..node.end_byte())
         .map(str::trim)
         .filter(|text| !text.is_empty())
-        .map(str::to_string)
 }
 
 fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {

@@ -1,5 +1,6 @@
 use brokk_bifrost_analysis::{
     AnalyzerConfig, ExceptionHandlingAnalysis, ExceptionHandlingSmell, ExceptionSmellWeights,
+    code_quality::{ReportExceptionHandlingSmellsParams, report_exception_handling_smells},
 };
 
 use crate::common::InlineTestProject;
@@ -97,7 +98,7 @@ function sample() {
 
 #[test]
 fn python_flags_bare_tiny_except_but_not_meaningful_reraise() {
-    assert_one_bad_handler(
+    let findings = analyze(
         "sample.py",
         r#"
 def sample():
@@ -112,7 +113,15 @@ def sample():
         notify_ops()
         raise
 "#,
-        "<bare>",
+    );
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert_eq!(findings[0].catch_type, "<bare>");
+    assert_eq!(findings[0].body_statement_count, 0);
+    assert!(
+        findings[0]
+            .reasons
+            .iter()
+            .any(|reason| reason == "empty-body")
     );
 }
 
@@ -195,13 +204,22 @@ func ignoreError() error {
     return nil
 }
 
+func nestedRecover() {
+    defer func() {
+        defer func() {
+            if recovered := recover(); recovered != nil {}
+        }()
+    }()
+}
+
 func propagateError() error {
     err := work()
-    return err
+    if err != nil { return err }
+    return nil
 }
 "#,
     );
-    assert_eq!(findings.len(), 2, "findings: {findings:#?}");
+    assert_eq!(findings.len(), 3, "findings: {findings:#?}");
     assert!(
         findings
             .iter()
@@ -235,6 +253,13 @@ fn if_let_badly() {
 fn propagate() -> Result<(), Error> {
     work()?;
     Ok(())
+}
+
+fn propagate_match() -> Result<(), Error> {
+    match work() {
+        Ok(value) => Ok(value),
+        Err(error) => return Err(error),
+    }
 }
 "#,
     );
@@ -288,4 +313,113 @@ fun sample() {
 "#,
         "Exception",
     );
+}
+
+#[test]
+fn mixed_language_report_retains_findings_and_marks_unsupported_files() {
+    let project = InlineTestProject::new()
+        .file(
+            "Sample.kt",
+            "fun sample() { try { work() } catch (error: Exception) {} }",
+        )
+        .file(
+            "sample.rs",
+            "fn sample(value: Result<(), Error>) { match value { Err(error) => {}, Ok(()) => {} } }",
+        )
+        .file("notes.txt", "catch every error")
+        .file("broken.py", "def broken(:\n    pass\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+
+    let result = report_exception_handling_smells(
+        workspace.analyzer(),
+        ReportExceptionHandlingSmellsParams {
+            file_paths: vec![
+                "Sample.kt".to_string(),
+                "sample.rs".to_string(),
+                "notes.txt".to_string(),
+                "broken.py".to_string(),
+            ],
+            ..Default::default()
+        },
+    );
+
+    assert!(result.report.contains("`Sample.kt`"), "{}", result.report);
+    assert!(result.report.contains("`sample.rs`"), "{}", result.report);
+    assert_eq!(result.unsupported_files.len(), 1, "{result:#?}");
+    assert_eq!(result.unsupported_files[0].file, "notes.txt");
+    assert_eq!(result.failed_files.len(), 1, "{result:#?}");
+    assert_eq!(result.failed_files[0].file, "broken.py");
+    assert!(
+        result.report.contains("Unsupported files:"),
+        "{}",
+        result.report
+    );
+    assert!(
+        result.report.contains("Analysis failures:"),
+        "{}",
+        result.report
+    );
+    assert!(!result.report.contains("No exception-handling smells"));
+}
+
+#[test]
+fn narrow_type_and_non_logging_identifier_do_not_gain_generic_or_log_scores() {
+    for (path, source) in [
+        (
+            "sample.py",
+            "try:\n    work()\nexcept DomainException:\n    process(logger)\n",
+        ),
+        (
+            "Sample.cs",
+            "class Sample { void Run() { try { Work(); } catch (DomainException error) { error.Handle(); } } }",
+        ),
+        (
+            "sample.php",
+            "<?php try { work(); } catch (DomainException $error) { process($logger); }",
+        ),
+        (
+            "Sample.kt",
+            "fun sample() { try { work() } catch (error: DomainException) { process(logger) } }",
+        ),
+    ] {
+        let findings = analyze(path, source);
+        assert!(
+            findings.iter().all(|finding| {
+                !finding
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.starts_with("generic-catch:") || reason == "log-only-body")
+            }),
+            "{path}: {findings:#?}"
+        );
+    }
+}
+
+#[test]
+fn cpp_nested_recovery_statements_receive_meaningful_body_credit() {
+    let findings = analyze(
+        "sample.cpp",
+        "void sample() { try {} catch (...) { if (recoverable()) { audit(); notify_ops(); recover(); } } }",
+    );
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert_eq!(findings[0].body_statement_count, 3, "{findings:#?}");
+    assert_eq!(findings[0].score, 2, "{findings:#?}");
+}
+
+#[test]
+fn c_error_semantics_are_explicitly_unsupported() {
+    let project = InlineTestProject::new()
+        .file("sample.c", "int sample(void) { return -1; }")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let result = report_exception_handling_smells(
+        workspace.analyzer(),
+        ReportExceptionHandlingSmellsParams {
+            file_paths: vec!["sample.c".to_string()],
+            ..Default::default()
+        },
+    );
+    assert_eq!(result.unsupported_files.len(), 1, "{result:#?}");
+    assert!(result.report.contains("errno"), "{}", result.report);
 }
