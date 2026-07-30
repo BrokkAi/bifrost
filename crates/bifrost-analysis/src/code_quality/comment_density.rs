@@ -1,7 +1,6 @@
 //! MCP `report_comment_density_for_code_unit` and
-//! `report_comment_density_for_files` handlers. Java-only because the
-//! underlying analyzer trait method `comment_density_*` only has Java
-//! implementations today. Output format mirrors brokk-core's
+//! `report_comment_density_for_files` handlers. The shared analyzer trait
+//! supports every parsed source language. Output format mirrors brokk-core's
 //! `CodeQualityToolsMcp.reportCommentDensity*` byte-for-byte.
 //!
 //! Unlike the other handlers in this module, the file-list flavour does
@@ -10,8 +9,7 @@
 //! shared helper's silent-skip contract.
 
 use super::sanitize_table_cell;
-use crate::analyzer::common::language_for_file;
-use crate::analyzer::{CodeUnit, CommentDensityStats, IAnalyzer, Language};
+use crate::analyzer::{CommentDensityStats, IAnalyzer};
 use crate::path_utils::{
     AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver, rel_path_string,
 };
@@ -21,11 +19,10 @@ const DEFAULT_COMMENT_DENSITY_MAX_LINES: i32 = 120;
 const DEFAULT_COMMENT_DENSITY_MAX_TOP_LEVEL_ROWS: i32 = 60;
 const DEFAULT_COMMENT_DENSITY_MAX_FILES: i32 = 25;
 
-/// Sentinel returned by brokk-core MCP when comment density isn't available
-/// for the requested symbol or file. Bifrost mirrors the wording exactly so
-/// callers comparing reports across servers see identical bytes.
-const COMMENT_DENSITY_JAVA_ONLY: &str =
-    "Comment density is only available for Java symbols in this analyzer snapshot.";
+/// Returned when the selected declaration's analyzer cannot provide parsed
+/// comment density (for example, an unsupported file type).
+const COMMENT_DENSITY_UNAVAILABLE: &str =
+    "Comment density is unavailable for this symbol in this analyzer snapshot.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportCommentDensityForCodeUnitParams {
@@ -63,7 +60,7 @@ pub struct ReportCommentDensityForFilesResult {
 }
 
 /// MCP `report_comment_density_for_code_unit` handler. Looks up the requested
-/// symbol, prefers a Java-extension definition, then renders the per-symbol
+/// symbol, selects the first parsed definition that supports density, then renders the per-symbol
 /// comment-density block (own + rolled-up header/inline/span).
 pub fn report_comment_density_for_code_unit(
     analyzer: &dyn IAnalyzer,
@@ -88,14 +85,12 @@ pub fn report_comment_density_for_code_unit(
             truncated: false,
         };
     }
-    let cu = defs
+    let Some(stats) = defs
         .iter()
-        .find(|d| code_unit_extension(d) == Some("java".to_string()))
-        .cloned()
-        .unwrap_or_else(|| defs[0].clone());
-    let Some(stats) = analyzer.comment_density(&cu) else {
+        .find_map(|code_unit| analyzer.comment_density(code_unit))
+    else {
         return ReportCommentDensityForCodeUnitResult {
-            report: COMMENT_DENSITY_JAVA_ONLY.to_string(),
+            report: COMMENT_DENSITY_UNAVAILABLE.to_string(),
             truncated: false,
         };
     };
@@ -106,7 +101,7 @@ pub fn report_comment_density_for_code_unit(
 /// MCP `report_comment_density_for_files` handler. For each requested file
 /// the report emits a section with a markdown table whose rows are top-level
 /// declarations and their own / rolled-up header / inline / span line counts.
-/// Non-Java files and missing files produce single-line placeholders so the
+/// Unsupported files and missing files produce single-line placeholders so the
 /// output stays useful when callers pass mixed lists.
 pub fn report_comment_density_for_files(
     analyzer: &dyn IAnalyzer,
@@ -156,17 +151,10 @@ pub fn report_comment_density_for_files(
             }
         };
         let rel_display = rel_path_string(&file);
-        if language_for_file(&file) != Language::Java {
-            lines.push(format!("### `{rel_display}`"));
-            lines.push("(not a Java file; skipped)".to_string());
-            lines.push(String::new());
-            files_shown += 1;
-            continue;
-        }
         let stats = analyzer.comment_density_by_top_level(&file);
         if stats.is_empty() {
             lines.push(format!("### `{rel_display}`"));
-            lines.push(COMMENT_DENSITY_JAVA_ONLY.to_string());
+            lines.push("(comment density unavailable; skipped)".to_string());
             lines.push(String::new());
             files_shown += 1;
             continue;
@@ -223,14 +211,6 @@ pub fn report_comment_density_for_files(
     }
 }
 
-fn code_unit_extension(cu: &CodeUnit) -> Option<String> {
-    cu.source()
-        .rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(str::to_string)
-}
-
 fn format_comment_density_for_unit(s: &CommentDensityStats) -> String {
     let mut lines: Vec<String> = Vec::with_capacity(6);
     lines.push("## Comment density".to_string());
@@ -266,6 +246,7 @@ fn truncate_to_line_cap(text: String, max_lines: i32) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::{Language, ProjectFile};
     use crate::test_support::AnalyzerFixture;
 
     const SAMPLE_JAVA: &str = "package com.example;\n\
@@ -309,19 +290,6 @@ mod tests {
             },
         );
         assert_eq!(result.report, "No definition found for: com.example.Nope");
-    }
-
-    #[test]
-    fn comment_density_for_code_unit_non_java_returns_java_only_sentinel() {
-        let fix = AnalyzerFixture::new(&[("src/lib.rs", "fn trivial() -> i32 { 0 }\n")]);
-        let result = report_comment_density_for_code_unit(
-            fix.analyzer.analyzer(),
-            ReportCommentDensityForCodeUnitParams {
-                fq_name: "trivial".to_string(),
-                max_lines: 0,
-            },
-        );
-        assert_eq!(result.report, COMMENT_DENSITY_JAVA_ONLY);
     }
 
     #[test]
@@ -412,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn comment_density_for_files_non_java_file_emits_skip_block() {
+    fn comment_density_for_files_unsupported_file_emits_skip_block() {
         let fix = AnalyzerFixture::new(&[("Foo.java", SAMPLE_JAVA), ("notes.txt", "hello\n")]);
         let result = report_comment_density_for_files(
             fix.analyzer.analyzer(),
@@ -423,7 +391,141 @@ mod tests {
             },
         );
         assert!(result.report.contains("### `notes.txt`"));
-        assert!(result.report.contains("(not a Java file; skipped)"));
+        assert!(
+            result
+                .report
+                .contains("(comment density unavailable; skipped)")
+        );
+    }
+
+    #[test]
+    fn comment_density_supports_every_parsed_language_for_files_and_symbols() {
+        let files = [
+            (
+                "JavaTop.java",
+                "// header\nclass JavaTop {\n    void method() {\n        // inline\n        int value = 1;\n    }\n}\n",
+            ),
+            (
+                "go_top.go",
+                "// header\ntype GoTop struct {\n    Value int // inline\n}\n",
+            ),
+            (
+                "cpp_top.cpp",
+                "// header\nclass CppTop {\n    int method() {\n        // inline\n        return 1;\n    }\n};\n",
+            ),
+            (
+                "javascript_top.js",
+                "// header\nclass JavaScriptTop {\n    method() {\n        // inline\n        return 1;\n    }\n}\n",
+            ),
+            (
+                "typescript_top.ts",
+                "// header\nclass TypeScriptTop {\n    method(): number {\n        // inline\n        return 1;\n    }\n}\n",
+            ),
+            (
+                "tsx_top.tsx",
+                "// header\nclass TsxTop {\n    render() {\n        return <div>{/* inline */}</div>;\n    }\n}\n",
+            ),
+            (
+                "python_top.py",
+                "# header\nclass PythonTop:\n    def method(self):\n        # inline\n        return 1\n",
+            ),
+            (
+                "rust_top.rs",
+                "// header\nstruct RustTop {\n    value: i32, // inline\n}\n",
+            ),
+            (
+                "php_top.php",
+                "<?php\n// header\nclass PhpTop {\n    public int $value; // inline\n}\n",
+            ),
+            (
+                "scala_top.scala",
+                "// header\nclass ScalaTop {\n    def method: Int = {\n        // inline\n        1\n    }\n}\n",
+            ),
+            (
+                "csharp_top.cs",
+                "// header\nclass CSharpTop {\n    int Method() {\n        // inline\n        return 1;\n    }\n}\n",
+            ),
+            (
+                "ruby_top.rb",
+                "# header\nclass RubyTop\n  def method\n    # inline\n    1\n  end\nend\n",
+            ),
+            (
+                "kotlin_top.kt",
+                "// header\nclass KotlinTop {\n    fun method(): Int {\n        // inline\n        return 1\n    }\n}\n",
+            ),
+        ];
+        let fixture_files: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, source)| (*path, *source))
+            .collect();
+        let fix = AnalyzerFixture::new(&fixture_files);
+        let analyzer = fix.analyzer.analyzer();
+        assert_eq!(
+            analyzer.languages(),
+            Language::ANALYZABLE.into_iter().collect(),
+            "fixture must cover every parsed language"
+        );
+        let result = report_comment_density_for_files(
+            analyzer,
+            ReportCommentDensityForFilesParams {
+                file_paths: files.iter().map(|(path, _)| (*path).to_string()).collect(),
+                max_top_level_rows: 0,
+                max_files: 0,
+            },
+        );
+
+        for (path, _) in files {
+            assert!(
+                result.report.contains(&format!("### `{path}`")),
+                "{path}: {}",
+                result.report
+            );
+            let file = ProjectFile::new(fix.project_root(), path);
+            let declaration = analyzer
+                .top_level_declarations(&file)
+                .into_iter()
+                .find(|unit| !unit.is_module() && !unit.is_synthetic())
+                .unwrap_or_else(|| panic!("expected a top-level declaration in {path}"));
+            let symbol_result = report_comment_density_for_code_unit(
+                analyzer,
+                ReportCommentDensityForCodeUnitParams {
+                    fq_name: declaration.fq_name(),
+                    max_lines: 0,
+                },
+            );
+            assert!(
+                symbol_result.report.starts_with("## Comment density"),
+                "{path}: {}",
+                symbol_result.report
+            );
+            assert!(
+                symbol_result
+                    .report
+                    .contains(&format!("- Symbol: `{}`", declaration.fq_name())),
+                "{path}: {}",
+                symbol_result.report
+            );
+            assert!(
+                symbol_result.report.contains("- Own: header 1,"),
+                "{path}: {}",
+                symbol_result.report
+            );
+            if matches!(
+                path,
+                "javascript_top.js" | "typescript_top.ts" | "tsx_top.tsx"
+            ) {
+                assert!(
+                    symbol_result.report.contains("inline 1"),
+                    "{path}: {}",
+                    symbol_result.report
+                );
+            }
+        }
+        assert!(
+            !result.report.contains("comment density unavailable"),
+            "{}",
+            result.report
+        );
     }
 
     #[test]
