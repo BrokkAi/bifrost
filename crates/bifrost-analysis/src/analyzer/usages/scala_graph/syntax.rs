@@ -1614,14 +1614,36 @@ pub(crate) fn call_arities_for_reference(node: Node<'_>) -> Option<Vec<usize>> {
 }
 
 pub(crate) fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallSiteShape> {
-    let parent = node.parent()?;
-    if parent.kind() == "case_class_pattern" && parent.named_child(0) == Some(node) {
+    // Qualified extractor types may wrap the focused terminal in stable and
+    // applied type nodes before reaching the case-class pattern.
+    let mut pattern_type = node;
+    while let Some(parent) = pattern_type.parent().filter(|parent| {
+        if parent.kind() == "stable_type_identifier" {
+            let mut cursor = parent.walk();
+            return parent.named_children(&mut cursor).last() == Some(pattern_type);
+        }
+        matches!(
+            parent.kind(),
+            "generic_type" | "applied_constructor_type" | "annotated_type" | "type"
+        )
+    }) {
+        pattern_type = parent;
+    }
+    if let Some(parent) = pattern_type.parent().filter(|parent| {
+        parent.kind() == "case_class_pattern"
+            && parent.child_by_field_name("type") == Some(pattern_type)
+    }) {
+        // In Scala 3 indented cases tree-sitter exposes the constructor type
+        // through the same `pattern` field as the arguments. Counting named
+        // children other than the parser-proven type is stable in both forms.
         let mut cursor = parent.walk();
         let arity = parent
-            .children_by_field_name("pattern", &mut cursor)
+            .named_children(&mut cursor)
+            .filter(|child| *child != pattern_type)
             .count();
         return Some(ScalaCallSiteShape::ordinary(&[arity]));
     }
+    let parent = node.parent()?;
     if parent.kind() == "infix_pattern" && parent.child_by_field_name("operator") == Some(node) {
         return Some(ScalaCallSiteShape::ordinary(&[1]));
     }
@@ -2487,6 +2509,11 @@ object Use { val value = new ArrayOps(1) }
   val typed: Structure.Value = ???
   val packageTyped: model.Structure.Value = ???
 }
+enum Token:
+  case Number(value: Int)
+object EnumUse:
+  def invalid(token: Token): Int = token match
+    case Token.Number(first, second) => first + second
 "#;
         let mut parser = Parser::new();
         parser
@@ -2496,6 +2523,8 @@ object Use { val value = new ArrayOps(1) }
         let mut value_roles = Vec::new();
         let mut box_roles = Vec::new();
         let mut package_paths = Vec::new();
+        let mut extractor_shapes = Vec::new();
+        let mut enum_extractor_shapes = Vec::new();
         let mut stack = vec![tree.root_node()];
         while let Some(node) = stack.pop() {
             if matches!(node.kind(), "identifier" | "type_identifier")
@@ -2510,9 +2539,17 @@ object Use { val value = new ArrayOps(1) }
                         {
                             package_paths.push(reference.segments.clone());
                         }
+                        if reference.role == ScalaQualifiedStableTypeRole::Extractor {
+                            extractor_shapes
+                                .push(call_site_shape_for_reference(reference.expression));
+                        }
                         value_roles.push(reference.role);
                     }
                     "Box" => box_roles.push(reference.role),
+                    "Number" if reference.role == ScalaQualifiedStableTypeRole::Extractor => {
+                        enum_extractor_shapes
+                            .push(call_site_shape_for_reference(reference.expression));
+                    }
                     _ => {}
                 }
             }
@@ -2534,5 +2571,17 @@ object Use { val value = new ArrayOps(1) }
         );
         assert_eq!(package_paths, vec![vec!["model", "Structure", "Value"]]);
         assert_eq!(box_roles, vec![ScalaQualifiedStableTypeRole::Constructor]);
+        assert_eq!(
+            extractor_shapes,
+            vec![Some(ScalaCallSiteShape::ordinary(&[1]))],
+            "{}",
+            tree.root_node().to_sexp(),
+        );
+        assert_eq!(
+            enum_extractor_shapes,
+            vec![Some(ScalaCallSiteShape::ordinary(&[2]))],
+            "{}",
+            tree.root_node().to_sexp(),
+        );
     }
 }
