@@ -39,6 +39,7 @@ mod hierarchy;
 pub(crate) mod imports;
 pub(crate) mod language;
 mod supertypes;
+pub(crate) mod syntax;
 pub(crate) mod types;
 
 use crate::analyzer::js_ts::cache::{

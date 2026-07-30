@@ -63,9 +63,11 @@ pub(super) fn scan_files_for_seeds(
         .flatten();
     let lookup_only_local_property = language == Language::JavaScript
         && target_owner.is_none()
-        && target.is_field()
+        && target_member.is_some()
         && exported_local_property_root.is_none()
-        && !analyzer.declarations(target.source()).contains(target);
+        && (!analyzer.declarations(target.source()).contains(target)
+            || (target.is_function()
+                && function_target_has_non_program_local_receiver(analyzer, target, language)));
     let direct_local_property =
         lookup_only_local_property || exported_local_property_root.is_some();
     let direct_local_property_ranges = direct_local_property.then(|| analyzer.ranges(target));
@@ -219,6 +221,43 @@ pub(super) fn scan_files_for_seeds(
     hits.into_iter().chain(unproven_hits).collect()
 }
 
+fn function_target_has_non_program_local_receiver(
+    analyzer: &dyn IAnalyzer,
+    target: &CodeUnit,
+    language: Language,
+) -> bool {
+    let Some(member) = member_name(target) else {
+        return false;
+    };
+    let Ok(source) = target.source().read_to_string() else {
+        return false;
+    };
+    let Some(parser_language) = js_ts_tree_sitter_language_for_file(target.source(), language)
+    else {
+        return false;
+    };
+    let mut parser = Parser::new();
+    if parser.set_language(&parser_language).is_err() {
+        return false;
+    }
+    let Some(tree) = parser.parse(&source, None) else {
+        return false;
+    };
+    let root = tree.root_node();
+    let bindings = JsTsLexicalBindingIndex::build(root, &source);
+    direct_property_definitions(root, &source, &analyzer.ranges(target), &member)
+        .into_iter()
+        .any(|definition| {
+            let receiver = slice(definition.receiver.root, &source);
+            bindings.is_bound_at(receiver, definition.receiver.root.start_byte())
+                && !bindings.is_program_binding_at(
+                    receiver,
+                    definition.receiver.root.start_byte(),
+                    root,
+                )
+        })
+}
+
 pub(super) struct ScanCtx<'a> {
     pub(super) file: &'a ProjectFile,
     pub(super) source: &'a str,
@@ -231,8 +270,8 @@ pub(super) struct ScanCtx<'a> {
     target_member: Option<&'a str>,
     /// Exact host object for a parentless browser-global property such as `window.Promise`.
     browser_global_object: Option<&'a str>,
-    /// Parentless JS fields omitted from the declaration catalog remain available for
-    /// exact, same-file definition lookup and targeted usage scans.
+    /// Parentless JS direct-property targets that are definition-only in practice remain
+    /// available for exact, same-file definition lookup and targeted usage scans.
     lookup_only_local_property: bool,
     local_property_definitions: Option<Vec<LocalPropertyDefinition>>,
     /// Import edges from this file that resolve to the target's seed set.

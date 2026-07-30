@@ -2781,6 +2781,7 @@ fn terminal_presentation(
         | CodeQueryResultValue::TypestateWitness { .. }
         | CodeQueryResultValue::FlowEndpoint { .. }
         | CodeQueryResultValue::FlowWitness { .. }
+        | CodeQueryResultValue::TaintFinding { .. }
         | CodeQueryResultValue::ReceiverAnalysis { .. } => return Err(()),
     };
     if actual_domain != expected_domain || path != expected_path.as_str() {

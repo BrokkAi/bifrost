@@ -3676,12 +3676,51 @@ fn resolve_scala_with_context(
             if text.is_empty() {
                 return no_definition("no_reference_text", "Scala identifier is blank");
             }
-            if scala_lexical_binding_declares_name_before(
-                root,
-                source,
-                text,
-                identifier.start_byte(),
-            ) {
+            let bindings = scala_bindings_before(ctx, &resolver, root, identifier.start_byte());
+            let shadowed = bindings.is_shadowed(text)
+                || scala_lexical_binding_declares_name_before(
+                    root,
+                    source,
+                    text,
+                    identifier.start_byte(),
+                );
+            if shadowed {
+                let binding = precise_scala_binding(&bindings, text);
+                if binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.declaration_owner.is_some())
+                {
+                    if let Some(outcome) = scala_explicit_local_member_import_outcome(
+                        ctx, &resolver, root, identifier, text,
+                    ) {
+                        return outcome;
+                    }
+                    if let Some(fqn) = resolver.resolve_member(text) {
+                        return scala_fqn_outcome(support, &fqn, text);
+                    }
+                }
+                if let Some(owner) = binding.and_then(|binding| binding.declaration_owner) {
+                    match scala_exact_owner_member_candidate_units(ctx, &owner, text, false) {
+                        ScalaExactMemberResolution::Found(mut candidates) => {
+                            candidates.retain(|unit| {
+                                !ctx.scala.is_type_alias(unit)
+                                    && !scala_constructor_only_callable(ctx.scala, unit)
+                            });
+                            if !candidates.is_empty() {
+                                return candidates_outcome(candidates);
+                            }
+                        }
+                        ScalaExactMemberResolution::Ambiguous => {
+                            return no_definition(
+                                "ambiguous_scala_local_member",
+                                format!(
+                                    "`{text}` has multiple physical definitions on its bound enclosing owner"
+                                ),
+                            );
+                        }
+                        ScalaExactMemberResolution::NoMatch => {}
+                    }
+                }
                 return no_definition(
                     "local_variable_reference",
                     format!("`{text}` is a local Scala value"),
@@ -3866,12 +3905,24 @@ fn scala_import_reference_outcome(
     for info in relevant {
         saw_relevant = true;
         if let Some(structured_path) = info.path.as_ref() {
-            let focused_terminal_segment =
-                scala_direct_import_segment_index(import, focus_start_byte, focus_end_byte)
-                    .is_some_and(|focus_index| {
-                        focus_index + 1 == structured_path.segments.len()
-                            && structured_path.segments[focus_index] == name
-                    });
+            let focus_index =
+                scala_direct_import_segment_index(import, focus_start_byte, focus_end_byte);
+            let focused_terminal_segment = focus_index.is_some_and(|focus_index| {
+                focus_index + 1 == structured_path.segments.len()
+                    && structured_path.segments[focus_index] == name
+            });
+            if info.is_wildcard
+                && let Some(focus_index) = focus_index
+                && let Some(outcome) = scala_wildcard_import_owner_outcome(
+                    ctx,
+                    &lexical_resolver,
+                    root,
+                    node,
+                    &structured_path.segments[..=focus_index],
+                )
+            {
+                return Some(outcome);
+            }
             if focused_terminal_segment
                 && let Some((member, owner_segments)) = structured_path.segments.split_last()
                 && let Some(exact_owner) = scala_exact_bound_stable_owner(
@@ -3984,6 +4035,73 @@ fn scala_import_reference_outcome(
     })
 }
 
+fn scala_wildcard_import_owner_outcome(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver<'_>,
+    root: Node<'_>,
+    node: Node<'_>,
+    segments: &[String],
+) -> Option<DefinitionLookupOutcome> {
+    if segments.is_empty() {
+        return None;
+    }
+    if let Some(exact_owner) = scala_exact_bound_stable_owner(ctx, resolver, root, node, segments) {
+        return Some(candidates_outcome(vec![exact_owner]));
+    }
+    let display = segments.join(".");
+    match scala_exact_enclosing_singleton_path(ctx, node.start_byte(), segments) {
+        ScalaExactMemberResolution::Found(candidates) => {
+            return Some(candidates_outcome(candidates));
+        }
+        ScalaExactMemberResolution::Ambiguous => {
+            return Some(no_definition(
+                "ambiguous_scala_type",
+                format!("`{display}` resolves to multiple physical Scala owners"),
+            ));
+        }
+        ScalaExactMemberResolution::NoMatch => {}
+    }
+
+    let singleton = match resolver.resolve_owner_segments(segments, ScalaOwnerKind::SingletonObject)
+    {
+        ScalaNameResolution::Resolved(owner) => Some(owner._declaration),
+        ScalaNameResolution::Ambiguous => {
+            return Some(no_definition(
+                "ambiguous_scala_type",
+                format!("`{display}` resolves to multiple physical Scala owners"),
+            ));
+        }
+        ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Unresolved => None,
+    };
+    if let Some(singleton) = singleton {
+        return Some(candidates_outcome(vec![singleton]));
+    }
+
+    let mut owners = Vec::new();
+    for kind in [ScalaOwnerKind::Class, ScalaOwnerKind::TypeNamespace] {
+        match resolver.resolve_owner_segments(segments, kind) {
+            ScalaNameResolution::Resolved(owner) => owners.push(owner._declaration),
+            ScalaNameResolution::Ambiguous => {
+                return Some(no_definition(
+                    "ambiguous_scala_type",
+                    format!("`{display}` resolves to multiple physical Scala owners"),
+                ));
+            }
+            ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Unresolved => {}
+        }
+    }
+    sort_units(&mut owners);
+    owners.dedup();
+    match owners.as_slice() {
+        [owner] => Some(candidates_outcome(vec![owner.clone()])),
+        [_, _, ..] => Some(no_definition(
+            "ambiguous_scala_type",
+            format!("`{display}` resolves to multiple physical Scala owners"),
+        )),
+        [] => None,
+    }
+}
+
 fn scala_import_member_outcome(
     scala: &ScalaAnalyzer,
     support: &dyn BoundedDefinitionLookup,
@@ -3996,27 +4114,27 @@ fn scala_import_member_outcome(
     }
 
     let mut candidates = Vec::new();
-    for kind in [ScalaOwnerKind::SingletonObject, ScalaOwnerKind::Class] {
+    for kind in [
+        ScalaOwnerKind::SingletonObject,
+        ScalaOwnerKind::Class,
+        ScalaOwnerKind::TypeNamespace,
+    ] {
         let ScalaNameResolution::Resolved(owner) =
             resolver.resolve_owner_segments(owner_segments, kind)
         else {
             continue;
         };
-        candidates.extend(
-            support
-                .fqn_direct_children(&owner.fqn)
-                .into_iter()
-                .filter(|unit| unit.identifier() == member.as_str())
-                .filter(|unit| unit.is_function() || unit.is_field())
-                .filter(|unit| !scala.is_type_alias(unit))
-                .filter(|unit| {
-                    scala.structural_parent_of(unit).as_ref() == Some(&owner._declaration)
-                }),
-        );
+        candidates.extend(scala_exact_terminal_member_candidates(
+            scala,
+            support,
+            &owner._declaration,
+            member,
+            ScalaQualifiedTerminalRole::Any,
+        ));
     }
     sort_units(&mut candidates);
     candidates.dedup();
-    (!candidates.is_empty()).then(|| candidates_outcome(candidates))
+    scala_terminal_candidates_outcome(candidates)
 }
 
 fn scala_exact_bound_stable_owner(
@@ -4099,6 +4217,13 @@ fn scala_direct_import_segment_index(
 struct ScalaFocusedQualifiedPath<'tree> {
     segments: Vec<(Node<'tree>, String)>,
     focus_index: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScalaQualifiedTerminalRole {
+    Any,
+    Type,
+    Term,
 }
 
 /// Preserve the parser's segment boundaries for a qualified path. The generic
@@ -4219,9 +4344,53 @@ fn resolve_scala_focused_qualified_path(
         });
     }
 
-    // Terminal resolution must continue through the normal field/type role so
-    // a missing child cannot silently return its successfully resolved owner.
     if path.focus_index + 1 == names.len() {
+        // Extractors need constructor-shape validation. The generic qualified
+        // terminal path only validates owner/member identity, so leave this
+        // parser-proven role to `resolve_scala_parser_proven_term_role`.
+        if qualified_stable_type_reference(node, ctx.source)
+            .is_some_and(|reference| reference.role == ScalaQualifiedStableTypeRole::Extractor)
+        {
+            return None;
+        }
+        let role = if scala_is_type_position(node) || is_scala_class_reference(node, ctx.source) {
+            ScalaQualifiedTerminalRole::Type
+        } else {
+            ScalaQualifiedTerminalRole::Term
+        };
+        let owner_segments = names[..names.len() - 1]
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>();
+        let member = names[names.len() - 1];
+        if matches!(
+            scala_reference_node(node),
+            Some(ScalaReferenceNode::Call(_))
+        ) {
+            if member == "apply"
+                && let Some(outcome) =
+                    scala_exact_qualified_apply_outcome(ctx, resolver, root, node, &owner_segments)
+            {
+                return Some(outcome);
+            }
+            if let Some(outcome) =
+                scala_exact_java_static_terminal_outcome(ctx, resolver, &owner_segments, member)
+            {
+                return Some(outcome);
+            }
+            return None;
+        }
+        if let Some(outcome) = scala_exact_qualified_terminal_outcome(
+            ctx,
+            resolver,
+            root,
+            node,
+            &owner_segments,
+            member,
+            role,
+        ) {
+            return Some(outcome);
+        }
         return None;
     }
     let root_name = names[0];
@@ -4300,6 +4469,294 @@ fn resolve_scala_focused_qualified_path(
             ),
         },
     )
+}
+
+fn scala_exact_qualified_apply_outcome(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver<'_>,
+    root: Node<'_>,
+    node: Node<'_>,
+    owner_segments: &[String],
+) -> Option<DefinitionLookupOutcome> {
+    let root_name = owner_segments.first()?;
+    let bindings = scala_bindings_before(ctx, resolver, root, node.start_byte());
+    if bindings.is_shadowed(root_name)
+        || scala_lexical_binding_declares_name_before(
+            root,
+            ctx.source,
+            root_name,
+            node.start_byte(),
+        )
+    {
+        return None;
+    }
+    let display = owner_segments.join(".");
+    match resolver.resolve_owner_segments(owner_segments, ScalaOwnerKind::SingletonObject) {
+        ScalaNameResolution::Resolved(owner) => Some(scala_exact_singleton_apply_outcome(
+            ctx,
+            &owner._declaration,
+            &display,
+            call_site_shape_for_reference(node).as_ref(),
+        )),
+        ScalaNameResolution::Ambiguous => Some(no_definition(
+            "ambiguous_scala_callable",
+            format!("`{display}` resolves to multiple physical Scala companion owners"),
+        )),
+        ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Unresolved => {
+            match resolver.resolve_owner_segments(owner_segments, ScalaOwnerKind::Class) {
+                ScalaNameResolution::Resolved(owner) => {
+                    Some(scala_exact_type_apply_or_constructor_outcome(
+                        ctx,
+                        &owner._declaration,
+                        &format!("{display}.apply"),
+                        call_site_shape_for_reference(node).as_ref(),
+                    ))
+                }
+                ScalaNameResolution::Ambiguous => Some(no_definition(
+                    "ambiguous_scala_callable",
+                    format!("`{display}` resolves to multiple physical Scala class owners"),
+                )),
+                ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Unresolved => {
+                    scala_exact_qualified_terminal_outcome(
+                        ctx,
+                        resolver,
+                        root,
+                        node,
+                        owner_segments,
+                        "apply",
+                        ScalaQualifiedTerminalRole::Term,
+                    )
+                }
+            }
+        }
+    }
+}
+
+fn scala_exact_java_static_terminal_outcome(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver<'_>,
+    owner_segments: &[String],
+    member: &str,
+) -> Option<DefinitionLookupOutcome> {
+    let ScalaNameResolution::Resolved(owner) =
+        resolver.resolve_owner_segments(owner_segments, ScalaOwnerKind::Class)
+    else {
+        return None;
+    };
+    if language_for_file(owner._declaration.source()) != Language::Java {
+        return None;
+    }
+    let exact_fqn = format!("{}.{}", owner._declaration.fq_name(), member);
+    let mut candidates = ctx
+        .support
+        .fqn_in_language(&exact_fqn, Language::Java)
+        .into_iter()
+        .filter(|unit| unit.fq_name() == exact_fqn)
+        .collect::<Vec<_>>();
+    sort_units(&mut candidates);
+    candidates.dedup();
+    scala_terminal_candidates_outcome(candidates)
+}
+
+fn scala_exact_qualified_terminal_outcome(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver<'_>,
+    root: Node<'_>,
+    node: Node<'_>,
+    owner_segments: &[String],
+    member: &str,
+    role: ScalaQualifiedTerminalRole,
+) -> Option<DefinitionLookupOutcome> {
+    let owner_display = owner_segments.join(".");
+    match role {
+        ScalaQualifiedTerminalRole::Term => {
+            if let Some(exact_owner) =
+                scala_exact_bound_stable_owner(ctx, resolver, root, node, owner_segments)
+            {
+                return scala_terminal_candidates_outcome(scala_exact_terminal_member_candidates(
+                    ctx.scala,
+                    ctx.support,
+                    &exact_owner,
+                    member,
+                    role,
+                ));
+            }
+            let root_name = owner_segments.first()?;
+            let bindings = scala_bindings_before(ctx, resolver, root, node.start_byte());
+            if bindings.is_shadowed(root_name)
+                || scala_lexical_binding_declares_name_before(
+                    root,
+                    ctx.source,
+                    root_name,
+                    node.start_byte(),
+                )
+            {
+                return None;
+            }
+            let owner = match resolver
+                .resolve_owner_segments(owner_segments, ScalaOwnerKind::SingletonObject)
+            {
+                ScalaNameResolution::Resolved(owner) => owner._declaration,
+                ScalaNameResolution::Ambiguous => {
+                    return Some(no_definition(
+                        "ambiguous_scala_type",
+                        format!(
+                            "`{owner_display}.{member}` resolves to multiple physical Scala owners"
+                        ),
+                    ));
+                }
+                ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Unresolved => {
+                    return None;
+                }
+            };
+            scala_terminal_candidates_outcome(scala_exact_terminal_member_candidates(
+                ctx.scala,
+                ctx.support,
+                &owner,
+                member,
+                role,
+            ))
+        }
+        ScalaQualifiedTerminalRole::Type => {
+            let owner = match resolver
+                .resolve_owner_segments(owner_segments, ScalaOwnerKind::TypeNamespace)
+            {
+                ScalaNameResolution::Resolved(owner) => owner._declaration,
+                ScalaNameResolution::Ambiguous => {
+                    return Some(no_definition(
+                        "ambiguous_scala_type",
+                        format!(
+                            "`{owner_display}.{member}` resolves to multiple physical Scala owners"
+                        ),
+                    ));
+                }
+                ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Unresolved => {
+                    return None;
+                }
+            };
+            scala_terminal_candidates_outcome(scala_exact_terminal_member_candidates(
+                ctx.scala,
+                ctx.support,
+                &owner,
+                member,
+                role,
+            ))
+        }
+        ScalaQualifiedTerminalRole::Any => {
+            let mut owners = Vec::new();
+            for kind in [
+                ScalaOwnerKind::SingletonObject,
+                ScalaOwnerKind::Class,
+                ScalaOwnerKind::TypeNamespace,
+            ] {
+                match resolver.resolve_owner_segments(owner_segments, kind) {
+                    ScalaNameResolution::Resolved(owner) => owners.push(owner._declaration),
+                    ScalaNameResolution::Ambiguous => {
+                        return Some(no_definition(
+                            "ambiguous_scala_type",
+                            format!(
+                                "`{owner_display}.{member}` resolves to multiple physical Scala owners"
+                            ),
+                        ));
+                    }
+                    ScalaNameResolution::MissingExplicitImport
+                    | ScalaNameResolution::Unresolved => {}
+                }
+            }
+            sort_units(&mut owners);
+            owners.dedup();
+            let [owner] = owners.as_slice() else {
+                return if owners.len() > 1 {
+                    Some(no_definition(
+                        "ambiguous_scala_type",
+                        format!(
+                            "`{owner_display}.{member}` resolves to multiple physical Scala owners"
+                        ),
+                    ))
+                } else {
+                    None
+                };
+            };
+            scala_terminal_candidates_outcome(scala_exact_terminal_member_candidates(
+                ctx.scala,
+                ctx.support,
+                owner,
+                member,
+                role,
+            ))
+        }
+    }
+}
+
+fn scala_exact_terminal_member_candidates(
+    scala: &ScalaAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    owner: &CodeUnit,
+    member: &str,
+    role: ScalaQualifiedTerminalRole,
+) -> Vec<CodeUnit> {
+    let mut candidates = Vec::new();
+    if matches!(
+        role,
+        ScalaQualifiedTerminalRole::Any | ScalaQualifiedTerminalRole::Term
+    ) {
+        let exact_fqn = format!("{}.{member}", owner.fq_name());
+        candidates.extend(
+            support
+                .fqn(&exact_fqn)
+                .into_iter()
+                .filter(|unit| unit.fq_name() == exact_fqn)
+                .filter(|unit| !unit.is_class() && !scala.is_type_alias(unit))
+                .filter(|unit| scala.structural_parent_of(unit).as_ref() == Some(owner)),
+        );
+        let singleton_fqn = format!("{}.{}$", owner.fq_name(), member);
+        candidates.extend(support.fqn(&singleton_fqn).into_iter().filter(|unit| {
+            unit.is_class()
+                && unit.fq_name() == singleton_fqn
+                && scala.structural_parent_of(unit).as_ref() == Some(owner)
+        }));
+    }
+    if matches!(
+        role,
+        ScalaQualifiedTerminalRole::Any | ScalaQualifiedTerminalRole::Type
+    ) {
+        candidates.extend(
+            support
+                .fqn_direct_children(&owner.fq_name())
+                .into_iter()
+                .filter(|unit| unit.identifier().trim_end_matches('$') == member)
+                .filter(|unit| unit.source() == owner.source())
+                .filter(|unit| scala.structural_parent_of(unit).as_ref() == Some(owner))
+                .filter(|unit| {
+                    unit.is_class() && !unit.short_name().ends_with('$')
+                        || scala.is_type_alias(unit)
+                }),
+        );
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
+}
+
+fn scala_terminal_candidates_outcome(
+    mut candidates: Vec<CodeUnit>,
+) -> Option<DefinitionLookupOutcome> {
+    if candidates.is_empty() {
+        return None;
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    let distinct_fqns = candidates
+        .iter()
+        .map(CodeUnit::fq_name)
+        .collect::<HashSet<_>>();
+    if distinct_fqns.len() > 1 {
+        return Some(no_definition(
+            "ambiguous_scala_type",
+            "the selected Scala terminal has multiple physical declarations across namespaces",
+        ));
+    }
+    Some(candidates_outcome(candidates))
 }
 
 fn scala_exact_enclosing_singleton_path(
@@ -7373,6 +7830,7 @@ fn scala_callable_matches_constructed_arguments(
                 ScalaParameterTypeIdentity::Declaration(expected) => {
                     scala_exact_subtype_relation(ctx, actual, expected)
                 }
+                ScalaParameterTypeIdentity::TypeParameter(_) => ScalaTypedCandidateMatch::Unknown,
             };
             match relation {
                 ScalaTypedCandidateMatch::Match => {}
@@ -8552,7 +9010,7 @@ fn scala_active_path_declares_name_before_mode(
         }
 
         match node.kind() {
-            "class_definition" | "function_definition" => {
+            "class_definition" | "extension_definition" | "function_definition" => {
                 if scala_parameters_declare_name_before(node, source, name, cutoff_start) {
                     return true;
                 }
@@ -9730,6 +10188,7 @@ const SCALA_SCOPE_NODES: &[&str] = &[
     "object_definition",
     "trait_definition",
     "enum_definition",
+    "extension_definition",
     "function_definition",
     "block",
     "indented_block",
@@ -9814,7 +10273,7 @@ fn scala_seed_active_path(
             bindings.enter_scope();
         }
         match node.kind() {
-            "class_definition" => {
+            "class_definition" | "extension_definition" => {
                 scala_seed_parameters(ctx, resolver, node, cutoff_start, bindings)
             }
             "function_definition" => {

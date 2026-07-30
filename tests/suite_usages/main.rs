@@ -34,6 +34,7 @@ mod usages_go_graph_test;
 mod usages_java_graph_test;
 mod usages_js_ts_graph_test;
 mod usages_js_ts_path_alias_test;
+mod usages_kotlin_graph_test;
 mod usages_local_inference_test;
 mod usages_php_graph_test;
 mod usages_python_graph_test;

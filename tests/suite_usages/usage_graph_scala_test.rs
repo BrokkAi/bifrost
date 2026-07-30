@@ -384,6 +384,9 @@ class QualifiedExternal extends replica.Base { def value(input: Exact): Exact = 
         .build();
     let value = usage_graph_at(project.root(), "{}");
 
+    // `usage_graph` intentionally catalogs only class and callable nodes. The
+    // exact `JsonSchemas.root`/`children` field inverses are covered in the
+    // targeted Scala usage suite.
     for (caller, callee) in [
         ("lexical.Direct.beforeClass", "lexical.Direct.Factory"),
         ("lexical.InheritedUse.nested", "lexical.Contract.Inherited"),
@@ -1354,6 +1357,61 @@ object Use {
 }
 
 #[test]
+fn scala_inverted_records_stream_reactor_shaped_inherited_parameterless_edges() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Config.scala",
+            r#"package app
+
+import java.util
+import scala.jdk.CollectionConverters.*
+
+trait DeleteModeConfigKeys {
+  def connectorPrefix: String
+  def DELETE_MODE: String = s"$connectorPrefix.delete.mode"
+}
+
+trait AssignmentBase {
+  def ASSIGNMENT: util.Set[String]
+  def getAssignment: util.Set[String] = ASSIGNMENT
+}
+
+trait SchemaBase {
+  def createSchemaNested: String = "schema"
+}
+
+final class Config
+    extends DeleteModeConfigKeys
+    with AssignmentBase
+    with SchemaBase {
+  def connectorPrefix: String = "sink"
+  def ASSIGNMENT: util.Set[String] = new util.HashSet[String]()
+  def deleteMode: String = DELETE_MODE
+  def assignment = getAssignment.asScala
+  def nested: String = createSchemaNested.toString
+}
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+
+    for (caller, callee) in [
+        (
+            "app.Config.deleteMode",
+            "app.DeleteModeConfigKeys.DELETE_MODE",
+        ),
+        ("app.Config.assignment", "app.AssignmentBase.getAssignment"),
+        ("app.Config.nested", "app.SchemaBase.createSchemaNested"),
+    ] {
+        assert!(
+            has_edge(&value, caller, callee),
+            "missing inherited parameterless edge {caller} -> {callee}: {}",
+            value["edges"]
+        );
+    }
+}
+
+#[test]
 fn type_references_edge_to_the_type_node() {
     let value = usage_graph();
 
@@ -2254,12 +2312,23 @@ class Consumer {
             "{caller} should edge to the exact imported object: {}",
             value["edges"]
         );
+    }
+    for caller in [
+        "app.Consumer.methodLocal",
+        "app.Consumer.anonymousLocal",
+        "app.Consumer.siblingScope",
+    ] {
         assert!(
             !has_edge(&value, caller, "app.Owner$.RetryTick"),
             "{caller} must not edge to the same-name class: {}",
             value["edges"]
         );
     }
+    assert!(
+        has_edge(&value, "app.Consumer.aliasLocal", "app.Owner$.RetryTick"),
+        "a direct import token denotes both the term companion and type namespace: {}",
+        value["edges"]
+    );
     for caller in [
         "app.Consumer.beforeImport",
         "app.Consumer.shadowed",
@@ -3012,6 +3081,111 @@ object Yaml {
         assert!(
             !has_edge(&value, caller, callee),
             "incompatible method value leaked {caller} -> {callee}: {}",
+            value["edges"]
+        );
+    }
+}
+
+#[test]
+fn scala_inverted_records_zio_http_exact_function_and_receiver_shapes() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/ZioHttpShapes.scala",
+            r#"package app
+
+trait Platform {
+  def fromConfig: Int = 1
+  private def sink(value: Int): Int = value
+  def default: Int = sink(fromConfig)
+}
+
+final case class JsonSchemas(root: String, children: List[String])
+
+sealed trait JsonSchema {
+  def annotate(label: String): JsonSchema = this
+}
+
+trait OtherJsonSchema {
+  def annotate(label: String): OtherJsonSchema = this
+}
+
+object OpenApi {
+  private def fromSerializableSchema(schema: String): JsonSchema = new JsonSchema {}
+  private def fromZSchemaMultiple(schema: String): JsonSchemas = JsonSchemas(schema, List(schema))
+  private def reconcileIfBothDefined[T](left: Option[T], right: Option[T])(combine: (T, T) => Option[T]): Option[T] =
+    for {
+      l <- left
+      r <- right
+      c <- combine(l, r)
+    } yield c
+  private def combinePatterns(left: String, right: String): Option[String] = Some(left + right)
+
+  def annotateValues(schema: String): JsonSchema = {
+    val valuesSchema = fromSerializableSchema(schema)
+    valuesSchema.annotate("value")
+  }
+
+  def selectRoot(left: String, right: String): String = {
+    val leftSchema = fromZSchemaMultiple(left)
+    val rightSchema = fromZSchemaMultiple(right)
+    rightSchema.root
+  }
+
+  def selectChildren(left: String, right: String): List[String] = {
+    val leftSchema = fromZSchemaMultiple(left)
+    val rightSchema = fromZSchemaMultiple(right)
+    rightSchema.children
+  }
+
+  def combine(left: Option[String], right: Option[String]): Option[String] =
+    reconcileIfBothDefined(left, right)(combinePatterns)
+}
+"#,
+        )
+        .file(
+            "app/Decoys.scala",
+            r#"package app
+
+object Decoys {
+  final case class OtherSchemas(root: Int, children: Vector[Int])
+
+  private def reconcileIfBothDefined[T](left: Option[T], right: Option[T])(combine: (T, T) => Option[T]): Option[T] =
+    left.orElse(right)
+
+  def combine(left: Option[String], right: Option[String]): Option[String] = {
+    def combinePatterns(left: String, right: String): Option[String] = None
+    reconcileIfBothDefined(left, right)(combinePatterns)
+  }
+
+  def annotateOther(schema: OtherJsonSchema): OtherJsonSchema =
+    schema.annotate("other")
+
+  def root(other: OtherSchemas): Int = other.root
+  def children(other: OtherSchemas): Vector[Int] = other.children
+}
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+
+    for (caller, callee) in [
+        ("app.Platform.default", "app.Platform.fromConfig"),
+        ("app.OpenApi$.annotateValues", "app.JsonSchema.annotate"),
+        ("app.OpenApi$.combine", "app.OpenApi$.combinePatterns"),
+    ] {
+        assert!(
+            has_edge(&value, caller, callee),
+            "missing zio-http-shaped edge {caller} -> {callee}: {}",
+            value["edges"]
+        );
+    }
+    for (caller, callee) in [
+        ("app.Decoys$.combine", "app.OpenApi$.combinePatterns"),
+        ("app.Decoys$.annotateOther", "app.JsonSchema.annotate"),
+    ] {
+        assert!(
+            !has_edge(&value, caller, callee),
+            "wrong-owner zio-http decoy leaked {caller} -> {callee}: {}",
             value["edges"]
         );
     }

@@ -366,10 +366,10 @@ impl ScanCtx<'_> {
         if !self.direct_names.contains(text) {
             return false;
         }
-        self.seeds.is_none_or(|seeds| {
-            let shadowed = namespace != RustReferenceNamespace::Macro
-                && (self.lexical_scope.name_bound_at(text, byte)
-                    || self.item_shadows_target(text, byte));
+        let shadowed = namespace != RustReferenceNamespace::Macro
+            && (self.lexical_scope.name_bound_at(text, byte)
+                || self.item_shadows_target(text, byte));
+        if self.seeds.is_none_or(|seeds| {
             let resolution = self.rust.usage_reference_at(
                 self.file,
                 seeds,
@@ -380,7 +380,14 @@ impl ScanCtx<'_> {
                 false,
             );
             resolution.is_exact()
-        })
+        }) {
+            return true;
+        }
+        !shadowed
+            && self.refs.resolve_bare(text).is_some_and(|fqn| {
+                self.matches_unique_visible_resolved_fqn_in_namespace(fqn, byte, namespace)
+                    && self.authorize_exact_target_segments(&[text], byte, namespace, false)
+            })
     }
 
     pub(super) fn matches_path(
@@ -391,7 +398,7 @@ impl ScanCtx<'_> {
         root_shadowed: bool,
         leading_absolute: bool,
     ) -> bool {
-        self.seeds.is_some_and(|seeds| {
+        if self.seeds.is_some_and(|seeds| {
             let resolution = self.rust.usage_reference_at(
                 self.file,
                 seeds,
@@ -402,7 +409,13 @@ impl ScanCtx<'_> {
                 leading_absolute,
             );
             resolution.is_exact()
-        })
+        }) {
+            return true;
+        }
+        if root_shadowed && !leading_absolute {
+            return false;
+        }
+        self.reference_context_path_matches_target(segments, byte, namespace, leading_absolute)
     }
 
     pub(super) fn path_root_shadowed_at(&self, name: &str, byte: usize) -> bool {
@@ -424,6 +437,79 @@ impl ScanCtx<'_> {
                         .usage_local_module_prefix_visible_at(self.file, seeds, name, byte)
             })
     }
+
+    fn reference_context_path_matches_target(
+        &self,
+        segments: &[&str],
+        byte: usize,
+        namespace: RustReferenceNamespace,
+        leading_absolute: bool,
+    ) -> bool {
+        if leading_absolute || rust_path_root_is_rooted(segments) {
+            return false;
+        }
+        let Some(fqn) = self.reference_context_path_fqn(segments, namespace) else {
+            return false;
+        };
+        self.matches_unique_visible_resolved_fqn_in_namespace(&fqn, byte, namespace)
+            && self.authorize_exact_target_segments(segments, byte, namespace, false)
+    }
+
+    fn reference_context_path_fqn(
+        &self,
+        segments: &[&str],
+        namespace: RustReferenceNamespace,
+    ) -> Option<String> {
+        match namespace {
+            RustReferenceNamespace::PathPrefix => {
+                self.refs.resolve_scoped_owner(&segments.join("::"))
+            }
+            RustReferenceNamespace::Macro => None,
+            RustReferenceNamespace::Type
+            | RustReferenceNamespace::Value
+            | RustReferenceNamespace::Any => {
+                let (name, prefix) = segments.split_last()?;
+                if prefix.is_empty() {
+                    self.refs.resolve_bare(name).map(str::to_string)
+                } else {
+                    self.refs.resolve_scoped(&prefix.join("::"), name)
+                }
+            }
+        }
+    }
+
+    fn matches_unique_visible_resolved_fqn_in_namespace(
+        &self,
+        fqn: &str,
+        byte: usize,
+        namespace: RustReferenceNamespace,
+    ) -> bool {
+        self.matches_unique_visible_candidate_in_namespace(self.support.fqn(fqn), byte, namespace)
+    }
+
+    fn authorize_exact_target_segments(
+        &self,
+        segments: &[&str],
+        byte: usize,
+        namespace: RustReferenceNamespace,
+        leading_absolute: bool,
+    ) -> bool {
+        let roots = BTreeSet::from([self.target.clone()]);
+        let seeds = self.rust.usage_binding_seeds(&roots);
+        let resolution = self.rust.usage_reference_at(
+            self.file,
+            &seeds,
+            segments,
+            byte,
+            namespace,
+            false,
+            leading_absolute,
+        );
+        self.rust
+            .usage_exact_root_for_resolution(&resolution, &seeds)
+            .as_ref()
+            == Some(self.target)
+    }
 }
 
 fn periodic_cancellation_requested(
@@ -436,6 +522,13 @@ fn periodic_cancellation_requested(
     }
     *checks_remaining = 255;
     cancellation.is_some_and(CancellationToken::is_cancelled)
+}
+
+fn rust_path_root_is_rooted(segments: &[&str]) -> bool {
+    matches!(
+        segments.first().copied(),
+        Some("crate" | "self" | "super" | "$crate")
+    )
 }
 
 pub(super) fn rust_reference_namespace(node: Node<'_>) -> RustReferenceNamespace {
@@ -502,6 +595,30 @@ fn scan_node(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 "use_declaration" => {
                     record_use_import_hits(node, ctx);
                     return TreeWalkAction::Skip;
+                }
+                "scoped_identifier" | "scoped_type_identifier" if !ctx.target_is_module => {
+                    let Some(path) = rust_path_segments(node) else {
+                        return TreeWalkAction::Descend;
+                    };
+                    if path.len() <= 1 {
+                        return TreeWalkAction::Descend;
+                    }
+                    let segments = super::hits::path_segment_texts(&path, ctx.source);
+                    let root = path[0];
+                    let root_shadowed = ctx.path_root_shadowed_at(segments[0], root.start_byte());
+                    let namespace = rust_reference_namespace(node);
+                    if ctx.matches_path(
+                        &segments,
+                        node.start_byte(),
+                        namespace,
+                        root_shadowed,
+                        crate::analyzer::usages::rust_graph::hits::rust_path_is_leading_absolute(
+                            node,
+                        ),
+                    ) && let Some(name) = path.last()
+                    {
+                        record_hit(*name, ctx);
+                    }
                 }
                 "macro_invocation" if ctx.target_is_macro => {
                     record_macro_invocation_hit(node, ctx);
@@ -703,7 +820,7 @@ fn record_use_import_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             if matches!(current.kind(), "identifier" | "type_identifier")
                 && is_local_use_binding_node(current)
             {
-                if use_as_clause_original_terminal(current)
+                if !use_as_clause_alias_node(current)
                     && let Some(path) =
                         crate::analyzer::rust::rust_focused_use_path(current, ctx.source)
                 {
@@ -725,8 +842,8 @@ fn record_use_import_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                         ),
                     ) {
                         record_import_hit(current, ctx);
-                        return TreeWalkAction::Descend;
                     }
+                    return TreeWalkAction::Descend;
                 }
                 let text = current
                     .utf8_text(ctx.source.as_bytes())
@@ -774,9 +891,9 @@ fn is_local_use_binding_node(node: Node<'_>) -> bool {
             return !use_path_leaf_is_prefix(node);
         }
         if parent.kind() == "scoped_use_list"
-            && parent
-                .child_by_field_name("path")
-                .is_some_and(|path| same_node(path, node))
+            && parent.child_by_field_name("path").is_some_and(|path| {
+                path.start_byte() <= node.start_byte() && node.end_byte() <= path.end_byte()
+            })
         {
             return false;
         }
@@ -800,25 +917,11 @@ fn is_local_use_binding_node(node: Node<'_>) -> bool {
     true
 }
 
-fn use_as_clause_original_terminal(node: Node<'_>) -> bool {
-    let Some(path) = node.parent() else {
-        return false;
-    };
-    let clause = if path.kind() == "use_as_clause" {
-        path
-    } else {
-        let Some(clause) = path.parent() else {
-            return false;
-        };
-        if clause.kind() != "use_as_clause" {
-            return false;
-        }
-        clause
-    };
-    clause
-        .child_by_field_name("path")
-        .and_then(use_path_terminal_node)
-        .is_some_and(|terminal| same_node(terminal, node))
+fn use_as_clause_alias_node(node: Node<'_>) -> bool {
+    node.parent()
+        .filter(|parent| parent.kind() == "use_as_clause")
+        .and_then(|parent| parent.child_by_field_name("alias"))
+        .is_some_and(|alias| same_node(alias, node))
 }
 
 fn use_path_leaf_is_prefix(node: Node<'_>) -> bool {
@@ -830,14 +933,6 @@ fn use_path_leaf_is_prefix(node: Node<'_>) -> bool {
             .child_by_field_name("path")
             .is_some_and(|path| same_node(path, node))
     })
-}
-
-fn use_path_terminal_node(node: Node<'_>) -> Option<Node<'_>> {
-    match node.kind() {
-        "scoped_identifier" | "scoped_type_identifier" => node.child_by_field_name("name"),
-        "identifier" | "type_identifier" | "self" | "super" | "crate" => Some(node),
-        _ => None,
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2502,7 +2597,9 @@ fn self_static_owner_matches_target(owner_node: Node<'_>, ctx: &MemberScanCtx<'_
     while let Some(node) = current {
         match node.kind() {
             "impl_item" => {
-                if impl_item_contains_requested_target(node, ctx) {
+                if impl_item_contains_requested_target(node, ctx)
+                    || impl_item_contains_scan_target(node, ctx)
+                {
                     return true;
                 }
                 if ctx.scan_target != ctx.requested_target

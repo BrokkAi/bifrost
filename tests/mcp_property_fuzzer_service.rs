@@ -515,6 +515,44 @@ fn i2_fires_when_no_definition_is_not_shadowed_by_a_more_qualified_resolution() 
     assert_eq!(violations[0].shape, "spelling-status-drift");
 }
 
+// Drift is a verdict disagreement: with no resolved spelling in the
+// partition there is no verdict to diverge from. An all-fail mix
+// (ambiguous bare, unresolvable_import_boundary qualified, no_definition
+// path-anchored - finatra's QueueModule example modules, tier-6) compares
+// failure modes at different stages, which is not drift; genuine boundary
+// bugs carry their own dedicated invariants.
+#[test]
+fn i2_silent_when_no_spelling_resolves_to_anchor_a_verdict() {
+    let records = vec![
+        defs_spelling(0, "provideQueue", "ctx", "t", "ambiguous"),
+        defs_spelling(
+            1,
+            "com.twitter.finatra.example.QueueModule.provideQueue",
+            "ctx",
+            "t",
+            "unresolvable_import_boundary",
+        ),
+        defs_spelling(
+            2,
+            "examples/injectable-twitter-server/scala/src/main/scala/com/twitter/finatra/example/QueueModule.scala#provideQueue",
+            "ctx",
+            "t",
+            "no_definition",
+        ),
+        defs_spelling(
+            3,
+            "examples/injectable-twitter-server/scala/src/main/scala/com/twitter/finatra/example/QueueModule.scala#com.twitter.finatra.example.QueueModule.provideQueue",
+            "ctx",
+            "t",
+            "no_definition",
+        ),
+    ];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i2(&refs(&records), "scala", &mut sink, &mut summary);
+    assert!(sink.into_sorted_vec().is_empty());
+}
+
 // Location verdicts legitimately differ across *different* reference sites:
 // one symbol's probes span several (context, target) references (a php
 // property and its same-named method share one display fq — Faker's

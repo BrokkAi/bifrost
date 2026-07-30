@@ -71,9 +71,7 @@ use crate::analyzer::semantic::{
 use crate::analyzer::structural::search::{DetailedCodeQueryDomain, execute_code_query_detailed};
 use crate::analyzer::structural::{
     CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, CodeQueryExecutionWork,
-    CodeQueryResultItem, CodeQueryResultValue, CodeQuerySemanticCompleteness,
-    CodeQuerySemanticEvidence, CodeQuerySemanticLimits, CodeQuerySemanticProof,
-    CodeQuerySemanticWork,
+    CodeQuerySemanticLimits, CodeQuerySemanticWork,
 };
 use crate::analyzer::typestate::{
     BoundTypestateSubjectSpec, CompiledProtocol, PROTOCOL_SCHEMA_VERSION,
@@ -1172,7 +1170,7 @@ fn certainty_reasons(finding: &TypestateFinding) -> Result<Vec<CertaintyReason>,
     Ok(reasons)
 }
 
-fn policy_location(
+pub(super) fn policy_location(
     workspace: &WorkspaceAnalyzer,
     locator: &crate::analyzer::semantic::SemanticLocator,
 ) -> Result<PolicySourceLocation, String> {
@@ -1214,7 +1212,7 @@ fn policy_location(
     ))
 }
 
-fn program_point_locator(
+pub(super) fn program_point_locator(
     point: &ProgramPointHandle,
 ) -> &crate::analyzer::semantic::SemanticLocator {
     let row = point
@@ -1230,7 +1228,7 @@ fn program_point_locator(
         .locator
 }
 
-fn semantic_root_key(root: &ProcedureHandle) -> String {
+pub(super) fn semantic_root_key(root: &ProcedureHandle) -> String {
     let mut bytes = Vec::new();
     let locator = root.semantics().locator();
     bytes.extend_from_slice(locator.path().as_str().as_bytes());
@@ -1248,7 +1246,7 @@ fn semantic_root_key(root: &ProcedureHandle) -> String {
     stable_hex(&bytes)
 }
 
-fn semantic_site_key(
+pub(super) fn semantic_site_key(
     workspace: &WorkspaceAnalyzer,
     locator: &crate::analyzer::semantic::SemanticLocator,
 ) -> String {
@@ -1282,7 +1280,7 @@ fn semantic_root_key_from_locator(locator: &crate::analyzer::semantic::SemanticL
     stable_hex(&bytes)
 }
 
-fn stable_hex(bytes: &[u8]) -> String {
+pub(super) fn stable_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut encoded = String::with_capacity(digest.len() * 2);
     for byte in digest {
@@ -1417,27 +1415,6 @@ fn require_uninterrupted_semantic_outcome<T>(
     }
 }
 
-fn policy_semantic_work_limits(limits: CodeQuerySemanticLimits) -> SemanticWork {
-    SemanticWork {
-        source_bytes: limits.max_source_bytes,
-        procedures: limits.max_rows_per_dimension,
-        blocks: limits.max_rows_per_dimension,
-        program_points: limits.max_rows_per_dimension,
-        values: limits.max_rows_per_dimension,
-        allocations: limits.max_rows_per_dimension,
-        call_sites: limits.max_rows_per_dimension,
-        memory_locations: limits.max_rows_per_dimension,
-        captures: limits.max_rows_per_dimension,
-        source_mappings: limits.max_rows_per_dimension,
-        evidence: limits.max_rows_per_dimension,
-        gaps: limits.max_rows_per_dimension,
-        events: limits.max_rows_per_dimension,
-        control_edges: limits.max_rows_per_dimension,
-        nested_entries: limits.max_rows_per_dimension,
-        owned_text_bytes: limits.max_retained_bytes,
-    }
-}
-
 impl<'a> TypestatePolicyCompiler<'a> {
     pub(crate) fn new(
         workspace: &'a WorkspaceAnalyzer,
@@ -1448,7 +1425,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
             workspace,
             query_limits,
             cancellation,
-            semantic_budget: SemanticBudget::new(policy_semantic_work_limits(
+            semantic_budget: SemanticBudget::new(super::selector_compiler::semantic_work_limits(
                 query_limits.semantic,
             ))
             .expect("validated CodeQuery semantic limits are positive"),
@@ -1972,7 +1949,8 @@ impl<'a> TypestatePolicyCompiler<'a> {
                         selector.path
                     ))
                 })?;
-            let (proof, completeness) = selected_site_quality(result_item);
+            let (proof, completeness) =
+                super::selector_compiler::selected_site_quality(result_item);
             let Some(span) = evidence.byte_span else {
                 return Err(TypestatePolicyCompileError::SemanticUnavailable(format!(
                     "selector `{}` produced a row without a source span",
@@ -2131,7 +2109,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
             return self.resolve_matched_selection(selection);
         }
         let artifact = self.materialize(&selection.file)?;
-        let range = source_range(&selection.span);
+        let range = super::selector_compiler::source_range(&selection.span);
         let lookup = procedures_for_source_ranges(
             &artifact,
             &[range],
@@ -2249,7 +2227,11 @@ impl<'a> TypestatePolicyCompiler<'a> {
                 &self.semantic_execution_budget,
             );
             oracle
-                .pointees_at_source(&selection.file, source_range(&selection.span), &mut request)
+                .pointees_at_source(
+                    &selection.file,
+                    super::selector_compiler::source_range(&selection.span),
+                    &mut request,
+                )
                 .map_err(TypestatePolicyCompileError::SemanticProvider)?
         };
         require_uninterrupted_semantic_outcome(&outcome, "matched source heap analysis")?;
@@ -2622,99 +2604,6 @@ struct SelectedSite {
     require_exact_call: bool,
     proof: ProofStatus,
     completeness: EvidenceCompleteness,
-}
-
-fn selected_site_quality(item: &CodeQueryResultItem) -> (ProofStatus, EvidenceCompleteness) {
-    let semantic = match &item.value {
-        CodeQueryResultValue::Procedure { value } => Some(&value.evidence),
-        CodeQueryResultValue::ProgramPoint { value } => Some(&value.evidence),
-        CodeQueryResultValue::ControlEdge { value } => Some(&value.evidence),
-        CodeQueryResultValue::TypestateWitness { value } => Some(&value.quality),
-        _ => None,
-    };
-    let (proof, mut completeness) = if let Some(semantic) = semantic {
-        semantic_binding_quality(semantic)
-    } else {
-        match &item.value {
-            CodeQueryResultValue::TypestateFinding { value } => (
-                if value.path_proven {
-                    ProofStatus::Proven
-                } else {
-                    ProofStatus::Unproven("selector path is unproven".into())
-                },
-                if value.path_complete && value.analysis_complete {
-                    EvidenceCompleteness::Complete
-                } else {
-                    EvidenceCompleteness::Partial("selector analysis is incomplete".into())
-                },
-            ),
-            CodeQueryResultValue::ReferenceSite { value } => (
-                proof_from_label(value.proof),
-                EvidenceCompleteness::Complete,
-            ),
-            CodeQueryResultValue::CallSite { value } => (
-                proof_from_label(value.proof),
-                EvidenceCompleteness::Complete,
-            ),
-            CodeQueryResultValue::ReceiverAnalysis { .. } => (
-                ProofStatus::Unproven("selector receiver analysis has no exact proof".into()),
-                EvidenceCompleteness::Partial(
-                    "selector receiver analysis has no exhaustive evidence".into(),
-                ),
-            ),
-            CodeQueryResultValue::FlowEndpoint { .. }
-            | CodeQueryResultValue::FlowWitness { .. } => (
-                ProofStatus::Unproven(
-                    "value-flow selector results are not policy-classified".into(),
-                ),
-                EvidenceCompleteness::Partial(
-                    "value-flow selector results are not policy-classified".into(),
-                ),
-            ),
-            CodeQueryResultValue::StructuralMatch { .. }
-            | CodeQueryResultValue::Declaration { .. }
-            | CodeQueryResultValue::File { .. }
-            | CodeQueryResultValue::ExpressionSite { .. } => {
-                (ProofStatus::Proven, EvidenceCompleteness::Complete)
-            }
-            CodeQueryResultValue::Procedure { .. }
-            | CodeQueryResultValue::ProgramPoint { .. }
-            | CodeQueryResultValue::ControlEdge { .. }
-            | CodeQueryResultValue::TypestateWitness { .. } => {
-                unreachable!("semantic result evidence was handled above")
-            }
-        }
-    };
-    if item.provenance_truncated {
-        completeness = EvidenceCompleteness::Partial("selector provenance was truncated".into());
-    }
-    (proof, completeness)
-}
-
-fn semantic_binding_quality(
-    evidence: &CodeQuerySemanticEvidence,
-) -> (ProofStatus, EvidenceCompleteness) {
-    let proof = match evidence.proof {
-        CodeQuerySemanticProof::Proven => ProofStatus::Proven,
-        CodeQuerySemanticProof::Unproven => {
-            ProofStatus::Unproven("selector semantic evidence is unproven".into())
-        }
-    };
-    let completeness = match evidence.completeness {
-        CodeQuerySemanticCompleteness::Complete => EvidenceCompleteness::Complete,
-        CodeQuerySemanticCompleteness::Partial => {
-            EvidenceCompleteness::Partial("selector semantic evidence is partial".into())
-        }
-    };
-    (proof, completeness)
-}
-
-fn proof_from_label(label: &str) -> ProofStatus {
-    if label == "proven" {
-        ProofStatus::Proven
-    } else {
-        ProofStatus::Unproven(format!("selector evidence is {label}").into())
-    }
 }
 
 fn conjoin_proof(left: &ProofStatus, right: &ProofStatus) -> ProofStatus {
@@ -3116,15 +3005,6 @@ fn selector<'a>(
         .get(path)
         .copied()
         .ok_or_else(|| TypestatePolicyCompileError::MissingSelector(path.as_str().to_owned()))
-}
-
-fn source_range(span: &ByteRange<usize>) -> Range {
-    Range {
-        start_byte: span.start,
-        end_byte: span.end,
-        start_line: 0,
-        end_line: 0,
-    }
 }
 
 fn select_call(

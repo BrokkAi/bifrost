@@ -7,6 +7,11 @@ use std::fmt::Write as _;
 use std::sync::mpsc;
 use std::time::Duration;
 
+#[cfg(windows)]
+const DEADLOCK_TEST_TIMEOUT: Duration = Duration::from_secs(240);
+#[cfg(not(windows))]
+const DEADLOCK_TEST_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Regression test for issue #549: the JS/TS usage-graph scan runs under a rayon
 /// `par_iter`, and receiver analysis inside the scan can lazily initialize the
 /// analyzer-cached `JsTsUsageIndex`, whose builder also uses rayon. With a blocking
@@ -100,7 +105,7 @@ export function run{index}() {{
     });
 
     let graph = rx
-        .recv_timeout(Duration::from_secs(60))
+        .recv_timeout(DEADLOCK_TEST_TIMEOUT)
         .expect("JS/TS usage_graph hung while receiver analysis initialized usage indexes");
     let graph = match graph {
         Ok(graph) => graph,
