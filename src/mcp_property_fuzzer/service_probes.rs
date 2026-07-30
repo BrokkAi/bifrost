@@ -1973,11 +1973,9 @@ pub fn check_i2(
                     .map(|(order, _)| *order)
                     .max();
                 entries.retain(|(order, status)| {
-                    *status != "no_definition"
-                        || max_resolved_order.is_none_or(|max| *order >= max)
+                    *status != "no_definition" || max_resolved_order.is_none_or(|max| *order >= max)
                 });
-                let mut statuses: Vec<&str> =
-                    entries.iter().map(|(_, status)| *status).collect();
+                let mut statuses: Vec<&str> = entries.iter().map(|(_, status)| *status).collect();
                 statuses.sort_unstable();
                 statuses.dedup();
                 statuses.len() > 1

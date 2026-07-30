@@ -470,13 +470,7 @@ fn i2_silent_when_bare_spelling_reports_invalid_location_where_qualified_resolve
 fn i2_silent_when_bare_spelling_reports_no_definition_where_qualified_resolves() {
     let records = vec![
         defs_spelling(0, "t_gnode", "ctx", "t", "no_definition"),
-        defs_spelling(
-            1,
-            "perspective.t_gnode.t_gnode",
-            "ctx",
-            "t",
-            "resolved",
-        ),
+        defs_spelling(1, "perspective.t_gnode.t_gnode", "ctx", "t", "resolved"),
         defs_spelling(
             2,
             "rust/perspective-server/cpp/perspective/src/cpp/gnode.cpp#t_gnode",
