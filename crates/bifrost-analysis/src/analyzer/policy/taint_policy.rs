@@ -159,6 +159,11 @@ pub(crate) struct CompiledTaintPolicyPlan {
     pub(crate) work: PolicyWorkReport,
 }
 
+enum TaintPolicyCompilation {
+    Plans(Vec<CompiledTaintPolicyPlan>),
+    Clean(PolicyWorkReport),
+}
+
 struct PreparedTaintPlan {
     policy_id: PolicyId,
     sources: Box<[CompiledTaintSource]>,
@@ -263,7 +268,7 @@ impl ProductionTaintPolicyEvaluator {
             match TaintPolicyCompiler::new(workspace, budget.query_limits(), cancellation)
                 .compile(policy, spec)
             {
-                Ok(compiled) => {
+                Ok(TaintPolicyCompilation::Plans(compiled)) => {
                     let work = compiled
                         .first()
                         .map(|plan| plan.work.clone())
@@ -280,6 +285,9 @@ impl ProductionTaintPolicyEvaluator {
                         );
                         plans.push(compiled.plan);
                     }
+                }
+                Ok(TaintPolicyCompilation::Clean(work)) => {
+                    payloads.insert(policy_id, PreparedPayload::complete(work));
                 }
                 Err(failure) => {
                     payloads.insert(policy_id, prepared_compile_failure_payload(*failure));
@@ -429,13 +437,19 @@ impl<'a> TaintPolicyCompiler<'a> {
         }
     }
 
-    pub(crate) fn compile(
+    fn compile(
         mut self,
         policy: &LoadedPolicy,
         spec: &ResolvedTaintPolicySpec,
-    ) -> Result<Vec<CompiledTaintPolicyPlan>, Box<TaintPolicyCompileFailure>> {
+    ) -> Result<TaintPolicyCompilation, Box<TaintPolicyCompileFailure>> {
         match self.compile_inner(policy, spec) {
-            Ok(compiled) => Ok(compiled),
+            Ok(compiled) => Ok(TaintPolicyCompilation::Plans(compiled)),
+            Err(
+                TaintPolicyCompileError::EmptyCompiledSources
+                | TaintPolicyCompileError::EmptyCompiledSinks,
+            ) => Ok(TaintPolicyCompilation::Clean(
+                self.compilation_work_report(),
+            )),
             Err(error) => Err(Box::new(TaintPolicyCompileFailure {
                 error,
                 work: self.compilation_work_report(),
@@ -1885,10 +1899,12 @@ fn prepared_compile_failure_payload(failure: TaintPolicyCompileFailure) -> Prepa
         }
         TaintPolicyCompileError::MissingSelector(_)
         | TaintPolicyCompileError::SemanticProvider(_)
-        | TaintPolicyCompileError::EmptyCompiledSources
-        | TaintPolicyCompileError::EmptyCompiledSinks
         | TaintPolicyCompileError::Model(_)
         | TaintPolicyCompileError::Plan(_) => None,
+        TaintPolicyCompileError::EmptyCompiledSources
+        | TaintPolicyCompileError::EmptyCompiledSinks => {
+            unreachable!("empty endpoint selections are handled as clean compilations")
+        }
     };
     let Some(reason) = incomplete else {
         return prepared_failure_payload(&message, work);

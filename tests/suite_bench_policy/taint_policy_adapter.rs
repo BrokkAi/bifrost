@@ -256,6 +256,36 @@ fn production_taint_matched_value_uses_the_direct_source_observation() {
 }
 
 #[test]
+fn production_taint_complete_zero_match_is_clean_without_propagation() {
+    let policy = single_policy(
+        "test.zero-match-taint",
+        "(language python (call :callee (name \"source_one\")))",
+        "return-value",
+    );
+    let outcome = evaluate_one(
+        r#"
+def sink_one(value):
+    pass
+
+def run():
+    sink_one("constant")
+"#,
+        &policy,
+    );
+    let run = &outcome.report().runs()[0];
+    assert!(matches!(run.completion(), PolicyRunCompletion::Complete));
+    assert!(run.findings().is_empty());
+    assert!(run.diagnostics().is_empty());
+    assert!(outcome.taint_findings().is_empty());
+    assert!(
+        run.work()
+            .metrics()
+            .iter()
+            .all(|metric| metric.name() != "taint.propagation_solves")
+    );
+}
+
+#[test]
 fn production_taint_policies_share_a_batch_and_all_renderers_keep_the_same_evidence() {
     let project = InlineTestProject::with_language(Language::Python)
         .file("app.py", SOURCE)

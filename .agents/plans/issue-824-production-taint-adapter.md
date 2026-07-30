@@ -29,6 +29,7 @@ The observable proof is an inline multi-source/multi-sink fixture. Its selectors
 - [x] (2026-07-30 09:40Z) Added request-wide solve, semantic, finding, witness-count, witness-step, expansion, and retained-byte budgets; retained each reconstructed witness once behind `Arc`; and made proof/completeness pair-local.
 - [x] (2026-07-30 09:40Z) Added the production public query route on `PolicyBatchOutcome`, a `CodeQueryResultValue::TaintFinding` transport case, taint-owned witness envelopes that reuse `CodeQueryFlowWitnessStep`, and Rust/Python/LSP/VS Code model handling without fake flow plan references.
 - [x] (2026-07-30 10:18Z) Closed all twelve guided-review findings and completed final task-scoped validation and diff review. The policy-pack gate remains unavailable because the installed skill exposes no callable `list_policies` or `run_policy`; the VS Code typecheck is likewise unavailable because this worktree has no installed `tsc`.
+- [x] (2026-07-30 10:55Z) Rebased the PR onto current `origin/master` and fixed the LSP-discovered zero-match boundary: completely executed source or sink selectors with no matches now produce a clean complete policy run without constructing or solving an empty taint plan.
 
 ## Surprises & Discoveries
 
@@ -61,6 +62,9 @@ The observable proof is an inline multi-source/multi-sink fixture. Its selectors
 
 - Observation: the unselected sibling-callee fixture retains a diagnostic-neutral taint finding, but its deeper return/formal chain has partial Base evidence.
   Evidence: the compiler discovers the common caller and performs exactly one propagation solve; `PolicyBatchOutcome::taint_findings` retains the positive path, while the existing policy projection correctly reports `PartialDiscovery`, emits no scored policy finding, and never converts partial evidence into a complete negative.
+
+- Observation: the PR's Rust matrix exposed two deterministic Scala definition regressions already present after rebasing onto current master.
+  Evidence: the branch has no Scala or definition-resolver diff, but `scala_enclosing_terms_precede_implicit_companions_but_not_local_imports` and `scala_definition_api_preserves_parameterized_enum_case_source_identity` fail locally on the rebased tree with the same assertions as Linux and Windows CI. Fixing them would widen #824 into unrelated Scala resolver work.
 
 ## Decision Log
 
