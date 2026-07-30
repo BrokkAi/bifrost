@@ -135,7 +135,9 @@ fn record_scoped_target_segment_hit(
         return;
     };
     if in_use_declaration {
-        if focused_use_path_matches(path, RustReferenceNamespace::PathPrefix, ctx) {
+        if ctx.target_is_module
+            && focused_use_path_matches(path, RustReferenceNamespace::PathPrefix, ctx)
+        {
             if let Some(segment) = rust_path_segments(path).and_then(|path| path.last().copied()) {
                 record_target_segment(segment, true, ctx);
             }
@@ -399,7 +401,7 @@ pub(super) fn rust_path_is_leading_absolute(mut node: Node<'_>) -> bool {
     }
 }
 
-fn path_segment_texts<'a>(path: &[Node<'_>], source: &'a str) -> Vec<&'a str> {
+pub(super) fn path_segment_texts<'a>(path: &[Node<'_>], source: &'a str) -> Vec<&'a str> {
     path.iter()
         .map(|node| node_text(*node, source))
         .map(|segment| {

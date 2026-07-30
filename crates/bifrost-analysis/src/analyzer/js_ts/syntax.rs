@@ -56,6 +56,20 @@ impl JsTsLexicalBindingIndex {
                         index.insert_pattern(pattern, source, scope);
                     }
                 }
+                "for_in_statement" => {
+                    if let Some(pattern) = node.child_by_field_name("left")
+                        && let Some(declaration_kind) = for_in_declaration_kind(node, pattern)
+                    {
+                        let scope = if declaration_kind == "var" {
+                            enclosing_var_binding_scope(node)
+                        } else {
+                            Some(node_scope(node))
+                        };
+                        if let Some(scope) = scope {
+                            index.insert_pattern(pattern, source, scope);
+                        }
+                    }
+                }
                 "function_declaration" | "generator_function_declaration" | "class_declaration" => {
                     if let Some(name) = node.child_by_field_name("name")
                         && let Some(scope) = enclosing_lexical_scope(node)
@@ -118,7 +132,10 @@ impl JsTsLexicalBindingIndex {
     }
 
     fn insert_parameters(&mut self, function: Node<'_>, source: &str) {
-        let Some(parameters) = function.child_by_field_name("parameters") else {
+        let Some(parameters) = function
+            .child_by_field_name("parameters")
+            .or_else(|| function.child_by_field_name("parameter"))
+        else {
             return;
         };
         self.insert_pattern(parameters, source, node_scope(function));
@@ -291,36 +308,61 @@ fn variable_binding_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope> {
     let is_var = node
         .parent()
         .is_some_and(|parent| parent.kind() == "variable_declaration");
+    if is_var {
+        return enclosing_var_binding_scope(node);
+    }
     let mut current = node.parent();
     while let Some(parent) = current {
-        let is_scope = if is_var {
-            matches!(
-                parent.kind(),
-                "program"
-                    | "function_declaration"
-                    | "generator_function_declaration"
-                    | "function_expression"
-                    | "generator_function"
-                    | "arrow_function"
-                    | "method_definition"
-            )
-        } else {
-            matches!(
-                parent.kind(),
-                "program"
-                    | "statement_block"
-                    | "for_statement"
-                    | "for_in_statement"
-                    | "switch_body"
-                    | "catch_clause"
-            )
-        };
-        if is_scope {
+        if matches!(
+            parent.kind(),
+            "program"
+                | "statement_block"
+                | "for_statement"
+                | "for_in_statement"
+                | "switch_body"
+                | "catch_clause"
+        ) {
             return Some(node_scope(parent));
         }
         current = parent.parent();
     }
     None
+}
+
+fn enclosing_var_binding_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "program"
+                | "function_declaration"
+                | "generator_function_declaration"
+                | "function_expression"
+                | "generator_function"
+                | "arrow_function"
+                | "method_definition"
+        ) {
+            return Some(node_scope(parent));
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn for_in_declaration_kind<'tree>(
+    statement: Node<'tree>,
+    left: Node<'tree>,
+) -> Option<&'static str> {
+    let mut cursor = statement.walk();
+    statement
+        .children(&mut cursor)
+        .take_while(|child| child.id() != left.id())
+        .find_map(|child| match child.kind() {
+            "const" => Some("const"),
+            "let" => Some("let"),
+            "var" => Some("var"),
+            _ => None,
+        })
 }
 
 fn enclosing_lexical_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope> {
@@ -657,5 +699,59 @@ mod tests {
                 .kind()
         );
         assert!(static_member_receiver(private_receiver, source).is_none());
+    }
+
+    #[test]
+    fn lexical_binding_index_tracks_for_of_and_single_arrow_parameters() {
+        let source = r#"
+function render(tasks) {
+  for (const task of tasks) {
+    consume(task.status);
+  }
+  return tasks.filter(task => task.status);
+}
+"#;
+        let tree = parse_javascript(source);
+        let bindings = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+        let for_of_use = source.find("task.status").expect("for-of task");
+        let arrow_use = source.rfind("task.status").expect("arrow task");
+
+        assert!(bindings.is_bound_at("task", for_of_use));
+        assert!(bindings.is_bound_at("task", arrow_use));
+        assert_ne!(
+            bindings.binding_scope_at("task", for_of_use),
+            bindings.binding_scope_at("task", arrow_use)
+        );
+    }
+
+    #[test]
+    fn lexical_binding_index_keeps_var_for_of_function_scoped() {
+        let source = r#"
+function render(tasks) {
+  for (var task of tasks) {
+    consume(task.status);
+  }
+  return task.status;
+}
+"#;
+        let tree = parse_javascript(source);
+        let bindings = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+        let loop_use = source.find("task.status").expect("loop task");
+        let later_use = source.rfind("task.status").expect("later task");
+
+        assert_eq!(
+            bindings.binding_scope_at("task", loop_use),
+            bindings.binding_scope_at("task", later_use)
+        );
+    }
+
+    #[test]
+    fn lexical_binding_index_does_not_declare_bare_for_of_target() {
+        let source = "for (task of tasks) { consume(task.status); }";
+        let tree = parse_javascript(source);
+        let bindings = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+        let use_byte = source.find("task.status").expect("task use");
+
+        assert!(!bindings.is_bound_at("task", use_byte));
     }
 }

@@ -46,6 +46,7 @@ use super::suppression::{
     PolicySuppressionPolicyHashState, PolicySuppressionReview, PolicySuppressionTemporalState,
     load_policy_suppressions_from_root,
 };
+use super::taint_policy::ProductionTaintPolicyEvaluator;
 use super::typestate_policy::ProductionTypestatePolicyEvaluator;
 use super::{PolicyBatchBudget, PolicyBudget};
 
@@ -147,6 +148,7 @@ impl RetainedSize for PolicyEvaluationOptions {
 /// Complete canonical report plus the already precedence-resolved CLI status.
 pub struct PolicyBatchOutcome {
     report: PolicyReportDocument,
+    taint_findings: Vec<crate::analyzer::structural::CodeQueryTaintFinding>,
     exit_status: u8,
     max_serialized_report_bytes: usize,
 }
@@ -158,6 +160,22 @@ impl PolicyBatchOutcome {
 
     pub fn into_report(self) -> PolicyReportDocument {
         self.report
+    }
+
+    /// Diagnostic-neutral taint query rows retained by the same propagation
+    /// runs that produced the policy report.
+    pub fn taint_findings(&self) -> &[crate::analyzer::structural::CodeQueryTaintFinding] {
+        &self.taint_findings
+    }
+
+    pub fn taint_query_results(
+        &self,
+    ) -> impl ExactSizeIterator<Item = crate::analyzer::structural::CodeQueryResultValue> + '_ {
+        self.taint_findings.iter().cloned().map(|value| {
+            crate::analyzer::structural::CodeQueryResultValue::TaintFinding {
+                value: Box::new(value),
+            }
+        })
     }
 
     pub const fn exit_status(&self) -> u8 {
@@ -552,10 +570,22 @@ fn evaluate_prepared_policy_inputs(
     };
     check_policy_cancellation(cancellation)?;
 
-    let typestate = ProductionTypestatePolicyEvaluator::default();
-    let evaluator = DefaultPolicyEvaluator::new().with_typestate(&typestate);
     let mut runs = HashMap::with_capacity(runnable_ids.len());
     let workspace = supplied_workspace.or(owned_analyzer.as_ref());
+    let taint = workspace.map_or_else(ProductionTaintPolicyEvaluator::default, |workspace| {
+        ProductionTaintPolicyEvaluator::prepare(
+            registry
+                .policies()
+                .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id)),
+            workspace,
+            cancellation,
+            batch_budget.per_policy(),
+        )
+    });
+    let typestate = ProductionTypestatePolicyEvaluator::default();
+    let evaluator = DefaultPolicyEvaluator::new()
+        .with_taint(&taint)
+        .with_typestate(&typestate);
     for policy in registry
         .policies()
         .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id))
@@ -719,9 +749,11 @@ fn evaluate_prepared_policy_inputs(
     let report = builder.finish().map_err(|error| {
         PolicyCoordinatorError::new(format!("failed to finish policy report: {error}"))
     })?;
+    let taint_findings = taint.take_public_findings();
     let exit_status = report_exit_status(&report, threshold_exceeded);
     Ok(PolicyBatchOutcome {
         report,
+        taint_findings,
         exit_status,
         max_serialized_report_bytes: batch_budget.max_serialized_report_bytes(),
     })

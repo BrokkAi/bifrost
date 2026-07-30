@@ -18,10 +18,6 @@ const wheelBuilder = readFileSync(
   new URL("../.github/workflows/build-wheels.yml", import.meta.url),
   "utf8",
 );
-const wheelPublisher = readFileSync(
-  new URL("../.github/workflows/publish-wheels.yml", import.meta.url),
-  "utf8",
-);
 const tagVerifier = readFileSync(
   new URL("./verify-release-tag-commit.sh", import.meta.url),
   "utf8",
@@ -46,7 +42,7 @@ function jobNeedsPromotionEvidence(job) {
 test("release is the only tag and manual-dispatch entrypoint for package publication", () => {
   assert.match(release, /^  push:\n    tags:/mu);
   assert.match(release, /^  workflow_dispatch:/mu);
-  for (const publisher of [cratePublisher, wheelPublisher, wheelBuilder]) {
+  for (const publisher of [cratePublisher, wheelBuilder]) {
     assert.match(publisher, /^  workflow_call:/mu);
     assert.doesNotMatch(publisher, /^  push:/mu);
     assert.doesNotMatch(publisher, /^  workflow_dispatch:/mu);
@@ -63,10 +59,14 @@ test("release context captures a commit and every called workflow receives it", 
     release,
     /ref: \$\{\{ needs\.release-context\.outputs\.tag \}\}/u,
   );
-  for (const workflow of [cratePublisher, wheelBuilder, wheelPublisher]) {
+  for (const workflow of [cratePublisher, wheelBuilder]) {
     assert.match(workflow, /^      commit:/mu);
   }
   assert.match(release, /commit: \$\{\{ needs\.release-context\.outputs\.commit \}\}/u);
+  assert.match(
+    jobBlock(release, "publish-wheels"),
+    /RELEASE_COMMIT: \$\{\{ needs\.release-context\.outputs\.commit \}\}/u,
+  );
 });
 
 test("publish actions fail closed if the remote tag no longer selects the validated commit", () => {
@@ -74,19 +74,17 @@ test("publish actions fail closed if the remote tag no longer selects the valida
   assert.match(tagVerifier, /"\$\{tag_ref\}\*"/u);
   assert.match(tagVerifier, /refs\/tags\/\$\{release_tag\}/u);
   assert.match(tagVerifier, /test "\$actual_commit" = "\$expected_commit"/u);
-  for (const workflow of [release, cratePublisher, wheelPublisher]) {
+  for (const workflow of [release, cratePublisher]) {
     assert.match(workflow, /git ls-remote --tags origin/u);
     assert.match(workflow, /test "\$actual_commit" = "\$RELEASE_COMMIT"/u);
   }
 });
 
-test("reusable workflow inputs are environment-bound before shell execution", () => {
-  for (const publisher of [cratePublisher, wheelPublisher]) {
-    assert.match(publisher, /RELEASE_TAG: \$\{\{ inputs\.tag \}\}/u);
-    assert.match(publisher, /RELEASE_VERSION: \$\{\{ inputs\.version \}\}/u);
-    assert.match(publisher, /RELEASE_COMMIT: \$\{\{ inputs\.commit \}\}/u);
-    assert.doesNotMatch(publisher, /(?:bash|echo).*\$\{\{ inputs\./u);
-  }
+test("reusable crate publisher inputs are environment-bound before shell execution", () => {
+  assert.match(cratePublisher, /RELEASE_TAG: \$\{\{ inputs\.tag \}\}/u);
+  assert.match(cratePublisher, /RELEASE_VERSION: \$\{\{ inputs\.version \}\}/u);
+  assert.match(cratePublisher, /RELEASE_COMMIT: \$\{\{ inputs\.commit \}\}/u);
+  assert.doesNotMatch(cratePublisher, /(?:bash|echo).*\$\{\{ inputs\./u);
 });
 
 test("promotion evidence covers validation before every external publisher", () => {
@@ -158,12 +156,14 @@ test("publishers preserve their platform, environment, and OIDC protections", ()
   ]) {
     assert.ok(wheelBuilder.includes(`target: ${target}`));
   }
-  for (const publisher of [cratePublisher, wheelPublisher]) {
-    assert.match(publisher, /^    environment: release$/mu);
-    assert.match(publisher, /^      id-token: write$/mu);
-  }
+  assert.match(cratePublisher, /^    environment: release$/mu);
+  assert.match(cratePublisher, /^      id-token: write$/mu);
+  const wheelPublisher = jobBlock(release, "publish-wheels");
+  assert.match(wheelPublisher, /^    environment: release$/mu);
+  assert.match(wheelPublisher, /^      id-token: write$/mu);
   assert.match(cratePublisher, /crates-io-auth-action/u);
   assert.match(wheelPublisher, /gh-action-pypi-publish/u);
+  assert.doesNotMatch(release, /uses: \.\/\.github\/workflows\/publish-wheels\.yml/u);
 });
 
 test("an always-run summary names targets and safe retry guidance", () => {

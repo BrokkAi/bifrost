@@ -32,6 +32,7 @@ from bifrost_searchtools import (
     CodeQueryFlowCompletion,
     CodeQueryFlowEndpoint,
     CodeQueryFlowWitness,
+    CodeQueryTaintFinding,
     CodeQueryMatch,
     CodeQueryOperatorDisposition,
     CodeQueryPhysicalOperator,
@@ -632,8 +633,41 @@ class CodeQueryModelTest(unittest.TestCase):
             "retained_bytes": 96,
             "omitted_steps_lower_bound": 0,
         }
+        taint_finding = {
+            "result_type": "taint_finding",
+            "id": "taint-1",
+            "path": "src/Flow.java",
+            "language": "java",
+            "range": source_range,
+            "sink_event_id": "sink-1",
+            "sink": {"path": "src/Flow.java", "range": source_range},
+            "reached_labels": ["untrusted"],
+            "origins": [
+                {
+                    "id": "origin-1",
+                    "event_id": "source-1",
+                    "labels": ["untrusted"],
+                    "site": {"path": "src/Flow.java", "range": source_range},
+                }
+            ],
+            "witnesses": [
+                {
+                    "id": "taint-witness-1",
+                    "finding_id": "taint-1",
+                    "witness_index": 0,
+                    "path": "src/Flow.java",
+                    "language": "java",
+                    "range": source_range,
+                    "quality": evidence,
+                    "steps": witness["steps"],
+                    "retained_bytes": 96,
+                    "omitted_steps_lower_bound": 0,
+                }
+            ],
+            "evidence": evidence,
+        }
         result = CodeQueryResult.from_dict(
-            {"results": [endpoint, witness], "truncated": False}
+            {"results": [endpoint, witness, taint_finding], "truncated": False}
         )
 
         self.assertIsInstance(result.results[0], CodeQueryFlowEndpoint)
@@ -642,8 +676,11 @@ class CodeQueryModelTest(unittest.TestCase):
         self.assertTrue(result.results[0].ambiguous)
         self.assertIsInstance(result.results[1], CodeQueryFlowWitness)
         self.assertEqual(result.results[1].steps[0].boundary, "dispatch")
+        self.assertIsInstance(result.results[2], CodeQueryTaintFinding)
+        self.assertEqual(result.results[2].witnesses[0].finding_id, "taint-1")
         self.assertIn("flow endpoint; reached; may; incomplete", result.render_text())
         self.assertIn("flow witness; 1 steps", result.render_text())
+        self.assertIn("taint finding; 1 labels; 1 origins", result.render_text())
 
     def test_execution_mode_alias_is_reexported_from_public_import_paths(self) -> None:
         self.assertIs(CodeQueryExecutionMode, ModelCodeQueryExecutionMode)
