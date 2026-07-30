@@ -2521,13 +2521,20 @@ fn trait_implementer_static_member_matches_target(
     let Some(owner_fqn) = structured_owner_candidate_fqn(owner_node, segments, ctx) else {
         return false;
     };
-    let roots = ctx
+    let mut roots = ctx
         .support
         .fqn(&owner_fqn)
         .into_iter()
         .filter(|candidate| rust_is_type_definition(ctx.analyzer, candidate))
         .filter(|candidate| !ctx.rust.is_rust_trait_declaration(candidate))
         .collect::<BTreeSet<_>>();
+    if ctx
+        .rust
+        .is_rust_trait_impl_member_declaration(ctx.requested_target)
+        && let Some(owner) = ctx.rust.parent_of(ctx.requested_target)
+    {
+        roots.insert(canonical_member_owner(ctx.rust, owner));
+    }
     if roots.is_empty() {
         return false;
     }

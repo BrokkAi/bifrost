@@ -11174,60 +11174,101 @@ fn backward(checkpointer: &mut Checkpointer, state: usize) {
 #[test]
 fn rust_graph_associated_paths_keep_owner_type_hits() {
     let consumer = r#"
-use burn_std::distribution::Distribution;
-use hickory_proto::op::ResponseCode;
+use burn_core as burn;
+use burn_std::{bf16, f16};
 
-fn build() {
-    let _ = Distribution::Default;
-    let _ = ResponseCode::NXDomain;
+fn takes(_f: fn(&f16) -> f32) {}
+fn takes_bf16(_f: fn(&bf16) -> f32) {}
+
+fn sort() {
+    takes(f16::to_f32);
+    takes_bf16(bf16::to_f32);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::decoy::Distribution as OtherDistribution;
+    use burn::tensor::Distribution;
+    use burn::tensor::TensorData;
+    use burn::tensor::Tolerance;
+
+    fn build() {
+        let _ = Distribution::Default;
+        let _ = OtherDistribution::Default;
+        let _ = TensorData::zeros();
+        let _ = Tolerance::default();
+        takes(burn::tensor::f16::to_f32);
+    }
 }
 "#;
     let (project, analyzer) = rust_analyzer_with_files(&[
         (
             "Cargo.toml",
-            "[workspace]\nmembers = [\"burn-std\", \"hickory-proto\", \"app\"]\nresolver = \"2\"\n",
+            "[workspace]\nmembers = [\"crates/burn-std\", \"crates/burn-core\", \"crates/burn-nn\"]\nresolver = \"2\"\n",
         ),
         (
-            "burn-std/Cargo.toml",
+            "crates/burn-std/Cargo.toml",
             "[package]\nname = \"burn-std\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
         ),
-        ("burn-std/src/lib.rs", "pub mod distribution;\n"),
         (
-            "burn-std/src/distribution.rs",
+            "crates/burn-std/src/lib.rs",
+            "pub mod decoy;\npub mod distribution;\npub mod tensor;\npub use half::{bf16, f16};\nmod cast;\n",
+        ),
+        (
+            "crates/burn-std/src/decoy.rs",
             "pub enum Distribution { Default }\n",
         ),
         (
-            "hickory-proto/Cargo.toml",
-            "[package]\nname = \"hickory-proto\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        ),
-        ("hickory-proto/src/lib.rs", "pub mod op;\n"),
-        (
-            "hickory-proto/src/op.rs",
-            "pub enum ResponseCode { NXDomain }\n",
+            "crates/burn-std/src/distribution.rs",
+            "pub enum Distribution { Default }\n",
         ),
         (
-            "app/Cargo.toml",
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nburn_std = { package = \"burn-std\", path = \"../burn-std\" }\nhickory_proto = { package = \"hickory-proto\", path = \"../hickory-proto\" }\n",
+            "crates/burn-std/src/tensor.rs",
+            "pub struct TensorData;\nimpl TensorData { pub fn zeros() -> Self { Self } }\npub struct Tolerance;\nimpl Tolerance { pub fn default() -> Self { Self } }\n",
         ),
-        ("app/src/lib.rs", consumer),
+        (
+            "crates/burn-std/src/cast.rs",
+            "use crate::{bf16, f16};\npub trait ToElement { fn to_f32(&self) -> f32; }\nimpl ToElement for f16 { fn to_f32(&self) -> f32 { Self::to_f32(*self) } }\nimpl ToElement for bf16 { fn to_f32(&self) -> f32 { Self::to_f32(*self) } }\n",
+        ),
+        (
+            "crates/burn-core/Cargo.toml",
+            "[package]\nname = \"burn-core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nburn_std = { package = \"burn-std\", path = \"../burn-std\" }\n",
+        ),
+        (
+            "crates/burn-core/src/lib.rs",
+            "pub mod decoy {\n    pub use burn_std::decoy::Distribution;\n}\npub mod tensor {\n    pub use burn_std::distribution::Distribution;\n    pub use burn_std::tensor::{TensorData, Tolerance};\n}\n",
+        ),
+        (
+            "crates/burn-nn/Cargo.toml",
+            "[package]\nname = \"burn-nn\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nburn_core = { package = \"burn-core\", path = \"../burn-core\" }\nburn_std = { package = \"burn-std\", path = \"../burn-std\" }\n",
+        ),
+        ("crates/burn-nn/src/lib.rs", consumer),
     ]);
-    let candidate = project.file("app/src/lib.rs");
+    let candidate = project.file("crates/burn-nn/src/lib.rs");
     for (target_fqn, marker, owner_len) in [
         (
-            "burn-std.src.distribution.Distribution",
+            "crates.burn-std.src.distribution.Distribution",
             "Distribution::Default",
             "Distribution".len(),
         ),
         (
-            "hickory-proto.src.op.ResponseCode",
-            "ResponseCode::NXDomain",
-            "ResponseCode".len(),
+            "crates.burn-std.src.tensor.TensorData",
+            "TensorData::zeros",
+            "TensorData".len(),
+        ),
+        (
+            "crates.burn-std.src.tensor.Tolerance",
+            "Tolerance::default",
+            "Tolerance".len(),
         ),
     ] {
         let target = definition(&analyzer, target_fqn);
-        let hits = UsageFinder::new()
-            .find_usages_default(&analyzer, &[target])
-            .all_hits();
+        let hits = authoritative_hits(
+            &analyzer,
+            &target,
+            [candidate.clone()].into_iter().collect(),
+        );
         let expected = consumer.find(marker).expect("associated owner path");
 
         assert!(
@@ -11239,6 +11280,145 @@ fn build() {
             "associated value paths must retain an owner-type hit for {target_fqn}: {hits:#?}"
         );
     }
+
+    let f16_target = member(
+        &analyzer,
+        &project.file("crates/burn-std/src/cast.rs"),
+        "f16",
+        "to_f32",
+    );
+    let f16_hits = authoritative_hits(
+        &analyzer,
+        &f16_target,
+        [candidate.clone()].into_iter().collect(),
+    );
+    let f16_expected = consumer
+        .find("to_f32")
+        .expect("qualified function value terminal");
+    assert!(
+        f16_hits.iter().any(|hit| {
+            hit.file == candidate
+                && (hit.start_offset, hit.end_offset)
+                    == (f16_expected, f16_expected + "to_f32".len())
+                && hit.kind == UsageHitKind::Reference
+        }),
+        "re-exported associated function values must retain the terminal member hit: {f16_hits:#?}"
+    );
+    let bf16_decoy = consumer
+        .find("bf16::to_f32")
+        .expect("same-named trait member on a sibling implementer")
+        + "bf16::".len();
+    assert!(
+        f16_hits
+            .iter()
+            .all(|hit| hit.file != candidate || hit.start_offset != bf16_decoy),
+        "a same-named trait member on a sibling implementer must stay unrelated: {f16_hits:#?}"
+    );
+
+    let distribution_target =
+        definition(&analyzer, "crates.burn-std.src.distribution.Distribution");
+    let distribution_hits = authoritative_hits(
+        &analyzer,
+        &distribution_target,
+        [candidate.clone()].into_iter().collect(),
+    );
+    let decoy = consumer
+        .find("OtherDistribution::Default")
+        .expect("same-named sibling reexport");
+    assert!(
+        distribution_hits
+            .iter()
+            .all(|hit| hit.file != candidate || hit.start_offset != decoy),
+        "a same-named sibling reexport must not be attributed to the physical owner: {distribution_hits:#?}"
+    );
+
+    let tensor_target = definition(&analyzer, "crates.burn-core.src.tensor");
+    let tensor_hits = authoritative_hits(
+        &analyzer,
+        &tensor_target,
+        [candidate.clone()].into_iter().collect(),
+    );
+    let tensor_expected = consumer
+        .find("burn::tensor::Distribution")
+        .expect("facade module qualifier")
+        + "burn::".len();
+    assert!(
+        tensor_hits.iter().any(|hit| {
+            hit.file == candidate
+                && (hit.start_offset, hit.end_offset)
+                    == (tensor_expected, tensor_expected + "tensor".len())
+                && hit.kind == UsageHitKind::Import
+        }),
+        "a facade module qualifier inside an import must retain the module hit: {tensor_hits:#?}"
+    );
+}
+
+#[test]
+fn authoritative_rust_path_attribute_module_keeps_terminal_trait_import() {
+    let bench = r#"
+#[path = "common/mod.rs"]
+mod common;
+#[path = "other/mod.rs"]
+mod other;
+
+use common::BencherExt;
+use other::BencherExt as OtherBencherExt;
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/burn-backend-tests\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "crates/burn-backend-tests/Cargo.toml",
+            "[package]\nname = \"burn-backend-tests\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bench]]\nname = \"conv\"\npath = \"benches/conv.rs\"\nharness = false\n",
+        ),
+        (
+            "crates/burn-backend-tests/src/lib.rs",
+            "pub fn placeholder() {}\n",
+        ),
+        (
+            "crates/burn-backend-tests/benches/common/mod.rs",
+            "pub trait BencherExt {}\n",
+        ),
+        (
+            "crates/burn-backend-tests/benches/other/mod.rs",
+            "pub trait BencherExt {}\n",
+        ),
+        ("crates/burn-backend-tests/benches/conv.rs", bench),
+    ]);
+    let candidate = project.file("crates/burn-backend-tests/benches/conv.rs");
+    let target = definition(
+        &analyzer,
+        "crates.burn-backend-tests.benches.common.BencherExt",
+    );
+    let hits = authoritative_hits(
+        &analyzer,
+        &target,
+        [candidate.clone()].into_iter().collect(),
+    );
+    let expected = bench
+        .find("common::BencherExt")
+        .expect("path module trait import")
+        + "common::".len();
+    let decoy = bench
+        .find("other::BencherExt")
+        .expect("same-named sibling trait import")
+        + "other::".len();
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == candidate
+                && (hit.start_offset, hit.end_offset) == (expected, expected + "BencherExt".len())
+                && hit.kind == UsageHitKind::Import
+        }),
+        "a #[path] module must retain the terminal trait import: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file != candidate || hit.start_offset != decoy),
+        "a same-named trait from a sibling #[path] module must stay unrelated: {hits:#?}"
+    );
 }
 
 #[test]

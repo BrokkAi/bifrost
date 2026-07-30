@@ -628,6 +628,22 @@ local gate, but is not the focus.
   receiver-identity issue #1276 and namespace-assignment issue #1277. The
   language remains open pending their completed structured fixes and a new
   clean five-repository replay.
+- [x] (2026-07-30) Resumed Rust ranks six through ten as a strictly
+  repository-depth-first campaign. QWED completed with zero missing. Wealthfolio
+  then received its owned fix, direct `origin/master` publication, clean
+  pushed-head replay with zero missing, and issue closure before Burn began.
+  Burn's 14 genuine rows under assigned issues #1279 and #1280 reduced to four
+  structured gaps: canonical re-export identity, glob-inherited module aliases,
+  `#[path]` local-module routing, and associated trait-member owner resolution.
+  The dirty-tree full Burn proof completed all 1,178 inverse targets across
+  10,000 sampled sites with zero missing; focused faithful regressions and
+  sibling-owner negatives pass. The complete usage gate then exposed three
+  crate/orphan isolation regressions in the initial alias collapse. Cross-target
+  admission is now limited to exact dependency-provenance routes whose Cargo
+  root owns the target, all 1,380 usage tests pass, and a second full Burn
+  replay again reports zero missing. Burn remains in local-gate/publication
+  state, and Hickory DNS and nmstate will not be touched until its clean
+  pushed-head replay and issue closures finish.
 - [x] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [x] Complete C++ and publish its evidence and user summary.
