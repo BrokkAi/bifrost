@@ -1,5 +1,6 @@
 mod adapter;
 mod cache;
+mod clones;
 mod declarations;
 pub(crate) mod diagnostics;
 mod hierarchy;
@@ -9,13 +10,16 @@ mod semantic;
 pub(crate) mod structural;
 mod tests;
 
+use crate::analyzer::clone_detection::{
+    CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
+};
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer,
-    ImportAnalysisProvider, Language, Project, ProjectFile, SemanticDiagnostic, SignatureMetadata,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
-    TypeAliasProvider, TypeHierarchyProvider,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
+    IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile, SemanticDiagnostic,
+    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -24,6 +28,7 @@ use std::sync::atomic::Ordering;
 
 pub(crate) use adapter::GoAdapter;
 use cache::GoMemoCaches;
+use clones::build_go_clone_candidate_data;
 pub(crate) use declarations::{
     collect_go_import_infos, determine_go_package_name, go_embedded_type_nodes,
     go_structured_type_identity_bounded,
@@ -633,6 +638,46 @@ impl IAnalyzer for GoAnalyzer {
 
     fn in_test_region(&self, code_unit: &crate::analyzer::CodeUnit) -> bool {
         self.inner.in_test_region(code_unit)
+    }
+
+    fn find_structural_clone_smells(
+        &self,
+        file: &ProjectFile,
+        weights: CloneSmellWeights,
+    ) -> Vec<CloneSmell> {
+        self.find_structural_clone_smells_for_files(std::slice::from_ref(file), weights)
+    }
+
+    fn find_structural_clone_smells_for_files(
+        &self,
+        files: &[ProjectFile],
+        weights: CloneSmellWeights,
+    ) -> Vec<CloneSmell> {
+        let requested_files: Vec<ProjectFile> = files
+            .iter()
+            .filter(|file| file_language(file) == Language::Go)
+            .cloned()
+            .collect();
+        if requested_files.is_empty() {
+            return Vec::new();
+        }
+
+        let all_candidates: Vec<CloneCandidateProfile> = self
+            .get_all_declarations()
+            .into_iter()
+            .filter(|code_unit| {
+                code_unit.is_function() && file_language(code_unit.source()) == Language::Go
+            })
+            .filter_map(|code_unit| build_go_clone_candidate_data(self, &code_unit, weights))
+            .map(|candidate| CloneCandidateProfile::create(candidate, weights))
+            .collect();
+
+        detect_structural_clone_smells(
+            &requested_files,
+            all_candidates,
+            weights,
+            refine_clone_similarity_with_ast,
+        )
     }
 
     fn find_test_assertion_smells(
