@@ -67,6 +67,8 @@ pub(crate) fn analyze_for_file(
         Language::Php => analyze_php(analyzer, file, &source, tree.root_node(), &weights),
         Language::Scala => analyze_scala(analyzer, file, &source, tree.root_node(), &weights),
         Language::CSharp => analyze_csharp(analyzer, file, &source, tree.root_node(), &weights),
+        Language::Ruby => analyze_ruby(analyzer, file, &source, tree.root_node(), &weights),
+        Language::Kotlin => analyze_kotlin(analyzer, file, &source, tree.root_node(), &weights),
         _ => {
             return ExceptionHandlingAnalysis::Unsupported {
                 reason: format!(
@@ -551,6 +553,73 @@ fn analyze_scala(
     )
 }
 
+fn analyze_ruby(
+    analyzer: &(impl IAnalyzer + ?Sized),
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    weights: &ExceptionSmellWeights,
+) -> Vec<ExceptionHandlingSmell> {
+    let mut handlers = Vec::new();
+    for rescue in collect_nodes_by_kind(root, "rescue") {
+        if !rescue.is_named() {
+            continue;
+        }
+        let catch_type = rescue
+            .child_by_field_name("exceptions")
+            .and_then(|node| node_text(node, source))
+            .unwrap_or_else(|| "StandardError".to_string());
+        let broad = classify_ruby_type(&catch_type, weights);
+        handlers.push((rescue, rescue, catch_type, broad));
+    }
+    for rescue in collect_nodes_by_kind(root, "rescue_modifier") {
+        let Some(handler) = rescue.child_by_field_name("handler") else {
+            continue;
+        };
+        handlers.push((
+            rescue,
+            handler,
+            "StandardError".to_string(),
+            classify_ruby_type("StandardError", weights),
+        ));
+    }
+    analyze_preextracted_handlers(analyzer, file, source, handlers, weights, |body| {
+        has_descendant_of_kind(body, "retry") || contains_identifier(body, source, "raise")
+    })
+}
+
+fn analyze_kotlin(
+    analyzer: &(impl IAnalyzer + ?Sized),
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    weights: &ExceptionSmellWeights,
+) -> Vec<ExceptionHandlingSmell> {
+    analyze_handler_nodes(
+        analyzer,
+        file,
+        source,
+        collect_nodes_by_kind(root, "catch_block"),
+        weights,
+        |node, source| {
+            let catch_type = direct_named_child_matching(node, |kind| {
+                matches!(
+                    kind,
+                    "user_type"
+                        | "nullable_type"
+                        | "not_nullable_type"
+                        | "parenthesized_type"
+                        | "function_type"
+                )
+            })
+            .and_then(|type_node| node_text(type_node, source))?;
+            let broad = classify_java_family(&catch_type, weights);
+            Some((node, catch_type, broad))
+        },
+        &["jump_expression"],
+    )
+}
+
 fn analyze_handler_nodes<'tree>(
     analyzer: &(impl IAnalyzer + ?Sized),
     file: &ProjectFile,
@@ -703,6 +772,27 @@ fn classify_cpp_type(catch_type: &str, weights: &ExceptionSmellWeights) -> Optio
     }
 }
 
+fn classify_ruby_type(catch_type: &str, weights: &ExceptionSmellWeights) -> Option<(i32, String)> {
+    if catch_type.contains("Exception") && !catch_type.contains("StandardError") {
+        Some((
+            weights.generic_throwable_weight,
+            "generic-catch:Exception".to_string(),
+        ))
+    } else if catch_type.contains("RuntimeError") {
+        Some((
+            weights.generic_runtime_exception_weight,
+            "generic-catch:RuntimeError".to_string(),
+        ))
+    } else if catch_type.contains("StandardError") {
+        Some((
+            weights.generic_exception_weight,
+            "generic-catch:StandardError".to_string(),
+        ))
+    } else {
+        None
+    }
+}
+
 fn cpp_catch_type(parameters: Node<'_>, source: &str) -> String {
     for kind in [
         "qualified_identifier",
@@ -720,6 +810,17 @@ fn cpp_catch_type(parameters: Node<'_>, source: &str) -> String {
 }
 
 fn handler_statement_count(body: Node<'_>) -> u32 {
+    if body.kind() == "catch_block" {
+        return named_child_by_kind(body, "statements")
+            .map(handler_statement_count)
+            .unwrap_or(0);
+    }
+    if body.kind() == "rescue" {
+        return body
+            .child_by_field_name("body")
+            .map(handler_statement_count)
+            .unwrap_or(0);
+    }
     if body.kind() == "case_clause" {
         return children_by_field_name(body, "body").len() as u32;
     }
@@ -865,6 +966,15 @@ fn named_child_by_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tre
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| child.kind() == kind)
+}
+
+fn direct_named_child_matching(
+    node: Node<'_>,
+    mut predicate: impl FnMut(&str) -> bool,
+) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| predicate(child.kind()))
 }
 
 fn children_by_field_name<'tree>(node: Node<'tree>, field: &str) -> Vec<Node<'tree>> {

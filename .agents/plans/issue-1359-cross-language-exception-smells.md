@@ -16,7 +16,7 @@ The implementation uses the current Brokk Java analyzers and their tests as the 
 - [x] (2026-07-30 20:12Z) Wrote this ExecPlan with four independently testable milestones.
 - [x] (2026-07-30 20:28Z) Milestone 1: made the analyzer/result/report boundary distinguish analyzed-clean, unsupported, and failed inputs; extracted shared stack-safe scoring and preserved all seven focused Java/report tests.
 - [x] (2026-07-30 21:04Z) Milestone 2: ported Brokk behavior for C/C++, JavaScript/JSX, TypeScript/TSX, Python, PHP, Scala, C#, Go, and Rust; nine focused cross-language tests pass with positive and propagation/rethrow near-miss coverage.
-- [ ] Milestone 3: add structured Ruby and Kotlin semantics with positive and realistic near-miss coverage.
+- [x] (2026-07-30 21:24Z) Milestone 3: added structured Ruby `rescue`/`rescue_modifier` and Kotlin `catch_block` semantics; all eleven focused language tests pass, including meaningful rethrow near misses.
 - [ ] Milestone 4: complete mixed-language MCP/report integration, validation, policy checking, and review.
 
 ## Surprises & Discoveries
@@ -35,6 +35,9 @@ The implementation uses the current Brokk Java analyzers and their tests as the 
 
 - Observation: the workspace package name is `brokk-bifrost-analysis`, not `bifrost-analysis`.
   Evidence: the first focused command failed package selection; rerunning `cargo test -p brokk-bifrost-analysis exception_smells` passed all seven selected tests.
+
+- Observation: Kotlin's grammar places the catch parameter identifier and `user_type` directly under `catch_block`, and omits `statements` for an empty handler.
+  Evidence: inspecting the parsed S-expression showed `(catch_block (simple_identifier) (user_type (type_identifier)))` for an empty catch and an additional `(statements ... (jump_expression ...))` for a rethrowing catch.
 
 ## Decision Log
 
@@ -60,7 +63,7 @@ The implementation uses the current Brokk Java analyzers and their tests as the 
 
 ## Outcomes & Retrospective
 
-Milestones 1 and 2 are complete. Unsupported input is explicit, Java behavior remains green, and the Brokk-backed language families now use structured parser nodes. The focused suite proves C/C++, JS/JSX, TS/TSX, Python, PHP, Scala, C#, Go, and Rust positives plus realistic rethrow or propagation near misses.
+Milestones 1 through 3 are complete. Unsupported input is explicit, Java behavior remains green, and every language named by the issue now uses structured parser nodes. The focused suite proves C/C++, JS/JSX, TS/TSX, Python, PHP, Scala, C#, Go, Rust, Ruby, and Kotlin positives plus realistic rethrow or propagation near misses.
 
 ## Context and Orientation
 
@@ -130,3 +133,5 @@ Revision note (2026-07-30): Initial plan created after verifying issue #1359 and
 Revision note (2026-07-30): Marked Milestone 1 complete, recorded the validated Cargo package name, and summarized its passing focused tests.
 
 Revision note (2026-07-30): Marked Milestone 2 complete and recorded the decision to colocate the language-specific extractors behind the shared trait default.
+
+Revision note (2026-07-30): Marked Milestone 3 complete and recorded the Kotlin grammar shape that determined empty-body and rethrow handling.

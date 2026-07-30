@@ -247,3 +247,45 @@ fn propagate() -> Result<(), Error> {
         "findings: {findings:#?}"
     );
 }
+
+#[test]
+fn ruby_flags_bare_empty_rescue_but_not_meaningful_reraise() {
+    assert_one_bad_handler(
+        "sample.rb",
+        r#"
+def sample
+  begin
+    work
+  rescue
+  end
+
+  begin
+    work
+  rescue StandardError => error
+    audit(error)
+    notify_ops(error)
+    raise
+  end
+end
+"#,
+        "StandardError",
+    );
+}
+
+#[test]
+fn kotlin_flags_empty_generic_catch_but_not_meaningful_rethrow() {
+    assert_one_bad_handler(
+        "Sample.kt",
+        r#"
+fun sample() {
+    try { work() } catch (error: Exception) {}
+    try { work() } catch (error: Exception) {
+        audit(error)
+        notifyOps(error)
+        throw error
+    }
+}
+"#,
+        "Exception",
+    );
+}
