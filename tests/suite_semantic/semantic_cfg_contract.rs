@@ -2944,6 +2944,666 @@ fn typescript_java_common_control_topology_is_label_equivalent() {
     );
 }
 
+/// Kotlin's label-equivalent of [`assert_reference_common_control_topology`].
+///
+/// The shared reference fixture cannot be reused verbatim: Kotlin has no
+/// statement wrapper node, so a trailing `;` widens no anchor and its selectors
+/// (`positive();`, `break;`) would each match a call's entry, invoke, and both
+/// continuation points at once. A `;` also terminates an `if`, so
+/// `if (c) a(); else b();` is not even valid Kotlin. The arms are therefore
+/// braced, which gives each one an anchor of its own, and the assertions below
+/// are the same ones the shared helper makes.
+#[test]
+fn kotlin_common_control_topology_is_label_equivalent() {
+    let source = r#"
+fun select(positiveFlag: Boolean): Int {
+    start()
+    if (positiveFlag) { positive() } else { negative() }
+    var index = 0
+    while (index < 2) {
+        body()
+        if (index == 1) { break }
+        index = index + 1
+        continue
+    }
+    done()
+    return index
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("src/Reference.kt", source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/Reference.kt");
+    graph
+        .bind(
+            "entry",
+            PointSelector::new("fun select")
+                .procedure("select")
+                .effect("entry"),
+        )
+        .bind(
+            "branch",
+            PointSelector::new("positiveFlag")
+                .occurrence(1)
+                .procedure("select")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "positive_arm",
+            PointSelector::new("{ positive() }").procedure("select"),
+        )
+        .bind(
+            "negative_arm",
+            PointSelector::new("{ negative() }").procedure("select"),
+        )
+        .bind(
+            "loop_condition",
+            PointSelector::new("index < 2")
+                .procedure("select")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "body_call",
+            PointSelector::new("body()")
+                .procedure("select")
+                .effect("invoke"),
+        )
+        .bind("break", PointSelector::new("break").procedure("select"))
+        .bind(
+            "continue",
+            PointSelector::new("continue").procedure("select"),
+        )
+        .bind(
+            "done_call",
+            PointSelector::new("done()")
+                .procedure("select")
+                .effect("invoke"),
+        )
+        .bind(
+            "return",
+            PointSelector::new("return index")
+                .procedure("select")
+                .effect("procedure_return"),
+        )
+        .bind(
+            "normal_exit",
+            PointSelector::new("fun select")
+                .procedure("select")
+                .effect("normal_exit"),
+        );
+
+    graph.assert_successors(
+        "branch",
+        &[
+            expected_edge("positive_arm", ControlEdgeKind::ConditionalTrue),
+            expected_edge("negative_arm", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "return",
+        &[expected_edge("normal_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("entry", "branch");
+    graph.assert_reachable("positive_arm", "loop_condition");
+    graph.assert_reachable("negative_arm", "loop_condition");
+    graph.assert_reachable("continue", "loop_condition");
+    graph.assert_reachable("loop_condition", "body_call");
+    graph.assert_reachable("break", "done_call");
+    graph.assert_reachable("done_call", "return");
+    graph.assert_adjacency_symmetric();
+}
+
+/// Materialize one Kotlin fixture, first proving the fixture itself is the
+/// Kotlin the test means: a recovered parse would lower a tree the source never
+/// described, and every assertion below it would be about that tree instead.
+fn kotlin_graph(path: &str, source: &str) -> SemanticGraph {
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file(path, source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let errors =
+        brokk_bifrost::analyzer::IAnalyzer::parse_errors(analyzer.analyzer(), &project.file(path))
+            .unwrap_or_default();
+    assert!(errors.is_empty(), "{path} must parse cleanly: {errors:?}");
+    SemanticGraph::materialize(&project, &analyzer, path)
+}
+
+#[test]
+fn kotlin_safe_call_skips_the_selection_when_the_receiver_is_null() {
+    let source = r#"
+fun read(box: Holder?): Int {
+    return box?.size()
+}
+"#;
+    let mut graph = kotlin_graph("src/SafeCall.kt", source);
+    graph
+        .bind(
+            "null_test",
+            PointSelector::new("box?.size()")
+                .procedure("read")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "skip",
+            PointSelector::new("box?.size()")
+                .procedure("read")
+                .effect("value_flow"),
+        )
+        .bind(
+            "invoke",
+            PointSelector::new("box?.size()")
+                .procedure("read")
+                .effect("invoke"),
+        )
+        .bind(
+            "normal_exit",
+            PointSelector::new("fun read")
+                .procedure("read")
+                .effect("normal_exit"),
+        );
+
+    // The null arm reaches the join directly from the test: the invocation is
+    // not on the path a null receiver takes.
+    graph.assert_predecessors(
+        "skip",
+        &[expected_edge(
+            "null_test",
+            ControlEdgeKind::ConditionalFalse,
+        )],
+    );
+    graph.assert_unreachable("skip", "invoke");
+    graph.assert_reachable("null_test", "invoke");
+    graph.assert_reachable("skip", "normal_exit");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn kotlin_elvis_evaluates_its_default_only_on_the_null_branch() {
+    let source = r#"
+fun pick(primary: Int?, fallback: Int): Int {
+    return primary ?: fallback
+}
+"#;
+    let mut graph = kotlin_graph("src/Elvis.kt", source);
+    graph
+        .bind(
+            "elvis_test",
+            PointSelector::new("primary ?: fallback")
+                .procedure("pick")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "present",
+            PointSelector::new("primary ?: fallback")
+                .procedure("pick")
+                .effect("value_flow"),
+        )
+        // The default operand owns two points, an entry and a value-carrying
+        // exit; the entry is the one the false arm targets.
+        .bind(
+            "default_entry",
+            PointSelector::new("fallback")
+                .occurrence(1)
+                .procedure("pick")
+                .anchor_occurrence(0),
+        );
+
+    graph.assert_predecessors(
+        "default_entry",
+        &[expected_edge(
+            "elvis_test",
+            ControlEdgeKind::ConditionalFalse,
+        )],
+    );
+    graph.assert_predecessors(
+        "present",
+        &[expected_edge(
+            "elvis_test",
+            ControlEdgeKind::ConditionalTrue,
+        )],
+    );
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn kotlin_when_chains_its_entries_and_falls_through_to_else() {
+    let source = r#"
+fun classify(code: Int): Int {
+    return when (code) {
+        7 -> { low() }
+        9 -> { high() }
+        else -> { other() }
+    }
+}
+"#;
+    let mut graph = kotlin_graph("src/When.kt", source);
+    graph
+        .bind(
+            "seven_decision",
+            PointSelector::new("7")
+                .procedure("classify")
+                .outgoing_kind(ControlEdgeKind::SwitchCase),
+        )
+        .bind(
+            "nine_entry",
+            PointSelector::new("9")
+                .procedure("classify")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "nine_decision",
+            PointSelector::new("9")
+                .procedure("classify")
+                .outgoing_kind(ControlEdgeKind::SwitchCase),
+        )
+        .bind(
+            "low_arm",
+            PointSelector::new("{ low() }").procedure("classify"),
+        )
+        .bind(
+            "high_arm",
+            PointSelector::new("{ high() }").procedure("classify"),
+        )
+        .bind(
+            "other_arm",
+            PointSelector::new("{ other() }").procedure("classify"),
+        )
+        .bind(
+            "normal_exit",
+            PointSelector::new("fun classify")
+                .procedure("classify")
+                .effect("normal_exit"),
+        );
+
+    graph.assert_successors(
+        "seven_decision",
+        &[
+            expected_edge("low_arm", ControlEdgeKind::SwitchCase),
+            expected_edge("nine_entry", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "nine_decision",
+        &[
+            expected_edge("high_arm", ControlEdgeKind::SwitchCase),
+            expected_edge("other_arm", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_reachable("low_arm", "normal_exit");
+    graph.assert_reachable("high_arm", "normal_exit");
+    graph.assert_reachable("other_arm", "normal_exit");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn kotlin_return_runs_the_finally_before_leaving() {
+    let source = r#"
+fun guard(): Int {
+    try {
+        return risky()
+    } finally {
+        cleanup()
+    }
+}
+"#;
+    let mut graph = kotlin_graph("src/Guard.kt", source);
+    graph
+        // Resolving this selector is itself the assertion that the return does
+        // not jump straight to the exit: it leaves through a cleanup edge.
+        .bind(
+            "return_terminal",
+            PointSelector::new("return risky()")
+                .procedure("guard")
+                .effect("procedure_return")
+                .outgoing_kind(ControlEdgeKind::Cleanup),
+        )
+        .bind(
+            "normal_exit",
+            PointSelector::new("fun guard")
+                .procedure("guard")
+                .effect("normal_exit"),
+        );
+    graph.assert_reachable("return_terminal", "normal_exit");
+    graph.assert_adjacency_symmetric();
+
+    // The finalizer is specialized once per completion route it can be reached
+    // by: falling out of the body, returning through it, and propagating an
+    // exception out of it.
+    let guard = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| procedure.kind() == ProcedureKind::Function)
+        .expect("Kotlin top-level function should be a procedure");
+    let cleanup_calls = guard
+        .call_sites()
+        .iter()
+        .filter(|call| mapped_source(guard, source, call.source) == "cleanup()")
+        .count();
+    assert_eq!(cleanup_calls, 3);
+}
+
+#[test]
+fn kotlin_labeled_break_leaves_every_enclosing_loop() {
+    let source = r#"
+fun scan(): Int {
+    outer@ while (more()) {
+        while (deeper()) {
+            if (stop()) { break@outer }
+            step()
+        }
+        after()
+    }
+    if (ready()) { finish() }
+    return 0
+}
+"#;
+    let mut graph = kotlin_graph("src/Scan.kt", source);
+    graph
+        .bind(
+            "labeled_break",
+            PointSelector::new("break@outer").procedure("scan"),
+        )
+        .bind(
+            "after_loop",
+            PointSelector::new("if (ready()) { finish() }").procedure("scan"),
+        )
+        .bind(
+            "inner_continuation",
+            PointSelector::new("after()")
+                .procedure("scan")
+                .effect("invoke"),
+        )
+        .bind(
+            "normal_exit",
+            PointSelector::new("fun scan")
+                .procedure("scan")
+                .effect("normal_exit"),
+        );
+
+    graph.assert_successors(
+        "labeled_break",
+        &[expected_edge("after_loop", ControlEdgeKind::Normal)],
+    );
+    graph.assert_unreachable("labeled_break", "inner_continuation");
+    graph.assert_reachable("after_loop", "normal_exit");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn kotlin_enumerates_members_accessors_initializers_and_nested_callables() {
+    let source = r#"
+class Shapes(private val seed: Int) {
+    val computed = compute()
+
+    var tracked: Int = 0
+        get() = field
+        set(value) { field = value }
+
+    init {
+        register()
+    }
+
+    constructor(seed: Int, extra: Int) : this(seed) {
+        record(extra)
+    }
+
+    fun method() {
+        val task = { nested() }
+        run(task)
+        fun local(): Int {
+            return 1
+        }
+        local()
+    }
+}
+"#;
+    let graph = kotlin_graph("src/Shapes.kt", source);
+    let procedures = graph.artifact().procedures();
+    let count = |kind: ProcedureKind| {
+        procedures
+            .iter()
+            .filter(|procedure| procedure.kind() == kind)
+            .count()
+    };
+
+    // `computed`'s initializer, `tracked`'s initializer, and the `init` block.
+    assert_eq!(count(ProcedureKind::Initializer), 3);
+    assert_eq!(count(ProcedureKind::Accessor), 2);
+    assert_eq!(count(ProcedureKind::Constructor), 1);
+    assert_eq!(count(ProcedureKind::Method), 1);
+    assert_eq!(count(ProcedureKind::LocalFunction), 1);
+    assert_eq!(count(ProcedureKind::Lambda), 1);
+
+    let method = procedures
+        .iter()
+        .find(|procedure| procedure.kind() == ProcedureKind::Method)
+        .expect("Kotlin member function should be a procedure");
+    for nested in procedures.iter().filter(|procedure| {
+        matches!(
+            procedure.kind(),
+            ProcedureKind::Lambda | ProcedureKind::LocalFunction
+        )
+    }) {
+        assert_eq!(
+            nested.lexical_parent(),
+            Some(method.id()),
+            "a callable declared inside a member function is lexically nested in it"
+        );
+    }
+}
+
+/// A `.kts` script has no declaration for its own body, so its free top-level
+/// statements are a documented file-level omission — but everything the script
+/// declares, including the lambdas it passes, is lowered exactly as in a `.kt`
+/// file.
+#[test]
+fn kotlin_script_lowers_declared_callables_and_omits_its_free_statements() {
+    let source = r#"plugins {
+    kotlin("jvm")
+}
+
+val greeting = compose("hello")
+
+fun shout(text: String): String {
+    return text
+}
+"#;
+    let graph = kotlin_graph("build.gradle.kts", source);
+    let procedures = graph.artifact().procedures();
+    let named = |kind: ProcedureKind, name: &str| {
+        procedures.iter().any(|procedure| {
+            procedure.kind() == kind
+                && procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+        })
+    };
+    assert!(named(ProcedureKind::Function, "shout"));
+    assert!(named(ProcedureKind::Initializer, "greeting"));
+
+    let calls = procedures
+        .iter()
+        .flat_map(|procedure| {
+            procedure
+                .call_sites()
+                .iter()
+                .map(|call| mapped_source(procedure, source, call.source))
+        })
+        .collect::<Vec<_>>();
+    assert!(calls.contains(&"compose(\"hello\")"));
+    // The trailing lambda keeps its own boundary and body...
+    assert!(calls.contains(&"kotlin(\"jvm\")"));
+    // ...while the free call that receives it belongs to no declaration.
+    assert!(!calls.iter().any(|call| call.starts_with("plugins")));
+}
+
+/// One dense file of Kotlin-specific syntax, lowered end to end.
+///
+/// Its value is that the shared IR validator runs over every shape at once:
+/// duplicate scoped gaps, dangling edges, and non-dense provenance all fail
+/// materialization rather than waiting for a construct-specific test.
+#[test]
+fn kotlin_lowers_the_language_surface_without_validation_gaps() {
+    let source = r#"package survey
+
+import kotlin.collections.List
+
+open class Base(val seed: Int) {
+    open fun describe(): String = "base"
+}
+
+interface Sink {
+    fun accept(value: Int)
+    fun reset() {
+    }
+}
+
+enum class Mode(val weight: Int) {
+    FAST(1),
+    SLOW(2) {
+        override fun describe(): String = "slow"
+    };
+
+    open fun describe(): String = name
+}
+
+object Registry {
+    val entries = mutableListOf<Int>()
+
+    fun register(value: Int) {
+        entries.add(value)
+    }
+}
+
+class Survey(seed: Int, private val sink: Sink?) : Base(seed) {
+    val lazily by lazy { compute() }
+
+    var counter: Int = 0
+        get() = field
+        set(value) {
+            field = value
+        }
+
+    companion object {
+        const val LIMIT = 8
+
+        fun create(): Survey = Survey(0, null)
+    }
+
+    init {
+        Registry.register(seed)
+    }
+
+    constructor(seed: Int) : this(seed, null) {
+        counter = seed
+    }
+
+    override fun describe(): String = "survey-${'$'}{counter}"
+
+    fun branches(flag: Boolean, code: Int, text: String?): Int {
+        val label = text ?: "none"
+        val size = text?.length
+        val forced = text!!.length
+        var total = if (flag) 1 else 2
+        total = total + label.length + forced
+        when (code) {
+            0, 1 -> total = total - 1
+            in 2..4 -> total = total + 2
+            is Int -> total = total * 2
+            else -> total = 0
+        }
+        val guarded = when {
+            flag && code > 0 -> 1
+            !flag || code < 0 -> 2
+            else -> 3
+        }
+        return total + guarded + (size ?: 0)
+    }
+
+    fun loops(rows: List<Pair<Int, Int>>): Int {
+        var sum = 0
+        outer@ for ((left, right) in rows) {
+            var index = 0
+            while (index < left) {
+                if (index == right) {
+                    continue@outer
+                }
+                if (index > LIMIT) {
+                    break@outer
+                }
+                index++
+            }
+            do {
+                sum = sum + 1
+            } while (sum < left)
+        }
+        return sum
+    }
+
+    fun resources(path: String): Int {
+        try {
+            return open(path)
+        } catch (error: IllegalStateException) {
+            return -1
+        } catch (error: Exception) {
+            throw error
+        } finally {
+            close(path)
+        }
+    }
+
+    fun callables(rows: List<Int>): Int {
+        val doubler = { value: Int -> value * 2 }
+        val named = ::helper
+        val bound = Survey::describe
+        val anonymous = fun(value: Int): Int {
+            return value + 1
+        }
+        rows.forEach { row ->
+            sink?.accept(doubler(row))
+        }
+        val listener = object : Sink {
+            override fun accept(value: Int) {
+                Registry.register(value)
+            }
+        }
+        listener.accept(anonymous(rows[0]))
+        return named(rows.size) + bound(this).length
+    }
+
+    suspend fun awaited(value: Int): Int {
+        val doubled = value * 2
+        return doubled
+    }
+
+    infix fun combine(other: Int): Int = counter + other
+
+    fun infixUse(other: Int): Int = this combine other
+}
+
+fun helper(value: Int): Int {
+    fun inner(inner: Int): Int {
+        return inner + 1
+    }
+    return inner(value)
+}
+
+val topLevel = helper(1)
+"#;
+    let graph = kotlin_graph("src/Survey.kt", source);
+    graph.assert_adjacency_symmetric();
+    assert!(
+        graph.artifact().procedures().len() > 20,
+        "the survey fixture should publish every declared callable boundary"
+    );
+}
+
 #[test]
 fn java_enumerates_methods_constructors_initializers_and_lambdas() {
     let project = InlineTestProject::with_language(Language::Java)

@@ -512,9 +512,9 @@ fn mixed_language_workspace_routes_kotlin_and_java() {
     assert!(analyzer.is_analyzed(&kotlin_file));
     assert!(analyzer.is_analyzed(&java_file));
 
-    // Semantic materialization stays explicitly unsupported for Kotlin until
-    // issue #1241 — asserted by materializing, not merely by the provider
-    // being present, so wiring Kotlin to a working lowerer would fail here.
+    // Semantic materialization is live for Kotlin (#1241) — asserted by
+    // materializing, not merely by the provider being present, so unwiring the
+    // lowerer would fail here.
     let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
     let mut budget = brokk_bifrost::analyzer::semantic::SemanticBudget::default();
     let outcome = workspace
@@ -526,12 +526,21 @@ fn mixed_language_workspace_routes_kotlin_and_java() {
             ),
         )
         .expect("Kotlin semantics must resolve to an outcome, not an error");
+    let brokk_bifrost::analyzer::semantic::SemanticOutcome::Complete {
+        value: artifact, ..
+    } = outcome
+    else {
+        panic!("Kotlin program semantics must materialize completely: {outcome:?}");
+    };
     assert!(
-        matches!(
-            outcome,
-            brokk_bifrost::analyzer::semantic::SemanticOutcome::Unsupported { .. }
-        ),
-        "Kotlin program semantics must be explicitly Unsupported until #1241: {outcome:?}"
+        artifact.procedures().iter().any(|procedure| procedure
+            .locator()
+            .declaration()
+            .segments()
+            .last()
+            .and_then(|segment| segment.name())
+            == Some("serve")),
+        "Kotlin lowering must publish the file's declared method"
     );
 }
 

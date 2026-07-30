@@ -31,18 +31,21 @@
 //! `query_code` and `(language kotlin …)` search Kotlin files like any other
 //! registered language.
 //!
+//! Executable-semantics lowering is live (#1241): [`semantic`] publishes a
+//! versioned `ProgramSemanticsProvider`, and its module header documents the
+//! source-level constructs that stay capability-scoped.
+//!
 //! Capabilities owned by sibling issues stay explicitly unsupported here:
 //! usage graphs (#1239 — Kotlin is a member of the shared JVM usage-candidate
 //! realm but has no edge builder yet, so find-references and reference-rewriting
-//! rename abstain) and CFG/semantic lowering (#1241 —
-//! the analyzer delegate hands out the shared `UnsupportedProgramSemantics`
-//! provider instead of lowering).
+//! rename abstain).
 
 mod adapter;
 pub(crate) mod declarations;
 mod hierarchy;
 pub(crate) mod imports;
 pub(crate) mod language;
+mod semantic;
 pub(crate) mod structural;
 mod supertypes;
 pub(crate) mod syntax;
