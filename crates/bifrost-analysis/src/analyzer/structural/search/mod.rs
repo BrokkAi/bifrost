@@ -47,7 +47,8 @@ use crate::analyzer::reference_candidates::{
 };
 use crate::analyzer::structural::analysis_context::{
     ProtocolRef, ProtocolRegistrationSet, QueryAnalysisContext, QueryAnalysisContextError,
-    QueryAnalysisValidationLimits, ValueFlowPlanRef, ValueFlowPlanRegistrationSet,
+    QueryAnalysisValidationLimits, TaintResultRegistrationSet, ValueFlowPlanRef,
+    ValueFlowPlanRegistrationSet,
 };
 use crate::analyzer::structural::capabilities::QueryFeature;
 #[cfg(test)]
@@ -913,6 +914,7 @@ pub fn execute_workspace_request_with_registration_limits(
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResponse {
     let value_flow_registrations = ValueFlowPlanRegistrationSet::default();
+    let taint_registrations = TaintResultRegistrationSet::default();
     execute_request_internal(
         workspace.analyzer(),
         Some(workspace),
@@ -923,6 +925,7 @@ pub fn execute_workspace_request_with_registration_limits(
             workspace_generation,
             registrations,
             &value_flow_registrations,
+            &taint_registrations,
         )),
         None,
     )
@@ -1400,6 +1403,7 @@ pub fn execute_workspace_request_with_registration_cancellation(
     cancellation: &CancellationToken,
 ) -> CodeQueryResponse {
     let value_flow_registrations = ValueFlowPlanRegistrationSet::default();
+    let taint_registrations = TaintResultRegistrationSet::default();
     execute_request_internal(
         workspace.analyzer(),
         Some(workspace),
@@ -1410,6 +1414,7 @@ pub fn execute_workspace_request_with_registration_cancellation(
             workspace_generation,
             registrations,
             &value_flow_registrations,
+            &taint_registrations,
         )),
         None,
     )
@@ -1452,6 +1457,32 @@ pub fn execute_workspace_request_with_analysis_registration_lease(
     cancellation: Option<&CancellationToken>,
     summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
 ) -> CodeQueryResponse {
+    let taint_registrations = TaintResultRegistrationSet::default();
+    execute_workspace_request_with_all_analysis_registration_lease(
+        workspace,
+        workspace_generation,
+        registrations,
+        value_flow_registrations,
+        &taint_registrations,
+        query,
+        limits,
+        cancellation,
+        summary_lease,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn execute_workspace_request_with_all_analysis_registration_lease(
+    workspace: &WorkspaceAnalyzer,
+    workspace_generation: u64,
+    registrations: &ProtocolRegistrationSet,
+    value_flow_registrations: &ValueFlowPlanRegistrationSet,
+    taint_registrations: &TaintResultRegistrationSet,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
+) -> CodeQueryResponse {
     execute_request_internal(
         workspace.analyzer(),
         Some(workspace),
@@ -1462,6 +1493,7 @@ pub fn execute_workspace_request_with_analysis_registration_lease(
             workspace_generation,
             registrations,
             value_flow_registrations,
+            taint_registrations,
         )),
         Some(summary_lease),
     )
@@ -1473,7 +1505,12 @@ fn execute_request_internal(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
-    registrations: Option<(u64, &ProtocolRegistrationSet, &ValueFlowPlanRegistrationSet)>,
+    registrations: Option<(
+        u64,
+        &ProtocolRegistrationSet,
+        &ValueFlowPlanRegistrationSet,
+        &TaintResultRegistrationSet,
+    )>,
     summary_lease: Option<crate::analyzer::typestate::ProductionTypestateSummaryLease>,
 ) -> CodeQueryResponse {
     if query_plan_requires_typestate(&query.plan) && !limits.typestate.is_valid() {
@@ -1490,7 +1527,7 @@ fn execute_request_internal(
         None
     } else if let (
         Some(workspace),
-        Some((workspace_generation, registrations, value_flow_registrations)),
+        Some((workspace_generation, registrations, value_flow_registrations, taint_registrations)),
     ) = (workspace, registrations)
     {
         let requested = requested_protocol_refs(&query.plan);
@@ -1516,6 +1553,8 @@ fn execute_request_internal(
             &requested,
             value_flow_registrations,
             &requested_value_flows,
+            taint_registrations,
+            &[],
             QueryAnalysisValidationLimits::new(
                 limits.semantic.max_materialized_files,
                 limits.semantic.max_source_bytes,
@@ -1531,7 +1570,7 @@ fn execute_request_internal(
     } else {
         None
     };
-    let workspace_generation = registrations.map_or(0, |(generation, _, _)| generation);
+    let workspace_generation = registrations.map_or(0, |(generation, _, _, _)| generation);
     match query.execution_mode {
         CodeQueryExecutionMode::Results => CodeQueryResponse::Results(
             execute_internal_with_analysis(
@@ -5545,10 +5584,16 @@ fn query_analysis_context_error_result(error: QueryAnalysisContextError) -> Code
         QueryAnalysisContextError::GenerationExhausted
         | QueryAnalysisContextError::TooManyResolvedProtocols
         | QueryAnalysisContextError::TooManyResolvedValueFlowPlans
+        | QueryAnalysisContextError::TooManyResolvedTaintResults
         | QueryAnalysisContextError::WorkspaceGenerationMismatch { .. }
         | QueryAnalysisContextError::StaleArtifact { .. }
         | QueryAnalysisContextError::ArtifactIdentityUnavailable { .. }
-        | QueryAnalysisContextError::ArtifactValidationFailed { .. } => {
+        | QueryAnalysisContextError::ArtifactValidationFailed { .. }
+        | QueryAnalysisContextError::UnresolvedTaintResultReference { .. }
+        | QueryAnalysisContextError::TaintRegistrationInvalid { .. }
+        | QueryAnalysisContextError::TaintResultRootMismatch
+        | QueryAnalysisContextError::TaintPlanReportMismatch
+        | QueryAnalysisContextError::StaleTaintResultHandle => {
             CodeQueryDiagnosticCode::TypestateRegistrationStale
         }
     };

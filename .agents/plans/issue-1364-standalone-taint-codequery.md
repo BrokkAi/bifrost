@@ -17,7 +17,7 @@ The observable demonstration is an inline Java project with compatible multiple-
 - [x] (2026-07-30 21:15 SAST) Completed the guided diagnosis and repository-native planning pass and recorded the implementation design in this ExecPlan; the delegated planning pass was interrupted after source exploration, so the primary agent completed the plan from the verified code paths.
 - [x] (2026-07-30 21:20 SAST) Received plan approval and began Milestone 1 on the existing issue branch.
 - [x] (2026-07-30 21:43 SAST) Milestone 1: extracted one immutable retained production taint result per compatible batch, made policy and public projection consume the same plan/report pair, added conservative retained-memory and artifact accounting, and passed all five focused taint-policy adapter tests.
-- [ ] Milestone 2: add bounded generation-scoped taint-result registration, exact-root lookup, and prepared-request snapshots.
+- [x] (2026-07-30 22:04 SAST) Milestone 2: added bounded generation-scoped multi-root taint-result registrations, exact semantic-root lookup, shared artifact validation, immutable request snapshots through runtime/MCP, generation clearing, alias/conflict semantics, and transactional retained-byte limits.
 - [ ] Milestone 3: add schema-v7 `taint`/`taint_ref` JSON and RQL vocabulary and projection-only typed execution.
 - [ ] Milestone 4: complete public transports, editor support, docs, lifecycle/equivalence tests, and final validation.
 - [ ] Run the required five-perspective guided review, remediate accepted findings, and update this plan with the final outcome.
@@ -38,6 +38,9 @@ The observable demonstration is an inline Java project with compatible multiple-
 
 - Observation: the installed Bifrost skills are visible, but this task exposes none of their code-intelligence or policy-checking MCP calls.
   Evidence: tool discovery found no `search_symbols`, `get_symbol_sources`, `list_policies`, or `run_policy`. Repository-native search is the current navigation fallback, and no policy-pack success may be claimed unless those tools become callable.
+
+- Observation: registration identity cannot rely on allocation addresses if separately constructed but equal immutable results are to alias.
+  Evidence: Milestone 2 initially used shared plan/report allocation identity, then replaced it before checkpointing with a deterministic digest over compatibility, exact root, projection limits, semantic artifacts, and canonical projected findings. The digest remains internal and never affects public finding IDs.
 
 ## Decision Log
 
@@ -75,7 +78,7 @@ The observable demonstration is an inline Java project with compatible multiple-
 
 ## Outcomes & Retrospective
 
-Milestone 1 is complete. Production policy preparation now retains the authoritative plan/report pair as a `ProductionTaintAnalysisResult`; both public taint rows and policy findings are projected from that pair, and `PolicyBatchOutcome` exposes the immutable retained results for later host registration. The focused adapter tests prove one retained result for compatible policies and field-for-field reprojection equality, while retained-byte and artifact accounting establish the bounds needed by Milestone 2. The existing compiler, batch planner, one-solve path, finding collector, projector, policy classification, CVSS, and transport models remain authoritative.
+Milestones 1 and 2 are complete. Production policy preparation now retains the authoritative plan/report pair as a `ProductionTaintAnalysisResult`; both public taint rows and policy findings are projected from that pair, and `PolicyBatchOutcome` exposes the immutable retained results for host registration. Hosts can bind one or more exact procedure roots to a bounded `TaintResultRef`, snapshot registrations into a prepared request, and clear them when the workspace generation advances. Registration validates the same semantic artifacts under the existing shared budget and accounts for plans, reports, and artifacts transactionally. The focused adapter test proves aliasing, cleanup, duplicate-root rejection, limit rollback, and field-for-field reprojection equality. The existing compiler, batch planner, one-solve path, finding collector, projector, policy classification, CVSS, and transport models remain authoritative.
 
 ## Context and Orientation
 
@@ -303,3 +306,5 @@ and `CodeQueryExecutionLimits` must include `taint: CodeQueryTaintLimits`. The a
 Revision note (2026-07-30): Created the initial self-contained plan after live issue/remote verification and guided diagnosis. The plan chooses a retained per-batch production result, a multi-root host registration keyed by structured procedure identity, schema-v7 projection-only execution, and alias-independent public IDs so policy and query output can be exactly equivalent.
 
 Revision note (2026-07-30 21:43 SAST): Recorded Milestone 1 completion after the focused adapter suite passed. The implementation keeps the production plan/report allocation intact, routes both projections through it, and adds the conservative ownership accounting required for bounded registration.
+
+Revision note (2026-07-30 22:04 SAST): Recorded Milestone 2 completion after the focused registration behavior test and all-target analysis/runtime/MCP checks passed. The host boundary now snapshots and clears taint registrations with workspace generation while exact-root resolution remains projection-only.

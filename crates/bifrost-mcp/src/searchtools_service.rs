@@ -244,6 +244,7 @@ pub struct SearchToolsService {
     workspace_generation: AtomicU64,
     query_protocols: RwLock<crate::analyzer::structural::ProtocolRegistrationSet>,
     query_value_flows: RwLock<crate::analyzer::structural::ValueFlowPlanRegistrationSet>,
+    query_taint_results: RwLock<crate::analyzer::structural::TaintResultRegistrationSet>,
     typestate_summaries:
         RwLock<Arc<crate::analyzer::typestate::ProductionTypestateSummaryRepository>>,
     /// A deferred workspace build (file discovery + parse) runs on a background
@@ -291,6 +292,7 @@ pub(crate) struct PreparedQueryCode {
     workspace_generation: u64,
     query_protocols: crate::analyzer::structural::ProtocolRegistrationSet,
     query_value_flows: crate::analyzer::structural::ValueFlowPlanRegistrationSet,
+    query_taint_results: crate::analyzer::structural::TaintResultRegistrationSet,
     typestate_summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
 }
 
@@ -548,6 +550,7 @@ impl SearchToolsService {
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -609,6 +612,7 @@ impl SearchToolsService {
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -723,6 +727,52 @@ impl SearchToolsService {
             .write()
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
             .unregister(plan_ref))
+    }
+
+    /// Register retained production taint results for in-process CodeQuery callers.
+    pub fn register_query_taint_results(
+        &self,
+        taint_ref: crate::analyzer::structural::TaintResultRef,
+        results: Vec<Arc<crate::analyzer::policy::ProductionTaintAnalysisResult>>,
+    ) -> Result<crate::analyzer::structural::TaintResultRegistrationOutcome, SearchToolsServiceError>
+    {
+        let workspace_generation = {
+            let session = self.read_session()?;
+            session.as_ref().ok_or_else(Self::closed_error)?;
+            self.workspace_generation()
+        };
+        let registration = crate::analyzer::structural::TaintResultRegistration::new(
+            workspace_generation,
+            results,
+        )
+        .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
+        let session = self.read_session()?;
+        session.as_ref().ok_or_else(Self::closed_error)?;
+        if self.workspace_generation() != workspace_generation {
+            return Err(SearchToolsServiceError::invalid_params(
+                "workspace generation changed while preparing the taint result registration",
+            ));
+        }
+        let outcome = self
+            .query_taint_results
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
+            .register(taint_ref, registration)
+            .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
+        drop(session);
+        Ok(outcome)
+    }
+
+    /// Remove one host-defined retained taint-result alias.
+    pub fn unregister_query_taint_results(
+        &self,
+        taint_ref: &crate::analyzer::structural::TaintResultRef,
+    ) -> Result<bool, SearchToolsServiceError> {
+        Ok(self
+            .query_taint_results
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
+            .unregister(taint_ref))
     }
 
     /// Construct with no file watcher and no semantic indexer: the caller drives
@@ -1111,6 +1161,7 @@ impl SearchToolsService {
             workspace_generation,
             query_protocols,
             query_value_flows,
+            query_taint_results,
             typestate_summary_lease,
         } = self.prepare_query_code(arguments)?;
         let result = self.query_code_result_for_snapshot(
@@ -1120,6 +1171,7 @@ impl SearchToolsService {
             workspace_generation,
             &query_protocols,
             &query_value_flows,
+            &query_taint_results,
             typestate_summary_lease,
         );
         snapshot.finish("query_code", result)
@@ -1143,6 +1195,7 @@ impl SearchToolsService {
             let snapshot = self.snapshot_for_query()?;
             let query_protocols = self.query_protocol_snapshot()?;
             let query_value_flows = self.query_value_flow_snapshot()?;
+            let query_taint_results = self.query_taint_result_snapshot()?;
             if generation != self.workspace_generation() {
                 continue;
             }
@@ -1159,6 +1212,7 @@ impl SearchToolsService {
                 workspace_generation: generation,
                 query_protocols,
                 query_value_flows,
+                query_taint_results,
                 typestate_summary_lease,
             });
         }
@@ -1175,6 +1229,7 @@ impl SearchToolsService {
             workspace_generation,
             query_protocols,
             query_value_flows,
+            query_taint_results,
             typestate_summary_lease,
         } = prepared;
         let result = (|| {
@@ -1185,6 +1240,7 @@ impl SearchToolsService {
                 workspace_generation,
                 &query_protocols,
                 &query_value_flows,
+                &query_taint_results,
                 typestate_summary_lease,
             )?;
             let rendered_text = output.render_text();
@@ -1208,14 +1264,16 @@ impl SearchToolsService {
         workspace_generation: u64,
         query_protocols: &crate::analyzer::structural::ProtocolRegistrationSet,
         query_value_flows: &crate::analyzer::structural::ValueFlowPlanRegistrationSet,
+        query_taint_results: &crate::analyzer::structural::TaintResultRegistrationSet,
         typestate_summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
     ) -> Result<crate::analyzer::structural::CodeQueryResponse, SearchToolsServiceError> {
         let query = Self::decode_query_code_input(snapshot, arguments)?;
         Ok(CodeIntelligenceRuntime::new(snapshot, cancellation)
-            .execute_query_with_analysis_registration_lease(
+            .execute_query_with_all_analysis_registration_lease(
                 workspace_generation,
                 query_protocols,
                 query_value_flows,
+                query_taint_results,
                 &query,
                 crate::analyzer::structural::CodeQueryExecutionLimits::default(),
                 typestate_summary_lease,
@@ -1349,6 +1407,16 @@ impl SearchToolsService {
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))
     }
 
+    fn query_taint_result_snapshot(
+        &self,
+    ) -> Result<crate::analyzer::structural::TaintResultRegistrationSet, SearchToolsServiceError>
+    {
+        self.query_taint_results
+            .read()
+            .map(|registrations| registrations.clone())
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))
+    }
+
     fn advance_workspace_generation(&self) {
         let mut summaries = self
             .typestate_summaries
@@ -1359,6 +1427,10 @@ impl SearchToolsService {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
         self.query_value_flows
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.query_taint_results
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
@@ -1411,6 +1483,7 @@ impl SearchToolsService {
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -1457,6 +1530,7 @@ impl SearchToolsService {
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -1503,6 +1577,7 @@ impl SearchToolsService {
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -1564,6 +1639,7 @@ impl SearchToolsService {
             workspace_generation: AtomicU64::new(0),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -1756,6 +1832,7 @@ impl SearchToolsService {
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -2998,6 +3075,7 @@ mod watcher_startup_tests {
             workspace_generation: AtomicU64::new(0),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -3579,6 +3657,7 @@ public partial class MudDialogContainer
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -3819,6 +3898,7 @@ mod client_roots_tests {
             workspace_generation: AtomicU64::new(0),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -4311,6 +4391,7 @@ mod tests {
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),

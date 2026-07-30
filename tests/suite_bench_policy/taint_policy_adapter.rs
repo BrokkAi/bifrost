@@ -6,7 +6,13 @@ use brokk_bifrost::analyzer::policy::{
     evaluate_policy_inputs_with_analyzer, write_policy_human, write_policy_json,
     write_policy_sarif,
 };
+use brokk_bifrost::analyzer::structural::{
+    TaintResultRef, TaintResultRegistration, TaintResultRegistrationError,
+    TaintResultRegistrationLimits, TaintResultRegistrationOutcome, TaintResultRegistrationSet,
+    TaintResultRegistrationSetError,
+};
 use brokk_bifrost::{AnalyzerConfig, Language};
+use std::sync::Arc;
 
 const SOURCE: &str = r#"
 def source_one():
@@ -380,6 +386,52 @@ fn production_taint_policies_share_a_batch_and_all_renderers_keep_the_same_evide
             .expect("retained production taint projection"),
         outcome.taint_findings()
     );
+    let first_ref = TaintResultRef::new("request", "primary").expect("bounded taint ref");
+    let alias_ref = TaintResultRef::new("request", "alias").expect("bounded taint ref");
+    let registration = TaintResultRegistration::new(7, vec![Arc::clone(retained)])
+        .expect("valid retained taint registration");
+    let mut registrations = TaintResultRegistrationSet::default();
+    assert_eq!(
+        registrations
+            .register(first_ref.clone(), registration)
+            .expect("insert retained taint result"),
+        TaintResultRegistrationOutcome::Inserted
+    );
+    assert_eq!(
+        registrations
+            .register(
+                alias_ref.clone(),
+                TaintResultRegistration::new(7, vec![Arc::clone(retained)])
+                    .expect("valid taint alias"),
+            )
+            .expect("alias retained taint result"),
+        TaintResultRegistrationOutcome::Aliased
+    );
+    assert_eq!(registrations.reference_count(), 2);
+    assert_eq!(registrations.registration_count(), 1);
+    assert!(registrations.unregister(&first_ref));
+    assert_eq!(registrations.reference_count(), 1);
+    assert_eq!(registrations.registration_count(), 1);
+    assert!(registrations.unregister(&alias_ref));
+    assert_eq!(registrations.registration_count(), 0);
+
+    assert!(matches!(
+        TaintResultRegistration::new(7, vec![Arc::clone(retained), Arc::clone(retained)]),
+        Err(TaintResultRegistrationError::DuplicateRoot)
+    ));
+    let mut bounded = TaintResultRegistrationSet::with_limits(
+        TaintResultRegistrationLimits::bounded(1, 1, 0, usize::MAX, usize::MAX),
+    );
+    assert!(matches!(
+        bounded.register(
+            first_ref,
+            TaintResultRegistration::new(7, vec![Arc::clone(retained)])
+                .expect("valid bounded registration"),
+        ),
+        Err(TaintResultRegistrationSetError::RetainedPlanBytes(0))
+    ));
+    assert_eq!(bounded.reference_count(), 0);
+    assert_eq!(bounded.registration_count(), 0);
     assert_eq!(outcome.taint_query_results().len(), 2);
     for result in outcome.taint_query_results() {
         let value = serde_json::to_value(result).expect("public taint query serialization");

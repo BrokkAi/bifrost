@@ -48,8 +48,8 @@ use crate::analyzer::semantic::workspace_oracle::{
     ProcedureRangeLookupStatus, procedures_for_source_ranges,
 };
 use crate::analyzer::semantic::{
-    CandidateCoverage, EvidenceCompleteness, OracleCallContext, ProcedureHandle,
-    ProgramPointHandle, ProofStatus, SemanticBudget, SemanticOutcome, ValueHandle,
+    CandidateCoverage, EvidenceCompleteness, LengthDelimitedDigest, OracleCallContext,
+    ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticBudget, SemanticOutcome, ValueHandle,
     WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic::{DispatchOracle, ValueFlowOracle};
@@ -200,6 +200,7 @@ pub struct ProductionTaintAnalysisResult {
     projection_limits: crate::analyzer::structural::CodeQueryTaintProjectionLimits,
     artifact_keys: Box<[crate::analyzer::semantic::SemanticArtifactKey]>,
     retained_artifact_bytes: usize,
+    registration_digest: Box<str>,
 }
 
 impl ProductionTaintAnalysisResult {
@@ -242,6 +243,7 @@ impl ProductionTaintAnalysisResult {
             projection_limits,
             artifact_keys: artifact_keys.into_boxed_slice(),
             retained_artifact_bytes: usize::try_from(retained_artifact_bytes).unwrap_or(usize::MAX),
+            registration_digest: "".into(),
         }
     }
 
@@ -289,6 +291,33 @@ impl ProductionTaintAnalysisResult {
 
     pub const fn retained_artifact_bytes(&self) -> usize {
         self.retained_artifact_bytes
+    }
+
+    pub fn registration_digest(&self) -> &str {
+        assert!(
+            !self.registration_digest.is_empty(),
+            "production taint result must receive its registration digest"
+        );
+        &self.registration_digest
+    }
+
+    fn set_registration_digest(
+        &mut self,
+        findings: &[crate::analyzer::structural::CodeQueryTaintFinding],
+    ) -> Result<(), serde_json::Error> {
+        assert!(self.registration_digest.is_empty());
+        let mut digest = LengthDelimitedDigest::new(b"bifrost.production_taint_result.v1");
+        digest.push(self.compatibility.workspace_snapshot().as_bytes());
+        digest.push(self.compatibility.propagation_semantics().as_bytes());
+        digest.push(format!("{:?}", self.compatibility.unmodeled_call_behavior()).as_bytes());
+        digest.push(format!("{:?}", self.compatibility.universe()).as_bytes());
+        digest.push(format!("{:?}", self.expected_root().artifact().key()).as_bytes());
+        digest.push(format!("{:?}", self.expected_root().semantics().locator()).as_bytes());
+        digest.push(format!("{:?}", self.projection_limits).as_bytes());
+        digest.push(format!("{:?}", self.artifact_keys).as_bytes());
+        digest.push(&serde_json::to_vec(findings)?);
+        self.registration_digest = digest.finish().to_string().into_boxed_str();
+        Ok(())
     }
 
     pub fn project_findings(
@@ -1073,18 +1102,21 @@ fn solve_and_project_batch(
         budget.max_witness_steps(),
         budget.max_witness_bytes(),
     );
-    let retained = Arc::new(ProductionTaintAnalysisResult::new(
+    let mut retained = ProductionTaintAnalysisResult::new(
         Arc::new(batch.analysis().clone()),
         Arc::new(report),
         batch.compatibility().clone(),
         projection_limits,
-    ));
-    debug_assert!(retained.plan_report_match());
-    public_findings.extend(
-        retained
-            .project_findings(workspace, projection_limits)
-            .map_err(|error| error.to_string())?,
     );
+    debug_assert!(retained.plan_report_match());
+    let projected_findings = retained
+        .project_findings(workspace, projection_limits)
+        .map_err(|error| error.to_string())?;
+    retained
+        .set_registration_digest(&projected_findings)
+        .map_err(|error| error.to_string())?;
+    public_findings.extend(projected_findings);
+    let retained = Arc::new(retained);
 
     for projection in batch.projections() {
         let plan = metadata
