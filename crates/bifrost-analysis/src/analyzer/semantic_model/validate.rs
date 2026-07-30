@@ -363,13 +363,15 @@ impl Validator {
         let mut parameter_names = HashSet::new();
         for (index, parameter) in signature.parameters.iter().enumerate() {
             let parameter_path = format!("{path}.parameters[{index}]");
-            self.language_identifier(&format!("{parameter_path}.name"), &parameter.name);
-            if !parameter_names.insert(&parameter.name) {
-                self.error(
-                    "parameter.duplicate",
-                    format!("{parameter_path}.name"),
-                    format!("duplicate parameter `{}`", parameter.name),
-                );
+            if let Some(name) = &parameter.name {
+                self.language_identifier(&format!("{parameter_path}.name"), name);
+                if !parameter_names.insert(name) {
+                    self.error(
+                        "parameter.duplicate",
+                        format!("{parameter_path}.name"),
+                        format!("duplicate parameter `{name}`"),
+                    );
+                }
             }
             self.type_ref(
                 &format!("{parameter_path}.type"),

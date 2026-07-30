@@ -700,7 +700,10 @@
       "type": "object",
       "properties": {
         "name": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "optional": {
           "type": "boolean",
@@ -716,7 +719,6 @@
       },
       "additionalProperties": false,
       "required": [
-        "name",
         "type"
       ]
     },

@@ -226,7 +226,8 @@ pub struct Signature {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Parameter {
-    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub r#type: TypeRef,
     #[serde(default)]
     pub optional: bool,
