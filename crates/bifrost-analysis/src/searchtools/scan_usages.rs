@@ -1210,40 +1210,80 @@ pub(super) fn resolve_scan_usages_target(
 
     let range_context = DeclarationNameRangeContext::new(&file, source);
 
-    let matching_location_units = |units: Vec<CodeUnit>| {
-        units
-            .into_iter()
-            .filter_map(|unit| {
-                let selector_matches = selector.is_some_and(|symbol| {
-                    unit.fq_name() == symbol
-                        || unit.short_name() == symbol
-                        || definition_selector(&unit) == symbol
-                        || display_symbol_for_target(&unit) == symbol
-                });
-                let ranges = if selector_matches && unit.is_module() {
-                    analyzer.ranges_of(&unit)
-                } else if selector_matches || selector.is_none() {
-                    range_context.name_ranges(analyzer, &unit)
-                } else {
-                    return None;
-                };
-                let best_span = ranges
-                    .into_iter()
-                    .filter(|range| scan_usages_target_matches_range(selection, *range))
-                    .map(|range| range.end_byte.saturating_sub(range.start_byte))
-                    .min()?;
-                Some((unit, best_span))
-            })
-            .collect::<Vec<_>>()
+    // The selector to match is an explicit parameter (not closed over) so the
+    // same pool computation can be re-run with `selector_arg: None` below for
+    // the not_found corrective hint, which asks "what's actually here" rather
+    // than "what matches the caller's spelling".
+    let location_units =
+        |units: Vec<CodeUnit>,
+         selector_arg: Option<&str>,
+         matches_selector: &dyn Fn(&CodeUnit, &str) -> bool| {
+            units
+                .into_iter()
+                .filter_map(|unit| {
+                    let selector_matches =
+                        selector_arg.is_some_and(|symbol| matches_selector(&unit, symbol));
+                    let ranges = if selector_matches && unit.is_module() {
+                        analyzer.ranges_of(&unit)
+                    } else if selector_matches || selector_arg.is_none() {
+                        range_context.name_ranges(analyzer, &unit)
+                    } else {
+                        return None;
+                    };
+                    let best_span = ranges
+                        .into_iter()
+                        .filter(|range| scan_usages_target_matches_range(selection, *range))
+                        .map(|range| range.end_byte.saturating_sub(range.start_byte))
+                        .min()?;
+                    Some((unit, best_span))
+                })
+                .collect::<Vec<_>>()
+        };
+
+    // Exact selector forms (fq_name, definition_selector, and the display
+    // symbol) are tried first; a bare identifier is accepted as a
+    // location-pinned short name only in a second pass, and only when no
+    // exact form matched anything at this location. This ordering is the
+    // fix for #1231: without it, a short-name coincidence elsewhere in the
+    // matching_units pool could out-narrow (or otherwise interfere with) a
+    // genuine exact-selector match at the same location.
+    let selector_matches_exact_form = |unit: &CodeUnit, symbol: &str| {
+        unit.fq_name() == symbol
+            || definition_selector(unit) == symbol
+            || display_symbol_for_target(unit) == symbol
+    };
+    // Members' short_name is owner-qualified (`Widget.helper`), so bare-name
+    // acceptance also matches the terminal segment: the location already pins
+    // the target, making the bare terminal exactly as unambiguous for a method
+    // as for a free function. Exact string equality on the structured
+    // short_name convention's own `.` join - no source parsing.
+    let selector_matches_short_name = |unit: &CodeUnit, symbol: &str| {
+        let short_name = unit.short_name();
+        short_name == symbol
+            || short_name
+                .rsplit_once('.')
+                .is_some_and(|(_, terminal)| terminal == symbol)
     };
 
-    let mut matching_units = matching_location_units(declarations_in_file(analyzer, &file));
+    let declarations_here = declarations_in_file(analyzer, &file);
+    let mut matching_units = location_units(
+        declarations_here.clone(),
+        selector,
+        &selector_matches_exact_form,
+    );
+    if matching_units.is_empty() && selector.is_some() {
+        matching_units = location_units(
+            declarations_here.clone(),
+            selector,
+            &selector_matches_short_name,
+        );
+    }
     if matching_units.is_empty()
         && let Some(symbol) = selector
     {
         let declarations = analyzer.declarations(&file);
         let lookup = AnalyzerDefinitionLookup::new(analyzer, language_for_file(&file));
-        let lookup_only_candidates = lookup
+        let lookup_only_candidates: Vec<CodeUnit> = lookup
             .fqn(symbol)
             .into_iter()
             .filter(|unit| {
@@ -1253,7 +1293,18 @@ pub(super) fn resolve_scan_usages_target(
                     && !declarations.contains(unit)
             })
             .collect();
-        matching_units = matching_location_units(lookup_only_candidates);
+        matching_units = location_units(
+            lookup_only_candidates.clone(),
+            selector,
+            &selector_matches_exact_form,
+        );
+        if matching_units.is_empty() {
+            matching_units = location_units(
+                lookup_only_candidates,
+                selector,
+                &selector_matches_short_name,
+            );
+        }
     }
 
     if matching_units.is_empty() && selector.is_none() {
@@ -1270,45 +1321,35 @@ pub(super) fn resolve_scan_usages_target(
     if matching_units.is_empty()
         && let Some(symbol) = target.symbol.as_deref()
     {
+        // The location itself resolves to a declaration, just not under this
+        // spelling. Name the resolvable candidate so the corrective message
+        // never reads as a bare refusal (I5-honesty, #1231): state that
+        // selectors are fully-qualified, and offer what a line-only request
+        // at this same location would have resolved to.
+        let here = resolve_location_groups(
+            analyzer,
+            location_units(declarations_here, None, &selector_matches_exact_form),
+            true,
+        );
+        let reason = match here.first() {
+            Some((candidate, _)) => format!(
+                "no declaration matching `{symbol}` at location; the declaration here is `{candidate}` \u{2014} selectors use fully-qualified names"
+            ),
+            None => format!(
+                "no declaration matching `{symbol}` at location; selectors use fully-qualified names"
+            ),
+        };
         return ScanUsageTargetResolution::NotFound(not_found_input(
             scan_usages_target_label(&target),
             Some(scan_usages_location_diagnostic(
                 &target,
                 range_context.content(),
-                &format!("no declaration matching selector `{symbol}` at location"),
+                &reason,
             )),
         ));
     }
 
-    let narrowest_span = matching_units
-        .iter()
-        .map(|(_, span)| *span)
-        .min()
-        .expect("non-empty matching units");
-    let mut matches: Vec<CodeUnit> = matching_units
-        .into_iter()
-        .filter_map(|(unit, span)| (span == narrowest_span).then_some(unit))
-        .collect();
-
-    // A source-backed synthetic identity may intentionally share its declaration
-    // name range with the source declaration that owns it. Scala primary
-    // constructors are the current example: `class Service(value: String)`
-    // defines both the `Service` type and a synthetic `Service.Service`
-    // constructor at the `Service` token. A plain location target selects the
-    // source declaration, while an explicit `symbol` selector can still request
-    // the synthetic identity.
-    if selector.is_none() && matches.iter().any(|unit| !unit.is_synthetic()) {
-        matches.retain(|unit| !unit.is_synthetic());
-    }
-
-    matches.sort_by(|left, right| {
-        primary_range(analyzer, left)
-            .map(|range| (range.start_line, range.start_byte))
-            .cmp(&primary_range(analyzer, right).map(|range| (range.start_line, range.start_byte)))
-            .then_with(|| left.fq_name().cmp(&right.fq_name()))
-    });
-
-    let groups = distinct_definitions(analyzer, matches);
+    let groups = resolve_location_groups(analyzer, matching_units, selector.is_none());
     if groups.len() > 1 {
         let label = scan_usages_target_label(&target);
         return ScanUsageTargetResolution::Ambiguous(ambiguous_usage_symbol_from_groups(
@@ -1321,9 +1362,53 @@ pub(super) fn resolve_scan_usages_target(
         ));
     }
 
-    let (_, overloads) = groups.into_iter().next().expect("non-empty target groups");
+    let (_, overloads) = groups
+        .into_iter()
+        .next()
+        .expect("non-empty target groups: matching_units was checked non-empty above");
     let symbol = definition_selector(&overloads[0]);
     ScanUsageTargetResolution::Resolved { symbol, overloads }
+}
+
+/// Narrow a location-matched pool (`CodeUnit`, byte-span-of-narrowest-matching-range)
+/// to the narrowest span, optionally drop synthetic identities that share a
+/// source declaration's name range (see the doc comment at the call site),
+/// and partition what remains into distinct selectable definitions via
+/// [`distinct_definitions`]. Shared by the main resolution path and the
+/// not_found corrective hint so both report exactly the same candidate for
+/// the same location.
+fn resolve_location_groups(
+    analyzer: &dyn IAnalyzer,
+    pool: Vec<(CodeUnit, usize)>,
+    filter_synthetic: bool,
+) -> Vec<(String, Vec<CodeUnit>)> {
+    let Some(narrowest_span) = pool.iter().map(|(_, span)| *span).min() else {
+        return Vec::new();
+    };
+    let mut matches: Vec<CodeUnit> = pool
+        .into_iter()
+        .filter_map(|(unit, span)| (span == narrowest_span).then_some(unit))
+        .collect();
+
+    // A source-backed synthetic identity may intentionally share its declaration
+    // name range with the source declaration that owns it. Scala primary
+    // constructors are the current example: `class Service(value: String)`
+    // defines both the `Service` type and a synthetic `Service.Service`
+    // constructor at the `Service` token. A plain location target selects the
+    // source declaration, while an explicit `symbol` selector can still request
+    // the synthetic identity.
+    if filter_synthetic && matches.iter().any(|unit| !unit.is_synthetic()) {
+        matches.retain(|unit| !unit.is_synthetic());
+    }
+
+    matches.sort_by(|left, right| {
+        primary_range(analyzer, left)
+            .map(|range| (range.start_line, range.start_byte))
+            .cmp(&primary_range(analyzer, right).map(|range| (range.start_line, range.start_byte)))
+            .then_with(|| left.fq_name().cmp(&right.fq_name()))
+    });
+
+    distinct_definitions(analyzer, matches)
 }
 
 pub(super) fn scan_usages_location_diagnostic(

@@ -419,7 +419,6 @@ fn typescript_exact_helper_flow() {
 }
 
 #[test]
-#[ignore = "requires a proven complete source-to-sink meeting through C# static calls"]
 fn csharp_exact_helper_flow() {
     assert_single_file_exact_helper_flow(
         "csharp",
@@ -456,10 +455,10 @@ fn csharp_exact_helper_flow() {
         "relayed",
         "copy",
         ExpectedSinkOutcome::Reached,
-        ExpectedSinkOutcome::Inconclusive,
+        ExpectedSinkOutcome::NotReached,
         SemanticInputStatus::Unknown,
         false,
-        false,
+        true,
         1,
     );
 }

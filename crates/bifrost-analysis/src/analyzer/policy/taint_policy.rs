@@ -13,6 +13,7 @@ use std::ops::Range as ByteRange;
 use std::sync::Arc;
 
 use crate::CancellationToken;
+use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::dataflow::{
     DataflowRequest, SemanticInputStatus, SolverBudget, SummaryWitness, SummaryWitnessStepKind,
     WitnessReconstructionLimits, WitnessRetentionLimits,
@@ -25,7 +26,7 @@ use crate::analyzer::policy::finding::{
     FindingIncompleteReason, PolicyDiagnostic, PolicyDiagnosticCode, PolicyDiagnosticImpact,
     PolicyDiagnosticSeverity, PolicyFailureReason, PolicyIncompleteReason,
     PolicyLocationRelationship, PolicyRunCompletion, ProofMetadata, ProofReason, ProofState,
-    RelatedPolicyLocation, WitnessStep, WitnessStepKind,
+    RelatedPolicyLocation, WitnessStepKind,
 };
 use crate::analyzer::policy::finding::{PolicyWorkMetric, PolicyWorkReport, PolicyWorkUnit};
 use crate::analyzer::policy::finding_identity::{
@@ -48,15 +49,12 @@ use crate::analyzer::semantic::workspace_oracle::{
 };
 use crate::analyzer::semantic::{
     CandidateCoverage, EvidenceCompleteness, OracleCallContext, ProcedureHandle,
-    ProgramPointHandle, ProofStatus, SemanticArtifact, SemanticBudget, SemanticBudgetDimension,
-    SemanticExecutionBudget, SemanticOutcome, SemanticRequest, SemanticWork, ValueHandle,
+    ProgramPointHandle, ProofStatus, SemanticBudget, SemanticOutcome, ValueHandle,
     WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic::{DispatchOracle, ValueFlowOracle};
-use crate::analyzer::structural::search::{DetailedCodeQueryDomain, execute_code_query_detailed};
 use crate::analyzer::structural::{
-    CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, CodeQueryExecutionWork,
-    CodeQuerySemanticLimits, CodeQuerySemanticWork,
+    CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryExecutionLimits,
 };
 use crate::analyzer::taint::{
     SourceClassId, SourceEventKey, TaintAnalysisPlan, TaintBatch, TaintBatchCompatibilityKey,
@@ -68,7 +66,6 @@ use crate::analyzer::value_flow::{
     ValueFlowCarrier, ValueFlowEventKey, ValueFlowEventKind, ValueFlowInput,
     ValueFlowObservationPhase, ValueFlowPlan, ValueFlowSinkSpec, ValueFlowSourceSpec,
 };
-use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 
 #[derive(Debug)]
 pub(crate) enum TaintPolicyCompileError {
@@ -139,64 +136,40 @@ pub(crate) struct TaintPolicyCompileFailure {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct CompiledTaintSource {
+pub(crate) struct CompiledTaintEndpoint {
     pub(crate) endpoint: ResolvedEndpointIdentity,
     pub(crate) event: ValueFlowEventKey,
     pub(crate) labels: Box<[TaintLabel]>,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct CompiledTaintSink {
-    pub(crate) endpoint: ResolvedEndpointIdentity,
-    pub(crate) event: ValueFlowEventKey,
-}
-
 pub(crate) struct CompiledTaintPolicyPlan {
     pub(crate) internal_policy_id: String,
     pub(crate) plan: TaintPolicyPlan,
-    pub(crate) sources: Box<[CompiledTaintSource]>,
-    pub(crate) sinks: Box<[CompiledTaintSink]>,
-    pub(crate) work: PolicyWorkReport,
+    pub(crate) sources: Box<[CompiledTaintEndpoint]>,
+    pub(crate) sinks: Box<[CompiledTaintEndpoint]>,
 }
 
 enum TaintPolicyCompilation {
-    Plans(Vec<CompiledTaintPolicyPlan>),
+    Plans {
+        roots: Vec<CompiledTaintPolicyPlan>,
+        work: PolicyWorkReport,
+    },
     Clean(PolicyWorkReport),
 }
 
 struct PreparedTaintPlan {
     policy_id: PolicyId,
-    sources: Box<[CompiledTaintSource]>,
-    sinks: Box<[CompiledTaintSink]>,
+    sources: Box<[CompiledTaintEndpoint]>,
+    sinks: Box<[CompiledTaintEndpoint]>,
 }
 
-struct PreparedPayload {
-    projections: Vec<TaintProjectedFinding>,
-    completion: PolicyRunCompletion,
-    diagnostics: Vec<PolicyDiagnostic>,
-    diagnostics_truncated: bool,
-    work: PolicyWorkReport,
-}
-
-impl PreparedPayload {
-    fn complete(work: PolicyWorkReport) -> Self {
-        Self {
-            projections: Vec::new(),
-            completion: PolicyRunCompletion::Complete,
-            diagnostics: Vec::new(),
-            diagnostics_truncated: false,
-            work,
-        }
-    }
-
-    fn finish(self) -> TaintProjectionPayload {
-        TaintProjectionPayload {
-            projections: self.projections,
-            completion: self.completion,
-            diagnostics: self.diagnostics,
-            diagnostics_truncated: self.diagnostics_truncated,
-            work: self.work,
-        }
+fn complete_payload(work: PolicyWorkReport) -> TaintProjectionPayload {
+    TaintProjectionPayload {
+        projections: Vec::new(),
+        completion: PolicyRunCompletion::Complete,
+        diagnostics: Vec::new(),
+        diagnostics_truncated: false,
+        work,
     }
 }
 
@@ -268,13 +241,9 @@ impl ProductionTaintPolicyEvaluator {
             match TaintPolicyCompiler::new(workspace, budget.query_limits(), cancellation)
                 .compile(policy, spec)
             {
-                Ok(TaintPolicyCompilation::Plans(compiled)) => {
-                    let work = compiled
-                        .first()
-                        .map(|plan| plan.work.clone())
-                        .unwrap_or_default();
-                    payloads.insert(policy_id.clone(), PreparedPayload::complete(work));
-                    for compiled in compiled {
+                Ok(TaintPolicyCompilation::Plans { roots, work }) => {
+                    payloads.insert(policy_id.clone(), complete_payload(work));
+                    for compiled in roots {
                         metadata.insert(
                             compiled.internal_policy_id.clone(),
                             PreparedTaintPlan {
@@ -287,7 +256,7 @@ impl ProductionTaintPolicyEvaluator {
                     }
                 }
                 Ok(TaintPolicyCompilation::Clean(work)) => {
-                    payloads.insert(policy_id, PreparedPayload::complete(work));
+                    payloads.insert(policy_id, complete_payload(work));
                 }
                 Err(failure) => {
                     payloads.insert(policy_id, prepared_compile_failure_payload(*failure));
@@ -331,12 +300,7 @@ impl ProductionTaintPolicyEvaluator {
         }
 
         Self {
-            prepared: RefCell::new(
-                payloads
-                    .into_iter()
-                    .map(|(policy, payload)| (policy, payload.finish()))
-                    .collect(),
-            ),
+            prepared: RefCell::new(payloads),
             public_findings: RefCell::new(public_findings),
         }
     }
@@ -367,28 +331,15 @@ impl TaintPolicyEvaluator for ProductionTaintPolicyEvaluator {
                     "taint policy was not prepared by the policy coordinator",
                     PolicyWorkReport::default(),
                 )
-                .finish()
             })
     }
 }
 
 pub(crate) struct TaintPolicyCompiler<'a> {
-    workspace: &'a WorkspaceAnalyzer,
-    query_limits: CodeQueryExecutionLimits,
-    cancellation: &'a CancellationToken,
-    semantic_budget: SemanticBudget,
-    semantic_execution_budget: SemanticExecutionBudget,
-    query_work: CodeQueryExecutionWork,
-    artifacts: HashMap<ProjectFile, Arc<SemanticArtifact>>,
+    selectors: super::selector_compiler::PolicySelectorSession<'a>,
 }
 
-#[derive(Clone)]
-struct SelectedSite {
-    file: ProjectFile,
-    span: ByteRange<usize>,
-    proof: ProofStatus,
-    completeness: EvidenceCompleteness,
-}
+type SelectedSite = super::selector_compiler::PolicySelectedSite;
 
 #[derive(Clone)]
 struct BoundEndpoint {
@@ -421,19 +372,12 @@ impl<'a> TaintPolicyCompiler<'a> {
         cancellation: &'a CancellationToken,
     ) -> Self {
         Self {
-            workspace,
-            query_limits,
-            cancellation,
-            semantic_budget: SemanticBudget::new(super::selector_compiler::semantic_work_limits(
-                query_limits.semantic,
-            ))
-            .expect("validated CodeQuery semantic limits are positive"),
-            semantic_execution_budget: SemanticExecutionBudget::new(
-                query_limits.semantic.max_materialized_files,
-                query_limits.semantic.max_traversal_steps,
+            selectors: super::selector_compiler::PolicySelectorSession::new(
+                workspace,
+                "taint",
+                query_limits,
+                cancellation,
             ),
-            query_work: CodeQueryExecutionWork::default(),
-            artifacts: HashMap::new(),
         }
     }
 
@@ -443,16 +387,19 @@ impl<'a> TaintPolicyCompiler<'a> {
         spec: &ResolvedTaintPolicySpec,
     ) -> Result<TaintPolicyCompilation, Box<TaintPolicyCompileFailure>> {
         match self.compile_inner(policy, spec) {
-            Ok(compiled) => Ok(TaintPolicyCompilation::Plans(compiled)),
+            Ok(compiled) => Ok(TaintPolicyCompilation::Plans {
+                roots: compiled,
+                work: self.selectors.work_report("taint"),
+            }),
             Err(
                 TaintPolicyCompileError::EmptyCompiledSources
                 | TaintPolicyCompileError::EmptyCompiledSinks,
             ) => Ok(TaintPolicyCompilation::Clean(
-                self.compilation_work_report(),
+                self.selectors.work_report("taint"),
             )),
             Err(error) => Err(Box::new(TaintPolicyCompileFailure {
                 error,
-                work: self.compilation_work_report(),
+                work: self.selectors.work_report("taint"),
             })),
         }
     }
@@ -548,13 +495,17 @@ impl<'a> TaintPolicyCompiler<'a> {
             .iter()
             .chain(&all_sinks)
             .map(|endpoint| endpoint.point.procedure().clone())
-            .chain(self.artifacts.values().flat_map(|artifact| {
-                artifact.procedures().iter().map(|procedure| {
-                    artifact
-                        .procedure_handle(procedure.id())
-                        .expect("a live artifact owns each retained procedure")
-                })
-            }))
+            .chain(
+                self.selectors
+                    .materialized_artifacts()
+                    .flat_map(|artifact| {
+                        artifact.procedures().iter().map(|procedure| {
+                            artifact
+                                .procedure_handle(procedure.id())
+                                .expect("a live artifact owns each retained procedure")
+                        })
+                    }),
+            )
             .collect::<Vec<_>>();
         roots.sort_by(|left, right| left.semantics().locator().cmp(right.semantics().locator()));
         roots.dedup();
@@ -660,7 +611,6 @@ impl<'a> TaintPolicyCompiler<'a> {
                 plan,
                 sources: source_metadata.into_boxed_slice(),
                 sinks: sink_metadata.into_boxed_slice(),
-                work: self.compilation_work_report(),
             });
         }
         if compiled.is_empty() {
@@ -676,58 +626,9 @@ impl<'a> TaintPolicyCompiler<'a> {
         selector: &ResolvedPolicySelector,
         _binding: &PolicyPort,
     ) -> Result<Vec<SelectedSite>, TaintPolicyCompileError> {
-        let limits = self.remaining_query_limits()?;
-        let detailed = execute_code_query_detailed(
-            self.workspace.analyzer(),
-            &selector.query,
-            limits,
-            Some(self.cancellation),
-        );
-        self.query_work = self.query_work.saturating_add(detailed.work);
-        self.charge_query_semantic_work(detailed.work.semantic)?;
-        if !matches!(detailed.result.completion(), CodeQueryCompletion::Complete) {
-            let diagnostics = detailed
-                .result
-                .diagnostics
-                .iter()
-                .map(|diagnostic| format!("{}: {}", diagnostic.code.as_str(), diagnostic.message))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(TaintPolicyCompileError::QueryIncomplete {
-                completion: detailed.result.completion(),
-                detail: format!("`{}` ({diagnostics})", selector.path),
-            });
-        }
-        let mut sites = Vec::new();
-        for evidence in detailed.evidence {
-            if matches!(evidence.domain, DetailedCodeQueryDomain::File) {
-                continue;
-            }
-            let item = detailed
-                .result
-                .results
-                .get(evidence.result_index)
-                .ok_or_else(|| {
-                    TaintPolicyCompileError::SemanticUnavailable(format!(
-                        "selector `{}` evidence refers to an absent result row",
-                        selector.path
-                    ))
-                })?;
-            let Some(span) = evidence.byte_span else {
-                return Err(TaintPolicyCompileError::SemanticUnavailable(format!(
-                    "selector `{}` produced a row without a source span",
-                    selector.path
-                )));
-            };
-            let (proof, completeness) = super::selector_compiler::selected_site_quality(item);
-            sites.push(SelectedSite {
-                file: evidence.file,
-                span,
-                proof,
-                completeness,
-            });
-        }
-        Ok(sites)
+        self.selectors
+            .select(selector)
+            .map_err(taint_selector_error)
     }
 
     fn resolve_selected_values(
@@ -738,15 +639,21 @@ impl<'a> TaintPolicyCompiler<'a> {
         if matches!(binding, PolicyPort::MatchedValue) {
             return self.resolve_matched_value(selection);
         }
-        let artifact = self.materialize(&selection.file)?;
+        let artifact = self
+            .selectors
+            .materialize(&selection.file)
+            .map_err(taint_selector_error)?;
         let lookup = procedures_for_source_ranges(
             &artifact,
             &[super::selector_compiler::source_range(&selection.span)],
-            self.remaining_semantic_traversal_steps()?,
-            self.cancellation,
+            self.selectors
+                .remaining_semantic_traversal_steps()
+                .map_err(taint_selector_error)?,
+            self.selectors.cancellation(),
         );
         if !self
-            .semantic_execution_budget
+            .selectors
+            .execution_budget()
             .charge_traversal(lookup.examined)
         {
             return Err(query_budget_error(
@@ -789,13 +696,9 @@ impl<'a> TaintPolicyCompiler<'a> {
         &mut self,
         selection: SelectedSite,
     ) -> Result<Vec<ResolvedTaintValue>, TaintPolicyCompileError> {
-        let oracle = self.workspace.semantic_oracle_provider();
+        let oracle = self.selectors.workspace().semantic_oracle_provider();
         let outcome = {
-            let mut request = SemanticRequest::with_execution_budget(
-                &mut self.semantic_budget,
-                self.cancellation,
-                &self.semantic_execution_budget,
-            );
+            let mut request = self.selectors.semantic_request();
             oracle
                 .pointees_at_source(
                     &selection.file,
@@ -805,16 +708,19 @@ impl<'a> TaintPolicyCompiler<'a> {
                 .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?
         };
         require_uninterrupted_outcome(&outcome, "taint matched source binding")?;
-        self.require_execution_budget("taint matched source binding")?;
+        self.selectors
+            .require_execution_budget("taint matched source binding")
+            .map_err(taint_selector_error)?;
         let result = outcome.available_value().ok_or_else(|| {
             TaintPolicyCompileError::SemanticUnavailable(
                 "matched source row produced no point-sensitive value observation".to_owned(),
             )
         })?;
         if let Some(observation) = result.observations().first() {
-            self.artifacts
-                .entry(selection.file.clone())
-                .or_insert_with(|| Arc::clone(observation.query().point().procedure().artifact()));
+            self.selectors.remember_artifact(
+                selection.file.clone(),
+                Arc::clone(observation.query().point().procedure().artifact()),
+            );
         }
         let proof = if matches!(outcome, SemanticOutcome::Complete { .. }) {
             selection.proof
@@ -850,7 +756,7 @@ impl<'a> TaintPolicyCompiler<'a> {
         &mut self,
         root: &ProcedureHandle,
     ) -> Result<DiscoveredValueFlow, TaintPolicyCompileError> {
-        let oracle = self.workspace.semantic_oracle_provider();
+        let oracle = self.selectors.workspace().semantic_oracle_provider();
         let context = OracleCallContext::empty();
         let mut pending = vec![root.clone()];
         let mut seen = HashSet::new();
@@ -862,17 +768,15 @@ impl<'a> TaintPolicyCompiler<'a> {
                 continue;
             }
             let outcome = {
-                let mut request = SemanticRequest::with_execution_budget(
-                    &mut self.semantic_budget,
-                    self.cancellation,
-                    &self.semantic_execution_budget,
-                );
+                let mut request = self.selectors.semantic_request();
                 oracle
                     .procedure_relations(&procedure, &context, &mut request)
                     .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?
             };
             require_uninterrupted_outcome(&outcome, "taint value-flow discovery")?;
-            self.require_execution_budget("taint value-flow discovery")?;
+            self.selectors
+                .require_execution_budget("taint value-flow discovery")
+                .map_err(taint_selector_error)?;
             let status = SemanticInputStatus::from_outcome(&outcome);
             let snapshot = outcome.available_value().cloned().ok_or_else(|| {
                 TaintPolicyCompileError::SemanticUnavailable(
@@ -886,17 +790,15 @@ impl<'a> TaintPolicyCompiler<'a> {
                     .call_site_handle(call_row.id)
                     .expect("a live procedure owns each retained call site");
                 let dispatch = {
-                    let mut request = SemanticRequest::with_execution_budget(
-                        &mut self.semantic_budget,
-                        self.cancellation,
-                        &self.semantic_execution_budget,
-                    );
+                    let mut request = self.selectors.semantic_request();
                     oracle.resolve_call(&call, &mut request).map_err(|error| {
                         TaintPolicyCompileError::SemanticProvider(error.to_string())
                     })?
                 };
                 require_uninterrupted_outcome(&dispatch, "taint call dispatch")?;
-                self.require_execution_budget("taint call dispatch")?;
+                self.selectors
+                    .require_execution_budget("taint call dispatch")
+                    .map_err(taint_selector_error)?;
                 let dispatch_status = SemanticInputStatus::from_outcome(&dispatch);
                 let Some(dispatch) = dispatch.available_value() else {
                     continue;
@@ -907,11 +809,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                         continue;
                     }
                     let outcome = {
-                        let mut request = SemanticRequest::with_execution_budget(
-                            &mut self.semantic_budget,
-                            self.cancellation,
-                            &self.semantic_execution_budget,
-                        );
+                        let mut request = self.selectors.semantic_request();
                         oracle
                             .call_bindings(&call, candidate, &context, &mut request)
                             .map_err(|error| {
@@ -919,7 +817,9 @@ impl<'a> TaintPolicyCompiler<'a> {
                             })?
                     };
                     require_uninterrupted_outcome(&outcome, "taint call binding")?;
-                    self.require_execution_budget("taint call binding")?;
+                    self.selectors
+                        .require_execution_budget("taint call binding")
+                        .map_err(taint_selector_error)?;
                     let status = dispatch_status.merge(SemanticInputStatus::from_outcome(&outcome));
                     if let Some(binding) = outcome.available_value().cloned() {
                         bindings.push(ValueFlowInput::new(binding, status));
@@ -953,210 +853,6 @@ impl<'a> TaintPolicyCompiler<'a> {
         )
         .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))
     }
-
-    fn materialize(
-        &mut self,
-        file: &ProjectFile,
-    ) -> Result<Arc<SemanticArtifact>, TaintPolicyCompileError> {
-        if let Some(artifact) = self.artifacts.get(file) {
-            return Ok(Arc::clone(artifact));
-        }
-        let outcome = {
-            let mut request = SemanticRequest::with_execution_budget(
-                &mut self.semantic_budget,
-                self.cancellation,
-                &self.semantic_execution_budget,
-            );
-            self.workspace
-                .materialize_program_semantics(file, &mut request)
-                .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?
-        };
-        require_uninterrupted_outcome(&outcome, "taint program semantics materialization")?;
-        self.require_execution_budget("taint program semantics materialization")?;
-        let artifact = outcome.available_value().cloned().ok_or_else(|| {
-            TaintPolicyCompileError::SemanticUnavailable(format!(
-                "program semantics are unavailable for {}",
-                file.abs_path().display()
-            ))
-        })?;
-        self.artifacts.insert(file.clone(), Arc::clone(&artifact));
-        Ok(artifact)
-    }
-
-    fn remaining_query_limits(&self) -> Result<CodeQueryExecutionLimits, TaintPolicyCompileError> {
-        let remaining = |limit: usize, used: u64| {
-            limit.saturating_sub(usize::try_from(used).unwrap_or(usize::MAX))
-        };
-        let max_scanned_files = remaining(
-            self.query_limits.max_scanned_files,
-            self.query_work.scanned_files,
-        );
-        let max_scanned_source_bytes = remaining(
-            self.query_limits.max_scanned_source_bytes,
-            self.query_work.scanned_source_bytes,
-        );
-        let max_fact_nodes =
-            remaining(self.query_limits.max_fact_nodes, self.query_work.fact_nodes);
-        let max_pipeline_rows = remaining(
-            self.query_limits.max_pipeline_rows,
-            self.query_work.pipeline_rows,
-        );
-        if [
-            max_scanned_files,
-            max_scanned_source_bytes,
-            max_fact_nodes,
-            max_pipeline_rows,
-        ]
-        .contains(&0)
-        {
-            return Err(query_budget_error(
-                CodeQueryDiagnosticCode::ExecutionBudgetExhausted,
-                "taint selectors exhausted the shared structural query budget",
-            ));
-        }
-        let semantic_remaining = self.semantic_budget.remaining();
-        let semantic = CodeQuerySemanticLimits {
-            max_materialized_files: self
-                .semantic_execution_budget
-                .remaining_materialized_files(),
-            max_source_bytes: semantic_remaining.source_bytes,
-            max_rows_per_dimension: SemanticBudgetDimension::ALL
-                .into_iter()
-                .filter(|dimension| {
-                    !matches!(
-                        dimension,
-                        SemanticBudgetDimension::SourceBytes
-                            | SemanticBudgetDimension::OwnedTextBytes
-                    )
-                })
-                .map(|dimension| semantic_remaining.get(dimension))
-                .min()
-                .unwrap_or(0),
-            max_retained_bytes: semantic_remaining.owned_text_bytes,
-            max_traversal_steps: self.remaining_semantic_traversal_steps()?,
-        };
-        if !semantic.all_positive() {
-            return Err(query_budget_error(
-                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                "taint selectors exhausted the shared semantic query budget",
-            ));
-        }
-        Ok(CodeQueryExecutionLimits {
-            max_scanned_files,
-            max_scanned_source_bytes,
-            max_fact_nodes,
-            max_pipeline_rows,
-            semantic,
-            typestate: self.query_limits.typestate,
-            value_flow: self.query_limits.value_flow,
-        })
-    }
-
-    fn remaining_semantic_traversal_steps(&self) -> Result<usize, TaintPolicyCompileError> {
-        let remaining = self.semantic_execution_budget.remaining_traversal_steps();
-        if remaining == 0 {
-            Err(query_budget_error(
-                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                "taint semantic lookup exhausted the shared traversal budget",
-            ))
-        } else {
-            Ok(remaining)
-        }
-    }
-
-    fn charge_query_semantic_work(
-        &mut self,
-        work: CodeQuerySemanticWork,
-    ) -> Result<(), TaintPolicyCompileError> {
-        let usize_work = |value| usize::try_from(value).unwrap_or(usize::MAX);
-        if !self.semantic_execution_budget.charge_external_query_work(
-            usize_work(work.unique_materialized_files),
-            usize_work(work.traversal_steps),
-        ) {
-            return Err(query_budget_error(
-                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                "taint selectors exhausted the shared semantic execution budget",
-            ));
-        }
-        self.semantic_budget
-            .charge(SemanticWork {
-                source_bytes: usize_work(work.source_bytes),
-                procedures: usize_work(work.procedures),
-                blocks: usize_work(work.blocks),
-                program_points: usize_work(work.program_points),
-                values: usize_work(work.values),
-                allocations: usize_work(work.allocations),
-                call_sites: usize_work(work.call_sites),
-                memory_locations: usize_work(work.memory_locations),
-                captures: usize_work(work.captures),
-                source_mappings: usize_work(work.source_mappings),
-                evidence: usize_work(work.evidence),
-                gaps: usize_work(work.gaps),
-                events: usize_work(work.events),
-                control_edges: usize_work(work.control_edges),
-                nested_entries: usize_work(work.nested_entries),
-                owned_text_bytes: usize_work(work.retained_bytes),
-            })
-            .map_err(|_| {
-                query_budget_error(
-                    CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                    "taint selectors exhausted the shared semantic materialization budget",
-                )
-            })
-    }
-
-    fn require_execution_budget(&self, operation: &str) -> Result<(), TaintPolicyCompileError> {
-        if self.semantic_execution_budget.work().exhausted {
-            Err(query_budget_error(
-                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                format!("{operation} exhausted the shared semantic file or traversal budget"),
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn compilation_work_report(&self) -> PolicyWorkReport {
-        let semantic = self.semantic_budget.used();
-        let execution = self.semantic_execution_budget.work();
-        let metrics = [
-            PolicyWorkMetric::try_new(
-                "taint.semantic_materialized_files",
-                PolicyWorkUnit::Count,
-                u64::try_from(execution.materialized_files).unwrap_or(u64::MAX),
-            ),
-            PolicyWorkMetric::try_new(
-                "taint.semantic_traversal_steps",
-                PolicyWorkUnit::Count,
-                u64::try_from(execution.traversal_steps).unwrap_or(u64::MAX),
-            ),
-            PolicyWorkMetric::try_new(
-                "taint.semantic_source_bytes",
-                PolicyWorkUnit::Bytes,
-                u64::try_from(semantic.source_bytes).unwrap_or(u64::MAX),
-            ),
-            PolicyWorkMetric::try_new(
-                "taint.semantic_program_points",
-                PolicyWorkUnit::Rows,
-                u64::try_from(semantic.program_points).unwrap_or(u64::MAX),
-            ),
-        ]
-        .into_iter()
-        .filter_map(Result::ok)
-        .collect();
-        PolicyWorkReport::try_new(
-            self.query_work.scanned_files,
-            self.query_work.scanned_source_bytes,
-            self.query_work.fact_nodes,
-            self.query_work.pipeline_rows,
-            self.query_work.examined_references,
-            0,
-            0,
-            0,
-            metrics,
-        )
-        .unwrap_or_default()
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1164,7 +860,7 @@ fn solve_and_project_batch(
     batch: &TaintBatch,
     metadata: &HashMap<String, PreparedTaintPlan>,
     policies: &[&LoadedPolicy],
-    payloads: &mut HashMap<PolicyId, PreparedPayload>,
+    payloads: &mut HashMap<PolicyId, TaintProjectionPayload>,
     workspace: &WorkspaceAnalyzer,
     cancellation: &CancellationToken,
     budget: &PolicyBudget,
@@ -1453,7 +1149,7 @@ fn project_policy_findings(
         groups.sort_by(|left, right| left.source.identity.cmp(&right.source.identity));
 
         let sink_locator = finding.key().sink().site();
-        let sink_key = super::typestate_policy::semantic_site_key(workspace, sink_locator);
+        let sink_key = super::semantic_identity::semantic_site_key(workspace, sink_locator);
         let sink_identity = StableSemanticIdentity::canonical_ast_identity(
             sink_locator.language().config_label(),
             sink_locator.path().clone(),
@@ -1462,7 +1158,7 @@ fn project_policy_findings(
         .map_err(|error| error.to_string())?;
         let sink_ref =
             AnalysisEventRef::try_new("bifrost", &sink_key).map_err(|error| error.to_string())?;
-        let primary = super::typestate_policy::policy_location(workspace, sink_locator)?;
+        let primary = super::semantic_identity::policy_location(workspace, sink_locator)?;
         let mut source_facts = Vec::new();
         let mut pairs = Vec::new();
         for group in &groups {
@@ -1495,7 +1191,7 @@ fn project_policy_findings(
                 scenario_hash,
             )
             .map_err(|error| error.to_string())?;
-            let pair_key = super::typestate_policy::stable_hex(
+            let pair_key = super::semantic_identity::stable_hex(
                 format!(
                     "{sink_key}:{:?}:{:?}",
                     group.source.analysis_projection_hash, sink.analysis_projection_hash
@@ -1614,7 +1310,7 @@ fn source_scenario(
     workspace: &WorkspaceAnalyzer,
     origin: &TaintOriginFindingEvidence,
 ) -> Result<SourceScenarioId, String> {
-    let key = super::typestate_policy::semantic_site_key(
+    let key = super::semantic_identity::semantic_site_key(
         workspace,
         origin.origin().value_flow_key().site(),
     );
@@ -1626,7 +1322,7 @@ fn taint_evidence_ref(
     label: &TaintLabel,
     scenarios: &[SourceScenarioId],
 ) -> Result<EvidenceRef, String> {
-    let key = super::typestate_policy::stable_hex(
+    let key = super::semantic_identity::stable_hex(
         format!("{endpoint:?}:{label:?}:{scenarios:?}").as_bytes(),
     );
     EvidenceRef::try_new("bifrost", key).map_err(|error| error.to_string())
@@ -1651,7 +1347,7 @@ fn project_taint_origins(
                 source_endpoint: group.source.identity.clone(),
                 source_label: label.clone(),
                 source_evidence: group.source.definition.evidence.clone(),
-                primary: super::typestate_policy::policy_location(
+                primary: super::semantic_identity::policy_location(
                     workspace,
                     origin.origin().value_flow_key().site(),
                 )?,
@@ -1734,7 +1430,7 @@ fn project_taint_report(
     let mut related = Vec::new();
     let mut omitted_related = 0_u64;
     for origin in &group.origins {
-        let location = super::typestate_policy::policy_location(
+        let location = super::semantic_identity::policy_location(
             workspace,
             origin.origin().value_flow_key().site(),
         )?;
@@ -1796,11 +1492,16 @@ fn project_taint_witnesses(
     let mut witness_refs = Vec::new();
     for (index, witness) in retained.into_iter().take(retained_limit).enumerate() {
         let id_key =
-            super::typestate_policy::stable_hex(format!("{finding_key}:{index}").as_bytes());
+            super::semantic_identity::stable_hex(format!("{finding_key}:{index}").as_bytes());
         let id = WitnessId::try_new("bifrost", id_key).map_err(|error| error.to_string())?;
-        let mut steps = Vec::new();
-        for step in witness.steps().iter().take(budget.max_witness_steps()) {
-            let (kind, label) = match step.kind() {
+        let projected = super::witness_projection::project_summary_witness(
+            workspace,
+            witness,
+            id.clone(),
+            budget.max_witness_steps(),
+            budget.max_witness_bytes(),
+            true,
+            |kind| match kind {
                 SummaryWitnessStepKind::Seed => (WitnessStepKind::Source, "taint source"),
                 SummaryWitnessStepKind::Edge(_) => {
                     (WitnessStepKind::Propagation, "taint propagation")
@@ -1808,57 +1509,19 @@ fn project_taint_witnesses(
                 SummaryWitnessStepKind::EndSummaryGap(_) => {
                     (WitnessStepKind::Return, "taint summary boundary")
                 }
-            };
-            steps.push(
-                WitnessStep::try_new(
-                    kind,
-                    Some(super::typestate_policy::policy_location(
-                        workspace,
-                        super::typestate_policy::program_point_locator(step.source()),
-                    )?),
-                    label,
-                    Vec::new(),
-                )
-                .map_err(|error| error.to_string())?,
-            );
-            let candidate = BoundedWitness::try_new(id.clone(), steps.clone(), true, 1)
-                .map_err(|error| error.to_string())?;
-            if usize::try_from(candidate.retained_bytes()).unwrap_or(usize::MAX)
-                > budget.max_witness_bytes()
-            {
-                steps.pop();
-                break;
-            }
-        }
-        if steps.is_empty() {
+            },
+        )?;
+        let Some(projected) = projected else {
             omitted = omitted.saturating_add(1);
             continue;
-        }
-        let mut omitted_steps = witness
-            .omitted_steps_lower_bound()
-            .saturating_add(witness.steps().len().saturating_sub(steps.len()));
-        if (witness.truncated()
-            || witness.alternatives_truncated()
-            || witness.retention_truncated())
-            && omitted_steps == 0
-        {
-            omitted_steps = 1;
-        }
-        witnesses.push(
-            BoundedWitness::try_new(
-                id.clone(),
-                steps,
-                omitted_steps > 0,
-                u64::try_from(omitted_steps).unwrap_or(u64::MAX),
-            )
-            .map_err(|error| error.to_string())?,
-        );
+        };
+        witnesses.push(projected);
         witness_refs.push(id);
     }
     Ok((witnesses, witness_refs, omitted))
 }
 
-fn prepared_failure_payload(message: &str, work: PolicyWorkReport) -> PreparedPayload {
+fn prepared_failure_payload(message: &str, work: PolicyWorkReport) -> TaintProjectionPayload {
     let completion = PolicyRunCompletion::failed(vec![PolicyFailureReason::InternalInvariant])
         .expect("one failure reason is canonical");
     let diagnostic = PolicyDiagnostic::try_new(
@@ -1870,7 +1533,7 @@ fn prepared_failure_payload(message: &str, work: PolicyWorkReport) -> PreparedPa
         Vec::new(),
     )
     .ok();
-    PreparedPayload {
+    TaintProjectionPayload {
         projections: Vec::new(),
         completion,
         diagnostics: diagnostic.into_iter().collect(),
@@ -1879,7 +1542,7 @@ fn prepared_failure_payload(message: &str, work: PolicyWorkReport) -> PreparedPa
     }
 }
 
-fn prepared_compile_failure_payload(failure: TaintPolicyCompileFailure) -> PreparedPayload {
+fn prepared_compile_failure_payload(failure: TaintPolicyCompileFailure) -> TaintProjectionPayload {
     let TaintPolicyCompileFailure { error, work } = failure;
     let message = error.to_string();
     let incomplete = match &error {
@@ -1920,7 +1583,7 @@ fn prepared_compile_failure_payload(failure: TaintPolicyCompileFailure) -> Prepa
         Vec::new(),
     )
     .ok();
-    PreparedPayload {
+    TaintProjectionPayload {
         projections: Vec::new(),
         completion,
         diagnostics: diagnostic.into_iter().collect(),
@@ -2217,13 +1880,13 @@ fn bind_taint_sinks(
 fn value_flow_sources(
     plan: &TaintPolicyPlan,
     endpoints: &[BoundEndpoint],
-) -> Result<Vec<CompiledTaintSource>, TaintPolicyCompileError> {
+) -> Result<Vec<CompiledTaintEndpoint>, TaintPolicyCompileError> {
     plan.analysis()
         .value_flow()
         .sources()
         .zip(endpoints)
         .map(|((_id, spec), endpoint)| {
-            Ok(CompiledTaintSource {
+            Ok(CompiledTaintEndpoint {
                 endpoint: endpoint.endpoint.clone(),
                 event: spec.key().clone(),
                 labels: endpoint.labels.clone(),
@@ -2235,15 +1898,16 @@ fn value_flow_sources(
 fn value_flow_sinks(
     plan: &TaintPolicyPlan,
     endpoints: &[BoundEndpoint],
-) -> Result<Vec<CompiledTaintSink>, TaintPolicyCompileError> {
+) -> Result<Vec<CompiledTaintEndpoint>, TaintPolicyCompileError> {
     plan.analysis()
         .value_flow()
         .sinks()
         .zip(endpoints)
         .map(|((_id, spec), endpoint)| {
-            Ok(CompiledTaintSink {
+            Ok(CompiledTaintEndpoint {
                 endpoint: endpoint.endpoint.clone(),
                 event: spec.key().clone(),
+                labels: endpoint.labels.clone(),
             })
         })
         .collect()
@@ -2277,5 +1941,21 @@ fn query_budget_error(
     TaintPolicyCompileError::QueryIncomplete {
         completion: CodeQueryCompletion::Incomplete { codes: vec![code] },
         detail: detail.into(),
+    }
+}
+
+fn taint_selector_error(
+    error: super::selector_compiler::PolicySelectorSessionError,
+) -> TaintPolicyCompileError {
+    match error {
+        super::selector_compiler::PolicySelectorSessionError::Incomplete { completion, detail } => {
+            TaintPolicyCompileError::QueryIncomplete { completion, detail }
+        }
+        super::selector_compiler::PolicySelectorSessionError::Unavailable(detail) => {
+            TaintPolicyCompileError::SemanticUnavailable(detail)
+        }
+        super::selector_compiler::PolicySelectorSessionError::Provider(detail) => {
+            TaintPolicyCompileError::SemanticProvider(detail)
+        }
     }
 }

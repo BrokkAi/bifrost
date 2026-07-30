@@ -71,18 +71,78 @@ jobs:
           test -f "$archive"
           echo "checksum=$(sha256sum "$archive" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
 
+      - name: Check whether exact crate version is already published
+        id: existing
+        shell: bash
+        env:
+          EXPECTED_CHECKSUM: ${{ steps.package.outputs.checksum }}
+        run: |
+          set -euo pipefail
+          endpoint="https://crates.io/api/v1/crates/${CRATE_PACKAGE}/${RELEASE_VERSION}"
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+          status="$(curl --silent --show-error --location --output "$response_file" --write-out '%{http_code}' --user-agent 'cargo/1.85.0' "$endpoint")"
+
+          case "$status" in
+            200)
+              actual_checksum="$(jq -r '.version.checksum // empty' "$response_file")"
+              test -n "$actual_checksum"
+              if [[ "$actual_checksum" != "$EXPECTED_CHECKSUM" ]]; then
+                echo "Registry checksum mismatch for existing ${CRATE_PACKAGE} ${RELEASE_VERSION}: expected ${EXPECTED_CHECKSUM}, got ${actual_checksum}" >&2
+                exit 1
+              fi
+              echo "${CRATE_PACKAGE} ${RELEASE_VERSION} is already published with the expected checksum"
+              echo "already-published=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "${CRATE_PACKAGE} ${RELEASE_VERSION} is not yet published"
+              echo "already-published=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Unexpected crates.io response ${status} while checking ${CRATE_PACKAGE} ${RELEASE_VERSION}" >&2
+              cat "$response_file" >&2
+              exit 1
+              ;;
+          esac
+
       - name: Authenticate to crates.io (trusted publishing)
         id: auth
+        if: steps.existing.outputs.already-published != 'true'
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
 
       - name: Publish
+        if: steps.existing.outputs.already-published != 'true'
         run: cargo publish --locked --package "$CRATE_PACKAGE"
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Verify exact registry version and checksum
-        run: >
-          bash scripts/wait-for-crate-version.sh
-          "$CRATE_PACKAGE"
-          "$RELEASE_VERSION"
-          "${{ steps.package.outputs.checksum }}"
+        shell: bash
+        env:
+          EXPECTED_CHECKSUM: ${{ steps.package.outputs.checksum }}
+        run: |
+          set -euo pipefail
+          endpoint="https://crates.io/api/v1/crates/${CRATE_PACKAGE}/${RELEASE_VERSION}"
+          max_attempts=30
+
+          for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+            response="$(curl --fail --silent --show-error --user-agent 'cargo/1.85.0' "$endpoint" 2>/dev/null || true)"
+            checksum="$(jq -r '.version.checksum // empty' <<<"$response")"
+            if [[ -n "$checksum" ]]; then
+              if [[ "$checksum" != "$EXPECTED_CHECKSUM" ]]; then
+                echo "Registry checksum mismatch for ${CRATE_PACKAGE} ${RELEASE_VERSION}: expected ${EXPECTED_CHECKSUM}, got ${checksum}" >&2
+                exit 1
+              fi
+              echo "Registry exposes ${CRATE_PACKAGE} ${RELEASE_VERSION} with checksum ${checksum}"
+              exit 0
+            fi
+
+            if (( attempt < max_attempts )); then
+              delay=$((attempt < 5 ? attempt * 2 : 10))
+              echo "Waiting ${delay}s for crates.io to expose ${CRATE_PACKAGE} ${RELEASE_VERSION} (attempt ${attempt}/${max_attempts})"
+              sleep "$delay"
+            fi
+          done
+
+          echo "crates.io did not expose ${CRATE_PACKAGE} ${RELEASE_VERSION} within the bounded retry window" >&2
+          exit 1
