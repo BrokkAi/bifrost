@@ -18,9 +18,9 @@ use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
 use crate::analyzer::{DispatchExtensibility, Language, ProjectFile, Range, RustAnalyzer};
-use crate::hash::HashMap;
+use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v3";
+const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v4";
 
 impl_program_semantics_provider!(RustAnalyzer, RustSemanticLowerer);
 
@@ -131,7 +131,6 @@ struct ProcedureSpec<'tree> {
     lexical_parent: Option<ProcedureId>,
     kind: ProcedureKind,
     properties: ProcedureProperties,
-    has_parameter_bindings: bool,
     callable: Node<'tree>,
 }
 
@@ -191,7 +190,6 @@ fn enumerate_procedures<'tree>(
                 lexical_parent: frame.lexical_parent,
                 kind,
                 properties,
-                has_parameter_bindings: callable_has_parameter_bindings(frame.node),
                 callable: frame.node,
             });
             callable_body_scope = Some((body.id(), identity.id, identity.declaration_path));
@@ -381,12 +379,6 @@ fn function_has_self_parameter(node: Node<'_>) -> bool {
         })
 }
 
-fn callable_has_parameter_bindings(node: Node<'_>) -> bool {
-    node.child_by_field_name("parameters")
-        .map(named_children)
-        .is_some_and(|parameters| !parameters.is_empty())
-}
-
 fn field_matches(parent: Node<'_>, field: &str, child: Node<'_>) -> bool {
     parent
         .child_by_field_name(field)
@@ -426,6 +418,8 @@ struct LoweringContext<'tree, 'targets> {
     expression_values: HashMap<usize, ValueId>,
     parameters: HashMap<Box<str>, ValueId>,
     locals: HashMap<Box<str>, Vec<LocalBinding>>,
+    definitely_non_dropping: HashSet<ValueId>,
+    parameter_cleanup_required: bool,
     receiver: Option<ValueId>,
     next_cleanup_region: usize,
 }
@@ -462,7 +456,20 @@ fn lower_procedure<'tree>(
         exceptional_exit,
         function_scope,
     } = ProcedureLoweringSession::start(parts, budget, cancellation)?;
-    let body_scope = if spec.has_parameter_bindings {
+    let mut context = LoweringContext {
+        source: prepared.source(),
+        session,
+        expression_values: HashMap::default(),
+        parameters: HashMap::default(),
+        locals: HashMap::default(),
+        definitely_non_dropping: HashSet::default(),
+        parameter_cleanup_required: rust_parameters_may_require_drop(spec.callable),
+        receiver: None,
+        next_cleanup_region: 0,
+    };
+    context.emit_procedure_inputs(&mut builder, spec.callable)?;
+    let body_scope = if context.parameter_cleanup_required {
+        context.next_cleanup_region = 1;
         builder.push_scope(
             Some(function_scope),
             ScopeBinding::Cleanup {
@@ -472,19 +479,9 @@ fn lower_procedure<'tree>(
     } else {
         function_scope
     };
-    let mut context = LoweringContext {
-        source: prepared.source(),
-        session,
-        expression_values: HashMap::default(),
-        parameters: HashMap::default(),
-        locals: HashMap::default(),
-        receiver: None,
-        next_cleanup_region: usize::from(spec.has_parameter_bindings),
-    };
-    context.emit_procedure_inputs(&mut builder, spec.callable)?;
     context.emit_local_bindings(&mut builder, spec.body)?;
 
-    if spec.has_parameter_bindings {
+    if context.parameter_cleanup_required {
         context.add_drop_omission_gaps(
             &mut builder,
             normal_exit,
@@ -647,6 +644,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .ok_or_else(|| RustLoweringError::Invalid("too many parameters".into()))?;
                 value
             };
+            if rust_parameter_is_definitely_non_dropping(node) {
+                self.definitely_non_dropping.insert(value);
+            }
             for name in slot.names {
                 self.parameters.insert(name.into_boxed_str(), value);
             }
@@ -693,6 +693,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         scope_end,
                         value,
                     });
+                if node
+                    .child_by_field_name("value")
+                    .is_some_and(|initializer| {
+                        self.expression_is_definitely_non_dropping(initializer)
+                    })
+                {
+                    self.definitely_non_dropping.insert(value);
+                }
             }
             Ok(WalkControl::Continue)
         })
@@ -722,6 +730,35 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .iter()
             .find(|binding| binding.declaration_start == declaration_start)
             .map(|binding| binding.value)
+    }
+
+    fn expression_is_definitely_non_dropping(&self, node: Node<'_>) -> bool {
+        if matches!(expression_value_kind(node), SemanticValueKind::Constant) {
+            return true;
+        }
+        let Some(name) = (node.kind() == "identifier")
+            .then(|| node_text(self.source, node))
+            .flatten()
+        else {
+            return false;
+        };
+        self.local_at(name, node.start_byte())
+            .or_else(|| self.parameters.get(name).copied())
+            .is_some_and(|value| self.definitely_non_dropping.contains(&value))
+    }
+
+    fn let_declaration_may_require_drop(&self, node: Node<'_>) -> bool {
+        let Some(pattern) = node.child_by_field_name("pattern") else {
+            return true;
+        };
+        let Some(name) = identity_binding_identifier(pattern) else {
+            return true;
+        };
+        let Some(name_text) = node_text(self.source, name) else {
+            return true;
+        };
+        self.local_declaration_value(name_text, name.start_byte())
+            .is_none_or(|value| !self.definitely_non_dropping.contains(&value))
     }
 
     fn expression_value(
@@ -1024,10 +1061,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RustLoweringError> {
-        let has_lexical_locals = named_children(node)
+        let has_drop_obligations = named_children(node)
             .into_iter()
-            .any(|child| child.kind() == "let_declaration");
-        let scope_exit = has_lexical_locals
+            .filter(|child| child.kind() == "let_declaration")
+            .any(|child| self.let_declaration_may_require_drop(child));
+        let scope_exit = has_drop_obligations
             .then(|| self.point(builder, node, Vec::new()))
             .transpose()?;
         let effective_next = scope_exit.map(EdgeTarget::normal).unwrap_or(next);
@@ -1054,7 +1092,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             scope
         };
-        let block_scope = if has_lexical_locals {
+        let block_scope = if has_drop_obligations {
             self.push_cleanup_scope(builder, labeled_scope)?
         } else {
             labeled_scope
@@ -2908,6 +2946,23 @@ fn rust_expression_has_direct_value_evidence(node: Node<'_>) -> bool {
             | "parenthesized_expression"
             | "reference_expression"
     ) || is_runtime_leaf(node.kind())
+}
+
+fn rust_parameter_is_definitely_non_dropping(node: Node<'_>) -> bool {
+    node.child_by_field_name("type")
+        .is_some_and(|ty| ty.kind() == "reference_type")
+        || node.kind() == "reference_type"
+}
+
+fn rust_parameters_may_require_drop(callable: Node<'_>) -> bool {
+    callable
+        .child_by_field_name("parameters")
+        .map(named_children)
+        .is_some_and(|parameters| {
+            parameters
+                .into_iter()
+                .any(|parameter| !rust_parameter_is_definitely_non_dropping(parameter))
+        })
 }
 
 fn runtime_expression_children(node: Node<'_>) -> Vec<Node<'_>> {
