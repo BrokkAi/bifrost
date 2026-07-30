@@ -30,12 +30,13 @@ const MAX_PENDING_MCP_RESPONSES: usize = 4;
 const MCP_ANALYZER_REQUEST_BUDGET: Duration = Duration::from_secs(5);
 #[doc(hidden)]
 pub const BENCHMARK_MCP_REQUEST_BUDGET_SECS: u64 = 60;
-const AGENTS_GUIDANCE_URI: &str = "bifrost://agent-guidance/agents.md";
-const AGENTS_GUIDANCE_MIME_TYPE: &str = "text/markdown";
+pub(crate) const AGENTS_GUIDANCE_URI: &str = "bifrost://agent-guidance/agents.md";
+pub(crate) const AGENTS_GUIDANCE_MIME_TYPE: &str = "text/markdown";
 const ROOTS_REQUEST_ID_PREFIX: &str = "bifrost-roots-";
 const CODEX_MCP_CLIENT_NAME: &str = "codex-mcp-client";
 const CODEX_SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
-const AGENTS_GUIDANCE_TEXT: &str = include_str!("../resources/agent-guidance/bifrost-agents.md");
+pub(crate) const AGENTS_GUIDANCE_TEXT: &str =
+    include_str!("../resources/agent-guidance/bifrost-agents.md");
 
 #[doc(hidden)]
 pub const BENCHMARK_PROFILE_BOUNDARY_METHOD: &str = "bifrost/benchmark-profile-boundary";
@@ -362,12 +363,41 @@ pub fn run_stdio_server(
     run_stdio_server_with_build_identity(root, render_options, spec, env!("CARGO_PKG_VERSION"))
 }
 
+/// Selects the `rmcp`-backed MCP host over the hand-written stack below.
+///
+/// Temporary migration switch for issue #1328. It exists so the same wire
+/// contract suite can be run against either implementation while the new host
+/// is built up milestone by milestone, and so a misbehaving new path can be
+/// turned off at runtime. It is deleted once the hand-written stack is.
+#[doc(hidden)]
+pub const MCP_RMCP_HOST_ENV: &str = "BIFROST_MCP_RMCP";
+
+fn rmcp_host_enabled(value: Option<&OsStr>) -> Result<bool, String> {
+    match value {
+        None => Ok(false),
+        Some(value) if value == "on" => Ok(true),
+        Some(value) if value == "off" => Ok(false),
+        Some(value) => Err(format!(
+            "{MCP_RMCP_HOST_ENV} must be `on` or `off`, not `{}`",
+            value.to_string_lossy()
+        )),
+    }
+}
+
 pub fn run_stdio_server_with_build_identity(
     root: Option<PathBuf>,
     render_options: McpRenderOptions,
     spec: &McpServerSpec,
     build_identity: &str,
 ) -> Result<(), String> {
+    if rmcp_host_enabled(std::env::var_os(MCP_RMCP_HOST_ENV).as_deref())? {
+        return crate::rmcp_host::run_stdio_server_with_build_identity(
+            root,
+            render_options,
+            spec,
+            build_identity,
+        );
+    }
     // Explicit roots build in the background. Rootless servers answer initialize
     // without touching process cwd and bind only from a client-provided workspace.
     let accepts_client_roots = root.is_none();
@@ -561,7 +591,7 @@ pub fn run_stdio_server_with_build_identity(
     Ok(())
 }
 
-fn file_watching_enabled(value: Option<&OsStr>) -> Result<bool, String> {
+pub(crate) fn file_watching_enabled(value: Option<&OsStr>) -> Result<bool, String> {
     match value {
         None => Ok(true),
         Some(value) if value == "on" => Ok(true),

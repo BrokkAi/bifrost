@@ -26,8 +26,18 @@ jaq-json = "2.0"
 jaq-std = "3.0"
 notify = "6.1.1"
 quick-xml = "0.40"
+# The official MCP Rust SDK owns protocol parsing, dispatch, revision
+# negotiation, wire types, stdio framing, and cancellation plumbing. Default
+# features are off deliberately: `macros`/`schemars` exist to generate tool
+# schemas from Rust types, and Bifrost's tool schemas are hand-written JSON
+# built by mcp_registry, so pulling them in would add build weight for nothing.
+rmcp = { version = "3.0.1", default-features = false, features = ["server", "transport-io"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "io-std", "sync", "time", "macros"] }
+# `RequestContext::ct` is a tokio_util CancellationToken and rmcp does not
+# re-export the type, so awaiting MCP cancellation needs the crate directly.
+tokio-util = { version = "0.7", default-features = false }
 url = { version = "2.5.8", default-features = false, features = ["std"] }
 xee-xpath = "0.1.5"
 xot = "0.31"

@@ -10,6 +10,7 @@ pub use brokk_bifrost_analysis::{
 };
 pub use brokk_bifrost_runtime::{CodeIntelligenceRuntime, code_intelligence};
 
+pub mod analyzer_pool;
 pub mod mcp_cli;
 pub mod mcp_common;
 pub mod mcp_core;
@@ -19,6 +20,7 @@ pub mod mcp_registry;
 pub mod mcp_slopcop;
 pub mod mcp_text;
 mod project_watcher;
+pub mod rmcp_host;
 pub mod scoped_project;
 pub mod searchtools_service;
 pub mod structured_data;
