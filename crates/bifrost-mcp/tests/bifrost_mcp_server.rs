@@ -3511,8 +3511,18 @@ fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std:
         .expect("spawn bifrost")
 }
 
+/// Spawn a rootless server on the rmcp host.
+///
+/// Rootless behavior is where the two MCP hosts genuinely differ during the
+/// issue #1328 migration: the rmcp host refuses any pre-`initialize` request
+/// outright, and it asks a Roots-capable client for its workspace from the
+/// tool call that needs one rather than from a lifecycle notification. The
+/// assertions below describe that contract, so they pin the host explicitly
+/// instead of depending on which one happens to be the default. Delete this
+/// `env` line together with the switch when the hand-written host goes.
 fn spawn_rootless_server(cwd: &std::path::Path, mode: &str) -> std::process::Child {
     Command::new(mcp_server_binary())
+        .env("BIFROST_MCP_RMCP", "on")
         .env("BIFROST_SEMANTIC_INDEX", "off")
         .arg("--force-semantic-cpu")
         .arg("--mcp")
