@@ -115,6 +115,7 @@ pub use i_analyzer::{
 pub use java::JavaAnalyzer;
 pub use javascript::JavascriptAnalyzer;
 pub(crate) use js_ts::{AliasResolver, resolve_js_ts_module_specifier};
+pub use jvm::java_artifact::JavaJarPackProducer;
 pub use kotlin::KotlinAnalyzer;
 pub use model::SemanticDiagnostic;
 pub use model::{

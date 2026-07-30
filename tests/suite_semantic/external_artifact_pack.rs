@@ -3,7 +3,12 @@ use brokk_bifrost::analyzer::semantic_model::{
     Compatibility, CompilerOptions, Completeness, ExternalArtifactKind,
     ExternalArtifactPackProducer, NameSelector, Provenance, Safety, compile_pack,
 };
-use brokk_bifrost::analyzer::{CSharpAssemblyPackProducer, Language, Project, TestProject};
+use brokk_bifrost::analyzer::{
+    CSharpAssemblyPackProducer, JavaJarPackProducer, Language, Project, TestProject,
+};
+use std::io::Write;
+use std::process::Command;
+use zip::write::SimpleFileOptions;
 
 const DLL: &[u8] = include_bytes!("../fixtures/csharp-external/ExternalLibrary.dll");
 
@@ -79,5 +84,125 @@ fn csharp_repeated_production_is_byte_identical_and_external() {
         files_before
             .iter()
             .all(|file| file.abs_path() != temp.path().join("ExternalLibrary.dll"))
+    );
+}
+
+#[test]
+fn java_source_and_class_share_declaration_ids() {
+    if !jdk_tool_available("javac") || !jdk_tool_available("jar") {
+        eprintln!("skipping Java pack integration: javac and jar are required");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let source_root = temp.path().join("src/fixture");
+    let classes = temp.path().join("classes");
+    std::fs::create_dir_all(&source_root).unwrap();
+    std::fs::create_dir(&classes).unwrap();
+    let source = "package fixture; public class Api<T> { public Api() {} public <U> U map(U value) { return value; } }\n";
+    let source_file = source_root.join("Api.java");
+    std::fs::write(&source_file, source).unwrap();
+    let source_jar = temp.path().join("fixture-sources.jar");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&source_jar).unwrap());
+    zip.start_file("fixture/Api.java", SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(source.as_bytes()).unwrap();
+    zip.finish().unwrap();
+    run_jdk(
+        Command::new("javac")
+            .arg("-parameters")
+            .arg("-d")
+            .arg(&classes)
+            .arg(&source_file),
+    );
+    let class_jar = temp.path().join("fixture.jar");
+    run_jdk(
+        Command::new("jar")
+            .current_dir(&classes)
+            .arg("cf")
+            .arg(&class_jar)
+            .arg("."),
+    );
+
+    let source_production = JavaJarPackProducer.produce_exact_artifact(
+        &java_request(source_jar, ExternalArtifactKind::JavaSourceJar),
+        &ArtifactProducerLimits::default(),
+    );
+    let class_production = JavaJarPackProducer.produce_exact_artifact(
+        &java_request(class_jar, ExternalArtifactKind::JavaClassJar),
+        &ArtifactProducerLimits::default(),
+    );
+    assert!(
+        source_production.diagnostics.is_empty(),
+        "{:?}",
+        source_production.diagnostics
+    );
+    assert!(
+        class_production.diagnostics.is_empty(),
+        "{:?}",
+        class_production.diagnostics
+    );
+    let source_pack = source_production.pack.as_ref().unwrap();
+    let class_pack = class_production.pack.as_ref().unwrap();
+    let AuthoredPayload::DeclarationFacts {
+        types: source_types,
+        members: source_members,
+        ..
+    } = &source_pack.shards[0].payload
+    else {
+        panic!("source producer must emit declarations");
+    };
+    let AuthoredPayload::DeclarationFacts {
+        types: class_types,
+        members: class_members,
+        ..
+    } = &class_pack.shards[0].payload
+    else {
+        panic!("class producer must emit declarations");
+    };
+    let source_type = source_types
+        .iter()
+        .find(|fact| fact.name == "fixture.Api")
+        .unwrap();
+    let class_type = class_types
+        .iter()
+        .find(|fact| fact.name == "fixture.Api")
+        .unwrap();
+    assert_eq!(source_type.id, class_type.id);
+    let source_method = source_members
+        .iter()
+        .find(|fact| fact.owner == source_type.id && fact.name == "map")
+        .unwrap();
+    let class_method = class_members
+        .iter()
+        .find(|fact| fact.owner == class_type.id && fact.name == "map")
+        .unwrap();
+    assert_eq!(source_method.id, class_method.id);
+}
+
+fn java_request(
+    path: std::path::PathBuf,
+    artifact_kind: ExternalArtifactKind,
+) -> ArtifactProductionRequest {
+    let mut request = request(path);
+    request.artifact_kind = artifact_kind;
+    request.pack_id = "fixture.java-api".to_owned();
+    request.ecosystem = "maven".to_owned();
+    request.activation[0].package.as_mut().unwrap().name = "fixture:java-api".to_owned();
+    request
+}
+
+fn jdk_tool_available(tool: &str) -> bool {
+    Command::new(tool)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn run_jdk(command: &mut Command) {
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "JDK command failed: {command:?}\n{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

@@ -17,7 +17,7 @@ This issue does not install packs, download artifacts, solve classpaths, decompi
 - [x] (2026-07-30 13:02Z) Chose the producer result, identity, origin, diagnostic, compatibility-adapter, and milestone boundaries recorded below.
 - [x] (2026-07-30 13:26Z) Implemented and validated the shared exact-artifact producer contract, bounded diagnostics, stable identity helpers, optional binary parameter names, and regenerated schema.
 - [x] (2026-07-30 13:46Z) Implemented the exact C# assembly producer, structured CLI type decoding, bounded partial diagnostics, and a fact-backed compatibility projection for the existing resolver index.
-- [ ] Implement the Java source/class JAR producer and project its facts into the existing JVM resolver index without regressing Scala or Kotlin source-JAR behavior.
+- [x] (2026-07-30 14:15Z) Implemented Java source/class JAR production, cross-origin stable IDs, bounded JVM signature decoding, and JVM-index projection without regressing Scala or Kotlin source-JAR behavior.
 - [ ] Complete cross-producer integration tests, documentation, specialist review, policy validation, and the final focused Rust validation matrix.
 
 ## Surprises & Discoveries
@@ -40,6 +40,12 @@ This issue does not install packs, download artifacts, solve classpaths, decompi
   Evidence: the produced `Client<T>` and `Convert<U>` facts contain `T` and `U` as structured type parameters while the `Convert` parameter is intentionally emitted with `name: None`.
 - Observation: `TestProject::all_files()` correctly includes arbitrary files under its root, including a DLL; the external-artifact invariant therefore requires dependency artifacts to remain outside the workspace root rather than expecting file enumeration to filter extensions.
   Evidence: the first integration-test arrangement put the fixture DLL beside `Probe.cs` and correctly observed it in `all_files()`; moving the exact dependency artifact outside the project root proved producer use does not add it to the workspace set.
+- Observation: tree-sitter Java exposes `type_parameters` as a named child rather than a consistently addressable field on every declaration shape.
+  Evidence: the first source/class fixture run emitted the source `Surface` without `T`; selecting the structural `type_parameters` child and its first identifier restored matching source and binary generic metadata.
+- Observation: a public nested class file under a private owner cannot be filtered correctly one class entry at a time.
+  Evidence: `Surface$Hidden$Leaks.class` carries public flags of its own. Retaining private owners until a bounded post-pass applies enclosing visibility prevents that nested declaration from leaking into the produced pack.
+- Observation: package-private Java types remain part of the legacy same-package resolver contract even though the reusable API pack deliberately emits only public and protected facts.
+  Evidence: the existing JVM tests require `PackageHelper` and package-nested lookup from the same package. The compatibility index overlays produced public/protected facts while retaining its package-private type entries; package access is not exported as reusable pack API.
 
 ## Decision Log
 
@@ -79,6 +85,8 @@ This issue does not install packs, download artifacts, solve classpaths, decompi
 Milestone one is complete. The public semantic-model surface now includes an exact-artifact request/result contract, bounded diagnostic collector, byte-limited reader with exact SHA-256, and domain-separated type/member identity helpers. Binary parameters may omit names without inventing data, and the generated schema records that contract. Twenty focused semantic-pack tests, eleven semantic-model unit tests, formatting, and strict featureless library Clippy passed. The next milestone is the C# assembly producer and compatibility projection.
 
 Milestone two is complete. `CSharpAssemblyPackProducer` now reads one exact PE/CLI assembly, records its digest in activation, emits externally visible type and member facts with structured signatures, generic parameters, hierarchy, modifiers, effective nested visibility, and metadata-token locators, and reports malformed or record-limited production as bounded partial data. `CSharpExternalDeclarationIndex` consumes the produced facts through a compatibility projection and retains production diagnostics. Ten focused C# tests, the new semantic-suite producer test, formatting, and strict featureless library Clippy passed. The next milestone is the Java source/class JAR producer and JVM compatibility projection.
+
+Milestone three is complete. `JavaJarPackProducer` reads one exact source or class JAR under entry, per-entry byte, total-byte, record, diagnostic, and signature-depth limits. Source declarations are extracted structurally from tree-sitter; class descriptors and Signature attributes use a bounded grammar cursor. Both forms emit types, nested effective visibility, members, generic parameters, structured signatures, hierarchy, modifiers, locators, and stable IDs. The existing JVM index invokes the producer for Java artifacts and overlays its type facts while preserving the Scala/Kotlin source-JAR path and package-private Java lookup contract. Thirty-two JVM-focused tests, four producer-specific tests, the Java semantic integration test, formatting, featureless checks, and strict featureless library Clippy passed. The remaining milestone is documentation, broader integration and package validation, specialist review, and repository policy execution.
 
 ## Context and Orientation
 
