@@ -71,7 +71,7 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "report_comment_density_for_code_unit",
-            "Java comment density for one symbol identified by fully qualified name. Reports header vs inline comment line counts, declaration span lines, and rolled-up totals for class-like units. Output format matches the brokk-core MCP byte-for-byte.",
+            "Comment density for one parsed-language symbol identified by fully qualified name. Reports header vs inline comment line counts, declaration span lines, and rolled-up totals for class-like units. Output format matches the brokk-core MCP byte-for-byte.",
             json!({
                 "type": "object",
                 "properties": {
@@ -135,7 +135,7 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "report_comment_density_for_files",
-            "Java comment density tables for the given source files: one section per file and one row per top-level declaration with own and rolled-up header / inline / span line counts. Non-Java files are skipped with a one-line placeholder. Output format matches the brokk-core MCP byte-for-byte.",
+            "Comment density tables for parsed source files: one section per file and one row per top-level declaration with own and rolled-up header / inline / span line counts. Unsupported files are skipped with a one-line placeholder. Output format matches the brokk-core MCP byte-for-byte.",
             json!({
                 "type": "object",
                 "properties": {

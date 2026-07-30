@@ -7,6 +7,7 @@ mod clone_detection;
 pub mod cognitive_complexity;
 #[cfg(test)]
 mod cognitive_complexity_tests;
+mod comment_density;
 pub mod common;
 mod complete_value_cache;
 mod config;

@@ -7563,6 +7563,9 @@ fn is_comment_like(trimmed_line: &str) -> bool {
         || trimmed_line.starts_with("*/")
         || trimmed_line.starts_with('*')
         || trimmed_line.starts_with("//")
+        || trimmed_line.strip_prefix('#').is_some_and(|rest| {
+            rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace)
+        })
         || trimmed_line.starts_with("#[")
 }
 
@@ -7570,6 +7573,7 @@ fn first_comment_offset(line: &str) -> Option<usize> {
     ["/**", "/*", "//", "#["]
         .into_iter()
         .filter_map(|marker| line.find(marker))
+        .chain(line.find("# "))
         .min()
 }
 
