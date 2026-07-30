@@ -28,11 +28,16 @@
 //!
 //! # Milestone status
 //!
-//! Type references are resolved. Callable and property references, the inverted
-//! whole-workspace edge builder, and cross-language JVM scanning are the
-//! remaining milestones of #1239; each abstains with a specific diagnostic rather
-//! than returning an empty success, so a caller can always tell "no references"
-//! from "not supported yet". See `.agents/plans/kotlin-usage-graph-1239.md`.
+//! The *query* path is complete: a reference to a Kotlin type, constructor,
+//! function, or property resolves, through inheritance, companions, objects,
+//! extensions, and receiver chains, with same-owner and unproven references in
+//! their own channels. What remains of #1239 is the *edge* path — the inverted
+//! whole-workspace builder behind `usage_graph`/`callers`/`callees` — and
+//! cross-language JVM scanning for the query path, so a Kotlin query still sees
+//! only `.kt` files and Kotlin source still contributes no edges. Neither gap
+//! reports a wrong answer: the edge builders return no Kotlin edges, which is
+//! the status quo the workspace graph already records. See
+//! `.agents/plans/kotlin-usage-graph-1239.md`.
 
 mod extractor;
 mod hits;
