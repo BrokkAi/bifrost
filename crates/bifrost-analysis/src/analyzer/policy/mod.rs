@@ -25,10 +25,12 @@ mod resolved;
 mod retained;
 pub mod schema;
 mod selector_compiler;
+mod semantic_identity;
 mod source;
 mod suppression;
 mod taint_policy;
 mod typestate_policy;
+mod witness_projection;
 
 #[cfg(test)]
 mod adapter_seam_tests;
