@@ -235,9 +235,7 @@ pub(super) fn resolve_js_ts(
             site.focus_start_byte,
         )
         .filter(|binding| matches!(binding.kind, ImportKind::Named | ImportKind::Default));
-        let receiver_candidates = if let Some(binding) = imported_receiver_binding
-            && matches!(binding.kind, ImportKind::Named | ImportKind::Default)
-        {
+        let receiver_candidates = if let Some(binding) = imported_receiver_binding {
             let exported_name = match binding.kind {
                 ImportKind::Named => binding.imported_name.as_deref().unwrap_or(qualifier),
                 ImportKind::Default => "default",
@@ -262,7 +260,7 @@ pub(super) fn resolve_js_ts(
             }
             same_file
         };
-        let member_candidates =
+        let generic_member_candidates =
             if language == Language::JavaScript && imported_receiver_binding.is_some() {
                 jsts_file_scoped_member_candidates(
                     analyzer,
@@ -276,8 +274,15 @@ pub(super) fn resolve_js_ts(
             } else {
                 jsts_member_candidates(analyzer, support, receiver_candidates, name, value_position)
             };
-        if !member_candidates.is_empty() {
-            return js_ts_candidates_outcome(analyzer, member_candidates);
+        let program_binding = lexical_bindings.is_program_binding_at(
+            qualifier,
+            site.focus_start_byte,
+            tree.root_node(),
+        );
+        if (imported_receiver_binding.is_some() || program_binding)
+            && !generic_member_candidates.is_empty()
+        {
+            return js_ts_candidates_outcome(analyzer, generic_member_candidates);
         }
         match jsts_receiver_provider_member_candidates(
             analyzer, support, file, language, source, tree, site, name, &batch,
@@ -370,6 +375,9 @@ pub(super) fn resolve_js_ts(
                 "no_indexed_definition",
                 format!("`{reference}` did not resolve to an indexed JS/TS definition"),
             );
+        }
+        if !generic_member_candidates.is_empty() {
+            return js_ts_candidates_outcome(analyzer, generic_member_candidates);
         }
         let exact_same_file = jsts_unproven_same_file_dotted_candidates(dotted_lookup);
         if !exact_same_file.is_empty() {

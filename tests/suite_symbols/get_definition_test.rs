@@ -8016,6 +8016,45 @@ fn rust_nonterminal_scoped_focus_does_not_retry_terminal_or_flat_names() {
 }
 
 #[test]
+fn rust_struct_pattern_field_name_stays_unresolved_instead_of_cross_owner_field() {
+    let source = r#"
+struct GodotTy {
+    ty: usize,
+}
+
+enum RustTy {
+    BuiltinIdent { ty: usize },
+}
+
+fn run(value: RustTy) {
+    let RustTy::BuiltinIdent { ty: ident } = value else {
+        return;
+    };
+    let _ = ident;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    let start = source
+        .find("BuiltinIdent { ty: ident }")
+        .expect("struct-pattern field")
+        + "BuiltinIdent { ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"].is_null(), "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "unresolved_struct_owner",
+        "{value}"
+    );
+}
+
+#[test]
 fn rust_scoped_path_focus_preserves_owner_and_terminal_roles() {
     let source = r#"
 mod primary;
@@ -8226,6 +8265,109 @@ fn run() {
     assert_eq!(
         terminal_result["definitions"][0]["fqn"], "PTR.read",
         "{terminal_value}"
+    );
+}
+
+#[test]
+fn rust_scoped_import_terminal_prefers_exact_imported_type_over_owner_module() {
+    let source = r#"
+mod burn {
+    pub mod tensor {
+        pub struct TensorData;
+    }
+}
+
+use burn::tensor::TensorData;
+
+fn run(_: TensorData) {}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    let terminal = source
+        .find("use burn::tensor::TensorData;")
+        .expect("import terminal")
+        + "use burn::tensor::".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, terminal),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "burn.tensor.TensorData",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_scoped_enum_variant_terminal_prefers_exact_variant_over_owner_type() {
+    let source = r#"
+enum Distribution {
+    Default,
+}
+
+fn run() {
+    let _ = Distribution::Default;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    let terminal = source
+        .find("Distribution::Default")
+        .expect("variant terminal")
+        + "Distribution::".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, terminal),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Distribution.Default",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_scoped_imported_associated_method_terminal_prefers_exact_method_over_owner_type() {
+    let source = r#"
+mod compare {
+    pub struct Tolerance;
+
+    impl Default for Tolerance {
+        fn default() -> Self {
+            Self
+        }
+    }
+}
+
+use compare::Tolerance;
+
+fn run() {
+    let _ = Tolerance::default();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    let terminal = source
+        .find("Tolerance::default")
+        .expect("associated method terminal")
+        + "Tolerance::".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, terminal),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "compare.Tolerance.default",
+        "{value}"
     );
 }
 
@@ -11608,6 +11750,53 @@ function render(primary, secondary) {
 }
 
 #[test]
+fn javascript_callback_parameter_member_assignment_stays_with_same_closure_binding() {
+    let source = r#"
+function render(primary, secondary) {
+  primary.map(task => {
+    task.status = "ready";
+    consume(task.status);
+  });
+  secondary.map(task => {
+    consume(task.status);
+  });
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("app.js", source)
+        .build();
+
+    let reads: Vec<_> = source
+        .match_indices("task.status")
+        .map(|(start, _)| start + "task.".len())
+        .collect();
+    assert_eq!(reads.len(), 3);
+
+    let local = lookup(
+        project.root(),
+        &location_reference("app.js", source, reads[1]),
+    );
+    assert_eq!(local["results"][0]["status"], "resolved", "{local}");
+    assert_eq!(
+        local["results"][0]["definitions"][0]["start_line"], 4,
+        "{local}"
+    );
+
+    let unrelated = lookup(
+        project.root(),
+        &location_reference("app.js", source, reads[2]),
+    );
+    assert_eq!(
+        unrelated["results"][0]["status"], "no_definition",
+        "{unrelated}"
+    );
+    assert!(
+        unrelated["results"][0]["definitions"].is_null(),
+        "{unrelated}"
+    );
+}
+
+#[test]
 fn javascript_unproven_same_file_receiver_does_not_resolve_assignment_created_property() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
@@ -11636,6 +11825,52 @@ function render() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "no_definition", "{value}");
     assert!(result["definitions"].is_null(), "{value}");
+}
+
+#[test]
+fn javascript_local_member_read_before_write_stays_unresolved() {
+    let source = r#"
+function render(task) {
+  consume(task.status);
+  task.status = "ready";
+  return task.status;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("app.js", source)
+        .build();
+
+    let reads: Vec<_> = source
+        .match_indices("task.status")
+        .map(|(start, _)| start + "task.".len())
+        .collect();
+    assert_eq!(reads.len(), 3);
+
+    let before_write = lookup(
+        project.root(),
+        &location_reference("app.js", source, reads[0]),
+    );
+    assert_eq!(
+        before_write["results"][0]["status"], "no_definition",
+        "{before_write}"
+    );
+    assert!(
+        before_write["results"][0]["definitions"].is_null(),
+        "{before_write}"
+    );
+
+    let after_write = lookup(
+        project.root(),
+        &location_reference("app.js", source, reads[2]),
+    );
+    assert_eq!(
+        after_write["results"][0]["status"], "resolved",
+        "{after_write}"
+    );
+    assert_eq!(
+        after_write["results"][0]["definitions"][0]["start_line"], 4,
+        "{after_write}"
+    );
 }
 
 #[test]
@@ -24319,6 +24554,55 @@ object Consumer {
 }
 
 #[test]
+fn scala_explicit_qualified_apply_beats_same_named_type_member() {
+    let source = r#"package app
+
+object Result {
+  opaque type Success[+A] = A
+  object Success {
+    def apply[A](value: A): Success[A] = value
+  }
+}
+
+object Consumer {
+  val success = Result.Success.apply(1)
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Result.scala", source)
+        .build();
+
+    let success_start = source
+        .find("Result.Success.apply")
+        .expect("qualified explicit apply")
+        + "Result.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Result.scala", source, success_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Result$.Success$",
+        "{value}"
+    );
+
+    let apply_start = source.find(".apply(1)").expect("apply member") + 1;
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Result.scala", source, apply_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Result$.Success$.apply",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_renamed_member_import_resolves_to_member_definition() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
@@ -24531,6 +24815,429 @@ object Outer {
     assert_eq!(
         result["definitions"].as_array().map(Vec::len),
         Some(1),
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_qualified_terminal_resolves_val_type_alias_and_case_object_children() {
+    let source = r#"
+package app
+
+object Registry {
+  val default = 1
+  type Alias = Int
+  case object Ready
+}
+
+object Consumer {
+  val direct = Registry.default
+  val alias: Registry.Alias = 1
+  val state = Registry.Ready
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Registry.scala", source)
+        .build();
+
+    for (needle, offset, expected) in [
+        (
+            "Registry.default",
+            "Registry.".len(),
+            "app.Registry$.default",
+        ),
+        ("Registry.Alias", "Registry.".len(), "app.Registry$.Alias"),
+        ("Registry.Ready", "Registry.".len(), "app.Registry$.Ready$"),
+    ] {
+        let start = source.find(needle).expect("qualified terminal") + offset;
+        let value = lookup(
+            project.root(),
+            &location_reference("app/Registry.scala", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
+fn scala_import_terminal_resolves_val_type_alias_and_case_object_children() {
+    let source = r#"
+package app
+
+object Registry {
+  val default = 1
+  type Alias = Int
+  case object Ready
+}
+
+object Consumer:
+  import app.Registry.default
+  import app.Registry.Alias
+  import app.Registry.Ready
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Registry.scala", source)
+        .build();
+
+    for (needle, offset, expected) in [
+        (
+            "Registry.default",
+            "Registry.".len(),
+            "app.Registry$.default",
+        ),
+        ("Registry.Alias", "Registry.".len(), "app.Registry$.Alias"),
+        ("Registry.Ready", "Registry.".len(), "app.Registry$.Ready$"),
+    ] {
+        let start = source.find(needle).expect("import terminal") + offset;
+        let value = lookup(
+            project.root(),
+            &location_reference("app/Registry.scala", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
+fn scala_import_terminal_resolves_nested_object_from_companion_owner() {
+    let source = r#"
+package app
+
+object S3Vectors {
+  object DeletionStatus
+}
+
+object Consumer:
+  import app.S3Vectors.DeletionStatus
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/S3Vectors.scala", source)
+        .build();
+
+    let start = source
+        .find("S3Vectors.DeletionStatus")
+        .expect("nested object import terminal")
+        + "S3Vectors.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/S3Vectors.scala", source, start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.S3Vectors$.DeletionStatus$",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_import_terminal_resolves_nested_case_object_permission() {
+    let source = r#"
+package app
+
+object Permissions {
+  sealed trait Permission
+  case object EditMetadata extends Permission
+}
+
+object Controller:
+  import app.Permissions.EditMetadata
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Permissions.scala", source)
+        .build();
+
+    let start = source
+        .find("Permissions.EditMetadata")
+        .expect("permission import terminal")
+        + "Permissions.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Permissions.scala", source, start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Permissions$.EditMetadata$",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_import_terminal_resolves_qualified_object_field_member() {
+    let source = r#"
+package app
+
+object JsonValueCodecJsValue {
+  val jsValueCodec: String = "codec"
+}
+
+object Script:
+  import app.JsonValueCodecJsValue.jsValueCodec
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/JsonValueCodecJsValue.scala", source)
+        .build();
+
+    let start = source
+        .find("JsonValueCodecJsValue.jsValueCodec")
+        .expect("object field import terminal")
+        + "JsonValueCodecJsValue.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/JsonValueCodecJsValue.scala", source, start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.JsonValueCodecJsValue$.jsValueCodec",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_import_terminal_with_type_and_term_companions_reports_namespace_ambiguity() {
+    let source = r#"
+package app
+
+object model {
+  class Position
+  object Position
+
+  trait Variant
+  object Variant
+
+  final case class Elo(value: Int)
+  object Elo
+}
+
+object Consumer:
+  import app.model.Position
+  import app.model.Variant
+  import app.model.Elo
+
+  val position: Position = new Position
+  def useVariant(v: Variant): Variant = v
+  val rating: Elo = Elo(1200)
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Model.scala", source)
+        .build();
+
+    for (needle, offset) in [
+        ("model.Position", "model.".len()),
+        ("model.Variant", "model.".len()),
+        ("model.Elo", "model.".len()),
+    ] {
+        let start = source.find(needle).expect("type-facing import") + offset;
+        let value = lookup(
+            project.root(),
+            &location_reference("app/Model.scala", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "no_definition", "{value}");
+        assert_eq!(
+            result["diagnostics"][0]["kind"], "ambiguous_scala_type",
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn scala_wildcard_import_owner_prefers_exact_singleton_chain_over_same_named_class() {
+    let source = r#"
+package app
+
+final case class CorrespondenceClock(increment: Int)
+object CorrespondenceClock:
+  val daySeconds = 24 * 60 * 60
+
+final case class BinaryFen(value: Array[Byte])
+object BinaryFen:
+  object implementation:
+    val marker = 1
+
+object Consumer:
+  import CorrespondenceClock.*
+  import BinaryFen.implementation.*
+
+  val one = daySeconds
+  val two = marker
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Consumer.scala", source)
+        .build();
+
+    for (needle, offset, expected) in [
+        ("CorrespondenceClock.*", 0, "app.CorrespondenceClock$"),
+        ("BinaryFen.implementation.*", 0, "app.BinaryFen$"),
+        ("implementation.*", 0, "app.BinaryFen$.implementation$"),
+    ] {
+        let start = source.find(needle).expect("wildcard import owner") + offset;
+        let value = lookup(
+            project.root(),
+            &location_reference("app/Consumer.scala", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
+fn scala_qualified_stable_terminals_preserve_exact_nested_singleton_members() {
+    let source = r#"
+package app
+
+object Color:
+  case object White
+  case object Black
+
+object CutModifier:
+  case object None
+
+object Crazyhouse:
+  object Data:
+    val init = 1
+
+object Consumer:
+  val white = Color.White
+  val black = Color.Black
+  val none = CutModifier.None
+  val init = Crazyhouse.Data.init
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Stable.scala", source)
+        .build();
+
+    for (needle, offset, expected) in [
+        ("Color.White", "Color.".len(), "app.Color$.White$"),
+        ("Color.Black", "Color.".len(), "app.Color$.Black$"),
+        (
+            "CutModifier.None",
+            "CutModifier.".len(),
+            "app.CutModifier$.None$",
+        ),
+        (
+            "Crazyhouse.Data",
+            "Crazyhouse.".len(),
+            "app.Crazyhouse$.Data$",
+        ),
+        (
+            "Crazyhouse.Data.init",
+            "Crazyhouse.Data.".len(),
+            "app.Crazyhouse$.Data$.init",
+        ),
+    ] {
+        let start = source.find(needle).expect("qualified stable terminal") + offset;
+        let value = lookup(
+            project.root(),
+            &location_reference("app/Stable.scala", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
+fn scala_extension_receiver_binding_shadows_same_named_extension_member() {
+    let source = r#"
+package app
+
+opaque type Centis = Int
+object Centis:
+  extension (centis: Centis)
+    inline def centis: Int = centis
+    def roundTenths: Int = (if centis > 0 then centis + 5 else centis - 4) / 10
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Centis.scala", source)
+        .build();
+
+    let expression = "if centis > 0 then centis + 5 else centis - 4";
+    let expression_start = source.find(expression).expect("centis expression");
+    let references = ["centis > 0", "then centis + 5", "else centis - 4"].map(|needle| {
+        expression_start
+            + expression.find(needle).expect("expression reference")
+            + needle.find("centis").expect("centis token")
+    });
+    for start in references {
+        let value = lookup(
+            project.root(),
+            &location_reference("app/Centis.scala", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "no_definition", "{value}");
+        assert!(result["definitions"][0].is_null(), "{value}");
+    }
+}
+
+#[test]
+fn scala_explicit_case_class_apply_member_resolves_to_primary_constructor() {
+    let source = r#"
+package app
+
+final case class MigrateSingleImageForm(id: String)
+
+object Controller {
+  val form = MigrateSingleImageForm.apply("image")
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/MigrateSingleImageForm.scala", source)
+        .build();
+
+    let start = source.find(".apply(").expect("explicit apply member") + 1;
+    let value = lookup(
+        project.root(),
+        &location_reference("app/MigrateSingleImageForm.scala", source, start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.MigrateSingleImageForm.MigrateSingleImageForm",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_qualified_java_static_method_resolves_terminal_member() {
+    let scala_source = r#"
+package app
+
+object Consumer {
+  val hash = javaish.DeprecatedHashWrapper.sha1("payload")
+}
+"#;
+    let project = InlineTestProject::new()
+        .file(
+            "javaish/DeprecatedHashWrapper.java",
+            "package javaish; public final class DeprecatedHashWrapper { public static String sha1(String value) { return value; } }\n",
+        )
+        .file("app/Consumer.scala", scala_source)
+        .build();
+
+    let start = scala_source
+        .find(".sha1(")
+        .expect("qualified Java static method")
+        + 1;
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Consumer.scala", scala_source, start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["language"], "java", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "javaish.DeprecatedHashWrapper.sha1",
         "{value}"
     );
 }
@@ -27962,4 +28669,146 @@ fn scala_wildcard_imported_member_from_unindexed_import_still_fails_honestly() {
 
     let result = &value["results"][0];
     assert_ne!(result["status"], "resolved", "{value}");
+}
+
+#[test]
+fn scala_wildcard_import_owner_prefers_companion_object_over_same_named_child() {
+    let source = r#"
+package org.http4s
+
+final class Request
+
+object Request {
+  def Request: Int = 1
+}
+
+object Message {
+  import Request._
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("src/Message.scala", source)
+        .build();
+    let start = source.find("import Request._").expect("wildcard owner") + "import ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/Message.scala", source, start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "org.http4s.Request$",
+        "{value}"
+    );
+    assert_ne!(
+        result["definitions"][0]["fqn"], "org.http4s.Request$.Request",
+        "the wildcard owner must stay on the companion object: {value}"
+    );
+}
+
+#[test]
+fn scala_nested_wildcard_import_owner_prefers_companion_object_over_same_named_child() {
+    let source = r#"
+package org.http4s.ember.server.internal
+
+private[internal] class WebSocketHelpers(maxFrameSize: Int) {
+  import WebSocketHelpers._
+}
+
+object WebSocketHelpers {
+  def WebSocketHelpers: Int = 1
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("src/WebSocketHelpers.scala", source)
+        .build();
+    let start = source
+        .find("import WebSocketHelpers._")
+        .expect("nested wildcard owner")
+        + "import ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/WebSocketHelpers.scala", source, start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "org.http4s.ember.server.internal.WebSocketHelpers$",
+        "{value}"
+    );
+    assert_ne!(
+        result["definitions"][0]["fqn"],
+        "org.http4s.ember.server.internal.WebSocketHelpers$.WebSocketHelpers",
+        "the wildcard owner must not collapse to a same-named child: {value}"
+    );
+}
+
+#[test]
+fn scala_type_position_prefers_type_alias_over_same_named_value() {
+    let source = r#"
+package org.http4s.headers
+
+object Shared {
+  class EntityTag
+}
+
+object ETag {
+  type EntityTag = Shared.EntityTag
+  val EntityTag: Shared.EntityTag = new Shared.EntityTag
+}
+
+final case class ETag(tag: EntityTag)
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("src/ETag.scala", source)
+        .build();
+    let start = source.rfind("EntityTag)").expect("case class type");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/ETag.scala", source, start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "org.http4s.headers.ETag$.EntityTag",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["start_line"], 9, "{value}");
+}
+
+#[test]
+fn scala_nested_class_parameter_infix_operator_uses_parameter_type_owner() {
+    let source = r#"
+package org.http4s
+
+object Uri {
+  class Path {
+    def /(segment: String): Path = this
+  }
+
+  def /(segment: String): Uri.type = this
+
+  final case class Holder(path: Uri.Path) {
+    def add(newSegment: String): Uri.Path = path / newSegment
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("src/Uri.scala", source)
+        .build();
+    let start = source.rfind(" / ").expect("infix operator") + 1;
+    let value = lookup(
+        project.root(),
+        &location_reference("src/Uri.scala", source, start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "org.http4s.Uri$.Path./",
+        "{value}"
+    );
 }

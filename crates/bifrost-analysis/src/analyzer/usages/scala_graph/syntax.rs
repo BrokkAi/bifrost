@@ -61,6 +61,7 @@ pub(crate) enum ScalaMethodValueContext {
 pub(crate) enum ScalaParameterTypeIdentity {
     Builtin(&'static str),
     Declaration(CodeUnit),
+    TypeParameter(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -302,6 +303,7 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
                             .filter(|segments| !segments.is_empty()),
                     },
                 );
+                record_generic_owner_facts(node, source, &mut facts);
             }
             "class_definition" | "full_enum_case" => {
                 let mut cursor = node.walk();
@@ -398,12 +400,28 @@ fn scala_alias_underlying_type_path(type_node: Node<'_>, source: &str) -> Vec<St
 fn record_generic_owner_facts(node: Node<'_>, source: &str, facts: &mut ScalaSourceFacts) {
     let type_parameters = node
         .child_by_field_name("type_parameters")
+        .or_else(|| {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| child.kind() == "type_parameters")
+        })
         .map(|parameters| {
             let mut cursor = parameters.walk();
             parameters
                 .named_children(&mut cursor)
                 .filter_map(|parameter| {
-                    let name = parameter.child_by_field_name("name").unwrap_or(parameter);
+                    let name = parameter
+                        .child_by_field_name("name")
+                        .or_else(|| {
+                            let mut cursor = parameter.walk();
+                            parameter.named_children(&mut cursor).find(|child| {
+                                matches!(
+                                    child.kind(),
+                                    "identifier" | "operator_identifier" | "type_identifier"
+                                )
+                            })
+                        })
+                        .unwrap_or(parameter);
                     matches!(
                         name.kind(),
                         "identifier" | "operator_identifier" | "type_identifier"

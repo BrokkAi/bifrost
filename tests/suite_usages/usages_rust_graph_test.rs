@@ -4971,7 +4971,7 @@ fn main() {
         vec![named_type, qualified_type],
         type_hits
             .iter()
-            .filter(|hit| hit.file == consumer_file)
+            .filter(|hit| { hit.file == consumer_file && hit.kind == UsageHitKind::Reference })
             .map(|hit| hit.start_offset)
             .collect::<Vec<_>>(),
         "named and crate-qualified uses must resolve through the public re-export: {type_hits:#?}"
@@ -4995,7 +4995,7 @@ fn main() {
         vec![named_variant, qualified_variant],
         variant_hits
             .iter()
-            .filter(|hit| hit.file == consumer_file)
+            .filter(|hit| { hit.file == consumer_file && hit.kind == UsageHitKind::Reference })
             .map(|hit| hit.start_offset)
             .collect::<Vec<_>>(),
         "named and crate-qualified tuple-variant patterns must retain exact terminal ranges: {variant_hits:#?}"
@@ -7048,6 +7048,42 @@ fn bar() {
         hits.iter()
             .any(|hit| hit.snippet.contains("Foo::frobnicate()")),
         "hit should be the static associated call site: {hits:?}"
+    );
+}
+
+#[test]
+fn rust_graph_strategy_finds_self_trait_associated_function_candidate() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
+pub trait Trait: Sized {
+    fn new_with_uninit() -> Self;
+
+    fn build() -> Self {
+        Self::new_with_uninit()
+    }
+}
+
+pub struct Foo;
+
+impl Trait for Foo {
+    fn new_with_uninit() -> Self {
+        Foo
+    }
+}
+"#,
+    )]);
+
+    let hits = rust_graph_hits(&analyzer, "Trait.new_with_uninit");
+    assert_eq!(
+        1,
+        hits.len(),
+        "expected the Self::new_with_uninit() call to hit Trait.new_with_uninit: {hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("Self::new_with_uninit()")),
+        "hit should be the trait Self-associated call site: {hits:?}"
     );
 }
 
@@ -9507,6 +9543,50 @@ fn consume(_: CommitActivityDraft) {}
 }
 
 #[test]
+fn rust_grouped_same_crate_type_import_terminal_stays_exact() {
+    let source = r#"
+mod quotes {
+    pub mod types {
+        pub struct AssetId;
+        pub struct Day;
+        pub struct QuoteSource;
+    }
+}
+
+use crate::quotes::types::{AssetId, Day, QuoteSource};
+
+fn consume(_: AssetId, _: Day, _: QuoteSource) {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let target = definition(&analyzer, "quotes.types.AssetId");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .all_hits_including_imports();
+    let expected = source
+        .find("AssetId, Day")
+        .expect("grouped import terminal");
+    let sibling = source
+        .find("Day, QuoteSource")
+        .expect("sibling grouped import");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/lib.rs")
+                && (hit.start_offset, hit.end_offset) == (expected, expected + "AssetId".len())
+                && hit.kind == UsageHitKind::Import
+        }),
+        "grouped same-crate type import must keep the original terminal exact: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != project.file("src/lib.rs")
+                || (hit.start_offset, hit.end_offset) != (sibling, sibling + "Day".len())
+        }),
+        "a grouped sibling terminal must stay unrelated: {hits:#?}"
+    );
+}
+
+#[test]
 fn rust_grouped_use_module_qualifier_reconstructs_outer_dependency_path() {
     let consumer = "use toml_parser::{parser::Event};\nuse other_parser::{parser::Other};\npub fn consume(_: Event) {}\n";
     let (project, analyzer) = rust_analyzer_with_files(&[
@@ -10532,6 +10612,54 @@ fn execute() {
 }
 
 #[test]
+fn rust_graph_same_crate_imported_bare_function_call_stays_exact() {
+    let consumer = r#"
+use crate::db::{get_connection, init};
+
+fn run() {
+    get_connection();
+    init();
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod db;\npub mod app;\n"),
+        (
+            "src/db.rs",
+            "pub fn get_connection() {}\npub fn init() {}\n",
+        ),
+        ("src/app.rs", consumer),
+    ]);
+    let candidate = project.file("src/app.rs");
+    let target = definition(&analyzer, "db.get_connection");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .all_hits();
+    let expected = consumer
+        .find("get_connection();")
+        .expect("same-crate imported bare call");
+    let sibling = consumer
+        .find("init();")
+        .expect("sibling imported bare call");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == candidate
+                && (hit.start_offset, hit.end_offset)
+                    == (expected, expected + "get_connection".len())
+                && hit.kind == UsageHitKind::Reference
+        }),
+        "a same-crate imported function must keep its exact bare call edge: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != candidate
+                || (hit.start_offset, hit.end_offset) != (sibling, sibling + "init".len())
+        }),
+        "a sibling imported function must stay unrelated: {hits:#?}"
+    );
+}
+
+#[test]
 fn rust_graph_imported_receiver_method_call_keeps_exact_owner() {
     let consumer = r#"
 use crate::checkpoint::base::Checkpointer;
@@ -10642,6 +10770,44 @@ fn build() {
             "associated value paths must retain an owner-type hit for {target_fqn}: {hits:#?}"
         );
     }
+}
+
+#[test]
+fn rust_graph_qualified_function_value_argument_records_terminal_reference() {
+    let consumer = r#"
+use defs::f16;
+
+fn takes(_f: fn(&f16) -> f32) {}
+
+fn run() {
+    takes(f16::to_f32);
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "mod defs;\nmod consumer;\n"),
+        (
+            "src/defs.rs",
+            "pub struct f16;\nimpl f16 { pub fn to_f32(&self) -> f32 { 0.0 } }\n",
+        ),
+        ("src/consumer.rs", consumer),
+    ]);
+    let candidate = project.file("src/consumer.rs");
+    let target = member(&analyzer, &project.file("src/defs.rs"), "f16", "to_f32");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .all_hits();
+    let expected = consumer
+        .find("to_f32")
+        .expect("qualified function value terminal");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == candidate
+                && (hit.start_offset, hit.end_offset) == (expected, expected + "to_f32".len())
+                && hit.kind == UsageHitKind::Reference
+        }),
+        "qualified function values must retain the terminal member hit: {hits:#?}"
+    );
 }
 
 #[test]
@@ -10775,6 +10941,79 @@ fn run() {
                     != (local_activities, local_activities + "activities".len())
         }),
         "a local shadowing activities module must not be authorized as the crate::activities owner: {activities_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_graph_scoped_member_chain_keeps_module_owner_hit() {
+    let source = r#"
+mod assets {
+    pub struct Column;
+    impl Column {
+        pub fn eq(&self, _: &str) -> bool { true }
+    }
+    pub static id: Column = Column;
+}
+
+fn run() {
+    let _ = assets::id.eq("asset-1");
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let candidate = project.file("src/lib.rs");
+    let target = definition(&analyzer, "assets");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .all_hits();
+    let expected = source
+        .find("assets::id.eq")
+        .expect("member-chain module owner");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == candidate
+                && (hit.start_offset, hit.end_offset) == (expected, expected + "assets".len())
+                && hit.kind == UsageHitKind::Reference
+        }),
+        "a module root inside a scoped member chain must retain its exact owner hit: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_graph_enum_variant_path_keeps_terminal_exact() {
+    let source = r#"
+mod errors {
+    pub enum Error {
+        Unexpected(String),
+        Other,
+    }
+}
+
+fn build() {
+    let _ = errors::Error::Unexpected(String::new());
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let candidate = project.file("src/lib.rs");
+    let target = analyzer
+        .get_definitions("errors.Error.Unexpected")
+        .into_iter()
+        .find(CodeUnit::is_field)
+        .expect("Error::Unexpected variant");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .all_hits();
+    let expected = source
+        .find("Unexpected(String::new())")
+        .expect("enum variant terminal");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == candidate
+                && (hit.start_offset, hit.end_offset) == (expected, expected + "Unexpected".len())
+                && hit.kind == UsageHitKind::Reference
+        }),
+        "a scoped enum variant path must keep the exact terminal hit: {hits:#?}"
     );
 }
 
