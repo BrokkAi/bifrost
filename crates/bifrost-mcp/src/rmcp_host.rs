@@ -87,23 +87,22 @@ enum WorkspaceBindingSource {
 /// correlate by hand.
 struct ConnectionState {
     accepts_client_roots: bool,
-    /// Whether `initialize` has already been answered on this connection.
+    /// What the handshake established, or nothing if it has not happened.
     ///
-    /// A second `initialize` is refused. The handshake is what decides whether
-    /// this connection may bind workspaces from client roots or from Codex
-    /// sandbox metadata, so letting a peer redo it would let it re-negotiate
-    /// that authority mid-session. `rmcp` permits duplicates; Bifrost does not.
-    initialize_received: bool,
-    client_supports_roots: bool,
+    /// This is a phase, not an attribute, and it is deliberately the *only*
+    /// route to the values the handshake produces. Bifrost's client-supplied
+    /// authorization sources -- MCP Roots and Codex sandbox metadata -- are
+    /// meaningless before capability negotiation, so making them unreachable
+    /// from `Handshake` turns "forgot to check whether initialize happened"
+    /// into a compile error instead of a bypass. It has been exactly that
+    /// bypass once already: an earlier version stored `initialize_received`
+    /// beside `client_supports_roots` and a predicate simply stopped consulting
+    /// it, which let a first-message `tools/call` bind an arbitrary directory
+    /// through rmcp's stateless SEP-2575 lifecycle.
+    negotiated: Option<NegotiatedConnection>,
     workspace_binding_source: WorkspaceBindingSource,
     codex_sandbox_cwd_uri: Option<String>,
     codex_sandbox_root: Option<PathBuf>,
-    /// Handle for asking this client questions, captured at `initialize`.
-    ///
-    /// Needed because Bifrost requests roots from inside the tool call that
-    /// needs a workspace, not from a lifecycle notification. See
-    /// [`BifrostMcpHandler::activate_workspace_from_client_roots`].
-    peer: Option<rmcp::service::Peer<RoleServer>>,
     /// The revocation count the current binding was made under.
     ///
     /// Compared against [`RootsRevocations::observed`], which the transport
@@ -113,12 +112,22 @@ struct ConnectionState {
     bound_at_revocation: u64,
 }
 
+/// What a completed `initialize` established about this client.
+struct NegotiatedConnection {
+    client_supports_roots: bool,
+    /// Handle for asking this client questions.
+    ///
+    /// Needed because Bifrost requests roots from inside the tool call that
+    /// needs a workspace, not from a lifecycle notification. See
+    /// [`BifrostMcpHandler::activate_workspace_from_client_roots`].
+    peer: rmcp::service::Peer<RoleServer>,
+}
+
 impl ConnectionState {
     fn new(accepts_client_roots: bool) -> Self {
         Self {
             accepts_client_roots,
-            initialize_received: false,
-            client_supports_roots: false,
+            negotiated: None,
             workspace_binding_source: if accepts_client_roots {
                 WorkspaceBindingSource::None
             } else {
@@ -126,16 +135,20 @@ impl ConnectionState {
             },
             codex_sandbox_cwd_uri: None,
             codex_sandbox_root: None,
-            peer: None,
             bound_at_revocation: 0,
         }
     }
 
-    /// Codex sandbox metadata is only honored for a rootless server whose
-    /// client did not advertise MCP Roots. A client that speaks Roots must use
-    /// Roots, and an explicitly rooted server ignores client scope entirely.
+    /// Codex sandbox metadata is only honored after a handshake, for a rootless
+    /// server whose client did not advertise MCP Roots. A client that speaks
+    /// Roots must use Roots, and an explicitly rooted server ignores client
+    /// scope entirely.
     fn accepts_codex_sandbox_state(&self) -> bool {
-        self.accepts_client_roots && !self.client_supports_roots
+        self.accepts_client_roots
+            && self
+                .negotiated
+                .as_ref()
+                .is_some_and(|negotiated| !negotiated.client_supports_roots)
     }
 
     fn clear_binding(&mut self) {
@@ -322,39 +335,86 @@ impl BifrostMcpHandler {
         })
     }
 
-    /// Ask a legacy (`2025-11-25`) client for its roots and bind the first
-    /// usable one, for the request that needs a workspace right now.
+    /// Ask a legacy (`2025-11-25`) client for its roots and bind one, for the
+    /// request that needs a workspace right now.
+    ///
+    /// Two properties this has to get right, both learned the hard way.
     ///
     /// The exchange runs inside the tool call rather than from a lifecycle
-    /// notification, and that placement is the whole point. `rmcp` dispatches
-    /// every notification and every request on its own task and resolves a
-    /// server-to-client response by waking the task that awaits it, so it does
-    /// not preserve message arrival order. A background refresh would therefore
-    /// race the very requests it exists to serve: a client that answers
-    /// `roots/list` and immediately calls a tool could see the tool call
-    /// overtake its own answer and be told the server is not bound to a
-    /// workspace. Consuming the answer in the request that asked for it removes
-    /// that race by construction, and gives the legacy revision the same shape
-    /// as the `2026-07-28` MRTR path.
+    /// notification, because `rmcp` dispatches every notification and request
+    /// on its own task and does not preserve arrival order. A background
+    /// refresh would race the very requests it exists to serve. Consuming the
+    /// answer in the request that asked for it removes that race by
+    /// construction.
     ///
-    /// Returns whether a workspace is now active.
+    /// The workspace lock is *not* held across the round trip. Holding it means
+    /// every other tool call -- including trivial ones -- parks invisibly for
+    /// as long as the client takes to answer, which for an IDE showing a
+    /// folder-approval dialog is unbounded and not even cancellable. So the
+    /// lock is dropped for the await and re-acquired to bind, and correctness
+    /// across that gap comes from two re-checks rather than from exclusion:
+    /// another call may have bound already, and the client may have revoked the
+    /// roots it is about to name.
     #[allow(deprecated)] // Roots: see the note on the `Root` import.
-    async fn activate_workspace_from_client_roots(&self, state: &mut ConnectionState) -> bool {
-        if !state.accepts_client_roots || !state.client_supports_roots {
-            return false;
-        }
-        let Some(peer) = state.peer.clone() else {
-            return false;
+    async fn ensure_client_workspace(&self, cancelled: &McpCancellationToken) {
+        let (peer, revocations_at_request) = {
+            let mut state = self.workspace.lock().await;
+            if self.client_roots_binding_is_stale(&state) {
+                self.revoke_client_roots(&mut state);
+            }
+            if !state.accepts_client_roots
+                || state.workspace_binding_source != WorkspaceBindingSource::None
+            {
+                return;
+            }
+            let Some(negotiated) = state.negotiated.as_ref() else {
+                eprintln!(
+                    "bifrost: refusing to request MCP roots before the initialize handshake completes"
+                );
+                return;
+            };
+            if !negotiated.client_supports_roots {
+                return;
+            }
+            // Snapshotted before the request goes out, so an answer that the
+            // client supersedes mid-flight can be recognized as stale. Reading
+            // it after the round trip would fold the revocation into the new
+            // binding and mark the withdrawn scope permanently fresh.
+            (negotiated.peer.clone(), self.roots_revocations.observed())
         };
 
-        let result = match peer.list_roots().await {
-            Ok(result) => result,
-            Err(error) => {
-                eprintln!("bifrost: MCP roots/list failed: {error}");
-                return false;
+        // Bounded and cancellable: a client that never answers must not pin a
+        // request forever, and one that gives up must not keep us waiting.
+        let result = tokio::select! {
+            result = tokio::time::timeout(mcp_analyzer_request_budget(), peer.list_roots()) => result,
+            () = cancelled.cancelled() => {
+                eprintln!("bifrost: MCP roots/list abandoned; the client cancelled the request that asked for it");
+                return;
             }
         };
-        self.bind_first_usable_root(state, &result.roots)
+
+        let mut state = self.workspace.lock().await;
+        if state.workspace_binding_source != WorkspaceBindingSource::None {
+            // A concurrent call already negotiated a workspace. Its binding is
+            // as good as the one this answer would produce.
+            return;
+        }
+        if self.roots_revocations.observed() != revocations_at_request {
+            eprintln!(
+                "bifrost: discarding a superseded MCP roots/list answer; the client changed its roots while the request was in flight"
+            );
+            return;
+        }
+        match result {
+            Ok(Ok(result)) => {
+                self.bind_first_usable_root(&mut state, &result.roots);
+            }
+            Ok(Err(error)) => eprintln!("bifrost: MCP roots/list failed: {error}"),
+            Err(_elapsed) => eprintln!(
+                "bifrost: MCP roots/list timed out after {:?}; the client did not supply a workspace",
+                mcp_analyzer_request_budget()
+            ),
+        }
     }
 
     /// Whether the client withdrew authorization for the currently bound scope.
@@ -371,8 +431,19 @@ impl BifrostMcpHandler {
 
     /// Drop the client-roots scope and stop any work admitted against it.
     fn revoke_client_roots(&self, state: &mut ConnectionState) {
+        self.revoke_workspace(state, "changed MCP workspace roots");
+    }
+
+    /// The one way a workspace is given up.
+    ///
+    /// Unbinding, cancelling work admitted against the old scope, and clearing
+    /// the connection's record of it are a single operation: a caller that
+    /// performs two of the three leaves analyzer threads grinding against a
+    /// directory the client has withdrawn. Splitting them by hand is how the
+    /// Codex paths came to skip the cancellation.
+    fn revoke_workspace(&self, state: &mut ConnectionState, reason: &str) {
         if let Err(error) = self.service.unbind_client_workspace() {
-            eprintln!("bifrost: failed to revoke changed MCP workspace roots: {error}");
+            eprintln!("bifrost: failed to revoke {reason}: {error}");
         }
         self.in_flight
             .cancel_stale(self.service.workspace_generation());
@@ -448,7 +519,7 @@ impl BifrostMcpHandler {
             .and_then(Value::as_str);
 
         let Some(sandbox_cwd) = sandbox_cwd else {
-            self.revoke_codex_sandbox_workspace(state, thread_id, "metadata missing")?;
+            self.revoke_codex_sandbox_workspace(state, thread_id, "metadata missing");
             log_codex_workspace_event("workspace metadata missing", thread_id);
             return Err(unbound_workspace_error());
         };
@@ -465,7 +536,7 @@ impl BifrostMcpHandler {
         let candidate = match file_uri_to_path(sandbox_cwd) {
             Ok(candidate) => candidate,
             Err(error) => {
-                self.revoke_codex_sandbox_workspace(state, thread_id, "metadata invalid")?;
+                self.revoke_codex_sandbox_workspace(state, thread_id, "metadata invalid");
                 log_codex_workspace_event(
                     &format!(
                         "rejected workspace metadata error={}",
@@ -481,14 +552,11 @@ impl BifrostMcpHandler {
         };
 
         if state.workspace_binding_source == WorkspaceBindingSource::CodexSandboxState {
-            self.revoke_codex_sandbox_workspace(state, thread_id, "metadata changed")?;
+            self.revoke_codex_sandbox_workspace(state, thread_id, "metadata changed");
         }
 
         if self.service.active_workspace_root().is_some() {
-            self.service
-                .unbind_client_workspace()
-                .map_err(|error| map_service_error(error.code, error.message))?;
-            state.clear_binding();
+            self.revoke_workspace(state, "the previous workspace reason=metadata changed");
             log_codex_workspace_event(
                 "revoked previous workspace reason=metadata changed",
                 thread_id,
@@ -510,7 +578,7 @@ impl BifrostMcpHandler {
                 Ok(())
             }
             Err(error) => {
-                state.clear_binding();
+                self.revoke_workspace(state, "the failed Codex workspace bind");
                 log_codex_workspace_event(
                     &format!(
                         "failed workspace bind source={CODEX_SANDBOX_STATE_META_CAPABILITY} error={}",
@@ -528,16 +596,12 @@ impl BifrostMcpHandler {
         state: &mut ConnectionState,
         thread_id: Option<&str>,
         reason: &str,
-    ) -> Result<(), ErrorData> {
+    ) {
         if state.workspace_binding_source != WorkspaceBindingSource::CodexSandboxState {
-            return Ok(());
+            return;
         }
-        self.service
-            .unbind_client_workspace()
-            .map_err(|error| map_service_error(error.code, error.message))?;
-        state.clear_binding();
+        self.revoke_workspace(state, &format!("the Codex workspace reason={reason}"));
         log_codex_workspace_event(&format!("revoked MCP workspace reason={reason}"), thread_id);
-        Ok(())
     }
 
     /// Bind a workspace for a `2026-07-28` client, which has no post-handshake
@@ -617,13 +681,26 @@ impl BifrostMcpHandler {
     /// Everything a tool call needs decided before it may touch the analyzer:
     /// authorization, scope, and argument normalization. Runs under the
     /// workspace lock so concurrent calls cannot interleave with a rebind.
-    async fn prepare_tool_call(
+    fn prepare_tool_call(
         &self,
         state: &mut ConnectionState,
         name: &str,
         arguments: Value,
         meta: &rmcp::model::RequestMetaObject,
     ) -> Result<PreparedToolCall, ErrorData> {
+        // Defence in depth, independent of every binding source below. rmcp's
+        // stateless SEP-2575 lifecycle serves a request whose `_meta` carries
+        // the required keys without ever calling `initialize`, so "a tool call
+        // implies a completed handshake" is false. A client-supplied workspace
+        // is only meaningful once capabilities have been negotiated, and an
+        // explicitly rooted server has nothing to negotiate.
+        if state.accepts_client_roots && state.negotiated.is_none() {
+            eprintln!(
+                "bifrost: refusing a workspace tool call received before the initialize handshake"
+            );
+            return Err(unbound_workspace_error());
+        }
+
         // A roots change that reached the transport before this call did
         // revokes the scope, whether or not its notification handler has run
         // yet. The counter comes from `RootsOrderedTransport`, which increments
@@ -635,11 +712,6 @@ impl BifrostMcpHandler {
 
         self.reconcile_codex_sandbox_workspace(state, meta)?;
 
-        // This is the first moment a workspace is actually needed, so it is
-        // the moment to ask the client for one.
-        if state.workspace_binding_source == WorkspaceBindingSource::None {
-            self.activate_workspace_from_client_roots(state).await;
-        }
         if state.workspace_binding_source == WorkspaceBindingSource::None {
             return Err(unbound_workspace_error());
         }
@@ -918,15 +990,16 @@ impl ServerHandler for BifrostMcpHandler {
         let client_is_codex = request.client_info.name == CODEX_MCP_CLIENT_NAME;
         let advertise_codex_sandbox_state = {
             let mut state = self.workspace.lock().await;
-            if state.initialize_received {
+            if state.negotiated.is_some() {
                 return Err(ErrorData::invalid_request(
                     "MCP initialize may only be sent once per connection",
                     None,
                 ));
             }
-            state.initialize_received = true;
-            state.client_supports_roots = client_supports_roots;
-            state.peer = Some(context.peer.clone());
+            state.negotiated = Some(NegotiatedConnection {
+                client_supports_roots,
+                peer: context.peer.clone(),
+            });
             let protocol = if !state.accepts_client_roots {
                 "explicit-root"
             } else if client_supports_roots {
@@ -974,7 +1047,12 @@ impl ServerHandler for BifrostMcpHandler {
     /// `prepare_tool_call` re-checks the wire-ordered revocation counter.
     async fn on_roots_list_changed(&self, _context: NotificationContext<RoleServer>) {
         let mut state = self.workspace.lock().await;
-        if !state.accepts_client_roots || !state.client_supports_roots {
+        if !state.accepts_client_roots
+            || !state
+                .negotiated
+                .as_ref()
+                .is_some_and(|negotiated| negotiated.client_supports_roots)
+        {
             return;
         }
         // Guarded by the same staleness test the request path uses, because
@@ -1024,6 +1102,11 @@ impl ServerHandler for BifrostMcpHandler {
             return Ok(tool_success_result(output).into());
         }
 
+        // Negotiating a workspace can require a client round trip, so it
+        // happens before the preparation lock is taken -- see
+        // `ensure_client_workspace`.
+        self.ensure_client_workspace(&context.ct).await;
+
         // Workspace-mutating tools stay ordered against everything else by
         // holding the workspace lock across execution; ordinary tools release
         // it once their scope and arguments are settled.
@@ -1034,9 +1117,7 @@ impl ServerHandler for BifrostMcpHandler {
         {
             return Ok(input_required.into());
         }
-        let prepared = self
-            .prepare_tool_call(&mut state, &name, arguments, &context.meta)
-            .await?;
+        let prepared = self.prepare_tool_call(&mut state, &name, arguments, &context.meta)?;
         self.in_flight
             .cancel_stale(self.service.workspace_generation());
         let (arguments, workspace_scope) = match prepared {

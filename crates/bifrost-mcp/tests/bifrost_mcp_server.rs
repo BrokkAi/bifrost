@@ -2705,6 +2705,57 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
         json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
     );
 
+    // A roots change that reaches the server while its roots/list is still
+    // outstanding supersedes the answer. The client withdrew that scope, so it
+    // must never become analyzer scope -- not even briefly, and not by being
+    // stamped as current when it is bound.
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 19,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["PluginOnly"] }
+            }
+        }),
+    );
+    let stale_roots_request = read_line(&mut reader, &mut stderr);
+    assert_eq!(
+        stale_roots_request["method"], "roots/list",
+        "{stale_roots_request}"
+    );
+    write_line(
+        &mut stdin,
+        json!({ "jsonrpc": "2.0", "method": "notifications/roots/list_changed" }),
+    );
+    let plugin_uri = url::Url::from_directory_path(plugin_dir.path())
+        .expect("plugin file URI")
+        .to_string();
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": stale_roots_request["id"],
+            "result": { "roots": [{ "uri": plugin_uri, "name": "stale" }] }
+        }),
+    );
+    let superseded = read_line(&mut reader, &mut stderr);
+    assert!(
+        superseded["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not bound to a workspace")),
+        "a superseded roots answer must not be bound: {superseded}"
+    );
+    assert!(
+        !plugin_dir
+            .path()
+            .join(".bifrost/cache/bifrost_cache.db")
+            .exists(),
+        "a withdrawn root must never become analyzer storage"
+    );
+
     // Bifrost asks for roots when a request actually needs a workspace, so the
     // first tool call is what triggers the exchange. A relative root can never
     // resolve against process cwd, so answering with one leaves the call
@@ -3410,6 +3461,8 @@ fn assert_codex_metadata_cannot_bind_before_initialize(
     cwd: &std::path::Path,
     sandbox_root: &std::path::Path,
 ) {
+    // Shape 1: a bare pre-initialize call. The MCP lifecycle permits only
+    // `ping` before `initialize`, so the server refuses the whole session.
     let mut child = spawn_rootless_server(cwd, "workspace|symbol");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
@@ -3427,12 +3480,47 @@ fn assert_codex_metadata_cannot_bind_before_initialize(
         response.is_empty(),
         "a tools/call before initialize must not be served: {response}"
     );
-
+    drop(stdin);
     let mut diagnostics = String::new();
-    let _ = stderr.read_to_string(&mut diagnostics);
+    stderr
+        .read_to_string(&mut diagnostics)
+        .expect("read server diagnostics");
     assert!(
         diagnostics.contains("expect initialized request"),
         "the server must refuse the session, not the individual call: {diagnostics}"
+    );
+    child.wait().expect("wait bifrost");
+
+    // Shape 2, and the one that actually got through: MCP 2026-07-28 has a
+    // stateless lifecycle, so a request whose `_meta` carries the required
+    // negotiation keys is dispatched to the handler with no `initialize` at
+    // all. Bifrost must still refuse to read a directory on the strength of
+    // sandbox metadata alone -- the handshake is what decides whether this
+    // connection may name its own workspace. Supplying a junk `requestState`
+    // is part of the shape: it steers the call past the MRTR activation branch
+    // and straight at the Codex binding path.
+    let mut child = spawn_rootless_server(cwd, "workspace|symbol");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+
+    let mut stateless_call =
+        codex_search_symbols_call(0, sandbox_root, "codex-test-thread", "CodexWorkspace");
+    stateless_call["params"]["requestState"] = json!("unsolicited");
+    stateless_call["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
+        json!("2026-07-28");
+    stateless_call["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!({});
+    let refused = round_trip(&mut stdin, &mut reader, &mut stderr, stateless_call);
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not bound to a workspace")),
+        "the stateless 2026-07-28 lifecycle must not let Codex metadata bind a workspace \
+         without a handshake: {refused}"
+    );
+    assert!(
+        !refused.to_string().contains("CodexWorkspace"),
+        "no analyzer result may be returned for an unauthorized workspace: {refused}"
     );
     assert!(
         !sandbox_root
@@ -3441,7 +3529,7 @@ fn assert_codex_metadata_cannot_bind_before_initialize(
         "Codex metadata must not grant workspace authority before capability negotiation"
     );
     drop(stdin);
-    let _ = child.wait();
+    child.wait().expect("wait bifrost");
 }
 
 fn codex_search_symbols_call(
