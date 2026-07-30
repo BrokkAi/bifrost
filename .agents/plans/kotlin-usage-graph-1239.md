@@ -128,6 +128,28 @@ reports call relationships in both directions.
   Evidence: `kotlin_generic_parameter_shadows_a_class_of_the_same_name`, which reported the type parameter as a
   reference to the imported class before the walk grew a separate type-parameter scope stack.
 
+- Observation: library types cannot be usage-graph nodes, and that is by design — but the same fact leaks into name
+  *precedence*, where it is a genuine imprecision. The ladder's existence predicate asks "is there a workspace
+  declaration with this fully-qualified name?", because an external type is deliberately never a `CodeUnit`
+  (`KotlinTypeResolution` keeps `Source` and `External` apart; #1238 recorded that fabricating one is forbidden). The
+  enclosing-scope tier sits *above* the same-package tier, so a name real Kotlin resolves through a scope inherited
+  from a library supertype falls through and can match a workspace type instead.
+  Evidence: probed with a Kotlin class extending a supertype the workspace cannot see, alongside a same-package type of
+  the nested name. Both tokens of `fun make(value: Inner): Inner` were reported as usages of `app.Inner`; if the unseen
+  supertype declares a nested `Inner`, real Kotlin means `ExternalBase.Inner` and those are false positives. Recorded
+  as the characterization test
+  `kotlin_scope_inherited_from_an_unseen_supertype_falls_through_to_the_package`.
+  Mechanism: `crates/bifrost-analysis/src/analyzer/kotlin/hierarchy.rs` resolves ancestors through the source-only
+  `realm_type_by_fqn`, so an unseen supertype contributes no ancestor `CodeUnit` and its nested scopes never reach
+  `scope_owners_at`.
+  Only that tier is exposed: an explicit import is terminal and fails closed correctly, and star and default imports
+  sit below same-package so a fall-through there ends in "unresolved", which is the right answer anyway since usages of
+  an external type are not reportable.
+  Deliberately *not* fixed in this issue. The source-only predicate is shared by `kotlin/hierarchy.rs`, #1238's
+  definition resolver, and this graph; fixing it in one would make find-references disagree with go-to-definition about
+  what a name means, which is what sharing the ladder exists to prevent. Owned by #1144 (semantic model packs), which is
+  what gives the ladder an "exists anywhere, source or pack" question distinct from "is a workspace declaration".
+
 - Observation: `GlobalUsageDefinitionIndex` implements `BoundedDefinitionLookup`, which is the *only* thing #1238's
   `KotlinCtx` needs from its caller besides `&dyn IAnalyzer`. That makes the entire #1238 semantic layer — receiver
   typing, member lookup order, companion detection, cross-file declared-type and extension-receiver reading —

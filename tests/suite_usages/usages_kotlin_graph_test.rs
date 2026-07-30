@@ -691,6 +691,72 @@ class Outer {
     assert_no_hit_line(&hits, 5); // the declaration itself
 }
 
+/// Characterization test for a known imprecision, not a guarantee.
+///
+/// The Kotlin name ladder's existence predicate asks "is there a *workspace*
+/// declaration with this fully-qualified name?". Library types are deliberately
+/// not workspace declarations — `KotlinTypeResolution` keeps `Source(CodeUnit)`
+/// and `External(JvmExternalType)` apart, and #1238 recorded that an external
+/// type must never be fabricated as a `CodeUnit`. That is right for the graph's
+/// *node set*: the usage graph can never report usages of a symbol that is not in
+/// the workspace.
+///
+/// It is not right for the ladder's *precedence*. The enclosing-scope tier sits
+/// above the same-package tier, so a name that real Kotlin resolves through a
+/// scope inherited from a library supertype falls through here and can match a
+/// workspace type instead. `kotlin/hierarchy.rs` resolves ancestors through the
+/// same source-only lookup, so an unseen supertype contributes no ancestor
+/// `CodeUnit` and its nested scopes never reach the scope tier.
+///
+/// Only this one tier is exposed. An explicit import is terminal, so it fails
+/// closed correctly (see
+/// `kotlin_explicit_import_of_an_unknown_type_does_not_fall_through_to_the_package`).
+/// Star and default imports sit *below* same-package, so a fall-through there
+/// ends in "unresolved", which is the right answer anyway.
+///
+/// The imprecision is shared by `kotlin/hierarchy.rs`, the #1238 definition
+/// resolver, and this module, all of which use the source-only predicate. Fixing
+/// it here alone would make find-references disagree with go-to-definition about
+/// what a name means, which is exactly what sharing the ladder exists to prevent.
+/// It is owned by #1144 (semantic model packs), which is what will give the
+/// ladder an "exists anywhere, source or pack" question distinct from "is a
+/// workspace declaration".
+///
+/// This test asserts today's behaviour so that closing the gap fails here loudly
+/// instead of changing Kotlin's answers silently. When #1144 lands, the correct
+/// update is to assert no hits.
+#[test]
+fn kotlin_scope_inherited_from_an_unseen_supertype_falls_through_to_the_package() {
+    let (_project, analyzer) = kotlin_workspace(&[
+        (
+            "src/app/Inner.kt",
+            "package app
+
+class Inner
+",
+        ),
+        (
+            "src/app/Sub.kt",
+            "package app
+
+import ext.ExternalBase
+
+class Sub : ExternalBase() {
+
+    fun make(value: Inner): Inner = value
+}
+",
+        ),
+    ]);
+
+    let hits = hits(&usages(&analyzer, &definition(&analyzer, "app.Inner")));
+
+    // `ext.ExternalBase` is outside the workspace, standing in for a library
+    // class. If it declares a nested `Inner`, real Kotlin resolves both tokens on
+    // line 7 to `ExternalBase.Inner` and these hits are false positives.
+    assert_hit_line(&hits, 7);
+}
+
 #[test]
 fn kotlin_generic_parameter_shadows_a_class_of_the_same_name() {
     // Kotlin has separate namespaces for types and values, so a shadowing test
