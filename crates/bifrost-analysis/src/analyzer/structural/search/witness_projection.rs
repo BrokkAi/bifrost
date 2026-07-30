@@ -310,7 +310,7 @@ fn public_source_site(
     }
 }
 
-fn public_taint_event_id(
+pub(super) fn public_taint_event_id(
     plan_ref: &str,
     role: &str,
     event: &crate::analyzer::value_flow::ValueFlowEventKey,

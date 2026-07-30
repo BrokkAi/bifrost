@@ -19,7 +19,7 @@ The observable demonstration is an inline Java project with compatible multiple-
 - [x] (2026-07-30 21:43 SAST) Milestone 1: extracted one immutable retained production taint result per compatible batch, made policy and public projection consume the same plan/report pair, added conservative retained-memory and artifact accounting, and passed all five focused taint-policy adapter tests.
 - [x] (2026-07-30 22:04 SAST) Milestone 2: added bounded generation-scoped multi-root taint-result registrations, exact semantic-root lookup, shared artifact validation, immutable request snapshots through runtime/MCP, generation clearing, alias/conflict semantics, and transactional retained-byte limits.
 - [x] (2026-07-30 22:28 SAST) Milestone 3: added schema-v7 `taint`/`taint_ref` JSON and RQL vocabulary, `procedure -> taint_finding` typing and `file_of`, projection-only execution with taint-specific limits/diagnostics, and JSON/RQL end-to-end equivalence against the retained production result.
-- [ ] Milestone 4: complete public transports, editor support, docs, lifecycle/equivalence tests, and final validation.
+- [x] (2026-07-30 22:43 SAST) Milestone 4: updated MCP schema, LSP compatible-head completion, Python guidance, VS Code TextMate grammar/tests, and public JSON/RQL/query docs; expanded lifecycle/equivalence coverage and fixed detailed provenance to resolve aggregated findings by stable sink identity.
 - [ ] Run the required five-perspective guided review, remediate accepted findings, and update this plan with the final outcome.
 
 ## Surprises & Discoveries
@@ -41,6 +41,9 @@ The observable demonstration is an inline Java project with compatible multiple-
 
 - Observation: registration identity cannot rely on allocation addresses if separately constructed but equal immutable results are to alias.
   Evidence: Milestone 2 initially used shared plan/report allocation identity, then replaced it before checkpointing with a deterministic digest over compatibility, exact root, projection limits, semantic artifacts, and canonical projected findings. The digest remains internal and never affects public finding IDs.
+
+- Observation: public projection aggregates raw findings by sink, so positional pairing cannot recover detailed source provenance.
+  Evidence: the query adapter initially zipped projected rows with `report.findings()`. It now indexes retained sink locators by the same stable sink event ID carried by each public row, preserving correct file/byte provenance when several raw findings share one sink.
 
 ## Decision Log
 
@@ -78,7 +81,7 @@ The observable demonstration is an inline Java project with compatible multiple-
 
 ## Outcomes & Retrospective
 
-Milestones 1 and 2 are complete. Production policy preparation now retains the authoritative plan/report pair as a `ProductionTaintAnalysisResult`; both public taint rows and policy findings are projected from that pair, and `PolicyBatchOutcome` exposes the immutable retained results for host registration. Hosts can bind one or more exact procedure roots to a bounded `TaintResultRef`, snapshot registrations into a prepared request, and clear them when the workspace generation advances. Registration validates the same semantic artifacts under the existing shared budget and accounts for plans, reports, and artifacts transactionally. The focused adapter test proves aliasing, cleanup, duplicate-root rejection, limit rollback, and field-for-field reprojection equality. The existing compiler, batch planner, one-solve path, finding collector, projector, policy classification, CVSS, and transport models remain authoritative.
+Milestones 1 through 4 are complete. Production policy preparation retains the authoritative plan/report pair as a `ProductionTaintAnalysisResult`; both public taint rows and policy findings are projected from that pair, and `PolicyBatchOutcome` exposes the immutable retained results for host registration. Hosts can bind one or more exact procedure roots to a bounded `TaintResultRef`, snapshot registrations into a prepared request, and clear them when the workspace generation advances. Schema-v7 JSON and RQL expose only the projection-only `taint` traversal and required `taint_ref`; MCP, LSP, Python, VS Code, and public docs track that surface while older exact schema pins remain unchanged. Focused policy, query, MCP-schema, LSP-completion, docs, Python syntax, and featureless workspace checks pass. The existing compiler, batch planner, one-solve path, finding collector, projector, policy classification, CVSS, and transport models remain authoritative. Final guided review and its remediation remain.
 
 ## Context and Orientation
 

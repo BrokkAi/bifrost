@@ -1,4 +1,4 @@
-use super::witness_projection::locator_file;
+use super::witness_projection::{locator_file, public_taint_event_id};
 use super::{
     CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact, CodeQueryResultRef,
     CodeQueryTaintFinding, CodeQueryTaintLimits, SemanticProcedureValue,
@@ -66,6 +66,23 @@ impl TaintQueryState {
                 return Vec::new();
             }
         };
+        let locations = result
+            .report()
+            .findings()
+            .iter()
+            .map(|finding| {
+                let sink = finding.key().sink();
+                let locator = sink.site();
+                let span = locator.anchor().span();
+                (
+                    public_taint_event_id(result.projection_scope(), "sink", sink),
+                    (
+                        locator_file(workspace, locator),
+                        span.start_byte() as usize..span.end_byte() as usize,
+                    ),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
         let projected = match result.project_findings(workspace, limits.projection_limits()) {
             Ok(projected) => projected,
             Err(error) => {
@@ -89,14 +106,15 @@ impl TaintQueryState {
         projected
             .into_iter()
             .take(retained)
-            .zip(result.report().findings())
-            .map(|(public, retained)| {
-                let locator = retained.entry().procedure().semantics().locator();
-                let span = locator.anchor().span();
+            .map(|public| {
+                let (file, byte_span) = locations
+                    .get(&public.sink_event_id)
+                    .expect("projected taint finding must retain its sink location")
+                    .clone();
                 SemanticTaintFindingValue {
                     public,
-                    file: locator_file(workspace, locator),
-                    byte_span: span.start_byte() as usize..span.end_byte() as usize,
+                    file,
+                    byte_span,
                 }
             })
             .collect()

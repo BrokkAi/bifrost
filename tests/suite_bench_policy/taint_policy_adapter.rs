@@ -7,10 +7,11 @@ use brokk_bifrost::analyzer::policy::{
     write_policy_sarif,
 };
 use brokk_bifrost::analyzer::structural::{
-    CodeQuery, CodeQueryExecutionLimits, ProtocolRegistrationSet, TaintResultRef,
-    TaintResultRegistration, TaintResultRegistrationError, TaintResultRegistrationLimits,
-    TaintResultRegistrationOutcome, TaintResultRegistrationSet, TaintResultRegistrationSetError,
-    ValueFlowPlanRegistrationSet, execute_workspace_request_with_all_analysis_registration_lease,
+    CodeQuery, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, ProtocolRegistrationSet,
+    TaintResultRef, TaintResultRegistration, TaintResultRegistrationError,
+    TaintResultRegistrationLimits, TaintResultRegistrationOutcome, TaintResultRegistrationSet,
+    TaintResultRegistrationSetError, ValueFlowPlanRegistrationSet,
+    execute_workspace_request_with_all_analysis_registration_lease,
 };
 use brokk_bifrost::analyzer::typestate::ProductionTypestateSummaryRepository;
 use brokk_bifrost::{AnalyzerConfig, Language};
@@ -409,6 +410,14 @@ fn production_taint_policies_share_a_batch_and_all_renderers_keep_the_same_evide
             .expect("alias retained taint result"),
         TaintResultRegistrationOutcome::Aliased
     );
+    assert!(matches!(
+        registrations.register(
+            first_ref.clone(),
+            TaintResultRegistration::new(8, vec![Arc::clone(retained)])
+                .expect("different-generation registration"),
+        ),
+        Err(TaintResultRegistrationSetError::ReferenceConflict { .. })
+    ));
     assert_eq!(registrations.reference_count(), 2);
     assert_eq!(registrations.registration_count(), 1);
 
@@ -422,26 +431,29 @@ fn production_taint_policies_share_a_batch_and_all_renderers_keep_the_same_evide
     }))
     .expect("schema-v7 taint JSON query");
     let rql_query = CodeQuery::from_sexp(
-        r#"(taint :taint-ref request:primary (procedure-of (function :name "run")))"#,
+        r#"(taint :taint-ref request:alias (procedure-of (function :name "run")))"#,
     )
     .expect("schema-v7 taint RQL query");
-    let execute = |query: &CodeQuery| {
-        let summaries = Arc::new(ProductionTypestateSummaryRepository::new());
-        let lease = summaries.lease(7).expect("generation-scoped summary lease");
-        execute_workspace_request_with_all_analysis_registration_lease(
-            &workspace,
-            7,
-            &ProtocolRegistrationSet::default(),
-            &ValueFlowPlanRegistrationSet::default(),
-            &registrations,
-            query,
-            CodeQueryExecutionLimits::default(),
-            None,
-            lease,
-        )
-    };
-    let json_response = execute(&json_query);
-    let rql_response = execute(&rql_query);
+    let execute =
+        |query: &CodeQuery, generation: u64, taint_registrations: &TaintResultRegistrationSet| {
+            let summaries = Arc::new(ProductionTypestateSummaryRepository::new());
+            let lease = summaries
+                .lease(generation)
+                .expect("generation-scoped summary lease");
+            execute_workspace_request_with_all_analysis_registration_lease(
+                &workspace,
+                generation,
+                &ProtocolRegistrationSet::default(),
+                &ValueFlowPlanRegistrationSet::default(),
+                taint_registrations,
+                query,
+                CodeQueryExecutionLimits::default(),
+                None,
+                lease,
+            )
+        };
+    let json_response = execute(&json_query, 7, &registrations);
+    let rql_response = execute(&rql_query, 7, &registrations);
     let json_result = json_response.result().expect("executed JSON result");
     let rql_result = rql_response.result().expect("executed RQL result");
     assert!(
@@ -459,6 +471,55 @@ fn production_taint_policies_share_a_batch_and_all_renderers_keep_the_same_evide
         serde_json::to_value(&rql_result.results).expect("RQL result serialization")
     );
     assert_eq!(json_result.results.len(), outcome.taint_findings().len());
+
+    let missing_query = CodeQuery::from_json(&serde_json::json!({
+        "schema_version": 7,
+        "match": { "kind": "function", "name": "run" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "taint", "taint_ref": "request:missing" }
+        ]
+    }))
+    .expect("missing-ref taint query");
+    let missing = execute(&missing_query, 7, &registrations);
+    assert!(
+        missing
+            .result()
+            .expect("missing-ref result")
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code
+                == CodeQueryDiagnosticCode::UnresolvedTaintResultReference)
+    );
+
+    let wrong_root_query = CodeQuery::from_json(&serde_json::json!({
+        "schema_version": 7,
+        "match": { "kind": "function", "name": "source_one" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "taint", "taint_ref": "request:primary" }
+        ]
+    }))
+    .expect("wrong-root taint query");
+    let wrong_root = execute(&wrong_root_query, 7, &registrations);
+    assert!(
+        wrong_root
+            .result()
+            .expect("wrong-root result")
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::TaintRootMismatch)
+    );
+
+    let stale = execute(&json_query, 8, &registrations);
+    assert!(
+        stale
+            .result()
+            .expect("stale result")
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::TaintRegistrationStale)
+    );
 
     assert!(registrations.unregister(&first_ref));
     assert_eq!(registrations.reference_count(), 1);
