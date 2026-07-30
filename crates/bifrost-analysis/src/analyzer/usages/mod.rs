@@ -10,7 +10,7 @@
 //! - [`ImportGraphCandidateProvider`] for the candidate file set, with
 //!   [`TextSearchCandidateProvider`] as a substring-scan fallback.
 //! - Language-specific graph strategies for JavaScript / TypeScript, Python, PHP, Rust,
-//!   Java, C#, C++, Go, and Scala targets.
+//!   Java, Kotlin, C#, C++, Go, Ruby, and Scala targets.
 
 pub mod call_relations;
 mod candidates;
@@ -26,6 +26,7 @@ mod graph_core;
 pub(crate) mod inverted_edges;
 pub(crate) mod java_graph;
 pub(crate) mod js_ts_graph;
+pub(crate) mod kotlin_graph;
 mod local_inference;
 mod model;
 mod outcome;
@@ -67,6 +68,7 @@ pub use go_graph::GoUsageGraphStrategy;
 pub(crate) use graph_core::{ImportEdge, ImportEdgeKind};
 pub use java_graph::JavaUsageGraphStrategy;
 pub use js_ts_graph::JsTsExportUsageGraphStrategy;
+pub use kotlin_graph::KotlinUsageGraphStrategy;
 pub use local_inference::{
     LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
 };
