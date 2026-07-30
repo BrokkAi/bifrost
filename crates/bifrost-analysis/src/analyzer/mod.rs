@@ -338,8 +338,7 @@ pub(crate) fn structural_spec_for(
         Language::Scala => &scala::structural::SCALA_STRUCTURAL_SPEC,
         Language::CSharp => &csharp::structural::CSHARP_STRUCTURAL_SPEC,
         Language::Ruby => &ruby::structural::RUBY_STRUCTURAL_SPEC,
-        // Kotlin structural CodeQuery/RQL support is issue #1240.
-        Language::Kotlin => return None,
+        Language::Kotlin => &kotlin::structural::KOTLIN_STRUCTURAL_SPEC,
         Language::None => return None,
     })
 }

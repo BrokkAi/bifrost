@@ -122,13 +122,13 @@ fn cpp_function_like_macro_invocation_matches_call_callee_query() {
 }
 
 /// Languages that are analyzable but whose structural (CodeQuery/RQL) adapter
-/// is not implemented yet. Kotlin's is issue #1240.
+/// is not implemented yet. Empty since Kotlin landed (issue #1240).
 ///
 /// Every analyzable language must still appear in `cases` below, so adding a
 /// language without an adapter fails this test until it is listed here — and
 /// the assertions below require each listed language to match *nothing*, so
 /// this list cannot outlive the gap it documents.
-const STRUCTURAL_ADAPTER_PENDING: &[&str] = &["kotlin"];
+const STRUCTURAL_ADAPTER_PENDING: &[&str] = &[];
 
 #[test]
 fn shared_call_query_matches_every_analyzable_language_without_adapter_diagnostics() {
@@ -1967,6 +1967,483 @@ object App {
     assert!(lambda.diagnostics.is_empty(), "{:?}", lambda.diagnostics);
     assert_eq!(lambda.structural_matches().len(), 1);
     assert_eq!(lambda.structural_matches()[0].text, "(value: String) => {…");
+}
+
+/// Kotlin's normalized shapes (issue #1240).
+///
+/// Every fixture body is deliberately multi-line: the vendored fwcd grammar
+/// synthesizes an `_automatic_semicolon` between statements and reports a
+/// MISSING node when several statements share one line, so a compact
+/// `fun run() { audit() }` would exercise error recovery rather than the
+/// shapes under test.
+const KOTLIN_APP: &str = r#"
+package app
+
+import kotlin.math.max
+import kotlin.collections.List as KList
+
+@Deprecated("use Service2")
+class Service(val name: String) {
+    constructor(name: String, extra: Int) : this(name)
+
+    fun run(code: String): String {
+        audit(code)
+        val password = "hunter2"
+        val flag = true
+        val callback = { value: String ->
+            return value
+        }
+        this.name
+        listOf(1).forEach { value ->
+            audit(value.toString())
+        }
+        auditNamed(code = "named")
+        val limit = -3
+        return code
+    }
+}
+
+object App {
+    fun audit(code: String): String = code
+
+    fun auditNamed(code: String): String = code
+
+    val service = Service("primary")
+
+    val cached: Service? = null
+
+    fun main() {
+        service.run("input")
+        cached?.run("safe")
+        max(1, 2)
+        for (item in listOf(1, 2)) {
+            if (item == 1) {
+                continue
+            }
+        }
+        if (cached == null) {
+            throw IllegalStateException("missing")
+        }
+    }
+}
+"#;
+
+fn kotlin_query(query: serde_json::Value) -> CodeQueryResult {
+    run_query_with_files(&[("kotlin/App.kt", KOTLIN_APP)], query)
+}
+
+fn kotlin_match_texts(output: &CodeQueryResult) -> Vec<&str> {
+    output
+        .structural_matches()
+        .iter()
+        .map(|mat| mat.text.as_str())
+        .collect()
+}
+
+/// Kotlin joins the shared RQL surface with no language-specific vocabulary:
+/// `(language kotlin …)` must answer exactly what the equivalent JSON does.
+#[test]
+fn kotlin_rql_and_json_queries_agree() {
+    let project = InlineTestProject::new()
+        .file("kotlin/App.kt", KOTLIN_APP)
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+
+    let rql = CodeQuery::from_source(
+        r#"(language kotlin (call :callee (name "run") :receiver (name "service")))"#,
+    )
+    .expect("Kotlin RQL should parse");
+    let rql_output = execute(workspace.analyzer(), &rql);
+
+    let json = CodeQuery::from_json(&json!({
+        "languages": ["kotlin"],
+        "match": {
+            "kind": "call",
+            "callee": { "name": "run" },
+            "receiver": { "name": "service" }
+        }
+    }))
+    .expect("Kotlin JSON query should parse");
+    let json_output = execute(workspace.analyzer(), &json);
+
+    assert!(rql_output.diagnostics.is_empty(), "{:?}", rql_output);
+    assert_eq!(
+        kotlin_match_texts(&rql_output),
+        vec![r#"service.run("input")"#]
+    );
+    assert_eq!(
+        kotlin_match_texts(&rql_output),
+        kotlin_match_texts(&json_output)
+    );
+}
+
+#[test]
+fn kotlin_structural_adapter_matches_calls_receivers_and_arguments() {
+    let audit = kotlin_query(json!({
+        "languages": ["kotlin"],
+        "match": {
+            "kind": "call",
+            "callee": { "name": "audit" },
+            "args": [{ "name": "code", "capture": "code" }]
+        }
+    }));
+    assert!(audit.diagnostics.is_empty(), "{:?}", audit.diagnostics);
+    assert_eq!(kotlin_match_texts(&audit), vec!["audit(code)"]);
+    assert_eq!(audit.structural_matches()[0].captures[0].text, "code");
+
+    let method_call = kotlin_query(json!({
+        "languages": ["kotlin"],
+        "match": {
+            "kind": "call",
+            "callee": { "name": "run" },
+            "receiver": { "name": "service" }
+        }
+    }));
+    assert!(
+        method_call.diagnostics.is_empty(),
+        "{:?}",
+        method_call.diagnostics
+    );
+    assert_eq!(
+        kotlin_match_texts(&method_call),
+        vec![r#"service.run("input")"#]
+    );
+
+    // `?.` is a navigation suffix like `.`, so a safe call carries a receiver
+    // rather than dropping one.
+    let safe_call = kotlin_query(json!({
+        "languages": ["kotlin"],
+        "match": {
+            "kind": "call",
+            "callee": { "name": "run" },
+            "receiver": { "name": "cached" }
+        }
+    }));
+    assert!(
+        safe_call.diagnostics.is_empty(),
+        "{:?}",
+        safe_call.diagnostics
+    );
+    assert_eq!(
+        kotlin_match_texts(&safe_call),
+        vec![r#"cached?.run("safe")"#]
+    );
+
+    // A trailing lambda sits outside the parentheses but is still an argument.
+    let trailing_lambda = kotlin_query(json!({
+        "languages": ["kotlin"],
+        "match": {
+            "kind": "call",
+            "callee": { "name": "forEach" },
+            "args": [{ "kind": "lambda", "has": { "kind": "call", "callee": { "name": "audit" } } }]
+        }
+    }));
+    assert!(
+        trailing_lambda.diagnostics.is_empty(),
+        "{:?}",
+        trailing_lambda.diagnostics
+    );
+    assert_eq!(
+        kotlin_match_texts(&trailing_lambda),
+        vec!["listOf(1).forEach { value ->…"]
+    );
+
+    // Kotlin has real keyword arguments, unlike Java.
+    let named_argument = kotlin_query(json!({
+        "languages": ["kotlin"],
+        "match": {
+            "kind": "call",
+            "callee": { "name": "auditNamed" },
+            "kwargs": { "code": { "kind": "string_literal", "capture": "value" } }
+        }
+    }));
+    assert!(
+        named_argument.diagnostics.is_empty(),
+        "{:?}",
+        named_argument.diagnostics
+    );
+    assert_eq!(
+        kotlin_match_texts(&named_argument),
+        vec![r#"auditNamed(code = "named")"#]
+    );
+    assert_eq!(
+        named_argument.structural_matches()[0].captures[0].text,
+        r#""named""#
+    );
+
+    // ...and a named argument is a keyword argument, never an assignment: the
+    // grammar spells `f(code = "named")` as a two-child `value_argument`, so
+    // there is no assignment fact for `{kind: assignment}` to find.
+    let named_argument_is_not_assignment = kotlin_query(json!({
+        "languages": ["kotlin"],
+        "match": {
+            "kind": "assignment",
+            "left": { "name": "code" },
+            "right": { "kind": "string_literal" }
+        }
+    }));
+    assert!(
+        named_argument_is_not_assignment.diagnostics.is_empty(),
+        "{:?}",
+        named_argument_is_not_assignment.diagnostics
+    );
+    assert!(
+        named_argument_is_not_assignment
+            .structural_matches()
+            .is_empty(),
+        "unexpected named-argument assignment match: {named_argument_is_not_assignment:?}"
+    );
+}
+
+#[test]
+fn kotlin_structural_adapter_matches_assignments_literals_and_field_access() {
+    let assignment = kotlin_query(json!({
+        "languages": ["kotlin"],
+        "match": {
+            "kind": "assignment",
+            "left": { "name": "password" },
+            "right": { "kind": "string_literal", "capture": "value" }
+        }
+    }));
+    assert!(
+        assignment.diagnostics.is_empty(),
+        "{:?}",
+        assignment.diagnostics
+    );
+    assert_eq!(
+        kotlin_match_texts(&assignment),
+        vec![r#"val password = "hunter2""#]
+    );
+    assert_eq!(
+        assignment.structural_matches()[0].captures[0].text,
+        r#""hunter2""#
+    );
+
+    // `-3` is `(prefix_expression (integer_literal))`; only the signed wrapper
+    // becomes the numeric literal.
+    let signed_numeric = kotlin_query(json!({
+        "languages": ["kotlin"],
+        "match": {
+            "kind": "assignment",
+            "left": { "name": "limit" },
+            "right": { "kind": "numeric_literal", "capture": "value" }
+        }
+    }));
+    assert!(
+        signed_numeric.diagnostics.is_empty(),
+        "{:?}",
+        signed_numeric.diagnostics
+    );
+    assert_eq!(kotlin_match_texts(&signed_numeric), vec!["val limit = -3"]);
+    assert_eq!(
+        signed_numeric.structural_matches()[0].captures[0].text,
+        "-3"
+    );
+
+    let boolean_literal = kotlin_query(json!({
+        "languages": ["kotlin"],
+        "match": { "kind": "boolean_literal", "text": { "regex": "^true$" } }
+    }));
+    assert!(
+        boolean_literal.diagnostics.is_empty(),
+        "{:?}",
+        boolean_literal.diagnostics
+    );
+    assert_eq!(kotlin_match_texts(&boolean_literal), vec!["true"]);
+
+    let field_access = kotlin_query(json!({
+        "languages": ["kotlin"],
+        "match": {
+            "kind": "field_access",
+            "object": { "name": "this" },
+            "field": { "name": "name" }
+        }
+    }));
+    assert!(
+        field_access.diagnostics.is_empty(),
+        "{:?}",
+        field_access.diagnostics
+    );
+    assert_eq!(kotlin_match_texts(&field_access), vec!["this.name"]);
+}
+
+#[test]
+fn kotlin_structural_adapter_matches_imports_by_leaf_path_and_alias() {
+    let leaf = kotlin_query(json!({
+        "languages": ["kotlin"],
+        "match": { "kind": "import", "module": { "name": "max" } }
+    }));
+    assert!(leaf.diagnostics.is_empty(), "{:?}", leaf.diagnostics);
+    assert_eq!(kotlin_match_texts(&leaf), vec!["import kotlin.math.max"]);
+
+    let full_path = kotlin_query(json!({
+        "languages": ["kotlin"],
+        "match": { "kind": "import", "module": { "name": "kotlin.math.max" } }
+    }));
+    assert!(
+        full_path.diagnostics.is_empty(),
+        "{:?}",
+        full_path.diagnostics
+    );
+    assert_eq!(
+        kotlin_match_texts(&full_path),
+        vec!["import kotlin.math.max"]
+    );
+
+    // An alias introduces an extra spelling; the imported path stays a valid
+    // one, so both `KList` and `kotlin.collections.List` find the same import.
+    let alias = kotlin_query(json!({
+        "languages": ["kotlin"],
+        "match": { "kind": "import", "module": { "name": "KList" } }
+    }));
+    assert!(alias.diagnostics.is_empty(), "{:?}", alias.diagnostics);
+    assert_eq!(
+        kotlin_match_texts(&alias),
+        vec!["import kotlin.collections.List as KList"]
+    );
+
+    let aliased_path = kotlin_query(json!({
+        "languages": ["kotlin"],
+        "match": { "kind": "import", "module": { "name": "kotlin.collections.List" } }
+    }));
+    assert!(
+        aliased_path.diagnostics.is_empty(),
+        "{:?}",
+        aliased_path.diagnostics
+    );
+    assert_eq!(
+        kotlin_match_texts(&aliased_path),
+        vec!["import kotlin.collections.List as KList"]
+    );
+
+    // An interior path segment is not the module.
+    let shared_prefix = kotlin_query(json!({
+        "languages": ["kotlin"],
+        "match": { "kind": "import", "module": { "name": "math" } }
+    }));
+    assert!(
+        shared_prefix.diagnostics.is_empty(),
+        "{:?}",
+        shared_prefix.diagnostics
+    );
+    assert!(
+        shared_prefix.structural_matches().is_empty(),
+        "unexpected shared-prefix import match: {shared_prefix:?}"
+    );
+}
+
+#[test]
+fn kotlin_structural_adapter_matches_declarations_constructors_and_annotations() {
+    let declarations = kotlin_query(json!({
+        "languages": ["kotlin"],
+        "match": { "kind": "declaration", "name": { "regex": "^(Service|run|App|audit)$" } }
+    }));
+    assert!(
+        declarations.diagnostics.is_empty(),
+        "{:?}",
+        declarations.diagnostics
+    );
+    let declaration_rows: Vec<_> = declarations
+        .structural_matches()
+        .iter()
+        .map(|mat| (mat.kind, mat.text.as_str()))
+        .collect();
+    assert_eq!(
+        declaration_rows,
+        vec![
+            ("class", "@Deprecated(\"use Service2\")…"),
+            ("constructor", "(val name: String)"),
+            (
+                "constructor",
+                "constructor(name: String, extra: Int) : this(name)"
+            ),
+            ("method", "fun run(code: String): String {…"),
+            ("class", "object App {…"),
+            ("method", "fun audit(code: String): String = code"),
+        ]
+    );
+
+    // Kotlin gets a real constructor mapping, and both spellings are one kind.
+    let constructors = kotlin_query(json!({
+        "languages": ["kotlin"],
+        "match": { "kind": "constructor", "name": { "regex": "^Service$" } }
+    }));
+    assert!(
+        constructors.diagnostics.is_empty(),
+        "{:?}",
+        constructors.diagnostics
+    );
+    assert_eq!(
+        kotlin_match_texts(&constructors),
+        vec![
+            "(val name: String)",
+            "constructor(name: String, extra: Int) : this(name)",
+        ]
+    );
+
+    // A function directly inside a class body (including an `object`) is a
+    // method; a top-level one stays a function.
+    let methods = kotlin_query(json!({
+        "languages": ["kotlin"],
+        "match": { "kind": "method", "name": { "regex": "^(run|audit)$" } }
+    }));
+    assert!(methods.diagnostics.is_empty(), "{:?}", methods.diagnostics);
+    assert_eq!(
+        kotlin_match_texts(&methods),
+        vec![
+            "fun run(code: String): String {…",
+            "fun audit(code: String): String = code",
+        ]
+    );
+
+    let decorated_class = kotlin_query(json!({
+        "languages": ["kotlin"],
+        "match": { "kind": "class", "decorators": [{ "name": "Deprecated" }] }
+    }));
+    assert!(
+        decorated_class.diagnostics.is_empty(),
+        "{:?}",
+        decorated_class.diagnostics
+    );
+    assert_eq!(
+        kotlin_match_texts(&decorated_class),
+        vec!["@Deprecated(\"use Service2\")…"]
+    );
+}
+
+#[test]
+fn kotlin_structural_adapter_splits_jump_expressions_into_returns_and_throws() {
+    let lambda = kotlin_query(json!({
+        "languages": ["kotlin"],
+        "match": { "kind": "lambda", "has": { "kind": "return" } }
+    }));
+    assert!(lambda.diagnostics.is_empty(), "{:?}", lambda.diagnostics);
+    assert_eq!(kotlin_match_texts(&lambda), vec!["{ value: String ->…"]);
+
+    // `jump_expression` is one node type for return/throw/break/continue: the
+    // throw spelling is refined to `throw`, and `continue` is neither.
+    let returns = kotlin_query(json!({
+        "languages": ["kotlin"],
+        "match": { "kind": "return" }
+    }));
+    assert!(returns.diagnostics.is_empty(), "{:?}", returns.diagnostics);
+    assert_eq!(
+        kotlin_match_texts(&returns),
+        vec!["return value", "return code"]
+    );
+
+    let throws = kotlin_query(json!({
+        "languages": ["kotlin"],
+        "match": {
+            "kind": "throw",
+            "has": { "kind": "call", "callee": { "name": "IllegalStateException" } }
+        }
+    }));
+    assert!(throws.diagnostics.is_empty(), "{:?}", throws.diagnostics);
+    assert_eq!(
+        kotlin_match_texts(&throws),
+        vec![r#"throw IllegalStateException("missing")"#]
+    );
 }
 
 #[test]
