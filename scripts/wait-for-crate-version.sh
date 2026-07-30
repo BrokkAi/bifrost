@@ -11,9 +11,10 @@ readonly crate=$1
 readonly version=$2
 readonly expected_checksum=$3
 readonly endpoint="https://crates.io/api/v1/crates/${crate}/${version}"
+readonly max_attempts=30
 
-for attempt in {1..10}; do
-  response=$(curl --fail --silent --show-error "$endpoint" 2>/dev/null || true)
+for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+  response=$(curl --fail --silent --show-error --user-agent 'cargo/1.85.0' "$endpoint" 2>/dev/null || true)
   checksum=$(jq -r '.version.checksum // empty' <<<"$response")
   if [[ -n "$checksum" ]]; then
     if [[ "$checksum" != "$expected_checksum" ]]; then
@@ -24,9 +25,9 @@ for attempt in {1..10}; do
     exit 0
   fi
 
-  if (( attempt < 10 )); then
+  if (( attempt < max_attempts )); then
     delay=$((attempt < 5 ? attempt * 2 : 10))
-    echo "Waiting ${delay}s for crates.io to expose ${crate} ${version} (attempt ${attempt}/10)"
+    echo "Waiting ${delay}s for crates.io to expose ${crate} ${version} (attempt ${attempt}/${max_attempts})"
     sleep "$delay"
   fi
 done
