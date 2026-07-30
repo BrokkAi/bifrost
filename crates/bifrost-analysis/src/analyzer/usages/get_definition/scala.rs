@@ -10196,6 +10196,35 @@ const SCALA_SCOPE_NODES: &[&str] = &[
     "lambda_expression",
 ];
 
+// #1337: `scala_active_path_node_visits_for_test` counts every AST node the active-path
+// walk below visits while seeding the binding prefix visible at a cutoff. Issue #910's fix
+// ("Bound Scala receiver binding inference") made that walk run once per lookup and thread
+// its shared prefix down instead of recursively rebuilding it per receiver; a regression
+// back to per-receiver rebuilding would make this count scale with the number of preceding
+// factory-valued declarations instead of staying flat. `scala_receiver_binding_seed_is_bounded_across_repeated_companion_factories`
+// pins that count directly instead of a wall-clock elapsed budget, which flaked under box
+// load without actually verifying the algorithmic-complexity property it was meant to guard.
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static SCALA_ACTIVE_PATH_NODE_VISITS_FOR_TEST: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Test-only counter of AST nodes visited by [`scala_seed_active_path`] on the calling
+/// thread since the last [`reset_scala_active_path_node_visits_for_test`]. See #1337.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn scala_active_path_node_visits_for_test() -> usize {
+    SCALA_ACTIVE_PATH_NODE_VISITS_FOR_TEST.with(std::cell::Cell::get)
+}
+
+/// Resets the counter read by [`scala_active_path_node_visits_for_test`]. See #1337.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn reset_scala_active_path_node_visits_for_test() {
+    SCALA_ACTIVE_PATH_NODE_VISITS_FOR_TEST.with(|cell| cell.set(0));
+}
+
 fn scala_bindings_before(
     ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver,
@@ -10217,6 +10246,8 @@ fn scala_seed_active_path(
     let root = node;
     let mut stack = vec![node];
     while let Some(node) = stack.pop() {
+        #[cfg(any(test, feature = "test-support"))]
+        SCALA_ACTIVE_PATH_NODE_VISITS_FOR_TEST.with(|cell| cell.set(cell.get() + 1));
         if !ctx.scope_step() {
             return;
         }

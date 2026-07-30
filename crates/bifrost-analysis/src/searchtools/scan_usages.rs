@@ -693,6 +693,56 @@ const SCAN_USAGES_MAX_DURATION: Duration = Duration::from_secs(5);
 /// large-workspace batch callers, not a way to opt out of bounded execution entirely.
 pub(crate) const SCAN_USAGES_MAX_DURATION_CEILING: Duration = Duration::from_secs(300);
 
+// #1337: tests that pin the *count/byte*-based budget behavior (demote-to-summary,
+// candidate-file truncation, too-many-callsites) go through the public service surface,
+// which always applies the real [`SCAN_USAGES_MAX_DURATION`] wall-clock deadline. Under
+// box load, real elapsed time can cross that 5s deadline before the count/byte limit the
+// test actually means to exercise is reached, flipping the observed `incomplete_reason`
+// (or completeness) out from under the assertions -- flaky, not a real product bug. This
+// flag lets such tests disable the wall-clock deadline deterministically (no `Instant`
+// reads involved at all, so no amount of real elapsed time can trip it) while leaving
+// every other budget -- candidate files, source bytes, callsites, response bytes -- fully
+// enforced. It never affects a call that supplies an explicit `max_duration_secs`
+// (production behavior, and any test that deliberately exercises the ceiling clamp).
+#[cfg(any(test, feature = "test-support"))]
+static SCAN_USAGES_TIME_BUDGET_DISABLED_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(test, feature = "test-support"))]
+fn scan_usages_time_budget_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// RAII guard returned by [`disable_time_budget_for_test`]; restores the real wall-clock
+/// budget on drop.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub struct ScanUsagesTimeBudgetGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for ScanUsagesTimeBudgetGuard {
+    fn drop(&mut self) {
+        SCAN_USAGES_TIME_BUDGET_DISABLED_FOR_TEST
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Deterministically disables the [`SCAN_USAGES_MAX_DURATION`] wall-clock deadline for the
+/// lifetime of the returned guard, for calls that leave `max_duration_secs` unset. Production
+/// code never calls this -- the real deadline always applies outside tests. See #1337.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn disable_time_budget_for_test() -> ScanUsagesTimeBudgetGuard {
+    let lock = scan_usages_time_budget_test_lock()
+        .lock()
+        .expect("scan_usages time-budget test mutex poisoned");
+    SCAN_USAGES_TIME_BUDGET_DISABLED_FOR_TEST.store(true, std::sync::atomic::Ordering::Release);
+    ScanUsagesTimeBudgetGuard { _lock: lock }
+}
+
 impl ScanUsagesExecutionContext {
     /// `max_duration`, when `Some`, overrides [`SCAN_USAGES_MAX_DURATION`] for this call (clamped to
     /// [`SCAN_USAGES_MAX_DURATION_CEILING`]) -- see `max_duration_secs` on the request params.
@@ -700,6 +750,17 @@ impl ScanUsagesExecutionContext {
         cancellation: CancellationToken,
         max_duration: Option<Duration>,
     ) -> Self {
+        #[cfg(any(test, feature = "test-support"))]
+        if max_duration.is_none()
+            && SCAN_USAGES_TIME_BUDGET_DISABLED_FOR_TEST.load(std::sync::atomic::Ordering::Acquire)
+        {
+            // No `.with_timeout(..)` call: the token's deadline stays `None`, so
+            // `is_cancelled`/`is_timed_out` never consult the wall clock at all.
+            return Self {
+                cancellation,
+                ..Self::default()
+            };
+        }
         let max_duration = max_duration
             .unwrap_or(SCAN_USAGES_MAX_DURATION)
             .min(SCAN_USAGES_MAX_DURATION_CEILING);

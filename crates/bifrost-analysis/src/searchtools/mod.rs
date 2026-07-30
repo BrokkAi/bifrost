@@ -168,6 +168,8 @@ pub use scan_usages::classify_test_files;
 pub use scan_usages::scan_usages_by_location;
 pub use scan_usages::scan_usages_by_reference;
 pub use scan_usages::usage_graph;
+#[cfg(any(test, feature = "test-support"))]
+pub use scan_usages::{ScanUsagesTimeBudgetGuard, disable_time_budget_for_test};
 pub use scan_usages::{
     scan_usages_by_location_with_cancellation, scan_usages_by_reference_with_cancellation,
 };
