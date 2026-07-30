@@ -460,6 +460,67 @@ fn i2_silent_when_bare_spelling_reports_invalid_location_where_qualified_resolve
     assert!(sink.into_sorted_vec().is_empty());
 }
 
+// no_definition on a less qualified spelling is the same qualification
+// divergence one stage later: the bare selector is too weak to name the
+// reference's target, and a more qualified spelling resolves it
+// (perspective's ctor `t_gnode`, tier-6). Exempt in that direction only —
+// the reverse (qualified no_definition where bare resolved) stays drift,
+// guarded by i2_fires_when_one_declarations_spellings_drift_at_the_location_stage.
+#[test]
+fn i2_silent_when_bare_spelling_reports_no_definition_where_qualified_resolves() {
+    let records = vec![
+        defs_spelling(0, "t_gnode", "ctx", "t", "no_definition"),
+        defs_spelling(
+            1,
+            "perspective.t_gnode.t_gnode",
+            "ctx",
+            "t",
+            "resolved",
+        ),
+        defs_spelling(
+            2,
+            "rust/perspective-server/cpp/perspective/src/cpp/gnode.cpp#t_gnode",
+            "ctx",
+            "t",
+            "resolved",
+        ),
+        defs_spelling(
+            3,
+            "rust/perspective-server/cpp/perspective/src/cpp/gnode.cpp#perspective.t_gnode.t_gnode",
+            "ctx",
+            "t",
+            "resolved",
+        ),
+    ];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i2(&refs(&records), "c", &mut sink, &mut summary);
+    assert!(sink.into_sorted_vec().is_empty());
+}
+
+// A no_definition sitting at or beyond the most qualified resolved spelling
+// is not qualification divergence and must keep firing.
+#[test]
+fn i2_fires_when_no_definition_is_not_shadowed_by_a_more_qualified_resolution() {
+    let records = vec![
+        defs_spelling(0, "t_gnode", "ctx", "t", "resolved"),
+        defs_spelling(1, "perspective.t_gnode", "ctx", "t", "resolved"),
+        defs_spelling(
+            2,
+            "src/cpp/gnode.cpp#perspective.t_gnode",
+            "ctx",
+            "t",
+            "no_definition",
+        ),
+    ];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i2(&refs(&records), "c", &mut sink, &mut summary);
+    let violations = sink.into_sorted_vec();
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    assert_eq!(violations[0].shape, "spelling-status-drift");
+}
+
 // Location verdicts legitimately differ across *different* reference sites:
 // one symbol's probes span several (context, target) references (a php
 // property and its same-named method share one display fq — Faker's
