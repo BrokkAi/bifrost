@@ -16,7 +16,7 @@ pub fn run_core_stdio_server(
         render_options,
         git_repo,
     )?;
-    run_stdio_server(Some(root), render_options, &spec)
+    run_stdio_server(Some(root), render_options, &spec, None)
 }
 
 pub fn run_searchtools_stdio_server(
@@ -29,7 +29,7 @@ pub fn run_searchtools_stdio_server(
         render_options,
         git_repo,
     )?;
-    run_stdio_server(Some(root), render_options, &spec)
+    run_stdio_server(Some(root), render_options, &spec, None)
 }
 
 pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {

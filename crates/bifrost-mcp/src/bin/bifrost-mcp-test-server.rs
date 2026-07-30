@@ -64,6 +64,7 @@ fn run(arguments: Arguments) -> Result<(), String> {
         initial_root,
         arguments.render_options,
         &spec,
+        None,
         env!("CARGO_PKG_VERSION"),
     )
 }

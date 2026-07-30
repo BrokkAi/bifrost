@@ -39,6 +39,26 @@ Current Codex does not advertise standard roots. For any rootless connection who
 
 Explicit `--root` integrations remain authoritative and do not require roots negotiation. The packaged launcher also translates `BIFROST_WORKSPACE_ROOT` into an explicit `--root`. Prefer an explicit root for manual fixed-project configurations. Packaged plugins use client-provided roots or Codex sandbox-state metadata so package-local command resolution stays independent from analyzer scope.
 
+## Immutable Git Snapshot Diffs
+
+An MCP host that captures review snapshots in a private Git object store can
+launch Bifrost with `--diff-snapshot-object-dir /path/to/objects`. This trusted
+launch setting names a Git `objects` directory; Bifrost resolves it to an
+absolute path and rejects a missing or non-directory path at startup. It is not
+an MCP tool argument, so an MCP caller cannot choose an arbitrary object-store
+filesystem path.
+
+`analyze_diff` accepts commit-ish or tree-ish values for explicit `base` and
+`target` endpoints, preferring a commit when a spelling can resolve to either.
+Its response labels commits by full hash and trees as `tree:<oid>`. Omitting
+both endpoints retains the HEAD-to-live-worktree comparison. A commit supplied
+as `target` alone compares against its first parent, while a tree-only target
+is rejected because trees have no parents and therefore needs an explicit
+`base`. When both endpoints are immutable commits or trees, Bifrost compares
+only those snapshots and ignores the live worktree, index, and `.gitattributes`.
+Objects available only in the snapshot store resolve only when the server was
+launched with the flag.
+
 When standard roots or sandbox-state metadata controls a rootless connection, `activate_workspace` is unavailable even if the selected toolset exposes it. Change the workspace through the MCP host instead. This prevents a tool call from widening the client-approved scope; explicit-root integrations retain the normal workspace activation behavior.
 
 ## Toolsets
