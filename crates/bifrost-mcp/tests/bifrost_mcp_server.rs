@@ -2972,24 +2972,12 @@ fn rootless_mcp_binds_from_codex_sandbox_state_and_revokes_per_call_scope() {
         .file("SecondWorkspace.java", "class SecondWorkspace {}\n")
         .build();
 
+    assert_codex_metadata_cannot_bind_before_initialize(plugin_dir.path(), workspace.root());
+
     let mut child = spawn_rootless_server(plugin_dir.path(), "workspace|symbol");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
-
-    let before_initialize = round_trip(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        codex_search_symbols_call(0, workspace.root(), "codex-test-thread", "CodexWorkspace"),
-    );
-    assert_eq!(before_initialize["error"]["code"], -32603);
-    assert!(
-        before_initialize["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("not bound to a workspace")),
-        "Codex metadata must not grant workspace authority before capability negotiation: {before_initialize}"
-    );
 
     let initialize = round_trip(
         &mut stdin,
@@ -3461,6 +3449,50 @@ fn codex_initialize_request(id: i64) -> Value {
     let mut request = codex_handshake_message("initialize");
     request["id"] = json!(id);
     request
+}
+
+/// A Codex tool call sent before `initialize` must not bind a workspace.
+///
+/// The MCP lifecycle permits only `ping` before `initialize`, so the server
+/// refuses the call outright and ends the session rather than answering it.
+/// That is stricter than returning an "unbound workspace" error: the sandbox
+/// metadata is never even interpreted, and the sandbox root is never touched.
+fn assert_codex_metadata_cannot_bind_before_initialize(
+    cwd: &std::path::Path,
+    sandbox_root: &std::path::Path,
+) {
+    let mut child = spawn_rootless_server(cwd, "workspace|symbol");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+
+    write_line(
+        &mut stdin,
+        codex_search_symbols_call(0, sandbox_root, "codex-test-thread", "CodexWorkspace"),
+    );
+    let mut response = String::new();
+    reader
+        .read_line(&mut response)
+        .expect("read pre-initialize response");
+    assert!(
+        response.is_empty(),
+        "a tools/call before initialize must not be served: {response}"
+    );
+
+    let mut diagnostics = String::new();
+    let _ = stderr.read_to_string(&mut diagnostics);
+    assert!(
+        diagnostics.contains("expect initialized request"),
+        "the server must refuse the session, not the individual call: {diagnostics}"
+    );
+    assert!(
+        !sandbox_root
+            .join(".bifrost/cache/bifrost_cache.db")
+            .exists(),
+        "Codex metadata must not grant workspace authority before capability negotiation"
+    );
+    drop(stdin);
+    let _ = child.wait();
 }
 
 fn codex_search_symbols_call(

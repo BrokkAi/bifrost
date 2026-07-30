@@ -85,6 +85,13 @@ enum WorkspaceBindingSource {
 /// correlate by hand.
 struct ConnectionState {
     accepts_client_roots: bool,
+    /// Whether `initialize` has already been answered on this connection.
+    ///
+    /// A second `initialize` is refused. The handshake is what decides whether
+    /// this connection may bind workspaces from client roots or from Codex
+    /// sandbox metadata, so letting a peer redo it would let it re-negotiate
+    /// that authority mid-session. `rmcp` permits duplicates; Bifrost does not.
+    initialize_received: bool,
     client_supports_roots: bool,
     workspace_binding_source: WorkspaceBindingSource,
     codex_sandbox_cwd_uri: Option<String>,
@@ -92,16 +99,27 @@ struct ConnectionState {
     /// Bumped every time the client reports its roots changed.
     ///
     /// A `roots/list` answer that arrives after a change describes a scope the
-    /// client has already replaced. Binding it, even for an instant, would let
-    /// the analyzer touch a directory the client no longer authorizes, so an
-    /// answer whose epoch no longer matches is discarded.
+    /// client has already replaced, so an answer whose epoch no longer matches
+    /// is discarded.
     roots_epoch: u64,
+    /// Roots the client authorized but that Bifrost has not analyzed yet.
+    ///
+    /// Recording is separate from binding on purpose. Binding canonicalizes
+    /// the root, creates `.bifrost/cache` inside it, and starts a background
+    /// index build, so it must not happen merely because a client mentioned a
+    /// directory -- only because a request actually needs that workspace.
+    /// Keeping the two apart is also what makes a superseded answer harmless:
+    /// `rmcp` dispatches notifications on spawned tasks, so a
+    /// `roots/list_changed` can lose the race against the answer it supersedes,
+    /// and a recorded-but-unbound root leaves nothing behind when it does.
+    pending_client_roots: Option<Vec<PathBuf>>,
 }
 
 impl ConnectionState {
     fn new(accepts_client_roots: bool) -> Self {
         Self {
             accepts_client_roots,
+            initialize_received: false,
             client_supports_roots: false,
             workspace_binding_source: if accepts_client_roots {
                 WorkspaceBindingSource::None
@@ -111,6 +129,7 @@ impl ConnectionState {
             codex_sandbox_cwd_uri: None,
             codex_sandbox_root: None,
             roots_epoch: 0,
+            pending_client_roots: None,
         }
     }
 
@@ -125,6 +144,7 @@ impl ConnectionState {
         self.workspace_binding_source = WorkspaceBindingSource::None;
         self.codex_sandbox_cwd_uri = None;
         self.codex_sandbox_root = None;
+        self.pending_client_roots = None;
     }
 }
 
@@ -302,24 +322,57 @@ impl BifrostMcpHandler {
         })
     }
 
-    /// Bind the first usable root from a client's roots list, or unbind and
-    /// explain when none of them is usable.
+    /// Record the roots a client authorized, without touching the filesystem.
     ///
-    /// A client that answers with an empty list has revoked Bifrost's scope;
-    /// that is a legitimate answer, not a failure, and the server must go back
-    /// to serving nothing rather than keep analyzing the old directory.
+    /// An empty list is a legitimate answer meaning "you may analyze nothing":
+    /// the active workspace is revoked and the server goes back to serving no
+    /// workspace tools rather than continuing on the old directory.
+    /// [`Self::activate_recorded_roots`] turns a recording into an actual
+    /// analyzer scope, the first time a request needs one.
     #[allow(deprecated)] // Roots: see the note on the `Root` import.
-    fn bind_client_roots(&self, state: &mut ConnectionState, roots: &[Root]) {
+    fn record_client_roots(&self, state: &mut ConnectionState, roots: &[Root]) {
+        let mut candidates = Vec::with_capacity(roots.len());
         let mut last_error = None;
         for root in roots {
-            let path = match client_root_to_path(&root.uri) {
-                Ok(path) => path,
-                Err(error) => {
-                    last_error = Some(error);
-                    continue;
-                }
-            };
-            match self.service.bind_client_workspace(path) {
+            match client_root_to_path(&root.uri) {
+                Ok(path) => candidates.push(path),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        // Whatever the client just said replaces whatever it said before, so
+        // the previous scope is revoked either way.
+        if let Err(error) = self.service.unbind_client_workspace() {
+            eprintln!("bifrost: failed to clear the previous MCP workspace root: {error}");
+        }
+        self.in_flight
+            .cancel_stale(self.service.workspace_generation());
+        state.clear_binding();
+
+        if candidates.is_empty() {
+            match last_error {
+                Some(error) => eprintln!("bifrost: no usable MCP workspace root: {error}"),
+                None => eprintln!(
+                    "bifrost: MCP client returned no workspace roots; server remains unbound"
+                ),
+            }
+            return;
+        }
+        if let Some(error) = last_error {
+            eprintln!("bifrost: ignoring an unusable MCP workspace root: {error}");
+        }
+        state.pending_client_roots = Some(candidates);
+    }
+
+    /// Bind the first usable recorded root, so a request that needs a workspace
+    /// gets one. Returns whether a workspace is now active.
+    fn activate_recorded_roots(&self, state: &mut ConnectionState) -> bool {
+        let Some(candidates) = state.pending_client_roots.take() else {
+            return false;
+        };
+        let mut last_error = None;
+        for candidate in candidates {
+            match self.service.bind_client_workspace(candidate) {
                 Ok(root) => {
                     self.in_flight
                         .cancel_stale(self.service.workspace_generation());
@@ -330,24 +383,15 @@ impl BifrostMcpHandler {
                         "bifrost: bound MCP workspace source=roots/list root={}",
                         escape_terminal_text(root.to_string_lossy().as_ref())
                     );
-                    return;
+                    return true;
                 }
                 Err(error) => last_error = Some(error.to_string()),
             }
         }
-
-        if let Err(error) = self.service.unbind_client_workspace() {
-            eprintln!("bifrost: failed to clear unusable MCP workspace roots: {error}");
+        if let Some(error) = last_error {
+            eprintln!("bifrost: no usable MCP workspace root: {error}");
         }
-        self.in_flight
-            .cancel_stale(self.service.workspace_generation());
-        state.clear_binding();
-        match last_error {
-            Some(error) => eprintln!("bifrost: no usable MCP workspace root: {error}"),
-            None => {
-                eprintln!("bifrost: MCP client returned no workspace roots; server remains unbound")
-            }
-        }
+        false
     }
 
     /// Ask a legacy (`2025-11-25`) client for its roots and bind from the
@@ -377,7 +421,7 @@ impl BifrostMcpHandler {
             return;
         }
         match result {
-            Ok(result) => self.bind_client_roots(&mut state, &result.roots),
+            Ok(result) => self.record_client_roots(&mut state, &result.roots),
             Err(error) => eprintln!("bifrost: MCP roots/list failed: {error}"),
         }
     }
@@ -561,7 +605,7 @@ impl BifrostMcpHandler {
                 serde_json::from_value::<rmcp::model::ListRootsResult>(value.clone()).ok()
             });
         match roots {
-            Some(result) => self.bind_client_roots(state, &result.roots),
+            Some(result) => self.record_client_roots(state, &result.roots),
             None => eprintln!(
                 "bifrost: MCP roots activation retry carried no usable {ROOTS_INPUT_REQUEST_KEY} response"
             ),
@@ -581,6 +625,11 @@ impl BifrostMcpHandler {
     ) -> Result<PreparedToolCall, ErrorData> {
         self.reconcile_codex_sandbox_workspace(state, meta)?;
 
+        // This is the first moment a workspace is actually needed, so it is
+        // the moment recorded client roots become an analyzer scope.
+        if state.workspace_binding_source == WorkspaceBindingSource::None {
+            self.activate_recorded_roots(state);
+        }
         if state.workspace_binding_source == WorkspaceBindingSource::None {
             return Err(unbound_workspace_error());
         }
@@ -859,6 +908,13 @@ impl ServerHandler for BifrostMcpHandler {
         let client_is_codex = request.client_info.name == CODEX_MCP_CLIENT_NAME;
         let advertise_codex_sandbox_state = {
             let mut state = self.workspace.lock().await;
+            if state.initialize_received {
+                return Err(ErrorData::invalid_request(
+                    "MCP initialize may only be sent once per connection",
+                    None,
+                ));
+            }
+            state.initialize_received = true;
             state.client_supports_roots = client_supports_roots;
             let protocol = if !state.accepts_client_roots {
                 "explicit-root"
