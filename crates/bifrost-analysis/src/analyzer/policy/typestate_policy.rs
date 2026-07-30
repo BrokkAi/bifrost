@@ -7,11 +7,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
-use std::fmt::Write as _;
 use std::ops::Range as ByteRange;
 use std::sync::Arc;
-
-use sha2::{Digest, Sha256};
 
 use crate::CancellationToken;
 use crate::analyzer::common::language_for_file;
@@ -34,11 +31,10 @@ use crate::analyzer::policy::evaluator::{
 };
 use crate::analyzer::policy::finding::{
     BoundedWitness, CertaintyReason, FindingCertainty, FindingCompleteness,
-    FindingIncompleteReason, PolicyByteSpan, PolicyDiagnostic, PolicyDiagnosticCode,
-    PolicyDiagnosticImpact, PolicyDiagnosticSeverity, PolicyDisplayRegion, PolicyFailureReason,
-    PolicyIncompleteReason, PolicyLocationRelationship, PolicyRunCompletion, PolicySourceLocation,
-    PolicyWorkMetric, PolicyWorkReport, PolicyWorkUnit, ProofMetadata, ProofReason, ProofState,
-    RelatedPolicyLocation, WitnessStep, WitnessStepKind,
+    FindingIncompleteReason, PolicyDiagnostic, PolicyDiagnosticCode, PolicyDiagnosticImpact,
+    PolicyDiagnosticSeverity, PolicyFailureReason, PolicyIncompleteReason,
+    PolicyLocationRelationship, PolicyRunCompletion, PolicyWorkMetric, PolicyWorkReport,
+    PolicyWorkUnit, ProofMetadata, ProofReason, ProofState, RelatedPolicyLocation, WitnessStepKind,
 };
 use crate::analyzer::policy::finding_identity::{
     AnalysisFindingId, AnalysisSubjectRef, StableSemanticIdentity, TypestateScenarioId, WitnessId,
@@ -64,14 +60,12 @@ use crate::analyzer::semantic::{
     DispatchOracle, DispatchResult, EvidenceCompleteness, HeapOracle, IcfgExitProfile,
     IcfgProvider, IcfgSnapshot, IcfgSnapshotLimits, ObservationPhase, OracleCallContext,
     ProcedureHandle, ProcedurePortHandle, ProcedurePortKind, ProgramPointHandle, ProofStatus,
-    SemanticArtifact, SemanticBudget, SemanticBudgetDimension, SemanticExecutionBudget,
-    SemanticExecutionWork, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticWork,
-    ValueAtPoint, ValueFlowOracle, ValueHandle, WorkspaceIcfgProvider,
+    SemanticBudget, SemanticBudgetDimension, SemanticExecutionBudget, SemanticExecutionWork,
+    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticWork, ValueAtPoint,
+    ValueFlowOracle, ValueHandle, WorkspaceIcfgProvider,
 };
-use crate::analyzer::structural::search::{DetailedCodeQueryDomain, execute_code_query_detailed};
 use crate::analyzer::structural::{
     CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, CodeQueryExecutionWork,
-    CodeQuerySemanticLimits, CodeQuerySemanticWork,
 };
 use crate::analyzer::typestate::{
     BoundTypestateSubjectSpec, CompiledProtocol, PROTOCOL_SCHEMA_VERSION,
@@ -92,7 +86,6 @@ use crate::analyzer::typestate::{
 };
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
 use crate::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
-use crate::text_utils::{compute_line_starts, line_column_for_offset};
 
 #[derive(Debug)]
 pub(crate) enum TypestatePolicyCompileError {
@@ -205,13 +198,7 @@ pub(crate) struct CompiledTypestatePolicy {
 }
 
 pub(crate) struct TypestatePolicyCompiler<'a> {
-    workspace: &'a WorkspaceAnalyzer,
-    query_limits: CodeQueryExecutionLimits,
-    cancellation: &'a CancellationToken,
-    semantic_budget: SemanticBudget,
-    semantic_execution_budget: SemanticExecutionBudget,
-    query_work: CodeQueryExecutionWork,
-    artifacts: HashMap<ProjectFile, Arc<SemanticArtifact>>,
+    selectors: super::selector_compiler::PolicySelectorSession<'a>,
     syntax_trees: HashMap<ProjectFile, tree_sitter::Tree>,
     formal_names: HashMap<ProcedurePortHandle, Box<[String]>>,
 }
@@ -774,14 +761,16 @@ fn project_finding(
     let subject_namespace = subject_locator.language().config_label();
     let site_path = site.path().clone();
     let site_namespace = site.language().config_label();
-    let scenario_key = semantic_root_key(root);
+    let scenario_key = super::semantic_identity::semantic_root_key(root);
     let scenario = TypestateScenarioId::try_new("bifrost", &scenario_key)
         .map_err(|error| error.to_string())?;
-    let site_key = semantic_site_key(workspace, site);
+    let site_key = super::semantic_identity::semantic_site_key(workspace, site);
     let site_identity =
         StableSemanticIdentity::protocol_violation_site(site_namespace, site_path, &site_key)
             .map_err(|error| error.to_string())?;
-    let subject_key = stable_hex(bound_subject.key().public_canonical_rendering().as_bytes());
+    let subject_key = super::semantic_identity::stable_hex(
+        bound_subject.key().public_canonical_rendering().as_bytes(),
+    );
     let subject_identity =
         StableSemanticIdentity::protocol_subject(subject_namespace, subject_path, &subject_key)
             .map_err(|error| error.to_string())?;
@@ -813,8 +802,9 @@ fn project_finding(
             &violation,
         )
         .map_err(|error| error.to_string())?;
-        let finding_key =
-            stable_hex(format!("{}:{}:{}", subject_key, site_key, facts.semantic_hash).as_bytes());
+        let finding_key = super::semantic_identity::stable_hex(
+            format!("{}:{}:{}", subject_key, site_key, facts.semantic_hash).as_bytes(),
+        );
         let (report, witness_refs) = projected_report(
             workspace,
             finding,
@@ -975,7 +965,7 @@ fn projected_report(
     report_options: &PolicyReportOptions,
     budget: &PolicyBudget,
 ) -> Result<(ProjectedFindingReport, Vec<WitnessId>), String> {
-    let primary = policy_location(workspace, finding.site())?;
+    let primary = super::semantic_identity::policy_location(workspace, finding.site())?;
     let certainty = match finding.certainty() {
         TypestateFindingCertainty::Must => FindingCertainty::Definite,
         TypestateFindingCertainty::May | TypestateFindingCertainty::Inconclusive => {
@@ -1019,11 +1009,17 @@ fn projected_report(
         .enumerate()
     {
         let witness = finding_witness.witness();
-        let id_key = stable_hex(format!("{finding_key}:{index}").as_bytes());
+        let id_key =
+            super::semantic_identity::stable_hex(format!("{finding_key}:{index}").as_bytes());
         let id = WitnessId::try_new("bifrost", &id_key).map_err(|error| error.to_string())?;
-        let mut steps = Vec::new();
-        for step in witness.steps().take(retained_step_limit) {
-            let (kind, label) = match step.kind() {
+        let projected = super::witness_projection::project_summary_witness(
+            workspace,
+            witness.summary(),
+            id.clone(),
+            retained_step_limit,
+            retained_byte_limit,
+            false,
+            |kind| match kind {
                 SummaryWitnessStepKind::Seed => (WitnessStepKind::Source, "typestate seed"),
                 SummaryWitnessStepKind::Edge(_) => {
                     (WitnessStepKind::Propagation, "typestate propagation")
@@ -1031,45 +1027,13 @@ fn projected_report(
                 SummaryWitnessStepKind::EndSummaryGap(_) => {
                     (WitnessStepKind::Return, "typestate summary boundary")
                 }
-            };
-            let source = program_point_locator(step.source());
-            let step = WitnessStep::try_new(
-                kind,
-                Some(policy_location(workspace, source)?),
-                label,
-                Vec::new(),
-            )
-            .map_err(|error| error.to_string())?;
-            steps.push(step);
-            let candidate = BoundedWitness::try_new(id.clone(), steps.clone(), true, 1)
-                .map_err(|error| error.to_string())?;
-            if usize::try_from(candidate.retained_bytes()).unwrap_or(usize::MAX)
-                > retained_byte_limit
-            {
-                steps.pop();
-                break;
-            }
-        }
-        if steps.is_empty() {
+            },
+        )?;
+        let Some(projected) = projected else {
             omitted_witnesses = omitted_witnesses.saturating_add(1);
             continue;
-        }
-        let mut omitted = witness
-            .omitted_steps_lower_bound()
-            .saturating_add(witness.step_count().saturating_sub(steps.len()));
-        if witness.truncated() && omitted == 0 {
-            omitted = 1;
-        }
-        let truncated = omitted > 0;
-        witnesses.push(
-            BoundedWitness::try_new(
-                id.clone(),
-                steps,
-                truncated,
-                u64::try_from(omitted).unwrap_or(u64::MAX),
-            )
-            .map_err(|error| error.to_string())?,
-        );
+        };
+        witnesses.push(projected);
         witness_refs.push(id);
     }
     let witnesses_truncated = omitted_witnesses > 0;
@@ -1091,7 +1055,7 @@ fn projected_report(
         .max_related_locations_per_finding()
         .min(report_options.origins_per_finding);
     for acquisition in acquisitions {
-        let location = policy_location(workspace, acquisition)?;
+        let location = super::semantic_identity::policy_location(workspace, acquisition)?;
         if location == primary
             || related
                 .iter()
@@ -1168,125 +1132,6 @@ fn certainty_reasons(finding: &TypestateFinding) -> Result<Vec<CertaintyReason>,
         reasons.push(CertaintyReason::analyzer_ambiguity(code).map_err(|error| error.to_string())?);
     }
     Ok(reasons)
-}
-
-pub(super) fn policy_location(
-    workspace: &WorkspaceAnalyzer,
-    locator: &crate::analyzer::semantic::SemanticLocator,
-) -> Result<PolicySourceLocation, String> {
-    let span = locator.anchor().span();
-    let file = ProjectFile::new(
-        workspace.analyzer().project().root().to_path_buf(),
-        locator.path().as_path(),
-    );
-    let (start_line, start_column, end_line, end_column) = workspace
-        .analyzer()
-        .indexed_source(&file)
-        .map(|source| {
-            let starts = compute_line_starts(&source);
-            let (start_line, start_column) =
-                line_column_for_offset(&source, &starts, span.start_byte() as usize);
-            let (end_line, end_column) =
-                line_column_for_offset(&source, &starts, span.end_byte() as usize);
-            (start_line, start_column, end_line, end_column)
-        })
-        .unwrap_or_else(|| {
-            (
-                span.start().line() as usize + 1,
-                span.start().byte_column() as usize + 1,
-                span.end().line() as usize + 1,
-                span.end().byte_column() as usize + 1,
-            )
-        });
-    Ok(PolicySourceLocation::span(
-        locator.path().clone(),
-        PolicyByteSpan::new(u64::from(span.start_byte()), u64::from(span.end_byte()))
-            .map_err(|error| error.to_string())?,
-        PolicyDisplayRegion::new(
-            start_line as u64,
-            start_column as u64,
-            end_line as u64,
-            end_column as u64,
-        )
-        .map_err(|error| error.to_string())?,
-    ))
-}
-
-pub(super) fn program_point_locator(
-    point: &ProgramPointHandle,
-) -> &crate::analyzer::semantic::SemanticLocator {
-    let row = point
-        .procedure()
-        .semantics()
-        .point(point.id())
-        .expect("validated typestate witness point resolves");
-    &point
-        .procedure()
-        .semantics()
-        .source_mapping(row.source)
-        .expect("validated typestate witness point has a source mapping")
-        .locator
-}
-
-pub(super) fn semantic_root_key(root: &ProcedureHandle) -> String {
-    let mut bytes = Vec::new();
-    let locator = root.semantics().locator();
-    bytes.extend_from_slice(locator.path().as_str().as_bytes());
-    bytes.push(0);
-    bytes.extend_from_slice(locator.language().config_label().as_bytes());
-    bytes.push(0);
-    for segment in locator.declaration().segments() {
-        bytes.extend_from_slice(segment.kind().stable_label().as_bytes());
-        bytes.push(0);
-        if let Some(name) = segment.name() {
-            bytes.extend_from_slice(name.as_bytes());
-        }
-        bytes.extend_from_slice(&segment.sibling_ordinal().to_le_bytes());
-    }
-    stable_hex(&bytes)
-}
-
-pub(super) fn semantic_site_key(
-    workspace: &WorkspaceAnalyzer,
-    locator: &crate::analyzer::semantic::SemanticLocator,
-) -> String {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(semantic_root_key_from_locator(locator).as_bytes());
-    bytes.extend_from_slice(locator.role().stable_label().as_bytes());
-    let span = locator.anchor().span();
-    let file = ProjectFile::new(
-        workspace.analyzer().project().root().to_path_buf(),
-        locator.path().as_path(),
-    );
-    if let Some(source) = workspace.analyzer().indexed_source(&file)
-        && let Some(slice) = source.get(span.start_byte() as usize..span.end_byte() as usize)
-    {
-        bytes.extend_from_slice(slice.as_bytes());
-    }
-    bytes.extend_from_slice(&locator.anchor().occurrence().to_le_bytes());
-    stable_hex(&bytes)
-}
-
-fn semantic_root_key_from_locator(locator: &crate::analyzer::semantic::SemanticLocator) -> String {
-    let mut bytes = Vec::new();
-    for segment in locator.declaration().segments() {
-        bytes.extend_from_slice(segment.kind().stable_label().as_bytes());
-        bytes.push(0);
-        if let Some(name) = segment.name() {
-            bytes.extend_from_slice(name.as_bytes());
-        }
-        bytes.extend_from_slice(&segment.sibling_ordinal().to_le_bytes());
-    }
-    stable_hex(&bytes)
-}
-
-pub(super) fn stable_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut encoded = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(&mut encoded, "{byte:02x}").expect("writing to String is infallible");
-    }
-    encoded
 }
 
 fn failed_projection_payload(message: &str) -> TypestateProjectionPayload {
@@ -1394,6 +1239,22 @@ fn query_budget_error(
     }
 }
 
+fn typestate_selector_error(
+    error: super::selector_compiler::PolicySelectorSessionError,
+) -> TypestatePolicyCompileError {
+    match error {
+        super::selector_compiler::PolicySelectorSessionError::Incomplete { completion, detail } => {
+            TypestatePolicyCompileError::QueryIncomplete { completion, detail }
+        }
+        super::selector_compiler::PolicySelectorSessionError::Unavailable(detail) => {
+            TypestatePolicyCompileError::SemanticUnavailable(detail)
+        }
+        super::selector_compiler::PolicySelectorSessionError::Provider(detail) => {
+            TypestatePolicyCompileError::SemanticProvider(SemanticProviderError::internal(detail))
+        }
+    }
+}
+
 fn require_uninterrupted_semantic_outcome<T>(
     outcome: &SemanticOutcome<T>,
     operation: &str,
@@ -1422,19 +1283,12 @@ impl<'a> TypestatePolicyCompiler<'a> {
         cancellation: &'a CancellationToken,
     ) -> Self {
         Self {
-            workspace,
-            query_limits,
-            cancellation,
-            semantic_budget: SemanticBudget::new(super::selector_compiler::semantic_work_limits(
-                query_limits.semantic,
-            ))
-            .expect("validated CodeQuery semantic limits are positive"),
-            semantic_execution_budget: SemanticExecutionBudget::new(
-                query_limits.semantic.max_materialized_files,
-                query_limits.semantic.max_traversal_steps,
+            selectors: super::selector_compiler::PolicySelectorSession::new(
+                workspace,
+                "typestate",
+                query_limits,
+                cancellation,
             ),
-            query_work: CodeQueryExecutionWork::default(),
-            artifacts: HashMap::new(),
             syntax_trees: HashMap::new(),
             formal_names: HashMap::new(),
         }
@@ -1449,7 +1303,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
             Ok(compiled) => Ok(compiled),
             Err(error) => Err(Box::new(TypestatePolicyCompileFailure {
                 error,
-                work: self.compilation_work_report(),
+                work: self.selectors.work_report("typestate"),
             })),
         }
     }
@@ -1825,9 +1679,9 @@ impl<'a> TypestatePolicyCompiler<'a> {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let semantic_compile_work = self.semantic_budget.used();
-        let semantic_remaining = self.semantic_budget.remaining();
-        let semantic_compile_execution_work = self.semantic_execution_budget.work();
+        let semantic_compile_work = self.selectors.semantic_used();
+        let semantic_remaining = self.selectors.semantic_remaining();
+        let semantic_compile_execution_work = self.selectors.execution_budget().work();
         if !roots.is_empty()
             && (SemanticBudgetDimension::ALL
                 .into_iter()
@@ -1845,11 +1699,11 @@ impl<'a> TypestatePolicyCompiler<'a> {
             subjects: subjects.into_boxed_slice(),
             event_endpoints: event_endpoints.into_boxed_slice(),
             terminal_endpoints: terminal_endpoints.into_boxed_slice(),
-            query_work: self.query_work,
+            query_work: self.selectors.query_work(),
             semantic_compile_work,
             semantic_remaining,
             semantic_compile_execution_work,
-            semantic_execution_budget: self.semantic_execution_budget.clone(),
+            semantic_execution_budget: self.selectors.execution_budget().clone(),
         })
     }
 
@@ -1912,189 +1766,19 @@ impl<'a> TypestatePolicyCompiler<'a> {
         selector: &ResolvedPolicySelector,
         binding: &SelectorBinding,
     ) -> Result<Vec<SelectedSite>, TypestatePolicyCompileError> {
-        let limits = self.remaining_query_limits()?;
-        let detailed = execute_code_query_detailed(
-            self.workspace.analyzer(),
-            &selector.query,
-            limits,
-            Some(self.cancellation),
-        );
-        self.query_work = self.query_work.saturating_add(detailed.work);
-        self.charge_query_semantic_work(detailed.work.semantic)?;
-        if !matches!(detailed.result.completion(), CodeQueryCompletion::Complete) {
-            let diagnostics = detailed
-                .result
-                .diagnostics
-                .iter()
-                .map(|diagnostic| format!("{}: {}", diagnostic.code.as_str(), diagnostic.message))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(TypestatePolicyCompileError::QueryIncomplete {
-                completion: detailed.result.completion(),
-                detail: format!("`{}` ({diagnostics})", selector.path),
-            });
-        }
-        let mut sites = Vec::new();
-        for evidence in detailed.evidence {
-            if matches!(evidence.domain, DetailedCodeQueryDomain::File) {
-                continue;
-            }
-            let result_item = detailed
-                .result
-                .results
-                .get(evidence.result_index)
-                .ok_or_else(|| {
-                    TypestatePolicyCompileError::SemanticUnavailable(format!(
-                        "selector `{}` evidence refers to an absent result row",
-                        selector.path
-                    ))
-                })?;
-            let (proof, completeness) =
-                super::selector_compiler::selected_site_quality(result_item);
-            let Some(span) = evidence.byte_span else {
-                return Err(TypestatePolicyCompileError::SemanticUnavailable(format!(
-                    "selector `{}` produced a row without a source span",
-                    selector.path
-                )));
-            };
-            sites.push(SelectedSite {
-                file: evidence.file,
-                span,
-                require_exact_call: matches!(binding, SelectorBinding::MatchedValue),
-                proof,
-                completeness,
-            });
-        }
-        Ok(sites)
-    }
-
-    fn remaining_query_limits(
-        &self,
-    ) -> Result<CodeQueryExecutionLimits, TypestatePolicyCompileError> {
-        let remaining = |limit: usize, used: u64| {
-            limit.saturating_sub(usize::try_from(used).unwrap_or(usize::MAX))
-        };
-        let max_scanned_files = remaining(
-            self.query_limits.max_scanned_files,
-            self.query_work.scanned_files,
-        );
-        let max_scanned_source_bytes = remaining(
-            self.query_limits.max_scanned_source_bytes,
-            self.query_work.scanned_source_bytes,
-        );
-        let max_fact_nodes =
-            remaining(self.query_limits.max_fact_nodes, self.query_work.fact_nodes);
-        let max_pipeline_rows = remaining(
-            self.query_limits.max_pipeline_rows,
-            self.query_work.pipeline_rows,
-        );
-        if [
-            max_scanned_files,
-            max_scanned_source_bytes,
-            max_fact_nodes,
-            max_pipeline_rows,
-        ]
-        .contains(&0)
-        {
-            return Err(query_budget_error(
-                CodeQueryDiagnosticCode::ExecutionBudgetExhausted,
-                "typestate selectors exhausted the shared structural query budget",
-            ));
-        }
-
-        let semantic_remaining = self.semantic_budget.remaining();
-        let max_materialized_files = self
-            .semantic_execution_budget
-            .remaining_materialized_files();
-        let max_source_bytes = semantic_remaining.source_bytes;
-        let max_rows_per_dimension = SemanticBudgetDimension::ALL
+        Ok(self
+            .selectors
+            .select(selector)
+            .map_err(typestate_selector_error)?
             .into_iter()
-            .filter(|dimension| {
-                !matches!(
-                    dimension,
-                    SemanticBudgetDimension::SourceBytes | SemanticBudgetDimension::OwnedTextBytes
-                )
+            .map(|site| SelectedSite {
+                file: site.file,
+                span: site.span,
+                require_exact_call: matches!(binding, SelectorBinding::MatchedValue),
+                proof: site.proof,
+                completeness: site.completeness,
             })
-            .map(|dimension| semantic_remaining.get(dimension))
-            .min()
-            .unwrap_or(0);
-        let max_retained_bytes = semantic_remaining.owned_text_bytes;
-        let max_traversal_steps = self.remaining_semantic_traversal_steps()?;
-        let semantic = CodeQuerySemanticLimits {
-            max_materialized_files,
-            max_source_bytes,
-            max_rows_per_dimension,
-            max_retained_bytes,
-            max_traversal_steps,
-        };
-        if !semantic.all_positive() {
-            return Err(query_budget_error(
-                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                "typestate selectors exhausted the shared semantic query budget",
-            ));
-        }
-        Ok(CodeQueryExecutionLimits {
-            max_scanned_files,
-            max_scanned_source_bytes,
-            max_fact_nodes,
-            max_pipeline_rows,
-            semantic,
-            typestate: self.query_limits.typestate,
-            value_flow: self.query_limits.value_flow,
-        })
-    }
-
-    fn remaining_semantic_traversal_steps(&self) -> Result<usize, TypestatePolicyCompileError> {
-        let remaining = self.semantic_execution_budget.remaining_traversal_steps();
-        if remaining == 0 {
-            Err(query_budget_error(
-                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                "typestate semantic lookup exhausted the shared traversal budget",
-            ))
-        } else {
-            Ok(remaining)
-        }
-    }
-
-    fn charge_query_semantic_work(
-        &mut self,
-        work: CodeQuerySemanticWork,
-    ) -> Result<(), TypestatePolicyCompileError> {
-        let usize_work = |value| usize::try_from(value).unwrap_or(usize::MAX);
-        if !self.semantic_execution_budget.charge_external_query_work(
-            usize_work(work.unique_materialized_files),
-            usize_work(work.traversal_steps),
-        ) {
-            return Err(query_budget_error(
-                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                "typestate selectors exhausted the shared semantic execution budget",
-            ));
-        }
-        self.semantic_budget
-            .charge(SemanticWork {
-                source_bytes: usize_work(work.source_bytes),
-                procedures: usize_work(work.procedures),
-                blocks: usize_work(work.blocks),
-                program_points: usize_work(work.program_points),
-                values: usize_work(work.values),
-                allocations: usize_work(work.allocations),
-                call_sites: usize_work(work.call_sites),
-                memory_locations: usize_work(work.memory_locations),
-                captures: usize_work(work.captures),
-                source_mappings: usize_work(work.source_mappings),
-                evidence: usize_work(work.evidence),
-                gaps: usize_work(work.gaps),
-                events: usize_work(work.events),
-                control_edges: usize_work(work.control_edges),
-                nested_entries: usize_work(work.nested_entries),
-                owned_text_bytes: usize_work(work.retained_bytes),
-            })
-            .map_err(|_| {
-                query_budget_error(
-                    CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                    "typestate selectors exhausted the shared semantic materialization budget",
-                )
-            })
+            .collect())
     }
 
     fn resolve_selection(
@@ -2108,16 +1792,22 @@ impl<'a> TypestatePolicyCompiler<'a> {
         {
             return self.resolve_matched_selection(selection);
         }
-        let artifact = self.materialize(&selection.file)?;
+        let artifact = self
+            .selectors
+            .materialize(&selection.file)
+            .map_err(typestate_selector_error)?;
         let range = super::selector_compiler::source_range(&selection.span);
         let lookup = procedures_for_source_ranges(
             &artifact,
             &[range],
-            self.remaining_semantic_traversal_steps()?,
-            self.cancellation,
+            self.selectors
+                .remaining_semantic_traversal_steps()
+                .map_err(typestate_selector_error)?,
+            self.selectors.cancellation(),
         );
         if !self
-            .semantic_execution_budget
+            .selectors
+            .execution_budget()
             .charge_traversal(lookup.examined)
         {
             return Err(query_budget_error(
@@ -2156,7 +1846,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
         };
         let (value, observation_point, role) =
             select_value(&procedure, &call, &selection.span, effective_binding, phase)?;
-        let oracle = self.workspace.semantic_oracle_provider();
+        let oracle = self.selectors.workspace().semantic_oracle_provider();
         let at_point = ValueAtPoint::new(
             value,
             observation_point.clone(),
@@ -2168,16 +1858,14 @@ impl<'a> TypestatePolicyCompiler<'a> {
                 error.to_string(),
             ))
         })?;
-        let mut request = SemanticRequest::with_execution_budget(
-            &mut self.semantic_budget,
-            self.cancellation,
-            &self.semantic_execution_budget,
-        );
+        let mut request = self.selectors.semantic_request();
         let outcome = oracle
             .pointees(&at_point, &mut request)
             .map_err(TypestatePolicyCompileError::SemanticProvider)?;
         require_uninterrupted_semantic_outcome(&outcome, "heap analysis")?;
-        self.require_execution_budget("heap analysis")?;
+        self.selectors
+            .require_execution_budget("heap analysis")
+            .map_err(typestate_selector_error)?;
         let result = outcome.available_value().ok_or_else(|| {
             TypestatePolicyCompileError::SemanticUnavailable(
                 "heap analysis produced no object candidates".to_owned(),
@@ -2219,13 +1907,9 @@ impl<'a> TypestatePolicyCompiler<'a> {
         &mut self,
         selection: SelectedSite,
     ) -> Result<ResolvedSelection, TypestatePolicyCompileError> {
-        let oracle = self.workspace.semantic_oracle_provider();
+        let oracle = self.selectors.workspace().semantic_oracle_provider();
         let outcome = {
-            let mut request = SemanticRequest::with_execution_budget(
-                &mut self.semantic_budget,
-                self.cancellation,
-                &self.semantic_execution_budget,
-            );
+            let mut request = self.selectors.semantic_request();
             oracle
                 .pointees_at_source(
                     &selection.file,
@@ -2235,7 +1919,9 @@ impl<'a> TypestatePolicyCompiler<'a> {
                 .map_err(TypestatePolicyCompileError::SemanticProvider)?
         };
         require_uninterrupted_semantic_outcome(&outcome, "matched source heap analysis")?;
-        self.require_execution_budget("matched source heap analysis")?;
+        self.selectors
+            .require_execution_budget("matched source heap analysis")
+            .map_err(typestate_selector_error)?;
         let result = outcome.available_value().ok_or_else(|| {
             TypestatePolicyCompileError::SemanticUnavailable(
                 "matched source row produced no point-sensitive value observation".to_owned(),
@@ -2285,19 +1971,17 @@ impl<'a> TypestatePolicyCompiler<'a> {
         call: &CallSiteHandle,
         expected_name: &str,
     ) -> Result<u32, TypestatePolicyCompileError> {
-        let oracle = self.workspace.semantic_oracle_provider();
+        let oracle = self.selectors.workspace().semantic_oracle_provider();
         let dispatch = {
-            let mut request = SemanticRequest::with_execution_budget(
-                &mut self.semantic_budget,
-                self.cancellation,
-                &self.semantic_execution_budget,
-            );
+            let mut request = self.selectors.semantic_request();
             oracle
                 .resolve_call(call, &mut request)
                 .map_err(TypestatePolicyCompileError::SemanticProvider)?
         };
         require_uninterrupted_semantic_outcome(&dispatch, "formal-name dispatch")?;
-        self.require_execution_budget("formal-name dispatch")?;
+        self.selectors
+            .require_execution_budget("formal-name dispatch")
+            .map_err(typestate_selector_error)?;
         if !dispatch.is_complete() {
             return Err(TypestatePolicyCompileError::AmbiguousSemanticSite(format!(
                 "formal-name binding `{expected_name}` requires complete dispatch"
@@ -2323,17 +2007,15 @@ impl<'a> TypestatePolicyCompiler<'a> {
                 )));
             }
             let bindings = {
-                let mut request = SemanticRequest::with_execution_budget(
-                    &mut self.semantic_budget,
-                    self.cancellation,
-                    &self.semantic_execution_budget,
-                );
+                let mut request = self.selectors.semantic_request();
                 oracle
                     .call_bindings(call, candidate, &OracleCallContext::empty(), &mut request)
                     .map_err(TypestatePolicyCompileError::SemanticProvider)?
             };
             require_uninterrupted_semantic_outcome(&bindings, "formal-name argument binding")?;
-            self.require_execution_budget("formal-name argument binding")?;
+            self.selectors
+                .require_execution_budget("formal-name argument binding")
+                .map_err(typestate_selector_error)?;
             if !bindings.is_complete() {
                 return Err(TypestatePolicyCompileError::AmbiguousSemanticSite(format!(
                     "formal-name binding `{expected_name}` requires complete argument binding"
@@ -2403,14 +2085,16 @@ impl<'a> TypestatePolicyCompiler<'a> {
         if let Some(names) = self.formal_names.get(formal) {
             return Ok(parameter_names_match(names, expected_name));
         }
-        if self.cancellation.is_cancelled() {
+        if self.selectors.cancellation().is_cancelled() {
             return Err(TypestatePolicyCompileError::QueryIncomplete {
                 completion: CodeQueryCompletion::Cancelled,
                 detail: "formal-parameter layout resolution was cancelled".to_owned(),
             });
         }
-        self.remaining_semantic_traversal_steps()?;
-        if !self.semantic_execution_budget.charge_traversal(1) {
+        self.selectors
+            .remaining_semantic_traversal_steps()
+            .map_err(typestate_selector_error)?;
+        if !self.selectors.execution_budget().charge_traversal(1) {
             return Err(query_budget_error(
                 CodeQueryDiagnosticCode::SemanticBudgetExhausted,
                 "formal-parameter layout resolution exhausted the shared traversal budget",
@@ -2425,10 +2109,15 @@ impl<'a> TypestatePolicyCompiler<'a> {
         };
         let span = locator.anchor().span();
         let file = ProjectFile::new(
-            self.workspace.analyzer().project().root().to_path_buf(),
+            self.selectors
+                .workspace()
+                .analyzer()
+                .project()
+                .root()
+                .to_path_buf(),
             locator.path().as_path(),
         );
-        let Some(source) = self.workspace.analyzer().indexed_source(&file) else {
+        let Some(source) = self.selectors.workspace().analyzer().indexed_source(&file) else {
             return Ok(false);
         };
         let language = language_for_file(&file);
@@ -2465,87 +2154,6 @@ impl<'a> TypestatePolicyCompiler<'a> {
         let matches = parameter_names_match(&names, expected_name);
         self.formal_names.insert(formal.clone(), names);
         Ok(matches)
-    }
-
-    fn materialize(
-        &mut self,
-        file: &ProjectFile,
-    ) -> Result<Arc<SemanticArtifact>, TypestatePolicyCompileError> {
-        if let Some(artifact) = self.artifacts.get(file) {
-            return Ok(Arc::clone(artifact));
-        }
-        let mut request = SemanticRequest::with_execution_budget(
-            &mut self.semantic_budget,
-            self.cancellation,
-            &self.semantic_execution_budget,
-        );
-        let outcome = self
-            .workspace
-            .materialize_program_semantics(file, &mut request)
-            .map_err(TypestatePolicyCompileError::SemanticProvider)?;
-        require_uninterrupted_semantic_outcome(&outcome, "program semantics materialization")?;
-        self.require_execution_budget("program semantics materialization")?;
-        let artifact = outcome.available_value().cloned().ok_or_else(|| {
-            TypestatePolicyCompileError::SemanticUnavailable(format!(
-                "program semantics are unavailable for {}",
-                file.abs_path().display()
-            ))
-        })?;
-        self.artifacts.insert(file.clone(), Arc::clone(&artifact));
-        Ok(artifact)
-    }
-
-    fn require_execution_budget(&self, operation: &str) -> Result<(), TypestatePolicyCompileError> {
-        if self.semantic_execution_budget.work().exhausted {
-            Err(query_budget_error(
-                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                format!("{operation} exhausted the shared semantic file or traversal budget"),
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn compilation_work_report(&self) -> PolicyWorkReport {
-        let semantic = self.semantic_budget.used();
-        let execution = self.semantic_execution_budget.work();
-        let metrics = [
-            PolicyWorkMetric::try_new(
-                "typestate.semantic_materialized_files",
-                PolicyWorkUnit::Count,
-                u64::try_from(execution.materialized_files).unwrap_or(u64::MAX),
-            ),
-            PolicyWorkMetric::try_new(
-                "typestate.semantic_traversal_steps",
-                PolicyWorkUnit::Count,
-                u64::try_from(execution.traversal_steps).unwrap_or(u64::MAX),
-            ),
-            PolicyWorkMetric::try_new(
-                "typestate.semantic_source_bytes",
-                PolicyWorkUnit::Bytes,
-                u64::try_from(semantic.source_bytes).unwrap_or(u64::MAX),
-            ),
-            PolicyWorkMetric::try_new(
-                "typestate.semantic_program_points",
-                PolicyWorkUnit::Rows,
-                u64::try_from(semantic.program_points).unwrap_or(u64::MAX),
-            ),
-        ]
-        .into_iter()
-        .filter_map(Result::ok)
-        .collect();
-        PolicyWorkReport::try_new(
-            self.query_work.scanned_files,
-            self.query_work.scanned_source_bytes,
-            self.query_work.fact_nodes,
-            self.query_work.pipeline_rows,
-            self.query_work.examined_references,
-            0,
-            0,
-            0,
-            metrics,
-        )
-        .unwrap_or_default()
     }
 }
 
