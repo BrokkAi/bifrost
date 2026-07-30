@@ -6,7 +6,7 @@ use super::ir::{
     MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
     MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError, QueryStep,
     ReceiverTraversalFilter, ReferenceTraversalFilter, SetOperator, StringPredicate,
-    TypestateTraversal, ValueFlowTraversal, WitnessTraversal,
+    TaintTraversal, TypestateTraversal, ValueFlowTraversal, WitnessTraversal,
 };
 use super::schema::{
     ALL_QUERY_STEP_OPS, CodeQueryExecutionMode, PatternField, QueryField, QueryStepField,
@@ -497,6 +497,23 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     )?;
                 QueryStep::ValueFlow(ValueFlowTraversal { plan_ref })
             }
+            super::schema::QueryStepOp::Taint => {
+                let taint_ref_path = child_path(&entry_path, "taint_ref");
+                let taint_ref = object
+                    .get("taint_ref")
+                    .ok_or_else(|| QueryError::new(&taint_ref_path, "required field is missing"))?
+                    .as_str()
+                    .ok_or_else(|| {
+                        QueryError::new(&taint_ref_path, "expected a taint result reference string")
+                    })?
+                    .parse()
+                    .map_err(
+                        |error: super::super::analysis_context::TaintResultRefError| {
+                            QueryError::new(taint_ref_path, error.to_string())
+                        },
+                    )?;
+                QueryStep::Taint(TaintTraversal { taint_ref })
+            }
             super::schema::QueryStepOp::Witness => QueryStep::Witness(WitnessTraversal::default()),
             _ => QueryStep::from_label(label)
                 .expect("option-free and defaultable query steps construct from their labels"),
@@ -518,6 +535,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
         );
         let typestate = matches!(step, QueryStep::Typestate(_));
         let value_flow = matches!(step, QueryStep::ValueFlow(_));
+        let taint = matches!(step, QueryStep::Taint(_));
         let witness = matches!(step, QueryStep::Witness(_));
         for key in object.keys() {
             match QueryStepField::from_label(key) {
@@ -535,6 +553,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 Some(QueryStepField::Capture) if receiver => {}
                 Some(QueryStepField::ProtocolRef) if typestate => {}
                 Some(QueryStepField::PlanRef) if value_flow => {}
+                Some(QueryStepField::TaintRef) if taint => {}
                 Some(QueryStepField::MaxSteps | QueryStepField::MaxBytes) if witness => {}
                 Some(
                     QueryStepField::ReferenceKinds
@@ -554,6 +573,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::Capture
                     | QueryStepField::ProtocolRef
                     | QueryStepField::PlanRef
+                    | QueryStepField::TaintRef
                     | QueryStepField::MaxSteps
                     | QueryStepField::MaxBytes,
                 )

@@ -19,6 +19,7 @@ const RQL_INITIAL_SCHEMA_VERSION: u32 = 2;
 const RQL_CFG_SCHEMA_VERSION: u32 = 3;
 const RQL_TYPESTATE_SCHEMA_VERSION: u32 = 4;
 const RQL_DECLARATION_CONTAINMENT_SCHEMA_VERSION: u32 = 5;
+const RQL_VALUE_FLOW_SCHEMA_VERSION: u32 = 6;
 const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
     SchemaVersionDescriptor::new(RQL_INITIAL_SCHEMA_VERSION, None, true),
     SchemaVersionDescriptor::new(
@@ -37,8 +38,13 @@ const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[
         true,
     ),
     SchemaVersionDescriptor::new(
-        SCHEMA_VERSION as u32,
+        RQL_VALUE_FLOW_SCHEMA_VERSION,
         Some(RQL_DECLARATION_CONTAINMENT_SCHEMA_VERSION),
+        true,
+    ),
+    SchemaVersionDescriptor::new(
+        SCHEMA_VERSION as u32,
+        Some(RQL_VALUE_FLOW_SCHEMA_VERSION),
         true,
     ),
 ];
@@ -98,6 +104,7 @@ pub enum ValueShape {
     CallTraversalCompleteness,
     ProtocolRef,
     ValueFlowPlanRef,
+    TaintResultRef,
 }
 
 impl ValueShape {
@@ -130,6 +137,9 @@ impl ValueShape {
             Self::CallTraversalCompleteness => "exhaustive or proven_subset",
             Self::ProtocolRef => "a bounded protocol reference in namespace:name form",
             Self::ValueFlowPlanRef => "a bounded value-flow plan reference in namespace:name form",
+            Self::TaintResultRef => {
+                "a bounded retained taint result reference in namespace:name form"
+            }
         }
     }
 
@@ -140,6 +150,9 @@ impl ValueShape {
             Self::ProtocolRef => Some((3, crate::analyzer::structural::MAX_PROTOCOL_REF_BYTES)),
             Self::ValueFlowPlanRef => {
                 Some((3, crate::analyzer::structural::MAX_PROTOCOL_REF_BYTES))
+            }
+            Self::TaintResultRef => {
+                Some((3, crate::analyzer::structural::MAX_TAINT_RESULT_REF_BYTES))
             }
             _ => None,
         }
@@ -318,6 +331,10 @@ macro_rules! query_step_ops {
                 matches!(self, Self::ValueFlow)
             }
 
+            pub fn allows_taint_options(self) -> bool {
+                matches!(self, Self::Taint)
+            }
+
             pub fn allows_witness_options(self) -> bool {
                 matches!(self, Self::Witness)
             }
@@ -332,6 +349,7 @@ pub enum QuerySemanticFacet {
     ControlEdges,
     Typestate,
     ValueFlow,
+    Taint,
 }
 
 query_step_ops! {
@@ -345,8 +363,9 @@ query_step_ops! {
     CfgEdgeTarget { label: "cfg_edge_target", signature: "control_edge -> program_point", description: "Project each control edge to its target program point.", semantic: [Procedures, ProgramPoints, ControlEdges], since: 3, }
     Typestate { label: "typestate", signature: "procedure -> typestate_finding", description: "Run one registered diagnostic-neutral typestate analysis for the exact procedure root.", semantic: [Procedures, Typestate], since: 4, }
     ValueFlow { label: "value_flow", signature: "procedure -> flow_endpoint", description: "Run one registered diagnostic-neutral value-flow plan for the exact procedure root.", semantic: [Procedures, ValueFlow], since: 6, }
+    Taint { label: "taint", signature: "procedure -> taint_finding", description: "Project findings retained by one host-registered production taint result for the exact procedure root.", semantic: [Procedures, Taint], since: 7, }
     Witness { label: "witness", signature: "typestate_finding|flow_endpoint -> typestate_witness|flow_witness", description: "Project bounded retained evidence from each typestate finding or reached flow endpoint without rerunning analysis.", since: 4, }
-    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|reference_site|call_site|expression_site|receiver_analysis -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, reference sites, call sites, expression sites, or receiver analyses to their workspace files." }
+    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|taint_finding|reference_site|call_site|expression_site|receiver_analysis -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, taint findings, reference sites, call sites, expression sites, or receiver analyses to their workspace files." }
     ImportsOf { label: "imports_of", signature: "file -> file", description: "Traverse one direct project-local import edge forward." }
     ImportersOf { label: "importers_of", signature: "file -> file", description: "Traverse one direct project-local import edge backward." }
     Supertypes { label: "supertypes", signature: "declaration -> declaration", description: "Traverse indexed supertypes from supported type declarations." }
@@ -498,6 +517,7 @@ macro_rules! rql_forms {
                     | Self::CfgEdgeTarget
                     | Self::Typestate
                     | Self::ValueFlow
+                    | Self::Taint
                     | Self::Witness
                     | Self::FileOf
                     | Self::ImportsOf
@@ -695,6 +715,14 @@ rql_forms! {
         signature: "(value-flow :plan-ref namespace:name query)",
         description: (QueryStepOp::ValueFlow),
         step: ValueFlow,
+    }
+    Taint {
+        labels: ["taint"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(taint :taint-ref namespace:name query)",
+        description: (QueryStepOp::Taint),
+        step: Taint,
     }
     Witness {
         labels: ["witness"],
@@ -1087,6 +1115,7 @@ json_fields! {
     Capture { label: "capture", shape: CaptureName, signature: "\"capture\": \"declared_name\"", description: "Analyze every unique range bound to a declared positive structural capture." }
     ProtocolRef { label: "protocol_ref", shape: ProtocolRef, signature: "\"protocol_ref\": \"namespace:name\"", description: "Select one host-registered compiled protocol and binding plan." }
     PlanRef { label: "plan_ref", shape: ValueFlowPlanRef, signature: "\"plan_ref\": \"namespace:name\"", description: "Select one host-registered immutable value-flow plan." }
+    TaintRef { label: "taint_ref", shape: TaintResultRef, signature: "\"taint_ref\": \"namespace:name\"", description: "Select one host-registered immutable retained production taint result." }
     MaxSteps { label: "max_steps", shape: NonNegativeInteger, signature: "\"max_steps\": non-negative integer", description: "Further cap retained witness steps without rerunning analysis." }
     MaxBytes { label: "max_bytes", shape: NonNegativeInteger, signature: "\"max_bytes\": non-negative integer", description: "Further cap retained witness bytes without rerunning analysis." }
 }
@@ -1144,6 +1173,10 @@ const VALUE_FLOW_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::required(
     QueryStepField::PlanRef,
     &[":plan-ref", ":plan_ref"],
 )];
+const TAINT_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::required(
+    QueryStepField::TaintRef,
+    &[":taint-ref", ":taint_ref"],
+)];
 const WITNESS_STEP_OPTIONS: &[QueryStepOption] = &[
     QueryStepOption::optional(QueryStepField::MaxSteps, &[":max-steps"]),
     QueryStepOption::optional(QueryStepField::MaxBytes, &[":max-bytes"]),
@@ -1154,6 +1187,7 @@ impl QueryStepOp {
         match self {
             Self::Typestate => TYPESTATE_STEP_OPTIONS,
             Self::ValueFlow => VALUE_FLOW_STEP_OPTIONS,
+            Self::Taint => TAINT_STEP_OPTIONS,
             Self::Witness => WITNESS_STEP_OPTIONS,
             _ => &[],
         }
@@ -1261,11 +1295,11 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn rql_schema_lineage_defaults_to_version_six_and_accepts_exact_pins() {
+    fn rql_schema_lineage_defaults_to_version_seven_and_accepts_exact_pins() {
         assert_eq!(
             resolve_rql_schema_version(None).unwrap(),
             SchemaVersionResolution {
-                version: 6,
+                version: 7,
                 origin: SchemaVersionOrigin::ImplicitCompatible,
             }
         );
@@ -1307,7 +1341,7 @@ mod tests {
 
         let error = resolve_rql_schema_version(Some(1)).unwrap_err();
         assert_eq!(error.requested, 1);
-        assert_eq!(error.supported, vec![2, 3, 4, 5, 6]);
+        assert_eq!(error.supported, vec![2, 3, 4, 5, 6, 7]);
     }
 
     #[test]

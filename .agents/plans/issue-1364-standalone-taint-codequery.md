@@ -18,7 +18,7 @@ The observable demonstration is an inline Java project with compatible multiple-
 - [x] (2026-07-30 21:20 SAST) Received plan approval and began Milestone 1 on the existing issue branch.
 - [x] (2026-07-30 21:43 SAST) Milestone 1: extracted one immutable retained production taint result per compatible batch, made policy and public projection consume the same plan/report pair, added conservative retained-memory and artifact accounting, and passed all five focused taint-policy adapter tests.
 - [x] (2026-07-30 22:04 SAST) Milestone 2: added bounded generation-scoped multi-root taint-result registrations, exact semantic-root lookup, shared artifact validation, immutable request snapshots through runtime/MCP, generation clearing, alias/conflict semantics, and transactional retained-byte limits.
-- [ ] Milestone 3: add schema-v7 `taint`/`taint_ref` JSON and RQL vocabulary and projection-only typed execution.
+- [x] (2026-07-30 22:28 SAST) Milestone 3: added schema-v7 `taint`/`taint_ref` JSON and RQL vocabulary, `procedure -> taint_finding` typing and `file_of`, projection-only execution with taint-specific limits/diagnostics, and JSON/RQL end-to-end equivalence against the retained production result.
 - [ ] Milestone 4: complete public transports, editor support, docs, lifecycle/equivalence tests, and final validation.
 - [ ] Run the required five-perspective guided review, remediate accepted findings, and update this plan with the final outcome.
 
@@ -308,3 +308,5 @@ Revision note (2026-07-30): Created the initial self-contained plan after live i
 Revision note (2026-07-30 21:43 SAST): Recorded Milestone 1 completion after the focused adapter suite passed. The implementation keeps the production plan/report allocation intact, routes both projections through it, and adds the conservative ownership accounting required for bounded registration.
 
 Revision note (2026-07-30 22:04 SAST): Recorded Milestone 2 completion after the focused registration behavior test and all-target analysis/runtime/MCP checks passed. The host boundary now snapshots and clears taint registrations with workspace generation while exact-root resolution remains projection-only.
+
+Revision note (2026-07-30 22:28 SAST): Recorded Milestone 3 completion after 105 query/schema/editor-source tests, five focused production taint adapter tests, and all-target analysis/runtime/MCP checks passed. Schema v7 preserves exact v2-v6 pins, and both JSON and RQL reach the same retained findings without a query-side solver path.
