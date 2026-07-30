@@ -2,8 +2,8 @@ use brokk_bifrost::AnalyzerConfig;
 use brokk_bifrost::analyzer::semantic::{
     AbstractObjectIdentity, AllocationKind, ArgumentDomain, CallArgumentExpansion,
     CancellationToken, CandidateCoverage, DispatchExtensibility, ProcedureKind, ProcedurePortKind,
-    ProcedureSemantics, SemanticBudget, SemanticEffect, SemanticRequest, SemanticValueKind,
-    ValueFlowKind,
+    ProcedureSemantics, SemanticBudget, SemanticEffect, SemanticGapImpact, SemanticRequest,
+    SemanticValueKind, ValueFlowKind,
 };
 
 use crate::common::{
@@ -218,4 +218,110 @@ object Sample {
             .any(|allocation| allocation.kind == AllocationKind::Object),
         "factory construction must retain allocation identity"
     );
+}
+
+#[test]
+fn scala_proves_declared_returns_only_for_same_typed_lexical_bindings() {
+    const SOURCE: &str = r#"
+object ExactReturns {
+  implicit def intToString(value: Int): String = value.toString
+
+  def implicitRelay(value: String): String = {
+    val relayed = value
+    relayed
+  }
+
+  def explicitRelay(value: String): String = {
+    val relayed = value
+    return relayed
+  }
+
+  def widened(value: String): Any = {
+    val relayed = value
+    relayed
+  }
+
+  def shadowed(value: String): String = {
+    {
+      val value = 42
+      value
+    }
+  }
+}
+"#;
+
+    let project = InlineTestProject::new()
+        .file("values/ExactReturns.scala", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "values/ExactReturns.scala");
+
+    for name in ["implicitRelay", "explicitRelay"] {
+        let procedure = procedure_named(&graph, name, ProcedureKind::Method);
+        let returned = procedure
+            .points()
+            .iter()
+            .flat_map(|point| &point.events)
+            .find_map(|event| match event.effect {
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Return,
+                    source,
+                    ..
+                } => Some(source),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{name} must publish an identity return flow"));
+        assert_eq!(
+            mapped_source(
+                procedure,
+                SOURCE,
+                procedure.value(returned).expect("returned value").source
+            ),
+            "relayed"
+        );
+        if name == "implicitRelay" {
+            assert!(
+                procedure
+                    .gaps()
+                    .iter()
+                    .all(|gap| !gap.impacts.contains(SemanticGapImpact::ReturnTransfer)),
+                "{name} must not retain a return-transfer gap: {:#?}",
+                procedure.gaps()
+            );
+        } else {
+            assert!(
+                procedure.gaps().iter().all(|gap| {
+                    gap.detail.as_ref()
+                        != "Scala explicit return may apply an implicit conversion to the declared result type"
+                }),
+                "{name} must not retain an explicit-return adaptation gap: {:#?}",
+                procedure.gaps()
+            );
+        }
+    }
+
+    for name in ["widened", "shadowed"] {
+        let procedure = procedure_named(&graph, name, ProcedureKind::Method);
+        assert!(
+            procedure
+                .points()
+                .iter()
+                .flat_map(|point| &point.events)
+                .all(|event| !matches!(
+                    event.effect,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Return,
+                        ..
+                    }
+                )),
+            "{name} must not publish an unproven identity return"
+        );
+        assert!(
+            procedure
+                .gaps()
+                .iter()
+                .any(|gap| gap.impacts.contains(SemanticGapImpact::ReturnTransfer)),
+            "{name} must retain the conservative return-transfer gap"
+        );
+    }
 }
