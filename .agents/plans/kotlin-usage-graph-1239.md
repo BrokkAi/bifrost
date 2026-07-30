@@ -81,6 +81,9 @@ reports call relationships in both directions.
       extensions, overload arity, callable references, override declarations, and the unproven/same-owner hit channels
       (both trimmed out of milestone 1 because a written type reference is never uncertain).
 - [ ] Milestone 3: inverted edge builder; `usage_graph`, `callers`, `callees`, relevance, and dead code light up.
+      Wants #1345 (publish Kotlin return types and extension receivers in `SignatureMetadata`) landed before or
+      alongside it — see the sequencing note in `Milestone 2` for why the reparse path is fine for the query path and
+      not for the whole-workspace pass.
 - [ ] Milestone 4: cross-language JVM symmetry — Kotlin call sites for Java/Scala targets and vice versa.
 - [ ] Milestone 5: rename reference rewriting, the abstention matrix, dead-code bulk eligibility, capability notes.
 
@@ -705,11 +708,20 @@ breadth-first through the realm-aware `type_hierarchy_provider`; then visible ex
 field resolves to the owner or one of its ancestors. Extension candidates are identified by the presence of the
 `receiver` tree-sitter field on the declaration — a structured check, never a name heuristic.
 
-Kotlin's `SignatureMetadata` records no return type and no extension receiver (a gap #1238 flagged as a follow-up), so
-both are currently recovered by re-reading the declaring file's syntax. In the graph builders that read must go through
-a shared per-scan cache keyed by `ProjectFile`, because the inverted builder runs in parallel across files and would
-otherwise reparse the same declaring file once per reference. Use a `Mutex<HashMap<..>>` cache passed into the scan,
-exactly as `java_graph` does with `MethodReturnCache` / `FileReturnCache`.
+Kotlin's `SignatureMetadata` records no return type and no extension receiver (a gap #1238 flagged as a follow-up and
+issue #1345 now owns), so both are currently recovered by re-reading the declaring file's syntax. In the graph builders
+that read must go through a shared per-scan cache keyed by `ProjectFile`, because the inverted builder runs in parallel
+across files and would otherwise reparse the same declaring file once per reference. Use a `Mutex<HashMap<..>>` cache
+passed into the scan, exactly as `java_graph` does with `MethodReturnCache` / `FileReturnCache`.
+
+Sequencing against #1345: milestone 2 does not need it. The query path re-reads a bounded number of declaring files per
+request, which is the arrangement #1238 shipped and measured. Milestone 3 is where it starts to matter, because the
+inverted pass resolves every reference in the workspace and the cache bounds the reparse count to one per declaring
+file while still adding a parse of a large fraction of the workspace to every graph build, and serialising parallel
+workers on the cache. Issue #568 is the precedent: PHP deriving return facts at index time by reparsing signature
+strings took `workspace_build` on FastRoute from 55.6 ms to 129.1 ms. So #1345 should land before or alongside
+milestone 3, and milestone 3 should read the published facts where they exist rather than being written against the
+reparse path and retrofitted.
 
 Reference shapes to record, per target kind:
 
