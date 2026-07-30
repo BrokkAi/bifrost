@@ -52,6 +52,7 @@
 
 mod adapter;
 pub(crate) mod declarations;
+pub(crate) mod diagnostics;
 mod hierarchy;
 pub(crate) mod imports;
 pub(crate) mod language;
@@ -59,8 +60,10 @@ mod semantic;
 pub(crate) mod structural;
 mod supertypes;
 pub(crate) mod syntax;
+mod tests;
 pub(crate) mod types;
 
+use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::cache::{
     build_weighted_cache, weight_code_unit_set, weight_code_unit_vec_by_unit,
     weight_project_file_set,
@@ -71,13 +74,14 @@ use crate::analyzer::pool_memo::PoolSafeMemo;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer,
     ImportAnalysisProvider, JvmAnalyzerConfig, Language, Project, ProjectFile, SemanticDiagnostic,
-    SignatureMetadata, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
-    UsageFactsIndex,
+    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, UsageFactsIndex,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
+use tests::detect_kotlin_test_assertion_smells;
 
 pub(crate) use adapter::KotlinAdapter;
 
@@ -395,7 +399,10 @@ impl IAnalyzer for KotlinAnalyzer {
     }
 
     fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
-        self.inner.semantic_diagnostics(file, source)
+        diagnostics::collect_kotlin_semantic_diagnostics(self, file, source, None)
+            .into_iter()
+            .map(SemanticDiagnostic::from)
+            .collect()
     }
 
     fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
@@ -542,4 +549,24 @@ impl IAnalyzer for KotlinAnalyzer {
     fn in_test_region(&self, code_unit: &CodeUnit) -> bool {
         self.inner.in_test_region(code_unit)
     }
+
+    fn find_test_assertion_smells(
+        &self,
+        file: &ProjectFile,
+        weights: TestAssertionWeights,
+    ) -> Vec<TestAssertionSmell> {
+        if file_language(file) != Language::Kotlin || !self.contains_tests(file) {
+            return Vec::new();
+        }
+        let Ok(source) = self.inner.project().read_source(file) else {
+            return Vec::new();
+        };
+        detect_kotlin_test_assertion_smells(self, file, &source, &weights)
+    }
+
+    fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
+        Some(self)
+    }
 }
+
+impl TestDetectionProvider for KotlinAnalyzer {}

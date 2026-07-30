@@ -302,3 +302,108 @@ fn python_nested_function_body_is_not_counted() {
         return helper()\n";
     assert_eq!(python_score(src, "outer"), 0);
 }
+
+// ===== Kotlin =====
+//
+// Unlike the ports above, Kotlin has no `brokk-shared` reference
+// implementation to match byte-for-byte (issue #1243 is new coverage, not a
+// port), so these assert plausible scores derived by hand-tracing the
+// scorer against `KOTLIN_COGNITIVE_CONFIG` rather than a reference fixture.
+// Fixtures are deliberately multi-line: the vendored grammar emits a
+// MISSING `_automatic_semicolon` error node for a single-line function body,
+// which would make `compute_cognitive_complexities` see an unparseable file.
+
+const KOTLIN_FILE: &str = "com/example/Test.kt";
+
+fn kotlin_score(method_body: &str, identifier: &str) -> u32 {
+    let source = format!(
+        "package com.example\n\n\
+         class Test {{\n\
+         {method_body}\n\
+         }}\n"
+    );
+    score(&[(KOTLIN_FILE, source.as_str())], KOTLIN_FILE, identifier)
+}
+
+#[test]
+fn kotlin_simple_function_is_zero() {
+    let body = "    fun method(): Int {\n        \
+        return 0\n    \
+    }";
+    assert_eq!(kotlin_score(body, "method"), 0);
+}
+
+#[test]
+fn kotlin_flat_function_with_calls_does_not_flag() {
+    let body = "    fun method(a: Int, b: Int): Int {\n        \
+        val sum = a + b\n        \
+        val doubled = sum * 2\n        \
+        return doubled\n    \
+    }";
+    assert_eq!(kotlin_score(body, "method"), 0);
+}
+
+#[test]
+fn kotlin_nested_if_picks_up_nesting() {
+    let body = "    fun method(a: Int, b: Int): Int {\n        \
+        if (a > 0) {\n            \
+            if (b > 0) {\n                \
+                return 1\n            \
+            }\n        \
+        }\n        \
+        return 0\n    \
+    }";
+    // Outer if at nesting 0 (+1), inner if at nesting 1 (+2): matches the
+    // same shape and score as the Java/Python nested-if ports above.
+    assert_eq!(kotlin_score(body, "method"), 3);
+}
+
+#[test]
+fn kotlin_when_if_loop_and_conjunction_score_plausibly() {
+    let body = "    fun method(x: Int): Int {\n        \
+        for (i in 0 until x) {\n            \
+            if (x > 0 && i > 0 || i < 10) {\n                \
+                break\n            \
+            }\n        \
+        }\n        \
+        while (x > 0) {\n            \
+            continue\n        \
+        }\n        \
+        return when (x) {\n            \
+            1 -> x\n            \
+            else -> 0\n        \
+        }\n    \
+    }";
+    // for (+1) -> if at nesting 1 (+2) with && / || counted as two distinct
+    // operator runs (+2) -> while (+1) -> when's one non-default entry (+1),
+    // its `else` arm contributing nothing.
+    assert_eq!(kotlin_score(body, "method"), 7);
+}
+
+#[test]
+fn kotlin_labeled_break_counts_extra_but_unlabeled_is_free() {
+    let labeled_body = "    fun method(x: Int): Int {\n        \
+        outer@ for (i in 0 until x) {\n            \
+            for (j in 0 until x) {\n                \
+                if (j == 1) {\n                    \
+                    break@outer\n                \
+                }\n            \
+            }\n        \
+        }\n        \
+        return 0\n    \
+    }";
+    // Outer for (+1) -> inner for at nesting 1 (+2) -> if at nesting 2 (+3)
+    // -> labeled `break@outer` (+1).
+    assert_eq!(kotlin_score(labeled_body, "method"), 7);
+
+    let unlabeled_body = "    fun method(x: Int): Int {\n        \
+        for (i in 0 until x) {\n            \
+            if (i == 1) {\n                \
+                break\n            \
+            }\n        \
+        }\n        \
+        return 0\n    \
+    }";
+    // Outer for (+1) -> if at nesting 1 (+2) -> unlabeled `break` (+0).
+    assert_eq!(kotlin_score(unlabeled_body, "method"), 3);
+}

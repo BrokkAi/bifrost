@@ -24,6 +24,16 @@ pub type DefaultCasePredicate = fn(Node<'_>, &str) -> bool;
 /// `decorated_definition` wrapping a `function_definition`).
 pub type NamedFunctionBoundaryPredicate = fn(Node<'_>) -> bool;
 
+/// Predicate overriding the default "does this jump carry a label" check
+/// (`named_child_count() > 0`). Needed when a language folds several jump
+/// forms into one node kind for reasons other than a label — Kotlin's
+/// `jump_expression` covers `break`, `continue`, `return`, and `throw`
+/// alike, and only a `break`/`continue`/`return` that carries an explicit
+/// `label` child is a SonarSource-style labeled jump. An ordinary `return
+/// value` or `throw value` carries a named child too (the value), so the
+/// generic child-count check would misreport it as labeled.
+pub type JumpLabelPredicate = fn(Node<'_>, &str) -> bool;
+
 /// Configuration that adapts the generic scorer to a specific language.
 ///
 /// Each `*_types` slice lists the tree-sitter node kinds that map to a
@@ -76,6 +86,9 @@ pub struct Config {
     /// that cannot be enumerated by kind alone (e.g. Python decorated
     /// functions).
     pub named_function_boundary_predicate: Option<NamedFunctionBoundaryPredicate>,
+    /// Optional override for "is this jump labeled", replacing the default
+    /// `named_child_count() > 0` heuristic. See [`JumpLabelPredicate`].
+    pub jump_label_predicate: Option<JumpLabelPredicate>,
 }
 
 impl Config {
@@ -98,6 +111,7 @@ impl Config {
             else_clause_types: &[],
             default_case_predicate: None,
             named_function_boundary_predicate: None,
+            jump_label_predicate: None,
         }
     }
 
@@ -165,7 +179,11 @@ pub fn compute(root: Node<'_>, source: &str, config: &Config) -> u32 {
             }
             push_named_children(&mut work, node, frame.nesting, false);
         } else if slice_contains(config.jump_types, kind) {
-            if is_labeled_jump(node) {
+            let labeled = config
+                .jump_label_predicate
+                .map(|predicate| predicate(node, source))
+                .unwrap_or_else(|| is_labeled_jump(node));
+            if labeled {
                 complexity = complexity.saturating_add(1);
             }
             push_named_children(&mut work, node, frame.nesting, false);

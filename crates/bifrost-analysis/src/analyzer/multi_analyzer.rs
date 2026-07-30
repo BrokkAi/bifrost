@@ -182,8 +182,7 @@ impl AnalyzerDelegate {
             Self::Rust(analyzer) => Some(analyzer),
             Self::Scala(analyzer) => Some(analyzer),
             Self::Ruby(analyzer) => Some(analyzer),
-            // Kotlin AST-backed test detection is issue #1243.
-            Self::Kotlin(analyzer) => analyzer.test_detection_provider(),
+            Self::Kotlin(analyzer) => Some(analyzer),
         }
     }
 
@@ -925,6 +924,25 @@ impl IAnalyzer for MultiAnalyzer {
     }
 
     fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
+        // A Kotlin file's unresolved-type diagnostics must see the same
+        // wider JVM source realm its import and hierarchy resolution do:
+        // otherwise a type declared in a Java or Scala sibling file would be
+        // misreported as unrecognized. Only `MultiAnalyzer` can construct
+        // that realm view (see `kotlin_realm`), so this is the one place the
+        // widening happens rather than inside `KotlinAnalyzer` itself.
+        if language_for_file(file) == Language::Kotlin
+            && let Some((kotlin, realm)) = self.kotlin_realm()
+        {
+            return crate::analyzer::kotlin::diagnostics::collect_kotlin_semantic_diagnostics(
+                kotlin,
+                file,
+                source,
+                Some(&realm),
+            )
+            .into_iter()
+            .map(SemanticDiagnostic::from)
+            .collect();
+        }
         self.delegate_for_file(file)
             .map(|delegate| delegate.analyzer().semantic_diagnostics(file, source))
             .unwrap_or_default()
