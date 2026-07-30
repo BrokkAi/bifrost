@@ -204,7 +204,7 @@ extension-module = ["pyo3/extension-module"]
 # on bifrost-analysis's test-only hooks (e.g. scan_usages::disable_time_budget_for_test,
 # usages::get_definition::scala_active_path_node_visits_for_test) for the integration tests
 # under `tests/` without affecting non-test builds of this package. See #1337.
-brokk-bifrost-analysis = { path = "crates/bifrost-analysis", version = "=0.8.13", features = ["test-support"] }
+brokk-bifrost-analysis = { path = "crates/bifrost-analysis", version = "=0.8.16", features = ["test-support"] }
 filetime = "0.2"
 jsonschema = { version = "0.48.0", default-features = false }
 pretty_assertions = "1.4.1"
