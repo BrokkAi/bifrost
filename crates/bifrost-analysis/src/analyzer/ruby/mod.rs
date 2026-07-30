@@ -1,5 +1,6 @@
 mod adapter;
 mod cache;
+mod clones;
 mod declarations;
 mod diagnostics;
 mod hierarchy;
@@ -9,13 +10,17 @@ mod semantic;
 pub(crate) mod structural;
 mod tests;
 
+use crate::analyzer::clone_detection::{
+    CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
+};
+use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::build_weighted_cache;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, CodeUnitType,
-    DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo, Project,
-    ProjectFile, Range, RubyMethodDispatchMode, SemanticDiagnostic, SignatureMetadata,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
+    CodeUnitType, DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo,
+    Project, ProjectFile, Range, RubyMethodDispatchMode, SemanticDiagnostic, SignatureMetadata,
     TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
@@ -27,6 +32,7 @@ use tree_sitter::Node;
 
 pub(crate) use adapter::RubyAdapter;
 use cache::{weight_code_unit_set, weight_code_unit_vec, weight_project_file_set};
+use clones::build_ruby_clone_candidate_data;
 
 pub(crate) use declarations::{
     RubyFieldScope, RubyNamePath, extract_name_path, extract_name_segments, parse_ruby_tree,
@@ -546,6 +552,46 @@ impl IAnalyzer for RubyAnalyzer {
 
     fn in_test_region(&self, code_unit: &crate::analyzer::CodeUnit) -> bool {
         self.inner.in_test_region(code_unit)
+    }
+
+    fn find_structural_clone_smells(
+        &self,
+        file: &ProjectFile,
+        weights: CloneSmellWeights,
+    ) -> Vec<CloneSmell> {
+        self.find_structural_clone_smells_for_files(std::slice::from_ref(file), weights)
+    }
+
+    fn find_structural_clone_smells_for_files(
+        &self,
+        files: &[ProjectFile],
+        weights: CloneSmellWeights,
+    ) -> Vec<CloneSmell> {
+        let requested_files: Vec<ProjectFile> = files
+            .iter()
+            .filter(|file| file_language(file) == Language::Ruby)
+            .cloned()
+            .collect();
+        if requested_files.is_empty() {
+            return Vec::new();
+        }
+
+        let all_candidates: Vec<CloneCandidateProfile> = self
+            .get_all_declarations()
+            .into_iter()
+            .filter(|code_unit| {
+                code_unit.is_function() && file_language(code_unit.source()) == Language::Ruby
+            })
+            .filter_map(|code_unit| build_ruby_clone_candidate_data(self, &code_unit, weights))
+            .map(|candidate| CloneCandidateProfile::create(candidate, weights))
+            .collect();
+
+        detect_structural_clone_smells(
+            &requested_files,
+            all_candidates,
+            weights,
+            refine_clone_similarity_with_ast,
+        )
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {

@@ -28,6 +28,7 @@ mod python_js_ts_dead_code_smells;
 mod python_structural_clone_smells;
 mod python_test_assertion_smells;
 mod ruby_dead_code_smells;
+mod ruby_structural_clone_smells;
 mod rust_dead_code_smells;
 mod rust_structural_clone_smells;
 mod scala_dead_code_smells;

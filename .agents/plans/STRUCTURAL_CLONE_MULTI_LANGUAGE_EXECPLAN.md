@@ -36,7 +36,7 @@ The observable outcome is that `report_structural_clone_smells` works consistent
 - [x] (2026-07-30) Audited Brokk's current implementation. `TreeSitterAnalyzer` owns generic candidate extraction and leaf-token normalization; Java, Python, and JS/TS refine that generic behavior with language-specific AST labels. This phase will port that remaining shared seam rather than copy three complete traversals.
 - [x] (2026-07-30) Completed Milestone 9. Added a shared stack-safe tree-sitter normalization profile and Go structural-clone support. All four focused Go behaviors and the ten shared clone-engine unit tests pass.
 - [x] (2026-07-30) Completed Milestone 10. Added Rust structural-clone support, an exact concrete-candidate gate, and five focused tests; the Go regression slice remains green.
-- [ ] Complete Milestone 11: add Ruby structural-clone support with focused tests.
+- [x] (2026-07-30) Completed Milestone 11. Added Ruby structural-clone support and five focused tests, including ordinary and singleton method candidates.
 - [ ] Complete Milestone 12: prove mixed Go/Rust/Ruby MCP reporting, update language-neutral tool text, and run the final regression and policy gates.
 - [ ] Add this plan’s milestone tracker updates as each language slice lands.
 - [ ] Keep the `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` sections current during implementation.
@@ -271,6 +271,13 @@ Milestone 10 validation completed with:
 Add `crates/bifrost-analysis/src/analyzer/ruby/clones.rs` with Ruby's variable, constant, string, symbol, number, boolean, and comment classifications, then wire `RubyAnalyzer` to the shared detector. Candidates are ordinary `method` and `singleton_method` declarations already emitted as function `CodeUnit`s. Do not infer dynamic method bodies from `define_method`, blocks, or lambdas in this milestone.
 
 Add `tests/suite_smells/ruby_structural_clone_smells.rs` with the same four behavior contracts. Run all three new language modules before creating the Ruby checkpoint commit.
+
+Milestone 11 validation completed with:
+
+    cargo test --test suite_smells -- ruby_structural_clone_smells --nocapture
+    test result: ok. 5 passed; 0 failed
+
+The Go and Rust focused modules passed immediately before this milestone, and `cargo fmt --all` formatted the complete working tree before the Ruby test run.
 
 ### Milestone 12: Mixed-language MCP hardening
 
