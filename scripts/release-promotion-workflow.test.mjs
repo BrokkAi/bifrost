@@ -131,8 +131,18 @@ test("promotion evidence covers validation before every external publisher", () 
     /^    needs: \[release-context, publish-crate-mcp, publish-crate-lsp\]$/mu,
   );
   assert.match(cratePublisher, /^      package:/mu);
-  assert.match(cratePublisher, /wait-for-crate-version\.sh/u);
   assert.match(cratePublisher, /steps\.package\.outputs\.checksum/u);
+  assert.match(cratePublisher, /Verify exact registry version and checksum/u);
+  assert.match(cratePublisher, /max_attempts=30/u);
+  assert.match(
+    cratePublisher,
+    /for \(\(attempt = 1; attempt <= max_attempts; attempt\+\+\)\)/u,
+  );
+  assert.match(
+    cratePublisher,
+    /if \[\[ "\$checksum" != "\$EXPECTED_CHECKSUM" \]\]/u,
+  );
+  assert.match(cratePublisher, /within the bounded retry window/u);
 });
 
 test("publishers preserve their platform, environment, and OIDC protections", () => {
