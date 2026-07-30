@@ -416,7 +416,7 @@ fn callee_node_for_call<'tree>(node: Node<'tree>, language: Language) -> Option<
             _ => None,
         },
         Language::Scala => scala_callee_node_for_call(node),
-        Language::Kotlin => super::kotlin::kotlin_callee(node),
+        Language::Kotlin => crate::analyzer::kotlin::syntax::kotlin_callee(node),
         Language::Ruby => node.child_by_field_name("method"),
         _ => node
             .child_by_field_name("function")
@@ -435,7 +435,7 @@ fn argument_nodes_for_call(node: Node<'_>, language: Language) -> Vec<Node<'_>> 
     // one level down inside `call_suffix`, so neither the field lookup nor the
     // shared child-kind list below reaches it.
     if language == Language::Kotlin {
-        return super::kotlin::kotlin_value_arguments(node)
+        return crate::analyzer::kotlin::syntax::kotlin_value_arguments(node)
             .into_iter()
             .collect();
     }
