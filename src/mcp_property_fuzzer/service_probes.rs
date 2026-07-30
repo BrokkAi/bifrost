@@ -1961,6 +1961,17 @@ pub fn check_i2(
                     .push((*order, status.as_str()));
             }
             let drift = entries_by_partition.iter_mut().any(|entries| {
+                // Drift is a verdict disagreement: at least one spelling in
+                // the partition must have resolved for there to be a verdict
+                // to diverge from. When every spelling fails (ambiguous bare,
+                // unresolvable_import_boundary qualified, no_definition
+                // path-anchored - finatra's QueueModule example modules) the
+                // comparison is between failure modes at different stages,
+                // which is qualification divergence in the limit, not drift;
+                // genuine boundary bugs carry their own dedicated invariants.
+                if !entries.iter().any(|(_, status)| *status == "resolved") {
+                    return false;
+                }
                 // no_definition on a less qualified spelling is the same
                 // divergence one stage later: the selector was too weak to
                 // name the reference's target and a more qualified spelling
