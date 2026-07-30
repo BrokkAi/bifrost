@@ -20,6 +20,9 @@
 //! objects inside bodies are deliberately not indexed as declarations in this
 //! tier.
 
+use super::syntax::{
+    kotlin_binding_type_text, kotlin_declared_return_type_text, kotlin_extension_receiver_text,
+};
 use crate::analyzer::common::{
     collapse_whitespace, node_source_text as node_text,
     node_source_text_trimmed as node_text_trimmed,
@@ -404,8 +407,15 @@ impl<'a> KotlinVisitor<'a> {
             let type_text = kotlin_declared_type_text(parameter, self.source)
                 .map(|text| format!(": {text}"))
                 .unwrap_or_default();
-            self.parsed
-                .add_signature(field, format!("{binding} {name}{type_text}"));
+            // A `val`/`var` constructor parameter is a property, and what it
+            // declares is the type a receiver of it has. Publishing that here
+            // (issue #1345) is what lets a consumer type `d.base.greet()`
+            // without re-parsing this file.
+            self.parsed.add_signature_with_metadata(
+                field,
+                SignatureMetadata::new(format!("{binding} {name}{type_text}"), Vec::new())
+                    .with_return_type_text(kotlin_binding_type_text(parameter, self.source)),
+            );
         }
     }
 
@@ -489,9 +499,20 @@ impl<'a> KotlinVisitor<'a> {
                 .map(|receiver| format!("{receiver}."))
                 .unwrap_or_default();
             let prefix = kotlin_modifier_prefix(node, self.source);
-            self.parsed.add_signature(
+            // The written type and, for an extension property, the receiver it
+            // extends are published rather than left to be recovered by a
+            // re-read of this file (issue #1345). The receiver comes from the
+            // `property_declaration`'s `receiver` field; the type from the
+            // individual `variable_declaration`, because a destructuring
+            // `val (a, b) = pair` types each name separately.
+            self.parsed.add_signature_with_metadata(
                 code_unit,
-                format!("{prefix}{binding} {receiver_prefix}{name}{type_text}"),
+                SignatureMetadata::new(
+                    format!("{prefix}{binding} {receiver_prefix}{name}{type_text}"),
+                    Vec::new(),
+                )
+                .with_return_type_text(kotlin_binding_type_text(variable, self.source))
+                .with_extension_receiver_type(kotlin_extension_receiver_text(node, self.source)),
             );
         }
     }
@@ -830,7 +851,14 @@ fn kotlin_callable_signature_metadata(
     let facts = first_named_child(node, "function_value_parameters")
         .map(|list| kotlin_function_parameter_facts(list, source))
         .unwrap_or_else(|| kotlin_parameter_facts_from(Vec::new(), 0, false));
+    // Publishing the written return type and extension receiver here is what
+    // keeps a consumer from having to re-read and re-parse the declaring file to
+    // learn them (issue #1345). Both are recorded as *spelled*: resolution
+    // belongs to the consumer and its scope, because a spelled type means
+    // whatever the file that wrote it says it means.
     kotlin_signature_metadata(signature, facts)
+        .with_return_type_text(kotlin_declared_return_type_text(node, source))
+        .with_extension_receiver_type(kotlin_extension_receiver_text(node, source))
 }
 
 #[cfg(test)]

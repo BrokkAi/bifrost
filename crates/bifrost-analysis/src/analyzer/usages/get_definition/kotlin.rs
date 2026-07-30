@@ -50,6 +50,7 @@ use crate::analyzer::kotlin::syntax::{
 };
 use crate::analyzer::kotlin::types::{KotlinNameScope, KotlinTypeName, resolve_kotlin_type_name};
 use crate::analyzer::tree_walk::{first_named_child_of_kind, named_children};
+use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -237,6 +238,48 @@ impl<'a> KotlinCtx<'a> {
             file_syntax: RefCell::new(HashMap::default()),
             file_facts: RefCell::new(file_facts),
         }
+    }
+
+    /// The scope a *declaration* is written in, built entirely from the index.
+    ///
+    /// The package comes from the declaration's own identity, the imports from
+    /// the import index, and the enclosing owners from the declaration ranges —
+    /// so unlike [`Self::scope_in`], nothing here reads or parses the declaring
+    /// file. That is what makes the published-facts path of
+    /// [`Self::declared_type_of`] a genuine saving rather than a reordering: the
+    /// spelled type still has to be resolved in the file that wrote it, and this
+    /// is how that file's scope is obtained without opening it.
+    fn declaration_scope(&self, unit: &CodeUnit) -> Option<KotlinScope> {
+        let byte = self.analyzer.ranges(unit).into_iter().min()?.start_byte;
+        Some(KotlinScope {
+            facts: self.indexed_file_facts(unit),
+            owners: self.scope_owners_at(unit.source(), byte),
+        })
+    }
+
+    /// The package and imports of `unit`'s file, taken from the index.
+    ///
+    /// Seeds the same cache [`Self::file_facts`] reads, because the two produce
+    /// the same answer: a Kotlin `CodeUnit` records the package of the file that
+    /// declared it, which is exactly what parsing that file's package header
+    /// would report.
+    fn indexed_file_facts(&self, unit: &CodeUnit) -> Rc<KotlinFileFacts> {
+        let file = unit.source();
+        if let Some(cached) = self.file_facts.borrow().get(file) {
+            return Rc::clone(cached);
+        }
+        let facts = Rc::new(KotlinFileFacts {
+            package_name: unit.package_name().to_string(),
+            imports: self
+                .analyzer
+                .import_analysis_provider()
+                .map(|provider| provider.import_info_of(file))
+                .unwrap_or_default(),
+        });
+        self.file_facts
+            .borrow_mut()
+            .insert(file.clone(), Rc::clone(&facts));
+        facts
     }
 
     /// The package and imports of `file`.
@@ -471,6 +514,16 @@ impl<'a> KotlinCtx<'a> {
     /// scope, because a spelled type means whatever the file that wrote it says
     /// it means.
     fn declared_type_of(&self, unit: &CodeUnit, depth: usize) -> Option<CodeUnit> {
+        // The index publishes what a Kotlin declaration wrote (issue #1345), so
+        // the case that matters — a written type, which is what a receiver chain
+        // needs at every link — costs a lookup rather than a parse of the
+        // declaring file. The syntax path below stays for what the index cannot
+        // publish: an unwritten type inferred from an initializer, an enum
+        // entry's own enum, and a declaration parse recovery dropped entirely.
+        if let Some(resolved) = self.published_declared_type_of(unit) {
+            return Some(resolved);
+        }
+
         let (syntax, range) = self.declaration_syntax(unit)?;
         let node = kotlin_declaration_node(syntax.tree.root_node(), &range)?;
         // An enum entry has no written type: it is an instance of its own enum.
@@ -518,9 +571,54 @@ impl<'a> KotlinCtx<'a> {
         kotlin_expression_type(&declaring, initializer, depth + 1)
     }
 
+    /// The type `unit` declares, read from the published index rather than from
+    /// the declaring file's syntax.
+    ///
+    /// Restricted to Kotlin declarations. In a JVM realm a member lookup can
+    /// return a Java or Scala unit, and several of those languages publish a
+    /// return type of their own — resolving one of *those* spellings through
+    /// Kotlin's name ladder would answer a Kotlin question with another
+    /// language's syntax.
+    fn published_declared_type_of(&self, unit: &CodeUnit) -> Option<CodeUnit> {
+        if language_for_target(unit) != Language::Kotlin {
+            return None;
+        }
+        let spelled = self
+            .analyzer
+            .signature_metadata(unit)
+            .into_iter()
+            .find_map(|entry| entry.return_type_text().map(str::to_string))?;
+        let scope = self.declaration_scope(unit)?;
+        self.resolve_type_unit(&spelled, &scope)
+    }
+
     /// The type an extension function extends, or `None` when the callable is
     /// not an extension.
     fn extension_receiver_unit(&self, unit: &CodeUnit) -> Option<CodeUnit> {
+        // Extension conformance is checked once per candidate, so a member
+        // lookup considering several same-named extensions used to re-parse
+        // several declaring files to decide which applied. The published
+        // receiver (issue #1345) answers both halves of that question from the
+        // index: which candidates are extensions at all, and what each extends.
+        if language_for_target(unit) == Language::Kotlin {
+            let metadata = self.analyzer.signature_metadata(unit);
+            if let Some(spelled) = metadata
+                .iter()
+                .find_map(|entry| entry.extension_receiver_type())
+            {
+                let spelled = spelled.to_string();
+                let scope = self.declaration_scope(unit)?;
+                return self.resolve_type_unit(&spelled, &scope);
+            }
+            if !metadata.is_empty() {
+                // Every indexed Kotlin callable and property carries metadata,
+                // so metadata that records no receiver is positive evidence that
+                // the declaration is not an extension — not a gap to go and
+                // re-read the file about.
+                return None;
+            }
+        }
+
         let (syntax, range) = self.declaration_syntax(unit)?;
         let node = kotlin_declaration_node(syntax.tree.root_node(), &range)?;
         let receiver = node.child_by_field_name("receiver")?;

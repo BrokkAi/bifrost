@@ -111,6 +111,57 @@ pub(crate) fn kotlin_navigation_receiver(navigation: Node<'_>) -> Option<Node<'_
         .find(|child| child.kind() != "navigation_suffix")
 }
 
+/// Whether a node kind spells `receiver.member`.
+///
+/// Two node kinds do. An ordinary member access is `navigation_expression`; the
+/// *left-hand side of an assignment* is `directly_assignable_expression`, which
+/// the grammar gives a distinct kind but the identical shape — a receiver
+/// followed by `navigation_suffix`. Missing the second one would report a
+/// property's reads and not its writes, even though Kotlin indexes one
+/// declaration for both.
+pub(crate) fn kotlin_is_navigation_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "navigation_expression" | "directly_assignable_expression"
+    )
+}
+
+/// The member a navigation selects: the `simple_identifier` inside its
+/// `navigation_suffix`.
+///
+/// `.` and `?.` produce the same shape, so a safe call reads exactly like a
+/// plain one — which is correct, because a safe call names the same member.
+pub(crate) fn kotlin_navigation_member(navigation: Node<'_>) -> Option<Node<'_>> {
+    first_named_child_of_kind(navigation, "navigation_suffix")
+        .and_then(|suffix| first_named_child_of_kind(suffix, "simple_identifier"))
+}
+
+/// How many wrapper layers `kotlin_unwrap_receiver` peels before giving up.
+const MAX_RECEIVER_WRAPPER_DEPTH: usize = 32;
+
+/// Strip the wrappers that do not change *what* a receiver denotes: `!!`
+/// (`postfix_expression`) and redundant parentheses.
+///
+/// Iterative and depth-capped rather than recursive, per the repository's
+/// stack-safety rule: `(((x)))!!` is legal Kotlin and a malformed tree can nest
+/// further still.
+pub(crate) fn kotlin_unwrap_receiver(node: Node<'_>) -> Node<'_> {
+    let mut current = node;
+    for _ in 0..MAX_RECEIVER_WRAPPER_DEPTH {
+        let inner = match current.kind() {
+            "postfix_expression" | "parenthesized_expression" => named_children(current)
+                .into_iter()
+                .find(|child| child.is_named() && child.kind() != "postfix_unary_operator"),
+            _ => None,
+        };
+        match inner {
+            Some(inner) => current = inner,
+            None => break,
+        }
+    }
+    current
+}
+
 /// The `type_identifier` children of a `user_type`, in source order.
 ///
 /// One per dotted segment: `lib.Base` yields the `lib` token then the `Base`
@@ -184,6 +235,106 @@ pub(crate) fn kotlin_is_expression_kind(kind: &str) -> bool {
             | "postfix_expression"
             | "object_literal"
     )
+}
+
+/// How many type wrappers (`T?`, `(T)`, `T & Any`) one spelling walk unwraps
+/// before giving up.
+///
+/// A written type nests wrappers only a handful deep in real source; the cap
+/// exists so a pathological or recovery-mangled tree cannot make one lookup
+/// unbounded.
+const MAX_TYPE_WRAPPER_DEPTH: usize = 32;
+
+/// The dotted nominal name a Kotlin type node spells, exactly as written.
+///
+/// `lib.Base` yields `"lib.Base"`, `Base?` yields `"Base"`, `List<String>`
+/// yields `"List"`, and a shape that names no nominal type at all — a function
+/// type, a star projection — yields `None`.
+///
+/// Nullability and generic arguments are dropped because what a consumer does
+/// with this is *resolve* it: it is a name to look up in the writing file's
+/// scope, not rendered source. The full written form is already carried by the
+/// declaration's rendered signature label, so nothing is lost from the index.
+/// Resolution deliberately stays with the consumer — a spelled type means
+/// whatever the file that wrote it says it means, and resolving at index time
+/// would bake in one file's imports.
+///
+/// The walk is iterative and depth-capped rather than recursive, per the
+/// repository's stack-safety rule for analyzer tree walks.
+pub(crate) fn kotlin_type_spelling(node: Node<'_>, source: &str) -> Option<String> {
+    let mut frontier = vec![node];
+    for _ in 0..MAX_TYPE_WRAPPER_DEPTH {
+        let mut next = Vec::new();
+        for current in frontier {
+            match current.kind() {
+                "user_type" => {
+                    let segments = kotlin_user_type_segments(current)
+                        .into_iter()
+                        .map(|segment| segment.utf8_text(source.as_bytes()).unwrap_or_default())
+                        .filter(|segment| !segment.is_empty())
+                        .collect::<Vec<_>>();
+                    if !segments.is_empty() {
+                        return Some(segments.join("."));
+                    }
+                }
+                // Wrappers that hold the nominal type one level down. A
+                // `type_projection` is how a generic argument is spelled, and
+                // `receiver_type` is what the `receiver` field holds.
+                "nullable_type" | "not_nullable_type" | "parenthesized_type" | "receiver_type"
+                | "type_projection" => next.extend(named_children(current)),
+                _ => {}
+            }
+        }
+        if next.is_empty() {
+            return None;
+        }
+        frontier = next;
+    }
+    None
+}
+
+/// The return type a `function_declaration` writes, or `None` when it writes
+/// none.
+///
+/// The return type is the only bare type node among a function's children:
+/// parameters live inside `function_value_parameters`, and an extension's
+/// receiver sits behind the `receiver` field, which is why the receiver is
+/// excluded by node identity rather than by position. A function with an
+/// expression body and no written type (`fun f() = compute()`) writes no return
+/// type and is reported absent — inferring what the source did not write is
+/// semantic work this does not do.
+pub(crate) fn kotlin_declared_return_type_text(function: Node<'_>, source: &str) -> Option<String> {
+    let receiver = function
+        .child_by_field_name("receiver")
+        .map(|node| node.id());
+    named_children(function)
+        .into_iter()
+        .filter(|child| Some(child.id()) != receiver)
+        .find_map(|child| kotlin_type_spelling(child, source))
+}
+
+/// The type a binding writes, or `None` when it writes none.
+///
+/// A `variable_declaration` (`val base: Base`) or a `class_parameter`
+/// (`class D(val base: Base)`) holds its name and then its type node, so the
+/// type is the first child that spells one.
+pub(crate) fn kotlin_binding_type_text(binding: Node<'_>, source: &str) -> Option<String> {
+    named_children(binding)
+        .into_iter()
+        .find_map(|child| kotlin_type_spelling(child, source))
+}
+
+/// The type an extension declaration extends, or `None` when the declaration is
+/// not an extension.
+///
+/// `receiver` is one of the very few genuine tree-sitter fields in the vendored
+/// grammar, carried by both `function_declaration` and `property_declaration`,
+/// so extension-ness is a structured check and never a name heuristic.
+pub(crate) fn kotlin_extension_receiver_text(
+    declaration: Node<'_>,
+    source: &str,
+) -> Option<String> {
+    kotlin_type_spelling(declaration.child_by_field_name("receiver")?, source)
 }
 
 /// The declaration node covering `range`.
