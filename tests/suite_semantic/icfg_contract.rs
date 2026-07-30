@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use brokk_bifrost::analyzer::semantic::{
     CancellationToken, ControlEdgeKind, DispatchBoundaryKind, IcfgEdgeKind, IcfgLimitKind,
-    IcfgProvider, IcfgSnapshotLimits, SemanticBudget, SemanticOutcome, SemanticRequest,
+    IcfgProvider, IcfgSnapshotLimits, SemanticBudget, SemanticCapability, SemanticGapKind,
+    SemanticOutcome, SemanticRequest,
 };
 use brokk_bifrost::{
     AnalyzerConfig, Language, OverlayProject, ProjectFile, TestProject, WorkspaceAnalyzer,
@@ -12,7 +13,7 @@ use crate::common::{
     InlineTestProject,
     semantic_graph::{
         CallContextSelector, ExpectedIcfgBoundary, ExpectedIcfgBoundaryKind, IcfgGraph,
-        IcfgOutcomeKind, IcfgTopologyRenderLimits, PointSelector, icfg_edge,
+        IcfgOutcomeKind, IcfgTopologyRenderLimits, PointSelector, SemanticGraph, icfg_edge,
         resolve_procedure_handle,
     },
 };
@@ -1145,6 +1146,64 @@ fn go_defer_gap_downgrades_only_return_paths_that_cross_it() {
 }
 
 #[test]
+fn rust_non_dropping_reference_bindings_keep_matched_normal_return_complete() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "reference.rs",
+            r#"
+                fn target(value: &str) -> &str {
+                    let relayed = value;
+                    relayed
+                }
+
+                fn caller(input: &str) {
+                    target(input);
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = IcfgGraph::materialize(
+        &project,
+        &analyzer,
+        "reference.rs",
+        PointSelector::new("fn caller(input: &str)")
+            .procedure("caller")
+            .effect("entry"),
+    );
+    graph
+        .bind_call(
+            "target_call",
+            "reference.rs",
+            PointSelector::new("target(input)")
+                .procedure("caller")
+                .effect("invoke"),
+        )
+        .bind_node(
+            "target_exit",
+            "reference.rs",
+            PointSelector::new("fn target(value: &str)")
+                .procedure("target")
+                .effect("normal_exit"),
+            ["target_call"],
+        )
+        .bind_node(
+            "continuation",
+            "reference.rs",
+            PointSelector::new("target(input)")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+            root(),
+        );
+    let expected =
+        icfg_edge("continuation", IcfgEdgeKind::NormalReturn).originating_call("target_call");
+    graph.assert_successors("target_exit", &[expected]);
+    graph.assert_edge_proven_complete("target_exit", expected);
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
 fn rust_local_drop_gap_downgrades_matched_normal_return() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
@@ -1194,6 +1253,140 @@ fn rust_local_drop_gap_downgrades_matched_normal_return() {
             "continuation",
             "drop.rs",
             PointSelector::new("target()")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+            root(),
+        );
+    let expected =
+        icfg_edge("continuation", IcfgEdgeKind::NormalReturn).originating_call("target_call");
+    graph.assert_successors("target_exit", &[expected]);
+    graph.assert_edge_unproven_partial("target_exit", expected);
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn rust_lifetime_extended_temporary_drop_downgrades_matched_normal_return() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "borrowed_drop.rs",
+            r#"
+                struct Guard;
+                impl Drop for Guard {
+                    fn drop(&mut self) {}
+                }
+
+                fn target() {
+                    let guard = &Guard;
+                }
+
+                fn caller() {
+                    target();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = IcfgGraph::materialize(
+        &project,
+        &analyzer,
+        "borrowed_drop.rs",
+        PointSelector::new("fn caller()")
+            .procedure("caller")
+            .effect("entry"),
+    );
+    graph
+        .bind_call(
+            "target_call",
+            "borrowed_drop.rs",
+            PointSelector::new("target()")
+                .procedure("caller")
+                .effect("invoke"),
+        )
+        .bind_node(
+            "target_exit",
+            "borrowed_drop.rs",
+            PointSelector::new("fn target()")
+                .procedure("target")
+                .effect("normal_exit"),
+            ["target_call"],
+        )
+        .bind_node(
+            "continuation",
+            "borrowed_drop.rs",
+            PointSelector::new("target()")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+            root(),
+        );
+    let expected =
+        icfg_edge("continuation", IcfgEdgeKind::NormalReturn).originating_call("target_call");
+    graph.assert_successors("target_exit", &[expected]);
+    graph.assert_edge_unproven_partial("target_exit", expected);
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn rust_anonymous_parameter_drop_downgrades_matched_normal_return() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "anonymous_drop.rs",
+            r#"
+                struct Guard;
+                impl Drop for Guard {
+                    fn drop(&mut self) {}
+                }
+
+                fn target(_: Guard) {}
+
+                fn caller() {
+                    target(Guard);
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut semantics = SemanticGraph::materialize(&project, &analyzer, "anonymous_drop.rs");
+    semantics.bind(
+        "target_normal_exit",
+        PointSelector::new("fn target(_: Guard)")
+            .procedure("target")
+            .effect("normal_exit"),
+    );
+    semantics.assert_point_gap(
+        "target_normal_exit",
+        SemanticCapability::CleanupControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    let mut graph = IcfgGraph::materialize(
+        &project,
+        &analyzer,
+        "anonymous_drop.rs",
+        PointSelector::new("fn caller()")
+            .procedure("caller")
+            .effect("entry"),
+    );
+    graph
+        .bind_call(
+            "target_call",
+            "anonymous_drop.rs",
+            PointSelector::new("target(Guard)")
+                .procedure("caller")
+                .effect("invoke"),
+        )
+        .bind_node(
+            "target_exit",
+            "anonymous_drop.rs",
+            PointSelector::new("fn target(_: Guard)")
+                .procedure("target")
+                .effect("normal_exit"),
+            ["target_call"],
+        )
+        .bind_node(
+            "continuation",
+            "anonymous_drop.rs",
+            PointSelector::new("target(Guard)")
                 .procedure("caller")
                 .effect("call_continuation")
                 .outgoing_kind(ControlEdgeKind::Normal),
