@@ -10113,6 +10113,68 @@ fn consume(_: CommitActivityDraft) {}
 }
 
 #[test]
+fn rust_grouped_pub_use_scoped_type_terminal_keeps_exact_identity() {
+    let source = r#"
+mod dispatch;
+mod hostname;
+pub use crate::{
+    dispatch::DispatchConfig,
+    hostname::{DispatchConfig as OtherDispatchConfig, HostNameState},
+};
+
+fn consume(_: DispatchConfig, _: OtherDispatchConfig, _: HostNameState) {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "rust/Cargo.toml",
+            "[workspace]\nresolver = \"2\"\nmembers = [\"src/lib\"]\n",
+        ),
+        (
+            "rust/src/lib/Cargo.toml",
+            "[package]\nname = \"nmstate\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\npath = \"lib.rs\"\n",
+        ),
+        ("rust/src/lib/lib.rs", source),
+        ("rust/src/lib/dispatch.rs", "pub struct DispatchConfig;\n"),
+        (
+            "rust/src/lib/hostname.rs",
+            "pub struct HostNameState;\npub struct DispatchConfig;\n",
+        ),
+    ]);
+    let target = definition(&analyzer, "rust.src.lib.dispatch.DispatchConfig");
+    let hits = authoritative_hits(
+        &analyzer,
+        &target,
+        HashSet::from_iter([project.file("rust/src/lib/lib.rs")]),
+    );
+    let expected = source
+        .find("dispatch::DispatchConfig")
+        .expect("grouped public re-export terminal")
+        + "dispatch::".len();
+    let unrelated = source
+        .find("hostname::{DispatchConfig")
+        .expect("same-named sibling public re-export")
+        + "hostname::{".len();
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("rust/src/lib/lib.rs")
+                && (hit.start_offset, hit.end_offset)
+                    == (expected, expected + "DispatchConfig".len())
+                && hit.kind == UsageHitKind::Import
+        }),
+        "grouped public re-export must retain the physical type terminal: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != project.file("rust/src/lib/lib.rs")
+                || (hit.start_offset, hit.end_offset)
+                    != (unrelated, unrelated + "DispatchConfig".len())
+        }),
+        "same-named grouped sibling re-export must remain unrelated: {hits:#?}"
+    );
+}
+
+#[test]
 fn rust_grouped_same_crate_type_import_terminal_stays_exact() {
     let source = r#"
 mod quotes {

@@ -2170,13 +2170,30 @@ impl RustAnalyzer {
                         .map(|route| route.origin.clone()),
                 );
             }
-            let resolved = if leading_absolute && !leading_absolute_local {
-                None
+            let resolved_modules = if leading_absolute && !leading_absolute_local {
+                Vec::new()
             } else if matches!(prefix.first(), Some(&"crate" | &"self" | &"super")) {
-                resolve_rust_module_segments_with_crate(&package, &module.crate_root, prefix)
-                    .map(|package| ModuleKey::new(file, &package))
+                let mut crate_packages = index
+                    .module_files
+                    .cargo_routes
+                    .target_roots_for_file(file)
+                    .into_iter()
+                    .map(|root| rust_package_name(&root))
+                    .collect::<Vec<_>>();
+                if crate_packages.is_empty() {
+                    crate_packages.push(module.crate_root.clone());
+                }
+                crate_packages.sort();
+                crate_packages.dedup();
+                crate_packages
+                    .into_iter()
+                    .filter_map(|crate_package| {
+                        resolve_rust_module_segments_with_crate(&package, &crate_package, prefix)
+                            .map(|package| ModuleKey::new(file, &package))
+                    })
+                    .collect()
             } else {
-                Some(ModuleKey {
+                vec![ModuleKey {
                     crate_root: module.crate_root.clone(),
                     components: if leading_absolute {
                         prefix
@@ -2191,9 +2208,9 @@ impl RustAnalyzer {
                             .chain(prefix.iter().map(|segment| (*segment).to_string()))
                             .collect()
                     },
-                })
+                }]
             };
-            if let Some(resolved) = resolved {
+            for resolved in resolved_modules {
                 matches.extend(
                     index
                         .declaration_domains

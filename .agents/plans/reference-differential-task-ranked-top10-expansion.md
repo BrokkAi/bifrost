@@ -649,7 +649,8 @@ local gate, but is not the focus.
   1,380 usage tests, the featureless full test gate, formatting, and strict
   all-target/all-feature Clippy passed; assigned issues #1279 and #1280 were
   closed only after the pushed-head replay.
-- [ ] (2026-07-30) Hickory DNS rank nine is the only active Rust repository.
+- [x] (2026-07-30) Finished Hickory DNS rank nine depth-first at pushed merge
+  head `418429bf`.
   Its clean `976f80d9` baseline audited all 314 files and all 1,142 targets,
   reducing the historical 23 rows to eight exact residuals. Reopened assigned
   cross-repository inverse tickets #1278 and #1279 before edits; open assigned
@@ -665,8 +666,27 @@ local gate, but is not the focus.
   created before its fix and now has a behavior regression. The complete
   featureless Cargo suite passes with the known one-millisecond C# wall-clock
   test isolated and passing separately; formatting, diff hygiene, and strict
-  all-target/all-feature Clippy also pass. Nmstate remains untouched until
-  Hickory is committed, published, clean-replayed, closed, and cleaned up.
+  all-target/all-feature Clippy also pass. The authoritative clean pushed-head
+  replay audited all 314 files and 10,000 sites, queried 1,000 of 1,140
+  distinct targets, and reported zero missing, file errors, or candidate-limit
+  overflow. Assigned issues #1278, #1279, #1282, #1283, and #1375 were closed
+  only after that proof; intermediate outputs and generated caches were
+  removed while retaining the baseline, clean replay, and final test log.
+- [ ] (2026-07-30) Nmstate rank ten is the only active Rust repository. Its
+  clean `418429bf` baseline audited all 346 files and 10,000 sites, queried all
+  575 distinct targets without truncation or file errors, and found exactly
+  two reproducible terminal type misses in
+  `pub use crate::{ dispatch::DispatchConfig, ..., hostname::HostNameState }`.
+  Reopened assigned issue #1279 before implementation. The structured fix now
+  routes scoped type terminals through the exact import matcher and resolves
+  rooted inverse paths from Cargo target roots, including explicit
+  `[lib] path = "lib.rs"` workspace layouts, while retaining same-named
+  sibling and grouped-`self` namespace negatives. Both production witnesses
+  are exact import hits on the dirty candidate. Formatting, strict
+  all-target/all-feature Clippy, the complete featureless Cargo gate, and all
+  1,420 non-timing usage tests pass; the single one-millisecond C# budget test
+  passes in isolation. Publication, clean pushed-head replay, issue closure,
+  and cleanup remain before Rust completion.
 - [x] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [x] Complete C++ and publish its evidence and user summary.
