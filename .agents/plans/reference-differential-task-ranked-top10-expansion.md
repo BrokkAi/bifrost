@@ -672,7 +672,8 @@ local gate, but is not the focus.
   overflow. Assigned issues #1278, #1279, #1282, #1283, and #1375 were closed
   only after that proof; intermediate outputs and generated caches were
   removed while retaining the baseline, clean replay, and final test log.
-- [ ] (2026-07-30) Nmstate rank ten is the only active Rust repository. Its
+- [x] (2026-07-30) Finished nmstate rank ten and the Rust ranks-six-through-ten
+  campaign depth-first at pushed code head `4718a30c`. Its
   clean `418429bf` baseline audited all 346 files and 10,000 sites, queried all
   575 distinct targets without truncation or file errors, and found exactly
   two reproducible terminal type misses in
@@ -685,8 +686,12 @@ local gate, but is not the focus.
   are exact import hits on the dirty candidate. Formatting, strict
   all-target/all-feature Clippy, the complete featureless Cargo gate, and all
   1,420 non-timing usage tests pass; the single one-millisecond C# budget test
-  passes in isolation. Publication, clean pushed-head replay, issue closure,
-  and cleanup remain before Rust completion.
+  passes in isolation. The authoritative clean pushed-head replay audited all
+  346 files and 10,000 sites, queried all 575 targets, and reported zero
+  missing, truncation, candidate-limit overflow, or file errors; both original
+  witnesses are exact import hits. Issue #1279 was closed only after that
+  proof. Candidate diagnostics and generated caches were removed while the
+  baseline and clean replay were retained.
 - [x] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [x] Complete C++ and publish its evidence and user summary.
@@ -702,7 +707,7 @@ local gate, but is not the focus.
   user summary.
 - [ ] Complete PHP ranks six through ten and publish its evidence and user
   summary.
-- [ ] Complete Rust ranks six through ten and publish its evidence and user
+- [x] Complete Rust ranks six through ten and publish its evidence and user
   summary.
 - [ ] Complete Scala ranks six through ten and publish its evidence and user
   summary.
