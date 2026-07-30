@@ -18,7 +18,7 @@ use crate::{
         report_long_method_and_god_object_smells, report_secret_like_code,
         report_structural_clone_smells, report_test_assertion_smells,
     },
-    diff_analysis::{AnalyzeDiffParams, analyze_diff_at_root},
+    diff_analysis::{AnalyzeDiffParams, DiffAnalysisOptions, analyze_diff_at_root},
     file_tools::{
         find_filenames, find_files_containing, get_file_contents, list_files, search_file_contents,
     },
@@ -259,6 +259,7 @@ pub struct SearchToolsService {
     update_strategy: UpdateStrategy,
     semantic_indexing: bool,
     watcher_starter: WatcherStarter,
+    diff_snapshot_object_dir: Option<PathBuf>,
 }
 
 struct WorkspaceSession {
@@ -497,6 +498,14 @@ fn maybe_start_semantic_checked(
 }
 
 impl SearchToolsService {
+    /// Configure trusted Git objects that immutable `analyze_diff` endpoints
+    /// may resolve. This is host configuration, never a tool argument.
+    #[must_use]
+    pub fn with_diff_snapshot_object_dir(mut self, dir: PathBuf) -> Self {
+        self.diff_snapshot_object_dir = Some(dir);
+        self
+    }
+
     pub fn new(root: PathBuf) -> Result<Self, String> {
         Self::new_with_strategy(
             root,
@@ -556,6 +565,7 @@ impl SearchToolsService {
             update_strategy: UpdateStrategy::Manual,
             semantic_indexing: false,
             watcher_starter,
+            diff_snapshot_object_dir: None,
         })
     }
 
@@ -617,6 +627,7 @@ impl SearchToolsService {
             update_strategy: UpdateStrategy::Manual,
             semantic_indexing: false,
             watcher_starter,
+            diff_snapshot_object_dir: None,
         })
     }
 
@@ -811,7 +822,14 @@ impl SearchToolsService {
             })?;
             let root = self.service_root()?;
             return Self::structured_only(
-                analyze_diff_at_root(&root, params).map_err(SearchToolsServiceError::internal)?,
+                analyze_diff_at_root(
+                    &root,
+                    params,
+                    &DiffAnalysisOptions {
+                        snapshot_object_dir: self.diff_snapshot_object_dir.clone(),
+                    },
+                )
+                .map_err(SearchToolsServiceError::internal)?,
             );
         }
         if name == "query_code" {
@@ -1419,6 +1437,7 @@ impl SearchToolsService {
             update_strategy,
             semantic_indexing,
             watcher_starter,
+            diff_snapshot_object_dir: None,
         })
     }
 
@@ -1465,6 +1484,7 @@ impl SearchToolsService {
             update_strategy,
             semantic_indexing,
             watcher_starter,
+            diff_snapshot_object_dir: None,
         })
     }
 
@@ -1511,6 +1531,7 @@ impl SearchToolsService {
             update_strategy,
             semantic_indexing,
             watcher_starter,
+            diff_snapshot_object_dir: None,
         })
     }
 
@@ -1572,6 +1593,7 @@ impl SearchToolsService {
             update_strategy,
             semantic_indexing: semantic_indexing_enabled(),
             watcher_starter: production_watcher_starter(),
+            diff_snapshot_object_dir: None,
         }
     }
 
@@ -1764,6 +1786,7 @@ impl SearchToolsService {
             update_strategy,
             semantic_indexing,
             watcher_starter,
+            diff_snapshot_object_dir: None,
         })
     }
 
@@ -3587,6 +3610,7 @@ public partial class MudDialogContainer
             update_strategy: UpdateStrategy::WatchFiles,
             semantic_indexing: false,
             watcher_starter: production_watcher_starter(),
+            diff_snapshot_object_dir: None,
         }
     }
 
@@ -3827,6 +3851,7 @@ mod client_roots_tests {
             update_strategy: UpdateStrategy::Manual,
             semantic_indexing: false,
             watcher_starter: production_watcher_starter(),
+            diff_snapshot_object_dir: None,
         };
         let canonical_linked = linked_root.canonicalize().unwrap();
         service
@@ -4319,6 +4344,7 @@ mod tests {
             update_strategy: UpdateStrategy::WatchFiles,
             semantic_indexing: true,
             watcher_starter: production_watcher_starter(),
+            diff_snapshot_object_dir: None,
         };
 
         service.close().unwrap();

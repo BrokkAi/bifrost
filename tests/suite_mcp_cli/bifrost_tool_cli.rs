@@ -49,6 +49,55 @@ fn commit_paths(repo: &Repository, paths: &[&str], message: &str) {
     .unwrap();
 }
 
+fn snapshot_tree(root: &Path, objects: &Path, path: &str, contents: &str) -> String {
+    fs::create_dir_all(objects).expect("create snapshot objects directory");
+    let mut hash = Command::new("git");
+    hash.arg("-C")
+        .arg(root)
+        .args(["hash-object", "-w", "--stdin"])
+        .env("GIT_OBJECT_DIRECTORY", objects)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let mut child = hash.spawn().expect("spawn git hash-object");
+    child
+        .stdin
+        .as_mut()
+        .expect("hash stdin")
+        .write_all(contents.as_bytes())
+        .expect("write snapshot blob");
+    let output = child.wait_with_output().expect("wait for git hash-object");
+    assert!(
+        output.status.success(),
+        "git hash-object failed: {output:?}"
+    );
+    let blob = String::from_utf8(output.stdout)
+        .expect("blob oid utf8")
+        .trim()
+        .to_string();
+
+    let mut mktree = Command::new("git");
+    mktree
+        .arg("-C")
+        .arg(root)
+        .arg("mktree")
+        .env("GIT_OBJECT_DIRECTORY", objects)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let mut child = mktree.spawn().expect("spawn git mktree");
+    child
+        .stdin
+        .as_mut()
+        .expect("mktree stdin")
+        .write_all(format!("100644 blob {blob}\t{path}\n").as_bytes())
+        .expect("write snapshot tree");
+    let output = child.wait_with_output().expect("wait for git mktree");
+    assert!(output.status.success(), "git mktree failed: {output:?}");
+    String::from_utf8(output.stdout)
+        .expect("tree oid utf8")
+        .trim()
+        .to_string()
+}
+
 #[test]
 fn tool_get_summaries_prints_structured_json_without_content() {
     let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
@@ -761,6 +810,269 @@ fn analyze_diff_remains_available_in_tool_cli() {
     let payload: Value = serde_json::from_slice(&output.stdout).expect("json stdout");
     assert_eq!(payload["isError"], false, "{payload}");
     assert!(payload["structuredContent"]["endpoints"]["target"].is_string());
+}
+
+#[test]
+fn analyze_diff_cli_reads_immutable_trees_from_configured_snapshot_objects() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    let repo = Repository::init(root).expect("init repo");
+    fs::write(root.join("lib.go"), "package sample\nfunc LiveHead() {}\n").expect("write head");
+    commit_paths(&repo, &["lib.go"], "head");
+
+    let objects = temp.path().join("snapshot-objects");
+    let baseline = snapshot_tree(
+        root,
+        &objects,
+        "lib.go",
+        "package sample\nfunc CapturedBefore() {}\n",
+    );
+    let after = snapshot_tree(
+        root,
+        &objects,
+        "lib.go",
+        "package sample\nfunc CapturedAfter() {}\n",
+    );
+
+    fs::write(
+        root.join("lib.go"),
+        "package sample\nfunc MutatedLive() {}\n",
+    )
+    .expect("mutate worktree");
+    fs::write(
+        root.join("unrelated.go"),
+        "package sample\nfunc AddedLive() {}\n",
+    )
+    .expect("add live file");
+
+    let args = serde_json::json!({"base": baseline, "target": after}).to_string();
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(root)
+        .arg("--diff-snapshot-object-dir")
+        .arg(&objects)
+        .arg("--tool")
+        .arg("analyze_diff")
+        .arg("--args")
+        .arg(&args)
+        .output()
+        .expect("run snapshot analyze_diff");
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("json stdout");
+    assert_eq!(payload["isError"], false, "{payload}");
+    let result = &payload["structuredContent"];
+    assert_eq!(result["endpoints"]["base"], format!("tree:{baseline}"));
+    assert_eq!(result["endpoints"]["target"], format!("tree:{after}"));
+    let deleted = result["patch_symbols"]["preimage"]["deleted"]
+        .as_array()
+        .expect("deleted symbols");
+    assert!(
+        deleted
+            .iter()
+            .any(|symbol| symbol["name"] == "CapturedBefore"),
+        "{result}"
+    );
+    let introduced = result["patch_symbols"]["postimage"]["introduced"]
+        .as_array()
+        .expect("introduced symbols");
+    assert!(
+        introduced
+            .iter()
+            .any(|symbol| symbol["name"] == "CapturedAfter"),
+        "{result}"
+    );
+    assert!(
+        introduced
+            .iter()
+            .all(|symbol| symbol["name"] != "MutatedLive"),
+        "{result}"
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(root)
+        .arg("--tool")
+        .arg("analyze_diff")
+        .arg("--args")
+        .arg(args)
+        .output()
+        .expect("run snapshot analyze_diff without alternate");
+    assert!(!output.status.success(), "missing alternate should fail");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unable to resolve revision"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn diff_snapshot_object_dir_rejects_missing_path() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    let repo = Repository::init(root).expect("init repo");
+    fs::write(root.join("lib.rs"), "pub fn answer() -> i32 { 1 }\n").expect("write source");
+    commit_paths(&repo, &["lib.rs"], "base");
+    let missing_objects = root.join("missing-snapshot-objects");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(root)
+        .arg("--diff-snapshot-object-dir")
+        .arg(&missing_objects)
+        .arg("--tool")
+        .arg("analyze_diff")
+        .arg("--args")
+        .arg("{}")
+        .output()
+        .expect("run bifrost --tool analyze_diff with missing snapshot objects");
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("Failed to resolve --diff-snapshot-object-dir"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&missing_objects.display().to_string()),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("--diff-snapshot-object-dir must name a directory"),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty(), "stderr:\n{stderr}");
+}
+
+#[test]
+fn diff_snapshot_object_dir_rejects_missing_path_for_mcp_launch() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    let missing_objects = root.join("missing-snapshot-objects");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(root)
+        .arg("--diff-snapshot-object-dir")
+        .arg(&missing_objects)
+        .arg("--mcp")
+        .arg("searchtools")
+        // Prevent a missing validation call from hanging on inherited stdin.
+        .stdin(Stdio::null())
+        .output()
+        .expect("run bifrost MCP with missing snapshot objects");
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("Failed to resolve --diff-snapshot-object-dir"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&missing_objects.display().to_string()),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("--diff-snapshot-object-dir must name a directory"),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty(), "stderr:\n{stderr}");
+}
+
+#[test]
+fn diff_snapshot_object_dir_rejects_regular_file() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    let repo = Repository::init(root).expect("init repo");
+    fs::write(root.join("lib.rs"), "pub fn answer() -> i32 { 1 }\n").expect("write source");
+    commit_paths(&repo, &["lib.rs"], "base");
+    let objects_file = root.join("snapshot-objects-file");
+    fs::write(&objects_file, "not a directory\n").expect("write snapshot objects file");
+    let canonical_objects_file = objects_file
+        .canonicalize()
+        .expect("canonical snapshot objects file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(root)
+        .arg("--diff-snapshot-object-dir")
+        .arg(&objects_file)
+        .arg("--tool")
+        .arg("analyze_diff")
+        .arg("--args")
+        .arg("{}")
+        .output()
+        .expect("run bifrost --tool analyze_diff with snapshot objects file");
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("--diff-snapshot-object-dir must name a directory"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&canonical_objects_file.display().to_string()),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Failed to resolve --diff-snapshot-object-dir"),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty(), "stderr:\n{stderr}");
+}
+
+#[test]
+fn diff_snapshot_object_dir_rejects_regular_file_for_rootless_mcp_launch() {
+    let temp = TempDir::new().expect("tempdir");
+    let objects_file = temp.path().join("snapshot-objects-file");
+    fs::write(&objects_file, "not a directory\n").expect("write snapshot objects file");
+    let canonical_objects_file = objects_file
+        .canonicalize()
+        .expect("canonical snapshot objects file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--diff-snapshot-object-dir")
+        .arg(&objects_file)
+        .arg("--mcp")
+        .arg("searchtools")
+        // Prevent a missing validation call from hanging on inherited stdin.
+        .stdin(Stdio::null())
+        .output()
+        .expect("run rootless bifrost MCP with snapshot objects file");
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("--diff-snapshot-object-dir must name a directory"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&canonical_objects_file.display().to_string()),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Failed to resolve --diff-snapshot-object-dir"),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty(), "stderr:\n{stderr}");
+}
+
+#[test]
+fn diff_snapshot_object_dir_is_rejected_for_lsp() {
+    let temp = TempDir::new().expect("tempdir");
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--diff-snapshot-object-dir")
+        .arg(temp.path())
+        .arg("--lsp")
+        .output()
+        .expect("run bifrost --lsp with snapshot objects");
+    assert!(!output.status.success(), "incompatible mode should fail");
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("--diff-snapshot-object-dir"), "{stderr}");
+    assert!(stderr.contains("--lsp"), "{stderr}");
 }
 
 #[test]
