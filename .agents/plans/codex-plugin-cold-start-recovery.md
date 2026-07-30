@@ -10,9 +10,9 @@ After this work, installing the Bifrost Codex plugin into a clean location and o
 
 - [x] (2026-07-30 19:21Z) Started from clean `origin/master` commit `ce694ac9` in dedicated branch `dave/fix-codex-plugin-cold-start`.
 - [x] (2026-07-30 19:21Z) Reproduced the empty-cache diagnostic state and compared public v0.8.16 checksums with the plugin metadata.
-- [ ] Add a Codex-manifest-driven packaged cold-cache smoke and release immutability guard.
-- [ ] Correct the stale v0.8.16 release checksum projections and validate download, MCP initialization, tool list, and recovery commands.
-- [ ] Run package and policy validation; record outcomes.
+- [x] (2026-07-30 19:30Z) Added a Codex-manifest-driven packaged cold-cache smoke and a release-asset immutability guard.
+- [x] (2026-07-30 19:33Z) Corrected the v0.8.16 release checksum projections; downloaded and verified the public macOS archive, completed the staged MCP smoke, and verified packaged `doctor` then `prepare` recovery.
+- [ ] Finish the pre-existing packed-install test in the constrained desktop command environment; record policy-gate availability without claiming a clean repository policy result.
 
 ## Surprises & Discoveries
 
@@ -29,10 +29,15 @@ After this work, installing the Bifrost Codex plugin into a clean location and o
 - Decision: Drive the new release smoke through `.codex-plugin/plugin.json` and its `mcpServers` file.
   Rationale: It proves the exact Codex package contract that failed in a fresh Codex task, including package-relative command and working-directory resolution.
   Date/Author: 2026-07-30 / Codex.
+- Decision: Set `overwrite_files: false` on the binary-release upload action.
+  Rationale: Release archive bytes are part of the plugin's signed expectation. A retry must fail and preserve the original asset rather than replace it with a newly built archive that invalidates already-staged metadata.
+  Date/Author: 2026-07-30 / Codex.
 
 ## Outcomes & Retrospective
 
-Pending implementation and validation.
+The launcher metadata now matches the current public v0.8.16 release assets, so a fresh managed install can complete. The release workflow prevents later recovery attempts from mutating the archive name after a plugin package has pinned its digest. The packaged smoke now derives both executable and working directory from the Codex plugin manifest, verifies cold `prepare`, sends the recorded Codex initialize protocol, checks `search_symbols`, `list_policies`, and `run_policy` in `tools/list`, and calls both policy tools.
+
+Validation completed: `npm test` (113 tests), `npm run check` with an isolated npm cache, `node --test plugins/bifrost-agent/test/launcher.test.mjs` (34 tests), `node --test scripts/release-promotion-workflow.test.mjs` (9 tests), manifest validation, public archive SHA-256 verification, the staged Codex MCP smoke, and packaged `doctor`/`prepare`. The pre-existing packed-install test is still awaiting completion under the desktop command-duration boundary. No repository-wide `bifrost.code-smells` result is claimed: this task started with no registered Bifrost MCP tools, and the staged smoke only proves callable `list_policies` and `run_policy` on its disposable workspace.
 
 ## Context and Orientation
 
@@ -73,3 +78,5 @@ The public v0.8.16 archive digest evidence is retained in the `Surprises & Disco
 The launcher continues to expose `doctor --json`, `prepare [--json]`, and serve mode. The smoke accepts `--plugin-dir <directory>` and `--cache-dir <empty-directory>` and must derive the executable and working directory from the Codex manifest’s `mcpServers` JSON rather than hardcoding a host-specific path. The release action must pass an explicit `overwrite_files: false` setting to prevent a later run from replacing an archive referenced by a prior package.
 
 Plan update (2026-07-30 19:21Z): recorded the published-checksum mismatch and refined the plan to test the Codex manifest rather than the existing Claude-only selection.
+
+Plan update (2026-07-30 19:33Z): recorded the completed public-artifact and packaged-MCP evidence, plus the exact scope of the remaining validation limitation.
