@@ -82,7 +82,7 @@ fn ordered_parameter_changes_semantic_identity() {
             .unwrap()
             .parameters
             .push(Parameter {
-                name: "second".to_owned(),
+                name: Some("second".to_owned()),
                 r#type: TypeRef::Named {
                     name: "java.lang.Integer".to_owned(),
                     arguments: Vec::new(),
@@ -212,12 +212,35 @@ fn language_names_and_owner_type_parameters_are_not_stable_ids() {
     types[0].type_parameters = vec!["TValue".to_owned()];
     members[0].name = "getURL".to_owned();
     let signature = members[0].signature.as_mut().unwrap();
-    signature.parameters[0].name = "_value".to_owned();
+    signature.parameters[0].name = Some("_value".to_owned());
     signature.returns = Some(TypeRef::TypeParameter {
         name: "TValue".to_owned(),
     });
 
     compile_pack(&authored, &CompilerOptions::default()).unwrap();
+}
+
+#[test]
+fn binary_signatures_can_omit_parameter_names() {
+    let mut authored = authored_declarations();
+    let AuthoredPayload::DeclarationFacts { members, .. } = &mut authored.shards[0].payload else {
+        unreachable!()
+    };
+    members[0].signature.as_mut().unwrap().parameters[0].name = None;
+
+    let compiled = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+    let decoded = decode_shard_for_manifest(
+        &compiled.manifest,
+        &compiled.shards[0].descriptor,
+        &compiled.shards[0].bytes,
+        &DecodeLimits::default(),
+    )
+    .unwrap();
+    let members = decoded.payload().declaration_facts().unwrap().1;
+    assert_eq!(
+        members[0].signature.as_ref().unwrap().parameters[0].name,
+        None
+    );
 }
 
 #[test]

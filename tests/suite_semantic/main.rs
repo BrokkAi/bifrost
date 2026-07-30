@@ -21,6 +21,7 @@ mod dataflow_clients;
 mod dataflow_ide;
 mod dataflow_summaries;
 mod dataflow_tabulation;
+mod external_artifact_pack;
 mod icfg_contract;
 mod measure_analyzer_persisted_memory;
 mod measure_dataflow_lifecycle;

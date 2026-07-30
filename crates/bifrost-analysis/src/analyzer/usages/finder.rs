@@ -5,6 +5,7 @@ use crate::analyzer::usages::csharp_graph::CSharpUsageGraphStrategy;
 use crate::analyzer::usages::go_graph::GoUsageGraphStrategy;
 use crate::analyzer::usages::java_graph::JavaUsageGraphStrategy;
 use crate::analyzer::usages::js_ts_graph::JsTsExportUsageGraphStrategy;
+use crate::analyzer::usages::kotlin_graph::KotlinUsageGraphStrategy;
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::php_graph::PhpUsageGraphStrategy;
@@ -53,8 +54,8 @@ pub struct CandidateFilesSample {
 /// Facade that wires a [`CandidateFileProvider`] together with language-specific usage
 /// dispatch for a single fuzzy lookup. The strategy chosen depends on the target's language:
 ///
-/// - JavaScript / TypeScript, Python, PHP, Rust, Java, C#, C++, Go, and Scala targets
-///   are routed to their graph strategy first.
+/// - JavaScript / TypeScript, Python, PHP, Rust, Java, Kotlin, C#, C++, Go, Ruby, and
+///   Scala targets are routed to their graph strategy first.
 /// - Graph strategies can explicitly mark an internal outcome as fallback-safe; those
 ///   diagnostics are surfaced as failures instead of being masked by text matches.
 /// - Targets without a graph strategy surface a structured unsupported-language failure.
@@ -614,6 +615,7 @@ impl_graph_usage_analyzer!(PythonExportUsageGraphStrategy);
 impl_graph_usage_analyzer!(PhpUsageGraphStrategy);
 impl_graph_usage_analyzer!(RustExportUsageGraphStrategy);
 impl_graph_usage_analyzer!(JavaUsageGraphStrategy);
+impl_graph_usage_analyzer!(KotlinUsageGraphStrategy);
 impl_graph_usage_analyzer!(CSharpUsageGraphStrategy);
 impl_graph_usage_analyzer!(CppUsageGraphStrategy);
 impl_graph_usage_analyzer!(GoUsageGraphStrategy);
@@ -673,6 +675,13 @@ fn graph_find_usages(
             scan_scope,
             max_usages,
         ),
+        Language::Kotlin => graph_strategy_find_usages(
+            &KotlinUsageGraphStrategy::new(),
+            analyzer,
+            overloads,
+            scan_scope,
+            max_usages,
+        ),
         Language::CSharp => graph_strategy_find_usages(
             &CSharpUsageGraphStrategy::new(),
             analyzer,
@@ -708,8 +717,7 @@ fn graph_find_usages(
             scan_scope,
             max_usages,
         ),
-        // Kotlin usage graphs are issue #1239.
-        Language::Kotlin | Language::None => GraphUsageOutcome::terminal_failure(
+        Language::None => GraphUsageOutcome::terminal_failure(
             overloads[0].fq_name(),
             GraphFailureReason::UnsupportedTargetLanguage(
                 "no graph usage strategy is available for this target language",

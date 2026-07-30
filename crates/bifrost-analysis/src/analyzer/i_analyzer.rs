@@ -836,11 +836,11 @@ pub trait IAnalyzer: Send + Sync + Any {
         Vec::new()
     }
 
-    /// Comment density for a single declaration. Language-specific analyzers
-    /// may override; default is unsupported. Mirrors brokk-shared
-    /// `IAnalyzer.commentDensity(CodeUnit)`.
-    fn comment_density(&self, _code_unit: &CodeUnit) -> Option<CommentDensityStats> {
-        None
+    /// Comment density for a single declaration. All tree-sitter-backed
+    /// languages use the shared parser-backed implementation; specialized
+    /// analyzers may override it when they need compatibility behavior.
+    fn comment_density(&self, code_unit: &CodeUnit) -> Option<CommentDensityStats> {
+        crate::analyzer::comment_density::for_code_unit(self, code_unit)
     }
 
     /// Comment density for the first resolved declaration that supports it.
@@ -851,12 +851,9 @@ pub trait IAnalyzer: Send + Sync + Any {
             .find_map(|cu| self.comment_density(&cu))
     }
 
-    /// Per-top-level-declaration comment density for a file. Default is an
-    /// empty vector — non-Java analyzers stay silent until they add their own
-    /// implementation. Mirrors brokk-shared
-    /// `IAnalyzer.commentDensityByTopLevel(ProjectFile)`.
-    fn comment_density_by_top_level(&self, _file: &ProjectFile) -> Vec<CommentDensityStats> {
-        Vec::new()
+    /// Per-top-level-declaration comment density for a parsed source file.
+    fn comment_density_by_top_level(&self, file: &ProjectFile) -> Vec<CommentDensityStats> {
+        crate::analyzer::comment_density::by_top_level(self, file)
     }
 
     /// Detect suspicious exception-handling sites in `file` using `weights`.

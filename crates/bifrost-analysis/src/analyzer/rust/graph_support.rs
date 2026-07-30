@@ -478,11 +478,37 @@ impl RustAnalyzer {
         }
         // Only after cargo routing fails — the miss path, not the hot path — try
         // a `use <crate> as <alias>` module alias so the binder is built solely
-        // for unresolved roots (issue #1089).
-        if let Some(aliased) = self.rust_apply_import_alias(importing_file, module_specifier) {
-            return self.resolve_module_package(importing_file, &aliased);
+        // for unresolved roots (issue #1089). Chained renames in one file can
+        // cycle (`use a::b as c` plus `use c::d as a`: zellij overflowed the
+        // rayon worker stack recursing through them, #1347). The rewrite
+        // replaces only the root, so the specifier grows every hop and a
+        // whole-string visited set never trips; the cycle lives in root space
+        // (the binder maps each root to exactly one target, so revisiting a
+        // root is deterministically an infinite loop). Chase iteratively,
+        // bounded by the binder's root count; a repeated root stops expanding
+        // and the last specifier falls through to the path arithmetic.
+        let mut seen_roots = HashSet::default();
+        let mut current = module_specifier.to_string();
+        loop {
+            let root = current.split("::").next().unwrap_or(current.as_str());
+            if !seen_roots.insert(root.to_string()) {
+                break;
+            }
+            let Some(aliased) = self.rust_apply_import_alias(importing_file, &current) else {
+                break;
+            };
+            if is_rooted_rust_module_path(&aliased) {
+                return resolve_rust_module_path_with_crate(&package, &crate_package, &aliased);
+            }
+            if let Some(package) = self
+                .cargo_routes()
+                .resolve_module_package(importing_file, &aliased)
+            {
+                return Some(package);
+            }
+            current = aliased;
         }
-        resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier)
+        resolve_rust_module_path_with_crate(&package, &crate_package, &current)
     }
 
     /// The cached per-file [`RustReferenceContext`] — the one primitive both the

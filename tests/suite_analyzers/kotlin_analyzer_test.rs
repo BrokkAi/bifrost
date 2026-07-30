@@ -533,22 +533,6 @@ fn mixed_language_workspace_routes_kotlin_and_java() {
         ),
         "Kotlin program semantics must be explicitly Unsupported until #1241: {outcome:?}"
     );
-
-    // Structural CodeQuery/RQL likewise stays absent until issue #1240.
-    let kotlin_only = InlineTestProject::with_language(Language::Kotlin)
-        .file(
-            "src/Only.kt",
-            "package only
-
-class Only
-",
-        )
-        .build();
-    let kotlin_analyzer = KotlinAnalyzer::new(kotlin_only.project_dyn());
-    assert!(
-        kotlin_analyzer.structural_search_providers().is_empty(),
-        "Kotlin must expose no structural search provider yet"
-    );
 }
 
 #[test]

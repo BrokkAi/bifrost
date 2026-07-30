@@ -26,10 +26,15 @@
 //! `crate::analyzer::usages::get_definition::kotlin` because it is a consumer
 //! of this module's index rather than part of it.
 //!
+//! Structural CodeQuery/RQL is live too (#1240): [`structural`] supplies the
+//! [`crate::analyzer::structural::StructuralSpec`] the shared engine needs, so
+//! `query_code` and `(language kotlin …)` search Kotlin files like any other
+//! registered language.
+//!
 //! Capabilities owned by sibling issues stay explicitly unsupported here:
 //! usage graphs (#1239 — Kotlin is a member of the shared JVM usage-candidate
 //! realm but has no edge builder yet, so find-references and reference-rewriting
-//! rename abstain), structural RQL (#1240), and CFG/semantic lowering (#1241 —
+//! rename abstain) and CFG/semantic lowering (#1241 —
 //! the analyzer delegate hands out the shared `UnsupportedProgramSemantics`
 //! provider instead of lowering).
 
@@ -38,7 +43,9 @@ pub(crate) mod declarations;
 mod hierarchy;
 pub(crate) mod imports;
 pub(crate) mod language;
+pub(crate) mod structural;
 mod supertypes;
+pub(crate) mod syntax;
 pub(crate) mod types;
 
 use crate::analyzer::js_ts::cache::{

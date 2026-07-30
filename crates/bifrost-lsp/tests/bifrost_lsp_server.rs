@@ -1547,12 +1547,17 @@ export function leak_resource(): object {
     );
     assert!(taint["error"].is_null(), "{taint}");
     assert_eq!(
-        taint["result"]["report"]["runs"][0]["completion"]["type"], "unsupported",
+        taint["result"]["report"]["runs"][0]["completion"]["type"], "complete",
         "{taint}"
     );
     assert_eq!(
-        taint["result"]["report"]["runs"][0]["completion"]["capability"]["type"],
-        "taint_evaluation",
+        taint["result"]["report"]["runs"][0]["findings"],
+        json!([]),
+        "{taint}"
+    );
+    assert_eq!(
+        taint["result"]["report"]["runs"][0]["diagnostics"],
+        json!([]),
         "{taint}"
     );
 

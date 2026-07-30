@@ -7,6 +7,7 @@ mod clone_detection;
 pub mod cognitive_complexity;
 #[cfg(test)]
 mod cognitive_complexity_tests;
+mod comment_density;
 pub mod common;
 mod complete_value_cache;
 mod config;
@@ -80,8 +81,9 @@ pub(crate) use cpp::{
 };
 pub use csharp::CSharpAnalyzer;
 pub use csharp::external::{
-    CSharpExternalDeclarationIndex, CSharpExternalDeclarationSource, CSharpExternalMember,
-    CSharpExternalMemberKind, CSharpExternalType, CSharpExternalTypeKind, CSharpVisibility,
+    CSharpAssemblyPackProducer, CSharpExternalDeclarationIndex, CSharpExternalDeclarationSource,
+    CSharpExternalMember, CSharpExternalMemberKind, CSharpExternalType, CSharpExternalTypeKind,
+    CSharpVisibility,
 };
 pub(crate) use csharp::{
     CSharpMemberName, csharp_attribute_name_node, csharp_attribute_terminal_name,
@@ -114,6 +116,7 @@ pub use i_analyzer::{
 pub use java::JavaAnalyzer;
 pub use javascript::JavascriptAnalyzer;
 pub(crate) use js_ts::{AliasResolver, resolve_js_ts_module_specifier};
+pub use jvm::java_artifact::JavaJarPackProducer;
 pub use kotlin::KotlinAnalyzer;
 pub use model::SemanticDiagnostic;
 pub use model::{
@@ -335,8 +338,7 @@ pub(crate) fn structural_spec_for(
         Language::Scala => &scala::structural::SCALA_STRUCTURAL_SPEC,
         Language::CSharp => &csharp::structural::CSHARP_STRUCTURAL_SPEC,
         Language::Ruby => &ruby::structural::RUBY_STRUCTURAL_SPEC,
-        // Kotlin structural CodeQuery/RQL support is issue #1240.
-        Language::Kotlin => return None,
+        Language::Kotlin => &kotlin::structural::KOTLIN_STRUCTURAL_SPEC,
         Language::None => return None,
     })
 }

@@ -3685,9 +3685,21 @@ fn resolve_scala_with_context(
                     identifier.start_byte(),
                 );
             if shadowed {
-                if let Some(binding) = precise_scala_binding(&bindings, text)
-                    && let Some(owner) = binding.declaration_owner
+                let binding = precise_scala_binding(&bindings, text);
+                if binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.declaration_owner.is_some())
                 {
+                    if let Some(outcome) = scala_explicit_local_member_import_outcome(
+                        ctx, &resolver, root, identifier, text,
+                    ) {
+                        return outcome;
+                    }
+                    if let Some(fqn) = resolver.resolve_member(text) {
+                        return scala_fqn_outcome(support, &fqn, text);
+                    }
+                }
+                if let Some(owner) = binding.and_then(|binding| binding.declaration_owner) {
                     match scala_exact_owner_member_candidate_units(ctx, &owner, text, false) {
                         ScalaExactMemberResolution::Found(mut candidates) => {
                             candidates.retain(|unit| {
@@ -4333,6 +4345,14 @@ fn resolve_scala_focused_qualified_path(
     }
 
     if path.focus_index + 1 == names.len() {
+        // Extractors need constructor-shape validation. The generic qualified
+        // terminal path only validates owner/member identity, so leave this
+        // parser-proven role to `resolve_scala_parser_proven_term_role`.
+        if qualified_stable_type_reference(node, ctx.source)
+            .is_some_and(|reference| reference.role == ScalaQualifiedStableTypeRole::Extractor)
+        {
+            return None;
+        }
         let role = if scala_is_type_position(node) || is_scala_class_reference(node, ctx.source) {
             ScalaQualifiedTerminalRole::Type
         } else {
@@ -10176,6 +10196,35 @@ const SCALA_SCOPE_NODES: &[&str] = &[
     "lambda_expression",
 ];
 
+// #1337: `scala_active_path_node_visits_for_test` counts every AST node the active-path
+// walk below visits while seeding the binding prefix visible at a cutoff. Issue #910's fix
+// ("Bound Scala receiver binding inference") made that walk run once per lookup and thread
+// its shared prefix down instead of recursively rebuilding it per receiver; a regression
+// back to per-receiver rebuilding would make this count scale with the number of preceding
+// factory-valued declarations instead of staying flat. `scala_receiver_binding_seed_is_bounded_across_repeated_companion_factories`
+// pins that count directly instead of a wall-clock elapsed budget, which flaked under box
+// load without actually verifying the algorithmic-complexity property it was meant to guard.
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static SCALA_ACTIVE_PATH_NODE_VISITS_FOR_TEST: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Test-only counter of AST nodes visited by [`scala_seed_active_path`] on the calling
+/// thread since the last [`reset_scala_active_path_node_visits_for_test`]. See #1337.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn scala_active_path_node_visits_for_test() -> usize {
+    SCALA_ACTIVE_PATH_NODE_VISITS_FOR_TEST.with(std::cell::Cell::get)
+}
+
+/// Resets the counter read by [`scala_active_path_node_visits_for_test`]. See #1337.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn reset_scala_active_path_node_visits_for_test() {
+    SCALA_ACTIVE_PATH_NODE_VISITS_FOR_TEST.with(|cell| cell.set(0));
+}
+
 fn scala_bindings_before(
     ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver,
@@ -10197,6 +10246,8 @@ fn scala_seed_active_path(
     let root = node;
     let mut stack = vec![node];
     while let Some(node) = stack.pop() {
+        #[cfg(any(test, feature = "test-support"))]
+        SCALA_ACTIVE_PATH_NODE_VISITS_FOR_TEST.with(|cell| cell.set(cell.get() + 1));
         if !ctx.scope_step() {
             return;
         }

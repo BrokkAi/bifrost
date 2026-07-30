@@ -3,6 +3,12 @@ use crate::analyzer::java::declarations::{
     node_text, normalize_java_full_name, parse_tree,
 };
 use crate::analyzer::jvm::dependency_discovery::{discover_build_tools, discover_metadata};
+use crate::analyzer::jvm::java_artifact::JavaJarPackProducer;
+use crate::analyzer::semantic_model::{
+    ActivationSelector, ArtifactProducerLimits, ArtifactProductionRequest, AuthoredPayload,
+    Compatibility, ExternalArtifactKind, ExternalArtifactPackProducer, NameSelector,
+    ProducerDiagnostic, Provenance, Safety, TypeFact, TypeKind, Visibility,
+};
 use crate::analyzer::{
     JvmAnalyzerConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalDependencies,
     JvmMavenCoordinate, Project, ProjectFile,
@@ -30,6 +36,7 @@ const MAX_ANALYZER_SOURCE_TYPES: usize = 4_096;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct JvmExternalDeclarationIndex {
     types_by_fqn: HashMap<String, JvmExternalType>,
+    production_diagnostics: Vec<ProducerDiagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +137,11 @@ impl JvmExternalDeclarationIndex {
         self.types_by_fqn.is_empty()
     }
 
+    #[cfg(test)]
+    pub(crate) fn production_diagnostics(&self) -> &[ProducerDiagnostic] {
+        &self.production_diagnostics
+    }
+
     pub(crate) fn get(&self, fqn: &str) -> Option<&JvmExternalType> {
         self.types_by_fqn.get(fqn)
     }
@@ -226,6 +238,7 @@ impl JvmExternalDeclarationIndex {
         };
         let entry_count = archive.len().min(MAX_ARCHIVE_ENTRIES);
         let mut total_bytes = 0u64;
+        let mut java_facts = None;
         for index in 0..entry_count {
             let Ok(entry) = archive.by_index(index) else {
                 continue;
@@ -253,7 +266,20 @@ impl JvmExternalDeclarationIndex {
                 continue;
             }
             let external_types = language.source_types(artifact_path, &source_path, &source);
-            for external_type in external_types {
+            if matches!(language, SourceJarLanguage::Java) && java_facts.is_none() {
+                java_facts =
+                    Some(self.produce_java_type_facts(
+                        artifact_path,
+                        ExternalArtifactKind::JavaSourceJar,
+                    ));
+            }
+            for mut external_type in external_types {
+                if let Some(fact) = java_facts
+                    .as_ref()
+                    .and_then(|facts| facts.get(&external_type.fqn))
+                {
+                    apply_java_type_fact(&mut external_type, fact);
+                }
                 self.insert(external_type);
             }
         }
@@ -269,6 +295,8 @@ impl JvmExternalDeclarationIndex {
         };
         let entry_count = archive.len().min(MAX_ARCHIVE_ENTRIES);
         let mut total_bytes = 0u64;
+        let java_facts =
+            self.produce_java_type_facts(artifact_path, ExternalArtifactKind::JavaClassJar);
         for index in 0..entry_count {
             let Ok(entry) = archive.by_index(index) else {
                 continue;
@@ -294,12 +322,88 @@ impl JvmExternalDeclarationIndex {
             {
                 continue;
             }
-            if let Some(external_type) = class_type(artifact_path, &class_entry, &bytes) {
+            if let Some(mut external_type) = class_type(artifact_path, &class_entry, &bytes) {
+                if let Some(fact) = java_facts.get(&external_type.fqn) {
+                    apply_java_type_fact(&mut external_type, fact);
+                }
                 self.insert(external_type);
             }
         }
         total_bytes
     }
+
+    fn produce_java_type_facts(
+        &mut self,
+        artifact_path: &Path,
+        artifact_kind: ExternalArtifactKind,
+    ) -> HashMap<String, TypeFact> {
+        let production = JavaJarPackProducer.produce_exact_artifact(
+            &ArtifactProductionRequest {
+                path: artifact_path.to_path_buf(),
+                artifact_kind,
+                pack_id: "bifrost.external.java".to_owned(),
+                pack_version: env!("CARGO_PKG_VERSION").to_owned(),
+                ecosystem: "maven".to_owned(),
+                compatibility: Compatibility {
+                    bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                    toolchains: Vec::new(),
+                },
+                activation: vec![ActivationSelector {
+                    package: None,
+                    module: None,
+                    toolchain: Some(NameSelector {
+                        name: "jvm".to_owned(),
+                        version: None,
+                    }),
+                    targets: Vec::new(),
+                    configurations: Vec::new(),
+                    artifact_sha256: None,
+                }],
+                provenance: Provenance {
+                    source: "local dependency artifact".to_owned(),
+                    revision: None,
+                },
+                license: "NOASSERTION".to_owned(),
+                safety: Safety {
+                    generated_code_only: false,
+                    review_required: false,
+                },
+            },
+            &ArtifactProducerLimits::default(),
+        );
+        self.production_diagnostics
+            .extend(production.diagnostics.iter().cloned());
+        production
+            .pack
+            .into_iter()
+            .flat_map(|pack| pack.shards)
+            .flat_map(|shard| match shard.payload {
+                AuthoredPayload::DeclarationFacts { types, .. } => types,
+                AuthoredPayload::GeneratorRules { .. } => Vec::new(),
+            })
+            .map(|fact| (fact.name.clone(), fact))
+            .collect()
+    }
+}
+
+fn apply_java_type_fact(external_type: &mut JvmExternalType, fact: &TypeFact) {
+    external_type.kind = match fact.type_kind {
+        TypeKind::Interface | TypeKind::Trait => JvmExternalTypeKind::Interface,
+        TypeKind::Enum => JvmExternalTypeKind::Enum,
+        TypeKind::Annotation => JvmExternalTypeKind::Annotation,
+        TypeKind::Record => JvmExternalTypeKind::Record,
+        TypeKind::Class
+        | TypeKind::Delegate
+        | TypeKind::Struct
+        | TypeKind::Module
+        | TypeKind::TypeAlias => JvmExternalTypeKind::Class,
+    };
+    external_type.visibility = match fact.visibility {
+        Visibility::Public => JvmVisibility::Public,
+        Visibility::Protected | Visibility::ProtectedInternal => JvmVisibility::Protected,
+        Visibility::Package | Visibility::Internal => JvmVisibility::PackagePrivate,
+        Visibility::Private => JvmVisibility::Private,
+    };
 }
 
 /// A source language Bifrost can read out of a published `-sources.jar`.
@@ -1139,6 +1243,11 @@ mod tests {
         };
         let config = fixture.coordinate_config();
         let index = JvmExternalDeclarationIndex::build(&config, fixture.project_root());
+        assert!(
+            index.production_diagnostics().is_empty(),
+            "{:?}",
+            index.production_diagnostics()
+        );
 
         let service = index.get("com.example.dep.ExternalService").unwrap();
         assert_eq!("com.example.dep", service.package_name());

@@ -1319,6 +1319,12 @@ fn run_rql_query_result(
                         .iter()
                         .map(|step| path_to_uri_string(&workspace_root.join(&step.source.path)))
                         .collect(),
+                    CodeQueryResultValue::TaintFinding { value } => value
+                        .witnesses
+                        .iter()
+                        .flat_map(|witness| &witness.steps)
+                        .map(|step| path_to_uri_string(&workspace_root.join(&step.source.path)))
+                        .collect(),
                     _ => Vec::new(),
                 };
                 let path = match &result.value {
@@ -1331,6 +1337,7 @@ fn run_rql_query_result(
                     CodeQueryResultValue::TypestateWitness { value } => &value.path,
                     CodeQueryResultValue::FlowEndpoint { value } => &value.path,
                     CodeQueryResultValue::FlowWitness { value } => &value.path,
+                    CodeQueryResultValue::TaintFinding { value } => &value.sink.path,
                     CodeQueryResultValue::File { value } => &value.path,
                     CodeQueryResultValue::ReferenceSite { value } => &value.path,
                     CodeQueryResultValue::CallSite { value } => &value.path,

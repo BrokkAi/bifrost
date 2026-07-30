@@ -27,5 +27,6 @@ mod policy_source;
 mod policy_suppression_evaluation;
 mod policy_suppression_loading;
 mod scan_usages_same_owner_policy;
+mod taint_policy_adapter;
 #[cfg(unix)]
 mod temp_storage_scripts;

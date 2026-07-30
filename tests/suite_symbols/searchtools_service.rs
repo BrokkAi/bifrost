@@ -1,8 +1,10 @@
 use crate::common::{InlineTestProject, line_of};
 use brokk_bifrost::{
     AnalyzerConfig, FilesystemProject, Language, Project, SearchToolsService,
-    SearchToolsServiceErrorCode, WorkspaceAnalyzer, scoped_project::create_scoped_service,
-    searchtools::SCAN_USAGES_RESPONSE_BUDGET_BYTES, searchtools_render::RenderOptions,
+    SearchToolsServiceErrorCode, WorkspaceAnalyzer,
+    scoped_project::create_scoped_service,
+    searchtools::{SCAN_USAGES_RESPONSE_BUDGET_BYTES, disable_time_budget_for_test},
+    searchtools_render::RenderOptions,
 };
 use git2::{Repository, Signature};
 use serde_json::Value;
@@ -5121,6 +5123,10 @@ fn scan_usages_scope_paths_are_bounded_by_the_response_budget() {
 
 #[test]
 fn scan_usages_truncated_zero_hit_result_is_partial_failure_with_candidate_sample() {
+    // #1337: pins the candidate-file-count truncation behavior (1005 candidate files vs.
+    // the 1000-file cap), not the wall-clock budget -- disable the latter so a slow box
+    // can't race the two and flip which one this test observes.
+    let _time_budget_guard = disable_time_budget_for_test();
     let mut project = InlineTestProject::with_language(Language::Php)
         .file(
             "composer.json",
@@ -8940,6 +8946,11 @@ fn nested_function_is_isolated() {
 
 #[test]
 fn scan_usages_paths_scope_does_not_truncate_broad_glob_candidates_before_scanning() {
+    // #1337: this test's contract is that a path-scoped scan over 1005 candidate files
+    // completes fully (no generic pre-scan cap applied) -- disable the wall-clock budget
+    // so a slow box scanning 1005 files can't trip it and manufacture a spurious
+    // incompleteness the count-based assertions below don't expect.
+    let _time_budget_guard = disable_time_budget_for_test();
     let mut project = InlineTestProject::with_language(Language::Java).file(
         "Greeter.java",
         "public class Greeter {\n    public String hello() { return \"hi\"; }\n}\n",
@@ -9020,6 +9031,11 @@ fn scan_usages_paths_scope_keeps_cross_language_scala_usages_of_java_type() {
 
 #[test]
 fn scan_usages_demotes_large_result_to_summary_within_budget() {
+    // #1337: pins the response-byte-budget demotion (350 hits should not fit in
+    // SCAN_USAGES_RESPONSE_BUDGET_BYTES), not the wall-clock budget -- disable the latter
+    // so a slow box can't race the two and report `incomplete_reason: time_budget` instead
+    // of the `response_budget` this test asserts.
+    let _time_budget_guard = disable_time_budget_for_test();
     let temp = TempDir::new().unwrap();
     fs::write(
         temp.path().join("Target.java"),
@@ -9089,6 +9105,10 @@ fn scan_usages_demotes_large_result_to_summary_within_budget() {
 
 #[test]
 fn scan_usages_too_many_callsites_returns_incomplete_summary_with_observed_files() {
+    // #1337: pins the callsite-count limit (1001 callsites vs. the 1000 cap), not the
+    // wall-clock budget -- disable the latter so a slow box can't race the two and report
+    // `incomplete_reason: time_budget` instead of the `callsites` this test asserts.
+    let _time_budget_guard = disable_time_budget_for_test();
     let temp = TempDir::new().unwrap();
     fs::write(
         temp.path().join("Target.java"),

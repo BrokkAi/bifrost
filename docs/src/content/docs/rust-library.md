@@ -17,7 +17,7 @@ That produces a dependency like:
 
 ```toml
 [dependencies]
-brokk-bifrost = "0.8.13"
+brokk-bifrost = "0.8.16"
 ```
 
 For local development against a checkout, use a path dependency:
@@ -31,6 +31,40 @@ The package name uses a hyphen, but Rust imports use the crate name with an unde
 ```rust
 use brokk_bifrost::{AnalyzerConfig, FilesystemProject, WorkspaceAnalyzer};
 ```
+
+## Choose a Package
+
+`brokk-bifrost` is the supported default dependency. It is the compatibility
+facade: it re-exports the analyzer and service API, and Cargo resolves the
+analysis, runtime, MCP, and LSP implementation crates automatically. Most
+applications should depend on this package alone.
+
+For an application that only hosts Bifrost over the Language Server Protocol,
+depend directly on the focused LSP host instead:
+
+```bash
+cargo add brokk-bifrost-lsp@0.8
+```
+
+Start its stdio server with a deterministic fallback workspace root:
+
+```rust
+use std::path::PathBuf;
+
+fn main() -> Result<(), String> {
+    brokk_bifrost_lsp::run_lsp_stdio_server(PathBuf::from("/path/to/project"))
+}
+```
+
+The LSP client can replace that fallback with its advertised workspace folders
+during initialization. Reserve the process's standard input and output for LSP
+messages, and follow the [LSP server guide](/lsp/) for protocol configuration.
+
+`brokk-bifrost-analysis`, `brokk-bifrost-runtime`, and
+`brokk-bifrost-mcp` are lower-level workspace components. They are published
+so focused hosts can compose them, but they are not necessary for ordinary
+library consumers; prefer the facade unless you specifically own one of those
+protocol boundaries.
 
 ## Minimal Analyzer
 

@@ -24,6 +24,10 @@
 //! - an import is `import_header` = `identifier` (one `simple_identifier` per
 //!   segment), optional `import_alias`, optional `wildcard_import`.
 //!
+//! The positional reads themselves live in `crate::analyzer::kotlin::syntax`,
+//! shared with the usage graphs (issue #1239) so the two cannot drift apart
+//! about what a syntax shape means.
+//!
 //! # How a name becomes a declaration
 //!
 //! Name precedence is not reimplemented here. `crate::analyzer::kotlin::types`
@@ -39,6 +43,11 @@
 use super::*;
 use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::kotlin::declarations::kotlin_package_name;
+use crate::analyzer::kotlin::syntax::{
+    kotlin_call_arity, kotlin_call_with_callee, kotlin_callee, kotlin_declaration_node,
+    kotlin_enclosing_import_header, kotlin_is_declaration_name, kotlin_is_expression_kind,
+    kotlin_named_argument_label,
+};
 use crate::analyzer::kotlin::types::{KotlinNameScope, KotlinTypeName, resolve_kotlin_type_name};
 use crate::analyzer::tree_walk::{first_named_child_of_kind, named_children};
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
@@ -634,44 +643,6 @@ impl<'a> KotlinCtx<'a> {
     }
 }
 
-/// The `import_header` `node` sits inside, if any.
-///
-/// Walking up rather than testing the parent alone: an import's focus can land
-/// on the `identifier`'s `simple_identifier`, on the `import_alias`'s
-/// `type_identifier`, or on the header itself.
-fn kotlin_enclosing_import_header(node: Node<'_>) -> Option<Node<'_>> {
-    let mut current = Some(node);
-    while let Some(candidate) = current {
-        if candidate.kind() == "import_header" {
-            return Some(candidate);
-        }
-        current = candidate.parent();
-    }
-    None
-}
-
-/// Whether `node` is the name a declaration introduces rather than a reference
-/// to something declared elsewhere.
-fn kotlin_is_declaration_name(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    let expected_kind = match parent.kind() {
-        "class_declaration" | "object_declaration" | "companion_object" | "type_alias"
-        | "type_parameter" => "type_identifier",
-        "function_declaration"
-        | "variable_declaration"
-        | "parameter"
-        | "class_parameter"
-        | "enum_entry"
-        | "parameter_with_optional_type" => "simple_identifier",
-        _ => return false,
-    };
-    node.kind() == expected_kind
-        && first_named_child_of_kind(parent, expected_kind)
-            .is_some_and(|name| name.id() == node.id())
-}
-
 /// Resolve a focus inside `import a.b.C`, `import a.b.C as D`, or `import a.b.*`.
 ///
 /// Focusing segment *k* of the dotted path means the prefix `0..=k`: putting
@@ -803,71 +774,6 @@ fn kotlin_type_spelling_through(ctx: &KotlinCtx<'_>, node: Node<'_>) -> String {
 // ---------------------------------------------------------------------------
 // Calls, constructors, and named arguments.
 // ---------------------------------------------------------------------------
-
-/// The `call_expression` whose callee is `node`, if any.
-///
-/// A call's children are the callee expression followed by `call_suffix`, so
-/// "is this the callee" is "is this the first named child that is not the
-/// suffix" — the grammar exposes no field to ask directly.
-fn kotlin_call_with_callee(node: Node<'_>) -> Option<Node<'_>> {
-    let call = node
-        .parent()
-        .filter(|parent| parent.kind() == "call_expression")?;
-    (kotlin_callee(call)?.id() == node.id()).then_some(call)
-}
-
-pub(super) fn kotlin_callee(call: Node<'_>) -> Option<Node<'_>> {
-    // A `constructor_invocation` (a supertype list entry such as `: Base(1)`)
-    // spells its callee as the `user_type` it constructs; an ordinary call
-    // spells it as the child that is not the argument suffix.
-    named_children(call)
-        .into_iter()
-        .find(|child| !matches!(child.kind(), "call_suffix" | "value_arguments"))
-}
-
-/// The `value_arguments` node a Kotlin call passes its arguments in.
-///
-/// An ordinary call nests it inside `call_suffix`; a `constructor_invocation`
-/// holds it directly.
-pub(super) fn kotlin_value_arguments(call: Node<'_>) -> Option<Node<'_>> {
-    if let Some(arguments) = first_named_child_of_kind(call, "value_arguments") {
-        return Some(arguments);
-    }
-    first_named_child_of_kind(call, "call_suffix")
-        .and_then(|suffix| first_named_child_of_kind(suffix, "value_arguments"))
-}
-
-/// How many arguments a call passes.
-///
-/// A trailing lambda (`items.forEach { … }`) is an argument even though it sits
-/// outside the parentheses, so it counts: without it, every trailing-lambda
-/// call would look like it passed one argument too few and would fail to match
-/// its own overload.
-fn kotlin_call_arity(call: Node<'_>) -> usize {
-    let Some(suffix) = first_named_child_of_kind(call, "call_suffix") else {
-        return 0;
-    };
-    let positional = first_named_child_of_kind(suffix, "value_arguments")
-        .map(|arguments| {
-            named_children(arguments)
-                .into_iter()
-                .filter(|child| child.kind() == "value_argument")
-                .count()
-        })
-        .unwrap_or(0);
-    let trailing = usize::from(first_named_child_of_kind(suffix, "annotated_lambda").is_some());
-    positional + trailing
-}
-
-/// Whether `node` is the *label* of a named argument rather than its value.
-///
-/// `foo(name = 1)` is `(value_argument (simple_identifier) (integer_literal))`;
-/// a positional `foo(name)` is `(value_argument (simple_identifier))`. The label
-/// is therefore the first of two or more named children.
-fn kotlin_named_argument_label(argument: Node<'_>, node: Node<'_>) -> bool {
-    let children = named_children(argument);
-    children.len() > 1 && children[0].id() == node.id()
-}
 
 /// Resolve `name(...)` where `name` is spelled without a receiver.
 ///
@@ -1491,37 +1397,6 @@ fn kotlin_binding_name<'a>(binding: Node<'_>, source: &'a str) -> Option<&'a str
     first_named_child_of_kind(binding, "simple_identifier")?
         .utf8_text(source.as_bytes())
         .ok()
-}
-
-/// Whether a node kind can appear as the value half of a property declaration.
-fn kotlin_is_expression_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "call_expression"
-            | "navigation_expression"
-            | "as_expression"
-            | "simple_identifier"
-            | "parenthesized_expression"
-            | "postfix_expression"
-            | "object_literal"
-    )
-}
-
-/// The declaration node covering `range`.
-///
-/// The smallest covering node is not always the declaration: an `enum_entry`
-/// spans exactly its own name, so its `simple_identifier` child covers the same
-/// bytes and would win. Climbing back out to the outermost node with the same
-/// span picks the declaration rather than the name inside it.
-fn kotlin_declaration_node<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {
-    let mut node = smallest_named_node_covering(root, range.start_byte, range.end_byte)?;
-    while let Some(parent) = node.parent() {
-        if parent.start_byte() != node.start_byte() || parent.end_byte() != node.end_byte() {
-            break;
-        }
-        node = parent;
-    }
-    Some(node)
 }
 
 /// The return type a function declaration writes, if it wrote one.

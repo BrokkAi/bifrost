@@ -145,6 +145,10 @@ pub(crate) use scala::{
     ScalaDefinitionProvider, ScalaTypeLookupResolution, resolve_scala_bounded,
     scala_type_lookup_resolution, scala_type_lookup_resolution_in_session,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use scala::{
+    reset_scala_active_path_node_visits_for_test, scala_active_path_node_visits_for_test,
+};
 
 /// Resolve a bare `name` against the lexically enclosing scope chain, innermost
 /// first — the language-agnostic generalization of Java's nested-type resolution

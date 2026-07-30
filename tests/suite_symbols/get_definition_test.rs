@@ -25372,6 +25372,18 @@ object App:
 
 #[test]
 fn scala_receiver_binding_seed_is_bounded_across_repeated_companion_factories() {
+    // #910 fixed an exponential forward-definition tail: resolving `cls.entered`'s receiver
+    // used to recursively rebuild the visible-binding prefix from scratch for every one of
+    // the preceding factory-valued `val`s instead of reusing one shared, monotonically
+    // seeded prefix. This used to be pinned by a wall-clock `elapsed < 10s` budget, which
+    // flaked under box load (#1337) without actually checking the property the test cares
+    // about. Pin it directly instead: `scala_active_path_node_visits_for_test` counts every
+    // AST node the binding-prefix seed walk visits. Reusing the shared prefix makes that
+    // walk run once per lookup (linear in the file's node count); a regression back to
+    // per-receiver rebuilding makes it scale with the number of preceding companion-factory
+    // `val`s instead, blowing well past a generous linear multiple of that count.
+    const COMPANION_FACTORY_COUNT: usize = 64;
+
     let mut source = String::from(
         r#"
 package app
@@ -25388,7 +25400,7 @@ object Definitions {
   def newCompleteClassSymbol(): Symbol = new Symbol
 "#,
     );
-    for index in 0..64 {
+    for index in 0..COMPANION_FACTORY_COUNT {
         source.push_str(&format!("  val route{index} = Routes.make()\n"));
     }
     source.push_str(
@@ -25402,15 +25414,28 @@ object Definitions {
         .file("app/Definitions.scala", source.clone())
         .build();
     let entered_start = source.find("cls.entered").expect("member selection") + "cls.".len();
-    let started = std::time::Instant::now();
+    brokk_bifrost::usages::get_definition::reset_scala_active_path_node_visits_for_test();
     let value = lookup(
         project.root(),
         &location_reference("app/Definitions.scala", &source, entered_start),
     );
+    let node_visits =
+        brokk_bifrost::usages::get_definition::scala_active_path_node_visits_for_test();
 
+    // A single reused-prefix seed walk touches a small constant number of nodes per
+    // companion-factory `val`; a per-receiver rebuild touches on the order of
+    // `COMPANION_FACTORY_COUNT` full walks, each itself proportional to
+    // `COMPANION_FACTORY_COUNT`. 32x is generous headroom above the former and well short
+    // of the latter (~`COMPANION_FACTORY_COUNT`x more).
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(10),
-        "Scala receiver binding reconstruction exceeded its bounded regression budget: {value}"
+        node_visits <= 32 * COMPANION_FACTORY_COUNT,
+        "Scala receiver binding seed walk visited {node_visits} nodes across {COMPANION_FACTORY_COUNT} \
+         companion factories -- exceeds the bounded regression budget, suggesting the \
+         per-receiver prefix is being rebuilt instead of reused: {value}"
+    );
+    assert!(
+        node_visits > 0,
+        "expected the active-path seed walk to run at least once for this lookup: {value}"
     );
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
