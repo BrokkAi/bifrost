@@ -49,6 +49,18 @@ You can see it working three ways. First, the existing wire-level integration su
 - Observation: The current "four-slot" constraint is not a pool. `MAX_IN_FLIGHT_CANCELLABLE_REQUESTS = 4` in `crates/bifrost-mcp/src/mcp_common.rs:28` *rejects* the fifth concurrent cancellable request with JSON-RPC error `-32000` ("too many in-flight cancellable tool requests"). The issue asks for a real pool that *waits* asynchronously. This is a deliberate behavior change, not a refactor, and any test asserting the busy rejection has to change with it.
   Evidence: `McpRequestCancellations::register_at` returns `McpRequestRegistrationError::AtCapacity`, which `run_stdio_server` maps to `SERVER_BUSY`.
 
+- Observation: **MCP Roots is deprecated wholesale in `2026-07-28` by SEP-2577**, including the `InputRequest::ListRoots` variant that issue #1328 names as the forward path for rootless activation. `rmcp` marks `Root`, `ListRootsRequest`, `ListRootsResult`, and `Peer::list_roots` `#[deprecated(since = "2.0.0")]`. Sampling and Logging are deprecated by the same SEP. Deprecated is not removed, and SEP-2577 ships no replacement for "which directory may this server analyze", so Bifrost has no alternative that preserves its security model. The plan therefore proceeds as issue #1328 specifies, with `#[allow(deprecated)]` and a documented reason at each use site, and Bifrost should move to SEP-2577's successor for workspace scope once one exists. This is worth raising on the issue.
+  Evidence: `rmcp-3.0.1/src/model.rs:3474` onwards carries the deprecation on every Roots type; `rmcp-3.0.1/CHANGELOG.md` records "deprecate roots, sampling, and logging (SEP-2577)" in 1.8.0 and "deprecate roots/sampling/logging types" in 2.0.0.
+
+- Observation: `server/discover` needed no Bifrost code at all, and the `_meta` build identity flows into it for free alongside `io.modelcontextprotocol/serverInfo`. Against the milestone-1 host, a stateless `2026-07-28` request returns `{"resultType":"complete","supportedVersions":["2024-11-05","2025-03-26","2025-06-18","2025-11-25","2026-07-28"],"capabilities":{"resources":{},"tools":{}},"instructions":"Analyzer-backed search tools for source code workspaces.","ttlMs":0,"cacheScope":"private","_meta":{"io.bifrost/build-identity":"0.8.16","io.modelcontextprotocol/serverInfo":{"name":"bifrost","version":"0.8.16"}}}`.
+  Evidence: Manual stdio transcript against `target/debug/bifrost-mcp-test-server` with `BIFROST_MCP_RMCP=on`, 2026-07-30.
+
+- Observation: A `2026-07-28` client may only skip `initialize` if its very first request carries the required `_meta` keys `io.modelcontextprotocol/protocolVersion` and `io.modelcontextprotocol/clientCapabilities`. Without them, `rmcp` refuses the session with "expect initialized request". Any test that exercises the stateless path must send that `_meta` on *every* request, because the SDK then sets `require_request_metadata()` for the rest of the session.
+  Evidence: `rmcp-3.0.1/src/service/server.rs:521-550`; a `server/discover` with no `params._meta` terminated the session with `MCP initialization failed: expect initialized request, but received: ... CustomRequest { method: "server/discover" }`.
+
+- Observation: Under `rmcp`, responses to concurrently outstanding requests are not in request order, whereas the hand-written host answered strictly in order because a single reader thread drove everything. The existing contract suite is unaffected because `round_trip` writes one request and reads one line, keeping exactly one request in flight; a client that pipelines must correlate by id.
+  Evidence: Piping `tools/list`, `resources/list`, and `resources/read` in one batch returned ids 1, 3, 4, 2.
+
 - Observation: Bifrost has no Tokio anywhere in its dependency tree today; `Cargo.lock` contains no `tokio` entry. Adding `rmcp` introduces Tokio plus roughly 78 transitive packages into a crate that is published to crates.io.
   Evidence: `grep -n 'name = "tokio"' Cargo.lock` matches nothing on `7fbd8ec5`; `cargo add rmcp@3 --features server,transport-io` in a scratch project locked 78 packages.
 
@@ -64,6 +76,14 @@ You can see it working three ways. First, the existing wire-level integration su
 
 - Decision: Convert the analyzer admission limit from "reject the fifth request with `-32000`" to "wait for a permit, cancellation-aware".
   Rationale: Issue #1328 requires it in so many words ("Checkout must be asynchronous and cancellation-aware so waiting does not block a runtime thread"), and the rejection behavior only existed because the old reader thread had nowhere to park a waiting request. The fairness benchmark, not the rejection, is the regression gate for the capacity policy.
+  Date/Author: 2026-07-30, David Baker Effendi (via Claude).
+
+- Decision: Keep using MCP Roots even though SEP-2577 deprecates it, isolated behind `#[allow(deprecated)]` with the reason stated at the import in `crates/bifrost-mcp/src/rmcp_host.rs`.
+  Rationale: Bifrost's entire security model is "analyze only a directory a client authorized", and Roots is the only protocol mechanism that answers that question. SEP-2577 deprecates Roots without shipping a replacement, and every adapter Bifrost is configured against still speaks it. Silently dropping Roots would leave rootless servers with no way to bind at all; ignoring the deprecation without recording it would leave the next contributor guessing. Issue #1328 asks for the MRTR Roots flow explicitly, so the plan delivers it and flags the deprecation for the issue owner.
+  Date/Author: 2026-07-30, David Baker Effendi (via Claude).
+
+- Decision: One `tokio::sync::Mutex<ConnectionState>` is both the workspace-authorization lock and the serialization point for tool-call preparation. Every call takes it to reconcile scope, check authorization, and normalize arguments; workspace-mutating tools additionally hold it across execution. An analyzer permit is only ever taken while already holding it or after releasing it, never the other way round.
+  Rationale: The old host got preparation ordering for free from its single reader thread, and workspace-mutating tools got mutual exclusion the same way. Under `rmcp` every request is concurrent, so both properties have to become explicit. Making preparation the critical section preserves the old semantics exactly while still letting four analyzer executions overlap. A single lock with a stated order removes any possibility of a lock-order deadlock.
   Date/Author: 2026-07-30, David Baker Effendi (via Claude).
 
 - Decision: Keep the analyzer synchronous. Analyzer work runs on `tokio::task::spawn_blocking`, not by making `SearchToolsService` async.

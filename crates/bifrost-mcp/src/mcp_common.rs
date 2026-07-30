@@ -33,8 +33,8 @@ pub const BENCHMARK_MCP_REQUEST_BUDGET_SECS: u64 = 60;
 pub(crate) const AGENTS_GUIDANCE_URI: &str = "bifrost://agent-guidance/agents.md";
 pub(crate) const AGENTS_GUIDANCE_MIME_TYPE: &str = "text/markdown";
 const ROOTS_REQUEST_ID_PREFIX: &str = "bifrost-roots-";
-const CODEX_MCP_CLIENT_NAME: &str = "codex-mcp-client";
-const CODEX_SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
+pub(crate) const CODEX_MCP_CLIENT_NAME: &str = "codex-mcp-client";
+pub(crate) const CODEX_SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
 pub(crate) const AGENTS_GUIDANCE_TEXT: &str =
     include_str!("../resources/agent-guidance/bifrost-agents.md");
 
@@ -192,7 +192,7 @@ impl McpRequestCancellations {
     }
 }
 
-fn mcp_analyzer_request_budget() -> Duration {
+pub(crate) fn mcp_analyzer_request_budget() -> Duration {
     benchmark_mcp_request_budget_secs(std::env::var(BENCHMARK_MCP_REQUEST_BUDGET_SECS_ENV).ok())
         .map(Duration::from_secs)
         .unwrap_or(MCP_ANALYZER_REQUEST_BUDGET)
@@ -619,7 +619,7 @@ fn background_tool_request(message: &Value, spec: &McpServerSpec) -> Option<(Val
     ))
 }
 
-fn serial_tool_request(tool_name: &str) -> bool {
+pub(crate) fn serial_tool_request(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "activate_workspace" | "refresh" | "update_paths" | "get_active_workspace"
@@ -929,7 +929,7 @@ fn handle_response(
     connection.finish_roots_response()
 }
 
-fn client_root_to_path(root: &str) -> Result<PathBuf, String> {
+pub(crate) fn client_root_to_path(root: &str) -> Result<PathBuf, String> {
     let native_path = PathBuf::from(root);
     if native_path.is_absolute() {
         return Ok(native_path);
@@ -938,7 +938,7 @@ fn client_root_to_path(root: &str) -> Result<PathBuf, String> {
     file_uri_to_path(root)
 }
 
-fn file_uri_to_path(uri: &str) -> Result<PathBuf, String> {
+pub(crate) fn file_uri_to_path(uri: &str) -> Result<PathBuf, String> {
     let parsed =
         url::Url::parse(uri).map_err(|error| format!("invalid root URI `{uri}`: {error}"))?;
     if parsed.scheme() != "file" {
@@ -1442,12 +1442,10 @@ fn log_codex_workspace_event(event: &str, thread_id: Option<&str>) {
     }
 }
 
+pub(crate) const UNBOUND_WORKSPACE_MESSAGE: &str = "Bifrost is not bound to a workspace. The MCP client must provide an approved filesystem root via roots/list or Codex sandbox-state metadata, or configure Bifrost with --root or BIFROST_WORKSPACE_ROOT.";
+
 fn unbound_workspace_error() -> (i64, String) {
-    (
-        INTERNAL_ERROR,
-        "Bifrost is not bound to a workspace. The MCP client must provide an approved filesystem root via roots/list or Codex sandbox-state metadata, or configure Bifrost with --root or BIFROST_WORKSPACE_ROOT."
-            .to_string(),
-    )
+    (INTERNAL_ERROR, UNBOUND_WORKSPACE_MESSAGE.to_string())
 }
 
 fn map_service_error(code: SearchToolsServiceErrorCode, message: String) -> (i64, String) {
@@ -1459,7 +1457,7 @@ fn map_service_error(code: SearchToolsServiceErrorCode, message: String) -> (i64
     (jsonrpc_code, message)
 }
 
-fn fit_get_summaries_output_to_budget(
+pub(crate) fn fit_get_summaries_output_to_budget(
     service: &SearchToolsService,
     output: ToolOutput,
     render_options: RenderOptions,
