@@ -17,7 +17,9 @@ use crate::analyzer::kotlin::syntax::{
     kotlin_import_header_segments, kotlin_is_declaration_name, kotlin_navigation_receiver,
     kotlin_user_type_segments,
 };
-use crate::analyzer::tree_walk::{TreeWalkAction, first_named_child_of_kind, walk_tree_iterative};
+use crate::analyzer::tree_walk::{
+    TreeWalkAction, first_named_child_of_kind, named_children, walk_tree_iterative,
+};
 use crate::analyzer::usages::common::node_text;
 use crate::analyzer::usages::kotlin_graph::hits;
 use crate::analyzer::usages::kotlin_graph::resolver::{KotlinNameResolver, TargetKind, TargetSpec};
@@ -67,6 +69,14 @@ pub(super) struct ScanCtx<'a> {
     pub(super) max_usages: usize,
     pub(super) limit_exceeded: &'a mut bool,
     pub(super) enclosing_cache: HashMap<(usize, usize), hits::EnclosingContext>,
+    /// Which scope kinds each open frame opened, so the walk's exit callback
+    /// unwinds exactly what its matching enter pushed.
+    pending_exits: Vec<ScopeExit>,
+}
+
+struct ScopeExit {
+    values: bool,
+    type_parameters: bool,
 }
 
 pub(super) fn scan_file(
@@ -101,7 +111,10 @@ pub(super) fn scan_file(
 
     let line_starts = compute_line_starts(&source);
     let names = KotlinNameResolver::new(analyzer, file, tree.root_node(), &source);
-    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    let mut scopes = WalkScopes {
+        values: LocalInferenceEngine::new(LocalInferenceConfig::default()),
+        type_parameters: Vec::new(),
+    };
     let mut ctx = ScanCtx {
         analyzer,
         file,
@@ -114,43 +127,108 @@ pub(super) fn scan_file(
         max_usages: state.max_usages,
         limit_exceeded: state.limit_exceeded,
         enclosing_cache: HashMap::default(),
+        pending_exits: Vec::new(),
     };
-    walk(tree.root_node(), &mut ctx, &mut bindings);
+    walk(tree.root_node(), &mut ctx, &mut scopes);
 }
 
-fn walk(root: Node<'_>, ctx: &mut ScanCtx<'_>, bindings: &mut LocalInferenceEngine<String>) {
-    let mut state = (ctx, bindings);
+/// Everything the walk carries down the tree and unwinds on the way back up.
+///
+/// Value bindings and type-parameter names are tracked *separately* because
+/// Kotlin has separate namespaces for types and values. `val Base = 1` shadows
+/// the class `Base` where a value is expected (`Base.length` reads the string's
+/// property) but not where a type is expected (`val x: Base` is still the class).
+/// Collapsing the two into one shadow map — which is what the single-namespace
+/// languages do — would make each one wrong in the other's positions.
+struct WalkScopes {
+    values: LocalInferenceEngine<String>,
+    /// Type-parameter names in scope, innermost frame last. `class Box<Base>`
+    /// makes every `Base` inside the class the parameter, not the class.
+    type_parameters: Vec<Vec<String>>,
+}
+
+impl WalkScopes {
+    fn type_parameter_in_scope(&self, name: &str) -> bool {
+        self.type_parameters
+            .iter()
+            .any(|frame| frame.iter().any(|declared| declared == name))
+    }
+}
+
+fn walk(root: Node<'_>, ctx: &mut ScanCtx<'_>, scopes: &mut WalkScopes) {
+    let mut state = (ctx, scopes);
     walk_tree_iterative(
         root,
         &mut state,
-        |node, (ctx, bindings)| {
+        |node, (ctx, scopes)| {
             if *ctx.limit_exceeded {
                 return TreeWalkAction::Stop;
             }
-            let enters_scope = SCOPE_NODES.contains(&node.kind());
-            if enters_scope {
-                bindings.enter_scope();
+            let enters_value_scope = SCOPE_NODES.contains(&node.kind());
+            let declared_type_parameters = type_parameter_names(node, ctx.source);
+            let enters_type_scope = !declared_type_parameters.is_empty();
+            if enters_value_scope {
+                scopes.values.enter_scope();
             }
-            seed_declarations(node, ctx, bindings);
-            record_reference(node, ctx, bindings);
-            if enters_scope {
+            if enters_type_scope {
+                scopes.type_parameters.push(declared_type_parameters);
+            }
+            seed_value_declarations(node, ctx, &mut scopes.values);
+            record_reference(node, ctx, scopes);
+
+            if enters_value_scope || enters_type_scope {
+                // The exit callback cannot see which of the two it is unwinding,
+                // so it is recorded on the frame itself.
+                ctx.pending_exits.push(ScopeExit {
+                    values: enters_value_scope,
+                    type_parameters: enters_type_scope,
+                });
                 TreeWalkAction::DescendWithExit
             } else {
                 TreeWalkAction::Descend
             }
         },
-        |(_, bindings)| bindings.exit_scope(),
+        |(ctx, scopes)| {
+            let Some(exit) = ctx.pending_exits.pop() else {
+                return;
+            };
+            if exit.values {
+                scopes.values.exit_scope();
+            }
+            if exit.type_parameters {
+                scopes.type_parameters.pop();
+            }
+        },
     );
 }
 
-/// Record every name a declaration introduces as a *shadow*: a value binding of
+/// The type parameters `node` declares, if it declares any.
+///
+/// Read from the `type_parameters` child rather than from a field, because the
+/// grammar names no field for it. Both `class Box<T>` and `fun <T> f()` carry it.
+fn type_parameter_names(node: Node<'_>, source: &str) -> Vec<String> {
+    let Some(parameters) = first_named_child_of_kind(node, "type_parameters") else {
+        return Vec::new();
+    };
+    named_children(parameters)
+        .into_iter()
+        .filter(|child| child.kind() == "type_parameter")
+        .filter_map(|parameter| first_named_child_of_kind(parameter, "type_identifier"))
+        .map(|name| node_text(name, source))
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Record every name a value declaration introduces as a *shadow*: a binding of
 /// unknown type.
 ///
 /// For a type query that is all that is needed, and it is needed: a local
-/// `val Base = 1` shadows the type `Base`, so a later bare `Base` is not a
-/// reference to the class. Milestone 2 extends this to record the binding's
-/// resolved type, which is what receiver typing needs.
-fn seed_declarations(
+/// `val Registry = "text"` shadows the object `Registry` in value positions, so a
+/// later `Registry.length` is not a reference to the object. Milestone 2 extends
+/// this to record the binding's resolved type, which is what receiver typing
+/// needs.
+fn seed_value_declarations(
     node: Node<'_>,
     ctx: &ScanCtx<'_>,
     bindings: &mut LocalInferenceEngine<String>,
@@ -171,13 +249,9 @@ fn seed_declarations(
     }
 }
 
-fn record_reference(
-    node: Node<'_>,
-    ctx: &mut ScanCtx<'_>,
-    bindings: &LocalInferenceEngine<String>,
-) {
+fn record_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>, scopes: &WalkScopes) {
     match ctx.spec.kind {
-        TargetKind::Type => record_type_reference(node, ctx, bindings),
+        TargetKind::Type => record_type_reference(node, ctx, scopes),
         // Milestone 2 of issue #1239. The strategy refuses these target kinds up
         // front with an explicit diagnostic, so this arm is unreachable rather
         // than silently empty.
@@ -185,15 +259,11 @@ fn record_reference(
     }
 }
 
-fn record_type_reference(
-    node: Node<'_>,
-    ctx: &mut ScanCtx<'_>,
-    bindings: &LocalInferenceEngine<String>,
-) {
+fn record_type_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>, scopes: &WalkScopes) {
     match node.kind() {
         "import_header" => record_import_reference(node, ctx),
-        "user_type" => record_user_type_reference(node, ctx),
-        "simple_identifier" => record_qualifier_reference(node, ctx, bindings),
+        "user_type" => record_user_type_reference(node, ctx, scopes),
+        "simple_identifier" => record_qualifier_reference(node, ctx, &scopes.values),
         _ => {}
     }
 }
@@ -232,7 +302,7 @@ fn record_import_reference(header: Node<'_>, ctx: &mut ScanCtx<'_>) {
 /// the target is the one recorded. That is what makes focusing `Outer` in
 /// `Outer.Inner` a reference to `Outer` and focusing `Inner` a reference to
 /// `Outer.Inner`, rather than attributing both to the outer name.
-fn record_user_type_reference(user_type: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn record_user_type_reference(user_type: Node<'_>, ctx: &mut ScanCtx<'_>, scopes: &WalkScopes) {
     // A nested `user_type` is reached through its parent's segment walk, so
     // visiting it again would record the same token twice. Generic arguments are
     // not nested `user_type`s of their owner (they sit inside `type_arguments`),
@@ -246,9 +316,17 @@ fn record_user_type_reference(user_type: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
     let segments = kotlin_user_type_segments(user_type);
     let mut spelling = String::new();
-    for segment in segments {
-        let name = node_text(segment, ctx.source);
+    for (index, segment) in segments.iter().enumerate() {
+        let name = node_text(*segment, ctx.source);
         if name.is_empty() {
+            return;
+        }
+        // A generic parameter shadows a class of the same name for the whole
+        // declaration that introduced it: inside `class Box<Base>`, every `Base`
+        // is the parameter. Only the *leading* segment can be shadowed -- a
+        // parameter is a single name, so it can never be the `Inner` of
+        // `Outer.Inner`.
+        if index == 0 && scopes.type_parameter_in_scope(name) {
             return;
         }
         if !spelling.is_empty() {
@@ -257,10 +335,10 @@ fn record_user_type_reference(user_type: Node<'_>, ctx: &mut ScanCtx<'_>) {
         spelling.push_str(name);
         if ctx
             .names
-            .resolve_type(&spelling, segment.start_byte())
-            .is_some_and(|resolved| resolved.fq_name() == ctx.spec.owner.fq_name())
+            .resolve_type_fqn(&spelling, segment.start_byte())
+            .is_some_and(|resolved| resolved == ctx.spec.owner.fq_name())
         {
-            hits::push_hit(segment, ctx);
+            hits::push_hit(*segment, ctx);
             return;
         }
     }
@@ -298,8 +376,8 @@ fn record_qualifier_reference(
     }
     if ctx
         .names
-        .resolve_type(name, node.start_byte())
-        .is_some_and(|resolved| resolved.fq_name() == ctx.spec.owner.fq_name())
+        .resolve_type_fqn(name, node.start_byte())
+        .is_some_and(|resolved| resolved == ctx.spec.owner.fq_name())
     {
         hits::push_hit(node, ctx);
     }

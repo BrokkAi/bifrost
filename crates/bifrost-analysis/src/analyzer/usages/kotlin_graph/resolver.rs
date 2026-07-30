@@ -67,7 +67,7 @@ impl TargetSpec {
     }
 
     pub(super) fn from_target(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> Option<Self> {
-        if target.is_class() {
+        if target.is_class() || is_kotlin_type_alias(analyzer, target) {
             return Some(Self {
                 target: target.clone(),
                 kind: TargetKind::Type,
@@ -92,6 +92,22 @@ impl TargetSpec {
             owner,
         })
     }
+}
+
+/// Whether `unit` is a Kotlin `typealias`.
+///
+/// `declarations.rs` indexes a type alias as a `Field` `CodeUnit` and records the
+/// alias-ness separately, so `is_class()` is false for one. That makes the flag
+/// load-bearing here twice over: an alias is *referenced* in type positions
+/// (`val v: Parent`), so a query for one is a type query, and a spelled name can
+/// *resolve* to one, so the name ladder has to count it as an existing type.
+/// Without this, a query for an alias would fall into the property arm and be
+/// answered by receiver typing, which an alias never has.
+fn is_kotlin_type_alias(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
+    unit.is_field()
+        && analyzer
+            .type_alias_provider()
+            .is_some_and(|provider| provider.is_type_alias(unit))
 }
 
 /// The file-level half of a Kotlin name scope: what the file declares itself to
@@ -141,11 +157,18 @@ impl<'a> KotlinNameResolver<'a> {
         }
     }
 
-    /// The fully-qualified name `spelled` denotes at `byte`, if exactly one
-    /// indexed type answers to it.
-    pub(super) fn resolve_type(&self, spelled: &str, byte: usize) -> Option<CodeUnit> {
-        let fqn = self.resolve_type_name(spelled, byte).resolved()?;
-        self.type_named(&fqn)
+    /// The fully-qualified name the type `spelled` at `byte` denotes.
+    ///
+    /// Answers with the *name*, not a declaration, because in the JVM realm the
+    /// name is the identity. Two source files declaring `lib.Base` — a vendored
+    /// copy, or the same package built by two modules — are one classpath entry
+    /// and therefore one usage-graph node, so a reference to `Base` is a
+    /// reference to both. Returning a single `CodeUnit` here would have to either
+    /// pick one arbitrarily or fail closed, and failing closed would report zero
+    /// usages for every duplicated type in a monorepo. Java's usage graph reports
+    /// both copies for exactly this reason.
+    pub(super) fn resolve_type_fqn(&self, spelled: &str, byte: usize) -> Option<String> {
+        self.resolve_type_name(spelled, byte).resolved()
     }
 
     pub(super) fn resolve_type_name(&self, spelled: &str, byte: usize) -> KotlinTypeName {
@@ -155,28 +178,25 @@ impl<'a> KotlinNameResolver<'a> {
             imports: &self.facts.imports,
             scope_owners: owners,
         };
-        resolve_kotlin_type_name(spelled, &scope, |candidate| {
-            self.type_named(candidate).is_some()
-        })
+        resolve_kotlin_type_name(spelled, &scope, |candidate| self.type_exists(candidate))
     }
 
-    /// The single indexed type declaration named `fqn`, across every language in
-    /// the workspace.
+    /// Whether any language in the workspace indexes a type named `fqn`.
     ///
-    /// Ambiguity is an answer, not a coin flip: two declarations sharing a
-    /// fully-qualified name means the workspace cannot say which one a reference
-    /// meant, so this returns `None` rather than picking the first.
-    pub(super) fn type_named(&self, fqn: &str) -> Option<CodeUnit> {
-        let mut matches = self
-            .analyzer
+    /// Kotlin type aliases count: a spelled name can resolve to one, and a
+    /// reference through an alias is a reference to the alias. Synthetic units do
+    /// not: Kotlin's primary constructors are synthetic `Owner.Owner` callables,
+    /// and no type reference names one.
+    fn type_exists(&self, fqn: &str) -> bool {
+        self.analyzer
             .global_usage_definition_index()
             .by_fqn(fqn)
             .iter()
-            .filter(|unit| unit.is_class() && !unit.is_synthetic() && unit.fq_name() == fqn)
-            .cloned()
-            .collect::<Vec<_>>();
-        matches.dedup();
-        (matches.len() == 1).then(|| matches.remove(0))
+            .any(|unit| {
+                !unit.is_synthetic()
+                    && unit.fq_name() == fqn
+                    && (unit.is_class() || is_kotlin_type_alias(self.analyzer, unit))
+            })
     }
 
     /// Fully-qualified names of the declarations enclosing `byte`, innermost

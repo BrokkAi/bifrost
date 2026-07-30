@@ -13,8 +13,8 @@
 
 use crate::common::InlineTestProject;
 use brokk_bifrost::usages::{
-    ExplicitCandidateProvider, FuzzyResult, KotlinUsageGraphStrategy, UsageFinder, UsageHit,
-    UsageHitKind,
+    ExplicitCandidateProvider, FuzzyResult, KotlinUsageGraphStrategy, UsageAnalyzer, UsageFinder,
+    UsageHit, UsageHitKind,
 };
 use brokk_bifrost::{CodeUnit, IAnalyzer, KotlinAnalyzer, Language};
 use std::sync::Arc;
@@ -405,4 +405,536 @@ fn kotlin_target_is_routed_to_the_kotlin_strategy() {
         KotlinUsageGraphStrategy::can_handle(&target),
         "a .kt declaration must be handled by the Kotlin strategy"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Type-position shapes. Each of these has a Java or Scala counterpart in the
+// sibling suites; the shapes differ, the guarantee does not.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn kotlin_type_usage_reports_generic_arguments_annotations_and_type_checks() {
+    // Java counterpart: java_graph_strategy_counts_generic_type_arguments_as_type_usages
+    // and java_graph_strategy_counts_annotation_type_references_without_same_name_confusion.
+    // All three shapes are ordinary `user_type` nodes in Kotlin, so one fixture
+    // proves the walk reaches them wherever they nest.
+    let (_project, analyzer) = kotlin_workspace(&[
+        ("src/lib/Base.kt", BASE_KT),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.Base
+
+fun generic(items: List<Base>): Map<String, Base>? = null
+
+fun narrow(value: Any): Boolean = value is Base
+
+fun cast(value: Any): Base = value as Base
+",
+        ),
+    ]);
+
+    let target = definition(&analyzer, "lib.Base");
+    let hits = hits(&usages(&analyzer, &target));
+
+    assert_hit_line(&hits, 5); // List<Base> and Map<String, Base>
+    assert_hit_line(&hits, 7); // value is Base
+    assert_hit_line(&hits, 9); // value as Base
+}
+
+#[test]
+fn kotlin_type_usage_reports_an_annotation_use() {
+    let (_project, analyzer) = kotlin_workspace(&[
+        (
+            "src/lib/Marker.kt",
+            "package lib
+
+annotation class Marker
+",
+        ),
+        (
+            "src/app/Tagged.kt",
+            "package app
+
+import lib.Marker
+
+@Marker
+class Tagged
+",
+        ),
+    ]);
+
+    let target = definition(&analyzer, "lib.Marker");
+    let hits = hits(&usages(&analyzer, &target));
+
+    assert_hit_line(&hits, 5); // @Marker
+}
+
+#[test]
+fn kotlin_type_usage_reports_an_enum_type_and_its_entry_qualifier() {
+    // Java counterpart: java_graph_strategy_counts_enum_type_references.
+    let (_project, analyzer) = kotlin_workspace(&[
+        (
+            "src/lib/Color.kt",
+            "package lib
+
+enum class Color {
+
+    RED,
+
+    GREEN
+}
+",
+        ),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.Color
+
+fun pick(): Color = Color.RED
+",
+        ),
+    ]);
+
+    let target = definition(&analyzer, "lib.Color");
+    let hits = hits(&usages(&analyzer, &target));
+
+    // Both the return type and the `Color` qualifier of `Color.RED` name the enum.
+    assert_hit_line(&hits, 5);
+}
+
+#[test]
+fn kotlin_type_usage_reports_a_data_class_and_an_interface_supertype() {
+    // Java counterpart: java_graph_strategy_counts_record_type_references and
+    // java_graph_strategy_handles_interface_references_and_receivers.
+    let (_project, analyzer) = kotlin_workspace(&[
+        (
+            "src/lib/Contract.kt",
+            "package lib
+
+interface Contract
+
+data class Payload(val value: Int)
+",
+        ),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.Contract
+import lib.Payload
+
+class Impl : Contract
+
+fun send(payload: Payload): Payload = payload
+",
+        ),
+    ]);
+
+    let contract = definition(&analyzer, "lib.Contract");
+    let contract_hits = hits(&usages(&analyzer, &contract));
+    assert_hit_line(&contract_hits, 6); // class Impl : Contract
+
+    let payload = definition(&analyzer, "lib.Payload");
+    let payload_hits = hits(&usages(&analyzer, &payload));
+    assert_hit_line(&payload_hits, 8); // fun send(payload: Payload): Payload
+}
+
+#[test]
+fn kotlin_type_usage_reports_a_typealias_target_and_the_alias_itself() {
+    let (_project, analyzer) = kotlin_workspace(&[
+        ("src/lib/Base.kt", BASE_KT),
+        (
+            "src/app/Aliases.kt",
+            "package app
+
+import lib.Base
+
+typealias Parent = Base
+
+fun hold(value: Parent): Parent = value
+",
+        ),
+    ]);
+
+    // The right-hand side of a `typealias` is a real reference to the aliased
+    // class; the alias's own name is a declaration, not a reference.
+    let base_hits = hits(&usages(&analyzer, &definition(&analyzer, "lib.Base")));
+    assert_hit_line(&base_hits, 5);
+
+    // Uses of the alias are uses of the alias declaration.
+    let alias_hits = hits(&usages(&analyzer, &definition(&analyzer, "app.Parent")));
+    assert_hit_line(&alias_hits, 7);
+    assert_no_hit_line(&alias_hits, 5);
+}
+
+// ---------------------------------------------------------------------------
+// Name resolution edge cases. Kotlin's ladder differs from Java's and Scala's,
+// so these are the cases where copying either would have been wrong.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn kotlin_type_usage_reports_a_same_package_reference_without_an_import() {
+    // Java counterpart: java_graph_strategy_counts_same_package_implicit_type_and_method_references.
+    let (_project, analyzer) = kotlin_workspace(&[
+        ("src/lib/Base.kt", BASE_KT),
+        (
+            "src/lib/Neighbour.kt",
+            "package lib
+
+fun hold(value: Base): Base = value
+",
+        ),
+    ]);
+
+    let hits = hits(&usages(&analyzer, &definition(&analyzer, "lib.Base")));
+    assert_hit_line(&hits, 3);
+}
+
+#[test]
+fn kotlin_type_usage_reports_a_star_imported_reference() {
+    let (_project, analyzer) = kotlin_workspace(&[
+        ("src/lib/Base.kt", BASE_KT),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.*
+
+fun hold(value: Base): Base = value
+",
+        ),
+    ]);
+
+    let hits = hits(&usages(&analyzer, &definition(&analyzer, "lib.Base")));
+    assert_hit_line(&hits, 5);
+}
+
+#[test]
+fn kotlin_colliding_star_imports_report_no_usage() {
+    // Kotlin rejects a name two star imports bind to different owners. The
+    // reference is a compile error, so it is a usage of neither candidate --
+    // reporting it for one would be picking a winner the language refuses to.
+    let (_project, analyzer) = kotlin_workspace(&[
+        ("src/lib/Base.kt", BASE_KT),
+        (
+            "src/other/Base.kt",
+            "package other
+
+class Base
+",
+        ),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.*
+import other.*
+
+fun hold(value: Base): Base = value
+",
+        ),
+    ]);
+
+    let hits = hits(&usages(&analyzer, &definition(&analyzer, "lib.Base")));
+    assert_no_hit_line(&hits, 6);
+}
+
+#[test]
+fn kotlin_explicit_import_of_an_unknown_type_does_not_fall_through_to_the_package() {
+    // The subtle tier rule from kotlin/types.rs: an explicit import *claims* the
+    // name whether or not its target exists, so it does not fall through to the
+    // same-package tier. A file importing a nonexistent `other.Base` therefore
+    // does not reference its own package's `Base`. Java has no equivalent rule --
+    // this is why the Kotlin ladder is reused rather than reimplemented.
+    let (_project, analyzer) = kotlin_workspace(&[
+        ("src/lib/Base.kt", BASE_KT),
+        (
+            "src/lib/Consumer.kt",
+            "package lib
+
+import other.Base
+
+fun hold(value: Base): Base = value
+",
+        ),
+    ]);
+
+    let hits = hits(&usages(&analyzer, &definition(&analyzer, "lib.Base")));
+    assert_no_hit_line(&hits, 5);
+}
+
+#[test]
+fn kotlin_type_usage_reports_a_nested_type_named_from_inside_its_owner() {
+    let (_project, analyzer) = kotlin_workspace(&[(
+        "src/lib/Outer.kt",
+        "package lib
+
+class Outer {
+
+    class Inner
+
+    fun make(value: Inner): Inner = value
+}
+",
+    )]);
+
+    // Inside `Outer`, the nested `Inner` is nameable unqualified: the enclosing
+    // scope is the first tier of the ladder.
+    let hits = hits(&usages(
+        &analyzer,
+        &definition(&analyzer, "lib.Outer.Inner"),
+    ));
+    assert_hit_line(&hits, 7);
+    assert_no_hit_line(&hits, 5); // the declaration itself
+}
+
+#[test]
+fn kotlin_generic_parameter_shadows_a_class_of_the_same_name() {
+    // Kotlin has separate namespaces for types and values, so a shadowing test
+    // has to exist for each. This is the type side: inside `class Box<Base>`,
+    // every `Base` is the parameter, not the class. The value side is
+    // kotlin_type_usage_excludes_a_shadowing_local_binding.
+    let (_project, analyzer) = kotlin_workspace(&[
+        ("src/lib/Base.kt", BASE_KT),
+        (
+            "src/app/Box.kt",
+            "package app
+
+import lib.Base
+
+class Box<Base> {
+
+    fun get(value: Base): Base = value
+}
+
+fun real(value: Base): Base = value
+",
+        ),
+    ]);
+
+    let hits = hits(&usages(&analyzer, &definition(&analyzer, "lib.Base")));
+
+    // Inside the class, `Base` is the type parameter.
+    assert_no_hit_line(&hits, 7);
+    // Outside it, the same spelling is the imported class again.
+    assert_hit_line(&hits, 10);
+}
+
+#[test]
+fn kotlin_duplicate_source_copies_of_one_fqn_are_both_reported() {
+    // Java counterpart: java_graph_strategy_uses_java_fqn_identity_across_duplicate_source_copies.
+    // Two source files declaring `lib.Base` -- a vendored copy, or one package
+    // built by two modules -- are one classpath entry and therefore one
+    // usage-graph node. A reference to `Base` is a reference to both, so querying
+    // either copy must report it. Failing closed on the ambiguity would report
+    // zero usages for every duplicated type in a monorepo.
+    let (_project, analyzer) = kotlin_workspace(&[
+        ("copy-one/lib/Base.kt", BASE_KT),
+        ("copy-two/lib/Base.kt", BASE_KT),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.Base
+
+fun hold(value: Base): Base = value
+",
+        ),
+    ]);
+
+    let copies: Vec<CodeUnit> = analyzer
+        .get_definitions("lib.Base")
+        .into_iter()
+        .filter(CodeUnit::is_class)
+        .collect();
+    assert_eq!(2, copies.len(), "expected two source copies of lib.Base");
+
+    for copy in copies {
+        let hits = hits(&usages(&analyzer, &copy));
+        assert_hit_line(&hits, 5);
+    }
+}
+
+#[test]
+fn kotlin_script_files_resolve_type_references_like_source_files() {
+    // `.kts` goes through the same path as `.kt` with no script special casing,
+    // which is the boundary #1236 and #1238 both settled on. A declaration in a
+    // script is indexed, so a reference to one is a usage.
+    let (_project, analyzer) = kotlin_workspace(&[
+        ("src/lib/Base.kt", BASE_KT),
+        (
+            "src/app/setup.main.kts",
+            "package app
+
+import lib.Base
+
+fun hold(value: Base): Base = value
+",
+        ),
+    ]);
+
+    let hits = hits(&usages(&analyzer, &definition(&analyzer, "lib.Base")));
+    assert_hit_line(&hits, 5);
+}
+
+// ---------------------------------------------------------------------------
+// Result-surface and budget contracts. These are language-agnostic guarantees
+// the sibling suites also assert; Kotlin must not be the one language that
+// reports them differently.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn kotlin_import_hits_are_editor_visible_but_external_usage_free() {
+    // Java counterpart: java_import_hits_are_editor_visible_but_external_usage_free.
+    // An import is a reference a rename must rewrite, but it is not a *use* of
+    // the class, so the two surfaces must disagree about it on purpose.
+    let (_project, analyzer) = kotlin_workspace(&[
+        ("src/lib/Base.kt", BASE_KT),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.Base
+
+fun hold(value: Base): Base = value
+",
+        ),
+    ]);
+
+    let result = usages(&analyzer, &definition(&analyzer, "lib.Base"));
+    let external: Vec<UsageHit> = result.all_hits().into_iter().collect();
+    let editor: Vec<UsageHit> = result.all_hits_including_imports().into_iter().collect();
+
+    assert!(
+        external
+            .iter()
+            .all(|hit| !hit.snippet.contains("import lib")),
+        "the external usage surface must exclude import hits: {external:#?}"
+    );
+    assert!(
+        editor.iter().any(|hit| hit.snippet.contains("import lib")),
+        "the editor surface must include the import hit: {editor:#?}"
+    );
+}
+
+#[test]
+fn kotlin_usage_query_respects_the_candidate_file_set() {
+    // Java counterpart: java_graph_strategy_respects_candidate_files. A caller
+    // that narrows the scan to a file with no references must get no references,
+    // not a whole-workspace answer.
+    let (project, analyzer) = kotlin_workspace(&[
+        ("src/lib/Base.kt", BASE_KT),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.Base
+
+fun hold(value: Base): Base = value
+",
+        ),
+        (
+            "src/app/Unrelated.kt",
+            "package app
+
+class Unrelated
+",
+        ),
+    ]);
+
+    let candidates = [project.file("src/app/Unrelated.kt")].into_iter().collect();
+    let target = definition(&analyzer, "lib.Base");
+    let result = KotlinUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits: Vec<UsageHit> = result.all_hits_including_imports().into_iter().collect();
+
+    assert!(
+        hits.is_empty(),
+        "a scan restricted to an unrelated file must report nothing: {hits:#?}"
+    );
+}
+
+#[test]
+fn kotlin_usage_query_reports_too_many_callsites_past_the_limit() {
+    // Java counterpart: java_graph_strategy_reports_too_many_callsites_for_high_fanout_symbol,
+    // Scala counterpart: scala_graph_enforces_max_usages_limit. Truncation must be
+    // reported as truncation, never as a complete answer.
+    let mut files: Vec<(String, String)> =
+        vec![("src/lib/Base.kt".to_string(), BASE_KT.to_string())];
+    for index in 0..6 {
+        files.push((
+            format!("src/app/User{index}.kt"),
+            format!(
+                "package app
+
+import lib.Base
+
+fun hold{index}(value: Base): Base = value
+"
+            ),
+        ));
+    }
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect();
+    let (_project, analyzer) = kotlin_workspace(&borrowed);
+
+    let target = definition(&analyzer, "lib.Base");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = KotlinUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        3,
+    );
+
+    let FuzzyResult::TooManyCallsites { limit, .. } = result else {
+        panic!("expected a truncated result past the usage limit, got {result:?}");
+    };
+    assert_eq!(3, limit);
+}
+
+#[test]
+fn kotlin_usage_scan_is_stack_safe_for_deeply_nested_scopes() {
+    // Scala counterpart: scala_usage_scan_is_stack_safe_for_deep_lexical_scopes.
+    // The walk is iterative, so depth costs heap rather than stack; a recursive
+    // walk overflows here instead of answering.
+    const DEPTH: usize = 400;
+    let mut body = String::new();
+    for _ in 0..DEPTH {
+        body.push_str("    run {\n");
+    }
+    body.push_str("        hold(null)\n");
+    for _ in 0..DEPTH {
+        body.push_str("    }\n");
+    }
+    let source = format!(
+        "package app
+
+import lib.Base
+
+fun hold(value: Base?): Base? = value
+
+fun deep() {{
+{body}}}
+"
+    );
+
+    let (_project, analyzer) =
+        kotlin_workspace(&[("src/lib/Base.kt", BASE_KT), ("src/app/Deep.kt", &source)]);
+
+    let target = definition(&analyzer, "lib.Base");
+    let hits = hits(&usages(&analyzer, &target));
+
+    // The point is that the scan returns at all; the `hold` signature above is a
+    // real reference, so a successful scan also finds something.
+    assert_hit_line(&hits, 5);
 }

@@ -70,6 +70,11 @@ reports call relationships in both directions.
       `unsupported_target_language`. 11 new tests in `tests/suite_usages/usages_kotlin_graph_test.rs`.
       Full validation: `suite_usages` 1340 passed, `suite_symbols` 1110 passed, `suite_cross_language` 246 passed,
       `cargo clippy --all-targets -- -D warnings` clean.
+- [x] (2026-07-30 12:15Z) Milestone 1c: audited Kotlin's coverage against `usages_java_graph_test.rs` and
+      `usages_scala_graph_test.rs` and closed every gap milestone 1 claims (see `Coverage parity with Java and Scala`).
+      28 tests. Found and fixed three real defects on the way — duplicate-fqn fail-closed, `typealias` misclassified as
+      a property, and generic parameters not shadowing a same-named class — all recorded in
+      `Surprises & Discoveries`.
 - [ ] Milestone 2: query path for constructors, functions, and properties. Per the revised decision below, this now
       starts by promoting #1238's `KotlinCtx` into a shared `analyzer/kotlin/semantics.rs` and calling it, rather than
       reimplementing receiver typing and member lookup. Remaining: receiver typing, companions, objects, inheritance,
@@ -90,6 +95,36 @@ reports call relationships in both directions.
   moving the helper by routing it through `kotlin_value_arguments`; the trailing-lambda term still reads `call_suffix`
   directly, because only an ordinary call can carry a trailing lambda.
 
+- Observation: Kotlin failed closed on a duplicated fully-qualified name where Java reports both copies. The first
+  Kotlin name resolver returned a single `CodeUnit` and required the lookup to be unambiguous, so two source files
+  declaring `lib.Base` — a vendored copy, or one package built by two modules — made every reference to `Base` resolve
+  to nothing, reporting zero usages for a type that is used everywhere.
+  Evidence: `kotlin_duplicate_source_copies_of_one_fqn_are_both_reported`, written against Java's
+  `java_graph_strategy_uses_java_fqn_identity_across_duplicate_source_copies`, failed before the fix.
+  Fixed at the root by resolving to the *fully-qualified name* rather than to a declaration: in the JVM realm the name
+  is the identity, which is exactly what `usages/workspace_graph.rs` already says ("two declarations in the same
+  ecosystem with the same fully-qualified name are the same node"). The uniqueness requirement was borrowed from
+  #1238's `resolve_type_unit`, where it is right — a *definition* query must not pick one of two candidates — and
+  wrong here, because a usage query asks whether the reference names the target, and it names both.
+
+- Observation: a Kotlin `typealias` is indexed as a `CodeUnitType::Field` with the alias-ness recorded separately
+  (`declarations.rs`, `visit_type_alias` calls `mark_type_alias`), so `is_class()` is false for one. That silently put
+  alias targets in the property arm, where a query for `typealias Parent = Base` abstained as an unimplemented
+  property, and it also kept the name ladder from resolving any spelling that names an alias.
+  Evidence: `kotlin_type_usage_reports_a_typealias_target_and_the_alias_itself` failed with `expected a hit on line 7,
+  got []`.
+  Fixed by consulting `IAnalyzer::type_alias_provider()` in both places: a type-alias unit classifies as
+  `TargetKind::Type`, and `type_exists` counts one. An alias is referenced in type positions and has no receiver, so
+  answering it with receiver typing would have been meaningless once milestone 2 filled the property arm in.
+
+- Observation: Kotlin has *separate namespaces for types and values*, which makes the single shadow map every other
+  graph language uses wrong for it. `val Base = 1` shadows the class `Base` where a value is expected (`Base.length`
+  reads the local string's property) but not where a type is expected (`val x: Base` is still the class); a generic
+  parameter `class Box<Base>` does exactly the reverse. Java's `maybe_record_type_hit` can use one
+  `LocalInferenceEngine` shadow space for both because Java has one namespace.
+  Evidence: `kotlin_generic_parameter_shadows_a_class_of_the_same_name`, which reported the type parameter as a
+  reference to the imported class before the walk grew a separate type-parameter scope stack.
+
 - Observation: `GlobalUsageDefinitionIndex` implements `BoundedDefinitionLookup`, which is the *only* thing #1238's
   `KotlinCtx` needs from its caller besides `&dyn IAnalyzer`. That makes the entire #1238 semantic layer — receiver
   typing, member lookup order, companion detection, cross-file declared-type and extension-receiver reading —
@@ -100,6 +135,73 @@ reports call relationships in both directions.
   Consequence: the Decision Log entry "the graph module does not call `resolve_kotlin`" is still right about
   `resolve_kotlin` itself, but wrong about the layer beneath it. See the revised decision below; milestone 2's plan
   changes from "reimplement receiver typing" to "promote the semantic layer and call it".
+
+## Coverage parity with Java and Scala
+
+This section is the checklist that keeps Kotlin's tests honest against its JVM siblings. It exists because a new
+language's suite tends to test what the implementation happens to do, while the sibling suites encode years of
+adversarial cases — `usages_java_graph_test.rs` has 68 tests over 4601 lines and `usages_scala_graph_test.rs` has
+roughly 190 over 12794, against Kotlin's 28. Raw counts are the wrong comparison (Scala's bulk is `given`/`using`,
+implicits, `apply`/`unapply`, and export clauses, none of which Kotlin has), so what matters is whether every *shape
+Kotlin can express* has a case, and whether every language-agnostic *guarantee* is asserted for Kotlin too.
+
+Reviewed as of milestone 1, and every gap that milestone 1 claims to cover is now closed. The type-position shapes
+have Kotlin cases: generic arguments, annotation uses, `is`/`as` operands, enums, `data class`, interface supertypes,
+`typealias`, nested-segment resolution, and the same-package/star-import/enclosing-scope tiers of the ladder. The
+adversarial same-name cases have Kotlin cases: a same-named type in another package, colliding star imports, a
+shadowing local binding, a shadowing generic parameter, and the terminal-explicit-import rule. The language-agnostic
+result contracts have Kotlin cases: import hits visible to the editor surface but absent from the external usage
+surface, candidate-file restriction, the `max_usages` truncation report, and stack safety under deep nesting.
+
+Two Kotlin-specific cases have no Java or Scala counterpart at all and were added because the language forces them.
+Colliding star imports are a *compile error* in Kotlin, so the reference is a usage of neither candidate and reporting
+it for one would be picking a winner the language refuses to pick. An explicit import claims a name whether or not its
+target exists, so a file importing a nonexistent `other.Base` does not reference its own package's `Base` — Java has
+no equivalent tier rule, which is the concrete reason the Kotlin ladder is reused rather than reimplemented.
+
+One divergence from Java is deliberate and one was a bug. Deliberate: Kotlin has separate namespaces for types and
+values, so shadowing needs two tests rather than one — `val Base = 1` shadows the class where a value is expected but
+not where a type is, and a generic parameter does the reverse. Java's single shadow map is wrong for Kotlin, which is
+why the walk tracks value bindings and type parameters separately. The bug is recorded in `Surprises & Discoveries`:
+Kotlin was failing closed on a duplicated fully-qualified name where Java reports both copies.
+
+Inherited by later milestones. The following sibling cases have no Kotlin counterpart *yet* because the behaviour they
+test does not exist yet; each milestone must close its own row before it is done, and the Kotlin-specific shape is
+named so the case is not merely transliterated from Java.
+
+Milestone 2 (callables and properties) owes: arity matching including defaults, `vararg`, and a trailing lambda
+(Java's `accepts_varargs_expanded_and_array_calls_but_rejects_wrong_arity`, Scala's
+`callable_arity_accepts_defaults_and_repeated_parameters`); an override declaration reported as an override hit
+(Java's `method_declaration_hits_validate_the_visited_overload_signature`); inherited members resolved to the
+declaring ancestor and *not* to a sibling that redeclares them (Java's
+`keeps_concrete_override_receiver_proof_narrow` and `separates_interface_calls_from_concrete_overrides`, Scala's
+`trait_member_conflict_does_not_guess_inherited_receiver`); a receiver whose type cannot be proven landing in the
+unproven channel rather than the proven one (Java's `push_unproven_hit` paths, exercised through
+`excludes_incompatible_anonymous_return_receivers`); same-owner classification excluding implicit-`this` calls from the
+external surface while `super` stays external (Java's `filters_same_file_self_calls` and
+`counts_this_field_and_method_usages`); receiver-chain budget exhaustion reported rather than silently truncated
+(Java's `budgets_deep_return_receiver_chains`); a bare property read shadowed by a local at or below the class scope
+(Java's `finds_bare_inherited_field_read_and_excludes_local_shadows`); and the Kotlin-only shapes with no sibling at
+all — companion-object members reached through both the class name and the companion name, extension functions whose
+declared `receiver` type must conform, safe-call and `!!` receivers, and a smart cast staying unproven.
+
+Milestone 3 (the inverted edge builder) owes the whole edge-path suite: `usage_graph_java_test.rs`'s
+`resolves_instance_static_and_constructor_calls`, `receiver_typing_is_type_based_not_name_based`, and
+`every_edge_endpoint_is_a_node`, plus Scala's `scala_usage_graph_bulk_fetch_bypasses_lru_and_preserves_point_entry`,
+which exists because hydrating each file through the per-file LRU during a whole-workspace build evicts the cache a
+user's interactive queries depend on.
+
+Milestone 4 (cross-language JVM) owes the symmetric counterparts of Java's existing one-directional set:
+`java_type_usage_lookup_merges_java_and_scala_source_hits`,
+`java_nested_type_usage_lookup_requires_import_or_qualification_in_scala`,
+`java_type_usage_lookup_handles_same_package_and_wildcard_scala_imports`,
+`java_type_usage_lookup_ignores_scala_local_type_shadowing`, and
+`java_type_usage_lookup_respects_usage_finder_file_filter_for_scala_hits` — each of which needs a Kotlin-source
+version, *and* a Kotlin-target version reading Java and Scala source, which Java's suite has no precedent for because
+its cross-language support only runs one way.
+
+Milestone 5 owes the abstention matrix and the rename cases, which have no direct sibling equivalent because Kotlin is
+the first language where rename was gated on the usage graph landing.
 
 ## Decision Log
 
