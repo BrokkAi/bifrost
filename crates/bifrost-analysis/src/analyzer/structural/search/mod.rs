@@ -101,7 +101,9 @@ use semantic::{
     SemanticQueryContext,
 };
 use typestate::{SemanticTypestateFindingValue, SemanticTypestateWitnessValue};
+pub(crate) use value_flow::public_witness_step;
 use value_flow::{SemanticFlowEndpointValue, SemanticFlowWitnessValue};
+pub use witness_projection::project_taint_finding_report;
 
 // Internal wiring: hoist the handful of `expansions`-child items the moved
 // test module (tests.rs) still reaches via a bare `super::name` path, exactly
@@ -162,6 +164,10 @@ pub use results::CodeQuerySemanticWork;
 pub use results::CodeQuerySourceSite;
 pub(crate) use results::CodeQueryStableOwnerCandidate;
 pub(crate) use results::CodeQueryStableOwnerDerivation;
+pub use results::CodeQueryTaintFinding;
+pub use results::CodeQueryTaintOrigin;
+pub use results::CodeQueryTaintProjectionLimits;
+pub use results::CodeQueryTaintWitness;
 pub use results::CodeQueryTypestateCertainty;
 pub use results::CodeQueryTypestateFinding;
 pub use results::CodeQueryTypestateFindingKind;

@@ -977,6 +977,222 @@ impl ValueFlowPlan {
             .map(|index| self.sinks[index].id)
     }
 
+    pub(crate) fn source_id_for_key(
+        &self,
+        key: &super::ValueFlowEventKey,
+    ) -> Option<ValueFlowSourceId> {
+        self.sources
+            .binary_search_by(|source| source.spec.key().cmp(key))
+            .ok()
+            .map(|index| self.sources[index].id)
+    }
+
+    /// Hash only the transfer semantics that determine propagation. Source and
+    /// sink observations are deliberately excluded so compatible clients can
+    /// union their demand sets and share one fixed-point solve.
+    pub(crate) fn propagation_semantics_hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.root.hash(state);
+        self.unmodeled_call_behavior.hash(state);
+        self.external_summaries.fingerprint().hash(state);
+        self.curated_call_models.len().hash(state);
+        for model in &self.curated_call_models {
+            model.call.hash(state);
+            model.model.fingerprint().hash(state);
+        }
+        for rule in &self.local_rules {
+            rule.point.hash(state);
+            rule.event_index.hash(state);
+            rule.kind.hash(state);
+            self.carrier_keys[rule.source.index()].hash(state);
+            self.carrier_keys[rule.target.index()].hash(state);
+            rule.proof.hash(state);
+            rule.completeness.hash(state);
+        }
+        for rule in &self.call_rules {
+            rule.call.hash(state);
+            rule.callee.hash(state);
+            rule.kind.hash(state);
+            self.carrier_keys[rule.source.index()].hash(state);
+            self.carrier_keys[rule.target.index()].hash(state);
+            rule.proof.hash(state);
+            rule.completeness.hash(state);
+        }
+        for binding in &self.summary_location_bindings {
+            binding.call.hash(state);
+            binding.port.hash(state);
+            self.carrier_keys[binding.carrier.index()].hash(state);
+        }
+        self.snapshot_procedures.hash(state);
+        self.binding_pairs.hash(state);
+        self.discovery_status.hash(state);
+        self.discovery_complete.hash(state);
+        self.structural_discovery_complete.hash(state);
+    }
+
+    pub(crate) fn has_same_propagation_semantics(&self, other: &Self) -> bool {
+        self.root == other.root
+            && self.unmodeled_call_behavior == other.unmodeled_call_behavior
+            && self.external_summaries == other.external_summaries
+            && self.curated_call_models == other.curated_call_models
+            && same_local_rules(self, other)
+            && same_call_rules(self, other)
+            && same_summary_location_bindings(self, other)
+            && self.snapshot_procedures == other.snapshot_procedures
+            && self.binding_pairs == other.binding_pairs
+            && self.discovery_status == other.discovery_status
+            && self.discovery_complete == other.discovery_complete
+            && self.structural_discovery_complete == other.structural_discovery_complete
+    }
+
+    /// Union endpoint observations from transfer-compatible plans and rebind
+    /// their dense carrier/source/sink IDs once. This is the only supported
+    /// path for sharing propagation across different policy demand sets.
+    pub(crate) fn union_observations(plans: &[&Self]) -> Result<Self, ValueFlowPlanError> {
+        let first = plans.first().ok_or(ValueFlowPlanError::MissingCarrier)?;
+        if plans
+            .iter()
+            .skip(1)
+            .any(|plan| !first.has_same_propagation_semantics(plan))
+        {
+            return Err(ValueFlowPlanError::IncompatibleObservationUnion);
+        }
+
+        let mut keyed = plans
+            .iter()
+            .flat_map(|plan| plan.carriers.iter().cloned())
+            .map(|carrier| Ok((carrier.stable_key()?, carrier)))
+            .collect::<Result<Vec<_>, ValueFlowPlanError>>()?;
+        keyed.sort_by(|left, right| left.0.cmp(&right.0));
+        keyed.dedup_by(|left, right| left.1 == right.1);
+        if keyed.len() > MAX_VALUE_FLOW_CARRIERS {
+            return Err(ValueFlowPlanError::LimitExceeded);
+        }
+        if keyed.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(ValueFlowPlanError::StableCarrierCollision);
+        }
+        let mut carriers = Vec::with_capacity(keyed.len());
+        let mut carrier_keys = Vec::with_capacity(keyed.len());
+        let mut carrier_ids = HashMap::default();
+        for (index, (key, carrier)) in keyed.into_iter().enumerate() {
+            let id = ValueFlowCarrierId::try_from_index(index)
+                .map_err(|_| ValueFlowPlanError::CarrierIdOverflow)?;
+            carrier_ids.insert(carrier.clone(), id);
+            carrier_keys.push(key);
+            carriers.push(carrier);
+        }
+        let remap = |id: ValueFlowCarrierId| {
+            carrier_ids
+                .get(&first.carriers[id.index()])
+                .copied()
+                .ok_or(ValueFlowPlanError::MissingCarrier)
+        };
+        let mut local_rules = first.local_rules.to_vec();
+        for rule in &mut local_rules {
+            rule.source = remap(rule.source)?;
+            rule.target = remap(rule.target)?;
+        }
+        let mut call_rules = first.call_rules.to_vec();
+        for rule in &mut call_rules {
+            rule.source = remap(rule.source)?;
+            rule.target = remap(rule.target)?;
+        }
+        let mut summary_location_bindings = first.summary_location_bindings.to_vec();
+        for binding in &mut summary_location_bindings {
+            binding.carrier = remap(binding.carrier)?;
+        }
+
+        let mut source_specs = plans
+            .iter()
+            .flat_map(|plan| plan.sources.iter().map(|source| source.spec.clone()))
+            .collect::<Vec<_>>();
+        source_specs.sort_by(|left, right| left.key().cmp(right.key()));
+        source_specs.dedup();
+        if source_specs.len() > MAX_VALUE_FLOW_SOURCES
+            || source_specs
+                .windows(2)
+                .any(|pair| pair[0].key() == pair[1].key())
+        {
+            return Err(ValueFlowPlanError::DuplicateEventKey);
+        }
+        let sources = source_specs
+            .into_iter()
+            .enumerate()
+            .map(|(index, spec)| {
+                Ok(BoundValueFlowSource {
+                    id: ValueFlowSourceId::try_from_index(index)
+                        .map_err(|_| ValueFlowPlanError::SourceIdOverflow)?,
+                    carrier: *carrier_ids
+                        .get(spec.carrier())
+                        .ok_or(ValueFlowPlanError::MissingCarrier)?,
+                    spec,
+                })
+            })
+            .collect::<Result<Vec<_>, ValueFlowPlanError>>()?;
+        let mut sink_specs = plans
+            .iter()
+            .flat_map(|plan| plan.sinks.iter().map(|sink| sink.spec.clone()))
+            .collect::<Vec<_>>();
+        sink_specs.sort_by(|left, right| left.key().cmp(right.key()));
+        sink_specs.dedup();
+        if sink_specs.len() > MAX_VALUE_FLOW_SINKS
+            || sink_specs
+                .windows(2)
+                .any(|pair| pair[0].key() == pair[1].key())
+        {
+            return Err(ValueFlowPlanError::DuplicateEventKey);
+        }
+        let sinks = sink_specs
+            .into_iter()
+            .enumerate()
+            .map(|(index, spec)| {
+                Ok(BoundValueFlowSink {
+                    id: ValueFlowSinkId::try_from_index(index)
+                        .map_err(|_| ValueFlowPlanError::SinkIdOverflow)?,
+                    carrier: *carrier_ids
+                        .get(spec.carrier())
+                        .ok_or(ValueFlowPlanError::MissingCarrier)?,
+                    spec,
+                })
+            })
+            .collect::<Result<Vec<_>, ValueFlowPlanError>>()?;
+
+        let carrier_components = build_carrier_components(carriers.len(), &local_rules);
+        let fallback_locations =
+            build_fallback_location_index(&carriers, &carrier_ids, &carrier_components);
+        let fallback_profiles = build_call_fallback_profiles(
+            std::iter::once(&first.root)
+                .chain(first.snapshot_procedures.iter())
+                .collect::<Vec<_>>(),
+            &carrier_ids,
+            &carrier_components,
+        );
+
+        Ok(Self {
+            root: first.root.clone(),
+            unmodeled_call_behavior: first.unmodeled_call_behavior,
+            external_summaries: first.external_summaries.clone(),
+            curated_call_models: first.curated_call_models.clone(),
+            carriers: carriers.into_boxed_slice(),
+            carrier_keys: carrier_keys.into_boxed_slice(),
+            carrier_ids,
+            local_rules: local_rules.into_boxed_slice(),
+            call_rules: call_rules.into_boxed_slice(),
+            fallback_profiles: fallback_profiles.into_boxed_slice(),
+            fallback_locations,
+            summary_location_bindings: summary_location_bindings.into_boxed_slice(),
+            sources: sources.into_boxed_slice(),
+            sinks: sinks.into_boxed_slice(),
+            snapshot_procedures: first.snapshot_procedures.clone(),
+            binding_pairs: first.binding_pairs.clone(),
+            discovery_status: first.discovery_status,
+            discovery_complete: plans.iter().all(|plan| plan.discovery_complete),
+            structural_discovery_complete: plans
+                .iter()
+                .all(|plan| plan.structural_discovery_complete),
+            owner: Arc::new(()),
+        })
+    }
+
     pub fn carrier_id(&self, carrier: &ValueFlowCarrier) -> Option<ValueFlowCarrierId> {
         self.carrier_ids.get(carrier).copied()
     }
@@ -1688,6 +1904,7 @@ pub enum ValueFlowPlanError {
     InvalidSummaryLocationPort,
     DuplicateSummaryLocationBinding,
     IncompatibleExternalSummary,
+    IncompatibleObservationUnion,
     StableCarrierCollision,
     CarrierIdOverflow,
     SourceIdOverflow,
@@ -1725,6 +1942,9 @@ impl fmt::Display for ValueFlowPlanError {
                 .write_str("multiple summary location bindings target the same call and port"),
             Self::IncompatibleExternalSummary => formatter
                 .write_str("external summaries are incompatible with the active analysis contract"),
+            Self::IncompatibleObservationUnion => {
+                formatter.write_str("value-flow observations have different propagation semantics")
+            }
             Self::StableCarrierCollision => {
                 formatter.write_str("distinct value-flow carriers share one stable key")
             }
@@ -2139,6 +2359,58 @@ fn compare_local_rules(left: &LocalFlowRule, right: &LocalFlowRule) -> Ordering 
         .then_with(|| left.source.cmp(&right.source))
         .then_with(|| left.target.cmp(&right.target))
         .then_with(|| relation_kind_rank(left.kind).cmp(&relation_kind_rank(right.kind)))
+}
+
+fn same_local_rules(left: &ValueFlowPlan, right: &ValueFlowPlan) -> bool {
+    left.local_rules.len() == right.local_rules.len()
+        && left
+            .local_rules
+            .iter()
+            .zip(&right.local_rules)
+            .all(|(left_rule, right_rule)| {
+                left_rule.point == right_rule.point
+                    && left_rule.event_index == right_rule.event_index
+                    && left_rule.kind == right_rule.kind
+                    && left.carrier_keys[left_rule.source.index()]
+                        == right.carrier_keys[right_rule.source.index()]
+                    && left.carrier_keys[left_rule.target.index()]
+                        == right.carrier_keys[right_rule.target.index()]
+                    && left_rule.proof == right_rule.proof
+                    && left_rule.completeness == right_rule.completeness
+            })
+}
+
+fn same_call_rules(left: &ValueFlowPlan, right: &ValueFlowPlan) -> bool {
+    left.call_rules.len() == right.call_rules.len()
+        && left
+            .call_rules
+            .iter()
+            .zip(&right.call_rules)
+            .all(|(left_rule, right_rule)| {
+                left_rule.call == right_rule.call
+                    && left_rule.callee == right_rule.callee
+                    && left_rule.kind == right_rule.kind
+                    && left.carrier_keys[left_rule.source.index()]
+                        == right.carrier_keys[right_rule.source.index()]
+                    && left.carrier_keys[left_rule.target.index()]
+                        == right.carrier_keys[right_rule.target.index()]
+                    && left_rule.proof == right_rule.proof
+                    && left_rule.completeness == right_rule.completeness
+            })
+}
+
+fn same_summary_location_bindings(left: &ValueFlowPlan, right: &ValueFlowPlan) -> bool {
+    left.summary_location_bindings.len() == right.summary_location_bindings.len()
+        && left
+            .summary_location_bindings
+            .iter()
+            .zip(&right.summary_location_bindings)
+            .all(|(left_binding, right_binding)| {
+                left_binding.call == right_binding.call
+                    && left_binding.port == right_binding.port
+                    && left.carrier_keys[left_binding.carrier.index()]
+                        == right.carrier_keys[right_binding.carrier.index()]
+            })
 }
 
 fn relation_kind_rank(kind: ValueFlowRelationKind) -> u8 {

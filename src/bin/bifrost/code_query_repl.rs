@@ -964,6 +964,28 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         if value.truncated { "; truncated" } else { "" },
                     ));
                 }
+                CodeQueryResultValue::TaintFinding { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let id = sanitize_terminal_text(&value.id);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} ({} label{}; {} origin{}; {} witness{})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "taint finding:", use_color),
+                        paint(Style::new().bold(), &id, use_color),
+                        value.reached_labels.len(),
+                        if value.reached_labels.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        },
+                        value.origins.len(),
+                        if value.origins.len() == 1 { "" } else { "s" },
+                        value.witnesses.len(),
+                        if value.witnesses.len() == 1 { "" } else { "es" },
+                    ));
+                }
                 CodeQueryResultValue::File { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     out.push_str(&format!(
