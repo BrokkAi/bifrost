@@ -379,11 +379,11 @@ mod tests {
 
     #[test]
     fn exception_smells_unsupported_files_are_not_reported_as_clean() {
-        let fix = AnalyzerFixture::new(&[("src/lib.rs", "fn trivial() -> i32 { 0 }\n")]);
+        let fix = AnalyzerFixture::new(&[("notes.txt", "not parsed source\n")]);
         let result = report_exception_handling_smells(
             fix.analyzer.analyzer(),
             ReportExceptionHandlingSmellsParams {
-                file_paths: vec!["src/lib.rs".to_string()],
+                file_paths: vec!["notes.txt".to_string()],
                 ..Default::default()
             },
         );
@@ -393,7 +393,7 @@ mod tests {
                 .starts_with("Exception-handling smell analysis produced no supported results.")
         );
         assert!(result.report.contains("Unsupported files:"));
-        assert!(result.report.contains("`src/lib.rs`"));
+        assert!(result.report.contains("`notes.txt`"));
         assert_eq!(result.unsupported_files.len(), 1);
         assert!(result.failed_files.is_empty());
     }

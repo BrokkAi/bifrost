@@ -15,6 +15,7 @@ mod cpp_test_assertion_smells;
 mod csharp_dead_code_smells;
 mod csharp_go_rust_test_assertion_smells;
 mod csharp_structural_clone_smells;
+mod exception_handling_smells;
 mod go_dead_code_smells;
 mod java_dead_code_smells;
 mod java_structural_clone_smells;

@@ -862,14 +862,9 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn find_exception_handling_smells(
         &self,
         file: &ProjectFile,
-        _weights: ExceptionSmellWeights,
+        weights: ExceptionSmellWeights,
     ) -> ExceptionHandlingAnalysis {
-        ExceptionHandlingAnalysis::Unsupported {
-            reason: format!(
-                "exception-handling smell semantics are unavailable for {}",
-                file.rel_path().display()
-            ),
-        }
+        crate::analyzer::exception_handling::analyze_for_file(self, file, weights)
     }
 
     /// Detect suspicious low-value or brittle test assertions in `file`

@@ -15,7 +15,7 @@ The implementation uses the current Brokk Java analyzers and their tests as the 
 - [x] (2026-07-30 20:05Z) Verified issue #1359, the clean matching branch, current Bifrost call path, and the current Brokk implementations and tests.
 - [x] (2026-07-30 20:12Z) Wrote this ExecPlan with four independently testable milestones.
 - [x] (2026-07-30 20:28Z) Milestone 1: made the analyzer/result/report boundary distinguish analyzed-clean, unsupported, and failed inputs; extracted shared stack-safe scoring and preserved all seven focused Java/report tests.
-- [ ] Milestone 2: port Brokk parity for C/C++, JavaScript/TypeScript, Python, PHP, Scala, C#, Go, and Rust while preserving Java behavior.
+- [x] (2026-07-30 21:04Z) Milestone 2: ported Brokk behavior for C/C++, JavaScript/JSX, TypeScript/TSX, Python, PHP, Scala, C#, Go, and Rust; nine focused cross-language tests pass with positive and propagation/rethrow near-miss coverage.
 - [ ] Milestone 3: add structured Ruby and Kotlin semantics with positive and realistic near-miss coverage.
 - [ ] Milestone 4: complete mixed-language MCP/report integration, validation, policy checking, and review.
 
@@ -54,9 +54,13 @@ The implementation uses the current Brokk Java analyzers and their tests as the 
   Rationale: Brokk has no reference implementation for these languages, so the profiles must reflect their actual exception models rather than Java spellings.
   Date/Author: 2026-07-30 / Codex
 
+- Decision: keep the language-specific AST extractors together in `analyzer/exception_handling.rs` instead of creating nine one-function facade modules.
+  Rationale: every analyzer already reaches the same object-safe trait default, and the extractors share one parser lifecycle, result boundary, scorer, and handler builder. Separate functions retain language-specific syntax without adding repetitive facade wiring or mode flags.
+  Date/Author: 2026-07-30 / Codex
+
 ## Outcomes & Retrospective
 
-Milestone 1 is complete. Unsupported Rust input now produces an explicit structured/report status instead of false-clean text, Java behavior remains green, and the reusable scorer/tree helpers are ready for the language ports.
+Milestones 1 and 2 are complete. Unsupported input is explicit, Java behavior remains green, and the Brokk-backed language families now use structured parser nodes. The focused suite proves C/C++, JS/JSX, TS/TSX, Python, PHP, Scala, C#, Go, and Rust positives plus realistic rethrow or propagation near misses.
 
 ## Context and Orientation
 
@@ -124,3 +128,5 @@ The shared exception module operates on tree-sitter `Node` values, `ProjectFile`
 Revision note (2026-07-30): Initial plan created after verifying issue #1359 and comparing Bifrost with current Brokk master.
 
 Revision note (2026-07-30): Marked Milestone 1 complete, recorded the validated Cargo package name, and summarized its passing focused tests.
+
+Revision note (2026-07-30): Marked Milestone 2 complete and recorded the decision to colocate the language-specific extractors behind the shared trait default.
