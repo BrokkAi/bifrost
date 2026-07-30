@@ -7,7 +7,7 @@ use brokk_bifrost::{
 };
 use git2::{IndexAddOption, Repository, Signature};
 use rusqlite::Connection;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex, Once};
@@ -586,6 +586,86 @@ fn fq_segments_by_name(
                 out.insert(unit.fq_name(), segments);
             }
         }
+    }
+    out
+}
+
+/// Issue #1345: a warm workspace must not lose the Kotlin return types and
+/// extension receivers a cold build published.
+///
+/// Losing them would be worse than never publishing them, because the consumers
+/// that read the published fact treat its absence as "the source wrote no type"
+/// — so a warm build would silently answer receiver-chain and extension-
+/// conformance questions differently from a cold one.
+#[test]
+fn warm_kotlin_return_type_and_extension_receiver_metadata_survive_store_roundtrip() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_file(
+        root,
+        "src/Library.kt",
+        r#"package lib
+
+class Book(val title: String) {
+    fun describe(): String = title
+}
+
+fun Book.stamp(): Book = this
+
+fun untyped() = 1
+"#,
+    );
+    let repo = init_git_repo(root);
+    commit_all(&repo, "kotlin signature metadata");
+    let project: Arc<dyn Project> = Arc::new(TestProject::new(
+        root.canonicalize().unwrap(),
+        Language::Kotlin,
+    ));
+
+    let cold = build_persisted(project.clone(), AnalyzerConfig::default());
+    let cold_facts = kotlin_signature_facts(&cold);
+    drop(cold);
+    let warm = build_persisted(project, AnalyzerConfig::default());
+    let warm_facts = kotlin_signature_facts(&warm);
+
+    assert_eq!(
+        cold_facts.get("lib.stamp"),
+        Some(&(Some("Book".to_string()), Some("Book".to_string()))),
+        "cold build must publish the extension's return type and receiver: \
+         {cold_facts:#?}"
+    );
+    assert_eq!(
+        cold_facts.get("lib.Book.describe"),
+        Some(&(Some("String".to_string()), None))
+    );
+    assert_eq!(cold_facts.get("lib.untyped"), Some(&(None, None)));
+    assert_eq!(
+        warm_facts, cold_facts,
+        "a warm build must report exactly what the cold build published"
+    );
+}
+
+/// Written return type and extension receiver of every Kotlin callable and
+/// property in the workspace, by fully-qualified name.
+fn kotlin_signature_facts(
+    workspace: &WorkspaceAnalyzer,
+) -> BTreeMap<String, (Option<String>, Option<String>)> {
+    let analyzer = workspace.analyzer();
+    let mut out = BTreeMap::new();
+    for unit in analyzer.get_all_declarations() {
+        if unit.is_class() {
+            continue;
+        }
+        let Some(metadata) = analyzer.signature_metadata(&unit).into_iter().next() else {
+            continue;
+        };
+        out.insert(
+            unit.fq_name(),
+            (
+                metadata.return_type_text().map(str::to_string),
+                metadata.extension_receiver_type().map(str::to_string),
+            ),
+        );
     }
     out
 }

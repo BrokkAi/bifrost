@@ -1024,6 +1024,29 @@ impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
                 break;
             }
         }
+        // A Scala class is equally nameable from Kotlin source, and the three JVM
+        // languages share one candidate space, so find-references on a Scala type
+        // must see its Kotlin call sites too (#1239 milestone 4). Kotlin's own
+        // scan resolves those names, so what is added here is the file set.
+        if !limit_exceeded
+            && !scan_scope.is_cancelled()
+            && let Some(target) = overloads.first().filter(|target| target.is_class())
+        {
+            let mut cross_unproven = BTreeSet::new();
+            let mut cross_raw = 0usize;
+            crate::analyzer::usages::kotlin_graph::scan_kotlin_files_for_jvm_type(
+                analyzer,
+                candidate_files,
+                target,
+                max_usages,
+                &mut hits[0],
+                &mut cross_unproven,
+                &mut cross_raw,
+                &mut limit_exceeded,
+            );
+            observed_hits.extend(hits[0].iter().cloned());
+        }
+
         if limit_exceeded || observed_hits.len() > max_usages {
             return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
                 short_name: overloads[0].short_name().to_string(),

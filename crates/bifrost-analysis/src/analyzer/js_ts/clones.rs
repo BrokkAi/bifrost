@@ -1,7 +1,3 @@
-use crate::analyzer::CloneSmellWeights;
-use crate::analyzer::clone_detection::{
-    CloneCandidateData, compute_ast_refinement_similarity_percent,
-};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
 const JS_TS_IDENTIFIER_TYPES: &[&str] = &["identifier", "property_identifier"];
@@ -105,26 +101,6 @@ fn normalize_js_ts_clone_ast_label(node: Node<'_>, source: &str) -> String {
         return "IGN".to_string();
     }
     format!("N:{kind}")
-}
-
-pub(crate) fn refine_js_ts_clone_similarity(
-    left: &CloneCandidateData,
-    right: &CloneCandidateData,
-    token_similarity: i32,
-    weights: CloneSmellWeights,
-) -> i32 {
-    if left.ast_signature.is_empty() || right.ast_signature.is_empty() {
-        return token_similarity;
-    }
-    let ast_similarity =
-        compute_ast_refinement_similarity_percent(&left.ast_signature, &right.ast_signature);
-    if ast_similarity == 0 {
-        return token_similarity;
-    }
-    if ast_similarity < weights.ast_similarity_percent {
-        return 0;
-    }
-    token_similarity.min(ast_similarity)
 }
 
 fn parse_js_ts_tree(source: &str, parser_language: TsLanguage) -> Option<Tree> {

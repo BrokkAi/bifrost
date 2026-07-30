@@ -31,18 +31,31 @@
 //! `query_code` and `(language kotlin …)` search Kotlin files like any other
 //! registered language.
 //!
-//! Capabilities owned by sibling issues stay explicitly unsupported here:
-//! usage graphs (#1239 — Kotlin is a member of the shared JVM usage-candidate
-//! realm but has no edge builder yet, so find-references and reference-rewriting
-//! rename abstain) and CFG/semantic lowering (#1241 —
-//! the analyzer delegate hands out the shared `UnsupportedProgramSemantics`
-//! provider instead of lowering).
+//! Executable-semantics lowering is live (#1241): [`semantic`] publishes a
+//! versioned `ProgramSemanticsProvider`, and its module header documents the
+//! source-level constructs that stay capability-scoped.
+//!
+//! Reference, usage, and call graphs are live (#1239). Both usage paths answer
+//! for Kotlin: `crate::analyzer::usages::kotlin_graph` resolves "who uses this
+//! declaration?" for `scan_usages`, LSP references, and reference-rewriting
+//! rename, and builds the whole-workspace `caller -> callee` edge set behind
+//! `usage_graph`, `callers`/`callees`, relevance ranking, and dead-code
+//! detection. The shared JVM realm is symmetric for Kotlin: a Kotlin reference
+//! resolves onto Java and Scala declarations, and a Java or Scala reference onto
+//! Kotlin ones, in both usage paths.
+//!
+//! One realm asymmetry is *not* Kotlin's and is not closed here: Scala's own
+//! edge builder resolves type names against the Scala-only declaration index, so
+//! Scala source contributes no edges onto Java or Kotlin declarations. Java had
+//! the same gap until #1239 milestone 4 gave its builder the realm-aware index;
+//! Scala's resolver is structured differently and needs its own change.
 
 mod adapter;
 pub(crate) mod declarations;
 mod hierarchy;
 pub(crate) mod imports;
 pub(crate) mod language;
+mod semantic;
 pub(crate) mod structural;
 mod supertypes;
 pub(crate) mod syntax;
@@ -100,6 +113,36 @@ crate::analyzer::impl_forward_query_provider!(KotlinAnalyzer);
 impl KotlinAnalyzer {
     pub fn new(project: Arc<dyn Project>) -> Self {
         Self::new_with_config(project, AnalyzerConfig::default())
+    }
+
+    /// Hydrate many files' indexed state in one store round-trip.
+    ///
+    /// The whole-workspace usage-edge builder needs every Kotlin file's
+    /// declarations and ranges at once. Pulling them one file at a time would go
+    /// through the per-file LRU and evict the entries a user's interactive
+    /// queries depend on, so the build would leave every subsequent `scan_usages`
+    /// cold. Mirrors Java's and Scala's builders for the same reason.
+    pub(crate) fn bulk_file_states(
+        &self,
+        files: impl IntoIterator<Item = ProjectFile>,
+        source_mode: crate::analyzer::BulkFileStateSource,
+    ) -> crate::hash::HashMap<ProjectFile, crate::analyzer::tree_sitter_analyzer::FileState> {
+        self.inner.bulk_file_states(files, source_mode)
+    }
+
+    #[doc(hidden)]
+    pub fn reset_full_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    #[doc(hidden)]
+    pub fn full_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test()
+    }
+
+    #[doc(hidden)]
+    pub fn bulk_hydration_count_for_test(&self) -> usize {
+        self.inner.bulk_hydration_count_for_test()
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
@@ -175,6 +218,27 @@ impl KotlinAnalyzer {
         self.external_index.get_or_init(|| {
             JvmExternalDeclarationIndex::build_for_project(&self.jvm_config, self.inner.project())
         })
+    }
+
+    /// Row-capped projections for bounded receiver queries (issue #1242).
+    ///
+    /// A bounded query must be able to observe exhaustion before an unbounded
+    /// row set is cloned, which the unbounded `IAnalyzer` accessors cannot
+    /// report.
+    pub(crate) fn signature_metadata_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> crate::analyzer::store::LimitedQueryRows<SignatureMetadata> {
+        self.inner.signature_metadata_limited(code_unit, limit)
+    }
+
+    pub(crate) fn ranges_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> crate::analyzer::store::LimitedQueryRows<crate::analyzer::Range> {
+        self.inner.ranges_limited(code_unit, limit)
     }
 }
 

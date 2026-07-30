@@ -10,7 +10,9 @@ mod semantic;
 pub(crate) mod structural;
 mod tests;
 
-use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
+use crate::analyzer::clone_detection::{
+    CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
+};
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::{
@@ -29,7 +31,7 @@ use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
 pub(crate) use adapter::JavaAdapter;
 use cache::JavaMemoCaches;
-use clones::{build_clone_candidate_data, refine_java_clone_similarity};
+use clones::build_clone_candidate_data;
 use comments::{build_java_roll_up_stats, collect_java_comment_aggregates};
 use declarations::{
     collect_type_identifiers, find_nearest_declaration_from_node, is_comment_node,
@@ -730,7 +732,7 @@ impl IAnalyzer for JavaAnalyzer {
             &requested_files,
             all_candidates,
             weights,
-            refine_java_clone_similarity,
+            refine_clone_similarity_with_ast,
         )
     }
 }

@@ -97,9 +97,7 @@ impl AnalyzerDelegate {
             Self::Rust(analyzer) => analyzer,
             Self::Scala(analyzer) => analyzer,
             Self::Ruby(analyzer) => analyzer,
-            // Kotlin lowering is issue #1241; until then every capability is
-            // explicitly unsupported rather than absent.
-            Self::Kotlin(_) => &crate::analyzer::semantic::UNSUPPORTED_PROGRAM_SEMANTICS,
+            Self::Kotlin(analyzer) => analyzer,
         }
     }
 
@@ -526,9 +524,20 @@ impl TypeHierarchyProvider for MultiAnalyzer {
         // language's own descendant index, which only walks its own
         // declarations. Kotlin's realm-aware index does resolve across the
         // realm, so folding it in is what makes `Api`'s Kotlin implementors
-        // show up. The reverse direction — Java and Scala subclasses of a
-        // Kotlin type — needs those languages' resolvers to become
-        // realm-aware, which belongs to #1239.
+        // show up.
+        //
+        // The reverse direction — Java and Scala subclasses of a *Kotlin* type
+        // — is still missing, and cannot be fixed here. Each language's
+        // descendant index is the inverse of its own ancestor resolution, and
+        // Java's and Scala's resolve a spelled supertype against their own
+        // declarations only; folding their indexes in for a Kotlin unit would
+        // fold in indexes that never saw the Kotlin declaration in the first
+        // place. Closing it means giving those two hierarchy resolvers the
+        // realm-aware existence predicate Kotlin's already has (`realm_type_exists`
+        // / `realm_type_by_fqn` in `kotlin/hierarchy.rs`) — a change to those
+        // analyzers, not to this dispatch. Issue #1239 made *usage* resolution
+        // realm-aware in both directions; hierarchy resolution is a separate
+        // seam and remains one-directional.
         if language_for_file(code_unit.source()) != Language::Kotlin
             && let Some((kotlin, realm)) = self.kotlin_realm()
         {

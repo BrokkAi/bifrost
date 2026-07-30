@@ -95,6 +95,22 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
         }
         let _scala_scope = crate::profiling::scope("java_graph::scan_scala_files");
         scan_scala_files_for_java_type(analyzer, candidate_files, &spec, &mut state, None);
+        drop(_scala_scope);
+        // A Java class is equally nameable from Kotlin source; the realm is one
+        // candidate space, so find-references on a Java type must see its Kotlin
+        // call sites too (#1239 milestone 4).
+        let _kotlin_scope = crate::profiling::scope("java_graph::scan_kotlin_files");
+        crate::analyzer::usages::kotlin_graph::scan_kotlin_files_for_jvm_type(
+            analyzer,
+            candidate_files,
+            target,
+            max_usages,
+            state.hits,
+            state.unproven_hits,
+            state.raw_match_count,
+            state.limit_exceeded,
+        );
+        drop(_kotlin_scope);
 
         if limit_exceeded || hits.len() > max_usages {
             return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {

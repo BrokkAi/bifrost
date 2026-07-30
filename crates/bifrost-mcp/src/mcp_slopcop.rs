@@ -265,7 +265,7 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "report_structural_clone_smells",
-            "Detects suspicious structural clones using token shingles plus Java AST refinement. Uses analyzer-provided clone smells for high-recall triage. Output format matches the brokk-core MCP byte-for-byte.",
+            "Detects suspicious structural clones using token shingles plus language-specific AST refinement. Uses analyzer-provided clone smells for high-recall triage. Output format matches the brokk-core MCP byte-for-byte.",
             json!({
                 "type": "object",
                 "properties": {

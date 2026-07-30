@@ -6,7 +6,7 @@ use crate::hash::HashMap;
 use std::sync::Mutex;
 use tree_sitter::{Node, Parser};
 
-pub(super) const METHOD_RECEIVER_CHAIN_LIMIT: usize = 64;
+pub(in crate::analyzer::usages) const METHOD_RECEIVER_CHAIN_LIMIT: usize = 64;
 pub(super) const METHOD_RECEIVER_CHAIN_LIMIT_NAME: &str = "java_method_receiver_chain_depth";
 
 pub(super) type MethodReturnCacheKey = (ProjectFile, String, Option<String>);

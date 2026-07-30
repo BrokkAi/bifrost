@@ -75,17 +75,67 @@ reports call relationships in both directions.
       28 tests. Found and fixed three real defects on the way — duplicate-fqn fail-closed, `typealias` misclassified as
       a property, and generic parameters not shadowing a same-named class — all recorded in
       `Surprises & Discoveries`.
-- [ ] Milestone 2: query path for constructors, functions, and properties. Per the revised decision below, this now
-      starts by promoting #1238's `KotlinCtx` into a shared `analyzer/kotlin/semantics.rs` and calling it, rather than
-      reimplementing receiver typing and member lookup. Remaining: receiver typing, companions, objects, inheritance,
-      extensions, overload arity, callable references, override declarations, and the unproven/same-owner hit channels
-      (both trimmed out of milestone 1 because a written type reference is never uncertain).
-- [ ] Milestone 3: inverted edge builder; `usage_graph`, `callers`, `callees`, relevance, and dead code light up.
-      Wants #1345 (publish Kotlin return types and extension receivers in `SignatureMetadata`) landed before or
-      alongside it — see the sequencing note in `Milestone 2` for why the reparse path is fine for the query path and
-      not for the whole-workspace pass.
-- [ ] Milestone 4: cross-language JVM symmetry — Kotlin call sites for Java/Scala targets and vice versa.
-- [ ] Milestone 5: rename reference rewriting, the abstention matrix, dead-code bulk eligibility, capability notes.
+- [x] (2026-07-30) Issue #1345: Kotlin `SignatureMetadata` now publishes the *written* return type and, for an
+      extension, the receiver type it extends; Kotlin properties (including `val`/`var` constructor parameters) carry
+      metadata at all for the first time. Both are recorded as the *spelled nominal* name — `lib.Base` for `lib.Base?`,
+      `List` for `List<String>` — because what a consumer does with them is resolve them in the writing file's scope,
+      and the full written form is already in the rendered signature label. `usages/get_definition/kotlin.rs` reads the
+      published facts first and keeps its syntax re-read only for what the index cannot publish (an unwritten type
+      inferred from an initializer, an enum entry's own enum, a declaration parse recovery dropped). Kotlin
+      `lang_epoch!` salt gained `kotlin-signature-returns-receivers-2026-07`. Cost, 2 000 Kotlin declarations over 200
+      files, cold build, debug profile, five runs: 2171/2176/2124/2174/2150 ms before, 2290/2262/2296/2224/2450 ms
+      after — about +5 % — against #568's +132 % precedent, and it is *added structured reads inside the existing
+      declaration walk*, not a reparse. See `Surprises & Discoveries`.
+- [x] (2026-07-30) Milestone 2: the query path is complete for every target kind. Constructors, functions, and
+      properties resolve through receiver typing, inheritance, companions, objects, extensions, overload arity,
+      callable references, override declarations, top-level declarations, and receiver chains, with the unproven and
+      same-owner channels wired. `usages_kotlin_graph_test.rs` 29 → 50; `suite_usages` 1371 → 1392.
+      `kotlin_callable_target_abstains_with_a_specific_diagnostic` deleted as the plan prescribed. Two real defects
+      found on the way, both in `Surprises & Discoveries`: a property *write* parses as
+      `directly_assignable_expression` rather than `navigation_expression`, and a Kotlin top-level callable has no
+      indexed owner at all.
+- [x] (2026-07-30) Companion-ness is now a *published* fact, resolving the follow-up milestone 2 recorded.
+      `SignatureMetadata` gained `companion_object`, `kotlin/declarations.rs::visit_object_like` sets it for the
+      `companion_object` node kind it already distinguishes, and the Kotlin `lang_epoch!` salt gained
+      `kotlin-companion-object-marker-2026-07`. Both consumers now read the marker instead of re-parsing the declaring
+      file: `kotlin_graph::resolver::is_companion_object` and #1238's `KotlinCtx::is_companion_object`, which had its
+      own syntax re-read. The alternative shapes were weighed and rejected: a `mark_type_alias`-style marker set needs
+      a `ParsedFile` field, an analyzer field, a store column (`scala_trait_count` is the precedent), a provider trait,
+      and `MultiAnalyzer` delegation; the metadata field is one serde-defaulted `bool` on a blob that is already
+      persisted per declaration.
+- [x] (2026-07-30) Milestone 3: the inverted edge builder. `kotlin_graph/inverted.rs` walks every Kotlin file once and
+      records types, constructions, calls, property reads/writes, callable references, and imports;
+      `KotlinEdgeResolver` in `kotlin_graph/shared.rs` prefetches file states in bulk;
+      `build_kotlin_usage_edge_weights` / `build_kotlin_usage_edges` are registered in the `Jvm` realm in
+      `usages/workspace_graph.rs` and `searchtools/scan_usages.rs`. The two usage paths now share their whole
+      resolution backbone through the new `resolver::KotlinResolutionCtx` trait — receiver typing, member lookup order,
+      the name ladder, and the published facts have exactly one implementation, and only the two lexical questions a
+      whole-workspace pass answers more cheaply differ. New `tests/suite_usages/usage_graph_kotlin_test.rs` (9 tests,
+      fixture `tests/fixtures/usage-graph-kotlin/`), plus the bulk-hydration unit test in `kotlin_graph.rs`.
+      One real defect found on the way and recorded in `Surprises & Discoveries`: a constructor call written without a
+      type annotation was invisible to a *type* query. The plan's "confirm with a test that `resolved_ecosystems`
+      still reports `Jvm` once now three passes run over it" is
+      `workspace_graph::tests::the_jvm_realm_is_resolved_once_across_its_three_builders`, which also asserts the
+      Kotlin→Java edge so a realm resolved once but producing nothing cannot pass.
+- [x] (2026-07-30) Milestone 4: cross-language JVM symmetry. Edge path — Kotlin source now contributes edges onto Java
+      and Scala declarations, and Java source onto Kotlin ones (the return direction needed Java's builder to resolve
+      names against the realm-aware index rather than the Java-only one; see `Surprises & Discoveries`). Query path —
+      a JVM *type* target is scanned in every JVM language's files in both directions, through
+      `kotlin_graph::scan_kotlin_files_for_jvm_type` and `java_graph::scan_jvm_files_for_foreign_type`, with candidate
+      discovery generalised from the pairwise "a Java class also keeps Scala files" special case to "a JVM type target
+      keeps every JVM language's files". 5 new tests in `tests/suite_analyzers/jvm_shared_realm.rs`.
+      Not closed, and not Kotlin's: Scala's own edge builder resolves type names against the Scala-only index, so Scala
+      source contributes no edges onto Java *or* Kotlin declarations. That predates this issue — see
+      `Surprises & Discoveries`.
+- [x] (2026-07-30) Milestone 5 (partial): the capability notes and the same-owner surface. `kotlin/mod.rs` no longer
+      lists usage graphs as an unsupported boundary; `kotlin_graph.rs`'s module header states what both paths answer
+      and where cross-language stops. Kotlin joined the `scan_usages` same-owner uniformity matrix in
+      `tests/suite_bench_policy/scan_usages_same_owner_policy.rs` (3 new tests: the uniformity case, the
+      `include_same_owner` listing, and implicit-`this`-is-same-owner / `super`-stays-external).
+- [ ] Milestone 5 (remaining): rename reference-rewriting tests, the abstention matrix table test, and dead-code bulk
+      eligibility. Rename needs no new code — `symbol_rename.rs` asks the usage finder, which now answers — but it
+      needs its own tests. Dead-code *registration* for Kotlin is owned by the phase-3 work in `code_quality/` and is
+      deliberately untouched here.
 
 ## Surprises & Discoveries
 
@@ -161,6 +211,81 @@ reports call relationships in both directions.
   `resolve_kotlin` itself, but wrong about the layer beneath it. See the revised decision below; milestone 2's plan
   changes from "reimplement receiver typing" to "promote the semantic layer and call it".
 
+- Observation: a Kotlin property *write* is not a `navigation_expression`. `counter.count = 1` parses as
+  `(assignment (directly_assignable_expression (simple_identifier) (navigation_suffix (simple_identifier))) …)` — a
+  distinct node kind with the *identical* shape, receiver then `navigation_suffix`. The first milestone-2 property arm
+  matched only `navigation_expression` and so reported a property's reads and not its writes, even though the index
+  records one `Field` unit for both.
+  Evidence: `kotlin_property_access_reports_reads_and_writes_as_one_property` failed with the read reported and the
+  write absent; confirmed against `vendor/tree-sitter-kotlin/src/node-types.json`, which lists
+  `directly_assignable_expression` with `navigation_suffix` among its children.
+  Fixed with a shared `kotlin_is_navigation_kind` predicate in `analyzer/kotlin/syntax.rs`, so every consumer that
+  means "receiver.member" accepts both kinds rather than each remembering the second one.
+
+- Observation: a Kotlin top-level function or property has **no indexed owner** — `analyzer.parent_of` returns `None`,
+  because Kotlin genuinely declares it straight into a package and this language has no synthetic file-scope unit (its
+  `lang_epoch!` salt carries no `synthetic-file-scope-code-units` token, unlike nine of the other ten). Milestone 1's
+  `TargetSpec::from_target` did `let owner = analyzer.parent_of(target)?`, so every top-level target would have
+  abstained with `unsupported_target_shape` — reporting "not supported" for what is Kotlin's most idiomatic
+  declaration form.
+  Evidence: `kotlin_top_level_function_call_reports_in_the_same_package_and_through_an_import` and
+  `kotlin_callable_reference_reports_the_function`, both of which target `lib.helper`.
+  Fixed by making `TargetSpec::owner` an `Option` and modelling an owner-less target as one named through the file's
+  own scope with no receiver at all, rather than by inventing an owner the index does not have.
+
+- Observation: whether a nested `object` is a `companion object` is **not published by the index** — a companion and an
+  ordinary nested object are both nested classes, and the `Companion` default name is a name-resolution rule a source
+  file may override, so it cannot be read off the identity. #1238 answers the question by re-reading the declaring
+  file's syntax, and milestone 2 does the same. That is bounded here — a query has one target, so it asks once — but
+  the *inverted* builder asks it per callee owner, which is exactly the shape #1345 existed to remove.
+  Consequence for milestone 3: publish companion-ness as an indexed fact (a `SignatureMetadata` flag or a dedicated
+  provider) before the edge builder needs it, or the builder reintroduces a per-declaration reparse. Recorded as a
+  follow-up rather than done here, because it is a second extractor-behaviour change and #1345 was scoped to return
+  types and receivers.
+  **Resolved in milestone 3** by the `SignatureMetadata::companion_object` marker and the
+  `kotlin-companion-object-marker-2026-07` salt token; see `Progress`.
+
+- Observation: a Kotlin constructor call written *without* a type annotation was invisible to a type query.
+  `Base()` is spelled exactly like a function call — the token is a bare `simple_identifier`, not a `user_type` — so
+  none of the type arm's cases saw it: the `user_type` arm needs a written type, and the qualifier arm only fires for a
+  navigation *receiver*. Milestone 1's test happened to write `val held: Base = Base()`, whose *annotation* produced
+  the hit on that line, so the gap was invisible.
+  Evidence: `usage_graph` on a mixed workspace reported `app.KotlinCaller.callJava -> lib.JavaGreeter.greet` but no
+  edge to `lib.JavaGreeter` itself, even though `JavaGreeter()` is right there. The characterization is
+  `kotlin_type_usage_reports_a_constructor_call_written_without_a_type_annotation`.
+  This matters more than it looks: `val x = Base()` is the idiomatic Kotlin form, so the most common way to mention a
+  class was not a usage of it, and a class constructed everywhere and annotated nowhere read as unused.
+  Fixed with a `call_expression` arm in the type scan and the matching `record_constructor_of` in the edge builder,
+  both guarded by the value-namespace shadow check so `val Base = { -> 1 }; Base()` is not a reference to the class.
+
+- Observation: Java's usage graph resolved type names against the *Java-only* declaration index, so a Java file naming
+  a Kotlin class declared next door resolved to nothing and the reference was silently lost — the exact asymmetry
+  milestone 4 exists to close, but in Java's code rather than Kotlin's. Kotlin's ladder was realm-aware from milestone
+  1 because its `exists` predicate is caller-supplied and this plan pointed it at `global_usage_definition_index`,
+  which `MultiAnalyzer` merges across every language; `JavaAnalyzer::resolve_usage_type_name` hard-wires its own.
+  Evidence: `java_source_contributes_edges_onto_kotlin_declarations` — `new KotlinGreeter().greet()` in a `.java` file
+  produced no edges at all before the change.
+  Fixed by splitting `resolve_usage_type_name_in(index, file, name)` out of `resolve_usage_type_name`, so the index is
+  a parameter, and having the Java scanners pass the realm-aware one. Java's *visibility* model is untouched: the same
+  import, wildcard, and same-package tiers decide, so a Kotlin class in another package still needs an import.
+  Scala has the same shape of gap and it is **not** closed here. Its builder resolves through `ScalaAnalyzer`-specific
+  structures (`ProjectTypes`, `forward_owner_facts`, normalized fqns) rather than a single index parameter, so there is
+  no one-line seam; and the gap is symmetric and pre-existing — Scala source contributes no edges onto *Java*
+  declarations either, which is nothing to do with Kotlin. Probed and confirmed with a Scala caller of both a Java and
+  a Kotlin class in the milestone-4 fixture. The Scala *query* path does cross the realm, in both directions.
+
+- Observation: the Kotlin edge builder pulls each Kotlin file through the per-file LRU once, which Java's and Scala's
+  do not. Both of those resolve entirely through workspace-wide indexes; Kotlin additionally reads per-*declaration*
+  published facts — an overload's arities, a companion marker, a callee's return type — and those are keyed by
+  declaration, so they route through `fetch_file_state` for the declaring file rather than through the bulk map the
+  builder already holds. The bulk prefetch still happens and still does its job for declarations and class ranges; the
+  extra hydration is one per file, then cached, not one per declaration.
+  Evidence: `kotlin_usage_graph_bulk_fetch_hydrates_each_file_at_most_once` asserts exactly that bound rather than
+  hiding it. Scala's equivalent test asserts zero.
+  Not fixed here. Closing it means threading a facts view over the bulk `FileState` map through
+  `KotlinResolutionCtx`, so that `kotlin_callable_arities`, `is_companion_object`, `extension_receiver_fq_name`, and
+  `declared_type_of` read from it — a mechanical but wide change, and the current cost is bounded and measured.
+
 ## Coverage parity with Java and Scala
 
 This section is the checklist that keeps Kotlin's tests honest against its JVM siblings. It exists because a new
@@ -210,20 +335,34 @@ external surface while `super` stays external (Java's `filters_same_file_self_ca
 all — companion-object members reached through both the class name and the companion name, extension functions whose
 declared `receiver` type must conform, safe-call and `!!` receivers, and a smart cast staying unproven.
 
-Milestone 3 (the inverted edge builder) owes the whole edge-path suite: `usage_graph_java_test.rs`'s
-`resolves_instance_static_and_constructor_calls`, `receiver_typing_is_type_based_not_name_based`, and
-`every_edge_endpoint_is_a_node`, plus Scala's `scala_usage_graph_bulk_fetch_bypasses_lru_and_preserves_point_entry`,
-which exists because hydrating each file through the per-file LRU during a whole-workspace build evicts the cache a
-user's interactive queries depend on.
+Milestone 3 (the inverted edge builder) owed the whole edge-path suite, and it is now closed:
+`usage_graph_kotlin_test.rs` has Kotlin versions of `resolves_instance_static_and_constructor_calls` (as
+`resolves_instance_companion_object_and_constructor_calls`), `receiver_typing_is_type_based_not_name_based`, and
+`every_edge_endpoint_is_a_node`, plus the Kotlin-only shapes with no sibling — an inherited member resolving to the
+declaring ancestor while an override resolves to the override, an extension reached through the type it extends, a
+top-level callable named through an import, and a same-owner call producing no proven inbound edge.
+Scala's `scala_usage_graph_bulk_fetch_bypasses_lru_and_preserves_point_entry` has a deliberately weaker Kotlin
+counterpart, `kotlin_usage_graph_bulk_fetch_hydrates_each_file_at_most_once`: Kotlin's builder reads per-declaration
+published facts, which route through the declaring file's state, so the honest bound is one LRU hydration per file
+rather than zero. `Surprises & Discoveries` records why and what closing it would take.
+One row is deliberately *not* a Kotlin edge-path test: the workspace usage catalog carries only classes and callables,
+and excludes synthetic declarations, so a Kotlin property and a Kotlin primary constructor are not graph nodes at all.
+`a_property_read_references_its_owner_and_invents_no_property_node` pins that as the contract rather than leaving the
+absence unexplained; the property *reference* itself is a query-path question and is covered there.
 
-Milestone 4 (cross-language JVM) owes the symmetric counterparts of Java's existing one-directional set:
-`java_type_usage_lookup_merges_java_and_scala_source_hits`,
-`java_nested_type_usage_lookup_requires_import_or_qualification_in_scala`,
-`java_type_usage_lookup_handles_same_package_and_wildcard_scala_imports`,
-`java_type_usage_lookup_ignores_scala_local_type_shadowing`, and
-`java_type_usage_lookup_respects_usage_finder_file_filter_for_scala_hits` — each of which needs a Kotlin-source
-version, *and* a Kotlin-target version reading Java and Scala source, which Java's suite has no precedent for because
-its cross-language support only runs one way.
+Milestone 4 (cross-language JVM) owed the symmetric counterparts of Java's existing one-directional set. The direction
+matrix is now covered in `tests/suite_analyzers/jvm_shared_realm.rs`, which is where the realm's own behaviour tests
+live and therefore where a future reader looks for them: Kotlin-source hits on a Java target and on a Scala target,
+Java-source and Scala-source hits on a Kotlin target, and both edge directions for Kotlin↔Java and Kotlin→Scala. The
+visibility *tiers* those Java tests enumerate one by one (same package, wildcard import, local shadowing) are not
+re-enumerated per language pair: cross-language scanning reuses each language's own name ladder unchanged, and those
+ladders already have their own per-language tier tests, so a pairwise matrix would be testing the same ladder three
+more times rather than testing the crossing.
+
+Two rows are honestly *not* covered, and both are Scala's rather than Kotlin's: Scala source contributes no edges onto
+Java or Kotlin declarations (its edge builder is Scala-index-bound; see `Surprises & Discoveries`), so
+`mixed_jvm_usage_graph_has_edges_in_both_directions` holds for Java↔Kotlin but not for any pair involving Scala as the
+*caller*.
 
 Milestone 5 owes the abstention matrix and the rename cases, which have no direct sibling equivalent because Kotlin is
 the first language where rename was gated on the usage graph landing.
@@ -281,6 +420,53 @@ the first language where rename was gated on the usage graph landing.
   milestone 3 therefore keeps its own file-local walk and consults the shared layer only for the per-declaration facts,
   behind the `Mutex`-guarded caches milestone 2 introduces.
   Date/Author: 2026-07-30, David Baker Effendi (agent).
+
+- Decision (revised 2026-07-30, supersedes the previous entry as it applies to *milestone 2*): the query path builds
+  its own receiver typing in `kotlin_graph/resolver.rs` on top of the shared syntax readers, the shared name ladder,
+  and the facts #1345 now publishes — it does not construct or call `KotlinCtx`.
+  Rationale: the previous entry's premise was that `KotlinCtx` is the only place the "Kotlin facts the index does not
+  publish" live. #1345 changed that premise for the two facts that mattered: what a declaration declares, and what an
+  extension extends are now *published*, so reading them needs a lookup rather than a per-request parse cache. What is
+  left in `KotlinCtx` — an `Rc`/`RefCell` file-syntax cache, per-cursor scope construction — is precisely what makes it
+  neither `Send` nor `Sync`, and milestone 3's builder cannot hold it. Writing milestone 2 against `KotlinCtx` would
+  therefore have meant writing milestone 3 against something else, which is the drift the sharing was supposed to
+  prevent. Both paths now share the *published facts* and the *name ladder* instead, which is a stronger seam: it is
+  the index, not a cache, so navigation and usages cannot disagree without the index itself being wrong. One fact is
+  still unpublished and still read from syntax — whether a nested object is a companion — and `Surprises &
+  Discoveries` records why that must be published before milestone 3.
+  Date/Author: 2026-07-30, agent.
+
+- Decision (2026-07-30, milestone 3): the two usage paths share their resolution backbone through a
+  `resolver::KotlinResolutionCtx` trait, implemented by the query scan's `ScanCtx` and the edge scan's
+  `KotlinEdgeScan`, rather than by duplicating receiver typing in the inverted builder.
+  Rationale: `usages/traits.rs` says "both usage paths share one resolver" is a contract, not a convention, and until
+  this milestone the Kotlin side had only one path to be consistent with. The alternative — a second copy of receiver
+  typing, member lookup order, and the companion/extension rules in `inverted.rs` — is exactly the drift the plan's
+  Decision Log has twice reorganised itself to avoid, and it would guarantee that `usage_graph` and find-references
+  eventually disagree about which declaration a call means. The trait is deliberately narrow: an analyzer, the file's
+  source, the value bindings, the two name-ladder entry points, and the two *lexical* questions the paths genuinely
+  answer differently — which declarations enclose a byte, and where the per-declaration type cache lives. A query
+  answers the lexical questions through `IAnalyzer::enclosing_code_unit`, because it must attribute each hit to a
+  caller anyway; the whole-workspace builder answers them from the `ClassRangeIndex` it already holds and would
+  otherwise pay for twice.
+  Date/Author: 2026-07-30, agent.
+
+- Decision (2026-07-30, milestone 4): cross-language usage queries cross the realm for *type* targets only.
+  Rationale: which declaration `receiver.member` binds to is decided by the target language's own member-lookup rules
+  — Kotlin searches own members, then the companion, then ancestors breadth-first, then visible extensions; Java and
+  Scala search differently — and answering one language's member question with another language's rules is a guess,
+  not a resolution. A *type* reference has no such ambiguity: a written name either resolves to the target's
+  fully-qualified name under the writing file's own visibility rules or it does not, and in the JVM realm the
+  fully-qualified name is the identity. Java's pre-existing Scala scanner already drew this line
+  (`scan_scala_files_for_java_type` refuses anything but `TargetKind::Type`); milestone 4 generalises the line rather
+  than moving it.
+  Date/Author: 2026-07-30, agent.
+
+- Decision: `METHOD_RECEIVER_CHAIN_LIMIT` is shared with Java rather than restated, by widening
+  `java_graph::return_type` to `pub(super)` and the constant to `pub(in crate::analyzer::usages)`.
+  Rationale: the plan called for it, and a second constant would let the two JVM languages report different budgets for
+  the same shape of expression. Two lines of visibility, no behaviour change to Java.
+  Date/Author: 2026-07-30, agent.
 
 - Decision: resolve names in the graph builders through a realm-aware predicate rather than through
   `KotlinAnalyzer::resolve_type_name_in_file`.

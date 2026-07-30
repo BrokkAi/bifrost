@@ -20,6 +20,7 @@ mod usage_graph_csharp_test;
 mod usage_graph_go_test;
 mod usage_graph_identity_test;
 mod usage_graph_java_test;
+mod usage_graph_kotlin_test;
 mod usage_graph_php_test;
 mod usage_graph_python_test;
 mod usage_graph_ruby_test;

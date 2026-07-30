@@ -209,6 +209,14 @@ const SCALA: &[(&str, &str)] = &[(
     "class Foo {\n  def target(): Unit = {}\n  def caller(): Unit = this.target()\n  def uncalled(): Unit = {}\n}\n",
 )];
 
+// Written multi-line with blank lines between declarations: the vendored Kotlin
+// grammar emits `MISSING _automatic_semicolon` recovery for a single-line class
+// body, which would silently index nothing.
+const KOTLIN: &[(&str, &str)] = &[(
+    "Foo.kt",
+    "class Foo {\n\n    fun target() {\n    }\n\n    fun caller() {\n        this.target()\n    }\n\n    fun uncalled() {\n    }\n}\n",
+)];
+
 macro_rules! uniformity_case {
     ($name:ident, $lang:expr, $files:expr) => {
         #[test]
@@ -229,6 +237,7 @@ uniformity_case!(typescript_same_owner_only, Language::TypeScript, TYPESCRIPT);
 uniformity_case!(javascript_same_owner_only, Language::JavaScript, JAVASCRIPT);
 uniformity_case!(cpp_same_owner_only, Language::Cpp, CPP);
 uniformity_case!(scala_same_owner_only, Language::Scala, SCALA);
+uniformity_case!(kotlin_same_owner_only, Language::Kotlin, KOTLIN);
 
 // Go's fq_name is import-path-qualified; resolve the method by its owner-scoped
 // name.
@@ -511,6 +520,54 @@ fn scala_different_instance_of_same_type_stays_external() {
     assert_eq!(
         entry.same_owner_sites, None,
         "a different instance is not a same-owner site: {entry:#?}"
+    );
+}
+
+#[test]
+fn kotlin_include_same_owner_lists_kind_tagged_site() {
+    let listed = scan(Language::Kotlin, KOTLIN, "Foo.target", true);
+    assert_eq!(listed.status, ScanUsagesStatus::NoExternalUsages);
+    assert_eq!(listed.same_owner_sites, Some(1));
+    let locations: Vec<_> = listed
+        .same_owner_files
+        .iter()
+        .flat_map(|group| group.hits.iter())
+        .collect();
+    assert_eq!(locations.len(), 1, "one listed site: {listed:#?}");
+    assert_eq!(
+        locations[0].kind.as_deref(),
+        Some("self_receiver"),
+        "listed same-owner site must be kind-tagged: {listed:#?}"
+    );
+}
+
+/// A Kotlin implicit-`this` call is same-owner too, and `super` is not.
+///
+/// The bare form is how Kotlin is normally written, so getting only the explicit
+/// `this.target()` right would leave the common case on the external surface;
+/// and a `super` call names an ancestor's declaration from outside it, so it
+/// must stay external.
+#[test]
+fn kotlin_implicit_this_is_same_owner_and_super_stays_external() {
+    let implicit: &[(&str, &str)] = &[(
+        "Foo.kt",
+        "class Foo {\n\n    fun target() {\n    }\n\n    fun caller() {\n        target()\n    }\n}\n",
+    )];
+    assert_same_owner_only(Language::Kotlin, implicit, "Foo.target");
+
+    let with_super: &[(&str, &str)] = &[(
+        "Foo.kt",
+        "open class Base {\n\n    open fun target() {\n    }\n}\n\nclass Foo : Base() {\n\n    override fun target() {\n        super.target()\n    }\n}\n",
+    )];
+    let entry = scan(Language::Kotlin, with_super, "Base.target", false);
+    assert_eq!(
+        entry.status,
+        ScanUsagesStatus::Found,
+        "a super call is an external usage of what it overrides: {entry:#?}"
+    );
+    assert_eq!(
+        entry.same_owner_sites, None,
+        "a super receiver must not be classified same-owner: {entry:#?}"
     );
 }
 

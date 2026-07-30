@@ -387,14 +387,13 @@ pub(crate) fn build_workspace_usage_graph_with_cancellation(
         UsageEcosystem::Rust,
         super::rust_graph::build_rust_usage_edge_weights
     );
-    // One JVM realm, several resolvers. Java, Scala, and Kotlin declarations
-    // share one node space, so both builders run over the *same* candidate set
+    // One JVM realm, three resolvers. Java, Scala, and Kotlin declarations share
+    // one node space, so all three builders run over the *same* candidate set
     // and merge into it. There is no double counting: each resolver only scans
-    // files of its own language, so the two passes cover disjoint call sites.
-    // Kotlin's own edge builder arrives with #1239; until then Kotlin
-    // declarations are realm members that Java and Scala references can resolve
-    // onto, with no outbound edges of their own — an explicit gap, not a
-    // silent one.
+    // files of its own language, so the three passes cover disjoint call sites.
+    // The realm is symmetric — a reference resolved in any of the three can land
+    // on a declaration from any of them — which is what makes a mixed
+    // Java/Kotlin workspace report call relationships in both directions.
     record_package_edges!(
         "workspace_usage_graph::resolve_jvm_java",
         UsageEcosystem::Jvm,
@@ -404,6 +403,11 @@ pub(crate) fn build_workspace_usage_graph_with_cancellation(
         "workspace_usage_graph::resolve_jvm_scala",
         UsageEcosystem::Jvm,
         super::scala_graph::build_scala_usage_edge_weights
+    );
+    record_package_edges!(
+        "workspace_usage_graph::resolve_jvm_kotlin",
+        UsageEcosystem::Jvm,
+        super::kotlin_graph::build_kotlin_usage_edge_weights
     );
     record_package_edges!(
         "workspace_usage_graph::resolve_csharp",
@@ -533,5 +537,89 @@ fn record_weighted_edges(
         {
             nodes[index].unproven_inbound += total;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{
+        AnalyzerDelegate, JavaAnalyzer, KotlinAnalyzer, MultiAnalyzer, ScalaAnalyzer, TestProject,
+    };
+    use std::sync::Arc;
+
+    /// The `Jvm` realm is resolved once even though three builders run over it.
+    ///
+    /// `resolved_ecosystems` is what a consumer reads to know which realms a
+    /// graph actually covers, and it is deduplicated with `Vec::dedup`, which
+    /// only collapses *consecutive* duplicates. With one JVM builder that was
+    /// vacuously true; with three it is a real invariant, and a future reordering
+    /// that interleaved another ecosystem between them would silently start
+    /// reporting `Jvm` twice.
+    #[test]
+    fn the_jvm_realm_is_resolved_once_across_its_three_builders() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        ProjectFile::new(root.clone(), "app/Greeter.java")
+            .write(
+                "package app;\n\npublic class Greeter {\n    public String greet() { return \"hi\"; }\n}\n"
+                    .to_string(),
+            )
+            .unwrap();
+        ProjectFile::new(root.clone(), "app/Service.scala")
+            .write(
+                "package app\n\nclass Service {\n  def run(): String = \"scala\"\n}\n".to_string(),
+            )
+            .unwrap();
+        ProjectFile::new(root.clone(), "app/Caller.kt")
+            .write(
+                "package app\n\nclass Caller {\n\n    fun call(): String {\n        val greeter = Greeter()\n        return greeter.greet()\n    }\n}\n"
+                    .to_string(),
+            )
+            .unwrap();
+
+        let project = TestProject::new(root, Language::Java);
+        let analyzer = MultiAnalyzer::new(BTreeMap::from([
+            (
+                Language::Java,
+                AnalyzerDelegate::Java(JavaAnalyzer::new(Arc::new(project.clone()))),
+            ),
+            (
+                Language::Scala,
+                AnalyzerDelegate::Scala(ScalaAnalyzer::new(Arc::new(project.clone()))),
+            ),
+            (
+                Language::Kotlin,
+                AnalyzerDelegate::Kotlin(KotlinAnalyzer::new(Arc::new(project))),
+            ),
+        ]));
+
+        let catalog = WorkspaceUsageCatalog::build(&analyzer);
+        let selected = BTreeSet::from([UsageEcosystem::Jvm]);
+        let WorkspaceUsageGraphBuildOutcome::Complete(graph) =
+            build_workspace_usage_graph_with_cancellation(
+                &analyzer,
+                catalog,
+                &selected,
+                &CancellationToken::default(),
+            )
+        else {
+            panic!("uncancelled workspace usage graph build");
+        };
+
+        assert_eq!(
+            graph.resolved_ecosystems,
+            vec![UsageEcosystem::Jvm],
+            "three JVM builders must still resolve one realm"
+        );
+        // Measured on a real Kotlin -> Java edge, so a graph that resolved the
+        // realm once but produced nothing would not pass.
+        assert!(
+            graph.edges.iter().any(|edge| {
+                graph.nodes[edge.from].key.fqn == "app.Caller.call"
+                    && graph.nodes[edge.to].key.fqn == "app.Greeter"
+            }),
+            "expected the Kotlin -> Java edge the shared realm exists to provide"
+        );
     }
 }

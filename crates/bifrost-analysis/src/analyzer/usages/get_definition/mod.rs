@@ -130,7 +130,10 @@ pub(crate) use java::{
     JavaTypeLookupResolution, java_lombok_accessor_field_candidates,
     java_lombok_generated_accessor_field_candidates, java_type_lookup_resolution,
 };
-pub(crate) use kotlin::{KotlinTypeLookupResolution, kotlin_type_lookup_resolution};
+pub(crate) use kotlin::{
+    KotlinDefinitionProvider, KotlinTypeLookupResolution, kotlin_type_lookup_resolution,
+    kotlin_type_lookup_resolution_in_session, resolve_kotlin_bounded,
+};
 pub(crate) use php::{
     PhpDefinitionProvider, php_type_lookup_resolution_bounded, resolve_php_bounded,
 };

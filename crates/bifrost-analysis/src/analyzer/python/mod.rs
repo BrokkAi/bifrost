@@ -12,7 +12,9 @@ mod syntax;
 mod tests;
 mod usage_index;
 
-use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
+use crate::analyzer::clone_detection::{
+    CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
+};
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::build_weighted_cache;
 use crate::analyzer::store::LimitedQueryRows;
@@ -38,7 +40,7 @@ use cache::{
     PythonUsageEdgesKey, weight_code_unit_set, weight_code_unit_vec, weight_export_index,
     weight_project_file_set, weight_python_usage_edges,
 };
-use clones::{build_clone_candidate_data, refine_python_clone_similarity};
+use clones::build_clone_candidate_data;
 pub(crate) use declarations::python_package_prefix_fq;
 use declarations::{
     collect_python_identifiers, parse_python_tree, py_node_text, python_expanded_comment_start,
@@ -1153,7 +1155,7 @@ impl IAnalyzer for PythonAnalyzer {
             &requested_files,
             all_candidates,
             weights,
-            refine_python_clone_similarity,
+            refine_clone_similarity_with_ast,
         )
     }
 }

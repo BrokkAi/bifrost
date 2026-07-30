@@ -69,8 +69,12 @@ analyzer's indexed declarations.
 - [x] (2026-07-29 14:00Z) Milestone 5: abstention-matrix test, the Kotlin local-binding fix it exposed, and
       capability notes. Full validation: `suite_symbols` 1110 passed, `suite_analyzers` 671 passed,
       `bifrost_lsp_server` 196 passed, `cargo clippy --all-targets --all-features -- -D warnings` clean.
-- [ ] Remaining, owned by sibling issues: find-references and reference-rewriting rename for Kotlin (#1239),
-      structural RQL (#1240), CFG/semantic lowering including smart casts (#1241).
+- [x] (2026-07-30) Find-references and reference-rewriting rename for Kotlin landed with #1239 — both usage paths now
+      answer for Kotlin, so `textDocument/references` and `rename_symbol` no longer abstain. See
+      `.agents/plans/kotlin-usage-graph-1239.md`. That work also replaced this issue's `KotlinCtx::is_companion_object`
+      syntax re-read with the published `SignatureMetadata` marker, so navigation and the usage graphs answer
+      "is this object a companion?" from one fact.
+- [ ] Remaining, owned by sibling issues: structural RQL (#1240), CFG/semantic lowering including smart casts (#1241).
 
 ## Surprises & Discoveries
 
