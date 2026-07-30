@@ -714,7 +714,6 @@ fn kotlin_exact_helper_flow() {
 }
 
 #[test]
-#[ignore = "requires a proven complete witness across the C header declaration boundary"]
 fn c_exact_helper_flow_through_header_declaration() {
     let files = [
         InlineSourceFile {
@@ -765,12 +764,11 @@ fn c_exact_helper_flow_through_header_declaration() {
         SemanticInputStatus::Unknown,
         false,
         false,
-        2,
+        1,
     );
 }
 
 #[test]
-#[ignore = "requires a proven complete witness across the C++ header declaration boundary"]
 fn cpp_exact_helper_flow_through_header_declaration() {
     let files = [
         InlineSourceFile {
@@ -821,7 +819,7 @@ fn cpp_exact_helper_flow_through_header_declaration() {
         SemanticInputStatus::Unknown,
         false,
         false,
-        2,
+        1,
     );
 }
 
