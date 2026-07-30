@@ -17,9 +17,9 @@ use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
 use crate::analyzer::{CSharpAnalyzer, Language, ProjectFile, Range};
-use crate::hash::HashMap;
+use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v2";
+const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v3";
 
 impl_program_semantics_provider!(CSharpAnalyzer, CSharpSemanticLowerer);
 
@@ -48,7 +48,7 @@ impl ProgramSemanticsLowerer for CSharpSemanticLowerer {
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
-        let (specs, initial_work) =
+        let (procedure_inventory, initial_work) =
             match enumerate_procedures(file, prepared, budget, cancellation)? {
                 ProcedureEnumeration::Complete {
                     value,
@@ -70,13 +70,25 @@ impl ProgramSemanticsLowerer for CSharpSemanticLowerer {
                 }
             };
 
+        let ProcedureInventory {
+            specs,
+            static_callable_returns,
+            type_receiver_shadows,
+        } = procedure_inventory;
         lower_procedure_batch(
             &specs,
             initial_work,
             budget,
             cancellation,
             |spec, staged_budget, cancellation| {
-                lower_procedure(prepared, spec, staged_budget, cancellation)
+                lower_procedure(
+                    prepared,
+                    spec,
+                    &static_callable_returns,
+                    &type_receiver_shadows,
+                    staged_budget,
+                    cancellation,
+                )
             },
         )
     }
@@ -133,7 +145,30 @@ struct ProcedureSpec<'tree> {
     callable: Node<'tree>,
 }
 
-type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<Vec<ProcedureSpec<'tree>>>;
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StaticCallableKey {
+    namespace: Box<[Box<str>]>,
+    owner: Box<str>,
+    name: Box<str>,
+}
+
+type StaticCallableReturnTypes = HashMap<StaticCallableKey, Option<Box<str>>>;
+
+#[derive(Debug, Default)]
+struct TypeReceiverShadows {
+    resolution_open: bool,
+    names: HashSet<Box<str>>,
+}
+
+type TypeReceiverShadowIndex = HashMap<usize, TypeReceiverShadows>;
+
+struct ProcedureInventory<'tree> {
+    specs: Vec<ProcedureSpec<'tree>>,
+    static_callable_returns: StaticCallableReturnTypes,
+    type_receiver_shadows: TypeReceiverShadowIndex,
+}
+
+type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<ProcedureInventory<'tree>>;
 
 struct ProcedureEnumerationFrame<'tree> {
     node: Node<'tree>,
@@ -151,6 +186,8 @@ fn enumerate_procedures<'tree>(
     let mut inventory =
         ProcedureInventoryBuilder::new(file, prepared.dialect(), root, "csharp-source", budget)?;
     let mut specs = Vec::new();
+    let mut static_callable_returns = StaticCallableReturnTypes::default();
+    let mut type_receiver_shadows = TypeReceiverShadowIndex::default();
     let root_path = file_scoped_namespace_path(prepared.source(), root, &mut inventory)?;
     let mut stack = vec![ProcedureEnumerationFrame {
         node: root,
@@ -176,7 +213,22 @@ fn enumerate_procedures<'tree>(
                 name.as_deref(),
                 anchor,
             )?;
+            if segment_kind == DeclarationSegmentKind::Type {
+                type_receiver_shadows.insert(
+                    frame.node.start_byte(),
+                    TypeReceiverShadows {
+                        resolution_open: has_modifier(prepared.source(), frame.node, "partial"),
+                        names: HashSet::default(),
+                    },
+                );
+            }
         }
+        record_type_receiver_shadow(&mut type_receiver_shadows, frame.node, prepared.source());
+        record_static_callable_return_type(
+            &mut static_callable_returns,
+            frame.node,
+            prepared.source(),
+        );
 
         let mut child_parent = frame.lexical_parent;
         if let Some((kind, segment_kind, body, properties)) =
@@ -194,7 +246,7 @@ fn enumerate_procedures<'tree>(
                 Ok(identity) => identity,
                 Err(stop) => return Ok(stop.into_outcome()),
             };
-            specs.push(ProcedureSpec {
+            let spec = ProcedureSpec {
                 id: identity.id,
                 body,
                 locator: identity.locator,
@@ -202,7 +254,8 @@ fn enumerate_procedures<'tree>(
                 kind,
                 properties,
                 callable: frame.node,
-            });
+            };
+            specs.push(spec);
             child_parent = Some(identity.id);
             child_path = identity.declaration_path;
         }
@@ -218,7 +271,11 @@ fn enumerate_procedures<'tree>(
         }
     }
 
-    Ok(inventory.complete(specs))
+    Ok(inventory.complete(ProcedureInventory {
+        specs,
+        static_callable_returns,
+        type_receiver_shadows,
+    }))
 }
 
 fn file_scoped_namespace_path(
@@ -305,6 +362,62 @@ fn callable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
         .and_then(|name| nonempty_node_text(source, name))
         .map(Box::<str>::from)
         .or_else(|| enclosing_variable_name(source, node))
+}
+
+fn record_static_callable_return_type(
+    returns: &mut StaticCallableReturnTypes,
+    callable: Node<'_>,
+    source: &str,
+) {
+    if callable.kind() != "method_declaration" || !has_modifier(source, callable, "static") {
+        return;
+    }
+    let Some(owner_node) = enclosing_type_node(callable) else {
+        return;
+    };
+    if enclosing_type_node(owner_node).is_some() {
+        return;
+    }
+    let Some(owner) = declaration_container_name(source, owner_node) else {
+        return;
+    };
+    let Some(name) = callable_name(source, callable) else {
+        return;
+    };
+    let return_type = callable
+        .child_by_field_name("returns")
+        .or_else(|| callable.child_by_field_name("type"))
+        .and_then(|return_type| intrinsic_type_identity(return_type, source));
+    let key = StaticCallableKey {
+        namespace: enclosing_namespace_path(source, callable),
+        owner,
+        name,
+    };
+    match returns.entry(key) {
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            entry.insert(None);
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(return_type);
+        }
+    }
+}
+
+fn enclosing_namespace_path(source: &str, node: Node<'_>) -> Box<[Box<str>]> {
+    let mut path = Vec::new();
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "namespace_declaration" | "file_scoped_namespace_declaration"
+        ) && let Some(name) = declaration_container_name(source, parent)
+        {
+            path.push(name);
+        }
+        current = parent.parent();
+    }
+    path.reverse();
+    path.into_boxed_slice()
 }
 
 fn enclosing_accessor_owner(node: Node<'_>) -> Option<Node<'_>> {
@@ -593,9 +706,13 @@ impl<'tree> CleanupBody<'tree> {
 
 struct LoweringContext<'tree, 'targets> {
     prepared: &'tree PreparedSyntaxTree,
+    static_callable_returns: &'targets StaticCallableReturnTypes,
+    type_receiver_shadows: &'targets TypeReceiverShadowIndex,
+    callable_type_parameters: HashSet<Box<str>>,
     session: ProcedureLoweringSession<'targets>,
     expression_values: HashMap<usize, ValueId>,
     parameters: HashMap<Box<str>, ValueId>,
+    parameter_types: HashMap<Box<str>, Box<str>>,
     locals: HashMap<Box<str>, Vec<LocalBinding>>,
     receiver: Option<ValueId>,
     cleanups: Vec<CleanupRegion<'tree>>,
@@ -607,13 +724,16 @@ struct LocalBinding {
     scope_start: usize,
     scope_end: usize,
     value: ValueId,
+    type_identity: Option<Box<str>>,
 }
 
-fn lower_procedure<'tree>(
+fn lower_procedure<'tree, 'targets>(
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
-    budget: &SemanticBudget,
-    cancellation: &CancellationToken,
+    static_callable_returns: &'targets StaticCallableReturnTypes,
+    type_receiver_shadows: &'targets TypeReceiverShadowIndex,
+    budget: &'targets SemanticBudget,
+    cancellation: &'targets CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), CSharpLoweringError> {
     let mut parts = ProcedureSemanticsParts::new(
         spec.id,
@@ -634,9 +754,13 @@ fn lower_procedure<'tree>(
     } = ProcedureLoweringSession::start(parts, budget, cancellation)?;
     let mut context = LoweringContext {
         prepared,
+        static_callable_returns,
+        type_receiver_shadows,
+        callable_type_parameters: callable_type_parameter_names(spec.callable, prepared.source()),
         session,
         expression_values: HashMap::default(),
         parameters: HashMap::default(),
+        parameter_types: HashMap::default(),
         locals: HashMap::default(),
         receiver: None,
         cleanups: Vec::new(),
@@ -884,7 +1008,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 })?;
                 value
             };
+            let type_identity = (!slot.receiver)
+                .then(|| node.child_by_field_name("type"))
+                .flatten()
+                .and_then(|type_node| intrinsic_type_identity(type_node, self.prepared.source()));
             for name in slot.names {
+                if let Some(type_identity) = &type_identity {
+                    self.parameter_types
+                        .insert(name.clone().into_boxed_str(), type_identity.clone());
+                }
                 self.parameters.insert(name.into_boxed_str(), value);
             }
         }
@@ -940,6 +1072,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     metadata,
                     SemanticValueKind::Local,
                 )?;
+                let type_identity = node
+                    .parent()
+                    .and_then(|declaration| declaration.child_by_field_name("type"))
+                    .filter(|type_node| type_node.kind() != "implicit_type")
+                    .and_then(|type_node| {
+                        intrinsic_type_identity(type_node, self.prepared.source())
+                    });
                 self.locals
                     .entry(text.into())
                     .or_default()
@@ -949,6 +1088,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         scope_start,
                         scope_end,
                         value,
+                        type_identity,
                     });
             }
             Ok(WalkControl::Continue)
@@ -956,6 +1096,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     fn local_at(&self, name: &str, byte: usize) -> Option<ValueId> {
+        self.local_binding_at(name, byte)
+            .map(|binding| binding.value)
+    }
+
+    fn binding_type_at(&self, name: &str, byte: usize) -> Option<&str> {
+        self.local_binding_at(name, byte)
+            .and_then(|binding| binding.type_identity.as_deref())
+            .or_else(|| self.parameter_types.get(name).map(Box::as_ref))
+    }
+
+    fn local_binding_at(&self, name: &str, byte: usize) -> Option<&LocalBinding> {
         self.locals
             .get(name)?
             .iter()
@@ -965,7 +1116,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     && byte < binding.scope_end
             })
             .min_by_key(|binding| binding.scope_end - binding.scope_start)
-            .map(|binding| binding.value)
     }
 
     fn local_declaration_value(&self, name: &str, declaration_start: usize) -> Option<ValueId> {
@@ -1120,11 +1270,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let value =
                 self.expression_value(builder, *initializer, expression_value_kind(*initializer))?;
             let identity_conversion = declared_type.is_some_and(|declared_type| {
-                local_initializer_has_identity_conversion(
-                    declared_type,
-                    *initializer,
-                    self.prepared.source(),
-                )
+                self.local_initializer_has_identity_conversion(declared_type, *initializer)
             });
             if identity_conversion {
                 self.append_effect(
@@ -1165,6 +1311,61 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             });
         }
         Ok(())
+    }
+
+    fn local_initializer_has_identity_conversion(
+        &self,
+        declared_type: Node<'tree>,
+        initializer: Node<'tree>,
+    ) -> bool {
+        if declared_type.kind() == "implicit_type"
+            || initializer.kind() == "implicit_object_creation_expression"
+        {
+            return true;
+        }
+        let source = self.prepared.source();
+        let Some(declared_identity) = intrinsic_type_identity(declared_type, source) else {
+            return initializer.kind() == "object_creation_expression"
+                && initializer
+                    .child_by_field_name("type")
+                    .is_some_and(|created_type| {
+                        super::csharp_type_node_identity(created_type, source)
+                            == super::csharp_type_node_identity(declared_type, source)
+                    });
+        };
+        match initializer.kind() {
+            "identifier" => node_text(source, initializer)
+                .and_then(|name| self.binding_type_at(name, initializer.start_byte()))
+                .is_some_and(|source_identity| source_identity == declared_identity.as_ref()),
+            "invocation_expression" => self
+                .static_invocation_return_type(initializer)
+                .is_some_and(|return_type| return_type == declared_identity.as_ref()),
+            "object_creation_expression" => {
+                initializer
+                    .child_by_field_name("type")
+                    .is_some_and(|created_type| {
+                        intrinsic_type_identity(created_type, source)
+                            .is_some_and(|created_identity| created_identity == declared_identity)
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    fn static_invocation_return_type(&self, invocation: Node<'tree>) -> Option<&str> {
+        let key = static_invocation_key(invocation, self.prepared.source())?;
+        if self.local_at(&key.owner, invocation.start_byte()).is_some()
+            || self.parameters.contains_key(&key.owner)
+            || self.callable_type_parameters.contains(&key.owner)
+            || receiver_name_is_lexically_shadowed(
+                invocation,
+                &key.owner,
+                self.type_receiver_shadows,
+            )
+        {
+            return None;
+        }
+        self.static_callable_returns.get(&key)?.as_deref()
     }
 
     fn assignment_expression(
@@ -1812,6 +2013,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.emit_lexical_input_flow(builder, node, entry, result)?;
         }
         match node.kind() {
+            "object_creation_expression"
+                if is_intrinsic_object_construction(node, self.prepared.source()) =>
+            {
+                self.intrinsic_object_construction(builder, node, entry, next, scope, stack)
+            }
             "invocation_expression"
             | "object_creation_expression"
             | "implicit_object_creation_expression"
@@ -2898,6 +3104,41 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn intrinsic_object_construction(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), CSharpLoweringError> {
+        let normal = self.point(builder, node, Vec::new())?;
+        let exceptional = self.point(builder, node, Vec::new())?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        self.session
+            .add_allocation(builder, normal, result, AllocationKind::Object)?;
+        self.edge(builder, entry, EdgeTarget::normal(normal))?;
+        self.edge(
+            builder,
+            entry,
+            EdgeTarget {
+                point: exceptional,
+                kind: ControlEdgeKind::Exceptional,
+            },
+        )?;
+        self.edge(builder, normal, next)?;
+        self.abrupt(
+            builder,
+            exceptional,
+            scope,
+            CompletionKind::Throw,
+            None,
+            stack,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn call_expression(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -3786,24 +4027,159 @@ fn variable_declarator_initializer(declarator: Node<'_>) -> Option<Node<'_>> {
         })
 }
 
-fn local_initializer_has_identity_conversion(
-    declared_type: Node<'_>,
-    initializer: Node<'_>,
-    source: &str,
+fn static_invocation_key(invocation: Node<'_>, source: &str) -> Option<StaticCallableKey> {
+    let function = invocation.child_by_field_name("function")?;
+    if function.kind() != "member_access_expression" {
+        return None;
+    }
+    let receiver = csharp_call_receiver(function)?;
+    if receiver.kind() != "identifier" {
+        return None;
+    }
+    let name = function.child_by_field_name("name")?;
+    let member = super::csharp_member_name(name)?;
+    if member.explicit_generic_arity.is_some() {
+        return None;
+    }
+    Some(StaticCallableKey {
+        namespace: enclosing_namespace_path(source, invocation),
+        owner: Box::from(nonempty_node_text(source, receiver)?),
+        name: Box::from(nonempty_node_text(source, member.identifier)?),
+    })
+}
+
+fn receiver_name_is_lexically_shadowed(
+    node: Node<'_>,
+    name: &str,
+    type_shadows: &TypeReceiverShadowIndex,
 ) -> bool {
-    if declared_type.kind() == "implicit_type"
-        || initializer.kind() == "implicit_object_creation_expression"
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "struct_declaration"
+                | "record_declaration"
+                | "record_struct_declaration"
+        ) {
+            let shadows = type_shadows
+                .get(&parent.start_byte())
+                .expect("every enclosing C# type must have receiver-shadow evidence");
+            if shadows.resolution_open || shadows.names.contains(name) {
+                return true;
+            }
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+fn callable_type_parameter_names(node: Node<'_>, source: &str) -> HashSet<Box<str>> {
+    let mut names = HashSet::default();
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if is_callable_kind(candidate.kind())
+            && let Some(parameters) = candidate.child_by_field_name("type_parameters")
+        {
+            for parameter in named_children(parameters) {
+                if parameter.kind() == "type_parameter"
+                    && let Some(name) = parameter
+                        .child_by_field_name("name")
+                        .and_then(|name| nonempty_node_text(source, name))
+                {
+                    names.insert(Box::from(name));
+                }
+            }
+        }
+        current = candidate.parent();
+    }
+    names
+}
+
+fn record_type_receiver_shadow(
+    shadows: &mut TypeReceiverShadowIndex,
+    node: Node<'_>,
+    source: &str,
+) {
+    let shadow_name = match node.kind() {
+        "variable_declarator"
+            if node
+                .parent()
+                .and_then(|declaration| declaration.parent())
+                .is_some_and(|owner| {
+                    matches!(
+                        owner.kind(),
+                        "field_declaration" | "event_field_declaration"
+                    )
+                }) =>
+        {
+            node.child_by_field_name("name")
+        }
+        "property_declaration"
+        | "event_declaration"
+        | "class_declaration"
+        | "interface_declaration"
+        | "struct_declaration"
+        | "record_declaration"
+        | "record_struct_declaration" => node.child_by_field_name("name"),
+        "type_parameter"
+            if node
+                .parent()
+                .and_then(|parameters| parameters.parent())
+                .is_some_and(|owner| declaration_container_kind(owner).is_some()) =>
+        {
+            node.child_by_field_name("name")
+        }
+        _ => None,
+    };
+    let enclosing_type = enclosing_type_node(node);
+    if node.kind() == "base_list"
+        && let Some(owner) = enclosing_type
+        && let Some(evidence) = shadows.get_mut(&owner.start_byte())
     {
-        return true;
+        evidence.resolution_open = true;
     }
-    if initializer.kind() != "object_creation_expression" {
-        return false;
+    if let Some(name) = shadow_name.and_then(|name| nonempty_node_text(source, name))
+        && let Some(owner) = enclosing_type
+        && let Some(evidence) = shadows.get_mut(&owner.start_byte())
+    {
+        evidence.names.insert(Box::from(name));
     }
-    initializer
-        .child_by_field_name("type")
-        .is_some_and(|created_type| {
-            super::csharp_type_node_identity(declared_type, source)
-                == super::csharp_type_node_identity(created_type, source)
+}
+
+fn enclosing_type_node(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "struct_declaration"
+                | "record_declaration"
+                | "record_struct_declaration"
+        ) {
+            return Some(parent);
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn intrinsic_type_identity(node: Node<'_>, source: &str) -> Option<Box<str>> {
+    (node.kind() == "predefined_type")
+        .then(|| super::csharp_type_node_identity(node, source))
+        .filter(|identity| !identity.is_empty())
+        .map(Box::<str>::from)
+}
+
+fn is_intrinsic_object_construction(node: Node<'_>, source: &str) -> bool {
+    node.kind() == "object_creation_expression"
+        && call_arguments(node).is_empty()
+        && object_initializer(node).is_none()
+        && node.child_by_field_name("type").is_some_and(|type_node| {
+            type_node.kind() == "predefined_type"
+                && super::csharp_type_node_identity(type_node, source) == "object"
         })
 }
 
