@@ -783,6 +783,41 @@ fn diff_snapshot_object_dir_rejects_missing_path() {
 }
 
 #[test]
+fn diff_snapshot_object_dir_rejects_missing_path_for_mcp_launch() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    let missing_objects = root.join("missing-snapshot-objects");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(root)
+        .arg("--diff-snapshot-object-dir")
+        .arg(&missing_objects)
+        .arg("--mcp")
+        .arg("searchtools")
+        // Prevent a missing validation call from hanging on inherited stdin.
+        .stdin(Stdio::null())
+        .output()
+        .expect("run bifrost MCP with missing snapshot objects");
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("Failed to resolve --diff-snapshot-object-dir"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&missing_objects.display().to_string()),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("--diff-snapshot-object-dir must name a directory"),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty(), "stderr:\n{stderr}");
+}
+
+#[test]
 fn diff_snapshot_object_dir_rejects_regular_file() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path();
@@ -806,6 +841,42 @@ fn diff_snapshot_object_dir_rejects_regular_file() {
         .arg("{}")
         .output()
         .expect("run bifrost --tool analyze_diff with snapshot objects file");
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("--diff-snapshot-object-dir must name a directory"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&canonical_objects_file.display().to_string()),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Failed to resolve --diff-snapshot-object-dir"),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty(), "stderr:\n{stderr}");
+}
+
+#[test]
+fn diff_snapshot_object_dir_rejects_regular_file_for_rootless_mcp_launch() {
+    let temp = TempDir::new().expect("tempdir");
+    let objects_file = temp.path().join("snapshot-objects-file");
+    fs::write(&objects_file, "not a directory\n").expect("write snapshot objects file");
+    let canonical_objects_file = objects_file
+        .canonicalize()
+        .expect("canonical snapshot objects file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--diff-snapshot-object-dir")
+        .arg(&objects_file)
+        .arg("--mcp")
+        .arg("searchtools")
+        // Prevent a missing validation call from hanging on inherited stdin.
+        .stdin(Stdio::null())
+        .output()
+        .expect("run rootless bifrost MCP with snapshot objects file");
     let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
 
     assert!(!output.status.success(), "stderr:\n{stderr}");
