@@ -391,7 +391,7 @@ impl fmt::Display for ValueFlowModelError {
 
 impl Error for ValueFlowModelError {}
 
-fn semantic_locator_heap_bytes(locator: &SemanticLocator) -> usize {
+pub(crate) fn semantic_locator_heap_bytes(locator: &SemanticLocator) -> usize {
     let segments = locator.declaration().segments();
     locator
         .path()

@@ -9,6 +9,7 @@ pub use client::{
     ValueFlowFact, ValueFlowProblem, ValueFlowSolveError, ValueFlowUncertainty,
     solve_value_flow_with_summaries, solve_value_flow_with_witnesses,
 };
+pub(crate) use model::semantic_locator_heap_bytes;
 pub use model::{
     ValueFlowCarrier, ValueFlowCarrierId, ValueFlowCarrierKey, ValueFlowEventKey,
     ValueFlowEventKind, ValueFlowModelError, ValueFlowObservationPhase, ValueFlowPortKey,

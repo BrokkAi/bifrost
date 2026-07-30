@@ -182,6 +182,131 @@ fn complete_payload(work: PolicyWorkReport) -> TaintProjectionPayload {
 pub(crate) struct ProductionTaintPolicyEvaluator {
     prepared: RefCell<HashMap<PolicyId, TaintProjectionPayload>>,
     public_findings: RefCell<Vec<crate::analyzer::structural::CodeQueryTaintFinding>>,
+    retained_analyses: RefCell<Vec<Arc<ProductionTaintAnalysisResult>>>,
+}
+
+/// One immutable production-compiled taint plan and the retained report from
+/// its single compatible-batch solve.
+///
+/// Policy projection and standalone CodeQuery projection both consume this
+/// exact plan/report pair. Constructing another plan or invoking propagation is
+/// deliberately outside this type's API.
+#[derive(Debug)]
+pub struct ProductionTaintAnalysisResult {
+    plan: Arc<TaintAnalysisPlan>,
+    report: Arc<TaintFindingReport>,
+    compatibility: TaintBatchCompatibilityKey,
+    projection_scope: Box<str>,
+    projection_limits: crate::analyzer::structural::CodeQueryTaintProjectionLimits,
+    artifact_keys: Box<[crate::analyzer::semantic::SemanticArtifactKey]>,
+    retained_artifact_bytes: usize,
+}
+
+impl ProductionTaintAnalysisResult {
+    fn new(
+        plan: Arc<TaintAnalysisPlan>,
+        report: Arc<TaintFindingReport>,
+        compatibility: TaintBatchCompatibilityKey,
+        projection_limits: crate::analyzer::structural::CodeQueryTaintProjectionLimits,
+    ) -> Self {
+        assert!(
+            report.belongs_to(&plan),
+            "retained taint plan/report mismatch"
+        );
+        let mut artifact_keys = HashSet::new();
+        let mut artifact_allocations =
+            HashSet::<*const crate::analyzer::semantic::SemanticArtifact>::new();
+        let mut retained_artifact_bytes = 0u64;
+        plan.for_each_retained_artifact(|artifact| {
+            artifact_keys.insert(artifact.key().clone());
+            if artifact_allocations.insert(Arc::as_ptr(artifact)) {
+                retained_artifact_bytes = retained_artifact_bytes.saturating_add(
+                    crate::analyzer::semantic::service::semantic_artifact_retained_bytes(artifact),
+                );
+            }
+        });
+        plan.for_each_retained_artifact_key(|key| {
+            artifact_keys.insert(key.clone());
+        });
+        let mut artifact_keys = artifact_keys.into_iter().collect::<Vec<_>>();
+        artifact_keys.sort_unstable();
+        let projection_scope = compatibility
+            .propagation_semantics()
+            .to_owned()
+            .into_boxed_str();
+        Self {
+            plan,
+            report,
+            compatibility,
+            projection_scope,
+            projection_limits,
+            artifact_keys: artifact_keys.into_boxed_slice(),
+            retained_artifact_bytes: usize::try_from(retained_artifact_bytes).unwrap_or(usize::MAX),
+        }
+    }
+
+    pub fn plan(&self) -> &Arc<TaintAnalysisPlan> {
+        &self.plan
+    }
+
+    pub fn report(&self) -> &Arc<TaintFindingReport> {
+        &self.report
+    }
+
+    pub const fn compatibility(&self) -> &TaintBatchCompatibilityKey {
+        &self.compatibility
+    }
+
+    pub const fn projection_scope(&self) -> &str {
+        &self.projection_scope
+    }
+
+    pub const fn projection_limits(
+        &self,
+    ) -> crate::analyzer::structural::CodeQueryTaintProjectionLimits {
+        self.projection_limits
+    }
+
+    pub fn expected_root(&self) -> &ProcedureHandle {
+        self.plan.value_flow().root()
+    }
+
+    pub fn plan_report_match(&self) -> bool {
+        self.report.belongs_to(&self.plan)
+    }
+
+    pub fn retained_plan_bytes(&self) -> usize {
+        self.plan.retained_bytes()
+    }
+
+    pub fn retained_report_bytes(&self) -> usize {
+        self.report.retained_bytes()
+    }
+
+    pub fn artifact_keys(&self) -> &[crate::analyzer::semantic::SemanticArtifactKey] {
+        &self.artifact_keys
+    }
+
+    pub const fn retained_artifact_bytes(&self) -> usize {
+        self.retained_artifact_bytes
+    }
+
+    pub fn project_findings(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        limits: crate::analyzer::structural::CodeQueryTaintProjectionLimits,
+    ) -> Result<
+        Vec<crate::analyzer::structural::CodeQueryTaintFinding>,
+        crate::analyzer::taint::TaintModelError,
+    > {
+        crate::analyzer::structural::project_taint_finding_report(
+            workspace,
+            &self.plan,
+            &self.report,
+            &self.projection_scope,
+            limits,
+        )
+    }
 }
 
 struct TaintExecutionBudget {
@@ -231,6 +356,7 @@ impl ProductionTaintPolicyEvaluator {
         let mut metadata = HashMap::new();
         let mut plans = Vec::new();
         let mut public_findings = Vec::new();
+        let mut retained_analyses = Vec::new();
         let mut execution_budget = TaintExecutionBudget::new(budget);
 
         for policy in &policies {
@@ -277,6 +403,7 @@ impl ProductionTaintPolicyEvaluator {
                         budget,
                         &mut execution_budget,
                         &mut public_findings,
+                        &mut retained_analyses,
                     ) {
                         for internal_id in batch.policy_ids() {
                             if let Some(plan) = metadata.get(internal_id) {
@@ -302,6 +429,7 @@ impl ProductionTaintPolicyEvaluator {
         Self {
             prepared: RefCell::new(payloads),
             public_findings: RefCell::new(public_findings),
+            retained_analyses: RefCell::new(retained_analyses),
         }
     }
 
@@ -309,6 +437,10 @@ impl ProductionTaintPolicyEvaluator {
         &self,
     ) -> Vec<crate::analyzer::structural::CodeQueryTaintFinding> {
         std::mem::take(&mut *self.public_findings.borrow_mut())
+    }
+
+    pub(crate) fn take_retained_analyses(&self) -> Vec<Arc<ProductionTaintAnalysisResult>> {
+        std::mem::take(&mut *self.retained_analyses.borrow_mut())
     }
 }
 
@@ -866,6 +998,7 @@ fn solve_and_project_batch(
     budget: &PolicyBudget,
     execution_budget: &mut TaintExecutionBudget,
     public_findings: &mut Vec<crate::analyzer::structural::CodeQueryTaintFinding>,
+    retained_analyses: &mut Vec<Arc<ProductionTaintAnalysisResult>>,
 ) -> Result<(), String> {
     let limits = budget.query_limits();
     let value_flow_limits = limits.value_flow;
@@ -934,20 +1067,23 @@ fn solve_and_project_batch(
     execution_budget.remaining_witness_bytes = execution_budget
         .remaining_witness_bytes
         .saturating_sub(report.retained_witness_bytes());
+    let projection_limits = crate::analyzer::structural::CodeQueryTaintProjectionLimits::new(
+        budget.max_origins_per_finding(),
+        budget.max_witnesses_per_finding(),
+        budget.max_witness_steps(),
+        budget.max_witness_bytes(),
+    );
+    let retained = Arc::new(ProductionTaintAnalysisResult::new(
+        Arc::new(batch.analysis().clone()),
+        Arc::new(report),
+        batch.compatibility().clone(),
+        projection_limits,
+    ));
+    debug_assert!(retained.plan_report_match());
     public_findings.extend(
-        crate::analyzer::structural::project_taint_finding_report(
-            workspace,
-            batch.analysis(),
-            &report,
-            batch.compatibility().propagation_semantics(),
-            crate::analyzer::structural::CodeQueryTaintProjectionLimits::new(
-                budget.max_origins_per_finding(),
-                budget.max_witnesses_per_finding(),
-                budget.max_witness_steps(),
-                budget.max_witness_bytes(),
-            ),
-        )
-        .map_err(|error| error.to_string())?,
+        retained
+            .project_findings(workspace, projection_limits)
+            .map_err(|error| error.to_string())?,
     );
 
     for projection in batch.projections() {
@@ -969,8 +1105,8 @@ fn solve_and_project_batch(
             policy,
             spec,
             plan,
-            batch.analysis().universe(),
-            &report,
+            retained.plan().universe(),
+            retained.report(),
             budget,
         )?;
         let payload = payloads
@@ -989,12 +1125,13 @@ fn solve_and_project_batch(
             PolicyWorkUnit::Count,
             u64::try_from(batch.projections().len().saturating_sub(1)).unwrap_or(u64::MAX),
         )?;
-        if !report.is_complete() {
+        if !retained.report().is_complete() {
             payload.completion =
                 PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PartialDiscovery])
                     .map_err(|error| error.to_string())?;
         }
     }
+    retained_analyses.push(retained);
     Ok(())
 }
 

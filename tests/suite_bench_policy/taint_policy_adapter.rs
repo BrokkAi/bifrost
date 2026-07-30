@@ -367,6 +367,19 @@ fn production_taint_policies_share_a_batch_and_all_renderers_keep_the_same_evide
     }
 
     assert_eq!(outcome.taint_findings().len(), 2);
+    assert_eq!(outcome.taint_analysis_results().len(), 1);
+    let retained = &outcome.taint_analysis_results()[0];
+    assert!(retained.plan_report_match());
+    assert!(retained.retained_plan_bytes() > std::mem::size_of_val(retained.plan().as_ref()));
+    assert!(retained.retained_report_bytes() > std::mem::size_of_val(retained.report().as_ref()));
+    assert!(!retained.artifact_keys().is_empty());
+    assert!(retained.retained_artifact_bytes() > 0);
+    assert_eq!(
+        retained
+            .project_findings(&workspace, retained.projection_limits())
+            .expect("retained production taint projection"),
+        outcome.taint_findings()
+    );
     assert_eq!(outcome.taint_query_results().len(), 2);
     for result in outcome.taint_query_results() {
         let value = serde_json::to_value(result).expect("public taint query serialization");
