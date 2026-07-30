@@ -5,7 +5,9 @@
 
 mod artifact;
 mod compiler;
+mod identity;
 mod model;
+mod producer;
 mod source;
 mod validate;
 
@@ -15,7 +17,13 @@ pub use artifact::{
     decode_manifest, decode_shard, decode_shard_for_manifest,
 };
 pub use compiler::{CompilerOptions, CompressionPolicy, compile_pack, compile_source};
+pub use identity::{MemberIdentity, TypeIdentity, member_declaration_id, type_declaration_id};
 pub use model::*;
+pub use producer::{
+    ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
+    BoundedProducerDiagnostics, ExactArtifact, ExternalArtifactKind, ExternalArtifactPackProducer,
+    ProducerDiagnostic, ProducerDiagnosticSeverity, read_exact_artifact,
+};
 pub use source::SourceFormat;
 pub use validate::{Diagnostic, DiagnosticSeverity};
 

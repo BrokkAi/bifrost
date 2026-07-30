@@ -81,8 +81,9 @@ pub(crate) use cpp::{
 };
 pub use csharp::CSharpAnalyzer;
 pub use csharp::external::{
-    CSharpExternalDeclarationIndex, CSharpExternalDeclarationSource, CSharpExternalMember,
-    CSharpExternalMemberKind, CSharpExternalType, CSharpExternalTypeKind, CSharpVisibility,
+    CSharpAssemblyPackProducer, CSharpExternalDeclarationIndex, CSharpExternalDeclarationSource,
+    CSharpExternalMember, CSharpExternalMemberKind, CSharpExternalType, CSharpExternalTypeKind,
+    CSharpVisibility,
 };
 pub(crate) use csharp::{
     CSharpMemberName, csharp_attribute_name_node, csharp_attribute_terminal_name,
@@ -115,6 +116,7 @@ pub use i_analyzer::{
 pub use java::JavaAnalyzer;
 pub use javascript::JavascriptAnalyzer;
 pub(crate) use js_ts::{AliasResolver, resolve_js_ts_module_specifier};
+pub use jvm::java_artifact::JavaJarPackProducer;
 pub use kotlin::KotlinAnalyzer;
 pub use model::SemanticDiagnostic;
 pub use model::{

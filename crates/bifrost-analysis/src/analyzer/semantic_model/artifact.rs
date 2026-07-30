@@ -814,7 +814,8 @@ fn collect_declared_type_refs(root: &TypeRef, ids: &mut HashSet<String>) {
                 }
                 stack.extend(arguments);
             }
-            TypeRef::Array { element } => stack.push(element),
+            TypeRef::Array { element } | TypeRef::ByRef { element } => stack.push(element),
+            TypeRef::Wildcard { bound, .. } => stack.extend(bound.as_deref()),
             TypeRef::Tuple { elements } => stack.extend(elements),
             TypeRef::Function { parameters, result } => {
                 stack.push(result);

@@ -87,6 +87,23 @@ test("reusable crate publisher inputs are environment-bound before shell executi
   assert.doesNotMatch(cratePublisher, /(?:bash|echo).*\$\{\{ inputs\./u);
 });
 
+test("crate publisher verifies registry visibility with bounded inline recovery", () => {
+  assert.match(
+    cratePublisher,
+    /EXPECTED_CHECKSUM: \$\{\{ steps\.package\.outputs\.checksum \}\}/u,
+  );
+  assert.match(
+    cratePublisher,
+    /endpoint="https:\/\/crates\.io\/api\/v1\/crates\/\$\{CRATE_PACKAGE\}\/\$\{RELEASE_VERSION\}"/u,
+  );
+  assert.match(cratePublisher, /max_attempts=30/u);
+  assert.match(
+    cratePublisher,
+    /for \(\(attempt = 1; attempt <= max_attempts; attempt\+\+\)\); do/u,
+  );
+  assert.match(cratePublisher, /actual_checksum.*EXPECTED_CHECKSUM/su);
+});
+
 test("promotion evidence covers validation before every external publisher", () => {
   const evidence = jobBlock(release, "promotion-evidence");
   for (const prerequisite of [
@@ -131,18 +148,6 @@ test("promotion evidence covers validation before every external publisher", () 
     /^    needs: \[release-context, publish-crate-mcp, publish-crate-lsp\]$/mu,
   );
   assert.match(cratePublisher, /^      package:/mu);
-  assert.match(cratePublisher, /steps\.package\.outputs\.checksum/u);
-  assert.match(cratePublisher, /Verify exact registry version and checksum/u);
-  assert.match(cratePublisher, /max_attempts=30/u);
-  assert.match(
-    cratePublisher,
-    /for \(\(attempt = 1; attempt <= max_attempts; attempt\+\+\)\)/u,
-  );
-  assert.match(
-    cratePublisher,
-    /if \[\[ "\$checksum" != "\$EXPECTED_CHECKSUM" \]\]/u,
-  );
-  assert.match(cratePublisher, /within the bounded retry window/u);
 });
 
 test("publishers preserve their platform, environment, and OIDC protections", () => {
