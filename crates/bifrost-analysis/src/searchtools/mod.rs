@@ -342,7 +342,7 @@ fn primary_range_with_cpp_classifier(
 fn resolve_file_patterns(analyzer: &dyn IAnalyzer, patterns: &[String]) -> ResolvedFilePatterns {
     let mut matched = BTreeSet::new();
     let mut globs = Vec::new();
-    let resolver = WorkspaceFileResolver::new(analyzer.project());
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
     let go_modules = OnceLock::new();
     let has_go = analyzer.languages().contains(&Language::Go);
     let mut ambiguous_paths = Vec::new();

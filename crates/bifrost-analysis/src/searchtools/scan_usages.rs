@@ -1639,7 +1639,7 @@ pub(super) fn scan_usages_backend(
     let mut work_entries = Vec::new();
     let mut resolved_targets = Vec::new();
 
-    let resolver = WorkspaceFileResolver::new(analyzer.project());
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
     for request in targets {
         if context.cancellation.is_cancelled() {
             work_entries.push(incomplete_work_entry(
@@ -3699,7 +3699,7 @@ pub(super) fn build_scan_usages_path_filter(
             ignored_paths: 0,
         };
     };
-    let resolver = WorkspaceFileResolver::new(analyzer.project());
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
     let mut rules = Vec::new();
     let mut ignored_paths = 0;
     for raw in paths {
@@ -3804,8 +3804,7 @@ pub fn classify_test_files(
     analyzer: &dyn IAnalyzer,
     params: ClassifyTestFilesParams,
 ) -> ClassifyTestFilesResult {
-    let project = analyzer.project();
-    let resolver = WorkspaceFileResolver::new(project);
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
     let mut classifications = BTreeMap::new();
     let mut unresolved = Vec::new();
     for input in params.file_paths.iter() {

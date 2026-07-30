@@ -758,7 +758,14 @@ pub fn check_i1_ex(
             .rsplit(['#', '.', '$'])
             .next()
             .unwrap_or(&symbol.identifier);
-        if !fragment.contains(name_token) {
+        // An unnamed Kotlin companion object displays as `Companion`, but its
+        // declaration text carries only the lowercase keyword
+        // (`public companion object { ... }`) — never the capitalized token.
+        // Accept the keyword form, same acceptance class as the Go `type `
+        // re-insertion and the aux-constructor/module-name conventions.
+        let token_present = fragment.contains(name_token)
+            || (name_token == "Companion" && fragment.contains("companion object"));
+        if !token_present {
             sink.record(i1_violation(
                 language,
                 SHAPE_RANGE_NAME_TOKEN_ABSENT,

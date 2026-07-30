@@ -229,6 +229,68 @@ impl AnalyzerSnapshotCaches {
     }
 }
 
+/// Every workspace file bucketed by basename, captured by one ignore-aware
+/// listing of the project tree.
+///
+/// This is what `WorkspaceFileResolver` needs to answer "which file does the
+/// bare name `Widget.cs` mean?", and building it costs a whole-workspace walk.
+/// The type lives beside the query-scope machinery rather than in
+/// `path_utils` because the *cell* holding it is request-scoped analyzer state
+/// (`IAnalyzer::workspace_file_index_cell`), exactly like
+/// `AnalyzerSnapshotCaches`: `IAnalyzer` is a public extension boundary, so the
+/// container must be nameable from the trait signature even though its
+/// representation stays crate-private.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct WorkspaceFileIndex {
+    root: std::path::PathBuf,
+    by_basename: crate::hash::HashMap<String, Vec<ProjectFile>>,
+}
+
+/// The request-scoped, single-flight cell that holds one [`WorkspaceFileIndex`].
+///
+/// `Arc<OnceLock<..>>` for the same reason `top_level_class_units_by_package`
+/// uses it (#1194): resolvers are built concurrently inside `rayon` closures,
+/// and a check-then-build-then-store `Option` would let every thread that
+/// missed the check redo the same whole-workspace walk.
+#[doc(hidden)]
+pub type WorkspaceFileIndexCell = Arc<OnceLock<Arc<WorkspaceFileIndex>>>;
+
+impl WorkspaceFileIndex {
+    /// One ignore-aware listing of `project`, bucketed by basename.
+    pub(crate) fn build(project: &dyn Project) -> Self {
+        let mut by_basename: crate::hash::HashMap<String, Vec<ProjectFile>> = Default::default();
+        if let Ok(files) = project.all_files() {
+            for file in files {
+                let Some(name) = file.rel_path().file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                by_basename.entry(name.to_string()).or_default().push(file);
+            }
+            for matches in by_basename.values_mut() {
+                matches.sort();
+            }
+        }
+        Self {
+            root: project.root().to_path_buf(),
+            by_basename,
+        }
+    }
+
+    /// Whether this index describes the workspace rooted at `root`. A shared
+    /// cell is scoped to one request, and a request can legitimately touch more
+    /// than one analyzer (reference differentials hold a before/after pair), so
+    /// consumers must confirm the cached listing is about *their* workspace
+    /// before trusting it.
+    pub(crate) fn covers(&self, root: &std::path::Path) -> bool {
+        self.root == root
+    }
+
+    pub(crate) fn matches(&self, basename: &str) -> Option<&[ProjectFile]> {
+        self.by_basename.get(basename).map(Vec::as_slice)
+    }
+}
+
 impl AnalyzerQueryContext {
     pub fn record_store_error(&self, error: StoreError) {
         let mut slot = self
@@ -255,6 +317,22 @@ pub trait IAnalyzer: Send + Sync + Any {
 
     /// Ends a top-level query boundary and releases request-scoped memoized state.
     fn end_query(&self, _context: &Arc<AnalyzerQueryContext>) {}
+
+    /// The cell in which the active request memoizes its workspace file
+    /// listing, or `None` when no query scope is open.
+    ///
+    /// Resolving a bare or dotted name to a workspace file needs every file's
+    /// basename, which costs a full ignore-aware tree walk. That walk was paid
+    /// once per `WorkspaceFileResolver`, and resolvers are constructed per call
+    /// site and per symbol — so one `get_symbol_sources` request over N dotted
+    /// C# names walked the repository O(N) times (#1334). The listing is stable
+    /// for the duration of one request by the same argument the rest of the
+    /// read cache rests on, so it is memoized against the request scope rather
+    /// than a process-global cache with bespoke invalidation.
+    #[doc(hidden)]
+    fn workspace_file_index_cell(&self) -> Option<WorkspaceFileIndexCell> {
+        None
+    }
 
     fn top_level_declarations(&self, _file: &ProjectFile) -> Vec<CodeUnit> {
         Vec::new()

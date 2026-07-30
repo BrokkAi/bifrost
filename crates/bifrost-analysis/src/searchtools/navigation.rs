@@ -701,7 +701,7 @@ fn get_navigation_by_location_with_cancellation(
         }];
     }
 
-    let resolver = WorkspaceFileResolver::new(analyzer.project());
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
     let mut pending = Vec::new();
     let mut results: Vec<Option<DefinitionLookupResult>> = vec![None; params.references.len()];
 
@@ -811,7 +811,7 @@ pub fn get_type_by_location(analyzer: &dyn IAnalyzer, params: GetTypeParams) -> 
         };
     }
 
-    let resolver = WorkspaceFileResolver::new(analyzer.project());
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
     let mut pending = Vec::new();
     let mut results: Vec<Option<TypeLookupResult>> = vec![None; params.references.len()];
 
@@ -887,7 +887,7 @@ pub fn get_type_by_location(analyzer: &dyn IAnalyzer, params: GetTypeParams) -> 
 pub fn rename_symbol(analyzer: &dyn IAnalyzer, params: RenameSymbolParams) -> RenameSymbolResult {
     let _scope = profiling::scope("searchtools::rename_symbol");
 
-    let resolver = WorkspaceFileResolver::new(analyzer.project());
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
     let file = match resolver.resolve_literal(params.path.trim()) {
         ResolvedFileInput::File(file) => file,
         ResolvedFileInput::Ambiguous(item) => {

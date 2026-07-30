@@ -893,6 +893,13 @@ struct QueryReadCache {
     /// `top_level_class_units_by_package_cell`) and calling `get_or_init` on that handle keeps the
     /// expensive hydration off the coarse lock while still guaranteeing only one thread runs it.
     top_level_class_units_by_package: TopLevelClassUnitsByPackageCell,
+    /// The workspace file listing bucketed by basename, walked at most once per
+    /// request (#1334). Same `Arc<OnceLock<..>>` single-flight shape and the
+    /// same reason as the bucket map above: `WorkspaceFileResolver`s are
+    /// constructed per call site and inside per-symbol `rayon` closures, so a
+    /// non-single-flight cache would let concurrent misses each redo the
+    /// ignore-aware tree walk this exists to eliminate.
+    workspace_file_index: crate::analyzer::WorkspaceFileIndexCell,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -916,6 +923,7 @@ impl QueryReadCache {
             self.file_states.clear();
             self.prepared_syntax.clear();
             self.top_level_class_units_by_package = Arc::new(OnceLock::new());
+            self.workspace_file_index = Arc::new(OnceLock::new());
         }
         if !self
             .contexts
@@ -935,6 +943,7 @@ impl QueryReadCache {
             self.file_states.clear();
             self.prepared_syntax.clear();
             self.top_level_class_units_by_package = Arc::new(OnceLock::new());
+            self.workspace_file_index = Arc::new(OnceLock::new());
         }
     }
 
@@ -988,6 +997,14 @@ impl QueryReadCache {
     fn top_level_class_units_by_package_cell(&self) -> Option<TopLevelClassUnitsByPackageCell> {
         self.is_active()
             .then(|| Arc::clone(&self.top_level_class_units_by_package))
+    }
+
+    /// The single-flight cell backing `IAnalyzer::workspace_file_index_cell`.
+    /// Cloned out from under the coarse mutex so the tree walk never runs while
+    /// it is held.
+    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
+        self.is_active()
+            .then(|| Arc::clone(&self.workspace_file_index))
     }
 
     fn prepared_syntax_cell(
@@ -6826,6 +6843,10 @@ where
             .lock()
             .expect("query read cache mutex poisoned");
         cache.end(context);
+    }
+
+    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
+        self.query_read_cache_lock().workspace_file_index_cell()
     }
 
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {

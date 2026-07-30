@@ -1941,7 +1941,7 @@ pub fn check_i2(
         // distinct declarations and legitimately diverge at the location
         // stage too, so the comparison is per partition.
         if tool == "get_definitions_by_reference" {
-            let mut statuses_by_partition: [Vec<&str>; 2] = [Vec::new(), Vec::new()];
+            let mut entries_by_partition: [Vec<(usize, &str)>; 2] = [Vec::new(), Vec::new()];
             for (record, outcome) in group.iter().zip(outcomes.iter()) {
                 let SpellingOutcome::Resolved { status, .. } = outcome else {
                     continue;
@@ -1954,12 +1954,28 @@ pub fn check_i2(
                 if status == "invalid_location" {
                     continue;
                 }
-                let ProbeKind::Spelling { spelling, .. } = &record.kind else {
+                let ProbeKind::Spelling { spelling, order } = &record.kind else {
                     continue;
                 };
-                statuses_by_partition[names_companion(spelling) as usize].push(status.as_str());
+                entries_by_partition[names_companion(spelling) as usize]
+                    .push((*order, status.as_str()));
             }
-            let drift = statuses_by_partition.iter_mut().any(|statuses| {
+            let drift = entries_by_partition.iter_mut().any(|entries| {
+                // no_definition on a less qualified spelling is the same
+                // divergence one stage later: the selector was too weak to
+                // name the reference's target and a more qualified spelling
+                // resolves it (perspective's ctor `t_gnode`). Exempt only in
+                // that direction — a qualified spelling reporting
+                // no_definition where a weaker one resolved remains drift.
+                let max_resolved_order = entries
+                    .iter()
+                    .filter(|(_, status)| *status == "resolved")
+                    .map(|(order, _)| *order)
+                    .max();
+                entries.retain(|(order, status)| {
+                    *status != "no_definition" || max_resolved_order.is_none_or(|max| *order >= max)
+                });
+                let mut statuses: Vec<&str> = entries.iter().map(|(_, status)| *status).collect();
                 statuses.sort_unstable();
                 statuses.dedup();
                 statuses.len() > 1

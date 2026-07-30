@@ -21,12 +21,17 @@
 //! type reachable only through an unconfigured classpath stays explicitly
 //! unknown.
 //!
+//! Definition, declaration, type, hover, and signature navigation are live
+//! (#1238); the resolver itself lives in
+//! `crate::analyzer::usages::get_definition::kotlin` because it is a consumer
+//! of this module's index rather than part of it.
+//!
 //! Capabilities owned by sibling issues stay explicitly unsupported here:
-//! definition navigation (#1238), usage graphs (#1239 — Kotlin is a member of
-//! the shared JVM usage-candidate realm but has no edge builder yet),
-//! structural RQL (#1240), and CFG/semantic lowering (#1241 — the analyzer
-//! delegate hands out the shared `UnsupportedProgramSemantics` provider
-//! instead of lowering).
+//! usage graphs (#1239 — Kotlin is a member of the shared JVM usage-candidate
+//! realm but has no edge builder yet, so find-references and reference-rewriting
+//! rename abstain), structural RQL (#1240), and CFG/semantic lowering (#1241 —
+//! the analyzer delegate hands out the shared `UnsupportedProgramSemantics`
+//! provider instead of lowering).
 
 mod adapter;
 pub(crate) mod declarations;
@@ -179,6 +184,10 @@ impl IAnalyzer for KotlinAnalyzer {
 
     fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.inner.end_query(context);
+    }
+
+    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
+        self.inner.workspace_file_index_cell()
     }
 
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {

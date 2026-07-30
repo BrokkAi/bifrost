@@ -92,7 +92,7 @@ pub(crate) fn parse_kotlin_file(file: &ProjectFile, source: &str, tree: &Tree) -
     parsed
 }
 
-fn kotlin_package_name(root: Node<'_>, source: &str) -> String {
+pub(crate) fn kotlin_package_name(root: Node<'_>, source: &str) -> String {
     first_named_child(root, "package_header")
         .and_then(|header| first_named_child(header, "identifier"))
         .map(|identifier| {

@@ -15,6 +15,7 @@ mod csharp;
 mod go;
 pub(crate) mod java;
 mod js_ts;
+mod kotlin;
 mod php;
 mod python;
 mod ruby;
@@ -164,6 +165,7 @@ fn resolve_one<'a>(
             | Language::Go
             | Language::Java
             | Language::JavaScript
+            | Language::Kotlin
             | Language::Rust
             | Language::Scala
             | Language::TypeScript
@@ -191,6 +193,17 @@ fn resolve_one<'a>(
         Language::Java => {
             context.support.set_language(language);
             java::resolve_java_type(
+                analyzer,
+                &context.support,
+                &file,
+                &source,
+                tree.as_ref(),
+                &site,
+            )
+        }
+        Language::Kotlin => {
+            context.support.set_language(language);
+            kotlin::resolve_kotlin_type(
                 analyzer,
                 &context.support,
                 &file,

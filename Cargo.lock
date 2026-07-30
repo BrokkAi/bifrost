@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost"
-version = "0.8.12"
+version = "0.8.13"
 dependencies = [
  "bincode",
  "brokk-bifrost-analysis",
@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-analysis"
-version = "0.8.12"
+version = "0.8.13"
 dependencies = [
  "bincode",
  "cap-fs-ext",
@@ -383,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-lsp"
-version = "0.8.12"
+version = "0.8.13"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-runtime",
@@ -401,7 +401,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-mcp"
-version = "0.8.12"
+version = "0.8.13"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-runtime",
@@ -423,7 +423,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-runtime"
-version = "0.8.12"
+version = "0.8.13"
 dependencies = [
  "brokk-bifrost-analysis",
  "serde_json",

@@ -1,8 +1,9 @@
-use crate::analyzer::{Project, ProjectFile};
-use crate::hash::HashMap;
+use crate::analyzer::{
+    IAnalyzer, Project, ProjectFile, WorkspaceFileIndex, WorkspaceFileIndexCell,
+};
 use serde::Serialize;
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AmbiguousPathInput {
@@ -18,14 +19,38 @@ pub enum ResolvedFileInput {
 
 pub struct WorkspaceFileResolver<'a> {
     project: &'a dyn Project,
-    basename_index: OnceLock<HashMap<String, Vec<ProjectFile>>>,
+    /// The active request's shared listing cell, when the caller had an
+    /// analyzer and a query scope was open. Resolvers are built per call site
+    /// and per symbol, so without this each one paid its own whole-workspace
+    /// walk (#1334).
+    shared_index: Option<WorkspaceFileIndexCell>,
+    /// This resolver's own listing: used when no request scope is available,
+    /// and as the fallback if the shared cell turns out to describe a different
+    /// workspace than this resolver's project.
+    private_index: OnceLock<Arc<WorkspaceFileIndex>>,
 }
 
 impl<'a> WorkspaceFileResolver<'a> {
+    /// A resolver whose listing lives and dies with the resolver. For callers
+    /// that have no analyzer at hand; every request-scoped caller should prefer
+    /// [`WorkspaceFileResolver::for_analyzer`].
     pub fn new(project: &'a dyn Project) -> Self {
         Self {
             project,
-            basename_index: OnceLock::new(),
+            shared_index: None,
+            private_index: OnceLock::new(),
+        }
+    }
+
+    /// A resolver that shares the active request's workspace listing, so one
+    /// request walks the tree at most once however many resolvers it builds.
+    /// With no query scope open this behaves exactly like
+    /// [`WorkspaceFileResolver::new`].
+    pub fn for_analyzer(analyzer: &'a dyn IAnalyzer) -> Self {
+        Self {
+            project: analyzer.project(),
+            shared_index: analyzer.workspace_file_index_cell(),
+            private_index: OnceLock::new(),
         }
     }
 
@@ -67,23 +92,21 @@ impl<'a> WorkspaceFileResolver<'a> {
     }
 
     fn basename_matches(&self, basename: &str) -> Option<&[ProjectFile]> {
-        let index = self.basename_index.get_or_init(|| {
-            let mut index: HashMap<String, Vec<ProjectFile>> = HashMap::default();
-            if let Ok(files) = self.project.all_files() {
-                for file in files {
-                    let Some(name) = file.rel_path().file_name().and_then(|name| name.to_str())
-                    else {
-                        continue;
-                    };
-                    index.entry(name.to_string()).or_default().push(file);
-                }
-                for matches in index.values_mut() {
-                    matches.sort();
-                }
+        self.index().matches(basename)
+    }
+
+    fn index(&self) -> &WorkspaceFileIndex {
+        // `get_or_init` runs on this resolver's own `Arc` handle, which is how
+        // the request-shared cell guarantees the walk happens once even when
+        // many `rayon` workers miss it at the same instant.
+        if let Some(shared) = &self.shared_index {
+            let index = shared.get_or_init(|| Arc::new(WorkspaceFileIndex::build(self.project)));
+            if index.covers(self.project.root()) {
+                return index;
             }
-            index
-        });
-        index.get(basename).map(Vec::as_slice)
+        }
+        self.private_index
+            .get_or_init(|| Arc::new(WorkspaceFileIndex::build(self.project)))
     }
 }
 

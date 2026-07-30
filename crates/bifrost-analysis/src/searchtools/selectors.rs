@@ -750,7 +750,7 @@ pub(super) fn split_workspace_definition_selector<'a>(
     input: &'a str,
 ) -> DefinitionSelector<'a> {
     split_definition_selector_with_workspace_files(
-        &WorkspaceFileResolver::new(analyzer.project()),
+        &WorkspaceFileResolver::for_analyzer(analyzer),
         input,
     )
 }
@@ -847,7 +847,7 @@ pub(super) fn split_path_qualified_definition_selector<'a>(
     analyzer: &dyn IAnalyzer,
     input: &'a str,
 ) -> Option<PathQualifiedSelector<'a>> {
-    let resolver = WorkspaceFileResolver::new(analyzer.project());
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
     for separator in ["::", ":"] {
         let Some((path, name)) = input.split_once(separator) else {
             continue;
@@ -1352,7 +1352,7 @@ pub(super) fn invalid_file_anchored_selector_guidance(
     if path.is_empty() || selector.is_empty() {
         return None;
     }
-    let file = match WorkspaceFileResolver::new(analyzer.project()).resolve_literal(path) {
+    let file = match WorkspaceFileResolver::for_analyzer(analyzer).resolve_literal(path) {
         ResolvedFileInput::File(file) => file,
         ResolvedFileInput::Ambiguous(_) | ResolvedFileInput::NotFound(_) => return None,
     };
@@ -1427,7 +1427,7 @@ pub(super) fn dotted_file_symbol_selector<'a>(
     analyzer: &dyn IAnalyzer,
     input: &'a str,
 ) -> Option<PathQualifiedSelector<'a>> {
-    let resolver = WorkspaceFileResolver::new(analyzer.project());
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
     for (separator, _) in input.rmatch_indices('.') {
         let path_candidate = &input[..separator];
         let symbol = &input[separator + 1..];
