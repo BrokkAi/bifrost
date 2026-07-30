@@ -269,22 +269,25 @@ pub(crate) fn lexical_package_at(file_package: &str, source: &str, byte: usize) 
         return file_package.to_string();
     };
     let mut modules = Vec::new();
-    let mut current = tree
-        .root_node()
-        .descendant_for_byte_range(byte, byte)
-        .and_then(|node| node.parent());
-    while let Some(parent) = current {
-        if parent.kind() == "mod_item"
-            && let Some(name_node) = parent.child_by_field_name("name")
+    let mut current = tree.root_node();
+    loop {
+        let mut cursor = current.walk();
+        let next = current
+            .named_children(&mut cursor)
+            .find(|child| child.start_byte() <= byte && byte < child.end_byte());
+        let Some(child) = next else {
+            break;
+        };
+        if child.kind() == "mod_item"
+            && let Some(name_node) = child.child_by_field_name("name")
         {
             let name = super::declarations::rust_node_text(name_node, source).trim();
             if !name.is_empty() {
                 modules.push(name.to_string());
             }
         }
-        current = parent.parent();
+        current = child;
     }
-    modules.reverse();
     if file_package.is_empty() {
         modules.join(".")
     } else if modules.is_empty() {

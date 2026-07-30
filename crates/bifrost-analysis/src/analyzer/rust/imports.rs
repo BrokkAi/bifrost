@@ -1,4 +1,6 @@
-use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile};
+use crate::analyzer::{
+    CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, ProjectFile,
+};
 use crate::hash::HashSet;
 use std::sync::Arc;
 use tree_sitter::Node;
@@ -632,6 +634,29 @@ pub(super) fn resolve_rust_module_path_with_crate(
         .filter(|segment| !segment.is_empty())
         .collect();
     resolve_rust_module_segments_with_crate(package, crate_package, &segments)
+}
+
+/// Resolve an import's module specifier against the lexical module containing
+/// the import. In particular, `self` and `super` must start from an inline
+/// module's package rather than the package inferred from the backing file.
+pub(crate) fn resolve_rust_import_package_scoped(
+    rust: &RustAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    scope_start: usize,
+    module_specifier: &str,
+) -> Option<String> {
+    let segments =
+        crate::analyzer::symbol_lookup::parse_symbol_path(Language::Rust, module_specifier);
+    let first = segments.first().map(String::as_str)?;
+    if !matches!(first, "self" | "super") {
+        return rust.resolve_module_package(file, module_specifier);
+    }
+    let file_package = rust_package_name(file);
+    let lexical_package =
+        super::lexical_scope::lexical_package_at(&file_package, source, scope_start);
+    let crate_package = rust_crate_root_package(file);
+    resolve_rust_module_segments_with_crate(&lexical_package, &crate_package, &segments)
 }
 
 pub(crate) fn resolve_rust_module_segments_with_crate<S: AsRef<str>>(

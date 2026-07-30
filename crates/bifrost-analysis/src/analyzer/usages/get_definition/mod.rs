@@ -91,7 +91,6 @@ pub(crate) use rust::{
     rust_expression_type_definition_candidates_cached, rust_expression_type_definition_fqn_cached,
     rust_field_definition_type_candidates_cached, rust_forward_bare_token_reference_fqn,
     rust_is_type_definition, rust_resolve_type_node_fqn,
-    rust_type_node_definition_candidates_cached,
 };
 use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Parser, Tree};

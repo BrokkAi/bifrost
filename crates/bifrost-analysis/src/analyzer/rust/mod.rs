@@ -39,7 +39,8 @@ use declarations::collect_rust_type_identifiers;
 pub(crate) use declarations::rust_package_name;
 pub use field_roles::rust_is_field_declaration_name;
 pub(crate) use imports::{
-    resolve_rust_module_segments_with_crate, rust_crate_root_package, rust_focused_use_path,
+    resolve_rust_import_package_scoped, resolve_rust_module_segments_with_crate,
+    rust_crate_root_package, rust_focused_use_path,
 };
 use tests::detect_rust_test_assertion_smells;
 
