@@ -5,9 +5,9 @@ use crate::analyzer::semantic_model::{
     ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact, HierarchyKind, Locator,
     MemberFact, MemberIdentity, MemberKind, Parameter, Producer, ProducerDiagnostic,
     ProducerDiagnosticSeverity, Signature, TypeFact, TypeIdentity, TypeKind, TypeRef, Visibility,
-    member_declaration_id, read_exact_artifact, type_declaration_id,
+    WildcardVariance, member_declaration_id, read_exact_artifact, type_declaration_id,
 };
-use crate::hash::HashMap;
+use crate::hash::{HashMap, HashSet};
 use jclassfile::attributes::{Attribute, NestedClassFlags};
 use jclassfile::class_file::{ClassFile, ClassFlags};
 use jclassfile::constant_pool::ConstantPool;
@@ -21,6 +21,7 @@ const MAX_ARCHIVE_ENTRIES: usize = 10_000;
 const MAX_SOURCE_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CLASS_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TOTAL_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_CENTRAL_DIRECTORY_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JavaJarPackProducer;
@@ -60,41 +61,65 @@ impl ExternalArtifactPackProducer for JavaJarPackProducer {
             request.artifact_kind,
             ExternalArtifactKind::JavaSourceJar | ExternalArtifactKind::JavaClassJar
         ) {
-            return ArtifactProduction::failed(ProducerDiagnostic {
-                severity: ProducerDiagnosticSeverity::Error,
-                code: "artifact.kind".to_owned(),
-                location: None,
-                message: "Java producer requires a source or class JAR artifact".to_owned(),
-            });
+            return ArtifactProduction::failed(
+                ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Error,
+                    code: "artifact.kind".to_owned(),
+                    location: None,
+                    message: "Java producer requires a source or class JAR artifact".to_owned(),
+                },
+                limits,
+            );
         }
-        let artifact = match read_exact_artifact(&request.path, limits.max_artifact_bytes) {
+        let artifact = match read_exact_artifact(&request.path, limits) {
             Ok(artifact) => artifact,
-            Err(diagnostic) => return ArtifactProduction::failed(diagnostic),
+            Err(diagnostic) => return ArtifactProduction::failed(diagnostic, limits),
         };
         let jar_name = match artifact.path().file_name().and_then(|name| name.to_str()) {
             Some(name) => name.to_owned(),
             None => {
-                return ArtifactProduction::failed(ProducerDiagnostic {
-                    severity: ProducerDiagnosticSeverity::Error,
-                    code: "artifact.path_encoding".to_owned(),
-                    location: None,
-                    message: "artifact filename is not valid UTF-8".to_owned(),
-                });
+                return ArtifactProduction::failed(
+                    ProducerDiagnostic {
+                        severity: ProducerDiagnosticSeverity::Error,
+                        code: "artifact.path_encoding".to_owned(),
+                        location: None,
+                        message: "artifact filename is not valid UTF-8".to_owned(),
+                    },
+                    limits,
+                );
             }
         };
+        if zip_directory_status(artifact.bytes()) == ZipDirectoryStatus::Exceeded {
+            return ArtifactProduction::failed(
+                ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Error,
+                    code: "limit.archive_directory".to_owned(),
+                    location: None,
+                    message: "JAR central directory exceeds bounded entry or byte limits"
+                        .to_owned(),
+                },
+                limits,
+            );
+        }
         let mut archive = match ZipArchive::new(Cursor::new(artifact.bytes())) {
             Ok(archive) => archive,
             Err(_) => {
-                return ArtifactProduction::failed(ProducerDiagnostic {
-                    severity: ProducerDiagnosticSeverity::Error,
-                    code: "java.archive.invalid".to_owned(),
-                    location: None,
-                    message: "artifact is not a readable ZIP/JAR archive".to_owned(),
-                });
+                return ArtifactProduction::failed(
+                    ProducerDiagnostic {
+                        severity: ProducerDiagnosticSeverity::Error,
+                        code: "java.archive.invalid".to_owned(),
+                        location: None,
+                        message: "artifact is not a readable ZIP/JAR archive".to_owned(),
+                    },
+                    limits,
+                );
             }
         };
         let mut diagnostics = BoundedProducerDiagnostics::new(limits);
         let mut declarations = Vec::new();
+        let mut source_entries = Vec::new();
+        let mut remaining_records = limits.max_records;
+        let mut record_limit_hit = false;
         let mut total_bytes = 0u64;
         let entry_limit = archive.len().min(MAX_ARCHIVE_ENTRIES);
         if archive.len() > MAX_ARCHIVE_ENTRIES {
@@ -155,13 +180,8 @@ impl ExternalArtifactPackProducer for JavaJarPackProducer {
                 continue;
             }
             match request.artifact_kind {
-                ExternalArtifactKind::JavaSourceJar => match std::str::from_utf8(&bytes) {
-                    Ok(source) => declarations.extend(source_api_types(
-                        &entry_name,
-                        source,
-                        limits.max_signature_depth,
-                        &mut diagnostics,
-                    )),
+                ExternalArtifactKind::JavaSourceJar => match String::from_utf8(bytes) {
+                    Ok(source) => source_entries.push((entry_name, source)),
                     Err(_) => diagnostics.warning(
                         "java.source.encoding",
                         Some(entry_name),
@@ -173,6 +193,8 @@ impl ExternalArtifactPackProducer for JavaJarPackProducer {
                     &entry_name,
                     &bytes,
                     limits.max_signature_depth,
+                    &mut remaining_records,
+                    &mut record_limit_hit,
                     &mut diagnostics,
                 ) {
                     ClassEntryResult::Declaration(declaration) => declarations.push(declaration),
@@ -185,6 +207,33 @@ impl ExternalArtifactPackProducer for JavaJarPackProducer {
                 },
                 ExternalArtifactKind::DotNetAssembly => unreachable!(),
             }
+        }
+        if request.artifact_kind == ExternalArtifactKind::JavaSourceJar {
+            let known_types = source_entries
+                .iter()
+                .flat_map(|(_, source)| source_declared_type_names(source))
+                .collect::<HashSet<_>>();
+            for (entry_name, source) in source_entries {
+                declarations.extend(source_api_types(
+                    &entry_name,
+                    &source,
+                    &known_types,
+                    limits.max_signature_depth,
+                    &mut remaining_records,
+                    &mut record_limit_hit,
+                    &mut diagnostics,
+                ));
+            }
+        }
+        if record_limit_hit {
+            diagnostics.warning(
+                "limit.records",
+                None,
+                format!(
+                    "producer stopped after {} declaration records",
+                    limits.max_records
+                ),
+            );
         }
         apply_enclosing_visibility(&mut declarations);
         declarations.retain(|declaration| {
@@ -201,6 +250,82 @@ impl ExternalArtifactPackProducer for JavaJarPackProducer {
             diagnostics,
         )
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ZipDirectoryStatus {
+    Valid,
+    Invalid,
+    Exceeded,
+}
+
+fn zip_directory_status(bytes: &[u8]) -> ZipDirectoryStatus {
+    const EOCD: &[u8; 4] = b"PK\x05\x06";
+    const ZIP64_LOCATOR: &[u8; 4] = b"PK\x06\x07";
+    const ZIP64_EOCD: &[u8; 4] = b"PK\x06\x06";
+    let search_start = bytes.len().saturating_sub(u16::MAX as usize + 22);
+    let Some(eocd) = (search_start..bytes.len().saturating_sub(3))
+        .rev()
+        .find(|offset| bytes.get(*offset..offset + 4) == Some(EOCD))
+    else {
+        return ZipDirectoryStatus::Invalid;
+    };
+    let Some(entries) = little_u16(bytes, eocd + 10) else {
+        return ZipDirectoryStatus::Invalid;
+    };
+    let Some(directory_bytes) = little_u32(bytes, eocd + 12) else {
+        return ZipDirectoryStatus::Invalid;
+    };
+    if entries != u16::MAX && directory_bytes != u32::MAX {
+        return if usize::from(entries) <= MAX_ARCHIVE_ENTRIES
+            && u64::from(directory_bytes) <= MAX_CENTRAL_DIRECTORY_BYTES
+        {
+            ZipDirectoryStatus::Valid
+        } else {
+            ZipDirectoryStatus::Exceeded
+        };
+    }
+    let locator_start = eocd.saturating_sub(20);
+    if bytes.get(locator_start..locator_start + 4) != Some(ZIP64_LOCATOR) {
+        return ZipDirectoryStatus::Invalid;
+    }
+    let Some(zip64_offset) =
+        little_u64(bytes, locator_start + 8).and_then(|offset| usize::try_from(offset).ok())
+    else {
+        return ZipDirectoryStatus::Invalid;
+    };
+    if bytes.get(zip64_offset..zip64_offset + 4) != Some(ZIP64_EOCD) {
+        return ZipDirectoryStatus::Invalid;
+    }
+    let Some(entries) = little_u64(bytes, zip64_offset + 32) else {
+        return ZipDirectoryStatus::Invalid;
+    };
+    let Some(directory_bytes) = little_u64(bytes, zip64_offset + 40) else {
+        return ZipDirectoryStatus::Invalid;
+    };
+    if entries <= MAX_ARCHIVE_ENTRIES as u64 && directory_bytes <= MAX_CENTRAL_DIRECTORY_BYTES {
+        ZipDirectoryStatus::Valid
+    } else {
+        ZipDirectoryStatus::Exceeded
+    }
+}
+
+fn little_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?,
+    ))
+}
+
+fn little_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
+    ))
+}
+
+fn little_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?,
+    ))
 }
 
 fn apply_enclosing_visibility(declarations: &mut [JavaApiType]) {
@@ -232,7 +357,7 @@ fn finish_production(
         type_ids.insert(
             declaration.name.clone(),
             type_declaration_id(TypeIdentity {
-                ecosystem: &request.ecosystem,
+                ecosystem: "jvm",
                 name: &declaration.name,
             }),
         );
@@ -301,6 +426,10 @@ fn finish_production(
                 name: &member.name,
                 generic_arity,
                 parameter_types: &parameter_types,
+                return_type: member
+                    .signature
+                    .as_ref()
+                    .and_then(|signature| signature.returns.as_ref()),
             });
             members.push(MemberFact {
                 id,
@@ -378,7 +507,10 @@ fn finish_production(
 fn source_api_types(
     source_path: &str,
     source: &str,
+    known_types: &HashSet<String>,
     max_depth: usize,
+    remaining_records: &mut usize,
+    record_limit_hit: &mut bool,
     diagnostics: &mut BoundedProducerDiagnostics,
 ) -> Vec<JavaApiType> {
     let Some(tree) = parse_tree(source) else {
@@ -398,6 +530,7 @@ fn source_api_types(
     }
     let root = tree.root_node();
     let package_name = determine_package_name(root, source);
+    let resolution = SourceTypeResolution::new(root, source, package_name.clone(), known_types);
     let mut result = Vec::new();
     let mut stack = Vec::new();
     for index in (0..root.named_child_count()).rev() {
@@ -437,21 +570,30 @@ fn source_api_types(
         let hierarchy = source_hierarchy(
             node,
             source,
-            &type_parameters,
-            max_depth,
-            diagnostics,
-            source_path,
-        );
-        let members = source_members(
-            node,
-            source,
-            &name,
+            &resolution,
             &type_parameters,
             max_depth,
             diagnostics,
             source_path,
         );
         if matches!(visibility, Visibility::Public | Visibility::Protected) {
+            if !take_record(remaining_records, record_limit_hit) {
+                break;
+            }
+            let members = source_members(
+                node,
+                source,
+                &resolution,
+                &name,
+                type_kind,
+                visibility,
+                &type_parameters,
+                max_depth,
+                remaining_records,
+                record_limit_hit,
+                diagnostics,
+                source_path,
+            );
             result.push(JavaApiType {
                 name: name.clone(),
                 type_kind,
@@ -487,12 +629,18 @@ fn source_api_types(
     result
 }
 
+#[allow(clippy::too_many_arguments)] // Source traversal carries explicit owner, limit, and diagnostic state.
 fn source_members(
     owner: Node<'_>,
     source: &str,
+    resolution: &SourceTypeResolution<'_>,
     owner_name: &str,
+    owner_kind: TypeKind,
+    owner_visibility: Visibility,
     owner_parameters: &[String],
     max_depth: usize,
+    remaining_records: &mut usize,
+    record_limit_hit: &mut bool,
     diagnostics: &mut BoundedProducerDiagnostics,
     source_path: &str,
 ) -> Vec<JavaApiMember> {
@@ -504,6 +652,7 @@ fn source_members(
         Some(TypeKind::Interface | TypeKind::Annotation)
     );
     let mut result = Vec::new();
+    let mut has_constructor = false;
     for index in 0..body.named_child_count() {
         let Some(node) = body.named_child(index) else {
             continue;
@@ -517,6 +666,7 @@ fn source_members(
                     node.kind(),
                     "constructor_declaration" | "compact_constructor_declaration"
                 );
+                has_constructor |= constructor;
                 let Some(name_node) = node.child_by_field_name("name") else {
                     continue;
                 };
@@ -532,15 +682,18 @@ fn source_members(
                     continue;
                 }
                 let type_parameters = source_type_parameters(node, source);
-                let parameters = source_parameters(
+                let Some(parameters) = source_parameters(
                     node,
                     source,
+                    resolution,
                     owner_parameters,
                     &type_parameters,
                     max_depth,
                     diagnostics,
                     source_path,
-                );
+                ) else {
+                    continue;
+                };
                 let returns = if constructor {
                     None
                 } else {
@@ -548,6 +701,7 @@ fn source_members(
                         source_type_ref(
                             r#type,
                             source,
+                            resolution,
                             owner_parameters,
                             &type_parameters,
                             0,
@@ -570,6 +724,9 @@ fn source_members(
                     continue;
                 }
                 let modifiers = source_modifiers(node, source);
+                if !take_record(remaining_records, record_limit_hit) {
+                    break;
+                }
                 result.push(JavaApiMember {
                     name: name.to_owned(),
                     member_kind: if constructor {
@@ -599,9 +756,15 @@ fn source_members(
                 let Some(type_node) = node.child_by_field_name("type") else {
                     continue;
                 };
-                let Some(field_type) =
-                    source_type_ref(type_node, source, owner_parameters, &[], 0, max_depth)
-                else {
+                let Some(field_type) = source_type_ref(
+                    type_node,
+                    source,
+                    resolution,
+                    owner_parameters,
+                    &[],
+                    0,
+                    max_depth,
+                ) else {
                     diagnostics.warning(
                         "java.source.unsupported_field_type",
                         Some(source_path.to_owned()),
@@ -630,6 +793,9 @@ fn source_members(
                         continue;
                     };
                     let name = node_text(name_node, source).trim();
+                    if !take_record(remaining_records, record_limit_hit) {
+                        break;
+                    }
                     result.push(JavaApiMember {
                         name: name.to_owned(),
                         member_kind: if node.kind() == "constant_declaration" {
@@ -656,21 +822,208 @@ fn source_members(
             _ => {}
         }
     }
+    if owner_kind == TypeKind::Record {
+        let components = source_parameters(
+            owner,
+            source,
+            resolution,
+            owner_parameters,
+            &[],
+            max_depth,
+            diagnostics,
+            source_path,
+        )
+        .unwrap_or_default();
+        if !has_constructor {
+            push_generated_member(
+                &mut result,
+                remaining_records,
+                record_limit_hit,
+                generated_java_member(
+                    "<init>",
+                    MemberKind::Constructor,
+                    owner_visibility,
+                    false,
+                    components.clone(),
+                    None,
+                    owner_name,
+                    source_path,
+                ),
+            );
+        }
+        for component in components {
+            let Some(name) = component.name.clone() else {
+                continue;
+            };
+            push_generated_member(
+                &mut result,
+                remaining_records,
+                record_limit_hit,
+                generated_java_member(
+                    &name,
+                    MemberKind::Method,
+                    Visibility::Public,
+                    false,
+                    Vec::new(),
+                    Some(component.r#type),
+                    owner_name,
+                    source_path,
+                ),
+            );
+        }
+        for (name, parameters, returns) in [
+            (
+                "equals",
+                vec![Parameter {
+                    name: Some("other".to_owned()),
+                    r#type: named_type("java.lang.Object".to_owned()),
+                    optional: false,
+                    variadic: false,
+                }],
+                named_type("boolean".to_owned()),
+            ),
+            ("hashCode", Vec::new(), named_type("int".to_owned())),
+            (
+                "toString",
+                Vec::new(),
+                named_type("java.lang.String".to_owned()),
+            ),
+        ] {
+            push_generated_member(
+                &mut result,
+                remaining_records,
+                record_limit_hit,
+                generated_java_member(
+                    name,
+                    MemberKind::Method,
+                    Visibility::Public,
+                    false,
+                    parameters,
+                    Some(returns),
+                    owner_name,
+                    source_path,
+                ),
+            );
+        }
+    } else if owner_kind == TypeKind::Enum {
+        push_generated_member(
+            &mut result,
+            remaining_records,
+            record_limit_hit,
+            generated_java_member(
+                "values",
+                MemberKind::Method,
+                Visibility::Public,
+                true,
+                Vec::new(),
+                Some(TypeRef::Array {
+                    element: Box::new(named_type(owner_name.to_owned())),
+                }),
+                owner_name,
+                source_path,
+            ),
+        );
+        push_generated_member(
+            &mut result,
+            remaining_records,
+            record_limit_hit,
+            generated_java_member(
+                "valueOf",
+                MemberKind::Method,
+                Visibility::Public,
+                true,
+                vec![Parameter {
+                    name: Some("name".to_owned()),
+                    r#type: named_type("java.lang.String".to_owned()),
+                    optional: false,
+                    variadic: false,
+                }],
+                Some(named_type(owner_name.to_owned())),
+                owner_name,
+                source_path,
+            ),
+        );
+    } else if owner_kind == TypeKind::Class && !has_constructor {
+        push_generated_member(
+            &mut result,
+            remaining_records,
+            record_limit_hit,
+            JavaApiMember {
+                name: "<init>".to_owned(),
+                member_kind: MemberKind::Constructor,
+                visibility: owner_visibility,
+                is_static: false,
+                is_abstract: false,
+                is_virtual: false,
+                signature: Some(Signature {
+                    type_parameters: Vec::new(),
+                    parameters: Vec::new(),
+                    returns: None,
+                }),
+                locator: Locator::Source {
+                    path: source_path.to_owned(),
+                    symbol: Some(format!("{owner_name}.<init>")),
+                },
+            },
+        );
+    }
     result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generated_java_member(
+    name: &str,
+    member_kind: MemberKind,
+    visibility: Visibility,
+    is_static: bool,
+    parameters: Vec<Parameter>,
+    returns: Option<TypeRef>,
+    owner_name: &str,
+    source_path: &str,
+) -> JavaApiMember {
+    JavaApiMember {
+        name: name.to_owned(),
+        member_kind,
+        visibility,
+        is_static,
+        is_abstract: false,
+        is_virtual: !is_static && member_kind == MemberKind::Method,
+        signature: Some(Signature {
+            type_parameters: Vec::new(),
+            parameters,
+            returns,
+        }),
+        locator: Locator::Source {
+            path: source_path.to_owned(),
+            symbol: Some(format!("{owner_name}.{name}")),
+        },
+    }
+}
+
+fn push_generated_member(
+    result: &mut Vec<JavaApiMember>,
+    remaining_records: &mut usize,
+    record_limit_hit: &mut bool,
+    member: JavaApiMember,
+) {
+    if take_record(remaining_records, record_limit_hit) {
+        result.push(member);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn source_parameters(
     node: Node<'_>,
     source: &str,
+    resolution: &SourceTypeResolution<'_>,
     owner_parameters: &[String],
     member_parameters: &[String],
     max_depth: usize,
     diagnostics: &mut BoundedProducerDiagnostics,
     source_path: &str,
-) -> Vec<Parameter> {
+) -> Option<Vec<Parameter>> {
     let Some(parameters) = node.child_by_field_name("parameters") else {
-        return Vec::new();
+        return Some(Vec::new());
     };
     let mut result = Vec::new();
     for index in 0..parameters.named_child_count() {
@@ -686,6 +1039,7 @@ fn source_parameters(
         let Some(r#type) = source_type_ref(
             type_node,
             source,
+            resolution,
             owner_parameters,
             member_parameters,
             0,
@@ -696,7 +1050,7 @@ fn source_parameters(
                 Some(source_path.to_owned()),
                 "could not represent Java parameter type",
             );
-            continue;
+            return None;
         };
         let name = parameter
             .child_by_field_name("name")
@@ -708,12 +1062,13 @@ fn source_parameters(
             variadic: parameter.kind() == "spread_parameter",
         });
     }
-    result
+    Some(result)
 }
 
 fn source_hierarchy(
     node: Node<'_>,
     source: &str,
+    resolution: &SourceTypeResolution<'_>,
     type_parameters: &[String],
     max_depth: usize,
     diagnostics: &mut BoundedProducerDiagnostics,
@@ -728,9 +1083,15 @@ fn source_hierarchy(
             continue;
         };
         for candidate in hierarchy_type_nodes(container) {
-            if let Some(target) =
-                source_type_ref(candidate, source, type_parameters, &[], 0, max_depth)
-            {
+            if let Some(target) = source_type_ref(
+                candidate,
+                source,
+                resolution,
+                type_parameters,
+                &[],
+                0,
+                max_depth,
+            ) {
                 result.push(HierarchyFact {
                     hierarchy_kind,
                     target,
@@ -766,6 +1127,7 @@ fn hierarchy_type_nodes(container: Node<'_>) -> Vec<Node<'_>> {
 fn source_type_ref(
     node: Node<'_>,
     source: &str,
+    resolution: &SourceTypeResolution<'_>,
     owner_parameters: &[String],
     member_parameters: &[String],
     depth: usize,
@@ -784,6 +1146,7 @@ fn source_type_ref(
                 element: Box::new(source_type_ref(
                     element,
                     source,
+                    resolution,
                     owner_parameters,
                     member_parameters,
                     depth + 1,
@@ -798,6 +1161,11 @@ fn source_type_ref(
             let name = compact_type_name(node_text(base, source));
             let arguments = node
                 .child_by_field_name("type_arguments")
+                .or_else(|| {
+                    (0..node.named_child_count())
+                        .filter_map(|index| node.named_child(index))
+                        .find(|child| child.kind() == "type_arguments")
+                })
                 .into_iter()
                 .flat_map(|arguments| {
                     (0..arguments.named_child_count())
@@ -807,6 +1175,7 @@ fn source_type_ref(
                     source_type_ref(
                         argument,
                         source,
+                        resolution,
                         owner_parameters,
                         member_parameters,
                         depth + 1,
@@ -815,7 +1184,7 @@ fn source_type_ref(
                 })
                 .collect::<Option<Vec<_>>>()?;
             Some(TypeRef::Named {
-                name,
+                name: resolution.resolve(&name)?,
                 arguments,
                 nullable: false,
             })
@@ -823,11 +1192,47 @@ fn source_type_ref(
         "annotated_type" => source_type_ref(
             node.child_by_field_name("type")?,
             source,
+            resolution,
             owner_parameters,
             member_parameters,
             depth + 1,
             max_depth,
         ),
+        "wildcard" => {
+            let variance = if (0..node.child_count())
+                .filter_map(|index| node.child(index))
+                .any(|child| child.kind() == "super")
+            {
+                WildcardVariance::Super
+            } else if (0..node.child_count())
+                .filter_map(|index| node.child(index))
+                .any(|child| child.kind() == "extends")
+            {
+                WildcardVariance::Extends
+            } else {
+                WildcardVariance::Any
+            };
+            let bound = (0..node.named_child_count())
+                .filter_map(|index| node.named_child(index))
+                .find(|child| is_source_type_node(child.kind()))
+                .map(|bound| {
+                    source_type_ref(
+                        bound,
+                        source,
+                        resolution,
+                        owner_parameters,
+                        member_parameters,
+                        depth + 1,
+                        max_depth,
+                    )
+                    .map(Box::new)
+                });
+            let bound = match bound {
+                Some(bound) => Some(bound?),
+                None => None,
+            };
+            Some(TypeRef::Wildcard { variance, bound })
+        }
         "type_identifier" => {
             let name = compact_type_name(node_text(node, source));
             if owner_parameters.iter().any(|parameter| parameter == &name)
@@ -836,24 +1241,28 @@ fn source_type_ref(
                 Some(TypeRef::TypeParameter { name })
             } else {
                 Some(TypeRef::Named {
-                    name,
+                    name: resolution.resolve(&name)?,
                     arguments: Vec::new(),
                     nullable: false,
                 })
             }
         }
-        "integral_type"
-        | "floating_point_type"
-        | "boolean_type"
-        | "primitive_type"
-        | "scoped_type_identifier" => Some(TypeRef::Named {
-            name: compact_type_name(node_text(node, source)),
+        "integral_type" | "floating_point_type" | "boolean_type" | "primitive_type" => {
+            Some(TypeRef::Named {
+                name: compact_type_name(node_text(node, source)),
+                arguments: Vec::new(),
+                nullable: false,
+            })
+        }
+        "scoped_type_identifier" => Some(TypeRef::Named {
+            name: resolution.resolve(&compact_type_name(node_text(node, source)))?,
             arguments: Vec::new(),
             nullable: false,
         }),
         _ if node.named_child_count() == 1 => source_type_ref(
             node.named_child(0)?,
             source,
+            resolution,
             owner_parameters,
             member_parameters,
             depth + 1,
@@ -941,6 +1350,7 @@ fn is_source_type_node(kind: &str) -> bool {
             | "floating_point_type"
             | "boolean_type"
             | "primitive_type"
+            | "wildcard"
     )
 }
 
@@ -948,6 +1358,169 @@ fn compact_type_name(name: &str) -> String {
     name.chars()
         .filter(|character| !character.is_ascii_whitespace())
         .collect()
+}
+
+struct SourceTypeResolution<'a> {
+    package_name: String,
+    explicit_imports: HashMap<String, String>,
+    wildcard_imports: Vec<String>,
+    known_types: &'a HashSet<String>,
+}
+
+impl<'a> SourceTypeResolution<'a> {
+    fn new(
+        root: Node<'_>,
+        source: &str,
+        package_name: String,
+        known_types: &'a HashSet<String>,
+    ) -> Self {
+        let mut explicit_imports = HashMap::default();
+        let mut wildcard_imports = Vec::new();
+        for index in 0..root.named_child_count() {
+            let Some(import) = root.named_child(index) else {
+                continue;
+            };
+            if import.kind() != "import_declaration"
+                || (0..import.child_count())
+                    .filter_map(|index| import.child(index))
+                    .any(|child| child.kind() == "static")
+            {
+                continue;
+            }
+            let imported_name = (0..import.named_child_count())
+                .filter_map(|index| import.named_child(index))
+                .find(|child| matches!(child.kind(), "identifier" | "scoped_identifier"));
+            let Some(imported_name) = imported_name else {
+                continue;
+            };
+            let qualified = compact_type_name(node_text(imported_name, source));
+            let wildcard = (0..import.named_child_count())
+                .filter_map(|index| import.named_child(index))
+                .any(|child| child.kind() == "asterisk");
+            if wildcard {
+                wildcard_imports.push(qualified);
+            } else if let Some(simple) = terminal_identifier(imported_name, source) {
+                explicit_imports.insert(simple, qualified);
+            }
+        }
+        Self {
+            package_name,
+            explicit_imports,
+            wildcard_imports,
+            known_types,
+        }
+    }
+
+    fn resolve(&self, name: &str) -> Option<String> {
+        if name.contains('.') {
+            return Some(name.to_owned());
+        }
+        if let Some(imported) = self.explicit_imports.get(name) {
+            return Some(imported.clone());
+        }
+        let same_package = if self.package_name.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{}.{name}", self.package_name)
+        };
+        if self.known_types.contains(&same_package) {
+            return Some(same_package);
+        }
+        if JAVA_LANG_TYPES.contains(&name) {
+            return Some(format!("java.lang.{name}"));
+        }
+        let mut candidates = self
+            .wildcard_imports
+            .iter()
+            .map(|package| format!("{package}.{name}"))
+            .filter(|candidate| self.known_types.contains(candidate));
+        let candidate = candidates.next()?;
+        candidates.next().is_none().then_some(candidate)
+    }
+}
+
+const JAVA_LANG_TYPES: &[&str] = &[
+    "Boolean",
+    "Byte",
+    "Character",
+    "Class",
+    "ClassLoader",
+    "Cloneable",
+    "Comparable",
+    "Double",
+    "Enum",
+    "Error",
+    "Exception",
+    "Float",
+    "Integer",
+    "Iterable",
+    "Long",
+    "Math",
+    "Number",
+    "Object",
+    "Record",
+    "RuntimeException",
+    "Short",
+    "String",
+    "StringBuilder",
+    "System",
+    "Thread",
+    "Throwable",
+    "Void",
+];
+
+fn terminal_identifier(node: Node<'_>, source: &str) -> Option<String> {
+    let mut current = node;
+    loop {
+        if current.kind() == "identifier" {
+            return Some(node_text(current, source).trim().to_owned());
+        }
+        current = current
+            .child_by_field_name("name")
+            .or_else(|| current.named_child(current.named_child_count().checked_sub(1)?))?;
+    }
+}
+
+fn source_declared_type_names(source: &str) -> Vec<String> {
+    let Some(tree) = parse_tree(source) else {
+        return Vec::new();
+    };
+    let root = tree.root_node();
+    let package_name = determine_package_name(root, source);
+    let mut result = Vec::new();
+    let mut stack = Vec::new();
+    for index in (0..root.named_child_count()).rev() {
+        if let Some(node) = root.named_child(index)
+            && source_type_kind(node.kind()).is_some()
+        {
+            stack.push((node, None::<String>));
+        }
+    }
+    while let Some((node, parent)) = stack.pop() {
+        let Some(name_node) = node.child_by_field_name("name") else {
+            continue;
+        };
+        let simple = node_text(name_node, source).trim();
+        let nested = parent
+            .as_deref()
+            .map(|parent| format!("{parent}.{simple}"))
+            .unwrap_or_else(|| simple.to_owned());
+        result.push(if package_name.is_empty() {
+            nested.clone()
+        } else {
+            format!("{package_name}.{nested}")
+        });
+        if let Some(body) = node.child_by_field_name("body") {
+            for index in (0..body.named_child_count()).rev() {
+                if let Some(child) = body.named_child(index)
+                    && source_type_kind(child.kind()).is_some()
+                {
+                    stack.push((child, Some(nested.clone())));
+                }
+            }
+        }
+    }
+    result
 }
 
 enum ClassEntryResult {
@@ -961,8 +1534,13 @@ fn class_api_type(
     class_entry: &str,
     bytes: &[u8],
     max_depth: usize,
+    remaining_records: &mut usize,
+    record_limit_hit: &mut bool,
     diagnostics: &mut BoundedProducerDiagnostics,
 ) -> ClassEntryResult {
+    if !take_record(remaining_records, record_limit_hit) {
+        return ClassEntryResult::Skipped;
+    }
     let Ok(class_file) = jclassfile::class_file::parse(bytes) else {
         return ClassEntryResult::Invalid;
     };
@@ -973,14 +1551,15 @@ fn class_api_type(
     let Some(internal_name) = class_name_at(&class_file, class_file.this_class()) else {
         return ClassEntryResult::Invalid;
     };
-    let name = binary_class_name(&internal_name);
+    let name = binary_declared_class_name(&class_file, &internal_name);
     let visibility = binary_class_visibility(&class_file, &internal_name);
     let class_signature =
         signature_attribute(class_file.attributes(), &class_file).and_then(|signature| {
             let mut cursor = SignatureCursor::new(signature.as_bytes(), max_depth);
             cursor.parse_class_signature().filter(|_| cursor.at_end())
         });
-    let (type_parameters, hierarchy) = match class_signature {
+    let class_signature_decoded = class_signature.is_some();
+    let (type_parameters, mut hierarchy) = match class_signature {
         Some(value) => value,
         None => {
             let mut hierarchy = Vec::new();
@@ -992,22 +1571,25 @@ fn class_api_type(
             {
                 hierarchy.push(HierarchyFact {
                     hierarchy_kind: HierarchyKind::Extends,
-                    target: named_type(binary_class_name(&superclass)),
+                    target: named_type(binary_declared_class_name(&class_file, &superclass)),
                 });
             }
             for interface in class_file.interfaces() {
                 if let Some(interface) = class_name_at(&class_file, *interface) {
                     hierarchy.push(HierarchyFact {
                         hierarchy_kind: HierarchyKind::Implements,
-                        target: named_type(binary_class_name(&interface)),
+                        target: named_type(binary_declared_class_name(&class_file, &interface)),
                     });
                 }
             }
             (Vec::new(), hierarchy)
         }
     };
+    for relation in &mut hierarchy {
+        normalize_binary_type_ref(&mut relation.target, &class_file);
+    }
     if signature_attribute(class_file.attributes(), &class_file).is_some()
-        && type_parameters.is_empty()
+        && !class_signature_decoded
     {
         diagnostics.warning(
             "java.class.unsupported_signature",
@@ -1026,10 +1608,16 @@ fn class_api_type(
             max_depth,
             diagnostics,
         ) {
+            if !take_record(remaining_records, record_limit_hit) {
+                break;
+            }
             members.push(member);
         }
     }
     for method in class_file.methods() {
+        if *record_limit_hit {
+            break;
+        }
         if let Some(member) = class_method_member(
             jar_name,
             class_entry,
@@ -1039,6 +1627,9 @@ fn class_api_type(
             max_depth,
             diagnostics,
         ) {
+            if !take_record(remaining_records, record_limit_hit) {
+                break;
+            }
             members.push(member);
         }
     }
@@ -1073,6 +1664,15 @@ fn class_api_type(
     })
 }
 
+fn take_record(remaining_records: &mut usize, record_limit_hit: &mut bool) -> bool {
+    if *remaining_records == 0 {
+        *record_limit_hit = true;
+        return false;
+    }
+    *remaining_records -= 1;
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn class_field_member(
     jar_name: &str,
@@ -1100,7 +1700,7 @@ fn class_field_member(
         let mut cursor = SignatureCursor::new(descriptor.as_bytes(), max_depth);
         decoded = cursor.parse_type(0).filter(|_| cursor.at_end());
     }
-    let Some(field_type) = decoded else {
+    let Some(mut field_type) = decoded else {
         diagnostics.warning(
             "java.class.unsupported_field_signature",
             Some(class_entry.to_owned()),
@@ -1108,6 +1708,7 @@ fn class_field_member(
         );
         return None;
     };
+    normalize_binary_type_ref(&mut field_type, class_file);
     Some(JavaApiMember {
         name: name.clone(),
         member_kind: if flags.contains(FieldFlags::ACC_FINAL)
@@ -1159,7 +1760,7 @@ fn class_method_member(
         let mut cursor = SignatureCursor::new(signature.as_bytes(), max_depth);
         cursor.parse_method_signature().filter(|_| cursor.at_end())
     });
-    let (type_parameters, parameter_types, returns) = match generic {
+    let (type_parameters, mut parameter_types, mut returns) = match generic {
         Some(value) => value,
         None => {
             let mut cursor = SignatureCursor::new(descriptor.as_bytes(), max_depth);
@@ -1176,6 +1777,12 @@ fn class_method_member(
             (Vec::new(), parameters, returns)
         }
     };
+    for parameter in &mut parameter_types {
+        normalize_binary_type_ref(parameter, class_file);
+    }
+    if let Some(returns) = &mut returns {
+        normalize_binary_type_ref(returns, class_file);
+    }
     let parameter_names = method
         .attributes()
         .iter()
@@ -1251,14 +1858,69 @@ fn class_name_at(class_file: &ClassFile, index: u16) -> Option<String> {
     utf8_at(class_file, *name_index).map(str::to_owned)
 }
 
-fn binary_class_name(internal_name: &str) -> String {
-    internal_name
-        .chars()
-        .map(|character| match character {
-            '/' | '$' => '.',
-            _ => character,
-        })
-        .collect()
+fn binary_declared_class_name(class_file: &ClassFile, internal_name: &str) -> String {
+    for attribute in class_file.attributes() {
+        let Attribute::InnerClasses { classes } = attribute else {
+            continue;
+        };
+        for class in classes {
+            let Some(candidate) = class_name_at(class_file, class.inner_class_info_index()) else {
+                continue;
+            };
+            if candidate != internal_name
+                || class.outer_class_info_index() == 0
+                || class.inner_name_index() == 0
+            {
+                continue;
+            }
+            let Some(outer) = class_name_at(class_file, class.outer_class_info_index()) else {
+                continue;
+            };
+            let Some(inner) = utf8_at(class_file, class.inner_name_index()) else {
+                continue;
+            };
+            return format!(
+                "{}.{}",
+                binary_declared_class_name(class_file, &outer),
+                inner
+            );
+        }
+    }
+    internal_name.replace('/', ".")
+}
+
+fn normalize_binary_type_ref(r#type: &mut TypeRef, class_file: &ClassFile) {
+    match r#type {
+        TypeRef::Named {
+            name, arguments, ..
+        } => {
+            let internal_name = name.replace('.', "/");
+            *name = binary_declared_class_name(class_file, &internal_name);
+            for argument in arguments {
+                normalize_binary_type_ref(argument, class_file);
+            }
+        }
+        TypeRef::Array { element } | TypeRef::ByRef { element } => {
+            normalize_binary_type_ref(element, class_file);
+        }
+        TypeRef::Wildcard { bound, .. } => {
+            if let Some(bound) = bound {
+                normalize_binary_type_ref(bound, class_file);
+            }
+        }
+        TypeRef::Tuple { elements } => {
+            for element in elements {
+                normalize_binary_type_ref(element, class_file);
+            }
+        }
+        TypeRef::Function { parameters, result } => {
+            for parameter in parameters {
+                normalize_binary_type_ref(parameter, class_file);
+            }
+            normalize_binary_type_ref(result, class_file);
+        }
+        TypeRef::Declared { .. } | TypeRef::TypeParameter { .. } => {}
+    }
 }
 
 fn binary_class_visibility(class_file: &ClassFile, internal_name: &str) -> Visibility {
@@ -1484,20 +2146,37 @@ impl<'a> SignatureCursor<'a> {
                         match self.peek()? {
                             b'*' => {
                                 self.take();
-                                arguments.push(named_type("java.lang.Object".to_owned()));
+                                arguments.push(TypeRef::Wildcard {
+                                    variance: WildcardVariance::Any,
+                                    bound: None,
+                                });
                             }
-                            b'+' | b'-' => {
+                            b'+' => {
                                 self.take();
-                                arguments.push(self.parse_type(depth + 1)?);
+                                arguments.push(TypeRef::Wildcard {
+                                    variance: WildcardVariance::Extends,
+                                    bound: Some(Box::new(self.parse_type(depth + 1)?)),
+                                });
+                            }
+                            b'-' => {
+                                self.take();
+                                arguments.push(TypeRef::Wildcard {
+                                    variance: WildcardVariance::Super,
+                                    bound: Some(Box::new(self.parse_type(depth + 1)?)),
+                                });
                             }
                             _ => arguments.push(self.parse_type(depth + 1)?),
                         }
                     }
                     self.take();
                 }
-                b'/' | b'$' | b'.' => {
+                b'/' | b'.' => {
                     self.take();
                     name.push('.');
+                }
+                b'$' => {
+                    self.take();
+                    name.push('$');
                 }
                 byte if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-') => {
                     self.take();
@@ -1540,16 +2219,21 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     const SURFACE_SOURCE: &str = "package fixture.api;\n\
+        import java.util.List;\n\
         public class Surface<T> extends Base implements Contract {\n\
           public T value;\n\
           public Surface() {}\n\
-          protected java.util.List<T> copy(T input) { return null; }\n\
+          protected List<T> copy(T input) { return null; }\n\
           public <U> U convert(U value) { return value; }\n\
           public static class Nested {}\n\
           private static class Hidden { public static class Leaks {} }\n\
         }\n";
     const BASE_SOURCE: &str = "package fixture.api; public class Base {}\n";
     const CONTRACT_SOURCE: &str = "package fixture.api; public interface Contract {}\n";
+    const PAIR_SOURCE: &str =
+        "package fixture.api; public record Pair(String name, int count) {}\n";
+    const FLAVOR_SOURCE: &str = "package fixture.api; public enum Flavor { VANILLA }\n";
+    const DOLLAR_SOURCE: &str = "package fixture.api; public class Dollar$Type { public Dollar$Type self() { return this; } }\n";
 
     struct JavaFixture {
         _temp: tempfile::TempDir,
@@ -1558,10 +2242,11 @@ mod tests {
     }
 
     impl JavaFixture {
-        fn new() -> Option<Self> {
-            if !tool_available("javac") || !tool_available("jar") {
-                return None;
-            }
+        fn new() -> Self {
+            assert!(
+                tool_available("javac") && tool_available("jar"),
+                "Java producer parity tests require javac and jar"
+            );
             let temp = tempfile::tempdir().unwrap();
             let source_root = temp.path().join("src");
             let package_root = source_root.join("fixture/api");
@@ -1571,6 +2256,9 @@ mod tests {
             fs::write(package_root.join("Surface.java"), SURFACE_SOURCE).unwrap();
             fs::write(package_root.join("Base.java"), BASE_SOURCE).unwrap();
             fs::write(package_root.join("Contract.java"), CONTRACT_SOURCE).unwrap();
+            fs::write(package_root.join("Pair.java"), PAIR_SOURCE).unwrap();
+            fs::write(package_root.join("Flavor.java"), FLAVOR_SOURCE).unwrap();
+            fs::write(package_root.join("Dollar$Type.java"), DOLLAR_SOURCE).unwrap();
             let source_jar = temp.path().join("fixture-sources.jar");
             write_source_jar(&source_jar);
             run(Command::new("javac")
@@ -1579,18 +2267,21 @@ mod tests {
                 .arg(&classes)
                 .arg(package_root.join("Surface.java"))
                 .arg(package_root.join("Base.java"))
-                .arg(package_root.join("Contract.java")));
+                .arg(package_root.join("Contract.java"))
+                .arg(package_root.join("Pair.java"))
+                .arg(package_root.join("Flavor.java"))
+                .arg(package_root.join("Dollar$Type.java")));
             let class_jar = temp.path().join("fixture.jar");
             run(Command::new("jar")
                 .current_dir(&classes)
                 .arg("cf")
                 .arg(&class_jar)
                 .arg("."));
-            Some(Self {
+            Self {
                 _temp: temp,
                 source_jar,
                 class_jar,
-            })
+            }
         }
     }
 
@@ -1630,10 +2321,7 @@ mod tests {
 
     #[test]
     fn source_and_class_jars_share_declaration_ids_and_keep_distinct_origins() {
-        let Some(fixture) = JavaFixture::new() else {
-            eprintln!("skipping Java pack fixture: javac and jar are required");
-            return;
-        };
+        let fixture = JavaFixture::new();
         let source = JavaJarPackProducer.produce_exact_artifact(
             &request(
                 fixture.source_jar.clone(),
@@ -1686,19 +2374,52 @@ mod tests {
         assert!(!class_types.iter().any(|fact| fact.name.contains("Hidden")));
 
         for member_name in ["<init>", "value", "copy", "convert"] {
-            let source_id = source_members
+            let source_member = source_members
                 .iter()
                 .find(|fact| fact.owner == source_surface.id && fact.name == member_name)
-                .unwrap_or_else(|| panic!("missing source member {member_name}"))
-                .id
-                .clone();
-            let class_id = class_members
+                .unwrap_or_else(|| panic!("missing source member {member_name}"));
+            let class_member = class_members
                 .iter()
                 .find(|fact| fact.owner == class_surface.id && fact.name == member_name)
-                .unwrap_or_else(|| panic!("missing class member {member_name}"))
-                .id
-                .clone();
-            assert_eq!(source_id, class_id, "identity mismatch for {member_name}");
+                .unwrap_or_else(|| panic!("missing class member {member_name}"));
+            assert_eq!(
+                source_member.id, class_member.id,
+                "identity mismatch for {member_name}: source={:?}, class={:?}",
+                source_member.signature, class_member.signature
+            );
+        }
+        for (type_name, member_names) in [
+            (
+                "fixture.api.Pair",
+                &["<init>", "name", "count", "equals", "hashCode", "toString"][..],
+            ),
+            ("fixture.api.Flavor", &["values", "valueOf"][..]),
+            ("fixture.api.Dollar$Type", &["<init>", "self"][..]),
+        ] {
+            let source_type = source_types
+                .iter()
+                .find(|fact| fact.name == type_name)
+                .unwrap();
+            let class_type = class_types
+                .iter()
+                .find(|fact| fact.name == type_name)
+                .unwrap();
+            assert_eq!(source_type.id, class_type.id);
+            for member_name in member_names {
+                let source_member = source_members
+                    .iter()
+                    .find(|fact| fact.owner == source_type.id && fact.name == *member_name)
+                    .unwrap_or_else(|| panic!("missing source member {type_name}.{member_name}"));
+                let class_member = class_members
+                    .iter()
+                    .find(|fact| fact.owner == class_type.id && fact.name == *member_name)
+                    .unwrap_or_else(|| panic!("missing class member {type_name}.{member_name}"));
+                assert_eq!(
+                    source_member.id, class_member.id,
+                    "identity mismatch for {type_name}.{member_name}: source={:?}, class={:?}",
+                    source_member.signature, class_member.signature
+                );
+            }
         }
     }
 
@@ -1765,7 +2486,10 @@ mod tests {
             &ArtifactProducerLimits::default(),
         );
         assert!(production.pack.is_none());
-        assert_eq!(production.diagnostics[0].code, "java.archive.invalid");
+        assert!(matches!(
+            production.diagnostics[0].code.as_str(),
+            "java.archive.invalid" | "limit.archive_directory"
+        ));
     }
 
     fn declarations(pack: &AuthoredSemanticModelPack) -> (&[TypeFact], &[MemberFact]) {
@@ -1783,6 +2507,9 @@ mod tests {
             ("fixture/api/Surface.java", SURFACE_SOURCE),
             ("fixture/api/Base.java", BASE_SOURCE),
             ("fixture/api/Contract.java", CONTRACT_SOURCE),
+            ("fixture/api/Pair.java", PAIR_SOURCE),
+            ("fixture/api/Flavor.java", FLAVOR_SOURCE),
+            ("fixture/api/Dollar$Type.java", DOLLAR_SOURCE),
         ] {
             zip.start_file(name, SimpleFileOptions::default()).unwrap();
             zip.write_all(source.as_bytes()).unwrap();

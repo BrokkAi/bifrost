@@ -72,13 +72,16 @@ pub struct ArtifactProduction {
 }
 
 impl ArtifactProduction {
-    pub fn failed(diagnostic: ProducerDiagnostic) -> Self {
+    pub fn failed(diagnostic: ProducerDiagnostic, limits: &ArtifactProducerLimits) -> Self {
+        let mut diagnostics = BoundedProducerDiagnostics::new(limits);
+        diagnostics.push_diagnostic(diagnostic);
+        let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
         Self {
             artifact_sha256: None,
             pack: None,
             completeness: Completeness::Partial,
-            diagnostics: vec![diagnostic],
-            suppressed_diagnostics: 0,
+            diagnostics,
+            suppressed_diagnostics,
         }
     }
 }
@@ -114,7 +117,7 @@ impl ExactArtifact {
 
 pub fn read_exact_artifact(
     path: &Path,
-    max_artifact_bytes: u64,
+    limits: &ArtifactProducerLimits,
 ) -> Result<ExactArtifact, ProducerDiagnostic> {
     let metadata = path.metadata().map_err(|error| ProducerDiagnostic {
         severity: ProducerDiagnosticSeverity::Error,
@@ -122,7 +125,7 @@ pub fn read_exact_artifact(
         location: None,
         message: bounded_message(
             format!("could not inspect exact artifact: {error}"),
-            ArtifactProducerLimits::default().max_diagnostic_message_bytes,
+            limits.max_diagnostic_message_bytes,
         ),
     })?;
     if !metadata.is_file() {
@@ -133,12 +136,15 @@ pub fn read_exact_artifact(
             message: "exact artifact path is not a regular file".to_owned(),
         });
     }
-    if metadata.len() > max_artifact_bytes {
+    if metadata.len() > limits.max_artifact_bytes {
         return Err(ProducerDiagnostic {
             severity: ProducerDiagnosticSeverity::Error,
             code: "limit.artifact_bytes".to_owned(),
             location: None,
-            message: format!("exact artifact exceeds {max_artifact_bytes} bytes"),
+            message: bounded_message(
+                format!("exact artifact exceeds {} bytes", limits.max_artifact_bytes),
+                limits.max_diagnostic_message_bytes,
+            ),
         });
     }
 
@@ -148,11 +154,11 @@ pub fn read_exact_artifact(
         location: None,
         message: bounded_message(
             format!("could not open exact artifact: {error}"),
-            ArtifactProducerLimits::default().max_diagnostic_message_bytes,
+            limits.max_diagnostic_message_bytes,
         ),
     })?;
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(max_artifact_bytes.saturating_add(1))
+    file.take(limits.max_artifact_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|error| ProducerDiagnostic {
             severity: ProducerDiagnosticSeverity::Error,
@@ -160,15 +166,18 @@ pub fn read_exact_artifact(
             location: None,
             message: bounded_message(
                 format!("could not read exact artifact: {error}"),
-                ArtifactProducerLimits::default().max_diagnostic_message_bytes,
+                limits.max_diagnostic_message_bytes,
             ),
         })?;
-    if bytes.len() as u64 > max_artifact_bytes {
+    if bytes.len() as u64 > limits.max_artifact_bytes {
         return Err(ProducerDiagnostic {
             severity: ProducerDiagnosticSeverity::Error,
             code: "limit.artifact_bytes".to_owned(),
             location: None,
-            message: format!("exact artifact exceeds {max_artifact_bytes} bytes"),
+            message: bounded_message(
+                format!("exact artifact exceeds {} bytes", limits.max_artifact_bytes),
+                limits.max_diagnostic_message_bytes,
+            ),
         });
     }
 
@@ -228,9 +237,18 @@ impl BoundedProducerDiagnostics {
         self.diagnostics.push(ProducerDiagnostic {
             severity,
             code: code.into(),
-            location,
+            location: location.map(|location| bounded_message(location, self.max_message_bytes)),
             message: bounded_message(message.into(), self.max_message_bytes),
         });
+    }
+
+    fn push_diagnostic(&mut self, diagnostic: ProducerDiagnostic) {
+        self.push(
+            diagnostic.severity,
+            diagnostic.code,
+            diagnostic.location,
+            diagnostic.message,
+        );
     }
 
     pub fn finish(self) -> (Vec<ProducerDiagnostic>, usize) {
@@ -259,7 +277,14 @@ mod tests {
     fn exact_artifact_reader_hashes_bounded_bytes() {
         let mut temp = tempfile::NamedTempFile::new().unwrap();
         temp.write_all(b"artifact").unwrap();
-        let artifact = read_exact_artifact(temp.path(), 8).unwrap();
+        let artifact = read_exact_artifact(
+            temp.path(),
+            &ArtifactProducerLimits {
+                max_artifact_bytes: 8,
+                ..ArtifactProducerLimits::default()
+            },
+        )
+        .unwrap();
 
         assert_eq!(artifact.path(), temp.path());
         assert_eq!(artifact.bytes(), b"artifact");
@@ -268,7 +293,15 @@ mod tests {
             lower_hex_string(&sha256_bytes(b"artifact"))
         );
         assert_eq!(
-            read_exact_artifact(temp.path(), 7).unwrap_err().code,
+            read_exact_artifact(
+                temp.path(),
+                &ArtifactProducerLimits {
+                    max_artifact_bytes: 7,
+                    ..ArtifactProducerLimits::default()
+                }
+            )
+            .unwrap_err()
+            .code,
             "limit.artifact_bytes"
         );
     }
@@ -286,7 +319,23 @@ mod tests {
         let (diagnostics, suppressed) = diagnostics.finish();
 
         assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].location.as_deref(), Some("entr"));
         assert_eq!(diagnostics[0].message, "abcd");
         assert_eq!(suppressed, 1);
+
+        let failure = ArtifactProduction::failed(
+            ProducerDiagnostic {
+                severity: ProducerDiagnosticSeverity::Error,
+                code: "failure".to_owned(),
+                location: Some("unbounded-location".to_owned()),
+                message: "unbounded-message".to_owned(),
+            },
+            &ArtifactProducerLimits {
+                max_diagnostics: 0,
+                ..limits
+            },
+        );
+        assert!(failure.diagnostics.is_empty());
+        assert_eq!(failure.suppressed_diagnostics, 1);
     }
 }

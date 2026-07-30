@@ -16,8 +16,9 @@ pub struct TypeIdentity<'a> {
 
 /// Canonical semantic identity for a member supplied by an external artifact.
 ///
-/// Return types and parameter names are excluded because Java and C# do not
-/// overload on return type and binary parameter names are optional metadata.
+/// Parameter names are excluded because binary names are optional metadata.
+/// Return types are retained because CLI metadata and C# conversion operators
+/// can distinguish members that otherwise have the same overload shape.
 #[derive(Debug, Clone, Copy)]
 pub struct MemberIdentity<'a> {
     pub owner_id: &'a str,
@@ -25,6 +26,7 @@ pub struct MemberIdentity<'a> {
     pub name: &'a str,
     pub generic_arity: usize,
     pub parameter_types: &'a [TypeRef],
+    pub return_type: Option<&'a TypeRef>,
 }
 
 pub fn type_declaration_id(identity: TypeIdentity<'_>) -> String {
@@ -50,6 +52,9 @@ pub fn member_declaration_id(identity: MemberIdentity<'_>) -> String {
         let encoded = serde_json::to_vec(ty).expect("type references are JSON serializable");
         hasher.value(&encoded);
     });
+    let return_type = serde_json::to_vec(&identity.return_type)
+        .expect("optional return type is JSON serializable");
+    hasher.field("return_type", &return_type);
     format!("member.{}", lower_hex_string(&hasher.finish()))
 }
 
@@ -89,6 +94,7 @@ mod tests {
             name: "Send",
             generic_arity: 0,
             parameter_types,
+            return_type: None,
         };
 
         assert_eq!(

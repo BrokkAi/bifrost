@@ -258,6 +258,14 @@ pub enum TypeRef {
     Array {
         element: Box<TypeRef>,
     },
+    ByRef {
+        element: Box<TypeRef>,
+    },
+    Wildcard {
+        variance: WildcardVariance,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bound: Option<Box<TypeRef>>,
+    },
     Tuple {
         elements: Vec<TypeRef>,
     },
@@ -265,6 +273,14 @@ pub enum TypeRef {
         parameters: Vec<TypeRef>,
         result: Box<TypeRef>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WildcardVariance {
+    Any,
+    Extends,
+    Super,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

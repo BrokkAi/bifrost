@@ -439,8 +439,27 @@ impl Validator {
                         );
                     }
                 }
-                TypeRef::Array { element } => {
+                TypeRef::Array { element } | TypeRef::ByRef { element } => {
                     stack.push((element, depth + 1, format!("{current_path}.element")))
+                }
+                TypeRef::Wildcard { variance, bound } => {
+                    if matches!(variance, WildcardVariance::Any) && bound.is_some() {
+                        self.error(
+                            "type.wildcard_any_bound",
+                            &current_path,
+                            "an unbounded wildcard cannot declare a bound",
+                        );
+                    }
+                    if !matches!(variance, WildcardVariance::Any) && bound.is_none() {
+                        self.error(
+                            "type.wildcard_missing_bound",
+                            &current_path,
+                            "a variant wildcard requires a bound",
+                        );
+                    }
+                    if let Some(bound) = bound {
+                        stack.push((bound, depth + 1, format!("{current_path}.bound")));
+                    }
                 }
                 TypeRef::Tuple { elements } => {
                     if elements.is_empty() {

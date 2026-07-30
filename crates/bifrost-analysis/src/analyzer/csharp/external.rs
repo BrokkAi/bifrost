@@ -21,6 +21,9 @@ const MAX_ASSETS_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_METADATA_ROWS: u32 = 100_000;
 const MAX_METADATA_TOTAL_ROWS: u32 = 250_000;
 const MAX_SIGNATURE_DEPTH: usize = 64;
+const MAX_SIGNATURE_PARAMETERS: usize = 4_096;
+const MAX_ARRAY_RANK: usize = 64;
+const MAX_DECODED_METADATA_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PROJECT_OUTPUTS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +49,7 @@ pub enum CSharpExternalMemberKind {
     Method,
     Field,
     Property,
+    Event,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CSharpExternalDeclarationSource {
@@ -137,7 +141,9 @@ impl DecodedType {
             }),
             Self::Array { .. } => Err("multidimensional array types are not representable"),
             Self::Pointer(_) => Err("pointer types are not representable"),
-            Self::ByRef(inner) => inner.type_ref(owner_type_parameters, member_type_parameters),
+            Self::ByRef(inner) => Ok(TypeRef::ByRef {
+                element: Box::new(inner.type_ref(owner_type_parameters, member_type_parameters)?),
+            }),
         }
     }
 }
@@ -558,7 +564,13 @@ fn decoded_type_from_semantic(
             )?),
             rank: 1,
         }),
-        TypeRef::Declared { .. } | TypeRef::Tuple { .. } | TypeRef::Function { .. } => None,
+        TypeRef::ByRef { element } => Some(DecodedType::ByRef(Box::new(
+            decoded_type_from_semantic(element, owner_parameters, member_parameters)?,
+        ))),
+        TypeRef::Declared { .. }
+        | TypeRef::Wildcard { .. }
+        | TypeRef::Tuple { .. }
+        | TypeRef::Function { .. } => None,
     }
 }
 
@@ -572,27 +584,38 @@ impl ExternalArtifactPackProducer for CSharpAssemblyPackProducer {
         limits: &ArtifactProducerLimits,
     ) -> ArtifactProduction {
         if request.artifact_kind != ExternalArtifactKind::DotNetAssembly {
-            return ArtifactProduction::failed(ProducerDiagnostic {
-                severity: ProducerDiagnosticSeverity::Error,
-                code: "artifact.kind".to_owned(),
-                location: None,
-                message: "C# producer requires a .NET assembly artifact".to_owned(),
-            });
+            return ArtifactProduction::failed(
+                ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Error,
+                    code: "artifact.kind".to_owned(),
+                    location: None,
+                    message: "C# producer requires a .NET assembly artifact".to_owned(),
+                },
+                limits,
+            );
         }
-        let artifact = match read_exact_artifact(
-            &request.path,
-            limits.max_artifact_bytes.min(MAX_ASSEMBLY_BYTES),
-        ) {
-            Ok(artifact) => artifact,
-            Err(diagnostic) => return ArtifactProduction::failed(diagnostic),
+        let read_limits = ArtifactProducerLimits {
+            max_artifact_bytes: limits.max_artifact_bytes.min(MAX_ASSEMBLY_BYTES),
+            ..*limits
         };
-        let Some(external_types) = parse_assembly(artifact.path(), artifact.bytes()) else {
-            return ArtifactProduction::failed(ProducerDiagnostic {
-                severity: ProducerDiagnosticSeverity::Error,
-                code: "csharp.metadata.invalid".to_owned(),
-                location: None,
-                message: "artifact does not contain supported bounded CLI metadata".to_owned(),
-            });
+        let artifact = match read_exact_artifact(&request.path, &read_limits) {
+            Ok(artifact) => artifact,
+            Err(diagnostic) => return ArtifactProduction::failed(diagnostic, limits),
+        };
+        let Some((external_types, omitted_signatures)) = parse_assembly_bounded(
+            artifact.path(),
+            artifact.bytes(),
+            limits.max_signature_depth.min(MAX_SIGNATURE_DEPTH),
+        ) else {
+            return ArtifactProduction::failed(
+                ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Error,
+                    code: "csharp.metadata.invalid".to_owned(),
+                    location: None,
+                    message: "artifact does not contain supported bounded CLI metadata".to_owned(),
+                },
+                limits,
+            );
         };
         let Some(locator_path) = artifact
             .path()
@@ -600,21 +623,33 @@ impl ExternalArtifactPackProducer for CSharpAssemblyPackProducer {
             .and_then(|name| name.to_str())
             .map(str::to_owned)
         else {
-            return ArtifactProduction::failed(ProducerDiagnostic {
-                severity: ProducerDiagnosticSeverity::Error,
-                code: "artifact.path_encoding".to_owned(),
-                location: None,
-                message: "artifact filename is not valid UTF-8".to_owned(),
-            });
+            return ArtifactProduction::failed(
+                ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Error,
+                    code: "artifact.path_encoding".to_owned(),
+                    location: None,
+                    message: "artifact filename is not valid UTF-8".to_owned(),
+                },
+                limits,
+            );
         };
 
         let mut diagnostics = BoundedProducerDiagnostics::new(limits);
+        if omitted_signatures > 0 {
+            diagnostics.warning(
+                "csharp.signature.omitted",
+                None,
+                format!(
+                    "omitted {omitted_signatures} members whose signatures were malformed, unsupported, or exceeded the configured depth"
+                ),
+            );
+        }
         let mut type_ids = HashMap::default();
         for ty in external_types.iter().filter(|ty| ty.externally_visible()) {
             type_ids.insert(
                 ty.fqn.clone(),
                 type_declaration_id(TypeIdentity {
-                    ecosystem: &request.ecosystem,
+                    ecosystem: "cli",
                     name: &ty.fqn,
                 }),
             );
@@ -763,6 +798,7 @@ impl ExternalArtifactPackProducer for CSharpAssemblyPackProducer {
                     name: &member.name,
                     generic_arity: member.generic_arity,
                     parameter_types: &parameter_types,
+                    return_type: returns.as_ref(),
                 });
                 members.push(MemberFact {
                     id,
@@ -880,6 +916,7 @@ fn semantic_member_kind(kind: CSharpExternalMemberKind) -> MemberKind {
         CSharpExternalMemberKind::Method => MemberKind::Method,
         CSharpExternalMemberKind::Field => MemberKind::Field,
         CSharpExternalMemberKind::Property => MemberKind::Property,
+        CSharpExternalMemberKind::Event => MemberKind::Event,
     }
 }
 
@@ -909,10 +946,9 @@ fn external_type_kind(kind: TypeKind) -> CSharpExternalTypeKind {
 fn external_member_kind(kind: MemberKind) -> CSharpExternalMemberKind {
     match kind {
         MemberKind::Constructor => CSharpExternalMemberKind::Constructor,
-        MemberKind::Field | MemberKind::Constant | MemberKind::Event => {
-            CSharpExternalMemberKind::Field
-        }
+        MemberKind::Field | MemberKind::Constant => CSharpExternalMemberKind::Field,
         MemberKind::Property => CSharpExternalMemberKind::Property,
+        MemberKind::Event => CSharpExternalMemberKind::Event,
         MemberKind::Method | MemberKind::Function => CSharpExternalMemberKind::Method,
     }
 }
@@ -1141,8 +1177,23 @@ struct PropertyRow {
     name: String,
     sig: Vec<u8>,
 }
+#[derive(Clone)]
+struct EventRow {
+    flags: u16,
+    name: String,
+    event_type: u32,
+}
 
+#[cfg(test)]
 fn parse_assembly(path: &Path, bytes: &[u8]) -> Option<Vec<CSharpExternalType>> {
+    parse_assembly_bounded(path, bytes, MAX_SIGNATURE_DEPTH).map(|(types, _)| types)
+}
+
+fn parse_assembly_bounded(
+    path: &Path,
+    bytes: &[u8],
+    max_signature_depth: usize,
+) -> Option<(Vec<CSharpExternalType>, usize)> {
     let pe = PE::parse(bytes).ok()?;
     let metadata = metadata_bytes(&pe, bytes)?;
     let streams = Streams::parse(metadata)?;
@@ -1161,34 +1212,41 @@ fn parse_assembly(path: &Path, bytes: &[u8]) -> Option<Vec<CSharpExternalType>> 
     {
         return None;
     }
+    let mut decode_budget = MetadataDecodeBudget::default();
     let types = (1..=layout.rows(2))
-        .map(|i| read_typedef(&layout, i, strings))
+        .map(|i| read_typedef(&layout, i, strings, &mut decode_budget))
         .collect::<Option<Vec<_>>>()?;
     let type_refs = (1..=layout.rows(1))
-        .map(|i| read_typeref(&layout, i, strings))
+        .map(|i| read_typeref(&layout, i, strings, &mut decode_budget))
         .collect::<Option<Vec<_>>>()?;
     let type_specs = (1..=layout.rows(27))
-        .map(|i| read_typespec(&layout, i, blobs))
+        .map(|i| read_typespec(&layout, i, blobs, &mut decode_budget))
         .collect::<Option<Vec<_>>>()?;
     let fields = (1..=layout.rows(4))
-        .map(|i| read_field(&layout, i, strings, blobs))
+        .map(|i| read_field(&layout, i, strings, blobs, &mut decode_budget))
         .collect::<Option<Vec<_>>>()?;
     let methods = (1..=layout.rows(6))
-        .map(|i| read_method(&layout, i, strings, blobs))
+        .map(|i| read_method(&layout, i, strings, blobs, &mut decode_budget))
         .collect::<Option<Vec<_>>>()?;
     let properties = (1..=layout.rows(23))
-        .map(|i| read_property(&layout, i, strings, blobs))
+        .map(|i| read_property(&layout, i, strings, blobs, &mut decode_budget))
+        .collect::<Option<Vec<_>>>()?;
+    let events = (1..=layout.rows(20))
+        .map(|i| read_event(&layout, i, strings, &mut decode_budget))
         .collect::<Option<Vec<_>>>()?;
     let nested = nested_map(&layout);
     let property_owners = property_owners(&layout, types.len() as u32, properties.len() as u32);
     let property_accessors = property_accessors(&layout, &methods);
-    let generic = generic_parameters(&layout, strings);
+    let event_owners = event_owners(&layout, types.len() as u32, events.len() as u32);
+    let event_accessors = association_accessors(&layout, &methods, 0);
+    let generic = generic_parameters(&layout, strings, &mut decode_budget);
     let interfaces = interfaces_for(&layout, &types, &type_refs, &type_specs);
     let mut names = Vec::new();
     for (idx, row) in types.iter().enumerate() {
         names.push(full_type_name((idx + 1) as u32, row, &types, &nested));
     }
     let mut result = Vec::new();
+    let mut omitted_signatures = 0usize;
     for (idx, row) in types.iter().enumerate() {
         let token = 0x0200_0000 | ((idx + 1) as u32);
         let fqn = names[idx].clone();
@@ -1207,7 +1265,7 @@ fn parse_assembly(path: &Path, bytes: &[u8]) -> Option<Vec<CSharpExternalType>> 
             .skip(row.field_start.saturating_sub(1) as usize)
             .take(end_field.saturating_sub(row.field_start) as usize)
         {
-            members.push(member(
+            if let Some(member) = member(
                 path,
                 0x0400_0000 | (field_index as u32 + 1),
                 &fqn,
@@ -1220,7 +1278,12 @@ fn parse_assembly(path: &Path, bytes: &[u8]) -> Option<Vec<CSharpExternalType>> 
                 &types,
                 &type_refs,
                 &type_specs,
-            ));
+                max_signature_depth,
+            ) {
+                members.push(member);
+            } else {
+                omitted_signatures = omitted_signatures.saturating_add(1);
+            }
         }
         for (method_index, m) in methods
             .iter()
@@ -1233,7 +1296,7 @@ fn parse_assembly(path: &Path, bytes: &[u8]) -> Option<Vec<CSharpExternalType>> 
             } else {
                 CSharpExternalMemberKind::Method
             };
-            members.push(member(
+            if let Some(member) = member(
                 path,
                 0x0600_0000 | (method_index as u32 + 1),
                 &fqn,
@@ -1250,7 +1313,12 @@ fn parse_assembly(path: &Path, bytes: &[u8]) -> Option<Vec<CSharpExternalType>> 
                 &types,
                 &type_refs,
                 &type_specs,
-            ));
+                max_signature_depth,
+            ) {
+                members.push(member);
+            } else {
+                omitted_signatures = omitted_signatures.saturating_add(1);
+            }
         }
         for (pidx, p) in properties
             .iter()
@@ -1261,7 +1329,7 @@ fn parse_assembly(path: &Path, bytes: &[u8]) -> Option<Vec<CSharpExternalType>> 
                 .get(&(pidx as u32 + 1))
                 .copied()
                 .unwrap_or(p.flags);
-            members.push(member(
+            if let Some(member) = member(
                 path,
                 0x1700_0000 | (pidx as u32 + 1),
                 &fqn,
@@ -1274,7 +1342,50 @@ fn parse_assembly(path: &Path, bytes: &[u8]) -> Option<Vec<CSharpExternalType>> 
                 &types,
                 &type_refs,
                 &type_specs,
-            ));
+                max_signature_depth,
+            ) {
+                members.push(member);
+            } else {
+                omitted_signatures = omitted_signatures.saturating_add(1);
+            }
+        }
+        for (event_index, event) in events.iter().enumerate().filter(|(event_index, _)| {
+            event_owners.get(&(*event_index as u32 + 1)) == Some(&(idx as u32 + 1))
+        }) {
+            let flags = event_accessors
+                .get(&(event_index as u32 + 1))
+                .copied()
+                .unwrap_or(event.flags);
+            let Some(event_type) = resolve_typedef_or_ref_type_at_depth(
+                event.event_type,
+                &types,
+                &type_refs,
+                &type_specs,
+                max_signature_depth,
+                0,
+            ) else {
+                omitted_signatures = omitted_signatures.saturating_add(1);
+                continue;
+            };
+            members.push(CSharpExternalMember {
+                owner_fqn: fqn.clone(),
+                name: event.name.clone(),
+                kind: CSharpExternalMemberKind::Event,
+                visibility: member_visibility(flags),
+                is_static: flags & 0x10 != 0,
+                is_abstract: flags & 0x400 != 0,
+                is_virtual: flags & 0x40 != 0,
+                generic_arity: 0,
+                type_parameters: Vec::new(),
+                return_type: Some(event_type.legacy_name()),
+                parameter_types: Vec::new(),
+                return_type_ref: Some(event_type),
+                parameter_type_refs: Vec::new(),
+                source: CSharpExternalDeclarationSource::Assembly {
+                    path: path.to_path_buf(),
+                    metadata_token: 0x1400_0000 | (event_index as u32 + 1),
+                },
+            });
         }
         let namespace = fqn
             .rsplit_once('.')
@@ -1338,7 +1449,7 @@ fn parse_assembly(path: &Path, bytes: &[u8]) -> Option<Vec<CSharpExternalType>> 
         result[index].is_effectively_visible =
             effective_type_visibility((index + 1) as u32, &result, &nested);
     }
-    Some(result)
+    Some((result, omitted_signatures))
 }
 
 fn effective_type_visibility(
@@ -1396,10 +1507,17 @@ fn member(
     types: &[TypeRow],
     type_refs: &[TypeRefRow],
     type_specs: &[TypeSpecRow],
-) -> CSharpExternalMember {
-    let (return_type_ref, parameter_type_refs, generic_arity) =
-        decode_signature(sig, method, types, type_refs, type_specs);
-    CSharpExternalMember {
+    max_signature_depth: usize,
+) -> Option<CSharpExternalMember> {
+    let (return_type_ref, parameter_type_refs, generic_arity) = decode_signature(
+        sig,
+        method,
+        types,
+        type_refs,
+        type_specs,
+        max_signature_depth,
+    )?;
+    Some(CSharpExternalMember {
         owner_fqn: owner.to_string(),
         name: name.to_string(),
         kind,
@@ -1420,7 +1538,7 @@ fn member(
             path: path.to_path_buf(),
             metadata_token: token,
         },
-    }
+    })
 }
 
 struct Streams<'a> {
@@ -1518,12 +1636,17 @@ impl<'a> TableLayout<'a> {
         self.data.get(start..start + size)
     }
 }
-fn read_typedef(l: &TableLayout<'_>, i: u32, s: &[u8]) -> Option<TypeRow> {
+fn read_typedef(
+    l: &TableLayout<'_>,
+    i: u32,
+    s: &[u8],
+    budget: &mut MetadataDecodeBudget,
+) -> Option<TypeRow> {
     let mut p = 0;
     let r = l.row(2, i)?;
     let flags = u32at(r, &mut p)?;
-    let name = str_index(r, &mut p, l.heap, s)?;
-    let namespace = str_index(r, &mut p, l.heap, s)?;
+    let name = str_index(r, &mut p, l.heap, s, budget)?;
+    let namespace = str_index(r, &mut p, l.heap, s, budget)?;
     let extends = index(r, &mut p, coded_size(&l.rows, &[2, 1, 27], 2))?;
     let field_start = index(r, &mut p, index_size(l.rows(4)))?;
     let method_start = index(r, &mut p, index_size(l.rows(6)))?;
@@ -1536,48 +1659,94 @@ fn read_typedef(l: &TableLayout<'_>, i: u32, s: &[u8]) -> Option<TypeRow> {
         method_start,
     })
 }
-fn read_typeref(l: &TableLayout<'_>, i: u32, s: &[u8]) -> Option<TypeRefRow> {
+fn read_typeref(
+    l: &TableLayout<'_>,
+    i: u32,
+    s: &[u8],
+    budget: &mut MetadataDecodeBudget,
+) -> Option<TypeRefRow> {
     let mut p = 0;
     let r = l.row(1, i)?;
     let scope = index(r, &mut p, coded_size(&l.rows, &[0, 26, 35, 1], 2))?;
-    let name = str_index(r, &mut p, l.heap, s)?;
-    let namespace = str_index(r, &mut p, l.heap, s)?;
+    let name = str_index(r, &mut p, l.heap, s, budget)?;
+    let namespace = str_index(r, &mut p, l.heap, s, budget)?;
     Some(TypeRefRow {
         scope,
         name,
         namespace,
     })
 }
-fn read_typespec(l: &TableLayout<'_>, i: u32, blobs: &[u8]) -> Option<TypeSpecRow> {
+fn read_typespec(
+    l: &TableLayout<'_>,
+    i: u32,
+    blobs: &[u8],
+    budget: &mut MetadataDecodeBudget,
+) -> Option<TypeSpecRow> {
     let mut p = 0;
-    let sig = blob_index(l.row(27, i)?, &mut p, l.heap, blobs)?;
+    let sig = blob_index(l.row(27, i)?, &mut p, l.heap, blobs, budget)?;
     Some(TypeSpecRow { sig })
 }
-fn read_field(l: &TableLayout<'_>, i: u32, s: &[u8], b: &[u8]) -> Option<FieldRow> {
+fn read_field(
+    l: &TableLayout<'_>,
+    i: u32,
+    s: &[u8],
+    b: &[u8],
+    budget: &mut MetadataDecodeBudget,
+) -> Option<FieldRow> {
     let mut p = 0;
     let r = l.row(4, i)?;
     let flags = u16at(r, &mut p)?;
-    let name = str_index(r, &mut p, l.heap, s)?;
-    let sig = blob_index(r, &mut p, l.heap, b)?;
+    let name = str_index(r, &mut p, l.heap, s, budget)?;
+    let sig = blob_index(r, &mut p, l.heap, b, budget)?;
     Some(FieldRow { flags, name, sig })
 }
-fn read_method(l: &TableLayout<'_>, i: u32, s: &[u8], b: &[u8]) -> Option<MethodRow> {
+fn read_method(
+    l: &TableLayout<'_>,
+    i: u32,
+    s: &[u8],
+    b: &[u8],
+    budget: &mut MetadataDecodeBudget,
+) -> Option<MethodRow> {
     let mut p = 0;
     let r = l.row(6, i)?;
     take(r, &mut p, 4)?;
     take(r, &mut p, 2)?;
     let flags = u16at(r, &mut p)?;
-    let name = str_index(r, &mut p, l.heap, s)?;
-    let sig = blob_index(r, &mut p, l.heap, b)?;
+    let name = str_index(r, &mut p, l.heap, s, budget)?;
+    let sig = blob_index(r, &mut p, l.heap, b, budget)?;
     Some(MethodRow { flags, name, sig })
 }
-fn read_property(l: &TableLayout<'_>, i: u32, s: &[u8], b: &[u8]) -> Option<PropertyRow> {
+fn read_property(
+    l: &TableLayout<'_>,
+    i: u32,
+    s: &[u8],
+    b: &[u8],
+    budget: &mut MetadataDecodeBudget,
+) -> Option<PropertyRow> {
     let mut p = 0;
     let r = l.row(23, i)?;
     let flags = u16at(r, &mut p)?;
-    let name = str_index(r, &mut p, l.heap, s)?;
-    let sig = blob_index(r, &mut p, l.heap, b)?;
+    let name = str_index(r, &mut p, l.heap, s, budget)?;
+    let sig = blob_index(r, &mut p, l.heap, b, budget)?;
     Some(PropertyRow { flags, name, sig })
+}
+
+fn read_event(
+    layout: &TableLayout<'_>,
+    event_index: u32,
+    strings: &[u8],
+    budget: &mut MetadataDecodeBudget,
+) -> Option<EventRow> {
+    let mut cursor = 0;
+    let row = layout.row(20, event_index)?;
+    let flags = u16at(row, &mut cursor)?;
+    let name = str_index(row, &mut cursor, layout.heap, strings, budget)?;
+    let event_type = index(row, &mut cursor, coded_size(&layout.rows, &[2, 1, 27], 2))?;
+    Some(EventRow {
+        flags,
+        name,
+        event_type,
+    })
 }
 
 fn nested_map(l: &TableLayout<'_>) -> HashMap<u32, u32> {
@@ -1626,7 +1795,47 @@ fn property_owners(l: &TableLayout<'_>, type_count: u32, prop_count: u32) -> Has
     }
     out
 }
+fn event_owners(l: &TableLayout<'_>, type_count: u32, event_count: u32) -> HashMap<u32, u32> {
+    let mut maps = Vec::new();
+    for i in 1..=l.rows(18) {
+        let Some(row) = l.row(18, i) else {
+            continue;
+        };
+        let mut cursor = 0;
+        let Some(owner) = index(row, &mut cursor, index_size(type_count)) else {
+            continue;
+        };
+        let Some(start) = index(row, &mut cursor, index_size(event_count)) else {
+            continue;
+        };
+        if owner > 0 && owner <= type_count && start > 0 && start <= event_count.saturating_add(1) {
+            maps.push((owner, start));
+        }
+    }
+    maps.sort();
+    let mut owners = HashMap::default();
+    for (map_index, (owner, start)) in maps.iter().enumerate() {
+        let end = maps
+            .get(map_index + 1)
+            .map(|(_, next_start)| *next_start)
+            .unwrap_or(event_count + 1);
+        if end < *start || end > event_count.saturating_add(1) {
+            continue;
+        }
+        for event in *start..end {
+            owners.insert(event, *owner);
+        }
+    }
+    owners
+}
 fn property_accessors(l: &TableLayout<'_>, methods: &[MethodRow]) -> HashMap<u32, u16> {
+    association_accessors(l, methods, 1)
+}
+fn association_accessors(
+    l: &TableLayout<'_>,
+    methods: &[MethodRow],
+    association_tag: u32,
+) -> HashMap<u32, u16> {
     let mut out = HashMap::default();
     for i in 1..=l.rows(24) {
         let Some(row) = l.row(24, i) else {
@@ -1642,14 +1851,14 @@ fn property_accessors(l: &TableLayout<'_>, methods: &[MethodRow]) -> HashMap<u32
         let Some(association) = index(row, &mut p, coded_size(&l.rows, &[20, 23], 1)) else {
             continue;
         };
-        if association & 1 != 1 {
+        if association & 1 != association_tag {
             continue;
         }
         let Some(method) = methods.get(method.saturating_sub(1) as usize) else {
             continue;
         };
-        let property = association >> 1;
-        out.entry(property)
+        let associated_row = association >> 1;
+        out.entry(associated_row)
             .and_modify(|flags| {
                 if method.flags & 7 > *flags & 7 {
                     *flags = method.flags;
@@ -1664,7 +1873,11 @@ struct GenericParameters {
     methods: HashMap<u32, Vec<String>>,
 }
 
-fn generic_parameters(l: &TableLayout<'_>, strings: &[u8]) -> GenericParameters {
+fn generic_parameters(
+    l: &TableLayout<'_>,
+    strings: &[u8],
+    budget: &mut MetadataDecodeBudget,
+) -> GenericParameters {
     let mut types: HashMap<u32, Vec<(u16, String)>> = HashMap::default();
     let mut methods: HashMap<u32, Vec<(u16, String)>> = HashMap::default();
     for i in 1..=l.rows(42) {
@@ -1677,7 +1890,7 @@ fn generic_parameters(l: &TableLayout<'_>, strings: &[u8]) -> GenericParameters 
         let Some(owner) = index(r, &mut p, coded_size(&l.rows, &[2, 6], 1)) else {
             continue;
         };
-        let Some(name) = str_index(r, &mut p, l.heap, strings) else {
+        let Some(name) = str_index(r, &mut p, l.heap, strings, budget) else {
             continue;
         };
         if owner == 0 || name.is_empty() {
@@ -1762,9 +1975,16 @@ fn resolve_typedef_or_ref(
     type_refs: &[TypeRefRow],
     type_specs: &[TypeSpecRow],
 ) -> String {
-    resolve_typedef_or_ref_type_at_depth(value, types, type_refs, type_specs, 0)
-        .map(|value| value.legacy_name())
-        .unwrap_or_default()
+    resolve_typedef_or_ref_type_at_depth(
+        value,
+        types,
+        type_refs,
+        type_specs,
+        MAX_SIGNATURE_DEPTH,
+        0,
+    )
+    .map(|value| value.legacy_name())
+    .unwrap_or_default()
 }
 fn resolve_typedef_or_ref_type(
     value: u32,
@@ -1772,16 +1992,24 @@ fn resolve_typedef_or_ref_type(
     type_refs: &[TypeRefRow],
     type_specs: &[TypeSpecRow],
 ) -> Option<DecodedType> {
-    resolve_typedef_or_ref_type_at_depth(value, types, type_refs, type_specs, 0)
+    resolve_typedef_or_ref_type_at_depth(
+        value,
+        types,
+        type_refs,
+        type_specs,
+        MAX_SIGNATURE_DEPTH,
+        0,
+    )
 }
 fn resolve_typedef_or_ref_type_at_depth(
     value: u32,
     types: &[TypeRow],
     type_refs: &[TypeRefRow],
     type_specs: &[TypeSpecRow],
+    max_signature_depth: usize,
     depth: usize,
 ) -> Option<DecodedType> {
-    if depth >= MAX_SIGNATURE_DEPTH {
+    if depth >= max_signature_depth {
         return None;
     }
     let tag = value & 3;
@@ -1813,6 +2041,7 @@ fn resolve_typedef_or_ref_type_at_depth(
                 types,
                 type_refs,
                 type_specs,
+                max_signature_depth,
                 depth + 1,
             )
         }
@@ -1867,30 +2096,44 @@ fn decode_signature(
     types: &[TypeRow],
     type_refs: &[TypeRefRow],
     type_specs: &[TypeSpecRow],
-) -> (Option<DecodedType>, Vec<DecodedType>, usize) {
+    max_signature_depth: usize,
+) -> Option<(Option<DecodedType>, Vec<DecodedType>, usize)> {
     let mut p = 0;
-    let Some(header) = blob.get(p).copied() else {
-        return (None, Vec::new(), 0);
-    };
+    let header = blob.get(p).copied()?;
     p += 1;
     let generic = if header & 0x10 != 0 {
-        compressed(blob, &mut p).unwrap_or(0) as usize
+        compressed(blob, &mut p)? as usize
     } else {
         0
     };
     let count = if method || header & 0x0f == 0x08 {
-        compressed(blob, &mut p).unwrap_or(0) as usize
+        compressed(blob, &mut p)? as usize
     } else {
         0
     };
-    let ret = decode_type(blob, &mut p, types, type_refs, type_specs);
+    if count > MAX_SIGNATURE_PARAMETERS || count > blob.len().saturating_sub(p) {
+        return None;
+    }
+    let ret = Some(decode_type(
+        blob,
+        &mut p,
+        types,
+        type_refs,
+        type_specs,
+        max_signature_depth,
+    )?);
     let mut params = Vec::new();
     for _ in 0..count {
-        if let Some(value) = decode_type(blob, &mut p, types, type_refs, type_specs) {
-            params.push(value);
-        }
+        params.push(decode_type(
+            blob,
+            &mut p,
+            types,
+            type_refs,
+            type_specs,
+            max_signature_depth,
+        )?);
     }
-    (ret, params, generic)
+    Some((ret, params, generic))
 }
 fn decode_type(
     blob: &[u8],
@@ -1898,8 +2141,17 @@ fn decode_type(
     types: &[TypeRow],
     type_refs: &[TypeRefRow],
     type_specs: &[TypeSpecRow],
+    max_signature_depth: usize,
 ) -> Option<DecodedType> {
-    decode_type_at_depth(blob, p, types, type_refs, type_specs, 0)
+    decode_type_at_depth(
+        blob,
+        p,
+        types,
+        type_refs,
+        type_specs,
+        max_signature_depth,
+        0,
+    )
 }
 fn decode_type_at_depth(
     blob: &[u8],
@@ -1907,9 +2159,10 @@ fn decode_type_at_depth(
     types: &[TypeRow],
     type_refs: &[TypeRefRow],
     type_specs: &[TypeSpecRow],
+    max_signature_depth: usize,
     depth: usize,
 ) -> Option<DecodedType> {
-    if depth >= MAX_SIGNATURE_DEPTH {
+    if depth >= max_signature_depth {
         return None;
     }
     let element = *blob.get(*p)?;
@@ -1941,20 +2194,45 @@ fn decode_type_at_depth(
         });
     }
     match element {
-        0x0f => decode_type_at_depth(blob, p, types, type_refs, type_specs, depth + 1)
-            .map(Box::new)
-            .map(DecodedType::Pointer),
-        0x10 => decode_type_at_depth(blob, p, types, type_refs, type_specs, depth + 1)
-            .map(Box::new)
-            .map(DecodedType::ByRef),
-        0x1d => decode_type_at_depth(blob, p, types, type_refs, type_specs, depth + 1)
-            .map(Box::new)
-            .map(|element| DecodedType::Array { element, rank: 1 }),
+        0x0f => decode_type_at_depth(
+            blob,
+            p,
+            types,
+            type_refs,
+            type_specs,
+            max_signature_depth,
+            depth + 1,
+        )
+        .map(Box::new)
+        .map(DecodedType::Pointer),
+        0x10 => decode_type_at_depth(
+            blob,
+            p,
+            types,
+            type_refs,
+            type_specs,
+            max_signature_depth,
+            depth + 1,
+        )
+        .map(Box::new)
+        .map(DecodedType::ByRef),
+        0x1d => decode_type_at_depth(
+            blob,
+            p,
+            types,
+            type_refs,
+            type_specs,
+            max_signature_depth,
+            depth + 1,
+        )
+        .map(Box::new)
+        .map(|element| DecodedType::Array { element, rank: 1 }),
         0x11 | 0x12 => resolve_typedef_or_ref_type_at_depth(
             compressed(blob, p)?,
             types,
             type_refs,
             type_specs,
+            max_signature_depth,
             depth + 1,
         ),
         0x13 => compressed(blob, p).map(|index| DecodedType::TypeParameter {
@@ -1966,13 +2244,30 @@ fn decode_type_at_depth(
             index: index as usize,
         }),
         0x14 => {
-            let inner = decode_type_at_depth(blob, p, types, type_refs, type_specs, depth + 1)?;
+            let inner = decode_type_at_depth(
+                blob,
+                p,
+                types,
+                type_refs,
+                type_specs,
+                max_signature_depth,
+                depth + 1,
+            )?;
             let rank = compressed(blob, p)?;
+            if rank as usize > MAX_ARRAY_RANK {
+                return None;
+            }
             let sizes = compressed(blob, p)?;
+            if sizes as usize > MAX_ARRAY_RANK {
+                return None;
+            }
             for _ in 0..sizes {
                 compressed(blob, p)?;
             }
             let lowers = compressed(blob, p)?;
+            if lowers as usize > MAX_ARRAY_RANK {
+                return None;
+            }
             for _ in 0..lowers {
                 compressed(blob, p)?;
             }
@@ -1989,6 +2284,7 @@ fn decode_type_at_depth(
                 types,
                 type_refs,
                 type_specs,
+                max_signature_depth,
                 depth + 1,
             )?;
             let count = compressed(blob, p)?;
@@ -2000,6 +2296,7 @@ fn decode_type_at_depth(
                     types,
                     type_refs,
                     type_specs,
+                    max_signature_depth,
                     depth + 1,
                 )?);
             }
@@ -2010,7 +2307,15 @@ fn decode_type_at_depth(
         }
         0x1f | 0x20 => {
             compressed(blob, p)?;
-            decode_type_at_depth(blob, p, types, type_refs, type_specs, depth + 1)
+            decode_type_at_depth(
+                blob,
+                p,
+                types,
+                type_refs,
+                type_specs,
+                max_signature_depth,
+                depth + 1,
+            )
         }
         _ => None,
     }
@@ -2131,23 +2436,56 @@ fn index(b: &[u8], p: &mut usize, size: usize) -> Option<u32> {
         u32at(b, p)
     }
 }
-fn str_index(b: &[u8], p: &mut usize, heap: u8, strings: &[u8]) -> Option<String> {
+struct MetadataDecodeBudget {
+    remaining_bytes: usize,
+}
+
+impl Default for MetadataDecodeBudget {
+    fn default() -> Self {
+        Self {
+            remaining_bytes: MAX_DECODED_METADATA_BYTES,
+        }
+    }
+}
+
+impl MetadataDecodeBudget {
+    fn consume(&mut self, bytes: usize) -> Option<()> {
+        self.remaining_bytes = self.remaining_bytes.checked_sub(bytes)?;
+        Some(())
+    }
+}
+
+fn str_index(
+    b: &[u8],
+    p: &mut usize,
+    heap: u8,
+    strings: &[u8],
+    budget: &mut MetadataDecodeBudget,
+) -> Option<String> {
     let idx = index(b, p, if heap & 1 != 0 { 4 } else { 2 })? as usize;
     if idx == 0 {
         return Some(String::new());
     }
     let end = strings.get(idx..)?.iter().position(|v| *v == 0)? + idx;
+    budget.consume(end.saturating_sub(idx))?;
     std::str::from_utf8(strings.get(idx..end)?)
         .ok()
         .map(str::to_string)
 }
-fn blob_index(b: &[u8], p: &mut usize, heap: u8, blobs: &[u8]) -> Option<Vec<u8>> {
+fn blob_index(
+    b: &[u8],
+    p: &mut usize,
+    heap: u8,
+    blobs: &[u8],
+    budget: &mut MetadataDecodeBudget,
+) -> Option<Vec<u8>> {
     let idx = index(b, p, if heap & 4 != 0 { 4 } else { 2 })? as usize;
     if idx == 0 {
         return Some(Vec::new());
     }
     let mut start = idx;
     let len = compressed(blobs, &mut start)? as usize;
+    budget.consume(len)?;
     blobs
         .get(start..start.checked_add(len)?)
         .map(ToOwned::to_owned)
@@ -2308,6 +2646,20 @@ mod tests {
     }
 
     #[test]
+    fn assembly_producer_applies_signature_depth_limit() {
+        let production = produce_fixture(&ArtifactProducerLimits {
+            max_signature_depth: 0,
+            ..ArtifactProducerLimits::default()
+        });
+
+        assert_eq!(production.completeness, Completeness::Partial);
+        assert!(production.pack.is_some());
+        assert!(production.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "csharp.signature.omitted" && diagnostic.message.contains("omitted")
+        }));
+    }
+
+    #[test]
     fn assembly_producer_rejects_non_cli_input_without_panicking() {
         let temp = tempfile::tempdir().unwrap();
         let assembly = temp.path().join("broken.dll");
@@ -2338,27 +2690,53 @@ mod tests {
             "fixture table layout"
         );
         let layout = TableLayout::parse(streams.tables.expect("fixture tables")).unwrap();
+        let mut decode_budget = MetadataDecodeBudget::default();
         assert!(
-            (1..=layout.rows(2))
-                .all(|i| read_typedef(&layout, i, streams.strings.unwrap()).is_some()),
+            (1..=layout.rows(2)).all(|i| read_typedef(
+                &layout,
+                i,
+                streams.strings.unwrap(),
+                &mut decode_budget
+            )
+            .is_some()),
             "fixture type definitions"
         );
         assert!(
             (1..=layout.rows(4)).all(|i| {
-                read_field(&layout, i, streams.strings.unwrap(), streams.blobs.unwrap()).is_some()
+                read_field(
+                    &layout,
+                    i,
+                    streams.strings.unwrap(),
+                    streams.blobs.unwrap(),
+                    &mut decode_budget,
+                )
+                .is_some()
             }),
             "fixture fields"
         );
         assert!(
             (1..=layout.rows(6)).all(|i| {
-                read_method(&layout, i, streams.strings.unwrap(), streams.blobs.unwrap()).is_some()
+                read_method(
+                    &layout,
+                    i,
+                    streams.strings.unwrap(),
+                    streams.blobs.unwrap(),
+                    &mut decode_budget,
+                )
+                .is_some()
             }),
             "fixture methods"
         );
         assert!(
             (1..=layout.rows(23)).all(|i| {
-                read_property(&layout, i, streams.strings.unwrap(), streams.blobs.unwrap())
-                    .is_some()
+                read_property(
+                    &layout,
+                    i,
+                    streams.strings.unwrap(),
+                    streams.blobs.unwrap(),
+                    &mut decode_budget,
+                )
+                .is_some()
             }),
             "fixture properties"
         );
