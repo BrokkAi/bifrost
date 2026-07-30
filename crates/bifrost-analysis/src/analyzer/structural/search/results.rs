@@ -271,6 +271,10 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryFlowWitness>,
     },
+    TaintFinding {
+        #[serde(flatten)]
+        value: Box<CodeQueryTaintFinding>,
+    },
     File {
         #[serde(flatten)]
         value: CodeQueryFile,
@@ -618,6 +622,89 @@ pub struct CodeQueryFlowWitness {
     pub alternatives_truncated: bool,
     #[serde(skip_serializing_if = "is_false")]
     pub retention_truncated: bool,
+}
+
+/// One bounded source occurrence contributing to an aggregated taint sink.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryTaintOrigin {
+    pub id: String,
+    pub event_id: String,
+    pub labels: Vec<String>,
+    pub site: CodeQuerySourceSite,
+}
+
+/// One bounded witness owned by an aggregated taint finding.
+///
+/// Steps reuse the source-backed flow witness representation. The envelope is
+/// taint-specific because one finding can aggregate several origins and is not
+/// itself a registered value-flow endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryTaintWitness {
+    pub id: String,
+    pub finding_id: String,
+    pub witness_index: usize,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub quality: CodeQuerySemanticEvidence,
+    pub steps: Vec<CodeQueryFlowWitnessStep>,
+    pub retained_bytes: usize,
+    #[serde(skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    pub omitted_steps_lower_bound: usize,
+    #[serde(skip_serializing_if = "is_false")]
+    pub alternatives_truncated: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub retention_truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeQueryTaintProjectionLimits {
+    pub max_origins_per_finding: usize,
+    pub max_witnesses_per_finding: usize,
+    pub max_steps_per_witness: usize,
+    pub max_witness_bytes: usize,
+}
+
+impl CodeQueryTaintProjectionLimits {
+    pub const fn new(
+        max_origins_per_finding: usize,
+        max_witnesses_per_finding: usize,
+        max_steps_per_witness: usize,
+        max_witness_bytes: usize,
+    ) -> Self {
+        Self {
+            max_origins_per_finding,
+            max_witnesses_per_finding,
+            max_steps_per_witness,
+            max_witness_bytes,
+        }
+    }
+}
+
+/// Diagnostic-neutral public projection of one retained taint finding.
+///
+/// Flow witness steps deliberately reuse [`CodeQueryFlowWitnessStep`]; this
+/// envelope adds only taint-specific aggregation that a flow endpoint cannot
+/// represent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryTaintFinding {
+    pub id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub sink_event_id: String,
+    pub sink: CodeQuerySourceSite,
+    pub reached_labels: Vec<String>,
+    pub origins: Vec<CodeQueryTaintOrigin>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub origins_truncated: bool,
+    pub witnesses: Vec<CodeQueryTaintWitness>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub witnesses_truncated: bool,
+    pub evidence: CodeQuerySemanticEvidence,
+    #[serde(skip_serializing_if = "is_false")]
+    pub ambiguous: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2067,6 +2154,7 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::ReferenceSite { .. }
         | CodeQueryResultValue::CallSite { .. }
         | CodeQueryResultValue::ExpressionSite { .. }
+        | CodeQueryResultValue::TaintFinding { .. }
         | CodeQueryResultValue::ReceiverAnalysis { .. } => None,
     }
 }
@@ -2152,6 +2240,7 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::TypestateWitness { .. }
                 | CodeQueryResultValue::FlowEndpoint { .. }
                 | CodeQueryResultValue::FlowWitness { .. }
+                | CodeQueryResultValue::TaintFinding { .. }
                 | CodeQueryResultValue::File { .. }
                 | CodeQueryResultValue::ReferenceSite { .. }
                 | CodeQueryResultValue::CallSite { .. }
@@ -2294,6 +2383,22 @@ impl CodeQueryResult {
                             value.steps.len(),
                             if value.steps.len() == 1 { "" } else { "s" },
                             if value.truncated { "; truncated" } else { "" },
+                            value.id,
+                        ));
+                    }
+                    CodeQueryResultValue::TaintFinding { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [taint finding; {} label{}; {} origin{}; {} witness{}{}] {}\n",
+                            value.sink.path,
+                            value.sink.range.start_line,
+                            value.sink.range.start_column,
+                            value.reached_labels.len(),
+                            if value.reached_labels.len() == 1 { "" } else { "s" },
+                            value.origins.len(),
+                            if value.origins.len() == 1 { "" } else { "s" },
+                            value.witnesses.len(),
+                            if value.witnesses.len() == 1 { "" } else { "es" },
+                            if value.ambiguous { "; ambiguous" } else { "" },
                             value.id,
                         ));
                     }

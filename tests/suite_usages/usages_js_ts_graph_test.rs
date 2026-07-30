@@ -445,6 +445,20 @@ fn find_js_target(
         .expect("target definition not found")
 }
 
+fn find_js_definition(
+    analyzer: &JavascriptAnalyzer,
+    source_file: &ProjectFile,
+    fq_name: &str,
+    predicate: impl Fn(&CodeUnit) -> bool,
+) -> CodeUnit {
+    analyzer
+        .global_usage_definition_index()
+        .fqn_for_test(fq_name)
+        .into_iter()
+        .find(|unit| unit.source() == source_file && predicate(unit))
+        .expect("definition not found")
+}
+
 fn authoritative_js_hits(
     analyzer: &JavascriptAnalyzer,
     target: &CodeUnit,
@@ -3192,6 +3206,68 @@ fn js_commonjs_required_binding_shadowing_does_not_count() {
         hits.iter()
             .all(|hit| hit.file != project.file("consumer.js")),
         "shadowed required binding must not count as a consumer usage"
+    );
+}
+
+#[test]
+fn js_function_valued_local_property_inverse_hits_exact_same_scope_read_only() {
+    let source = r#"
+function makeLogger() {
+  var $log = {};
+  $log.reset = function() {};
+  $log.reset();
+}
+"#;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("logger.js", source).build());
+    let file = project.file("logger.js");
+    let target = find_js_definition(&analyzer, &file, "$log.reset", |cu| {
+        cu.fq_name() == "$log.reset" && cu.is_function()
+    });
+
+    let hits = authoritative_js_hits(&analyzer, &target, file);
+    let expected = BTreeSet::from([(
+        source.rfind("$log.reset").expect("member call") + "$log.".len(),
+        source.rfind("$log.reset").expect("member call") + "$log.reset".len(),
+    )]);
+    let actual = hits
+        .into_iter()
+        .filter(|hit| hit.kind == UsageHitKind::Reference)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(actual, expected, "only the same-scope read should count");
+}
+
+#[test]
+fn js_function_valued_local_property_inverse_rejects_shadowing_other_receivers_reads_before_write_and_lhs()
+ {
+    let source = r#"
+function makeLogger($log, other) {
+  $log.reset();
+  other.reset = function() {};
+  {
+    let $log = {};
+    $log.reset();
+  }
+  $log.reset = function() {};
+  other.reset();
+}
+"#;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("logger.js", source).build());
+    let file = project.file("logger.js");
+    let target = find_js_definition(&analyzer, &file, "$log.reset", |cu| {
+        cu.fq_name() == "$log.reset" && cu.is_function()
+    });
+
+    let hits = authoritative_js_hits(&analyzer, &target, file);
+    let actual = hits
+        .into_iter()
+        .filter(|hit| hit.kind == UsageHitKind::Reference)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+
+    assert!(
+        actual.is_empty(),
+        "read-before-write, different receivers, shadowed receivers, and assignment LHS sites must not count: {actual:?}"
     );
 }
 

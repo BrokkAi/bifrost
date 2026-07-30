@@ -628,6 +628,10 @@ impl TaintPolicyPlan {
             analysis,
         })
     }
+
+    pub(crate) const fn analysis(&self) -> &TaintAnalysisPlan {
+        &self.analysis
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -701,29 +705,41 @@ impl TaintBatchPlanner {
                     return Err(TaintPlanError::DuplicatePolicyId);
                 }
                 let first = policies.first().ok_or(TaintPlanError::EmptyBatch)?;
-                let projections = policies
-                    .iter()
-                    .map(|policy| TaintPolicyProjection {
-                        policy_id: policy.policy_id.clone(),
-                        sources: policy.analysis.sources.clone(),
-                        sinks: policy.analysis.sinks.clone(),
-                    })
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice();
-                let mut sources = first.analysis.sources.to_vec();
-                let mut sinks = first.analysis.sinks.to_vec();
                 for policy in policies.iter().skip(1) {
                     ensure_same_semantics(&first.analysis, &policy.analysis)?;
-                    merge_sources(&mut sources, &policy.analysis.sources)?;
-                    merge_sinks(&mut sinks, &policy.analysis.sinks)?;
+                }
+                let value_flow = ValueFlowPlan::union_observations(
+                    &policies
+                        .iter()
+                        .map(|policy| policy.analysis.value_flow())
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(|_| TaintPlanError::IncompatibleBatchMember)?;
+                let projections = policies
+                    .iter()
+                    .map(|policy| {
+                        Ok(TaintPolicyProjection {
+                            policy_id: policy.policy_id.clone(),
+                            sources: remap_sources(&policy.analysis, &value_flow)?
+                                .into_boxed_slice(),
+                            sinks: remap_sinks(&policy.analysis, &value_flow)?.into_boxed_slice(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, TaintPlanError>>()?
+                    .into_boxed_slice();
+                let mut sources = Vec::new();
+                let mut sinks = Vec::new();
+                for projection in &projections {
+                    merge_sources(&mut sources, &projection.sources)?;
+                    merge_sinks(&mut sinks, &projection.sinks)?;
                 }
                 let analysis = TaintAnalysisPlan::new(
-                    first.analysis.value_flow.clone(),
+                    value_flow.clone(),
                     first.analysis.universe.clone(),
                     sources,
                     sinks,
-                    first.analysis.sanitizers.to_vec(),
-                    first.analysis.transforms.to_vec(),
+                    remap_sanitizers(&first.analysis, &value_flow)?,
+                    remap_transforms(&first.analysis, &value_flow)?,
                 )?;
                 Ok(TaintBatch {
                     compatibility,
@@ -740,13 +756,154 @@ fn ensure_same_semantics(
     right: &TaintAnalysisPlan,
 ) -> Result<(), TaintPlanError> {
     if left.universe != right.universe
-        || left.value_flow != right.value_flow
-        || left.sanitizers != right.sanitizers
-        || left.transforms != right.transforms
+        || !left
+            .value_flow
+            .has_same_propagation_semantics(&right.value_flow)
+        || !same_sanitizers(left, right)
+        || !same_transforms(left, right)
     {
         return Err(TaintPlanError::IncompatibleBatchMember);
     }
     Ok(())
+}
+
+fn remap_sources(
+    analysis: &TaintAnalysisPlan,
+    value_flow: &ValueFlowPlan,
+) -> Result<Vec<TaintSourceBinding>, TaintPlanError> {
+    analysis
+        .sources
+        .iter()
+        .map(|source| {
+            let spec = analysis
+                .value_flow
+                .source(source.source)
+                .ok_or(TaintPlanError::InvalidSource)?;
+            let remapped = value_flow
+                .source_id_for_key(spec.key())
+                .ok_or(TaintPlanError::InvalidSource)?;
+            Ok(TaintSourceBinding::new(
+                remapped,
+                source.classes.clone(),
+                source.origin.clone(),
+            ))
+        })
+        .collect()
+}
+
+fn remap_sinks(
+    analysis: &TaintAnalysisPlan,
+    value_flow: &ValueFlowPlan,
+) -> Result<Vec<TaintSinkBinding>, TaintPlanError> {
+    analysis
+        .sinks
+        .iter()
+        .map(|sink| {
+            let spec = analysis
+                .value_flow
+                .sink(sink.sink)
+                .ok_or(TaintPlanError::InvalidSink)?;
+            let remapped = value_flow
+                .sink_id_for_key(spec.key())
+                .ok_or(TaintPlanError::InvalidSink)?;
+            Ok(TaintSinkBinding::new(remapped, sink.accepted.clone()))
+        })
+        .collect()
+}
+
+fn remapped_carrier(
+    source: &ValueFlowPlan,
+    target: &ValueFlowPlan,
+    carrier: ValueFlowCarrierId,
+) -> Result<ValueFlowCarrierId, TaintPlanError> {
+    let key = source
+        .carrier_key(carrier)
+        .ok_or(TaintPlanError::InvalidCarrierBinding)?;
+    target
+        .carrier_id_for_key(key)
+        .ok_or(TaintPlanError::InvalidCarrierBinding)
+}
+
+fn remap_sanitizers(
+    analysis: &TaintAnalysisPlan,
+    value_flow: &ValueFlowPlan,
+) -> Result<Vec<TaintSanitizerBinding>, TaintPlanError> {
+    analysis
+        .sanitizers
+        .iter()
+        .map(|binding| {
+            let carrier = remapped_carrier(&analysis.value_flow, value_flow, binding.carrier)?;
+            Ok(if binding.resolved {
+                TaintSanitizerBinding::resolved(
+                    binding.point.clone(),
+                    binding.phase,
+                    binding.event_index,
+                    carrier,
+                    binding.removed.clone(),
+                )
+            } else {
+                TaintSanitizerBinding::unresolved(
+                    binding.point.clone(),
+                    binding.phase,
+                    binding.event_index,
+                    carrier,
+                    binding.removed.clone(),
+                )
+            })
+        })
+        .collect()
+}
+
+fn remap_transforms(
+    analysis: &TaintAnalysisPlan,
+    value_flow: &ValueFlowPlan,
+) -> Result<Vec<TaintTransformBinding>, TaintPlanError> {
+    analysis
+        .transforms
+        .iter()
+        .map(|binding| {
+            Ok(TaintTransformBinding::new(
+                binding.point.clone(),
+                binding.phase,
+                binding.event_index,
+                remapped_carrier(&analysis.value_flow, value_flow, binding.carrier)?,
+                binding.function.clone(),
+            ))
+        })
+        .collect()
+}
+
+fn same_sanitizers(left: &TaintAnalysisPlan, right: &TaintAnalysisPlan) -> bool {
+    left.sanitizers.len() == right.sanitizers.len()
+        && left
+            .sanitizers
+            .iter()
+            .zip(&right.sanitizers)
+            .all(|(left_binding, right_binding)| {
+                left_binding.point == right_binding.point
+                    && left_binding.phase == right_binding.phase
+                    && left_binding.event_index == right_binding.event_index
+                    && left_binding.removed == right_binding.removed
+                    && left_binding.resolved == right_binding.resolved
+                    && left.value_flow.carrier_key(left_binding.carrier)
+                        == right.value_flow.carrier_key(right_binding.carrier)
+            })
+}
+
+fn same_transforms(left: &TaintAnalysisPlan, right: &TaintAnalysisPlan) -> bool {
+    left.transforms.len() == right.transforms.len()
+        && left
+            .transforms
+            .iter()
+            .zip(&right.transforms)
+            .all(|(left_binding, right_binding)| {
+                left_binding.point == right_binding.point
+                    && left_binding.phase == right_binding.phase
+                    && left_binding.event_index == right_binding.event_index
+                    && left_binding.function == right_binding.function
+                    && left.value_flow.carrier_key(left_binding.carrier)
+                        == right.value_flow.carrier_key(right_binding.carrier)
+            })
 }
 
 fn merge_sources(

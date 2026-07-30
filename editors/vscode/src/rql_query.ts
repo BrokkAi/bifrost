@@ -245,6 +245,45 @@ export interface RqlFlowWitnessResult extends RqlQueryResultBase {
   retention_truncated?: boolean;
 }
 
+export interface RqlTaintOrigin {
+  id: string;
+  event_id: string;
+  labels: string[];
+  site: RqlSourceSite;
+}
+
+export interface RqlTaintWitness {
+  id: string;
+  finding_id: string;
+  witness_index: number;
+  path: string;
+  language: string;
+  range: RqlResultRange;
+  quality: RqlSemanticEvidence;
+  steps: RqlFlowWitnessStep[];
+  retained_bytes: number;
+  truncated?: boolean;
+  omitted_steps_lower_bound: number;
+  alternatives_truncated?: boolean;
+  retention_truncated?: boolean;
+}
+
+export interface RqlTaintFindingResult extends RqlQueryResultBase {
+  result_type: "taint_finding";
+  id: string;
+  language: string;
+  range: RqlResultRange;
+  sink_event_id: string;
+  sink: RqlSourceSite;
+  reached_labels: string[];
+  origins: RqlTaintOrigin[];
+  origins_truncated?: boolean;
+  witnesses: RqlTaintWitness[];
+  witnesses_truncated?: boolean;
+  evidence: RqlSemanticEvidence;
+  ambiguous?: boolean;
+}
+
 export interface RqlReferenceSiteResult extends RqlQueryResultBase {
   result_type: "reference_site";
   language: string;
@@ -344,6 +383,7 @@ export type RqlQueryResultItem =
   | RqlTypestateWitnessResult
   | RqlFlowEndpointResult
   | RqlFlowWitnessResult
+  | RqlTaintFindingResult
   | RqlFileResult
   | RqlReferenceSiteResult
   | RqlCallSiteResult
@@ -453,6 +493,8 @@ export function queryResultLabel(result: RqlQueryResultItem): string {
       return `${result.reachability}: ${result.sink.id}`;
     case "flow_witness":
       return `flow witness ${result.witness_index + 1}: ${result.steps.length} step${result.steps.length === 1 ? "" : "s"}`;
+    case "taint_finding":
+      return `taint: ${result.reached_labels.join(", ")}`;
     case "file":
       return result.path;
     case "reference_site":
@@ -482,6 +524,8 @@ export function queryResultDescription(result: RqlQueryResultItem): string {
       return `${result.certainty ?? "n/a"} · ${result.completion} · ${result.plan_ref}`;
     case "flow_witness":
       return `${semanticEvidenceLabel(result.quality)} · ${result.truncated ? "truncated" : "complete"}`;
+    case "taint_finding":
+      return `${semanticEvidenceLabel(result.evidence)} · ${result.origins.length} origin${result.origins.length === 1 ? "" : "s"}`;
     case "file":
       return `file · ${result.language}`;
     case "reference_site":
@@ -573,6 +617,15 @@ export function queryResultTooltip(result: RqlQueryResultItem): string {
         (result.alternatives_truncated ? "\n\nAlternative witnesses were omitted." : "") +
         (result.retention_truncated ? "\n\nWitness retention hit its request bound." : "")
       );
+    case "taint_finding":
+      return (
+        `**Taint finding** at ${result.path}:${result.range.start_line}:${result.range.start_column}` +
+        `\n\nLabels: ${result.reached_labels.map((label) => `\`${label}\``).join(", ")}` +
+        `\n\nOrigins: ${result.origins.length}; witnesses: ${result.witnesses.length}` +
+        `\n\nEvidence: ${semanticEvidenceLabel(result.evidence)}` +
+        (result.origins_truncated ? "\n\nOrigins were truncated." : "") +
+        (result.witnesses_truncated ? "\n\nWitnesses were truncated." : "")
+      );
     case "file":
       return `**file** at ${result.path}\n\nLanguage: ${result.language}`;
     case "reference_site":
@@ -627,6 +680,8 @@ export function queryResultIcon(result: RqlQueryResultItem): string {
       return "target";
     case "flow_witness":
       return "debug-alt";
+    case "taint_finding":
+      return "warning";
     case "file":
       return "file-code";
     case "reference_site":
@@ -655,6 +710,7 @@ export function queryResultRange(result: RqlQueryResultItem): RqlResultRange | u
     case "typestate_witness":
     case "flow_endpoint":
     case "flow_witness":
+    case "taint_finding":
       return result.range;
     case "structural_match":
     case "declaration":

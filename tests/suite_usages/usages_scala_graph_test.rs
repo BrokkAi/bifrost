@@ -5706,6 +5706,334 @@ object OtherSyntax:
 }
 
 #[test]
+fn scala_inverse_replay_records_companion_import_tokens_across_term_and_type_namespaces() {
+    let source = r#"package app
+import model.Topic // positive-direct-topic-import
+import model.Topic.* // positive-topic-wildcard-owner-import
+
+object Use {
+  val built = Topic.make("value")
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Topic.scala",
+            r#"package model
+case class Topic(value: String)
+object Topic {
+  def make(value: String): Topic = Topic(value)
+}
+"#,
+        ),
+        (
+            "decoy/Topic.scala",
+            r#"package decoy
+case class Topic(value: Int)
+object Topic
+
+object Use {
+  import decoy.Topic // negative-other-owner-topic-import
+}
+"#,
+        ),
+        ("app/Use.scala", source),
+    ]);
+    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let inverse = ScalaUsageGraphStrategy::new();
+
+    for (target, positives, negatives) in [
+        (
+            definition(&analyzer, "model.Topic"),
+            vec![(
+                "positive-direct-topic-import",
+                "import model.Topic // positive-direct-topic-import",
+                "Topic",
+            )],
+            vec!["negative-other-owner-topic-import"],
+        ),
+        (
+            definition(&analyzer, "model.Topic$"),
+            vec![
+                (
+                    "positive-direct-topic-import",
+                    "import model.Topic // positive-direct-topic-import",
+                    "Topic",
+                ),
+                (
+                    "positive-topic-wildcard-owner-import",
+                    "import model.Topic.* // positive-topic-wildcard-owner-import",
+                    "Topic",
+                ),
+            ],
+            vec!["negative-other-owner-topic-import"],
+        ),
+    ] {
+        let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        let inverse_hits = reference_surface_hits(inverse.find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        for bucket in [&targeted_hits, &inverse_hits] {
+            for (marker, line, token) in &positives {
+                assert_hit_contains(bucket, marker);
+                let range = exact_segment(source, line, token);
+                assert!(
+                    bucket.iter().any(|hit| {
+                        hit.kind == UsageHitKind::Import
+                            && hit.start_offset == range.0
+                            && hit.end_offset == range.1
+                    }),
+                    "expected exact import range {range:?} for {}: {bucket:#?}",
+                    target.fq_name()
+                );
+            }
+            for marker in &negatives {
+                assert_no_hit_contains(bucket, marker);
+            }
+        }
+    }
+}
+
+#[test]
+fn scala_inverse_replay_records_inherited_parameterless_helpers_in_stream_reactor_shapes() {
+    let source = r#"package app
+
+import java.util
+import scala.jdk.CollectionConverters.*
+
+trait DeleteModeConfigKeys {
+  def connectorPrefix: String
+  def DELETE_MODE: String = s"$connectorPrefix.delete.mode"
+}
+
+trait AssignmentBase {
+  def ASSIGNMENT: util.Set[String]
+  def getAssignment: util.Set[String] = ASSIGNMENT
+}
+
+trait SchemaBase {
+  def createSchemaNested: String = "schema"
+}
+
+final class Config
+    extends DeleteModeConfigKeys
+    with AssignmentBase
+    with SchemaBase {
+  def connectorPrefix: String = "sink"
+  def ASSIGNMENT: util.Set[String] = new util.HashSet[String]()
+  def deleteMode: String = DELETE_MODE // positive-delete-mode-inherited
+  def assignment = getAssignment.asScala // positive-get-assignment-inherited
+  def nested: String = createSchemaNested.toString // positive-create-schema-nested-inherited
+}
+
+final class Decoy {
+  val DELETE_MODE = "shadow"
+  def deleteMode: String = DELETE_MODE // negative-shadow-delete-mode
+  def assignment(getAssignment: String): String = getAssignment // negative-shadow-get-assignment
+  def nested(createSchemaNested: String): String = createSchemaNested // negative-shadow-create-schema-nested
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/Config.scala", source)]);
+    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let inverse = ScalaUsageGraphStrategy::new();
+
+    for (target_fqn, positive, negatives, line, token) in [
+        (
+            "app.DeleteModeConfigKeys.DELETE_MODE",
+            "positive-delete-mode-inherited",
+            vec!["negative-shadow-delete-mode"],
+            "  def deleteMode: String = DELETE_MODE // positive-delete-mode-inherited",
+            "DELETE_MODE",
+        ),
+        (
+            "app.AssignmentBase.getAssignment",
+            "positive-get-assignment-inherited",
+            vec!["negative-shadow-get-assignment"],
+            "  def assignment = getAssignment.asScala // positive-get-assignment-inherited",
+            "getAssignment",
+        ),
+        (
+            "app.SchemaBase.createSchemaNested",
+            "positive-create-schema-nested-inherited",
+            vec!["negative-shadow-create-schema-nested"],
+            "  def nested: String = createSchemaNested.toString // positive-create-schema-nested-inherited",
+            "createSchemaNested",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        let inverse_hits = reference_surface_hits(inverse.find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        let range = exact_segment(source, line, token);
+        for bucket in [&targeted_hits, &inverse_hits] {
+            assert_hit_contains(bucket, positive);
+            for negative in &negatives {
+                assert_no_hit_contains(bucket, negative);
+            }
+            assert!(
+                bucket.iter().any(|hit| {
+                    hit.kind == UsageHitKind::Reference
+                        && hit.start_offset == range.0
+                        && hit.end_offset == range.1
+                }),
+                "expected exact helper range {range:?} for {target_fqn}: {bucket:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn scala_inverse_replay_records_zio_http_exact_function_and_receiver_shapes() {
+    let source = r#"package app
+
+trait Platform {
+  def fromConfig: Int = 1
+  private def sink(value: Int): Int = value
+  def default: Int = sink(fromConfig) // positive-from-config-method-value
+}
+
+final case class JsonSchemas(root: String, children: List[String])
+
+sealed trait JsonSchema {
+  def annotate(label: String): JsonSchema = this
+}
+
+trait OtherJsonSchema {
+  def annotate(label: String): OtherJsonSchema = this
+}
+
+object OpenApi {
+  private def fromSerializableSchema(schema: String): JsonSchema = new JsonSchema {}
+  private def fromZSchemaMultiple(schema: String): JsonSchemas = JsonSchemas(schema, List(schema))
+  private def reconcileIfBothDefined[T](left: Option[T], right: Option[T])(combine: (T, T) => Option[T]): Option[T] =
+    for {
+      l <- left
+      r <- right
+      c <- combine(l, r)
+    } yield c
+  private def combinePatterns(left: String, right: String): Option[String] = Some(left + right)
+
+  def annotateValues(schema: String): JsonSchema = {
+    val valuesSchema = fromSerializableSchema(schema)
+    valuesSchema.annotate("value") // positive-values-schema-annotate
+  }
+
+  def selectRoot(left: String, right: String): String = {
+    val leftSchema = fromZSchemaMultiple(left)
+    val rightSchema = fromZSchemaMultiple(right)
+    rightSchema.root // positive-right-schema-root
+  }
+
+  def selectChildren(left: String, right: String): List[String] = {
+    val leftSchema = fromZSchemaMultiple(left)
+    val rightSchema = fromZSchemaMultiple(right)
+    rightSchema.children // positive-right-schema-children
+  }
+
+  def combine(left: Option[String], right: Option[String]): Option[String] =
+    reconcileIfBothDefined(left, right)(combinePatterns) // positive-combine-patterns
+}
+
+object Decoys {
+  final case class OtherSchemas(root: Int, children: Vector[Int])
+
+  private def reconcileIfBothDefined[T](left: Option[T], right: Option[T])(combine: (T, T) => Option[T]): Option[T] =
+    left.orElse(right)
+
+  def combine(left: Option[String], right: Option[String]): Option[String] = {
+    def combinePatterns(left: String, right: String): Option[String] = None
+    reconcileIfBothDefined(left, right)(combinePatterns) // negative-shadow-combine-patterns
+  }
+
+  def annotateOther(schema: OtherJsonSchema): OtherJsonSchema =
+    schema.annotate("other") // negative-other-annotate
+
+  def root(other: OtherSchemas): Int =
+    other.root // negative-other-root
+
+  def children(other: OtherSchemas): Vector[Int] =
+    other.children // negative-other-children
+
+  def default: Int = {
+    val fromConfig = 2
+    fromConfig // negative-shadow-from-config
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/ZioHttpShapes.scala", source)]);
+    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let inverse = ScalaUsageGraphStrategy::new();
+
+    for (target_fqn, positive, negatives, line, token) in [
+        (
+            "app.Platform.fromConfig",
+            "positive-from-config-method-value",
+            vec!["negative-shadow-from-config"],
+            "  def default: Int = sink(fromConfig) // positive-from-config-method-value",
+            "fromConfig",
+        ),
+        (
+            "app.JsonSchema.annotate",
+            "positive-values-schema-annotate",
+            vec!["negative-other-annotate"],
+            "    valuesSchema.annotate(\"value\") // positive-values-schema-annotate",
+            "annotate",
+        ),
+        (
+            "app.JsonSchemas.root",
+            "positive-right-schema-root",
+            vec!["negative-other-root"],
+            "    rightSchema.root // positive-right-schema-root",
+            "root",
+        ),
+        (
+            "app.JsonSchemas.children",
+            "positive-right-schema-children",
+            vec!["negative-other-children"],
+            "    rightSchema.children // positive-right-schema-children",
+            "children",
+        ),
+        (
+            "app.OpenApi$.combinePatterns",
+            "positive-combine-patterns",
+            vec!["negative-shadow-combine-patterns"],
+            "    reconcileIfBothDefined(left, right)(combinePatterns) // positive-combine-patterns",
+            "combinePatterns",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        let inverse_hits = reference_surface_hits(inverse.find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        let range = exact_segment(source, line, token);
+        for bucket in [&targeted_hits, &inverse_hits] {
+            assert_hit_contains(bucket, positive);
+            for negative in &negatives {
+                assert_no_hit_contains(bucket, negative);
+            }
+            assert!(
+                bucket.iter().any(|hit| {
+                    hit.kind == UsageHitKind::Reference
+                        && hit.start_offset == range.0
+                        && hit.end_offset == range.1
+                }),
+                "expected exact zio-http-shaped range {range:?} for {target_fqn}: {bucket:#?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn scala_inverse_replay_records_imported_function_values_under_higher_order_calls() {
     let consumer_source = r#"package app
 import model.MatchFields.{editsField, metadataField, sourceField}

@@ -1065,6 +1065,117 @@ class CodeQueryFlowWitness:
 
 
 @dataclass(frozen=True)
+class CodeQueryTaintOrigin:
+    id: str
+    event_id: str
+    labels: tuple[str, ...]
+    site: CodeQuerySourceSite
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryTaintOrigin:
+        return cls(
+            id=data["id"],
+            event_id=data["event_id"],
+            labels=tuple(_strict_list(data, "labels")),
+            site=CodeQuerySourceSite.from_dict(data["site"]),
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryTaintWitness:
+    id: str
+    finding_id: str
+    witness_index: int
+    path: str
+    language: str
+    range: CodeQueryRange
+    quality: CodeQuerySemanticEvidence
+    steps: tuple[CodeQueryFlowWitnessStep, ...]
+    retained_bytes: int
+    omitted_steps_lower_bound: int
+    truncated: bool = False
+    alternatives_truncated: bool = False
+    retention_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryTaintWitness:
+        return cls(
+            id=data["id"],
+            finding_id=data["finding_id"],
+            witness_index=_strict_nonnegative_int(data, "witness_index"),
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            quality=CodeQuerySemanticEvidence.from_dict(data["quality"]),
+            steps=tuple(
+                CodeQueryFlowWitnessStep.from_dict(step)
+                for step in _strict_list(data, "steps")
+            ),
+            retained_bytes=_strict_nonnegative_int(data, "retained_bytes"),
+            omitted_steps_lower_bound=_strict_nonnegative_int(
+                data, "omitted_steps_lower_bound"
+            ),
+            truncated=_strict_bool(data, "truncated", False),
+            alternatives_truncated=_strict_bool(
+                data, "alternatives_truncated", False
+            ),
+            retention_truncated=_strict_bool(data, "retention_truncated", False),
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryTaintFinding:
+    id: str
+    path: str
+    language: str
+    range: CodeQueryRange
+    sink_event_id: str
+    sink: CodeQuerySourceSite
+    reached_labels: tuple[str, ...]
+    origins: tuple[CodeQueryTaintOrigin, ...]
+    witnesses: tuple[CodeQueryTaintWitness, ...]
+    evidence: CodeQuerySemanticEvidence
+    origins_truncated: bool = False
+    witnesses_truncated: bool = False
+    ambiguous: bool = False
+    provenance: list[CodeQueryProvenance] = field(default_factory=list)
+    provenance_truncated: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryTaintFinding:
+        return cls(
+            id=data["id"],
+            path=data["path"],
+            language=data["language"],
+            range=CodeQueryRange.from_dict(data["range"]),
+            sink_event_id=data["sink_event_id"],
+            sink=CodeQuerySourceSite.from_dict(data["sink"]),
+            reached_labels=tuple(_strict_list(data, "reached_labels")),
+            origins=tuple(
+                CodeQueryTaintOrigin.from_dict(origin)
+                for origin in _strict_list(data, "origins")
+            ),
+            witnesses=tuple(
+                CodeQueryTaintWitness.from_dict(witness)
+                for witness in _strict_list(data, "witnesses")
+            ),
+            evidence=CodeQuerySemanticEvidence.from_dict(data["evidence"]),
+            origins_truncated=_strict_bool(data, "origins_truncated", False),
+            witnesses_truncated=_strict_bool(data, "witnesses_truncated", False),
+            ambiguous=_strict_bool(data, "ambiguous", False),
+            provenance=_query_provenance(data),
+            provenance_truncated=bool(data.get("provenance_truncated", False)),
+        )
+
+    def render_text(self) -> str:
+        return (
+            f"{self.sink.path}:{self.sink.range.start_line}:"
+            f"{self.sink.range.start_column} [taint finding; "
+            f"{len(self.reached_labels)} labels; {len(self.origins)} origins]"
+        )
+
+
+@dataclass(frozen=True)
 class CodeQueryFile:
     path: str
     language: str
@@ -1380,6 +1491,7 @@ CodeQueryResultItem = (
     | CodeQueryTypestateWitness
     | CodeQueryFlowEndpoint
     | CodeQueryFlowWitness
+    | CodeQueryTaintFinding
     | CodeQueryFile
     | CodeQueryReferenceSite
     | CodeQueryCallSite
@@ -1408,6 +1520,8 @@ def _code_query_result_item(data: dict) -> CodeQueryResultItem:
         return CodeQueryFlowEndpoint.from_dict(data)
     if result_type == "flow_witness":
         return CodeQueryFlowWitness.from_dict(data)
+    if result_type == "taint_finding":
+        return CodeQueryTaintFinding.from_dict(data)
     if result_type == "file":
         return CodeQueryFile.from_dict(data)
     if result_type == "reference_site":

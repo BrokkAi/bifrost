@@ -900,6 +900,21 @@ struct QueryReadCache {
     /// non-single-flight cache would let concurrent misses each redo the
     /// ignore-aware tree walk this exists to eliminate.
     workspace_file_index: crate::analyzer::WorkspaceFileIndexCell,
+    /// Owner units keyed by owner fq name, resolved at most once per name per
+    /// request (#1230 item 6).
+    ///
+    /// `parent_of` answers a *single-name* question with a store
+    /// `definition_candidates` query, and the callers that dominate a Rust scan
+    /// ask it once per declaration: every top-level item in a module asks for
+    /// the same owner name, so a file of N items paid N identical queries (8/60
+    /// gdb samples, all under `export_index_of_declarations`). Memoizing by
+    /// owner name collapses those to one per distinct owner.
+    ///
+    /// A plain `HashMap` under the existing coarse mutex, not an
+    /// `Arc<OnceLock<..>>` per key: each entry is one bounded lookup rather
+    /// than a whole-workspace hydration, so a racing duplicate query is cheap
+    /// and single-flighting per key would cost more than it saves.
+    parent_units: HashMap<String, Option<CodeUnit>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -924,6 +939,7 @@ impl QueryReadCache {
             self.prepared_syntax.clear();
             self.top_level_class_units_by_package = Arc::new(OnceLock::new());
             self.workspace_file_index = Arc::new(OnceLock::new());
+            self.parent_units.clear();
         }
         if !self
             .contexts
@@ -944,6 +960,7 @@ impl QueryReadCache {
             self.prepared_syntax.clear();
             self.top_level_class_units_by_package = Arc::new(OnceLock::new());
             self.workspace_file_index = Arc::new(OnceLock::new());
+            self.parent_units.clear();
         }
     }
 
@@ -972,6 +989,16 @@ impl QueryReadCache {
             || self.file_states.len() < QUERY_FILE_STATE_CACHE_CAPACITY
         {
             self.file_states.insert(key, state);
+        }
+    }
+
+    fn parent_unit(&self, owner_fq_name: &str) -> Option<Option<CodeUnit>> {
+        self.parent_units.get(owner_fq_name).cloned()
+    }
+
+    fn retain_parent_unit(&mut self, owner_fq_name: String, unit: Option<CodeUnit>) {
+        if self.is_active() {
+            self.parent_units.insert(owner_fq_name, unit);
         }
     }
 
@@ -1582,6 +1609,11 @@ pub struct TreeSitterAnalyzer<A> {
     /// any pattern was applied, so this counter pins the *per-scan* work to the
     /// size of the answer rather than the size of the workspace.
     search_candidate_hydration_count: Arc<AtomicUsize>,
+    /// Materializations of the whole analyzed-file listing. Rust module
+    /// resolution answered a *single-module* question by relisting every
+    /// analyzed file and recomputing its package name, once per call; pinned by
+    /// #1230 item 3.
+    analyzed_file_listing_count: Arc<AtomicUsize>,
     /// Whole-workspace declaration scans issued to answer a *package-scoped*
     /// class lookup (`class_declarations_in_package`). Pinned by #1194.
     package_declaration_scan_count: Arc<AtomicUsize>,
@@ -1625,6 +1657,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             full_declaration_scan_count: Arc::clone(&self.full_declaration_scan_count),
             search_candidate_hydration_count: Arc::clone(&self.search_candidate_hydration_count),
             package_declaration_scan_count: Arc::clone(&self.package_declaration_scan_count),
+            analyzed_file_listing_count: Arc::clone(&self.analyzed_file_listing_count),
             global_usage_definition_index_build_count: Arc::clone(
                 &self.global_usage_definition_index_build_count,
             ),
@@ -1811,6 +1844,7 @@ where
             package_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
             global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
             workspace_path_scan_count: Arc::new(AtomicUsize::new(0)),
+            analyzed_file_listing_count: Arc::new(AtomicUsize::new(0)),
             _state: PhantomData,
         })
     }
@@ -1998,6 +2032,7 @@ where
             package_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
             global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
             workspace_path_scan_count: Arc::new(AtomicUsize::new(0)),
+            analyzed_file_listing_count: Arc::new(AtomicUsize::new(0)),
             _state: PhantomData,
         }
     }
@@ -3965,7 +4000,30 @@ where
         self.store_context.live_paths.snapshot()
     }
 
+    /// The persisted half of [`IAnalyzer::parent_of`] — the owner unit named by
+    /// popping `code_unit`'s last fq segment — memoized against the request's
+    /// read-cache scope (#1230 item 6).
+    ///
+    /// Language analyzers whose `parent_of` is this lookup plus a structural
+    /// fallback route through here so a request pays one
+    /// `definition_candidates` query per distinct owner name instead of one per
+    /// asking declaration. With no scope open there is no memo and the
+    /// behaviour is exactly the unmemoized lookup.
+    pub(crate) fn definition_parent_unit(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        let owner_fq_name = crate::analyzer::i_analyzer::default_parent_fq_name(code_unit)?;
+        let cached = self.query_read_cache_lock().parent_unit(&owner_fq_name);
+        if let Some(parent) = cached {
+            return parent;
+        }
+        let parent = IAnalyzer::definitions(self, &owner_fq_name).next();
+        self.query_read_cache_lock()
+            .retain_parent_unit(owner_fq_name, parent.clone());
+        parent
+    }
+
     fn analyzed_live_files(&self) -> Vec<ProjectFile> {
+        self.analyzed_file_listing_count
+            .fetch_add(1, Ordering::Relaxed);
         if let Some(files) = self
             .query_read_cache
             .lock()
@@ -4689,6 +4747,16 @@ where
     #[doc(hidden)]
     pub fn full_declaration_scan_count_for_test(&self) -> usize {
         self.full_declaration_scan_count.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn reset_analyzed_file_listing_count_for_test(&self) {
+        self.analyzed_file_listing_count.store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn analyzed_file_listing_count_for_test(&self) -> usize {
+        self.analyzed_file_listing_count.load(Ordering::Relaxed)
     }
 
     #[doc(hidden)]

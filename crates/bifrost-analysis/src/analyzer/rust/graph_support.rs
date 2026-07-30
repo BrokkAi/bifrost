@@ -118,6 +118,54 @@ fn join_rust_fqn(package: &str, name: &str) -> String {
     }
 }
 
+/// The analyzed Rust files bucketed by their path-derived package name — the
+/// indexed form of the two questions [`RustAnalyzer::resolve_module_files`] asks
+/// of the workspace: "is this file analyzed?" and "which analyzed files spell
+/// package `p`?".
+///
+/// Both were previously answered by materializing a fresh `BTreeSet` of every
+/// analyzed file and recomputing the allocating `rust_package_name` for each of
+/// them, *per call* — a whole-workspace sweep to answer a single-module question,
+/// issued once per import binding per file per reference context (#1230 item 3).
+/// The projection retains file identities and their path-derived package names
+/// only: no declarations, file states, sources, or persisted rows, so it is a
+/// pure reindex of data `get_analyzed_files` already returns and cannot change
+/// what a resolution answers.
+#[derive(Debug, Default)]
+pub(super) struct RustPackageFileIndex {
+    /// Every analyzed file, in `get_analyzed_files` (sorted) order so membership
+    /// is a binary search rather than a second owned copy of each file.
+    files: Vec<ProjectFile>,
+    /// Package name -> indices into `files`, ascending.
+    by_package: HashMap<String, Vec<u32>>,
+}
+
+impl RustPackageFileIndex {
+    fn build(files: BTreeSet<ProjectFile>) -> Self {
+        let files: Vec<ProjectFile> = files.into_iter().collect();
+        let mut by_package: HashMap<String, Vec<u32>> = HashMap::default();
+        for (index, file) in files.iter().enumerate() {
+            by_package
+                .entry(rust_package_name(file))
+                .or_default()
+                .push(u32::try_from(index).unwrap_or(u32::MAX));
+        }
+        Self { files, by_package }
+    }
+
+    fn contains(&self, file: &ProjectFile) -> bool {
+        self.files.binary_search(file).is_ok()
+    }
+
+    fn files_in_package(&self, package: &str) -> impl Iterator<Item = &ProjectFile> {
+        self.by_package
+            .get(package)
+            .into_iter()
+            .flatten()
+            .filter_map(|index| self.files.get(*index as usize))
+    }
+}
+
 fn insert_single_reexport_target(
     named: &mut HashMap<String, String>,
     exported_name: String,
@@ -220,14 +268,18 @@ impl RustAnalyzer {
         targets
     }
 
-    pub fn export_index_of(&self, file: &ProjectFile) -> ExportIndex {
+    /// The cached per-file export index. Shared by handle: the index is
+    /// immutable for the analyzer instance's lifetime, and callers ask for it
+    /// once per export name per pending file, so deep-cloning the whole map on
+    /// every cache hit was pure waste (#1230 item 5).
+    pub fn export_index_of(&self, file: &ProjectFile) -> Arc<ExportIndex> {
         if let Some(cached) = self.export_indexes.get(file) {
-            return (*cached).clone();
+            return cached;
         }
         let declarations = self.declarations(file);
         let index = Arc::new(self.export_index_of_declarations(file, &declarations));
         self.export_indexes.insert(file.clone(), index.clone());
-        (*index).clone()
+        index
     }
 
     pub(super) fn export_index_of_declarations(
@@ -426,11 +478,37 @@ impl RustAnalyzer {
         }
         // Only after cargo routing fails — the miss path, not the hot path — try
         // a `use <crate> as <alias>` module alias so the binder is built solely
-        // for unresolved roots (issue #1089).
-        if let Some(aliased) = self.rust_apply_import_alias(importing_file, module_specifier) {
-            return self.resolve_module_package(importing_file, &aliased);
+        // for unresolved roots (issue #1089). Chained renames in one file can
+        // cycle (`use a::b as c` plus `use c::d as a`: zellij overflowed the
+        // rayon worker stack recursing through them, #1347). The rewrite
+        // replaces only the root, so the specifier grows every hop and a
+        // whole-string visited set never trips; the cycle lives in root space
+        // (the binder maps each root to exactly one target, so revisiting a
+        // root is deterministically an infinite loop). Chase iteratively,
+        // bounded by the binder's root count; a repeated root stops expanding
+        // and the last specifier falls through to the path arithmetic.
+        let mut seen_roots = HashSet::default();
+        let mut current = module_specifier.to_string();
+        loop {
+            let root = current.split("::").next().unwrap_or(current.as_str());
+            if !seen_roots.insert(root.to_string()) {
+                break;
+            }
+            let Some(aliased) = self.rust_apply_import_alias(importing_file, &current) else {
+                break;
+            };
+            if is_rooted_rust_module_path(&aliased) {
+                return resolve_rust_module_path_with_crate(&package, &crate_package, &aliased);
+            }
+            if let Some(package) = self
+                .cargo_routes()
+                .resolve_module_package(importing_file, &aliased)
+            {
+                return Some(package);
+            }
+            current = aliased;
         }
-        resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier)
+        resolve_rust_module_path_with_crate(&package, &crate_package, &current)
     }
 
     /// The cached per-file [`RustReferenceContext`] — the one primitive both the
@@ -585,10 +663,24 @@ impl RustAnalyzer {
     ) -> ReferenceContextResult<Option<String>> {
         reference_context_checkpoint(progress)?;
         let module_files = self.resolve_module_files(file, module_specifier);
+        self.canonical_export_fqn_from_files(&module_files, name, forward, progress)
+    }
+
+    /// The `(module_files, name)` half of [`Self::canonical_export_fqn_with_progress`],
+    /// split out so callers that resolve every export name of *one* module
+    /// specifier route the invariant `resolve_module_files` once instead of once
+    /// per name (#1230 item 4).
+    fn canonical_export_fqn_from_files(
+        &self,
+        module_files: &[ProjectFile],
+        name: &str,
+        forward: bool,
+        progress: &dyn Fn() -> bool,
+    ) -> ReferenceContextResult<Option<String>> {
         let targets = if forward {
-            self.forward_exported_targets_from_files_with_progress(&module_files, name, progress)?
+            self.forward_exported_targets_from_files_with_progress(module_files, name, progress)?
         } else {
-            self.exported_targets_from_files(&module_files, name)
+            self.exported_targets_from_files(module_files, name)
         };
         single_rust_target_fqn(self, targets, progress)
     }
@@ -613,13 +705,9 @@ impl RustAnalyzer {
         )?;
         for name in names {
             reference_context_checkpoint(progress)?;
-            if let Some(fqn) = self.canonical_export_fqn_with_progress(
-                file,
-                module_specifier,
-                &name,
-                forward,
-                progress,
-            )? {
+            if let Some(fqn) =
+                self.canonical_export_fqn_from_files(&module_files, &name, forward, progress)?
+            {
                 scoped.insert(format!("{local}::{name}"), fqn);
             }
         }
@@ -645,13 +733,9 @@ impl RustAnalyzer {
         )?;
         for name in names {
             reference_context_checkpoint(progress)?;
-            if let Some(fqn) = self.canonical_export_fqn_with_progress(
-                file,
-                module_specifier,
-                &name,
-                forward,
-                progress,
-            )? {
+            if let Some(fqn) =
+                self.canonical_export_fqn_from_files(&module_files, &name, forward, progress)?
+            {
                 candidates.entry(name).or_default().insert(fqn);
             }
         }
@@ -667,36 +751,36 @@ impl RustAnalyzer {
     ) -> ReferenceContextResult<()> {
         reference_context_checkpoint(progress)?;
         let export_index = self.export_index_of(file);
-        for (exported_name, entry) in export_index.exports_by_name {
+        for (exported_name, entry) in &export_index.exports_by_name {
             reference_context_checkpoint(progress)?;
             if let ExportEntry::ReexportedNamed {
                 module_specifier,
                 imported_name,
             } = entry
             {
-                let module_files = self.resolve_module_files(file, &module_specifier);
+                let module_files = self.resolve_module_files(file, module_specifier);
                 let mut targets = if forward {
                     self.forward_exported_targets_from_files_with_progress(
                         &module_files,
-                        &imported_name,
+                        imported_name,
                         progress,
                     )?
                 } else {
-                    self.exported_targets_from_files(&module_files, &imported_name)
+                    self.exported_targets_from_files(&module_files, imported_name)
                 };
                 if targets.is_empty() {
                     targets.extend(rust_declaration_targets_in_files_with_progress(
                         self,
                         &module_files,
-                        &imported_name,
+                        imported_name,
                         progress,
                     )?);
                 }
-                insert_single_reexport_target(named, exported_name, targets);
+                insert_single_reexport_target(named, exported_name.clone(), targets);
             }
         }
 
-        for star in export_index.reexport_stars {
+        for star in &export_index.reexport_stars {
             reference_context_checkpoint(progress)?;
             let module_files = self.resolve_module_files(file, &star.module_specifier);
             let mut export_names = HashSet::default();
@@ -746,7 +830,7 @@ impl RustAnalyzer {
             }
             let export_index = self.export_index_of(&module_file);
             names.extend(export_index.exports_by_name.keys().cloned());
-            for star in export_index.reexport_stars {
+            for star in &export_index.reexport_stars {
                 pending.extend(self.resolve_module_files(&module_file, &star.module_specifier));
             }
         }
@@ -813,7 +897,7 @@ impl RustAnalyzer {
                 }
                 None => {}
             }
-            for star in index.reexport_stars {
+            for star in &index.reexport_stars {
                 pending.extend(
                     self.resolve_module_files(&file, &star.module_specifier)
                         .into_iter()
@@ -860,12 +944,24 @@ impl RustAnalyzer {
         })
     }
 
+    /// The analyzed-file listing bucketed by path-derived Rust package name,
+    /// built at most once per analyzer instance. Same lifetime and invalidation
+    /// as `cargo_routes` — both are pure projections of the analyzed-file set,
+    /// so both are rebuilt by `update`/`update_all`/`clone_with_project` and by
+    /// nothing else (#1230 item 3).
+    fn package_file_index(&self) -> Arc<RustPackageFileIndex> {
+        self.package_file_index
+            .get_or_init(|| Arc::new(RustPackageFileIndex::build(self.get_analyzed_files())))
+            .clone()
+    }
+
     pub fn resolve_module_files(
         &self,
         importing_file: &ProjectFile,
         module_specifier: &str,
     ) -> Vec<ProjectFile> {
-        let analyzed_files = self.get_analyzed_files();
+        self.note_module_file_resolution();
+        let analyzed_files = self.package_file_index();
         let package = rust_package_name(importing_file);
         let crate_package = rust_crate_root_package(importing_file);
         let rooted = is_rooted_rust_module_path(module_specifier);
@@ -874,10 +970,11 @@ impl RustAnalyzer {
                 .cargo_routes()
                 .resolve_crate_root_file(importing_file, module_specifier)
         {
-            return analyzed_files
-                .into_iter()
-                .filter(|file| file == &root_file)
-                .collect();
+            return if analyzed_files.contains(&root_file) {
+                vec![root_file]
+            } else {
+                Vec::new()
+            };
         }
         let Some(resolved_module) = (if rooted {
             resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier)
@@ -888,8 +985,8 @@ impl RustAnalyzer {
         };
 
         let mut files: Vec<_> = analyzed_files
-            .into_iter()
-            .filter(|file| rust_package_name(file) == resolved_module)
+            .files_in_package(&resolved_module)
+            .cloned()
             .collect();
         files.extend(
             self.inner

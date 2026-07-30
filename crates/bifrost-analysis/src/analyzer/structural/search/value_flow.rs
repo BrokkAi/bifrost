@@ -928,7 +928,7 @@ fn public_path_quality(quality: PathQuality) -> CodeQuerySemanticEvidence {
     }
 }
 
-fn public_witness_step(
+pub(crate) fn public_witness_step(
     workspace: &WorkspaceAnalyzer,
     step: &crate::analyzer::dataflow::SummaryWitnessStep,
 ) -> CodeQueryFlowWitnessStep {

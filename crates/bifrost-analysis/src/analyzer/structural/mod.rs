@@ -92,7 +92,8 @@ pub use search::{
     CodeQueryReferenceSite, CodeQueryResponse, CodeQueryResult, CodeQueryResultItem,
     CodeQueryResultRef, CodeQueryResultValue, CodeQuerySemanticCompleteness,
     CodeQuerySemanticEvidence, CodeQuerySemanticLimits, CodeQuerySemanticProof,
-    CodeQuerySemanticWork, CodeQuerySourceSite, CodeQueryTypestateCertainty,
+    CodeQuerySemanticWork, CodeQuerySourceSite, CodeQueryTaintFinding, CodeQueryTaintOrigin,
+    CodeQueryTaintProjectionLimits, CodeQueryTaintWitness, CodeQueryTypestateCertainty,
     CodeQueryTypestateFinding, CodeQueryTypestateFindingKind, CodeQueryTypestateLimits,
     CodeQueryTypestateSubject, CodeQueryTypestateUncertainty, CodeQueryTypestateWitness,
     CodeQueryTypestateWitnessStep, CodeQueryTypestateWitnessStepKind, CodeQueryTypestateWork,
@@ -105,5 +106,6 @@ pub use search::{
     execute_workspace_request_with_registration_lease,
     execute_workspace_request_with_registration_limits,
     execute_workspace_request_with_registrations, execute_workspace_with_limits,
+    project_taint_finding_report,
 };
 pub use spec::{RoleSink, StructuralSpec};
