@@ -41,15 +41,6 @@ use crate::analyzer::tree_walk::{first_named_child_of_kind, named_children};
 use crate::analyzer::usages::reference_site::smallest_named_node_covering;
 use tree_sitter::Node;
 
-/// How many wrapper layers [`kotlin_unwrap_receiver`] will strip.
-///
-/// `a!!!!.b` is not real Kotlin, but a recovered parse tree can nest wrappers
-/// arbitrarily, and this walk runs on every receiver in a workspace. The cap
-/// keeps a pathological tree from turning one receiver read into an unbounded
-/// walk; a receiver that needs more than this many layers stays unresolved,
-/// which is an explicit miss rather than a hang.
-const MAX_RECEIVER_UNWRAP_DEPTH: usize = 8;
-
 /// The callee expression of a Kotlin call.
 ///
 /// A `call_expression`'s children are the callee followed by `call_suffix`, and a
@@ -113,45 +104,11 @@ pub(crate) fn kotlin_named_argument_label(argument: Node<'_>, node: Node<'_>) ->
     children.len() > 1 && children[0].id() == node.id()
 }
 
-/// The member `simple_identifier` selected by a `navigation_expression`.
-///
-/// `a.b`, `a?.b`, and `a!!.b` all produce the same shape: a receiver expression
-/// followed by a `navigation_suffix` holding the member name.
-pub(crate) fn kotlin_navigation_member(navigation: Node<'_>) -> Option<Node<'_>> {
-    let suffix = first_named_child_of_kind(navigation, "navigation_suffix")?;
-    first_named_child_of_kind(suffix, "simple_identifier")
-}
-
 /// The receiver expression a `navigation_expression` selects from.
 pub(crate) fn kotlin_navigation_receiver(navigation: Node<'_>) -> Option<Node<'_>> {
     named_children(navigation)
         .into_iter()
         .find(|child| child.kind() != "navigation_suffix")
-}
-
-/// Strip the wrappers that do not change what a receiver expression denotes.
-///
-/// `a!!.b` parses the `!!` as a `postfix_expression` around `a`, and `(a).b`
-/// parses the parentheses as a `parenthesized_expression`. Both select from
-/// exactly what `a` selects from, so a receiver reader should see `a`.
-///
-/// Iterative with a depth cap rather than recursive, per the repository's
-/// stack-safety rule for analyzer tree walks.
-pub(crate) fn kotlin_unwrap_receiver(node: Node<'_>) -> Node<'_> {
-    let mut current = node;
-    for _ in 0..MAX_RECEIVER_UNWRAP_DEPTH {
-        if !matches!(
-            current.kind(),
-            "postfix_expression" | "parenthesized_expression"
-        ) {
-            return current;
-        }
-        let Some(inner) = named_children(current).into_iter().next() else {
-            return current;
-        };
-        current = inner;
-    }
-    current
 }
 
 /// The `type_identifier` children of a `user_type`, in source order.
@@ -165,32 +122,6 @@ pub(crate) fn kotlin_user_type_segments(user_type: Node<'_>) -> Vec<Node<'_>> {
         .into_iter()
         .filter(|child| child.kind() == "type_identifier")
         .collect()
-}
-
-/// Unwrap the type decorations around a nominal type to reach its `user_type`.
-///
-/// Returns `None` for a shape that names no nominal type at all — a function
-/// type, a star projection — so a caller cannot mistake "there is no name here"
-/// for "the name did not resolve".
-pub(crate) fn kotlin_nominal_type_node(node: Node<'_>) -> Option<Node<'_>> {
-    let mut current = node;
-    for _ in 0..MAX_RECEIVER_UNWRAP_DEPTH {
-        if current.kind() == "user_type" {
-            return Some(current);
-        }
-        if !matches!(
-            current.kind(),
-            "nullable_type"
-                | "not_nullable_type"
-                | "parenthesized_type"
-                | "receiver_type"
-                | "type_projection"
-        ) {
-            return None;
-        }
-        current = named_children(current).into_iter().next()?;
-    }
-    None
 }
 
 /// Whether `node` is the name a declaration introduces rather than a reference to

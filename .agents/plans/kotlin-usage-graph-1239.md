@@ -61,18 +61,45 @@ reports call relationships in both directions.
       `usages/workspace_graph.rs` and `searchtools/scan_usages.rs`, the #1238 Kotlin definition resolver in
       `usages/get_definition/kotlin.rs`, and the dead-code candidate routing in `code_quality/dead_code_smells.rs`.
 - [x] (2026-07-30 09:35Z) Wrote this ExecPlan.
-- [ ] Milestone 1: shared Kotlin syntax helpers, `kotlin_graph` module skeleton, `TargetSpec`, query path for type
-      targets, `finder.rs` dispatch arm.
-- [ ] Milestone 2: query path for constructors, functions, and properties — receiver typing, companions, objects,
-      inheritance, extensions, overload arity, callable references, override declarations.
+- [x] (2026-07-30 10:20Z) Milestone 1a: extracted the Kotlin grammar shape readers from
+      `usages/get_definition/kotlin.rs` into a shared `analyzer/kotlin/syntax.rs`, fixing the latent
+      `kotlin_call_arity` bug for `constructor_invocation` on the way. `suite_symbols -- kotlin` still 49 passed.
+- [x] (2026-07-30 11:05Z) Milestone 1b: `usages/kotlin_graph/` with `TargetSpec`, `KotlinNameResolver`, the forward
+      scan, and hit recording; `KotlinUsageGraphStrategy` wired into the `finder.rs` dispatch. Kotlin type references
+      resolve; callable and property targets abstain with `unsupported_target_shape` instead of the blanket
+      `unsupported_target_language`. 11 new tests in `tests/suite_usages/usages_kotlin_graph_test.rs`.
+      Full validation: `suite_usages` 1340 passed, `suite_symbols` 1110 passed, `suite_cross_language` 246 passed,
+      `cargo clippy --all-targets -- -D warnings` clean.
+- [ ] Milestone 2: query path for constructors, functions, and properties. Per the revised decision below, this now
+      starts by promoting #1238's `KotlinCtx` into a shared `analyzer/kotlin/semantics.rs` and calling it, rather than
+      reimplementing receiver typing and member lookup. Remaining: receiver typing, companions, objects, inheritance,
+      extensions, overload arity, callable references, override declarations, and the unproven/same-owner hit channels
+      (both trimmed out of milestone 1 because a written type reference is never uncertain).
 - [ ] Milestone 3: inverted edge builder; `usage_graph`, `callers`, `callees`, relevance, and dead code light up.
 - [ ] Milestone 4: cross-language JVM symmetry — Kotlin call sites for Java/Scala targets and vice versa.
 - [ ] Milestone 5: rename reference rewriting, the abstention matrix, dead-code bulk eligibility, capability notes.
 
 ## Surprises & Discoveries
 
-Nothing yet; this section is filled in as milestones land. Record every non-obvious structural fact here with the
-failing test or command output that exposed it, in the style of `.agents/plans/kotlin-navigation-1238.md`.
+- Observation: `kotlin_call_arity` as written by #1238 read its argument list by walking into `call_suffix` itself,
+  so it returned `0` for a `constructor_invocation` — which holds `value_arguments` *directly* rather than nesting it
+  inside a suffix. No #1238 caller passes a `constructor_invocation`, so the bug was latent; the graph's constructor
+  arm would have been the first caller to hit it, and would have silently failed to match any superclass constructor
+  call's arity.
+  Evidence: `kotlin_value_arguments` already handled both shapes and `kotlin_call_arity` did not use it. Fixed while
+  moving the helper by routing it through `kotlin_value_arguments`; the trailing-lambda term still reads `call_suffix`
+  directly, because only an ordinary call can carry a trailing lambda.
+
+- Observation: `GlobalUsageDefinitionIndex` implements `BoundedDefinitionLookup`, which is the *only* thing #1238's
+  `KotlinCtx` needs from its caller besides `&dyn IAnalyzer`. That makes the entire #1238 semantic layer — receiver
+  typing, member lookup order, companion detection, cross-file declared-type and extension-receiver reading —
+  constructible from what the usage graph already holds, at the cost of one line
+  (`analyzer.global_usage_definition_index()`).
+  Evidence: `crates/bifrost-analysis/src/analyzer/global_usage_definition_index.rs:212`, and `KotlinCtx`'s two fields
+  `analyzer: &dyn IAnalyzer` / `support: &dyn BoundedDefinitionLookup`.
+  Consequence: the Decision Log entry "the graph module does not call `resolve_kotlin`" is still right about
+  `resolve_kotlin` itself, but wrong about the layer beneath it. See the revised decision below; milestone 2's plan
+  changes from "reimplement receiver typing" to "promote the semantic layer and call it".
 
 ## Decision Log
 
@@ -111,6 +138,21 @@ failing test or command output that exposed it, in the style of `.agents/plans/k
   workspace. What *is* shared is the layer below both: the syntax helpers (see the previous decision) and the Kotlin
   name-resolution ladder `resolve_kotlin_type_name` in `crates/bifrost-analysis/src/analyzer/kotlin/types.rs`, so
   navigation and usages can never disagree about what a name means.
+  Date/Author: 2026-07-30, David Baker Effendi (agent).
+
+- Decision (revised 2026-07-30, supersedes the second half of the previous entry): promote #1238's `KotlinCtx` and its
+  semantic helpers out of `usages/get_definition/kotlin.rs` into a shared `crate::analyzer::kotlin::semantics`, and
+  have the query path *call* that layer instead of reimplementing receiver typing.
+  Rationale: `KotlinCtx` needs exactly two things from its caller — a `&dyn IAnalyzer` and a
+  `&dyn BoundedDefinitionLookup` — and `GlobalUsageDefinitionIndex` implements the latter, so the usage graph can
+  construct it from what it already holds. What that layer answers is not "definition navigation": it is "Kotlin facts
+  the index does not publish" — what type a declaration declares, whether a nested object is a companion, what an
+  extension extends, which members a receiver type reaches and in what order. Writing a second copy of the member
+  lookup order would guarantee that find-references and go-to-definition eventually disagree about which declaration a
+  call means, which is precisely the failure this issue exists to avoid. The original entry's reasoning still holds for
+  `resolve_kotlin` (the per-cursor entry point) and for the *inverted* builder, which is parallel and cannot hold `Rc`;
+  milestone 3 therefore keeps its own file-local walk and consults the shared layer only for the per-declaration facts,
+  behind the `Mutex`-guarded caches milestone 2 introduces.
   Date/Author: 2026-07-30, David Baker Effendi (agent).
 
 - Decision: resolve names in the graph builders through a realm-aware predicate rather than through
