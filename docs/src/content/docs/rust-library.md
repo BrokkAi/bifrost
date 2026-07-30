@@ -17,7 +17,7 @@ That produces a dependency like:
 
 ```toml
 [dependencies]
-brokk-bifrost = "0.8.13"
+brokk-bifrost = "0.8.14"
 ```
 
 For local development against a checkout, use a path dependency:
