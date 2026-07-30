@@ -11797,6 +11797,37 @@ function render(primary, secondary) {
 }
 
 #[test]
+fn javascript_for_of_and_single_arrow_bindings_block_broader_local_property_candidates() {
+    let source = r#"
+function update(task) {
+  task.status = "ready";
+}
+
+function render(tasks) {
+  for (const task of tasks) {
+    consume(task.status);
+  }
+  return tasks.filter(task => task.status);
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("app.js", source)
+        .build();
+
+    let reads: Vec<_> = source
+        .match_indices("task.status")
+        .map(|(start, _)| start + "task.".len())
+        .collect();
+    assert_eq!(reads.len(), 3);
+
+    for read in &reads[1..] {
+        let value = lookup(project.root(), &location_reference("app.js", source, *read));
+        assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+        assert!(value["results"][0]["definitions"].is_null(), "{value}");
+    }
+}
+
+#[test]
 fn javascript_unproven_same_file_receiver_does_not_resolve_assignment_created_property() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
@@ -11871,6 +11902,43 @@ function render(task) {
         after_write["results"][0]["definitions"][0]["start_line"], 4,
         "{after_write}"
     );
+}
+
+#[test]
+fn javascript_program_local_member_read_before_write_does_not_use_broader_candidates() {
+    let source = r#"
+export const state = {};
+
+export function read() {
+  return state.remoteServerKey;
+}
+
+export function update(value) {
+  state.remoteServerKey = value;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("app.js", source)
+        .file(
+            "other.js",
+            r#"
+export const state = {};
+state.remoteServerKey = "unrelated";
+"#,
+        )
+        .build();
+
+    let reference = source
+        .find("state.remoteServerKey")
+        .expect("program-local property read")
+        + "state.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app.js", source, reference),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    assert!(value["results"][0]["definitions"].is_null(), "{value}");
 }
 
 #[test]

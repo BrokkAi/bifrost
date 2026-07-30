@@ -279,6 +279,36 @@ pub(super) fn resolve_js_ts(
             site.focus_start_byte,
             tree.root_node(),
         );
+        let dotted_lookup = JstsDottedLookup {
+            analyzer,
+            support,
+            file,
+            root: tree.root_node(),
+            source,
+            reference,
+            receiver: qualifier,
+            value_position,
+            before_byte: site.range.start_byte,
+        };
+        if language == Language::JavaScript
+            && imported_receiver_binding.is_none()
+            && let Some(local_candidates) = focused.and_then(|node| {
+                jsts_exact_local_dotted_candidates(
+                    dotted_lookup,
+                    &lexical_bindings,
+                    node,
+                    &generic_member_candidates,
+                )
+            })
+        {
+            if !local_candidates.is_empty() {
+                return js_ts_candidates_outcome(analyzer, local_candidates);
+            }
+            return no_definition(
+                "no_indexed_definition",
+                format!("`{reference}` did not resolve to an indexed JS/TS definition"),
+            );
+        }
         if (imported_receiver_binding.is_some() || program_binding)
             && !generic_member_candidates.is_empty()
         {
@@ -288,18 +318,35 @@ pub(super) fn resolve_js_ts(
             analyzer, support, file, language, source, tree, site, name, &batch,
         ) {
             ReceiverAnalysisOutcome::Precise(candidates) if !candidates.is_empty() => {
-                return js_ts_candidates_outcome(
-                    analyzer,
-                    if language == Language::TypeScript {
-                        if value_position {
-                            jsts_value_space_candidates(analyzer, candidates)
-                        } else {
-                            jsts_type_space_candidates(analyzer, candidates)
-                        }
-                    } else {
+                let candidates = if language == Language::TypeScript {
+                    if value_position {
                         jsts_value_space_candidates(analyzer, candidates)
-                    },
-                );
+                    } else {
+                        jsts_type_space_candidates(analyzer, candidates)
+                    }
+                } else {
+                    jsts_value_space_candidates(analyzer, candidates)
+                };
+                if language == Language::JavaScript
+                    && imported_receiver_binding.is_none()
+                    && let Some(local_candidates) = focused.and_then(|node| {
+                        jsts_exact_local_dotted_candidates(
+                            dotted_lookup,
+                            &lexical_bindings,
+                            node,
+                            &candidates,
+                        )
+                    })
+                {
+                    if !local_candidates.is_empty() {
+                        return js_ts_candidates_outcome(analyzer, local_candidates);
+                    }
+                    return no_definition(
+                        "no_indexed_definition",
+                        format!("`{reference}` did not resolve to an indexed JS/TS definition"),
+                    );
+                }
+                return js_ts_candidates_outcome(analyzer, candidates);
             }
             ReceiverAnalysisOutcome::Ambiguous(_)
             | ReceiverAnalysisOutcome::Unsupported { .. }
@@ -343,38 +390,6 @@ pub(super) fn resolve_js_ts(
         };
         if !new_receiver_member_candidates.is_empty() {
             return js_ts_candidates_outcome(analyzer, new_receiver_member_candidates);
-        }
-        let dotted_lookup = JstsDottedLookup {
-            analyzer,
-            support,
-            file,
-            root: tree.root_node(),
-            source,
-            reference,
-            receiver: qualifier,
-            value_position,
-            before_byte: site.range.start_byte,
-        };
-        if language == Language::JavaScript
-            && jsts_visible_import_binding(
-                imports,
-                &lexical_bindings,
-                tree.root_node(),
-                qualifier,
-                site.focus_start_byte,
-            )
-            .is_none()
-            && let Some(local_candidates) = focused.and_then(|node| {
-                jsts_exact_local_dotted_candidates(dotted_lookup, &lexical_bindings, node)
-            })
-        {
-            if !local_candidates.is_empty() {
-                return js_ts_candidates_outcome(analyzer, local_candidates);
-            }
-            return no_definition(
-                "no_indexed_definition",
-                format!("`{reference}` did not resolve to an indexed JS/TS definition"),
-            );
         }
         if !generic_member_candidates.is_empty() {
             return js_ts_candidates_outcome(analyzer, generic_member_candidates);
@@ -932,6 +947,7 @@ fn jsts_exact_local_dotted_candidates(
     ctx: JstsDottedLookup<'_, '_>,
     lexical_bindings: &JsTsLexicalBindingIndex,
     focused: Node<'_>,
+    hinted_candidates: &[CodeUnit],
 ) -> Option<Vec<CodeUnit>> {
     let binding_scope = lexical_bindings.binding_scope_at(ctx.receiver, ctx.before_byte)?;
     let (reference_receiver, property) =
@@ -942,31 +958,53 @@ fn jsts_exact_local_dotted_candidates(
     }
 
     let mut candidates = ctx.same_file_candidates();
-    candidates.retain(|candidate| {
-        direct_property_definitions(
-            ctx.root,
-            ctx.source,
-            &ctx.analyzer.ranges(candidate),
-            target_member,
-        )
+    candidates.extend(
+        hinted_candidates
+            .iter()
+            .filter(|candidate| candidate.source() == ctx.file)
+            .cloned(),
+    );
+    sort_units(&mut candidates);
+    candidates.dedup();
+    let candidates_with_definitions: Vec<_> = candidates
         .into_iter()
-        .any(|definition| {
-            slice(definition.receiver.root, ctx.source) == ctx.receiver
-                && definition.receiver.members.len() == reference_receiver.members.len()
-                && definition
-                    .receiver
-                    .members
-                    .iter()
-                    .zip(&reference_receiver.members)
-                    .all(|(actual, expected)| {
-                        slice(*actual, ctx.source) == slice(*expected, ctx.source)
-                    })
-                && lexical_bindings
-                    .binding_scope_at(ctx.receiver, definition.receiver.root.start_byte())
-                    == Some(binding_scope)
-                && definition.property_range.end_byte <= ctx.before_byte
+        .filter_map(|candidate| {
+            let definitions = direct_property_definitions(
+                ctx.root,
+                ctx.source,
+                &ctx.analyzer.ranges(&candidate),
+                target_member,
+            );
+            (!definitions.is_empty()).then_some((candidate, definitions))
         })
-    });
+        .collect();
+    if candidates_with_definitions.is_empty() {
+        return None;
+    }
+    let candidates = candidates_with_definitions
+        .into_iter()
+        .filter_map(|(candidate, definitions)| {
+            definitions
+                .into_iter()
+                .any(|definition| {
+                    slice(definition.receiver.root, ctx.source) == ctx.receiver
+                        && definition.receiver.members.len() == reference_receiver.members.len()
+                        && definition
+                            .receiver
+                            .members
+                            .iter()
+                            .zip(&reference_receiver.members)
+                            .all(|(actual, expected)| {
+                                slice(*actual, ctx.source) == slice(*expected, ctx.source)
+                            })
+                        && lexical_bindings
+                            .binding_scope_at(ctx.receiver, definition.receiver.root.start_byte())
+                            == Some(binding_scope)
+                        && definition.property_range.end_byte <= ctx.before_byte
+                })
+                .then_some(candidate)
+        })
+        .collect();
     Some(candidates)
 }
 
