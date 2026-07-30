@@ -9638,6 +9638,70 @@ fn consume(_: QuicStream) {}
 }
 
 #[test]
+fn rust_nested_grouped_self_import_keeps_module_namespace_exact() {
+    let consumer = r#"
+    use super::{
+        quic_config,
+        quic_stream::{self, QuicStream},
+    };
+
+    fn consume(_: QuicStream) {
+        let _ = quic_stream::DOQ_ALPN;
+        quic_config::configure();
+    }
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod quic;\n"),
+        (
+            "src/quic/mod.rs",
+            "pub mod quic_config;\npub mod quic_stream;\nmod quic_server;\nfn quic_stream() {}\n",
+        ),
+        ("src/quic/quic_config.rs", "pub fn configure() {}\n"),
+        (
+            "src/quic/quic_stream.rs",
+            "pub struct QuicStream;\npub const DOQ_ALPN: &[u8] = b\"doq\";\n",
+        ),
+        ("src/quic/quic_server.rs", consumer),
+    ]);
+    let module_target = analyzer
+        .get_definitions("quic.quic_stream")
+        .into_iter()
+        .find(CodeUnit::is_module)
+        .expect("quic_stream module");
+    let value_target = analyzer
+        .get_definitions("quic.quic_stream")
+        .into_iter()
+        .find(CodeUnit::is_function)
+        .expect("quic_stream function");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[module_target])
+        .all_hits_including_imports();
+    let expected = consumer
+        .find("quic_stream::{self")
+        .expect("nested grouped self import module path")
+        + "quic_stream::{".len();
+    let value_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[value_target])
+        .all_hits_including_imports();
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/quic/quic_server.rs")
+                && hit.start_offset == expected
+                && hit.end_offset == expected + "self".len()
+                && hit.kind == UsageHitKind::Import
+        }),
+        "expected exact nested grouped self module-prefix import hit: {hits:#?}"
+    );
+    assert!(
+        value_hits.iter().all(|hit| {
+            hit.file != project.file("src/quic/quic_server.rs") || hit.start_offset != expected
+        }),
+        "same-spelled value namespace must not capture nested grouped self import: {value_hits:#?}"
+    );
+}
+
+#[test]
 fn rust_grouped_same_crate_use_prefix_keeps_module_namespace_exact() {
     let source = r#"
 mod error {
@@ -9680,6 +9744,219 @@ fn consume(_: ApiResult, _: OtherApiResult) {}
         hits.iter()
             .all(|hit| { hit.file != project.file("src/lib.rs") || hit.start_offset != unrelated }),
         "unrelated grouped module prefix must stay unmatched: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_macro_token_tree_imported_uppercase_free_function_call_stays_exact() {
+    let source = r#"
+mod api {
+    pub struct FQDN {
+        raw: String,
+    }
+
+    #[allow(non_snake_case)]
+    pub fn FQDN(input: &str) -> FQDN {
+        FQDN {
+            raw: input.to_string(),
+        }
+    }
+}
+
+macro_rules! wrap {
+    ($value:expr) => { $value };
+}
+
+use crate::api::FQDN;
+
+pub fn run() {
+    let _ = wrap!(FQDN("example.testing."));
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let function_target = analyzer
+        .get_definitions("api.FQDN")
+        .into_iter()
+        .find(CodeUnit::is_function)
+        .expect("uppercase function target");
+    let type_target = analyzer
+        .get_definitions("api.FQDN")
+        .into_iter()
+        .find(CodeUnit::is_class)
+        .expect("same-named type target");
+
+    let function_hits = authoritative_hits(
+        &analyzer,
+        &function_target,
+        [project.file("src/lib.rs")].into_iter().collect(),
+    );
+    let expected = source
+        .find("FQDN(\"example.testing.\")")
+        .expect("macro token-tree uppercase call");
+    let type_hits = authoritative_hits(
+        &analyzer,
+        &type_target,
+        [project.file("src/lib.rs")].into_iter().collect(),
+    );
+
+    assert!(
+        function_hits
+            .iter()
+            .any(|hit| hit.file == project.file("src/lib.rs") && hit.start_offset == expected),
+        "expected exact macro token-tree uppercase function call: {function_hits:#?}"
+    );
+    assert!(
+        type_hits
+            .iter()
+            .all(|hit| hit.file != project.file("src/lib.rs") || hit.start_offset != expected),
+        "same-named type must not capture the macro token-tree call: {type_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_macro_token_tree_prefers_same_module_function_over_imported_module_name() {
+    let source = r#"
+mod tests {
+    use std::cmp;
+
+    macro_rules! wrap {
+        ($value:expr) => { $value };
+    }
+
+    fn cmp(a: i32, b: i32) -> cmp::Ordering {
+        a.cmp(&b)
+    }
+
+    pub fn run() {
+        let _ = wrap!(cmp(1, 2));
+    }
+}
+
+mod other {
+    pub fn cmp(_: i32, _: i32) {}
+}
+"#;
+    let (_project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let local_target = definition(&analyzer, "tests.cmp");
+    let other_target = definition(&analyzer, "other.cmp");
+
+    let local_hits = rust_graph_hits_for_target(&analyzer, local_target);
+    let other_hits = rust_graph_hits_for_target(&analyzer, other_target);
+
+    assert!(
+        local_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("cmp(1, 2)")),
+        "expected the same-module macro token-tree cmp() call to resolve locally: {local_hits:#?}"
+    );
+    assert!(
+        other_hits.is_empty(),
+        "same-named function in another module must stay unmatched: {other_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_macro_token_tree_tuple_constructor_beats_same_named_enum_variant() {
+    let source = r#"
+mod types {
+    pub struct PTR(pub u8);
+}
+
+use types::PTR;
+
+enum RData {
+    PTR(PTR),
+}
+
+fn run() {
+    let _ = vec![RData::PTR(PTR(1))];
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let file = project.file("src/lib.rs");
+    let constructor = definition(&analyzer, "types.PTR");
+    let variant = member(&analyzer, &file, "RData", "PTR");
+    let inner = source
+        .find("PTR(1)")
+        .expect("tuple constructor inside vec token tree");
+
+    let constructor_hits = authoritative_hits(
+        &analyzer,
+        &constructor,
+        [file.clone()].into_iter().collect(),
+    );
+    assert!(
+        constructor_hits
+            .iter()
+            .any(|hit| hit.file == file && hit.start_offset == inner),
+        "the imported tuple constructor must own the inner macro-token call: {constructor_hits:#?}"
+    );
+
+    let variant_hits =
+        authoritative_hits(&analyzer, &variant, [file.clone()].into_iter().collect());
+    assert!(
+        variant_hits
+            .iter()
+            .all(|hit| hit.file != file || hit.start_offset != inner),
+        "the enclosing enum's same-named variant must not steal the constructor call: {variant_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_macro_token_tree_unqualified_local_enum_variant_pattern_stays_exact() {
+    let source = r#"
+enum ParseState {
+    Start { id: u8 },
+}
+
+enum OtherState {
+    Start { id: u8 },
+}
+
+use ParseState::*;
+
+fn run(state: ParseState, other: OtherState) {
+    let _ = matches!(state, Start { .. });
+    let _ = matches!(other, OtherState::Start { .. });
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let target = member(
+        &analyzer,
+        &project.file("src/lib.rs"),
+        "ParseState",
+        "Start",
+    );
+    let other_target = member(
+        &analyzer,
+        &project.file("src/lib.rs"),
+        "OtherState",
+        "Start",
+    );
+    let hits = authoritative_hits(
+        &analyzer,
+        &target,
+        [project.file("src/lib.rs")].into_iter().collect(),
+    );
+    let expected = source
+        .find("Start { .. })")
+        .expect("unqualified local enum variant token-tree pattern");
+    let other_hits = authoritative_hits(
+        &analyzer,
+        &other_target,
+        [project.file("src/lib.rs")].into_iter().collect(),
+    );
+
+    assert!(
+        hits.iter()
+            .any(|hit| { hit.file == project.file("src/lib.rs") && hit.start_offset == expected }),
+        "expected exact local enum-variant pattern hit inside macro token tree: {hits:#?}"
+    );
+    assert!(
+        other_hits
+            .iter()
+            .all(|hit| hit.file != project.file("src/lib.rs") || hit.start_offset != expected),
+        "same-named sibling enum variant must stay unmatched: {other_hits:#?}"
     );
 }
 

@@ -8441,6 +8441,185 @@ impl From<u8> for NetError {
 }
 
 #[test]
+fn rust_function_local_type_shadows_module_import_for_scoped_owner() {
+    let source = r#"
+mod types;
+use types::RecordType;
+
+fn run() {
+    enum RecordType {
+        Svcb,
+        Https,
+    }
+
+    let _ = RecordType::Https;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .file("src/types.rs", "pub enum RecordType { A, Aaaa }\n")
+        .build();
+
+    let start = source
+        .find("RecordType::Https")
+        .expect("function-local enum owner");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(
+        result["definitions"].is_null(),
+        "the unindexed function-local enum must block the shadowed module import: {value}"
+    );
+}
+
+#[test]
+fn rust_macro_token_tuple_constructor_prefers_imported_type_over_enum_variant() {
+    let source = r#"
+use crate::rr::{
+    Name,
+    rdata::{A, PTR},
+};
+
+enum RData {
+    PTR(PTR),
+}
+
+fn run() {
+    let _ = vec![RData::PTR(PTR(Name)), RData::A(A)];
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "pub mod rr;\n")
+        .file(
+            "src/rr/mod.rs",
+            "pub mod rdata;\npub mod record_data;\npub struct Name;\n",
+        )
+        .file(
+            "src/rr/rdata/mod.rs",
+            "mod name;\npub use name::PTR;\npub struct A;\n",
+        )
+        .file(
+            "src/rr/rdata/name.rs",
+            "pub struct PTR(pub super::super::Name);\n",
+        )
+        .file("src/rr/record_data.rs", source)
+        .build();
+
+    let start = source
+        .rfind("PTR(Name)")
+        .expect("macro-token tuple constructor");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/rr/record_data.rs", source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "rr.rdata.name.PTR",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["kind"], "class", "{value}");
+}
+
+#[test]
+fn rust_glob_import_keeps_reexported_enum_variant_route_exact() {
+    let source = r#"
+fn run(value: crate::actual::State) {
+    use crate::exports::*;
+    assert!(matches!(value, Ready));
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "pub mod actual;\npub mod decoy;\npub mod exports;\npub mod consumer;\n",
+        )
+        .file("src/actual.rs", "pub enum State { Ready }\n")
+        .file("src/decoy.rs", "pub enum OtherState { Ready }\n")
+        .file("src/exports.rs", "pub use crate::actual::State::Ready;\n")
+        .file("src/consumer.rs", source)
+        .build();
+
+    let start = source
+        .rfind("Ready")
+        .expect("reexported enum variant pattern");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/consumer.rs", source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "actual.State.Ready",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["kind"], "field", "{value}");
+}
+
+#[test]
+fn rust_prelude_owner_is_not_stolen_by_unrelated_workspace_impl() {
+    let source = r#"
+use alloc::{string::String, vec::Vec};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run() {
+        let _: Option<String> = None;
+        let _ = Vec::from([1_u8, 2_u8]);
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"proto\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            "extern crate alloc;\npub mod dnssec;\npub mod rr;\n",
+        )
+        .file("src/dnssec/mod.rs", "pub mod supported_algorithm;\n")
+        .file(
+            "src/dnssec/supported_algorithm.rs",
+            r#"
+use alloc::vec::Vec;
+
+pub struct SupportedAlgorithms;
+
+impl From<&SupportedAlgorithms> for Vec<u8> {
+    fn from(_: &SupportedAlgorithms) -> Self {
+        Vec::new()
+    }
+}
+"#,
+        )
+        .file("src/rr/mod.rs", "pub mod domain;\n")
+        .file("src/rr/domain/mod.rs", "pub mod name;\n")
+        .file("src/rr/domain/name.rs", source)
+        .build();
+
+    let start = source.find("Vec::from").expect("prelude Vec call") + "Vec::".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/rr/domain/name.rs", source, start),
+    );
+    let result = &value["results"][0];
+    assert_ne!(
+        result["status"], "resolved",
+        "an unrelated workspace impl must not make the prelude owner look indexed: {value}"
+    );
+    assert!(
+        result["definitions"].is_null(),
+        "no workspace declaration owns this prelude Vec reference: {value}"
+    );
+}
+
+#[test]
 fn rust_unindexed_imports_are_not_stolen_by_enclosing_enum_variants() {
     let source = r#"
 use external_crate::{NetError, PTR, ResponseCode};

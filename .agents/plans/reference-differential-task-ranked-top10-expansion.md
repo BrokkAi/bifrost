@@ -641,9 +641,32 @@ local gate, but is not the focus.
   crate/orphan isolation regressions in the initial alias collapse. Cross-target
   admission is now limited to exact dependency-provenance routes whose Cargo
   root owns the target, all 1,380 usage tests pass, and a second full Burn
-  replay again reports zero missing. Burn remains in local-gate/publication
-  state, and Hickory DNS and nmstate will not be touched until its clean
-  pushed-head replay and issue closures finish.
+  replay again reports zero missing.
+- [x] (2026-07-30) Finished Burn depth-first at pushed merge head `976f80d9`.
+  The authoritative clean replay audited all 1,164 eligible files, sampled
+  10,000 sites, queried all 1,178 inverse targets, and reported zero missing,
+  truncation, candidate-limit errors, or file errors. Focused regressions,
+  1,380 usage tests, the featureless full test gate, formatting, and strict
+  all-target/all-feature Clippy passed; assigned issues #1279 and #1280 were
+  closed only after the pushed-head replay.
+- [ ] (2026-07-30) Hickory DNS rank nine is the only active Rust repository.
+  Its clean `976f80d9` baseline audited all 314 files and all 1,142 targets,
+  reducing the historical 23 rows to eight exact residuals. Reopened assigned
+  cross-repository inverse tickets #1278 and #1279 before edits; open assigned
+  forward tickets #1282 and #1283 already owned the other families. Structured
+  fixes now preserve macro-token calls/patterns, nested grouped-`self` imports,
+  function-local type shadowing, external-owner boundaries, and exact glob
+  re-export routes without leaking parent imports. Oldskool review found and
+  the implementation closed a glob-re-export false-negative before
+  publication. The final dirty-head replay audited all 314 files, sampled
+  exactly 10,000 sites, queried 1,000 of 1,140 distinct targets, and reported
+  zero missing, file errors, or candidate-limit overflow. Validation exposed
+  benchmark runtime identity omitting `crates/`; assigned issue #1375 was
+  created before its fix and now has a behavior regression. The complete
+  featureless Cargo suite passes with the known one-millisecond C# wall-clock
+  test isolated and passing separately; formatting, diff hygiene, and strict
+  all-target/all-feature Clippy also pass. Nmstate remains untouched until
+  Hickory is committed, published, clean-replayed, closed, and cleaned up.
 - [x] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [x] Complete C++ and publish its evidence and user summary.

@@ -685,6 +685,40 @@ impl RustAnalyzer {
         single_rust_target_fqn(self, targets, progress)
     }
 
+    pub(crate) fn forward_export_fqn_from_files(
+        &self,
+        module_files: &[ProjectFile],
+        name: &str,
+    ) -> Option<String> {
+        if let Some(fqn) = self
+            .canonical_export_fqn_from_files(module_files, name, true, &|| true)
+            .expect("uninterrupted Rust export traversal")
+        {
+            return Some(fqn);
+        }
+        let mut member_fqns = BTreeSet::new();
+        for file in module_files {
+            let index = self.export_index_of(file);
+            let Some(ExportEntry::ReexportedNamed {
+                module_specifier,
+                imported_name,
+            }) = index.exports_by_name.get(name)
+            else {
+                continue;
+            };
+            let Some(owner_fqn) = self.resolve_module_package(file, module_specifier) else {
+                continue;
+            };
+            let target_fqn = join_rust_fqn(&owner_fqn, imported_name);
+            if self.definitions(&target_fqn).next().is_some() {
+                member_fqns.insert(target_fqn);
+            }
+        }
+        (member_fqns.len() == 1)
+            .then(|| member_fqns.into_iter().next())
+            .flatten()
+    }
+
     fn insert_namespace_export_bindings(
         &self,
         file: &ProjectFile,
@@ -768,6 +802,13 @@ impl RustAnalyzer {
                 } else {
                     self.exported_targets_from_files(&module_files, imported_name)
                 };
+                if targets.is_empty() {
+                    targets.extend(self.rust_member_reexport_targets(
+                        file,
+                        module_specifier,
+                        imported_name,
+                    ));
+                }
                 if targets.is_empty() {
                     targets.extend(rust_declaration_targets_in_files_with_progress(
                         self,
@@ -873,11 +914,20 @@ impl RustAnalyzer {
                     module_specifier,
                     imported_name,
                 }) => {
-                    pending.extend(
-                        self.resolve_module_files(&file, module_specifier)
-                            .into_iter()
-                            .map(|target_file| (target_file, imported_name.clone(), true)),
-                    );
+                    let module_files = self.resolve_module_files(&file, module_specifier);
+                    if module_files.is_empty() {
+                        targets.extend(self.rust_member_reexport_targets(
+                            &file,
+                            module_specifier,
+                            imported_name,
+                        ));
+                    } else {
+                        pending.extend(
+                            module_files
+                                .into_iter()
+                                .map(|target_file| (target_file, imported_name.clone(), true)),
+                        );
+                    }
                 }
                 Some(ExportEntry::Default {
                     local_name: Some(local_name),
@@ -906,6 +956,26 @@ impl RustAnalyzer {
             }
         }
         Ok(targets)
+    }
+
+    fn rust_member_reexport_targets(
+        &self,
+        file: &ProjectFile,
+        owner_path: &str,
+        member_name: &str,
+    ) -> BTreeSet<(ProjectFile, String)> {
+        let Some(owner_fqn) = self.resolve_module_package(file, owner_path) else {
+            return BTreeSet::new();
+        };
+        let target_fqn = join_rust_fqn(&owner_fqn, member_name);
+        self.definitions(&target_fqn)
+            .map(|candidate| {
+                (
+                    candidate.source().clone(),
+                    candidate.identifier().to_string(),
+                )
+            })
+            .collect()
     }
 
     /// Rewrite a leading `use <crate> as <alias>` module-alias segment in
