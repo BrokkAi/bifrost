@@ -164,6 +164,39 @@ pub(super) fn enumerate_procedures<'tree>(
     Ok(inventory.complete(specs))
 }
 
+/// The class names this file declares that a bare call can construct.
+///
+/// Kotlin has no `new`: `Box(input)` is spelled exactly like a function call,
+/// so nothing in the call's own syntax says whether it allocates. Without
+/// whole-program resolution the constructions this adapter can *prove* are the
+/// ones naming a class declared in the same file; every other call stays an
+/// ordinary call site whose target the shared dispatch oracle resolves, rather
+/// than being guessed at from the callee's spelling.
+///
+/// Interfaces are excluded because they are not constructible, and `object`
+/// declarations because their name denotes the singleton rather than a
+/// constructor.
+pub(super) fn collect_constructible_types(
+    prepared: &PreparedSyntaxTree,
+    cancellation: &CancellationToken,
+) -> Result<HashSet<Box<str>>, LoweringCancelled> {
+    let source = prepared.source();
+    let mut names = HashSet::default();
+    try_walk_named_tree_preorder(prepared.tree().root_node(), true, |node| {
+        if cancellation.is_cancelled() {
+            return Err(LoweringCancelled);
+        }
+        if node.kind() == "class_declaration"
+            && !has_token(node, "interface")
+            && let Some(name) = declaration_container_name(source, node)
+        {
+            names.insert(name);
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(names)
+}
+
 struct CallableShape<'tree> {
     kind: ProcedureKind,
     segment_kind: DeclarationSegmentKind,
@@ -250,6 +283,17 @@ fn callable_shape<'tree>(
                 body,
             )
         }
+        // A primary-constructor parameter default is executable syntax with no
+        // body node of its own: it runs once per construction that omits the
+        // argument. Giving it an `Initializer` procedure is what lets the
+        // expression — and any call inside it — be lowered at all; when it runs
+        // relative to property initializers and `init` blocks stays a
+        // procedure-scoped gap, the same one every Kotlin initializer carries.
+        "class_parameter" => (
+            ProcedureKind::Initializer,
+            DeclarationSegmentKind::Initializer,
+            ProcedureBody::Expression(class_parameter_default(node)?),
+        ),
         "enum_entry" => {
             let arguments = child_of_kind(node, "value_arguments")?;
             (
@@ -378,9 +422,11 @@ fn accessor_property<'tree>(accessor: Node<'tree>) -> Option<Node<'tree>> {
 
 fn callable_name(source: &str, node: Node<'_>, kind: ProcedureKind) -> Option<Box<str>> {
     match node.kind() {
-        "function_declaration" | "enum_entry" => child_of_kind(node, "simple_identifier")
-            .and_then(|name| nonempty_node_text(source, name))
-            .map(Box::<str>::from),
+        "function_declaration" | "enum_entry" | "class_parameter" => {
+            child_of_kind(node, "simple_identifier")
+                .and_then(|name| nonempty_node_text(source, name))
+                .map(Box::<str>::from)
+        }
         "property_declaration" => binding_node(node)
             .and_then(|binding| binding_names(binding).first().copied())
             .and_then(|name| nonempty_node_text(source, name))

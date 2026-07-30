@@ -52,6 +52,7 @@ mod semantic_provider_contract;
 #[cfg(feature = "nlp")]
 mod semantic_search;
 mod semantic_value_cpp_contract;
+mod semantic_value_kotlin_contract;
 mod semantic_value_language_contract;
 mod semantic_value_php_contract;
 mod semantic_value_python_contract;

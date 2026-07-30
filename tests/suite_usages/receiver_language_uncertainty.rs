@@ -104,3 +104,30 @@ fn call(runner: &dyn Runner) {
 
     assert_explicitly_uncertain(&report);
 }
+
+#[test]
+fn kotlin_interface_dispatch_remains_explicitly_uncertain() {
+    let report = run(
+        "Receiver.kt",
+        r#"interface Runner {
+    fun run()
+}
+
+class Service : Runner {
+    override fun run() {}
+}
+
+fun call(runner: Runner) {
+    runner.run()
+}
+"#,
+        json!({
+            "languages": ["kotlin"],
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "inside": { "kind": "function", "name": "call" },
+            "steps": [{ "op": "points_to" }]
+        }),
+    );
+
+    assert_explicitly_uncertain(&report);
+}

@@ -162,6 +162,28 @@ pub(super) fn property_initializer(node: Node<'_>) -> Option<Node<'_>> {
     None
 }
 
+/// The default expression of a primary-constructor `class_parameter`.
+///
+/// The grammar spells `class C(val x: Int = compute())` as
+/// `class_parameter(binding_pattern_kind, simple_identifier, user_type, expr)`
+/// with no field naming the default, so the expression is the first named child
+/// after the parameter's own name and declared type.
+pub(super) fn class_parameter_default(node: Node<'_>) -> Option<Node<'_>> {
+    let mut seen_name = false;
+    for child in named_children(node) {
+        match child.kind() {
+            "modifiers" | "binding_pattern_kind" => continue,
+            _ if is_type_syntax(child.kind()) => continue,
+            "simple_identifier" if !seen_name => {
+                seen_name = true;
+            }
+            _ if seen_name => return Some(child),
+            _ => continue,
+        }
+    }
+    None
+}
+
 /// The delegate expression of a `val x by expr` property.
 pub(super) fn property_delegate_expression(node: Node<'_>) -> Option<Node<'_>> {
     child_of_kind(node, "property_delegate").and_then(first_named_child)
@@ -520,36 +542,88 @@ pub(super) fn trailing_lambda(call: Node<'_>) -> Option<Node<'_>> {
         .and_then(|annotated| child_of_kind(annotated, "lambda_literal"))
 }
 
-/// The value half of one `value_argument`.
+/// One argument of a call, with the expansion and domain its syntax proves.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CallArgumentNode<'tree> {
+    /// The expression evaluated for the argument. For a spread this is the
+    /// spread operand, because `*` itself produces no value of its own.
+    pub(super) value: Node<'tree>,
+    /// Whether the source spelled a label, which Kotlin binds by keyword.
+    pub(super) keyword: bool,
+    /// Whether the source spread an array into the positional tail.
+    pub(super) spread: bool,
+}
+
+impl CallArgumentNode<'_> {
+    pub(super) fn expansion(self) -> CallArgumentExpansion {
+        let domain = if self.keyword {
+            ArgumentDomain::Keyword
+        } else {
+            ArgumentDomain::Positional
+        };
+        if self.spread {
+            CallArgumentExpansion::Spread(domain)
+        } else {
+            CallArgumentExpansion::Direct(domain)
+        }
+    }
+}
+
+/// One `value_argument`, classified by the two things its syntax settles: the
+/// label that makes it a keyword argument, and the `*` that makes it a spread.
 ///
 /// A named argument spells its label as the first of two named children, so the
 /// value is the last one either way; the label reader is consulted so this and
 /// the shared usage readers cannot drift about which child is the label.
-pub(super) fn value_argument_value(argument: Node<'_>) -> Option<Node<'_>> {
+pub(super) fn value_argument_parts(argument: Node<'_>) -> Option<CallArgumentNode<'_>> {
     let children = named_children(argument)
         .into_iter()
         .filter(|child| child.kind() != "annotation")
         .collect::<Vec<_>>();
-    let last = children.last().copied()?;
+    let value = children.last().copied()?;
+    let keyword = children.len() >= 2 && kotlin_named_argument_label(argument, children[0]);
     debug_assert!(
-        children.len() < 2 || kotlin_named_argument_label(argument, children[0]),
+        children.len() < 2 || keyword,
         "a two-child value_argument is a named argument"
     );
-    Some(last)
+    if value.kind() == "spread_expression" {
+        return Some(CallArgumentNode {
+            value: first_named_child(value).unwrap_or(value),
+            keyword,
+            spread: true,
+        });
+    }
+    Some(CallArgumentNode {
+        value,
+        keyword,
+        spread: false,
+    })
 }
 
-/// Positional argument expressions of a call, trailing lambda included.
-pub(super) fn call_arguments(call: Node<'_>) -> Vec<Node<'_>> {
+/// The value half of one `value_argument`.
+pub(super) fn value_argument_value(argument: Node<'_>) -> Option<Node<'_>> {
+    value_argument_parts(argument).map(|argument| argument.value)
+}
+
+/// Argument expressions of a call, trailing lambda included.
+///
+/// A trailing lambda is bound positionally to the callee's last parameter, so
+/// it joins the list as an ordinary direct positional argument.
+pub(super) fn call_arguments(call: Node<'_>) -> Vec<CallArgumentNode<'_>> {
     let mut arguments = kotlin_value_arguments(call)
         .map(|list| {
             named_children(list)
                 .into_iter()
                 .filter(|child| child.kind() == "value_argument")
-                .filter_map(value_argument_value)
+                .filter_map(value_argument_parts)
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    arguments.extend(trailing_lambda(call));
+    arguments.extend(trailing_lambda(call).map(|lambda| CallArgumentNode {
+        value: lambda,
+        keyword: false,
+        spread: false,
+    }));
     arguments
 }
 

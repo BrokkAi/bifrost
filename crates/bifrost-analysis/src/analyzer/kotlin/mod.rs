@@ -179,6 +179,27 @@ impl KotlinAnalyzer {
             JvmExternalDeclarationIndex::build_for_project(&self.jvm_config, self.inner.project())
         })
     }
+
+    /// Row-capped projections for bounded receiver queries (issue #1242).
+    ///
+    /// A bounded query must be able to observe exhaustion before an unbounded
+    /// row set is cloned, which the unbounded `IAnalyzer` accessors cannot
+    /// report.
+    pub(crate) fn signature_metadata_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> crate::analyzer::store::LimitedQueryRows<SignatureMetadata> {
+        self.inner.signature_metadata_limited(code_unit, limit)
+    }
+
+    pub(crate) fn ranges_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> crate::analyzer::store::LimitedQueryRows<crate::analyzer::Range> {
+        self.inner.ranges_limited(code_unit, limit)
+    }
 }
 
 impl TypeAliasProvider for KotlinAnalyzer {

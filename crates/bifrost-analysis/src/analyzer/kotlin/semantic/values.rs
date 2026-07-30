@@ -186,6 +186,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
         }
 
+        // An extension's receiver is the one parameter Kotlin spells as a type
+        // rather than as a name, so the shared slot layout — which keys a
+        // parameter on the identifier it binds — cannot see it. The `receiver`
+        // field is structured, so the value is published from there directly.
+        // A top-level extension stays `is_static`, matching how it executes:
+        // the receiver is passed in, not dispatched on.
+        if self.receiver.is_none()
+            && let Some(node) = callable.child_by_field_name("receiver")
+        {
+            let metadata = self.value_mapping(builder, node)?;
+            self.receiver = Some(self.session.add_value_with_metadata(
+                builder,
+                metadata,
+                SemanticValueKind::Receiver,
+            )?);
+        }
+
         if self.receiver.is_none()
             && !properties.is_static
             && matches!(
@@ -266,6 +283,29 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
         }
         Ok(())
+    }
+
+    /// Whether a callee names a class this file declares, and no nearer binding
+    /// of the same name shadows it.
+    ///
+    /// Kotlin resolves a bare name against locals, parameters, and nested
+    /// callables before it reaches a type, so each of those is consulted first;
+    /// a qualified callee (`other.Box(…)`) is deliberately not claimed, because
+    /// the qualifier's meaning needs whole-program resolution.
+    pub(super) fn names_constructible_class(&self, callee: Node<'tree>) -> bool {
+        if callee.kind() != "simple_identifier" {
+            return false;
+        }
+        let Some(name) = node_text(self.prepared.source(), callee) else {
+            return false;
+        };
+        if self.local_at(name, callee.start_byte()).is_some()
+            || self.parameters.contains_key(name)
+            || self.local_callables.contains_key(name)
+        {
+            return false;
+        }
+        self.constructible_types.contains(name)
     }
 
     pub(super) fn resolution_gaps(

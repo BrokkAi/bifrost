@@ -23,10 +23,13 @@
 //!   rows, because exact call dispatch only recognizes `call_expression` and
 //!   `constructor_invocation`.
 //! * Primary-constructor parameter default expressions
-//!   (`class C(val x: Int = compute())`) are not lowered. A `primary_constructor`
-//!   has no body node, so there is no procedure to host either the expression or
-//!   a point-scoped gap; giving one a synthetic procedure is left to the
-//!   follow-up that models primary-constructor scheduling against `init` blocks.
+//!   (`class C(val x: Int = compute())`) are lowered as `Initializer`
+//!   procedures over the default expression itself, so the calls inside one are
+//!   ordinary call sites. *When* a default runs — it executes only at a
+//!   construction that omits the argument, interleaved with property
+//!   initializers and `init` blocks — stays a procedure-scoped gap, because the
+//!   schedule is a property of each construction site rather than of the
+//!   declaration.
 //! * A Kotlin script's free top-level statements are not lowered. Declared
 //!   callables inside a `.kts` file — including `val x = …` initializers —
 //!   enumerate exactly as they do in a `.kt` file; only the implicit script
@@ -45,9 +48,12 @@ use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
 use crate::analyzer::{KotlinAnalyzer, Language, ProjectFile, Range};
-use crate::hash::HashMap;
+use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"kotlin-value-semantics-v1";
+/// Bumped for #1242: keyword/spread argument domains, and primary-constructor
+/// parameter defaults as their own initializer procedures, both change the
+/// artifact a file lowers to.
+const ADAPTER_VERSION: &[u8] = b"kotlin-value-semantics-v2";
 
 impl_program_semantics_provider!(KotlinAnalyzer, KotlinSemanticLowerer);
 
@@ -141,6 +147,13 @@ impl ProgramSemanticsLowerer for KotlinSemanticLowerer {
             })
             .collect::<HashMap<_, _>>();
 
+        let Ok(constructible_types) = collect_constructible_types(prepared, cancellation) else {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: inventory_work,
+            });
+        };
+
         lower_procedure_batch(
             &specs,
             initial_work,
@@ -151,6 +164,7 @@ impl ProgramSemanticsLowerer for KotlinSemanticLowerer {
                     prepared,
                     spec,
                     &procedure_targets,
+                    &constructible_types,
                     staged_budget,
                     cancellation,
                 )
@@ -234,7 +248,8 @@ mod values;
 
 use control::lower_procedure;
 use inventory::{
-    NestedProcedureTarget, ProcedureBody, ProcedureEnumeration, ProcedureSpec, enumerate_procedures,
+    NestedProcedureTarget, ProcedureBody, ProcedureEnumeration, ProcedureSpec,
+    collect_constructible_types, enumerate_procedures,
 };
 
 type KotlinLoweringError = ProcedureLoweringError;
@@ -306,6 +321,9 @@ struct LoweringContext<'tree, 'targets> {
     /// a lambda bound to a local `val`. These are the only Kotlin callees whose
     /// target is provable without whole-program dispatch.
     local_callables: HashMap<Box<str>, NestedProcedureTarget>,
+    /// Classes this file declares, so a bare `Box(input)` call can be published
+    /// as the allocation it provably is.
+    constructible_types: &'targets HashSet<Box<str>>,
     receiver: Option<ValueId>,
     captured_receiver: Option<ValueId>,
     /// The label a `return@label` may name to leave *this* procedure, set for a

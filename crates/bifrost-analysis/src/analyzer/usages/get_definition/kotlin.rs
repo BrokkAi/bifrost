@@ -41,7 +41,7 @@
 //! bypass `MultiAnalyzer`'s realm widening and silently lose those answers.
 
 use super::*;
-use crate::analyzer::BoundedDefinitionLookup;
+use crate::analyzer::kotlin::KotlinAnalyzer;
 use crate::analyzer::kotlin::declarations::kotlin_package_name;
 use crate::analyzer::kotlin::syntax::{
     kotlin_call_arity, kotlin_call_with_callee, kotlin_callee, kotlin_declaration_node,
@@ -52,6 +52,7 @@ use crate::analyzer::kotlin::types::{KotlinNameScope, KotlinTypeName, resolve_ko
 use crate::analyzer::tree_walk::{first_named_child_of_kind, named_children};
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+use crate::analyzer::{BoundedDefinitionLookup, ForwardQueryProvider, SignatureMetadata};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -61,6 +62,93 @@ use std::rc::Rc;
 /// inherited nested types are rare and deep chains rarer, and a small cap keeps
 /// a cyclic hierarchy from turning one lookup into an unbounded traversal.
 const MAX_INHERITED_SCOPE_DEPTH: usize = 4;
+
+/// The declaration lookup a bounded Kotlin request resolves against.
+///
+/// Every query is charged to the request's session, so a receiver query over a
+/// large workspace reports exhaustion instead of quietly performing the
+/// unbounded navigation lookup.
+///
+/// Cross-language answers are deliberately not served. A Kotlin file in a JVM
+/// realm can name a Java or Scala declaration, but materialising another
+/// language's index speculatively is exactly the unbounded work this path
+/// exists to avoid, so an absent cross-language candidate is a resolution
+/// boundary rather than budget exhaustion — the same stance the Scala and Ruby
+/// bounded providers take.
+pub(crate) struct KotlinDefinitionProvider<'a> {
+    kotlin: &'a KotlinAnalyzer,
+    session: &'a ResolutionSession,
+}
+
+impl<'a> KotlinDefinitionProvider<'a> {
+    pub(crate) fn new(kotlin: &'a KotlinAnalyzer, session: &'a ResolutionSession) -> Self {
+        Self { kotlin, session }
+    }
+}
+
+impl BoundedDefinitionLookup for KotlinDefinitionProvider<'_> {
+    fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        let mut units = self
+            .session
+            .query_rows(|| self.kotlin.forward_definition_fqn(fqn));
+        sort_units(&mut units);
+        units.dedup();
+        units
+    }
+
+    fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
+        if language == Language::Kotlin {
+            self.fqn(fqn)
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
+        let mut units = self
+            .session
+            .query_rows(|| self.kotlin.forward_file_identifier(file, ident));
+        sort_units(&mut units);
+        units.dedup();
+        units
+    }
+
+    fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
+        let mut children = Vec::new();
+        for owner in self.fqn(fqn) {
+            children.extend(
+                self.session
+                    .query_rows(|| self.kotlin.forward_direct_children(&owner)),
+            );
+            if !self.session.observe_cancellation() {
+                return Vec::new();
+            }
+        }
+        sort_units(&mut children);
+        children.dedup();
+        children
+    }
+
+    fn fqn_exists(&self, fqn: &str) -> bool {
+        !self.fqn(fqn).is_empty()
+    }
+
+    fn package_exists(&self, package: &str) -> bool {
+        self.session
+            .query(|| self.kotlin.forward_package_exists(package))
+            .unwrap_or(false)
+    }
+
+    fn package_exists_in_language(&self, package: &str, language: Language) -> bool {
+        language == Language::Kotlin && self.package_exists(package)
+    }
+
+    fn fqn_prefix_exists(&self, prefix: &str) -> bool {
+        self.session
+            .query(|| self.kotlin.forward_fqn_prefix_exists(prefix))
+            .unwrap_or(false)
+    }
+}
 
 pub(super) fn parse_kotlin_tree(source: &str) -> Option<Tree> {
     let mut parser = Parser::new();
@@ -73,6 +161,53 @@ pub(super) fn parse_kotlin_tree(source: &str) -> Option<Tree> {
 pub(crate) fn resolve_kotlin(
     analyzer: &dyn IAnalyzer,
     support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+) -> DefinitionLookupOutcome {
+    resolve_kotlin_in_session(
+        analyzer,
+        support,
+        &ResolutionSession::unbounded(),
+        file,
+        source,
+        tree,
+        site,
+    )
+}
+
+/// Bounded Kotlin definition resolution for the receiver-query path (#1242).
+///
+/// The resolver itself is the same one navigation uses; only the session
+/// differs, so a bounded receiver query and a `get_definition` request cannot
+/// disagree about what a Kotlin reference denotes.
+pub(crate) fn resolve_kotlin_bounded(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<&CancellationToken>,
+) -> BoundedResolution<DefinitionLookupOutcome> {
+    let session = ResolutionSession::bounded(budget, cancellation);
+    let Some(kotlin) = resolve_analyzer::<KotlinAnalyzer>(analyzer) else {
+        return session.finish(no_definition(
+            "kotlin_analyzer_unavailable",
+            "Kotlin analyzer is unavailable",
+        ));
+    };
+    let support = KotlinDefinitionProvider::new(kotlin, &session);
+    let outcome = resolve_kotlin_in_session(analyzer, &support, &session, file, source, tree, site);
+    session.finish(outcome)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_kotlin_in_session(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    session: &ResolutionSession,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -93,7 +228,7 @@ pub(crate) fn resolve_kotlin(
         );
     };
 
-    let ctx = KotlinCtx::new(analyzer, support, file, source, root);
+    let ctx = KotlinCtx::new(analyzer, support, session, file, source, root);
 
     if let Some(header) = kotlin_enclosing_import_header(node) {
         return kotlin_import_reference_outcome(&ctx, header, node);
@@ -162,6 +297,12 @@ fn kotlin_identifier_reference_outcome(
 struct KotlinCtx<'a> {
     analyzer: &'a dyn IAnalyzer,
     support: &'a dyn BoundedDefinitionLookup,
+    /// Work accounting for this request. An unbounded session charges nothing,
+    /// so the ordinary navigation path is unchanged; a bounded one — the
+    /// receiver-query path of issue #1242 — charges every index query, syntax
+    /// read, and hierarchy expansion this resolver performs, so exhaustion is
+    /// reported rather than silently answered around.
+    session: &'a ResolutionSession,
     file: &'a ProjectFile,
     source: &'a str,
     /// Parsed syntax of the files this request has had to look inside, keyed by
@@ -213,6 +354,7 @@ impl<'a> KotlinCtx<'a> {
     fn new(
         analyzer: &'a dyn IAnalyzer,
         support: &'a dyn BoundedDefinitionLookup,
+        session: &'a ResolutionSession,
         file: &'a ProjectFile,
         source: &'a str,
         root: Node<'_>,
@@ -223,20 +365,82 @@ impl<'a> KotlinCtx<'a> {
         // header, and the same-package tier of the ladder needs it.
         let facts = Rc::new(KotlinFileFacts {
             package_name: kotlin_package_name(root, source),
-            imports: analyzer
-                .import_analysis_provider()
-                .map(|provider| provider.import_info_of(file))
-                .unwrap_or_default(),
+            imports: session.query_rows(|| {
+                analyzer
+                    .import_analysis_provider()
+                    .map(|provider| provider.import_info_of(file))
+                    .unwrap_or_default()
+            }),
         });
         let mut file_facts = HashMap::default();
         file_facts.insert(file.clone(), facts);
         Self {
             analyzer,
             support,
+            session,
             file,
             source,
             file_syntax: RefCell::new(HashMap::default()),
             file_facts: RefCell::new(file_facts),
+        }
+    }
+
+    /// One declaration's ranges, charged to this request.
+    fn ranges(&self, unit: &CodeUnit) -> Vec<Range> {
+        self.session.query_rows(|| self.analyzer.ranges(unit))
+    }
+
+    /// One declaration's published signature metadata, charged to this request.
+    fn signature_metadata(&self, unit: &CodeUnit) -> Vec<SignatureMetadata> {
+        self.session
+            .query_rows(|| self.analyzer.signature_metadata(unit))
+    }
+
+    fn parent_of(&self, unit: &CodeUnit) -> Option<CodeUnit> {
+        self.session
+            .query_optional(|| self.analyzer.parent_of(unit))
+    }
+
+    fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
+        self.session
+            .query_optional(|| self.analyzer.enclosing_code_unit(file, range))
+    }
+
+    /// One hierarchy expansion step, charged against the summary budget so a
+    /// deep or cyclic hierarchy exhausts a separate limit from syntax work.
+    fn direct_ancestors(&self, unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.session.summary_rows(|| {
+            self.analyzer
+                .type_hierarchy_provider()
+                .map(|provider| provider.get_direct_ancestors(unit))
+                .unwrap_or_default()
+        })
+    }
+
+    fn imports_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
+        self.session.query_rows(|| {
+            self.analyzer
+                .import_analysis_provider()
+                .map(|provider| provider.import_info_of(file))
+                .unwrap_or_default()
+        })
+    }
+
+    /// A `KotlinCtx` over another file's syntax, sharing this request's
+    /// analyzer, lookup, and work accounting.
+    fn declaring_ctx<'declaring>(
+        &'declaring self,
+        file: &'declaring ProjectFile,
+        source: &'declaring str,
+    ) -> KotlinCtx<'declaring> {
+        KotlinCtx {
+            analyzer: self.analyzer,
+            support: self.support,
+            session: self.session,
+            file,
+            source,
+            file_syntax: RefCell::new(HashMap::default()),
+            file_facts: RefCell::new(HashMap::default()),
         }
     }
 
@@ -250,7 +454,7 @@ impl<'a> KotlinCtx<'a> {
     /// spelled type still has to be resolved in the file that wrote it, and this
     /// is how that file's scope is obtained without opening it.
     fn declaration_scope(&self, unit: &CodeUnit) -> Option<KotlinScope> {
-        let byte = self.analyzer.ranges(unit).into_iter().min()?.start_byte;
+        let byte = self.ranges(unit).into_iter().min()?.start_byte;
         Some(KotlinScope {
             facts: self.indexed_file_facts(unit),
             owners: self.scope_owners_at(unit.source(), byte),
@@ -270,11 +474,7 @@ impl<'a> KotlinCtx<'a> {
         }
         let facts = Rc::new(KotlinFileFacts {
             package_name: unit.package_name().to_string(),
-            imports: self
-                .analyzer
-                .import_analysis_provider()
-                .map(|provider| provider.import_info_of(file))
-                .unwrap_or_default(),
+            imports: self.imports_of(file),
         });
         self.file_facts
             .borrow_mut()
@@ -293,11 +493,7 @@ impl<'a> KotlinCtx<'a> {
             .unwrap_or_default();
         let facts = Rc::new(KotlinFileFacts {
             package_name,
-            imports: self
-                .analyzer
-                .import_analysis_provider()
-                .map(|provider| provider.import_info_of(file))
-                .unwrap_or_default(),
+            imports: self.imports_of(file),
         });
         self.file_facts
             .borrow_mut()
@@ -311,10 +507,15 @@ impl<'a> KotlinCtx<'a> {
         if let Some(cached) = self.file_syntax.borrow().get(file) {
             return cached.clone();
         }
+        // Reading and parsing another file is the most expensive step this
+        // resolver takes, so it is charged before it happens rather than after.
         let syntax = self
-            .analyzer
-            .indexed_source(file)
-            .or_else(|| self.analyzer.project().read_source(file).ok())
+            .session
+            .query_optional(|| {
+                self.analyzer
+                    .indexed_source(file)
+                    .or_else(|| self.analyzer.project().read_source(file).ok())
+            })
             .and_then(|source| {
                 let tree = parse_kotlin_tree(&source)?;
                 Some(Rc::new(KotlinFileSyntax { source, tree }))
@@ -334,7 +535,7 @@ impl<'a> KotlinCtx<'a> {
     /// called, what type does this property declare — without inventing a
     /// second, text-based model of Kotlin.
     fn declaration_syntax(&self, unit: &CodeUnit) -> Option<(Rc<KotlinFileSyntax>, Range)> {
-        let range = self.analyzer.ranges(unit).into_iter().min()?;
+        let range = self.ranges(unit).into_iter().min()?;
         let syntax = self.file_syntax(unit.source())?;
         Some((syntax, range))
     }
@@ -415,7 +616,7 @@ impl<'a> KotlinCtx<'a> {
     /// missing metadata is an absence of evidence, and using it to reject a
     /// candidate would turn a gap in indexing into a confident wrong answer.
     fn accepts_arity(&self, unit: &CodeUnit, arity: usize) -> bool {
-        let metadata = self.analyzer.signature_metadata(unit);
+        let metadata = self.signature_metadata(unit);
         if metadata.is_empty() {
             return true;
         }
@@ -436,8 +637,7 @@ impl<'a> KotlinCtx<'a> {
         let Some(syntax) = self.file_syntax(unit.source()) else {
             return false;
         };
-        self.analyzer
-            .signature_metadata(unit)
+        self.signature_metadata(unit)
             .iter()
             .flat_map(|entry| entry.parameters().to_vec())
             .any(|parameter| {
@@ -488,7 +688,7 @@ impl<'a> KotlinCtx<'a> {
     /// The innermost class-like declaration enclosing `byte` in the requesting
     /// file.
     fn enclosing_class_at(&self, byte: usize) -> Option<CodeUnit> {
-        let start = self.analyzer.enclosing_code_unit(
+        let start = self.enclosing_code_unit(
             self.file,
             &Range {
                 start_byte: byte,
@@ -502,7 +702,7 @@ impl<'a> KotlinCtx<'a> {
             if unit.is_class() {
                 return Some(unit);
             }
-            current = self.analyzer.parent_of(&unit);
+            current = self.parent_of(&unit);
         }
         None
     }
@@ -528,17 +728,10 @@ impl<'a> KotlinCtx<'a> {
         let node = kotlin_declaration_node(syntax.tree.root_node(), &range)?;
         // An enum entry has no written type: it is an instance of its own enum.
         if node.kind() == "enum_entry" {
-            return self.analyzer.parent_of(unit).filter(CodeUnit::is_class);
+            return self.parent_of(unit).filter(CodeUnit::is_class);
         }
 
-        let declaring = KotlinCtx {
-            analyzer: self.analyzer,
-            support: self.support,
-            file: unit.source(),
-            source: &syntax.source,
-            file_syntax: RefCell::new(HashMap::default()),
-            file_facts: RefCell::new(HashMap::default()),
-        };
+        let declaring = self.declaring_ctx(unit.source(), &syntax.source);
         let type_node = match node.kind() {
             "property_declaration" => named_children(node)
                 .into_iter()
@@ -584,7 +777,6 @@ impl<'a> KotlinCtx<'a> {
             return None;
         }
         let spelled = self
-            .analyzer
             .signature_metadata(unit)
             .into_iter()
             .find_map(|entry| entry.return_type_text().map(str::to_string))?;
@@ -601,7 +793,7 @@ impl<'a> KotlinCtx<'a> {
         // receiver (issue #1345) answers both halves of that question from the
         // index: which candidates are extensions at all, and what each extends.
         if language_for_target(unit) == Language::Kotlin {
-            let metadata = self.analyzer.signature_metadata(unit);
+            let metadata = self.signature_metadata(unit);
             if let Some(spelled) = metadata
                 .iter()
                 .find_map(|entry| entry.extension_receiver_type())
@@ -622,14 +814,7 @@ impl<'a> KotlinCtx<'a> {
         let (syntax, range) = self.declaration_syntax(unit)?;
         let node = kotlin_declaration_node(syntax.tree.root_node(), &range)?;
         let receiver = node.child_by_field_name("receiver")?;
-        let declaring = KotlinCtx {
-            analyzer: self.analyzer,
-            support: self.support,
-            file: unit.source(),
-            source: &syntax.source,
-            file_syntax: RefCell::new(HashMap::default()),
-            file_facts: RefCell::new(HashMap::default()),
-        };
+        let declaring = self.declaring_ctx(unit.source(), &syntax.source);
         let spelled = kotlin_type_node_spelling(&declaring, receiver)?;
         let scope = declaring.scope_in(unit.source(), range.start_byte);
         declaring.resolve_type_unit(&spelled, &scope)
@@ -640,16 +825,13 @@ impl<'a> KotlinCtx<'a> {
         if subtype.fq_name() == supertype.fq_name() {
             return true;
         }
-        let Some(provider) = self.analyzer.type_hierarchy_provider() else {
-            return false;
-        };
         let target = supertype.fq_name();
         let mut seen = Vec::new();
         let mut frontier = vec![subtype.clone()];
         for _ in 0..MAX_MEMBER_HIERARCHY_DEPTH {
             let mut next = Vec::new();
             for unit in &frontier {
-                for ancestor in provider.get_direct_ancestors(unit) {
+                for ancestor in self.direct_ancestors(unit) {
                     let fqn = ancestor.fq_name();
                     if fqn == target {
                         return true;
@@ -686,7 +868,7 @@ impl<'a> KotlinCtx<'a> {
     /// provider, which is realm-aware: a Kotlin class extending a Java class in
     /// the same workspace inherits that class's scope too.
     fn scope_owners_at(&self, file: &ProjectFile, byte: usize) -> Vec<String> {
-        let Some(start) = self.analyzer.enclosing_code_unit(
+        let Some(start) = self.enclosing_code_unit(
             file,
             &Range {
                 start_byte: byte,
@@ -701,7 +883,7 @@ impl<'a> KotlinCtx<'a> {
         let mut lexical = Vec::new();
         let mut current = Some(start);
         while let Some(unit) = current {
-            current = self.analyzer.parent_of(&unit);
+            current = self.parent_of(&unit);
             lexical.push(unit);
         }
 
@@ -715,14 +897,11 @@ impl<'a> KotlinCtx<'a> {
             owners.push(fqn);
         }
 
-        let Some(provider) = self.analyzer.type_hierarchy_provider() else {
-            return owners;
-        };
         let mut frontier = lexical;
         for _ in 0..MAX_INHERITED_SCOPE_DEPTH {
             let mut next = Vec::new();
             for unit in &frontier {
-                for ancestor in provider.get_direct_ancestors(unit) {
+                for ancestor in self.direct_ancestors(unit) {
                     let fqn = ancestor.fq_name();
                     if owners.contains(&fqn) {
                         continue;
@@ -1177,9 +1356,7 @@ fn kotlin_member_candidates(
                     }
                 }
 
-                if let Some(provider) = ctx.analyzer.type_hierarchy_provider() {
-                    next.extend(provider.get_direct_ancestors(owner));
-                }
+                next.extend(ctx.direct_ancestors(owner));
             }
             if next.is_empty() {
                 break;
@@ -1321,14 +1498,53 @@ fn kotlin_this_owner(ctx: &KotlinCtx<'_>, node: Node<'_>) -> Option<CodeUnit> {
             .trim_end_matches('@')
             .to_string()
     });
+    // Inside an extension, an unlabelled `this` is the extension receiver, and
+    // it shadows the enclosing class instance a member extension also has.
+    // Only `this@Owner` reaches that dispatch receiver.
+    if label.is_none()
+        && let Some(receiver) = kotlin_enclosing_extension_receiver(node)
+        && let Some(spelled) = kotlin_type_node_spelling(ctx, receiver)
+    {
+        let scope = ctx.scope_at(receiver.start_byte());
+        return ctx.resolve_type_unit(&spelled, &scope);
+    }
     let mut current = ctx.enclosing_class_at(node.start_byte());
     while let Some(unit) = current {
         match label.as_deref() {
             Some(label) if unit.identifier() != label => {
-                current = ctx.analyzer.parent_of(&unit).filter(CodeUnit::is_class);
+                current = ctx.parent_of(&unit).filter(CodeUnit::is_class);
             }
             _ => return Some(unit),
         }
+    }
+    None
+}
+
+/// The `receiver` type node of the callable that owns `node`, when that
+/// callable is an extension.
+///
+/// The walk stops at any syntax that opens a receiver scope of its own: a
+/// lambda may or may not rebind `this` depending on the parameter type it is
+/// passed to, which is a whole-program fact, so an enclosing extension is not
+/// claimed through one.
+fn kotlin_enclosing_extension_receiver<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "function_declaration" | "property_declaration" => {
+                return parent.child_by_field_name("receiver");
+            }
+            "lambda_literal"
+            | "anonymous_function"
+            | "class_declaration"
+            | "object_declaration"
+            | "companion_object"
+            | "object_literal"
+            | "secondary_constructor"
+            | "anonymous_initializer" => return None,
+            _ => {}
+        }
+        current = parent.parent();
     }
     None
 }
@@ -1339,10 +1555,7 @@ fn kotlin_super_owner(ctx: &KotlinCtx<'_>, node: Node<'_>) -> Option<CodeUnit> {
     let enclosing = ctx.enclosing_class_at(node.start_byte())?;
     let named = first_named_child_of_kind(node, "user_type")
         .and_then(|user_type| kotlin_type_node_spelling(ctx, user_type));
-    let ancestors = ctx
-        .analyzer
-        .type_hierarchy_provider()?
-        .get_direct_ancestors(&enclosing);
+    let ancestors = ctx.direct_ancestors(&enclosing);
     match named {
         Some(named) => ancestors
             .into_iter()
@@ -1561,8 +1774,29 @@ pub(crate) fn kotlin_type_lookup_resolution(
     root: Node<'_>,
     site: &ResolvedReferenceSite,
 ) -> Option<KotlinTypeLookupResolution> {
+    kotlin_type_lookup_resolution_in_session(
+        analyzer,
+        support,
+        &ResolutionSession::unbounded(),
+        file,
+        source,
+        root,
+        site,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn kotlin_type_lookup_resolution_in_session(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    session: &ResolutionSession,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    site: &ResolvedReferenceSite,
+) -> Option<KotlinTypeLookupResolution> {
     let node = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
-    let ctx = KotlinCtx::new(analyzer, support, file, source, root);
+    let ctx = KotlinCtx::new(analyzer, support, session, file, source, root);
 
     if node.kind() == "type_identifier" {
         if kotlin_enclosing_import_header(node).is_some() {
@@ -1574,6 +1808,19 @@ pub(crate) fn kotlin_type_lookup_resolution(
         return Some(KotlinTypeLookupResolution::Type {
             fqn,
             target_kind: TypeLookupTargetKind::TypeReference,
+        });
+    }
+
+    // A site covering a whole expression — a construction, a call, a chained
+    // selection — types through the same expression typer receiver resolution
+    // uses. Kotlin has no `new`, so `Service()` is an ordinary `call_expression`
+    // and this is the only place a construction can answer with the class it
+    // builds.
+    if node.kind() != "simple_identifier" && kotlin_is_expression_kind(node.kind()) {
+        let unit = kotlin_expression_type(&ctx, node, 0)?;
+        return Some(KotlinTypeLookupResolution::Type {
+            fqn: unit.fq_name(),
+            target_kind: TypeLookupTargetKind::ValueExpression,
         });
     }
 

@@ -5,6 +5,7 @@ pub(super) fn lower_procedure<'tree, 'targets>(
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
     procedure_targets: &'targets HashMap<usize, NestedProcedureTarget>,
+    constructible_types: &'targets HashSet<Box<str>>,
     budget: &SemanticBudget,
     cancellation: &'targets CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), KotlinLoweringError> {
@@ -40,6 +41,7 @@ pub(super) fn lower_procedure<'tree, 'targets>(
         parameters: HashMap::default(),
         locals: HashMap::default(),
         local_callables: HashMap::default(),
+        constructible_types,
         receiver: None,
         captured_receiver: None,
         boundary_label: lambda_boundary_label(prepared.source(), spec.callable),
@@ -55,7 +57,9 @@ pub(super) fn lower_procedure<'tree, 'targets>(
         // One scoped fact per procedure: a delegated property is an initializer
         // too, so its generated accessor dispatch is reported alongside the
         // scheduling the adapter does not model rather than as a second row.
-        let detail = if spec.delegated {
+        let detail = if spec.callable.kind() == "class_parameter" {
+            "a primary-constructor parameter default runs only at a construction that omits the argument, and its order against property initializers and init blocks is not yet modeled"
+        } else if spec.delegated {
             "delegated property getValue/setValue dispatch is compiler-generated, and initializer scheduling across property initializers and init blocks is not yet modeled"
         } else {
             "initializer scheduling and source-order composition across property initializers and init blocks are not yet modeled"
@@ -1901,10 +1905,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.expression_value(builder, receiver_node, expression_value_kind(receiver_node))
             })
             .transpose()?;
+        // `Box(input)` is spelled as an ordinary call, so a construction is
+        // recognised from the callee naming a class this file declares.
+        let constructs_declared_class = node.kind() == "call_expression"
+            && callee_node.is_some_and(|callee| self.names_constructible_class(callee));
         let is_constructor = matches!(
             node.kind(),
             "constructor_invocation" | "constructor_delegation_call"
-        );
+        ) || constructs_declared_class;
         let callable_kind = if is_constructor {
             CallableReferenceKind::Constructor
         } else if receiver.is_some() {
@@ -1939,8 +1947,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let argument_values = arguments
             .iter()
             .map(|argument| {
-                self.expression_value(builder, *argument, expression_value_kind(*argument))
-                    .map(|value| SemanticCallArgument::direct(value, ArgumentDomain::Positional))
+                self.expression_value(
+                    builder,
+                    argument.value,
+                    expression_value_kind(argument.value),
+                )
+                .map(|value| SemanticCallArgument {
+                    value,
+                    expansion: argument.expansion(),
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         debug_assert_eq!(
@@ -1962,7 +1977,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 exceptional_continuation: exceptional,
             },
         )?;
-        if node.kind() == "constructor_invocation" {
+        if node.kind() == "constructor_invocation" || constructs_declared_class {
             self.session
                 .add_allocation(builder, normal, result, AllocationKind::Object)?;
         }
@@ -2001,7 +2016,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         if !receiver_already_evaluated {
             evaluations.extend(receiver_node);
         }
-        evaluations.extend(arguments);
+        evaluations.extend(arguments.iter().map(|argument| argument.value));
         self.schedule_expressions(
             builder,
             entry,
