@@ -700,7 +700,10 @@
       "type": "object",
       "properties": {
         "name": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "optional": {
           "type": "boolean",
@@ -716,7 +719,6 @@
       },
       "additionalProperties": false,
       "required": [
-        "name",
         "type"
       ]
     },
@@ -1411,6 +1413,50 @@
         {
           "type": "object",
           "properties": {
+            "element": {
+              "$ref": "#/$defs/TypeRef"
+            },
+            "kind": {
+              "type": "string",
+              "const": "by_ref"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "element"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "bound": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TypeRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "wildcard"
+            },
+            "variance": {
+              "$ref": "#/$defs/WildcardVariance"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "variance"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "elements": {
               "type": "array",
               "items": {
@@ -1479,6 +1525,14 @@
         "protected_internal",
         "package",
         "private"
+      ]
+    },
+    "WildcardVariance": {
+      "type": "string",
+      "enum": [
+        "any",
+        "extends",
+        "super"
       ]
     }
   }

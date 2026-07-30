@@ -8,4 +8,5 @@
 
 pub(crate) mod dependency_discovery;
 pub(crate) mod external;
+pub(crate) mod java_artifact;
 pub(crate) mod realm;
