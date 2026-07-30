@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    CodeQueryFlowWitness, CodeQueryRange, CodeQuerySemanticCompleteness, CodeQuerySemanticEvidence,
+    CodeQueryRange, CodeQuerySemanticCompleteness, CodeQuerySemanticEvidence,
     CodeQuerySemanticProof, CodeQuerySourceSite, CodeQueryTaintFinding, CodeQueryTaintOrigin,
-    public_witness_step,
+    CodeQueryTaintProjectionLimits, CodeQueryTaintWitness, public_witness_step,
 };
 use crate::analyzer::dataflow::{PathQuality, SummaryWitness};
 use crate::analyzer::semantic::{
@@ -131,12 +131,9 @@ pub fn project_taint_finding_report(
     workspace: &WorkspaceAnalyzer,
     plan: &TaintAnalysisPlan,
     report: &TaintFindingReport,
-    max_origins_per_finding: usize,
-    max_witnesses_per_finding: usize,
-    max_steps_per_witness: usize,
-    max_witness_bytes: usize,
+    projection_scope: &str,
+    limits: CodeQueryTaintProjectionLimits,
 ) -> Result<Vec<CodeQueryTaintFinding>, TaintModelError> {
-    let plan_ref = plan.universe().hash().to_string();
     let mut by_sink = BTreeMap::<ValueFlowEventKey, Vec<&TaintFinding>>::new();
     for finding in report.findings() {
         by_sink
@@ -177,6 +174,7 @@ pub fn project_taint_finding_report(
                         .map(|class| class.as_str().to_owned()),
                 );
                 for witness in origin.witnesses() {
+                    let witness = witness.as_ref();
                     if !witnesses.contains(&witness) {
                         witnesses.push(witness);
                     }
@@ -185,27 +183,31 @@ pub fn project_taint_finding_report(
         }
 
         let reached_labels = reached_labels.into_iter().collect::<Vec<_>>();
-        let sink_event_id = public_taint_event_id(&plan_ref, "sink", &sink);
+        let sink_event_id = public_taint_event_id(projection_scope, "sink", &sink);
         let origin_event_ids = origin_evidence
             .keys()
-            .map(|origin| public_taint_event_id(&plan_ref, "source", origin.value_flow_key()))
+            .map(|origin| {
+                public_taint_event_id(projection_scope, "source", origin.value_flow_key())
+            })
             .collect::<Vec<_>>();
         let finding_id = public_taint_finding_id(
-            &plan_ref,
+            projection_scope,
             &sink_event_id,
             &reached_labels,
             &origin_event_ids,
         );
         let omitted_origins = origin_evidence
             .len()
-            .saturating_sub(max_origins_per_finding);
+            .saturating_sub(limits.max_origins_per_finding);
         origins_truncated |= omitted_origins > 0;
 
         let mut origins = Vec::new();
         let mut retained_witnesses = Vec::new();
-        for (origin, (labels, witnesses)) in origin_evidence.iter().take(max_origins_per_finding) {
+        for (origin, (labels, witnesses)) in
+            origin_evidence.iter().take(limits.max_origins_per_finding)
+        {
             let event = origin.value_flow_key();
-            let event_id = public_taint_event_id(&plan_ref, "source", event);
+            let event_id = public_taint_event_id(projection_scope, "source", event);
             let labels = labels.iter().cloned().collect::<Vec<_>>();
             origins.push(CodeQueryTaintOrigin {
                 id: public_taint_origin_id(&finding_id, &event_id, &labels),
@@ -223,11 +225,11 @@ pub fn project_taint_finding_report(
 
         let omitted_witnesses = retained_witnesses
             .len()
-            .saturating_sub(max_witnesses_per_finding);
+            .saturating_sub(limits.max_witnesses_per_finding);
         witnesses_truncated |= omitted_witnesses > 0;
         let witnesses = retained_witnesses
             .into_iter()
-            .take(max_witnesses_per_finding)
+            .take(limits.max_witnesses_per_finding)
             .enumerate()
             .map(|(index, witness)| {
                 let (steps, retained_bytes, omitted_steps) = retain_prefix_by_bytes(
@@ -235,8 +237,8 @@ pub fn project_taint_finding_report(
                         .steps()
                         .iter()
                         .map(|step| public_witness_step(workspace, step)),
-                    max_steps_per_witness,
-                    max_witness_bytes,
+                    limits.max_steps_per_witness,
+                    limits.max_witness_bytes,
                     |step| serde_json::to_vec(step).map_or(usize::MAX, |bytes| bytes.len()),
                 );
                 let truncated = witness.truncated()
@@ -244,10 +246,9 @@ pub fn project_taint_finding_report(
                     || witness.retention_truncated()
                     || omitted_steps > 0;
                 witnesses_truncated |= truncated;
-                CodeQueryFlowWitness {
+                CodeQueryTaintWitness {
                     id: public_taint_witness_id(&finding_id, index, witness.quality()),
-                    endpoint_id: finding_id.clone(),
-                    plan_ref: plan_ref.clone(),
+                    finding_id: finding_id.clone(),
                     witness_index: index,
                     path: sink.site().path().as_str().to_owned(),
                     language: sink.site().language().config_label(),
@@ -268,6 +269,9 @@ pub fn project_taint_finding_report(
         complete &= !origins_truncated && !witnesses_truncated;
         projected.push(CodeQueryTaintFinding {
             id: finding_id,
+            path: sink.site().path().as_str().to_owned(),
+            language: sink.site().language().config_label(),
+            range: locator_range(workspace, sink.site()),
             sink_event_id,
             sink: public_source_site(workspace, sink.site()),
             reached_labels,

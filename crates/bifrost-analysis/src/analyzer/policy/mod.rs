@@ -24,6 +24,7 @@ mod report;
 mod resolved;
 mod retained;
 pub mod schema;
+mod selector_compiler;
 mod source;
 mod suppression;
 mod taint_policy;

@@ -20,17 +20,29 @@ The observable proof is an inline multi-source/multi-sink fixture. Its selectors
 - [x] (2026-07-29 21:11Z) Milestone 1: implemented `TaintPolicyCompiler` over stored structured CodeQuery selectors, exact source-backed semantic call/value bindings, bounded semantic discovery, and set-oriented per-root source/sink plans.
 - [x] (2026-07-29 21:11Z) Milestone 2: added coordinator-wide taint preparation, exact `TaintBatchPlanner` partitioning, one existing-client solve and one `collect_taint_findings` call per batch, plus observable solve/shared-membership work metrics.
 - [x] (2026-07-29 21:11Z) Milestone 3: implemented and installed `ProductionTaintPolicyEvaluator`; it projects the retained report into the sealed pair-local taint DTOs while leaving classification, CVSS, evidence validation, and renderers authoritative.
-- [x] (2026-07-29 21:11Z) Milestone 4: added the bounded sink-level `CodeQueryTaintFinding`/`CodeQueryTaintOrigin` envelope and reused `CodeQueryFlowWitness` plus the landed source-backed witness-step projection helper.
+- [x] (2026-07-29 21:11Z) Milestone 4: added the bounded sink-level `CodeQueryTaintFinding`/`CodeQueryTaintOrigin` envelope and the landed source-backed witness-step projection helper. The guided review later corrected witness ownership.
 - [x] (2026-07-29 21:11Z) Milestone 5: extended retained-origin tests and added an inline two-source/two-sink, two-policy integration test proving one shared solve, broad fallback classification, and human/JSON/SARIF parity.
 - [x] (2026-07-29 21:18Z) Completed formatting, strict featureless Clippy, the full policy and semantic integration binaries, and final diff review. Policy validation remains unavailable because tool discovery still exposes neither `list_policies` nor `run_policy`; no substitute result is claimed.
+- [x] (2026-07-30 07:58Z) Synced and rebased the three implementation checkpoints onto current `origin/master`, then ran the requested five-perspective guided review and queued all twelve findings.
+- [x] (2026-07-30 09:40Z) Reworked batching around endpoint-neutral propagation identity, unioned carrier/source/sink observations with dense ID rebinding, and added selected-procedure call-region discovery so caller/callee endpoints remain in one solve or fail inconclusively.
+- [x] (2026-07-30 09:40Z) Changed `matched-value` to use direct source-backed point/value observations, including multiple path-specialized observations, and centralized shared selector quality, source-range, and semantic-limit projection used by typestate and taint.
+- [x] (2026-07-30 09:40Z) Added request-wide solve, semantic, finding, witness-count, witness-step, expansion, and retained-byte budgets; retained each reconstructed witness once behind `Arc`; and made proof/completeness pair-local.
+- [x] (2026-07-30 09:40Z) Added the production public query route on `PolicyBatchOutcome`, a `CodeQueryResultValue::TaintFinding` transport case, taint-owned witness envelopes that reuse `CodeQueryFlowWitnessStep`, and Rust/Python/LSP/VS Code model handling without fake flow plan references.
+- [x] (2026-07-30 10:18Z) Closed all twelve guided-review findings and completed final task-scoped validation and diff review. The policy-pack gate remains unavailable because the installed skill exposes no callable `list_policies` or `run_policy`; the VS Code typecheck is likewise unavailable because this worktree has no installed `tsc`.
 
 ## Surprises & Discoveries
 
 - Observation: the production source tree now lives under `crates/bifrost-analysis/src/`, while PR #1329's historical diff still names the pre-split `src/` paths.
   Evidence: the requested seams resolve under `crates/bifrost-analysis/src/analyzer/...` at `HEAD`, and `git show 24fb9291` shows their earlier `src/analyzer/...` names.
 
-- Observation: `TaintBatchPlanner` unions class bindings only after requiring equal value-flow event domains and propagation semantics.
-  Evidence: `crates/bifrost-analysis/src/analyzer/taint/plan.rs` calls `ensure_same_semantics` before `merge_sources` and `merge_sinks`. The production compiler therefore fingerprints the complete `ValueFlowPlan` in its runtime compatibility key: identical endpoint domains share, while access-path, proof/completeness, call/oracle, external-summary, or endpoint-domain changes partition safely instead of poisoning a batch.
+- Observation: `TaintBatchPlanner` originally unioned class bindings only after requiring equal value-flow event domains and propagation semantics.
+  Evidence: the guided review showed that hashing the complete `ValueFlowPlan` made the union branch unreachable for different endpoint sets. `ValueFlowPlan::propagation_semantics_hash`, `has_same_propagation_semantics`, and `union_observations` now compare transfer structure by stable carrier keys, union observations, and densely rebind all client overlays once.
+
+- Observation: a taint finding is not a registered value-flow endpoint, so embedding it in `CodeQueryFlowWitness` requires false `plan_ref` and `endpoint_id` values.
+  Evidence: the original projector used `TaintUniverseHash` as `plan_ref` and the taint finding ID as `endpoint_id`. `CodeQueryTaintWitness` now owns `finding_id` while reusing the existing `CodeQueryFlowWitnessStep`; no duplicate witness-step model was introduced.
+
+- Observation: selected source ranges can map to several legitimate path-specialized value observations.
+  Evidence: the Python matched-value regression produces three structured observations for one selected name. Treating that as an ambiguous call is wrong; all bounded observations are now compiled directly and remain source-backed.
 
 - Observation: `TaintFindingReport` retains both the diagnostic-neutral findings and the owning `TaintSummaryResult`, so witness projection can reconstruct bounded witnesses without another propagation run.
   Evidence: `crates/bifrost-analysis/src/analyzer/taint/finding.rs` stores `result` and `findings`, and `collect_taint_findings` reconstructs origins from retained summary witnesses.
@@ -46,6 +58,9 @@ The observable proof is an inline multi-source/multi-sink fixture. Its selectors
 
 - Observation: unqualified `cargo clippy` selected Homebrew's `clippy-driver` while Cargo/rustc came from rustup; both report Rust 1.96.0 but use different LLVM patch releases and reject each other's crate metadata.
   Evidence: the initial shared and isolated-target runs failed with E0514. `/Users/dave/.cargo/bin/cargo-clippy clippy ...` selected rustup's matching driver and completed cleanly with `-D warnings`.
+
+- Observation: the unselected sibling-callee fixture retains a diagnostic-neutral taint finding, but its deeper return/formal chain has partial Base evidence.
+  Evidence: the compiler discovers the common caller and performs exactly one propagation solve; `PolicyBatchOutcome::taint_findings` retains the positive path, while the existing policy projection correctly reports `PartialDiscovery`, emits no scored policy finding, and never converts partial evidence into a complete negative.
 
 ## Decision Log
 
@@ -69,9 +84,9 @@ The observable proof is an inline multi-source/multi-sink fixture. Its selectors
   Rationale: this directly proves no second solver or policy-specific rerun exists. The report already owns the exact branded result needed for bounded origin and witness reconstruction.
   Date/Author: 2026-07-29 / Codex
 
-- Decision: compile every policy/root as one set-oriented endpoint domain and include the full hashed `ValueFlowPlan` in its runtime compatibility key.
-  Rationale: one plan already propagates every selected source and sink without a pair matrix. Equal domains can share and union class bindings through the existing planner; differing access paths, event sets, completeness, oracle/call, and external-summary semantics must partition safely rather than enter a group that later fails equality validation.
-  Date/Author: 2026-07-29 / Codex
+- Decision: compatibility excludes source/sink observation subsets but includes normalized propagation rules, root, call behavior, summaries, sanitizers, transforms, oracle/context/access-path semantics, and completeness-affecting discovery state.
+  Rationale: compatible policies must share propagation even when their endpoint subsets differ. The planner unions observations and remaps dense IDs, while exact normalized equality still rejects hash collisions or semantic drift.
+  Date/Author: 2026-07-30 / Codex
 
 - Decision: return an explicit capability-incomplete policy result for authored sanitizer, transform, external-model, or named-formal binding semantics not yet representable by the production lowering.
   Rationale: silently omitting these semantics could turn partial propagation into a complete clean negative. The current adapter either compiles exact structured support or misses safely; it does not substitute source-text matching or a weaker model.
@@ -81,9 +96,13 @@ The observable proof is an inline multi-source/multi-sink fixture. Its selectors
   Rationale: transforms can change which label an origin contributes at a sink. Recomputing or intersecting authored source labels downstream is incorrect, and rerunning witness analysis would violate the retained-result boundary.
   Date/Author: 2026-07-29 / Codex
 
-- Decision: introduce only one taint-specific public finding envelope and reuse `CodeQueryFlowWitness`, `CodeQueryFlowWitnessStep`, and the landed witness projection helper for witness bodies.
-  Rationale: taint adds sink aggregation, reached labels/classes, bounded origins, finding identity, and possibly multiple witness references; it does not add a new kind of source-backed witness step.
-  Date/Author: 2026-07-29 / Codex
+- Decision: introduce taint-specific finding, origin, and witness ownership envelopes, while reusing `CodeQueryFlowWitnessStep` and the landed witness projection helper for every step.
+  Rationale: taint adds sink aggregation, reached labels/classes, bounded origins, finding identity, and multiple witness references. Reusing `CodeQueryFlowWitness` itself would falsely claim a registered flow plan and endpoint; reusing its step type preserves the actual witness boundary without that false identity.
+  Date/Author: 2026-07-30 / Codex
+
+- Decision: expose diagnostic-neutral retained taint rows from `PolicyBatchOutcome` both as typed findings and `CodeQueryResultValue::TaintFinding` values.
+  Rationale: the production coordinator already owns the single retained report. This is the smallest public route that proves query and `.rqlp` views derive from the same solve without creating a second taint plan registry or solver.
+  Date/Author: 2026-07-30 / Codex
 
 - Decision: treat selector, semantic, solver, origin, or witness incompleteness as explicit non-clean completion and leave Base CVSS unscored.
   Rationale: incomplete propagation is not a complete negative, and existing policy/CVSS code already applies the correct reduction once the adapter supplies honest proof/completeness.
@@ -93,9 +112,11 @@ The observable proof is an inline multi-source/multi-sink fixture. Its selectors
 
 The production coordinator now prepares all runnable taint policies together, compiles exact structured endpoint matches into one set-oriented plan per root, partitions by the existing batch planner, invokes the existing taint client once per batch, and calls `collect_taint_findings` once on that result. Each participating policy consumes a retained projection from the same report. Work metrics make the shared solve observable in the canonical report.
 
-`collect_taint_findings` now retains the exact per-origin contributing class set and its already-reconstructed bounded witnesses. The policy adapter aggregates sink fact rows conservatively, bounds origin and witness output, constructs the existing sealed projection DTOs, and leaves the existing broad/refined classification and CVSS reducers untouched. The public projection likewise aggregates by sink, exposes reached labels and bounded origins, and reuses `CodeQueryFlowWitness` and `CodeQueryFlowWitnessStep`.
+`collect_taint_findings` now retains the exact per-origin contributing class set and its already-reconstructed bounded witnesses. The policy adapter aggregates sink fact rows conservatively, bounds origin and witness output, constructs the existing sealed projection DTOs, and leaves the existing broad/refined classification and CVSS reducers untouched. The public projection likewise aggregates by sink, exposes reached labels and bounded origins, and reuses `CodeQueryFlowWitnessStep`. Its taint witness envelope is finding-owned and therefore carries no fabricated value-flow plan or endpoint identity.
 
-Validation is green: `cargo check -p brokk-bifrost-analysis --lib`; `cargo fmt --all -- --check`; strict featureless `/Users/dave/.cargo/bin/cargo-clippy clippy -p brokk-bifrost --all-targets -- -D warnings`; all 193 policy integration tests (192 passed, one ignored); and all 522 semantic integration tests (499 passed, 23 intentionally ignored). The focused taint suite contributed 23 passing tests, and the new end-to-end adapter test proves two compatible policies report `taint.propagation_solves = 1` and `taint.propagation_shared_memberships = 1`.
+Validation is green: `cargo check -p brokk-bifrost --no-default-features`; `cargo fmt --all -- --check`; strict featureless `/Users/dave/.cargo/bin/cargo-clippy clippy -p brokk-bifrost --all-targets -- -D warnings`; all 196 policy integration tests (195 passed, one ignored); and the full semantic integration binary (500 passed, 23 intentionally ignored). The focused taint suite contributes 24 passing tests, and the end-to-end adapter tests prove compatible policies report `taint.propagation_solves = 1` and `taint.propagation_shared_memberships = 1`, caller/callee endpoints remain one region, matched values use direct observations, and an unselected common caller retains its partial diagnostic-neutral path without policy scoring.
+
+The Python 3.13 schema-v6 transport model test passes. The VS Code typecheck could not start because `tsc` is not installed in this worktree; no dependency installation was performed solely for this validation.
 
 The only unavailable gate is the repository policy pack: the installed policy skill has no registered `list_policies` or `run_policy` tool in this task. This is recorded as a validation-environment limitation, not a clean policy result.
 
@@ -131,7 +152,7 @@ Milestone 3 implements `ProductionTaintPolicyEvaluator` over the prepared report
 
 Stable IDs and hashes must omit absolute workspace mounts and run-local dense IDs. Origins and witness references retain deterministic bounded prefixes and explicit omission lower bounds. Witnesses are reconstructed only from `TaintFindingReport.result()` retained solver evidence. Install one prepared `ProductionTaintPolicyEvaluator` beside the typestate evaluator in `coordinator.rs` and call `DefaultPolicyEvaluator::with_taint`. The normal evaluator continues to select broad/finding-combination presentation, reduce classification, keep Base CVSS unscored when incomplete, and construct one canonical report for every renderer.
 
-Milestone 4 adds only the diagnostic-neutral taint fields absent from `CodeQueryFlowEndpoint`. Define a `CodeQueryTaintFinding` envelope in `structural/search/results.rs` with stable finding ID, sink-level identity/location, reached stable labels/classes, bounded origin records, proof/certainty, completeness, ambiguity, and references to zero or more existing `CodeQueryFlowWitness` values or IDs. Do not define a taint witness step type. Extract or generalize the existing source-backed witness conversion so the public envelope and policy `BoundedWitness` projection consume the same retained solver witness and truncation decision.
+Milestone 4 adds only the diagnostic-neutral taint fields absent from `CodeQueryFlowEndpoint`. Define a `CodeQueryTaintFinding` envelope in `structural/search/results.rs` with stable finding ID, sink-level identity/location, reached stable labels/classes, bounded origin records, proof/certainty, completeness, ambiguity, and finding-owned witness references. Do not define a taint witness step type. Extract or generalize the existing source-backed witness conversion so the public envelope and policy `BoundedWitness` projection consume the same retained solver witness and truncation decision.
 
 Expose a bounded projection function which accepts the retained `TaintFindingReport` plus compiled metadata and returns public taint envelopes. The production evaluator calls that projection and then converts the same rows into the sealed policy DTOs. If the existing schema can expose this envelope without a new independently registered analysis plan, add the smallest schema-v7 `taint` transition and transport cases; otherwise keep the envelope on the production compiler/evaluator API and document why a second generation-scoped plan/result registration would violate this slice. Any new visible vocabulary must enter through `query/schema.rs` and receive parser, decoder, validator range, hover/completion, grammar, Rust/Python/LSP/VS Code model, and documentation coverage.
 
@@ -240,7 +261,7 @@ At the end of Milestone 3:
 
 must implement `policy::projection::sealed::TaintAdapter` and `policy::evaluator::TaintPolicyEvaluator`. Its `evaluate_taint` implementation performs lookup and projection only; it does not compile selectors or run propagation.
 
-At the end of Milestone 4, `CodeQueryTaintFinding` is the sole taint-specific public envelope. It reuses `CodeQueryFlowWitness` and `CodeQueryFlowWitnessStep`; no `CodeQueryTaintWitnessStep` exists.
+At the end of Milestone 4, `CodeQueryTaintFinding`, `CodeQueryTaintOrigin`, and the finding-owned `CodeQueryTaintWitness` carry only taint-specific aggregation and ownership. They reuse `CodeQueryFlowWitnessStep`; no `CodeQueryTaintWitnessStep` exists.
 
 Revision note (2026-07-29): Created the initial self-contained execution plan after verifying current origin/master and mapping the landed value-flow, taint, policy, and witness seams. The plan chooses coordinator-wide preparation so the existing per-policy evaluator can consume shared retained propagation results.
 

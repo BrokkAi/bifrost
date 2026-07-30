@@ -13,13 +13,16 @@ use brokk_bifrost::analyzer::semantic::{
     ProcedureKind, ProofStatus, SemanticBudget, SemanticRequest, ValueFlowOracle,
     ValueFlowRelationKind, ValueFlowSnapshot,
 };
-use brokk_bifrost::analyzer::structural::project_taint_finding_report;
+use brokk_bifrost::analyzer::structural::{
+    CodeQueryTaintProjectionLimits, project_taint_finding_report,
+};
 use brokk_bifrost::analyzer::taint::{
     CompleteTaintTransferSummaryRepository, SourceClassId, SourceEventKey, TaintAnalysisPlan,
     TaintBatchCompatibilityKey, TaintBatchPlanner, TaintClassSet, TaintEdgeFunction,
-    TaintPolicyPlan, TaintSanitizerBinding, TaintSemanticSummarySet, TaintSinkBinding,
-    TaintSourceBinding, TaintTransferSummaryCacheStatus, TaintTransferSummaryRepositoryLimits,
-    TaintTransformBinding, TaintUniverse, collect_taint_findings, solve_taint_batch_with_witnesses,
+    TaintFindingCollectionLimits, TaintPolicyPlan, TaintSanitizerBinding, TaintSemanticSummarySet,
+    TaintSinkBinding, TaintSourceBinding, TaintTransferSummaryCacheStatus,
+    TaintTransferSummaryRepositoryLimits, TaintTransformBinding, TaintUniverse,
+    collect_taint_findings, collect_taint_findings_with_limits, solve_taint_batch_with_witnesses,
     solve_taint_with_reusable_summaries,
 };
 use brokk_bifrost::analyzer::value_flow::{
@@ -1784,10 +1787,8 @@ fn three_sources_and_four_sinks_share_one_set_oriented_ide_solve() {
         &fixture.analyzer,
         &fixture.plan,
         &report,
-        8,
-        8,
-        128,
-        1024 * 1024,
+        "test:retained-taint-report",
+        CodeQueryTaintProjectionLimits::new(8, 8, 128, 1024 * 1024),
     )
     .unwrap();
     assert_eq!(public.len(), 4);
@@ -1797,6 +1798,23 @@ fn three_sources_and_four_sinks_share_one_set_oriented_ide_solve() {
             && !finding.witnesses.is_empty()
             && !finding.ambiguous
     }));
+}
+
+#[test]
+fn finding_collection_enforces_request_wide_retention_limits() {
+    let fixture = fixture(None);
+    let report = collect_taint_findings_with_limits(
+        &fixture.plan,
+        solve(&fixture, WitnessRetentionLimits::new(1).unwrap()),
+        8,
+        WitnessReconstructionLimits::default(),
+        TaintFindingCollectionLimits::new(2, 1, 32, 64, 1024 * 1024).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(report.findings().len(), 2);
+    assert!(report.omitted_findings_lower_bound() >= 2);
+    assert_eq!(report.retained_witnesses(), 1);
+    assert!(!report.is_complete());
 }
 
 #[test]

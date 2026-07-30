@@ -1,9 +1,10 @@
 use crate::common::InlineTestProject;
 use brokk_bifrost::analyzer::policy::{
     HumanRenderColor, HumanRenderDetail, HumanRenderOptions, PolicyEvaluationDate,
-    PolicyEvaluationInput, PolicyEvaluationOptions, PolicyFindingEvidence, PolicyRunCompletion,
-    PolicySourceIdentity, SarifToolIdentity, evaluate_policy_inputs_with_analyzer,
-    write_policy_human, write_policy_json, write_policy_sarif,
+    PolicyEvaluationInput, PolicyEvaluationOptions, PolicyFindingEvidence, PolicyIncompleteReason,
+    PolicyRunCompletion, PolicySourceIdentity, SarifToolIdentity,
+    evaluate_policy_inputs_with_analyzer, write_policy_human, write_policy_json,
+    write_policy_sarif,
 };
 use brokk_bifrost::{AnalyzerConfig, Language};
 
@@ -25,6 +26,50 @@ def run():
     second = source_two()
     sink_one(first)
     sink_two(second)
+"#;
+
+const INTERPROCEDURAL_SOURCE: &str = r#"
+def source_one():
+    return "one"
+
+def sink_one(value):
+    pass
+
+def helper():
+    return source_one()
+
+def run():
+    sink_one(helper())
+"#;
+
+const MATCHED_VALUE_SOURCE: &str = r#"
+def source_one():
+    return "one"
+
+def sink_one(value):
+    pass
+
+def run():
+    first = source_one()
+    sink_one(first)
+"#;
+
+const SIBLING_CALLEE_SOURCE: &str = r#"
+def source_one():
+    return "one"
+
+def sink_one(value):
+    pass
+
+def produce():
+    return source_one()
+
+def consume(value):
+    sink_one(value)
+
+def run():
+    produced = produce()
+    consume(produced)
 "#;
 
 fn policy(id: &str, message: &str, severity: &str) -> String {
@@ -62,6 +107,154 @@ fn policy(id: &str, message: &str, severity: &str) -> String {
     )
 }
 
+fn subset_policy(id: &str) -> String {
+    format!(
+        r#"(policy
+          :schema-version 1
+          :id "{id}"
+          :name "Endpoint-neutral production taint adapter"
+          :message "subset presentation"
+          :severity note
+          :analysis (analysis
+            :type taint
+            :mode may
+            :call-modeling (call-modeling :unmodeled optimistic)
+            :sources (endpoint-set :entries [
+              (source :id first :display-name "first source" :categories [input.user]
+                :selector (rql :schema-version 6
+                  (language python (call :callee (name "source_one"))))
+                :bind return-value :labels [untrusted])])
+            :sinks (endpoint-set :entries [
+              (sink :id first-store :display-name "first sink" :categories [data.sensitive]
+                :selector (rql :schema-version 6
+                  (language python (call :callee (name "sink_one"))))
+                :dangerous-operand (argument :index 0) :accepts [untrusted])]))
+          :classification (classification
+            :fallback (classification-id :taxonomy "Test" :id "BROAD-TAINT")))"#
+    )
+}
+
+fn single_policy(id: &str, source_selector: &str, source_binding: &str) -> String {
+    format!(
+        r#"(policy
+          :schema-version 1
+          :id "{id}"
+          :name "Production taint adapter boundary"
+          :message "taint boundary"
+          :severity warning
+          :analysis (analysis
+            :type taint
+            :mode may
+            :call-modeling (call-modeling :unmodeled optimistic)
+            :sources (endpoint-set :entries [
+              (source :id first :display-name "first source" :categories [input.user]
+                :selector (rql :schema-version 6 {source_selector})
+                :bind {source_binding} :labels [untrusted])])
+            :sinks (endpoint-set :entries [
+              (sink :id first-store :display-name "first sink" :categories [data.sensitive]
+                :selector (rql :schema-version 6
+                  (language python (call :callee (name "sink_one"))))
+                :dangerous-operand (argument :index 0) :accepts [untrusted])]))
+          :classification (classification
+            :fallback (classification-id :taxonomy "Test" :id "BROAD-TAINT")))"#
+    )
+}
+
+fn evaluate_one(
+    source: &str,
+    policy_source: &str,
+) -> brokk_bifrost::analyzer::policy::PolicyBatchOutcome {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("app.py", source)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let input = [PolicyEvaluationInput::embedded(
+        PolicySourceIdentity::new("test:boundary.rqlp"),
+        policy_source,
+    )];
+    let options = PolicyEvaluationOptions::new(
+        PolicyEvaluationDate::from_ymd(2026, 7, 29).expect("fixed evaluation date"),
+    );
+    evaluate_policy_inputs_with_analyzer(project.root(), &input, &workspace, &options, None)
+        .expect("production taint boundary evaluation")
+}
+
+#[test]
+fn production_taint_keeps_caller_and_callee_endpoints_in_one_call_region() {
+    let policy = single_policy(
+        "test.interprocedural-taint",
+        "(language python (call :callee (name \"source_one\")))",
+        "return-value",
+    );
+    let outcome = evaluate_one(INTERPROCEDURAL_SOURCE, &policy);
+    assert_eq!(
+        outcome.report().runs().len(),
+        1,
+        "{:?}",
+        outcome.report().diagnostics()
+    );
+    assert_eq!(outcome.report().runs()[0].findings().len(), 1);
+    assert_eq!(outcome.taint_findings().len(), 1);
+}
+
+#[test]
+fn production_taint_discovers_an_unselected_common_caller_for_sibling_callees() {
+    let policy = single_policy(
+        "test.sibling-callee-taint",
+        "(language python (call :callee (name \"source_one\")))",
+        "return-value",
+    );
+    let outcome = evaluate_one(SIBLING_CALLEE_SOURCE, &policy);
+    assert_eq!(
+        outcome.report().runs().len(),
+        1,
+        "{:?}",
+        outcome.report().diagnostics()
+    );
+    let run = &outcome.report().runs()[0];
+    assert!(matches!(
+        run.completion(),
+        PolicyRunCompletion::Inconclusive { reasons }
+            if reasons.contains(&PolicyIncompleteReason::PartialDiscovery)
+    ));
+    assert!(run.findings().is_empty());
+    assert_eq!(outcome.taint_findings().len(), 1);
+    assert_eq!(
+        run.work()
+            .metrics()
+            .iter()
+            .find(|metric| metric.name() == "taint.propagation_solves")
+            .map(|metric| metric.value()),
+        Some(1)
+    );
+}
+
+#[test]
+fn production_taint_matched_value_uses_the_direct_source_observation() {
+    let policy = single_policy(
+        "test.matched-value-taint",
+        "(language python (name \"first\"))",
+        "matched-value",
+    );
+    let outcome = evaluate_one(MATCHED_VALUE_SOURCE, &policy);
+    assert_eq!(
+        outcome.report().runs().len(),
+        1,
+        "{:?}",
+        outcome.report().diagnostics()
+    );
+    let run = &outcome.report().runs()[0];
+    assert!(
+        run.diagnostics()
+            .iter()
+            .all(|diagnostic| !diagnostic.message().contains("semantic call site")),
+        "{:?}",
+        run.diagnostics()
+    );
+    assert_eq!(run.findings().len(), 1, "{:?}", run.diagnostics());
+    assert_eq!(outcome.taint_findings().len(), 1);
+}
+
 #[test]
 fn production_taint_policies_share_a_batch_and_all_renderers_keep_the_same_evidence() {
     let project = InlineTestProject::with_language(Language::Python)
@@ -69,7 +262,7 @@ fn production_taint_policies_share_a_batch_and_all_renderers_keep_the_same_evide
         .build();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let first = policy("test.taint-first", "first presentation", "warning");
-    let second = policy("test.taint-second", "second presentation", "error");
+    let second = subset_policy("test.taint-second");
     let inputs = [
         PolicyEvaluationInput::embedded(PolicySourceIdentity::new("test:first.rqlp"), &first),
         PolicyEvaluationInput::embedded(PolicySourceIdentity::new("test:second.rqlp"), &second),
@@ -81,7 +274,12 @@ fn production_taint_policies_share_a_batch_and_all_renderers_keep_the_same_evide
         evaluate_policy_inputs_with_analyzer(project.root(), &inputs, &workspace, &options, None)
             .expect("production taint evaluation");
 
-    assert_eq!(outcome.report().runs().len(), 2);
+    assert_eq!(
+        outcome.report().runs().len(),
+        2,
+        "report diagnostics: {:?}",
+        outcome.report().diagnostics()
+    );
     for run in outcome.report().runs() {
         assert!(
             matches!(
@@ -92,7 +290,12 @@ fn production_taint_policies_share_a_batch_and_all_renderers_keep_the_same_evide
             run.completion(),
             run.diagnostics()
         );
-        assert_eq!(run.findings().len(), 2);
+        let expected_findings = if run.policy_id().as_str() == "test.taint-first" {
+            2
+        } else {
+            1
+        };
+        assert_eq!(run.findings().len(), expected_findings);
         assert_eq!(
             run.work()
                 .metrics()
@@ -132,6 +335,31 @@ fn production_taint_policies_share_a_batch_and_all_renderers_keep_the_same_evide
             );
         }
     }
+
+    assert_eq!(outcome.taint_findings().len(), 2);
+    assert_eq!(outcome.taint_query_results().len(), 2);
+    for result in outcome.taint_query_results() {
+        let value = serde_json::to_value(result).expect("public taint query serialization");
+        assert_eq!(value["result_type"], "taint_finding");
+        assert!(value.get("plan_ref").is_none());
+        assert!(
+            value["witnesses"]
+                .as_array()
+                .expect("taint witness array")
+                .iter()
+                .all(|witness| witness.get("plan_ref").is_none()
+                    && witness.get("finding_id").is_some())
+        );
+    }
+    assert!(outcome.taint_findings().iter().all(|finding| {
+        finding.reached_labels == ["untrusted"]
+            && finding.origins.len() == 1
+            && !finding.witnesses.is_empty()
+            && finding
+                .witnesses
+                .iter()
+                .all(|witness| witness.finding_id == finding.id)
+    }));
 
     let finding_ids = outcome
         .report()

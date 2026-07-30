@@ -166,6 +166,8 @@ pub(crate) use results::CodeQueryStableOwnerCandidate;
 pub(crate) use results::CodeQueryStableOwnerDerivation;
 pub use results::CodeQueryTaintFinding;
 pub use results::CodeQueryTaintOrigin;
+pub use results::CodeQueryTaintProjectionLimits;
+pub use results::CodeQueryTaintWitness;
 pub use results::CodeQueryTypestateCertainty;
 pub use results::CodeQueryTypestateFinding;
 pub use results::CodeQueryTypestateFindingKind;
