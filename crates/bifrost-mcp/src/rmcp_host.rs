@@ -96,23 +96,12 @@ struct ConnectionState {
     workspace_binding_source: WorkspaceBindingSource,
     codex_sandbox_cwd_uri: Option<String>,
     codex_sandbox_root: Option<PathBuf>,
-    /// Bumped every time the client reports its roots changed.
+    /// Handle for asking this client questions, captured at `initialize`.
     ///
-    /// A `roots/list` answer that arrives after a change describes a scope the
-    /// client has already replaced, so an answer whose epoch no longer matches
-    /// is discarded.
-    roots_epoch: u64,
-    /// Roots the client authorized but that Bifrost has not analyzed yet.
-    ///
-    /// Recording is separate from binding on purpose. Binding canonicalizes
-    /// the root, creates `.bifrost/cache` inside it, and starts a background
-    /// index build, so it must not happen merely because a client mentioned a
-    /// directory -- only because a request actually needs that workspace.
-    /// Keeping the two apart is also what makes a superseded answer harmless:
-    /// `rmcp` dispatches notifications on spawned tasks, so a
-    /// `roots/list_changed` can lose the race against the answer it supersedes,
-    /// and a recorded-but-unbound root leaves nothing behind when it does.
-    pending_client_roots: Option<Vec<PathBuf>>,
+    /// Needed because Bifrost requests roots from inside the tool call that
+    /// needs a workspace, not from a lifecycle notification. See
+    /// [`BifrostMcpHandler::activate_workspace_from_client_roots`].
+    peer: Option<rmcp::service::Peer<RoleServer>>,
 }
 
 impl ConnectionState {
@@ -128,8 +117,7 @@ impl ConnectionState {
             },
             codex_sandbox_cwd_uri: None,
             codex_sandbox_root: None,
-            roots_epoch: 0,
-            pending_client_roots: None,
+            peer: None,
         }
     }
 
@@ -144,7 +132,6 @@ impl ConnectionState {
         self.workspace_binding_source = WorkspaceBindingSource::None;
         self.codex_sandbox_cwd_uri = None;
         self.codex_sandbox_root = None;
-        self.pending_client_roots = None;
     }
 }
 
@@ -322,56 +309,60 @@ impl BifrostMcpHandler {
         })
     }
 
-    /// Record the roots a client authorized, without touching the filesystem.
+    /// Ask a legacy (`2025-11-25`) client for its roots and bind the first
+    /// usable one, for the request that needs a workspace right now.
     ///
-    /// An empty list is a legitimate answer meaning "you may analyze nothing":
-    /// the active workspace is revoked and the server goes back to serving no
-    /// workspace tools rather than continuing on the old directory.
-    /// [`Self::activate_recorded_roots`] turns a recording into an actual
-    /// analyzer scope, the first time a request needs one.
+    /// The exchange runs inside the tool call rather than from a lifecycle
+    /// notification, and that placement is the whole point. `rmcp` dispatches
+    /// every notification and every request on its own task and resolves a
+    /// server-to-client response by waking the task that awaits it, so it does
+    /// not preserve message arrival order. A background refresh would therefore
+    /// race the very requests it exists to serve: a client that answers
+    /// `roots/list` and immediately calls a tool could see the tool call
+    /// overtake its own answer and be told the server is not bound to a
+    /// workspace. Consuming the answer in the request that asked for it removes
+    /// that race by construction, and gives the legacy revision the same shape
+    /// as the `2026-07-28` MRTR path.
+    ///
+    /// Returns whether a workspace is now active.
     #[allow(deprecated)] // Roots: see the note on the `Root` import.
-    fn record_client_roots(&self, state: &mut ConnectionState, roots: &[Root]) {
-        let mut candidates = Vec::with_capacity(roots.len());
-        let mut last_error = None;
-        for root in roots {
-            match client_root_to_path(&root.uri) {
-                Ok(path) => candidates.push(path),
-                Err(error) => last_error = Some(error),
-            }
+    async fn activate_workspace_from_client_roots(&self, state: &mut ConnectionState) -> bool {
+        if !state.accepts_client_roots || !state.client_supports_roots {
+            return false;
         }
-
-        // Whatever the client just said replaces whatever it said before, so
-        // the previous scope is revoked either way.
-        if let Err(error) = self.service.unbind_client_workspace() {
-            eprintln!("bifrost: failed to clear the previous MCP workspace root: {error}");
-        }
-        self.in_flight
-            .cancel_stale(self.service.workspace_generation());
-        state.clear_binding();
-
-        if candidates.is_empty() {
-            match last_error {
-                Some(error) => eprintln!("bifrost: no usable MCP workspace root: {error}"),
-                None => eprintln!(
-                    "bifrost: MCP client returned no workspace roots; server remains unbound"
-                ),
-            }
-            return;
-        }
-        if let Some(error) = last_error {
-            eprintln!("bifrost: ignoring an unusable MCP workspace root: {error}");
-        }
-        state.pending_client_roots = Some(candidates);
-    }
-
-    /// Bind the first usable recorded root, so a request that needs a workspace
-    /// gets one. Returns whether a workspace is now active.
-    fn activate_recorded_roots(&self, state: &mut ConnectionState) -> bool {
-        let Some(candidates) = state.pending_client_roots.take() else {
+        let Some(peer) = state.peer.clone() else {
             return false;
         };
+
+        let result = match peer.list_roots().await {
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!("bifrost: MCP roots/list failed: {error}");
+                return false;
+            }
+        };
+        self.bind_first_usable_root(state, &result.roots)
+    }
+
+    /// Bind the first root in `roots` that Bifrost can actually analyze.
+    ///
+    /// An empty or wholly unusable list is a legitimate answer meaning "you may
+    /// analyze nothing", so the server stays unbound rather than falling back
+    /// to anything. Shared by the legacy `roots/list` exchange and the
+    /// `2026-07-28` MRTR retry, which must apply identical validation: MRTR
+    /// roots arrive alongside a client-controlled `requestState` and are no
+    /// more trusted for it.
+    #[allow(deprecated)] // Roots: see the note on the `Root` import.
+    fn bind_first_usable_root(&self, state: &mut ConnectionState, roots: &[Root]) -> bool {
         let mut last_error = None;
-        for candidate in candidates {
+        for root in roots {
+            let candidate = match client_root_to_path(&root.uri) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+            };
             match self.service.bind_client_workspace(candidate) {
                 Ok(root) => {
                     self.in_flight
@@ -388,42 +379,14 @@ impl BifrostMcpHandler {
                 Err(error) => last_error = Some(error.to_string()),
             }
         }
-        if let Some(error) = last_error {
-            eprintln!("bifrost: no usable MCP workspace root: {error}");
+
+        match last_error {
+            Some(error) => eprintln!("bifrost: no usable MCP workspace root: {error}"),
+            None => {
+                eprintln!("bifrost: MCP client returned no workspace roots; server remains unbound")
+            }
         }
         false
-    }
-
-    /// Ask a legacy (`2025-11-25`) client for its roots and bind from the
-    /// answer. `2026-07-28` clients have no such lifecycle and go through the
-    /// MRTR path in `call_tool` instead.
-    ///
-    /// The workspace lock is deliberately *not* held across the round trip.
-    /// A client is entitled to send tool calls while it decides what its roots
-    /// are, and those calls must be answered -- with the ordinary "not bound to
-    /// a workspace" error -- rather than queue behind an answer the client is
-    /// waiting on us to make room for. Staleness is handled by the roots epoch
-    /// instead of by exclusion.
-    #[allow(deprecated)] // Roots: see the note on the `Root` import.
-    async fn refresh_client_roots(&self, peer: &rmcp::service::Peer<RoleServer>) {
-        let epoch = {
-            let state = self.workspace.lock().await;
-            if !state.accepts_client_roots || !state.client_supports_roots {
-                return;
-            }
-            state.roots_epoch
-        };
-
-        let result = peer.list_roots().await;
-
-        let mut state = self.workspace.lock().await;
-        if state.roots_epoch != epoch {
-            return;
-        }
-        match result {
-            Ok(result) => self.record_client_roots(&mut state, &result.roots),
-            Err(error) => eprintln!("bifrost: MCP roots/list failed: {error}"),
-        }
     }
 
     /// Re-validate the Codex sandbox scope carried on this call.
@@ -605,7 +568,9 @@ impl BifrostMcpHandler {
                 serde_json::from_value::<rmcp::model::ListRootsResult>(value.clone()).ok()
             });
         match roots {
-            Some(result) => self.record_client_roots(state, &result.roots),
+            Some(result) => {
+                self.bind_first_usable_root(state, &result.roots);
+            }
             None => eprintln!(
                 "bifrost: MCP roots activation retry carried no usable {ROOTS_INPUT_REQUEST_KEY} response"
             ),
@@ -616,7 +581,7 @@ impl BifrostMcpHandler {
     /// Everything a tool call needs decided before it may touch the analyzer:
     /// authorization, scope, and argument normalization. Runs under the
     /// workspace lock so concurrent calls cannot interleave with a rebind.
-    fn prepare_tool_call(
+    async fn prepare_tool_call(
         &self,
         state: &mut ConnectionState,
         name: &str,
@@ -626,9 +591,9 @@ impl BifrostMcpHandler {
         self.reconcile_codex_sandbox_workspace(state, meta)?;
 
         // This is the first moment a workspace is actually needed, so it is
-        // the moment recorded client roots become an analyzer scope.
+        // the moment to ask the client for one.
         if state.workspace_binding_source == WorkspaceBindingSource::None {
-            self.activate_recorded_roots(state);
+            self.activate_workspace_from_client_roots(state).await;
         }
         if state.workspace_binding_source == WorkspaceBindingSource::None {
             return Err(unbound_workspace_error());
@@ -916,6 +881,7 @@ impl ServerHandler for BifrostMcpHandler {
             }
             state.initialize_received = true;
             state.client_supports_roots = client_supports_roots;
+            state.peer = Some(context.peer.clone());
             let protocol = if !state.accepts_client_roots {
                 "explicit-root"
             } else if client_supports_roots {
@@ -952,27 +918,23 @@ impl ServerHandler for BifrostMcpHandler {
         Ok(info)
     }
 
-    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
-        self.refresh_client_roots(&context.peer).await;
-    }
-
-    async fn on_roots_list_changed(&self, context: NotificationContext<RoleServer>) {
-        {
-            let mut state = self.workspace.lock().await;
-            if !state.accepts_client_roots || !state.client_supports_roots {
-                return;
-            }
-            // Revoke first: until the new list arrives, Bifrost has no
-            // authorization for the directory it was analyzing.
-            if let Err(error) = self.service.unbind_client_workspace() {
-                eprintln!("bifrost: failed to revoke changed MCP workspace roots: {error}");
-            }
-            self.in_flight
-                .cancel_stale(self.service.workspace_generation());
-            state.clear_binding();
-            state.roots_epoch += 1;
+    /// A roots change revokes the current scope and nothing more.
+    ///
+    /// Bifrost does not chase the new list here. The next request that needs a
+    /// workspace asks for roots itself, which is what keeps the exchange free
+    /// of ordering races -- see
+    /// [`BifrostMcpHandler::activate_workspace_from_client_roots`].
+    async fn on_roots_list_changed(&self, _context: NotificationContext<RoleServer>) {
+        let mut state = self.workspace.lock().await;
+        if !state.accepts_client_roots || !state.client_supports_roots {
+            return;
         }
-        self.refresh_client_roots(&context.peer).await;
+        if let Err(error) = self.service.unbind_client_workspace() {
+            eprintln!("bifrost: failed to revoke changed MCP workspace roots: {error}");
+        }
+        self.in_flight
+            .cancel_stale(self.service.workspace_generation());
+        state.clear_binding();
     }
 
     async fn call_tool(
@@ -1023,7 +985,9 @@ impl ServerHandler for BifrostMcpHandler {
         {
             return Ok(input_required.into());
         }
-        let prepared = self.prepare_tool_call(&mut state, &name, arguments, &context.meta)?;
+        let prepared = self
+            .prepare_tool_call(&mut state, &name, arguments, &context.meta)
+            .await?;
         self.in_flight
             .cancel_stale(self.service.workspace_generation());
         let (arguments, workspace_scope) = match prepared {

@@ -2700,44 +2700,16 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
         initialize["result"]["capabilities"]["experimental"].is_null(),
         "standard roots must take precedence over Codex metadata: {initialize}"
     );
-
     write_line(
         &mut stdin,
         json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
     );
-    let roots_request = read_line(&mut reader, &mut stderr);
-    assert_eq!(roots_request["method"], "roots/list", "{roots_request}");
-    // If the client's roots change before it answers, the in-flight result is
-    // stale and must never become analyzer scope, even briefly.
-    write_line(
-        &mut stdin,
-        json!({ "jsonrpc": "2.0", "method": "notifications/roots/list_changed" }),
-    );
-    let plugin_uri = url::Url::from_directory_path(plugin_dir.path())
-        .expect("plugin file URI")
-        .to_string();
-    write_line(
-        &mut stdin,
-        json!({
-            "jsonrpc": "2.0",
-            "id": roots_request["id"],
-            "result": { "roots": [{ "uri": plugin_uri, "name": "stale" }] }
-        }),
-    );
-    let current_roots_request = read_line(&mut reader, &mut stderr);
-    assert_eq!(
-        current_roots_request["method"], "roots/list",
-        "{current_roots_request}"
-    );
-    write_line(
-        &mut stdin,
-        json!({
-            "jsonrpc": "2.0",
-            "id": current_roots_request["id"],
-            "result": { "roots": [{ "uri": "workspace", "name": "relative" }] }
-        }),
-    );
-    let rejected_relative_root = round_trip(
+
+    // Bifrost asks for roots when a request actually needs a workspace, so the
+    // first tool call is what triggers the exchange. A relative root can never
+    // resolve against process cwd, so answering with one leaves the call
+    // unserved rather than silently scoping the analyzer to the plugin dir.
+    let rejected_relative_root = call_tool_answering_roots(
         &mut stdin,
         &mut reader,
         &mut stderr,
@@ -2750,6 +2722,7 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
                 "arguments": { "patterns": ["RelativeWorkspace"] }
             }
         }),
+        json!({ "roots": [{ "uri": "workspace", "name": "relative" }] }),
     );
     assert!(
         rejected_relative_root["error"]["message"]
@@ -2758,28 +2731,10 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
         "a relative client root must never resolve against process cwd: {rejected_relative_root}"
     );
 
-    write_line(
-        &mut stdin,
-        json!({ "jsonrpc": "2.0", "method": "notifications/roots/list_changed" }),
-    );
-    let workspace_roots_request = read_line(&mut reader, &mut stderr);
-    assert_eq!(
-        workspace_roots_request["method"], "roots/list",
-        "{workspace_roots_request}"
-    );
     // Cursor 3.12.30 advertises standard MCP roots but returns its workspace as
-    // a native absolute path rather than a file URI.
-    let workspace_root = workspace.path().display().to_string();
-    write_line(
-        &mut stdin,
-        json!({
-            "jsonrpc": "2.0",
-            "id": workspace_roots_request["id"],
-            "result": { "roots": [{ "uri": workspace_root, "name": "fixture" }] }
-        }),
-    );
-
-    let search = round_trip(
+    // a native absolute path rather than a file URI. Codex sandbox metadata on
+    // the same call must not win against it.
+    let search = call_tool_answering_roots(
         &mut stdin,
         &mut reader,
         &mut stderr,
@@ -2792,6 +2747,9 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
                 "arguments": { "patterns": ["ClientWorkspace"] },
                 "_meta": codex_sandbox_metadata(plugin_dir.path(), "roots-precedence")
             }
+        }),
+        json!({
+            "roots": [{ "uri": workspace.path().display().to_string(), "name": "fixture" }]
         }),
     );
     assert_eq!(search["result"]["isError"], false, "{search}");
@@ -2823,6 +2781,8 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
         "{rejected_activation}"
     );
 
+    // An approved root stays approved: no further roots exchange, and the
+    // rejected activation left it untouched.
     let still_bound_search = round_trip(
         &mut stdin,
         &mut reader,
@@ -2846,48 +2806,16 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
         "{still_bound_search}"
     );
 
+    // A roots change revokes the scope immediately; the next request that needs
+    // a workspace re-negotiates one.
     write_line(
         &mut stdin,
         json!({ "jsonrpc": "2.0", "method": "notifications/roots/list_changed" }),
     );
-    let replacement_request = read_line(&mut reader, &mut stderr);
-    assert_eq!(
-        replacement_request["method"], "roots/list",
-        "{replacement_request}"
-    );
-    let unbound_during_refresh = round_trip(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 4,
-            "method": "tools/call",
-            "params": {
-                "name": "search_symbols",
-                "arguments": { "patterns": ["ClientWorkspace"] },
-                "_meta": codex_sandbox_metadata(plugin_dir.path(), "roots-refresh")
-            }
-        }),
-    );
-    assert!(
-        unbound_during_refresh["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("not bound to a workspace")),
-        "{unbound_during_refresh}"
-    );
     let replacement_uri = url::Url::from_directory_path(replacement.path())
         .expect("replacement file URI")
         .to_string();
-    write_line(
-        &mut stdin,
-        json!({
-            "jsonrpc": "2.0",
-            "id": replacement_request["id"],
-            "result": { "roots": [{ "uri": replacement_uri }] }
-        }),
-    );
-    let replacement_search = round_trip(
+    let replacement_search = call_tool_answering_roots(
         &mut stdin,
         &mut reader,
         &mut stderr,
@@ -2897,9 +2825,11 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
             "method": "tools/call",
             "params": {
                 "name": "search_symbols",
-                "arguments": { "patterns": ["ReplacementWorkspace"] }
+                "arguments": { "patterns": ["ReplacementWorkspace"] },
+                "_meta": codex_sandbox_metadata(plugin_dir.path(), "roots-refresh")
             }
         }),
+        json!({ "roots": [{ "uri": replacement_uri }] }),
     );
     assert_eq!(
         replacement_search["result"]["isError"], false,
@@ -2912,20 +2842,12 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
         "{replacement_search}"
     );
 
+    // An empty roots list is the client revoking Bifrost's scope outright.
     write_line(
         &mut stdin,
         json!({ "jsonrpc": "2.0", "method": "notifications/roots/list_changed" }),
     );
-    let revoke_request = read_line(&mut reader, &mut stderr);
-    write_line(
-        &mut stdin,
-        json!({
-            "jsonrpc": "2.0",
-            "id": revoke_request["id"],
-            "result": { "roots": [] }
-        }),
-    );
-    let revoked_search = round_trip(
+    let revoked_search = call_tool_answering_roots(
         &mut stdin,
         &mut reader,
         &mut stderr,
@@ -2938,6 +2860,7 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
                 "arguments": { "patterns": ["ReplacementWorkspace"] }
             }
         }),
+        json!({ "roots": [] }),
     );
     assert!(
         revoked_search["error"]["message"]
@@ -3449,6 +3372,32 @@ fn codex_initialize_request(id: i64) -> Value {
     let mut request = codex_handshake_message("initialize");
     request["id"] = json!(id);
     request
+}
+
+/// Send a tool call, answering the `roots/list` request it provokes.
+///
+/// Bifrost asks a Roots-capable client for its workspace from inside the call
+/// that needs one, so a call made while unbound is answered only after the
+/// client supplies roots. A call made while already bound provokes no request
+/// and its response arrives directly, which is why this peeks at the method
+/// rather than assuming an exchange happens.
+fn call_tool_answering_roots(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    request: Value,
+    roots_result: Value,
+) -> Value {
+    write_line(stdin, request);
+    let message = read_line(reader, stderr);
+    if message["method"] != "roots/list" {
+        return message;
+    }
+    write_line(
+        stdin,
+        json!({ "jsonrpc": "2.0", "id": message["id"], "result": roots_result }),
+    );
+    read_line(reader, stderr)
 }
 
 /// A Codex tool call sent before `initialize` must not bind a workspace.
