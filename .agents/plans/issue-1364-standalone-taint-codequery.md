@@ -20,7 +20,7 @@ The observable demonstration is an inline Java project with compatible multiple-
 - [x] (2026-07-30 22:04 SAST) Milestone 2: added bounded generation-scoped multi-root taint-result registrations, exact semantic-root lookup, shared artifact validation, immutable request snapshots through runtime/MCP, generation clearing, alias/conflict semantics, and transactional retained-byte limits.
 - [x] (2026-07-30 22:28 SAST) Milestone 3: added schema-v7 `taint`/`taint_ref` JSON and RQL vocabulary, `procedure -> taint_finding` typing and `file_of`, projection-only execution with taint-specific limits/diagnostics, and JSON/RQL end-to-end equivalence against the retained production result.
 - [x] (2026-07-30 22:43 SAST) Milestone 4: updated MCP schema, LSP compatible-head completion, Python guidance, VS Code TextMate grammar/tests, and public JSON/RQL/query docs; expanded lifecycle/equivalence coverage and fixed detailed provenance to resolve aggregated findings by stable sink identity.
-- [ ] Run the required five-perspective guided review, remediate accepted findings, and update this plan with the final outcome.
+- [x] (2026-07-30 23:18 SAST) Ran the required security, duplication, intent, operations, and architecture reviews. Remediated full-report projection before limits, missing in-loop cancellation, per-root rather than request-wide output budgets, non-transactional public-row publication, over-broad evidence limits, positional provenance, and public raw-plan exposure; reran focused regression and workspace checks.
 
 ## Surprises & Discoveries
 
@@ -43,7 +43,10 @@ The observable demonstration is an inline Java project with compatible multiple-
   Evidence: Milestone 2 initially used shared plan/report allocation identity, then replaced it before checkpointing with a deterministic digest over compatibility, exact root, projection limits, semantic artifacts, and canonical projected findings. The digest remains internal and never affects public finding IDs.
 
 - Observation: public projection aggregates raw findings by sink, so positional pairing cannot recover detailed source provenance.
-  Evidence: the query adapter initially zipped projected rows with `report.findings()`. It now indexes retained sink locators by the same stable sink event ID carried by each public row, preserving correct file/byte provenance when several raw findings share one sink.
+  Evidence: the query adapter initially zipped projected rows with `report.findings()`. The bounded shared projector now returns each public row with the exact sink file and byte span used to create it, preserving provenance when several raw findings share one sink without a second full-report scan.
+
+- Observation: retained-report bounds alone do not bound query projection work or output amplification.
+  Evidence: guided security, intent, and operations review showed that the first adapter projected every retained sink before applying row limits, checked cancellation only once, and reset byte/row limits for every procedure. The shared projector now emits a bounded prefix with cooperative checkpoints, exact retained-byte accounting, and request-wide remaining budgets.
 
 ## Decision Log
 
@@ -79,9 +82,15 @@ The observable demonstration is an inline Java project with compatible multiple-
   Rationale: `.agents/docs/test-harness-consolidation-2026-07.md` reserves new root integration binaries for process-isolated tests. These tests do not need process-global isolation and should reuse `InlineTestProject` for small projects.
   Date/Author: 2026-07-30 / Codex
 
+- Decision: keep exact root selection on durable semantic identity (artifact key plus semantic locator), rather than allocation-local `ProcedureHandle` equality.
+  Rationale: registrations are validated against the current content-addressed semantic artifacts, and equivalent partial materializations of the same artifact/locator denote the same procedure. Allocation identity would make valid immutable capabilities depend on which equivalent materialization supplied the query row and would conflict with the mount/materialization-independent identity requirement.
+  Date/Author: 2026-07-30 / Codex
+
 ## Outcomes & Retrospective
 
-Milestones 1 through 4 are complete. Production policy preparation retains the authoritative plan/report pair as a `ProductionTaintAnalysisResult`; both public taint rows and policy findings are projected from that pair, and `PolicyBatchOutcome` exposes the immutable retained results for host registration. Hosts can bind one or more exact procedure roots to a bounded `TaintResultRef`, snapshot registrations into a prepared request, and clear them when the workspace generation advances. Schema-v7 JSON and RQL expose only the projection-only `taint` traversal and required `taint_ref`; MCP, LSP, Python, VS Code, and public docs track that surface while older exact schema pins remain unchanged. Focused policy, query, MCP-schema, LSP-completion, docs, Python syntax, and featureless workspace checks pass. The existing compiler, batch planner, one-solve path, finding collector, projector, policy classification, CVSS, and transport models remain authoritative. Final guided review and its remediation remain.
+Milestones 1 through 4 and the guided review are complete. Production policy preparation retains the authoritative plan/report pair as a `ProductionTaintAnalysisResult`; both public taint rows and policy findings are published transactionally from that pair, and `PolicyBatchOutcome` exposes the immutable retained results for host registration without exposing the raw solver plan publicly. Hosts can bind one or more exact procedure roots to a bounded `TaintResultRef`, snapshot registrations into a prepared request, and clear them when the workspace generation advances. Schema-v7 JSON and RQL expose only the projection-only `taint` traversal and required `taint_ref`; MCP, LSP, Python, VS Code, and public docs track that surface while older exact schema pins remain unchanged. Projection now clamps evidence to production authority, applies request-wide finding and serialized-byte limits before accumulating output, checks cancellation throughout retained evidence traversal, and carries exact sink provenance without a second scan. Focused policy, query, MCP-schema, LSP-completion, docs, Python syntax, editor, full cross-language, semantic taint, and featureless workspace checks pass. The existing compiler, batch planner, one-solve path, finding collector, projector, policy classification, CVSS, and transport models remain authoritative. The installed policy-checking skill could not run because this session exposes neither `list_policies` nor `run_policy`; no policy-pack success is claimed.
+
+Final validation completed on 2026-07-30: the 105 structural-query tests, all 252 cross-language tests, 24 focused semantic-taint tests, five production adapter tests, MCP schema test, LSP completion test, three executable documentation tests, 80 VS Code extension tests, and 62 Python client tests passed. `cargo check --workspace --all-targets`, formatting, and diff checks passed. The final managed isolated gate `cargo clippy --all-targets --all-features -- -D warnings` passed with Cargo and rustc explicitly pinned to the same Homebrew 1.96.0 toolchain; its temporary target was removed. The first attempt revealed a same-version rustup/Homebrew LLVM metadata collision and was discarded by the helper before the pinned retry.
 
 ## Context and Orientation
 

@@ -247,11 +247,11 @@ impl ProductionTaintAnalysisResult {
         }
     }
 
-    pub fn plan(&self) -> &Arc<TaintAnalysisPlan> {
+    pub(crate) fn plan(&self) -> &Arc<TaintAnalysisPlan> {
         &self.plan
     }
 
-    pub fn report(&self) -> &Arc<TaintFindingReport> {
+    pub(crate) fn report(&self) -> &Arc<TaintFindingReport> {
         &self.report
     }
 
@@ -333,7 +333,55 @@ impl ProductionTaintAnalysisResult {
             &self.plan,
             &self.report,
             &self.projection_scope,
-            limits,
+            crate::analyzer::structural::CodeQueryTaintProjectionLimits::new(
+                limits
+                    .max_origins_per_finding
+                    .min(self.projection_limits.max_origins_per_finding),
+                limits
+                    .max_witnesses_per_finding
+                    .min(self.projection_limits.max_witnesses_per_finding),
+                limits
+                    .max_steps_per_witness
+                    .min(self.projection_limits.max_steps_per_witness),
+                limits
+                    .max_witness_bytes
+                    .min(self.projection_limits.max_witness_bytes),
+            ),
+        )
+    }
+
+    pub(crate) fn project_findings_bounded(
+        &self,
+        workspace: &WorkspaceAnalyzer,
+        limits: crate::analyzer::structural::CodeQueryTaintLimits,
+        max_findings: usize,
+        cancellation: &crate::cancellation::CancellationToken,
+    ) -> Result<
+        crate::analyzer::structural::BoundedTaintProjection,
+        crate::analyzer::taint::TaintModelError,
+    > {
+        crate::analyzer::structural::project_taint_finding_report_bounded(
+            workspace,
+            &self.plan,
+            &self.report,
+            &self.projection_scope,
+            crate::analyzer::structural::CodeQueryTaintProjectionLimits::new(
+                limits
+                    .max_origins_per_finding
+                    .min(self.projection_limits.max_origins_per_finding),
+                limits
+                    .max_witnesses_per_finding
+                    .min(self.projection_limits.max_witnesses_per_finding),
+                limits
+                    .max_steps_per_witness
+                    .min(self.projection_limits.max_steps_per_witness),
+                limits
+                    .max_witness_bytes
+                    .min(self.projection_limits.max_witness_bytes),
+            ),
+            limits.max_findings.min(max_findings),
+            limits.max_projected_bytes,
+            Some(cancellation),
         )
     }
 }
@@ -1115,7 +1163,6 @@ fn solve_and_project_batch(
     retained
         .set_registration_digest(&projected_findings)
         .map_err(|error| error.to_string())?;
-    public_findings.extend(projected_findings);
     let retained = Arc::new(retained);
 
     for projection in batch.projections() {
@@ -1163,6 +1210,7 @@ fn solve_and_project_batch(
                     .map_err(|error| error.to_string())?;
         }
     }
+    public_findings.extend(projected_findings);
     retained_analyses.push(retained);
     Ok(())
 }

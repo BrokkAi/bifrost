@@ -1,4 +1,3 @@
-use super::witness_projection::{locator_file, public_taint_event_id};
 use super::{
     CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact, CodeQueryResultRef,
     CodeQueryTaintFinding, CodeQueryTaintLimits, SemanticProcedureValue,
@@ -12,6 +11,8 @@ use crate::cancellation::CancellationToken;
 #[derive(Default)]
 pub(super) struct TaintQueryState {
     diagnostics: Vec<CodeQueryDiagnostic>,
+    emitted_findings: usize,
+    projected_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -66,24 +67,20 @@ impl TaintQueryState {
                 return Vec::new();
             }
         };
-        let locations = result
-            .report()
-            .findings()
-            .iter()
-            .map(|finding| {
-                let sink = finding.key().sink();
-                let locator = sink.site();
-                let span = locator.anchor().span();
-                (
-                    public_taint_event_id(result.projection_scope(), "sink", sink),
-                    (
-                        locator_file(workspace, locator),
-                        span.start_byte() as usize..span.end_byte() as usize,
-                    ),
-                )
-            })
-            .collect::<std::collections::HashMap<_, _>>();
-        let projected = match result.project_findings(workspace, limits.projection_limits()) {
+        let mut remaining_limits = limits;
+        remaining_limits.max_findings = limits
+            .max_findings
+            .saturating_sub(self.emitted_findings)
+            .min(max_findings);
+        remaining_limits.max_projected_bytes = limits
+            .max_projected_bytes
+            .saturating_sub(self.projected_bytes);
+        let projection = match result.project_findings_bounded(
+            workspace,
+            remaining_limits,
+            remaining_limits.max_findings,
+            cancellation,
+        ) {
             Ok(projected) => projected,
             Err(error) => {
                 self.push_diagnostic(
@@ -93,29 +90,35 @@ impl TaintQueryState {
                 return Vec::new();
             }
         };
-        let retained = projected.len().min(limits.max_findings).min(max_findings);
-        if retained < projected.len() {
+        if projection.cancelled {
+            self.push_diagnostic(
+                CodeQueryDiagnosticCode::Cancelled,
+                "taint finding projection was cancelled".to_owned(),
+            );
+        }
+        if projection.truncated {
             self.push_diagnostic(
                 CodeQueryDiagnosticCode::TaintFindingTruncated,
                 format!(
-                    "taint finding projection retained {retained} of {} findings",
-                    projected.len()
+                    "taint finding projection retained {} findings in {} bytes before reaching a query limit",
+                    projection.findings.len(),
+                    projection.retained_bytes,
                 ),
             );
         }
-        projected
+        self.emitted_findings = self
+            .emitted_findings
+            .saturating_add(projection.findings.len());
+        self.projected_bytes = self
+            .projected_bytes
+            .saturating_add(projection.retained_bytes);
+        projection
+            .findings
             .into_iter()
-            .take(retained)
-            .map(|public| {
-                let (file, byte_span) = locations
-                    .get(&public.sink_event_id)
-                    .expect("projected taint finding must retain its sink location")
-                    .clone();
-                SemanticTaintFindingValue {
-                    public,
-                    file,
-                    byte_span,
-                }
+            .map(|projected| SemanticTaintFindingValue {
+                public: projected.public,
+                file: projected.file,
+                byte_span: projected.byte_span,
             })
             .collect()
     }

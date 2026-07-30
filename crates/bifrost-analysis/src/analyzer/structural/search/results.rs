@@ -1302,6 +1302,7 @@ pub struct CodeQueryExecutionLimits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CodeQueryTaintLimits {
     pub max_findings: usize,
+    pub max_projected_bytes: usize,
     pub max_origins_per_finding: usize,
     pub max_witnesses_per_finding: usize,
     pub max_steps_per_witness: usize,
@@ -1312,6 +1313,8 @@ impl CodeQueryTaintLimits {
     pub fn is_valid(self) -> bool {
         self.max_findings > 0
             && self.max_findings <= 50_000
+            && self.max_projected_bytes > 0
+            && self.max_projected_bytes <= 64 * 1024 * 1024
             && self.max_origins_per_finding > 0
             && self.max_origins_per_finding <= 50_000
             && self.max_witnesses_per_finding > 0
@@ -2021,6 +2024,7 @@ impl Default for CodeQueryTaintLimits {
     fn default() -> Self {
         Self {
             max_findings: 50_000,
+            max_projected_bytes: 64 * 1024 * 1024,
             max_origins_per_finding: 4_096,
             max_witnesses_per_finding: 4_096,
             max_steps_per_witness: 4_096,

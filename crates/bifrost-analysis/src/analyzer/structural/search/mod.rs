@@ -107,6 +107,7 @@ use typestate::{SemanticTypestateFindingValue, SemanticTypestateWitnessValue};
 pub(crate) use value_flow::public_witness_step;
 use value_flow::{SemanticFlowEndpointValue, SemanticFlowWitnessValue};
 pub use witness_projection::project_taint_finding_report;
+pub(crate) use witness_projection::{BoundedTaintProjection, project_taint_finding_report_bounded};
 
 // Internal wiring: hoist the handful of `expansions`-child items the moved
 // test module (tests.rs) still reaches via a bare `super::name` path, exactly

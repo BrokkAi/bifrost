@@ -174,6 +174,7 @@ impl<'a> SemanticQueryContext<'a> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new_with_analysis(
         workspace: &'a WorkspaceAnalyzer,
         cancellation: Option<&'a CancellationToken>,

@@ -85,6 +85,7 @@ pub use rune_ir::{
     RenderedRuneIr, RuneIrError, RuneIrLanguage, RuneIrLimits, RuneIrSelection,
     render_source_rune_ir,
 };
+pub(crate) use search::{BoundedTaintProjection, project_taint_finding_report_bounded};
 pub use search::{
     CodeQueryCallArgument, CodeQueryCallSite, CodeQueryCapture, CodeQueryCompletion,
     CodeQueryControlEdge, CodeQueryDeclaration, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
