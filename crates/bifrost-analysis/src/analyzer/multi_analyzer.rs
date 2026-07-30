@@ -6,8 +6,9 @@ use crate::analyzer::{
     GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer,
     KotlinAnalyzer, Language, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range,
     RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, SearchSymbolCandidates, SearchSymbolPatternBatch,
-    SemanticDiagnostic, SignatureMetadata, SummaryFileProjection, TestDetectionProvider,
-    TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
+    SemanticDiagnostic, SignatureMetadata, SummaryFileProjection, TestAssertionAnalysis,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TypeAliasProvider,
+    TypeHierarchyProvider, TypescriptAnalyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use rayon::prelude::*;
@@ -1056,6 +1057,41 @@ impl IAnalyzer for MultiAnalyzer {
         delegate
             .analyzer()
             .find_exception_handling_smells(file, weights)
+    }
+
+    fn find_test_assertion_smells(
+        &self,
+        file: &ProjectFile,
+        weights: TestAssertionWeights,
+    ) -> Vec<TestAssertionSmell> {
+        self.delegate_for_file(file)
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .find_test_assertion_smells(file, weights)
+            })
+            .unwrap_or_default()
+    }
+
+    fn find_test_assertion_smells_limited(
+        &self,
+        file: &ProjectFile,
+        weights: TestAssertionWeights,
+        max_candidates: usize,
+    ) -> TestAssertionAnalysis {
+        self.delegate_for_file(file)
+            .map(|delegate| {
+                delegate.analyzer().find_test_assertion_smells_limited(
+                    file,
+                    weights,
+                    max_candidates,
+                )
+            })
+            .unwrap_or(TestAssertionAnalysis {
+                findings: Vec::new(),
+                inspected_candidates: None,
+                truncated: false,
+            })
     }
 
     fn find_structural_clone_smells(

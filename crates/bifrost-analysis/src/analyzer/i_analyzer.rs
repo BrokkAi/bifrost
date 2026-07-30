@@ -6,8 +6,8 @@ use crate::analyzer::{
     DeclarationInfo, ExceptionHandlingAnalysis, ExceptionSmellWeights, GlobalUsageDefinitionIndex,
     ImportAnalysisProvider, Language, ParseError, Project, ProjectFile, Range,
     SearchSymbolCandidate, SemanticDiagnostic, SignatureMetadata, SummaryFileProjection,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TypeAliasProvider,
-    TypeHierarchyProvider, UsageFactsIndex, metrics_from_declarations,
+    TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TypeAliasProvider, TypeHierarchyProvider, UsageFactsIndex, metrics_from_declarations,
 };
 use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use std::any::Any;
@@ -876,6 +876,22 @@ pub trait IAnalyzer: Send + Sync + Any {
         _weights: TestAssertionWeights,
     ) -> Vec<TestAssertionSmell> {
         Vec::new()
+    }
+
+    /// Detect assertion-smell candidates with an optional work budget.
+    /// Structured bounded implementations should override this method. The
+    /// default preserves complete legacy analysis without candidate accounting.
+    fn find_test_assertion_smells_limited(
+        &self,
+        file: &ProjectFile,
+        weights: TestAssertionWeights,
+        _max_candidates: usize,
+    ) -> TestAssertionAnalysis {
+        TestAssertionAnalysis {
+            findings: self.find_test_assertion_smells(file, weights),
+            inspected_candidates: None,
+            truncated: false,
+        }
     }
 
     fn find_structural_clone_smells(

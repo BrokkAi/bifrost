@@ -1,5 +1,8 @@
 use super::declarations::py_node_text;
 use super::*;
+use crate::analyzer::test_assertions::{
+    TestAssertionSignal, append_test_assertion_findings, compact_assertion_excerpt,
+};
 use regex::Regex;
 use std::sync::LazyLock;
 use tree_sitter::{Node, Parser};
@@ -26,17 +29,6 @@ static PY_VERIFY_RE: LazyLock<Regex> = LazyLock::new(|| {
 struct PythonTestCase {
     name: String,
     body: String,
-    start_byte: usize,
-}
-
-#[derive(Clone)]
-struct PythonAssertionSignal {
-    kind: String,
-    score: i32,
-    shallow: bool,
-    meaningful: bool,
-    reason: String,
-    excerpt: String,
     start_byte: usize,
 }
 
@@ -135,63 +127,26 @@ fn analyze_python_test_case(
     weights: &TestAssertionWeights,
     out: &mut Vec<TestAssertionSmell>,
 ) {
-    let assertions = collect_python_assertions(&test_case.body, weights);
-    let assertion_count = assertions.len() as i32;
+    let mut assertions = collect_python_assertions(&test_case.body, weights);
+    for assertion in &mut assertions {
+        assertion.start_byte = test_case.start_byte.saturating_add(assertion.start_byte);
+    }
     let symbol = format!("{}::{}", file, test_case.name);
-
-    if assertion_count == 0 {
-        out.push(TestAssertionSmell {
-            file: file.clone(),
-            enclosing_fq_name: symbol,
-            assertion_kind: "no-assertions".to_string(),
-            score: weights.no_assertion_weight,
-            assertion_count: 0,
-            reasons: vec!["no-assertions".to_string()],
-            excerpt: compact_python_excerpt(&test_case.body),
-            start_byte: test_case.start_byte,
-        });
-        return;
-    }
-
-    for assertion in &assertions {
-        if assertion.score <= 0 {
-            continue;
-        }
-        out.push(TestAssertionSmell {
-            file: file.clone(),
-            enclosing_fq_name: symbol.clone(),
-            assertion_kind: assertion.kind.clone(),
-            score: assertion.score,
-            assertion_count,
-            reasons: vec![assertion.reason.clone()],
-            excerpt: assertion.excerpt.clone(),
-            start_byte: test_case.start_byte + assertion.start_byte,
-        });
-    }
-
-    if assertions.iter().all(|assertion| assertion.shallow) {
-        let score = (weights.shallow_assertion_only_weight
-            - python_meaningful_assertion_credit(assertions.iter(), weights))
-        .max(0);
-        if score > 0 {
-            out.push(TestAssertionSmell {
-                file: file.clone(),
-                enclosing_fq_name: symbol,
-                assertion_kind: "shallow-assertions-only".to_string(),
-                score,
-                assertion_count,
-                reasons: vec!["shallow-assertions-only".to_string()],
-                excerpt: compact_python_excerpt(&test_case.body),
-                start_byte: test_case.start_byte,
-            });
-        }
-    }
+    append_test_assertion_findings(
+        file,
+        symbol,
+        compact_python_excerpt(&test_case.body),
+        test_case.start_byte,
+        &assertions,
+        weights,
+        out,
+    );
 }
 
 fn collect_python_assertions(
     body: &str,
     weights: &TestAssertionWeights,
-) -> Vec<PythonAssertionSignal> {
+) -> Vec<TestAssertionSignal> {
     let mut assertions = Vec::new();
 
     for captures in PY_ASSERT_EQUALITY_RE.captures_iter(body) {
@@ -215,32 +170,32 @@ fn collect_python_assertions(
                     weights.tautological_assertion_weight,
                 )
             };
-            assertions.push(PythonAssertionSignal {
+            assertions.push(TestAssertionSignal {
                 kind,
                 score,
                 shallow: false,
                 meaningful: false,
-                reason,
+                reasons: vec![reason],
                 excerpt: compact_python_excerpt(whole.as_str()),
                 start_byte: whole.start(),
             });
         } else if let Some(literal) = oversized_python_literal(&left, &right, weights) {
-            assertions.push(PythonAssertionSignal {
+            assertions.push(TestAssertionSignal {
                 kind: "overspecified-literal".to_string(),
                 score: weights.overspecified_literal_weight,
                 shallow: false,
                 meaningful: false,
-                reason: format!("overspecified-literal:{literal}"),
+                reasons: vec![format!("overspecified-literal:{literal}")],
                 excerpt: compact_python_excerpt(whole.as_str()),
                 start_byte: whole.start(),
             });
         } else {
-            assertions.push(PythonAssertionSignal {
+            assertions.push(TestAssertionSignal {
                 kind: "meaningful-assertion".to_string(),
                 score: 0,
                 shallow: false,
                 meaningful: true,
-                reason: "meaningful-assertion".to_string(),
+                reasons: vec!["meaningful-assertion".to_string()],
                 excerpt: compact_python_excerpt(whole.as_str()),
                 start_byte: whole.start(),
             });
@@ -277,12 +232,12 @@ fn collect_python_assertions(
                 false,
             ),
         };
-        assertions.push(PythonAssertionSignal {
+        assertions.push(TestAssertionSignal {
             kind,
             score,
             shallow,
             meaningful: score == 0,
-            reason,
+            reasons: vec![reason],
             excerpt: compact_python_excerpt(whole.as_str()),
             start_byte: whole.start(),
         });
@@ -323,22 +278,22 @@ fn collect_python_assertions(
         };
 
         if let Some((kind, score, shallow)) = maybe_signal {
-            assertions.push(PythonAssertionSignal {
+            assertions.push(TestAssertionSignal {
                 kind: kind.to_string(),
                 score,
                 shallow,
                 meaningful: false,
-                reason: kind.to_string(),
+                reasons: vec![kind.to_string()],
                 excerpt: compact_python_excerpt(whole.as_str()),
                 start_byte: whole.start(),
             });
         } else {
-            assertions.push(PythonAssertionSignal {
+            assertions.push(TestAssertionSignal {
                 kind: "meaningful-assertion".to_string(),
                 score: 0,
                 shallow: false,
                 meaningful: true,
-                reason: "meaningful-assertion".to_string(),
+                reasons: vec!["meaningful-assertion".to_string()],
                 excerpt: compact_python_excerpt(whole.as_str()),
                 start_byte: whole.start(),
             });
@@ -348,12 +303,12 @@ fn collect_python_assertions(
     for regex in [&*PY_RAISES_RE, &*PY_VERIFY_RE] {
         for captures in regex.captures_iter(body) {
             let whole = captures.get(0).expect("whole match");
-            assertions.push(PythonAssertionSignal {
+            assertions.push(TestAssertionSignal {
                 kind: "meaningful-assertion".to_string(),
                 score: 0,
                 shallow: false,
                 meaningful: true,
-                reason: "meaningful-assertion".to_string(),
+                reasons: vec!["meaningful-assertion".to_string()],
                 excerpt: compact_python_excerpt(whole.as_str()),
                 start_byte: whole.start(),
             });
@@ -361,15 +316,6 @@ fn collect_python_assertions(
     }
 
     assertions
-}
-
-fn python_meaningful_assertion_credit<'a>(
-    assertions: impl Iterator<Item = &'a PythonAssertionSignal>,
-    weights: &TestAssertionWeights,
-) -> i32 {
-    let count = assertions.filter(|assertion| assertion.meaningful).count() as i32;
-    let creditable = count.min(weights.meaningful_assertion_credit_cap.max(0));
-    weights.meaningful_assertion_credit.max(0) * creditable
 }
 
 fn normalize_python_expr(expr: &str) -> String {
@@ -412,7 +358,7 @@ fn oversized_python_literal(
 }
 
 fn compact_python_excerpt(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    compact_assertion_excerpt(text, 180)
 }
 
 pub(super) fn python_source_contains_tests(source: &str) -> bool {

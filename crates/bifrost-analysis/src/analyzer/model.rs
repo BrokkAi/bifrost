@@ -2291,6 +2291,15 @@ pub struct TestAssertionSmell {
     pub start_byte: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestAssertionAnalysis {
+    pub findings: Vec<TestAssertionSmell>,
+    /// Candidates consumed from an explicit work budget. `None` means the
+    /// analyzer preserves its legacy unbounded implementation.
+    pub inspected_candidates: Option<usize>,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloneSmellWeights {
     pub min_normalized_tokens: i32,

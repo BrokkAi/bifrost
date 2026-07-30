@@ -47,6 +47,7 @@ pub mod store;
 pub mod structural;
 pub(crate) mod symbol_lookup;
 pub mod taint;
+pub(crate) mod test_assertions;
 pub mod test_paths;
 pub mod tree_sitter_analyzer;
 pub(crate) mod tree_walk;
@@ -127,8 +128,8 @@ pub use model::{
     MaintainabilitySizeSmell, MaintainabilitySizeSmellWeights, ParameterMetadata, ParseError,
     ParseErrorKind, ProjectFile, Range, RubyMethodDispatchMode, SearchSymbolCandidate,
     SignatureMetadata, StructuredImportPath, StructuredImportPathKind, StructuredImportScope,
-    StructuredTypeIdentity, StructuredTypeName, SummaryFileProjection, TestAssertionSmell,
-    TestAssertionWeights, metrics_from_declarations,
+    StructuredTypeIdentity, StructuredTypeName, SummaryFileProjection, TestAssertionAnalysis,
+    TestAssertionSmell, TestAssertionWeights, metrics_from_declarations,
 };
 pub(crate) use model::{
     CallableLinkage, CppTemplateAliasTargetMetadata, CppTemplateExpression, CppTemplateMetadata,
