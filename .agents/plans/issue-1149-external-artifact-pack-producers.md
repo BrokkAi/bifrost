@@ -16,7 +16,7 @@ This issue does not install packs, download artifacts, solve classpaths, decompi
 - [x] (2026-07-30 13:02Z) Diagnosed the JVM, C#, and semantic-model boundaries and identified the missing exact-artifact producer seam.
 - [x] (2026-07-30 13:02Z) Chose the producer result, identity, origin, diagnostic, compatibility-adapter, and milestone boundaries recorded below.
 - [x] (2026-07-30 13:26Z) Implemented and validated the shared exact-artifact producer contract, bounded diagnostics, stable identity helpers, optional binary parameter names, and regenerated schema.
-- [ ] Implement the C# assembly producer and project its facts into the existing C# resolver index.
+- [x] (2026-07-30 13:46Z) Implemented the exact C# assembly producer, structured CLI type decoding, bounded partial diagnostics, and a fact-backed compatibility projection for the existing resolver index.
 - [ ] Implement the Java source/class JAR producer and project its facts into the existing JVM resolver index without regressing Scala or Kotlin source-JAR behavior.
 - [ ] Complete cross-producer integration tests, documentation, specialist review, policy validation, and the final focused Rust validation matrix.
 
@@ -36,6 +36,10 @@ This issue does not install packs, download artifacts, solve classpaths, decompi
   Evidence: `jclassfile` 0.6 exposes `Signature` and `MethodParameters` attributes, while the C# reader already counts GenericParam table rows. Milestone one therefore changed only `Parameter.name` to optional; producers must read generic parameter names where present and report partial metadata where absent rather than invent names.
 - Observation: Clippy can select Homebrew `cargo-clippy` even when Cargo and `RUSTC` are pinned to rustup, producing incompatible metadata despite the same Rust version string.
   Evidence: the first isolated Clippy attempt failed with E0514 and identified the Homebrew compiler; rerunning with `PATH=/Users/dave/.cargo/bin:...`, rustup `RUSTC`, and rustup `RUSTDOC` passed.
+- Observation: The checked-in C# fixture retains real GenericParam names for both the generic owner and its generic method, but binary method parameter names are not available through the focused metadata reader.
+  Evidence: the produced `Client<T>` and `Convert<U>` facts contain `T` and `U` as structured type parameters while the `Convert` parameter is intentionally emitted with `name: None`.
+- Observation: `TestProject::all_files()` correctly includes arbitrary files under its root, including a DLL; the external-artifact invariant therefore requires dependency artifacts to remain outside the workspace root rather than expecting file enumeration to filter extensions.
+  Evidence: the first integration-test arrangement put the fixture DLL beside `Probe.cs` and correctly observed it in `all_files()`; moving the exact dependency artifact outside the project root proved producer use does not add it to the workspace set.
 
 ## Decision Log
 
@@ -73,6 +77,8 @@ This issue does not install packs, download artifacts, solve classpaths, decompi
 ## Outcomes & Retrospective
 
 Milestone one is complete. The public semantic-model surface now includes an exact-artifact request/result contract, bounded diagnostic collector, byte-limited reader with exact SHA-256, and domain-separated type/member identity helpers. Binary parameters may omit names without inventing data, and the generated schema records that contract. Twenty focused semantic-pack tests, eleven semantic-model unit tests, formatting, and strict featureless library Clippy passed. The next milestone is the C# assembly producer and compatibility projection.
+
+Milestone two is complete. `CSharpAssemblyPackProducer` now reads one exact PE/CLI assembly, records its digest in activation, emits externally visible type and member facts with structured signatures, generic parameters, hierarchy, modifiers, effective nested visibility, and metadata-token locators, and reports malformed or record-limited production as bounded partial data. `CSharpExternalDeclarationIndex` consumes the produced facts through a compatibility projection and retains production diagnostics. Ten focused C# tests, the new semantic-suite producer test, formatting, and strict featureless library Clippy passed. The next milestone is the Java source/class JAR producer and JVM compatibility projection.
 
 ## Context and Orientation
 

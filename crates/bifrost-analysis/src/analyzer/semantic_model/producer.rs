@@ -19,6 +19,7 @@ pub struct ArtifactProductionRequest {
     pub artifact_kind: ExternalArtifactKind,
     pub pack_id: String,
     pub pack_version: String,
+    pub ecosystem: String,
     pub compatibility: Compatibility,
     pub activation: Vec<ActivationSelector>,
     pub provenance: Provenance,

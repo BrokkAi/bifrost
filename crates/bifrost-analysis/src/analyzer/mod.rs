@@ -80,8 +80,9 @@ pub(crate) use cpp::{
 };
 pub use csharp::CSharpAnalyzer;
 pub use csharp::external::{
-    CSharpExternalDeclarationIndex, CSharpExternalDeclarationSource, CSharpExternalMember,
-    CSharpExternalMemberKind, CSharpExternalType, CSharpExternalTypeKind, CSharpVisibility,
+    CSharpAssemblyPackProducer, CSharpExternalDeclarationIndex, CSharpExternalDeclarationSource,
+    CSharpExternalMember, CSharpExternalMemberKind, CSharpExternalType, CSharpExternalTypeKind,
+    CSharpVisibility,
 };
 pub(crate) use csharp::{
     CSharpMemberName, csharp_attribute_name_node, csharp_attribute_terminal_name,

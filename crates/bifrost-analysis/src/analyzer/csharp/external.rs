@@ -1,4 +1,13 @@
 use super::dependency_discovery::project_assets_files;
+use crate::analyzer::semantic_model::{
+    ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
+    AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics,
+    Compatibility, Completeness, ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact,
+    HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, NameSelector, Parameter,
+    Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance, Safety, Signature,
+    TypeFact, TypeIdentity, TypeKind, TypeRef, Visibility, member_declaration_id,
+    read_exact_artifact, type_declaration_id,
+};
 use crate::analyzer::{CSharpAnalyzerConfig, Project};
 use crate::hash::HashMap;
 use goblin::pe::PE;
@@ -43,6 +52,117 @@ pub enum CSharpExternalDeclarationSource {
     Assembly { path: PathBuf, metadata_token: u32 },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DecodedType {
+    Void,
+    Named {
+        name: String,
+        arguments: Vec<DecodedType>,
+    },
+    TypeParameter {
+        method: bool,
+        index: usize,
+    },
+    Array {
+        element: Box<DecodedType>,
+        rank: usize,
+    },
+    Pointer(Box<DecodedType>),
+    ByRef(Box<DecodedType>),
+}
+
+impl DecodedType {
+    fn legacy_name(&self) -> String {
+        match self {
+            Self::Void => "void".to_owned(),
+            Self::Named { name, arguments } => {
+                let name = csharp_alias(name);
+                if arguments.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!(
+                        "{name}<{}>",
+                        arguments
+                            .iter()
+                            .map(Self::legacy_name)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            }
+            Self::TypeParameter { method, index } => {
+                format!("{}{index}", if *method { "!!" } else { "!" })
+            }
+            Self::Array { element, rank } => format!(
+                "{}[{}]",
+                element.legacy_name(),
+                ",".repeat(rank.saturating_sub(1))
+            ),
+            Self::Pointer(inner) => format!("{}*", inner.legacy_name()),
+            Self::ByRef(inner) => format!("{}&", inner.legacy_name()),
+        }
+    }
+
+    fn type_ref(
+        &self,
+        owner_type_parameters: &[String],
+        member_type_parameters: &[String],
+    ) -> Result<TypeRef, &'static str> {
+        match self {
+            Self::Void => Err("void is not a value type"),
+            Self::Named { name, arguments } => Ok(TypeRef::Named {
+                name: name.clone(),
+                arguments: arguments
+                    .iter()
+                    .map(|argument| {
+                        argument.type_ref(owner_type_parameters, member_type_parameters)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                nullable: false,
+            }),
+            Self::TypeParameter { method, index } => {
+                let parameters = if *method {
+                    member_type_parameters
+                } else {
+                    owner_type_parameters
+                };
+                parameters
+                    .get(*index)
+                    .cloned()
+                    .map(|name| TypeRef::TypeParameter { name })
+                    .ok_or("generic parameter name is unavailable")
+            }
+            Self::Array { element, rank: 1 } => Ok(TypeRef::Array {
+                element: Box::new(element.type_ref(owner_type_parameters, member_type_parameters)?),
+            }),
+            Self::Array { .. } => Err("multidimensional array types are not representable"),
+            Self::Pointer(_) => Err("pointer types are not representable"),
+            Self::ByRef(inner) => inner.type_ref(owner_type_parameters, member_type_parameters),
+        }
+    }
+}
+
+fn csharp_alias(name: &str) -> &str {
+    match name {
+        "System.Void" => "void",
+        "System.Boolean" => "bool",
+        "System.Char" => "char",
+        "System.SByte" => "sbyte",
+        "System.Byte" => "byte",
+        "System.Int16" => "short",
+        "System.UInt16" => "ushort",
+        "System.Int32" => "int",
+        "System.UInt32" => "uint",
+        "System.Int64" => "long",
+        "System.UInt64" => "ulong",
+        "System.Single" => "float",
+        "System.Double" => "double",
+        "System.String" => "string",
+        "System.Object" => "object",
+        other => other,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CSharpExternalMember {
     owner_fqn: String,
@@ -53,8 +173,11 @@ pub struct CSharpExternalMember {
     is_abstract: bool,
     is_virtual: bool,
     generic_arity: usize,
+    type_parameters: Vec<String>,
     return_type: Option<String>,
     parameter_types: Vec<String>,
+    return_type_ref: Option<DecodedType>,
+    parameter_type_refs: Vec<DecodedType>,
     source: CSharpExternalDeclarationSource,
 }
 impl CSharpExternalMember {
@@ -108,8 +231,13 @@ pub struct CSharpExternalType {
     short_name: String,
     kind: CSharpExternalTypeKind,
     visibility: CSharpVisibility,
+    is_abstract: bool,
+    is_sealed: bool,
     generic_arity: usize,
+    type_parameters: Vec<String>,
+    base: Option<DecodedType>,
     interfaces: Vec<String>,
+    interface_refs: Vec<DecodedType>,
     source: CSharpExternalDeclarationSource,
     members: Vec<CSharpExternalMember>,
     is_effectively_visible: bool,
@@ -150,6 +278,7 @@ impl CSharpExternalType {
 #[derive(Debug, Clone, Default)]
 pub struct CSharpExternalDeclarationIndex {
     types: HashMap<String, Vec<CSharpExternalType>>,
+    production_diagnostics: Vec<ProducerDiagnostic>,
 }
 impl CSharpExternalDeclarationIndex {
     pub fn build_for_project(config: &CSharpAnalyzerConfig, project: &dyn Project) -> Self {
@@ -219,18 +348,582 @@ impl CSharpExternalDeclarationIndex {
     pub fn is_empty(&self) -> bool {
         self.types.is_empty()
     }
+    pub fn production_diagnostics(&self) -> &[ProducerDiagnostic] {
+        &self.production_diagnostics
+    }
     fn index_assembly(&mut self, path: &Path) {
-        let Ok(meta) = fs::metadata(path) else { return };
-        if !meta.is_file() || meta.len() > MAX_ASSEMBLY_BYTES {
+        let production = CSharpAssemblyPackProducer.produce_exact_artifact(
+            &ArtifactProductionRequest {
+                path: path.to_path_buf(),
+                artifact_kind: ExternalArtifactKind::DotNetAssembly,
+                pack_id: "bifrost.external.csharp".to_owned(),
+                pack_version: env!("CARGO_PKG_VERSION").to_owned(),
+                ecosystem: "nuget".to_owned(),
+                compatibility: Compatibility {
+                    bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                    toolchains: Vec::new(),
+                },
+                activation: vec![ActivationSelector {
+                    package: None,
+                    module: None,
+                    toolchain: Some(NameSelector {
+                        name: "dotnet".to_owned(),
+                        version: None,
+                    }),
+                    targets: Vec::new(),
+                    configurations: Vec::new(),
+                    artifact_sha256: None,
+                }],
+                provenance: Provenance {
+                    source: "local dependency artifact".to_owned(),
+                    revision: None,
+                },
+                license: "NOASSERTION".to_owned(),
+                safety: Safety {
+                    generated_code_only: false,
+                    review_required: false,
+                },
+            },
+            &ArtifactProducerLimits::default(),
+        );
+        self.production_diagnostics
+            .extend(production.diagnostics.iter().cloned());
+        let Some(pack) = production.pack.as_ref() else {
             return;
         };
-        let Ok(bytes) = fs::read(path) else { return };
-        let Some(types) = parse_assembly(path, &bytes) else {
-            return;
-        };
-        for ty in types {
+        for ty in project_pack_types(path, pack) {
             self.types.entry(ty.fqn.clone()).or_default().push(ty);
         }
+    }
+}
+
+fn project_pack_types(path: &Path, pack: &AuthoredSemanticModelPack) -> Vec<CSharpExternalType> {
+    let mut result = Vec::new();
+    let mut type_indexes = HashMap::default();
+    for shard in &pack.shards {
+        let AuthoredPayload::DeclarationFacts { types, .. } = &shard.payload else {
+            continue;
+        };
+        for fact in types {
+            let (namespace, short_name) = fact
+                .name
+                .rsplit_once('.')
+                .map_or(("", fact.name.as_str()), |(namespace, name)| {
+                    (namespace, name)
+                });
+            let base = fact
+                .hierarchy
+                .iter()
+                .find(|relation| relation.hierarchy_kind == HierarchyKind::Extends)
+                .and_then(|relation| {
+                    decoded_type_from_semantic(&relation.target, &fact.type_parameters, &[])
+                });
+            let interface_refs = fact
+                .hierarchy
+                .iter()
+                .filter(|relation| relation.hierarchy_kind == HierarchyKind::Implements)
+                .filter_map(|relation| {
+                    decoded_type_from_semantic(&relation.target, &fact.type_parameters, &[])
+                })
+                .collect::<Vec<_>>();
+            let source = CSharpExternalDeclarationSource::Assembly {
+                path: path.to_path_buf(),
+                metadata_token: locator_metadata_token(&fact.locator),
+            };
+            type_indexes.insert(fact.id.clone(), result.len());
+            result.push(CSharpExternalType {
+                fqn: fact.name.clone(),
+                namespace: namespace.to_owned(),
+                short_name: short_name.to_owned(),
+                kind: external_type_kind(fact.type_kind),
+                visibility: external_visibility(fact.visibility),
+                is_abstract: fact.is_abstract,
+                is_sealed: fact.is_sealed,
+                generic_arity: fact.type_parameters.len(),
+                type_parameters: fact.type_parameters.clone(),
+                base,
+                interfaces: interface_refs
+                    .iter()
+                    .map(DecodedType::legacy_name)
+                    .collect(),
+                interface_refs,
+                source,
+                members: Vec::new(),
+                is_effectively_visible: true,
+            });
+        }
+    }
+    for shard in &pack.shards {
+        let AuthoredPayload::DeclarationFacts { members, .. } = &shard.payload else {
+            continue;
+        };
+        for fact in members {
+            let Some(owner_index) = type_indexes.get(&fact.owner).copied() else {
+                continue;
+            };
+            let owner = &result[owner_index];
+            let signature = fact.signature.as_ref();
+            let member_parameters = signature
+                .map(|signature| signature.type_parameters.as_slice())
+                .unwrap_or_default();
+            let parameter_type_refs = signature
+                .into_iter()
+                .flat_map(|signature| &signature.parameters)
+                .filter_map(|parameter| {
+                    decoded_type_from_semantic(
+                        &parameter.r#type,
+                        &owner.type_parameters,
+                        member_parameters,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let return_type_ref = signature.and_then(|signature| {
+                signature.returns.as_ref().and_then(|returns| {
+                    decoded_type_from_semantic(returns, &owner.type_parameters, member_parameters)
+                })
+            });
+            let member = CSharpExternalMember {
+                name: fact.name.clone(),
+                kind: external_member_kind(fact.member_kind),
+                owner_fqn: owner.fqn.clone(),
+                visibility: external_visibility(fact.visibility),
+                is_static: fact.is_static,
+                is_abstract: fact.is_abstract,
+                is_virtual: fact.is_virtual,
+                generic_arity: member_parameters.len(),
+                type_parameters: member_parameters.to_vec(),
+                return_type: return_type_ref.as_ref().map(DecodedType::legacy_name),
+                parameter_types: parameter_type_refs
+                    .iter()
+                    .map(DecodedType::legacy_name)
+                    .collect(),
+                return_type_ref,
+                parameter_type_refs,
+                source: CSharpExternalDeclarationSource::Assembly {
+                    path: path.to_path_buf(),
+                    metadata_token: locator_metadata_token(&fact.locator),
+                },
+            };
+            result[owner_index].members.push(member);
+        }
+    }
+    result
+}
+
+fn locator_metadata_token(locator: &Locator) -> u32 {
+    let Locator::Artifact { symbol, .. } = locator else {
+        return 0;
+    };
+    u32::from_str_radix(symbol.strip_prefix("0x").unwrap_or(symbol), 16).unwrap_or(0)
+}
+
+fn decoded_type_from_semantic(
+    value: &TypeRef,
+    owner_parameters: &[String],
+    member_parameters: &[String],
+) -> Option<DecodedType> {
+    match value {
+        TypeRef::Named {
+            name, arguments, ..
+        } => Some(DecodedType::Named {
+            name: name.clone(),
+            arguments: arguments
+                .iter()
+                .map(|argument| {
+                    decoded_type_from_semantic(argument, owner_parameters, member_parameters)
+                })
+                .collect::<Option<Vec<_>>>()?,
+        }),
+        TypeRef::TypeParameter { name } => member_parameters
+            .iter()
+            .position(|parameter| parameter == name)
+            .map(|index| DecodedType::TypeParameter {
+                method: true,
+                index,
+            })
+            .or_else(|| {
+                owner_parameters
+                    .iter()
+                    .position(|parameter| parameter == name)
+                    .map(|index| DecodedType::TypeParameter {
+                        method: false,
+                        index,
+                    })
+            }),
+        TypeRef::Array { element } => Some(DecodedType::Array {
+            element: Box::new(decoded_type_from_semantic(
+                element,
+                owner_parameters,
+                member_parameters,
+            )?),
+            rank: 1,
+        }),
+        TypeRef::Declared { .. } | TypeRef::Tuple { .. } | TypeRef::Function { .. } => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CSharpAssemblyPackProducer;
+
+impl ExternalArtifactPackProducer for CSharpAssemblyPackProducer {
+    fn produce_exact_artifact(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+    ) -> ArtifactProduction {
+        if request.artifact_kind != ExternalArtifactKind::DotNetAssembly {
+            return ArtifactProduction::failed(ProducerDiagnostic {
+                severity: ProducerDiagnosticSeverity::Error,
+                code: "artifact.kind".to_owned(),
+                location: None,
+                message: "C# producer requires a .NET assembly artifact".to_owned(),
+            });
+        }
+        let artifact = match read_exact_artifact(
+            &request.path,
+            limits.max_artifact_bytes.min(MAX_ASSEMBLY_BYTES),
+        ) {
+            Ok(artifact) => artifact,
+            Err(diagnostic) => return ArtifactProduction::failed(diagnostic),
+        };
+        let Some(external_types) = parse_assembly(artifact.path(), artifact.bytes()) else {
+            return ArtifactProduction::failed(ProducerDiagnostic {
+                severity: ProducerDiagnosticSeverity::Error,
+                code: "csharp.metadata.invalid".to_owned(),
+                location: None,
+                message: "artifact does not contain supported bounded CLI metadata".to_owned(),
+            });
+        };
+        let Some(locator_path) = artifact
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+        else {
+            return ArtifactProduction::failed(ProducerDiagnostic {
+                severity: ProducerDiagnosticSeverity::Error,
+                code: "artifact.path_encoding".to_owned(),
+                location: None,
+                message: "artifact filename is not valid UTF-8".to_owned(),
+            });
+        };
+
+        let mut diagnostics = BoundedProducerDiagnostics::new(limits);
+        let mut type_ids = HashMap::default();
+        for ty in external_types.iter().filter(|ty| ty.externally_visible()) {
+            type_ids.insert(
+                ty.fqn.clone(),
+                type_declaration_id(TypeIdentity {
+                    ecosystem: &request.ecosystem,
+                    name: &ty.fqn,
+                }),
+            );
+        }
+
+        let mut types = Vec::new();
+        let mut members = Vec::new();
+        let mut record_limit_reported = false;
+        for ty in external_types.iter().filter(|ty| ty.externally_visible()) {
+            if types.len().saturating_add(members.len()) >= limits.max_records {
+                if !record_limit_reported {
+                    diagnostics.warning(
+                        "limit.records",
+                        None,
+                        format!(
+                            "producer stopped after {} declaration records",
+                            limits.max_records
+                        ),
+                    );
+                }
+                break;
+            }
+            let type_id = type_ids
+                .get(&ty.fqn)
+                .expect("visible types receive stable ids")
+                .clone();
+            let mut hierarchy = Vec::new();
+            if let Some(base) = &ty.base {
+                let base_name = base.legacy_name();
+                if !matches!(
+                    base_name.as_str(),
+                    "System.Object"
+                        | "System.ValueType"
+                        | "System.Enum"
+                        | "System.MulticastDelegate"
+                ) {
+                    match base.type_ref(&ty.type_parameters, &[]) {
+                        Ok(target) => hierarchy.push(HierarchyFact {
+                            hierarchy_kind: HierarchyKind::Extends,
+                            target,
+                        }),
+                        Err(message) => diagnostics.warning(
+                            "csharp.type.unsupported_base",
+                            Some(metadata_location(ty.source())),
+                            message,
+                        ),
+                    }
+                }
+            }
+            for interface in &ty.interface_refs {
+                match interface.type_ref(&ty.type_parameters, &[]) {
+                    Ok(target) => hierarchy.push(HierarchyFact {
+                        hierarchy_kind: HierarchyKind::Implements,
+                        target,
+                    }),
+                    Err(message) => diagnostics.warning(
+                        "csharp.type.unsupported_interface",
+                        Some(metadata_location(ty.source())),
+                        message,
+                    ),
+                }
+            }
+            types.push(TypeFact {
+                id: type_id.clone(),
+                name: ty.fqn.clone(),
+                type_kind: semantic_type_kind(ty.kind),
+                visibility: semantic_visibility(ty.visibility),
+                is_abstract: ty.is_abstract,
+                is_sealed: ty.is_sealed,
+                type_parameters: ty.type_parameters.clone(),
+                hierarchy,
+                aliases: Vec::new(),
+                extension_surfaces: Vec::new(),
+                locator: Locator::Artifact {
+                    path: locator_path.clone(),
+                    symbol: metadata_location(ty.source()),
+                },
+            });
+
+            for member in ty
+                .members
+                .iter()
+                .filter(|member| member.externally_visible())
+            {
+                if types.len().saturating_add(members.len()) >= limits.max_records {
+                    if !record_limit_reported {
+                        diagnostics.warning(
+                            "limit.records",
+                            None,
+                            format!(
+                                "producer stopped after {} declaration records",
+                                limits.max_records
+                            ),
+                        );
+                        record_limit_reported = true;
+                    }
+                    break;
+                }
+                let parameter_types = match member
+                    .parameter_type_refs
+                    .iter()
+                    .map(|value| value.type_ref(&ty.type_parameters, &member.type_parameters))
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    Ok(types) => types,
+                    Err(message) => {
+                        diagnostics.warning(
+                            "csharp.member.unsupported_parameter_type",
+                            Some(metadata_location(member.source())),
+                            message,
+                        );
+                        continue;
+                    }
+                };
+                let returns = match member.return_type_ref.as_ref() {
+                    None | Some(DecodedType::Void) => None,
+                    Some(value) => {
+                        match value.type_ref(&ty.type_parameters, &member.type_parameters) {
+                            Ok(value) => Some(value),
+                            Err(message) => {
+                                diagnostics.warning(
+                                    "csharp.member.unsupported_return_type",
+                                    Some(metadata_location(member.source())),
+                                    message,
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                };
+                if member.generic_arity != member.type_parameters.len() {
+                    diagnostics.warning(
+                        "csharp.member.missing_generic_parameter_names",
+                        Some(metadata_location(member.source())),
+                        format!(
+                            "signature declares {} generic parameters but metadata names {}",
+                            member.generic_arity,
+                            member.type_parameters.len()
+                        ),
+                    );
+                }
+                let member_kind = semantic_member_kind(member.kind);
+                let id = member_declaration_id(MemberIdentity {
+                    owner_id: &type_id,
+                    kind: member_kind,
+                    name: &member.name,
+                    generic_arity: member.generic_arity,
+                    parameter_types: &parameter_types,
+                });
+                members.push(MemberFact {
+                    id,
+                    owner: type_id.clone(),
+                    name: member.name.clone(),
+                    member_kind,
+                    visibility: semantic_visibility(member.visibility),
+                    is_static: member.is_static,
+                    is_abstract: member.is_abstract,
+                    is_virtual: member.is_virtual,
+                    signature: Some(Signature {
+                        type_parameters: member.type_parameters.clone(),
+                        parameters: parameter_types
+                            .into_iter()
+                            .map(|r#type| Parameter {
+                                name: None,
+                                r#type,
+                                optional: false,
+                                variadic: false,
+                            })
+                            .collect(),
+                        returns,
+                    }),
+                    aliases: Vec::new(),
+                    locator: Locator::Artifact {
+                        path: locator_path.clone(),
+                        symbol: metadata_location(member.source()),
+                    },
+                });
+            }
+        }
+
+        if types.is_empty() {
+            diagnostics.error(
+                "csharp.metadata.no_external_declarations",
+                None,
+                "assembly contains no externally visible declarations",
+            );
+            let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
+            return ArtifactProduction {
+                artifact_sha256: Some(artifact.sha256().to_owned()),
+                pack: None,
+                completeness: Completeness::Partial,
+                diagnostics,
+                suppressed_diagnostics,
+            };
+        }
+
+        let mut activation = request.activation.clone();
+        for selector in &mut activation {
+            selector.artifact_sha256 = Some(artifact.sha256().to_owned());
+        }
+        let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
+        let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
+            Completeness::Complete
+        } else {
+            Completeness::Partial
+        };
+        let pack = AuthoredSemanticModelPack {
+            schema_version: super::super::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
+            pack_id: request.pack_id.clone(),
+            version: request.pack_version.clone(),
+            producer: Producer {
+                name: "bifrost-csharp-assembly".to_owned(),
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+            },
+            language: "csharp".to_owned(),
+            ecosystem: request.ecosystem.clone(),
+            compatibility: request.compatibility.clone(),
+            provenance: request.provenance.clone(),
+            license: request.license.clone(),
+            completeness,
+            safety: request.safety.clone(),
+            shards: vec![AuthoredShard {
+                id: "declarations.external".to_owned(),
+                activation,
+                payload: AuthoredPayload::DeclarationFacts {
+                    types,
+                    members,
+                    relations: Vec::new(),
+                },
+            }],
+        };
+        ArtifactProduction {
+            artifact_sha256: Some(artifact.sha256().to_owned()),
+            pack: Some(pack),
+            completeness,
+            diagnostics,
+            suppressed_diagnostics,
+        }
+    }
+}
+
+fn metadata_location(source: &CSharpExternalDeclarationSource) -> String {
+    match source {
+        CSharpExternalDeclarationSource::Assembly { metadata_token, .. } => {
+            format!("0x{metadata_token:08x}")
+        }
+    }
+}
+
+fn semantic_type_kind(kind: CSharpExternalTypeKind) -> TypeKind {
+    match kind {
+        CSharpExternalTypeKind::Class => TypeKind::Class,
+        CSharpExternalTypeKind::Interface => TypeKind::Interface,
+        CSharpExternalTypeKind::Struct => TypeKind::Struct,
+        CSharpExternalTypeKind::Enum => TypeKind::Enum,
+        CSharpExternalTypeKind::Delegate => TypeKind::Delegate,
+    }
+}
+
+fn semantic_member_kind(kind: CSharpExternalMemberKind) -> MemberKind {
+    match kind {
+        CSharpExternalMemberKind::Constructor => MemberKind::Constructor,
+        CSharpExternalMemberKind::Method => MemberKind::Method,
+        CSharpExternalMemberKind::Field => MemberKind::Field,
+        CSharpExternalMemberKind::Property => MemberKind::Property,
+    }
+}
+
+fn semantic_visibility(visibility: CSharpVisibility) -> Visibility {
+    match visibility {
+        CSharpVisibility::Private => Visibility::Private,
+        CSharpVisibility::Internal => Visibility::Internal,
+        CSharpVisibility::ProtectedAndInternal => Visibility::Internal,
+        CSharpVisibility::Protected => Visibility::Protected,
+        CSharpVisibility::ProtectedOrInternal => Visibility::ProtectedInternal,
+        CSharpVisibility::Public => Visibility::Public,
+    }
+}
+
+fn external_type_kind(kind: TypeKind) -> CSharpExternalTypeKind {
+    match kind {
+        TypeKind::Interface | TypeKind::Trait => CSharpExternalTypeKind::Interface,
+        TypeKind::Struct | TypeKind::Record => CSharpExternalTypeKind::Struct,
+        TypeKind::Enum => CSharpExternalTypeKind::Enum,
+        TypeKind::Delegate => CSharpExternalTypeKind::Delegate,
+        TypeKind::Class | TypeKind::Annotation | TypeKind::Module | TypeKind::TypeAlias => {
+            CSharpExternalTypeKind::Class
+        }
+    }
+}
+
+fn external_member_kind(kind: MemberKind) -> CSharpExternalMemberKind {
+    match kind {
+        MemberKind::Constructor => CSharpExternalMemberKind::Constructor,
+        MemberKind::Field | MemberKind::Constant | MemberKind::Event => {
+            CSharpExternalMemberKind::Field
+        }
+        MemberKind::Property => CSharpExternalMemberKind::Property,
+        MemberKind::Method | MemberKind::Function => CSharpExternalMemberKind::Method,
+    }
+}
+
+fn external_visibility(visibility: Visibility) -> CSharpVisibility {
+    match visibility {
+        Visibility::Public => CSharpVisibility::Public,
+        Visibility::Protected => CSharpVisibility::Protected,
+        Visibility::Internal | Visibility::Package => CSharpVisibility::Internal,
+        Visibility::ProtectedInternal => CSharpVisibility::ProtectedOrInternal,
+        Visibility::Private => CSharpVisibility::Private,
     }
 }
 
@@ -489,7 +1182,7 @@ fn parse_assembly(path: &Path, bytes: &[u8]) -> Option<Vec<CSharpExternalType>> 
     let nested = nested_map(&layout);
     let property_owners = property_owners(&layout, types.len() as u32, properties.len() as u32);
     let property_accessors = property_accessors(&layout, &methods);
-    let generic = generic_arities(&layout, types.len() as u32);
+    let generic = generic_parameters(&layout, strings);
     let interfaces = interfaces_for(&layout, &types, &type_refs, &type_specs);
     let mut names = Vec::new();
     for (idx, row) in types.iter().enumerate() {
@@ -522,6 +1215,7 @@ fn parse_assembly(path: &Path, bytes: &[u8]) -> Option<Vec<CSharpExternalType>> 
                 CSharpExternalMemberKind::Field,
                 f.flags,
                 false,
+                Vec::new(),
                 &f.sig,
                 &types,
                 &type_refs,
@@ -547,6 +1241,11 @@ fn parse_assembly(path: &Path, bytes: &[u8]) -> Option<Vec<CSharpExternalType>> 
                 kind,
                 m.flags,
                 true,
+                generic
+                    .methods
+                    .get(&(method_index as u32 + 1))
+                    .cloned()
+                    .unwrap_or_default(),
                 &m.sig,
                 &types,
                 &type_refs,
@@ -570,6 +1269,7 @@ fn parse_assembly(path: &Path, bytes: &[u8]) -> Option<Vec<CSharpExternalType>> 
                 CSharpExternalMemberKind::Property,
                 flags,
                 false,
+                Vec::new(),
                 &p.sig,
                 &types,
                 &type_refs,
@@ -581,14 +1281,18 @@ fn parse_assembly(path: &Path, bytes: &[u8]) -> Option<Vec<CSharpExternalType>> 
             .map(|(ns, _)| ns.to_string())
             .unwrap_or_default();
         let short_name = fqn.rsplit('.').next().unwrap_or(&fqn).to_string();
-        let base = resolve_typedef_or_ref(row.extends, &types, &type_refs, &type_specs);
+        let base = resolve_typedef_or_ref_type(row.extends, &types, &type_refs, &type_specs);
+        let base_name = base
+            .as_ref()
+            .map(DecodedType::legacy_name)
+            .unwrap_or_default();
         let kind = if row.flags & 0x20 != 0 {
             CSharpExternalTypeKind::Interface
-        } else if base.ends_with("System.Enum") {
+        } else if base_name.ends_with("System.Enum") {
             CSharpExternalTypeKind::Enum
-        } else if base.ends_with("System.ValueType") {
+        } else if base_name.ends_with("System.ValueType") {
             CSharpExternalTypeKind::Struct
-        } else if base.ends_with("System.MulticastDelegate") {
+        } else if base_name.ends_with("System.MulticastDelegate") {
             CSharpExternalTypeKind::Delegate
         } else {
             CSharpExternalTypeKind::Class
@@ -599,8 +1303,26 @@ fn parse_assembly(path: &Path, bytes: &[u8]) -> Option<Vec<CSharpExternalType>> 
             short_name,
             kind,
             visibility: type_visibility(row.flags),
-            generic_arity: *generic.get(&((idx + 1) as u32)).unwrap_or(&0),
+            is_abstract: row.flags & 0x80 != 0,
+            is_sealed: row.flags & 0x100 != 0,
+            generic_arity: generic
+                .types
+                .get(&((idx + 1) as u32))
+                .map(Vec::len)
+                .unwrap_or(0),
+            type_parameters: generic
+                .types
+                .get(&((idx + 1) as u32))
+                .cloned()
+                .unwrap_or_default(),
+            base,
             interfaces: interfaces
+                .get(&((idx + 1) as u32))
+                .into_iter()
+                .flatten()
+                .map(DecodedType::legacy_name)
+                .collect(),
+            interface_refs: interfaces
                 .get(&((idx + 1) as u32))
                 .cloned()
                 .unwrap_or_default(),
@@ -669,12 +1391,14 @@ fn member(
     kind: CSharpExternalMemberKind,
     flags: u16,
     method: bool,
+    type_parameters: Vec<String>,
     sig: &[u8],
     types: &[TypeRow],
     type_refs: &[TypeRefRow],
     type_specs: &[TypeSpecRow],
 ) -> CSharpExternalMember {
-    let (ret, params, generic) = decode_signature(sig, method, types, type_refs, type_specs);
+    let (return_type_ref, parameter_type_refs, generic_arity) =
+        decode_signature(sig, method, types, type_refs, type_specs);
     CSharpExternalMember {
         owner_fqn: owner.to_string(),
         name: name.to_string(),
@@ -683,9 +1407,15 @@ fn member(
         is_static: flags & 0x10 != 0,
         is_abstract: flags & 0x400 != 0,
         is_virtual: flags & 0x40 != 0,
-        generic_arity: generic,
-        return_type: ret,
-        parameter_types: params,
+        generic_arity,
+        type_parameters,
+        return_type: return_type_ref.as_ref().map(DecodedType::legacy_name),
+        parameter_types: parameter_type_refs
+            .iter()
+            .map(DecodedType::legacy_name)
+            .collect(),
+        return_type_ref,
+        parameter_type_refs,
         source: CSharpExternalDeclarationSource::Assembly {
             path: path.to_path_buf(),
             metadata_token: token,
@@ -929,31 +1659,56 @@ fn property_accessors(l: &TableLayout<'_>, methods: &[MethodRow]) -> HashMap<u32
     }
     out
 }
-fn generic_arities(l: &TableLayout<'_>, type_count: u32) -> HashMap<u32, usize> {
-    let mut out = HashMap::default();
+struct GenericParameters {
+    types: HashMap<u32, Vec<String>>,
+    methods: HashMap<u32, Vec<String>>,
+}
+
+fn generic_parameters(l: &TableLayout<'_>, strings: &[u8]) -> GenericParameters {
+    let mut types: HashMap<u32, Vec<(u16, String)>> = HashMap::default();
+    let mut methods: HashMap<u32, Vec<(u16, String)>> = HashMap::default();
     for i in 1..=l.rows(42) {
         let Some(r) = l.row(42, i) else { continue };
         let mut p = 0;
-        let _ = u16at(r, &mut p);
+        let Some(number) = u16at(r, &mut p) else {
+            continue;
+        };
         let _ = u16at(r, &mut p);
         let Some(owner) = index(r, &mut p, coded_size(&l.rows, &[2, 6], 1)) else {
             continue;
         };
+        let Some(name) = str_index(r, &mut p, l.heap, strings) else {
+            continue;
+        };
+        if owner == 0 || name.is_empty() {
+            continue;
+        }
         if owner & 1 == 0 {
-            let ty = owner >> 1;
-            if ty > 0 && ty <= type_count {
-                *out.entry(ty).or_insert(0) += 1;
-            }
+            types.entry(owner >> 1).or_default().push((number, name));
+        } else {
+            methods.entry(owner >> 1).or_default().push((number, name));
         }
     }
-    out
+    let finish = |mut input: HashMap<u32, Vec<(u16, String)>>| {
+        input
+            .drain()
+            .map(|(owner, mut values)| {
+                values.sort_by_key(|(number, _)| *number);
+                (owner, values.into_iter().map(|(_, name)| name).collect())
+            })
+            .collect()
+    };
+    GenericParameters {
+        types: finish(types),
+        methods: finish(methods),
+    }
 }
 fn interfaces_for(
     l: &TableLayout<'_>,
     types: &[TypeRow],
     type_refs: &[TypeRefRow],
     type_specs: &[TypeSpecRow],
-) -> HashMap<u32, Vec<String>> {
+) -> HashMap<u32, Vec<DecodedType>> {
     let mut out = HashMap::default();
     for i in 1..=l.rows(9) {
         let Some(r) = l.row(9, i) else { continue };
@@ -964,8 +1719,7 @@ fn interfaces_for(
         let Some(interface) = index(r, &mut p, coded_size(&l.rows, &[2, 1, 27], 2)) else {
             continue;
         };
-        let value = resolve_typedef_or_ref(interface, types, type_refs, type_specs);
-        if !value.is_empty() {
+        if let Some(value) = resolve_typedef_or_ref_type(interface, types, type_refs, type_specs) {
             out.entry(owner).or_insert_with(Vec::new).push(value);
         }
     }
@@ -1001,42 +1755,57 @@ fn full_type_name(
         format!("{}.{}", namespace, parts.join("."))
     }
 }
+#[cfg(test)]
 fn resolve_typedef_or_ref(
     value: u32,
     types: &[TypeRow],
     type_refs: &[TypeRefRow],
     type_specs: &[TypeSpecRow],
 ) -> String {
-    resolve_typedef_or_ref_at_depth(value, types, type_refs, type_specs, 0)
+    resolve_typedef_or_ref_type_at_depth(value, types, type_refs, type_specs, 0)
+        .map(|value| value.legacy_name())
+        .unwrap_or_default()
 }
-fn resolve_typedef_or_ref_at_depth(
+fn resolve_typedef_or_ref_type(
+    value: u32,
+    types: &[TypeRow],
+    type_refs: &[TypeRefRow],
+    type_specs: &[TypeSpecRow],
+) -> Option<DecodedType> {
+    resolve_typedef_or_ref_type_at_depth(value, types, type_refs, type_specs, 0)
+}
+fn resolve_typedef_or_ref_type_at_depth(
     value: u32,
     types: &[TypeRow],
     type_refs: &[TypeRefRow],
     type_specs: &[TypeSpecRow],
     depth: usize,
-) -> String {
+) -> Option<DecodedType> {
     if depth >= MAX_SIGNATURE_DEPTH {
-        return String::new();
+        return None;
     }
     let tag = value & 3;
     let index = (value >> 2) as usize;
     match tag {
         0 => types
             .get(index.saturating_sub(1))
-            .map(|r| {
-                if r.namespace.is_empty() {
+            .map(|r| DecodedType::Named {
+                name: if r.namespace.is_empty() {
                     r.name.clone()
                 } else {
                     format!("{}.{}", r.namespace, r.name)
-                }
+                },
+                arguments: Vec::new(),
+            }),
+        1 => {
+            let name = type_ref_name(index, type_refs);
+            (!name.is_empty()).then(|| DecodedType::Named {
+                name,
+                arguments: Vec::new(),
             })
-            .unwrap_or_default(),
-        1 => type_ref_name(index, type_refs),
+        }
         2 => {
-            let Some(spec) = type_specs.get(index.saturating_sub(1)) else {
-                return String::new();
-            };
+            let spec = type_specs.get(index.saturating_sub(1))?;
             let mut cursor = 0;
             decode_type_at_depth(
                 &spec.sig,
@@ -1046,9 +1815,8 @@ fn resolve_typedef_or_ref_at_depth(
                 type_specs,
                 depth + 1,
             )
-            .unwrap_or_default()
         }
-        _ => String::new(),
+        _ => None,
     }
 }
 fn type_ref_name(index: usize, type_refs: &[TypeRefRow]) -> String {
@@ -1099,7 +1867,7 @@ fn decode_signature(
     types: &[TypeRow],
     type_refs: &[TypeRefRow],
     type_specs: &[TypeSpecRow],
-) -> (Option<String>, Vec<String>, usize) {
+) -> (Option<DecodedType>, Vec<DecodedType>, usize) {
     let mut p = 0;
     let Some(header) = blob.get(p).copied() else {
         return (None, Vec::new(), 0);
@@ -1130,7 +1898,7 @@ fn decode_type(
     types: &[TypeRow],
     type_refs: &[TypeRefRow],
     type_specs: &[TypeSpecRow],
-) -> Option<String> {
+) -> Option<DecodedType> {
     decode_type_at_depth(blob, p, types, type_refs, type_specs, 0)
 }
 fn decode_type_at_depth(
@@ -1140,46 +1908,63 @@ fn decode_type_at_depth(
     type_refs: &[TypeRefRow],
     type_specs: &[TypeSpecRow],
     depth: usize,
-) -> Option<String> {
+) -> Option<DecodedType> {
     if depth >= MAX_SIGNATURE_DEPTH {
         return None;
     }
     let element = *blob.get(*p)?;
     *p += 1;
     let primitive = match element {
-        0x01 => "void",
-        0x02 => "bool",
-        0x03 => "char",
-        0x04 => "sbyte",
-        0x05 => "byte",
-        0x06 => "short",
-        0x07 => "ushort",
-        0x08 => "int",
-        0x09 => "uint",
-        0x0a => "long",
-        0x0b => "ulong",
-        0x0c => "float",
-        0x0d => "double",
-        0x0e => "string",
-        0x18 => "IntPtr",
-        0x19 => "UIntPtr",
-        0x1c => "object",
+        0x01 => return Some(DecodedType::Void),
+        0x02 => "System.Boolean",
+        0x03 => "System.Char",
+        0x04 => "System.SByte",
+        0x05 => "System.Byte",
+        0x06 => "System.Int16",
+        0x07 => "System.UInt16",
+        0x08 => "System.Int32",
+        0x09 => "System.UInt32",
+        0x0a => "System.Int64",
+        0x0b => "System.UInt64",
+        0x0c => "System.Single",
+        0x0d => "System.Double",
+        0x0e => "System.String",
+        0x18 => "System.IntPtr",
+        0x19 => "System.UIntPtr",
+        0x1c => "System.Object",
         _ => "",
     };
     if !primitive.is_empty() {
-        return Some(primitive.to_string());
+        return Some(DecodedType::Named {
+            name: primitive.to_owned(),
+            arguments: Vec::new(),
+        });
     }
     match element {
         0x0f => decode_type_at_depth(blob, p, types, type_refs, type_specs, depth + 1)
-            .map(|v| format!("{v}*")),
+            .map(Box::new)
+            .map(DecodedType::Pointer),
         0x10 => decode_type_at_depth(blob, p, types, type_refs, type_specs, depth + 1)
-            .map(|v| format!("{v}&")),
+            .map(Box::new)
+            .map(DecodedType::ByRef),
         0x1d => decode_type_at_depth(blob, p, types, type_refs, type_specs, depth + 1)
-            .map(|v| format!("{v}[]")),
-        0x11 | 0x12 => compressed(blob, p)
-            .map(|v| resolve_typedef_or_ref_at_depth(v, types, type_refs, type_specs, depth + 1)),
-        0x13 => compressed(blob, p).map(|v| format!("!{v}")),
-        0x1e => compressed(blob, p).map(|v| format!("!!{v}")),
+            .map(Box::new)
+            .map(|element| DecodedType::Array { element, rank: 1 }),
+        0x11 | 0x12 => resolve_typedef_or_ref_type_at_depth(
+            compressed(blob, p)?,
+            types,
+            type_refs,
+            type_specs,
+            depth + 1,
+        ),
+        0x13 => compressed(blob, p).map(|index| DecodedType::TypeParameter {
+            method: false,
+            index: index as usize,
+        }),
+        0x1e => compressed(blob, p).map(|index| DecodedType::TypeParameter {
+            method: true,
+            index: index as usize,
+        }),
         0x14 => {
             let inner = decode_type_at_depth(blob, p, types, type_refs, type_specs, depth + 1)?;
             let rank = compressed(blob, p)?;
@@ -1191,21 +1976,21 @@ fn decode_type_at_depth(
             for _ in 0..lowers {
                 compressed(blob, p)?;
             }
-            Some(format!(
-                "{inner}[{}]",
-                ",".repeat(rank.saturating_sub(1) as usize)
-            ))
+            Some(DecodedType::Array {
+                element: Box::new(inner),
+                rank: rank as usize,
+            })
         }
         0x15 => {
             let _ = blob.get(*p)?;
             *p += 1;
-            let base = resolve_typedef_or_ref_at_depth(
+            let base = resolve_typedef_or_ref_type_at_depth(
                 compressed(blob, p)?,
                 types,
                 type_refs,
                 type_specs,
                 depth + 1,
-            );
+            )?;
             let count = compressed(blob, p)?;
             let mut arguments = Vec::new();
             for _ in 0..count {
@@ -1218,7 +2003,10 @@ fn decode_type_at_depth(
                     depth + 1,
                 )?);
             }
-            (!base.is_empty()).then(|| format!("{base}<{}>", arguments.join(", ")))
+            let DecodedType::Named { name, .. } = base else {
+                return None;
+            };
+            Some(DecodedType::Named { name, arguments })
         }
         0x1f | 0x20 => {
             compressed(blob, p)?;
@@ -1368,6 +2156,10 @@ fn blob_index(b: &[u8], p: &mut usize, heap: u8, blobs: &[u8]) -> Option<Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::semantic_model::{
+        ActivationSelector, Compatibility, CompilerOptions, NameSelector, Provenance, Safety,
+        compile_pack,
+    };
     use sha2::{Digest, Sha256};
 
     const DLL: &[u8] = include_bytes!(concat!(
@@ -1378,6 +2170,157 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/../../tests/fixtures/csharp-external/ExternalLibrary.dll.sha256"
     ));
+
+    fn production_request(path: PathBuf) -> ArtifactProductionRequest {
+        ArtifactProductionRequest {
+            path,
+            artifact_kind: ExternalArtifactKind::DotNetAssembly,
+            pack_id: "fixture.external-library".to_owned(),
+            pack_version: "1.0.0".to_owned(),
+            ecosystem: "nuget".to_owned(),
+            compatibility: Compatibility {
+                bifrost: ">=0.8.0, <1.0.0".to_owned(),
+                toolchains: Vec::new(),
+            },
+            activation: vec![ActivationSelector {
+                package: Some(NameSelector {
+                    name: "fixture:external-library".to_owned(),
+                    version: Some("1.0.0".to_owned()),
+                }),
+                module: None,
+                toolchain: None,
+                targets: Vec::new(),
+                configurations: Vec::new(),
+                artifact_sha256: None,
+            }],
+            provenance: Provenance {
+                source: "checked-in fixture".to_owned(),
+                revision: None,
+            },
+            license: "MIT".to_owned(),
+            safety: Safety {
+                generated_code_only: false,
+                review_required: false,
+            },
+        }
+    }
+
+    fn produce_fixture(limits: &ArtifactProducerLimits) -> ArtifactProduction {
+        let temp = tempfile::tempdir().unwrap();
+        let assembly = temp.path().join("ExternalLibrary.dll");
+        std::fs::write(&assembly, DLL).unwrap();
+        CSharpAssemblyPackProducer.produce_exact_artifact(&production_request(assembly), limits)
+    }
+
+    #[test]
+    fn assembly_producer_emits_deterministic_structured_api_pack() {
+        let first = produce_fixture(&ArtifactProducerLimits::default());
+        let second = produce_fixture(&ArtifactProducerLimits::default());
+
+        assert_eq!(first, second);
+        assert_eq!(first.completeness, Completeness::Complete);
+        assert!(first.diagnostics.is_empty(), "{:?}", first.diagnostics);
+        assert_eq!(
+            first.artifact_sha256.as_deref(),
+            SHA.split_whitespace().next()
+        );
+        let pack = first.pack.as_ref().expect("fixture pack");
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &pack.shards[0].payload
+        else {
+            panic!("C# producer must emit declaration facts");
+        };
+
+        let client = types
+            .iter()
+            .find(|fact| fact.name == "Fixture.Api.Client`1")
+            .expect("generic client type");
+        assert_eq!(client.type_parameters, ["T"]);
+        assert!(client.hierarchy.iter().any(|fact| {
+            fact.hierarchy_kind == HierarchyKind::Implements
+                && matches!(&fact.target, TypeRef::Named { name, .. } if name == "Fixture.Api.IClient")
+        }));
+        assert!(types.iter().any(|fact| fact.name.ends_with(".Nested")));
+        assert!(
+            types
+                .iter()
+                .any(|fact| fact.name.ends_with(".ProtectedNested"))
+        );
+        assert!(
+            !types
+                .iter()
+                .any(|fact| fact.name.ends_with(".PrivateNested"))
+        );
+        assert!(!types.iter().any(|fact| fact.name.contains("InternalOnly")));
+
+        let convert = members
+            .iter()
+            .find(|fact| fact.owner == client.id && fact.name == "Convert")
+            .expect("generic method");
+        let signature = convert.signature.as_ref().expect("method signature");
+        assert_eq!(signature.type_parameters, ["U"]);
+        assert_eq!(signature.parameters.len(), 1);
+        assert!(
+            signature
+                .parameters
+                .iter()
+                .all(|parameter| parameter.name.is_none())
+        );
+        assert!(matches!(
+            signature.parameters[0].r#type,
+            TypeRef::TypeParameter { ref name } if name == "U"
+        ));
+        assert!(matches!(
+            signature.returns,
+            Some(TypeRef::TypeParameter { ref name }) if name == "U"
+        ));
+        assert!(members.iter().all(|fact| {
+            matches!(
+                &fact.locator,
+                Locator::Artifact { path, symbol }
+                    if path == "ExternalLibrary.dll" && symbol.starts_with("0x")
+            )
+        }));
+
+        let first_compiled = compile_pack(pack, &CompilerOptions::default()).unwrap();
+        let second_compiled = compile_pack(
+            second.pack.as_ref().expect("second fixture pack"),
+            &CompilerOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(first_compiled, second_compiled);
+    }
+
+    #[test]
+    fn assembly_producer_reports_record_limit_as_partial() {
+        let production = produce_fixture(&ArtifactProducerLimits {
+            max_records: 2,
+            ..ArtifactProducerLimits::default()
+        });
+
+        assert_eq!(production.completeness, Completeness::Partial);
+        assert!(production.pack.is_some());
+        assert!(
+            production
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "limit.records")
+        );
+    }
+
+    #[test]
+    fn assembly_producer_rejects_non_cli_input_without_panicking() {
+        let temp = tempfile::tempdir().unwrap();
+        let assembly = temp.path().join("broken.dll");
+        std::fs::write(&assembly, b"not a PE").unwrap();
+        let production = CSharpAssemblyPackProducer.produce_exact_artifact(
+            &production_request(assembly),
+            &ArtifactProducerLimits::default(),
+        );
+
+        assert!(production.pack.is_none());
+        assert_eq!(production.completeness, Completeness::Partial);
+        assert_eq!(production.diagnostics[0].code, "csharp.metadata.invalid");
+    }
 
     #[test]
     fn external_fixture_is_pinned_and_exposes_members() {
@@ -1525,6 +2468,11 @@ mod tests {
                 assembly_paths: vec![assembly.clone()],
             },
             &project,
+        );
+        assert!(
+            index.production_diagnostics().is_empty(),
+            "{:?}",
+            index.production_diagnostics()
         );
 
         let mut aliases = HashMap::default();
