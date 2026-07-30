@@ -6,7 +6,6 @@ use tree_sitter::Node;
 use tree_sitter::Tree;
 
 use super::declarations::parse_csharp_file;
-use super::semantic::has_direct_token;
 use super::tests::csharp_contains_tests;
 use super::{
     csharp_normalize_full_name, csharp_signature_arity, csharp_signature_return_type,
@@ -27,33 +26,75 @@ static CSHARP_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
         case_types: &["switch_section", "switch_expression_arm"],
         binary_types: &["binary_expression"],
         logical_operators: &["&&", "||"],
-        jump_types: &["break_statement", "continue_statement"],
+        jump_types: &["goto_statement"],
         named_function_boundary_types: &[
             "method_declaration",
             "constructor_declaration",
             "local_function_statement",
+            "accessor_declaration",
+            "operator_declaration",
+            "conversion_operator_declaration",
+            "destructor_declaration",
         ],
         anonymous_function_types: &["lambda_expression", "anonymous_method_expression"],
-        default_case_predicate: Some(csharp_is_default_case),
+        case_increment_predicate: Some(csharp_case_increment),
+        jump_predicate: Some(|_| true),
         ..cognitive_complexity::Config::empty()
     });
 
-fn csharp_is_default_case(node: Node<'_>, _source: &str) -> bool {
-    if has_direct_token(node, "default") {
-        return true;
+fn csharp_case_increment(node: Node<'_>, _source: &str) -> u32 {
+    if node.kind() == "switch_expression_arm" {
+        let pattern = node.named_child(0);
+        let mut cursor = node.walk();
+        let guarded = node
+            .named_children(&mut cursor)
+            .any(|child| child.kind() == "when_clause");
+        return u32::from(guarded || !pattern.is_some_and(csharp_is_irrefutable_pattern));
     }
-    let mut work = vec![node];
-    while let Some(current) = work.pop() {
-        if current.kind() == "discard" {
-            return true;
+
+    let mut count = 0u32;
+    for index in 0..node.child_count() {
+        let Some(child) = node.child(index) else {
+            continue;
+        };
+        if child.kind() != "case" {
+            continue;
         }
-        for index in (0..current.named_child_count()).rev() {
-            if let Some(child) = current.named_child(index) {
-                work.push(child);
+
+        let mut pattern = None;
+        let mut guarded = false;
+        for label_index in index + 1..node.child_count() {
+            let Some(label_child) = node.child(label_index) else {
+                continue;
+            };
+            if label_child.kind() == ":" {
+                break;
+            }
+            if label_child.kind() == "when_clause" {
+                guarded = true;
+            } else if label_child.is_named() && pattern.is_none() {
+                pattern = Some(label_child);
             }
         }
+        if guarded || !pattern.is_some_and(csharp_is_irrefutable_pattern) {
+            count = count.saturating_add(1);
+        }
     }
-    false
+    count
+}
+
+fn csharp_is_irrefutable_pattern(mut pattern: Node<'_>) -> bool {
+    while pattern.kind() == "parenthesized_pattern" {
+        let Some(inner) = pattern.named_child(0) else {
+            return false;
+        };
+        pattern = inner;
+    }
+    matches!(pattern.kind(), "discard" | "var_pattern")
+        || (pattern.kind() == "declaration_pattern"
+            && pattern
+                .child_by_field_name("type")
+                .is_some_and(|ty| ty.kind() == "implicit_type"))
 }
 
 #[derive(Debug, Clone, Default)]

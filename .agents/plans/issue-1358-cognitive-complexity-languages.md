@@ -13,7 +13,7 @@ After this change, callers of the `compute_cognitive_complexity` MCP tool can an
 - [x] (2026-07-30 18:08Z) Ported the Brokk-backed language configurations and added focused positive and near-miss tests for Go, C/C++, JavaScript/JSX, TypeScript/TSX, PHP, and Scala; formatting and all 50 focused cognitive-complexity tests pass.
 - [x] (2026-07-30 18:22Z) Derived and validated the C# configuration from its tree-sitter grammar with nine focused tests for nesting, loops, catch, conditional expressions, switch forms, logical sequences, defaults, jumps, lambdas, and local-function boundaries; all 59 focused tests pass.
 - [x] (2026-07-30 18:31Z) Added a real mixed-language MCP call test covering Go, C, C++, JavaScript, JSX, TypeScript, TSX, PHP, Scala, and C#, and updated tool discovery documentation to enumerate the supported set and Kotlin exclusion; the focused integration test passes.
-- [ ] Run formatting, focused and broader featureless tests, repository policy checks, and adversarial review; resolve all correctness findings.
+- [x] (2026-07-30 19:03Z) Completed formatting, featureless clippy, 66 focused cognitive-complexity tests, 1,871 executed analysis library tests, and all 127 MCP package tests. The full analysis package's only failure is an unrelated pre-existing Kotlin doctest that is unchanged on this branch. The required five-specialist review found and drove fixes for C# case grouping, wildcard guards, nested-if fields, goto forms, callable boundaries, and bounded discard inspection; re-review is clean. Repository policy execution was attempted but `list_policies` and `run_policy` are not registered in this session, so no policy result is claimed.
 
 ## Surprises & Discoveries
 
@@ -28,6 +28,15 @@ After this change, callers of the `compute_cognitive_complexity` MCP tool can an
 
 - Observation: Bifrost's current tree-sitter-cpp grammar represents both ordinary cases and the default branch as `case_statement`; the Brokk reference's `default_statement` node does not exist here.
   Evidence: A first focused run scored the C default branch one point too high. The current grammar exposes an optional `value` field on `case_statement`, so `cpp_is_default_case` now recognizes default structurally through the absent field. The rerun passed all 50 focused tests.
+
+- Observation: Tree-sitter C# groups multiple `case` labels into one `switch_section`, while each `switch_expression_arm` remains a separate node.
+  Evidence: Specialist review and focused fixtures showed that the original one-node/one-increment scorer undercounted grouped labels and could suppress a mixed ordinary/default section. `Config::case_increment_predicate` now lets C# count direct structured labels without source-text parsing.
+
+- Observation: Else-if flattening cannot be inferred from a direct child merely having an if-like node kind.
+  Evidence: In tree-sitter C#, an unbraced nested consequence and an else-if alternative are both direct `if_statement` children. The scorer now checks the grammar's `alternative` field (or an explicit alternate-if node kind), and the unbraced nested fixture scores 3 rather than 2.
+
+- Observation: The installed Rust 1.96 Homebrew and rustup binaries report the same version but use incompatible compiler ABIs in this worktree.
+  Evidence: Chained validation initially produced E0514 dependency errors when Homebrew `rustc` consumed rustup artifacts. Pinning `PATH` to `/Users/dave/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin` made clippy and tests deterministic.
 
 ## Decision Log
 
@@ -51,9 +60,13 @@ After this change, callers of the `compute_cognitive_complexity` MCP tool can an
   Rationale: These are the established behavior-test locations; no new root-level integration test binary is justified.
   Date/Author: 2026-07-30 / Codex
 
+- Decision: Extend the generic scorer with optional case-count and jump predicates rather than special-casing C# in the traversal.
+  Rationale: C# switch sections can represent several labels and all C# `goto` forms contribute, including `goto default` with no named child. Language-configured predicates preserve the established behavior for every existing adapter while accurately representing the C# grammar.
+  Date/Author: 2026-07-30 / Codex
+
 ## Outcomes & Retrospective
 
-All implementation milestones are complete. Six reference-backed language families, their C/JSX/TSX dialect routes, and grammar-backed C# return scores through explicit adapter configurations. A single real MCP request proves that every requested file contributes its expected score, and tool discovery now states the exact supported set while leaving Kotlin excluded. No shared-scorer change was needed. Final validation and review remain.
+All milestones are complete. Six reference-backed language families, their C/JSX/TSX dialect routes, and grammar-backed C# return scores through explicit adapter configurations. A single real MCP request proves that every requested file contributes its expected score, and tool discovery states the exact supported set while leaving Kotlin excluded. Review materially hardened the shared scorer and C# adapter: nested consequences are no longer mistaken for else-if alternatives, grouped switch labels count independently, guarded and structurally wrapped wildcard patterns are distinguished, every C# goto form is represented, and discard checks stay bounded to label structure. The focused, analysis-library, MCP, formatting, and clippy gates pass. The full analysis package still exposes an unrelated Kotlin documentation example compiled as Rust; this branch does not modify it. Policy execution remains unverified because the installed skill's MCP capabilities were absent from the session.
 
 ## Context and Orientation
 
@@ -146,3 +159,5 @@ Plan revision note (2026-07-30): Recorded completion of the reference-backed mil
 Plan revision note (2026-07-30): Recorded the completed C# milestone, including AST-only default/discard recognition and the logical/switch semantic decisions.
 
 Plan revision note (2026-07-30): Recorded successful mixed-language MCP coverage and completion of the user-visible support description.
+
+Plan revision note (2026-07-30): Recorded the completed final gate, the specialist-review fixes to shared and C# scoring semantics, the Rust toolchain ABI workaround, the unrelated Kotlin doctest failure, and unavailable policy MCP capabilities.

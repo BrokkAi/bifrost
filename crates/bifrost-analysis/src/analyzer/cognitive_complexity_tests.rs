@@ -590,6 +590,19 @@ fn csharp_nested_if_and_else_if_are_scored() {
 }
 
 #[test]
+fn csharp_unbraced_nested_if_is_not_flattened_as_else_if() {
+    let src = r#"class Service {
+    int method(bool a, bool b) {
+        if (a)
+            if (b) return 1;
+        return 0;
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 3);
+}
+
+#[test]
 fn csharp_nested_loop_and_logical_operator_sequences_are_scored() {
     let src = r#"class Service {
     void method(bool a, bool b, bool c, int x) {
@@ -666,6 +679,93 @@ fn csharp_switch_expression_discard_arm_is_a_default_near_miss() {
 }
 "#;
     assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 1);
+}
+
+#[test]
+fn csharp_discard_in_case_body_or_arm_value_is_not_a_default() {
+    let src = r#"class Service {
+    int capture(out int value) { value = 0; return value; }
+
+    int method(int x) {
+        switch (x) { case 1: capture(out _); break; default: break; }
+        return x switch { 1 => capture(out _), _ => 0 };
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 2);
+}
+
+#[test]
+fn csharp_guarded_discard_cases_are_not_defaults() {
+    let src = r#"class Service {
+    int method(int x) {
+        switch (x) { case _ when x > 0: x++; break; default: break; }
+        return x switch { _ when x < 0 => -1, _ => 0 };
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 2);
+}
+
+#[test]
+fn csharp_switch_section_counts_each_non_default_label() {
+    let src = r#"class Service {
+    int method(int x) {
+        switch (x) {
+            case 1:
+            case 2: x++; break;
+            case 3:
+            default: break;
+        }
+        return x;
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 3);
+}
+
+#[test]
+fn csharp_wrapped_irrefutable_patterns_are_defaults_but_tuple_discard_is_not() {
+    let src = r#"class Service {
+    int method((int, int) value) {
+        return value switch { (_) => 0, var _ => 1, (1, _) => 2 };
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 1);
+}
+
+#[test]
+fn csharp_goto_label_is_scored_but_break_and_continue_are_not() {
+    let src = r#"class Service {
+    int method(bool ready) {
+        while (ready) {
+            if (ready) goto done;
+            break;
+        }
+    done:
+        return 0;
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 4);
+}
+
+#[test]
+fn csharp_all_goto_forms_are_scored() {
+    let src = r#"class Service {
+    int method(int x) {
+        switch (x) {
+            case 0: goto case 1;
+            case 1: goto default;
+            default: goto done;
+        }
+    done:
+        return 0;
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 5);
 }
 
 #[test]

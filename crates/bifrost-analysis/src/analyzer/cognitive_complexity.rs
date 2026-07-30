@@ -17,6 +17,14 @@ use tree_sitter::Node;
 /// complexity. Receives the case node and the full source text.
 pub type DefaultCasePredicate = fn(Node<'_>, &str) -> bool;
 
+/// Predicate returning the number of case labels represented by a case node.
+/// This supports grammars that group multiple labels into one container.
+pub type CaseIncrementPredicate = fn(Node<'_>, &str) -> u32;
+
+/// Predicate returning `true` when a configured jump contributes complexity.
+/// When absent, jumps retain the shared labeled-jump behavior.
+pub type JumpPredicate = fn(Node<'_>) -> bool;
+
 /// Predicate returning `true` when a node should be treated as a named
 /// function boundary (i.e. analysis should not descend into it once the
 /// scorer has already entered a function). Used for languages where the
@@ -72,6 +80,11 @@ pub struct Config {
     /// Optional predicate identifying the default branch of a case-like
     /// construct (e.g. Java's `default:`, Rust's `_ =>`).
     pub default_case_predicate: Option<DefaultCasePredicate>,
+    /// Optional counter for grammars where one case node can contain multiple
+    /// labels. Takes precedence over [`Self::default_case_predicate`].
+    pub case_increment_predicate: Option<CaseIncrementPredicate>,
+    /// Optional language-specific jump predicate.
+    pub jump_predicate: Option<JumpPredicate>,
     /// Optional predicate marking additional named-function-boundary nodes
     /// that cannot be enumerated by kind alone (e.g. Python decorated
     /// functions).
@@ -97,6 +110,8 @@ impl Config {
             anonymous_function_types: &[],
             else_clause_types: &[],
             default_case_predicate: None,
+            case_increment_predicate: None,
+            jump_predicate: None,
             named_function_boundary_predicate: None,
         }
     }
@@ -148,13 +163,19 @@ pub fn compute(root: Node<'_>, source: &str, config: &Config) -> u32 {
             complexity = complexity.saturating_add(control_flow_increment(frame.nesting));
             push_named_children(&mut work, node, frame.nesting + 1, false);
         } else if slice_contains(config.case_types, kind) {
-            let is_default = config
-                .default_case_predicate
-                .map(|pred| pred(node, source))
-                .unwrap_or(false);
-            if !is_default {
-                complexity = complexity.saturating_add(control_flow_increment(frame.nesting));
-            }
+            let case_count = config.case_increment_predicate.map_or_else(
+                || {
+                    u32::from(
+                        !config
+                            .default_case_predicate
+                            .map(|pred| pred(node, source))
+                            .unwrap_or(false),
+                    )
+                },
+                |predicate| predicate(node, source),
+            );
+            complexity = complexity
+                .saturating_add(control_flow_increment(frame.nesting).saturating_mul(case_count));
             push_named_children(&mut work, node, frame.nesting + 1, false);
         } else if slice_contains(config.default_case_types, kind) {
             push_named_children(&mut work, node, frame.nesting, false);
@@ -165,7 +186,10 @@ pub fn compute(root: Node<'_>, source: &str, config: &Config) -> u32 {
             }
             push_named_children(&mut work, node, frame.nesting, false);
         } else if slice_contains(config.jump_types, kind) {
-            if is_labeled_jump(node) {
+            if config
+                .jump_predicate
+                .map_or_else(|| is_labeled_jump(node), |predicate| predicate(node))
+            {
                 complexity = complexity.saturating_add(1);
             }
             push_named_children(&mut work, node, frame.nesting, false);
@@ -202,6 +226,7 @@ fn push_if_children<'tree>(
     config: &Config,
 ) {
     let children = named_children(node);
+    let alternative = node.child_by_field_name("alternative");
     // Iterate in reverse so children pop in source order from the stack.
     for child in children.into_iter().rev() {
         let kind = child.kind();
@@ -223,10 +248,16 @@ fn push_if_children<'tree>(
                 });
             }
         } else if config.is_any_if(kind) {
+            let else_if_continuation = slice_contains(config.alternate_if_types, kind)
+                || alternative.is_some_and(|candidate| candidate == child);
             work.push(Frame {
                 node: child,
-                nesting,
-                else_if_continuation: true,
+                nesting: if else_if_continuation {
+                    nesting
+                } else {
+                    nesting + 1
+                },
+                else_if_continuation,
                 root: false,
             });
         } else {
