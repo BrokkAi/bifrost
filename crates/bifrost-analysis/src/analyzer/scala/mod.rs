@@ -11,7 +11,9 @@ mod supertypes;
 mod tests;
 pub(crate) mod wildcard_imports;
 
-use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
+use crate::analyzer::clone_detection::{
+    CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
+};
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::cache::{
     build_weighted_cache, weight_code_unit_set, weight_code_unit_vec_by_unit,
@@ -36,7 +38,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 pub(crate) use adapter::ScalaAdapter;
-use clones::{build_scala_clone_candidate_data, refine_scala_clone_similarity};
+use clones::build_scala_clone_candidate_data;
 pub(crate) use declarations::scala_class_parameter_field_keyword;
 pub(crate) use imports::{
     ScalaExportInfo, ScalaExportSelector, scala_lexical_scope_path_at,
@@ -1177,7 +1179,7 @@ impl IAnalyzer for ScalaAnalyzer {
             &requested_files,
             all_candidates,
             weights,
-            refine_scala_clone_similarity,
+            refine_clone_similarity_with_ast,
         )
     }
 
