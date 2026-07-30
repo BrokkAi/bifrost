@@ -25,6 +25,7 @@ mod scala;
 pub(crate) use cpp::resolve_cpp_type_bounded;
 pub(crate) use csharp::resolve_csharp_type_bounded;
 pub(crate) use go::resolve_go_type_bounded;
+pub(crate) use kotlin::resolve_kotlin_type_bounded;
 pub(crate) use php::resolve_php_type_bounded;
 pub(crate) use python::resolve_python_type_bounded;
 pub(crate) use ruby::resolve_ruby_type_bounded;

@@ -11,8 +11,9 @@ same validation and canonicalization pipeline.
 
 > **Current runtime boundary:** compiling or decoding a semantic-model pack
 > does not install, store, match, or activate it in Java, C#, or any other
-> analyzer. This page documents the schema and artifact compiler delivered by
-> issue #1145. Runtime matching and installation are separate lifecycle work.
+> analyzer. This page documents the schema, artifact compiler, and exact Java
+> and C# artifact producers. Runtime matching and installation are separate
+> lifecycle work.
 
 Packs do not contain executable code, arbitrary templates, fake source, or
 procedure-effect/data-flow summaries. Generator expressions are bounded trees
@@ -51,6 +52,52 @@ constraint. It may narrow activation by target, configuration, or a lowercase
 SHA-256 artifact digest. The compiler derives sorted routing keys from these
 selectors and, for rule shards, their trigger kinds. A later runtime can route
 without reading unrelated payloads.
+
+## Exact-artifact producers
+
+Bifrost can construct declaration packs directly from one caller-selected
+Java source JAR, Java class JAR, or .NET assembly. The producer API does not
+discover dependencies, infer package coordinates from filenames, download
+artifacts, solve classpaths, or install its result. Discovery remains an
+analyzer concern; production receives the exact path together with explicit
+pack, ecosystem, compatibility, activation, provenance, license, and safety
+metadata.
+
+The producer reads and hashes the exact bytes once under a caller-controlled
+artifact limit. It copies the lowercase SHA-256 into every supplied activation
+selector and returns it beside the authored pack. Archive entry counts,
+per-entry and total uncompressed bytes, declaration records, signature depth,
+diagnostic count, diagnostic text, and diagnostic locations are bounded.
+Invalid input that cannot be identified produces no pack and, when the caller's
+diagnostic budget permits, a bounded error diagnostic. Unsupported metadata or
+an exhausted extraction limit can instead produce a useful `partial` pack with
+stable diagnostic codes and a suppressed-diagnostic count.
+
+Java source declarations are read from tree-sitter syntax. Java class
+descriptors and generic Signature attributes use a bounded grammar parser; C#
+types are read structurally from PE/CLI metadata. Producers emit public and
+protected API types and members after applying enclosing-type visibility. Java
+package-private declarations remain available to the legacy same-package
+resolver but are not exported as reusable public API facts. Dependency entries
+and assemblies remain external and are never added to `Project::all_files()`.
+
+Declaration identity deliberately excludes origin. Equivalent Java source and
+class declarations receive the same IDs, as do equivalent C# declarations
+from another copy of the same semantic API. Source paths, JAR entries, assembly
+metadata tokens, parameter names, and artifact digests do not participate in
+those IDs. They do participate in locators, activation, or compiled pack bytes,
+so a source pack and binary pack can share declaration IDs while retaining
+different pack and shard digests. Member identity includes owner, kind, name,
+generic arity, ordered parameter types, and return type. Including return type
+preserves distinct CLI metadata members such as conversion operators even
+though ordinary Java and C# source methods cannot overload only by return type.
+
+Binary formats do not guarantee parameter names. `signature.parameters[].name`
+is therefore optional: producers retain a source or binary name when it is
+available and omit it otherwise rather than inventing `arg0`-style data.
+Generic parameter names are retained from Java Signature or CLI GenericParam
+metadata when present. Unsupported generic shapes make the result partial
+instead of being flattened to a misleading string.
 
 ## Declaration-fact payload
 

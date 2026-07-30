@@ -26,18 +26,27 @@
 //! `crate::analyzer::usages::get_definition::kotlin` because it is a consumer
 //! of this module's index rather than part of it.
 //!
+//! Structural CodeQuery/RQL is live too (#1240): [`structural`] supplies the
+//! [`crate::analyzer::structural::StructuralSpec`] the shared engine needs, so
+//! `query_code` and `(language kotlin …)` search Kotlin files like any other
+//! registered language.
+//!
+//! Executable-semantics lowering is live (#1241): [`semantic`] publishes a
+//! versioned `ProgramSemanticsProvider`, and its module header documents the
+//! source-level constructs that stay capability-scoped.
+//!
 //! Capabilities owned by sibling issues stay explicitly unsupported here:
 //! usage graphs (#1239 — Kotlin is a member of the shared JVM usage-candidate
 //! realm but has no edge builder yet, so find-references and reference-rewriting
-//! rename abstain), structural RQL (#1240), and CFG/semantic lowering (#1241 —
-//! the analyzer delegate hands out the shared `UnsupportedProgramSemantics`
-//! provider instead of lowering).
+//! rename abstain).
 
 mod adapter;
 pub(crate) mod declarations;
 mod hierarchy;
 pub(crate) mod imports;
 pub(crate) mod language;
+mod semantic;
+pub(crate) mod structural;
 mod supertypes;
 pub(crate) mod syntax;
 pub(crate) mod types;
@@ -169,6 +178,27 @@ impl KotlinAnalyzer {
         self.external_index.get_or_init(|| {
             JvmExternalDeclarationIndex::build_for_project(&self.jvm_config, self.inner.project())
         })
+    }
+
+    /// Row-capped projections for bounded receiver queries (issue #1242).
+    ///
+    /// A bounded query must be able to observe exhaustion before an unbounded
+    /// row set is cloned, which the unbounded `IAnalyzer` accessors cannot
+    /// report.
+    pub(crate) fn signature_metadata_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> crate::analyzer::store::LimitedQueryRows<SignatureMetadata> {
+        self.inner.signature_metadata_limited(code_unit, limit)
+    }
+
+    pub(crate) fn ranges_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> crate::analyzer::store::LimitedQueryRows<crate::analyzer::Range> {
+        self.inner.ranges_limited(code_unit, limit)
     }
 }
 

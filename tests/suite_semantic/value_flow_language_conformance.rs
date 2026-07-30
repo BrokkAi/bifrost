@@ -419,7 +419,6 @@ fn typescript_exact_helper_flow() {
 }
 
 #[test]
-#[ignore = "requires a proven complete source-to-sink meeting through C# static calls"]
 fn csharp_exact_helper_flow() {
     assert_single_file_exact_helper_flow(
         "csharp",
@@ -456,10 +455,10 @@ fn csharp_exact_helper_flow() {
         "relayed",
         "copy",
         ExpectedSinkOutcome::Reached,
-        ExpectedSinkOutcome::Inconclusive,
+        ExpectedSinkOutcome::NotReached,
         SemanticInputStatus::Unknown,
         false,
-        false,
+        true,
         1,
     );
 }
@@ -499,7 +498,6 @@ fn javascript_exact_helper_flow() {
 }
 
 #[test]
-#[ignore = "requires a proven complete producer-bound Rust witness"]
 fn rust_exact_helper_flow() {
     assert_single_file_exact_helper_flow(
         "rust",
@@ -641,7 +639,6 @@ fn ruby_exact_helper_flow() {
 }
 
 #[test]
-#[ignore = "requires a proven complete source-to-sink meeting through Scala calls"]
 fn scala_exact_helper_flow() {
     assert_single_file_exact_helper_flow(
         "scala",
@@ -675,6 +672,44 @@ fn scala_exact_helper_flow() {
         SemanticInputStatus::Unknown,
         false,
         false,
+        1,
+    );
+}
+
+#[test]
+fn kotlin_exact_helper_flow() {
+    assert_single_file_exact_helper_flow(
+        "kotlin",
+        Language::Kotlin,
+        "src/ExactFlowFixture.kt",
+        r#"
+            package conformance
+
+            object ExactFlowFixture {
+                fun relay(value: String): String {
+                    val relayed = value
+                    return relayed
+                }
+
+                fun sink(flowed: String, clean: String) {}
+
+                fun run(input: String) {
+                    val copy = ExactFlowFixture.relay(input)
+                    val clean = "clean"
+                    ExactFlowFixture.sink(copy, clean)
+                }
+            }
+        "#,
+        ProcedureKind::Method,
+        "ExactFlowFixture.relay(input)",
+        "ExactFlowFixture.sink(copy, clean)",
+        "relayed",
+        "copy",
+        ExpectedSinkOutcome::Reached,
+        ExpectedSinkOutcome::NotReached,
+        SemanticInputStatus::Unknown,
+        false,
+        true,
         1,
     );
 }

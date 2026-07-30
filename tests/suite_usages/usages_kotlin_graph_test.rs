@@ -363,37 +363,794 @@ fun shadowed(): Int {
     assert_no_hit_line(&hits, 9);
 }
 
+// ---------------------------------------------------------------------------
+// Milestone 2: callables and properties
+// ---------------------------------------------------------------------------
+
+/// Hits on the *external* usage surface — what `scan_usages`, relevance ranking,
+/// and dead-code detection see. Same-owner and import hits are excluded from it
+/// by the cross-language contract, so a test that means "an outside caller uses
+/// this" must assert here rather than on the editor surface.
+fn external_hits(result: &FuzzyResult) -> Vec<UsageHit> {
+    result.all_hits().into_iter().collect()
+}
+
+/// Hits the scan could not prove: a reference that *might* name the target but
+/// whose receiver type could not be established.
+fn unproven_hits(result: &FuzzyResult) -> Vec<UsageHit> {
+    match result {
+        FuzzyResult::Success {
+            unproven_by_overload,
+            ..
+        } => unproven_by_overload
+            .values()
+            .flat_map(|set| set.iter().cloned())
+            .collect(),
+        other => panic!("expected a successful result, got {other:?}"),
+    }
+}
+
+const GREETER_KT: &str = "package lib
+
+open class Greeter {
+
+    val salutation: String = \"hello\"
+
+    open fun greet(name: String): String = salutation
+
+    fun greet(): String = salutation
+
+    companion object {
+
+        val DEFAULT: Greeter = Greeter()
+
+        fun of(): Greeter = Greeter()
+    }
+}
+
+class Unrelated {
+
+    fun greet(name: String): String = name
+}
+
+fun Greeter.shout(): String = salutation
+";
+
 #[test]
-fn kotlin_callable_target_abstains_with_a_specific_diagnostic() {
-    // Milestone 2 of issue #1239 resolves callable references. Until then the
-    // query must say so rather than report "no usages", which a caller would
-    // read as proof the function is unused. Delete this test when milestone 2
-    // lands and replace it with the real call-site behaviour.
+fn kotlin_member_call_on_a_typed_local_and_on_a_parameter_reports_both_call_sites() {
     let (_project, analyzer) = kotlin_workspace(&[
-        ("src/lib/Base.kt", BASE_KT),
+        ("src/lib/Greeter.kt", GREETER_KT),
         (
             "src/app/App.kt",
             "package app
 
-import lib.Base
+import lib.Greeter
 
-fun run(): String {
+fun viaLocal(): String {
 
-    val base = Base()
+    val greeter: Greeter = Greeter()
 
-    return base.greet(\"world\")
+    return greeter.greet(\"world\")
+}
+
+fun viaParameter(greeter: Greeter): String {
+
+    return greeter.greet(\"world\")
 }
 ",
         ),
     ]);
 
-    let target = definition(&analyzer, "lib.Base.greet");
-    let result = usages(&analyzer, &target);
+    let target = definition(&analyzer, "lib.Greeter.greet");
+    let hits = external_hits(&usages(&analyzer, &target));
+    assert_hit_line(&hits, 9);
+    assert_hit_text(&hits, 9, "greeter.greet");
+    assert_hit_line(&hits, 14);
+}
 
-    let FuzzyResult::Failure { reason_kind, .. } = result else {
-        panic!("expected an explicit abstention for a Kotlin callable, got {result:?}");
-    };
-    assert_eq!(reason_kind, "unsupported_target_shape");
+#[test]
+fn kotlin_same_name_member_on_an_unrelated_class_is_not_reported() {
+    // The exactness criterion: `greet` is spelled identically on two unrelated
+    // classes, and a name match is not an identity match.
+    let (_project, analyzer) = kotlin_workspace(&[
+        ("src/lib/Greeter.kt", GREETER_KT),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.Unrelated
+
+fun run(): String {
+
+    val other: Unrelated = Unrelated()
+
+    return other.greet(\"world\")
+}
+",
+        ),
+    ]);
+
+    let target = definition(&analyzer, "lib.Greeter.greet");
+    let hits = hits(&usages(&analyzer, &target));
+    assert_no_hit_line(&hits, 9);
+}
+
+#[test]
+fn kotlin_inherited_member_call_reports_against_the_base_declaration() {
+    let (_project, analyzer) = kotlin_workspace(&[
+        ("src/lib/Greeter.kt", GREETER_KT),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.Greeter
+
+class Loud : Greeter()
+
+fun run(): String {
+
+    val loud: Loud = Loud()
+
+    return loud.greet(\"world\")
+}
+",
+        ),
+    ]);
+
+    let target = definition(&analyzer, "lib.Greeter.greet");
+    let hits = external_hits(&usages(&analyzer, &target));
+    assert_hit_line(&hits, 11);
+}
+
+#[test]
+fn kotlin_override_declaration_is_reported_and_its_own_call_sites_are_not() {
+    // Two halves of one rule. The override *declaration* is a reference to what
+    // it overrides, so renaming the base renames it. A call on a receiver typed
+    // as the overriding class names the override, not the base, so it must not
+    // be reported as a usage of the base.
+    let (_project, analyzer) = kotlin_workspace(&[
+        ("src/lib/Greeter.kt", GREETER_KT),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.Greeter
+
+class Loud : Greeter() {
+
+    override fun greet(name: String): String = name
+}
+
+fun run(): String {
+
+    val loud: Loud = Loud()
+
+    return loud.greet(\"world\")
+}
+",
+        ),
+    ]);
+
+    let target = definition(&analyzer, "lib.Greeter.greet");
+    let result = usages(&analyzer, &target);
+    let editor = hits(&result);
+    let override_hit = editor
+        .iter()
+        .find(|hit| hit.line == 7)
+        .unwrap_or_else(|| panic!("expected the override declaration reported, got {editor:#?}"));
+    assert_eq!(override_hit.kind, UsageHitKind::OverrideDeclaration);
+    assert_no_hit_line(&editor, 14);
+}
+
+#[test]
+fn kotlin_companion_member_call_reports_through_the_class_and_companion_names() {
+    let (_project, analyzer) = kotlin_workspace(&[
+        ("src/lib/Greeter.kt", GREETER_KT),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.Greeter
+
+fun viaClass(): Greeter {
+
+    return Greeter.of()
+}
+
+fun viaCompanion(): Greeter {
+
+    return Greeter.Companion.of()
+}
+",
+        ),
+    ]);
+
+    let target = definition(&analyzer, "lib.Greeter.Companion.of");
+    let hits = external_hits(&usages(&analyzer, &target));
+    assert_hit_line(&hits, 7);
+    assert_hit_line(&hits, 12);
+}
+
+#[test]
+fn kotlin_extension_function_call_reports_the_extension_declaration() {
+    // An extension is reached through the type it extends, not through the file
+    // that declares it, so the receiver must be typed as `Greeter` for the call
+    // to name `lib.shout`.
+    let (_project, analyzer) = kotlin_workspace(&[
+        ("src/lib/Greeter.kt", GREETER_KT),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.Greeter
+import lib.shout
+
+fun run(greeter: Greeter): String {
+
+    return greeter.shout()
+}
+
+fun notTheExtension(other: String): Int {
+
+    return other.length
+}
+",
+        ),
+    ]);
+
+    let target = definition(&analyzer, "lib.shout");
+    let hits = external_hits(&usages(&analyzer, &target));
+    assert_hit_line(&hits, 8);
+    assert_hit_text(&hits, 8, "greeter.shout");
+}
+
+#[test]
+fn kotlin_top_level_function_call_reports_in_the_same_package_and_through_an_import() {
+    let (_project, analyzer) = kotlin_workspace(&[
+        (
+            "src/lib/Tools.kt",
+            "package lib
+
+fun helper(): Int = 1
+",
+        ),
+        (
+            "src/lib/Same.kt",
+            "package lib
+
+fun samePackage(): Int {
+
+    return helper()
+}
+",
+        ),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.helper
+
+fun imported(): Int {
+
+    return helper()
+}
+",
+        ),
+    ]);
+
+    let target = definition(&analyzer, "lib.helper");
+    let hits = external_hits(&usages(&analyzer, &target));
+    assert_hit_line(&hits, 5);
+    assert_hit_line(&hits, 7);
+}
+
+#[test]
+fn kotlin_constructor_call_reports_the_primary_constructor() {
+    let (_project, analyzer) = kotlin_workspace(&[
+        (
+            "src/lib/Book.kt",
+            "package lib
+
+class Book(val title: String)
+",
+        ),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.Book
+
+fun make(): Book {
+
+    return Book(\"x\")
+}
+",
+        ),
+    ]);
+
+    let target = definition(&analyzer, "lib.Book.Book");
+    let hits = external_hits(&usages(&analyzer, &target));
+    assert_hit_line(&hits, 7);
+}
+
+#[test]
+fn kotlin_wrong_arity_call_is_not_reported() {
+    let (_project, analyzer) = kotlin_workspace(&[
+        (
+            "src/lib/Book.kt",
+            "package lib
+
+class Book(val title: String, val copies: Int)
+
+fun only(one: Int): Int = one
+",
+        ),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.only
+
+fun run(): Int {
+
+    return only(1, 2)
+}
+",
+        ),
+    ]);
+
+    let target = definition(&analyzer, "lib.only");
+    let hits = hits(&usages(&analyzer, &target));
+    assert_no_hit_line(&hits, 7);
+}
+
+#[test]
+fn kotlin_default_parameter_call_with_fewer_arguments_and_a_trailing_lambda_are_reported() {
+    let (_project, analyzer) = kotlin_workspace(&[
+        (
+            "src/lib/Tools.kt",
+            "package lib
+
+fun checkout(title: String, copies: Int = 1): Int = copies
+
+fun withBlock(name: String, block: () -> Int): Int = block()
+",
+        ),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.checkout
+import lib.withBlock
+
+fun defaulted(): Int {
+
+    return checkout(\"x\")
+}
+
+fun trailing(): Int {
+
+    return withBlock(\"x\") { 1 }
+}
+",
+        ),
+    ]);
+
+    let checkout = definition(&analyzer, "lib.checkout");
+    assert_hit_line(&external_hits(&usages(&analyzer, &checkout)), 8);
+
+    // The trailing lambda is an argument even though it sits outside the
+    // parentheses; without counting it the call looks one argument short of its
+    // own declaration.
+    let with_block = definition(&analyzer, "lib.withBlock");
+    assert_hit_line(&external_hits(&usages(&analyzer, &with_block)), 13);
+}
+
+#[test]
+fn kotlin_safe_call_and_not_null_assertion_report_like_a_plain_call() {
+    let (_project, analyzer) = kotlin_workspace(&[
+        ("src/lib/Greeter.kt", GREETER_KT),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.Greeter
+
+fun safe(greeter: Greeter?): String? {
+
+    return greeter?.greet(\"world\")
+}
+
+fun asserted(greeter: Greeter?): String {
+
+    return greeter!!.greet(\"world\")
+}
+",
+        ),
+    ]);
+
+    let target = definition(&analyzer, "lib.Greeter.greet");
+    let hits = external_hits(&usages(&analyzer, &target));
+    assert_hit_line(&hits, 7);
+    assert_hit_line(&hits, 12);
+}
+
+#[test]
+fn kotlin_call_result_chain_reports_the_second_member() {
+    // `Greeter.of().greet(...)` can only be resolved by knowing what `of()`
+    // returns, which is the published return type issue #1345 records.
+    let (_project, analyzer) = kotlin_workspace(&[
+        ("src/lib/Greeter.kt", GREETER_KT),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.Greeter
+
+fun run(): String {
+
+    return Greeter.of().greet(\"world\")
+}
+",
+        ),
+    ]);
+
+    let target = definition(&analyzer, "lib.Greeter.greet");
+    let hits = external_hits(&usages(&analyzer, &target));
+    assert_hit_line(&hits, 7);
+    assert_hit_text(&hits, 7, "Greeter.of().greet");
+}
+
+#[test]
+fn kotlin_property_access_reports_reads_and_writes_as_one_property() {
+    let (_project, analyzer) = kotlin_workspace(&[
+        (
+            "src/lib/Counter.kt",
+            "package lib
+
+class Counter {
+
+    var count: Int = 0
+}
+",
+        ),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.Counter
+
+fun run(counter: Counter): Int {
+
+    counter.count = 1
+
+    return counter.count
+}
+",
+        ),
+    ]);
+
+    let target = definition(&analyzer, "lib.Counter.count");
+    let hits = external_hits(&usages(&analyzer, &target));
+    assert_hit_line(&hits, 7);
+    assert_hit_line(&hits, 9);
+}
+
+#[test]
+fn kotlin_shadowing_local_is_not_reported_as_a_property_reference() {
+    let (_project, analyzer) = kotlin_workspace(&[(
+        "src/lib/Counter.kt",
+        "package lib
+
+class Counter {
+
+    var count: Int = 0
+
+    fun shadowed(): Int {
+
+        val count: Int = 5
+
+        return count
+    }
+}
+",
+    )]);
+
+    let target = definition(&analyzer, "lib.Counter.count");
+    let hits = hits(&usages(&analyzer, &target));
+    assert_no_hit_line(&hits, 11);
+}
+
+#[test]
+fn kotlin_enum_entry_reference_reports_the_entry() {
+    let (_project, analyzer) = kotlin_workspace(&[
+        (
+            "src/lib/Genre.kt",
+            "package lib
+
+enum class Genre {
+
+    FICTION,
+    REFERENCE
+}
+",
+        ),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.Genre
+
+fun run(): Genre {
+
+    return Genre.FICTION
+}
+",
+        ),
+    ]);
+
+    let target = definition(&analyzer, "lib.Genre.FICTION");
+    let hits = external_hits(&usages(&analyzer, &target));
+    assert_hit_line(&hits, 7);
+}
+
+#[test]
+fn kotlin_callable_reference_reports_the_function() {
+    let (_project, analyzer) = kotlin_workspace(&[
+        (
+            "src/lib/Tools.kt",
+            "package lib
+
+fun helper(): Int = 1
+",
+        ),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.helper
+
+fun run(): () -> Int {
+
+    return ::helper
+}
+",
+        ),
+    ]);
+
+    let target = definition(&analyzer, "lib.helper");
+    let hits = external_hits(&usages(&analyzer, &target));
+    assert_hit_line(&hits, 7);
+}
+
+#[test]
+fn kotlin_implicit_this_and_own_type_companion_calls_are_same_owner_not_external_usages() {
+    // #1014 facet B, the uniform cross-language policy: a reference whose
+    // receiver is the current instance or the own type is recorded and then
+    // excluded from the external usage surface. Without it every private helper
+    // called only from its own class would look used.
+    let (_project, analyzer) = kotlin_workspace(&[(
+        "src/lib/Greeter.kt",
+        "package lib
+
+open class Greeter {
+
+    fun greet(name: String): String = name
+
+    fun implicitThis(): String = greet(\"a\")
+
+    fun explicitThis(): String = this.greet(\"b\")
+
+    fun viaCompanionHost(): String = Greeter.helper()
+
+    companion object {
+
+        fun helper(): String = \"c\"
+    }
+}
+",
+    )]);
+
+    let greet = definition(&analyzer, "lib.Greeter.greet");
+    let result = usages(&analyzer, &greet);
+    assert!(
+        external_hits(&result).is_empty(),
+        "self calls must not appear on the external usage surface, got {:#?}",
+        external_hits(&result)
+    );
+    // They are still recorded, and still visible to an editor's find-references.
+    let editor = hits(&result);
+    assert_hit_line(&editor, 7);
+    assert_hit_line(&editor, 9);
+    assert!(
+        editor
+            .iter()
+            .all(|hit| hit.kind == UsageHitKind::SelfReceiver),
+        "every self call must be classified as a same-owner hit, got {editor:#?}"
+    );
+
+    // An own-type companion access from inside the class is same-owner too.
+    let helper = definition(&analyzer, "lib.Greeter.Companion.helper");
+    assert!(
+        external_hits(&usages(&analyzer, &helper)).is_empty(),
+        "an own-type companion access is same-owner, not an external usage"
+    );
+}
+
+#[test]
+fn kotlin_call_through_another_variable_of_the_owner_type_stays_external() {
+    // The other half of the same-owner rule: same *type* is not same *owner*.
+    // A call through a different object is a real external usage even from
+    // inside the declaring class.
+    let (_project, analyzer) = kotlin_workspace(&[(
+        "src/lib/Greeter.kt",
+        "package lib
+
+class Greeter {
+
+    fun greet(name: String): String = name
+
+    fun viaOther(other: Greeter): String {
+
+        return other.greet(\"a\")
+    }
+}
+",
+    )]);
+
+    let target = definition(&analyzer, "lib.Greeter.greet");
+    let hits = external_hits(&usages(&analyzer, &target));
+    assert_hit_line(&hits, 9);
+}
+
+#[test]
+fn kotlin_super_call_is_an_external_usage() {
+    // `super.greet()` names the ancestor's declaration from outside it, so it
+    // stays on the external surface — matching Java.
+    let (_project, analyzer) = kotlin_workspace(&[
+        ("src/lib/Greeter.kt", GREETER_KT),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.Greeter
+
+class Loud : Greeter() {
+
+    override fun greet(name: String): String {
+
+        return super.greet(name)
+    }
+}
+",
+        ),
+    ]);
+
+    let target = definition(&analyzer, "lib.Greeter.greet");
+    let hits = external_hits(&usages(&analyzer, &target));
+    assert_hit_line(&hits, 9);
+    assert!(
+        hits.iter()
+            .filter(|hit| hit.line == 9)
+            .all(|hit| hit.kind != UsageHitKind::SelfReceiver),
+        "a super call is not a same-owner hit, got {hits:#?}"
+    );
+}
+
+#[test]
+fn kotlin_unresolvable_receiver_is_reported_as_unproven_not_proven() {
+    // A lambda parameter has no written type and Kotlin infers it, which is
+    // semantic work this issue does not do. The call site must still be visible:
+    // reporting it as proven would be a guess, and dropping it would let a
+    // declaration reachable only this way read as confidently dead.
+    let (_project, analyzer) = kotlin_workspace(&[
+        ("src/lib/Greeter.kt", GREETER_KT),
+        (
+            "src/app/App.kt",
+            "package app
+
+fun run(items: List<String>): List<String> {
+
+    return items.map { each -> each.greet(\"world\") }
+}
+",
+        ),
+    ]);
+
+    let target = definition(&analyzer, "lib.Greeter.greet");
+    let result = usages(&analyzer, &target);
+    assert!(
+        external_hits(&result).is_empty(),
+        "an unproven receiver must not produce a proven hit, got {:#?}",
+        external_hits(&result)
+    );
+    let unproven = unproven_hits(&result);
+    assert!(
+        unproven.iter().any(|hit| hit.line == 5),
+        "expected an unproven hit on line 5, got {unproven:#?}"
+    );
+}
+
+#[test]
+fn kotlin_named_argument_label_is_not_a_usage_of_a_same_named_property() {
+    // A label names a parameter, and Kotlin parameters are not indexed as
+    // `CodeUnit`s, so there is no target for the hit to be *of*. Asserted so the
+    // choice is not mistaken for an oversight.
+    let (_project, analyzer) = kotlin_workspace(&[
+        (
+            "src/lib/Book.kt",
+            "package lib
+
+class Book {
+
+    var title: String = \"\"
+}
+
+fun rename(title: String): String = title
+",
+        ),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.rename
+
+fun run(): String {
+
+    return rename(title = \"x\")
+}
+",
+        ),
+    ]);
+
+    let target = definition(&analyzer, "lib.Book.title");
+    let hits = hits(&usages(&analyzer, &target));
+    assert_no_hit_line(&hits, 7);
+}
+
+#[test]
+fn kotlin_dual_namespace_type_and_function_of_one_name_do_not_collide() {
+    // Kotlin has separate namespaces for types and values, so a class `Marker`
+    // and a function `Marker` are two declarations and a query for one must not
+    // report the other's references.
+    let (_project, analyzer) = kotlin_workspace(&[
+        (
+            "src/lib/Marker.kt",
+            "package lib
+
+class Marker
+
+fun Marker(): Int = 1
+",
+        ),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.Marker
+
+fun typePosition(value: Marker): Marker {
+
+    return value
+}
+",
+        ),
+    ]);
+
+    let function = definition(&analyzer, "lib.Marker");
+    let type_unit = analyzer
+        .get_definitions("lib.Marker")
+        .into_iter()
+        .find(brokk_bifrost::CodeUnit::is_class)
+        .expect("the class `lib.Marker` must be indexed alongside the function of the same name");
+    assert!(
+        !function.is_class() || !type_unit.is_class() || function == type_unit,
+        "fixture must declare both a type and a value named Marker"
+    );
+
+    // The written type positions belong to the class, not to the function.
+    let hits = hits(&usages(&analyzer, &type_unit));
+    assert_hit_line(&hits, 5);
 }
 
 #[test]

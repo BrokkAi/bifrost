@@ -40,7 +40,7 @@ fn run(
         .expect("query result should serialize")
 }
 
-fn direct_allocation_cases() -> [DirectAllocationCase; 7] {
+fn direct_allocation_cases() -> [DirectAllocationCase; 8] {
     [
         DirectAllocationCase {
             language: "cpp",
@@ -151,6 +151,75 @@ func composed() {
             enclosing_name: "direct",
             member_name: "Run",
             cap_operation: "member_targets",
+            expected_outcome: "precise",
+            expected_value_kind: "allocation_site",
+            declaration_field: "type_declaration",
+            expected_type_suffix: "Service",
+        },
+        DirectAllocationCase {
+            language: "kotlin",
+            path: "Receiver.kt",
+            direct_source: r#"class Service {
+    fun run() {}
+}
+
+class Other {
+    fun run() {}
+}
+
+object Caller {
+    fun direct() {
+        val service: Service = Service()
+        service.run()
+    }
+}
+"#,
+            cap_source: r#"class Service {
+    fun run() {}
+}
+
+object Caller {
+    fun capped(which: Int) {
+        val service: Service
+        if (which == 0) {
+            service = Service()
+        } else if (which == 1) {
+            service = Service()
+        } else if (which == 2) {
+            service = Service()
+        } else if (which == 3) {
+            service = Service()
+        } else {
+            service = Service()
+        }
+        service.run()
+    }
+}
+"#,
+            cap_extra_files: NO_EXTRA_FILES,
+            composition_source: r#"class Service {
+    fun run() {}
+}
+
+class Other {
+    fun run() {}
+}
+
+object Caller {
+    fun consume(value: Service) {}
+
+    fun composed() {
+        consume(Service())
+    }
+}
+"#,
+            enclosing_kind: "method",
+            enclosing_name: "direct",
+            member_name: "run",
+            // Kotlin member resolution answers with the nearest declaration
+            // rather than every same-named one, so the candidate cap is
+            // exercised through five live allocations instead of five members.
+            cap_operation: "points_to",
             expected_outcome: "precise",
             expected_value_kind: "allocation_site",
             declaration_field: "type_declaration",

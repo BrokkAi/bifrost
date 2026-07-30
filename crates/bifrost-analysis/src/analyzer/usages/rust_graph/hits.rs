@@ -59,9 +59,18 @@ fn record_token_tree_qualified_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             }
         };
         let root_shadowed = path_root_shadowed(&segment.path, ctx);
+        let imported_type_prefix_matches = segment.role == RustTokenPathRole::Prefix
+            && ctx.target_is_path_qualifier
+            && segments.len() == 1
+            && ctx.matches_identifier(
+                segments[0],
+                segment.node.start_byte(),
+                RustReferenceNamespace::Type,
+            );
         if !segments.is_empty()
             && !root_shadowed
-            && (ctx.matches_unique_resolved_fqn_in_namespace(&segment.fqn, namespace)
+            && (imported_type_prefix_matches
+                || ctx.matches_unique_resolved_fqn_in_namespace(&segment.fqn, namespace)
                 || ctx.matches_path(
                     &segments,
                     segment.node.start_byte(),

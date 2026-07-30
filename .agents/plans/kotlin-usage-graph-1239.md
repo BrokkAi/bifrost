@@ -75,15 +75,30 @@ reports call relationships in both directions.
       28 tests. Found and fixed three real defects on the way — duplicate-fqn fail-closed, `typealias` misclassified as
       a property, and generic parameters not shadowing a same-named class — all recorded in
       `Surprises & Discoveries`.
-- [ ] Milestone 2: query path for constructors, functions, and properties. Per the revised decision below, this now
-      starts by promoting #1238's `KotlinCtx` into a shared `analyzer/kotlin/semantics.rs` and calling it, rather than
-      reimplementing receiver typing and member lookup. Remaining: receiver typing, companions, objects, inheritance,
-      extensions, overload arity, callable references, override declarations, and the unproven/same-owner hit channels
-      (both trimmed out of milestone 1 because a written type reference is never uncertain).
+- [x] (2026-07-30) Issue #1345: Kotlin `SignatureMetadata` now publishes the *written* return type and, for an
+      extension, the receiver type it extends; Kotlin properties (including `val`/`var` constructor parameters) carry
+      metadata at all for the first time. Both are recorded as the *spelled nominal* name — `lib.Base` for `lib.Base?`,
+      `List` for `List<String>` — because what a consumer does with them is resolve them in the writing file's scope,
+      and the full written form is already in the rendered signature label. `usages/get_definition/kotlin.rs` reads the
+      published facts first and keeps its syntax re-read only for what the index cannot publish (an unwritten type
+      inferred from an initializer, an enum entry's own enum, a declaration parse recovery dropped). Kotlin
+      `lang_epoch!` salt gained `kotlin-signature-returns-receivers-2026-07`. Cost, 2 000 Kotlin declarations over 200
+      files, cold build, debug profile, five runs: 2171/2176/2124/2174/2150 ms before, 2290/2262/2296/2224/2450 ms
+      after — about +5 % — against #568's +132 % precedent, and it is *added structured reads inside the existing
+      declaration walk*, not a reparse. See `Surprises & Discoveries`.
+- [x] (2026-07-30) Milestone 2: the query path is complete for every target kind. Constructors, functions, and
+      properties resolve through receiver typing, inheritance, companions, objects, extensions, overload arity,
+      callable references, override declarations, top-level declarations, and receiver chains, with the unproven and
+      same-owner channels wired. `usages_kotlin_graph_test.rs` 29 → 50; `suite_usages` 1371 → 1392.
+      `kotlin_callable_target_abstains_with_a_specific_diagnostic` deleted as the plan prescribed. Two real defects
+      found on the way, both in `Surprises & Discoveries`: a property *write* parses as
+      `directly_assignable_expression` rather than `navigation_expression`, and a Kotlin top-level callable has no
+      indexed owner at all.
 - [ ] Milestone 3: inverted edge builder; `usage_graph`, `callers`, `callees`, relevance, and dead code light up.
-      Wants #1345 (publish Kotlin return types and extension receivers in `SignatureMetadata`) landed before or
-      alongside it — see the sequencing note in `Milestone 2` for why the reparse path is fine for the query path and
-      not for the whole-workspace pass.
+      #1345 has landed, so the builder should be written against the published facts from the start — the
+      per-declaration reparse path it was going to need no longer exists. `kotlin_graph/shared.rs` still has no
+      `UsageEdgeResolver` impl and `usages/workspace_graph.rs:390-406` / `searchtools/scan_usages.rs:2486-2490` still
+      run only the Java and Scala builders over the `Jvm` realm.
 - [ ] Milestone 4: cross-language JVM symmetry — Kotlin call sites for Java/Scala targets and vice versa.
 - [ ] Milestone 5: rename reference rewriting, the abstention matrix, dead-code bulk eligibility, capability notes.
 
@@ -160,6 +175,38 @@ reports call relationships in both directions.
   Consequence: the Decision Log entry "the graph module does not call `resolve_kotlin`" is still right about
   `resolve_kotlin` itself, but wrong about the layer beneath it. See the revised decision below; milestone 2's plan
   changes from "reimplement receiver typing" to "promote the semantic layer and call it".
+
+- Observation: a Kotlin property *write* is not a `navigation_expression`. `counter.count = 1` parses as
+  `(assignment (directly_assignable_expression (simple_identifier) (navigation_suffix (simple_identifier))) …)` — a
+  distinct node kind with the *identical* shape, receiver then `navigation_suffix`. The first milestone-2 property arm
+  matched only `navigation_expression` and so reported a property's reads and not its writes, even though the index
+  records one `Field` unit for both.
+  Evidence: `kotlin_property_access_reports_reads_and_writes_as_one_property` failed with the read reported and the
+  write absent; confirmed against `vendor/tree-sitter-kotlin/src/node-types.json`, which lists
+  `directly_assignable_expression` with `navigation_suffix` among its children.
+  Fixed with a shared `kotlin_is_navigation_kind` predicate in `analyzer/kotlin/syntax.rs`, so every consumer that
+  means "receiver.member" accepts both kinds rather than each remembering the second one.
+
+- Observation: a Kotlin top-level function or property has **no indexed owner** — `analyzer.parent_of` returns `None`,
+  because Kotlin genuinely declares it straight into a package and this language has no synthetic file-scope unit (its
+  `lang_epoch!` salt carries no `synthetic-file-scope-code-units` token, unlike nine of the other ten). Milestone 1's
+  `TargetSpec::from_target` did `let owner = analyzer.parent_of(target)?`, so every top-level target would have
+  abstained with `unsupported_target_shape` — reporting "not supported" for what is Kotlin's most idiomatic
+  declaration form.
+  Evidence: `kotlin_top_level_function_call_reports_in_the_same_package_and_through_an_import` and
+  `kotlin_callable_reference_reports_the_function`, both of which target `lib.helper`.
+  Fixed by making `TargetSpec::owner` an `Option` and modelling an owner-less target as one named through the file's
+  own scope with no receiver at all, rather than by inventing an owner the index does not have.
+
+- Observation: whether a nested `object` is a `companion object` is **not published by the index** — a companion and an
+  ordinary nested object are both nested classes, and the `Companion` default name is a name-resolution rule a source
+  file may override, so it cannot be read off the identity. #1238 answers the question by re-reading the declaring
+  file's syntax, and milestone 2 does the same. That is bounded here — a query has one target, so it asks once — but
+  the *inverted* builder asks it per callee owner, which is exactly the shape #1345 existed to remove.
+  Consequence for milestone 3: publish companion-ness as an indexed fact (a `SignatureMetadata` flag or a dedicated
+  provider) before the edge builder needs it, or the builder reintroduces a per-declaration reparse. Recorded as a
+  follow-up rather than done here, because it is a second extractor-behaviour change and #1345 was scoped to return
+  types and receivers.
 
 ## Coverage parity with Java and Scala
 
@@ -281,6 +328,27 @@ the first language where rename was gated on the usage graph landing.
   milestone 3 therefore keeps its own file-local walk and consults the shared layer only for the per-declaration facts,
   behind the `Mutex`-guarded caches milestone 2 introduces.
   Date/Author: 2026-07-30, David Baker Effendi (agent).
+
+- Decision (revised 2026-07-30, supersedes the previous entry as it applies to *milestone 2*): the query path builds
+  its own receiver typing in `kotlin_graph/resolver.rs` on top of the shared syntax readers, the shared name ladder,
+  and the facts #1345 now publishes — it does not construct or call `KotlinCtx`.
+  Rationale: the previous entry's premise was that `KotlinCtx` is the only place the "Kotlin facts the index does not
+  publish" live. #1345 changed that premise for the two facts that mattered: what a declaration declares, and what an
+  extension extends are now *published*, so reading them needs a lookup rather than a per-request parse cache. What is
+  left in `KotlinCtx` — an `Rc`/`RefCell` file-syntax cache, per-cursor scope construction — is precisely what makes it
+  neither `Send` nor `Sync`, and milestone 3's builder cannot hold it. Writing milestone 2 against `KotlinCtx` would
+  therefore have meant writing milestone 3 against something else, which is the drift the sharing was supposed to
+  prevent. Both paths now share the *published facts* and the *name ladder* instead, which is a stronger seam: it is
+  the index, not a cache, so navigation and usages cannot disagree without the index itself being wrong. One fact is
+  still unpublished and still read from syntax — whether a nested object is a companion — and `Surprises &
+  Discoveries` records why that must be published before milestone 3.
+  Date/Author: 2026-07-30, agent.
+
+- Decision: `METHOD_RECEIVER_CHAIN_LIMIT` is shared with Java rather than restated, by widening
+  `java_graph::return_type` to `pub(super)` and the constant to `pub(in crate::analyzer::usages)`.
+  Rationale: the plan called for it, and a second constant would let the two JVM languages report different budgets for
+  the same shape of expression. Two lines of visibility, no behaviour change to Java.
+  Date/Author: 2026-07-30, agent.
 
 - Decision: resolve names in the graph builders through a realm-aware predicate rather than through
   `KotlinAnalyzer::resolve_type_name_in_file`.

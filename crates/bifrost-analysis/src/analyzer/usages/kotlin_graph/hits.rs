@@ -5,16 +5,22 @@
 //! `IAnalyzer::enclosing_code_unit`, cached per byte range because a single
 //! reference is asked about several times while it is being classified.
 //!
-//! [`push_hit`] records a *proven* reference: one whose identity the scan
-//! established. Milestone 2 of issue #1239 adds the other two channels the
-//! cross-language contract defines -- unproven hits, for a reference that might
-//! name the target but could not be proven, and same-owner hits, for a proven
-//! reference whose receiver is the current instance (#1014 facet B). A type
-//! reference is always one or the other of proven and absent: a written type
+//! There are three channels, and keeping them apart is most of what "explicit"
+//! means in this issue's acceptance criteria. [`push_hit`] records a *proven*
+//! reference, one whose identity the scan established. [`push_unproven_hit`]
+//! records a reference that might name the target but could not be proven.
+//! [`push_self_receiver_hit`] records a proven reference whose receiver is the
+//! current instance or the own type, which the cross-language contract of #1014
+//! facet B excludes from the external usage surface.
+//!
+//! A *type* reference only ever lands in the first of the three: a written type
 //! either resolves to the target or does not, with no receiver to be unsure
-//! about.
+//! about. The other two exist for the callable and property arms.
 
-use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, reclassify_import_hit_at, usage_hit};
+use crate::analyzer::usages::common::{
+    SNIPPET_CONTEXT_LINES, reclassify_import_hit_at, reclassify_override_declaration_hit_at,
+    reclassify_self_receiver_hit_at, usage_hit,
+};
 use crate::analyzer::usages::kotlin_graph::extractor::ScanCtx;
 use crate::analyzer::{CodeUnit, Range};
 use crate::text_utils::{find_line_index_for_offset, snippet_around_line};
@@ -58,6 +64,55 @@ pub(super) fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 pub(super) fn push_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit(node, ctx);
     reclassify_import_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
+}
+
+/// Record a declaration that overrides the target as a reference to it.
+pub(super) fn push_override_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    push_hit(node, ctx);
+    reclassify_override_declaration_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
+}
+
+/// Record `node` as a same-owner receiver hit (#1014 facet B): a reference whose
+/// receiver is the current instance (`this`, implicit-`this`) or the own type
+/// itself, as a companion access from inside the companion's class is.
+///
+/// It is recorded and *then* reclassified, so it is still counted and
+/// inspectable as a same-owner site while being excluded from the external usage
+/// surface. Without that exclusion every private helper called only from its own
+/// class would look used. `super` is deliberately not routed here: a `super`
+/// call names an ancestor's declaration from outside it.
+pub(super) fn push_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    push_hit(node, ctx);
+    reclassify_self_receiver_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
+}
+
+/// Record a reference that *might* name the target but could not be proven —
+/// most often because the receiver's type could not be established.
+///
+/// This is the channel that keeps "we don't know" from collapsing into either
+/// "yes" or "no". It is surfaced separately in the result and excluded from
+/// proven-edge consumers, so a declaration reachable only through unproven
+/// references reads as inconclusive rather than as confidently dead.
+pub(super) fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let start = node.start_byte();
+    let line_idx = find_line_index_for_offset(ctx.line_starts, start);
+    let Some(enclosing) = enclosing_context(node, ctx).enclosing.clone() else {
+        return;
+    };
+    if enclosing == ctx.spec.target {
+        return;
+    }
+    ctx.unproven_hits.insert(
+        usage_hit(
+            ctx.file,
+            line_idx,
+            start,
+            node.end_byte(),
+            enclosing,
+            snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
+        )
+        .into_unproven(),
+    );
 }
 
 /// The declaration enclosing `node`.

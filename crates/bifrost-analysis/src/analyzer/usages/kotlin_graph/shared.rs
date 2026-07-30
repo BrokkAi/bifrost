@@ -6,9 +6,14 @@
 //! [`UsageQueryResolver`]; the companion [`crate::analyzer::usages::traits::UsageEdgeResolver`]
 //! arrives with milestone 3 of issue #1239, and until then Kotlin contributes no
 //! edges — the status quo the workspace graph already records.
+//!
+//! The scan is restricted to Kotlin files. A Kotlin target referenced from Java
+//! or Scala source is milestone 4; until it lands, such a reference is missing
+//! from the result rather than reported, which is the same one-directional gap
+//! Java's own cross-language support had before it grew `jvm_scala.rs`.
 
 use super::extractor::{ScanState, scan_file};
-use super::resolver::{TargetKind, TargetSpec};
+use super::resolver::TargetSpec;
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
@@ -55,21 +60,6 @@ impl<'a> UsageQueryResolver<'a> for KotlinQueryResolver {
         };
         drop(_spec_scope);
 
-        // Milestone 1 of issue #1239 resolves references to Kotlin types. A
-        // callable or property target abstains with a specific diagnostic rather
-        // than returning an empty success, so a caller can tell "this has no
-        // references" from "this is not implemented yet".
-        if spec.kind != TargetKind::Type {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsupportedTargetShape(
-                    "Kotlin usage analysis resolves type references only; callable and property \
-                     references are issue #1239 milestone 2",
-                ),
-                "KotlinUsageGraphStrategy",
-            );
-        }
-
         let _select_scope = crate::profiling::scope("kotlin_graph::select_files");
         let mut files: HashSet<ProjectFile> = scan_scope
             .candidate_files()
@@ -92,11 +82,13 @@ impl<'a> UsageQueryResolver<'a> for KotlinQueryResolver {
         drop(_select_scope);
 
         let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
+        let mut unproven_hits: BTreeSet<UsageHit> = BTreeSet::new();
         let mut raw_match_count = 0usize;
         let mut limit_exceeded = false;
         let mut state = ScanState {
             max_usages,
             hits: &mut hits,
+            unproven_hits: &mut unproven_hits,
             raw_match_count: &mut raw_match_count,
             limit_exceeded: &mut limit_exceeded,
         };
@@ -120,13 +112,15 @@ impl<'a> UsageQueryResolver<'a> for KotlinQueryResolver {
             });
         }
 
-        // No unproven channel yet: a written type either resolves to the target
-        // or does not, with no receiver to be uncertain about. Milestone 2's
-        // callable and property arms are what introduce unproven hits.
+        // A reference the scan could not prove is reported in its own channel
+        // rather than as a proven hit or as silence. A type reference never
+        // lands there — a written type either resolves to the target or does not,
+        // with no receiver to be uncertain about — but a call through a receiver
+        // whose type could not be established does.
         GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven(
             target.clone(),
             hits,
-            BTreeSet::new(),
+            unproven_hits,
         ))
     }
 }

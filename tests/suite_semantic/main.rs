@@ -21,6 +21,7 @@ mod dataflow_clients;
 mod dataflow_ide;
 mod dataflow_summaries;
 mod dataflow_tabulation;
+mod external_artifact_pack;
 mod icfg_contract;
 mod measure_analyzer_persisted_memory;
 mod measure_dataflow_lifecycle;
@@ -51,6 +52,7 @@ mod semantic_provider_contract;
 #[cfg(feature = "nlp")]
 mod semantic_search;
 mod semantic_value_cpp_contract;
+mod semantic_value_kotlin_contract;
 mod semantic_value_language_contract;
 mod semantic_value_php_contract;
 mod semantic_value_python_contract;

@@ -444,6 +444,105 @@ println(libraryCoordinate("core"))
     );
 }
 
+/// Issue #1345: the index publishes what a Kotlin declaration *wrote* for its
+/// return type and, for an extension, its receiver.
+///
+/// Both were previously recoverable only by re-reading and re-parsing the
+/// declaring file, which is affordable for one cursor position and not for the
+/// whole-workspace usage-edge pass that asks the same question of every
+/// reference.
+#[test]
+fn kotlin_signature_metadata_publishes_written_return_types_and_extension_receivers() {
+    let (_built, analyzer) = kotlin_analyzer(&[("src/Library.kt", LIBRARY_KT)]);
+    let facts = |fq: &str| -> (Option<String>, Option<String>) {
+        let unit = analyzer.get_definitions(fq).remove(0);
+        let metadata = analyzer
+            .signature_metadata(&unit)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("{fq} must carry signature metadata"));
+        (
+            metadata.return_type_text().map(str::to_string),
+            metadata.extension_receiver_type().map(str::to_string),
+        )
+    };
+
+    assert_eq!(
+        facts("com.example.library.Book.describe"),
+        (Some("String".to_string()), None),
+        "an ordinary member function publishes its return type and no receiver"
+    );
+    assert_eq!(
+        facts("com.example.library.stamp"),
+        (Some("Book".to_string()), Some("Book".to_string())),
+        "an extension publishes both what it returns and what it extends"
+    );
+    assert_eq!(
+        facts("com.example.library.checkout").0,
+        Some("List".to_string()),
+        "a generic return type publishes its nominal name, which is what a \
+         consumer resolves; the arguments stay in the rendered signature"
+    );
+    assert_eq!(
+        facts("com.example.library.Book.available"),
+        (Some("Boolean".to_string()), None),
+        "a property publishes the type it declares"
+    );
+    assert_eq!(
+        facts("com.example.library.Book.title").0,
+        Some("String".to_string()),
+        "a val constructor parameter is a property and publishes its type too"
+    );
+    assert_eq!(
+        facts("com.example.library.Catalog.shelve"),
+        (None, None),
+        "a function that writes no return type is absent, not empty: a consumer \
+         must be able to tell `not written` from `written as nothing`"
+    );
+}
+
+/// Issue #1345: the published facts must survive into `.kts`, whose declarations
+/// go through the same walk but sit at script top level rather than in a package.
+#[test]
+fn kts_scripts_publish_written_return_types_and_extension_receivers() {
+    let (_built, analyzer) = kotlin_analyzer(&[(
+        "build.gradle.kts",
+        r#"val libraryVersion: String = "1.2.3"
+
+fun libraryCoordinate(name: String): String = "com.example:$name:$libraryVersion"
+
+fun String.shout(): String = uppercase()
+
+fun untyped() = 1
+"#,
+    )]);
+    let metadata_of = |fq: &str| {
+        let unit = analyzer.get_definitions(fq).remove(0);
+        analyzer
+            .signature_metadata(&unit)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("{fq} must carry signature metadata"))
+    };
+
+    assert_eq!(
+        metadata_of("libraryCoordinate").return_type_text(),
+        Some("String")
+    );
+    assert_eq!(
+        metadata_of("libraryVersion").return_type_text(),
+        Some("String")
+    );
+    let shout = metadata_of("shout");
+    assert_eq!(shout.extension_receiver_type(), Some("String"));
+    assert_eq!(shout.return_type_text(), Some("String"));
+    assert_eq!(
+        metadata_of("untyped").return_type_text(),
+        None,
+        "an expression body with no written type infers nothing at index time"
+    );
+}
+
 #[test]
 fn incremental_update_tracks_edits_and_preserves_untouched_identities() {
     let (built, analyzer) = kotlin_analyzer(&[
@@ -512,9 +611,9 @@ fn mixed_language_workspace_routes_kotlin_and_java() {
     assert!(analyzer.is_analyzed(&kotlin_file));
     assert!(analyzer.is_analyzed(&java_file));
 
-    // Semantic materialization stays explicitly unsupported for Kotlin until
-    // issue #1241 — asserted by materializing, not merely by the provider
-    // being present, so wiring Kotlin to a working lowerer would fail here.
+    // Semantic materialization is live for Kotlin (#1241) — asserted by
+    // materializing, not merely by the provider being present, so unwiring the
+    // lowerer would fail here.
     let cancellation = brokk_bifrost::analyzer::semantic::CancellationToken::default();
     let mut budget = brokk_bifrost::analyzer::semantic::SemanticBudget::default();
     let outcome = workspace
@@ -526,28 +625,21 @@ fn mixed_language_workspace_routes_kotlin_and_java() {
             ),
         )
         .expect("Kotlin semantics must resolve to an outcome, not an error");
+    let brokk_bifrost::analyzer::semantic::SemanticOutcome::Complete {
+        value: artifact, ..
+    } = outcome
+    else {
+        panic!("Kotlin program semantics must materialize completely: {outcome:?}");
+    };
     assert!(
-        matches!(
-            outcome,
-            brokk_bifrost::analyzer::semantic::SemanticOutcome::Unsupported { .. }
-        ),
-        "Kotlin program semantics must be explicitly Unsupported until #1241: {outcome:?}"
-    );
-
-    // Structural CodeQuery/RQL likewise stays absent until issue #1240.
-    let kotlin_only = InlineTestProject::with_language(Language::Kotlin)
-        .file(
-            "src/Only.kt",
-            "package only
-
-class Only
-",
-        )
-        .build();
-    let kotlin_analyzer = KotlinAnalyzer::new(kotlin_only.project_dyn());
-    assert!(
-        kotlin_analyzer.structural_search_providers().is_empty(),
-        "Kotlin must expose no structural search provider yet"
+        artifact.procedures().iter().any(|procedure| procedure
+            .locator()
+            .declaration()
+            .segments()
+            .last()
+            .and_then(|segment| segment.name())
+            == Some("serve")),
+        "Kotlin lowering must publish the file's declared method"
     );
 }
 

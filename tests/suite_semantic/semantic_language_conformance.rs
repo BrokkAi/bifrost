@@ -739,6 +739,139 @@ fn scala_direct_call_conformance() {
 }
 
 #[test]
+fn kotlin_direct_call_conformance() {
+    assert_closed_dispatch_direct_call_conformance(DirectCallFixture {
+        language: Language::Kotlin,
+        dialect: SemanticLanguage::Standard(Language::Kotlin),
+        callee_path: "src/Leaf.kt",
+        callee_source: r#"package lib
+
+fun leaf(): Int {
+    return 7
+}
+"#,
+        callee_declaration: "fun leaf(): Int",
+        callee_name: "leaf",
+        caller_path: "src/Root.kt",
+        caller_source: r#"package app
+
+import lib.leaf
+
+fun root(): Int {
+    return leaf()
+}
+"#,
+        caller_declaration: "fun root(): Int",
+        caller_name: "root",
+        call: "leaf()",
+    });
+}
+
+/// Every Kotlin construct whose behavior the compiler generates is reported
+/// where it occurs instead of being dropped, and the four capabilities the
+/// adapter does not claim stay explicitly unsupported.
+#[test]
+fn kotlin_compiler_generated_behavior_is_capability_scoped() {
+    let source = r#"package caps
+
+class Caps {
+    val cached by lazy { compute() }
+
+    suspend fun fetch(): Int {
+        return 1
+    }
+
+    fun iterate(rows: List<Int>) {
+        for (row in rows) {
+            use(row)
+        }
+    }
+
+    fun escape(rows: List<Int>) {
+        rows.forEach {
+            return
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Kotlin)
+        .file("src/Caps.kt", source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "src/Caps.kt");
+    let capabilities = graph.artifact().capabilities();
+    for capability in [
+        SemanticCapability::AsyncSuspendResume,
+        SemanticCapability::GeneratorSuspension,
+        SemanticCapability::ConcurrentSpawn,
+        SemanticCapability::ResourceManagement,
+    ] {
+        assert!(
+            !capabilities.is_available(capability),
+            "{capability:?} has no Kotlin source syntax and must stay unsupported"
+        );
+    }
+
+    // `suspend` is a modifier, so the suspension points the compiler inserts
+    // are reported once for the whole callable.
+    assert_procedure_gap(
+        procedure_named(&graph, "fetch", ProcedureKind::Method),
+        SemanticCapability::AsyncSuspendResume,
+        SemanticGapKind::Unsupported,
+    );
+
+    // A delegated property keeps its delegate expression real — the `lazy`
+    // call and its lambda are ordinary rows — and scopes only the generated
+    // `getValue`/`setValue` dispatch.
+    let cached = procedure_named(&graph, "cached", ProcedureKind::Initializer);
+    assert_procedure_gap(
+        cached,
+        SemanticCapability::DeferredExecution,
+        SemanticGapKind::Unsupported,
+    );
+    exact_call_site(cached, source, "lazy { compute() }");
+    let delegate_lambda = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure.kind() == ProcedureKind::Lambda
+                && procedure.lexical_parent() == Some(cached.id())
+        })
+        .expect("a delegate lambda keeps its own procedure boundary");
+    exact_call_site(delegate_lambda, source, "compute()");
+
+    // `for (row in rows)` is three operator calls the source never spells.
+    assert_source_point_gap(
+        procedure_named(&graph, "iterate", ProcedureKind::Method),
+        source,
+        "row",
+        SemanticCapability::Calls,
+        SemanticGapKind::Unsupported,
+    );
+
+    // A bare `return` inside a lambda returns from the inline caller, which is
+    // control this adapter does not represent.
+    let escape = procedure_named(&graph, "escape", ProcedureKind::Method);
+    let escaping_lambda = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure.kind() == ProcedureKind::Lambda
+                && procedure.lexical_parent() == Some(escape.id())
+        })
+        .expect("a trailing lambda keeps its own procedure boundary");
+    assert_source_point_gap(
+        escaping_lambda,
+        source,
+        "return",
+        SemanticCapability::NonLocalControl,
+        SemanticGapKind::Unsupported,
+    );
+}
+
+#[test]
 fn go_direct_call_conformance() {
     assert_direct_call_conformance(DirectCallFixture {
         language: Language::Go,

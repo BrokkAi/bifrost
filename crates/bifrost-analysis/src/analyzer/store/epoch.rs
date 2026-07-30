@@ -421,11 +421,16 @@ lang_epoch!(
 // The live grammar fingerprint does not include parser tables. Keep the
 // vendored Kotlin revision in the salt so conflict-resolution-only grammar
 // changes cannot reuse analysis produced by an older parser.
+// Salt bumped (#1345): Kotlin callables now publish their written return type
+// and, for an extension, the receiver type they extend; Kotlin properties now
+// carry `SignatureMetadata` at all. Persisted rows written before this change
+// have neither, and a consumer that reads the published fact instead of
+// re-parsing would read a warm workspace as "no return type written".
 lang_epoch!(
     Kotlin,
     "kotlin",
     "treesitter/kotlin/",
-    "tree-sitter-kotlin-fwcd-c8ac3d26-2026-07;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07"
+    "tree-sitter-kotlin-fwcd-c8ac3d26-2026-07;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07;kotlin-signature-returns-receivers-2026-07"
 );
 
 #[cfg(test)]

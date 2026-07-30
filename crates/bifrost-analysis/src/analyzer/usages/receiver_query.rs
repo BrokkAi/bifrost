@@ -18,14 +18,15 @@ use crate::analyzer::usages::get_definition::{
     java::{BoundedJavaResolution, JavaResolutionSession, resolve_java_bounded},
     js_ts::parse_js_ts_tree,
     parse_tree_for_language, resolve_cpp_bounded, resolve_csharp_bounded, resolve_go_bounded,
-    resolve_php_bounded, resolve_python_bounded, resolve_reference_site_with_line_starts,
-    resolve_ruby_bounded, resolve_rust_bounded, resolve_scala_bounded,
+    resolve_kotlin_bounded, resolve_php_bounded, resolve_python_bounded,
+    resolve_reference_site_with_line_starts, resolve_ruby_bounded, resolve_rust_bounded,
+    resolve_scala_bounded,
 };
 use crate::analyzer::usages::get_type::{
     TypeLookupOutcome, TypeLookupStatus, TypeLookupType, java::resolve_java_type_bounded,
     resolve_cpp_type_bounded, resolve_csharp_type_bounded, resolve_go_type_bounded,
-    resolve_php_type_bounded, resolve_python_type_bounded, resolve_ruby_type_bounded,
-    resolve_rust_type_bounded, resolve_scala_type_bounded,
+    resolve_kotlin_type_bounded, resolve_php_type_bounded, resolve_python_type_bounded,
+    resolve_ruby_type_bounded, resolve_rust_type_bounded, resolve_scala_type_bounded,
 };
 use crate::analyzer::usages::js_ts_graph::receiver_analysis::{
     JsTsReceiverSyntaxIndex, JsTsReceiverSyntaxIndexBuild,
@@ -45,9 +46,9 @@ use crate::analyzer::usages::reference_site::{ResolvedReferenceSite, SourceLocat
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{
     AnalyzerDefinitionLookup, CSharpAnalyzer, CodeUnit, CppAnalyzer, DispatchExtensibility,
-    GoAnalyzer, IAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language, PhpAnalyzer, ProjectFile,
-    PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, TypescriptAnalyzer,
-    WorkspaceAnalyzer, resolve_analyzer,
+    GoAnalyzer, IAnalyzer, JavaAnalyzer, JavascriptAnalyzer, KotlinAnalyzer, Language, PhpAnalyzer,
+    ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer,
+    TypescriptAnalyzer, WorkspaceAnalyzer, resolve_analyzer,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
@@ -519,6 +520,7 @@ impl<'a> ReceiverQueryService<'a> {
             Language::Cpp
                 | Language::CSharp
                 | Language::Go
+                | Language::Kotlin
                 | Language::Php
                 | Language::Python
                 | Language::Ruby
@@ -2023,6 +2025,9 @@ fn resolve_structural_type_bounded(
         Language::Go => {
             resolve_go_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
         }
+        Language::Kotlin => {
+            resolve_kotlin_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
         Language::Php => {
             resolve_php_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
         }
@@ -2062,6 +2067,9 @@ fn resolve_structural_definition_bounded(
         }
         Language::Go => {
             resolve_go_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Kotlin => {
+            resolve_kotlin_bounded(analyzer, file, source, tree, site, budget, cancellation)
         }
         Language::Php => {
             resolve_php_bounded(analyzer, file, source, tree, site, budget, cancellation)
@@ -2139,6 +2147,8 @@ fn structural_member_dispatch_supports_precise(
             .map(|csharp| csharp.signature_metadata_limited(target, provider_limit)),
         Language::Go => resolve_analyzer::<GoAnalyzer>(analyzer)
             .map(|go| go.signature_metadata_limited(target, provider_limit)),
+        Language::Kotlin => resolve_analyzer::<KotlinAnalyzer>(analyzer)
+            .map(|kotlin| kotlin.signature_metadata_limited(target, provider_limit)),
         Language::Php => resolve_analyzer::<PhpAnalyzer>(analyzer)
             .map(|php| php.signature_metadata_limited(target, provider_limit)),
         Language::Python => resolve_analyzer::<PythonAnalyzer>(analyzer)
@@ -2858,6 +2868,7 @@ fn code_unit_ranges_bounded(
             | Language::Go
             | Language::Java
             | Language::JavaScript
+            | Language::Kotlin
             | Language::Php
             | Language::Python
             | Language::Ruby
@@ -2880,6 +2891,8 @@ fn code_unit_ranges_bounded(
                 .map(|java| java.inner().ranges_limited(unit, provider_limit)),
             Language::JavaScript => resolve_analyzer::<JavascriptAnalyzer>(analyzer)
                 .map(|javascript| javascript.ranges_limited(unit, provider_limit)),
+            Language::Kotlin => resolve_analyzer::<KotlinAnalyzer>(analyzer)
+                .map(|kotlin| kotlin.ranges_limited(unit, provider_limit)),
             Language::Php => resolve_analyzer::<PhpAnalyzer>(analyzer)
                 .map(|php| php.ranges_limited(unit, provider_limit)),
             Language::Python => resolve_analyzer::<PythonAnalyzer>(analyzer)
@@ -2987,6 +3000,22 @@ fn structural_factory_name_node(language: Language, node: Node<'_>) -> Option<No
             match function.kind() {
                 "attribute" => function.child_by_field_name("attribute"),
                 "identifier" => Some(function),
+                _ => None,
+            }
+        }
+        // Kotlin's grammar names neither the callee of a call nor the member
+        // of a navigation, so both are read through the shared positional
+        // readers the Kotlin adapters already use.
+        Language::Kotlin => {
+            if node.kind() != "call_expression" {
+                return None;
+            }
+            let callee = crate::analyzer::kotlin::syntax::kotlin_callee(node)?;
+            match callee.kind() {
+                "navigation_expression" => {
+                    crate::analyzer::kotlin::syntax::kotlin_navigation_member(callee)
+                }
+                "simple_identifier" => Some(callee),
                 _ => None,
             }
         }

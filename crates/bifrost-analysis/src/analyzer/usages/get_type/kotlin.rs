@@ -1,9 +1,13 @@
 use super::{TypeLookupOutcome, candidates_outcome_with_target_kind, no_type};
+use crate::analyzer::kotlin::KotlinAnalyzer;
 use crate::analyzer::usages::get_definition::{
-    KotlinTypeLookupResolution, kotlin_type_lookup_resolution,
+    BoundedResolution, KotlinDefinitionProvider, KotlinTypeLookupResolution, ResolutionSession,
+    kotlin_type_lookup_resolution, kotlin_type_lookup_resolution_in_session,
 };
+use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
-use crate::analyzer::{BoundedDefinitionLookup, IAnalyzer, ProjectFile};
+use crate::analyzer::{BoundedDefinitionLookup, IAnalyzer, ProjectFile, resolve_analyzer};
+use crate::cancellation::CancellationToken;
 use tree_sitter::Tree;
 
 /// Answer `get_type_by_location` for Kotlin (issue #1238).
@@ -22,19 +26,59 @@ pub(crate) fn resolve_kotlin_type(
     let Some(tree) = tree else {
         return no_type("kotlin_parse_failed", "Kotlin source could not be parsed");
     };
-    let Some(resolution) =
-        kotlin_type_lookup_resolution(analyzer, support, file, source, tree.root_node(), site)
-    else {
-        return no_type(
-            "no_explicit_type",
-            format!(
-                "`{}` does not have a proven Kotlin type at this location",
-                site.text
-            ),
-        );
+    let resolution =
+        kotlin_type_lookup_resolution(analyzer, support, file, source, tree.root_node(), site);
+    kotlin_type_outcome(support, site, resolution)
+}
+
+/// Bounded Kotlin type resolution for the receiver-query path (issue #1242).
+///
+/// Shares the resolver `get_type_by_location` uses, so a receiver query and a
+/// type request cannot disagree about what a Kotlin expression's type is; only
+/// the work accounting differs.
+pub(crate) fn resolve_kotlin_type_bounded(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<&CancellationToken>,
+) -> BoundedResolution<TypeLookupOutcome> {
+    let session = ResolutionSession::bounded(budget, cancellation);
+    let Some(kotlin) = resolve_analyzer::<KotlinAnalyzer>(analyzer) else {
+        return session.finish(no_type(
+            "kotlin_analyzer_unavailable",
+            "Kotlin analyzer is unavailable",
+        ));
     };
+    let Some(tree) = tree else {
+        return session.finish(no_type(
+            "kotlin_parse_failed",
+            "Kotlin source could not be parsed",
+        ));
+    };
+    let support = KotlinDefinitionProvider::new(kotlin, &session);
+    let resolution = kotlin_type_lookup_resolution_in_session(
+        analyzer,
+        &support,
+        &session,
+        file,
+        source,
+        tree.root_node(),
+        site,
+    );
+    let outcome = kotlin_type_outcome(&support, site, resolution);
+    session.finish(outcome)
+}
+
+fn kotlin_type_outcome(
+    support: &dyn BoundedDefinitionLookup,
+    site: &ResolvedReferenceSite,
+    resolution: Option<KotlinTypeLookupResolution>,
+) -> TypeLookupOutcome {
     match resolution {
-        KotlinTypeLookupResolution::Type { fqn, target_kind } => {
+        Some(KotlinTypeLookupResolution::Type { fqn, target_kind }) => {
             let candidates = support.fqn_in_any_language(&fqn);
             if candidates.is_empty() {
                 return no_type(
@@ -44,10 +88,17 @@ pub(crate) fn resolve_kotlin_type(
             }
             candidates_outcome_with_target_kind(fqn, candidates, target_kind)
         }
-        KotlinTypeLookupResolution::InappropriateSymbolContext => no_type(
+        Some(KotlinTypeLookupResolution::InappropriateSymbolContext) => no_type(
             "inappropriate_symbol_context",
             format!(
                 "`{}` is a callable declaration name, not a type-bearing expression",
+                site.text
+            ),
+        ),
+        None => no_type(
+            "no_explicit_type",
+            format!(
+                "`{}` does not have a proven Kotlin type at this location",
                 site.text
             ),
         ),

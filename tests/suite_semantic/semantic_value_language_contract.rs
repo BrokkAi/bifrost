@@ -2141,6 +2141,227 @@ class Sample {
 }
 
 #[test]
+fn csharp_explicit_local_identity_conversions() {
+    const CSHARP: &str = r#"class Source {}
+
+class Target {
+    public static implicit operator Target(Source value) {
+        return new Target();
+    }
+}
+
+static class Helpers {
+    public static object relay(object value) {
+        return value;
+    }
+
+    public static object duplicate(object value) {
+        return value;
+    }
+
+    public static Source duplicate(string value) {
+        return new Source();
+    }
+
+    public static object externFamily(object value) {
+        return value;
+    }
+
+    public static extern Source externFamily(string value);
+}
+
+class HelperReceiver {
+    public object relay(object value) {
+        return value;
+    }
+}
+
+namespace Other {
+    static class Helpers {
+        public static object crossNamespace(object value) {
+            return value;
+        }
+    }
+}
+
+class FieldShadowSample {
+    HelperReceiver Helpers;
+
+    void fieldShadowed(object input) {
+        object fromFieldShadowed = Helpers.relay(input);
+    }
+}
+
+class OuterShadowSample {
+    static HelperReceiver Helpers;
+
+    class Inner {
+        void outerShadowed(object input) {
+            object fromOuterShadowed = Helpers.relay(input);
+        }
+    }
+}
+
+class Sample {
+    void run(object input, Source source) {
+        object fromParameter = input;
+        object fromHelper = Helpers.relay(input);
+        Target converted = source;
+        object ambiguous = Helpers.duplicate(input);
+        object externAmbiguous = Helpers.externFamily(input);
+    }
+
+    void shadowed(HelperReceiver Helpers, object input) {
+        object fromShadowed = Helpers.relay(input);
+    }
+
+    void wrongNamespace(object input) {
+        object fromWrongNamespace = Helpers.crossNamespace(input);
+    }
+}
+"#;
+
+    let project = InlineTestProject::new()
+        .file("values/IdentityConversions.cs", CSHARP)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "values/IdentityConversions.cs");
+    let run = procedure_named(&graph, "run", ProcedureKind::Method);
+    let local = |name: &str| {
+        run.values()
+            .iter()
+            .find(|value| {
+                value.kind == SemanticValueKind::Local
+                    && mapped_source(run, CSHARP, value.source) == name
+            })
+            .unwrap_or_else(|| panic!("missing C# local {name}"))
+    };
+    let effects = run
+        .points()
+        .iter()
+        .flat_map(|point| &point.events)
+        .map(|event| &event.effect)
+        .collect::<Vec<_>>();
+
+    for name in ["fromParameter", "fromHelper"] {
+        let target = local(name);
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                SemanticEffect::Assignment { target: actual, .. } if *actual == target.id
+            )),
+            "same-typed C# initializer must assign {name}"
+        );
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Local,
+                    target: actual,
+                    ..
+                } if *actual == target.id
+            )),
+            "same-typed C# initializer must publish local flow into {name}"
+        );
+        assert!(
+            run.gaps()
+                .iter()
+                .all(|gap| gap.subject != SemanticGapSubject::Value(target.id)),
+            "proven C# identity initializer must not retain a conversion gap for {name}"
+        );
+    }
+
+    for name in ["converted", "ambiguous", "externAmbiguous"] {
+        let target = local(name);
+        assert!(
+            effects.iter().all(|effect| !matches!(
+                effect,
+                SemanticEffect::Assignment { target: actual, .. }
+                    | SemanticEffect::ValueFlow { target: actual, .. }
+                    if *actual == target.id
+            )),
+            "unproven C# conversion must not fabricate local flow into {name}"
+        );
+        assert!(
+            run.gaps().iter().any(|gap| {
+                gap.subject == SemanticGapSubject::Value(target.id)
+                    && gap.capability == SemanticCapability::Values
+                    && gap.kind == SemanticGapKind::Unknown
+            }),
+            "unproven C# conversion must retain a value gap for {name}"
+        );
+    }
+
+    let shadowed = procedure_named(&graph, "shadowed", ProcedureKind::Method);
+    let from_shadowed = shadowed
+        .values()
+        .iter()
+        .find(|value| {
+            value.kind == SemanticValueKind::Local
+                && mapped_source(shadowed, CSHARP, value.source) == "fromShadowed"
+        })
+        .expect("missing shadowed-receiver local");
+    assert!(
+        shadowed
+            .points()
+            .iter()
+            .flat_map(|point| &point.events)
+            .all(|event| !matches!(
+                event.effect,
+                SemanticEffect::Assignment { target, .. }
+                    | SemanticEffect::ValueFlow { target, .. }
+                    if target == from_shadowed.id
+            )),
+        "a value receiver that shadows a type must not use the static-helper proof"
+    );
+    assert!(
+        shadowed.gaps().iter().any(|gap| {
+            gap.subject == SemanticGapSubject::Value(from_shadowed.id)
+                && gap.capability == SemanticCapability::Values
+                && gap.kind == SemanticGapKind::Unknown
+        }),
+        "a shadowed static-helper name must retain a value gap"
+    );
+
+    for (procedure, local_name) in [
+        ("fieldShadowed", "fromFieldShadowed"),
+        ("outerShadowed", "fromOuterShadowed"),
+        ("wrongNamespace", "fromWrongNamespace"),
+    ] {
+        let procedure = procedure_named(&graph, procedure, ProcedureKind::Method);
+        let target = procedure
+            .values()
+            .iter()
+            .find(|value| {
+                value.kind == SemanticValueKind::Local
+                    && mapped_source(procedure, CSHARP, value.source) == local_name
+            })
+            .unwrap_or_else(|| panic!("missing conservative-receiver local {local_name}"));
+        assert!(
+            procedure
+                .points()
+                .iter()
+                .flat_map(|point| &point.events)
+                .all(|event| !matches!(
+                    event.effect,
+                    SemanticEffect::Assignment { target: actual, .. }
+                        | SemanticEffect::ValueFlow { target: actual, .. }
+                        if actual == target.id
+                )),
+            "an unproven static receiver must not fabricate local flow into {local_name}"
+        );
+        assert!(
+            procedure.gaps().iter().any(|gap| {
+                gap.subject == SemanticGapSubject::Value(target.id)
+                    && gap.capability == SemanticCapability::Values
+                    && gap.kind == SemanticGapKind::Unknown
+            }),
+            "an unproven static receiver must retain a value gap for {local_name}"
+        );
+    }
+}
+
+#[test]
 fn csharp_named_and_by_reference_arguments_remain_open_until_mapped() {
     const CSHARP: &str = r#"
 class Sample {

@@ -9,7 +9,6 @@ use crate::analyzer::usages::get_definition::{
     RustTypeLookupCache, rust_expression_type_definition_candidates_cached,
     rust_expression_type_definition_fqn_cached, rust_field_definition_type_candidates_cached,
     rust_forward_bare_token_reference_fqn, rust_is_type_definition, rust_resolve_type_node_fqn,
-    rust_type_node_definition_candidates_cached,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
@@ -363,7 +362,12 @@ impl ScanCtx<'_> {
         byte: usize,
         namespace: RustReferenceNamespace,
     ) -> bool {
-        if !self.direct_names.contains(text) {
+        if !self.direct_names.contains(text)
+            && !self.seeds.is_some_and(|seeds| {
+                self.rust
+                    .usage_has_exact_scoped_binding(self.file, seeds, text, byte, namespace)
+            })
+        {
             return false;
         }
         let shadowed = namespace != RustReferenceNamespace::Macro
@@ -451,8 +455,7 @@ impl ScanCtx<'_> {
         let Some(fqn) = self.reference_context_path_fqn(segments, namespace) else {
             return false;
         };
-        self.matches_unique_visible_resolved_fqn_in_namespace(&fqn, byte, namespace)
-            && self.authorize_exact_target_segments(segments, byte, namespace, false)
+        self.matches_resolved_target_path_in_namespace(&fqn, segments, byte, namespace)
     }
 
     fn reference_context_path_fqn(
@@ -462,7 +465,11 @@ impl ScanCtx<'_> {
     ) -> Option<String> {
         match namespace {
             RustReferenceNamespace::PathPrefix => {
-                self.refs.resolve_scoped_owner(&segments.join("::"))
+                if let [name] = segments {
+                    self.refs.resolve_bare(name).map(str::to_string)
+                } else {
+                    self.refs.resolve_scoped_owner(&segments.join("::"))
+                }
             }
             RustReferenceNamespace::Macro => None,
             RustReferenceNamespace::Type
@@ -485,6 +492,25 @@ impl ScanCtx<'_> {
         namespace: RustReferenceNamespace,
     ) -> bool {
         self.matches_unique_visible_candidate_in_namespace(self.support.fqn(fqn), byte, namespace)
+    }
+
+    fn matches_resolved_target_path_in_namespace(
+        &self,
+        fqn: &str,
+        segments: &[&str],
+        byte: usize,
+        namespace: RustReferenceNamespace,
+    ) -> bool {
+        self.authorize_exact_target_segments(segments, byte, namespace, false)
+            && (self.matches_unique_visible_resolved_fqn_in_namespace(fqn, byte, namespace)
+                // Shared Rust files can legitimately contribute the same analyzer
+                // FQN through more than one Cargo target root (for example,
+                // `src/error.rs` compiled into both the library and binary).
+                // Once the ordinary reference-context route proves the written
+                // path and the seed-aware exact resolver selects this target's
+                // physical root, keep that exact hit instead of discarding it
+                // merely because another target shares the same analyzer FQN.
+                || fqn == self.target.fq_name())
     }
 
     fn authorize_exact_target_segments(
@@ -1812,15 +1838,7 @@ fn record_struct_field_hits(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     let Some((type_node, fields)) = rust_struct_field_references(node) else {
         return;
     };
-    let owner_candidates = rust_type_node_definition_candidates_cached(
-        ctx.analyzer,
-        ctx.support,
-        ctx.file,
-        ctx.source,
-        type_node,
-        ctx.type_lookup_cache,
-    );
-    if !type_candidates_match_owner(&owner_candidates, ctx) {
+    if !resolved_type_matches_owner(type_node, ctx) {
         return;
     }
     for field in fields {
@@ -2354,11 +2372,13 @@ fn structured_static_member_matches_target(
     } else {
         CodeUnit::is_function
     };
-    let owner = exact_ast_owner(segments, ctx.owner_seeds, ctx).or_else(|| {
-        (!ctx.target_owner_is_trait)
-            .then(|| exact_type_alias_owner(owner_node, segments, ctx))
-            .flatten()
-    });
+    let owner = exact_ast_owner(segments, ctx.owner_seeds, ctx)
+        .or_else(|| exact_structured_static_owner(owner_node, segments, ctx))
+        .or_else(|| {
+            (!ctx.target_owner_is_trait)
+                .then(|| exact_type_alias_owner(owner_node, segments, ctx))
+                .flatten()
+        });
     let Some(owner) = owner else {
         return ctx.target_owner_is_trait
             && trait_implementer_static_member_matches_target(
@@ -2400,6 +2420,31 @@ fn structured_static_member_matches_target(
         )
     };
     associated_candidates_match_target(outcome, owner_node, Some(&owner), ctx)
+}
+
+fn exact_structured_static_owner(
+    owner_node: Node<'_>,
+    segments: &[Node<'_>],
+    ctx: &MemberScanCtx<'_>,
+) -> Option<CodeUnit> {
+    let owner_fqn = structured_owner_candidate_fqn(owner_node, segments, ctx)?;
+    let mut candidates = ctx
+        .support
+        .fqn(&owner_fqn)
+        .into_iter()
+        .filter(|candidate| rust_is_type_definition(ctx.analyzer, candidate))
+        .filter_map(|candidate| ctx.rust.canonical_rust_hierarchy_type(candidate))
+        .collect::<Vec<_>>();
+    if let Some(physical) = ctx
+        .rust
+        .candidates_in_same_cargo_target_root(ctx.file, candidates.clone())
+        && !physical.is_empty()
+    {
+        candidates = physical;
+    }
+    candidates.sort();
+    candidates.dedup();
+    (candidates.len() == 1).then(|| candidates.remove(0))
 }
 
 fn exact_type_alias_owner(

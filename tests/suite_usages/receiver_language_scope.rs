@@ -301,3 +301,90 @@ end
     );
     assert_exact_member(&module, "Registry.run");
 }
+
+/// Kotlin's receiver-bearing shapes that have no Java analogue: a safe call, an
+/// extension receiver, and a member reached through an `object` singleton.
+#[test]
+fn kotlin_safe_call_extension_and_object_receivers_stay_structured() {
+    let files = [(
+        "Scope.kt",
+        r#"class Service {
+    fun run() {}
+}
+
+object Registry {
+    fun run() {}
+}
+
+fun Service.extended() {
+    this.run()
+}
+
+fun safeCall(service: Service?) {
+    service?.run()
+}
+
+fun aliasCall() {
+    val original = Service()
+    val copy = original
+    copy.run()
+}
+
+fun objectCall() {
+    Registry.run()
+}
+"#,
+    )];
+
+    let safe = run(
+        &files,
+        json!({
+            "languages": ["kotlin"],
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "inside": { "kind": "function", "name": "safeCall" },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    );
+    assert_exact_member(&safe, "Service.run");
+
+    let extension = run(
+        &files,
+        json!({
+            "languages": ["kotlin"],
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "inside": { "kind": "function", "name": "extended" },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    );
+    assert_exact_member(&extension, "Service.run");
+
+    let alias = run(
+        &files,
+        json!({
+            "languages": ["kotlin"],
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" },
+                "receiver": { "name": "copy", "capture": "receiver" }
+            },
+            "inside": { "kind": "function", "name": "aliasCall" },
+            "steps": [{ "op": "points_to", "capture": "receiver" }]
+        }),
+    );
+    assert_ne!(first_row(&alias)["outcome"], "unsupported", "{alias}");
+    assert!(
+        first_row(&alias)["values"].to_string().contains("Service"),
+        "{alias}"
+    );
+
+    let object_member = run(
+        &files,
+        json!({
+            "languages": ["kotlin"],
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "inside": { "kind": "function", "name": "objectCall" },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    );
+    assert_exact_member(&object_member, "Registry.run");
+}

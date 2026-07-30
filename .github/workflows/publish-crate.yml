@@ -117,8 +117,32 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Verify exact registry version and checksum
-        run: >
-          bash scripts/wait-for-crate-version.sh
-          "$CRATE_PACKAGE"
-          "$RELEASE_VERSION"
-          "${{ steps.package.outputs.checksum }}"
+        shell: bash
+        env:
+          EXPECTED_CHECKSUM: ${{ steps.package.outputs.checksum }}
+        run: |
+          set -euo pipefail
+          endpoint="https://crates.io/api/v1/crates/${CRATE_PACKAGE}/${RELEASE_VERSION}"
+          max_attempts=30
+
+          for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+            response="$(curl --fail --silent --show-error --user-agent 'cargo/1.85.0' "$endpoint" 2>/dev/null || true)"
+            checksum="$(jq -r '.version.checksum // empty' <<<"$response")"
+            if [[ -n "$checksum" ]]; then
+              if [[ "$checksum" != "$EXPECTED_CHECKSUM" ]]; then
+                echo "Registry checksum mismatch for ${CRATE_PACKAGE} ${RELEASE_VERSION}: expected ${EXPECTED_CHECKSUM}, got ${checksum}" >&2
+                exit 1
+              fi
+              echo "Registry exposes ${CRATE_PACKAGE} ${RELEASE_VERSION} with checksum ${checksum}"
+              exit 0
+            fi
+
+            if (( attempt < max_attempts )); then
+              delay=$((attempt < 5 ? attempt * 2 : 10))
+              echo "Waiting ${delay}s for crates.io to expose ${CRATE_PACKAGE} ${RELEASE_VERSION} (attempt ${attempt}/${max_attempts})"
+              sleep "$delay"
+            fi
+          done
+
+          echo "crates.io did not expose ${CRATE_PACKAGE} ${RELEASE_VERSION} within the bounded retry window" >&2
+          exit 1

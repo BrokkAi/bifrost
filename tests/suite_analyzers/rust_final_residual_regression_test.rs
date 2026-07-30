@@ -304,6 +304,99 @@ fn consume(_: ApiResult, _: OtherApiResult) {}
 }
 
 #[test]
+fn inverse_rust_shared_lib_bin_imported_type_keeps_exact_terminal() {
+    let consumer = "use crate::User;\nfn consume(_: User) {}\n";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"demo-bin\"\npath = \"src/main.rs\"\n",
+        )
+        .file("src/lib.rs", "pub struct User;\nmod api;\n")
+        .file("src/main.rs", "struct User;\nfn consume(_: User) {}\n")
+        .file("src/api.rs", consumer)
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    let target = definition_in_file(&analyzer, &project.file("src/lib.rs"), "User");
+    let found = authoritative_hits(
+        &analyzer,
+        target,
+        analyzer.get_analyzed_files().into_iter().collect(),
+    );
+    let import_terminal = consumer.find("User").expect("import terminal");
+    let arg_terminal = consumer.rfind("User").expect("argument terminal");
+
+    assert!(
+        found.iter().any(|hit| {
+            hit.file == project.file("src/api.rs")
+                && (hit.start_offset, hit.end_offset)
+                    == (import_terminal, import_terminal + "User".len())
+        }),
+        "the lib-owned import terminal must survive same-FQN binary siblings: {found:#?}"
+    );
+    assert!(
+        found.iter().any(|hit| {
+            hit.file == project.file("src/api.rs")
+                && (hit.start_offset, hit.end_offset) == (arg_terminal, arg_terminal + "User".len())
+        }),
+        "the lib-owned consumer type must survive same-FQN binary siblings: {found:#?}"
+    );
+    assert!(
+        found
+            .iter()
+            .all(|hit| hit.file != project.file("src/main.rs")),
+        "same-FQN binary terminals must remain excluded from the lib-owned target: {found:#?}"
+    );
+}
+
+#[test]
+fn inverse_rust_shared_lib_bin_external_module_keeps_exact_grouped_prefix() {
+    let consumer = "use crate::{error::ApiResult, other::ApiResult as OtherApiResult};\nfn consume(_: ApiResult, _: OtherApiResult) {}\n";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"demo-bin\"\npath = \"src/main.rs\"\n",
+        )
+        .file("src/lib.rs", "pub mod api;\npub mod error;\npub mod other;\n")
+        .file("src/main.rs", "mod api;\nmod error;\nmod other;\n")
+        .file("src/api.rs", consumer)
+        .file("src/error.rs", "pub struct ApiResult;\n")
+        .file("src/other.rs", "pub struct ApiResult;\n")
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    let target = analyzer
+        .declarations(&project.file("src/main.rs"))
+        .into_iter()
+        .find(|unit| unit.is_module() && unit.identifier() == "error")
+        .expect("main-target error module");
+    let found = authoritative_hits(
+        &analyzer,
+        target,
+        [project.file("src/api.rs")].into_iter().collect(),
+    );
+    let expected = consumer
+        .find("error::ApiResult")
+        .expect("grouped exact module prefix");
+    let unrelated = consumer
+        .find("other::ApiResult")
+        .expect("unrelated grouped module prefix");
+
+    assert!(
+        found.iter().any(|hit| {
+            hit.file == project.file("src/api.rs")
+                && (hit.start_offset, hit.end_offset) == (expected, expected + "error".len())
+        }),
+        "external module prefix must resolve to the exact main-target declaration: {found:#?}"
+    );
+    assert!(
+        found.iter().all(|hit| {
+            hit.file != project.file("src/api.rs")
+                || (hit.start_offset, hit.end_offset) != (unrelated, unrelated + "other".len())
+        }),
+        "external module prefix must not cross to the unrelated owner: {found:#?}"
+    );
+}
+
+#[test]
 fn inverse_rust_default_scope_keeps_grouped_reexport_type_terminal_exact() {
     let source = r#"
 mod commit_activity {
@@ -333,6 +426,64 @@ pub use commit_activity::{
             (hit.start_offset, hit.end_offset) == (expected, expected + "CommitActivityDraft".len())
         }),
         "default inverse lookup must keep the grouped re-export terminal exact: {found:#?}"
+    );
+}
+
+#[test]
+fn inverse_rust_glob_imported_owner_qualifier_stays_exact_in_inline_test_module() {
+    let source = r#"
+mod retry;
+pub use retry::RetryClass;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod local {
+        pub enum RetryClass { Never }
+    }
+
+    #[test]
+    fn classify() {
+        assert_eq!(0, RetryClass::Never); // TARGET_PREFIX
+        assert_eq!(0, local::RetryClass::Never); // DECOY_PREFIX
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "pub mod errors;\n")
+        .file("src/errors/mod.rs", source)
+        .file("src/errors/retry.rs", "pub enum RetryClass { Never }\n")
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "errors.retry.RetryClass");
+    let found = authoritative_hits(
+        &analyzer,
+        target,
+        [project.file("src/errors/mod.rs")].into_iter().collect(),
+    );
+    let expected = source
+        .find("assert_eq!(0, RetryClass::Never)")
+        .expect("glob imported owner qualifier")
+        + "assert_eq!(0, ".len();
+    let unrelated = source
+        .find("local::RetryClass::Never")
+        .expect("local decoy owner qualifier")
+        + "local::".len();
+
+    assert!(
+        found.iter().any(|hit| {
+            hit.file == project.file("src/errors/mod.rs")
+                && (hit.start_offset, hit.end_offset) == (expected, expected + "RetryClass".len())
+        }),
+        "glob import through `use super::*` must retain the exact macro-token owner qualifier: {found:#?}"
+    );
+    assert!(
+        found.iter().all(|hit| {
+            hit.file != project.file("src/errors/mod.rs")
+                || (hit.start_offset, hit.end_offset) != (unrelated, unrelated + "RetryClass".len())
+        }),
+        "glob import through `use super::*` must not cross to the local macro-token decoy: {found:#?}"
     );
 }
 
