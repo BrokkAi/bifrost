@@ -683,6 +683,118 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
 }
 
 #[test]
+fn cognitive_complexity_reports_every_supported_language_in_one_mcp_call() {
+    let workspace = InlineTestProject::new()
+        .file(
+            "main.go",
+            "package main\nfunc goBusy(a, b bool) { if a { if b {} } }\n",
+        )
+        .file(
+            "main.c",
+            "int cBusy(int a, int b) { if (a) { if (b) return 1; } return 0; }\n",
+        )
+        .file(
+            "main.cpp",
+            "int cppBusy(int a, int b) { if (a) { if (b) return 1; } return 0; }\n",
+        )
+        .file(
+            "main.js",
+            "function jsBusy(a, b) { if (a) { if (b) return 1; } return 0; }\n",
+        )
+        .file(
+            "view.jsx",
+            "function jsxBusy(a, b) { if (a) { if (b) return <span />; } return null; }\n",
+        )
+        .file(
+            "main.ts",
+            "function tsBusy(a: boolean, b: boolean) { if (a) { if (b) return 1; } return 0; }\n",
+        )
+        .file(
+            "view.tsx",
+            "function tsxBusy(a: boolean, b: boolean) { if (a) { if (b) return <span />; } return null; }\n",
+        )
+        .file(
+            "main.php",
+            "<?php function phpBusy($a, $b) { if ($a) { if ($b) return 1; } return 0; }\n",
+        )
+        .file(
+            "Main.scala",
+            "def scalaBusy(a: Boolean, b: Boolean): Int = { if (a) { if (b) 1 else 0 } else 0 }\n",
+        )
+        .file(
+            "Service.cs",
+            "class Service { int csharpBusy(bool a, bool b) { if (a) { if (b) return 1; } return 0; } }\n",
+        )
+        .build();
+    let file_paths = [
+        "main.go",
+        "main.c",
+        "main.cpp",
+        "main.js",
+        "view.jsx",
+        "main.ts",
+        "view.tsx",
+        "main.php",
+        "Main.scala",
+        "Service.cs",
+    ];
+
+    let mut child = spawn_server(workspace.root(), "slopcop", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "compute_cognitive_complexity",
+                "arguments": {
+                    "file_paths": file_paths,
+                    "threshold": 1
+                }
+            }
+        }),
+    );
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    assert_eq!(
+        response["result"]["structuredContent"]["truncated"], false,
+        "{response}"
+    );
+    let report = response["result"]["structuredContent"]["report"]
+        .as_str()
+        .expect("cognitive complexity report");
+    for function in [
+        "goBusy",
+        "cBusy",
+        "cppBusy",
+        "jsBusy",
+        "jsxBusy",
+        "tsBusy",
+        "tsxBusy",
+        "phpBusy",
+        "scalaBusy",
+        "csharpBusy",
+    ] {
+        assert!(
+            report.contains(&format!("{function}: 3")),
+            "missing {function} from report:\n{report}"
+        );
+    }
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
 fn bifrost_defaults_to_cwd_searchtools_server() {
     let fixture_root = TempDir::new().expect("temp dir");
     fs::write(

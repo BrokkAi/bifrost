@@ -12,7 +12,7 @@ After this change, callers of the `compute_cognitive_complexity` MCP tool can an
 - [x] (2026-07-30 17:55Z) Located Brokk's reference configurations and fixtures for Go, C/C++, JavaScript/TypeScript, PHP, and Scala; confirmed that Brokk does not contain a C# cognitive-complexity implementation.
 - [x] (2026-07-30 18:08Z) Ported the Brokk-backed language configurations and added focused positive and near-miss tests for Go, C/C++, JavaScript/JSX, TypeScript/TSX, PHP, and Scala; formatting and all 50 focused cognitive-complexity tests pass.
 - [x] (2026-07-30 18:22Z) Derived and validated the C# configuration from its tree-sitter grammar with nine focused tests for nesting, loops, catch, conditional expressions, switch forms, logical sequences, defaults, jumps, lambdas, and local-function boundaries; all 59 focused tests pass.
-- [ ] Add a mixed-language MCP call test and update the tool description to state the supported language boundary.
+- [x] (2026-07-30 18:31Z) Added a real mixed-language MCP call test covering Go, C, C++, JavaScript, JSX, TypeScript, TSX, PHP, Scala, and C#, and updated tool discovery documentation to enumerate the supported set and Kotlin exclusion; the focused integration test passes.
 - [ ] Run formatting, focused and broader featureless tests, repository policy checks, and adversarial review; resolve all correctness findings.
 
 ## Surprises & Discoveries
@@ -53,7 +53,7 @@ After this change, callers of the `compute_cognitive_complexity` MCP tool can an
 
 ## Outcomes & Retrospective
 
-The first two implementation milestones are complete. Six reference-backed language families, their C/JSX/TSX dialect routes, and grammar-backed C# now return scores through explicit adapter configurations. No shared-scorer change was needed. MCP transport coverage, documentation, and final validation remain.
+All implementation milestones are complete. Six reference-backed language families, their C/JSX/TSX dialect routes, and grammar-backed C# return scores through explicit adapter configurations. A single real MCP request proves that every requested file contributes its expected score, and tool discovery now states the exact supported set while leaving Kotlin excluded. No shared-scorer change was needed. Final validation and review remain.
 
 ## Context and Orientation
 
@@ -144,3 +144,5 @@ Plan revision note (2026-07-30): Created the initial self-contained plan after i
 Plan revision note (2026-07-30): Recorded completion of the reference-backed milestone and the tree-sitter-cpp default-case grammar difference discovered by focused tests.
 
 Plan revision note (2026-07-30): Recorded the completed C# milestone, including AST-only default/discard recognition and the logical/switch semantic decisions.
+
+Plan revision note (2026-07-30): Recorded successful mixed-language MCP coverage and completion of the user-visible support description.
