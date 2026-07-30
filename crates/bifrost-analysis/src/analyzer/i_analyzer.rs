@@ -3,7 +3,7 @@ use crate::analyzer::store::StoreError;
 use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder};
 use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
-    DeclarationInfo, ExceptionHandlingSmell, ExceptionSmellWeights, GlobalUsageDefinitionIndex,
+    DeclarationInfo, ExceptionHandlingAnalysis, ExceptionSmellWeights, GlobalUsageDefinitionIndex,
     ImportAnalysisProvider, Language, ParseError, Project, ProjectFile, Range,
     SearchSymbolCandidate, SemanticDiagnostic, SignatureMetadata, SummaryFileProjection,
     TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TypeAliasProvider,
@@ -857,15 +857,19 @@ pub trait IAnalyzer: Send + Sync + Any {
     }
 
     /// Detect suspicious exception-handling sites in `file` using `weights`.
-    /// Default is an empty vector so analyzers without a port of the
-    /// heuristic stay silent. Mirrors brokk-shared
-    /// `IAnalyzer.findExceptionHandlingSmells`.
+    /// Analyzers without an implementation return an explicit unsupported
+    /// result so callers cannot mistake missing semantics for a clean file.
     fn find_exception_handling_smells(
         &self,
-        _file: &ProjectFile,
+        file: &ProjectFile,
         _weights: ExceptionSmellWeights,
-    ) -> Vec<ExceptionHandlingSmell> {
-        Vec::new()
+    ) -> ExceptionHandlingAnalysis {
+        ExceptionHandlingAnalysis::Unsupported {
+            reason: format!(
+                "exception-handling smell semantics are unavailable for {}",
+                file.rel_path().display()
+            ),
+        }
     }
 
     /// Detect suspicious low-value or brittle test assertions in `file`

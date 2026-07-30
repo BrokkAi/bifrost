@@ -9,7 +9,9 @@ use super::{
     ReportLines, append_ambiguous_path_notes, pick_weight, resolve_project_files,
     sanitize_table_cell,
 };
-use crate::analyzer::{ExceptionHandlingSmell, ExceptionSmellWeights, IAnalyzer};
+use crate::analyzer::{
+    ExceptionHandlingAnalysis, ExceptionHandlingSmell, ExceptionSmellWeights, IAnalyzer,
+};
 use crate::path_utils::{AmbiguousPathInput, rel_path_string};
 use serde::{Deserialize, Serialize};
 
@@ -86,6 +88,16 @@ pub struct ReportExceptionHandlingSmellsResult {
     pub truncated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub unsupported_files: Vec<ExceptionAnalysisNote>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub failed_files: Vec<ExceptionAnalysisNote>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExceptionAnalysisNote {
+    pub file: String,
+    pub reason: String,
 }
 
 pub fn report_exception_handling_smells(
@@ -141,8 +153,28 @@ pub fn report_exception_handling_smells(
     let mut input_truncated = resolved.input_truncated;
     let ambiguous_paths = resolved.ambiguous_paths.clone();
     let mut findings: Vec<ExceptionHandlingSmell> = Vec::new();
+    let mut analyzed_files = 0_usize;
+    let mut unsupported_files = Vec::new();
+    let mut failed_files = Vec::new();
     for file in &resolved.files {
-        findings.extend(analyzer.find_exception_handling_smells(file, weights));
+        match analyzer.find_exception_handling_smells(file, weights) {
+            ExceptionHandlingAnalysis::Analyzed(file_findings) => {
+                analyzed_files += 1;
+                findings.extend(file_findings);
+            }
+            ExceptionHandlingAnalysis::Unsupported { reason } => {
+                unsupported_files.push(ExceptionAnalysisNote {
+                    file: rel_path_string(file),
+                    reason,
+                });
+            }
+            ExceptionHandlingAnalysis::Failed { message } => {
+                failed_files.push(ExceptionAnalysisNote {
+                    file: rel_path_string(file),
+                    reason: message,
+                });
+            }
+        }
     }
 
     let filtered: Vec<ExceptionHandlingSmell> = {
@@ -161,10 +193,22 @@ pub fn report_exception_handling_smells(
     };
 
     if filtered.is_empty() {
+        let report = if unsupported_files.is_empty() && failed_files.is_empty() {
+            format!("No exception-handling smells met minScore {threshold}.")
+        } else {
+            render_empty_analysis_report(
+                threshold,
+                analyzed_files,
+                &unsupported_files,
+                &failed_files,
+            )
+        };
         return ReportExceptionHandlingSmellsResult {
-            report: format!("No exception-handling smells met minScore {threshold}."),
+            report,
             truncated: input_truncated,
             ambiguous_paths,
+            unsupported_files,
+            failed_files,
         };
     }
     let total = filtered.len();
@@ -193,6 +237,7 @@ pub fn report_exception_handling_smells(
         )
     ));
     append_ambiguous_path_notes(&mut lines, &ambiguous_paths);
+    append_analysis_notes(&mut lines, &unsupported_files, &failed_files);
     lines.blank();
     lines.line("| Score | Catch Type | Statements | Symbol | File | Reasons | Excerpt |");
     lines.line("|------:|------------|-----------:|--------|------|---------|---------|");
@@ -217,6 +262,55 @@ pub fn report_exception_handling_smells(
         report: lines.build(),
         truncated: input_truncated,
         ambiguous_paths,
+        unsupported_files,
+        failed_files,
+    }
+}
+
+fn render_empty_analysis_report(
+    threshold: i32,
+    analyzed_files: usize,
+    unsupported_files: &[ExceptionAnalysisNote],
+    failed_files: &[ExceptionAnalysisNote],
+) -> String {
+    let mut lines = ReportLines::with_capacity(4 + unsupported_files.len() + failed_files.len());
+    if analyzed_files == 0 {
+        lines.line("Exception-handling smell analysis produced no supported results.");
+    } else {
+        lines.line(format!(
+            "No exception-handling smells met minScore {threshold} in {analyzed_files} analyzed file(s)."
+        ));
+    }
+    append_analysis_notes(&mut lines, unsupported_files, failed_files);
+    lines.build()
+}
+
+fn append_analysis_notes(
+    lines: &mut ReportLines,
+    unsupported_files: &[ExceptionAnalysisNote],
+    failed_files: &[ExceptionAnalysisNote],
+) {
+    if !unsupported_files.is_empty() {
+        lines.blank();
+        lines.line("Unsupported files:");
+        for note in unsupported_files {
+            lines.line(format!(
+                "- `{}`: {}",
+                sanitize_table_cell(&note.file),
+                sanitize_table_cell(&note.reason)
+            ));
+        }
+    }
+    if !failed_files.is_empty() {
+        lines.blank();
+        lines.line("Analysis failures:");
+        for note in failed_files {
+            lines.line(format!(
+                "- `{}`: {}",
+                sanitize_table_cell(&note.file),
+                sanitize_table_cell(&note.reason)
+            ));
+        }
     }
 }
 
@@ -284,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn exception_smells_non_java_files_are_silently_skipped() {
+    fn exception_smells_unsupported_files_are_not_reported_as_clean() {
         let fix = AnalyzerFixture::new(&[("src/lib.rs", "fn trivial() -> i32 { 0 }\n")]);
         let result = report_exception_handling_smells(
             fix.analyzer.analyzer(),
@@ -293,10 +387,15 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(
-            result.report,
-            "No exception-handling smells met minScore 4."
+        assert!(
+            result
+                .report
+                .starts_with("Exception-handling smell analysis produced no supported results.")
         );
+        assert!(result.report.contains("Unsupported files:"));
+        assert!(result.report.contains("`src/lib.rs`"));
+        assert_eq!(result.unsupported_files.len(), 1);
+        assert!(result.failed_files.is_empty());
     }
 
     #[test]

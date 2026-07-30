@@ -14,7 +14,7 @@ The implementation uses the current Brokk Java analyzers and their tests as the 
 
 - [x] (2026-07-30 20:05Z) Verified issue #1359, the clean matching branch, current Bifrost call path, and the current Brokk implementations and tests.
 - [x] (2026-07-30 20:12Z) Wrote this ExecPlan with four independently testable milestones.
-- [ ] Milestone 1: make the analyzer/result/report boundary distinguish analyzed-clean, unsupported, and failed inputs; extract shared stack-safe scoring.
+- [x] (2026-07-30 20:28Z) Milestone 1: made the analyzer/result/report boundary distinguish analyzed-clean, unsupported, and failed inputs; extracted shared stack-safe scoring and preserved all seven focused Java/report tests.
 - [ ] Milestone 2: port Brokk parity for C/C++, JavaScript/TypeScript, Python, PHP, Scala, C#, Go, and Rust while preserving Java behavior.
 - [ ] Milestone 3: add structured Ruby and Kotlin semantics with positive and realistic near-miss coverage.
 - [ ] Milestone 4: complete mixed-language MCP/report integration, validation, policy checking, and review.
@@ -32,6 +32,9 @@ The implementation uses the current Brokk Java analyzers and their tests as the 
 
 - Observation: the installed Bifrost skills are visible but their MCP code-intelligence and policy tools are not registered in this task.
   Evidence: tool discovery returned no callable `search_symbols`, `get_symbol_sources`, `list_policies`, or `run_policy` tools. Repository inspection therefore uses `rg`, direct source reads, and git history, and final validation must report the registration failure if it remains.
+
+- Observation: the workspace package name is `brokk-bifrost-analysis`, not `bifrost-analysis`.
+  Evidence: the first focused command failed package selection; rerunning `cargo test -p brokk-bifrost-analysis exception_smells` passed all seven selected tests.
 
 ## Decision Log
 
@@ -53,7 +56,7 @@ The implementation uses the current Brokk Java analyzers and their tests as the 
 
 ## Outcomes & Retrospective
 
-Work has started. The plan and reference inventory are complete; implementation outcomes will be recorded after each milestone.
+Milestone 1 is complete. Unsupported Rust input now produces an explicit structured/report status instead of false-clean text, Java behavior remains green, and the reusable scorer/tree helpers are ready for the language ports.
 
 ## Context and Orientation
 
@@ -79,20 +82,20 @@ Run commands from `/Users/dave/.codex/worktrees/8d5d/bifrost`.
 
 For Milestone 1:
 
-    cargo test -p bifrost-analysis exception_smells
+    cargo test -p brokk-bifrost-analysis exception_smells
     cargo fmt --check
 
 For language milestones:
 
     cargo test --test suite_smells -- exception_handling_smells::
-    cargo test -p bifrost-analysis exception_smells
+    cargo test -p brokk-bifrost-analysis exception_smells
     cargo fmt --check
 
 For the final task-scoped gate, without the `nlp` feature:
 
     cargo fmt
     cargo test --test suite_smells
-    cargo test -p bifrost-analysis
+    cargo test -p brokk-bifrost-analysis
     cargo test -p bifrost-mcp --test bifrost_mcp_server
     cargo clippy --all-targets -- -D warnings
 
@@ -119,3 +122,5 @@ At the end of Milestone 1, `IAnalyzer::find_exception_handling_smells` returns a
 The shared exception module operates on tree-sitter `Node` values, `ProjectFile`, `ExceptionSmellWeights`, and `IAnalyzer` for enclosing-symbol lookup. It must use the registered parser selected by `parser_language_for_path`, iterative stacks or the existing iterative walk helpers, and AST fields. It must not use regexes, source splitting, or delimiter scanning as a substitute for grammar structure.
 
 Revision note (2026-07-30): Initial plan created after verifying issue #1359 and comparing Bifrost with current Brokk master.
+
+Revision note (2026-07-30): Marked Milestone 1 complete, recorded the validated Cargo package name, and summarized its passing focused tests.
