@@ -25,6 +25,7 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tree_sitter::Parser;
 
@@ -42,7 +43,9 @@ pub(crate) use imports::{
 };
 use tests::detect_rust_test_assertion_smells;
 
+use graph_support::RustPackageFileIndex;
 pub use graph_support::RustReferenceContext;
+
 use hierarchy::RustHierarchyIndex;
 pub use lexical_scope::{
     reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
@@ -62,6 +65,11 @@ pub struct RustAnalyzer {
     export_indexes: Cache<ProjectFile, Arc<crate::analyzer::usages::ExportIndex>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     cargo_routes: Arc<OnceLock<Arc<RustCargoRouteIndex>>>,
+    package_file_index: Arc<OnceLock<Arc<RustPackageFileIndex>>>,
+    /// `resolve_module_files` calls. A use-path's module files are invariant in
+    /// the export name being resolved, so this count is what proves the
+    /// per-export-name recomputation is gone (#1230 item 4).
+    module_file_resolution_count: Arc<AtomicUsize>,
     usage_index: Arc<OnceLock<RustUsageIndex>>,
     hierarchy_index: Arc<OnceLock<RustHierarchyIndex>>,
     #[allow(dead_code)]
@@ -144,6 +152,47 @@ impl RustAnalyzer {
         self.inner.prepared_syntax_parse_count_for_test(file)
     }
 
+    /// Per-instance counters behind the #1230 complexity pins. Each is shared by
+    /// `Clone` (so a cloned analyzer keeps counting into the same cell) and
+    /// reset by the analyzer that owns it, never process-globally, so suites
+    /// running in parallel cannot bleed into one another.
+    pub(super) fn note_module_file_resolution(&self) {
+        self.module_file_resolution_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn reset_module_file_resolution_count_for_test(&self) {
+        self.module_file_resolution_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn module_file_resolution_count_for_test(&self) -> usize {
+        self.module_file_resolution_count.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn reset_analyzed_file_listing_count_for_test(&self) {
+        self.inner.reset_analyzed_file_listing_count_for_test();
+    }
+
+    #[doc(hidden)]
+    pub fn analyzed_file_listing_count_for_test(&self) -> usize {
+        self.inner.analyzed_file_listing_count_for_test()
+    }
+
+    #[doc(hidden)]
+    pub fn reset_definition_candidates_query_count_for_test(&self) {
+        self.inner
+            .reset_definition_candidates_query_count_for_test();
+    }
+
+    #[doc(hidden)]
+    pub fn definition_candidates_query_count_for_test(&self) -> usize {
+        self.inner.definition_candidates_query_count_for_test()
+    }
+
     fn indexed_sources_unchanged(&self, changed_files: &BTreeSet<ProjectFile>) -> bool {
         changed_files
             .iter()
@@ -161,6 +210,7 @@ impl RustAnalyzer {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
         clone.cargo_routes = Arc::new(OnceLock::new());
+        clone.package_file_index = Arc::new(OnceLock::new());
         clone
     }
 
@@ -252,6 +302,8 @@ impl RustAnalyzer {
             export_indexes: build_weighted_cache(memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(OnceLock::new()),
+            package_file_index: Arc::new(OnceLock::new()),
+            module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             usage_index: Arc::new(OnceLock::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
@@ -285,6 +337,8 @@ impl RustAnalyzer {
             export_indexes: build_weighted_cache(memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(OnceLock::new()),
+            package_file_index: Arc::new(OnceLock::new()),
+            module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             usage_index: Arc::new(OnceLock::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
@@ -426,8 +480,13 @@ impl IAnalyzer for RustAnalyzer {
         self.inner.direct_children(code_unit)
     }
 
+    /// The same owner lookup as the [`IAnalyzer::parent_of`] default plus Rust's
+    /// structural fallback, routed through the request-scoped owner memo so a
+    /// file of N declarations asking for the same owner name costs one store
+    /// query rather than N (#1230 item 6).
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
-        IAnalyzer::parent_of(&self.inner, code_unit)
+        self.inner
+            .definition_parent_unit(code_unit)
             .or_else(|| self.inner.structural_parent_of(code_unit))
     }
 
@@ -490,6 +549,8 @@ impl IAnalyzer for RustAnalyzer {
             export_indexes: build_weighted_cache(self.memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(OnceLock::new()),
+            package_file_index: Arc::new(OnceLock::new()),
+            module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             usage_index: Arc::new(OnceLock::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
@@ -513,6 +574,8 @@ impl IAnalyzer for RustAnalyzer {
             export_indexes: build_weighted_cache(self.memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(OnceLock::new()),
+            package_file_index: Arc::new(OnceLock::new()),
+            module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             usage_index: Arc::new(OnceLock::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
