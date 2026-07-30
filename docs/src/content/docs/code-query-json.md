@@ -128,7 +128,7 @@ Roles are normalized edges from one structural fact to a related node or source 
 
 Each `args` pattern must match a distinct positional argument in source order, but the matches need not be contiguous and do not assert exact arity. For exact positions or arity, narrow the surrounding source shape in a follow-up query; version 2 has no positional-index operator.
 
-`kwargs` support is adapter-specific. Python, PHP, Scala, C#, and Ruby expose normalized named arguments; languages without that role return a capability diagnostic.
+`kwargs` support is adapter-specific. Python, PHP, Scala, C#, Ruby, and Kotlin expose normalized named arguments; languages without that role return a capability diagnostic.
 
 ## Captures And Results
 

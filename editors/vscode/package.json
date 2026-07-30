@@ -41,6 +41,7 @@
     "onLanguage:csharp",
     "onLanguage:php",
     "onLanguage:scala",
+    "onLanguage:kotlin",
     "onLanguage:bifrost-rql",
     "onLanguage:bifrost-rql-policy",
     "onLanguage:bifrost-rune-ir"
@@ -313,7 +314,7 @@
         },
         {
           "command": "bifrost.showRuneIr",
-          "when": "resourceLangId == java || resourceLangId == javascript || resourceLangId == javascriptreact || resourceLangId == typescript || resourceLangId == typescriptreact || resourceLangId == rust || resourceLangId == go || resourceLangId == python || resourceLangId == c || resourceLangId == cpp || resourceLangId == csharp || resourceLangId == php || resourceLangId == scala || resourceLangId == ruby"
+          "when": "resourceLangId == java || resourceLangId == javascript || resourceLangId == javascriptreact || resourceLangId == typescript || resourceLangId == typescriptreact || resourceLangId == rust || resourceLangId == go || resourceLangId == python || resourceLangId == c || resourceLangId == cpp || resourceLangId == csharp || resourceLangId == php || resourceLangId == scala || resourceLangId == kotlin || resourceLangId == ruby"
         }
       ],
       "editor/title": [
@@ -331,7 +332,7 @@
       "editor/context": [
         {
           "command": "bifrost.showRuneIr",
-          "when": "resourceLangId == java || resourceLangId == javascript || resourceLangId == javascriptreact || resourceLangId == typescript || resourceLangId == typescriptreact || resourceLangId == rust || resourceLangId == go || resourceLangId == python || resourceLangId == c || resourceLangId == cpp || resourceLangId == csharp || resourceLangId == php || resourceLangId == scala || resourceLangId == ruby",
+          "when": "resourceLangId == java || resourceLangId == javascript || resourceLangId == javascriptreact || resourceLangId == typescript || resourceLangId == typescriptreact || resourceLangId == rust || resourceLangId == go || resourceLangId == python || resourceLangId == c || resourceLangId == cpp || resourceLangId == csharp || resourceLangId == php || resourceLangId == scala || resourceLangId == kotlin || resourceLangId == ruby",
           "group": "navigation@10"
         }
       ]

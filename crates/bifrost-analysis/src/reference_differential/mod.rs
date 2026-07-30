@@ -467,6 +467,7 @@ fn corpus_language(label: &str) -> Result<Language, String> {
         "go" => Ok(Language::Go),
         "java" => Ok(Language::Java),
         "js" | "javascript" => Ok(Language::JavaScript),
+        "kotlin" => Ok(Language::Kotlin),
         "php" => Ok(Language::Php),
         "py" | "python" => Ok(Language::Python),
         "rust" => Ok(Language::Rust),
