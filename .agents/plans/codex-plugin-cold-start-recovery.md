@@ -12,7 +12,8 @@ After this work, installing the Bifrost Codex plugin into a clean location and o
 - [x] (2026-07-30 19:21Z) Reproduced the empty-cache diagnostic state and compared public v0.8.16 checksums with the plugin metadata.
 - [x] (2026-07-30 19:30Z) Added a Codex-manifest-driven packaged cold-cache smoke and a release-asset immutability guard.
 - [x] (2026-07-30 19:33Z) Corrected the v0.8.16 release checksum projections; downloaded and verified the public macOS archive, completed the staged MCP smoke, and verified packaged `doctor` then `prepare` recovery.
-- [ ] Finish the pre-existing packed-install test in the constrained desktop command environment; record policy-gate availability without claiming a clean repository policy result.
+- [x] (2026-07-30 19:42Z) Completed the clean-consumer packed-install test after preserving its terminal session; it loaded one extension and all four skills.
+- [x] (2026-07-30 19:42Z) Recorded policy-gate availability without claiming a clean repository policy result.
 
 ## Surprises & Discoveries
 
@@ -37,7 +38,7 @@ After this work, installing the Bifrost Codex plugin into a clean location and o
 
 The launcher metadata now matches the current public v0.8.16 release assets, so a fresh managed install can complete. The release workflow prevents later recovery attempts from mutating the archive name after a plugin package has pinned its digest. The packaged smoke now derives both executable and working directory from the Codex plugin manifest, verifies cold `prepare`, sends the recorded Codex initialize protocol, checks `search_symbols`, `list_policies`, and `run_policy` in `tools/list`, and calls both policy tools.
 
-Validation completed: `npm test` (113 tests), `npm run check` with an isolated npm cache, `node --test plugins/bifrost-agent/test/launcher.test.mjs` (34 tests), `node --test scripts/release-promotion-workflow.test.mjs` (9 tests), manifest validation, public archive SHA-256 verification, the staged Codex MCP smoke, and packaged `doctor`/`prepare`. The pre-existing packed-install test is still awaiting completion under the desktop command-duration boundary. No repository-wide `bifrost.code-smells` result is claimed: this task started with no registered Bifrost MCP tools, and the staged smoke only proves callable `list_policies` and `run_policy` on its disposable workspace.
+Validation completed: `npm test` (113 tests), `npm run check` with an isolated npm cache, `npm run test:packed` (one clean consumer extension and four skills), `node --test plugins/bifrost-agent/test/launcher.test.mjs` (34 tests), `node --test scripts/release-promotion-workflow.test.mjs` (9 tests), manifest validation, public archive SHA-256 verification, the staged Codex MCP smoke, and packaged `doctor`/`prepare`. No repository-wide `bifrost.code-smells` result is claimed: this task started with no registered Bifrost MCP tools, and the staged smoke only proves callable `list_policies` and `run_policy` on its disposable workspace.
 
 ## Context and Orientation
 
@@ -80,3 +81,5 @@ The launcher continues to expose `doctor --json`, `prepare [--json]`, and serve 
 Plan update (2026-07-30 19:21Z): recorded the published-checksum mismatch and refined the plan to test the Codex manifest rather than the existing Claude-only selection.
 
 Plan update (2026-07-30 19:33Z): recorded the completed public-artifact and packaged-MCP evidence, plus the exact scope of the remaining validation limitation.
+
+Plan update (2026-07-30 19:42Z): recorded the completed packed-consumer validation and final outcome.
