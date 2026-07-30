@@ -225,6 +225,12 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
 
         parsed
     }
+
+    fn cognitive_complexity_config(
+        &self,
+    ) -> Option<&'static crate::analyzer::cognitive_complexity::Config> {
+        Some(crate::analyzer::js_ts::cognitive_complexity_config())
+    }
 }
 
 #[derive(Clone)]

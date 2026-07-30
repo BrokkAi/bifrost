@@ -10,7 +10,7 @@ After this change, callers of the `compute_cognitive_complexity` MCP tool can an
 
 - [x] (2026-07-30 17:55Z) Diagnosed the empty-result path, verified the issue branch and current remote state, inspected the current language adapters and grammar metadata, and ran the 31-test cognitive-complexity baseline successfully.
 - [x] (2026-07-30 17:55Z) Located Brokk's reference configurations and fixtures for Go, C/C++, JavaScript/TypeScript, PHP, and Scala; confirmed that Brokk does not contain a C# cognitive-complexity implementation.
-- [ ] Port the Brokk-backed language configurations and add focused positive and near-miss tests for Go, C/C++, JavaScript/JSX, TypeScript/TSX, PHP, and Scala.
+- [x] (2026-07-30 18:08Z) Ported the Brokk-backed language configurations and added focused positive and near-miss tests for Go, C/C++, JavaScript/JSX, TypeScript/TSX, PHP, and Scala; formatting and all 50 focused cognitive-complexity tests pass.
 - [ ] Derive and validate the C# configuration from its tree-sitter grammar with parser-backed tests for statements, switch forms, logical sequences, defaults, and callable boundaries.
 - [ ] Add a mixed-language MCP call test and update the tool description to state the supported language boundary.
 - [ ] Run formatting, focused and broader featureless tests, repository policy checks, and adversarial review; resolve all correctness findings.
@@ -25,6 +25,9 @@ After this change, callers of the `compute_cognitive_complexity` MCP tool can an
 
 - Observation: One Bifrost C++ adapter serves C source and header extensions as well as C++.
   Evidence: `Language::Cpp` maps `c`, `cc`, `cpp`, `cxx`, `h`, `hpp`, `hh`, and `hxx` in `crates/bifrost-analysis/src/analyzer/model.rs`, so one configuration and explicit `.c` plus `.cpp` tests cover the issue's C/C++ scope.
+
+- Observation: Bifrost's current tree-sitter-cpp grammar represents both ordinary cases and the default branch as `case_statement`; the Brokk reference's `default_statement` node does not exist here.
+  Evidence: A first focused run scored the C default branch one point too high. The current grammar exposes an optional `value` field on `case_statement`, so `cpp_is_default_case` now recognizes default structurally through the absent field. The rerun passed all 50 focused tests.
 
 ## Decision Log
 
@@ -46,7 +49,7 @@ After this change, callers of the `compute_cognitive_complexity` MCP tool can an
 
 ## Outcomes & Retrospective
 
-Implementation has not started. The baseline is clean and the design is constrained to adapter configurations, behavior tests, MCP integration coverage, and tool documentation unless tests expose a genuine shared-scorer gap.
+The first implementation milestone is complete. Six reference-backed language families, including their C/JSX/TSX dialect routes, now return scores through explicit adapter configurations. No shared-scorer change was needed. C#, MCP transport coverage, documentation, and final validation remain.
 
 ## Context and Orientation
 
@@ -133,3 +136,5 @@ The implementation must return a lazily initialized static config. Shared JS/TS 
 The `source` parameter may be named `_source` because the implementation must decide from AST node kinds and direct tokens. The shared scorer's `Config`, `compute`, and report result types should remain source compatible unless a failing behavior test proves a generic semantic gap.
 
 Plan revision note (2026-07-30): Created the initial self-contained plan after issue diagnosis, Brokk reference inspection, grammar inspection, and a clean focused baseline.
+
+Plan revision note (2026-07-30): Recorded completion of the reference-backed milestone and the tree-sitter-cpp default-case grammar difference discovered by focused tests.

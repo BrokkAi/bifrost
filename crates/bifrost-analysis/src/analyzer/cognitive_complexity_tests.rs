@@ -302,3 +302,271 @@ fn python_nested_function_body_is_not_counted() {
         return helper()\n";
     assert_eq!(python_score(src, "outer"), 0);
 }
+
+// ===== Go =====
+
+#[test]
+fn go_nested_if_and_else_if_match_reference() {
+    let src = r#"package main
+func method(a, b int) int {
+    if a > 0 {
+        if b > 0 { return 1 }
+    } else if a < 0 {
+        return -1
+    }
+    return 0
+}
+"#;
+    assert_eq!(score(&[("main.go", src)], "main.go", "method"), 4);
+}
+
+#[test]
+fn go_loops_switch_select_logical_and_function_literal_match_reference() {
+    let src = r#"package main
+func method(ch chan int, x int) int {
+    f := func() int { if x > 0 { return 1 }; return 0 }
+outer:
+    for i := 0; i < x; i++ {
+        if x > 0 && i > 0 || i < 10 { break outer }
+    }
+    switch x { case 1: return f(); default: return 0 }
+    select { case <-ch: return 1; default: return 0 }
+}
+"#;
+    assert_eq!(score(&[("main.go", src)], "main.go", "method"), 10);
+}
+
+#[test]
+fn go_repeated_logical_operator_and_unlabeled_break_are_near_misses() {
+    let src = r#"package main
+func method(a, b, c bool) {
+    for {
+        if a && b && c { break }
+    }
+}
+"#;
+    assert_eq!(score(&[("main.go", src)], "main.go", "method"), 4);
+}
+
+// ===== C / C++ =====
+
+#[test]
+fn cpp_nested_if_and_else_if_match_reference() {
+    let src = r#"int method(int a, int b) {
+    if (a > 0) {
+        if (b > 0) return 1;
+    } else if (a < 0) {
+        return -1;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(score(&[("main.cpp", src)], "main.cpp", "method"), 4);
+}
+
+#[test]
+fn cpp_control_flow_logical_lambda_and_defaults_match_reference() {
+    let src = r#"int method(int x) {
+    auto f = [&]() { if (x > 0) return 1; return 0; };
+label:
+    for (int i = 0; i < x; i++) {
+        if (x > 0 && i > 0 || i < 10) break label;
+    }
+    while (x-- > 0) continue;
+    switch (x) { case 1: return f(); default: return 0; }
+    try { risky(); } catch (...) { recover(); }
+    return x > 0 ? 1 : 0;
+}
+"#;
+    assert_eq!(score(&[("main.cpp", src)], "main.cpp", "method"), 11);
+}
+
+#[test]
+fn c_extension_uses_cpp_config_and_near_misses_remain_free() {
+    let src = r#"int method(int a, int b, int c) {
+    while (a) {
+        if (a && b && c) break;
+    }
+    switch (a) { default: return a + b * c; }
+}
+"#;
+    assert_eq!(score(&[("main.c", src)], "main.c", "method"), 4);
+}
+
+// ===== JavaScript / JSX =====
+
+#[test]
+fn javascript_nesting_else_if_and_logical_sequences_are_scored() {
+    let src = r#"function method(a, b, c) {
+    if (a && b || c) {
+        if (b) return 1;
+    } else if (c) {
+        return -1;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(score(&[("main.js", src)], "main.js", "method"), 6);
+}
+
+#[test]
+fn javascript_language_specific_control_flow_and_defaults_are_scored() {
+    let src = r#"function method(items, ready, value) {
+    for (const item in items) {
+        if (item && ready) continue;
+    }
+    do {} while (ready);
+    try { risky(); } catch (error) { recover(error); }
+    switch (value) { case 1: return value ?? 0; default: return ready ? 1 : 0; }
+}
+"#;
+    assert_eq!(score(&[("main.js", src)], "main.js", "method"), 9);
+}
+
+#[test]
+fn javascript_nested_named_function_body_is_not_counted() {
+    let src = r#"function outer(a, b) {
+    function helper() {
+        if (a) { if (b) return 1; }
+        return 0;
+    }
+    return helper();
+}
+"#;
+    assert_eq!(score(&[("main.js", src)], "main.js", "outer"), 0);
+}
+
+#[test]
+fn jsx_arrow_function_is_scored_with_shared_config() {
+    let src = r#"const method = (ready) => {
+    if (ready) return <span>ready</span>;
+    return <span>waiting</span>;
+};
+"#;
+    assert_eq!(score(&[("view.jsx", src)], "view.jsx", "method"), 1);
+}
+
+// ===== TypeScript / TSX =====
+
+#[test]
+fn typescript_typed_control_flow_matches_reference() {
+    let src = r#"function method(a: number, b?: string): number {
+    if (a > 10 && b !== undefined) {
+        for (let i = 0; i < a; i++) {
+            if (i % 2 === 0) return i;
+        }
+    }
+    return b ?? "default" ? 1 : 0;
+}
+"#;
+    assert_eq!(score(&[("main.ts", src)], "main.ts", "method"), 9);
+}
+
+#[test]
+fn typescript_nested_arrow_body_is_not_counted() {
+    let src = r#"function outer(values: number[]): number {
+    const helper = (value: number): number => {
+        if (value > 0) { if (value % 2 === 0) return value; }
+        return 0;
+    };
+    return values.length;
+}
+"#;
+    assert_eq!(score(&[("main.ts", src)], "main.ts", "outer"), 0);
+}
+
+#[test]
+fn tsx_method_uses_typescript_config() {
+    let src = r#"function method(ready: boolean) {
+    if (ready) return <span>ready</span>;
+    return <span>waiting</span>;
+}
+"#;
+    assert_eq!(score(&[("view.tsx", src)], "view.tsx", "method"), 1);
+}
+
+// ===== PHP =====
+
+#[test]
+fn php_nested_if_and_else_if_match_reference() {
+    let src = r#"<?php
+function method($a, $b) {
+    if ($a > 0) {
+        if ($b > 0) return 1;
+    } elseif ($a < 0) {
+        return -1;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(score(&[("main.php", src)], "main.php", "method"), 4);
+}
+
+#[test]
+fn php_control_flow_logical_anonymous_function_and_defaults_match_reference() {
+    let src = r#"<?php
+function method($items, $x) {
+    $f = function() use ($x) { if ($x > 0) return 1; return 0; };
+    foreach ($items as $item) {
+        if ($x > 0 && $item || $x ?? false) break;
+    }
+    switch ($x) { case 1: return $f(); default: return 0; }
+    try { risky(); } catch (Exception $e) { recover(); }
+    return $x > 0 ? 1 : 0;
+}
+"#;
+    assert_eq!(score(&[("main.php", src)], "main.php", "method"), 11);
+}
+
+#[test]
+fn php_repeated_operator_and_unlabeled_jump_are_near_misses() {
+    let src = r#"<?php
+function method($a, $b, $c) {
+    while ($a) {
+        if ($a && $b && $c) break;
+    }
+}
+"#;
+    assert_eq!(score(&[("main.php", src)], "main.php", "method"), 4);
+}
+
+// ===== Scala =====
+
+#[test]
+fn scala_nested_if_and_else_if_match_reference() {
+    let src = r#"def method(a: Int, b: Int): Int = {
+  if (a > 0) {
+    if (b > 0) return 1
+  } else if (a < 0) {
+    return -1
+  }
+  0
+}
+"#;
+    assert_eq!(score(&[("Main.scala", src)], "Main.scala", "method"), 4);
+}
+
+#[test]
+fn scala_loops_match_logical_lambda_and_wildcard_match_reference() {
+    let src = r#"def method(xs: List[Int], x: Int): Int = {
+  val f = (y: Int) => { if (y > 0) 1 else 0 }
+  for (item <- xs) {
+    if (x > 0 && item > 0 || item < 10) return f(item)
+  }
+  try risky() catch { case _: Exception => recover() }
+  x match { case 1 => f(x); case _ => 0 }
+}
+"#;
+    assert_eq!(score(&[("Main.scala", src)], "Main.scala", "method"), 9);
+}
+
+#[test]
+fn scala_repeated_logical_operator_and_wildcard_are_near_misses() {
+    let src = r#"def method(a: Boolean, b: Boolean, c: Boolean, x: Int): Int = {
+  if (a && b && c) {
+    x match { case _ => 0 }
+  } else 0
+}
+"#;
+    assert_eq!(score(&[("Main.scala", src)], "Main.scala", "method"), 2);
+}
