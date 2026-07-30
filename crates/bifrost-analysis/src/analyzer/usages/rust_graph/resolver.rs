@@ -1,7 +1,9 @@
 use crate::analyzer::rust::lexical_scope::{self, RustLexicalScopeIndex};
+use crate::analyzer::rust::{resolve_rust_import_package_scoped, rust_package_name};
+use crate::analyzer::usages::ImportKind;
 use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
 use crate::analyzer::{
-    CodeUnit, GlobalUsageDefinitionIndex, IAnalyzer, ProjectFile, Range, RustAnalyzer,
+    CodeUnit, GlobalUsageDefinitionIndex, IAnalyzer, Language, ProjectFile, Range, RustAnalyzer,
     RustReferenceContext, SignatureMetadata, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
@@ -422,7 +424,57 @@ pub(crate) fn lexical_explicit_import_fqn(
     if fqns.len() == 1 {
         return fqns.into_iter().next();
     }
-    let mut pending = rust.resolve_visible_import_targets_forward(file, &binder, name);
+
+    for (scope_start, scoped_binder) in
+        lexical_scope::visible_import_binders_with_scopes_at(source, segment.start_byte())
+    {
+        let mut scoped_pending = Vec::new();
+        for binding in scoped_binder.bindings.values() {
+            let segments = crate::analyzer::symbol_lookup::parse_symbol_path(
+                Language::Rust,
+                &binding.module_specifier,
+            );
+            if binding.kind != ImportKind::Glob
+                || !matches!(segments.first().map(String::as_str), Some("self" | "super"))
+            {
+                continue;
+            }
+            let Some(package) = resolve_rust_import_package_scoped(
+                rust,
+                file,
+                source,
+                scope_start,
+                &binding.module_specifier,
+            ) else {
+                continue;
+            };
+            scoped_pending.extend(
+                rust.get_analyzed_files()
+                    .into_iter()
+                    .filter(|candidate| rust_package_name(candidate) == package)
+                    .map(|candidate| (candidate, name.to_string())),
+            );
+        }
+        let imported_fqns = resolve_lexical_import_target_fqns(rust, support, scoped_pending);
+        if !imported_fqns.is_empty() {
+            return (imported_fqns.len() == 1)
+                .then(|| imported_fqns.into_iter().next())
+                .flatten();
+        }
+    }
+
+    let pending = rust.resolve_visible_import_targets_forward(file, &binder, name);
+    let imported_fqns = resolve_lexical_import_target_fqns(rust, support, pending);
+    (imported_fqns.len() == 1)
+        .then(|| imported_fqns.into_iter().next())
+        .flatten()
+}
+
+fn resolve_lexical_import_target_fqns(
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    mut pending: Vec<(ProjectFile, String)>,
+) -> BTreeSet<String> {
     let mut visited = HashSet::default();
     let mut imported_fqns = BTreeSet::new();
     while let Some((target_file, target_name)) = pending.pop() {
@@ -451,10 +503,7 @@ pub(crate) fn lexical_explicit_import_fqn(
             &target_name,
         ));
     }
-    if imported_fqns.len() == 1 {
-        return imported_fqns.into_iter().next();
-    }
-    None
+    imported_fqns
 }
 
 fn rust_token_path_segment(node: Node<'_>) -> bool {

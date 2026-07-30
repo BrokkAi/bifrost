@@ -4,7 +4,8 @@ use brokk_bifrost::usages::{
     ExplicitCandidateProvider, FuzzyResult, UsageAnalyzer, UsageFinder, UsageHit, UsageHitKind,
 };
 use brokk_bifrost::{
-    AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, ProjectFile, RustAnalyzer,
+    AnalyzerConfig, AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, ProjectFile,
+    RustAnalyzer, WorkspaceAnalyzer,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -26,6 +27,30 @@ fn rust_analyzer_with_files(
     }
     let project = builder.build();
     let analyzer = RustAnalyzer::from_project(project.project().clone());
+    (project, analyzer)
+}
+
+fn persisted_warm_rust_analyzer_with_files(
+    files: &[(&str, &str)],
+) -> (crate::common::BuiltInlineTestProject, RustAnalyzer) {
+    let mut builder = InlineTestProject::with_language(Language::Rust);
+    for (path, contents) in files {
+        builder = builder.file(path, *contents);
+    }
+    let project = builder.build();
+    let cold = WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+        .expect("persisted Rust analyzer should build");
+    drop(cold);
+    let warm = WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+        .expect("persisted Rust analyzer should reopen");
+    let analyzer = match warm {
+        WorkspaceAnalyzer::Single(delegate) => match *delegate {
+            AnalyzerDelegate::Rust(analyzer) => analyzer,
+            _ => panic!("expected single Rust analyzer"),
+        },
+        WorkspaceAnalyzer::Multi(_) => panic!("expected single Rust analyzer"),
+        WorkspaceAnalyzer::Empty(_) => panic!("expected non-empty Rust analyzer"),
+    };
     (project, analyzer)
 }
 
@@ -1638,7 +1663,7 @@ fn member(
 }
 
 fn authoritative_hits(
-    analyzer: &RustAnalyzer,
+    analyzer: &dyn IAnalyzer,
     target: &CodeUnit,
     files: HashSet<ProjectFile>,
 ) -> BTreeSet<UsageHit> {
@@ -2084,6 +2109,233 @@ fn build(name: String) { let _ = User { name }; } // BINARY_DECOY
         hits.iter()
             .all(|hit| hit.file != project.file("src/main.rs")),
         "the binary's same-FQN field must remain unrelated: {hits:#?}"
+    );
+}
+
+#[test]
+fn authoritative_rust_test_module_struct_expression_fields_use_super_imported_owner() {
+    let lib = r#"
+pub struct User {
+    pub name: String,
+}
+
+pub struct Decoy {
+    pub name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_super_imported_field_labels() {
+        let name = String::from("Ada");
+        let _ = User {
+            name: String::from("Grace"), // EXPLICIT_FIELD
+        };
+        let _ = User { name }; // SHORTHAND_FIELD
+        let _ = Decoy { name: String::from("Linus") }; // DECOY_FIELD
+    }
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", lib)]);
+    let file = project.file("src/lib.rs");
+    let target = member(&analyzer, &file, "User", "name");
+    let hits = authoritative_hits(&analyzer, &target, [file.clone()].into_iter().collect());
+
+    let explicit = lib
+        .find("name: String::from(\"Grace\")")
+        .expect("explicit field label");
+    let shorthand = lib
+        .find("name }; // SHORTHAND_FIELD")
+        .expect("shorthand field label");
+    let decoy = lib
+        .find("name: String::from(\"Linus\")")
+        .expect("decoy field label");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == file
+                && (hit.start_offset, hit.end_offset) == (explicit, explicit + "name".len())
+        }),
+        "explicit field label inside #[cfg(test)] mod tests must resolve through use super::*: {hits:#?}"
+    );
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == file
+                && (hit.start_offset, hit.end_offset) == (shorthand, shorthand + "name".len())
+        }),
+        "shorthand field label inside #[cfg(test)] mod tests must resolve through use super::*: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != file || (hit.start_offset, hit.end_offset) != (decoy, decoy + "name".len())
+        }),
+        "same-named decoy owner must remain excluded inside test modules: {hits:#?}"
+    );
+}
+
+#[test]
+fn authoritative_rust_file_backed_test_module_super_glob_stays_in_own_module() {
+    let planner = r#"
+pub struct PlannerItem;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds() {
+        let _ = PlannerItem; // TARGET_ITEM
+    }
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod domain_events;\n"),
+        (
+            "src/domain_events/mod.rs",
+            "pub mod planner;\npub struct PlannerItem;\n",
+        ),
+        ("src/domain_events/planner.rs", planner),
+    ]);
+    let file = project.file("src/domain_events/planner.rs");
+    let target = analyzer
+        .get_definitions("domain_events.planner")
+        .into_iter()
+        .find(CodeUnit::is_module)
+        .expect("planner module");
+    let hits = authoritative_hits(&analyzer, &target, [file.clone()].into_iter().collect());
+    let expected = planner.find("use super::*").expect("super glob") + "use ".len();
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == file
+                && (hit.start_offset, hit.end_offset) == (expected, expected + "super".len())
+        }),
+        "a file-backed test module must resolve the `super` import prefix to its own enclosing module: {hits:#?}"
+    );
+}
+
+#[test]
+fn authoritative_rust_nested_super_import_struct_field_keeps_external_owner() {
+    let service = r#"
+#[cfg(test)]
+mod tests {
+    use super::super::assets_model::{Asset, Decoy};
+
+    fn build() {
+        let _ = Asset {
+            instrument_exchange_mic: Some("XNYS".to_string()),
+        };
+        let _ = Decoy {
+            instrument_exchange_mic: Some("XNAS".to_string()),
+        };
+    }
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod assets;\n"),
+        (
+            "src/assets/mod.rs",
+            "pub mod assets_model;\npub mod assets_service;\n",
+        ),
+        (
+            "src/assets/assets_model.rs",
+            "pub struct Asset { pub instrument_exchange_mic: Option<String> }\npub struct Decoy { pub instrument_exchange_mic: Option<String> }\n",
+        ),
+        ("src/assets/assets_service.rs", service),
+    ]);
+    let target = member(
+        &analyzer,
+        &project.file("src/assets/assets_model.rs"),
+        "Asset",
+        "instrument_exchange_mic",
+    );
+    let hits = authoritative_hits(
+        &analyzer,
+        &target,
+        [project.file("src/assets/assets_service.rs")]
+            .into_iter()
+            .collect(),
+    );
+    let expected = service
+        .find("instrument_exchange_mic: Some(\"XNYS\"")
+        .expect("Asset field label");
+    let unrelated = service
+        .find("instrument_exchange_mic: Some(\"XNAS\"")
+        .expect("Decoy field label");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/assets/assets_service.rs")
+                && (hit.start_offset, hit.end_offset)
+                    == (expected, expected + "instrument_exchange_mic".len())
+        }),
+        "nested cross-file super import must resolve the exact struct-field owner: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != project.file("src/assets/assets_service.rs")
+                || (hit.start_offset, hit.end_offset)
+                    != (unrelated, unrelated + "instrument_exchange_mic".len())
+        }),
+        "same-named field on the imported decoy owner must remain excluded: {hits:#?}"
+    );
+}
+
+#[test]
+fn authoritative_rust_reexported_struct_field_keeps_physical_owner() {
+    let consumer = r#"
+use crate::broker::{Decoy, UserInfo};
+
+fn build() {
+    let _ = UserInfo { team_role: None };
+    let _ = Decoy { team_role: None };
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod broker;\nmod client;\n"),
+        (
+            "src/broker/mod.rs",
+            "mod models;\npub use models::{Decoy, UserInfo};\n",
+        ),
+        (
+            "src/broker/models.rs",
+            "pub struct UserInfo { pub team_role: Option<String> }\npub struct Decoy { pub team_role: Option<String> }\n",
+        ),
+        ("src/client.rs", consumer),
+    ]);
+    let target = member(
+        &analyzer,
+        &project.file("src/broker/models.rs"),
+        "UserInfo",
+        "team_role",
+    );
+    let hits = authoritative_hits(
+        &analyzer,
+        &target,
+        [project.file("src/client.rs")].into_iter().collect(),
+    );
+    let expected = consumer
+        .find("team_role: None")
+        .expect("UserInfo field label");
+    let unrelated = consumer
+        .rfind("team_role: None")
+        .expect("Decoy field label");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/client.rs")
+                && (hit.start_offset, hit.end_offset) == (expected, expected + "team_role".len())
+        }),
+        "a grouped barrel reexport must retain the physical struct-field owner: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != project.file("src/client.rs")
+                || (hit.start_offset, hit.end_offset) != (unrelated, unrelated + "team_role".len())
+        }),
+        "a same-named field on a sibling reexport must remain excluded: {hits:#?}"
     );
 }
 
@@ -9294,6 +9546,47 @@ fn parent() {}
 }
 
 #[test]
+fn rust_imported_module_qualifier_keeps_exact_bare_prefix() {
+    let consumer = r#"
+use crate::schema::{accounts, assets};
+
+fn consume(_: assets::Table, _: accounts::Table) {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod consumer;\npub mod schema;\n"),
+        (
+            "src/schema.rs",
+            "pub mod accounts { pub struct Table; }\npub mod assets { pub struct Table; }\n",
+        ),
+        ("src/consumer.rs", consumer),
+    ]);
+    let target = definition(&analyzer, "schema.assets");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .all_hits_including_imports();
+    let expected = consumer.find("assets::Table").expect("assets qualifier");
+    let unrelated = consumer
+        .find("accounts::Table")
+        .expect("accounts qualifier");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/consumer.rs")
+                && hit.start_offset == expected
+                && hit.end_offset == expected + "assets".len()
+                && hit.kind == UsageHitKind::Reference
+        }),
+        "expected exact imported module qualifier hit: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != project.file("src/consumer.rs") || hit.start_offset != unrelated
+        }),
+        "an unrelated imported module qualifier must stay unrelated: {hits:#?}"
+    );
+}
+
+#[test]
 fn rust_grouped_self_import_keeps_module_namespace_exact() {
     let source = r#"
 mod quic_stream {
@@ -10660,6 +10953,182 @@ fn run() {
 }
 
 #[test]
+fn rust_graph_same_crate_imported_bare_function_call_stays_exact_after_persisted_reopen() {
+    let consumer = r#"
+use crate::db::{get_connection, init};
+
+fn run() {
+    get_connection();
+    init();
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::db::{get_connection, init};
+
+    fn run() {
+        get_connection();
+        init();
+    }
+}
+
+mod shadowed {
+    use crate::other::init as get_connection;
+
+    fn run() {
+        get_connection();
+    }
+}
+"#;
+    let (project, analyzer) = persisted_warm_rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod db;\npub mod other;\npub mod sync;\n"),
+        (
+            "src/db/mod.rs",
+            "pub fn get_connection() {}\npub fn init() {}\n",
+        ),
+        ("src/other.rs", "pub fn init() {}\n"),
+        ("src/sync/mod.rs", "pub mod app_sync;\n"),
+        ("src/sync/app_sync/mod.rs", "pub mod repository;\n"),
+        ("src/sync/app_sync/repository.rs", consumer),
+    ]);
+    let candidate = project.file("src/sync/app_sync/repository.rs");
+    let target = definition(&analyzer, "db.get_connection");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .all_hits_including_imports();
+    let imported = consumer
+        .find("get_connection, init")
+        .expect("outer grouped import terminal");
+    let expected = consumer
+        .find("get_connection();")
+        .expect("outer imported bare call");
+    let shadowed = consumer
+        .rfind("get_connection();")
+        .expect("narrowly shadowed imported bare call");
+    let sibling = consumer
+        .rfind("init();")
+        .expect("inline-test sibling imported bare call");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == candidate
+                && (hit.start_offset, hit.end_offset)
+                    == (expected, expected + "get_connection".len())
+                && hit.kind == UsageHitKind::Reference
+        }),
+        "a persisted reopen must keep the exact imported bare call edge: {hits:#?}"
+    );
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == candidate
+                && (hit.start_offset, hit.end_offset)
+                    == (imported, imported + "get_connection".len())
+                && hit.kind == UsageHitKind::Import
+        }),
+        "a persisted reopen must keep the exact grouped import terminal: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != candidate
+                || (hit.start_offset, hit.end_offset)
+                    != (shadowed, shadowed + "get_connection".len())
+        }),
+        "a narrower explicit import must shadow the file-level target after a persisted reopen: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != candidate
+                || (hit.start_offset, hit.end_offset) != (sibling, sibling + "init".len())
+        }),
+        "a persisted reopen must not cross to the sibling imported function: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_graph_concurrent_workspace_bare_function_queries_stay_isolated() {
+    let consumer = r#"
+#[cfg(test)]
+mod tests {
+    use crate::db::{init, run_migrations};
+
+    fn first() {
+        let db_path = init("first");
+        run_migrations(&db_path);
+    }
+
+    fn second() {
+        let db_path = init("second");
+        run_migrations(&db_path);
+    }
+}
+"#;
+    let (project, _) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod db;\npub mod sync;\n"),
+        (
+            "src/db/mod.rs",
+            "pub fn init(_: &str) -> String { String::new() }\npub fn run_migrations(_: &str) {}\n",
+        ),
+        ("src/sync/mod.rs", "pub mod app_sync;\n"),
+        ("src/sync/app_sync/mod.rs", "pub mod repository;\n"),
+        ("src/sync/app_sync/repository.rs", consumer),
+    ]);
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    let candidate = project.file("src/sync/app_sync/repository.rs");
+    let init = analyzer
+        .get_definitions("db.init")
+        .into_iter()
+        .next()
+        .expect("db.init");
+    let run_migrations = analyzer
+        .get_definitions("db.run_migrations")
+        .into_iter()
+        .next()
+        .expect("db.run_migrations");
+    let expected_init = consumer.find("init(\"first\")").expect("first init call");
+    let expected_migration = consumer
+        .find("run_migrations(&db_path)")
+        .expect("first migration call");
+
+    for _ in 0..8 {
+        std::thread::scope(|scope| {
+            let init_query = scope.spawn(|| {
+                authoritative_hits(analyzer, &init, [candidate.clone()].into_iter().collect())
+            });
+            let migration_query = scope.spawn(|| {
+                authoritative_hits(
+                    analyzer,
+                    &run_migrations,
+                    [candidate.clone()].into_iter().collect(),
+                )
+            });
+            let init_hits = init_query.join().expect("init query thread");
+            let migration_hits = migration_query.join().expect("migration query thread");
+
+            assert!(
+                init_hits.iter().any(|hit| {
+                    hit.file == candidate
+                        && (hit.start_offset, hit.end_offset)
+                            == (expected_init, expected_init + "init".len())
+                }),
+                "a concurrent workspace query must retain the imported init call: {init_hits:#?}"
+            );
+            assert!(
+                migration_hits.iter().any(|hit| {
+                    hit.file == candidate
+                        && (hit.start_offset, hit.end_offset)
+                            == (
+                                expected_migration,
+                                expected_migration + "run_migrations".len(),
+                            )
+                }),
+                "a concurrent workspace query must retain the imported migration call: {migration_hits:#?}"
+            );
+        });
+    }
+}
+
+#[test]
 fn rust_graph_imported_receiver_method_call_keeps_exact_owner() {
     let consumer = r#"
 use crate::checkpoint::base::Checkpointer;
@@ -11014,6 +11483,59 @@ fn build() {
                 && hit.kind == UsageHitKind::Reference
         }),
         "a scoped enum variant path must keep the exact terminal hit: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_graph_grouped_self_import_enum_variant_keeps_terminal_exact() {
+    let consumer = r#"
+use crate::errors::{self, Error as OtherError};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build() {
+        let _ = errors::Error::Unexpected(String::new());
+        let _ = OtherError::Other;
+    }
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod consumer;\npub mod errors;\n"),
+        (
+            "src/errors.rs",
+            "pub enum Error { Unexpected(String), Other }\n",
+        ),
+        ("src/consumer.rs", consumer),
+    ]);
+    let target = analyzer
+        .get_definitions("errors.Error.Unexpected")
+        .into_iter()
+        .find(CodeUnit::is_field)
+        .expect("Error::Unexpected variant");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[target])
+        .all_hits();
+    let expected = consumer
+        .find("Unexpected(String::new())")
+        .expect("grouped self imported enum variant terminal");
+    let unrelated = consumer.find("Other;").expect("unrelated enum variant");
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/consumer.rs")
+                && (hit.start_offset, hit.end_offset) == (expected, expected + "Unexpected".len())
+                && hit.kind == UsageHitKind::Reference
+        }),
+        "a grouped self-imported enum owner must keep the exact variant terminal: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != project.file("src/consumer.rs")
+                || (hit.start_offset, hit.end_offset) != (unrelated, unrelated + "Other".len())
+        }),
+        "another variant on an aliased owner must remain unrelated: {hits:#?}"
     );
 }
 

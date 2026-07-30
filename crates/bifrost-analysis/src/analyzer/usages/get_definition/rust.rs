@@ -5,8 +5,8 @@ use crate::analyzer::rust::field_roles::{
 use crate::analyzer::rust::lexical_scope;
 use crate::analyzer::rust::rust_focused_use_path;
 use crate::analyzer::rust::{
-    RustReferenceNamespace, resolve_rust_module_segments_with_crate, rust_crate_root_package,
-    rust_package_name,
+    RustReferenceNamespace, resolve_rust_import_package_scoped,
+    resolve_rust_module_segments_with_crate, rust_crate_root_package, rust_package_name,
 };
 use crate::analyzer::usages::rust_graph::{
     RustDefinitionProvider, rust_smallest_named_node_covering,
@@ -303,6 +303,12 @@ fn resolve_rust_bounded_in_session(
             "no Rust syntax node exists at the reference location",
         );
     };
+
+    if let Some(outcome) =
+        rust_rooted_use_prefix_outcome(analyzer, support.rust, support, file, source, tree, site)
+    {
+        return outcome;
+    }
 
     if let Some(outcome) = resolve_rust_field(analyzer, support, file, source, tree, site, cache) {
         return outcome;
@@ -762,6 +768,12 @@ fn resolve_rust_unscoped(
     let reference = site.text.as_str();
     if let Some(tree) = tree
         && let Some(outcome) =
+            rust_rooted_use_prefix_outcome(analyzer, rust, support, file, source, tree, site)
+    {
+        return outcome;
+    }
+    if let Some(tree) = tree
+        && let Some(outcome) =
             rust_struct_field_name_outcome(analyzer, support, file, source, tree, site)
     {
         return outcome;
@@ -1097,6 +1109,11 @@ fn resolve_rust_unscoped(
                         "`{reference}` is explicitly imported across a Rust crate/module boundary that is not indexed"
                     ));
                 }
+                RustVisibleImportResolution::GlobBoundButUnindexed => {
+                    return boundary_unchecked(format!(
+                        "`{reference}` is inherited from an unindexed Rust import"
+                    ));
+                }
                 RustVisibleImportResolution::Unbound => {
                     // Only an unbound name may fall back to a lexically enclosing
                     // declaration. An explicit import is authoritative even when a
@@ -1279,6 +1296,7 @@ enum RustVisibleImportResolution {
     Resolved(Vec<CodeUnit>),
     GlobResolved(Vec<CodeUnit>),
     BoundButUnindexed,
+    GlobBoundButUnindexed,
     Unbound,
 }
 
@@ -1358,7 +1376,8 @@ pub(crate) fn rust_forward_bare_token_reference_fqn(
             let local = current_module();
             if local.is_empty() { candidates } else { local }
         }
-        RustVisibleImportResolution::BoundButUnindexed => return None,
+        RustVisibleImportResolution::BoundButUnindexed
+        | RustVisibleImportResolution::GlobBoundButUnindexed => return None,
         RustVisibleImportResolution::Unbound => current_module(),
     };
     sort_units(&mut candidates);
@@ -1636,6 +1655,11 @@ fn rust_macro_name_outcome(
                     "Rust macro `{name}` is imported across a crate/module boundary that is not indexed"
                 )));
             }
+            RustVisibleImportResolution::GlobBoundButUnindexed => {
+                return Some(boundary_unchecked(format!(
+                    "Rust macro `{name}` is inherited from an unindexed import"
+                )));
+            }
             RustVisibleImportResolution::Unbound => rust_current_module_candidates(
                 analyzer,
                 rust,
@@ -1735,7 +1759,7 @@ fn rust_visible_import_resolution(
                 match binding.kind {
                     ImportKind::Named => {
                         let imported = binding.imported_name.as_deref().unwrap_or(reference);
-                        if let Some(package) = resolve_import_package_scoped(
+                        if let Some(package) = resolve_rust_import_package_scoped(
                             rust,
                             file,
                             source,
@@ -1743,10 +1767,13 @@ fn rust_visible_import_resolution(
                             &binding.module_specifier,
                         ) {
                             expected_fqns.insert(format!("{package}.{imported}"));
+                            if role == RustBareReferenceRole::Value {
+                                expected_fqns.insert(format!("{package}._module_.{imported}"));
+                            }
                         }
                     }
                     ImportKind::Namespace => {
-                        if let Some(fqn) = resolve_import_package_scoped(
+                        if let Some(fqn) = resolve_rust_import_package_scoped(
                             rust,
                             file,
                             source,
@@ -1807,14 +1834,12 @@ fn rust_visible_import_resolution(
             }
         }
         let mut candidates = Vec::new();
+        let mut crossed_unindexed_explicit_binding = false;
         for (target_file, target_name) in targets {
-            candidates.extend(rust_import_target_candidates(
-                rust,
-                support,
-                target_file,
-                target_name,
-                role,
-            ));
+            let resolved =
+                rust_import_target_candidates(rust, support, target_file, target_name, role);
+            candidates.extend(resolved.candidates);
+            crossed_unindexed_explicit_binding |= resolved.crossed_unindexed_explicit_binding;
         }
         if explicitly_bound && !expected_fqns.is_empty() {
             let exact: Vec<_> = candidates
@@ -1824,6 +1849,12 @@ fn rust_visible_import_resolution(
                 .collect();
             if !exact.is_empty() {
                 candidates = exact;
+            } else if candidates.is_empty() {
+                candidates = expected_fqns
+                    .iter()
+                    .flat_map(|fqn| support.fqn(fqn))
+                    .filter(|candidate| rust_role_accepts_imported(rust, role, candidate))
+                    .collect();
             }
         }
         sort_units(&mut candidates);
@@ -1837,6 +1868,9 @@ fn rust_visible_import_resolution(
         }
         if explicitly_bound {
             return RustVisibleImportResolution::BoundButUnindexed;
+        }
+        if crossed_unindexed_explicit_binding {
+            return RustVisibleImportResolution::GlobBoundButUnindexed;
         }
     }
     RustVisibleImportResolution::Unbound
@@ -1861,7 +1895,7 @@ fn rust_scoped_glob_forward_import_targets(
         {
             continue;
         }
-        let Some(package) = resolve_import_package_scoped(
+        let Some(package) = resolve_rust_import_package_scoped(
             rust,
             file,
             source,
@@ -1870,46 +1904,20 @@ fn rust_scoped_glob_forward_import_targets(
         ) else {
             continue;
         };
+        let files = rust
+            .get_analyzed_files()
+            .into_iter()
+            .filter(|candidate| rust_package_name(candidate) == package)
+            .collect::<Vec<_>>();
         targets.extend(
-            rust.get_analyzed_files()
+            files
                 .into_iter()
-                .filter(|candidate| rust_package_name(candidate) == package)
                 .map(|candidate| (candidate, reference.to_string())),
         );
     }
     targets.sort();
     targets.dedup();
     targets
-}
-
-/// Resolve an import's module specifier to its package, scope-aware:
-/// `self`/`super` prefixes resolve against the lexical module the import
-/// statement lives in (file package + inline `mod` path at the binder's
-/// scope start), so `use super::X` from a nested module means the parent
-/// inline module — not the file's parent package, which is where the
-/// file-level resolver incorrectly looked (#1074: `use super::ProgUpdate`
-/// from `mod tests` claimed the same-file type "is not indexed").
-fn resolve_import_package_scoped(
-    rust: &RustAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-    scope_start: usize,
-    module_specifier: &str,
-) -> Option<String> {
-    let segments =
-        crate::analyzer::symbol_lookup::parse_symbol_path(Language::Rust, module_specifier);
-    let first = segments.first().map(String::as_str)?;
-    if !matches!(first, "self" | "super") {
-        return rust.resolve_module_package(file, module_specifier);
-    }
-    let file_package = crate::analyzer::rust::rust_package_name(file);
-    let lexical_package = lexical_scope::lexical_package_at(&file_package, source, scope_start);
-    let crate_package = crate::analyzer::rust::rust_crate_root_package(file);
-    crate::analyzer::rust::resolve_rust_module_segments_with_crate(
-        &lexical_package,
-        &crate_package,
-        &segments,
-    )
 }
 
 /// True when a `self`/`super` import's module specifier resolves to the
@@ -1980,14 +1988,20 @@ fn import_path_resolves_within_file(
     (parent == file_package).then(|| name.clone())
 }
 
+struct RustImportTargetCandidates {
+    candidates: Vec<CodeUnit>,
+    crossed_unindexed_explicit_binding: bool,
+}
+
 fn rust_import_target_candidates(
     rust: &RustAnalyzer,
     support: &dyn RustDefinitionProvider,
     target_file: ProjectFile,
     target_name: String,
     role: RustBareReferenceRole,
-) -> Vec<CodeUnit> {
+) -> RustImportTargetCandidates {
     let mut candidates = Vec::new();
+    let mut crossed_explicit_binding = false;
     let mut pending = vec![(target_file, target_name)];
     let mut visited = HashSet::default();
     while let Some((file, name)) = pending.pop() {
@@ -2010,12 +2024,27 @@ fn rust_import_target_candidates(
         let Ok(source) = file.read_to_string() else {
             continue;
         };
-        let binder = lexical_scope::visible_import_binder_at(&source, source.len());
+        let binder = lexical_scope::visible_import_binder_at(&source, 0);
+        if rust_binder_has_external_binding(&binder, &name) {
+            crossed_explicit_binding = true;
+            if let Some(fqn) = rust.reference_context_of(&file).resolve_bare(&name) {
+                candidates.extend(
+                    support
+                        .fqn(fqn)
+                        .into_iter()
+                        .filter(|candidate| rust_role_accepts_imported(rust, role, candidate)),
+                );
+            }
+            continue;
+        }
         pending.extend(rust_forward_import_targets(rust, &file, &binder, &name));
     }
     sort_units(&mut candidates);
     candidates.dedup();
-    candidates
+    RustImportTargetCandidates {
+        crossed_unindexed_explicit_binding: crossed_explicit_binding && candidates.is_empty(),
+        candidates,
+    }
 }
 
 fn rust_forward_import_targets(
@@ -2767,6 +2796,53 @@ fn rust_enclosing_ancestor<'tree>(mut node: Node<'tree>, kind: &str) -> Option<N
     None
 }
 
+fn rust_rooted_use_prefix_outcome(
+    analyzer: &dyn IAnalyzer,
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+) -> Option<DefinitionLookupOutcome> {
+    let focused =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
+    let focused_text = rust_node_text(focused, source).trim();
+    if !matches!(focused_text, "self" | "super")
+        || rust_enclosing_ancestor(focused, "use_declaration").is_none()
+    {
+        return None;
+    }
+    let focused_path = rust_focused_use_path(focused, source)?;
+    if focused_path.root.start_byte() != focused.start_byte()
+        || focused_path.root.end_byte() != focused.end_byte()
+    {
+        return None;
+    }
+    let mut current = analyzer.enclosing_code_unit(file, &site.range);
+    while current.as_ref().is_some_and(|unit| !unit.is_module()) {
+        current = current.and_then(|unit| analyzer.parent_of(&unit));
+    }
+    let lexical_module = match focused_text {
+        "self" => current,
+        "super" => current.and_then(|unit| analyzer.parent_of(&unit)),
+        _ => unreachable!(),
+    };
+    if let Some(module) = lexical_module.filter(CodeUnit::is_module) {
+        return Some(candidates_outcome(vec![module]));
+    }
+    let fqn =
+        resolve_rust_import_package_scoped(rust, file, source, focused.start_byte(), focused_text)?;
+    let mut candidates = support
+        .fqn(&fqn)
+        .into_iter()
+        .filter(CodeUnit::is_module)
+        .collect::<Vec<_>>();
+    sort_units(&mut candidates);
+    candidates.dedup();
+    (!candidates.is_empty()).then(|| candidates_outcome(candidates))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rust_focused_use_path_outcome(
     analyzer: &dyn IAnalyzer,
@@ -2787,12 +2863,27 @@ fn rust_focused_use_path_outcome(
         RustFocusedPathRole::Declaration
     };
     let refs = support.forward_reference_context(rust, file)?;
-    let resolved_fqn = crate::analyzer::usages::rust_graph::resolve_rust_path_fqn(
-        rust,
-        &refs,
-        file,
-        &focused_path.full_path,
-    );
+    let rooted_segments =
+        crate::analyzer::symbol_lookup::parse_symbol_path(Language::Rust, &focused_path.full_path);
+    let resolved_fqn = if matches!(
+        rooted_segments.first().map(String::as_str),
+        Some("self" | "super")
+    ) {
+        resolve_rust_import_package_scoped(
+            rust,
+            file,
+            source,
+            focused.start_byte(),
+            &focused_path.full_path,
+        )
+    } else {
+        crate::analyzer::usages::rust_graph::resolve_rust_path_fqn(
+            rust,
+            &refs,
+            file,
+            &focused_path.full_path,
+        )
+    };
     Some(rust_focused_prefix_resolution_outcome(
         analyzer,
         rust,
@@ -3090,7 +3181,8 @@ fn rust_owner_root_availability(
         {
             return RustOwnerRootAvailability::Indexed;
         }
-        RustVisibleImportResolution::BoundButUnindexed => {
+        RustVisibleImportResolution::BoundButUnindexed
+        | RustVisibleImportResolution::GlobBoundButUnindexed => {
             return RustOwnerRootAvailability::Boundary;
         }
         RustVisibleImportResolution::Resolved(_)
@@ -3285,6 +3377,18 @@ fn rust_focused_prefix_resolution_outcome(
                     || rust_focused_is_workspace_module_namespace(rust, file, focused_text),
                     format!(
                         "focused Rust owner `{focused_text}` is explicitly imported across a crate/module boundary that is not indexed"
+                    ),
+                    "workspace_module_namespace",
+                    format!(
+                        "`{focused_text}` names a Rust crate or module in this workspace, not a single indexed declaration"
+                    ),
+                );
+            }
+            RustVisibleImportResolution::GlobBoundButUnindexed => {
+                return gated_boundary(
+                    || rust_focused_is_workspace_module_namespace(rust, file, focused_text),
+                    format!(
+                        "focused Rust owner `{focused_text}` is inherited from an unindexed import"
                     ),
                     "workspace_module_namespace",
                     format!(
@@ -4191,37 +4295,6 @@ pub(crate) fn rust_expression_type_definition_candidates_cached(
         &fqn,
         before_byte,
         Some(RustCurrentSyntax { file, source, root }),
-        cache,
-    )
-}
-
-pub(crate) fn rust_type_node_definition_candidates_cached(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn RustDefinitionProvider,
-    file: &ProjectFile,
-    source: &str,
-    type_node: Node<'_>,
-    cache: &mut RustTypeLookupCache,
-) -> Vec<CodeUnit> {
-    let reference_byte = type_node.start_byte();
-    let Some(fqn) = rust_resolve_type_node_fqn(
-        analyzer,
-        support,
-        file,
-        source,
-        type_node,
-        Some(reference_byte),
-    ) else {
-        return Vec::new();
-    };
-    let root = rust_root_node(support, type_node);
-    rust_type_definition_candidates_for_fqn(
-        analyzer,
-        support,
-        file,
-        &fqn,
-        reference_byte,
-        root.map(|root| RustCurrentSyntax { file, source, root }),
         cache,
     )
 }
@@ -5743,11 +5816,36 @@ fn rust_import_type_fqn(
     name: &str,
     reference_byte: Option<usize>,
 ) -> Option<String> {
-    let mut candidates: Vec<_> =
-        rust_imported_export_candidates(rust, support, file, name, reference_byte)
-            .into_iter()
-            .filter(|unit| unit.is_class())
-            .collect();
+    let visible = reference_byte
+        .zip(file.read_to_string().ok())
+        .map(|(reference_byte, source)| {
+            rust_visible_import_resolution(
+                rust,
+                support,
+                file,
+                &source,
+                reference_byte,
+                name,
+                RustBareReferenceRole::Type,
+            )
+        });
+    let imported = match visible {
+        Some(
+            RustVisibleImportResolution::Resolved(candidates)
+            | RustVisibleImportResolution::GlobResolved(candidates),
+        ) => candidates,
+        Some(
+            RustVisibleImportResolution::BoundButUnindexed
+            | RustVisibleImportResolution::GlobBoundButUnindexed,
+        ) => Vec::new(),
+        Some(RustVisibleImportResolution::Unbound) | None => {
+            rust_imported_export_candidates(rust, support, file, name, reference_byte)
+        }
+    };
+    let mut candidates: Vec<_> = imported
+        .into_iter()
+        .filter(|unit| unit.is_class())
+        .collect();
     sort_units(&mut candidates);
     candidates.dedup();
     (candidates.len() == 1).then(|| candidates.remove(0).fq_name())
@@ -6343,6 +6441,222 @@ pub fn dispatch() {
                         && rel_path_string(definition.source()) == "src/navigation.rs"
             ),
             "{value:#?}"
+        );
+    }
+
+    #[test]
+    fn bounded_definition_lookup_resolves_file_backed_super_import_prefix() {
+        let source = r#"
+pub struct PlannerItem;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+}
+"#
+        .to_string();
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Rust,
+            &[
+                ("src/lib.rs", "pub mod domain_events;\n"),
+                ("src/domain_events/mod.rs", "pub mod planner;\n"),
+                ("src/domain_events/planner.rs", &source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "src/domain_events/planner.rs");
+        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let site = site_for_expression(&source, &file, "use super::*", "super");
+        let outcome = resolve_rust_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+
+        let BoundedResolution::Complete { value, .. } = outcome else {
+            panic!("super import lookup should complete");
+        };
+        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
+        assert!(
+            value.definitions.iter().any(|definition| {
+                definition.is_module() && definition.fq_name() == "domain_events.planner"
+            }),
+            "super must resolve to the enclosing file-backed module: {value:#?}"
+        );
+        assert!(
+            value
+                .definitions
+                .iter()
+                .all(|definition| definition.fq_name() != "domain_events"),
+            "super must not skip the enclosing file-backed module: {value:#?}"
+        );
+    }
+
+    #[test]
+    fn full_definition_lookup_resolves_grouped_imported_module_prefix() {
+        let source = r#"
+use crate::schema::{accounts, assets};
+
+fn consume(_: assets::Table, _: accounts::Table) {}
+"#
+        .to_string();
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Rust,
+            &[
+                ("src/lib.rs", "pub mod app;\npub mod schema;\n"),
+                (
+                    "src/schema.rs",
+                    "pub mod accounts { pub struct Table; }\npub mod assets { pub struct Table; }\n",
+                ),
+                ("src/app.rs", &source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "src/app.rs");
+        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let site = site_for_expression(&source, &file, "assets::Table", "assets");
+        let rust =
+            resolve_analyzer::<RustAnalyzer>(fixture.analyzer.analyzer()).expect("Rust analyzer");
+        let support = AnalyzerRustDefinitionProvider::new(rust, false);
+        let mut cache = RustTypeLookupCache::default();
+        let value = resolve_rust(
+            fixture.analyzer.analyzer(),
+            &support,
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            &mut cache,
+            None,
+        );
+
+        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
+        assert!(
+            value.definitions.iter().any(|definition| {
+                definition.is_module() && definition.fq_name() == "schema.assets"
+            }),
+            "the imported prefix must resolve to the exact schema module: {value:#?}"
+        );
+        assert!(
+            value
+                .definitions
+                .iter()
+                .all(|definition| definition.fq_name() != "schema.accounts"),
+            "the sibling grouped import must stay unrelated: {value:#?}"
+        );
+    }
+
+    #[test]
+    fn grouped_unindexed_import_does_not_fall_back_to_same_named_crate_module() {
+        let source = r#"
+use crate::schema::{accounts, activities};
+
+mod tests {
+    use super::*;
+
+    fn consume() {
+        let _ = activities::activity_type_override;
+    }
+}
+"#
+        .to_string();
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Rust,
+            &[
+                (
+                    "src/lib.rs",
+                    "pub mod activities;\npub mod app;\npub mod schema;\n",
+                ),
+                ("src/activities.rs", "pub struct Repository;\n"),
+                (
+                    "src/schema.rs",
+                    "diesel::table! { accounts (id) { id -> Text } }\ndiesel::table! { activities (id) { id -> Text, activity_type_override -> Nullable<Text> } }\n",
+                ),
+                ("src/app.rs", &source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "src/app.rs");
+        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let site = site_for_expression(
+            &source,
+            &file,
+            "activities::activity_type_override",
+            "activities",
+        );
+        let rust =
+            resolve_analyzer::<RustAnalyzer>(fixture.analyzer.analyzer()).expect("Rust analyzer");
+        let support = AnalyzerRustDefinitionProvider::new(rust, false);
+        let mut cache = RustTypeLookupCache::default();
+        let value = resolve_rust(
+            fixture.analyzer.analyzer(),
+            &support,
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            &mut cache,
+            None,
+        );
+
+        assert!(
+            matches!(
+                value.status,
+                DefinitionLookupStatus::NoDefinition
+                    | DefinitionLookupStatus::UnresolvableImportBoundary
+            ),
+            "an unindexed explicit import must remain unresolved: {value:#?}"
+        );
+        assert!(
+            value.definitions.is_empty(),
+            "the explicit schema import must block the unrelated crate module: {value:#?}"
+        );
+    }
+
+    #[test]
+    fn grouped_self_import_terminal_resolves_imported_module() {
+        let source = "use crate::schema::{self, assets};\n";
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Rust,
+            &[
+                ("src/lib.rs", "pub mod app;\npub mod schema;\n"),
+                ("src/schema.rs", "pub mod assets {}\n"),
+                ("src/app.rs", source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "src/app.rs");
+        let tree = parse_rust_tree(source).expect("Rust tree");
+        let site = site_for_expression(source, &file, "crate::schema::{self, assets}", "self");
+        let rust =
+            resolve_analyzer::<RustAnalyzer>(fixture.analyzer.analyzer()).expect("Rust analyzer");
+        let support = AnalyzerRustDefinitionProvider::new(rust, false);
+        let mut cache = RustTypeLookupCache::default();
+        let value = resolve_rust(
+            fixture.analyzer.analyzer(),
+            &support,
+            &file,
+            source,
+            Some(&tree),
+            &site,
+            &mut cache,
+            None,
+        );
+
+        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
+        assert!(
+            value
+                .definitions
+                .iter()
+                .any(|definition| definition.is_module() && definition.fq_name() == "schema"),
+            "grouped `self` must resolve to the imported module: {value:#?}"
+        );
+        assert!(
+            value
+                .definitions
+                .iter()
+                .all(|definition| definition.fq_name() != "app"),
+            "grouped `self` must not resolve to the lexical module: {value:#?}"
         );
     }
 

@@ -723,10 +723,36 @@ pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>>
     // walker thread's clone has also been dropped.
     drop(tx);
 
-    let files = collector.join().expect("file-collector thread panicked");
+    let mut files = collector.join().expect("file-collector thread panicked");
 
     if let Some(err) = first_error.lock().expect("walk error lock poisoned").take() {
         return Err(err);
+    }
+    // Ignore walkers apply `.gitignore` patterns even to files already tracked
+    // by Git. Git itself does not: a broad pattern such as `db/` must not hide
+    // a tracked `src/db/mod.rs` from the analyzer. Union the repository index
+    // after the walk while retaining ignore behavior for untracked generated
+    // files.
+    if let Some(repo) = crate::gitblob::discover(root) {
+        let workdir = repo
+            .workdir()
+            .ok_or_else(|| io::Error::other("repository has no working directory"))?;
+        let canonical_root = root.canonicalize()?.normalize();
+        let canonical_workdir = workdir.canonicalize()?.normalize();
+        let index = repo.index().map_err(io::Error::other)?;
+        for entry in index.iter() {
+            let rel = crate::gitblob::index_path_to_string(&entry).map_err(io::Error::other)?;
+            let abs = canonical_workdir.join(rel);
+            let Ok(project_rel) = abs.strip_prefix(&canonical_root) else {
+                continue;
+            };
+            if abs.is_file() {
+                files.insert(ProjectFile::new(
+                    root.to_path_buf(),
+                    project_rel.to_path_buf(),
+                ));
+            }
+        }
     }
     Ok(files)
 }
@@ -1103,6 +1129,83 @@ mod tests {
             !rels.contains("sub/ignored.rs"),
             "`.gitignore` must still apply: {rels:?}"
         );
+    }
+
+    #[test]
+    fn collect_project_files_keeps_tracked_files_that_match_gitignore() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let repo = crate::gitblob::tests::init_repo(&root);
+        write_file(&root, "src/db/mod.rs", "pub fn connection() {}\n");
+        crate::gitblob::tests::commit_all(&repo, "tracked source");
+        write_file(&root, ".gitignore", "db/\n");
+        write_file(&root, "generated/db/ignored.rs", "fn generated() {}\n");
+
+        let rels: BTreeSet<String> = collect_workspace_files(&root)
+            .unwrap()
+            .into_iter()
+            .map(|file| file.rel_path().to_string_lossy().replace('\\', "/"))
+            .collect();
+
+        assert!(rels.contains("src/db/mod.rs"), "{rels:?}");
+        assert!(!rels.contains("generated/db/ignored.rs"), "{rels:?}");
+        let project = FilesystemProject::new(&root).unwrap();
+        assert!(
+            project
+                .analyzable_files(Language::Rust)
+                .unwrap()
+                .contains(&ProjectFile::new(&root, "src/db/mod.rs"))
+        );
+    }
+
+    #[test]
+    fn collect_project_files_maps_tracked_ignored_files_into_subdirectory_workspace() {
+        let temp = TempDir::new().unwrap();
+        let repo_root = temp.path().canonicalize().unwrap();
+        let repo = crate::gitblob::tests::init_repo(&repo_root);
+        write_file(
+            &repo_root,
+            "packages/app/src/db/mod.rs",
+            "pub fn connection() {}\n",
+        );
+        crate::gitblob::tests::commit_all(&repo, "tracked app source");
+        write_file(&repo_root, ".gitignore", "db/\n");
+        let app_root = repo_root.join("packages/app");
+
+        let rels: BTreeSet<String> = collect_workspace_files(&app_root)
+            .unwrap()
+            .into_iter()
+            .map(|file| file.rel_path().to_string_lossy().replace('\\', "/"))
+            .collect();
+
+        assert_eq!(rels, BTreeSet::from(["src/db/mod.rs".to_string()]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_project_files_maps_tracked_ignored_files_through_symlinked_workspace() {
+        let temp = TempDir::new().unwrap();
+        let repo_root = temp.path().join("repo");
+        std::fs::create_dir(&repo_root).unwrap();
+        let repo_root = repo_root.canonicalize().unwrap();
+        let repo = crate::gitblob::tests::init_repo(&repo_root);
+        write_file(
+            &repo_root,
+            "packages/app/src/db/mod.rs",
+            "pub fn connection() {}\n",
+        );
+        crate::gitblob::tests::commit_all(&repo, "tracked app source");
+        write_file(&repo_root, ".gitignore", "db/\n");
+        let linked_root = temp.path().join("linked-app");
+        std::os::unix::fs::symlink(repo_root.join("packages/app"), &linked_root).unwrap();
+
+        let rels: BTreeSet<String> = collect_workspace_files(&linked_root)
+            .unwrap()
+            .into_iter()
+            .map(|file| file.rel_path().to_string_lossy().replace('\\', "/"))
+            .collect();
+
+        assert_eq!(rels, BTreeSet::from(["src/db/mod.rs".to_string()]));
     }
 
     #[test]

@@ -10,7 +10,7 @@
 //! local names in an importer bind a seed
 //! ([`RustUsageIndex::matching_edges_for_importer`]).
 
-use crate::analyzer::usages::{ExportEntry, ExportIndex};
+use crate::analyzer::usages::{ExportEntry, ExportIndex, ImportKind};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use std::collections::{BTreeSet, VecDeque};
@@ -25,9 +25,9 @@ use super::graph_support::{
     rust_value_constructor_visibilities,
 };
 use super::imports::{
-    RustImportOwner, RustProjectedImport, RustVisibility, resolve_rust_module_path_with_crate,
-    resolve_rust_module_segments_with_crate, rust_crate_root_package, rust_import_projection,
-    rust_module_extents,
+    RustImportOwner, RustProjectedImport, RustVisibility, resolve_rust_import_package_scoped,
+    resolve_rust_module_path_with_crate, resolve_rust_module_segments_with_crate,
+    rust_crate_root_package, rust_import_projection, rust_module_extents,
 };
 
 /// How a local binding in an importer refers to its target: a named import
@@ -259,6 +259,7 @@ impl Domain {
 pub(crate) struct RustBindingSeeds {
     roots: BTreeSet<CodeUnit>,
     root_origins: HashSet<RustSymbolIdentity>,
+    root_identities: HashMap<CodeUnit, Vec<RustSymbolIdentity>>,
     identities: HashSet<RustSymbolIdentity>,
     identity_domains: HashMap<RustSymbolIdentity, Vec<Domain>>,
     edges_by_importer: HashMap<ProjectFile, Vec<RustImportEdge>>,
@@ -999,13 +1000,10 @@ impl RustUsageIndex {
             return None;
         };
         let mut matches = seeds.roots.iter().filter(|root| {
-            self.declaration_identities
+            seeds
+                .root_identities
                 .get(*root)
-                .is_some_and(|candidate| candidate == identity)
-                || self
-                    .value_constructor_identities
-                    .get(*root)
-                    .is_some_and(|candidate| candidate == identity)
+                .is_some_and(|candidates| candidates.contains(identity))
         });
         let root = matches.next()?.clone();
         matches.next().is_none().then_some(root)
@@ -1364,22 +1362,30 @@ impl RustUsageIndex {
     ) -> RustBindingSeeds {
         let mut identities = HashSet::default();
         let mut identity_domains: HashMap<RustSymbolIdentity, Vec<Domain>> = HashMap::default();
+        let mut root_identities: HashMap<CodeUnit, Vec<RustSymbolIdentity>> = HashMap::default();
         let mut pending = VecDeque::new();
         for root in roots {
-            let identity = self
+            let mut candidate_identities = self
                 .declaration_identities
                 .get(root)
                 .cloned()
-                .unwrap_or_else(|| RustSymbolIdentity {
+                .into_iter()
+                .chain(self.value_constructor_identities.get(root).cloned())
+                .collect::<Vec<_>>();
+            if candidate_identities.is_empty() {
+                candidate_identities.push(RustSymbolIdentity {
                     file: root.source().clone(),
                     module: ModuleKey::new(root.source(), root.package_name()),
                     name: root.identifier().to_string(),
                     namespace: RustSymbolNamespace::of(analyzer, root)
                         .unwrap_or(RustSymbolNamespace::Value),
                 });
-            let root_identities = std::iter::once(identity)
-                .chain(self.value_constructor_identities.get(root).cloned());
-            for identity in root_identities {
+            }
+            for identity in candidate_identities {
+                root_identities
+                    .entry(root.clone())
+                    .or_default()
+                    .push(identity.clone());
                 identities.insert(identity.clone());
                 if let Some(domains) = self.declaration_domains.get(&identity) {
                     identity_domains
@@ -1497,16 +1503,8 @@ impl RustUsageIndex {
             .collect();
         RustBindingSeeds {
             roots: roots.clone(),
-            root_origins: roots
-                .iter()
-                .flat_map(|root| {
-                    self.declaration_identities
-                        .get(root)
-                        .cloned()
-                        .into_iter()
-                        .chain(self.value_constructor_identities.get(root).cloned())
-                })
-                .collect(),
+            root_origins: root_identities.values().flatten().cloned().collect(),
+            root_identities,
             identities,
             identity_domains,
             edges_by_importer,
@@ -1736,6 +1734,30 @@ impl RustAnalyzer {
         (direct, qualified)
     }
 
+    pub(crate) fn usage_has_exact_scoped_binding(
+        &self,
+        file: &ProjectFile,
+        seeds: &RustBindingSeeds,
+        name: &str,
+        byte: usize,
+        namespace: RustReferenceNamespace,
+    ) -> bool {
+        scoped_explicit_import(self, file, byte, name).is_some_and(|scoped| {
+            unique_seed_identity_for_import_targets(
+                self,
+                file,
+                seeds,
+                &scoped.targets,
+                namespace,
+                byte,
+            )
+            .is_some()
+                || scoped.fqn.as_deref().is_some_and(|fqn| {
+                    unique_seed_identity_for_fqn(self, file, byte, seeds, fqn, namespace).is_some()
+                })
+        })
+    }
+
     /// All local names in `file` binding a seed (direct or namespace) — the
     /// owner-binding names the member scan keys on.
     pub(crate) fn usage_binding_local_names(
@@ -1945,8 +1967,9 @@ impl RustAnalyzer {
                         .declaration_domains
                         .iter()
                         .filter(|(identity, domains)| {
-                            identity.namespace == RustSymbolNamespace::Module
-                                && identity.file == route.target_file
+                            let domains = seeds.identity_domains.get(*identity).unwrap_or(domains);
+                            seeds.root_origins.contains(*identity)
+                                && identity.namespace == RustSymbolNamespace::Module
                                 && identity
                                     .module
                                     .with_suffix(std::slice::from_ref(&identity.name))
@@ -1976,6 +1999,52 @@ impl RustAnalyzer {
                     })
                     .map(|(identity, _)| identity.clone()),
             );
+            if matches.is_empty() {
+                let scoped_import = scoped_explicit_import(self, file, byte, segments[0]);
+                let identity = match scoped_import {
+                    Some(scoped) => unique_seed_identity_for_import_targets(
+                        self,
+                        file,
+                        seeds,
+                        &scoped.targets,
+                        namespace,
+                        byte,
+                    )
+                    .or_else(|| {
+                        scoped.fqn.as_deref().and_then(|fqn| {
+                            unique_seed_identity_for_fqn(self, file, byte, seeds, fqn, namespace)
+                        })
+                    }),
+                    None if index
+                        .origin_routes_by_file
+                        .get(file)
+                        .and_then(|routes| routes.get(segments[0]))
+                        .is_some_and(|routes| !routes.is_empty()) =>
+                    {
+                        // A structured import for this name exists, but none
+                        // is visible at this byte. The file-wide reference
+                        // context cannot restore a function-local import
+                        // outside its lexical extent.
+                        None
+                    }
+                    None => self
+                        .reference_context_of(file)
+                        .resolve_bare(segments[0])
+                        .and_then(|resolved_fqn| {
+                            unique_seed_identity_for_fqn(
+                                self,
+                                file,
+                                byte,
+                                seeds,
+                                resolved_fqn,
+                                namespace,
+                            )
+                        }),
+                };
+                if let Some(identity) = identity {
+                    matches.insert(identity);
+                }
+            }
         } else if segments.len() > 1 && matches.is_empty() {
             let terminal = segments[segments.len() - 1];
             let prefix = &segments[..segments.len() - 1];
@@ -2148,6 +2217,141 @@ fn edge_matches_single_seed(edge: &RustImportEdge, target: &RustSymbolIdentity) 
         RustImportEdgeKind::Glob => true,
         RustImportEdgeKind::Qualified(_) => false,
     }
+}
+
+fn unique_seed_identity_for_fqn(
+    analyzer: &RustAnalyzer,
+    importer: &ProjectFile,
+    byte: usize,
+    seeds: &RustBindingSeeds,
+    resolved_fqn: &str,
+    namespace: RustReferenceNamespace,
+) -> Option<RustSymbolIdentity> {
+    let index = analyzer.usage_index();
+    let importer_module = index.module_at_byte(importer, byte)?;
+    let mut matches = seeds
+        .root_identities
+        .iter()
+        .filter(|(root, _)| {
+            root.fq_name() == resolved_fqn
+                && index.declaration_visible_at(analyzer, root, importer, byte)
+        })
+        .flat_map(|(_, identities)| identities)
+        .filter(|identity| {
+            identity.namespace.accepts(namespace)
+                && (index.physical_owners.intersects(importer, &identity.file)
+                    || index
+                        .module_files
+                        .cargo_routes
+                        .target_relation(importer, &identity.file)
+                        == RustCargoTargetRelation::Shared
+                    || analyzer.files_share_cargo_target(importer, &identity.file) == Some(true))
+                && seeds.identity_domains.get(*identity).is_none_or(|domains| {
+                    domains
+                        .iter()
+                        .any(|domain| domain.contains_module(importer_module))
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        left.file
+            .cmp(&right.file)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    matches.dedup();
+    (matches.len() == 1).then(|| matches.remove(0))
+}
+
+struct ScopedExplicitImport {
+    targets: Vec<(ProjectFile, String)>,
+    fqn: Option<String>,
+}
+
+fn scoped_explicit_import(
+    analyzer: &RustAnalyzer,
+    file: &ProjectFile,
+    byte: usize,
+    name: &str,
+) -> Option<ScopedExplicitImport> {
+    let syntax = analyzer.prepared_syntax(file)?;
+    for (scope_start, binder) in
+        super::lexical_scope::visible_import_binders_with_scopes_at(syntax.source(), byte)
+    {
+        let Some(binding) = binder.bindings.get(name) else {
+            continue;
+        };
+        let fqn = match binding.kind {
+            ImportKind::Named => {
+                let imported = binding.imported_name.as_deref().unwrap_or(name);
+                resolve_rust_import_package_scoped(
+                    analyzer,
+                    file,
+                    syntax.source(),
+                    scope_start,
+                    &binding.module_specifier,
+                )
+                .map(|package| format!("{package}.{imported}"))
+            }
+            ImportKind::Namespace => resolve_rust_import_package_scoped(
+                analyzer,
+                file,
+                syntax.source(),
+                scope_start,
+                &binding.module_specifier,
+            ),
+            ImportKind::Default | ImportKind::CommonJsRequire | ImportKind::Glob => continue,
+        };
+        return Some(ScopedExplicitImport {
+            targets: analyzer.resolve_imported_export_from_binder_forward(file, &binder, name),
+            fqn,
+        });
+    }
+    None
+}
+
+fn unique_seed_identity_for_import_targets(
+    analyzer: &RustAnalyzer,
+    importer: &ProjectFile,
+    seeds: &RustBindingSeeds,
+    targets: &[(ProjectFile, String)],
+    namespace: RustReferenceNamespace,
+    byte: usize,
+) -> Option<RustSymbolIdentity> {
+    let index = analyzer.usage_index();
+    let importer_module = index.module_at_byte(importer, byte)?;
+    let mut matches = seeds
+        .root_identities
+        .iter()
+        .filter(|(root, _)| index.declaration_visible_at(analyzer, root, importer, byte))
+        .flat_map(|(_, identities)| identities)
+        .filter(|identity| {
+            identity.namespace.accepts(namespace)
+                && (index.physical_owners.intersects(importer, &identity.file)
+                    || index
+                        .module_files
+                        .cargo_routes
+                        .target_relation(importer, &identity.file)
+                        == RustCargoTargetRelation::Shared
+                    || analyzer.files_share_cargo_target(importer, &identity.file) == Some(true))
+                && seeds.identity_domains.get(*identity).is_none_or(|domains| {
+                    domains
+                        .iter()
+                        .any(|domain| domain.contains_module(importer_module))
+                })
+                && targets
+                    .iter()
+                    .any(|(file, name)| identity.file == *file && identity.name == *name)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        left.file
+            .cmp(&right.file)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    matches.dedup();
+    (matches.len() == 1).then(|| matches.remove(0))
 }
 
 fn imported_identity_domain(
@@ -2529,7 +2733,7 @@ fn edge_target_matches_exact_module(edge: &RustImportEdge) -> bool {
 mod tests {
     use super::*;
     use crate::analyzer::usages::ExportEntry;
-    use crate::analyzer::{Language, TestProject};
+    use crate::analyzer::{CodeUnitType, Language, TestProject};
 
     #[test]
     fn rust_domains_intersect_without_cross_crate_or_sibling_widening() {
@@ -2559,6 +2763,34 @@ mod tests {
             Domain::Crate(crate_a).intersect(&Domain::Crate(crate_b))
         );
         assert_eq!(Some(child.clone()), Domain::Public.intersect(&child));
+    }
+
+    #[test]
+    fn fallback_binding_identity_remains_an_exact_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let analyzer = analyzer_for(&root);
+        let source = ProjectFile::new(root, "src/db.rs");
+        let target = CodeUnit::new(
+            source.clone(),
+            CodeUnitType::Function,
+            "crate.src.db",
+            "get_connection",
+        );
+        let roots = BTreeSet::from([target.clone()]);
+        let index = RustUsageIndex::default();
+        let seeds = index.binding_seeds(&analyzer, &roots);
+        let resolution = RustReferenceResolution::Exact(RustSymbolIdentity {
+            file: source,
+            module: ModuleKey::new(target.source(), target.package_name()),
+            name: target.identifier().to_string(),
+            namespace: RustSymbolNamespace::Value,
+        });
+
+        assert_eq!(
+            index.exact_root_for_resolution(&resolution, &seeds),
+            Some(target)
+        );
     }
 
     fn project_file(root: &std::path::Path, index: usize) -> ProjectFile {
