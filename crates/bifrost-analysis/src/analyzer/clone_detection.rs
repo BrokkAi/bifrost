@@ -1,3 +1,4 @@
+use crate::analyzer::common::language_for_file;
 use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeUnit, IAnalyzer, Language, ProjectFile, parser_language_for,
 };
@@ -96,6 +97,9 @@ fn normalize_tree_sitter_clone_source(
     let mut has_candidate = false;
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
+        if profile.comment_kinds.contains(&node.kind()) {
+            continue;
+        }
         has_candidate |= profile.candidate_kinds.contains(&node.kind());
         ast_labels.push(normalize_clone_ast_label(node, source, profile));
         if node.named_child_count() == 0 {
@@ -395,6 +399,43 @@ where
             })
     });
     findings
+}
+
+pub(crate) fn detect_language_structural_clone_smells<F>(
+    analyzer: &dyn IAnalyzer,
+    files: &[ProjectFile],
+    weights: CloneSmellWeights,
+    language: Language,
+    build_candidate: F,
+) -> Vec<CloneSmell>
+where
+    F: Fn(&CodeUnit) -> Option<CloneCandidateData>,
+{
+    let requested_files: Vec<ProjectFile> = files
+        .iter()
+        .filter(|file| language_for_file(file) == language)
+        .cloned()
+        .collect();
+    if requested_files.is_empty() {
+        return Vec::new();
+    }
+
+    let all_candidates = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .filter(|code_unit| {
+            code_unit.is_function() && language_for_file(code_unit.source()) == language
+        })
+        .filter_map(|code_unit| build_candidate(&code_unit))
+        .map(|candidate| CloneCandidateProfile::create(candidate, weights))
+        .collect();
+
+    detect_structural_clone_smells(
+        &requested_files,
+        all_candidates,
+        weights,
+        refine_clone_similarity_with_ast,
+    )
 }
 
 fn compute_ast_label_multiset_similarity_percent(left: &str, right: &str) -> i32 {

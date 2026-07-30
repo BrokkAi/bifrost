@@ -73,12 +73,26 @@ def beta(seed)
   amount
 end
 "#;
-    let findings = analyze(
-        &[("lib/a.rb", ALPHA), ("lib/b.rb", loop_body)],
+    let files = [("lib/a.rb", ALPHA), ("lib/b.rb", loop_body)];
+    let permissive = analyze(
+        &files,
         &["lib/a.rb"],
         CloneSmellWeights {
             min_normalized_tokens: 12,
-            min_similarity_percent: 50,
+            min_similarity_percent: 30,
+            shingle_size: 2,
+            min_shared_shingles: 3,
+            ast_similarity_percent: 1,
+        },
+    );
+    assert!(!permissive.is_empty(), "{permissive:#?}");
+
+    let findings = analyze(
+        &files,
+        &["lib/a.rb"],
+        CloneSmellWeights {
+            min_normalized_tokens: 12,
+            min_similarity_percent: 30,
             shingle_size: 2,
             min_shared_shingles: 3,
             ast_similarity_percent: 85,

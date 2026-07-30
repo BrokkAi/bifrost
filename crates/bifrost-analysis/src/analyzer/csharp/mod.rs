@@ -10,7 +10,9 @@ mod semantic;
 pub(crate) mod structural;
 mod tests;
 
-use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
+use crate::analyzer::clone_detection::{
+    CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
+};
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::{
@@ -27,7 +29,7 @@ use tree_sitter::Node;
 
 use adapter::CSharpAdapter;
 use cache::CSharpMemoCaches;
-use clones::{build_csharp_clone_candidate_data, refine_csharp_clone_similarity};
+use clones::build_csharp_clone_candidate_data;
 use external::{CSharpExternalDeclarationIndex, CSharpExternalMember, CSharpExternalType};
 use imports::{
     csharp_static_using_from_import, csharp_using_alias_from_import, csharp_using_namespace,
@@ -2203,7 +2205,7 @@ impl IAnalyzer for CSharpAnalyzer {
             &requested_files,
             all_candidates,
             weights,
-            refine_csharp_clone_similarity,
+            refine_clone_similarity_with_ast,
         )
     }
 

@@ -66,6 +66,49 @@ fn flags_renamed_variable_clone_in_go() {
 }
 
 #[test]
+fn includes_receiver_method_candidates() {
+    let alpha = r#"
+package sample
+
+type Alpha struct{}
+
+func (Alpha) Compute(value int) int {
+    total := value + 2
+    if total > 20 {
+        return total * 3
+    }
+    return total - 4
+}
+"#;
+    let beta = r#"
+package sample
+
+type Beta struct{}
+
+func (Beta) Calculate(seed int) int {
+    amount := seed + 2
+    if amount > 20 {
+        return amount * 3
+    }
+    return amount - 4
+}
+"#;
+    let findings = analyze(
+        &[("src/a.go", alpha), ("src/b.go", beta)],
+        &["src/a.go"],
+        default_weights(),
+    );
+
+    assert!(
+        findings.iter().any(|finding| {
+            finding.enclosing_fq_name.contains("Compute")
+                && finding.peer_enclosing_fq_name.contains("Calculate")
+        }),
+        "{findings:#?}"
+    );
+}
+
+#[test]
 fn ast_refinement_suppresses_different_go_control_flow() {
     let loop_body = r#"
 package sample
@@ -79,8 +122,22 @@ func Beta(seed int) int {
     return amount
 }
 "#;
+    let files = [("src/a.go", ALPHA), ("src/b.go", loop_body)];
+    let permissive = analyze(
+        &files,
+        &["src/a.go"],
+        CloneSmellWeights {
+            min_normalized_tokens: 12,
+            min_similarity_percent: 50,
+            shingle_size: 2,
+            min_shared_shingles: 3,
+            ast_similarity_percent: 1,
+        },
+    );
+    assert!(!permissive.is_empty(), "{permissive:#?}");
+
     let findings = analyze(
-        &[("src/a.go", ALPHA), ("src/b.go", loop_body)],
+        &files,
         &["src/a.go"],
         CloneSmellWeights {
             min_normalized_tokens: 12,

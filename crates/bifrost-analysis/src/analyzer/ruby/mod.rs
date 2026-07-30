@@ -10,10 +10,7 @@ mod semantic;
 pub(crate) mod structural;
 mod tests;
 
-use crate::analyzer::clone_detection::{
-    CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
-};
-use crate::analyzer::common::language_for_file as file_language;
+use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::js_ts::build_weighted_cache;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
@@ -567,31 +564,9 @@ impl IAnalyzer for RubyAnalyzer {
         files: &[ProjectFile],
         weights: CloneSmellWeights,
     ) -> Vec<CloneSmell> {
-        let requested_files: Vec<ProjectFile> = files
-            .iter()
-            .filter(|file| file_language(file) == Language::Ruby)
-            .cloned()
-            .collect();
-        if requested_files.is_empty() {
-            return Vec::new();
-        }
-
-        let all_candidates: Vec<CloneCandidateProfile> = self
-            .get_all_declarations()
-            .into_iter()
-            .filter(|code_unit| {
-                code_unit.is_function() && file_language(code_unit.source()) == Language::Ruby
-            })
-            .filter_map(|code_unit| build_ruby_clone_candidate_data(self, &code_unit, weights))
-            .map(|candidate| CloneCandidateProfile::create(candidate, weights))
-            .collect();
-
-        detect_structural_clone_smells(
-            &requested_files,
-            all_candidates,
-            weights,
-            refine_clone_similarity_with_ast,
-        )
+        detect_language_structural_clone_smells(self, files, weights, Language::Ruby, |code_unit| {
+            build_ruby_clone_candidate_data(self, code_unit, weights)
+        })
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {

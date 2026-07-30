@@ -62,6 +62,49 @@ fn flags_renamed_variable_clone_in_rust() {
 }
 
 #[test]
+fn includes_associated_function_candidates() {
+    let alpha = r#"
+struct Alpha;
+
+impl Alpha {
+    fn compute(value: i32) -> i32 {
+        let total = value + 2;
+        if total > 20 {
+            return total * 3;
+        }
+        total - 4
+    }
+}
+"#;
+    let beta = r#"
+struct Beta;
+
+impl Beta {
+    fn calculate(seed: i32) -> i32 {
+        let amount = seed + 2;
+        if amount > 20 {
+            return amount * 3;
+        }
+        amount - 4
+    }
+}
+"#;
+    let findings = analyze(
+        &[("src/a.rs", alpha), ("src/b.rs", beta)],
+        &["src/a.rs"],
+        default_weights(),
+    );
+
+    assert!(
+        findings.iter().any(|finding| {
+            finding.enclosing_fq_name.contains("compute")
+                && finding.peer_enclosing_fq_name.contains("calculate")
+        }),
+        "{findings:#?}"
+    );
+}
+
+#[test]
 fn ast_refinement_suppresses_different_rust_control_flow() {
     let loop_body = r#"
 fn beta(seed: i32) -> i32 {
@@ -73,12 +116,26 @@ fn beta(seed: i32) -> i32 {
     amount
 }
 "#;
-    let findings = analyze(
-        &[("src/a.rs", ALPHA), ("src/b.rs", loop_body)],
+    let files = [("src/a.rs", ALPHA), ("src/b.rs", loop_body)];
+    let permissive = analyze(
+        &files,
         &["src/a.rs"],
         CloneSmellWeights {
             min_normalized_tokens: 12,
-            min_similarity_percent: 50,
+            min_similarity_percent: 30,
+            shingle_size: 2,
+            min_shared_shingles: 3,
+            ast_similarity_percent: 1,
+        },
+    );
+    assert!(!permissive.is_empty(), "{permissive:#?}");
+
+    let findings = analyze(
+        &files,
+        &["src/a.rs"],
+        CloneSmellWeights {
+            min_normalized_tokens: 12,
+            min_similarity_percent: 30,
             shingle_size: 2,
             min_shared_shingles: 3,
             ast_similarity_percent: 85,
