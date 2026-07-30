@@ -1,6 +1,6 @@
 use crate::analyzer::clone_detection::{
     CloneCandidateData, CloneCandidateProfile, compact_clone_excerpt,
-    detect_structural_clone_smells,
+    detect_structural_clone_smells, refine_clone_similarity_with_ast,
 };
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::fq_name::{FqName, SegmentKind};
@@ -18,7 +18,7 @@ use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
 use crate::analyzer::js_ts::cache::JsTsMemoCaches;
 use crate::analyzer::js_ts::clones::{
-    build_js_ts_clone_ast_signature, normalized_clone_tokens_js_ts, refine_js_ts_clone_similarity,
+    build_js_ts_clone_ast_signature, normalized_clone_tokens_js_ts,
 };
 use crate::analyzer::js_ts::diagnostics::collect_typescript_semantic_diagnostics;
 use crate::analyzer::js_ts::hierarchy::extract_ts_supertypes;
@@ -224,6 +224,12 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
         }
 
         parsed
+    }
+
+    fn cognitive_complexity_config(
+        &self,
+    ) -> Option<&'static crate::analyzer::cognitive_complexity::Config> {
+        Some(crate::analyzer::js_ts::cognitive_complexity_config())
     }
 }
 
@@ -787,7 +793,7 @@ impl IAnalyzer for TypescriptAnalyzer {
             &requested_files,
             all_candidates,
             weights,
-            refine_js_ts_clone_similarity,
+            refine_clone_similarity_with_ast,
         )
     }
 }

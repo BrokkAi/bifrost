@@ -17,22 +17,20 @@ use tree_sitter::Node;
 /// complexity. Receives the case node and the full source text.
 pub type DefaultCasePredicate = fn(Node<'_>, &str) -> bool;
 
+/// Predicate returning the number of case labels represented by a case node.
+/// This supports grammars that group multiple labels into one container.
+pub type CaseIncrementPredicate = fn(Node<'_>, &str) -> u32;
+
+/// Predicate returning `true` when a configured jump contributes complexity.
+/// When absent, jumps retain the shared labeled-jump behavior.
+pub type JumpPredicate = fn(Node<'_>) -> bool;
+
 /// Predicate returning `true` when a node should be treated as a named
 /// function boundary (i.e. analysis should not descend into it once the
 /// scorer has already entered a function). Used for languages where the
 /// concrete function-decoration node type varies (e.g. Python's
 /// `decorated_definition` wrapping a `function_definition`).
 pub type NamedFunctionBoundaryPredicate = fn(Node<'_>) -> bool;
-
-/// Predicate overriding the default "does this jump carry a label" check
-/// (`named_child_count() > 0`). Needed when a language folds several jump
-/// forms into one node kind for reasons other than a label — Kotlin's
-/// `jump_expression` covers `break`, `continue`, `return`, and `throw`
-/// alike, and only a `break`/`continue`/`return` that carries an explicit
-/// `label` child is a SonarSource-style labeled jump. An ordinary `return
-/// value` or `throw value` carries a named child too (the value), so the
-/// generic child-count check would misreport it as labeled.
-pub type JumpLabelPredicate = fn(Node<'_>, &str) -> bool;
 
 /// Configuration that adapts the generic scorer to a specific language.
 ///
@@ -82,13 +80,15 @@ pub struct Config {
     /// Optional predicate identifying the default branch of a case-like
     /// construct (e.g. Java's `default:`, Rust's `_ =>`).
     pub default_case_predicate: Option<DefaultCasePredicate>,
+    /// Optional counter for grammars where one case node can contain multiple
+    /// labels. Takes precedence over [`Self::default_case_predicate`].
+    pub case_increment_predicate: Option<CaseIncrementPredicate>,
+    /// Optional language-specific jump predicate.
+    pub jump_predicate: Option<JumpPredicate>,
     /// Optional predicate marking additional named-function-boundary nodes
     /// that cannot be enumerated by kind alone (e.g. Python decorated
     /// functions).
     pub named_function_boundary_predicate: Option<NamedFunctionBoundaryPredicate>,
-    /// Optional override for "is this jump labeled", replacing the default
-    /// `named_child_count() > 0` heuristic. See [`JumpLabelPredicate`].
-    pub jump_label_predicate: Option<JumpLabelPredicate>,
 }
 
 impl Config {
@@ -110,8 +110,9 @@ impl Config {
             anonymous_function_types: &[],
             else_clause_types: &[],
             default_case_predicate: None,
+            case_increment_predicate: None,
+            jump_predicate: None,
             named_function_boundary_predicate: None,
-            jump_label_predicate: None,
         }
     }
 
@@ -162,13 +163,19 @@ pub fn compute(root: Node<'_>, source: &str, config: &Config) -> u32 {
             complexity = complexity.saturating_add(control_flow_increment(frame.nesting));
             push_named_children(&mut work, node, frame.nesting + 1, false);
         } else if slice_contains(config.case_types, kind) {
-            let is_default = config
-                .default_case_predicate
-                .map(|pred| pred(node, source))
-                .unwrap_or(false);
-            if !is_default {
-                complexity = complexity.saturating_add(control_flow_increment(frame.nesting));
-            }
+            let case_count = config.case_increment_predicate.map_or_else(
+                || {
+                    u32::from(
+                        !config
+                            .default_case_predicate
+                            .map(|pred| pred(node, source))
+                            .unwrap_or(false),
+                    )
+                },
+                |predicate| predicate(node, source),
+            );
+            complexity = complexity
+                .saturating_add(control_flow_increment(frame.nesting).saturating_mul(case_count));
             push_named_children(&mut work, node, frame.nesting + 1, false);
         } else if slice_contains(config.default_case_types, kind) {
             push_named_children(&mut work, node, frame.nesting, false);
@@ -179,11 +186,10 @@ pub fn compute(root: Node<'_>, source: &str, config: &Config) -> u32 {
             }
             push_named_children(&mut work, node, frame.nesting, false);
         } else if slice_contains(config.jump_types, kind) {
-            let labeled = config
-                .jump_label_predicate
-                .map(|predicate| predicate(node, source))
-                .unwrap_or_else(|| is_labeled_jump(node));
-            if labeled {
+            if config
+                .jump_predicate
+                .map_or_else(|| is_labeled_jump(node), |predicate| predicate(node))
+            {
                 complexity = complexity.saturating_add(1);
             }
             push_named_children(&mut work, node, frame.nesting, false);
@@ -220,6 +226,7 @@ fn push_if_children<'tree>(
     config: &Config,
 ) {
     let children = named_children(node);
+    let alternative = node.child_by_field_name("alternative");
     // Iterate in reverse so children pop in source order from the stack.
     for child in children.into_iter().rev() {
         let kind = child.kind();
@@ -241,10 +248,16 @@ fn push_if_children<'tree>(
                 });
             }
         } else if config.is_any_if(kind) {
+            let else_if_continuation = slice_contains(config.alternate_if_types, kind)
+                || alternative.is_some_and(|candidate| candidate == child);
             work.push(Frame {
                 node: child,
-                nesting,
-                else_if_continuation: true,
+                nesting: if else_if_continuation {
+                    nesting
+                } else {
+                    nesting + 1
+                },
+                else_if_continuation,
                 root: false,
             });
         } else {

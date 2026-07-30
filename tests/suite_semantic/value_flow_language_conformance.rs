@@ -532,7 +532,6 @@ fn rust_exact_helper_flow() {
 }
 
 #[test]
-#[ignore = "requires a proven complete producer-bound Python witness"]
 fn python_exact_helper_flow() {
     assert_single_file_exact_helper_flow(
         "python",

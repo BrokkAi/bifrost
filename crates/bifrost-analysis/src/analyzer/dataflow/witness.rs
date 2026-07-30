@@ -674,7 +674,7 @@ impl WitnessEvidenceNode {
         exit: Arc<IcfgExitProfile>,
         exit_fact: FactId,
     ) -> Self {
-        let quality = if exit.has_return_affecting_gaps() {
+        let quality = if exit.has_matched_return_affecting_gaps() {
             predecessor_quality.conjoin(PathQuality::UNPROVEN_PARTIAL)
         } else {
             predecessor_quality
@@ -908,7 +908,7 @@ impl WitnessEvidenceNode {
         exit: &Arc<IcfgExitProfile>,
         exit_fact: FactId,
     ) -> bool {
-        let quality = if exit.has_return_affecting_gaps() {
+        let quality = if exit.has_matched_return_affecting_gaps() {
             predecessor_quality.conjoin(PathQuality::UNPROVEN_PARTIAL)
         } else {
             predecessor_quality
@@ -993,7 +993,7 @@ impl WitnessEvidenceNode {
         else {
             return None;
         };
-        let reason = exit.return_affecting_gap_reason()?;
+        let reason = exit.matched_return_affecting_gap_reason()?;
         Some(SummaryWitnessStep::new(
             SummaryWitnessStepKind::EndSummaryGap(exit.kind()),
             exit.callee_exit().clone(),
@@ -1553,7 +1553,7 @@ impl WitnessStore {
                         "end-summary entry and exit belong to different procedures",
                     ));
                 }
-                let expected = if exit.has_return_affecting_gaps() {
+                let expected = if exit.has_matched_return_affecting_gaps() {
                     predecessor.quality.conjoin(PathQuality::UNPROVEN_PARTIAL)
                 } else {
                     predecessor.quality

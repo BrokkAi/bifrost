@@ -42,7 +42,7 @@ static KOTLIN_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
         // level per link.
         else_clause_types: &["control_structure_body"],
         default_case_predicate: Some(kotlin_is_default_when_entry),
-        jump_label_predicate: Some(kotlin_is_labeled_jump),
+        jump_predicate: Some(kotlin_is_labeled_jump),
         ..cognitive_complexity::Config::empty()
     });
 
@@ -63,7 +63,7 @@ fn kotlin_is_default_when_entry(node: Node<'_>, _source: &str) -> bool {
 /// specific child kind — rather than any named child at all — is what keeps
 /// an unlabeled `return value` or `throw value` from being misread as a
 /// labeled jump.
-fn kotlin_is_labeled_jump(node: Node<'_>, _source: &str) -> bool {
+fn kotlin_is_labeled_jump(node: Node<'_>) -> bool {
     named_children(node)
         .into_iter()
         .any(|child| child.kind() == "label")

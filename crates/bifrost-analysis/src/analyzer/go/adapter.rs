@@ -1,9 +1,26 @@
+use crate::analyzer::cognitive_complexity;
 use crate::analyzer::{Language, LanguageAdapter, ProjectFile};
+use std::sync::LazyLock;
 use tree_sitter::Tree;
 
 use super::declarations::parse_go_file;
 use super::packages::canonical_go_package_name;
 use super::tests::go_contains_tests;
+
+static GO_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
+    LazyLock::new(|| cognitive_complexity::Config {
+        if_types: &["if_statement"],
+        loop_types: &["for_statement"],
+        case_types: &["expression_case", "type_case", "communication_case"],
+        default_case_types: &["default_case"],
+        binary_types: &["binary_expression"],
+        logical_operators: &["&&", "||"],
+        jump_types: &["break_statement", "continue_statement"],
+        named_function_boundary_types: &["function_declaration", "method_declaration"],
+        anonymous_function_types: &["func_literal"],
+        else_clause_types: &["else_clause"],
+        ..cognitive_complexity::Config::empty()
+    });
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GoAdapter;
@@ -69,5 +86,9 @@ impl LanguageAdapter for GoAdapter {
         tree: &Tree,
     ) -> crate::analyzer::tree_sitter_analyzer::ParsedFile {
         parse_go_file(file, source, tree)
+    }
+
+    fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
+        Some(&GO_COGNITIVE_CONFIG)
     }
 }

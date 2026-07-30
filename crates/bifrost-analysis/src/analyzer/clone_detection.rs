@@ -1,5 +1,39 @@
-use crate::analyzer::{CloneSmell, CloneSmellWeights, CodeUnit, ProjectFile};
+use crate::analyzer::common::language_for_file;
+use crate::analyzer::{
+    CloneSmell, CloneSmellWeights, CodeUnit, IAnalyzer, Language, ProjectFile, parser_language_for,
+};
 use std::collections::{HashMap, HashSet};
+use tree_sitter::{Node, Parser};
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CloneSyntaxProfile {
+    language: Language,
+    candidate_kinds: &'static [&'static str],
+    identifier_kinds: &'static [&'static str],
+    string_kinds: &'static [&'static str],
+    number_kinds: &'static [&'static str],
+    comment_kinds: &'static [&'static str],
+}
+
+impl CloneSyntaxProfile {
+    pub(crate) const fn new(
+        language: Language,
+        candidate_kinds: &'static [&'static str],
+        identifier_kinds: &'static [&'static str],
+        string_kinds: &'static [&'static str],
+        number_kinds: &'static [&'static str],
+        comment_kinds: &'static [&'static str],
+    ) -> Self {
+        Self {
+            language,
+            candidate_kinds,
+            identifier_kinds,
+            string_kinds,
+            number_kinds,
+            comment_kinds,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct CloneCandidateData {
@@ -14,6 +48,123 @@ pub(crate) struct CloneCandidateProfile {
     pub(crate) data: CloneCandidateData,
     pub(crate) shingles: LongShingles,
     pub(crate) shingle_count: usize,
+}
+
+pub(crate) fn build_tree_sitter_clone_candidate_data(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+    weights: CloneSmellWeights,
+    profile: CloneSyntaxProfile,
+) -> Option<CloneCandidateData> {
+    let source = analyzer.get_source(code_unit, false)?.trim().to_string();
+    if source.is_empty() {
+        return None;
+    }
+
+    let (normalized_tokens, ast_signature, has_candidate) =
+        normalize_tree_sitter_clone_source(&source, profile);
+    if !has_candidate {
+        return None;
+    }
+    if normalized_tokens.len() < weights.min_normalized_tokens.max(0) as usize {
+        return None;
+    }
+
+    Some(CloneCandidateData {
+        unit: code_unit.clone(),
+        normalized_tokens,
+        ast_signature,
+        excerpt: compact_clone_excerpt(&source),
+    })
+}
+
+fn normalize_tree_sitter_clone_source(
+    source: &str,
+    profile: CloneSyntaxProfile,
+) -> (Vec<String>, String, bool) {
+    let mut parser = Parser::new();
+    let language = parser_language_for(profile.language)
+        .expect("clone syntax profile must use a registered parser language");
+    parser
+        .set_language(&language)
+        .expect("failed to load clone syntax parser");
+    let Some(tree) = parser.parse(source, None) else {
+        return (Vec::new(), String::new(), false);
+    };
+
+    let mut normalized_tokens = Vec::new();
+    let mut ast_labels = Vec::new();
+    let mut has_candidate = false;
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if profile.comment_kinds.contains(&node.kind()) {
+            continue;
+        }
+        has_candidate |= profile.candidate_kinds.contains(&node.kind());
+        ast_labels.push(normalize_clone_ast_label(node, source, profile));
+        if node.named_child_count() == 0 {
+            let token = normalize_clone_leaf_token(node, source, profile);
+            if !token.is_empty() {
+                normalized_tokens.push(token);
+            }
+        }
+        for index in (0..node.child_count()).rev() {
+            if let Some(child) = node.child(index) {
+                stack.push(child);
+            }
+        }
+    }
+
+    (normalized_tokens, ast_labels.join("|"), has_candidate)
+}
+
+fn normalize_clone_leaf_token(node: Node<'_>, source: &str, profile: CloneSyntaxProfile) -> String {
+    let kind = node.kind();
+    let token = node_text(node, source);
+    if token.is_empty() || profile.comment_kinds.contains(&kind) {
+        return String::new();
+    }
+    if profile.identifier_kinds.contains(&kind) {
+        return "ID".to_string();
+    }
+    if profile.string_kinds.contains(&kind) {
+        return "STR".to_string();
+    }
+    if profile.number_kinds.contains(&kind) {
+        return "NUM".to_string();
+    }
+    if matches!(token, "true" | "false") {
+        return "BOOL".to_string();
+    }
+    if token.chars().count() == 1 && token.chars().all(|ch| !ch.is_alphanumeric()) {
+        return format!("OP:{token}");
+    }
+    format!("T:{kind}")
+}
+
+fn normalize_clone_ast_label(node: Node<'_>, source: &str, profile: CloneSyntaxProfile) -> String {
+    let kind = node.kind();
+    let text = node_text(node, source);
+    if profile.identifier_kinds.contains(&kind) {
+        return "ID".to_string();
+    }
+    if profile.string_kinds.contains(&kind) {
+        return "STR".to_string();
+    }
+    if profile.number_kinds.contains(&kind) {
+        return "NUM".to_string();
+    }
+    if matches!(text, "true" | "false") {
+        return "BOOL".to_string();
+    }
+    format!("N:{kind}")
+}
+
+fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    source
+        .get(node.start_byte()..node.end_byte())
+        .unwrap_or("")
+        .trim()
 }
 
 impl CloneCandidateProfile {
@@ -143,6 +294,26 @@ pub(crate) fn build_clone_reason(token_similarity: i32, refined_similarity: i32)
     format!("token-similarity:{token_similarity}, refined-similarity:{refined_similarity}")
 }
 
+pub(crate) fn refine_clone_similarity_with_ast(
+    left: &CloneCandidateData,
+    right: &CloneCandidateData,
+    token_similarity: i32,
+    weights: CloneSmellWeights,
+) -> i32 {
+    if left.ast_signature.is_empty() || right.ast_signature.is_empty() {
+        return token_similarity;
+    }
+    let ast_similarity =
+        compute_ast_refinement_similarity_percent(&left.ast_signature, &right.ast_signature);
+    if ast_similarity == 0 {
+        return token_similarity;
+    }
+    if ast_similarity < weights.ast_similarity_percent {
+        return 0;
+    }
+    token_similarity.min(ast_similarity)
+}
+
 pub(crate) fn compare_clone_units(left: &CodeUnit, right: &CodeUnit) -> std::cmp::Ordering {
     left.source()
         .to_string()
@@ -228,6 +399,43 @@ where
             })
     });
     findings
+}
+
+pub(crate) fn detect_language_structural_clone_smells<F>(
+    analyzer: &dyn IAnalyzer,
+    files: &[ProjectFile],
+    weights: CloneSmellWeights,
+    language: Language,
+    build_candidate: F,
+) -> Vec<CloneSmell>
+where
+    F: Fn(&CodeUnit) -> Option<CloneCandidateData>,
+{
+    let requested_files: Vec<ProjectFile> = files
+        .iter()
+        .filter(|file| language_for_file(file) == language)
+        .cloned()
+        .collect();
+    if requested_files.is_empty() {
+        return Vec::new();
+    }
+
+    let all_candidates = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .filter(|code_unit| {
+            code_unit.is_function() && language_for_file(code_unit.source()) == language
+        })
+        .filter_map(|code_unit| build_candidate(&code_unit))
+        .map(|candidate| CloneCandidateProfile::create(candidate, weights))
+        .collect();
+
+    detect_structural_clone_smells(
+        &requested_files,
+        all_candidates,
+        weights,
+        refine_clone_similarity_with_ast,
+    )
 }
 
 fn compute_ast_label_multiset_similarity_percent(left: &str, right: &str) -> i32 {

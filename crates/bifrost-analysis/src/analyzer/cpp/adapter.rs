@@ -2,7 +2,30 @@ use super::declarations::{CppVisitor, collect_cpp_identifiers, recover_quoted_in
 use super::tests::cpp_contains_tests;
 use super::*;
 use crate::analyzer::LanguageAdapter;
-use tree_sitter::Tree;
+use crate::analyzer::cognitive_complexity;
+use std::sync::LazyLock;
+use tree_sitter::{Node, Tree};
+
+static CPP_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
+    LazyLock::new(|| cognitive_complexity::Config {
+        if_types: &["if_statement"],
+        loop_types: &["for_statement", "while_statement", "do_statement"],
+        catch_types: &["catch_clause"],
+        conditional_types: &["conditional_expression"],
+        case_types: &["case_statement"],
+        binary_types: &["binary_expression"],
+        logical_operators: &["&&", "||", "and", "or"],
+        jump_types: &["break_statement", "continue_statement"],
+        named_function_boundary_types: &["function_definition"],
+        anonymous_function_types: &["lambda_expression"],
+        else_clause_types: &["else_clause"],
+        default_case_predicate: Some(cpp_is_default_case),
+        ..cognitive_complexity::Config::empty()
+    });
+
+fn cpp_is_default_case(node: Node<'_>, _source: &str) -> bool {
+    node.child_by_field_name("value").is_none()
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct CppAdapter;
@@ -61,5 +84,9 @@ impl LanguageAdapter for CppAdapter {
         visitor.visit_container(root, "", None, None, None, Vec::new());
         recover_quoted_includes(source, &mut parsed);
         parsed
+    }
+
+    fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
+        Some(&CPP_COGNITIVE_CONFIG)
     }
 }

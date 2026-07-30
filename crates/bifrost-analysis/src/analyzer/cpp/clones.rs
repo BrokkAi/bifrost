@@ -1,7 +1,5 @@
 use super::*;
-use crate::analyzer::clone_detection::{
-    CloneCandidateData, compact_clone_excerpt, compute_ast_refinement_similarity_percent,
-};
+use crate::analyzer::clone_detection::{CloneCandidateData, compact_clone_excerpt};
 use tree_sitter::{Node, Parser, Tree};
 
 pub(super) fn build_clone_candidate_data(
@@ -130,26 +128,6 @@ fn normalize_cpp_clone_ast_label(node: Node<'_>, source: &str) -> String {
         return "BOOL".to_string();
     }
     format!("N:{kind}")
-}
-
-pub(super) fn refine_cpp_clone_similarity(
-    left: &CloneCandidateData,
-    right: &CloneCandidateData,
-    token_similarity: i32,
-    weights: CloneSmellWeights,
-) -> i32 {
-    if left.ast_signature.is_empty() || right.ast_signature.is_empty() {
-        return token_similarity;
-    }
-    let ast_similarity =
-        compute_ast_refinement_similarity_percent(&left.ast_signature, &right.ast_signature);
-    if ast_similarity == 0 {
-        return token_similarity;
-    }
-    if ast_similarity < weights.ast_similarity_percent {
-        return 0;
-    }
-    token_similarity.min(ast_similarity)
 }
 
 fn parse_cpp_tree(source: &str) -> Option<Tree> {

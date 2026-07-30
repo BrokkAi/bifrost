@@ -51,7 +51,7 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "compute_cognitive_complexity",
-            "Compute heuristic cognitive complexity per function/method in the given files; flag those exceeding a threshold. Walks the language's tree-sitter AST, scoring control-flow breaks by SonarSource rules (each `if`/loop/`catch`/case adds 1+nesting; sequences of `&&`/`||` count per distinct adjacent operator; labeled `break`/`continue` add 1). Output format matches the brokk-core MCP byte-for-byte.",
+            "Compute heuristic cognitive complexity per function/method in Java, Python, Rust, Ruby, Go, C/C++, JavaScript/JSX, TypeScript/TSX, PHP, Scala, and C# files; Kotlin is tracked separately. Walks tree-sitter ASTs, scoring control-flow breaks by SonarSource rules (each `if`/loop/`catch`/case adds 1+nesting; logical-operator sequences count per distinct adjacent operator; language-specific jumps add 1 when applicable, including labeled `break`/`continue` and every C# `goto` form). Flags scores exceeding a threshold. Output format matches the brokk-core MCP byte-for-byte.",
             json!({
                 "type": "object",
                 "properties": {
@@ -265,7 +265,7 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "report_structural_clone_smells",
-            "Detects suspicious structural clones using token shingles plus Java AST refinement. Uses analyzer-provided clone smells for high-recall triage. Output format matches the brokk-core MCP byte-for-byte.",
+            "Detects suspicious structural clones using token shingles plus language-specific AST refinement. Uses analyzer-provided clone smells for high-recall triage. Output format matches the brokk-core MCP byte-for-byte.",
             json!({
                 "type": "object",
                 "properties": {

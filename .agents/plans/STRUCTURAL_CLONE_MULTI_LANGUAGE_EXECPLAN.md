@@ -32,8 +32,14 @@ The observable outcome is that `report_structural_clone_smells` works consistent
 - [x] (2026-05-18) Completed Milestone 7. Added first-pass C++ structural clone support in `src/analyzer/cpp_analyzer.rs` and focused C++ behavior tests in `tests/cpp_structural_clone_smells.rs`.
 - [x] (2026-05-18) Validated the Milestone 7 checkpoint with `cargo test --test cpp_structural_clone_smells -- --nocapture`, `cargo test --test searchtools_service python_boundary_returns_structural_clone_report_json -- --nocapture`, `cargo test --test bifrost_mcp_server bifrost_searchtools_server_speaks_mcp_stdio -- --nocapture`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
 - [x] (2026-05-18) Completed Milestone 8. Ran the cross-language hardening sweep across Java, Python, JS/TS, PHP, Scala, C#, and C++ clone suites plus the existing MCP/report checks, with `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings` clean at the end.
-- [ ] Add this plan’s milestone tracker updates as each language slice lands.
-- [ ] Keep the `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` sections current during implementation.
+- [x] (2026-07-30) Diagnosed issue #1361: Go, Rust, and Ruby publish named functions and methods as function `CodeUnit`s, but inherit the empty `IAnalyzer` structural-clone default. `MultiAnalyzer`, report rendering, shingle scoring, pair suppression, and stable ordering already work.
+- [x] (2026-07-30) Audited Brokk's current implementation. `TreeSitterAnalyzer` owns generic candidate extraction and leaf-token normalization; Java, Python, and JS/TS refine that generic behavior with language-specific AST labels. This phase will port that remaining shared seam rather than copy three complete traversals.
+- [x] (2026-07-30) Completed Milestone 9. Added a shared stack-safe tree-sitter normalization profile and Go structural-clone support. All four focused Go behaviors and the ten shared clone-engine unit tests pass.
+- [x] (2026-07-30) Completed Milestone 10. Added Rust structural-clone support, an exact concrete-candidate gate, and five focused tests; the Go regression slice remains green.
+- [x] (2026-07-30) Completed Milestone 11. Added Ruby structural-clone support and five focused tests, including ordinary and singleton method candidates.
+- [ ] Milestone 12 partially completed (2026-07-30). Completed mixed Go/Rust/Ruby MCP reporting, language-neutral tool text, adversarial review fixes, 58 structural-clone regressions, MCP stdio validation, formatting, and featureless clippy. Remaining: the required `bifrost.code-smells` MCP policy run is unavailable because this task has no `list_policies`/`run_policy` tools and launcher doctor reports the required 0.8.16 binary missing.
+- [x] (2026-07-30) Added this plan's milestone tracker updates as each #1361 language slice landed.
+- [x] (2026-07-30) Updated `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` through the final local validation state.
 
 ## Surprises & Discoveries
 
@@ -67,6 +73,24 @@ The observable outcome is that `report_structural_clone_smells` works consistent
 - Observation: C++ fit the same first-pass pattern as Scala and C# despite its richer syntax surface.
   Evidence: the bounded first-pass scope of free functions plus class methods was enough to produce stable focused tests without requiring a deeper shared-engine change.
 
+- Observation: Brokk's structural-clone engine is more generic than Bifrost's current language modules suggest.
+  Evidence: `brokk-shared/src/main/java/ai/brokk/analyzer/TreeSitterAnalyzer.java` implements candidate enumeration, generic leaf normalization, shingling, pair comparison, and ordering. Its Java, Python, and JS/TS subclasses mainly supply exact AST-label and literal classifications.
+
+- Observation: issue #1361 does not require new declaration extraction or mixed-language routing.
+  Evidence: Go `function_declaration` and `method_declaration`, Rust concrete `function_item`, and Ruby `method` and `singleton_method` declarations already become function `CodeUnit`s. `MultiAnalyzer::find_structural_clone_smells_for_files` already groups requested files by language and delegates each group.
+
+- Observation: extracted Go function snippets are parseable enough without a synthetic `package` wrapper.
+  Evidence: the shared parser produced stable tokens and AST signatures for both package functions and the focused control-flow near miss; all four tests in `go_structural_clone_smells` pass.
+
+- Observation: Rust trait signatures are published as function `CodeUnit`s even though they have no body.
+  Evidence: `rust/declarations.rs` visits both `function_item` and `function_signature_item`. The shared syntax profile now requires a concrete candidate node kind, and `ignores_trait_signatures_without_bodies` stays empty under deliberately permissive weights.
+
+- Observation: the default shell toolchain mixed a locally installed Rust compiler with Homebrew's Clippy driver.
+  Evidence: direct clippy failed with E0514 even in a fresh target; `/Users/dave/.local/bin/rustc` reported LLVM 22.1.2 while `/opt/homebrew/bin/clippy-driver` and `/opt/homebrew/bin/rustc` reported LLVM 22.1.6. Running the isolated-target helper with `RUSTC=/opt/homebrew/bin/rustc` and `/opt/homebrew/bin/cargo` passed and removed its target.
+
+- Observation: review against a moving `origin/master` can misclassify new upstream work as deletions on the issue branch.
+  Evidence: `origin/master` advanced from merge base `6312c27e` to `9792c6a7` (#1363) during this task. The initially reported Rust semantic rollback was the reverse diff of that upstream commit; the issue worktree never modified those semantic files.
+
 ## Decision Log
 
 - Decision: sequence the rollout as Brokk parity languages first, then new-language support.
@@ -80,6 +104,22 @@ The observable outcome is that `report_structural_clone_smells` works consistent
 - Decision: require a checkpoint commit after each completed milestone before beginning the next one.
   Rationale: the user explicitly wants the rollout broken into milestones committed between each one, and the clone-smell engine is cross-cutting enough that clean checkpoints reduce integration risk.
   Date/Author: 2026-05-18 / Codex
+
+- Decision: implement a small shared tree-sitter clone syntax profile for issue #1361, while leaving the already-working language modules unchanged.
+  Rationale: Go, Rust, and Ruby need the same iterative leaf and AST traversal that Brokk keeps in `TreeSitterAnalyzer`, but they need different node-kind classifications. Sharing the traversal removes new duplication without widening this issue into a migration of Java, Python, JS/TS, PHP, Scala, C#, or C++.
+  Date/Author: 2026-07-30 / Codex
+
+- Decision: keep candidate scope to named declarations already represented by the analyzers.
+  Rationale: Go functions and receiver methods, Rust concrete free and associated functions, and Ruby ordinary and singleton methods meet the issue contract. Rust signature-only trait items, Ruby `define_method`, anonymous blocks, lambdas, and Kotlin need separate declaration or ownership decisions and are outside #1361.
+  Date/Author: 2026-07-30 / Codex
+
+- Decision: supersede the initial plan to leave existing language modules entirely unchanged by centralizing their byte-for-byte AST refinement implementations.
+  Rationale: adversarial DRY review found seven existing language-named functions identical to the new shared helper. Routing Java, Python, JS/TS, PHP, Scala, C#, and C++ through the shared function removes semantic drift risk; the complete 58-test structural-clone sweep validates the mechanical consolidation.
+  Date/Author: 2026-07-30 / Codex
+
+- Decision: do not expand #1361 into clone-analysis cancellation, caching, or work-budget APIs.
+  Rationale: reviewers correctly noted that the established clone engine profiles all language functions and can perform quadratic comparisons, but that behavior predates #1361 across every supported analyzer and changing the public/internal query contract would be a separate cross-language performance project. The current issue preserves parity while reducing per-candidate parsing to one traversal for the new languages.
+  Date/Author: 2026-07-30 / Codex
 
 ## Outcomes & Retrospective
 
@@ -102,6 +142,10 @@ Milestone 6 outcome: C# now has a bounded first-pass clone feature too. Like Sca
 Milestone 7 outcome: C++ now has a bounded first-pass clone feature as the last language milestone in this rollout. The acceptance scope remains intentionally modest, but the shared engine was sufficient for the initial pass.
 
 Milestone 8 outcome: the multi-language rollout is complete for the planned targets. The hardening sweep shows the clone suites for Java, Python, JS/TS, PHP, Scala, C#, and C++ all passing together alongside the MCP/report checks, with formatting and clippy clean at the end.
+
+Milestones 9-11 outcome: Go, Rust, and Ruby now provide structural-clone candidates through declarative syntax profiles and the shared detector. Tests prove free functions, Go receiver methods, Rust associated functions, Ruby ordinary and singleton methods, concrete-body filtering, positive clones, AST-only near-miss rejection, thresholds, and stable ordering.
+
+Milestone 12 outcome so far: one mixed-language MCP report returns exactly one Go, Rust, and Ruby finding without symmetric duplicates; all 58 structural-clone tests and the real MCP stdio regression pass. Formatting and featureless clippy are clean. The code review's comment-handling, AST-test-strength, and duplication findings were fixed. The remaining validation gap is environmental: the Bifrost policy MCP tools are not registered and launcher doctor reports no compatible 0.8.16 binary, so no policy status can be claimed from this task.
 
 ## Context and Orientation
 
@@ -206,6 +250,59 @@ This is also the point to document any intentional language limitations in code 
 
 Checkpoint commit expectation: no new language support, only hardening, tests, and documentation updates.
 
+### Milestone 9: Shared normalization seam and Go support
+
+Extend `crates/bifrost-analysis/src/analyzer/clone_detection.rs` with a small tree-sitter syntax profile and an iterative traversal that parses one extracted function snippet and produces both normalized leaf tokens and an AST label signature. The profile must name the identifier, string, number, and comment node kinds for a language; boolean tokens and single-character operators retain the established shared normalization. The traversal must use an explicit stack so deeply nested functions do not add recursive Rust stack depth.
+
+Add `crates/bifrost-analysis/src/analyzer/go/clones.rs` and wire `GoAnalyzer` to the existing shared pairwise detector. Candidates are the analyzer's named function `CodeUnit`s in Go files, which already include package functions and receiver methods. Add `tests/suite_smells/go_structural_clone_smells.rs` for renamed-variable positives, a control-flow near miss, minimum-token filtering, and exact stable ordering.
+
+Run the focused Go tests and shared clone-engine unit tests. Commit the shared normalization seam and Go slice together because Go is the first executable proof that the new shared API is sufficient.
+
+Milestone 9 validation completed with:
+
+    cargo test --test suite_smells -- go_structural_clone_smells --nocapture
+    test result: ok. 4 passed; 0 failed
+
+    cargo test -p brokk-bifrost-analysis --lib clone_detection::tests -- --nocapture
+    test result: ok. 10 passed; 0 failed
+
+    cargo fmt --all -- --check
+
+### Milestone 10: Rust support
+
+Add `crates/bifrost-analysis/src/analyzer/rust/clones.rs` with Rust's exact identifier, literal, comment, and AST node kinds, then wire `RustAnalyzer` to the shared detector. Candidate filtering remains `CodeUnit::is_function`, which includes concrete free and associated functions emitted from `function_item`; declaration-only signatures are not emitted as concrete function candidates by this path.
+
+Add `tests/suite_smells/rust_structural_clone_smells.rs` with the same four behavior contracts as Go. Run the focused Rust tests plus the Go tests before creating the Rust checkpoint commit.
+
+Milestone 10 validation completed with:
+
+    cargo test --test suite_smells -- rust_structural_clone_smells --nocapture
+    test result: ok. 5 passed; 0 failed
+
+    cargo test --test suite_smells -- go_structural_clone_smells --nocapture
+    test result: ok. 4 passed; 0 failed
+
+    cargo fmt --all -- --check
+
+### Milestone 11: Ruby support
+
+Add `crates/bifrost-analysis/src/analyzer/ruby/clones.rs` with Ruby's variable, constant, string, symbol, number, boolean, and comment classifications, then wire `RubyAnalyzer` to the shared detector. Candidates are ordinary `method` and `singleton_method` declarations already emitted as function `CodeUnit`s. Do not infer dynamic method bodies from `define_method`, blocks, or lambdas in this milestone.
+
+Add `tests/suite_smells/ruby_structural_clone_smells.rs` with the same four behavior contracts. Run all three new language modules before creating the Ruby checkpoint commit.
+
+Milestone 11 validation completed with:
+
+    cargo test --test suite_smells -- ruby_structural_clone_smells --nocapture
+    test result: ok. 5 passed; 0 failed
+
+The Go and Rust focused modules passed immediately before this milestone, and `cargo fmt --all` formatted the complete working tree before the Ruby test run.
+
+### Milestone 12: Mixed-language MCP hardening
+
+Add a mixed-language test module under `tests/suite_smells/` that builds one inferred-language inline project, constructs Go, Rust, and Ruby delegates in a `MultiAnalyzer`, and invokes `report_structural_clone_smells`. The rendered report must contain one finding for each language and must not contain symmetric duplicates. Update the `report_structural_clone_smells` MCP description in `crates/bifrost-mcp/src/mcp_slopcop.rs` so it describes language-specific AST refinement rather than Java-only refinement.
+
+Run the new tests, all existing structural-clone modules, `cargo fmt --check`, featureless `cargo clippy --all-targets -- -D warnings`, and the repository `bifrost.code-smells` policy pack. Record results here and create the final checkpoint commit. This milestone does not change the public MCP schema, enable Kotlin, push the branch, or open a pull request.
+
 ## Concrete Steps
 
 For each milestone, the workflow should be:
@@ -274,3 +371,7 @@ The key internal interfaces expected to evolve are:
 - the shared clone-scoring helpers and their direct tests.
 
 No new external dependencies are expected. The work should continue to rely on the existing tree-sitter analyzers and the Rust test harnesses already present in `bifrost`.
+
+Revision note (2026-07-30): Extended the completed original rollout with Milestones 9-12 for issue #1361 after verifying that Brokk's base `TreeSitterAnalyzer` supplies a reusable normalization design and that Bifrost's Go, Rust, and Ruby declaration and routing layers are already sufficient.
+
+Revision note (2026-07-30): Recorded completed Go, Rust, Ruby, mixed-language MCP, review, regression, formatting, and clippy work; documented the moving-base review false positive, toolchain mismatch, shared-refinement consolidation, deferred pre-existing work-budget concern, and unavailable policy MCP gate.
