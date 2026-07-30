@@ -6,6 +6,7 @@ use crate::analyzer::{CloneSmellWeights, CodeUnit, Language};
 
 const GO_CLONE_SYNTAX: CloneSyntaxProfile = CloneSyntaxProfile::new(
     Language::Go,
+    &["function_declaration", "method_declaration"],
     &[
         "identifier",
         "field_identifier",

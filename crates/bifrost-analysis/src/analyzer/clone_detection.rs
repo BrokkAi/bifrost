@@ -7,6 +7,7 @@ use tree_sitter::{Node, Parser};
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CloneSyntaxProfile {
     language: Language,
+    candidate_kinds: &'static [&'static str],
     identifier_kinds: &'static [&'static str],
     string_kinds: &'static [&'static str],
     number_kinds: &'static [&'static str],
@@ -16,6 +17,7 @@ pub(crate) struct CloneSyntaxProfile {
 impl CloneSyntaxProfile {
     pub(crate) const fn new(
         language: Language,
+        candidate_kinds: &'static [&'static str],
         identifier_kinds: &'static [&'static str],
         string_kinds: &'static [&'static str],
         number_kinds: &'static [&'static str],
@@ -23,6 +25,7 @@ impl CloneSyntaxProfile {
     ) -> Self {
         Self {
             language,
+            candidate_kinds,
             identifier_kinds,
             string_kinds,
             number_kinds,
@@ -57,7 +60,11 @@ pub(crate) fn build_tree_sitter_clone_candidate_data(
         return None;
     }
 
-    let (normalized_tokens, ast_signature) = normalize_tree_sitter_clone_source(&source, profile);
+    let (normalized_tokens, ast_signature, has_candidate) =
+        normalize_tree_sitter_clone_source(&source, profile);
+    if !has_candidate {
+        return None;
+    }
     if normalized_tokens.len() < weights.min_normalized_tokens.max(0) as usize {
         return None;
     }
@@ -73,7 +80,7 @@ pub(crate) fn build_tree_sitter_clone_candidate_data(
 fn normalize_tree_sitter_clone_source(
     source: &str,
     profile: CloneSyntaxProfile,
-) -> (Vec<String>, String) {
+) -> (Vec<String>, String, bool) {
     let mut parser = Parser::new();
     let language = parser_language_for(profile.language)
         .expect("clone syntax profile must use a registered parser language");
@@ -81,13 +88,15 @@ fn normalize_tree_sitter_clone_source(
         .set_language(&language)
         .expect("failed to load clone syntax parser");
     let Some(tree) = parser.parse(source, None) else {
-        return (Vec::new(), String::new());
+        return (Vec::new(), String::new(), false);
     };
 
     let mut normalized_tokens = Vec::new();
     let mut ast_labels = Vec::new();
+    let mut has_candidate = false;
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
+        has_candidate |= profile.candidate_kinds.contains(&node.kind());
         ast_labels.push(normalize_clone_ast_label(node, source, profile));
         if node.named_child_count() == 0 {
             let token = normalize_clone_leaf_token(node, source, profile);
@@ -102,7 +111,7 @@ fn normalize_tree_sitter_clone_source(
         }
     }
 
-    (normalized_tokens, ast_labels.join("|"))
+    (normalized_tokens, ast_labels.join("|"), has_candidate)
 }
 
 fn normalize_clone_leaf_token(node: Node<'_>, source: &str, profile: CloneSyntaxProfile) -> String {

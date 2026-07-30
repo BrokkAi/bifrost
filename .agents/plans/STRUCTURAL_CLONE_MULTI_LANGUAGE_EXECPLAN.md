@@ -35,7 +35,7 @@ The observable outcome is that `report_structural_clone_smells` works consistent
 - [x] (2026-07-30) Diagnosed issue #1361: Go, Rust, and Ruby publish named functions and methods as function `CodeUnit`s, but inherit the empty `IAnalyzer` structural-clone default. `MultiAnalyzer`, report rendering, shingle scoring, pair suppression, and stable ordering already work.
 - [x] (2026-07-30) Audited Brokk's current implementation. `TreeSitterAnalyzer` owns generic candidate extraction and leaf-token normalization; Java, Python, and JS/TS refine that generic behavior with language-specific AST labels. This phase will port that remaining shared seam rather than copy three complete traversals.
 - [x] (2026-07-30) Completed Milestone 9. Added a shared stack-safe tree-sitter normalization profile and Go structural-clone support. All four focused Go behaviors and the ten shared clone-engine unit tests pass.
-- [ ] Complete Milestone 10: add Rust structural-clone support with focused tests.
+- [x] (2026-07-30) Completed Milestone 10. Added Rust structural-clone support, an exact concrete-candidate gate, and five focused tests; the Go regression slice remains green.
 - [ ] Complete Milestone 11: add Ruby structural-clone support with focused tests.
 - [ ] Complete Milestone 12: prove mixed Go/Rust/Ruby MCP reporting, update language-neutral tool text, and run the final regression and policy gates.
 - [ ] Add this plan’s milestone tracker updates as each language slice lands.
@@ -81,6 +81,9 @@ The observable outcome is that `report_structural_clone_smells` works consistent
 
 - Observation: extracted Go function snippets are parseable enough without a synthetic `package` wrapper.
   Evidence: the shared parser produced stable tokens and AST signatures for both package functions and the focused control-flow near miss; all four tests in `go_structural_clone_smells` pass.
+
+- Observation: Rust trait signatures are published as function `CodeUnit`s even though they have no body.
+  Evidence: `rust/declarations.rs` visits both `function_item` and `function_signature_item`. The shared syntax profile now requires a concrete candidate node kind, and `ignores_trait_signatures_without_bodies` stays empty under deliberately permissive weights.
 
 ## Decision Log
 
@@ -252,6 +255,16 @@ Milestone 9 validation completed with:
 Add `crates/bifrost-analysis/src/analyzer/rust/clones.rs` with Rust's exact identifier, literal, comment, and AST node kinds, then wire `RustAnalyzer` to the shared detector. Candidate filtering remains `CodeUnit::is_function`, which includes concrete free and associated functions emitted from `function_item`; declaration-only signatures are not emitted as concrete function candidates by this path.
 
 Add `tests/suite_smells/rust_structural_clone_smells.rs` with the same four behavior contracts as Go. Run the focused Rust tests plus the Go tests before creating the Rust checkpoint commit.
+
+Milestone 10 validation completed with:
+
+    cargo test --test suite_smells -- rust_structural_clone_smells --nocapture
+    test result: ok. 5 passed; 0 failed
+
+    cargo test --test suite_smells -- go_structural_clone_smells --nocapture
+    test result: ok. 4 passed; 0 failed
+
+    cargo fmt --all -- --check
 
 ### Milestone 11: Ruby support
 
