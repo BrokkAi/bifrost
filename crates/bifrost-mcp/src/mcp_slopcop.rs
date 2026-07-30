@@ -192,7 +192,7 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "report_test_assertion_smells",
-            "Detects low-value or brittle Java test assertion smells using weighted heuristics. Uses test detection as a fast filter, then scores missing assertions, tautologies, constant-truth checks, constant-equality checks, shallow assertions, oversized literals, and anonymous test doubles. Output format matches the brokk-core MCP byte-for-byte.",
+            "Detects low-value or brittle test assertion smells using language-aware weighted heuristics. Uses test detection as a fast filter, then scores supported forms such as missing assertions, tautologies, constant-truth checks, constant-equality checks, shallow assertions, and oversized literals. Output format matches the brokk-core MCP byte-for-byte.",
             json!({
                 "type": "object",
                 "properties": {

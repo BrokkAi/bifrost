@@ -7,6 +7,7 @@
 
 use tree_sitter::Node;
 
+use super::is_runtime_node;
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
 use crate::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
@@ -172,9 +173,7 @@ fn assignment_target_dispatches(node: Node<'_>) -> bool {
 }
 
 fn call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
-    node.child_by_field_name("arguments")
-        .map(runtime_expression_children)
-        .unwrap_or_default()
+    super::ruby_call_arguments(node)
 }
 
 fn first_runtime_named_child(node: Node<'_>) -> Option<Node<'_>> {
@@ -201,26 +200,6 @@ fn is_short_circuit_binary(source: &str, node: Node<'_>) -> bool {
     node.child_by_field_name("operator")
         .and_then(|operator| node_text(source, operator))
         .is_some_and(|operator| matches!(operator, "&&" | "and" | "||" | "or"))
-}
-
-fn is_runtime_node(kind: &str) -> bool {
-    !matches!(
-        kind,
-        "comment"
-            | "method_parameters"
-            | "lambda_parameters"
-            | "block_parameters"
-            | "block_parameter"
-            | "optional_parameter"
-            | "keyword_parameter"
-            | "splat_parameter"
-            | "hash_splat_parameter"
-            | "forward_parameter"
-            | "destructured_parameter"
-            | "exception_variable"
-            | "hash_key_symbol"
-            | "bare_symbol"
-    )
 }
 
 fn is_runtime_leaf(kind: &str) -> bool {

@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_TEST_ASSERTION_MIN_SCORE: i32 = 4;
 const DEFAULT_TEST_ASSERTION_MAX_FINDINGS: i32 = 80;
+const MAX_TEST_ASSERTION_FINDINGS: usize = 500;
+const MAX_TEST_ASSERTION_CANDIDATES: usize = 10_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportTestAssertionSmellsParams {
@@ -91,11 +93,12 @@ pub fn report_test_assertion_smells(
     } else {
         DEFAULT_TEST_ASSERTION_MIN_SCORE
     };
-    let findings_cap = if params.max_findings > 0 {
+    let requested_findings_cap = if params.max_findings > 0 {
         params.max_findings as usize
     } else {
         DEFAULT_TEST_ASSERTION_MAX_FINDINGS as usize
     };
+    let findings_cap = requested_findings_cap.min(MAX_TEST_ASSERTION_FINDINGS);
     let defaults = TestAssertionWeights::defaults();
     let weights = TestAssertionWeights {
         no_assertion_weight: pick_weight(params.no_assertion_weight, defaults.no_assertion_weight),
@@ -149,11 +152,25 @@ pub fn report_test_assertion_smells(
     let mut truncated = resolved.input_truncated;
     let ambiguous_paths = resolved.ambiguous_paths.clone();
     let mut findings: Vec<TestAssertionSmell> = Vec::new();
+    let mut remaining_candidates = MAX_TEST_ASSERTION_CANDIDATES;
     for file in &resolved.files {
         if !analyzer.contains_tests(file) {
             continue;
         }
-        findings.extend(analyzer.find_test_assertion_smells(file, weights));
+        if remaining_candidates == 0 {
+            truncated = true;
+            break;
+        }
+        let analysis =
+            analyzer.find_test_assertion_smells_limited(file, weights, remaining_candidates);
+        if let Some(inspected_candidates) = analysis.inspected_candidates {
+            remaining_candidates = remaining_candidates.saturating_sub(inspected_candidates);
+        }
+        truncated |= analysis.truncated;
+        findings.extend(analysis.findings);
+        if analysis.truncated {
+            break;
+        }
     }
 
     let mut filtered: Vec<TestAssertionSmell> = findings
@@ -163,8 +180,13 @@ pub fn report_test_assertion_smells(
     filtered.sort_by(test_assertion_smell_cmp);
 
     if filtered.is_empty() {
+        let suffix = if truncated {
+            " The request or analysis was truncated before completion."
+        } else {
+            ""
+        };
         return ReportTestAssertionSmellsResult {
-            report: format!("No test assertion smells met minScore {threshold}."),
+            report: format!("No test assertion smells met minScore {threshold}.{suffix}"),
             truncated,
             ambiguous_paths,
         };
@@ -173,6 +195,7 @@ pub fn report_test_assertion_smells(
     let total = filtered.len();
     let shown = findings_cap.min(total);
     let rows_truncated = total > shown;
+    let request_or_analysis_truncated = truncated;
     truncated |= rows_truncated;
 
     let mut lines = ReportLines::with_capacity(shown + 8);
@@ -213,9 +236,13 @@ pub fn report_test_assertion_smells(
             assertions = finding.assertion_count,
         ));
     }
-    if rows_truncated {
+    if rows_truncated || request_or_analysis_truncated {
         lines.blank();
-        lines.line("- Note: output truncated; increase maxFindings to see more.");
+        if rows_truncated && !request_or_analysis_truncated {
+            lines.line("- Note: output truncated; increase maxFindings to see more.");
+        } else {
+            lines.line("- Note: request or analysis truncated before completion.");
+        }
     }
 
     ReportTestAssertionSmellsResult {
