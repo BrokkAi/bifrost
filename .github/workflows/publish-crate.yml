@@ -51,7 +51,15 @@ jobs:
         shell: bash
         run: |
           test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
-          bash scripts/verify-release-tag-commit.sh "$RELEASE_TAG" "$RELEASE_COMMIT"
+          tag_ref="refs/tags/$RELEASE_TAG"
+          remote_refs="$(git ls-remote --tags origin "${tag_ref}*")"
+          actual_commit="$(awk -v tag_ref="$tag_ref" '
+            $2 == (tag_ref "^{}") { print $1; found = 1; exit }
+            $2 == tag_ref { fallback = $1 }
+            END { if (!found && fallback) print fallback }
+          ' <<< "$remote_refs")"
+          test -n "$actual_commit"
+          test "$actual_commit" = "$RELEASE_COMMIT"
           echo "Publishing $CRATE_PACKAGE from $RELEASE_TAG ($RELEASE_VERSION) at $RELEASE_COMMIT"
 
       - name: Package exact registry payload

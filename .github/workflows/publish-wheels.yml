@@ -40,7 +40,17 @@ jobs:
           ref: ${{ inputs.commit }}
 
       - name: Verify release tag still selects the validated commit
-        run: bash scripts/verify-release-tag-commit.sh "$RELEASE_TAG" "$RELEASE_COMMIT"
+        shell: bash
+        run: |
+          tag_ref="refs/tags/$RELEASE_TAG"
+          remote_refs="$(git ls-remote --tags origin "${tag_ref}*")"
+          actual_commit="$(awk -v tag_ref="$tag_ref" '
+            $2 == (tag_ref "^{}") { print $1; found = 1; exit }
+            $2 == tag_ref { fallback = $1 }
+            END { if (!found && fallback) print fallback }
+          ' <<< "$remote_refs")"
+          test -n "$actual_commit"
+          test "$actual_commit" = "$RELEASE_COMMIT"
 
       - name: Download wheel artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
