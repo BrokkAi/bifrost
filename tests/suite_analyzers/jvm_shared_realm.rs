@@ -329,3 +329,186 @@ fn a_java_name_the_kotlin_file_cannot_see_stays_unresolved() {
          visibility rules: a different package still needs an import"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Cross-language usage: Kotlin and its JVM neighbours (issue #1239, milestone 4)
+// ---------------------------------------------------------------------------
+
+use crate::common::search_tools::call_tool;
+use crate::common::usage_graph::has_edge;
+
+const XLANG_JAVA_GREETER: &str = "package lib;\n\
+     \n\
+     public class JavaGreeter {\n\
+         public String greet() { return \"java\"; }\n\
+     }\n";
+
+const XLANG_SCALA_GREETER: &str = "package lib\n\
+     \n\
+     class ScalaGreeter {\n\
+       def greet(): String = \"scala\"\n\
+     }\n";
+
+const XLANG_KOTLIN_GREETER: &str = "package lib\n\
+     \n\
+     class KotlinGreeter {\n\
+     \n\
+         fun greet(): String {\n\
+             return \"kotlin\"\n\
+         }\n\
+     }\n";
+
+const XLANG_KOTLIN_CALLER: &str = "package app\n\
+     \n\
+     import lib.JavaGreeter\n\
+     import lib.ScalaGreeter\n\
+     \n\
+     class KotlinCaller {\n\
+     \n\
+         fun callJava(): String {\n\
+             val greeter = JavaGreeter()\n\
+             return greeter.greet()\n\
+         }\n\
+     \n\
+         fun callScala(): String {\n\
+             val greeter = ScalaGreeter()\n\
+             return greeter.greet()\n\
+         }\n\
+     }\n";
+
+const XLANG_JAVA_CALLER: &str = "package app;\n\
+     \n\
+     import lib.KotlinGreeter;\n\
+     \n\
+     public class JavaCaller {\n\
+         public String callKotlin() { return new KotlinGreeter().greet(); }\n\
+     }\n";
+
+const XLANG_SCALA_CALLER: &str = "package app\n\
+     \n\
+     import lib.KotlinGreeter\n\
+     \n\
+     class ScalaCaller {\n\
+       def callKotlin(): String = new KotlinGreeter().greet()\n\
+     }\n";
+
+fn mixed_caller_workspace() -> crate::common::BuiltInlineTestProject {
+    InlineTestProject::new()
+        .file("src/lib/JavaGreeter.java", XLANG_JAVA_GREETER)
+        .file("src/lib/ScalaGreeter.scala", XLANG_SCALA_GREETER)
+        .file("src/lib/KotlinGreeter.kt", XLANG_KOTLIN_GREETER)
+        .file("src/app/KotlinCaller.kt", XLANG_KOTLIN_CALLER)
+        .file("src/app/JavaCaller.java", XLANG_JAVA_CALLER)
+        .file("src/app/ScalaCaller.scala", XLANG_SCALA_CALLER)
+        .build()
+}
+
+/// Every file path carrying a proven `scan_usages` hit for `symbol`.
+fn usage_hit_paths(project: &crate::common::BuiltInlineTestProject, symbol: &str) -> Vec<String> {
+    let scan = call_tool(
+        project,
+        "scan_usages_by_reference",
+        &serde_json::json!({ "symbols": [symbol], "include_tests": true }).to_string(),
+    );
+    scan["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|entry| entry["files"].as_array().into_iter().flatten())
+        .filter_map(|file| file["path"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn kotlin_source_contributes_edges_onto_java_and_scala_declarations() {
+    let built = mixed_caller_workspace();
+    let graph = usage_graph_at(built.root(), "{}");
+    let edges = || serde_json::to_string_pretty(&graph["edges"]).unwrap();
+
+    // Kotlin -> Java, both the construction and the call.
+    assert!(
+        has_edge(&graph, "app.KotlinCaller.callJava", "lib.JavaGreeter"),
+        "missing Kotlin -> Java type edge: {}",
+        edges()
+    );
+    assert!(
+        has_edge(&graph, "app.KotlinCaller.callJava", "lib.JavaGreeter.greet"),
+        "missing Kotlin -> Java call edge: {}",
+        edges()
+    );
+    // Kotlin -> Scala.
+    assert!(
+        has_edge(&graph, "app.KotlinCaller.callScala", "lib.ScalaGreeter"),
+        "missing Kotlin -> Scala type edge: {}",
+        edges()
+    );
+    assert!(
+        has_edge(
+            &graph,
+            "app.KotlinCaller.callScala",
+            "lib.ScalaGreeter.greet"
+        ),
+        "missing Kotlin -> Scala call edge: {}",
+        edges()
+    );
+}
+
+#[test]
+fn java_source_contributes_edges_onto_kotlin_declarations() {
+    let built = mixed_caller_workspace();
+    let graph = usage_graph_at(built.root(), "{}");
+    let edges = || serde_json::to_string_pretty(&graph["edges"]).unwrap();
+
+    // The return direction. Before this, Java's builder resolved names against
+    // the Java-only declaration index, so `new KotlinGreeter()` resolved to
+    // nothing and both references were silently lost.
+    assert!(
+        has_edge(&graph, "app.JavaCaller.callKotlin", "lib.KotlinGreeter"),
+        "missing Java -> Kotlin type edge: {}",
+        edges()
+    );
+    assert!(
+        has_edge(
+            &graph,
+            "app.JavaCaller.callKotlin",
+            "lib.KotlinGreeter.greet"
+        ),
+        "missing Java -> Kotlin call edge: {}",
+        edges()
+    );
+    crate::common::usage_graph::assert_every_edge_endpoint_is_a_node(&graph);
+}
+
+#[test]
+fn scan_usages_for_a_kotlin_class_reports_java_and_scala_call_sites() {
+    let built = mixed_caller_workspace();
+    let paths = usage_hit_paths(&built, "lib.KotlinGreeter");
+    assert!(
+        paths.iter().any(|path| path.ends_with("JavaCaller.java")),
+        "a Kotlin class's Java call sites must be reported: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|path| path.ends_with("ScalaCaller.scala")),
+        "a Kotlin class's Scala call sites must be reported: {paths:?}"
+    );
+}
+
+#[test]
+fn scan_usages_for_a_java_class_reports_kotlin_call_sites() {
+    let built = mixed_caller_workspace();
+    let paths = usage_hit_paths(&built, "lib.JavaGreeter");
+    assert!(
+        paths.iter().any(|path| path.ends_with("KotlinCaller.kt")),
+        "a Java class's Kotlin call sites must be reported: {paths:?}"
+    );
+}
+
+#[test]
+fn scan_usages_for_a_scala_class_reports_kotlin_call_sites() {
+    let built = mixed_caller_workspace();
+    let paths = usage_hit_paths(&built, "lib.ScalaGreeter");
+    assert!(
+        paths.iter().any(|path| path.ends_with("KotlinCaller.kt")),
+        "a Scala class's Kotlin call sites must be reported: {paths:?}"
+    );
+}

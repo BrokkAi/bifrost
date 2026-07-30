@@ -426,11 +426,17 @@ lang_epoch!(
 // carry `SignatureMetadata` at all. Persisted rows written before this change
 // have neither, and a consumer that reads the published fact instead of
 // re-parsing would read a warm workspace as "no return type written".
+// `kotlin-companion-object-marker-2026-07` (issue #1239, milestone 3): a Kotlin
+// `companion object` now publishes `SignatureMetadata::is_companion_object`, so
+// consumers can ask whether an owner's members answer to the enclosing class's
+// own name without re-parsing the declaring file. A companion indexed before
+// this change carries no metadata at all, and a warm workspace would read every
+// companion as an ordinary nested object — losing every `Base.of()` edge.
 lang_epoch!(
     Kotlin,
     "kotlin",
     "treesitter/kotlin/",
-    "tree-sitter-kotlin-fwcd-c8ac3d26-2026-07;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07;kotlin-signature-returns-receivers-2026-07"
+    "tree-sitter-kotlin-fwcd-c8ac3d26-2026-07;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07;kotlin-signature-returns-receivers-2026-07;kotlin-companion-object-marker-2026-07"
 );
 
 #[cfg(test)]

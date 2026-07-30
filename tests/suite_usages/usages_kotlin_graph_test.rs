@@ -1761,3 +1761,125 @@ fun deep() {{
     // real reference, so a successful scan also finds something.
     assert_hit_line(&hits, 5);
 }
+
+// ---------------------------------------------------------------------------
+// Milestone 3 / 4 visible behaviour
+// ---------------------------------------------------------------------------
+
+#[test]
+fn kotlin_type_usage_reports_a_constructor_call_written_without_a_type_annotation() {
+    // `Base()` on its own is the most common way to mention a class in Kotlin,
+    // and it is spelled exactly like a function call — a bare `simple_identifier`
+    // rather than a written type — so nothing in the type-annotation arms sees
+    // it. Before the edge builder needed it, a class constructed and never
+    // annotated read as unused.
+    let (_project, analyzer) = kotlin_workspace(&[
+        ("src/lib/Base.kt", BASE_KT),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.Base
+
+fun make() {
+
+    val held = Base()
+
+    println(held)
+}
+",
+        ),
+    ]);
+
+    let target = definition(&analyzer, "lib.Base");
+    let hits = hits(&usages(&analyzer, &target));
+
+    assert_hit_line(&hits, 3); // import lib.Base
+    assert_hit_line(&hits, 7); // val held = Base()
+    assert_hit_text(&hits, 7, "Base()");
+}
+
+#[test]
+fn kotlin_type_usage_excludes_a_constructor_shaped_call_on_a_shadowing_local() {
+    // `Base` here is a local function value, not the class. Kotlin has separate
+    // namespaces for types and values, so the local wins in this (value)
+    // position and the call is not a reference to the class.
+    let (_project, analyzer) = kotlin_workspace(&[
+        ("src/lib/Base.kt", BASE_KT),
+        (
+            "src/app/App.kt",
+            "package app
+
+import lib.Base
+
+fun make() {
+
+    val Base = { -> 1 }
+
+    val value = Base()
+
+    println(value)
+}
+",
+        ),
+    ]);
+
+    let target = definition(&analyzer, "lib.Base");
+    let hits = hits(&usages(&analyzer, &target));
+
+    assert_no_hit_line(&hits, 9);
+}
+
+#[test]
+fn kotlin_query_reports_usages_of_a_java_class_from_kotlin_source() {
+    // The realm is one candidate space, so a Kotlin file naming a Java class is
+    // a usage of it. The Kotlin name ladder already resolves against the
+    // realm-wide declaration index; what milestone 4 added is running the scan
+    // over Kotlin files for a non-Kotlin target.
+    let built = InlineTestProject::new()
+        .file(
+            "src/lib/Greeter.java",
+            "package lib;\n\npublic class Greeter {\n    public String greet() { return \"hi\"; }\n}\n",
+        )
+        .file(
+            "src/app/App.kt",
+            "package app
+
+import lib.Greeter
+
+fun make(): String {
+
+    val greeter = Greeter()
+
+    return greeter.greet()
+}
+",
+        )
+        .build();
+    let workspace = built.workspace_analyzer(brokk_bifrost::AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    let target = analyzer
+        .get_definitions("lib.Greeter")
+        .into_iter()
+        .find(CodeUnit::is_class)
+        .expect("lib.Greeter");
+
+    let files = analyzer.analyzed_files().into_iter().collect();
+    let provider = ExplicitCandidateProvider::new(Arc::new(files));
+    let result = UsageFinder::new()
+        .query_with_provider(
+            analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1000,
+            1000,
+        )
+        .result;
+    let hits = hits(&result);
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file.rel_path().to_string_lossy().ends_with("App.kt")),
+        "a Java class's Kotlin call sites must be reported: {hits:#?}"
+    );
+}

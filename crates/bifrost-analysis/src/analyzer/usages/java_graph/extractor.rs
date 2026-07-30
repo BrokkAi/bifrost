@@ -69,6 +69,26 @@ pub(super) struct ScanCtx<'a> {
     class_scope_depths: Vec<usize>,
 }
 
+impl ScanCtx<'_> {
+    /// Resolve a spelled type name through Java's own import and package tiers,
+    /// against the *realm-aware* declaration index.
+    ///
+    /// Java, Scala, and Kotlin share one JVM candidate space (#1237), so a Java
+    /// file can name a Kotlin or Scala class declared next door through an
+    /// ordinary import. `JavaAnalyzer::resolve_usage_type_name` searches the
+    /// Java-only index and would resolve that name to nothing, silently losing
+    /// the reference. Only the universe of declarations widens here — Java's
+    /// visibility rules are unchanged, so a class in another package still needs
+    /// an import (#1239 milestone 4).
+    pub(super) fn resolve_realm_type_name(&self, type_name: &str) -> Option<CodeUnit> {
+        self.java.resolve_usage_type_name_in(
+            self.analyzer.global_usage_definition_index(),
+            self.file,
+            type_name,
+        )
+    }
+}
+
 pub(super) fn scan_file(
     java: &JavaAnalyzer,
     analyzer: &dyn IAnalyzer,
@@ -382,7 +402,7 @@ fn record_selector_type_segments(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             node,
             ctx.source,
             |base| Ok(resolve_selector_root_type(base, ctx)),
-            |qualified| ctx.java.resolve_usage_type_name(ctx.file, qualified),
+            |qualified| ctx.resolve_realm_type_name(qualified),
             |owner, name| nested_type_for_owner(owner, name, ctx),
         ),
         "identifier"
@@ -407,8 +427,7 @@ fn record_selector_type_segments(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 fn resolve_selector_root_type(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
     let name = node_text(node, ctx.source);
     let direct = || {
-        ctx.java
-            .resolve_usage_type_name(ctx.file, name)
+        ctx.resolve_realm_type_name(name)
             .or_else(|| resolve_non_nested_type_from_node(node, ctx))
     };
     match ctx.bindings.resolve_symbol(name) {
@@ -741,7 +760,7 @@ fn method_reference_owner_fq_names(receiver: Node<'_>, ctx: &mut ScanCtx<'_>) ->
                     Ok(resolve_type_from_node(base, ctx))
                 }
             },
-            |qualified| ctx.java.resolve_usage_type_name(ctx.file, qualified),
+            |qualified| ctx.resolve_realm_type_name(qualified),
             |owner, name| nested_type_for_owner(owner, name, ctx),
         )
         .map(|owner| vec![owner.fq_name()])

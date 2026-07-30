@@ -218,7 +218,28 @@ impl JavaAnalyzer {
         file: &ProjectFile,
         raw_name: &str,
     ) -> Option<CodeUnit> {
-        let index = self.global_usage_definition_index();
+        self.resolve_usage_type_name_in(self.global_usage_definition_index(), file, raw_name)
+    }
+
+    /// Resolve a source type against a *supplied* declaration index, applying
+    /// Java's own import and package tiers.
+    ///
+    /// The index is a parameter because Java, Scala, and Kotlin share one JVM
+    /// candidate space (issue #1237): a Java file can name a Kotlin class
+    /// declared next door with no ceremony beyond an ordinary import, and the
+    /// Java-only index cannot see it. Callers holding the realm-aware
+    /// `MultiAnalyzer` index pass that one, which is what makes the realm
+    /// symmetric — Kotlin source could already resolve onto Java declarations,
+    /// and this is the return direction (issue #1239, milestone 4). What does
+    /// *not* widen is Java's visibility model: the same import, wildcard, and
+    /// same-package tiers decide, so a Kotlin class in another package still
+    /// needs an import.
+    pub(crate) fn resolve_usage_type_name_in(
+        &self,
+        index: &crate::analyzer::GlobalUsageDefinitionIndex,
+        file: &ProjectFile,
+        raw_name: &str,
+    ) -> Option<CodeUnit> {
         self.resolve_type_name_with(file, raw_name, |fqn| {
             index
                 .by_fqn(fqn)

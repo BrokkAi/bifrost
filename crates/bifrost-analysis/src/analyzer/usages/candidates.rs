@@ -152,7 +152,7 @@ fn find_import_graph_candidates(
         }
     }
 
-    add_scala_candidates_for_java_type(target, analyzer, &mut candidates, cancellation);
+    add_cross_language_jvm_candidates(target, analyzer, &mut candidates, cancellation);
 
     candidates
 }
@@ -309,35 +309,52 @@ fn find_transitive_importers_with_cancellation(
     importers
 }
 
-fn add_scala_candidates_for_java_type(
+/// Add candidate files written in the *other* JVM languages for a JVM type
+/// target.
+///
+/// Java, Scala, and Kotlin share one usage candidate space, so a reference to a
+/// type declared in any of them can live in a file of any of the others. This
+/// used to be a single pairwise special case (a Java class also collected Scala
+/// candidates); expressing it as "for a JVM type target, consider every JVM
+/// language" removes the special case rather than adding two more (#1239
+/// milestone 4).
+///
+/// The membership test is a literal substring scan, and deliberately so: this is
+/// candidate *discovery*, whose contract is to over-approximate. Proving that a
+/// token in one of these files really names the target is the strategy's job,
+/// and it does it from the syntax tree.
+fn add_cross_language_jvm_candidates(
     target: &CodeUnit,
     analyzer: &dyn IAnalyzer,
     candidates: &mut HashSet<ProjectFile>,
     cancellation: Option<&CancellationToken>,
 ) {
-    if language_for_target(target) != Language::Java || !target.is_class() {
-        return;
-    }
+    const JVM_LANGUAGES: [Language; 3] = [Language::Java, Language::Scala, Language::Kotlin];
 
-    let files = analyzed_files_for_language(analyzer, Language::Scala);
-    if files.is_empty() {
+    let target_language = language_for_target(target);
+    if !JVM_LANGUAGES.contains(&target_language) || !target.is_class() {
         return;
     }
 
     let target_name = target.identifier();
     let target_fq_name = target.fq_name();
-    for file in files {
-        if is_cancelled(cancellation) {
-            return;
-        }
-        if file.is_binary().unwrap_or(true) {
+    for language in JVM_LANGUAGES {
+        if language == target_language {
             continue;
         }
-        let Ok(source) = file.read_to_string() else {
-            continue;
-        };
-        if source.contains(target_name) || source.contains(&target_fq_name) {
-            candidates.insert(file);
+        for file in analyzed_files_for_language(analyzer, language) {
+            if is_cancelled(cancellation) {
+                return;
+            }
+            if file.is_binary().unwrap_or(true) {
+                continue;
+            }
+            let Ok(source) = file.read_to_string() else {
+                continue;
+            };
+            if source.contains(target_name) || source.contains(&target_fq_name) {
+                candidates.insert(file);
+            }
         }
     }
 }
@@ -439,10 +456,11 @@ fn find_text_candidates(
 /// making cost O(paths) instead of O(workspace) per symbol regardless of how common the symbol is.
 ///
 /// The set is filtered to the target's language because [`super::finder::graph_find_usages`]
-/// dispatches each query to a single language strategy. The one exception is a Java class, whose
-/// strategy also scans Scala candidates for cross-language (Scala → Java) usages, so Scala files
-/// are kept for that case — mirroring the Scala candidates the workspace-wide path contributes via
-/// `add_scala_candidates_for_java_type`. Dropping them would silently lose those usages.
+/// dispatches each query to a single language strategy. The one exception is a JVM class: Java,
+/// Scala, and Kotlin share one candidate space, and each of their strategies also scans the other
+/// two languages' files for references to a type, so every JVM file is kept for that case —
+/// mirroring the candidates the workspace-wide path contributes via
+/// `add_cross_language_jvm_candidates`. Dropping them would silently lose those usages.
 pub struct ExplicitCandidateProvider {
     files: Arc<HashSet<ProjectFile>>,
 }
@@ -460,15 +478,16 @@ impl CandidateFileProvider for ExplicitCandidateProvider {
         _analyzer: &dyn IAnalyzer,
     ) -> HashSet<ProjectFile> {
         let language = language_for_target(target);
-        // A Java-class query also resolves usages from Scala source (see the doc comment), so the
-        // Scala files must reach the strategy alongside the Java ones.
-        let keep_scala_for_java = language == Language::Java && target.is_class();
+        // A JVM *type* query resolves usages from every JVM language (see the doc comment), so
+        // those files must reach the strategy alongside the target language's own.
+        const JVM_LANGUAGES: [Language; 3] = [Language::Java, Language::Scala, Language::Kotlin];
+        let keep_jvm_realm = target.is_class() && JVM_LANGUAGES.contains(&language);
         self.files
             .iter()
             .filter(|file| {
                 let file_language = language_for_file(file);
                 file_language == language
-                    || (keep_scala_for_java && file_language == Language::Scala)
+                    || (keep_jvm_realm && JVM_LANGUAGES.contains(&file_language))
             })
             .cloned()
             .collect()

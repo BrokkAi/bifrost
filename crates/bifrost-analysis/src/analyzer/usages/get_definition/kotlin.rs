@@ -851,12 +851,15 @@ impl<'a> KotlinCtx<'a> {
         false
     }
 
+    /// Whether `unit` is a `companion object`.
+    ///
+    /// Read from the published `SignatureMetadata` marker (issue #1239,
+    /// milestone 3), which the Kotlin declaration walk sets from the very
+    /// `companion_object` node kind this used to re-read. Navigation and the
+    /// usage graphs consult the same published fact, so they cannot disagree
+    /// about which objects are companions.
     fn is_companion_object(&self, unit: &CodeUnit) -> bool {
-        let Some((syntax, range)) = self.declaration_syntax(unit) else {
-            return false;
-        };
-        kotlin_declaration_node(syntax.tree.root_node(), &range)
-            .is_some_and(|node| node.kind() == "companion_object")
+        crate::analyzer::usages::kotlin_graph::is_companion_object(self.analyzer, unit)
     }
 
     /// The declarations enclosing `byte`, innermost first, followed by the

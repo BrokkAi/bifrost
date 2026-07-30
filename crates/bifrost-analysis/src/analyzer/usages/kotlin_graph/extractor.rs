@@ -26,7 +26,7 @@ use crate::analyzer::tree_walk::{
 use crate::analyzer::usages::common::node_text;
 use crate::analyzer::usages::kotlin_graph::hits;
 use crate::analyzer::usages::kotlin_graph::resolver::{
-    KotlinNameResolver, ReceiverTargetMatch, TargetKind, TargetSpec, enclosing_owner_fq_names,
+    KotlinNameResolver, KotlinResolutionCtx, ReceiverTargetMatch, TargetKind, TargetSpec,
     kotlin_callable_arities, member_unit, receiver_is_same_owner, receiver_matches_target,
     receiver_type_fq_name,
 };
@@ -103,6 +103,51 @@ struct ScopeExit {
     values: bool,
     class_scope: bool,
     type_parameters: bool,
+}
+
+/// The query path's half of the shared receiver-typing contract.
+///
+/// Everything the resolver asks for is already here; the only method with real
+/// content is [`KotlinResolutionCtx::enclosing_owner_fq_names`], which a query
+/// answers through `IAnalyzer::enclosing_code_unit` because it has to attribute
+/// each hit to a caller anyway. The inverted builder answers the same question
+/// from the `ClassRangeIndex` it already holds.
+impl KotlinResolutionCtx for ScanCtx<'_> {
+    fn analyzer(&self) -> &dyn IAnalyzer {
+        self.analyzer
+    }
+
+    fn source(&self) -> &str {
+        self.source
+    }
+
+    fn bindings(&self) -> &LocalInferenceEngine<String> {
+        &self.bindings
+    }
+
+    fn resolve_type_fqn(&self, spelled: &str, byte: usize) -> Option<String> {
+        self.names.resolve_type_fqn(spelled, byte)
+    }
+
+    fn resolve_callable_fqn(&self, spelled: &str, byte: usize) -> Option<String> {
+        self.names.resolve_callable_fqn(spelled, byte)
+    }
+
+    fn enclosing_owner_fq_names(&mut self, node: Node<'_>) -> Vec<String> {
+        let mut owners = Vec::new();
+        let mut current = hits::enclosing_context(node, self).enclosing;
+        while let Some(unit) = current {
+            if unit.is_class() {
+                owners.push(unit.fq_name());
+            }
+            current = self.analyzer.parent_of(&unit);
+        }
+        owners
+    }
+
+    fn declared_type_cache(&mut self) -> &mut HashMap<String, Option<String>> {
+        &mut self.declared_type_cache
+    }
 }
 
 pub(super) fn scan_file(
@@ -498,7 +543,7 @@ fn record_bare_reference(token: Node<'_>, ctx: &mut ScanCtx<'_>, arity: Option<u
     // A member named without a receiver is an implicit-`this` reference, which
     // is same-owner under the uniform #1014 policy — but only when the name
     // really does resolve to the target from here.
-    let owners = enclosing_owner_fq_names(token, ctx);
+    let owners = ctx.enclosing_owner_fq_names(token);
     for owner in &owners {
         if let Some(found) = member_unit(owner, &ctx.spec.member_name, arity, ctx) {
             if found.fq_name() == ctx.spec.fq_name {
@@ -658,7 +703,37 @@ fn record_type_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>, types: &TypePara
         "import_header" => record_import_reference(node, ctx),
         "user_type" => record_user_type_reference(node, ctx, types),
         "simple_identifier" => record_qualifier_reference(node, ctx),
+        "call_expression" => record_constructed_type_reference(node, ctx),
         _ => {}
+    }
+}
+
+/// Record the type named by a constructor call written without a type
+/// annotation: the `Base` of `val b = Base()`.
+///
+/// Kotlin spells a constructor call exactly like a function call, so the token
+/// is a bare `simple_identifier` rather than a `user_type` — the arm above never
+/// sees it, and the qualifier arm below only fires for a navigation *receiver*.
+/// Without this, the most common way to mention a class in Kotlin (`Base()` on
+/// its own) is invisible to "who uses this class?".
+fn record_constructed_type_reference(call: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(callee) = kotlin_callee(call) else {
+        return;
+    };
+    if callee.kind() != "simple_identifier" || kotlin_is_declaration_name(callee) {
+        return;
+    }
+    let name = node_text(callee, ctx.source);
+    // A local of the same name is a value, not the class it hides.
+    if name.is_empty() || name != ctx.spec.member_name || ctx.bindings.is_shadowed(name) {
+        return;
+    }
+    if ctx
+        .names
+        .resolve_type_fqn(name, callee.start_byte())
+        .is_some_and(|resolved| resolved == ctx.spec.fq_name)
+    {
+        hits::push_hit(callee, ctx);
     }
 }
 

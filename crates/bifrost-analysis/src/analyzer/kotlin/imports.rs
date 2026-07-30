@@ -325,8 +325,14 @@ impl ImportAnalysisProvider for KotlinAnalyzer {
     /// needs each JVM member's files and top-level declarations, which the
     /// realm's forward-query surface does not expose. A half-crossing answer —
     /// imports counted, same-package references silently dropped — would be
-    /// worse than a clearly bounded one, so the whole question stays with the
-    /// usage-graph work in #1239.
+    /// worse than a clearly bounded one, so this index stays within one
+    /// language.
+    ///
+    /// The usage graphs do not depend on it crossing: a cross-language JVM type
+    /// query widens its own candidate set over every JVM language directly
+    /// (`usages/candidates.rs::add_cross_language_jvm_candidates`), so a Kotlin
+    /// reference to a Java type is found without this relation having an opinion
+    /// about it (#1239 milestone 4).
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
         if let Some(cached) = self.referencing_files.get(file) {
             return (*cached).clone();
