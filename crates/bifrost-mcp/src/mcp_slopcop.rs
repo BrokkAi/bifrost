@@ -90,7 +90,7 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "report_exception_handling_smells",
-            "Detects suspicious exception handlers using weighted heuristics designed for high-recall triage. Scores generic catches and tiny / empty / comment-only / log-only handlers, then subtracts credit for richer handler bodies. Use min_score, max_findings, and the per-rule weights to tune precision/recall. Output format matches the brokk-core MCP byte-for-byte.",
+            "Detects suspicious exception and error handlers using weighted, structured-AST heuristics designed for high-recall triage. Supports Java, Go, C++, JavaScript/JSX, TypeScript/TSX, Python, Rust, PHP, Scala, C#, Ruby, and Kotlin; C return-code/errno semantics are explicitly unsupported, and Go and Rust use their native error/panic models rather than catch-clause approximations. Scores broad handlers and tiny / empty / comment-only / log-only bodies, then subtracts credit for richer bodies. Unsupported inputs and analysis failures are reported explicitly. Use min_score, max_findings, and the per-rule weights to tune precision/recall.",
             json!({
                 "type": "object",
                 "properties": {

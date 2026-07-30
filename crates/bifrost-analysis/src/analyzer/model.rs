@@ -2385,6 +2385,16 @@ pub struct ExceptionHandlingSmell {
     pub start_byte: usize,
 }
 
+/// Capability-honest result of analyzing one file for exception-handling
+/// smells. An empty [`Self::Analyzed`] result is authoritative; unsupported
+/// semantics and analysis failures must never be represented as clean files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExceptionHandlingAnalysis {
+    Analyzed(Vec<ExceptionHandlingSmell>),
+    Unsupported { reason: String },
+    Failed { message: String },
+}
+
 impl Range {
     pub fn contains(&self, other: &Range) -> bool {
         self.start_byte <= other.start_byte && self.end_byte >= other.end_byte

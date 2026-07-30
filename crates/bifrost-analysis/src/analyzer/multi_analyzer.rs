@@ -2,7 +2,7 @@ use crate::analyzer::common::language_for_file;
 use crate::analyzer::jvm::realm::JvmSourceRealm;
 use crate::analyzer::{
     CSharpAnalyzer, CloneSmell, CloneSmellWeights, CodeUnit, CommentDensityStats, CppAnalyzer,
-    DeclarationInfo, ExceptionHandlingSmell, ExceptionSmellWeights, GlobalUsageDefinitionIndex,
+    DeclarationInfo, ExceptionHandlingAnalysis, ExceptionSmellWeights, GlobalUsageDefinitionIndex,
     GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer,
     KotlinAnalyzer, Language, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range,
     RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, SearchSymbolCandidates, SearchSymbolPatternBatch,
@@ -1026,14 +1026,18 @@ impl IAnalyzer for MultiAnalyzer {
         &self,
         file: &ProjectFile,
         weights: ExceptionSmellWeights,
-    ) -> Vec<ExceptionHandlingSmell> {
-        self.delegate_for_file(file)
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .find_exception_handling_smells(file, weights)
-            })
-            .unwrap_or_default()
+    ) -> ExceptionHandlingAnalysis {
+        let Some(delegate) = self.delegate_for_file(file) else {
+            return ExceptionHandlingAnalysis::Unsupported {
+                reason: format!(
+                    "no analyzer delegate is available for {}",
+                    file.rel_path().display()
+                ),
+            };
+        };
+        delegate
+            .analyzer()
+            .find_exception_handling_smells(file, weights)
     }
 
     fn find_structural_clone_smells(

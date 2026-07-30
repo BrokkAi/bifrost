@@ -43,7 +43,8 @@ pub use analyzer::usages;
 pub use analyzer::{
     AnalyzerConfig, AnalyzerDelegate, CSharpAnalyzer, CapabilityProvider, CloneSmell,
     CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CppAnalyzer, DeclarationInfo,
-    DeclarationKind, EmptyAnalyzer, FileSetProject, FilesystemProject, GoAnalyzer, IAnalyzer,
+    DeclarationKind, EmptyAnalyzer, ExceptionHandlingAnalysis, ExceptionHandlingSmell,
+    ExceptionSmellWeights, FileSetProject, FilesystemProject, GoAnalyzer, IAnalyzer,
     ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer, JvmAnalyzerConfig,
     JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact,
     JvmExternalDependencies, JvmMavenCoordinate, KotlinAnalyzer, Language, MultiAnalyzer,
