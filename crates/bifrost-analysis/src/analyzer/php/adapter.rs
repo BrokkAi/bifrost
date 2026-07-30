@@ -1,8 +1,32 @@
+use crate::analyzer::cognitive_complexity;
 use crate::analyzer::{Language, LanguageAdapter, ProjectFile};
+use std::sync::LazyLock;
 use tree_sitter::{Node, Parser, Tree};
 
 use super::declarations::{parse_php_file, php_declared_type_node};
 use super::tests::php_contains_tests;
+
+static PHP_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
+    LazyLock::new(|| cognitive_complexity::Config {
+        if_types: &["if_statement", "else_if_clause"],
+        loop_types: &[
+            "for_statement",
+            "foreach_statement",
+            "while_statement",
+            "do_statement",
+        ],
+        catch_types: &["catch_clause"],
+        conditional_types: &["conditional_expression"],
+        case_types: &["case_statement", "match_condition"],
+        default_case_types: &["default_statement", "match_default_expression"],
+        binary_types: &["binary_expression"],
+        logical_operators: &["&&", "||", "and", "or", "??"],
+        jump_types: &["break_statement", "continue_statement"],
+        named_function_boundary_types: &["function_definition", "method_declaration"],
+        anonymous_function_types: &["anonymous_function", "arrow_function"],
+        else_clause_types: &["else_clause"],
+        ..cognitive_complexity::Config::empty()
+    });
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct PhpAdapter;
@@ -53,6 +77,10 @@ impl LanguageAdapter for PhpAdapter {
         tree: &Tree,
     ) -> crate::analyzer::tree_sitter_analyzer::ParsedFile {
         parse_php_file(file, source, tree)
+    }
+
+    fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
+        Some(&PHP_COGNITIVE_CONFIG)
     }
 }
 

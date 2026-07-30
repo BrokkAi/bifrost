@@ -22,7 +22,7 @@ fn checked_in_targets_manifest_loads_and_validates() {
 
     assert_eq!(manifest.warmup_iterations, 2);
     assert_eq!(manifest.measured_iterations, 10);
-    assert_eq!(manifest.repos.len(), 10);
+    assert_eq!(manifest.repos.len(), 11);
 
     let covered_languages = manifest
         .repos

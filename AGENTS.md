@@ -75,12 +75,12 @@ When a comprehensive full-suite gate is actually required, it must pass `--featu
 featureless `cargo test` silently skips every `#![cfg(feature = "nlp")]` integration suite (they report `ok. 0 passed`,
 which looks green). Do not promote this comprehensive command into the default validation for an unrelated change.
 
-The `python` feature needs a Python interpreter at or above the `abi3-py312` floor, and pyo3's build script resolves
-`python3` through `PATH` — not through a shell alias. On macOS `/usr/bin/python3` (3.9) usually wins that lookup even
-when your interactive `python3` is newer, which fails the build with "cannot set a minimum Python version 3.12 higher
-than the interpreter version 3.9". Point pyo3 at a suitable interpreter when that happens:
+Run local Rust tests that enable the `python` feature through uv's Python 3.12 environment:
 
-    PYO3_PYTHON=$(brew --prefix python@3.13)/bin/python3.13 cargo test --features nlp,python
+    uv run --python 3.12 -- cargo test --features nlp,python
+
+PyO3 resolves its interpreter from the process environment; running Cargo directly bypasses uv and may select an
+incompatible system Python or one without the development library needed to link Rust test executables.
 
 Do not enable `extension-module` for tests. It suppresses libpython linkage, which is right for the wheel (the host
 interpreter supplies `Py*` at load time) and fatal for any executable, so a test build fails with undefined `_Py*`

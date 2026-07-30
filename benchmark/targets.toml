@@ -13,6 +13,7 @@ required_languages = [
   "php",
   "scala",
   "csharp",
+  "kotlin",
 ]
 required_scenarios = [
   "workspace_build",
@@ -354,4 +355,39 @@ definition_queries = [
 query_code_queries = [
   { id = "exact-sql-mapper-class", workloads = ["exact_name", "warm_reuse"], query_json = '{"languages":["csharp"],"where":["Dapper/SqlMapper.cs"],"match":{"kind":"class","name":"SqlMapper"},"limit":100}', required_paths = ["Dapper/SqlMapper.cs"], expected_witness_json = '{"result_type":"structural_match","path":"Dapper/SqlMapper.cs","kind":"class","enclosing_symbol":"Dapper.SqlMapper"}', min_results = 1, max_results = 1 },
   { id = "workspace-exact-sql-mapper-class", workloads = ["exact_name", "warm_reuse"], query_json = '{"languages":["csharp"],"match":{"kind":"class","name":"SqlMapper"},"limit":100}', required_paths = ["Dapper/SqlMapper.cs"], expected_witness_json = '{"result_type":"structural_match","path":"Dapper/SqlMapper.cs","kind":"class","enclosing_symbol":"Dapper.SqlMapper"}', min_results = 27, max_results = 27 },
+]
+
+[[repos]]
+name = "exposed-kotlin"
+url = "https://github.com/JetBrains/Exposed"
+commit = "2b37c5d1f6b593ac8a3f005a4475d42dc06cee5b"
+languages = ["kotlin"]
+extensions = ["kt", "kts"]
+scenarios = [
+  "workspace_build",
+  "search_symbols",
+  "get_symbol_locations",
+  "get_summaries",
+  "scan_usages",
+  "dead_code_smells",
+  "get_definition",
+  "query_code",
+]
+# most_relevant_files is deliberately excluded here: it reliably exceeds even
+# the 60s benchmark request budget on this repo's full multi-module workspace
+# (measured wall clock during evidence collection for #1244; see
+# .agents/docs/kotlin-product-surface-evidence-2026-07.md and issue #1373).
+search_patterns = ["Table"]
+location_symbols = ["org.jetbrains.exposed.v1.core.Table"]
+summary_targets = ["exposed-core/src/main/kotlin/org/jetbrains/exposed/v1/core/Table.kt"]
+usage_symbols = ["org.jetbrains.exposed.v1.exceptions.DuplicateColumnException.DuplicateColumnException"]
+dead_code_file_paths = ["exposed-core/src/main/kotlin/org/jetbrains/exposed/v1/core/Table.kt"]
+dead_code_fq_names = ["org.jetbrains.exposed.v1.core.isAlreadyQuoted"]
+dead_code_expect_report_contains = ["Candidate symbols analyzed: 1"]
+dead_code_expect_report_absent = ["no definition found", "not yet supported for smell analysis"]
+definition_queries = [
+  { path = "exposed-core/src/main/kotlin/org/jetbrains/exposed/v1/core/Table.kt", line = 614, column = 19, symbol = "DuplicateColumnException", expected_status = "resolved", expected_fqn = "org.jetbrains.exposed.v1.exceptions.DuplicateColumnException.DuplicateColumnException" },
+]
+query_code_queries = [
+  { id = "exact-table-class", workloads = ["exact_name", "warm_reuse"], query_json = '{"languages":["kotlin"],"where":["exposed-core/src/main/kotlin/org/jetbrains/exposed/v1/core/Table.kt"],"match":{"kind":"class","name":"Table"},"limit":100}', required_paths = ["exposed-core/src/main/kotlin/org/jetbrains/exposed/v1/core/Table.kt"], expected_witness_json = '{"result_type":"structural_match","path":"exposed-core/src/main/kotlin/org/jetbrains/exposed/v1/core/Table.kt","kind":"class","enclosing_symbol":"org.jetbrains.exposed.v1.core.Table"}', min_results = 1, max_results = 1 },
 ]

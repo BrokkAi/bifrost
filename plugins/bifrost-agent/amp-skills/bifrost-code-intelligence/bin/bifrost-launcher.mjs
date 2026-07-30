@@ -843,6 +843,7 @@ function installProgressHandlers() {
 
 function formatRecoveryMessage(requiredVersion, cachePath) {
   return `Expected ${requiredVersion ?? "unknown"}; cache ${cachePath ?? "unknown"}. ` +
+    "MCP startup did not complete, so Bifrost MCP tools were not registered. " +
     "Run this launcher with doctor, then prepare, and start a fresh host task.";
 }
 

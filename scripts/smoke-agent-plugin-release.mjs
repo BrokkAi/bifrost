@@ -25,7 +25,7 @@ const binaryPath = options.binaryPath
   : null;
 await assertEmptyCache(cacheDir);
 
-const launcher = await resolveClaudePluginLauncher(pluginDir);
+const codexLaunch = await resolveCodexPluginLaunch(pluginDir);
 
 const launcherEnv = {
   ...process.env,
@@ -35,16 +35,16 @@ const launcherEnv = {
   BIFROST_LAUNCHER_CACHE_DIR: cacheDir,
 };
 
-await prepare(launcher, os.tmpdir(), launcherEnv, binaryPath ? "explicit" : "installed");
+await prepare(codexLaunch.command, os.tmpdir(), launcherEnv, binaryPath ? "explicit" : "installed");
 await withDisposableSmokeWorkspace((workspace) =>
-  assertCodexSandboxWorkspaceBinding(launcher, pluginDir, workspace, launcherEnv)
+  assertCodexSandboxWorkspaceBinding(codexLaunch, workspace, launcherEnv)
 );
 await withDisposableSmokeWorkspace((workspace) =>
-  assertMcpRootsWorkspaceBinding(launcher, pluginDir, workspace, launcherEnv)
+  assertMcpRootsWorkspaceBinding(codexLaunch, workspace, launcherEnv)
 );
 await assertNoPluginWorkspaceCache(pluginDir);
 console.log(
-  `Packaged agent plugin passed Claude launcher resolution, the recorded Codex ${recordedCodexVersion} ` +
+  `Packaged Codex plugin passed .mcp.json launcher resolution, the recorded Codex ${recordedCodexVersion} ` +
   "handshake replay, and the MCP roots smoke."
 );
 
@@ -103,32 +103,41 @@ async function requiredFile(value, name) {
   return file;
 }
 
-async function resolveClaudePluginLauncher(pluginRoot) {
-  const manifestPath = path.join(pluginRoot, ".claude-plugin", "plugin.json");
+async function resolveCodexPluginLaunch(pluginRoot) {
+  const manifestPath = path.join(pluginRoot, ".codex-plugin", "plugin.json");
   const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
   assert.equal(
     typeof manifest.mcpServers,
     "string",
-    `${manifestPath} must select a host-specific MCP config`
+    `${manifestPath} must select the Codex MCP config`
   );
   const mcpConfigPath = path.resolve(pluginRoot, manifest.mcpServers);
   const mcpConfig = JSON.parse(await fs.readFile(mcpConfigPath, "utf8"));
   const server = mcpConfig.mcpServers?.bifrost;
   assert.ok(server, `${mcpConfigPath} must define the bifrost MCP server`);
   assert.equal(
+    typeof server.command,
+    "string",
+    `${mcpConfigPath} must define a launcher command`
+  );
+  assert.equal(
     server.command,
-    "${CLAUDE_PLUGIN_ROOT}/bin/bifrost-launcher.mjs",
-    `${mcpConfigPath} must resolve bundled files through CLAUDE_PLUGIN_ROOT`
+    "./bin/bifrost-launcher.mjs",
+    `${mcpConfigPath} must resolve the package-local launcher`
   );
   assert.equal(
     server.cwd,
-    undefined,
-    `${mcpConfigPath} must not depend on the Claude Code project working directory`
+    ".",
+    `${mcpConfigPath} must keep the package as the launcher working directory`
   );
-  const command = server.command.replaceAll("${CLAUDE_PLUGIN_ROOT}", pluginRoot);
+  assert.deepEqual(server.args, ["--mcp", "symbol|extended"]);
+  const mcpConfigDir = path.dirname(mcpConfigPath);
+  const command = path.resolve(mcpConfigDir, server.command);
+  const cwd = path.resolve(mcpConfigDir, server.cwd);
   assert.equal(path.isAbsolute(command), true, `${mcpConfigPath} did not resolve an absolute launcher path`);
+  assert.equal(path.isAbsolute(cwd), true, `${mcpConfigPath} did not resolve an absolute launcher working directory`);
   await fs.access(command);
-  return command;
+  return { command, cwd, args: server.args, manifestPath, mcpConfigPath };
 }
 
 async function assertEmptyCache(directory) {
@@ -187,9 +196,9 @@ async function prepare(launcherPath, cwd, env, expectedSource) {
   assert.match(status.binaryPath ?? "", /bifrost(?:\.exe)?$/);
 }
 
-async function assertCodexSandboxWorkspaceBinding(launcherPath, pluginCwd, workspaceRoot, env) {
+async function assertCodexSandboxWorkspaceBinding(codexLaunch, workspaceRoot, env) {
   const canonicalWorkspace = await fs.realpath(workspaceRoot);
-  const { logs } = await withMcpServer(launcherPath, pluginCwd, env, async ({ child, reader }) => {
+  const { logs } = await withMcpServer(codexLaunch, env, async ({ child, reader }) => {
     const serverRequests = [];
     reader.on("line", (line) => {
       try {
@@ -246,8 +255,8 @@ async function assertCodexSandboxWorkspaceBinding(launcherPath, pluginCwd, works
   await assertWorkspaceCache(workspaceRoot, "Codex sandbox metadata");
 }
 
-async function assertMcpRootsWorkspaceBinding(launcherPath, pluginCwd, workspaceRoot, env) {
-  const { logs } = await withMcpServer(launcherPath, pluginCwd, env, async ({ child, reader }) => {
+async function assertMcpRootsWorkspaceBinding(codexLaunch, workspaceRoot, env) {
+  const { logs } = await withMcpServer(codexLaunch, env, async ({ child, reader }) => {
     const initialize = await roundTrip(child, reader, {
       jsonrpc: "2.0",
       id: 1,
@@ -387,9 +396,9 @@ async function assertNoPluginWorkspaceCache(pluginCwd) {
   );
 }
 
-async function withMcpServer(launcherPath, pluginCwd, env, scenario) {
-  const child = spawn(process.execPath, [launcherPath, "--mcp", "symbol|extended"], {
-    cwd: pluginCwd,
+async function withMcpServer(codexLaunch, env, scenario) {
+  const child = spawn(process.execPath, [codexLaunch.command, ...codexLaunch.args], {
+    cwd: codexLaunch.cwd,
     env,
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -423,11 +432,15 @@ async function withMcpServer(launcherPath, pluginCwd, env, scenario) {
   const failure = scenarioError ?? shutdownError;
   if (failure) {
     const diagnosticLogs = logs.trim() ? `\nMCP stderr:\n${logs.trimEnd()}` : "";
-    throw new Error(`${failure.message}${diagnosticLogs}`, { cause: failure });
+    throw new Error(
+      `${failure.message}\nCodex manifest: ${codexLaunch.manifestPath}\nMCP config: ${codexLaunch.mcpConfigPath}${diagnosticLogs}`,
+      { cause: failure }
+    );
   }
   if (!shutdown.forcedSignal && (shutdown.code !== 0 || shutdown.signal)) {
     throw new Error(
-      `Packaged MCP launcher exited with ${shutdown.signal ?? shutdown.code}: ${logs}`
+      `Packaged Codex MCP launcher exited with ${shutdown.signal ?? shutdown.code}; ` +
+      `manifest=${codexLaunch.manifestPath}; config=${codexLaunch.mcpConfigPath}: ${logs}`
     );
   }
   return { value, logs };

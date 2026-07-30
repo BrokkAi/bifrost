@@ -302,3 +302,601 @@ fn python_nested_function_body_is_not_counted() {
         return helper()\n";
     assert_eq!(python_score(src, "outer"), 0);
 }
+
+// ===== Kotlin =====
+//
+// Unlike the ports above, Kotlin has no `brokk-shared` reference
+// implementation to match byte-for-byte (issue #1243 is new coverage, not a
+// port), so these assert plausible scores derived by hand-tracing the
+// scorer against `KOTLIN_COGNITIVE_CONFIG` rather than a reference fixture.
+// Fixtures are deliberately multi-line: the vendored grammar emits a
+// MISSING `_automatic_semicolon` error node for a single-line function body,
+// which would make `compute_cognitive_complexities` see an unparseable file.
+
+const KOTLIN_FILE: &str = "com/example/Test.kt";
+
+fn kotlin_score(method_body: &str, identifier: &str) -> u32 {
+    let source = format!(
+        "package com.example\n\n\
+         class Test {{\n\
+         {method_body}\n\
+         }}\n"
+    );
+    score(&[(KOTLIN_FILE, source.as_str())], KOTLIN_FILE, identifier)
+}
+
+#[test]
+fn kotlin_simple_function_is_zero() {
+    let body = "    fun method(): Int {\n        \
+        return 0\n    \
+    }";
+    assert_eq!(kotlin_score(body, "method"), 0);
+}
+
+#[test]
+fn kotlin_flat_function_with_calls_does_not_flag() {
+    let body = "    fun method(a: Int, b: Int): Int {\n        \
+        val sum = a + b\n        \
+        val doubled = sum * 2\n        \
+        return doubled\n    \
+    }";
+    assert_eq!(kotlin_score(body, "method"), 0);
+}
+
+#[test]
+fn kotlin_nested_if_picks_up_nesting() {
+    let body = "    fun method(a: Int, b: Int): Int {\n        \
+        if (a > 0) {\n            \
+            if (b > 0) {\n                \
+                return 1\n            \
+            }\n        \
+        }\n        \
+        return 0\n    \
+    }";
+    // Outer if at nesting 0 (+1), inner if at nesting 1 (+2): matches the
+    // same shape and score as the Java/Python nested-if ports above.
+    assert_eq!(kotlin_score(body, "method"), 3);
+}
+
+#[test]
+fn kotlin_when_if_loop_and_conjunction_score_plausibly() {
+    let body = "    fun method(x: Int): Int {\n        \
+        for (i in 0 until x) {\n            \
+            if (x > 0 && i > 0 || i < 10) {\n                \
+                break\n            \
+            }\n        \
+        }\n        \
+        while (x > 0) {\n            \
+            continue\n        \
+        }\n        \
+        return when (x) {\n            \
+            1 -> x\n            \
+            else -> 0\n        \
+        }\n    \
+    }";
+    // for (+1) -> if at nesting 1 (+2) with && / || counted as two distinct
+    // operator runs (+2) -> while (+1) -> when's one non-default entry (+1),
+    // its `else` arm contributing nothing.
+    assert_eq!(kotlin_score(body, "method"), 7);
+}
+
+#[test]
+fn kotlin_labeled_break_counts_extra_but_unlabeled_is_free() {
+    let labeled_body = "    fun method(x: Int): Int {\n        \
+        outer@ for (i in 0 until x) {\n            \
+            for (j in 0 until x) {\n                \
+                if (j == 1) {\n                    \
+                    break@outer\n                \
+                }\n            \
+            }\n        \
+        }\n        \
+        return 0\n    \
+    }";
+    // Outer for (+1) -> inner for at nesting 1 (+2) -> if at nesting 2 (+3)
+    // -> labeled `break@outer` (+1).
+    assert_eq!(kotlin_score(labeled_body, "method"), 7);
+
+    let unlabeled_body = "    fun method(x: Int): Int {\n        \
+        for (i in 0 until x) {\n            \
+            if (i == 1) {\n                \
+                break\n            \
+            }\n        \
+        }\n        \
+        return 0\n    \
+    }";
+    // Outer for (+1) -> if at nesting 1 (+2) -> unlabeled `break` (+0).
+    assert_eq!(kotlin_score(unlabeled_body, "method"), 3);
+}
+
+// ===== Go =====
+
+#[test]
+fn go_nested_if_and_else_if_match_reference() {
+    let src = r#"package main
+func method(a, b int) int {
+    if a > 0 {
+        if b > 0 { return 1 }
+    } else if a < 0 {
+        return -1
+    }
+    return 0
+}
+"#;
+    assert_eq!(score(&[("main.go", src)], "main.go", "method"), 4);
+}
+
+#[test]
+fn go_loops_switch_select_logical_and_function_literal_match_reference() {
+    let src = r#"package main
+func method(ch chan int, x int) int {
+    f := func() int { if x > 0 { return 1 }; return 0 }
+outer:
+    for i := 0; i < x; i++ {
+        if x > 0 && i > 0 || i < 10 { break outer }
+    }
+    switch x { case 1: return f(); default: return 0 }
+    select { case <-ch: return 1; default: return 0 }
+}
+"#;
+    assert_eq!(score(&[("main.go", src)], "main.go", "method"), 10);
+}
+
+#[test]
+fn go_repeated_logical_operator_and_unlabeled_break_are_near_misses() {
+    let src = r#"package main
+func method(a, b, c bool) {
+    for {
+        if a && b && c { break }
+    }
+}
+"#;
+    assert_eq!(score(&[("main.go", src)], "main.go", "method"), 4);
+}
+
+// ===== C / C++ =====
+
+#[test]
+fn cpp_nested_if_and_else_if_match_reference() {
+    let src = r#"int method(int a, int b) {
+    if (a > 0) {
+        if (b > 0) return 1;
+    } else if (a < 0) {
+        return -1;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(score(&[("main.cpp", src)], "main.cpp", "method"), 4);
+}
+
+#[test]
+fn cpp_control_flow_logical_lambda_and_defaults_match_reference() {
+    let src = r#"int method(int x) {
+    auto f = [&]() { if (x > 0) return 1; return 0; };
+label:
+    for (int i = 0; i < x; i++) {
+        if (x > 0 && i > 0 || i < 10) break label;
+    }
+    while (x-- > 0) continue;
+    switch (x) { case 1: return f(); default: return 0; }
+    try { risky(); } catch (...) { recover(); }
+    return x > 0 ? 1 : 0;
+}
+"#;
+    assert_eq!(score(&[("main.cpp", src)], "main.cpp", "method"), 11);
+}
+
+#[test]
+fn c_extension_uses_cpp_config_and_near_misses_remain_free() {
+    let src = r#"int method(int a, int b, int c) {
+    while (a) {
+        if (a && b && c) break;
+    }
+    switch (a) { default: return a + b * c; }
+}
+"#;
+    assert_eq!(score(&[("main.c", src)], "main.c", "method"), 4);
+}
+
+// ===== JavaScript / JSX =====
+
+#[test]
+fn javascript_nesting_else_if_and_logical_sequences_are_scored() {
+    let src = r#"function method(a, b, c) {
+    if (a && b || c) {
+        if (b) return 1;
+    } else if (c) {
+        return -1;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(score(&[("main.js", src)], "main.js", "method"), 6);
+}
+
+#[test]
+fn javascript_language_specific_control_flow_and_defaults_are_scored() {
+    let src = r#"function method(items, ready, value) {
+    for (const item in items) {
+        if (item && ready) continue;
+    }
+    do {} while (ready);
+    try { risky(); } catch (error) { recover(error); }
+    switch (value) { case 1: return value ?? 0; default: return ready ? 1 : 0; }
+}
+"#;
+    assert_eq!(score(&[("main.js", src)], "main.js", "method"), 9);
+}
+
+#[test]
+fn javascript_nested_named_function_body_is_not_counted() {
+    let src = r#"function outer(a, b) {
+    function helper() {
+        if (a) { if (b) return 1; }
+        return 0;
+    }
+    return helper();
+}
+"#;
+    assert_eq!(score(&[("main.js", src)], "main.js", "outer"), 0);
+}
+
+#[test]
+fn jsx_arrow_function_is_scored_with_shared_config() {
+    let src = r#"const method = (ready) => {
+    if (ready) return <span>ready</span>;
+    return <span>waiting</span>;
+};
+"#;
+    assert_eq!(score(&[("view.jsx", src)], "view.jsx", "method"), 1);
+}
+
+// ===== TypeScript / TSX =====
+
+#[test]
+fn typescript_typed_control_flow_matches_reference() {
+    let src = r#"function method(a: number, b?: string): number {
+    if (a > 10 && b !== undefined) {
+        for (let i = 0; i < a; i++) {
+            if (i % 2 === 0) return i;
+        }
+    }
+    return b ?? "default" ? 1 : 0;
+}
+"#;
+    assert_eq!(score(&[("main.ts", src)], "main.ts", "method"), 9);
+}
+
+#[test]
+fn typescript_nested_arrow_body_is_not_counted() {
+    let src = r#"function outer(values: number[]): number {
+    const helper = (value: number): number => {
+        if (value > 0) { if (value % 2 === 0) return value; }
+        return 0;
+    };
+    return values.length;
+}
+"#;
+    assert_eq!(score(&[("main.ts", src)], "main.ts", "outer"), 0);
+}
+
+#[test]
+fn tsx_method_uses_typescript_config() {
+    let src = r#"function method(ready: boolean) {
+    if (ready) return <span>ready</span>;
+    return <span>waiting</span>;
+}
+"#;
+    assert_eq!(score(&[("view.tsx", src)], "view.tsx", "method"), 1);
+}
+
+// ===== PHP =====
+
+#[test]
+fn php_nested_if_and_else_if_match_reference() {
+    let src = r#"<?php
+function method($a, $b) {
+    if ($a > 0) {
+        if ($b > 0) return 1;
+    } elseif ($a < 0) {
+        return -1;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(score(&[("main.php", src)], "main.php", "method"), 4);
+}
+
+#[test]
+fn php_control_flow_logical_anonymous_function_and_defaults_match_reference() {
+    let src = r#"<?php
+function method($items, $x) {
+    $f = function() use ($x) { if ($x > 0) return 1; return 0; };
+    foreach ($items as $item) {
+        if ($x > 0 && $item || $x ?? false) break;
+    }
+    switch ($x) { case 1: return $f(); default: return 0; }
+    try { risky(); } catch (Exception $e) { recover(); }
+    return $x > 0 ? 1 : 0;
+}
+"#;
+    assert_eq!(score(&[("main.php", src)], "main.php", "method"), 11);
+}
+
+#[test]
+fn php_repeated_operator_and_unlabeled_jump_are_near_misses() {
+    let src = r#"<?php
+function method($a, $b, $c) {
+    while ($a) {
+        if ($a && $b && $c) break;
+    }
+}
+"#;
+    assert_eq!(score(&[("main.php", src)], "main.php", "method"), 4);
+}
+
+// ===== Scala =====
+
+#[test]
+fn scala_nested_if_and_else_if_match_reference() {
+    let src = r#"def method(a: Int, b: Int): Int = {
+  if (a > 0) {
+    if (b > 0) return 1
+  } else if (a < 0) {
+    return -1
+  }
+  0
+}
+"#;
+    assert_eq!(score(&[("Main.scala", src)], "Main.scala", "method"), 4);
+}
+
+#[test]
+fn scala_loops_match_logical_lambda_and_wildcard_match_reference() {
+    let src = r#"def method(xs: List[Int], x: Int): Int = {
+  val f = (y: Int) => { if (y > 0) 1 else 0 }
+  for (item <- xs) {
+    if (x > 0 && item > 0 || item < 10) return f(item)
+  }
+  try risky() catch { case _: Exception => recover() }
+  x match { case 1 => f(x); case _ => 0 }
+}
+"#;
+    assert_eq!(score(&[("Main.scala", src)], "Main.scala", "method"), 9);
+}
+
+#[test]
+fn scala_repeated_logical_operator_and_wildcard_are_near_misses() {
+    let src = r#"def method(a: Boolean, b: Boolean, c: Boolean, x: Int): Int = {
+  if (a && b && c) {
+    x match { case _ => 0 }
+  } else 0
+}
+"#;
+    assert_eq!(score(&[("Main.scala", src)], "Main.scala", "method"), 2);
+}
+
+// ===== C# =====
+
+#[test]
+fn csharp_nested_if_and_else_if_are_scored() {
+    let src = r#"class Service {
+    int method(int a, int b) {
+        if (a > 0) {
+            if (b > 0) return 1;
+        } else if (a < 0) {
+            return -1;
+        }
+        return 0;
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 4);
+}
+
+#[test]
+fn csharp_unbraced_nested_if_is_not_flattened_as_else_if() {
+    let src = r#"class Service {
+    int method(bool a, bool b) {
+        if (a)
+            if (b) return 1;
+        return 0;
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 3);
+}
+
+#[test]
+fn csharp_nested_loop_and_logical_operator_sequences_are_scored() {
+    let src = r#"class Service {
+    void method(bool a, bool b, bool c, int x) {
+        for (var i = 0; i < x; i++) {
+            if (a && b || c) continue;
+        }
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 5);
+}
+
+#[test]
+fn csharp_loops_and_catch_are_scored() {
+    let src = r#"class Service {
+    int method(bool ready, int x) {
+        for (var i = 0; i < x; i++) {}
+        while (ready) break;
+        do { x--; } while (ready);
+        try { risky(); } catch (System.Exception) { recover(); }
+        return x;
+    }
+    void risky() {}
+    void recover() {}
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 4);
+}
+
+#[test]
+fn csharp_switch_statement_counts_case_but_not_default() {
+    let src = r#"class Service {
+    int method(int x) {
+        switch (x) { case 1: x++; break; default: x--; break; }
+        return x;
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 1);
+}
+
+#[test]
+fn csharp_conditional_expression_is_scored() {
+    let src = r#"class Service {
+    int method(bool ready) {
+        return ready ? 1 : 0;
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 1);
+}
+
+#[test]
+fn csharp_defaults_repeated_operator_and_unlabeled_jumps_are_near_misses() {
+    let src = r#"class Service {
+    int method(bool a, bool b, bool c, int x) {
+        while (a) {
+            if (a && b && c) break;
+            continue;
+        }
+        switch (x) { default: return x + 1; }
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 4);
+}
+
+#[test]
+fn csharp_switch_expression_discard_arm_is_a_default_near_miss() {
+    let src = r#"class Service {
+    int method(int x) {
+        return x switch { 1 => 1, _ => 0 };
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 1);
+}
+
+#[test]
+fn csharp_discard_in_case_body_or_arm_value_is_not_a_default() {
+    let src = r#"class Service {
+    int capture(out int value) { value = 0; return value; }
+
+    int method(int x) {
+        switch (x) { case 1: capture(out _); break; default: break; }
+        return x switch { 1 => capture(out _), _ => 0 };
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 2);
+}
+
+#[test]
+fn csharp_guarded_discard_cases_are_not_defaults() {
+    let src = r#"class Service {
+    int method(int x) {
+        switch (x) { case _ when x > 0: x++; break; default: break; }
+        return x switch { _ when x < 0 => -1, _ => 0 };
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 2);
+}
+
+#[test]
+fn csharp_switch_section_counts_each_non_default_label() {
+    let src = r#"class Service {
+    int method(int x) {
+        switch (x) {
+            case 1:
+            case 2: x++; break;
+            case 3:
+            default: break;
+        }
+        return x;
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 3);
+}
+
+#[test]
+fn csharp_wrapped_irrefutable_patterns_are_defaults_but_tuple_discard_is_not() {
+    let src = r#"class Service {
+    int method((int, int) value) {
+        return value switch { (_) => 0, var _ => 1, (1, _) => 2 };
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 1);
+}
+
+#[test]
+fn csharp_goto_label_is_scored_but_break_and_continue_are_not() {
+    let src = r#"class Service {
+    int method(bool ready) {
+        while (ready) {
+            if (ready) goto done;
+            break;
+        }
+    done:
+        return 0;
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 4);
+}
+
+#[test]
+fn csharp_all_goto_forms_are_scored() {
+    let src = r#"class Service {
+    int method(int x) {
+        switch (x) {
+            case 0: goto case 1;
+            case 1: goto default;
+            default: goto done;
+        }
+    done:
+        return 0;
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 5);
+}
+
+#[test]
+fn csharp_lambda_adds_nesting_inside_enclosing_method() {
+    let src = r#"using System;
+class Service {
+    int method(bool ready) {
+        Func<int> nested = () => { if (ready) return 1; return 0; };
+        return nested();
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "method"), 2);
+}
+
+#[test]
+fn csharp_nested_local_function_body_is_not_counted() {
+    let src = r#"class Service {
+    int outer(bool a, bool b) {
+        int helper() {
+            if (a) { if (b) return 1; }
+            return 0;
+        }
+        return helper();
+    }
+}
+"#;
+    assert_eq!(score(&[("Service.cs", src)], "Service.cs", "outer"), 0);
+}

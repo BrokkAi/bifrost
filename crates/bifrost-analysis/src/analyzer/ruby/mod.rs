@@ -11,6 +11,7 @@ pub(crate) mod structural;
 mod tests;
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
+use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::build_weighted_cache;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
@@ -18,7 +19,8 @@ use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
     CodeUnitType, DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo,
     Project, ProjectFile, Range, RubyMethodDispatchMode, SemanticDiagnostic, SignatureMetadata,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
+    TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TreeSitterAnalyzer, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -43,6 +45,49 @@ pub(crate) fn single_static_string_content_node(node: Node<'_>) -> Option<Node<'
     }
     let content = node.named_child(0)?;
     (content.kind() == "string_content").then_some(content)
+}
+
+pub(crate) fn ruby_call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
+    let Some(arguments) = ruby_call_arguments_node(node) else {
+        return Vec::new();
+    };
+    let mut cursor = arguments.walk();
+    arguments
+        .named_children(&mut cursor)
+        .filter(|child| is_runtime_node(child.kind()))
+        .collect()
+}
+
+pub(crate) fn ruby_first_call_argument(node: Node<'_>) -> Option<Node<'_>> {
+    let arguments = ruby_call_arguments_node(node)?;
+    let mut cursor = arguments.walk();
+    arguments
+        .named_children(&mut cursor)
+        .find(|child| is_runtime_node(child.kind()))
+}
+
+fn ruby_call_arguments_node(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("arguments")
+}
+
+fn is_runtime_node(kind: &str) -> bool {
+    !matches!(
+        kind,
+        "comment"
+            | "method_parameters"
+            | "lambda_parameters"
+            | "block_parameters"
+            | "block_parameter"
+            | "optional_parameter"
+            | "keyword_parameter"
+            | "splat_parameter"
+            | "hash_splat_parameter"
+            | "forward_parameter"
+            | "destructured_parameter"
+            | "exception_variable"
+            | "hash_key_symbol"
+            | "bare_symbol"
+    )
 }
 
 /// Returns the source range of the semantic identifier carried by a Ruby symbol.
@@ -567,6 +612,43 @@ impl IAnalyzer for RubyAnalyzer {
         detect_language_structural_clone_smells(self, files, weights, Language::Ruby, |code_unit| {
             build_ruby_clone_candidate_data(self, code_unit, weights)
         })
+    }
+
+    fn find_test_assertion_smells(
+        &self,
+        file: &ProjectFile,
+        weights: TestAssertionWeights,
+    ) -> Vec<TestAssertionSmell> {
+        if !self.contains_tests(file) || file_language(file) != Language::Ruby {
+            return Vec::new();
+        }
+        let Ok(source) = self.inner.project().read_source(file) else {
+            return Vec::new();
+        };
+        tests::detect_ruby_test_assertion_smells(file, &source, &weights)
+    }
+
+    fn find_test_assertion_smells_limited(
+        &self,
+        file: &ProjectFile,
+        weights: TestAssertionWeights,
+        max_candidates: usize,
+    ) -> TestAssertionAnalysis {
+        if !self.contains_tests(file) || file_language(file) != Language::Ruby {
+            return TestAssertionAnalysis {
+                findings: Vec::new(),
+                inspected_candidates: Some(0),
+                truncated: false,
+            };
+        }
+        let Ok(source) = self.inner.project().read_source(file) else {
+            return TestAssertionAnalysis {
+                findings: Vec::new(),
+                inspected_candidates: Some(0),
+                truncated: false,
+            };
+        };
+        tests::detect_ruby_test_assertion_smells_limited(file, &source, &weights, max_candidates)
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {

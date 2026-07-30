@@ -23,14 +23,16 @@ Run the core Rust checks before submitting a change:
 ```bash
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --features nlp,python
+uv run --python 3.12 -- cargo test --features nlp,python
 ```
 
 Bifrost's default feature set is empty. Include the `nlp` and `python` features
 when running the full test suite; a featureless `cargo test` skips the
 feature-gated integration suites. `--all-features` enables those same two
 features. Embedding acceleration is selected by the Python sidecar at runtime,
-so these checks do not require CUDA or Metal build tooling.
+so these checks do not require CUDA or Metal build tooling. Run Rust tests that
+enable the `python` feature through uv so PyO3 uses the project's Python 3.12
+environment rather than whichever system interpreter happens to be on `PATH`.
 
 Python:
 

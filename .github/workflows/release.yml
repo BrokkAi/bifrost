@@ -419,6 +419,7 @@ jobs:
           tag_name: ${{ needs.release-context.outputs.tag }}
           name: ${{ needs.release-context.outputs.tag }}
           generate_release_notes: true
+          overwrite_files: false
           files: |
             dist/${{ env.BIN_NAME }}-${{ needs.release-context.outputs.tag }}-*.tar.gz
             dist/${{ env.BIN_NAME }}-${{ needs.release-context.outputs.tag }}-*.zip

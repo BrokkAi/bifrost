@@ -23,6 +23,7 @@ mod dataflow_summaries;
 mod dataflow_tabulation;
 mod external_artifact_pack;
 mod icfg_contract;
+mod kotlin_semantic_diagnostics;
 mod measure_analyzer_persisted_memory;
 mod measure_dataflow_lifecycle;
 mod measure_file_dependency_graph;

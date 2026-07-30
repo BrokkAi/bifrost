@@ -24,7 +24,7 @@ pub fn run_slopcop_stdio_server(
     render_options: McpRenderOptions,
 ) -> Result<(), String> {
     let spec = crate::mcp_registry::resolve_server_spec("slopcop")?;
-    run_stdio_server(Some(root), render_options, &spec)
+    run_stdio_server(Some(root), render_options, &spec, None)
 }
 
 pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
@@ -51,7 +51,7 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "compute_cognitive_complexity",
-            "Compute heuristic cognitive complexity per function/method in the given files; flag those exceeding a threshold. Walks the language's tree-sitter AST, scoring control-flow breaks by SonarSource rules (each `if`/loop/`catch`/case adds 1+nesting; sequences of `&&`/`||` count per distinct adjacent operator; labeled `break`/`continue` add 1). Output format matches the brokk-core MCP byte-for-byte.",
+            "Compute heuristic cognitive complexity per function/method in Java, Python, Rust, Ruby, Go, C/C++, JavaScript/JSX, TypeScript/TSX, PHP, Scala, and C# files; Kotlin is tracked separately. Walks tree-sitter ASTs, scoring control-flow breaks by SonarSource rules (each `if`/loop/`catch`/case adds 1+nesting; logical-operator sequences count per distinct adjacent operator; language-specific jumps add 1 when applicable, including labeled `break`/`continue` and every C# `goto` form). Flags scores exceeding a threshold. Output format matches the brokk-core MCP byte-for-byte.",
             json!({
                 "type": "object",
                 "properties": {
@@ -90,7 +90,7 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "report_exception_handling_smells",
-            "Detects suspicious exception handlers using weighted heuristics designed for high-recall triage. Scores generic catches and tiny / empty / comment-only / log-only handlers, then subtracts credit for richer handler bodies. Use min_score, max_findings, and the per-rule weights to tune precision/recall. Output format matches the brokk-core MCP byte-for-byte.",
+            "Detects suspicious exception and error handlers using weighted, structured-AST heuristics designed for high-recall triage. Supports Java, Go, C++, JavaScript/JSX, TypeScript/TSX, Python, Rust, PHP, Scala, C#, Ruby, and Kotlin; C return-code/errno semantics are explicitly unsupported, and Go and Rust use their native error/panic models rather than catch-clause approximations. Scores broad handlers and tiny / empty / comment-only / log-only bodies, then subtracts credit for richer bodies. Unsupported inputs and analysis failures are reported explicitly. Use min_score, max_findings, and the per-rule weights to tune precision/recall.",
             json!({
                 "type": "object",
                 "properties": {
@@ -192,7 +192,7 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "report_test_assertion_smells",
-            "Detects low-value or brittle Java test assertion smells using weighted heuristics. Uses test detection as a fast filter, then scores missing assertions, tautologies, constant-truth checks, constant-equality checks, shallow assertions, oversized literals, and anonymous test doubles. Output format matches the brokk-core MCP byte-for-byte.",
+            "Detects low-value or brittle test assertion smells using language-aware weighted heuristics. Uses test detection as a fast filter, then scores supported forms such as missing assertions, tautologies, constant-truth checks, constant-equality checks, shallow assertions, and oversized literals. Output format matches the brokk-core MCP byte-for-byte.",
             json!({
                 "type": "object",
                 "properties": {
@@ -424,19 +424,19 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "analyze_diff",
-            "Diff two endpoints and return Bifrost-resolved semantic patch effects: changed files, introduced/edited/deleted/moved symbols, dependency symbols, signature/import/call-edge changes, changed test symbols, and large-callsite truncation notices. Three modes: omit both params to compare HEAD against the uncommitted working tree (`git diff HEAD`, staged plus unstaged plus new files); pass `target` alone to compare a single commit against its first parent; pass `base` and/or `target` to compare any two endpoints (`git diff <base> <target>`, or `<base>` against the working tree when `target` is omitted). Merge and root commits require an explicit `base`. The working-tree endpoint is a live snapshot with no locking: files may change between the diff and the analysis.",
+            "Diff two endpoints and return Bifrost-resolved semantic patch effects: changed files, introduced/edited/deleted/moved symbols, dependency symbols, signature/import/call-edge changes, changed test symbols, and large-callsite truncation notices. An explicit endpoint accepts a commit-ish or tree-ish; commit resolution wins when a spelling can resolve to either. Omit both parameters to compare HEAD against the live working tree. With `target` alone, a commit compares against its first parent; a tree-only target is rejected because a tree has no parent, so provide `base`. Endpoint labels report a full commit hash or `tree:<full-oid>`. When both endpoints are immutable commits or trees, comparison ignores the live working tree, index, and `.gitattributes`. Objects available only in a snapshot store require the host to launch Bifrost with `--diff-snapshot-object-dir`; this tool never accepts an object-store filesystem path argument.",
             json!({
                 "type": "object",
                 "properties": {
                     "base": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "Revspec of the \"before\" endpoint (commit hash, branch, or tag). Defaults to the first parent of `target`, or to HEAD when `target` is omitted."
+                        "description": "Commit-ish or tree-ish \"before\" endpoint. Commit resolution wins when both apply. Defaults to the first parent of a commit `target`, or HEAD when `target` is omitted. Snapshot-store objects require host launch configuration; no filesystem path is accepted here."
                     },
                     "target": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "Revspec of the \"after\" endpoint (commit hash, branch, or tag). Omit to use the uncommitted working tree."
+                        "description": "Commit-ish or tree-ish \"after\" endpoint. Commit resolution wins when both apply. Omit for the live working tree. A tree-only target requires explicit `base` because trees have no parents; immutable pairs ignore the live worktree, index, and .gitattributes. Snapshot-store objects require host launch configuration; no filesystem path is accepted here."
                     },
                     "include_tests": {
                         "type": "boolean",
