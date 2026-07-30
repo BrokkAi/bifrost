@@ -17,6 +17,7 @@ use crate::mcp_common::{
     UNBOUND_WORKSPACE_MESSAGE, client_root_to_path, file_uri_to_path, file_watching_enabled,
     fit_get_summaries_output_to_budget, mcp_analyzer_request_budget, serial_tool_request,
 };
+use crate::ordered_transport::{RootsOrderedTransport, RootsRevocations};
 use crate::tool_arguments::normalize_tool_arguments;
 use crate::{
     SearchToolsService, SearchToolsServiceErrorCode, analyzer::policy::escape_terminal_text,
@@ -38,6 +39,7 @@ use rmcp::model::{
 #[allow(deprecated)]
 use rmcp::model::Root;
 use rmcp::service::{NotificationContext, RequestContext};
+use rmcp::transport::IntoTransport;
 use rmcp::{RoleServer, ServerHandler, ServiceExt};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -102,6 +104,13 @@ struct ConnectionState {
     /// needs a workspace, not from a lifecycle notification. See
     /// [`BifrostMcpHandler::activate_workspace_from_client_roots`].
     peer: Option<rmcp::service::Peer<RoleServer>>,
+    /// The revocation count the current binding was made under.
+    ///
+    /// Compared against [`RootsRevocations::observed`], which the transport
+    /// increments in wire order. A request that sees a higher count knows the
+    /// client revoked this scope before the request arrived, whatever order
+    /// the notification handler and this request happen to be scheduled in.
+    bound_at_revocation: u64,
 }
 
 impl ConnectionState {
@@ -118,6 +127,7 @@ impl ConnectionState {
             codex_sandbox_cwd_uri: None,
             codex_sandbox_root: None,
             peer: None,
+            bound_at_revocation: 0,
         }
     }
 
@@ -264,6 +274,7 @@ pub struct BifrostMcpHandler {
     analyzer_pool: AnalyzerExecutionPool,
     in_flight: Arc<InFlightRequests>,
     roots_activations: RootsActivations,
+    roots_revocations: Arc<RootsRevocations>,
     /// Guards workspace authorization state and serializes every tool-call
     /// preparation, which is what the single reader thread used to do for
     /// free. Lock order is always this lock, then an analyzer permit.
@@ -277,6 +288,7 @@ impl BifrostMcpHandler {
         spec: &McpServerSpec,
         build_identity: &str,
         accepts_client_roots: bool,
+        roots_revocations: Arc<RootsRevocations>,
     ) -> Result<Self, String> {
         // Converting the registry's hand-written descriptors into the SDK's
         // `Tool` here turns a malformed descriptor into a startup error naming
@@ -305,6 +317,7 @@ impl BifrostMcpHandler {
             analyzer_pool: AnalyzerExecutionPool::default(),
             in_flight: Arc::new(InFlightRequests::default()),
             roots_activations: RootsActivations::default(),
+            roots_revocations,
             workspace: tokio::sync::Mutex::new(ConnectionState::new(accepts_client_roots)),
         })
     }
@@ -344,6 +357,28 @@ impl BifrostMcpHandler {
         self.bind_first_usable_root(state, &result.roots)
     }
 
+    /// Whether the client withdrew authorization for the currently bound scope.
+    ///
+    /// True when a `roots/list_changed` reached the transport after this
+    /// binding was made. The counter is incremented in wire order by
+    /// `RootsOrderedTransport`, so this answer does not depend on which task
+    /// the runtime happens to poll first -- which is the whole point, since
+    /// `rmcp` dispatches notifications and requests on separate tasks.
+    fn client_roots_binding_is_stale(&self, state: &ConnectionState) -> bool {
+        state.workspace_binding_source == WorkspaceBindingSource::ClientRoots
+            && state.bound_at_revocation != self.roots_revocations.observed()
+    }
+
+    /// Drop the client-roots scope and stop any work admitted against it.
+    fn revoke_client_roots(&self, state: &mut ConnectionState) {
+        if let Err(error) = self.service.unbind_client_workspace() {
+            eprintln!("bifrost: failed to revoke changed MCP workspace roots: {error}");
+        }
+        self.in_flight
+            .cancel_stale(self.service.workspace_generation());
+        state.clear_binding();
+    }
+
     /// Bind the first root in `roots` that Bifrost can actually analyze.
     ///
     /// An empty or wholly unusable list is a legitimate answer meaning "you may
@@ -370,6 +405,7 @@ impl BifrostMcpHandler {
                     state.workspace_binding_source = WorkspaceBindingSource::ClientRoots;
                     state.codex_sandbox_cwd_uri = None;
                     state.codex_sandbox_root = None;
+                    state.bound_at_revocation = self.roots_revocations.observed();
                     eprintln!(
                         "bifrost: bound MCP workspace source=roots/list root={}",
                         escape_terminal_text(root.to_string_lossy().as_ref())
@@ -588,6 +624,15 @@ impl BifrostMcpHandler {
         arguments: Value,
         meta: &rmcp::model::RequestMetaObject,
     ) -> Result<PreparedToolCall, ErrorData> {
+        // A roots change that reached the transport before this call did
+        // revokes the scope, whether or not its notification handler has run
+        // yet. The counter comes from `RootsOrderedTransport`, which increments
+        // it in wire order, so this comparison is what actually makes the rule
+        // hold; `on_roots_list_changed` only makes revocation prompt.
+        if self.client_roots_binding_is_stale(state) {
+            self.revoke_client_roots(state);
+        }
+
         self.reconcile_codex_sandbox_workspace(state, meta)?;
 
         // This is the first moment a workspace is actually needed, so it is
@@ -920,21 +965,25 @@ impl ServerHandler for BifrostMcpHandler {
 
     /// A roots change revokes the current scope and nothing more.
     ///
-    /// Bifrost does not chase the new list here. The next request that needs a
-    /// workspace asks for roots itself, which is what keeps the exchange free
-    /// of ordering races -- see
-    /// [`BifrostMcpHandler::activate_workspace_from_client_roots`].
+    /// Bifrost does not chase the new list here; the next request that needs a
+    /// workspace asks for roots itself, which is what keeps that exchange free
+    /// of ordering races. This handler exists only so revocation is *prompt* --
+    /// it stops in-flight analyzer work rather than letting it run to
+    /// completion against a scope the client withdrew. Correctness does not
+    /// depend on it running before the next request, because
+    /// `prepare_tool_call` re-checks the wire-ordered revocation counter.
     async fn on_roots_list_changed(&self, _context: NotificationContext<RoleServer>) {
         let mut state = self.workspace.lock().await;
         if !state.accepts_client_roots || !state.client_supports_roots {
             return;
         }
-        if let Err(error) = self.service.unbind_client_workspace() {
-            eprintln!("bifrost: failed to revoke changed MCP workspace roots: {error}");
+        // Guarded by the same staleness test the request path uses, because
+        // this handler can be scheduled arbitrarily late: by the time it runs,
+        // a tool call may already have re-negotiated a fresh scope, and tearing
+        // that one down would fail a call the client is still waiting on.
+        if self.client_roots_binding_is_stale(&state) {
+            self.revoke_client_roots(&mut state);
         }
-        self.in_flight
-            .cancel_stale(self.service.workspace_generation());
-        state.clear_binding();
     }
 
     async fn call_tool(
@@ -1077,12 +1126,16 @@ pub fn run_stdio_server_with_build_identity(
         (None, true) => SearchToolsService::new_unbound(),
         (None, false) => SearchToolsService::new_unbound_manual(),
     });
+    // The handler and the transport share this counter: the transport
+    // increments it in wire order, the handler compares against it.
+    let roots_revocations = Arc::new(RootsRevocations::default());
     let handler = BifrostMcpHandler::new(
         Arc::clone(&service),
         render_options,
         spec,
         build_identity,
         accepts_client_roots,
+        Arc::clone(&roots_revocations),
     )?;
 
     // No IO driver: `tokio::io::stdin`/`stdout` run on the blocking pool, so
@@ -1096,7 +1149,10 @@ pub fn run_stdio_server_with_build_identity(
 
     let result = runtime.block_on(async move {
         let running = handler
-            .serve(rmcp::transport::stdio())
+            .serve(RootsOrderedTransport::new(
+                rmcp::transport::stdio().into_transport(),
+                roots_revocations,
+            ))
             .await
             .map_err(|error| format!("MCP initialization failed: {error}"))?;
         running
