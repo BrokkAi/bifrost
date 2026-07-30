@@ -640,7 +640,6 @@ fn ruby_exact_helper_flow() {
 }
 
 #[test]
-#[ignore = "requires a proven complete source-to-sink meeting through Scala calls"]
 fn scala_exact_helper_flow() {
     assert_single_file_exact_helper_flow(
         "scala",

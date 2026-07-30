@@ -15,8 +15,9 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::tree_walk::{named_children, subtree_contains};
 use crate::analyzer::{DispatchExtensibility, Language, ProjectFile, Range, ScalaAnalyzer};
 use crate::hash::HashMap;
+use std::sync::Arc;
 
-const ADAPTER_VERSION: &[u8] = b"scala-value-semantics-v3";
+const ADAPTER_VERSION: &[u8] = b"scala-value-semantics-v4";
 
 impl_program_semantics_provider!(ScalaAnalyzer, ScalaSemanticLowerer);
 
@@ -536,10 +537,16 @@ struct LoweringContext<'tree, 'targets> {
     procedure_body_node_id: usize,
     expression_values: HashMap<usize, ValueId>,
     parameters: HashMap<Box<str>, ValueId>,
+    parameter_types: HashMap<Box<str>, ScalaTypeIdentityId>,
+    type_identities: Vec<Arc<[String]>>,
+    type_identity_ids: HashMap<Arc<[String]>, ScalaTypeIdentityId>,
     locals: HashMap<Box<str>, Vec<LocalBinding>>,
     receiver: Option<ValueId>,
     cleanups: Vec<CleanupRegion<'tree>>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScalaTypeIdentityId(usize);
 
 struct LocalBinding {
     declaration_start: usize,
@@ -547,6 +554,7 @@ struct LocalBinding {
     scope_start: usize,
     scope_end: usize,
     value: ValueId,
+    type_identity: Option<ScalaTypeIdentityId>,
 }
 
 fn lower_procedure<'tree>(
@@ -580,6 +588,9 @@ fn lower_procedure<'tree>(
         procedure_body_node_id: spec.body.id(),
         expression_values: HashMap::default(),
         parameters: HashMap::default(),
+        parameter_types: HashMap::default(),
+        type_identities: Vec::new(),
+        type_identity_ids: HashMap::default(),
         locals: HashMap::default(),
         receiver: None,
         cleanups: Vec::new(),
@@ -664,13 +675,7 @@ fn lower_procedure<'tree>(
             .transpose()?;
         let value = context.value(&mut builder, implicit_return, SemanticValueKind::Return)?;
         if let Some(result) = result
-            && result_node.is_some_and(|node| {
-                callable_result_has_identity_conversion(
-                    spec.callable,
-                    node,
-                    context.prepared.source(),
-                )
-            })
+            && result_node.is_some_and(|node| context.callable_result_has_identity_conversion(node))
         {
             context.append_effect(
                 &mut builder,
@@ -790,7 +795,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 })?;
                 value
             };
+            let type_identity = (!slot.receiver)
+                .then(|| node.child_by_field_name("type"))
+                .flatten()
+                .and_then(|type_node| self.intern_type_identity(type_node));
             for name in slot.names {
+                if let Some(type_identity) = type_identity {
+                    self.parameter_types
+                        .insert(name.clone().into_boxed_str(), type_identity);
+                }
                 self.parameters.insert(name.into_boxed_str(), value);
             }
             if contains_token(node, "using") || contains_token(node, "implicit") {
@@ -862,6 +875,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     metadata,
                     SemanticValueKind::Local,
                 )?;
+                let type_identity = node
+                    .child_by_field_name("type")
+                    .and_then(|type_node| self.intern_type_identity(type_node))
+                    .or_else(|| {
+                        let initializer = node.child_by_field_name("value")?;
+                        if initializer.kind() != "identifier" {
+                            return None;
+                        }
+                        let initializer_name = node_text(self.prepared.source(), initializer)?;
+                        self.binding_type_id_at(initializer_name, initializer.start_byte())
+                    });
                 self.locals
                     .entry(name.into())
                     .or_default()
@@ -871,6 +895,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         scope_start,
                         scope_end,
                         value,
+                        type_identity,
                     });
             }
             Ok(WalkControl::Continue)
@@ -878,6 +903,34 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     fn local_at(&self, name: &str, byte: usize) -> Option<ValueId> {
+        self.local_binding_at(name, byte)
+            .map(|binding| binding.value)
+    }
+
+    fn binding_type_at(&self, name: &str, byte: usize) -> Option<&[String]> {
+        let identity = self.binding_type_id_at(name, byte)?;
+        self.type_identities.get(identity.0).map(Arc::as_ref)
+    }
+
+    fn binding_type_id_at(&self, name: &str, byte: usize) -> Option<ScalaTypeIdentityId> {
+        if let Some(binding) = self.local_binding_at(name, byte) {
+            return binding.type_identity;
+        }
+        self.parameter_types.get(name).copied()
+    }
+
+    fn intern_type_identity(&mut self, node: Node<'tree>) -> Option<ScalaTypeIdentityId> {
+        let identity = scala_type_identity(node, self.prepared.source())?;
+        if let Some(id) = self.type_identity_ids.get(&identity) {
+            return Some(*id);
+        }
+        let id = ScalaTypeIdentityId(self.type_identities.len());
+        self.type_identities.push(Arc::clone(&identity));
+        self.type_identity_ids.insert(identity, id);
+        Some(id)
+    }
+
+    fn local_binding_at(&self, name: &str, byte: usize) -> Option<&LocalBinding> {
         self.locals
             .get(name)?
             .iter()
@@ -887,7 +940,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     && byte < binding.scope_end
             })
             .min_by_key(|binding| binding.scope_end - binding.scope_start)
-            .map(|binding| binding.value)
     }
 
     fn local_declaration_value(&self, name: &str, declaration_start: usize) -> Option<ValueId> {
@@ -2133,11 +2185,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     let source =
                         self.expression_value(builder, argument, expression_value_kind(argument))?;
                     let value = self.value(builder, terminal, SemanticValueKind::Return)?;
-                    if callable_result_has_identity_conversion(
-                        self.callable,
-                        argument,
-                        self.prepared.source(),
-                    ) {
+                    if self.callable_result_has_identity_conversion(argument) {
                         self.append_effect(
                             builder,
                             terminal,
@@ -2173,6 +2221,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             });
         }
         Ok(())
+    }
+
+    fn callable_result_has_identity_conversion(&self, result: Node<'tree>) -> bool {
+        let Some(declared) = self.callable.child_by_field_name("return_type") else {
+            return true;
+        };
+        let source = self.prepared.source();
+        let declared_identity = super::scala_type_lookup_segments(declared, source);
+        scala_constructed_type_node(result).is_some_and(|constructed| {
+            scala_type_nodes_have_same_identity(declared, constructed, source)
+        }) || scala_literal_has_declared_identity_type(declared, result, source)
+            || (callable_has_simple_parameter_shape(self.callable)
+                && result.kind() == "identifier"
+                && node_text(source, result)
+                    .and_then(|name| self.binding_type_at(name, result.start_byte()))
+                    .is_some_and(|identity| identity == declared_identity.as_slice()))
     }
 
     fn throw_expression(
@@ -3044,17 +3108,26 @@ fn scala_type_nodes_have_same_identity(left: Node<'_>, right: Node<'_>, source: 
     !left.is_empty() && left == super::scala_type_lookup_segments(right, source)
 }
 
-fn callable_result_has_identity_conversion(
-    callable: Node<'_>,
-    result: Node<'_>,
-    source: &str,
-) -> bool {
-    let Some(declared) = callable.child_by_field_name("return_type") else {
-        return true;
-    };
-    scala_constructed_type_node(result).is_some_and(|constructed| {
-        scala_type_nodes_have_same_identity(declared, constructed, source)
-    }) || scala_literal_has_declared_identity_type(declared, result, source)
+fn scala_type_identity(node: Node<'_>, source: &str) -> Option<Arc<[String]>> {
+    let segments = super::scala_type_lookup_segments(node, source);
+    (!segments.is_empty()).then(|| Arc::from(segments.into_boxed_slice()))
+}
+
+fn callable_has_simple_parameter_shape(callable: Node<'_>) -> bool {
+    let mut parameter_lists = 0;
+    for child in named_children(callable) {
+        match child.kind() {
+            "type_parameters" => return false,
+            "parameters" => {
+                parameter_lists += 1;
+                if parameter_lists > 1 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 fn scala_literal_has_declared_identity_type(
