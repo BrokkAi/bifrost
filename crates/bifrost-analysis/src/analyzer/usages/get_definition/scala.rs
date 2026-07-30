@@ -3685,9 +3685,21 @@ fn resolve_scala_with_context(
                     identifier.start_byte(),
                 );
             if shadowed {
-                if let Some(binding) = precise_scala_binding(&bindings, text)
-                    && let Some(owner) = binding.declaration_owner
+                let binding = precise_scala_binding(&bindings, text);
+                if binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.declaration_owner.is_some())
                 {
+                    if let Some(outcome) = scala_explicit_local_member_import_outcome(
+                        ctx, &resolver, root, identifier, text,
+                    ) {
+                        return outcome;
+                    }
+                    if let Some(fqn) = resolver.resolve_member(text) {
+                        return scala_fqn_outcome(support, &fqn, text);
+                    }
+                }
+                if let Some(owner) = binding.and_then(|binding| binding.declaration_owner) {
                     match scala_exact_owner_member_candidate_units(ctx, &owner, text, false) {
                         ScalaExactMemberResolution::Found(mut candidates) => {
                             candidates.retain(|unit| {
@@ -4333,6 +4345,14 @@ fn resolve_scala_focused_qualified_path(
     }
 
     if path.focus_index + 1 == names.len() {
+        // Extractors need constructor-shape validation. The generic qualified
+        // terminal path only validates owner/member identity, so leave this
+        // parser-proven role to `resolve_scala_parser_proven_term_role`.
+        if qualified_stable_type_reference(node, ctx.source)
+            .is_some_and(|reference| reference.role == ScalaQualifiedStableTypeRole::Extractor)
+        {
+            return None;
+        }
         let role = if scala_is_type_position(node) || is_scala_class_reference(node, ctx.source) {
             ScalaQualifiedTerminalRole::Type
         } else {
