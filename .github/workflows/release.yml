@@ -492,14 +492,56 @@ jobs:
   publish-wheels:
     name: publish wheels after promotion evidence
     needs: [release-context, promotion-evidence]
-    uses: ./.github/workflows/publish-wheels.yml
-    with:
-      tag: ${{ needs.release-context.outputs.tag }}
-      version: ${{ needs.release-context.outputs.version }}
-      commit: ${{ needs.release-context.outputs.commit }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: release
     permissions:
       contents: read
       id-token: write
+    env:
+      RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.release-context.outputs.version }}
+      RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
+    steps:
+      - name: Checkout validated source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.release-context.outputs.commit }}
+
+      - name: Verify release tag still selects the validated commit
+        shell: bash
+        run: |
+          tag_ref="refs/tags/$RELEASE_TAG"
+          remote_refs="$(git ls-remote --tags origin "${tag_ref}*")"
+          actual_commit="$(awk -v tag_ref="$tag_ref" '
+            $2 == (tag_ref "^{}") { print $1; found = 1; exit }
+            $2 == tag_ref { fallback = $1 }
+            END { if (!found && fallback) print fallback }
+          ' <<< "$remote_refs")"
+          test -n "$actual_commit"
+          test "$actual_commit" = "$RELEASE_COMMIT"
+
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download source distribution
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: sdist
+          path: dist
+
+      - name: Confirm validated release identity
+        run: echo "Publishing $RELEASE_TAG ($RELEASE_VERSION) from $RELEASE_COMMIT"
+
+      - name: Publish to PyPI (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
+        with:
+          packages-dir: dist
 
   pi-package:
     name: package Pi release asset
