@@ -276,6 +276,10 @@ impl TypestateWitness {
             .map(|step| TypestateWitnessStep { step })
     }
 
+    pub(crate) const fn summary(&self) -> &SummaryWitness {
+        &self.summary
+    }
+
     pub fn step_count(&self) -> usize {
         self.summary.steps().len()
     }
