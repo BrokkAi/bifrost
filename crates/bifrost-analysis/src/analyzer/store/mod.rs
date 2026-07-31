@@ -103,6 +103,70 @@ impl From<git2::Error> for StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SemanticPackActivationSourceKind {
+    Installed,
+    Generated,
+    PreShipped,
+    WorkspaceProduced,
+    Embedded,
+    EphemeralWorkspace,
+}
+
+impl SemanticPackActivationSourceKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Installed => "installed",
+            Self::Generated => "generated",
+            Self::PreShipped => "pre_shipped",
+            Self::WorkspaceProduced => "workspace_produced",
+            Self::Embedded => "embedded",
+            Self::EphemeralWorkspace => "ephemeral_workspace",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "installed" => Ok(Self::Installed),
+            "generated" => Ok(Self::Generated),
+            "pre_shipped" => Ok(Self::PreShipped),
+            "workspace_produced" => Ok(Self::WorkspaceProduced),
+            "embedded" => Ok(Self::Embedded),
+            "ephemeral_workspace" => Ok(Self::EphemeralWorkspace),
+            _ => Err(StoreError::new(format!(
+                "unknown semantic-pack activation source kind {value:?}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SemanticPackActiveReference {
+    pub manifest_digest: String,
+    pub source_kind: SemanticPackActivationSourceKind,
+    pub source_id: String,
+    pub workspace_produced: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticPackActiveSet {
+    pub active_set_digest: String,
+    pub members: Vec<SemanticPackActiveReference>,
+}
+
+impl SemanticPackActiveSet {
+    pub fn from_members(members: &[SemanticPackActiveReference]) -> Result<Self> {
+        let mut members = members.to_vec();
+        members.sort();
+        validate_semantic_pack_active_references(&members)?;
+        let active_set_digest = semantic_pack_active_set_digest(&members)?;
+        Ok(Self {
+            active_set_digest,
+            members,
+        })
+    }
+}
+
 // A completed parse is published atomically with its rows. Hot candidate
 // queries rely on this marker; full count validation remains on hydration and
 // explicit presence checks to quarantine externally corrupted cache rows.
@@ -195,6 +259,7 @@ pub struct AnalyzerStore {
     conn: Mutex<Connection>,
     readers: ReaderPool,
     db_path: Option<PathBuf>,
+    lifetime: Arc<()>,
     _ephemeral: Option<EphemeralDb>,
     #[cfg(test)]
     parsed_blob_transaction_starts: AtomicUsize,
@@ -318,6 +383,68 @@ impl Drop for EphemeralDb {
         let _ = std::fs::remove_file(self.path.with_extension("db-wal"));
         let _ = std::fs::remove_file(self.path.with_extension("db-shm"));
     }
+}
+
+fn validate_semantic_pack_active_references(members: &[SemanticPackActiveReference]) -> Result<()> {
+    for member in members {
+        if member.manifest_digest.len() != 64
+            || !member
+                .manifest_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(StoreError::new(format!(
+                "semantic-pack manifest digest must be lowercase SHA-256 hex: {:?}",
+                member.manifest_digest
+            )));
+        }
+        if member.source_id.is_empty() {
+            return Err(StoreError::new(
+                "semantic-pack activation source id must not be empty",
+            ));
+        }
+        let expected_workspace_produced = matches!(
+            member.source_kind,
+            SemanticPackActivationSourceKind::WorkspaceProduced
+                | SemanticPackActivationSourceKind::EphemeralWorkspace
+        );
+        if member.workspace_produced != expected_workspace_produced {
+            return Err(StoreError::new(format!(
+                "semantic-pack workspace-produced flag disagrees with source kind {:?}",
+                member.source_kind
+            )));
+        }
+    }
+    if members
+        .windows(2)
+        .any(|pair| pair[0].manifest_digest == pair[1].manifest_digest)
+    {
+        return Err(StoreError::new(
+            "semantic-pack active set contains a duplicate manifest digest",
+        ));
+    }
+    Ok(())
+}
+
+fn semantic_pack_active_set_digest(members: &[SemanticPackActiveReference]) -> Result<String> {
+    let mut canonical = members.to_vec();
+    canonical.sort();
+    validate_semantic_pack_active_references(&canonical)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"bifrost.semantic-pack-active-set.v1\0");
+    hasher.update((canonical.len() as u64).to_be_bytes());
+    for member in &canonical {
+        hash_length_prefixed(&mut hasher, member.manifest_digest.as_bytes());
+        hash_length_prefixed(&mut hasher, member.source_kind.as_str().as_bytes());
+        hash_length_prefixed(&mut hasher, member.source_id.as_bytes());
+        hasher.update([u8::from(member.workspace_produced)]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn hash_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
 }
 
 fn reader_source_path(conn: &Connection) -> Option<PathBuf> {
@@ -791,6 +918,7 @@ impl AnalyzerStore {
             conn: Mutex::new(conn),
             readers: ReaderPool::new(reader_source),
             db_path,
+            lifetime: Arc::new(()),
             _ephemeral: ephemeral,
             #[cfg(test)]
             parsed_blob_transaction_starts: AtomicUsize::new(0),
@@ -834,6 +962,97 @@ impl AnalyzerStore {
             Ok(store) => Ok(store),
             Err(_) => Self::open_in_memory_single_connection(),
         }
+    }
+
+    pub(crate) fn lifetime(&self) -> std::sync::Weak<()> {
+        Arc::downgrade(&self.lifetime)
+    }
+
+    pub fn semantic_pack_active_set(&self) -> Result<Option<SemanticPackActiveSet>> {
+        let connection = self.read_conn()?;
+        let digest = connection
+            .query_row(
+                "SELECT active_set_digest
+                 FROM semantic_pack_active_state
+                 WHERE singleton = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(active_set_digest) = digest else {
+            return Ok(None);
+        };
+        let mut statement = connection.prepare(
+            "SELECT manifest_digest, source_kind, source_id, workspace_produced
+             FROM semantic_pack_active_members
+             ORDER BY ordinal",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
+        })?;
+        let mut members = Vec::new();
+        for row in rows {
+            let (manifest_digest, source_kind, source_id, workspace_produced) = row?;
+            members.push(SemanticPackActiveReference {
+                manifest_digest,
+                source_kind: SemanticPackActivationSourceKind::parse(&source_kind)?,
+                source_id,
+                workspace_produced,
+            });
+        }
+        let computed = semantic_pack_active_set_digest(&members)?;
+        if computed != active_set_digest {
+            return Err(StoreError::new(format!(
+                "semantic-pack active-set digest mismatch: stored {active_set_digest}, computed {computed}"
+            )));
+        }
+        Ok(Some(SemanticPackActiveSet {
+            active_set_digest,
+            members,
+        }))
+    }
+
+    pub fn replace_semantic_pack_active_set(
+        &self,
+        members: &[SemanticPackActiveReference],
+    ) -> Result<SemanticPackActiveSet> {
+        let active_set = SemanticPackActiveSet::from_members(members)?;
+        let now = crate::cache_db::now_unix_seconds();
+        let mut connection = self.conn.lock().expect("analyzer store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute("DELETE FROM semantic_pack_active_members", [])?;
+        {
+            let mut insert = transaction.prepare(
+                "INSERT INTO semantic_pack_active_members(
+                   ordinal, manifest_digest, source_kind, source_id, workspace_produced
+                 ) VALUES(?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for (ordinal, member) in active_set.members.iter().enumerate() {
+                insert.execute(params![
+                    ordinal,
+                    &member.manifest_digest,
+                    member.source_kind.as_str(),
+                    &member.source_id,
+                    member.workspace_produced
+                ])?;
+            }
+        }
+        transaction.execute(
+            "INSERT INTO semantic_pack_active_state(
+               singleton, active_set_digest, updated_at
+             ) VALUES(1, ?1, ?2)
+             ON CONFLICT(singleton) DO UPDATE SET
+               active_set_digest = excluded.active_set_digest,
+               updated_at = excluded.updated_at",
+            params![&active_set.active_set_digest, now],
+        )?;
+        transaction.commit()?;
+        Ok(active_set)
     }
 
     fn open_ephemeral_temp_file() -> Result<Self> {
@@ -9122,6 +9341,97 @@ mod tests {
                 .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
                 .unwrap(),
             vec![(oid, "cpp".to_string())]
+        );
+    }
+
+    #[test]
+    fn scala_scalachess_fqn_recovery_epoch_invalidates_stale_rows_and_reuses_current() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "src/main/scala/chess/tiebreak/Tiebreak.scala",
+            "package chess\npackage tiebreak\n\nimport Tiebreak.*\n\ntrait Tournament:\n  def players: Set[String]\n  def gamesById(id: String): List[String]\n  def opponentsOf: String => List[String]\n  def scoreOf: String => Float\n  def lastRoundId: Option[String]\n\n  lazy val maxRounds = players.map(_.length).maxOption.getOrElse(0)\n\nobject Tournament:\n  private final class Impl extends Tournament:\n    override def players: Set[String] = Set.empty\n    override def gamesById(id: String): List[String] = Nil\n    override def opponentsOf: String => List[String] = _ => Nil\n    override def scoreOf: String => Float = _ => 0f\n    override def lastRoundId: Option[String] = None\n\n  def apply(value: Int): Tournament =\n    new Tournament {}\n\nobject Tiebreak:\n  def compute(value: Int): Tournament =\n    Tournament(value)\n",
+        );
+        let state = Arc::new(parse_state(&ScalaAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+
+        // Commit 20f61961 recovered declarations that tree-sitter attaches to
+        // malformed significant-indentation template bodies. That changed
+        // Scala FQNs without changing the grammar vocabulary covered by the
+        // automatic epoch fingerprint.
+        let prior_epoch = epoch::scala_epoch_before_scalachess_fqn_recovery();
+        assert_eq!(
+            prior_epoch,
+            "3b2bc096d66a98af42bd82ebe5549c4697601996ad439f6189dcf81a602b953a"
+        );
+        let prior_generation = store
+            .ensure_language_epoch_value("scala", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "scala",
+                prior_generation,
+                &ScalaAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "scala").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(
+                Language::Scala,
+                &crate::analyzer::scala::language::LANGUAGE.into(),
+            )
+            .unwrap();
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "scala").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "scala".to_string())])
+                .unwrap(),
+            vec![(oid, "scala".to_string())]
+        );
+
+        // Once the current epoch has been populated, reopening the same
+        // version must reuse its generation and keep the semantic state warm.
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "scala",
+                current_generation,
+                &ScalaAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        let reused_generation = store
+            .ensure_language_epoch(
+                Language::Scala,
+                &crate::analyzer::scala::language::LANGUAGE.into(),
+            )
+            .unwrap();
+        assert_eq!(reused_generation, current_generation);
+        assert!(store.contains_parsed_blob(oid, "scala").unwrap());
+        let hydrated = store
+            .hydrate_file_state(oid, "scala", &ScalaAdapter, &file)
+            .unwrap()
+            .expect("current-generation Scala rows should hydrate");
+        assert!(
+            hydrated
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "chess.tiebreak.Tournament$.apply"),
+            "hydrated declarations should retain the top-level companion apply: {:?}",
+            hydrated.declarations
+        );
+        assert!(
+            hydrated
+                .declarations
+                .iter()
+                .all(|unit| unit.fq_name() != "chess.tiebreak.Tournament.Tournament$.apply"),
+            "hydrated declarations must not retain the stale duplicate owner: {:?}",
+            hydrated.declarations
         );
     }
 

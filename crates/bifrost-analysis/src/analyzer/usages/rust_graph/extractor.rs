@@ -21,7 +21,7 @@ use crate::analyzer::usages::rust_graph::resolver::{
     RustBareTokenTreeRole, RustTokenTreeRoleCache, canonical_imported_impl_target,
     is_graph_visible_member_target, is_trait_owner, resolve_exact_owner_associated_item_matching,
     resolve_rust_path_fqn, rust_token_path_segment_is_qualified,
-    rust_unique_nominal_reference_namespace, trait_member_for_impl_member,
+    rust_unique_nominal_reference_namespace, token_tree_ancestor, trait_member_for_impl_member,
 };
 use crate::analyzer::usages::traits::UsageScanScope;
 use crate::analyzer::{
@@ -659,9 +659,7 @@ fn scan_node(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
                         .ok()
                         .map(str::trim)
                         .unwrap_or_default();
-                    let in_token_tree = node
-                        .parent()
-                        .is_some_and(|parent| parent.kind() == "token_tree");
+                    let in_token_tree = token_tree_ancestor(node).is_some();
                     let token_tree_role = ctx.token_tree_roles.role(node, ctx.source);
                     let token_tree_candidate = token_tree_role.is_reference_candidate()
                         || (token_tree_role == RustBareTokenTreeRole::Pattern

@@ -1,7 +1,6 @@
 mod adapter;
 mod cache;
 mod clones;
-mod comments;
 pub(crate) mod declarations;
 mod exceptions;
 mod hierarchy;
@@ -13,15 +12,15 @@ mod tests;
 use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
 };
-use crate::analyzer::common::language_for_file as file_language;
+use crate::analyzer::common::{is_unparseable_source, language_for_file as file_language};
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BuildProgressEvent, BulkFileStateSource,
-    CallableArity, CloneSmell, CloneSmellWeights, CodeUnit, CommentDensityStats, DeclarationInfo,
-    DeclarationKind, ExceptionHandlingAnalysis, ExceptionHandlingSmell, ExceptionSmellWeights,
-    IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile, SignatureMetadata,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
-    TypeHierarchyProvider, UsageFactsIndex,
+    CallableArity, CloneSmell, CloneSmellWeights, CodeUnit, DeclarationInfo, DeclarationKind,
+    ExceptionHandlingAnalysis, ExceptionHandlingSmell, ExceptionSmellWeights, IAnalyzer,
+    ImportAnalysisProvider, Language, Project, ProjectFile, SignatureMetadata, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
+    UsageFactsIndex,
 };
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
@@ -32,7 +31,6 @@ use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
 pub(crate) use adapter::JavaAdapter;
 use cache::JavaMemoCaches;
 use clones::build_clone_candidate_data;
-use comments::{build_java_roll_up_stats, collect_java_comment_aggregates};
 use declarations::{
     collect_type_identifiers, find_nearest_declaration_from_node, is_comment_node,
     is_declaration_parent, is_java_anonymous_structure, node_text, normalize_java_full_name,
@@ -638,33 +636,6 @@ impl IAnalyzer for JavaAnalyzer {
         self.inner.in_test_region(code_unit)
     }
 
-    fn comment_density(&self, code_unit: &CodeUnit) -> Option<CommentDensityStats> {
-        if file_language(code_unit.source()) != Language::Java {
-            return None;
-        }
-        let source = self.inner.project().read_source(code_unit.source()).ok()?;
-        let aggs = collect_java_comment_aggregates(self, code_unit.source(), &source);
-        Some(build_java_roll_up_stats(self, code_unit, &aggs))
-    }
-
-    fn comment_density_by_top_level(&self, file: &ProjectFile) -> Vec<CommentDensityStats> {
-        if file_language(file) != Language::Java {
-            return Vec::new();
-        }
-        let Ok(source) = self.inner.project().read_source(file) else {
-            return Vec::new();
-        };
-        let aggs = collect_java_comment_aggregates(self, file, &source);
-        // Bifrost emits a top-level Module per Java package declaration; brokk's
-        // Java analyzer does not. Skip module-kind tops so this method returns
-        // the same set of stats rows as brokk-shared `JavaAnalyzer.commentDensityByTopLevel`.
-        self.top_level_declarations(file)
-            .iter()
-            .filter(|cu| !cu.is_module() && !cu.is_synthetic())
-            .map(|top| build_java_roll_up_stats(self, top, &aggs))
-            .collect()
-    }
-
     fn find_exception_handling_smells(
         &self,
         file: &ProjectFile,
@@ -686,6 +657,11 @@ impl IAnalyzer for JavaAnalyzer {
                 };
             }
         };
+        if is_unparseable_source(&source) {
+            return ExceptionHandlingAnalysis::Failed {
+                message: format!("failed to parse {}", file.rel_path().display()),
+            };
+        }
         match detect_exception_handling_smells_java(self, file, &source, &weights) {
             Some(findings) => ExceptionHandlingAnalysis::Analyzed(findings),
             None => ExceptionHandlingAnalysis::Failed {

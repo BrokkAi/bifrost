@@ -6949,12 +6949,13 @@ where
             return Some(projection);
         }
         let storage_key = self.adapter.storage_language_key_for_file(file);
+        let generation = self.store_context.generations.get(&storage_key).copied()?;
         let projection = self
             .store_query_or_record(
                 self.store_context.store.summary_file_projection(
                     oid,
                     &storage_key,
-                    self.store_context.generations[&storage_key],
+                    generation,
                     self.adapter.as_ref(),
                     file,
                 ),

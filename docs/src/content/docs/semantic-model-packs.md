@@ -1,24 +1,31 @@
 ---
 title: Semantic-Model Packs
-description: Author versioned external declaration facts and generated-code rules, then compile them to deterministic, defensively decoded artifacts.
+description: Author, compile, install, select, and manage versioned semantic-model artifacts.
 ---
 
 Semantic-model packs are Bifrost's versioned interchange format for API facts
-that do not come from workspace source and for declarative facts emitted by
-framework or generator behavior. A producer can construct the public Rust
-model directly or load reviewed YAML or JSON. Both paths compile through the
-same validation and canonicalization pipeline.
+that do not come from workspace source, declarative facts emitted by framework
+or generator behavior, and reviewed external procedure behavior. A producer
+can construct the public Rust model directly or load reviewed YAML or JSON.
+Both paths compile through the same validation and canonicalization pipeline.
 
-> **Current runtime boundary:** compiling or decoding a semantic-model pack
-> does not install, store, match, or activate it in Java, C#, or any other
-> analyzer. This page documents the schema, artifact compiler, and exact Java
-> and C# artifact producers. Runtime matching and installation are separate
-> lifecycle work.
+Compilation alone does not install, store, match, or activate a pack; those
+operations belong to the catalog and generation-scoped runtime described below.
+
+> **Current runtime boundary:** Bifrost can compile, defensively decode,
+> install, strictly activate, and match semantic-model packs for one analyzer
+> generation. Projection into synthetic analyzer declarations and model URIs
+> remains a separate overlay step. Procedure-summary payloads are
+> activation-neutral: compiling, installing, selecting, loading, or activating
+> one does not yet change value-flow results.
+
+Together, the catalog and runtime can install, select, activate, account for, quarantine, and garbage-collect packs while keeping matching generation-local.
 
 Packs do not contain executable code, arbitrary templates, fake source, or
-procedure-effect/data-flow summaries. Generator expressions are bounded trees
-of literals, declared scalar captures, ordered concatenation, and named ASCII
-case transforms.
+unbounded evaluator inputs. Generator expressions are bounded trees of
+literals, declared scalar captures, ordered concatenation, and named ASCII case
+transforms. Procedure summaries are bounded typed records, not executable
+models or source-text matching rules.
 
 ## Version and extension rules
 
@@ -50,8 +57,87 @@ Each shard has one or more activation selectors. A selector can identify a
 package, module, or declared toolchain using an exact name and optional SemVer
 constraint. It may narrow activation by target, configuration, or a lowercase
 SHA-256 artifact digest. The compiler derives sorted routing keys from these
-selectors and, for rule shards, their trigger kinds. A later runtime can route
-without reading unrelated payloads.
+selectors and, for rule shards, their trigger kinds. The runtime uses the keys
+to avoid reading unrelated payloads, then strictly rechecks every populated
+selector field. Missing evidence never satisfies a constraint.
+
+Activation evidence is supplied as complete rows so a package, module,
+toolchain, target, configuration, and artifact digest from different resolved
+artifacts cannot be combined accidentally. Exact artifact evidence outranks
+versioned coordinates, which outrank named coordinates and language-only
+selectors. Ephemeral and durable workspace-produced sources outrank generated,
+installed, pre-shipped, and embedded sources in that order. A workspace control
+outranks a user control, but neither can bypass compatibility. Packs marked
+`review_required` need an explicit compatible enable. Equal-rank conflicting
+facts remain conflicts instead of becoming a last-write-wins answer.
+
+The generation-scoped runtime owns every selected decoded shard and builds
+exact-key postings for type and member IDs and names, aliases, relation IDs and
+directions, and every schema-version-one generator trigger. Lookups do not read
+SQLite, pack files, or unrelated postings; schema version one has no wildcard
+fallback path. Work, index entries, working bytes, retained bytes, and
+explanations are bounded. Cancellation, corruption, stale generations, and
+exhausted budgets never publish a complete cached value.
+
+## Catalog and lifecycle
+
+`SemanticPackCatalog` stores durable packs beneath one caller-selected shared
+root. The caller chooses the root explicitly so a host can apply its own
+platform and configuration policy. Catalog metadata lives in a separately
+versioned SQLite database. Immutable shard bytes live once at
+`objects/sha256/<first-two-hex>/<remaining-hex>`, keyed by the SHA-256 of their
+exact stored representation. The manifest content digest identifies the
+complete pack; semantic and uncompressed-content digests retain their distinct
+artifact roles.
+
+Installation validates the canonical manifest and every manifest-bound shard
+before publishing anything discoverable. Files are staged, synchronized, and
+atomically moved into the content-addressed tree. A single metadata transaction
+then publishes the complete pack, its normalized selectors, and its source.
+Installing identical bytes from several workspaces or sources reuses the same
+physical object while retaining every durable source attribution. Startup
+reconciliation removes bounded abandoned staging and unreferenced final files;
+it never promotes an orphan into an installed pack.
+
+Candidate discovery narrows by language, ecosystem, and the populated package,
+module, toolchain, or artifact selector index without reading shard payloads.
+It then checks SemVer compatibility, target, configuration, and artifact
+identity from validated catalog metadata. Candidates are opaque catalog
+handles: callers can inspect their identity and source through accessors but
+cannot alter the descriptor or provenance used by verified loading. Loading
+rechecks the digest path, size, stored bytes, manifest envelope, and decoded
+shard. Missing or corrupt durable content becomes a safe miss and is
+quarantined in a writable catalog; a read-only catalog rejects durable
+mutations and suppresses repeated attempts only for that process.
+
+Durable source kinds are installed, generated, pre-shipped, and
+workspace-produced. Embedded release resources and ephemeral-workspace packs
+use the same complete validation and selector path but remain in the catalog
+instance's session memory, so they are never copied into durable storage.
+Persistent workspace active sets may reference only exact registered durable
+sources. In-memory workspaces may reference only exact session sources because
+they have no durable workspace identity that can own a cross-process
+activation. Their activation accounting is tied to the workspace store's
+lifetime. Catalog active-set identity is a domain-separated digest over the
+full sorted manifest and source references, and durable activation rows protect
+selected objects across processes.
+
+That catalog identity is deliberately distinct from the runtime
+`active_model_set_hash`. The runtime hash covers selected semantic shard
+digests, payload kinds, and the matcher representation version but not
+equivalent source attribution or storage encoding. Analyzer-snapshot caches use
+a canonical activation-request key and retain only complete immutable
+runtimes. Before publication, the runtime rechecks source generations and
+coordinates selected catalog references with the workspace store. A failed or
+incomplete build preserves the previous active set.
+
+Accounting reports deduplicated installed and active bytes, physical objects,
+logical and active shards, sources, lookup hits and misses, quarantined packs,
+and activation counts by durable or session source. Pins, durable sources,
+workspace activations, reader leases, and in-flight installation reservations
+protect content from collection. Explicit bounded garbage collection removes
+only old packs with none of those roots, rechecks each object under the catalog
+write boundary, and reports bytes only when a file was actually removed.
 
 ## Exact-artifact producers
 
@@ -283,6 +369,62 @@ shards:
                   returns:
                     kind: capture
                     name: entity_type
+```
+
+## Procedure-summary payload
+
+A procedure-summary shard describes externally reviewed behavior without
+activating it. Each record has a stable ID and a structured target consisting
+of a canonical artifact-relative path, an exact symbol, receiver availability,
+and parameter count. The compiler derives a pack-scoped model ID, a summary
+contract version, and a content digest for every record; the defensive decoder
+recomputes and verifies those fields.
+
+Transfers connect a receiver or zero-based parameter to a normal return,
+receiver, exceptional return, declared capture, or declared heap location.
+Each transfer carries an explicit normal or exceptional exit kind, matching the
+reusable-summary contract even when an exceptional exit writes a heap or
+capture location.
+Effects represent allocation, calls to another summary in the same pack,
+escapes, unknown calls, unknown-call boundaries, and explicitly ambiguous call
+sets. Inputs must exist on the target, outputs must reference a location of the
+right kind, call targets must exist, and all collections have fixed validation
+budgets. Duplicate targets and duplicate IDs are rejected across shards.
+
+Completeness is explicit at both levels. A `partial` record remains partial
+after compilation and decoding; a partial pack cannot claim a `complete`
+record. Completeness is evidence metadata only and does not enable matching or
+flow application.
+
+```yaml
+payload:
+  kind: procedure_summaries
+  summaries:
+    - id: summary.helper
+      target:
+        path: com/acme/Flows.class
+        symbol: helper(java.lang.String)
+        has_receiver: true
+        parameter_count: 1
+      completeness: partial
+      locations:
+        - id: location.receiver-field
+          location_kind: heap
+      transfers:
+        - input:
+            kind: parameter
+            ordinal: 0
+          exit_kind: normal
+          output:
+            kind: normal_return
+      effects:
+        - kind: allocation
+          event: event.helper.allocate
+          output:
+            kind: heap
+            location: location.receiver-field
+        - kind: unknown_call_boundary
+          event: event.helper.unknown-boundary
 ```
 
 ## Canonical artifacts and digests

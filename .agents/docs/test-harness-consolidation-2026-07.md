@@ -144,6 +144,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `code_query_tutorials`
 - `code_query_typestate`
 - `code_query_typestate_context`
+- `code_query_value_flow`
 - `cross_language_attribute_target_declarations`
 - `cross_language_import_hits`
 - `cross_language_receiver_definition`
@@ -215,7 +216,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `lsp_click_around_regression`
 - `lsp_parameter_definition`
 
-### `suite_persistence` (14 modules)
+### `suite_persistence` (15 modules)
 
 - `analyzer_capability_parity`
 - `analyzer_query_parity`
@@ -228,6 +229,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `multi_analyzer_routing`
 - `multi_analyzer_test`
 - `parse_errors_cache`
+- `semantic_pack_catalog`
 - `structural_facts_persistence`
 - `unified_cache`
 - `workspace_analyzer_test`
@@ -249,6 +251,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `measure_python_usage_graph_memory`
 - `measure_semantic_cfg`
 - `measure_semantic_cfg_persistence`
+- `measure_semantic_pack_catalog`
 - `measure_semantic_oracles`
 - `measure_structural_facts_memory`
 - `measure_structural_facts_persistence`
@@ -367,4 +370,3 @@ Process isolation is load-bearing for these; they were deliberately not merged.
 - **`mcp_property_fuzzer_service`** - fuzzer harness driven specially by its own runner.
 - **`nlp_semantic_search_models`** - **found by audit**: opt-in real-model suite. CLAUDE.md/AGENTS.md document `BIFROST_NLP_MODEL_TESTS=1 cargo test --test nlp_semantic_search_models -- --ignored`; keeping it standalone preserves that documented invocation and keeps model-downloading code out of a shared harness.
 - **`scala_descendant_index_bench`** - `#[ignore]`d #908 measurement harness with process-global descendant-index counters; it is an instrument, not a regression pin.
-

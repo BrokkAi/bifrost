@@ -61,6 +61,8 @@ pub(crate) enum ScalaMethodValueContext {
 pub(crate) enum ScalaParameterTypeIdentity {
     Builtin(&'static str),
     Declaration(CodeUnit),
+    Logical(String),
+    LogicalCandidates(Vec<String>),
     TypeParameter(String),
     Unresolved(Vec<String>),
 }

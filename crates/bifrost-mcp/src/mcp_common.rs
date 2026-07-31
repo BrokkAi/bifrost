@@ -31,12 +31,13 @@ const MAX_PENDING_MCP_RESPONSES: usize = 4;
 const MCP_ANALYZER_REQUEST_BUDGET: Duration = Duration::from_secs(5);
 #[doc(hidden)]
 pub const BENCHMARK_MCP_REQUEST_BUDGET_SECS: u64 = 60;
-const AGENTS_GUIDANCE_URI: &str = "bifrost://agent-guidance/agents.md";
-const AGENTS_GUIDANCE_MIME_TYPE: &str = "text/markdown";
+pub(crate) const AGENTS_GUIDANCE_URI: &str = "bifrost://agent-guidance/agents.md";
+pub(crate) const AGENTS_GUIDANCE_MIME_TYPE: &str = "text/markdown";
 const ROOTS_REQUEST_ID_PREFIX: &str = "bifrost-roots-";
-const CODEX_MCP_CLIENT_NAME: &str = "codex-mcp-client";
-const CODEX_SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
-const AGENTS_GUIDANCE_TEXT: &str = include_str!("../resources/agent-guidance/bifrost-agents.md");
+pub(crate) const CODEX_MCP_CLIENT_NAME: &str = "codex-mcp-client";
+pub(crate) const CODEX_SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
+pub(crate) const AGENTS_GUIDANCE_TEXT: &str =
+    include_str!("../resources/agent-guidance/bifrost-agents.md");
 
 #[doc(hidden)]
 pub const BENCHMARK_PROFILE_BOUNDARY_METHOD: &str = "bifrost/benchmark-profile-boundary";
@@ -192,7 +193,7 @@ impl McpRequestCancellations {
     }
 }
 
-fn mcp_analyzer_request_budget() -> Duration {
+pub(crate) fn mcp_analyzer_request_budget() -> Duration {
     benchmark_mcp_request_budget_secs(std::env::var(BENCHMARK_MCP_REQUEST_BUDGET_SECS_ENV).ok())
         .map(Duration::from_secs)
         .unwrap_or(MCP_ANALYZER_REQUEST_BUDGET)
@@ -270,7 +271,7 @@ fn request_id_key(id: &Value) -> String {
     serde_json::to_string(id).expect("JSON-RPC request IDs always serialize")
 }
 
-fn request_correlation_id(id: &Value) -> String {
+pub(crate) fn request_correlation_id(id: &Value) -> String {
     format!("sha256:{:x}", Sha256::digest(request_id_key(id).as_bytes()))
 }
 
@@ -377,6 +378,33 @@ pub fn run_stdio_server(
     )
 }
 
+/// Selects the `rmcp`-backed MCP host instead of the hand-written stack below.
+///
+/// Off by default while the migration lands. The `rmcp` host is complete and
+/// the contract suite exercises both, but `rmcp` 3.0 was days old when Bifrost
+/// adopted it (issue #1328), so the switch stays opt-in until the new host has
+/// run against real clients. Flipping the default to `on` is a deliberate,
+/// separate step; deleting the stack below is the step after that.
+///
+/// While both hosts exist, anything that changes MCP behaviour has to be
+/// applied to both. That is not hypothetical -- the first upstream sync after
+/// the hosts diverged landed a `run_policy` feature on this one alone, and it
+/// had to be ported by hand. See the Scheduled removals section in AGENTS.md.
+#[doc(hidden)]
+pub const MCP_RMCP_HOST_ENV: &str = "BIFROST_MCP_RMCP";
+
+fn rmcp_host_enabled(value: Option<&OsStr>) -> Result<bool, String> {
+    match value {
+        None => Ok(false),
+        Some(value) if value == "on" => Ok(true),
+        Some(value) if value == "off" => Ok(false),
+        Some(value) => Err(format!(
+            "{MCP_RMCP_HOST_ENV} must be `on` or `off`, not `{}`",
+            value.to_string_lossy()
+        )),
+    }
+}
+
 pub fn run_stdio_server_with_build_identity(
     root: Option<PathBuf>,
     render_options: McpRenderOptions,
@@ -384,6 +412,14 @@ pub fn run_stdio_server_with_build_identity(
     diff_snapshot_object_dir: Option<PathBuf>,
     build_identity: &str,
 ) -> Result<(), String> {
+    if rmcp_host_enabled(std::env::var_os(MCP_RMCP_HOST_ENV).as_deref())? {
+        return crate::rmcp_host::run_stdio_server_with_build_identity(
+            root,
+            render_options,
+            spec,
+            build_identity,
+        );
+    }
     // Explicit roots build in the background. Rootless servers answer initialize
     // without touching process cwd and bind only from a client-provided workspace.
     let accepts_client_roots = root.is_none();
@@ -588,7 +624,7 @@ pub fn run_stdio_server_with_build_identity(
     Ok(())
 }
 
-fn file_watching_enabled(value: Option<&OsStr>) -> Result<bool, String> {
+pub(crate) fn file_watching_enabled(value: Option<&OsStr>) -> Result<bool, String> {
     match value {
         None => Ok(true),
         Some(value) if value == "on" => Ok(true),
@@ -616,7 +652,7 @@ fn background_tool_request(message: &Value, spec: &McpServerSpec) -> Option<(Val
     ))
 }
 
-fn serial_tool_request(tool_name: &str) -> bool {
+pub(crate) fn serial_tool_request(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "activate_workspace" | "refresh" | "update_paths" | "get_active_workspace"
@@ -934,7 +970,7 @@ fn handle_response(
     connection.finish_roots_response()
 }
 
-fn client_root_to_path(root: &str) -> Result<PathBuf, String> {
+pub(crate) fn client_root_to_path(root: &str) -> Result<PathBuf, String> {
     let native_path = PathBuf::from(root);
     if native_path.is_absolute() {
         return Ok(native_path);
@@ -943,7 +979,7 @@ fn client_root_to_path(root: &str) -> Result<PathBuf, String> {
     file_uri_to_path(root)
 }
 
-fn file_uri_to_path(uri: &str) -> Result<PathBuf, String> {
+pub(crate) fn file_uri_to_path(uri: &str) -> Result<PathBuf, String> {
     let parsed =
         url::Url::parse(uri).map_err(|error| format!("invalid root URI `{uri}`: {error}"))?;
     if parsed.scheme() != "file" {
@@ -1332,7 +1368,7 @@ fn execute_prepared_tool_call_with_correlation(
     }
 }
 
-fn attach_run_policy_correlation(
+pub(crate) fn attach_run_policy_correlation(
     output: ToolOutput,
     request_correlation_id: Option<&str>,
 ) -> ToolOutput {
@@ -1492,12 +1528,10 @@ fn log_codex_workspace_event(event: &str, thread_id: Option<&str>) {
     }
 }
 
+pub(crate) const UNBOUND_WORKSPACE_MESSAGE: &str = "Bifrost is not bound to a workspace. The MCP client must provide an approved filesystem root via roots/list or Codex sandbox-state metadata, or configure Bifrost with --root or BIFROST_WORKSPACE_ROOT.";
+
 fn unbound_workspace_error() -> (i64, String) {
-    (
-        INTERNAL_ERROR,
-        "Bifrost is not bound to a workspace. The MCP client must provide an approved filesystem root via roots/list or Codex sandbox-state metadata, or configure Bifrost with --root or BIFROST_WORKSPACE_ROOT."
-            .to_string(),
-    )
+    (INTERNAL_ERROR, UNBOUND_WORKSPACE_MESSAGE.to_string())
 }
 
 fn map_service_error(code: SearchToolsServiceErrorCode, message: String) -> (i64, String) {
@@ -1510,7 +1544,7 @@ fn map_service_error(code: SearchToolsServiceErrorCode, message: String) -> (i64
     (jsonrpc_code, message)
 }
 
-fn fit_get_summaries_output_to_budget(
+pub(crate) fn fit_get_summaries_output_to_budget(
     service: &SearchToolsService,
     output: ToolOutput,
     render_options: RenderOptions,
@@ -1849,6 +1883,21 @@ mod tests {
 
         let error = file_watching_enabled(Some(OsStr::new("disabled"))).unwrap_err();
         assert!(error.contains(MCP_FILE_WATCHER_ENV), "{error}");
+        assert!(error.contains("on` or `off"), "{error}");
+    }
+
+    #[test]
+    fn the_rmcp_host_is_opt_in_and_the_switch_is_strict() {
+        // Unset means the hand-written host for now. Getting this backwards
+        // would ship an untried protocol stack while every test claimed
+        // otherwise, so it is asserted rather than assumed.
+        assert!(!rmcp_host_enabled(None).unwrap());
+        assert!(rmcp_host_enabled(Some(OsStr::new("on"))).unwrap());
+        assert!(!rmcp_host_enabled(Some(OsStr::new("off"))).unwrap());
+
+        // A typo must not silently select a protocol implementation.
+        let error = rmcp_host_enabled(Some(OsStr::new("legacy"))).unwrap_err();
+        assert!(error.contains(MCP_RMCP_HOST_ENV), "{error}");
         assert!(error.contains("on` or `off"), "{error}");
     }
 

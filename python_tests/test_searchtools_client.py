@@ -29,6 +29,7 @@ from bifrost_searchtools import (
     CodeQueryExplain,
     CodeQueryFile,
     CodeQueryFlowCertainty,
+    CodeQueryFlowFactSymbol,
     CodeQueryFlowCompletion,
     CodeQueryFlowEndpoint,
     CodeQueryFlowWitness,
@@ -591,6 +592,65 @@ class CodeQueryModelTest(unittest.TestCase):
             "phase": "after_effects",
             "ordinal": 0,
         }
+        symbol_site = {
+            "id": "site-run",
+            "path": "src/Flow.java",
+            "language": "java",
+            "declaration": [
+                {
+                    "kind": "method",
+                    "name": "run",
+                    "start_byte": 8,
+                    "end_byte": 64,
+                    "occurrence": 0,
+                    "sibling_ordinal": 0,
+                }
+            ],
+            "role": "procedure",
+            "start_byte": 16,
+            "end_byte": 19,
+            "occurrence": 0,
+            "range": source_range,
+        }
+        field_site = {**symbol_site, "id": "site-field", "role": "memory_location"}
+        parameter_carrier = {
+            "kind": "port",
+            "id": "carrier-parameter",
+            "procedure": symbol_site,
+            "port": {"kind": "parameter", "ordinal": 0},
+        }
+        event["carrier"] = parameter_carrier
+        event["site"] = symbol_site
+        carrier_fact = {
+            "kind": "carrier",
+            "source": {**event, "phase": "before_effects"},
+            "carrier": {
+                "kind": "location",
+                "id": "carrier-location",
+                "root": parameter_carrier,
+                "selectors": [
+                    {"kind": "field", "field": field_site},
+                    {
+                        "kind": "exact_index",
+                        "index": {
+                            "kind": "value",
+                            "id": "carrier-index",
+                            "site": field_site,
+                            "role": "index",
+                            "ordinal": 1,
+                        },
+                    },
+                    {"kind": "any_index"},
+                ],
+                "exact": True,
+            },
+        }
+        meeting_fact = {
+            "kind": "meeting",
+            "source": carrier_fact["source"],
+            "sink": event,
+            "uncertain": True,
+        }
         endpoint = {
             "result_type": "flow_endpoint",
             "id": "endpoint-1",
@@ -625,8 +685,14 @@ class CodeQueryModelTest(unittest.TestCase):
                 {
                     "kind": {"type": "edge", "edge_kind": "normal"},
                     "source": {"path": "src/Flow.java", "range": source_range},
+                    "source_symbol": symbol_site,
                     "target": {"path": "src/Flow.java", "range": source_range},
+                    "target_symbol": field_site,
+                    "origin": {"path": "src/Flow.java", "range": source_range},
+                    "origin_symbol": symbol_site,
                     "boundary": "dispatch",
+                    "input": carrier_fact,
+                    "output": meeting_fact,
                     "evidence": evidence,
                 }
             ],
@@ -659,7 +725,16 @@ class CodeQueryModelTest(unittest.TestCase):
                     "language": "java",
                     "range": source_range,
                     "quality": evidence,
-                    "steps": witness["steps"],
+                    "steps": [
+                        {
+                            "kind": {"type": "edge", "edge_kind": "normal"},
+                            "source": {
+                                "path": "src/Flow.java",
+                                "range": source_range,
+                            },
+                            "evidence": evidence,
+                        }
+                    ],
                     "retained_bytes": 96,
                     "omitted_steps_lower_bound": 0,
                 }
@@ -676,8 +751,24 @@ class CodeQueryModelTest(unittest.TestCase):
         self.assertTrue(result.results[0].ambiguous)
         self.assertIsInstance(result.results[1], CodeQueryFlowWitness)
         self.assertEqual(result.results[1].steps[0].boundary, "dispatch")
+        self.assertIsInstance(result.results[1].steps[0].input, CodeQueryFlowFactSymbol)
+        self.assertEqual(result.results[1].steps[0].source_symbol.id, "site-run")
+        self.assertEqual(result.results[1].steps[0].target_symbol.id, "site-field")
+        self.assertEqual(result.results[1].steps[0].origin_symbol.id, "site-run")
+        self.assertEqual(result.results[1].steps[0].input.kind, "carrier")
+        self.assertEqual(
+            result.results[1].steps[0].input.carrier.root.port.ordinal,
+            0,
+        )
+        self.assertEqual(
+            [selector.kind for selector in result.results[1].steps[0].input.carrier.selectors],
+            ["field", "exact_index", "any_index"],
+        )
+        self.assertEqual(result.results[1].steps[0].output.kind, "meeting")
+        self.assertTrue(result.results[1].steps[0].output.uncertain)
         self.assertIsInstance(result.results[2], CodeQueryTaintFinding)
         self.assertEqual(result.results[2].witnesses[0].finding_id, "taint-1")
+        self.assertIsNone(result.results[2].witnesses[0].steps[0].input)
         self.assertIn("flow endpoint; reached; may; incomplete", result.render_text())
         self.assertIn("flow witness; 1 steps", result.render_text())
         self.assertIn("taint finding; 1 labels; 1 origins", result.render_text())

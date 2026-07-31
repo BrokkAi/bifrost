@@ -4,18 +4,24 @@
 //! versioned source model, validation, canonical compilation, and defensive artifact decoding.
 
 mod artifact;
+mod catalog;
 mod compiler;
 mod identity;
 mod model;
 mod producer;
+mod runtime;
 mod source;
 mod validate;
 
 pub use artifact::{
     ArtifactEncoding, ArtifactError, CompiledPackManifest, CompiledPayload,
-    CompiledSemanticModelPack, CompiledShard, CompiledShardDescriptor, DecodeLimits, PayloadKind,
-    decode_manifest, decode_shard, decode_shard_for_manifest,
+    CompiledProcedureSummary, CompiledProcedureTarget, CompiledSemanticModelPack, CompiledShard,
+    CompiledShardDescriptor, CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
+    CompiledSummaryLocation, CompiledSummaryLocationKind, CompiledSummaryOutput,
+    CompiledSummaryTransfer, DecodeLimits, PayloadKind, decode_manifest, decode_shard,
+    decode_shard_for_manifest,
 };
+pub use catalog::*;
 pub use compiler::{CompilerOptions, CompressionPolicy, compile_pack, compile_source};
 pub use identity::{MemberIdentity, TypeIdentity, member_declaration_id, type_declaration_id};
 pub use model::*;
@@ -24,6 +30,7 @@ pub use producer::{
     BoundedProducerDiagnostics, ExactArtifact, ExternalArtifactKind, ExternalArtifactPackProducer,
     ProducerDiagnostic, ProducerDiagnosticSeverity, read_exact_artifact,
 };
+pub use runtime::*;
 pub use source::SourceFormat;
 pub use validate::{Diagnostic, DiagnosticSeverity};
 

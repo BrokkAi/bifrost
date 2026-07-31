@@ -324,6 +324,50 @@ class Caller {
 }
 
 #[test]
+fn java_precise_dead_code_scan_stops_at_smell_usage_threshold() {
+    // Constructors stay on the precise per-symbol path. Once the second proven
+    // call site is found, continuing through the remaining callers cannot
+    // produce a dead-code or one-call-abstraction finding.
+    let (_project, analyzer) = java_analyzer_with_files(&[(
+        "com/example/Target.java",
+        r#"
+package com.example;
+
+class Target {
+    Target() {}
+}
+
+class Caller {
+    void caller() {
+        new Target();
+        new Target();
+        new Target();
+    }
+}
+"#,
+    )]);
+    let constructor = java_definition(&analyzer, "com.example.Target.Target");
+
+    let report = report(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["com/example/Target.java".to_string()],
+            fq_names: vec![constructor.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        report.contains("too many call sites (2, limit 1)"),
+        "{report}"
+    );
+    assert!(
+        !report.contains("| `function` | `com.example.Target.Target`"),
+        "{report}"
+    );
+}
+
+#[test]
 fn java_constructor_candidate_stays_on_precise_path() {
     let (_project, analyzer) = java_analyzer_with_files(&[(
         "com/example/Target.java",

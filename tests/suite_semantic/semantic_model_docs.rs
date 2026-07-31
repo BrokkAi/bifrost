@@ -45,6 +45,11 @@ fn documented_source_examples_match_checked_fixtures() {
             "tests/fixtures/semantic-model-packs/generator-rules-v1.yaml",
         ]
     );
-    assert!(document.contains("does not install, store, match, or activate"));
+    assert!(
+        document
+            .contains("install, select, activate, account for, quarantine, and garbage-collect")
+    );
+    assert!(document.contains("strictly activate, and match semantic-model packs"));
+    assert!(document.contains("Projection into synthetic analyzer declarations and model URIs"));
     assert!(document.contains("Every source pack must contain `schema_version: 1`"));
 }

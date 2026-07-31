@@ -519,22 +519,21 @@ fn rust_token_is_dollar_crate(node: Node<'_>, source: &str) -> bool {
 }
 
 pub(crate) fn rust_token_path_segment_is_qualified(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        parent.kind() == "token_tree"
-            && ((node
+    token_tree_ancestor(node).is_some_and(|_| {
+        (node
+            .prev_sibling()
+            .is_some_and(|separator| separator.kind() == "::")
+            && node
                 .prev_sibling()
+                .and_then(|separator| separator.prev_sibling())
+                .is_some_and(rust_token_path_segment))
+            || (node
+                .next_sibling()
                 .is_some_and(|separator| separator.kind() == "::")
                 && node
-                    .prev_sibling()
-                    .and_then(|separator| separator.prev_sibling())
-                    .is_some_and(rust_token_path_segment))
-                || (node
                     .next_sibling()
-                    .is_some_and(|separator| separator.kind() == "::")
-                    && node
-                        .next_sibling()
-                        .and_then(|separator| separator.next_sibling())
-                        .is_some_and(rust_token_path_segment)))
+                    .and_then(|separator| separator.next_sibling())
+                    .is_some_and(rust_token_path_segment))
     })
 }
 
@@ -570,7 +569,7 @@ impl RustTokenTreeRoleCache {
         if !rust_bare_token_tree_identifier(node) {
             return RustBareTokenTreeRole::Reference;
         }
-        let Some(mut token_tree) = direct_token_tree(node) else {
+        let Some(mut token_tree) = token_tree_ancestor(node) else {
             return RustBareTokenTreeRole::Reference;
         };
         loop {
@@ -587,7 +586,7 @@ impl RustTokenTreeRoleCache {
             {
                 return role;
             }
-            let Some(enclosing) = enclosing_token_tree(token_tree) else {
+            let Some(enclosing) = token_tree_ancestor(token_tree) else {
                 break;
             };
             token_tree = enclosing;
@@ -596,7 +595,7 @@ impl RustTokenTreeRoleCache {
     }
 }
 
-/// Classify a bare identifier represented directly by a macro token tree.
+/// Classify a bare identifier represented within a macro token tree.
 ///
 /// Tree-sitter intentionally leaves macro input as raw tokens. For the few
 /// spellings whose sibling punctuation is ambiguous (`as`, `=>`, and `|`),
@@ -646,23 +645,18 @@ pub(crate) fn rust_bare_token_tree_non_reference_role(node: Node<'_>, source: &s
 
 fn rust_bare_token_tree_identifier(node: Node<'_>) -> bool {
     matches!(node.kind(), "identifier" | "type_identifier")
-        && node
-            .parent()
-            .is_some_and(|parent| parent.kind() == "token_tree")
+        && token_tree_ancestor(node).is_some()
         && !rust_token_path_segment_is_qualified(node)
 }
 
-fn direct_token_tree(node: Node<'_>) -> Option<Node<'_>> {
-    node.parent().filter(|parent| parent.kind() == "token_tree")
-}
-
-fn enclosing_token_tree(node: Node<'_>) -> Option<Node<'_>> {
-    let mut current = node.parent();
-    while let Some(parent) = current {
+/// Return the nearest raw macro token tree, including through token-repetition
+/// nodes that tree-sitter inserts between a token and its enclosing delimiters.
+pub(crate) fn token_tree_ancestor(mut node: Node<'_>) -> Option<Node<'_>> {
+    while let Some(parent) = node.parent() {
         if parent.kind() == "token_tree" {
             return Some(parent);
         }
-        current = parent.parent();
+        node = parent;
     }
     None
 }

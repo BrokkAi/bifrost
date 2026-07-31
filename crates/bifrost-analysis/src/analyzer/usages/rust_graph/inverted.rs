@@ -39,7 +39,7 @@ use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
 use crate::analyzer::usages::rust_graph::resolver::{
     RustBareTokenTreeRole, RustTokenPathRole, RustTokenTreeRoleCache,
     resolve_rust_token_tree_paths, rust_token_path_segment_is_qualified,
-    rust_unique_nominal_reference_namespace,
+    rust_unique_nominal_reference_namespace, token_tree_ancestor,
 };
 use crate::analyzer::usages::same_owner::route_same_owner;
 use crate::analyzer::{
@@ -661,9 +661,7 @@ fn receiver_type(scopes: &[ScopeFacts], name: &str) -> Option<String> {
 
 fn handle_identifier(node: Node<'_>, ctx: &mut RustScan<'_, '_>, scopes: &[ScopeFacts]) {
     // The path/name parts of a scoped path are resolved by handle_scoped.
-    let in_token_tree = node
-        .parent()
-        .is_some_and(|parent| parent.kind() == "token_tree");
+    let in_token_tree = token_tree_ancestor(node).is_some();
     let token_tree_role = ctx.token_tree_roles.role(node, ctx.source);
     if in_token_tree && token_tree_role == RustBareTokenTreeRole::Pattern {
         if let Some(callee) = ctx.bare_pattern_value_callee(node) {

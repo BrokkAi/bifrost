@@ -25,6 +25,8 @@ Missing or invalid measurements make a candidate ineligible. Stale, corrupt, inc
 
 | Artifact | Owner and consumers | Lifetime and identity | Representation and admission | Reuse and observability | Decision |
 | --- | --- | --- | --- | --- | --- |
+| Compiled semantic-model packs | `semantic_model::SemanticPackCatalog`; activation runtime | Immutable manifests are keyed by canonical content SHA-256; immutable shard objects are keyed by their stored-byte SHA-256 in one caller-selected shared root. Each workspace separately persists a domain-separated active-set digest over sorted manifest and source references | Canonical manifest bytes stay in catalog metadata; all shard bytes use `objects/sha256/<prefix>/<digest>` because the retained benchmark rejected SQLite inlining. Install fully decodes every manifest-bound shard before reserving objects, publishing files, and committing pack metadata. Embedded and ephemeral-workspace packs use the same validation but remain session-only | Indexed selector rows discover candidates without loading shard payloads. Every load rechecks path, size, stored digest, schema, manifest envelope, and content/semantic digests. Accounting reports distinct installed/active bytes, shards, hits/misses, quarantine, and activation sources. Pins, durable sources, workspace activations, leases, and in-flight install reservations are explicit GC roots | **Promoted to a shared content-addressed catalog** for durable installed/generated/pre-shipped/workspace-produced packs; embedded and ephemeral packs remain session-only |
+| Active semantic-model runtime | `semantic_model::ResolvedActiveSemanticModels`; exact declaration and generator-rule consumers | Analyzer-snapshot memory value. The cache key binds the canonical activation request and matcher representation version; the cache owner binds source generations. `active_model_set_hash` covers selected semantic shard digests and payload kinds, not catalog source attribution | Strict row-based activation owns decoded shards once and builds compact exact-key postings for declarations, relations, aliases, and all schema-v1 rule triggers. Equal-rank conflicts remain explicit. Only complete, fresh, within-budget values publish through `CompleteValueCache` | Profiles report catalog candidates, loaded shards and records, index entries, working and retained bytes, and bounded explanations. Lookups report exact candidates examined and zero fallback work; they perform no catalog or SQLite access. Active catalog references publish only after complete construction and a generation freshness check | **Generation-local memory-only matcher**; persistence remains at the pack catalog layer and analyzer overlays remain #1148 |
 | Structural file facts | `StructuralFactsCache`; structural search and snapshot index consumers | Cross-process disk cache. Keyed by blob OID, language, live analyzer-store generation, and `STRUCTURAL_FACTS_SNAPSHOT_VERSION`; overlays do not persist | `FileFacts` node arena plus `CompactRows<RoleTarget>`; versioned packed bincode DTO. Decode validates spans, kinds, roles, row boundaries, source length, and counts before publication | Provider counters distinguish memory hit, persisted hydration, extraction, unavailable, and unknown. Persistence benchmarks cover time, memory, size, corruption, version, generation, replacement, GC, and concurrency | **Promoted to SQLite** in `structural_facts_snapshots` |
 | Snapshot structural index | `SnapshotStructuralIndexCache`; CodeQuery physical planning | Analyzer-snapshot memory value. Key binds workspace identity, canonical storage generations, exact scope, representation version, and complete file/fact inputs | Complete postings and selected compact rows behind `CompleteValueCache`; partial, cancelled, unavailable, or over-budget builds do not publish | Query profiles report lookup/hit/miss/build/wait, work, retained bytes, cancellation, unavailability, and fallback | **Memory-only**; persistence requires its own equivalent-candidate matrix |
 | Direct import topology | `SnapshotDerivedLayerCache`; structural import expansion | Analyzer-snapshot memory value. `DerivedLayerRequest` identifies the layer kind, projection-filter fingerprint, and representation version; it is deliberately not a complete durable key. The cache owner rotates the backing cache when source generations change | `CompactDirectedGraph<ProjectFile>` with support metadata retained in the value. Only complete bounded values publish | Derived-layer profiles report hits, builds, waits, completeness, work, time, retained bytes, and fallbacks | **Memory-only**; SQL graph prototype was discarded |
@@ -52,6 +54,9 @@ Missing or invalid measurements make a candidate ineligible. Stale, corrupt, inc
 - Analyzer-store generation, liveness, replacement, cascade cleanup, and garbage collection.
 - Concurrent readers and writers.
 - Windows-safe workspace-relative path reconstruction.
+- Semantic-pack producer/schema compatibility, normalized activation selectors,
+  workspace active-set membership, source identity, pins, lease expiry,
+  quarantine state, and content-addressed object reachability.
 
 Reporting-only metadata, policy messages, CWE labels, CVSS overlays, result limits, and sink-only observers do not invalidate a reusable transfer summary unless they change propagation or completeness semantics.
 
@@ -62,8 +67,19 @@ Reporting-only metadata, policy messages, CWE labels, CVSS overlays, result limi
 - `.agents/docs/semantic-cfg-lifecycle-benchmark-2026-07-20.md`
 - `.agents/docs/semantic-oracle-lifecycle-benchmark-2026-07-21.md`
 - `.agents/docs/dataflow-lifecycle-benchmark-2026-07-24.md`
+- `.agents/docs/semantic-pack-catalog-storage-benchmark-2026-07-31.md`
+- `.agents/plans/issue-1146-semantic-pack-catalog.md`
 - `.agents/plans/all-language-cfg-icfg-rollout.md`
 - `.agents/plans/issue-820-bounded-dataflow-tabulation.md`
 - `.agents/plans/language-agnostic-composable-typestate-platform.md`
 
 Revision note (2026-07-24): Created the first issue #817 inventory after the CFG/ICFG, oracle, snapshot structural-index, and bounded data-flow foundations landed, then linked the retained 56-sample data-flow lifecycle evidence. It records existing promotion and no-go decisions while leaving summary persistence explicitly dependent on concrete #823 shapes and new measurements.
+
+Revision note (2026-07-31): Added issue #1146's content-addressed
+semantic-model pack catalog, workspace active-set authority, session-only
+embedded/ephemeral boundary, measured zero-byte inline threshold, accounting,
+quarantine, lease, and garbage-collection lifecycle.
+
+Revision note (2026-07-31): Added issue #1147's strict activation runtime,
+semantic active-set identity, exact in-memory matcher, snapshot-owned
+single-flight cache, bounded retained memory, and publish-after-complete rule.

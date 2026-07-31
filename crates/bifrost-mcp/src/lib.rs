@@ -4,12 +4,14 @@
 pub use brokk_bifrost_analysis::nlp;
 pub use brokk_bifrost_analysis::{
     AnalyzerConfig, CancellationToken, FilesystemProject, Project, ProjectFile, WorkspaceAnalyzer,
-    analyzer, cache_db, cancellation, code_quality, collect_workspace_files, diff_analysis,
-    file_tools, git_file, gitblob, hash, path_normalization, path_utils, profiling, searchtools,
-    searchtools_render, sexp, symbol_rename, workspace_document,
+    WorkspaceFileListingCache, analyzer, cache_db, cancellation, code_quality,
+    collect_workspace_files, diff_analysis, file_tools, git_file, gitblob, hash,
+    path_normalization, path_utils, profiling, searchtools, searchtools_render, sexp,
+    symbol_rename, workspace_document,
 };
 pub use brokk_bifrost_runtime::{CodeIntelligenceRuntime, code_intelligence};
 
+pub mod analyzer_pool;
 pub mod mcp_cli;
 pub mod mcp_common;
 pub mod mcp_core;
@@ -18,7 +20,9 @@ pub mod mcp_nlp;
 pub mod mcp_registry;
 pub mod mcp_slopcop;
 pub mod mcp_text;
+pub mod ordered_transport;
 mod project_watcher;
+pub mod rmcp_host;
 pub mod scoped_project;
 pub mod searchtools_service;
 pub mod structured_data;

@@ -131,6 +131,13 @@ impl<'a> PhpVisitor<'a> {
                     scope: PhpScope::new(scope.package_name.clone(), scope.class_unit.clone()),
                 }))
             }
+            "anonymous_function" | "arrow_function" => {}
+            _ if scope.class_unit.is_none() && node.named_child_count() > 0 => {
+                stack.push(PhpWork::Container(PhpContainer {
+                    node,
+                    scope: PhpScope::new(scope.package_name.clone(), None),
+                }))
+            }
             _ => {}
         }
     }

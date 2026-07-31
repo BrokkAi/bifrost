@@ -107,6 +107,12 @@ fn normalize_tree_sitter_clone_source(
             if !token.is_empty() {
                 normalized_tokens.push(token);
             }
+            // Do not descend further: anonymous children of an emitted leaf
+            // would double-count it. Kotlin's soft-keyword identifiers
+            // (`value`, `field`) parse as a `simple_identifier` wrapping an
+            // anonymous keyword token, and emitting both breaks rename
+            // invariance against ordinary identifiers.
+            continue;
         }
         for index in (0..node.child_count()).rev() {
             if let Some(child) = node.child(index) {
@@ -343,9 +349,13 @@ where
         return Vec::new();
     }
 
+    let candidate_index = CloneCandidateIndex::new(&all_candidates);
+
     let mut findings = Vec::new();
     for left in requested_candidates {
-        for right in &all_candidates {
+        let peer_indices = candidate_index.peer_indices(left, &all_candidates, weights);
+        for peer_index in peer_indices {
+            let right = &all_candidates[peer_index];
             if left.data.unit == right.data.unit {
                 continue;
             }
@@ -399,6 +409,72 @@ where
             })
     });
     findings
+}
+
+struct CloneCandidateIndex {
+    candidates_by_shingle: HashMap<u64, Vec<usize>>,
+}
+
+impl CloneCandidateIndex {
+    fn new(all_candidates: &[CloneCandidateProfile]) -> Self {
+        let mut candidates_by_shingle: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (candidate_index, candidate) in all_candidates.iter().enumerate() {
+            for shingle in candidate.shingles.values() {
+                candidates_by_shingle
+                    .entry(*shingle)
+                    .or_default()
+                    .push(candidate_index);
+            }
+        }
+        Self {
+            candidates_by_shingle,
+        }
+    }
+
+    fn peer_indices(
+        &self,
+        left: &CloneCandidateProfile,
+        all_candidates: &[CloneCandidateProfile],
+        weights: CloneSmellWeights,
+    ) -> Vec<usize> {
+        let min_shared_shingles = weights.min_shared_shingles.max(0) as usize;
+        if min_shared_shingles == 0 {
+            return (0..all_candidates.len())
+                .filter(|index| {
+                    can_reach_clone_similarity(
+                        left.shingle_count,
+                        all_candidates[*index].shingle_count,
+                        weights,
+                    )
+                })
+                .collect();
+        }
+
+        let mut shared_shingle_counts = HashMap::new();
+        for shingle in left.shingles.values() {
+            let Some(candidate_indices) = self.candidates_by_shingle.get(shingle) else {
+                continue;
+            };
+            for candidate_index in candidate_indices {
+                *shared_shingle_counts
+                    .entry(*candidate_index)
+                    .or_insert(0usize) += 1;
+            }
+        }
+
+        shared_shingle_counts
+            .into_iter()
+            .filter_map(|(candidate_index, shared_shingles)| {
+                (shared_shingles >= min_shared_shingles
+                    && can_reach_clone_similarity(
+                        left.shingle_count,
+                        all_candidates[candidate_index].shingle_count,
+                        weights,
+                    ))
+                .then_some(candidate_index)
+            })
+            .collect()
+    }
 }
 
 pub(crate) fn detect_language_structural_clone_smells<F>(
@@ -548,11 +624,12 @@ fn intersection_size(left: &LongShingles, right: &LongShingles) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        LongShingles, can_reach_clone_similarity, compute_clone_token_similarity,
-        hashed_shingle_array,
+        CloneCandidateData, CloneCandidateIndex, CloneCandidateProfile, LongShingles,
+        can_reach_clone_similarity, compute_clone_token_similarity, hashed_shingle_array,
     };
-    use crate::analyzer::CloneSmellWeights;
+    use crate::analyzer::{CloneSmellWeights, CodeUnit, CodeUnitType, ProjectFile};
     use std::collections::HashSet;
+    use std::path::PathBuf;
 
     #[test]
     fn hashed_similarity_matches_string_shingle_similarity_for_identical_tokens() {
@@ -661,6 +738,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shingle_index_excludes_workspace_peers_without_enough_overlap() {
+        let weights = weights(1, 70, 1, 3, 70);
+        let mut candidates = vec![candidate(
+            "probe.cpp",
+            "probe",
+            &["A", "B", "C", "D"],
+            weights,
+        )];
+        candidates.extend((0..1_000).map(|index| {
+            candidate(
+                "workspace.cpp",
+                &format!("unrelated_{index}"),
+                &[
+                    &format!("X{index}"),
+                    &format!("Y{index}"),
+                    &format!("Z{index}"),
+                ],
+                weights,
+            )
+        }));
+        candidates.push(candidate(
+            "workspace.cpp",
+            "clone",
+            &["A", "B", "C", "D"],
+            weights,
+        ));
+        let candidate_index = CloneCandidateIndex::new(&candidates);
+        let mut peers = candidate_index.peer_indices(&candidates[0], &candidates, weights);
+        peers.sort_unstable();
+
+        assert_eq!(peers, vec![0, 1_001]);
+    }
+
     fn assert_similarity_matches_string_shingles(
         left: &[&str],
         right: &[&str],
@@ -713,6 +824,22 @@ mod tests {
 
     fn hashed_strings(tokens: &[String], shingle_size: i32) -> LongShingles {
         hashed_shingle_array(tokens, shingle_size)
+    }
+
+    fn candidate(
+        path: &str,
+        name: &str,
+        tokens: &[&str],
+        weights: CloneSmellWeights,
+    ) -> CloneCandidateProfile {
+        let file = ProjectFile::new(PathBuf::from("/workspace"), path);
+        let data = CloneCandidateData {
+            unit: CodeUnit::new(file, CodeUnitType::Function, "", name),
+            normalized_tokens: tokens.iter().map(|token| (*token).to_string()).collect(),
+            ast_signature: String::new(),
+            excerpt: String::new(),
+        };
+        CloneCandidateProfile::create(data, weights)
     }
 
     fn repeated_tokens<'a>(
