@@ -132,7 +132,7 @@ runtimes. Before publication, the runtime rechecks source generations and
 coordinates selected catalog references with the workspace store. A failed or
 incomplete build preserves the previous active set.
 
-### Declaration overlays and model locations
+### Projection into synthetic analyzer declarations and model URIs
 
 A ready declaration runtime publishes one immutable overlay in the analyzer
 snapshot cache. The overlay owns typed type, member, hierarchy, and relation
