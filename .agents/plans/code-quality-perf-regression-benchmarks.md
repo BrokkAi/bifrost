@@ -300,6 +300,14 @@ regression.
   probe's `arguments` table: the tool's default window is "last 7 days from now", which a pinned
   commit's history ages out of. Documented in `benchmark/README.md`.
 
+- 2026-07-31 (Milestone 2, early findings): the probes are already surfacing real latency. On
+  google-gson (debug build, local): comment_density_files p50 17.3 s, structural_clone_smells
+  p50 5.7 s, dead_code_smells p50 5.6 s, secret_like_code p50 5.5 s; and a dead-code probe against
+  the heavily-used `com.google.gson.Gson.fromJson` exceeded the MCP request-wide time budget
+  outright (the probe now targets `newBuilder` so the scenario stays deterministic). After the
+  corpus lands, cross-check these against open latency issues and file/annotate per the project's
+  five-second rule, with release-build timings.
+
 ## Progress
 
 - [x] Milestone 1: scenario variants, generic probes, runner payloads and oracle, dead-code

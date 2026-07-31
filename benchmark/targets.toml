@@ -43,6 +43,15 @@ scenarios = [
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
+  "dead_code_smells",
+  "comment_density_files",
+  "comment_density_code_unit",
+  "exception_smells",
+  "test_assertion_smells",
+  "structural_clone_smells",
+  "long_method_smells",
+  "secret_like_code",
+  "git_hotspots",
   "get_definition",
   "call_hierarchy",
   "type_hierarchy",
@@ -53,6 +62,17 @@ location_symbols = ["Gson.fromJson"]
 summary_targets = ["gson/src/main/java/com/google/gson/Gson.java"]
 seed_file_paths = ["gson/src/main/java/com/google/gson/Gson.java"]
 usage_symbols = ["Gson.fromJson"]
+code_quality_probes = [
+  { scenario = "dead_code_smells", file_paths = ["gson/src/main/java/com/google/gson/Gson.java"], fq_names = ["com.google.gson.Gson.newBuilder"], expect_report_contains = ["Candidate symbols analyzed: 1"], expect_report_absent = ["no definition found", "not yet supported for smell analysis"] },
+  { scenario = "comment_density_files", file_paths = ["gson/src/main/java/com/google/gson/Gson.java", "gson/src/main/java/com/google/gson/TypeAdapter.java", "gson/src/main/java/com/google/gson/GsonBuilder.java", "gson/src/main/java/com/google/gson/internal/bind/TypeAdapters.java", "gson/src/main/java/com/google/gson/stream/JsonReader.java"], expect_report_contains = ["### `gson/src/main/java/com/google/gson/Gson.java`", "| `com.google.gson.Gson` | 86 | 3 | 1131 | 4500 | 108 | 1615 |"], expect_report_absent = ["(comment density unavailable; skipped)"] },
+  { scenario = "comment_density_code_unit", file_paths = ["gson/src/main/java/com/google/gson/Gson.java"], fq_names = ["com.google.gson.Gson"], expect_report_contains = ["- Symbol: `com.google.gson.Gson`", "- Own: header 86, inline 3, span 1131"], expect_report_absent = ["Comment density is unavailable"] },
+  { scenario = "exception_smells", file_paths = ["gson/src/main/java/com/google/gson/Gson.java", "gson/src/main/java/com/google/gson/internal/bind/TypeAdapters.java", "gson/src/main/java/com/google/gson/internal/ConstructorConstructor.java", "gson/src/main/java/com/google/gson/internal/bind/ReflectiveTypeAdapterFactory.java"], expect_report_contains = ["`com.google.gson.Gson.assertFullConsumption` | `gson/src/main/java/com/google/gson/Gson.java` | `generic-catch:Exception, small-body:1", "`com.google.gson.internal.ConstructorConstructor.newDefaultConstructor`"], expect_report_absent = ["unsupported"] },
+  { scenario = "test_assertion_smells", file_paths = ["gson/src/test/java/com/google/gson/GsonTest.java", "gson/src/test/java/com/google/gson/GsonBuilderTest.java", "gson/src/test/java/com/google/gson/functional/PrimitiveTest.java", "gson/src/test/java/com/google/gson/functional/CollectionTest.java"], expect_report_contains = ["| 5 | `no-assertions` | 0 | `com.google.gson.GsonBuilderTest` |", "anonymous-test-double, reusable-test-double-candidate"] },
+  { scenario = "structural_clone_smells", file_paths = ["gson/src/main/java/com/google/gson/internal/bind/TypeAdapters.java", "gson/src/main/java/com/google/gson/Gson.java", "gson/src/main/java/com/google/gson/GsonBuilder.java", "gson/src/main/java/com/google/gson/internal/LinkedTreeMap.java"], expect_report_contains = ["`com.google.gson.GsonBuilder.addDeserializationExclusionStrategy` (gson/src/main/java/com/google/gson/GsonBuilder.java) | `com.google.gson.GsonBuilder.addSerializationExclusionStrategy`", "token-similarity:100"] },
+  { scenario = "long_method_smells", file_paths = ["gson/src/main/java/com/google/gson/Gson.java", "gson/src/main/java/com/google/gson/internal/bind/TypeAdapters.java", "gson/src/main/java/com/google/gson/stream/JsonReader.java"], expect_report_contains = ["- `com.google.gson.stream.JsonReader` in `gson/src/main/java/com/google/gson/stream/JsonReader.java:212-1916` [score 805]", "contains high-complexity workflow (CC 49)"] },
+  { scenario = "secret_like_code", file_paths = ["gson/src/main/java/com/google/gson/Gson.java"], expect_report_contains = ["| CURRENT | MEDIUM | `Credential assignment` | `gson/src/main/java/com/google/gson/internal/bind/JsonTreeReader.java:146` |"] },
+  { scenario = "git_hotspots", arguments = { since_iso = "2025-01-01T00:00:00Z", until_iso = "2026-01-01T00:00:00Z", max_commits = 150, max_files = 20 }, expect_report_contains = ["- Analyzed commits: 98", "| `pom.xml` | 32 | 0 | ACTIVE |"] },
+]
 definition_queries = [
   { path = "gson/src/main/java/com/google/gson/Gson.java", line = 319, column = 14, symbol = "TypeAdapter", expected_status = "resolved", expected_fqn = "com.google.gson.TypeAdapter" },
 ]
