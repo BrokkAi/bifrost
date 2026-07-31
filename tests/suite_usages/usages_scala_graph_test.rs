@@ -2145,8 +2145,13 @@ fn scala_inverse_resolves_bare_stable_list_entries_for_backticked_fields_and_obj
     let source = r#"package app
 
 sealed trait UsageRightsSpec
+final class StaffPhotographer private ()
 case object StaffPhotographer extends UsageRightsSpec
+final class ContractIllustrator private ()
+case object ContractIllustrator extends UsageRightsSpec
 case object ContractPhotographer extends UsageRightsSpec
+final case class CaseClassStable(value: Int) extends UsageRightsSpec
+object CaseClassStable extends UsageRightsSpec
 
 trait MediaType
 
@@ -2160,11 +2165,28 @@ object MimeDb {
 object UsageRights {
   val photographer: List[UsageRightsSpec] = List(
     StaffPhotographer, // positive-stable-object-list-entry
+    ContractIllustrator, // positive-companion-object-list-entry
     ContractPhotographer
   )
+  val caseClassCompanion: List[UsageRightsSpec] = List(
+    CaseClassStable // positive-case-class-companion-list-entry
+  )
+  def consumeCaseClass(factory: Int => CaseClassStable): CaseClassStable = factory(1)
+  val caseClassMethodValue = consumeCaseClass(CaseClassStable) // positive-case-class-companion-method-value
 }
 "#;
-    let (_project, analyzer) = scala_analyzer_with_files(&[("app/Witness.scala", source)]);
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("app/Witness.scala", source),
+        (
+            "decoy/Witness.scala",
+            r#"package decoy
+
+sealed trait UsageRightsSpec
+case object StaffPhotographer extends UsageRightsSpec
+case object ContractIllustrator extends UsageRightsSpec
+"#,
+        ),
+    ]);
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let strategy = ScalaUsageGraphStrategy::new();
     for (target, positive, token) in [
@@ -2177,6 +2199,16 @@ object UsageRights {
             definition(&analyzer, "app.StaffPhotographer$"),
             "positive-stable-object-list-entry",
             "StaffPhotographer",
+        ),
+        (
+            definition(&analyzer, "app.ContractIllustrator$"),
+            "positive-companion-object-list-entry",
+            "ContractIllustrator",
+        ),
+        (
+            definition(&analyzer, "app.CaseClassStable$"),
+            "positive-case-class-companion-list-entry",
+            "CaseClassStable",
         ),
     ] {
         let inverse_hits = reference_surface_hits(strategy.find_usages(
@@ -2201,6 +2233,32 @@ object UsageRights {
             }),
             "inverse query missed exact token {token:?}: {inverse_hits:#?}"
         );
+    }
+    let case_class = definition(&analyzer, "app.CaseClassStable");
+    let case_class_hits = reference_surface_hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&case_class),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(
+        &case_class_hits,
+        "positive-case-class-companion-method-value",
+    );
+    assert_no_hit_contains(&case_class_hits, "positive-case-class-companion-list-entry");
+    for decoy in ["decoy.StaffPhotographer$", "decoy.ContractIllustrator$"] {
+        let target = definition(&analyzer, decoy);
+        let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        let inverse_hits = reference_surface_hits(strategy.find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        assert_no_hit_contains(&targeted_hits, "positive-stable-object-list-entry");
+        assert_no_hit_contains(&targeted_hits, "positive-companion-object-list-entry");
+        assert_no_hit_contains(&inverse_hits, "positive-stable-object-list-entry");
+        assert_no_hit_contains(&inverse_hits, "positive-companion-object-list-entry");
     }
 }
 
@@ -11846,6 +11904,274 @@ object Consumer {
         hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&build)));
     assert_hit_contains(&build_hits, "exact-qualified-build");
     assert_no_hit_contains(&build_hits, "wrong-owner-build");
+}
+
+fn scala_guardian_local_receiver_reducer_source() -> &'static str {
+    r#"
+package app
+
+trait ActionFilter
+trait ActionBuilder {
+  def andThen(filter: ActionFilter): ActionBuilder = this
+}
+
+class Request
+class Response
+
+class ArchiveOwner {
+  object CommonActionFilters {
+    lazy val authorisedForArchive: ActionFilter = new ActionFilter {}
+  }
+}
+
+class OtherArchiveOwner {
+  object CommonActionFilters {
+    lazy val authorisedForArchive: ActionFilter = new ActionFilter {}
+  }
+}
+
+class Auth {
+  def innerServiceCall(request: Request): Response = new Response
+}
+
+class OtherAuth {
+  def innerServiceCall(request: Request): Response = new Response
+}
+
+class GuardianController(
+  authorisation: ArchiveOwner,
+  otherAuthorisation: OtherArchiveOwner,
+  auth: Auth,
+  otherAuth: OtherAuth,
+) {
+  private val authenticatedAndAuthorised =
+    new ActionBuilder {} andThen authorisation.CommonActionFilters.authorisedForArchive // positive-authorised-for-archive
+  private val authenticatedAndWrongOwner =
+    new ActionBuilder {} andThen otherAuthorisation.CommonActionFilters.authorisedForArchive // negative-authorised-for-archive-wrong-owner
+
+  private def fetchProjection(client: Request => Response): Response =
+    client(new Request)
+  private val inner = fetchProjection(auth.innerServiceCall) // positive-inner-service-call
+  private val otherInner = fetchProjection(otherAuth.innerServiceCall) // negative-inner-service-call-wrong-owner
+}
+"#
+}
+
+fn scala_guardian_local_receiver_reducer_analyzer()
+-> (crate::common::BuiltInlineTestProject, ScalaAnalyzer) {
+    scala_analyzer_with_files(&[(
+        "app/GuardianWitness.scala",
+        scala_guardian_local_receiver_reducer_source(),
+    )])
+}
+
+#[test]
+fn scala_usage_finder_resolves_guardian_nested_stable_value_on_typed_constructor_param() {
+    let (_project, analyzer) = scala_guardian_local_receiver_reducer_analyzer();
+    let target = definition(
+        &analyzer,
+        "app.ArchiveOwner.CommonActionFilters$.authorisedForArchive",
+    );
+    for target_hits in [
+        authoritative_scala_reference_hits(&analyzer, &target),
+        scala_reference_hits(&analyzer, &target, &["app/GuardianWitness.scala"]),
+    ] {
+        assert_hit_contains(&target_hits, "positive-authorised-for-archive");
+        assert_no_hit_contains(&target_hits, "negative-authorised-for-archive-wrong-owner");
+    }
+}
+
+#[test]
+fn scala_usage_finder_resolves_guardian_inner_service_call_method_value_exactly() {
+    let (_project, analyzer) = scala_guardian_local_receiver_reducer_analyzer();
+    let target = definition(&analyzer, "app.Auth.innerServiceCall");
+    for target_hits in [
+        authoritative_scala_reference_hits(&analyzer, &target),
+        scala_reference_hits(&analyzer, &target, &["app/GuardianWitness.scala"]),
+    ] {
+        assert_hit_contains(&target_hits, "positive-inner-service-call");
+        assert_no_hit_contains(&target_hits, "negative-inner-service-call-wrong-owner");
+    }
+}
+
+fn scala_guardian_import_bound_hybrid_result_source() -> &'static str {
+    r#"
+package lib.elasticsearch
+
+import com.gu.mediaservice.lib.logging.LogMarker
+import com.gu.mediaservice.model.Image
+import com.sksamuel.elastic4s.requests.searches.SearchHit
+import candidate.left._
+import candidate.shared._
+
+object HybridResult {
+  final case class SourceWrapper[T](value: T)
+  final case class HybridResult(image: Image)
+
+  def resolveHitAndFillInSemanticScore(
+    hit: SearchHit,
+    queryEmbedding: List[Double],
+    resolveHit: SearchHit => Option[SourceWrapper[Image]],
+  )(implicit logMarker: LogMarker): Option[SourceWrapper[Image]] = resolveHit(hit)
+
+  def resolveAmbiguous(
+    hit: AmbiguousHit,
+    resolveHit: AmbiguousHit => Option[SourceWrapper[Image]],
+  ): Option[SourceWrapper[Image]] = resolveHit(hit)
+}
+"#
+}
+
+fn scala_guardian_import_bound_media_elasticsearch_source() -> &'static str {
+    r#"
+package lib.elasticsearch
+
+import com.gu.mediaservice.lib.logging.LogMarker
+import com.gu.mediaservice.model.Image
+import com.sksamuel.elastic4s.ElasticDsl._
+import com.sksamuel.elastic4s.requests.searches._
+import candidate.right._
+import candidate.shared._
+import scalaz.syntax.std.list._
+
+class ElasticSearch {
+  import HybridResult.{SourceWrapper, resolveAmbiguous, resolveHitAndFillInSemanticScore}
+
+  private def resolveHit(hit: SearchHit) = Option.empty[SourceWrapper[Image]]
+  private def resolveHitWrong(hit: SearchHit) = None
+  private def resolveHitWrongArity(hit: SearchHit, queryEmbedding: List[Double]) = None
+  private def ambiguousHit(hit: AmbiguousHit) = Option.empty[SourceWrapper[Image]]
+
+  def fusedLexicalAndSemanticSearch(
+    lexicalSearchResponse: List[SearchHit],
+    semanticSearchResponse: List[SearchHit],
+    queryEmbedding: List[Double],
+  )(implicit logMarker: LogMarker) = {
+    for {
+      lexical <- Some(lexicalSearchResponse)
+      semantic <- Some(semanticSearchResponse)
+    } yield {
+      val lexicalHits = lexical.toList
+      val semanticHits = semantic.toList
+      val lexicalResults =
+        lexicalHits.flatMap(resolveHitAndFillInSemanticScore(_, queryEmbedding, resolveHit)) // positive-media-unresolved-resolve-hit
+      val semanticResults =
+      semanticHits.flatMap(resolveHitAndFillInSemanticScore(_, queryEmbedding, resolveHitWrong)) // negative-media-unresolved-resolve-hit-wrong-name
+      lexicalHits.flatMap(
+        resolveHitAndFillInSemanticScore(_, queryEmbedding, resolveHitWrongArity),
+      ) // negative-media-unresolved-resolve-hit-wrong-arity
+      resolveAmbiguous(null, ambiguousHit) // negative-logical-candidate-intersection
+      lexicalResults ++ semanticResults
+    }
+  }
+}
+"#
+}
+
+fn scala_guardian_replica_elasticsearch_source() -> &'static str {
+    r#"
+package lib.elasticsearch
+
+class ElasticSearch {
+  def unrelated(): Int = 1
+}
+"#
+}
+
+fn scala_guardian_production_like_import_bound_resolve_hit_analyzer()
+-> (crate::common::BuiltInlineTestProject, ScalaAnalyzer) {
+    scala_analyzer_with_files(&[
+        (
+            "shared/HybridResult.scala",
+            scala_guardian_import_bound_hybrid_result_source(),
+        ),
+        (
+            "media/ElasticSearch.scala",
+            scala_guardian_import_bound_media_elasticsearch_source(),
+        ),
+        (
+            "thrall/ElasticSearch.scala",
+            scala_guardian_replica_elasticsearch_source(),
+        ),
+    ])
+}
+
+#[test]
+fn scala_usage_finder_resolves_guardian_production_like_import_bound_resolve_hit_with_exact_media_target()
+ {
+    let (_project, analyzer) = scala_guardian_production_like_import_bound_resolve_hit_analyzer();
+    let target = analyzer
+        .get_definitions("lib.elasticsearch.ElasticSearch.resolveHit")
+        .into_iter()
+        .find(|unit| rel_path_string(unit.source()) == "media/ElasticSearch.scala")
+        .expect("media import-bound ElasticSearch.resolveHit");
+    let source = scala_guardian_import_bound_media_elasticsearch_source();
+    let line = "        lexicalHits.flatMap(resolveHitAndFillInSemanticScore(_, queryEmbedding, resolveHit)) // positive-media-unresolved-resolve-hit";
+    let line_start = source
+        .find(line)
+        .expect("media import-bound resolveHit line");
+    let token = ", resolveHit)) // positive-media-unresolved-resolve-hit";
+    let token_start = line
+        .find(token)
+        .expect("media import-bound resolveHit token");
+    let range = (
+        line_start + token_start + 2,
+        line_start + token_start + 2 + "resolveHit".len(),
+    );
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new([target.source().clone()].into_iter().collect()));
+    let inverse = scala_reference_hits(&analyzer, &target, &["media/ElasticSearch.scala"]);
+    let targeted = reference_surface_hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&target),
+                Some(&provider),
+                1000,
+                100,
+            )
+            .result,
+    );
+    for bucket in [&targeted, &inverse] {
+        assert_hit_contains(bucket, "positive-media-unresolved-resolve-hit");
+        assert_no_hit_contains(bucket, "negative-media-unresolved-resolve-hit-wrong-name");
+        assert_no_hit_contains(bucket, "negative-media-unresolved-resolve-hit-wrong-arity");
+        assert!(
+            bucket.iter().any(|hit| {
+                hit.kind == UsageHitKind::Reference
+                    && hit.start_offset == range.0
+                    && hit.end_offset == range.1
+            }),
+            "expected exact import-bound media resolveHit token range {range:?}: {bucket:#?}"
+        );
+    }
+
+    let ambiguous_target = analyzer
+        .get_definitions("lib.elasticsearch.ElasticSearch.ambiguousHit")
+        .into_iter()
+        .find(|unit| rel_path_string(unit.source()) == "media/ElasticSearch.scala")
+        .expect("media ambiguousHit");
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        [ambiguous_target.source().clone()].into_iter().collect(),
+    ));
+    let ambiguous_inverse =
+        scala_reference_hits(&analyzer, &ambiguous_target, &["media/ElasticSearch.scala"]);
+    let ambiguous_targeted = reference_surface_hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&ambiguous_target),
+                Some(&provider),
+                1000,
+                100,
+            )
+            .result,
+    );
+    for bucket in [&ambiguous_targeted, &ambiguous_inverse] {
+        assert_no_hit_contains(bucket, "negative-logical-candidate-intersection");
+    }
 }
 
 #[test]
