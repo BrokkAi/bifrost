@@ -3230,14 +3230,21 @@ fn start_session_watcher(
     watcher_starter: &WatcherStarter,
 ) -> Result<SessionWatcher, String> {
     match update_strategy {
-        UpdateStrategy::WatchFiles => watcher_starter(Arc::clone(&project))
-            .map(SessionWatcher::Active)
-            .map_err(|error| {
+        UpdateStrategy::WatchFiles => {
+            let watcher = watcher_starter(Arc::clone(&project)).map_err(|error| {
                 format!(
                     "Failed to start project watcher for {}: {error}",
                     project.root().display()
                 )
-            }),
+            })?;
+            // Listing-cache fills that precede watcher registration (the
+            // deferred index build, `find_filenames` during a pending build)
+            // can miss changes the watcher never saw. Drop the cache now that
+            // events are being captured: every fill that survives postdates
+            // event coverage, so watcher-driven invalidation is complete.
+            project.invalidate_cached_file_listing();
+            Ok(SessionWatcher::Active(watcher))
+        }
         UpdateStrategy::Manual => Ok(SessionWatcher::Disabled),
     }
 }
@@ -4346,6 +4353,40 @@ mod issue_1388_find_filenames_tests {
         );
     }
 
+    /// Fills that predate watcher registration (the deferred build,
+    /// `find_filenames` during a pending build) can miss changes no event
+    /// will ever report, so starting the session watcher must drop them.
+    #[test]
+    fn watcher_start_drops_pre_watcher_listing_fills() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "pub fn a() {}\n").unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project: Arc<dyn Project> = Arc::new(
+            FilesystemProject::with_cached_listing(root.clone(), Arc::clone(&cache)).unwrap(),
+        );
+
+        cache.files().unwrap();
+        // A change no watcher event will ever report: it lands before the
+        // watcher starts.
+        std::fs::write(root.join("extra.rs"), "pub fn b() {}\n").unwrap();
+
+        let _watcher = start_session_watcher(
+            Arc::clone(&project),
+            UpdateStrategy::WatchFiles,
+            &(Arc::new(ProjectChangeWatcher::start_polling_for_tests) as WatcherStarter),
+        )
+        .unwrap();
+
+        assert!(
+            cache
+                .files()
+                .unwrap()
+                .contains(&ProjectFile::new(root, "extra.rs")),
+            "watcher start must invalidate fills that predate event coverage"
+        );
+    }
+
     /// One workspace listing serves the whole session (#1401): repeated file
     /// tools reuse the cached walk while the workspace is quiet, and watcher
     /// events refresh it so new files appear without a per-call walk.
@@ -4872,7 +4913,8 @@ mod tests {
             "public class Thing { public String value() { return \"value\"; } }\n",
         )
         .unwrap();
-        let (_project, workspace) = build_persisted_workspace(dir.path().to_path_buf()).unwrap();
+        let (_project, workspace) =
+            build_persisted_workspace(dir.path().to_path_buf(), None).unwrap();
         let snapshot = Arc::new(workspace);
         let indexer = SemanticIndexer::start_with_provider(
             dir.path().to_path_buf(),
@@ -4921,7 +4963,8 @@ mod tests {
             "public class Thing { public String value() { return \"value\"; } }\n",
         )
         .unwrap();
-        let (_project, workspace) = build_persisted_workspace(dir.path().to_path_buf()).unwrap();
+        let (_project, workspace) =
+            build_persisted_workspace(dir.path().to_path_buf(), None).unwrap();
         let snapshot = Arc::new(workspace);
 
         // No CUDA/Metal and no --force-semantic-cpu: the indexer must not start.
