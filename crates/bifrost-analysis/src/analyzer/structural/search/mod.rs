@@ -39,7 +39,7 @@ use super::query::schema::{reference_kind_label, usage_proof_label};
 use super::query::{
     CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery,
     CodeQueryExecutionMode, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
-    CodeQuerySeed, HierarchyTraversal, QueryError, QueryStep, ReferenceTraversalFilter,
+    CodeQuerySeed, HierarchyTraversal, Pattern, QueryError, QueryStep, ReferenceTraversalFilter,
     SetOperator,
 };
 use crate::analyzer::reference_candidates::{
@@ -1350,7 +1350,9 @@ pub fn execute_with_limits(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResult {
-    execute_code_query_detailed(analyzer, query, limits, None).result
+    let mut result = execute_code_query_detailed(analyzer, query, limits, None).result;
+    augment_public_result_with_semantic_overlay(analyzer, query, &mut result);
+    result
 }
 
 #[doc(hidden)]
@@ -1359,7 +1361,7 @@ pub fn execute_workspace_with_limits(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResult {
-    execute_internal_with_analysis(
+    let mut result = execute_internal_with_analysis(
         workspace.analyzer(),
         Some(workspace),
         None,
@@ -1370,7 +1372,9 @@ pub fn execute_workspace_with_limits(
         None,
         false,
     )
-    .result
+    .result;
+    augment_public_result_with_semantic_overlay(workspace.analyzer(), query, &mut result);
+    result
 }
 
 #[cfg(test)]
@@ -1609,8 +1613,8 @@ fn execute_request_internal(
     };
     let workspace_generation = registrations.map_or(0, |(generation, _, _, _)| generation);
     match query.execution_mode {
-        CodeQueryExecutionMode::Results => CodeQueryResponse::Results(
-            execute_internal_with_analysis(
+        CodeQueryExecutionMode::Results => {
+            let mut result = execute_internal_with_analysis(
                 analyzer,
                 workspace,
                 analysis_context.as_ref(),
@@ -1621,8 +1625,10 @@ fn execute_request_internal(
                 None,
                 false,
             )
-            .result,
-        ),
+            .result;
+            augment_public_result_with_semantic_overlay(analyzer, query, &mut result);
+            CodeQueryResponse::Results(result)
+        }
         CodeQueryExecutionMode::Explain => match select_physical_plan(
             query,
             UnionExecutionStrategy::Auto,
@@ -1651,8 +1657,11 @@ fn execute_request_internal(
                 true,
             );
             let DetailedCodeQueryResult {
-                result, profile, ..
+                mut result,
+                profile,
+                ..
             } = detailed;
+            augment_public_result_with_semantic_overlay(analyzer, query, &mut result);
             match profile {
                 Some(profile) => CodeQueryResponse::Profile(Box::new(
                     CodeQueryProfile::from_internal(query, result, profile),
@@ -8190,6 +8199,12 @@ fn render_declaration(
         .signature()
         .map(str::to_string)
         .or_else(|| analyzer.signatures_of(&declaration.unit).into_iter().next());
+    let semantic_model = analyzer.semantic_model_overlay().and_then(|overlay| {
+        let matched = overlay.symbols_named(&fq_name);
+        (matched.disposition
+            == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique)
+            .then(|| Box::new(matched.records[0].provenance.clone()))
+    });
     CodeQueryDeclaration {
         id: full.then(|| declaration_id(&path, kind, &fq_name, declaration.range)),
         path,
@@ -8203,7 +8218,306 @@ fn render_declaration(
         node_range: full
             .then(|| cache.range_for_declaration(analyzer, declaration))
             .flatten(),
+        semantic_model,
     }
+}
+
+fn augment_public_result_with_semantic_overlay(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    result: &mut CodeQueryResult,
+) {
+    let Some(seed) = query.seed() else {
+        return;
+    };
+    if !seed.where_globs.is_empty()
+        || seed.inside.is_some()
+        || seed.inside_decl.is_some()
+        || seed.not_inside.is_some()
+        || !model_pattern_is_supported(&seed.root)
+    {
+        return;
+    }
+    let traversal = match query.plan.steps.as_slice() {
+        [QueryStep::EnclosingDecl] => None,
+        [QueryStep::EnclosingDecl, step @ QueryStep::Members]
+        | [QueryStep::EnclosingDecl, step @ QueryStep::Owner]
+        | [QueryStep::EnclosingDecl, step @ QueryStep::Supertypes(_)]
+        | [QueryStep::EnclosingDecl, step @ QueryStep::Subtypes(_)] => Some(step),
+        _ => return,
+    };
+    let Some(overlay) = analyzer.semantic_model_overlay() else {
+        return;
+    };
+
+    let roots = overlay
+        .symbols()
+        .iter()
+        .filter(|symbol| {
+            !symbol.provenance.ambiguous
+                && (seed.languages.is_empty()
+                    || seed
+                        .languages
+                        .iter()
+                        .any(|language| language.config_label() == symbol.language))
+                && model_pattern_matches(&seed.root, symbol)
+        })
+        .collect::<Vec<_>>();
+    let mut ambiguous_match = overlay.symbols().iter().any(|symbol| {
+        symbol.provenance.ambiguous
+            && (seed.languages.is_empty()
+                || seed
+                    .languages
+                    .iter()
+                    .any(|language| language.config_label() == symbol.language))
+            && model_pattern_matches(&seed.root, symbol)
+    });
+
+    let mut modeled = Vec::new();
+    for root in roots {
+        match traversal {
+            None => modeled.push(root),
+            Some(QueryStep::Members) => modeled.extend(
+                overlay
+                    .members_of(&root.id)
+                    .records
+                    .into_iter()
+                    .filter(|symbol| !symbol.provenance.ambiguous),
+            ),
+            Some(QueryStep::Owner) => {
+                if let Some(owner) = root.owner_id.as_deref() {
+                    let matched = overlay.symbols_with_id(owner);
+                    if matched.disposition
+                        == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+                    {
+                        modeled.push(matched.records[0]);
+                    }
+                }
+            }
+            Some(QueryStep::Supertypes(hierarchy)) => {
+                let (symbols, conflict) = model_hierarchy_symbols(&overlay, root, *hierarchy, true);
+                modeled.extend(symbols);
+                ambiguous_match |= conflict;
+            }
+            Some(QueryStep::Subtypes(hierarchy)) => {
+                let (symbols, conflict) =
+                    model_hierarchy_symbols(&overlay, root, *hierarchy, false);
+                modeled.extend(symbols);
+                ambiguous_match |= conflict;
+            }
+            Some(_) => unreachable!("model overlay traversal was validated above"),
+        }
+    }
+    modeled.sort_by(|left, right| {
+        left.qualified_name
+            .cmp(&right.qualified_name)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    modeled.dedup_by(|left, right| left.id == right.id);
+
+    let mut existing = result
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::Declaration { value } => Some(value.fq_name.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let available = query.limit.saturating_sub(result.results.len());
+    let mut retained = 0usize;
+    for symbol in modeled {
+        if existing.contains(&symbol.qualified_name) {
+            continue;
+        }
+        if retained == available {
+            result.truncated = true;
+            break;
+        }
+        let Some(language) = model_language_label(&symbol.language) else {
+            continue;
+        };
+        let Some(kind) = model_declaration_kind(symbol.kind) else {
+            continue;
+        };
+        existing.insert(symbol.qualified_name.clone());
+        let range = symbol.location.range();
+        result.results.push(CodeQueryResultItem {
+            value: CodeQueryResultValue::Declaration {
+                value: CodeQueryDeclaration {
+                    path: symbol.location.identity().to_string(),
+                    language,
+                    kind,
+                    fq_name: symbol.qualified_name.clone(),
+                    start_line: range.start_line,
+                    end_line: range.end_line,
+                    signature: symbol.signature.clone(),
+                    id: (!query.result_detail.is_compact()).then(|| symbol.id.clone()),
+                    node_range: None,
+                    semantic_model: Some(Box::new(symbol.provenance.clone())),
+                },
+            },
+            provenance: Vec::new(),
+            provenance_truncated: false,
+        });
+        retained = retained.saturating_add(1);
+    }
+    if ambiguous_match
+        && !result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::SemanticResultsOmitted
+                && diagnostic
+                    .message
+                    .contains("semantic-model declaration conflict")
+        })
+    {
+        result.diagnostics.push(CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message:
+                "semantic-model declaration conflict prevented an authoritative CodeQuery result"
+                    .to_string(),
+        });
+    }
+}
+
+fn model_hierarchy_symbols<'a>(
+    overlay: &'a crate::analyzer::semantic_model::SemanticModelOverlay,
+    root: &crate::analyzer::semantic_model::SemanticModelSymbol,
+    traversal: HierarchyTraversal,
+    supertypes: bool,
+) -> (
+    Vec<&'a crate::analyzer::semantic_model::SemanticModelSymbol>,
+    bool,
+) {
+    let max_depth = match traversal {
+        HierarchyTraversal::Direct => 1,
+        HierarchyTraversal::Depth(depth) => depth.get(),
+        HierarchyTraversal::Transitive => usize::MAX,
+    };
+    let mut queue = VecDeque::from([(root.id.clone(), 0usize)]);
+    let mut visited = HashSet::default();
+    visited.insert(root.id.clone());
+    let mut symbols = Vec::new();
+    let mut conflict = false;
+    while let Some((id, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+        let relations = if supertypes {
+            overlay.relations_from(&id)
+        } else {
+            overlay.relations_to(&id)
+        };
+        for relation in relations.records {
+            if relation.provenance.ambiguous {
+                conflict = true;
+                continue;
+            }
+            if !matches!(
+                relation.kind.as_str(),
+                "extends" | "implements" | "uses_trait"
+            ) {
+                continue;
+            }
+            let endpoint = if supertypes {
+                &relation.to
+            } else {
+                &relation.from
+            };
+            let mut matched = overlay.symbols_with_id(endpoint);
+            if matched.records.is_empty() {
+                matched = overlay.symbols_named(endpoint);
+            }
+            if matched.disposition
+                != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+            {
+                conflict |= !matched.records.is_empty();
+                continue;
+            }
+            let symbol = matched.records[0];
+            if visited.insert(symbol.id.clone()) {
+                symbols.push(symbol);
+                queue.push_back((symbol.id.clone(), depth.saturating_add(1)));
+            }
+        }
+    }
+    (symbols, conflict)
+}
+
+fn model_pattern_is_supported(pattern: &Pattern) -> bool {
+    pattern.text.is_none()
+        && pattern.capture.is_none()
+        && pattern.has.is_none()
+        && pattern.not_has.is_none()
+        && pattern.callee.is_none()
+        && pattern.receiver.is_none()
+        && pattern.args.is_empty()
+        && pattern.kwargs.is_empty()
+        && pattern.left.is_none()
+        && pattern.right.is_none()
+        && pattern.module.is_none()
+        && pattern.decorators.is_empty()
+        && pattern.object.is_none()
+        && pattern.field.is_none()
+}
+
+fn model_pattern_matches(
+    pattern: &Pattern,
+    symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
+) -> bool {
+    let Some(kind) = model_normalized_kind(symbol.kind) else {
+        return false;
+    };
+    (pattern.kinds.is_empty()
+        || pattern
+            .kinds
+            .iter()
+            .copied()
+            .any(|query_kind| kind.satisfies(query_kind)))
+        && !pattern
+            .not_kinds
+            .iter()
+            .copied()
+            .any(|query_kind| kind.satisfies(query_kind))
+        && pattern
+            .name
+            .as_ref()
+            .is_none_or(|name| name.matches(&symbol.name) || name.matches(&symbol.qualified_name))
+}
+
+fn model_normalized_kind(
+    kind: crate::analyzer::semantic_model::SemanticModelSymbolKind,
+) -> Option<NormalizedKind> {
+    use crate::analyzer::semantic_model::SemanticModelSymbolKind as ModelKind;
+    match kind {
+        ModelKind::Class
+        | ModelKind::Annotation
+        | ModelKind::Interface
+        | ModelKind::Trait
+        | ModelKind::Struct
+        | ModelKind::Enum
+        | ModelKind::Record => Some(NormalizedKind::Class),
+        ModelKind::Constructor => Some(NormalizedKind::Constructor),
+        ModelKind::Method => Some(NormalizedKind::Method),
+        ModelKind::Function | ModelKind::Delegate => Some(NormalizedKind::Function),
+        ModelKind::Module
+        | ModelKind::TypeAlias
+        | ModelKind::Field
+        | ModelKind::Property
+        | ModelKind::Constant
+        | ModelKind::Event => None,
+    }
+}
+
+fn model_declaration_kind(
+    kind: crate::analyzer::semantic_model::SemanticModelSymbolKind,
+) -> Option<&'static str> {
+    model_normalized_kind(kind).map(NormalizedKind::label)
+}
+
+fn model_language_label(language: &str) -> Option<&'static str> {
+    Language::from_config_label(language).map(Language::config_label)
 }
 
 fn render_file(file: &ProjectFile) -> CodeQueryFile {

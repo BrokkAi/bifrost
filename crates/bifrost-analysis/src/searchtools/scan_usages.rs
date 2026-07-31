@@ -3,6 +3,10 @@ use super::*;
 use crate::cancellation::CancellationToken;
 use std::time::Duration;
 
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanUsagesByReferenceParams {
     pub symbols: Vec<String>,
@@ -225,6 +229,10 @@ pub struct ScanUsagesEntry {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub unproven_files: Vec<UsageFileGroup>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub model_relations: Vec<crate::analyzer::semantic_model::SemanticModelRelation>,
+    #[serde(skip_serializing_if = "is_zero", default)]
+    pub model_relations_omitted: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub top_enclosing: Vec<UsageEnclosingCount>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub definition_sites_excluded: Option<usize>,
@@ -304,6 +312,8 @@ pub struct SymbolUsages {
     pub same_owner_files: Vec<UsageFileGroup>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub unproven_files: Vec<UsageFileGroup>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub model_relations: Vec<crate::analyzer::semantic_model::SemanticModelRelation>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1661,7 +1671,7 @@ pub(crate) fn scan_usages_by_reference_with_context(
         .enumerate()
         .map(|(index, symbol)| ScanUsageRequest::symbol(index, symbol))
         .collect();
-    scan_usages_backend(
+    let mut result = scan_usages_backend(
         analyzer,
         ScanUsagesSurface::Reference,
         params.include_tests,
@@ -1670,7 +1680,9 @@ pub(crate) fn scan_usages_by_reference_with_context(
         Vec::new(),
         params.include_same_owner,
         context,
-    )
+    );
+    attach_model_relations(analyzer, &mut result);
+    result
 }
 
 pub fn scan_usages_by_location(
@@ -3285,6 +3297,7 @@ pub(super) fn populate_usage_payload(
     entry.files = usage.files;
     entry.same_owner_files = usage.same_owner_files;
     entry.unproven_files = usage.unproven_files;
+    entry.model_relations = usage.model_relations;
     entry.top_enclosing = usage.top_enclosing;
     entry.definition_sites_excluded = usage.definition_sites_excluded;
     entry.files_truncated = usage.files_truncated;
@@ -3392,6 +3405,8 @@ pub(super) fn scan_usages_entry_base(
         files: Vec::new(),
         same_owner_files: Vec::new(),
         unproven_files: Vec::new(),
+        model_relations: Vec::new(),
+        model_relations_omitted: 0,
         top_enclosing: Vec::new(),
         definition_sites_excluded: None,
         files_truncated: None,
@@ -3619,7 +3634,197 @@ pub(super) fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsag
         files,
         same_owner_files,
         unproven_files: render_usage_file_groups(&state.unproven_rows, true),
+        model_relations: Vec::new(),
     }
+}
+
+fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResult) {
+    const MAX_MODEL_RELATIONS_PER_SYMBOL: usize = 256;
+
+    let Some(overlay) = analyzer.semantic_model_overlay() else {
+        return;
+    };
+    for entry in &mut result.results {
+        let input = match &entry.input {
+            ScanUsagesInput::Symbol(symbol) => symbol.as_str(),
+            ScanUsagesInput::Target(_) => entry
+                .fq_name
+                .as_deref()
+                .or(entry.symbol.as_deref())
+                .unwrap_or_default(),
+        };
+        let authored_target = entry.fq_name.is_some()
+            && !matches!(
+                entry.status,
+                ScanUsagesStatus::NotFound
+                    | ScanUsagesStatus::Ambiguous
+                    | ScanUsagesStatus::Failure
+            );
+        let mut symbol = if input.starts_with("bifrost-model://") {
+            overlay.symbols_at_uri(input)
+        } else {
+            entry
+                .fq_name
+                .as_deref()
+                .map(|name| overlay.symbols_named(name))
+                .filter(|matched| !matched.records.is_empty())
+                .unwrap_or_else(|| overlay.symbols_named(input))
+        };
+        if symbol.records.is_empty() {
+            symbol = overlay.symbols_with_id(input);
+        }
+        if symbol.disposition
+            != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+        {
+            if symbol.disposition
+                == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict
+            {
+                if authored_target {
+                    entry.notes.push(
+                        "Conflicting modeled declarations were omitted; authored usage resolution retained precedence."
+                            .to_string(),
+                    );
+                } else {
+                    entry.status = ScanUsagesStatus::Ambiguous;
+                    entry.message = Some(
+                        "conflicting active semantic-model declarations prevent an authoritative usage target"
+                            .to_string(),
+                    );
+                }
+            }
+            continue;
+        }
+        let model_symbol = symbol.records[0];
+        let relations = overlay.relations_to(&model_symbol.id);
+        if relations
+            .records
+            .iter()
+            .any(|relation| relation.provenance.ambiguous)
+        {
+            if authored_target {
+                entry.notes.push(
+                    "Conflicting modeled relations were omitted; authored usage resolution retained precedence."
+                        .to_string(),
+                );
+            } else {
+                entry.status = ScanUsagesStatus::Ambiguous;
+                entry.message = Some(
+                    "conflicting active semantic-model relations prevent an authoritative usage result"
+                        .to_string(),
+                );
+            }
+            continue;
+        }
+        let total_model_relations = relations.records.len();
+        entry.model_relations = relations
+            .records
+            .into_iter()
+            .take(MAX_MODEL_RELATIONS_PER_SYMBOL)
+            .cloned()
+            .collect();
+        entry.model_relations_omitted =
+            total_model_relations.saturating_sub(entry.model_relations.len());
+        if !entry.model_relations.is_empty() {
+            entry.symbol = Some(model_symbol.qualified_name.clone());
+            entry.fq_name = Some(model_symbol.qualified_name.clone());
+            entry.total_hits = Some(
+                entry
+                    .total_hits
+                    .unwrap_or_default()
+                    .saturating_add(entry.model_relations.len()),
+            );
+            entry.status = ScanUsagesStatus::Found;
+            entry.notes.push(
+                "Model relations are semantic facts and do not claim authored source hit text."
+                    .to_string(),
+            );
+        } else if entry.status == ScanUsagesStatus::NotFound {
+            entry.status = ScanUsagesStatus::UnverifiedAbsent;
+            entry.symbol = Some(model_symbol.qualified_name.clone());
+            entry.fq_name = Some(model_symbol.qualified_name.clone());
+            entry.message = Some(
+                "the semantic-model declaration resolved, but the active packs contain no modeled inbound relation"
+                    .to_string(),
+            );
+        }
+    }
+    fit_model_relations_to_response_budget(result);
+    result.summary = build_scan_usages_summary(&result.results);
+}
+
+fn fit_model_relations_to_response_budget(result: &mut ScanUsagesResult) {
+    const MODEL_RELATION_METADATA_MARGIN_BYTES: usize = 256;
+    let mut relation_sizes = result
+        .results
+        .iter()
+        .map(|entry| {
+            entry
+                .model_relations
+                .iter()
+                .map(|relation| {
+                    serde_json::to_vec(relation)
+                        .expect("semantic-model relations are serializable")
+                        .len()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    trim_model_relations_to_serialized_budget(
+        result,
+        &mut relation_sizes,
+        SCAN_USAGES_RESPONSE_BUDGET_BYTES.saturating_sub(MODEL_RELATION_METADATA_MARGIN_BYTES),
+    );
+    for entry in result
+        .results
+        .iter_mut()
+        .filter(|entry| entry.model_relations_omitted != 0)
+    {
+        entry.complete = false;
+        entry.incomplete_reason = Some(ScanUsagesIncompleteReason::ResponseBudget);
+    }
+    trim_model_relations_to_serialized_budget(
+        result,
+        &mut relation_sizes,
+        SCAN_USAGES_RESPONSE_BUDGET_BYTES,
+    );
+}
+
+fn trim_model_relations_to_serialized_budget(
+    result: &mut ScanUsagesResult,
+    relation_sizes: &mut [Vec<usize>],
+    budget: usize,
+) {
+    let mut serialized_bytes = serde_json::to_vec(result)
+        .expect("scan-usages results are serializable")
+        .len();
+    while serialized_bytes > budget {
+        let Some((entry_index, _)) = result
+            .results
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| !entry.model_relations.is_empty())
+            .max_by_key(|(_, entry)| entry.model_relations.len())
+        else {
+            break;
+        };
+        let entry = &mut result.results[entry_index];
+        let relation_count = entry.model_relations.len();
+        let relation_bytes = relation_sizes[entry_index]
+            .pop()
+            .expect("serialized relation sizes track retained relations");
+        let old_omitted_digits = decimal_digits(entry.model_relations_omitted);
+        entry.model_relations.pop();
+        entry.model_relations_omitted = entry.model_relations_omitted.saturating_add(1);
+        let new_omitted_digits = decimal_digits(entry.model_relations_omitted);
+        serialized_bytes = serialized_bytes
+            .saturating_sub(relation_bytes)
+            .saturating_sub(usize::from(relation_count > 1))
+            .saturating_add(new_omitted_digits.saturating_sub(old_omitted_digits));
+    }
+}
+
+fn decimal_digits(value: usize) -> usize {
+    value.checked_ilog10().unwrap_or(0) as usize + 1
 }
 
 /// Render same-owner usage sites as file groups, kind-tagged (`self_receiver`)

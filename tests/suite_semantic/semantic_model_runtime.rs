@@ -315,13 +315,17 @@ fn matcher_owns_exact_postings_after_the_catalog_is_dropped() {
 
     let by_name = active.types_named("com.acme.Widget");
     assert_eq!(by_name.disposition, SemanticModelMatchDisposition::Unique);
-    assert_eq!(by_name.records[0].id, "type.widget");
+    assert_eq!(by_name.records[0].record.id, "type.widget");
     assert_eq!(
-        active.types_named("com.acme.LegacyWidget").records[0].id,
+        active.types_named("com.acme.LegacyWidget").records[0]
+            .record
+            .id,
         "type.widget"
     );
     assert_eq!(
-        active.members_named("type.widget", "create").records[0].id,
+        active.members_named("type.widget", "create").records[0]
+            .record
+            .id,
         "member.widget.create"
     );
     assert_eq!(
@@ -331,11 +335,13 @@ fn matcher_owns_exact_postings_after_the_catalog_is_dropped() {
         0
     );
     assert_eq!(
-        active.relations_from("member.widget.create").records[0].id,
+        active.relations_from("member.widget.create").records[0]
+            .record
+            .id,
         "relation.widget.navigation"
     );
     assert_eq!(
-        active.relations_to("type.widget").records[0].id,
+        active.relations_to("type.widget").records[0].record.id,
         "relation.widget.navigation"
     );
     assert!(active.retained_bytes() > 0);
@@ -709,7 +715,7 @@ fn equal_rank_facts_conflict_and_higher_source_rank_shadows_them() {
     ));
     let matched = shadowed.types_with_id("type.widget");
     assert_eq!(matched.disposition, SemanticModelMatchDisposition::Unique);
-    assert_eq!(matched.records[0].name, "com.acme.AlternateWidget");
+    assert_eq!(matched.records[0].record.name, "com.acme.AlternateWidget");
     assert_eq!(matched.candidates_examined, 2);
 }
 

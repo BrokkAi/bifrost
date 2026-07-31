@@ -5074,6 +5074,7 @@ export function invoke(service: Service) { service.run(); }
             signature: None,
             id: id.map(str::to_string),
             node_range: Some(call_range),
+            semantic_model: None,
         };
         let item = CodeQueryResultItem {
             value: CodeQueryResultValue::CallSite {

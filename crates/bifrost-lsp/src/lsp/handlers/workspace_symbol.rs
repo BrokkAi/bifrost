@@ -1,10 +1,14 @@
 use lsp_types::{
-    Location, OneOf, SymbolKind, Uri, WorkspaceSymbol, WorkspaceSymbolParams,
+    Location, OneOf, Position, Range, SymbolKind, Uri, WorkspaceSymbol, WorkspaceSymbolParams,
     WorkspaceSymbolResponse,
 };
 
 use crate::analyzer::common::display_identifier_for_target;
-use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Range as ByteRange, WorkspaceAnalyzer};
+use crate::analyzer::{
+    CodeUnit, CodeUnitType, IAnalyzer, Range as ByteRange, SearchSymbolPatternBatch,
+    WorkspaceAnalyzer,
+};
+use crate::hash::HashSet;
 use crate::lsp::conversion::{byte_range_to_lsp_range, path_to_uri_string};
 use crate::lsp::handlers::util::FileContentCache;
 
@@ -34,13 +38,78 @@ pub fn handle(
 
     let mut content_cache = FileContentCache::default();
     let mut results = Vec::with_capacity(matches.len());
+    let mut authored_names = HashSet::default();
     for code_unit in matches {
         if let Some(symbol) = build_symbol(analyzer, &code_unit, &mut content_cache) {
+            authored_names.insert(code_unit.fq_name());
             results.push(symbol);
+        }
+    }
+    if let Some(overlay) = analyzer.semantic_model_overlay() {
+        let patterns = SearchSymbolPatternBatch::compile(vec![params.query.clone()], true, None);
+        let (modeled, _, _) =
+            overlay.search_with_limit(&patterns, MAX_RESULTS.saturating_sub(results.len()), None);
+        for symbol in modeled
+            .into_iter()
+            .filter(|symbol| !authored_names.contains(&symbol.qualified_name))
+        {
+            if let Some(symbol) = build_model_symbol(analyzer, symbol, &mut content_cache) {
+                results.push(symbol);
+            }
         }
     }
 
     Some(WorkspaceSymbolResponse::Nested(results))
+}
+
+fn build_model_symbol(
+    analyzer: &dyn IAnalyzer,
+    symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
+    cache: &mut FileContentCache,
+) -> Option<WorkspaceSymbol> {
+    let (uri, range): (Uri, Range) = match &symbol.location {
+        crate::analyzer::semantic_model::SemanticModelLocation::Authored(anchor) => {
+            let path = analyzer.project().root().join(&anchor.path);
+            let uri = path_to_uri_string(&path).parse().ok()?;
+            let source = cache.read_disk_or_empty(&path);
+            let byte_range = ByteRange {
+                start_byte: anchor.range.start_byte,
+                end_byte: anchor.range.end_byte,
+                start_line: anchor.range.start_line,
+                end_line: anchor.range.end_line,
+            };
+            (
+                uri,
+                byte_range_to_lsp_range(&source.body, &source.line_starts, &byte_range),
+            )
+        }
+        crate::analyzer::semantic_model::SemanticModelLocation::Model(location) => (
+            location.uri.parse().ok()?,
+            Range {
+                start: Position {
+                    line: u32::try_from(location.range.start_line.saturating_sub(1))
+                        .unwrap_or(u32::MAX),
+                    character: 0,
+                },
+                end: Position {
+                    line: u32::try_from(location.range.end_line.saturating_sub(1))
+                        .unwrap_or(u32::MAX),
+                    character: 0,
+                },
+            },
+        ),
+    };
+    Some(WorkspaceSymbol {
+        name: symbol.name.clone(),
+        kind: map_model_kind(symbol.kind),
+        tags: None,
+        container_name: symbol
+            .qualified_name
+            .strip_suffix(&format!(".{}", symbol.name))
+            .map(str::to_string),
+        location: OneOf::Left(Location { uri, range }),
+        data: serde_json::to_value(symbol).ok(),
+    })
 }
 
 fn build_symbol(
@@ -77,7 +146,13 @@ fn build_symbol(
         tags: None,
         container_name: container_name(code_unit),
         location: OneOf::Left(location),
-        data: None,
+        data: analyzer.semantic_model_overlay().and_then(|overlay| {
+            let modeled = overlay.symbols_named(&code_unit.fq_name());
+            (modeled.disposition
+                == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique)
+                .then(|| serde_json::to_value(modeled.records[0]).ok())
+                .flatten()
+        }),
     })
 }
 
@@ -98,5 +173,25 @@ fn map_kind(kind: CodeUnitType) -> SymbolKind {
         CodeUnitType::Module => SymbolKind::MODULE,
         CodeUnitType::Macro => SymbolKind::CONSTANT,
         CodeUnitType::FileScope => SymbolKind::FILE,
+    }
+}
+
+fn map_model_kind(kind: crate::analyzer::semantic_model::SemanticModelSymbolKind) -> SymbolKind {
+    use crate::analyzer::semantic_model::SemanticModelSymbolKind as ModelKind;
+    match kind {
+        ModelKind::Class | ModelKind::Record => SymbolKind::CLASS,
+        ModelKind::Annotation | ModelKind::Interface | ModelKind::Trait => SymbolKind::INTERFACE,
+        ModelKind::Delegate => SymbolKind::FUNCTION,
+        ModelKind::Struct => SymbolKind::STRUCT,
+        ModelKind::Enum => SymbolKind::ENUM,
+        ModelKind::Module => SymbolKind::MODULE,
+        ModelKind::TypeAlias => SymbolKind::TYPE_PARAMETER,
+        ModelKind::Constructor => SymbolKind::CONSTRUCTOR,
+        ModelKind::Method => SymbolKind::METHOD,
+        ModelKind::Function => SymbolKind::FUNCTION,
+        ModelKind::Field => SymbolKind::FIELD,
+        ModelKind::Property => SymbolKind::PROPERTY,
+        ModelKind::Constant => SymbolKind::CONSTANT,
+        ModelKind::Event => SymbolKind::EVENT,
     }
 }
