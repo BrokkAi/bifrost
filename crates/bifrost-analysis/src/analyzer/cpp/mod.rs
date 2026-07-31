@@ -34,7 +34,7 @@ use std::sync::{Arc, OnceLock};
 
 pub(crate) use adapter::CppAdapter;
 use cache::{weight_code_unit_set_by_file, weight_code_unit_vec_by_file, weight_project_file_set};
-use clones::build_clone_candidate_data;
+use clones::{build_clone_candidate_data, cpp_clone_parser};
 use compile_context::{CppCompileContext, CppCompileContexts};
 use tests::detect_cpp_test_assertion_smells;
 
@@ -958,14 +958,18 @@ impl IAnalyzer for CppAnalyzer {
         if requested_files.is_empty() {
             return Vec::new();
         }
+        let requested_file_set: HashSet<ProjectFile> = requested_files.iter().cloned().collect();
 
+        let mut parser = cpp_clone_parser();
         let all_candidates: Vec<CloneCandidateProfile> = self
             .get_all_declarations()
             .into_iter()
             .filter(|code_unit| {
-                code_unit.is_function() && file_language(code_unit.source()) == Language::Cpp
+                code_unit.is_function() && requested_file_set.contains(code_unit.source())
             })
-            .filter_map(|code_unit| build_clone_candidate_data(self, &code_unit, weights))
+            .filter_map(|code_unit| {
+                build_clone_candidate_data(self, &code_unit, weights, &mut parser)
+            })
             .map(|candidate| CloneCandidateProfile::create(candidate, weights))
             .collect();
         if all_candidates.is_empty() {
