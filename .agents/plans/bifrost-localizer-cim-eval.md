@@ -152,8 +152,8 @@ The observable outcomes are:
   per-repository `.bifrost/cache-dw10` namespace, so changing embedding fingerprints did not
   invalidate the completed `.bifrost/cache` Granite databases. No dw10 evaluation was run.
 - [ ] Run the three Granite retrieval arms over seeds 0, 1, and 2 at concurrency 30. The final
-  819-cell queue is active as `cimeval-r8-granite-grid-final.service` and started from exactly
-  the 273 baseline completions.
+  queue is active as `cimeval-r8-granite-grid-mj26.service`; the reportable directory started
+  from exactly the 273 baseline completions.
 - [x] (2026-07-31, campaign gate) Validated the immutable semantic runtime before the full
   queue. Two official Flipt sandbox cells ran concurrently against one shared repository DB;
   both completed and scored, both transient units exited successfully with zero restarts, and
@@ -195,8 +195,20 @@ The observable outcomes are:
   `runtime-semantic-context-c4483eb-6c62b71.tgz`, pinning Anvil `c4483eb`, Bifrost `378652eb`,
   Mjolnir `f7ba210`, and brokkbench `6c62b71`. The three semantic completions from superseded
   runtimes were moved, without deletion, to `invalidated/pre-final-runtime`; the reportable cell
-  directory therefore returned to exactly 273 baseline completions. The final 819-cell queue is
-  active at fixed concurrency 30 and uses max-reasoning Bedrock Luna with inline scoring.
+  directory therefore returned to exactly 273 baseline completions. The 819-cell queue started
+  at fixed concurrency 30 with max-reasoning Bedrock Luna and inline scoring, but its first
+  completion failed during ACP setup after concurrent Bedrock catalog discovery timed out and
+  Anvil advertised no model configuration control. The queue was stopped and that sole failed
+  completion was recoverably moved to `invalidated/startup-discovery-timeout`.
+- [x] (2026-07-31, startup-contract repair) Mjolnir `26a3084` launches every selected Anvil seat
+  with its exact provider-qualified `--default-model` and per-seat `--reasoning-effort`, making
+  requested runtime configuration independent of optional provider catalog discovery. All 38
+  focused roster tests, formatting, and Clippy pass. Immutable bundle
+  `runtime-semantic-mj26a3084.tgz` passed official-image preflight. Its one-cell Dubbo gate
+  generated successfully through multiple provider turns and tool rounds; the live process
+  table recorded Luna and `max` on both Mjolnir and Anvil. The smoke was stopped before freezing
+  a result because it had not elected semantic search, and the final queue then started with all
+  30 slots available. The first elected semantic trace remains a live context/budget gate.
 - [x] (2026-07-31, implementation) Brokkbench `64a2da6131f` extends the existing
   multi-arm scheduler with `--seeds`, so the full 91-task by three-arm by three-seed Granite
   matrix can enter one 819-cell queue. A single 30-worker pool now remains occupied through
@@ -310,6 +322,14 @@ The observable outcomes are:
   and deduplicated them to 120, yet recorded `context_bytes=0`. The symbol request exceeded
   Bifrost's 64-symbol schema ceiling, while a large file-summary response degraded to
   `compact_symbols.files`, which the old Anvil parser did not consume.
+
+- Observation: an explicit provider-qualified Mjolnir route was still vulnerable to Anvil's
+  independent startup catalog discovery.
+  Evidence: under the first final 30-way launch, Bedrock discovery timed out after 15 seconds in
+  one Anvil process. Its session default was empty, so `session/new` omitted the model option and
+  Mjolnir aborted with `ACP adapter did not advertise a model configuration control` before a
+  generation request. Passing the already-selected model and effort on the Anvil command line
+  removes catalog discovery from this correctness path.
 
 - Observation: the first official-container baseline smoke failed before any provider request
   because Mjolnir rejected the explicit wire ID `bedrock::openai.gpt-5.6-luna` when Anvil's
