@@ -1494,7 +1494,7 @@ fn member_kind(kind: MemberKind) -> SemanticModelSymbolKind {
 }
 
 fn terminal_name(name: &str) -> &str {
-    name.rsplit(['.', ':', '$'])
+    name.rsplit(['.', ':', '$']) // fqname-M4: declarative model and AST trigger names have no CodeUnit/FqName at this boundary
         .find(|part| !part.is_empty())
         .unwrap_or(name)
 }
