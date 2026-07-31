@@ -73,13 +73,16 @@ The observable outcomes are:
   opt-in direct-Podman networking/mount support in brokkbench commit `e05760f759f`. It resolves
   the released sample, prepares all clones/worktrees, builds immutable runtime bundles, and
   launches a scrubbed task in its official image without changing agenteval defaults.
-- [ ] Finish reportable runtime validation (completed: official Ubuntu 20 images run the
-  bundled GNU Bifrost plus static Mjolnir/Anvil; remaining: rebuild with the Mjolnir explicit
-  Anvil-route fix and pass one PolyBench plus one Pro generation/scoring smoke).
-- [ ] Finish the `cimeval` campaign commands (completed: prepare, runtime preflight, one-cell
-  generation; remaining: sequential prewarm/readiness, concurrent resumable waves, official
-  fresh-container scoring, load sampling, gate, and report aggregation).
-- [ ] Run provider preflight and the no-semantic seed-0 baseline at concurrency 30.
+- [x] (2026-07-31, implementation) Finished reportable runtime validation: official task
+  images run the bundled GNU Bifrost plus static Mjolnir/Anvil, Mjolnir commit `3e046fca`
+  routes explicit provider-qualified Anvil model IDs, and one PolyBench plus one Pro task
+  completed generation and independent fresh-container scoring.
+- [x] (2026-07-31, implementation) Finished the core `cimeval` campaign commands in
+  brokkbench commits `ce64f24fbb8` and `1f1d708aba1`: serial production prewarm, concurrent
+  resumable waves, official fresh-container scoring, load sampling, and report aggregation.
+- [ ] Run provider preflight and the no-semantic seed-0 baseline at concurrency 30 (two-family
+  Bedrock smoke complete with zero provider/trace failures; remaining 89 cells await official
+  image staging on the Optane-backed Podman store).
 - [ ] Pass the baseline sanity gate, then run baseline seeds 1 and 2 with measured concurrency
   escalation.
 - [ ] Precompute all Granite indexes on the A4000 at concurrency one while baseline cells run.
@@ -165,6 +168,28 @@ The observable outcomes are:
   Evidence: the remote runner creates the trace only through Anvil semantic-search telemetry;
   the cell collector now treats that trace and candidate telemetry as optional while retaining
   Mjolnir and Anvil stderr/stream files as required core artifacts.
+
+- Observation: Bedrock Luna completed both a SWE-bench Pro Ansible generation (42 tool calls,
+  107.9 seconds) and a SWE-PolyBench Dubbo generation (36 tool calls, 434.3 seconds) without a
+  provider or trace error. Independent fresh-container scoring resolved Ansible and correctly
+  rejected Dubbo because its patch caused a Java interface compilation failure.
+  Evidence: the two completed `baseline--seed-0` cells and their `score/result.json` records in
+  `/mnt/optane/bifrost-nlp-resources/runs/granite-r2-cim-20260731-r1`.
+
+- Observation: the official PolyBench evaluation applies both test and model patches first
+  with `git apply --ignore-whitespace --reject`, then falls back to GNU `patch --batch
+  --fuzz=5 -p1 -f`; importing its parser package normally also imports an unrelated Docker
+  dependency.
+  Evidence: the released PolyBench evaluation source and the Dubbo scoring smoke. The CIM
+  scorer now mirrors the patch behavior and loads the official constants/parser modules
+  without executing the package's unrelated initialization.
+
+- Observation: staging all 91 official OCI images in rootless Podman's default graph root
+  would consume the much smaller home filesystem.
+  Evidence: 89 images were initially absent and `/home` had about 105 GB free. The campaign
+  instead uses a generated `CONTAINERS_STORAGE_CONF` whose graph root is
+  `/mnt/optane/bifrost-nlp-resources/podman-storage`; it is populated in parallel before the
+  30-cell wave starts.
 
 ## Decision Log
 
@@ -252,6 +277,13 @@ The observable outcomes are:
   OpenRouter Luna. Never mix providers in the reported cells.
   Rationale: Bedrock was recently flaky.
   Date/Author: 2026-07-31, user and Codex.
+
+- Decision: store reportable campaign OCI layers under the Optane resource root rather than
+  rootless Podman's default home graph root.
+  Rationale: the 91-image official task set is large, while Optane has sufficient capacity and
+  keeps evaluation assets together. Every generation and scoring process receives the same
+  generated storage configuration so image identity and reuse remain consistent.
+  Date/Author: 2026-07-31, Codex.
 
 - Decision: stop after the Granite report and inventory changes across Bifrost, Anvil, and
   brokkbench.
