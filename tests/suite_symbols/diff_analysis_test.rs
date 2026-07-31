@@ -1260,7 +1260,9 @@ fn analyze_diff_snapshot_untracked_edit_delete_add_rename_and_binary() {
 fn analyze_diff_rejects_blob_endpoints_and_keeps_commits_available_with_alternate() {
     let temp = TempDir::new().unwrap();
     let root = temp.path();
-    git(root, &["init"]);
+    // The revision loop below resolves the branch by name, so pin the initial
+    // branch instead of inheriting the host's `init.defaultBranch`.
+    git(root, &["init", "-b", "master"]);
     git(root, &["config", "user.email", "tester@example.com"]);
     git(root, &["config", "user.name", "Tester"]);
     fs::write(root.join("lib.go"), "package sample\nfunc Old() {}\n").unwrap();

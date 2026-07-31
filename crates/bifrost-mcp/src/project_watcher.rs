@@ -98,13 +98,33 @@ fn event_handler(
     let project_for_callback = Arc::clone(project);
     move |result: notify::Result<Event>| match result {
         Ok(event) => handle_event(&project_for_callback, &pending_for_callback, event),
-        Err(_) => mark_full_refresh(&pending_for_callback),
+        Err(_) => {
+            project_for_callback.invalidate_cached_file_listing();
+            mark_full_refresh(&pending_for_callback);
+        }
     }
 }
 
 fn handle_event(project: &Arc<dyn Project>, pending: &Arc<Mutex<PendingChanges>>, event: Event) {
     if matches!(event.kind, EventKind::Access(_)) {
         return;
+    }
+
+    // Any real change may add or remove listed paths, or alter what the
+    // listing means (`.gitignore` edits, git index updates), so drop the
+    // session's cached workspace listing before classification below --
+    // `classify_project_path` consults `is_gitignored`, which refills the
+    // cache from the now-current filesystem state. Events touching only the
+    // analyzer's own SQLite state are exempt, exactly like the snapshot: those
+    // writes follow every analyzed change, and letting them drop the listing
+    // would defeat the cache during normal operation.
+    if event.paths.is_empty()
+        || event
+            .paths
+            .iter()
+            .any(|path| !is_internal_state_path(project.as_ref(), path))
+    {
+        project.invalidate_cached_file_listing();
     }
 
     if event.paths.is_empty() {
@@ -150,22 +170,8 @@ fn classify_project_path(project: &dyn Project, path: &Path) -> PathDisposition 
     if rel_path.as_os_str().is_empty() {
         return PathDisposition::RefreshFallback;
     }
-    // Generated SQLite state writes inside the watched workspace. Treating
-    // those writes as source changes repeatedly invalidates analyzer snapshots,
-    // but the rest of `.bifrost` is tracked project input and must remain live.
-    let mut components = rel_path.components();
-    if components
-        .next()
-        .is_some_and(|component| component.as_os_str() == crate::gitblob::PROJECT_DIR_NAME)
-    {
-        let child = components.next();
-        if child.is_some_and(|component| {
-            component.as_os_str() == crate::gitblob::CACHE_SUBDIR_NAME
-                || (components.next().is_none()
-                    && crate::cache_db::is_legacy_project_cache_file_name(component.as_os_str()))
-        }) {
-            return PathDisposition::IgnoredInternal;
-        }
+    if is_internal_state_rel_path(rel_path) {
+        return PathDisposition::IgnoredInternal;
     }
 
     let file = ProjectFile::new(project.root().to_path_buf(), rel_path.to_path_buf());
@@ -174,6 +180,36 @@ fn classify_project_path(project: &dyn Project, path: &Path) -> PathDisposition 
     }
 
     PathDisposition::ProjectFile(file)
+}
+
+/// Whether `path` is analyzer-owned state inside the workspace, judged by the
+/// path alone so it can gate listing-cache invalidation before any
+/// classification that itself reads the listing. Paths outside the root are
+/// not internal: they feed the refresh fallback.
+fn is_internal_state_path(project: &dyn Project, path: &Path) -> bool {
+    let path = path.to_path_buf().normalize();
+    path.strip_prefix(project.root())
+        .is_ok_and(is_internal_state_rel_path)
+}
+
+/// Generated SQLite state writes inside the watched workspace. Treating those
+/// writes as source changes would repeatedly invalidate analyzer snapshots and
+/// the cached file listing, but the rest of `.bifrost` is tracked project
+/// input and must remain live.
+fn is_internal_state_rel_path(rel_path: &Path) -> bool {
+    let mut components = rel_path.components();
+    if components
+        .next()
+        .is_none_or(|component| component.as_os_str() != crate::gitblob::PROJECT_DIR_NAME)
+    {
+        return false;
+    }
+    let child = components.next();
+    child.is_some_and(|component| {
+        component.as_os_str() == crate::gitblob::CACHE_SUBDIR_NAME
+            || (components.next().is_none()
+                && crate::cache_db::is_legacy_project_cache_file_name(component.as_os_str()))
+    })
 }
 
 fn mark_full_refresh(pending: &Arc<Mutex<PendingChanges>>) {
@@ -416,6 +452,58 @@ mod tests {
             );
             assert!(!state.requires_full_refresh);
         }
+    }
+
+    #[test]
+    fn events_invalidate_the_projects_cached_file_listing() {
+        use crate::WorkspaceFileListingCache;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project: Arc<dyn crate::Project> = Arc::new(
+            FilesystemProject::with_cached_listing(root.clone(), Arc::clone(&cache)).unwrap(),
+        );
+
+        cache.files().unwrap();
+        let extra = ProjectFile::new(root.clone(), "src/extra.rs");
+        fs::write(extra.abs_path(), "fn extra() {}\n").unwrap();
+        assert!(
+            !cache.files().unwrap().contains(&extra),
+            "listing must be cached until an event invalidates it"
+        );
+
+        // Analyzer-owned SQLite state writes must not drop the listing: they
+        // follow every analyzed change and would defeat the cache.
+        let cache_db = root
+            .join(crate::gitblob::PROJECT_DIR_NAME)
+            .join(crate::gitblob::CACHE_SUBDIR_NAME)
+            .join(crate::cache_db::CACHE_DB_FILE_NAME);
+        fs::create_dir_all(cache_db.parent().unwrap()).unwrap();
+        fs::write(&cache_db, "cache state").unwrap();
+        let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        handle_event(
+            &project,
+            &pending,
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(cache_db),
+        );
+        assert!(
+            !cache.files().unwrap().contains(&extra),
+            "internal cache-state events must not drop the cached listing"
+        );
+
+        handle_event(
+            &project,
+            &pending,
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(extra.abs_path()),
+        );
+
+        assert!(
+            cache.files().unwrap().contains(&extra),
+            "a watcher event must drop the cached listing"
+        );
     }
 
     #[test]
