@@ -4,6 +4,7 @@
 //! versioned source model, validation, canonical compilation, and defensive artifact decoding.
 
 mod artifact;
+mod catalog;
 mod compiler;
 mod identity;
 mod model;
@@ -16,6 +17,7 @@ pub use artifact::{
     CompiledSemanticModelPack, CompiledShard, CompiledShardDescriptor, DecodeLimits, PayloadKind,
     decode_manifest, decode_shard, decode_shard_for_manifest,
 };
+pub use catalog::*;
 pub use compiler::{CompilerOptions, CompressionPolicy, compile_pack, compile_source};
 pub use identity::{MemberIdentity, TypeIdentity, member_declaration_id, type_declaration_id};
 pub use model::*;
