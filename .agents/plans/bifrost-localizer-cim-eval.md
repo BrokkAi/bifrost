@@ -88,6 +88,8 @@ The observable outcomes are:
 - [ ] Pass the baseline sanity gate, then run baseline seeds 1 and 2 with measured concurrency
   escalation.
 - [ ] Precompute all Granite indexes on the A4000 at concurrency one while baseline cells run.
+  Fourteen of the 15 repository-shared indexes have immutable `READY.json` records; the final
+  `trinodb/trino` profiler remains active against the healthy Granite sidecar.
 - [ ] Run the three Granite retrieval arms over seeds 0, 1, and 2 with measured concurrency
   escalation.
 - [ ] Score, leak-audit, analyze, and report the baseline and Granite results.
@@ -192,6 +194,18 @@ The observable outcomes are:
   instead uses a generated `CONTAINERS_STORAGE_CONF` whose graph root is
   `/mnt/optane/bifrost-nlp-resources/podman-storage`; it is populated in parallel before the
   30-cell wave starts.
+
+- Observation: repository embedding and task-image staging are independent storage pipelines.
+  Granite's shared SQLite indexes live with the 15 primary clones under
+  `/home/jonathan/Projects/brokkbench/clones/`, while Podman stores immutable task-image layers
+  in its configured graph root. Moving the graph root does not copy, invalidate, or rebuild an
+  embedding index.
+
+- Observation: `/mnt/containers` is a large XFS filesystem with project quotas and native
+  overlay support, but its top level is root-owned. The existing `/mnt/containers/podman`
+  namespace is user-owned; creating the specifically requested sibling
+  `/mnt/containers/code_isnt_memory` requires one administrator-created directory before the
+  controller can initialize its store.
 
 - Observation: the initial r1 baseline wave was not sane: 6 of the first 17 completed traces
   attempted either repository-history inspection or web search, including RocketMQ 4122.
@@ -311,12 +325,15 @@ The observable outcomes are:
   Rationale: Bedrock was recently flaky.
   Date/Author: 2026-07-31, user and Codex.
 
-- Decision: store reportable campaign OCI layers under the Optane resource root rather than
-  rootless Podman's default home graph root.
-  Rationale: the 91-image official task set is large, while Optane has sufficient capacity and
-  keeps evaluation assets together. Every generation and scoring process receives the same
-  generated storage configuration so image identity and reuse remain consistent.
-  Date/Author: 2026-07-31, Codex.
+- Decision: store reportable campaign OCI layers under
+  `/mnt/containers/code_isnt_memory/podman-storage` using XFS-native overlay rather than under
+  the Optane resource root or rootless Podman's default home graph root. Preserve the old
+  Optane store until the new image inventory and a task-container smoke test pass.
+  Rationale: the 91-image official task set is large, `/mnt/containers` is the dedicated large
+  XFS volume, and native overlay avoids the FUSE workaround required by the previous store.
+  Every generation and scoring process receives the same generated storage configuration so
+  image identity and reuse remain consistent.
+  Date/Author: 2026-07-31, user and Codex.
 
 - Decision: stop after the Granite report and inventory changes across Bifrost, Anvil, and
   brokkbench.
