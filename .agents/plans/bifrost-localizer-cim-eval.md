@@ -96,10 +96,13 @@ The observable outcomes are:
   official test command run only after the agent patch and artifacts are captured. The prior
   separate pristine scorer remains available as `--scoring-mode pristine`; r5's already-closed
   generation sandboxes necessarily use it for their one-time score pass.
-- [ ] Pass the baseline sanity gate, then run baseline seeds 1 and 2 at concurrency 30. Seed 0
-  resolves 31/91 (34.1%), has zero unmitigated leak findings, and passes the legitimate-count,
-  resolve-band, and tool-call checks. New scheduling is stopped because mean uncached tokens
-  are 49.6k against the precommitted 5k-30k band; this must be resolved before seeds 1 and 2.
+- [ ] Finish baseline seeds 1 and 2 at concurrency 30. The corrected maximum-effort seed 0
+  resolves 49/91 (53.8%), has zero unmitigated leak findings, mean 39.6 turns, and baseline
+  Acc@5 50.5%. Resolve and turns are sane against CIM's published SC-OFF/OpenCode results.
+  Mean uncached-equivalent usage is 152.8k rather than the precommitted 5k-30k comparison
+  band; this is retained as a material Luna-max effort/cost warning, but it is no longer treated
+  as evidence of a broken harness because outcome, localization, turn, provider, timeout, and
+  leak checks all pass and the user explicitly selected maximum reasoning effort.
 - [x] (2026-07-31 10:01Z) Precomputed all Granite indexes on the A4000 at repository concurrency
   one. Bifrost commit `e36d4e6e` parallelizes each 64-file extraction group while preserving
   serial output order. The 15 repository `READY.json` records cover all 91 tasks. After resuming
@@ -127,6 +130,16 @@ The observable outcomes are:
   `scorer_failed` cell results with tracebacks instead of escaping a worker and canceling every
   queued future. All 24 cimeval tests and Ruff pass. The same immutable r8 run resumed with its
   38 completed cells intact and refilled to 30 live task containers.
+- [x] (2026-07-31 21:02Z) Corrected inline verifier overlap without reverting to a second
+  container for every cell. Forty-three of 91 max-baseline agents edited paths also touched by
+  held-out test patches, so brokkbench `3d5ffbc134c`, `155f7ebb44d`, and `2faaaa359ec` retain the
+  inline diagnostic and selectively publish a versioned pristine score. Git's patch parser
+  identifies held-out paths; candidate edits to those paths are omitted while production edits
+  are applied to the hidden-test checkout. All 43 conflicts have v2 scores, 30 of which resolve.
+  A real RocketMQ smoke ran official tests for 237 seconds and changed an artificial conflict
+  into a genuine resolve. Brokkbench `906c46377fb` also records shell network attempts as
+  mitigated by the enforced `ANVIL_OFFLINE_SHELL` network namespace; the regenerated audit has
+  91 cells and zero unmitigated findings. All 28 cimeval tests and Ruff pass.
 - [ ] (2026-07-31 18:55Z) Prewarm dw10 serially on the A4000. The first attempt was stopped
   after 42 task revisions because it incorrectly selected stock Voyage's `parent_alpha=0.5`.
   Bifrost `bac89d82` adds an explicit fingerprinted `dw10` profile with the checkpoint's
@@ -194,6 +207,12 @@ The observable outcomes are:
   with exit 128 in an official Ansible image. The service's automatic retry was stopped before
   it could repeat the expensive failure, and the corrected resume immediately created 30 live
   task containers.
+
+- Observation: inline scoring is not accurate enough by itself for this workload because agents
+  commonly edit the same public test files extended by the held-out patch.
+  Evidence: 43/91 r8 cells had `test_patch_applied=false`; zero of r5's 91 pristine scores had
+  that condition. Selective v2 pristine rescoring recovered 30 resolves and produced the final
+  49/91 baseline, while preserving successful inline scores and both failed diagnostic passes.
 
 - Observation: the WSL shim is available at `/usr/lib/wsl/lib/nvidia-smi`; the requested GPU is
   index 2, UUID `GPU-13db0817-4937-36dc-3061-d51b47799ce9`, model `NVIDIA RTX A4000`, with
@@ -431,6 +450,15 @@ The observable outcomes are:
   harness defects.
   Date/Author: 2026-07-31, user.
 
+- Decision: proceed after the corrected maximum-effort seed 0 despite retaining the token-band
+  check as a failed comparability warning.
+  Rationale: the final seed resolves 49/91 (53.8%), averages 39.6 turns, has baseline Acc@5
+  50.5%, zero provider/scorer failures, and zero unmitigated leak findings. These outcome and
+  behavior measures are sane against CIM. The 152.8k uncached-equivalent usage is a genuine
+  Luna-max effort/cost difference from CIM's Claude Opus 4.7 cells, not evidence that the run is
+  malfunctioning; reducing reasoning effort would contradict the user's explicit correction.
+  Date/Author: 2026-07-31, Codex.
+
 - Decision: keep model-provider networking in the task container, but run every Anvil shell
   child in a fresh Linux network namespace when `ANVIL_OFFLINE_SHELL` is set; reject any
   outside-sandbox shell override in that mode. Also remove web tools and replace task Git
@@ -468,6 +496,15 @@ The observable outcomes are:
   from verifier setup observing agent-mutated container state or a hidden patch interacting
   differently with the live checkout. Total worker concurrency remains capped at 30.
   Date/Author: 2026-07-31, user and Codex.
+
+- Decision: supersede the accepted inline corner-case loss with selective versioned pristine
+  fallback whenever the held-out patch cannot apply to the live agent checkout.
+  Rationale: overlap occurred in 43/91 cells, so it was not a corner case. Successful inline
+  scores still avoid a second container. Conflicts preserve the inline diagnostic, then use
+  Git-parsed held-out paths to omit agent edits to hidden-test files while applying production
+  changes and running the official scorer in a fresh task image. Reports prefer only a completed
+  v2 fallback, preserving immutable provenance and scorer fidelity.
+  Date/Author: 2026-07-31, Codex.
 
 - Decision: Anvil uses retrieval overfetch multiplier `m=2`; model-facing `k` has minimum 1,
   maximum 20, and default 20.
