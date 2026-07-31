@@ -9,3 +9,10 @@ Append new forward-only migrations and increment the catalog version in
 `PRAGMA user_version` without modifying the database. Migration SQL contains
 schema and data changes only, ends statements with semicolons, and contains no
 transaction control or connection pragmas.
+
+Current history:
+
+- `0001-current-baseline.sql`: immutable pack, object, selector, source, and
+  quarantine catalog.
+- `0002-lifecycle.sql`: pins, workspace activations, reader leases, install
+  reservations, and GC indexes.

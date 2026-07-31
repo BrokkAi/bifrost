@@ -60,7 +60,7 @@ pub(super) fn publish(
     let parent = destination
         .parent()
         .expect("digest object path always has a parent");
-    reject_symlink(parent, "object prefix directory")?;
+    reject_object_tree(root, parent)?;
     fs::create_dir_all(parent)
         .map_err(|error| CatalogError::io("create object prefix directory", error))?;
     reject_symlink(&destination, "catalog object")?;
@@ -100,10 +100,10 @@ pub(super) fn read(
         ));
     }
     let path = root.join(expected);
-    reject_symlink(
+    reject_object_tree(
+        root,
         path.parent()
             .expect("digest object path always has a prefix directory"),
-        "object prefix directory",
     )?;
     reject_symlink(&path, "catalog object")?;
     verify(&path, digest, stored_size)?;
@@ -115,6 +115,28 @@ pub(super) fn read(
         .and_then(|mut file| file.read_to_end(&mut bytes))
         .map_err(|error| CatalogError::io("read catalog object", error))?;
     Ok(bytes)
+}
+
+pub(super) fn delete(root: &Path, relative: &str, digest: &str) -> Result<bool, CatalogError> {
+    validate_digest(digest)?;
+    let expected = relative_object_path(digest);
+    if Path::new(relative) != expected {
+        return Err(CatalogError::Integrity(
+            "catalog object path does not match its digest".to_owned(),
+        ));
+    }
+    let path = root.join(expected);
+    reject_object_tree(
+        root,
+        path.parent()
+            .expect("digest object path always has a prefix directory"),
+    )?;
+    reject_symlink(&path, "catalog object")?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(CatalogError::io("delete catalog object", error)),
+    }
 }
 
 fn verify(path: &Path, digest: &str, stored_size: u64) -> Result<(), CatalogError> {
@@ -158,6 +180,13 @@ fn validate_digest(digest: &str) -> Result<(), CatalogError> {
 fn sha256(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("{digest:x}")
+}
+
+fn reject_object_tree(root: &Path, prefix: &Path) -> Result<(), CatalogError> {
+    for path in [root.join("objects"), root.join("objects/sha256")] {
+        reject_symlink(&path, "catalog object directory")?;
+    }
+    reject_symlink(prefix, "object prefix directory")
 }
 
 fn reject_symlink(path: &Path, label: &str) -> Result<(), CatalogError> {

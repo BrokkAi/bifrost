@@ -48,8 +48,10 @@ belong to issues #1147 and later children of #1144.
   file-backed SHA-256 CAS, fully validated and atomic concurrent installation,
   indexed selector discovery, verified loading, durable/read-only quarantine
   behavior, source attribution, and deduplicated accounting.
-- [ ] Implement session-only embedded/ephemeral entries, workspace active-set
-  references, durable activation scopes, leases, and garbage collection.
+- [x] (2026-07-31 08:03Z) Implemented session-only embedded/ephemeral entries,
+  workspace schema 13 active-set authority, coordinated durable activation
+  scopes, pins, expiring reader leases, install reservations, deduplicated
+  active accounting, and bounded race-safe garbage collection.
 - [ ] Complete migration, read-only, downgrade, corruption, concurrency,
   documentation, packaging, policy, and featureless Rust validation.
 
@@ -95,6 +97,21 @@ belong to issues #1147 and later children of #1144.
   new library pass with `-D warnings`. The broader all-target gate remains
   blocked by three unrelated `unnecessary_to_owned` warnings in
   `analyzer/usages/workspace_graph.rs`.
+
+- Observation: File-first installation and metadata-first GC need an explicit
+  handshake even though neither publishes a partial pack.
+  Evidence: without a short-lived stored-digest reservation, an installer could
+  verify an existing orphan object before its metadata transaction while GC
+  concurrently removed that same unreferenced file. Version 2 adds expiring
+  install reservations, and GC rechecks them under an immediate transaction
+  while deleting each object.
+
+- Observation: Milestone 2's catalog baseline was already checkpointed as
+  schema version 1.
+  Evidence: adding lifecycle tables to that SQL in place would make an
+  existing version-1 catalog appear current while lacking required tables.
+  The lifecycle schema therefore ships as forward-only migration 2, with a
+  preservation test from version 1.
 
 ## Decision Log
 
@@ -176,6 +193,22 @@ belong to issues #1147 and later children of #1144.
   a known-corrupt payload on every lookup. Conversely, a stale or
   caller-altered candidate must be a plain safe miss rather than an authority
   to quarantine an otherwise valid manifest.
+  Date/Author: 2026-07-31 / Codex
+
+- Decision: Reserve every validated stored digest in SQLite before publishing
+  or reusing its CAS file, then release the reservation in the final pack
+  transaction.
+  Rationale: The reservation is not discoverable pack metadata, so partial
+  packs remain impossible, while GC can see an in-flight install and cannot
+  delete an object between file verification and metadata publication. Expiry
+  makes crash recovery bounded.
+  Date/Author: 2026-07-31 / Codex
+
+- Decision: Represent ephemeral workspaces with an owned temporary catalog
+  root and session-only pack registration.
+  Rationale: The same schema and validation paths receive coverage without
+  mutating the shared user catalog. The catalog closes its SQLite handles
+  before deleting the temporary root, including on Windows.
   Date/Author: 2026-07-31 / Codex
 
 - Decision: Use durable activation scopes and expiring reader leases as

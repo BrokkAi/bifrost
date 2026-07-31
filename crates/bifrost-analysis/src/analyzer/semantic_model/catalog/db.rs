@@ -6,9 +6,11 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use super::{CatalogError, CatalogOpenMode};
 
 pub(super) const CATALOG_DB_FILE_NAME: &str = "catalog.db";
-const CURRENT_CATALOG_VERSION: i64 = 1;
+const CURRENT_CATALOG_VERSION: i64 = 2;
 const BASELINE_SQL: &str =
     include_str!("../../../../migrations/semantic-pack-catalog/0001-current-baseline.sql");
+const LIFECYCLE_SQL: &str =
+    include_str!("../../../../migrations/semantic-pack-catalog/0002-lifecycle.sql");
 
 pub(super) fn open(root: &Path, mode: CatalogOpenMode) -> Result<Connection, CatalogError> {
     let path = root.join(CATALOG_DB_FILE_NAME);
@@ -27,6 +29,15 @@ pub(super) fn open(root: &Path, mode: CatalogOpenMode) -> Result<Connection, Cat
     connection
         .busy_timeout(Duration::from_secs(5))
         .map_err(|error| CatalogError::sqlite("configure busy timeout", error))?;
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| CatalogError::sqlite("read catalog schema version", error))?;
+    if version > CURRENT_CATALOG_VERSION {
+        return Err(CatalogError::CatalogTooNew {
+            found: version,
+            supported: CURRENT_CATALOG_VERSION,
+        });
+    }
     match mode {
         CatalogOpenMode::ReadWrite => configure_writer(&mut connection)?,
         CatalogOpenMode::ReadOnly => configure_reader(&connection)?,
@@ -92,10 +103,15 @@ fn migrate(connection: &mut Connection, mode: CatalogOpenMode) -> Result<(), Cat
         transaction
             .execute_batch(BASELINE_SQL)
             .map_err(|error| CatalogError::sqlite("apply catalog baseline", error))?;
-        transaction
-            .pragma_update(None, "user_version", CURRENT_CATALOG_VERSION)
-            .map_err(|error| CatalogError::sqlite("publish catalog schema version", error))?;
     }
+    if locked_version <= 1 {
+        transaction
+            .execute_batch(LIFECYCLE_SQL)
+            .map_err(|error| CatalogError::sqlite("apply catalog lifecycle migration", error))?;
+    }
+    transaction
+        .pragma_update(None, "user_version", CURRENT_CATALOG_VERSION)
+        .map_err(|error| CatalogError::sqlite("publish catalog schema version", error))?;
     transaction
         .commit()
         .map_err(|error| CatalogError::sqlite("commit catalog migration", error))

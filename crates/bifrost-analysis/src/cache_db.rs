@@ -18,7 +18,7 @@ pub const LEGACY_SEMANTIC_DB_FILE_NAME: &str = "semantic_cache.db";
 pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 
 const BASELINE_MIGRATION_VERSION: i64 = 1;
-const CURRENT_MIGRATION_VERSION: i64 = 12;
+const CURRENT_MIGRATION_VERSION: i64 = 13;
 const BASELINE_CACHE_STATE_VERSIONS: (i64, i64, i64) = (1, 1, 10);
 const CURRENT_BASELINE_SQL: &str = include_str!("../migrations/cache/0001-current-baseline.sql");
 const PATH_SYMBOL_UNITS_SQL: &str = include_str!("../migrations/cache/0002-path-symbol-units.sql");
@@ -39,6 +39,8 @@ const IDENTIFIER_LOOKUP_MEMBERSHIP_SQL: &str =
 const CODE_UNIT_TEST_REGION_SQL: &str =
     include_str!("../migrations/cache/0011-code-unit-test-region.sql");
 const FQ_SEGMENTS_SQL: &str = include_str!("../migrations/cache/0012-fq-segments.sql");
+const SEMANTIC_MODEL_ACTIVE_SET_SQL: &str =
+    include_str!("../migrations/cache/0013-semantic-model-active-set.sql");
 const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     CURRENT_BASELINE_SQL,
     PATH_SYMBOL_UNITS_SQL,
@@ -52,6 +54,7 @@ const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     IDENTIFIER_LOOKUP_MEMBERSHIP_SQL,
     CODE_UNIT_TEST_REGION_SQL,
     FQ_SEGMENTS_SQL,
+    SEMANTIC_MODEL_ACTIVE_SET_SQL,
 ];
 #[cfg(test)]
 static CACHE_MIGRATIONS: Lazy<Migrations<'static>> =
@@ -89,6 +92,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
         .expect("apply code unit test region migration");
     conn.execute_batch(FQ_SEGMENTS_SQL)
         .expect("apply fq segments migration");
+    conn.execute_batch(SEMANTIC_MODEL_ACTIVE_SET_SQL)
+        .expect("apply semantic model active set migration");
     schema_object_definitions(&conn).expect("read current schema definitions")
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
@@ -1714,12 +1719,9 @@ mod tests {
         // bump forces such rows to re-extract and repopulate real segments).
         let mut conn = Connection::open_in_memory().unwrap();
         configure_connection(&mut conn).unwrap();
-        let pre_column = &CACHE_MIGRATION_SQL[..(CURRENT_MIGRATION_VERSION as usize - 1)];
+        let pre_column = &CACHE_MIGRATION_SQL[..11];
         migrate_with_sql(&mut conn, pre_column).unwrap();
-        assert_eq!(
-            cache_migration_version(&conn).unwrap(),
-            CURRENT_MIGRATION_VERSION - 1
-        );
+        assert_eq!(cache_migration_version(&conn).unwrap(), 11);
         assert!(!column_exists(&conn, "code_units", "fq_segments").unwrap());
 
         let oid = "2222222222222222222222222222222222222222";
@@ -1755,6 +1757,39 @@ mod tests {
             .unwrap();
         assert_eq!(short_name, "Widget");
         assert_eq!(fq_segments, None);
+    }
+
+    #[test]
+    fn semantic_pack_active_set_migration_preserves_analyzer_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        let before_active_sets = &CACHE_MIGRATION_SQL[..12];
+        migrate_with_sql(&mut conn, before_active_sets).unwrap();
+        assert_eq!(cache_migration_version(&conn).unwrap(), 12);
+        let oid = "3333333333333333333333333333333333333333";
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
+            [oid],
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert!(table_exists(&conn, "semantic_pack_active_state").unwrap());
+        assert!(table_exists(&conn, "semantic_pack_active_members").unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM blobs WHERE blob_oid = ?1",
+                [oid],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
     }
 
     #[test]
