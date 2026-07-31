@@ -96,13 +96,15 @@ The observable outcomes are:
   official test command run only after the agent patch and artifacts are captured. The prior
   separate pristine scorer remains available as `--scoring-mode pristine`; r5's already-closed
   generation sandboxes necessarily use it for their one-time score pass.
-- [ ] Finish baseline seeds 1 and 2 at concurrency 30. The corrected maximum-effort seed 0
-  resolves 49/91 (53.8%), has zero unmitigated leak findings, mean 39.6 turns, and baseline
-  Acc@5 50.5%. Resolve and turns are sane against CIM's published SC-OFF/OpenCode results.
-  Mean uncached-equivalent usage is 152.8k rather than the precommitted 5k-30k comparison
-  band; this is retained as a material Luna-max effort/cost warning, but it is no longer treated
-  as evidence of a broken harness because outcome, localization, turn, provider, timeout, and
-  leak checks all pass and the user explicitly selected maximum reasoning effort.
+- [ ] Finish baseline seed 2 at concurrency 30. Seed 1 completed 91/91 cells with 48 resolves
+  (52.7%), zero unmitigated leak findings, mean 42.3 turns, and baseline Acc@5 52.7%; all 91
+  trajectories localized without skips. Its 162.8k mean uncached-equivalent usage repeats seed
+  0's material Luna-max effort/cost warning, while resolve, localization, turns, provider,
+  timeout handling, and leak checks remain operationally sane. The persistent seed-2 service
+  `cimeval-r8-baseline-max-seed2.service` started with all 30 workers active and zero restarts.
+  Across the two completed seeds, seed 0 resolves 49/91 (53.8%) with mean 39.6 turns and Acc@5
+  50.5%; the results remain comparable in outcome, though not token budget, to CIM's published
+  SC-OFF/OpenCode results.
 - [x] (2026-07-31 10:01Z) Precomputed all Granite indexes on the A4000 at repository concurrency
   one. Bifrost commit `e36d4e6e` parallelizes each 64-file extraction group while preserving
   serial output order. The 15 repository `READY.json` records cover all 91 tasks. After resuming
@@ -140,7 +142,9 @@ The observable outcomes are:
   into a genuine resolve. Brokkbench `906c46377fb` also records shell network attempts as
   mitigated by the enforced `ANVIL_OFFLINE_SHELL` network namespace; the regenerated audit has
   91 cells and zero unmitigated findings. All 28 cimeval tests and Ruff pass.
-- [ ] (2026-07-31 18:55Z) Prewarm dw10 serially on the A4000. The first attempt was stopped
+- [ ] (2026-07-31 18:55Z) Prewarm dw10 serially on the A4000. The corrected run has completed
+  88/91 task revisions and is processing the first of the three remaining Trino revisions.
+  The first attempt was stopped
   after 42 task revisions because it incorrectly selected stock Voyage's `parent_alpha=0.5`.
   Bifrost `bac89d82` adds an explicit fingerprinted `dw10` profile with the checkpoint's
   `parent_alpha=0.65` and the shared Voyage prompt/pooling contract. The corrected fresh run is
