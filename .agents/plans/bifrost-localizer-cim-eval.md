@@ -96,15 +96,13 @@ The observable outcomes are:
   official test command run only after the agent patch and artifacts are captured. The prior
   separate pristine scorer remains available as `--scoring-mode pristine`; r5's already-closed
   generation sandboxes necessarily use it for their one-time score pass.
-- [ ] Finish baseline seed 2 at concurrency 30. Seed 1 completed 91/91 cells with 48 resolves
-  (52.7%), zero unmitigated leak findings, mean 42.3 turns, and baseline Acc@5 52.7%; all 91
-  trajectories localized without skips. Its 162.8k mean uncached-equivalent usage repeats seed
-  0's material Luna-max effort/cost warning, while resolve, localization, turns, provider,
-  timeout handling, and leak checks remain operationally sane. The persistent seed-2 service
-  `cimeval-r8-baseline-max-seed2.service` started with all 30 workers active and zero restarts.
-  Across the two completed seeds, seed 0 resolves 49/91 (53.8%) with mean 39.6 turns and Acc@5
-  50.5%; the results remain comparable in outcome, though not token budget, to CIM's published
-  SC-OFF/OpenCode results.
+- [x] (2026-07-31, campaign) Finished and analyzed all three max-reasoning Luna baseline seeds
+  at concurrency 30: 273/273 cells completed, localized, and scored, with 140 resolves (51.3%).
+  Seeds 0, 1, and 2 resolved 49/91 (53.8%), 48/91 (52.7%), and 43/91 (47.3%); their Acc@5 values
+  were 50.5%, 52.7%, and 50.5%. Mean turns were 39.6, 42.3, and 42.3. Mean cost/cell was $0.491,
+  $0.508, and $0.469, for $133.52 total and $0.954 per solve. The regenerated leakage audit
+  inspected all 273 cells and flagged zero. This passes the operational sanity gate and remains
+  comparable in outcome, though not token budget, to CIM's published SC-OFF/OpenCode results.
 - [x] (2026-07-31 10:01Z) Precomputed all Granite indexes on the A4000 at repository concurrency
   one. Bifrost commit `e36d4e6e` parallelizes each 64-file extraction group while preserving
   serial output order. The 15 repository `READY.json` records cover all 91 tasks. After resuming
@@ -142,23 +140,37 @@ The observable outcomes are:
   into a genuine resolve. Brokkbench `906c46377fb` also records shell network attempts as
   mitigated by the enforced `ANVIL_OFFLINE_SHELL` network namespace; the regenerated audit has
   91 cells and zero unmitigated findings. All 28 cimeval tests and Ruff pass.
-- [ ] (2026-07-31 18:55Z) Prewarm dw10 serially on the A4000. The corrected run has completed
-  88/91 task revisions and is processing the first of the three remaining Trino revisions.
-  The first attempt was stopped
+- [x] (2026-07-31, campaign) Prewarmed dw10 serially on the A4000 for all 91 task revisions
+  and all 15 shared repositories. The corrected run exited successfully with zero restarts;
+  Trino's final three revisions produced one repository-ready manifest and a shared
+  `cache-dw10` database. The first attempt was stopped
   after 42 task revisions because it incorrectly selected stock Voyage's `parent_alpha=0.5`.
   Bifrost `bac89d82` adds an explicit fingerprinted `dw10` profile with the checkpoint's
   `parent_alpha=0.65` and the shared Voyage prompt/pooling contract. The corrected fresh run is
-  `/mnt/optane/bifrost-nlp-resources/runs/dw10-cim-20260731-r2`; persistent services
-  `cimeval-dw10-r2-sidecar.service` and `cimeval-dw10-r2-prewarm.service` are active, and the
-  first profiler restarted materialization at 0/1316 while the A4000 reported 99% utilization.
-  dw10 uses the separate per-repository `.bifrost/cache-dw10` namespace so changing embedding
-  fingerprints cannot invalidate the completed `.bifrost/cache` Granite databases.
+  `/mnt/optane/bifrost-nlp-resources/runs/dw10-cim-20260731-r2`. Its sidecar was stopped after
+  readiness so Granite could reuse the A4000 and port 18765. dw10 uses the separate
+  per-repository `.bifrost/cache-dw10` namespace, so changing embedding fingerprints did not
+  invalidate the completed `.bifrost/cache` Granite databases. No dw10 evaluation was run.
 - [ ] Run the three Granite retrieval arms over seeds 0, 1, and 2 at concurrency 30.
 - [x] (2026-07-31, implementation) Brokkbench `64a2da6131f` extends the existing
   multi-arm scheduler with `--seeds`, so the full 91-task by three-arm by three-seed Granite
   matrix can enter one 819-cell queue. A single 30-worker pool now remains occupied through
   the campaign tail instead of draining once per seed; the legacy single-seed CLI and load-log
   names remain unchanged. All 29 cimeval tests and Ruff checks on the touched files pass.
+- [x] (2026-07-31, campaign setup) Prepared the task-side tokenizer-only directory at
+  `runtime/granite-tokenizer` in the r8 run. It contains only the 3.5 MiB `tokenizer.json`
+  (SHA-256 `bb637767e8dfb8044597df6c58243bff2e592ae9e3b310c0bbdb8591f6ac543d`),
+  rather than copying the 372 MiB host model/checkpoint tree into every one of 819 containers.
+  Granite weights remain exclusively in the host A4000 sidecar.
+- [x] (2026-07-31, implementation) Added reproducible final-analysis support in brokkbench
+  `3ce7216dbc0`, `6a94ce2b4ef`, and `83a8979c9a5`: Luna cost/cell and cost/solve,
+  mean-of-seed-means and across-seed standard deviation, CIM-style paired Wilcoxon tests,
+  candidate/reranker/timing aggregation, and versioned immutable runtime bundles. Bifrost
+  `71e8ac64` measures sidecar model-lock queue and service time and serializes retrieval budgets;
+  Anvil `709f227` freezes those diagnostics in its reranker trace. All 31 cimeval tests, focused
+  Bifrost/Anvil tests, formatting, Ruff, and the A4000 real-Granite smoke pass. The semantic
+  runtime bundle records Bifrost `71e8ac64`, Anvil `709f227`, Mjolnir `f7ba210`, and brokkbench
+  `83a8979c9a5`.
 - [ ] Score, leak-audit, analyze, and report the baseline and Granite results.
 - [ ] Run final validation, update this plan's retrospective, commit the Granite report, and
   stop before running any dw10 evaluation arms.
@@ -1012,13 +1024,7 @@ After all Granite DBs are ready:
 
     uv run cimeval run --run-dir <run-dir> \
       --arms all-signals,semantic-only,semantic-coedit-2-1 \
-      --profile granite-r2 --seed 0 --jobs 30 --resume
-    uv run cimeval run --run-dir <run-dir> \
-      --arms all-signals,semantic-only,semantic-coedit-2-1 \
-      --profile granite-r2 --seed 1 --jobs 30 --resume
-    uv run cimeval run --run-dir <run-dir> \
-      --arms all-signals,semantic-only,semantic-coedit-2-1 \
-      --profile granite-r2 --seed 2 --jobs 30 --resume
+      --seeds 0,1,2 --jobs 30 --resume
     uv run cimeval score --run-dir <run-dir>
     uv run cimeval report --run-dir <run-dir> --final
 
