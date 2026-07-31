@@ -435,6 +435,54 @@ class Consumer {
 }
 
 #[test]
+fn java_method_candidate_uses_precise_path_when_scala_files_are_present() {
+    let (_project, analyzer) = mixed_jvm_analyzer_with_files(&[
+        (
+            "com/example/JarManifest.java",
+            r#"
+package com.example;
+
+public class JarManifest {
+    public static JarManifest produceFromClass(Class<?> type) {
+        return new JarManifest();
+    }
+}
+"#,
+        ),
+        (
+            "app/Consumer.scala",
+            r#"
+package app
+
+import com.example.JarManifest
+
+class Consumer {
+  val manifest = JarManifest.produceFromClass(getClass)
+}
+"#,
+        ),
+    ]);
+
+    let report = report(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec![
+                "com/example/JarManifest.java".to_string(),
+                "app/Consumer.scala".to_string(),
+            ],
+            fq_names: vec!["com.example.JarManifest.produceFromClass".to_string()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        report.contains("only usage: app/Consumer.scala"),
+        "{report}"
+    );
+    assert!(!report.contains("no non-self usages found"), "{report}");
+}
+
+#[test]
 fn java_field_candidate_stays_on_precise_path_for_bare_identifier_reads() {
     let (_project, analyzer) = java_analyzer_with_files(&[(
         "com/example/Service.java",

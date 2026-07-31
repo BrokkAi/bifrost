@@ -1,6 +1,6 @@
 use super::extractor::{ReturnTypeCaches, ScanState, scan_file};
 use super::inverted;
-use super::jvm_scala::scan_scala_files_for_java_type;
+use super::jvm_scala::scan_scala_files_for_java_target;
 use super::resolver::TargetSpec;
 use super::return_type::{FileReturnCache, MethodAnonymousReturnCache, MethodReturnCache};
 use crate::analyzer::tree_sitter_analyzer::FileState;
@@ -94,7 +94,7 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
             }
         }
         let _scala_scope = crate::profiling::scope("java_graph::scan_scala_files");
-        scan_scala_files_for_java_type(analyzer, candidate_files, &spec, &mut state, None);
+        scan_scala_files_for_java_target(analyzer, candidate_files, &spec, &mut state, None);
         drop(_scala_scope);
         // A Java class is equally nameable from Kotlin source; the realm is one
         // candidate space, so find-references on a Java type must see its Kotlin

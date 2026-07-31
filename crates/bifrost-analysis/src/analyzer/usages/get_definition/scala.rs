@@ -4040,12 +4040,14 @@ fn scala_import_reference_outcome(
             {
                 let prefix_segments = &structured_path.segments[..=focus_index];
                 let prefix = prefix_segments.join(".");
-                for owner_tier in
-                    scala_owner_qualified_import_candidate_tiers(&enclosing_owners, prefix_segments)
-                {
-                    if let Some(indexed) = scala_fqn_probe(support, owner_tier) {
-                        return Some(candidates_outcome(indexed));
-                    }
+                if let Some(outcome) = scala_wildcard_import_owner_outcome(
+                    ctx,
+                    &lexical_resolver,
+                    root,
+                    node,
+                    prefix_segments,
+                ) {
+                    return Some(outcome);
                 }
                 let lexical_prefixes = if structured_path.lexical_prefixes.is_empty() {
                     resolver.package_prefixes.as_slice()

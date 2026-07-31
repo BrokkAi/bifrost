@@ -102,7 +102,7 @@ pub(crate) fn scan_jvm_files_for_foreign_type(
             return;
         }
     }
-    jvm_scala::scan_scala_files_for_java_type(analyzer, candidate_files, &spec, &mut state, None);
+    jvm_scala::scan_scala_files_for_java_target(analyzer, candidate_files, &spec, &mut state, None);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,6 +127,7 @@ pub(crate) fn dead_code_bulk_eligibility(
     match spec.kind {
         TargetKind::Type if scala_files_present => JavaDeadCodeBulkEligibility::NeedsPrecise,
         TargetKind::Type => JavaDeadCodeBulkEligibility::BulkSafe,
+        TargetKind::Method if scala_files_present => JavaDeadCodeBulkEligibility::NeedsPrecise,
         TargetKind::Method if static_imports_present => JavaDeadCodeBulkEligibility::NeedsPrecise,
         TargetKind::Method if overloaded_fqns.contains(target.fq_name().as_str()) => {
             JavaDeadCodeBulkEligibility::NeedsPrecise

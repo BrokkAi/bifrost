@@ -29143,6 +29143,61 @@ object WebSocketHelpers {
 }
 
 #[test]
+fn scala_import_owner_prefers_companion_object_over_constructor_only_same_name() {
+    let source = r#"
+package app
+
+final class MqttWriter
+
+object MqttWriter {
+  private val TargetFromFieldProperty = "mqtt.target.from.field"
+}
+
+object Consumer {
+  import MqttWriter.TargetFromFieldProperty
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("src/MqttWriter.scala", source)
+        .build();
+
+    let owner = source
+        .find("import MqttWriter.TargetFromFieldProperty")
+        .expect("import owner")
+        + "import ".len();
+    let owner_value = lookup(
+        project.root(),
+        &location_reference("src/MqttWriter.scala", source, owner),
+    );
+    let owner_result = &owner_value["results"][0];
+    assert_eq!(owner_result["status"], "resolved", "{owner_value}");
+    assert_eq!(
+        owner_result["definitions"][0]["fqn"], "app.MqttWriter$",
+        "{owner_value}"
+    );
+    assert_eq!(
+        owner_result["definitions"][0]["kind"], "class",
+        "{owner_value}"
+    );
+    assert_ne!(
+        owner_result["definitions"][0]["fqn"], "app.MqttWriter.MqttWriter",
+        "the import owner must not collapse to the synthetic constructor: {owner_value}"
+    );
+
+    let terminal = owner + "MqttWriter.".len();
+    let terminal_value = lookup(
+        project.root(),
+        &location_reference("src/MqttWriter.scala", source, terminal),
+    );
+    let terminal_result = &terminal_value["results"][0];
+    assert_eq!(terminal_result["status"], "resolved", "{terminal_value}");
+    assert_eq!(
+        terminal_result["definitions"][0]["fqn"], "app.MqttWriter$.TargetFromFieldProperty",
+        "{terminal_value}"
+    );
+}
+
+#[test]
 fn scala_type_position_prefers_type_alias_over_same_named_value() {
     let source = r#"
 package org.http4s.headers

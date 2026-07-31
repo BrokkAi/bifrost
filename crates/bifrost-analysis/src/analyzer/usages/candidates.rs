@@ -309,8 +309,8 @@ fn find_transitive_importers_with_cancellation(
     importers
 }
 
-/// Add candidate files written in the *other* JVM languages for a JVM type
-/// target.
+/// Add candidate files written in another JVM language when the target's usage
+/// strategy can prove references there.
 ///
 /// Java, Scala, and Kotlin share one usage candidate space, so a reference to a
 /// type declared in any of them can live in a file of any of the others. This
@@ -319,9 +319,13 @@ fn find_transitive_importers_with_cancellation(
 /// language" removes the special case rather than adding two more (#1239
 /// milestone 4).
 ///
-/// The membership test is a literal substring scan, and deliberately so: this is
-/// candidate *discovery*, whose contract is to over-approximate. Proving that a
-/// token in one of these files really names the target is the strategy's job,
+/// Java static members are also nameable from Scala. The Java strategy proves
+/// those member references from an explicit Java type receiver, so Scala files
+/// containing the member name must reach that strategy too.
+///
+/// The membership test is a literal substring scan, and deliberately so: this
+/// is candidate *discovery*, whose contract is to over-approximate. Proving that
+/// a token in one of these files really names the target is the strategy's job,
 /// and it does it from the syntax tree.
 fn add_cross_language_jvm_candidates(
     target: &CodeUnit,
@@ -332,13 +336,20 @@ fn add_cross_language_jvm_candidates(
     const JVM_LANGUAGES: [Language; 3] = [Language::Java, Language::Scala, Language::Kotlin];
 
     let target_language = language_for_target(target);
-    if !JVM_LANGUAGES.contains(&target_language) || !target.is_class() {
+    if !JVM_LANGUAGES.contains(&target_language) {
         return;
     }
 
     let target_name = target.identifier();
     let target_fq_name = target.fq_name();
-    for language in JVM_LANGUAGES {
+    let candidate_languages: &[Language] = if target.is_class() {
+        &JVM_LANGUAGES
+    } else if target_language == Language::Java && (target.is_function() || target.is_field()) {
+        &[Language::Scala]
+    } else {
+        return;
+    };
+    for &language in candidate_languages {
         if language == target_language {
             continue;
         }
@@ -455,12 +466,11 @@ fn find_text_candidates(
 /// that sweep and hands the pre-resolved path-scoped files straight to the language strategy,
 /// making cost O(paths) instead of O(workspace) per symbol regardless of how common the symbol is.
 ///
-/// The set is filtered to the target's language because [`super::finder::graph_find_usages`]
-/// dispatches each query to a single language strategy. The one exception is a JVM class: Java,
-/// Scala, and Kotlin share one candidate space, and each of their strategies also scans the other
-/// two languages' files for references to a type, so every JVM file is kept for that case —
-/// mirroring the candidates the workspace-wide path contributes via
-/// `add_cross_language_jvm_candidates`. Dropping them would silently lose those usages.
+/// The set is filtered to the target's language because
+/// [`super::finder::graph_find_usages`] dispatches each query to a single
+/// language strategy. JVM type targets retain every JVM-language file. Java
+/// member targets also retain Scala files because the Java strategy proves
+/// explicit static-owner member references there.
 pub struct ExplicitCandidateProvider {
     files: Arc<HashSet<ProjectFile>>,
 }
@@ -478,16 +488,20 @@ impl CandidateFileProvider for ExplicitCandidateProvider {
         _analyzer: &dyn IAnalyzer,
     ) -> HashSet<ProjectFile> {
         let language = language_for_target(target);
-        // A JVM *type* query resolves usages from every JVM language (see the doc comment), so
-        // those files must reach the strategy alongside the target language's own.
+        // Cross-language files must reach the strategy whenever it has a
+        // structured scanner for that target shape.
         const JVM_LANGUAGES: [Language; 3] = [Language::Java, Language::Scala, Language::Kotlin];
-        let keep_jvm_realm = target.is_class() && JVM_LANGUAGES.contains(&language);
         self.files
             .iter()
             .filter(|file| {
                 let file_language = language_for_file(file);
                 file_language == language
-                    || (keep_jvm_realm && JVM_LANGUAGES.contains(&file_language))
+                    || (target.is_class()
+                        && JVM_LANGUAGES.contains(&language)
+                        && JVM_LANGUAGES.contains(&file_language))
+                    || (language == Language::Java
+                        && (target.is_function() || target.is_field())
+                        && file_language == Language::Scala)
             })
             .cloned()
             .collect()
