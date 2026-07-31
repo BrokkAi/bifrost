@@ -82,16 +82,17 @@ The observable outcomes are:
   resumable waves, official fresh-container scoring, load sampling, and report aggregation.
 - [ ] Run provider preflight and the no-semantic seed-0 baseline at concurrency 30. The first
   r1 wave was stopped and invalidated after leak audit found repository-history and web-search
-  use. Brokkbench commits `842e59230ca` and `ce8bea80e6d` now use tree-identical synthetic-root
-  checkouts, an explicit no-web tool allowlist, trace audit, and Anvil's offline-shell boundary;
-  the formerly leaky RocketMQ 4122 cell is running as the r3 sanity gate.
+  use. The clean r3 wave produced 57 resumable cells before a deterministic Gitlink scrub
+  failure stopped its controller; brokkbench commit `a8012514ec6` fixes the root cause and the
+  exact formerly failing Vuls task now passes setup and runs Luna. All 55 completed cells with
+  a generation exit code report zero, so Bedrock remains healthy while the wave resumes.
 - [ ] Pass the baseline sanity gate, then run baseline seeds 1 and 2 with measured concurrency
   escalation.
-- [ ] Precompute all Granite indexes on the A4000 at concurrency one while baseline cells run.
-  Fourteen of the 15 repository-shared indexes have immutable `READY.json` records; the final
-  `trinodb/trino` repository remains active against the healthy Granite sidecar. Its first task
-  revision completed in 2710.3 seconds with 55,633 indexed chunks; the resumable worker is now
-  materializing the next revision against the same shared cache.
+- [x] (2026-07-31 10:01Z) Precomputed all Granite indexes on the A4000 at repository concurrency
+  one. Bifrost commit `e36d4e6e` parallelizes each 64-file extraction group while preserving
+  serial output order. The 15 repository `READY.json` records cover all 91 tasks. After resuming
+  the partially warm Trino database, the remaining campaign completed in 366.4 seconds; the
+  active CPU stages used roughly 30-45 cores instead of one.
 - [ ] Run the three Granite retrieval arms over seeds 0, 1, and 2 with measured concurrency
   escalation.
 - [ ] Score, leak-audit, analyze, and report the baseline and Granite results.
@@ -234,6 +235,35 @@ The observable outcomes are:
   logs. The resumed Trino revision exposed a live denominator of 1,291 missing files without a
   new progress protocol.
 
+- Observation: semantic file extraction was a single producer loop and dominated Trino index
+  construction: the first Trino revision spent about 2,692 of 2,710 seconds in extraction while
+  GPU embedding took 172 seconds. Bifrost issue #1413 records the regression and WSL profiling
+  limitations. Commit `e36d4e6e` extracts files in a Rayon indexed parallel iterator, merges in
+  input order, and removes the nested per-file summary Rayon call. Its exact serial/parallel
+  equivalence test, focused NLP tests, formatting, and NLP-library clippy pass. On the live
+  resumed Trino index CPU utilization rose from about one core to 30-45 cores; the entire
+  remaining 1,025-file delta and subsequent shared-cache checks completed in 366.4 seconds.
+
+- Observation: 64 concurrent analyzer-store readers make process RSS look much worse than
+  physical memory use because each connection maps the same SQLite pages. During Trino the
+  process reported about 15.2 GB RSS, but `smaps_rollup` showed 9.8 GB shared-clean mappings,
+  5.5 GB proportional usage, and 5.1 GB private memory. The private portion is consistent with
+  the configured 64 MiB page cache per reader. This is future per-reader tuning work, not a
+  blocker on the 98 GiB eval host.
+
+- Observation: the synthetic-root checkout scrub failed deterministically for Vuls task
+  `instance_future-architect__vuls-bff6...` because its source tree contains a Gitlink. Deleting
+  `.git` and re-adding the working tree flattened that entry and changed the tree hash.
+  Brokkbench commit `a8012514ec6` now creates the isolated root commit directly from the
+  verified tree with `git commit-tree`, repoints `HEAD`, and prunes old history. A Gitlink
+  regression test and the exact official task both pass setup.
+
+- Observation: after `/mnt/containers` ownership was corrected to `jonathan:jonathan`, the
+  controller created `/mnt/containers/code_isnt_memory/podman-storage` and verified rootless
+  native-overlay operation on XFS. Parallel image pulls initially showed zero committed images
+  while their first multi-gigabyte layers unpacked, despite 4.24 GB already present; committed
+  image IDs then began appearing normally.
+
 ## Decision Log
 
 - Decision: this delivery implements and evaluates Granite R2 only.
@@ -250,6 +280,14 @@ The observable outcomes are:
   Rationale: extra repository indexers would contend for the already saturated A4000 rather
   than improve throughput.
   Date/Author: 2026-07-31, user.
+
+- Decision: parallelize extraction within that single repository indexer using Rayon's host
+  thread pool, but preserve the input order during the serial merge and keep GPU/indexer
+  concurrency at one.
+  Rationale: the GPU is still saturated by one repository pipeline, while tree-sitter/summary
+  materialization was independently single-core and dominated wall time. Indexed collection
+  and deterministic global deduplication retain the persisted batching contract.
+  Date/Author: 2026-07-31, user and Codex.
 
 - Decision: use Bifrost's `semantic_index_profile` production-pipeline binary as the serial
   prewarm worker rather than teaching the controller to infer readiness from a one-shot query.
