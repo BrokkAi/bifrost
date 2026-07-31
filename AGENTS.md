@@ -37,9 +37,10 @@ will not go looking for an issue it was never told about.
 
 ## After v0.9.0: delete the hand-written MCP stack
 
-`crates/bifrost-mcp/src/mcp_common.rs` still contains Bifrost's pre-`rmcp` MCP implementation,
-reachable only via `BIFROST_MCP_RMCP=off`. It exists as a rollback lever because `rmcp` 3.0 was
-days old when issue #1328 adopted it, and it is not meant to outlive that caution.
+`crates/bifrost-mcp/src/mcp_common.rs` still contains Bifrost's pre-`rmcp` MCP implementation.
+It is currently the default; `BIFROST_MCP_RMCP=on` selects the `rmcp` host. Two steps precede the
+removal below: flip the default to `on`, then let it ride. Both exist because `rmcp` 3.0 was days
+old when issue #1328 adopted it, and neither is meant to outlive that caution.
 
 Remove the protocol half: `dispatch_message`, `dispatch_request`, `handle_notification`,
 `handle_response`, `McpConnectionState`, `McpRequestCancellations`, `OutboundMcpResponse` and
@@ -58,7 +59,11 @@ constants. The crate's entry point currently dispatches *from* the old module *i
 Do this promptly rather than when convenient. While both hosts exist the Codex sandbox
 authorization boundary has two copies that must be fixed in lockstep, and that duplication is
 exactly how the pre-handshake bypass in `09e37dd1` reached a green test suite: a security
-predicate was hand-copied and quietly lost a conjunct.
+predicate was hand-copied and quietly lost a conjunct. It is not a one-off risk either: the very
+first upstream sync after the hosts diverged landed a `run_policy` feature (#1394) on the
+hand-written host alone, and it had to be ported across by hand. Until the deletion, treat any
+change to MCP behaviour as a change to two implementations, and prefer sharing a function over
+copying it.
 
 # Analyzer Test Guidance
 

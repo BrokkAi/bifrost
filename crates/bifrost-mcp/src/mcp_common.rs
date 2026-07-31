@@ -378,26 +378,24 @@ pub fn run_stdio_server(
     )
 }
 
-/// Falls back to the hand-written MCP stack below instead of the `rmcp` host.
+/// Selects the `rmcp`-backed MCP host instead of the hand-written stack below.
 ///
-/// `rmcp` is the default. This is a rollback lever, not a feature flag: if the
-/// SDK-backed host misbehaves against some client in the field, setting
-/// `BIFROST_MCP_RMCP=off` restores the previous protocol implementation
-/// without a release. It exists because `rmcp` 3.0 was days old when Bifrost
-/// adopted it (issue #1328), and it is meant to be short-lived -- while both
-/// hosts exist, the Codex sandbox authorization boundary has two copies that
-/// must be fixed in lockstep, which is a standing hazard rather than a
-/// feature. The contract suite runs the rootless scenarios against both hosts
-/// so neither can rot silently.
+/// Off by default while the migration lands. The `rmcp` host is complete and
+/// the contract suite exercises both, but `rmcp` 3.0 was days old when Bifrost
+/// adopted it (issue #1328), so the switch stays opt-in until the new host has
+/// run against real clients. Flipping the default to `on` is a deliberate,
+/// separate step; deleting the stack below is the step after that.
 ///
-/// Removal is tracked separately; delete this switch, `mcp_common`'s protocol
-/// half, and the `McpHost` matrix in the contract suite together.
+/// While both hosts exist, anything that changes MCP behaviour has to be
+/// applied to both. That is not hypothetical -- the first upstream sync after
+/// the hosts diverged landed a `run_policy` feature on this one alone, and it
+/// had to be ported by hand. See the Scheduled removals section in AGENTS.md.
 #[doc(hidden)]
 pub const MCP_RMCP_HOST_ENV: &str = "BIFROST_MCP_RMCP";
 
 fn rmcp_host_enabled(value: Option<&OsStr>) -> Result<bool, String> {
     match value {
-        None => Ok(true),
+        None => Ok(false),
         Some(value) if value == "on" => Ok(true),
         Some(value) if value == "off" => Ok(false),
         Some(value) => Err(format!(
@@ -1889,10 +1887,11 @@ mod tests {
     }
 
     #[test]
-    fn rmcp_host_is_the_default_and_the_rollback_is_explicit() {
-        // Unset means the SDK-backed host. Getting this backwards would ship
-        // the retired implementation while every test claimed otherwise.
-        assert!(rmcp_host_enabled(None).unwrap());
+    fn the_rmcp_host_is_opt_in_and_the_switch_is_strict() {
+        // Unset means the hand-written host for now. Getting this backwards
+        // would ship an untried protocol stack while every test claimed
+        // otherwise, so it is asserted rather than assumed.
+        assert!(!rmcp_host_enabled(None).unwrap());
         assert!(rmcp_host_enabled(Some(OsStr::new("on"))).unwrap());
         assert!(!rmcp_host_enabled(Some(OsStr::new("off"))).unwrap());
 

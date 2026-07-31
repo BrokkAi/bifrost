@@ -1053,10 +1053,7 @@ mod tests {
         let missing = json!({"result": {"serverInfo": {}}});
         let error = validate_server_build_identity(&missing)
             .expect_err("missing identity must be rejected");
-        assert!(
-            error.contains("omitted serverInfo.buildIdentity"),
-            "{error}"
-        );
+        assert!(error.contains("omitted its build identity"), "{error}");
 
         let stale = json!({
             "result": {"serverInfo": {"buildIdentity": "stale-binary"}}
@@ -1066,9 +1063,34 @@ mod tests {
         assert!(error.contains("stale-binary"), "{error}");
         assert!(error.contains(crate::BIFROST_BUILD_IDENTITY), "{error}");
 
-        let current = json!({
+        // Both hosts must satisfy this. The hand-written stack reports the
+        // identity on `serverInfo`; the rmcp host reports it in the initialize
+        // result's `_meta`, because rmcp's `serverInfo` has no vendor field.
+        let legacy_location = json!({
             "result": {"serverInfo": {"buildIdentity": crate::BIFROST_BUILD_IDENTITY}}
         });
-        validate_server_build_identity(&current).expect("matching server identity");
+        validate_server_build_identity(&legacy_location).expect("matching server identity");
+
+        let meta_location = json!({
+            "result": {
+                "serverInfo": {"name": "bifrost"},
+                "_meta": {"io.bifrost/build-identity": crate::BIFROST_BUILD_IDENTITY}
+            }
+        });
+        validate_server_build_identity(&meta_location)
+            .expect("matching server identity reported through _meta");
+
+        // A stale identity in the new location must be caught too, or the
+        // benchmark would silently measure whatever binary happened to be on
+        // disk.
+        let stale_meta = json!({
+            "result": {
+                "serverInfo": {"name": "bifrost"},
+                "_meta": {"io.bifrost/build-identity": "stale-binary"}
+            }
+        });
+        let error = validate_server_build_identity(&stale_meta)
+            .expect_err("stale server must be rejected through _meta too");
+        assert!(error.contains("stale-binary"), "{error}");
     }
 }

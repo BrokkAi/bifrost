@@ -1061,6 +1061,16 @@ fn bifrost_mcp_query_code_transports_explain_and_profile_reports() {
 
 #[test]
 fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
+    // Both hosts: the upstream sync that added request correlation ids
+    // landed them on the fallback host alone, and only a wire assertion
+    // that runs against both would have caught the default host missing
+    // them.
+    for host in McpHost::ALL {
+        bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions_on(host);
+    }
+}
+
+fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions_on(host: McpHost) {
     let initial = InlineTestProject::with_language(Language::Python)
         .file("src/app.py", "def harmless(value):\n    return value\n")
         .file("policies/dynamic-eval.rqlp", MCP_DYNAMIC_EVAL_POLICY)
@@ -1080,7 +1090,7 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     assert_eq!(expected.exit_status(), 1);
     let expected_report = serde_json::to_value(expected.report()).expect("serialize direct report");
 
-    let mut child = spawn_server(initial.root(), "searchtools", &[]);
+    let mut child = spawn_server_on(host, initial.root(), "searchtools");
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
     let mut stderr = child.stderr.take().expect("stderr");
@@ -3820,7 +3830,9 @@ fn legacy_clients_never_see_a_result_type() {
     let workspace = InlineTestProject::new()
         .file("LegacyOnly.java", "class LegacyOnly {}\n")
         .build();
-    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    // Pinned: the fallback host has no `resultType` to suppress, so asserting
+    // its absence there would pass without testing anything.
+    let mut child = spawn_server_on(McpHost::Rmcp, workspace.root(), "searchtools");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = child.stderr.take().expect("stderr");
