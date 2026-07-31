@@ -13,3 +13,7 @@ entries atomically and stores their count in SQLite's `user_version` header.
 Never edit or add a down migration for a released file. This cache is derived
 data: an older binary rejects a newer `user_version` without modifying it, while
 an unrecognized pre-migration cache is rebuilt from migration 1.
+
+Migration `0013-semantic-model-active-set.sql` adds only workspace-local
+semantic-pack activation identity and source references. Immutable pack bytes
+and global lifecycle roots belong to the independent semantic-pack catalog.

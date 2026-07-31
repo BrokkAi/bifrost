@@ -278,7 +278,17 @@ pub fn find_filenames(
     analyzer: &dyn IAnalyzer,
     params: FindFilenamesParams,
 ) -> FindFilenamesResult {
-    let project = analyzer.project();
+    let files = analyzer.project().all_files().unwrap_or_default();
+    find_filenames_in_files(files, params)
+}
+
+/// Match filename glob patterns against an already-collected workspace file
+/// listing. Callers that have no analyzer snapshot (or must not wait for one)
+/// can obtain the listing from an ignore-aware walk and call this directly.
+pub fn find_filenames_in_files(
+    files: impl IntoIterator<Item = ProjectFile>,
+    params: FindFilenamesParams,
+) -> FindFilenamesResult {
     let limit = params.limit.max(1);
 
     let compiled: Vec<(Pattern, bool)> = params
@@ -303,18 +313,8 @@ pub fn find_filenames(
         };
     }
 
-    let all_files = match project.all_files() {
-        Ok(files) => files,
-        Err(_) => {
-            return FindFilenamesResult {
-                files: Vec::new(),
-                truncated: false,
-            };
-        }
-    };
-
     let mut matched: Vec<String> = Vec::new();
-    for file in all_files {
+    for file in files {
         let rel = rel_path_string(&file);
         let basename = file
             .rel_path()

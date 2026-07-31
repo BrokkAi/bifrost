@@ -562,19 +562,15 @@ mod tests {
         let root = temp.path().canonicalize().unwrap();
         ProjectFile::new(root.clone(), "app/Greeter.java")
             .write(
-                "package app;\n\npublic class Greeter {\n    public String greet() { return \"hi\"; }\n}\n"
-                    .to_string(),
+                "package app;\n\npublic class Greeter {\n    public String greet() { return \"hi\"; }\n}\n",
             )
             .unwrap();
         ProjectFile::new(root.clone(), "app/Service.scala")
-            .write(
-                "package app\n\nclass Service {\n  def run(): String = \"scala\"\n}\n".to_string(),
-            )
+            .write("package app\n\nclass Service {\n  def run(): String = \"scala\"\n}\n")
             .unwrap();
         ProjectFile::new(root.clone(), "app/Caller.kt")
             .write(
-                "package app\n\nclass Caller {\n\n    fun call(): String {\n        val greeter = Greeter()\n        return greeter.greet()\n    }\n}\n"
-                    .to_string(),
+                "package app\n\nclass Caller {\n\n    fun call(): String {\n        val greeter = Greeter()\n        return greeter.greet()\n    }\n}\n",
             )
             .unwrap();
 

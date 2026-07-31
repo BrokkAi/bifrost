@@ -25,6 +25,7 @@ mod java_test_assertion_smells;
 mod js_ts_structural_clone_smells;
 mod js_ts_test_assertion_smells;
 mod kotlin_dead_code_smells;
+mod kotlin_structural_clone_smells;
 mod kotlin_test_assertion_smells;
 mod php_dead_code_smells;
 mod php_structural_clone_smells;
