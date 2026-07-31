@@ -314,6 +314,13 @@ pub struct ResolvedValueFlowConformanceCase {
     witness_sink_ids: HashMap<String, brokk_bifrost::analyzer::value_flow::ValueFlowSinkId>,
 }
 
+impl ResolvedValueFlowConformanceCase {
+    pub fn sink_event_key(&self, alias: &str) -> &ValueFlowEventKey {
+        let sink_id = self.sink_ids[alias];
+        self.plan.sink(sink_id).expect("configured sink").key()
+    }
+}
+
 pub fn assert_value_flow_conformance(case: &ValueFlowConformanceCase<'_>) {
     let resolved = resolve_value_flow_conformance_case(case);
     assert_resolved_value_flow_conformance(case, &resolved);

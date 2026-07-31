@@ -20,8 +20,8 @@ The observable proof is the consolidated Rust integration suite: it compares the
 - [x] (2026-07-31 10:25Z) Carried the symbols through Python and VS Code models while leaving taint fact fields absent.
 - [x] (2026-07-31 12:05Z) Consolidated `tests/code_query_value_flow.rs` into `suite_cross_language` and exposed a reusable resolved conformance scenario.
 - [x] (2026-07-31 12:05Z) Ran the shared Java and TypeScript helper scenario through direct and public executors with exact endpoint and ordered witness-symbol parity.
+- [x] (2026-07-31 13:10Z) Added shared Java and TypeScript branch/merge, loop/exit, early-return/unreachable, and two-call matched-return scenarios with exact direct/public parity.
 - [ ] Run the existing Java and TypeScript helper scenario through direct, JSON, and RQL paths with exact endpoint and witness parity.
-- [ ] Add shared Java and TypeScript branch, loop, early-return, and matched-return scenarios.
 - [ ] Add shared Java and TypeScript exceptional cleanup, receiver, closure/capture, field/access-path, ambiguity, and unresolved-call scenarios.
 - [ ] Add the complete cancellation, truncation, and budget inventory.
 - [ ] Reuse the scenarios across the remaining adapters with explicit readiness outcomes.
@@ -50,6 +50,12 @@ The observable proof is the consolidated Rust integration suite: it compares the
 - Observation: public endpoints intentionally deduplicate semantically identical solver meetings while merging provenance.
   Evidence: the TypeScript helper produces six raw solver meetings but four distinct public endpoints; two public rows retain two provenance paths. The shared scenario records both the raw meeting count and the exact projected endpoint count.
 
+- Observation: negative public endpoints must be matched by their full sink event rather than argument ordinal.
+  Evidence: the early-return scenario has two `sink` calls whose first arguments both use ordinal zero. Matching path, full source anchor, occurrence, and event ordinal distinguishes the reachable and unreachable sinks and asserts zero false meetings at the latter.
+
+- Observation: TypeScript's multiple structured provenance paths recur across intraprocedural control flow.
+  Evidence: branch, loop, and early-return scenarios each retain three raw meetings and three distinct public endpoints for the reached sink, while Java retains one. Exact canonical witness-set parity confirms these are real paths rather than duplicated envelopes.
+
 ## Decision Log
 
 - Decision: add optional `input` and `output` fields to `CodeQueryFlowWitnessStep`, populated for public value-flow witnesses and omitted for the currently shared taint projection.
@@ -76,7 +82,9 @@ The observable proof is the consolidated Rust integration suite: it compares the
 
 The first two implementation milestones are complete. Public value-flow witness steps now preserve zero, carrier, and meeting facts; carriers contain stable source-backed value, port, allocation, call-result, scoped-root, and bounded location structures; source/sink events retain their configured carrier and full site; and every flow step retains full source/target/origin symbols. Run-local IDs and workspace mounts remain absent. Python parses the tagged shape strictly, VS Code preserves and renders concise fact transitions, and shared taint steps continue to omit flow-only facts.
 
-The former root public-query test is now part of `suite_cross_language`. One shared Java/TypeScript helper description drives the direct solver and public CodeQuery paths. The harness compares exact detected and absent sink projections, raw versus deduplicated meeting counts, and the complete ordered witness-symbol sequences after removing only generated IDs and redundant display ranges. Focused validation passed all 14 public-query module tests and the two direct Java/TypeScript baseline tests. The broader control-flow, heap, uncertainty, budget, and remaining-adapter matrix remains in progress.
+The former root public-query test is now part of `suite_cross_language`. One shared Java/TypeScript helper description drives the direct solver and public CodeQuery paths. The harness compares exact detected and absent sink projections, raw versus deduplicated meeting counts, and the complete ordered witness-symbol sequences after removing only generated IDs and redundant display ranges. Focused validation passed all 14 public-query module tests and the two direct Java/TypeScript baseline tests.
+
+The first control-flow matrix is also complete. Shared Java and TypeScript descriptions now prove branch joins, loop exits, early returns, an unreachable post-return call, and two call sites whose normal returns preserve their respective call origins. Public negative assertions identify sinks by full stable event identity, so same-ordinal arguments at different calls cannot alias in the test. Focused direct and public validation passes all eight new control-flow cases. Exceptional flow, heap/alias behavior, uncertainty, budgets, and remaining adapters remain in progress.
 
 ## Context and Orientation
 
@@ -195,3 +203,5 @@ Revision note (2026-07-31): Initial ExecPlan created after the user approved the
 Revision note (2026-07-31): Recorded the completed public symbol and transport milestone, including the expected serialized-byte increase and validation evidence.
 
 Revision note (2026-07-31): Recorded public event/step symbol completion, root-test consolidation, shared Java/TypeScript scenario execution, and exact direct/public canonical parity.
+
+Revision note (2026-07-31): Recorded the Java/TypeScript branch, loop, early-return/unreachable, and matched-return milestone plus full sink-event negative matching.

@@ -22,10 +22,15 @@ use serde_json::json;
 use crate::common::semantic_graph::SemanticGraph;
 use crate::common::{BuiltInlineTestProject, InlineTestProject};
 use crate::value_flow_conformance::{
-    ExpectedSinkOutcome, ValueFlowConformanceCase, assert_resolved_value_flow_conformance,
-    direct_witness_symbol_sequences, resolve_value_flow_conformance_case,
+    ExpectedSinkOutcome, ResolvedValueFlowConformanceCase, ValueFlowConformanceCase,
+    assert_resolved_value_flow_conformance, direct_witness_symbol_sequences,
+    resolve_value_flow_conformance_case,
 };
-use crate::value_flow_scenarios::{with_java_exact_helper, with_typescript_exact_helper};
+use crate::value_flow_scenarios::{
+    with_java_branch_merge, with_java_early_return, with_java_exact_helper, with_java_loop_exit,
+    with_java_two_matched_calls, with_typescript_branch_merge, with_typescript_early_return,
+    with_typescript_exact_helper, with_typescript_loop_exit, with_typescript_two_matched_calls,
+};
 
 const WORKSPACE_GENERATION: u64 = 23;
 const PLAN_REF: &str = "test:request-to-sink";
@@ -606,6 +611,46 @@ fn typescript_helper_scenario_runs_through_direct_and_public_queries() {
     with_typescript_exact_helper(assert_shared_helper_scenario);
 }
 
+#[test]
+fn java_branch_merge_runs_through_direct_and_public_queries() {
+    with_java_branch_merge(assert_shared_helper_scenario);
+}
+
+#[test]
+fn typescript_branch_merge_runs_through_direct_and_public_queries() {
+    with_typescript_branch_merge(assert_shared_helper_scenario);
+}
+
+#[test]
+fn java_loop_exit_runs_through_direct_and_public_queries() {
+    with_java_loop_exit(assert_shared_helper_scenario);
+}
+
+#[test]
+fn typescript_loop_exit_runs_through_direct_and_public_queries() {
+    with_typescript_loop_exit(assert_shared_helper_scenario);
+}
+
+#[test]
+fn java_early_return_excludes_unreachable_public_meeting() {
+    with_java_early_return(assert_shared_helper_scenario);
+}
+
+#[test]
+fn typescript_early_return_excludes_unreachable_public_meeting() {
+    with_typescript_early_return(assert_shared_helper_scenario);
+}
+
+#[test]
+fn java_two_call_sites_preserve_matched_returns_in_public_query() {
+    with_java_two_matched_calls(assert_shared_helper_scenario);
+}
+
+#[test]
+fn typescript_two_call_sites_preserve_matched_returns_in_public_query() {
+    with_typescript_two_matched_calls(assert_shared_helper_scenario);
+}
+
 fn assert_shared_helper_scenario(case: &ValueFlowConformanceCase<'_>) {
     let resolved = resolve_value_flow_conformance_case(case);
     assert_resolved_value_flow_conformance(case, &resolved);
@@ -639,7 +684,7 @@ fn assert_shared_helper_scenario(case: &ValueFlowConformanceCase<'_>) {
         summaries.lease(WORKSPACE_GENERATION).unwrap(),
     );
     let endpoints = serde_json::to_value(endpoints).unwrap();
-    assert_public_sink_outcomes(case, &endpoints);
+    assert_public_sink_outcomes(case, &resolved, &endpoints);
 
     let witnesses = execute_workspace_request_with_analysis_registration_lease(
         &resolved.analyzer,
@@ -725,7 +770,11 @@ fn shared_scenario_query(
     .unwrap()
 }
 
-fn assert_public_sink_outcomes(case: &ValueFlowConformanceCase<'_>, response: &serde_json::Value) {
+fn assert_public_sink_outcomes(
+    case: &ValueFlowConformanceCase<'_>,
+    resolved: &ResolvedValueFlowConformanceCase,
+    response: &serde_json::Value,
+) {
     let rows = response["results"].as_array().unwrap();
     assert_eq!(
         rows.len(),
@@ -738,13 +787,31 @@ fn assert_public_sink_outcomes(case: &ValueFlowConformanceCase<'_>, response: &s
                 .iter()
                 .filter(|sink| sink.outcome != ExpectedSinkOutcome::Reached)
                 .count(),
-        "{} exact public endpoint count: {response:#}",
-        case.name
+        "{} exact public endpoint count: expected {}, got {}",
+        case.name,
+        case.expected_meetings
+            .iter()
+            .map(|meeting| meeting.public_endpoint_count)
+            .sum::<usize>()
+            + case
+                .sinks
+                .iter()
+                .filter(|sink| sink.outcome != ExpectedSinkOutcome::Reached)
+                .count(),
+        rows.len()
     );
     for sink in case.sinks {
+        let sink_key = resolved.sink_event_key(sink.alias);
+        let anchor = sink_key.site().anchor();
         let matching = rows
             .iter()
-            .filter(|row| row["sink"]["ordinal"] == sink.argument)
+            .filter(|row| {
+                row["sink"]["site"]["path"] == sink_key.site().path().as_str()
+                    && row["sink"]["site"]["start_byte"] == anchor.span().start_byte()
+                    && row["sink"]["site"]["end_byte"] == anchor.span().end_byte()
+                    && row["sink"]["site"]["occurrence"] == anchor.occurrence()
+                    && row["sink"]["ordinal"] == sink_key.ordinal()
+            })
             .collect::<Vec<_>>();
         let expected_reachability = match sink.outcome {
             ExpectedSinkOutcome::Reached => "reached",
@@ -759,7 +826,7 @@ fn assert_public_sink_outcomes(case: &ValueFlowConformanceCase<'_>, response: &s
         assert_eq!(
             matching.len(),
             expected_count,
-            "{} {} public endpoint count: {response:#}",
+            "{} {} public endpoint count",
             case.name,
             sink.alias
         );

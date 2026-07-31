@@ -10,7 +10,11 @@ use crate::value_flow_conformance::{
     ExpectedWitness, InlineSourceFile, InterproceduralMilestone, ParameterSource,
     ProcedureSelector, ValueFlowConformanceCase, assert_value_flow_conformance,
 };
-use crate::value_flow_scenarios::{with_java_exact_helper, with_typescript_exact_helper};
+use crate::value_flow_scenarios::{
+    with_java_branch_merge, with_java_early_return, with_java_exact_helper, with_java_loop_exit,
+    with_java_two_matched_calls, with_typescript_branch_merge, with_typescript_early_return,
+    with_typescript_exact_helper, with_typescript_loop_exit, with_typescript_two_matched_calls,
+};
 
 const CALLS: &[CallSelector<'_>] = &[
     CallSelector {
@@ -254,6 +258,46 @@ fn java_exact_helper_flow() {
 #[test]
 fn typescript_exact_helper_flow() {
     with_typescript_exact_helper(assert_value_flow_conformance);
+}
+
+#[test]
+fn java_branch_merge_flow() {
+    with_java_branch_merge(assert_value_flow_conformance);
+}
+
+#[test]
+fn typescript_branch_merge_flow() {
+    with_typescript_branch_merge(assert_value_flow_conformance);
+}
+
+#[test]
+fn java_loop_exit_flow() {
+    with_java_loop_exit(assert_value_flow_conformance);
+}
+
+#[test]
+fn typescript_loop_exit_flow() {
+    with_typescript_loop_exit(assert_value_flow_conformance);
+}
+
+#[test]
+fn java_early_return_excludes_unreachable_sink() {
+    with_java_early_return(assert_value_flow_conformance);
+}
+
+#[test]
+fn typescript_early_return_excludes_unreachable_sink() {
+    with_typescript_early_return(assert_value_flow_conformance);
+}
+
+#[test]
+fn java_two_call_sites_match_returns() {
+    with_java_two_matched_calls(assert_value_flow_conformance);
+}
+
+#[test]
+fn typescript_two_call_sites_match_returns() {
+    with_typescript_two_matched_calls(assert_value_flow_conformance);
 }
 
 #[test]
