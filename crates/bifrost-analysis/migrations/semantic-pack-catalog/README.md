@@ -16,3 +16,5 @@ Current history:
   quarantine catalog.
 - `0002-lifecycle.sql`: pins, workspace activations, reader leases, install
   reservations, and GC indexes.
+- `0003-procedure-summaries.sql`: widens the generic shard payload-kind
+  constraint while preserving shard, selector, and routing rows.

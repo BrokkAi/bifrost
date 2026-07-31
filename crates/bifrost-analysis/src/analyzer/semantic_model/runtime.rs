@@ -1538,6 +1538,7 @@ fn active_model_set_hash(active: &[CandidateSelection]) -> String {
                 match selection.payload_kind {
                     PayloadKind::DeclarationFacts => 0u8,
                     PayloadKind::GeneratorRules => 1u8,
+                    PayloadKind::ProcedureSummaries => 2u8,
                 },
             )
         })

@@ -1,7 +1,21 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::analyzer::dataflow::{
+    MAX_AMBIGUOUS_SUMMARY_CALLEES, MAX_EXTERNAL_SUMMARY_MODEL_ID_BYTES,
+    MAX_SUMMARY_BOUNDARY_BINDINGS, MAX_SUMMARY_EFFECT_REFERENCES, MAX_SUMMARY_EFFECTS,
+    MAX_SUMMARY_TRANSFERS, SUMMARY_SCHEMA_VERSION,
+};
+
 pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 1;
+pub const PROCEDURE_SUMMARY_CONTRACT_VERSION: u32 = SUMMARY_SCHEMA_VERSION;
+pub const MAX_PROCEDURE_SUMMARY_ORDINAL: u32 = 65_535;
+pub const MAX_PROCEDURE_SUMMARY_LOCATIONS: usize = MAX_SUMMARY_BOUNDARY_BINDINGS;
+pub const MAX_PROCEDURE_SUMMARY_TRANSFERS: usize = MAX_SUMMARY_TRANSFERS;
+pub const MAX_PROCEDURE_SUMMARY_EFFECTS: usize = MAX_SUMMARY_EFFECTS;
+pub const MAX_PROCEDURE_SUMMARY_AMBIGUOUS_CALLEES: usize = MAX_AMBIGUOUS_SUMMARY_CALLEES;
+pub const MAX_PROCEDURE_SUMMARY_EFFECT_REFERENCES: usize = MAX_SUMMARY_EFFECT_REFERENCES;
+pub const MAX_PROCEDURE_SUMMARY_MODEL_ID_BYTES: usize = MAX_EXTERNAL_SUMMARY_MODEL_ID_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -88,6 +102,114 @@ pub enum AuthoredPayload {
     },
     GeneratorRules {
         rules: Vec<GeneratorRule>,
+    },
+    ProcedureSummaries {
+        summaries: Vec<AuthoredProcedureSummary>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredProcedureSummary {
+    pub id: String,
+    pub target: AuthoredProcedureTarget,
+    pub completeness: Completeness,
+    #[serde(default)]
+    pub locations: Vec<AuthoredSummaryLocation>,
+    pub transfers: Vec<AuthoredSummaryTransfer>,
+    #[serde(default)]
+    pub effects: Vec<AuthoredSummaryEffect>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredProcedureTarget {
+    pub path: String,
+    pub symbol: String,
+    #[serde(default)]
+    pub has_receiver: bool,
+    pub parameter_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredSummaryLocation {
+    pub id: String,
+    pub location_kind: AuthoredSummaryLocationKind,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthoredSummaryLocationKind {
+    Capture,
+    Heap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AuthoredSummaryInput {
+    Receiver {},
+    Parameter {
+        #[schemars(range(max = 65535))]
+        ordinal: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AuthoredSummaryOutput {
+    NormalReturn {},
+    Receiver {},
+    Capture { location: String },
+    Heap { location: String },
+    ExceptionalReturn {},
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredSummaryTransfer {
+    pub input: AuthoredSummaryInput,
+    pub exit_kind: AuthoredSummaryExitKind,
+    pub output: AuthoredSummaryOutput,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthoredSummaryExitKind {
+    Normal,
+    Exceptional,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AuthoredSummaryEffect {
+    Allocation {
+        event: String,
+        output: AuthoredSummaryOutput,
+    },
+    Call {
+        event: String,
+        callee: String,
+    },
+    Escape {
+        event: String,
+        input: AuthoredSummaryInput,
+    },
+    UnknownCall {
+        event: String,
+        input: AuthoredSummaryInput,
+    },
+    UnknownCallBoundary {
+        event: String,
+    },
+    AmbiguousCall {
+        event: String,
+        input: AuthoredSummaryInput,
+        candidates: Vec<String>,
     },
 }
 
@@ -527,6 +649,7 @@ impl AuthoredPayload {
                 relations,
             } => types.len() + members.len() + relations.len(),
             Self::GeneratorRules { rules } => rules.len(),
+            Self::ProcedureSummaries { summaries } => summaries.len(),
         }
     }
 }
