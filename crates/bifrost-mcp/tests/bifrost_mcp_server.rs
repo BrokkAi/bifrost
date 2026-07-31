@@ -3951,11 +3951,12 @@ fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std:
 
 /// Which MCP host serves a session.
 ///
-/// The two hosts coexist for the duration of the issue #1328 migration and the
-/// hand-written one is still the production default, so rootless behaviour --
-/// where all client-supplied workspace authorization lives -- has to be
-/// asserted against both. Testing only the opt-in host is what let a
-/// pre-handshake bypass reach a green suite once already.
+/// `rmcp` is the default; the hand-written stack remains reachable with
+/// `BIFROST_MCP_RMCP=off` as a rollback lever. Rootless behaviour -- where all
+/// client-supplied workspace authorization lives -- is asserted against both,
+/// because whichever one an operator falls back to has to be correct, and
+/// because testing only one host is what let a pre-handshake bypass reach a
+/// green suite once already.
 #[derive(Clone, Copy, Debug)]
 enum McpHost {
     /// The hand-written stack in `mcp_common.rs`. Still the default.
@@ -4018,10 +4019,10 @@ fn spawn_rootless_server_on(
 
 /// Spawn a rootless server on the rmcp host specifically.
 ///
-/// For the assertions that genuinely differ between hosts: the rmcp host
-/// refuses any pre-`initialize` request outright, and it asks a Roots-capable
-/// client for its workspace from the tool call that needs one rather than from
-/// a lifecycle notification. Everything host-agnostic should use
+/// For assertions that only hold on the default host: it refuses any
+/// pre-`initialize` request outright, and it asks a Roots-capable client for
+/// its workspace from the tool call that needs one rather than from a
+/// lifecycle notification. Contracts both hosts must honour should use
 /// [`spawn_rootless_server_on`] with [`McpHost::ALL`] instead.
 fn spawn_rootless_server(cwd: &std::path::Path, mode: &str) -> std::process::Child {
     spawn_rootless_server_on(McpHost::Rmcp, cwd, mode)

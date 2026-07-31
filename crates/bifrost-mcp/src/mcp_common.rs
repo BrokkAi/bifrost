@@ -363,18 +363,26 @@ pub fn run_stdio_server(
     run_stdio_server_with_build_identity(root, render_options, spec, env!("CARGO_PKG_VERSION"))
 }
 
-/// Selects the `rmcp`-backed MCP host over the hand-written stack below.
+/// Falls back to the hand-written MCP stack below instead of the `rmcp` host.
 ///
-/// Temporary migration switch for issue #1328. It exists so the same wire
-/// contract suite can be run against either implementation while the new host
-/// is built up milestone by milestone, and so a misbehaving new path can be
-/// turned off at runtime. It is deleted once the hand-written stack is.
+/// `rmcp` is the default. This is a rollback lever, not a feature flag: if the
+/// SDK-backed host misbehaves against some client in the field, setting
+/// `BIFROST_MCP_RMCP=off` restores the previous protocol implementation
+/// without a release. It exists because `rmcp` 3.0 was days old when Bifrost
+/// adopted it (issue #1328), and it is meant to be short-lived -- while both
+/// hosts exist, the Codex sandbox authorization boundary has two copies that
+/// must be fixed in lockstep, which is a standing hazard rather than a
+/// feature. The contract suite runs the rootless scenarios against both hosts
+/// so neither can rot silently.
+///
+/// Removal is tracked separately; delete this switch, `mcp_common`'s protocol
+/// half, and the `McpHost` matrix in the contract suite together.
 #[doc(hidden)]
 pub const MCP_RMCP_HOST_ENV: &str = "BIFROST_MCP_RMCP";
 
 fn rmcp_host_enabled(value: Option<&OsStr>) -> Result<bool, String> {
     match value {
-        None => Ok(false),
+        None => Ok(true),
         Some(value) if value == "on" => Ok(true),
         Some(value) if value == "off" => Ok(false),
         Some(value) => Err(format!(
@@ -1796,6 +1804,20 @@ mod tests {
 
         let error = file_watching_enabled(Some(OsStr::new("disabled"))).unwrap_err();
         assert!(error.contains(MCP_FILE_WATCHER_ENV), "{error}");
+        assert!(error.contains("on` or `off"), "{error}");
+    }
+
+    #[test]
+    fn rmcp_host_is_the_default_and_the_rollback_is_explicit() {
+        // Unset means the SDK-backed host. Getting this backwards would ship
+        // the retired implementation while every test claimed otherwise.
+        assert!(rmcp_host_enabled(None).unwrap());
+        assert!(rmcp_host_enabled(Some(OsStr::new("on"))).unwrap());
+        assert!(!rmcp_host_enabled(Some(OsStr::new("off"))).unwrap());
+
+        // A typo must not silently select a protocol implementation.
+        let error = rmcp_host_enabled(Some(OsStr::new("legacy"))).unwrap_err();
+        assert!(error.contains(MCP_RMCP_HOST_ENV), "{error}");
         assert!(error.contains("on` or `off"), "{error}");
     }
 
