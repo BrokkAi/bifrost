@@ -557,6 +557,110 @@ pub struct CodeQueryFlowEvent {
     pub ordinal: u32,
 }
 
+/// One stable source-backed locator used by a public value-flow symbol.
+///
+/// `id` deliberately omits the workspace mount and every run-local dense ID.
+/// The declaration path retains enough structure to distinguish anonymous or
+/// same-named declarations that share a source range.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryFlowSymbolSite {
+    pub id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub declaration: Vec<CodeQueryFlowDeclarationSegment>,
+    pub role: &'static str,
+    pub range: CodeQueryRange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryFlowDeclarationSegment {
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub start_byte: u32,
+    pub end_byte: u32,
+    pub occurrence: u32,
+    pub sibling_ordinal: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CodeQueryFlowPortSymbol {
+    Receiver,
+    Parameter { ordinal: u32 },
+    NormalReturn,
+    ExceptionalReturn,
+    Capture { slot: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CodeQueryFlowSelectorSymbol {
+    Field {
+        field: CodeQueryFlowSymbolSite,
+    },
+    ExactIndex {
+        index: Box<CodeQueryFlowCarrierSymbol>,
+    },
+    AnyIndex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CodeQueryFlowCarrierSymbol {
+    Value {
+        id: String,
+        site: CodeQueryFlowSymbolSite,
+        role: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ordinal: Option<u32>,
+    },
+    Port {
+        id: String,
+        procedure: CodeQueryFlowSymbolSite,
+        port: CodeQueryFlowPortSymbol,
+    },
+    Allocation {
+        id: String,
+        site: CodeQueryFlowSymbolSite,
+    },
+    CallResult {
+        id: String,
+        call: CodeQueryFlowSymbolSite,
+        result: Box<CodeQueryFlowCarrierSymbol>,
+        callee: CodeQueryFlowSymbolSite,
+    },
+    ScopedRoot {
+        id: String,
+        root_kind: &'static str,
+        site: CodeQueryFlowSymbolSite,
+    },
+    Location {
+        id: String,
+        root: Box<CodeQueryFlowCarrierSymbol>,
+        selectors: Vec<CodeQueryFlowSelectorSymbol>,
+        exact: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CodeQueryFlowFactSymbol {
+    Zero,
+    Carrier {
+        source: CodeQueryFlowEvent,
+        carrier: CodeQueryFlowCarrierSymbol,
+        #[serde(skip_serializing_if = "is_false")]
+        uncertain: bool,
+    },
+    Meeting {
+        source: CodeQueryFlowEvent,
+        sink: CodeQueryFlowEvent,
+        #[serde(skip_serializing_if = "is_false")]
+        uncertain: bool,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CodeQueryFlowEndpoint {
     pub id: String,
@@ -600,6 +704,10 @@ pub struct CodeQueryFlowWitnessStep {
     pub origin: Option<CodeQuerySourceSite>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub boundary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<CodeQueryFlowFactSymbol>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<CodeQueryFlowFactSymbol>,
     pub evidence: CodeQuerySemanticEvidence,
 }
 

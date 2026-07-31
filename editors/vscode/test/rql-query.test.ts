@@ -518,7 +518,39 @@ void test("renders diagnostic-neutral flow endpoints and navigable witnesses", (
         kind: { type: "end_summary_gap", return_kind: "normal" },
         source: { path: endpoint.path, range },
         evidence: { proof: "unproven", completeness: "partial" },
-        boundary: "unmaterialized"
+        boundary: "unmaterialized",
+        input: {
+          kind: "carrier",
+          source: endpoint.source!,
+          carrier: {
+            kind: "port",
+            id: "carrier-parameter",
+            procedure: {
+              id: "site-run",
+              path: endpoint.path,
+              language: endpoint.language,
+              declaration: [
+                {
+                  kind: "function",
+                  name: "run",
+                  start_byte: 12,
+                  end_byte: 96,
+                  occurrence: 0,
+                  sibling_ordinal: 0
+                }
+              ],
+              role: "procedure",
+              range
+            },
+            port: { kind: "parameter", ordinal: 0 }
+          }
+        },
+        output: {
+          kind: "meeting",
+          source: endpoint.source!,
+          sink: endpoint.sink,
+          uncertain: true
+        }
       }
     ],
     retained_bytes: 96,
@@ -541,6 +573,10 @@ void test("renders diagnostic-neutral flow endpoints and navigable witnesses", (
   const steps = flowWitnessStepTargets(witness);
   assert.equal(steps[0].label, "1. normal summary gap");
   assert.match(steps[0].tooltip, /Boundary: unmaterialized/);
+  assert.match(
+    steps[0].tooltip,
+    /Facts: source-a on port:carrier-parameter -> source-a meets sink-a/
+  );
   assert.equal(steps[0].uri, endpoint.uri);
   assert.deepEqual(steps[0].range, range);
 });

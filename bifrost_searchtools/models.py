@@ -916,6 +916,200 @@ class CodeQueryFlowEvent:
         )
 
 
+CodeQueryFlowPortKind = Literal[
+    "receiver", "parameter", "normal_return", "exceptional_return", "capture"
+]
+
+
+@dataclass(frozen=True)
+class CodeQueryFlowDeclarationSegment:
+    kind: str
+    name: str | None
+    start_byte: int
+    end_byte: int
+    occurrence: int
+    sibling_ordinal: int
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryFlowDeclarationSegment:
+        return cls(
+            kind=data["kind"],
+            name=data.get("name"),
+            start_byte=_strict_nonnegative_int(data, "start_byte"),
+            end_byte=_strict_nonnegative_int(data, "end_byte"),
+            occurrence=_strict_nonnegative_int(data, "occurrence"),
+            sibling_ordinal=_strict_nonnegative_int(data, "sibling_ordinal"),
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryFlowSymbolSite:
+    id: str
+    path: str
+    language: str
+    declaration: tuple[CodeQueryFlowDeclarationSegment, ...]
+    role: str
+    range: CodeQueryRange
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryFlowSymbolSite:
+        return cls(
+            id=data["id"],
+            path=data["path"],
+            language=data["language"],
+            declaration=tuple(
+                CodeQueryFlowDeclarationSegment.from_dict(segment)
+                for segment in _strict_list(data, "declaration")
+            ),
+            role=data["role"],
+            range=CodeQueryRange.from_dict(data["range"]),
+        )
+
+
+@dataclass(frozen=True)
+class CodeQueryFlowPortSymbol:
+    kind: CodeQueryFlowPortKind
+    ordinal: int | None = None
+    slot: int | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryFlowPortSymbol:
+        kind = data.get("kind")
+        if kind == "parameter":
+            return cls(kind=kind, ordinal=_strict_nonnegative_int(data, "ordinal"))
+        if kind == "capture":
+            return cls(kind=kind, slot=_strict_nonnegative_int(data, "slot"))
+        if kind in {"receiver", "normal_return", "exceptional_return"}:
+            return cls(kind=cast(CodeQueryFlowPortKind, kind))
+        raise ValueError(f"unknown value-flow port kind: {kind!r}")
+
+
+CodeQueryFlowSelectorKind = Literal["field", "exact_index", "any_index"]
+
+
+@dataclass(frozen=True)
+class CodeQueryFlowSelectorSymbol:
+    kind: CodeQueryFlowSelectorKind
+    field: CodeQueryFlowSymbolSite | None = None
+    index: CodeQueryFlowCarrierSymbol | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryFlowSelectorSymbol:
+        kind = data.get("kind")
+        if kind == "field":
+            return cls(kind=kind, field=CodeQueryFlowSymbolSite.from_dict(data["field"]))
+        if kind == "exact_index":
+            return cls(kind=kind, index=CodeQueryFlowCarrierSymbol.from_dict(data["index"]))
+        if kind == "any_index":
+            return cls(kind=kind)
+        raise ValueError(f"unknown value-flow selector kind: {kind!r}")
+
+
+CodeQueryFlowCarrierKind = Literal[
+    "value", "port", "allocation", "call_result", "scoped_root", "location"
+]
+
+
+@dataclass(frozen=True)
+class CodeQueryFlowCarrierSymbol:
+    kind: CodeQueryFlowCarrierKind
+    id: str
+    site: CodeQueryFlowSymbolSite | None = None
+    role: str | None = None
+    ordinal: int | None = None
+    procedure: CodeQueryFlowSymbolSite | None = None
+    port: CodeQueryFlowPortSymbol | None = None
+    call: CodeQueryFlowSymbolSite | None = None
+    result: CodeQueryFlowCarrierSymbol | None = None
+    callee: CodeQueryFlowSymbolSite | None = None
+    root_kind: str | None = None
+    root: CodeQueryFlowCarrierSymbol | None = None
+    selectors: tuple[CodeQueryFlowSelectorSymbol, ...] = ()
+    exact: bool | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryFlowCarrierSymbol:
+        kind = data.get("kind")
+        common = {"kind": kind, "id": data["id"]}
+        if kind == "value":
+            ordinal = data.get("ordinal")
+            if ordinal is not None:
+                ordinal = _strict_nonnegative_int(data, "ordinal")
+            return cls(
+                **common,
+                site=CodeQueryFlowSymbolSite.from_dict(data["site"]),
+                role=data["role"],
+                ordinal=ordinal,
+            )
+        if kind == "port":
+            return cls(
+                **common,
+                procedure=CodeQueryFlowSymbolSite.from_dict(data["procedure"]),
+                port=CodeQueryFlowPortSymbol.from_dict(data["port"]),
+            )
+        if kind == "allocation":
+            return cls(
+                **common, site=CodeQueryFlowSymbolSite.from_dict(data["site"])
+            )
+        if kind == "call_result":
+            return cls(
+                **common,
+                call=CodeQueryFlowSymbolSite.from_dict(data["call"]),
+                result=cls.from_dict(data["result"]),
+                callee=CodeQueryFlowSymbolSite.from_dict(data["callee"]),
+            )
+        if kind == "scoped_root":
+            return cls(
+                **common,
+                root_kind=data["root_kind"],
+                site=CodeQueryFlowSymbolSite.from_dict(data["site"]),
+            )
+        if kind == "location":
+            return cls(
+                **common,
+                root=cls.from_dict(data["root"]),
+                selectors=tuple(
+                    CodeQueryFlowSelectorSymbol.from_dict(selector)
+                    for selector in _strict_list(data, "selectors")
+                ),
+                exact=_strict_bool(data, "exact"),
+            )
+        raise ValueError(f"unknown value-flow carrier kind: {kind!r}")
+
+
+CodeQueryFlowFactKind = Literal["zero", "carrier", "meeting"]
+
+
+@dataclass(frozen=True)
+class CodeQueryFlowFactSymbol:
+    kind: CodeQueryFlowFactKind
+    source: CodeQueryFlowEvent | None = None
+    carrier: CodeQueryFlowCarrierSymbol | None = None
+    sink: CodeQueryFlowEvent | None = None
+    uncertain: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryFlowFactSymbol:
+        kind = data.get("kind")
+        if kind == "zero":
+            return cls(kind=kind)
+        if kind == "carrier":
+            return cls(
+                kind=kind,
+                source=CodeQueryFlowEvent.from_dict(data["source"]),
+                carrier=CodeQueryFlowCarrierSymbol.from_dict(data["carrier"]),
+                uncertain=_strict_bool(data, "uncertain", False),
+            )
+        if kind == "meeting":
+            return cls(
+                kind=kind,
+                source=CodeQueryFlowEvent.from_dict(data["source"]),
+                sink=CodeQueryFlowEvent.from_dict(data["sink"]),
+                uncertain=_strict_bool(data, "uncertain", False),
+            )
+        raise ValueError(f"unknown value-flow fact kind: {kind!r}")
+
+
 @dataclass(frozen=True)
 class CodeQueryFlowEndpoint:
     id: str
@@ -988,6 +1182,8 @@ class CodeQueryFlowWitnessStep:
     target: CodeQuerySourceSite | None = None
     origin: CodeQuerySourceSite | None = None
     boundary: str | None = None
+    input: CodeQueryFlowFactSymbol | None = None
+    output: CodeQueryFlowFactSymbol | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryFlowWitnessStep:
@@ -1006,6 +1202,16 @@ class CodeQueryFlowWitnessStep:
                 else None
             ),
             boundary=data.get("boundary"),
+            input=(
+                CodeQueryFlowFactSymbol.from_dict(data["input"])
+                if "input" in data
+                else None
+            ),
+            output=(
+                CodeQueryFlowFactSymbol.from_dict(data["output"])
+                if "output" in data
+                else None
+            ),
         )
 
 

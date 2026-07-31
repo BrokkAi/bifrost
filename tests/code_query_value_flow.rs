@@ -247,7 +247,20 @@ fn json_projects_exact_diagnostic_neutral_endpoint_and_witness_domains() {
     let value = &witness["results"][0];
     assert_eq!(value["result_type"], "flow_witness");
     assert_eq!(value["plan_ref"], PLAN_REF);
-    assert!(!value["steps"].as_array().unwrap().is_empty());
+    let steps = value["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 7, "{witness:#}");
+    assert!(steps.iter().all(|step| step.get("input").is_some()));
+    assert!(steps.iter().all(|step| step.get("output").is_some()));
+    assert!(
+        steps[..steps.len() - 1]
+            .iter()
+            .all(|step| step["input"]["kind"] == "zero" && step["output"]["kind"] == "zero")
+    );
+    let meeting = &steps.last().unwrap()["output"];
+    assert_eq!(meeting["kind"], "meeting", "{witness:#}");
+    assert_eq!(meeting["source"], endpoint["results"][0]["source"]);
+    assert_eq!(meeting["sink"], endpoint["results"][0]["sink"]);
+    assert!(meeting.get("uncertain").is_none());
 }
 
 #[test]
