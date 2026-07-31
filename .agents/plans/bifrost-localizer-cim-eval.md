@@ -84,8 +84,10 @@ The observable outcomes are:
   r1 wave was stopped and invalidated after leak audit found repository-history and web-search
   use. The clean r3 wave produced 57 resumable cells before a deterministic Gitlink scrub
   failure stopped its controller; brokkbench commit `a8012514ec6` fixes the root cause and the
-  exact formerly failing Vuls task now passes setup and runs Luna. All 55 completed cells with
-  a generation exit code report zero, so Bedrock remains healthy while the wave resumes.
+  exact formerly failing Vuls task completed with exit code zero in 744.9 seconds. Brokkbench
+  commit `58bb0a1b4e9` also cancels queued futures before executor shutdown instead of draining
+  the queue after a cell failure. All 56 completed cells with a generation exit code report
+  zero, so Bedrock remains healthy while the final old-store subset resumes at concurrency 30.
 - [ ] Pass the baseline sanity gate, then run baseline seeds 1 and 2 with measured concurrency
   escalation.
 - [x] (2026-07-31 10:01Z) Precomputed all Granite indexes on the A4000 at repository concurrency
@@ -257,6 +259,13 @@ The observable outcomes are:
   Brokkbench commit `a8012514ec6` now creates the isolated root commit directly from the
   verified tree with `git commit-tree`, repoints `HEAD`, and prunes old history. A Gitlink
   regression test and the exact official task both pass setup.
+
+- Observation: the run controller's exception handler attempted to cancel futures only after
+  leaving the `ThreadPoolExecutor` context. Python's context manager waits for the queue before
+  control reaches that handler, so the first scrub failure caused opaque queued work instead
+  of prompt cancellation. Commit `58bb0a1b4e9` moves cancellation inside the context; the full
+  15-test cimeval suite and Ruff pass. An obsolete one-worker reproduction was interrupted and
+  its single explicitly identified orphaned Teleport sandbox was removed before resuming.
 
 - Observation: after `/mnt/containers` ownership was corrected to `jonathan:jonathan`, the
   controller created `/mnt/containers/code_isnt_memory/podman-storage` and verified rootless
