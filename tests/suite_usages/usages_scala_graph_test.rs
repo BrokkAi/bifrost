@@ -1429,6 +1429,150 @@ object Use {
 }
 
 #[test]
+fn scala_inverse_records_bare_companion_calls_for_imported_and_same_file_types() {
+    let consumer = r#"package chess
+package tiebreak
+
+import chess.format.Uci
+import Tiebreak.*
+
+trait Tournament:
+  def players: Set[Player]
+  def gamesById(id: PlayerId): List[Game] // positive-trait-return-type
+  def opponentsOf: PlayerId => List[Player]
+  def scoreOf: PlayerId => TournamentScore
+  def lastRoundId: Option[String]
+
+  lazy val perfectTournamentPerformance: PlayerId => TiebreakPoint = memoize: id =>
+    val oppRatings: Seq[Int] =
+      gamesById(id).flatMap(_.opponent.rating.map(_.value))
+    if oppRatings.isEmpty then TiebreakPoint.zero
+    else
+      val myScore = scoreOf(id)
+      val minR = oppRatings.min - 800
+      val maxR = oppRatings.max + 800
+      if myScore == TournamentScore(0f) then TiebreakPoint(minR)
+      else TiebreakPoint(Tournament.binarySearch(oppRatings, myScore)(minR, maxR))
+
+  lazy val tournamentPerformance: PlayerId => TiebreakPoint = memoize: id =>
+    Elo
+      .computePerformanceRating:
+        gamesById(id)
+          .flatMap: game =>
+            game.opponent.rating.map(r => Elo.Game(game.points, r))
+      .map(elo => TiebreakPoint(elo.value)) | TiebreakPoint.zero
+
+  lazy val maxRounds = players.map(p => gamesById(p.id).size).maxOption.getOrElse(0)
+
+  lazy val directScore: Set[Player] => Map[PlayerId, Float] = memoize: tiedPlayers =>
+    tiedPlayers
+      .map: p =>
+        p.id -> gamesById(p.id)
+          .filter(g => tiedPlayers.excl(p).contains(g.opponent))
+          .groupBy(_.opponent.id)
+          .map: (_, games) =>
+            games.nonEmpty.so(games.score.value / games.size)
+          .sum
+      .toMap
+
+object Tournament:
+  private final class Impl extends Tournament:
+    override def gamesById(id: PlayerId): List[Game] = // positive-implementation-return-type
+      Nil
+
+  def apply(games: Map[String, Int], lastRound: Option[String]): Tournament =
+    new Tournament {}
+
+object Use:
+  def parse(value: String): Option[Uci] =
+    Uci(value) // positive-imported-overloaded-companion
+
+  def compute(games: Map[String, Int]): Tournament =
+    Tournament(games, None) // positive-same-file-companion
+
+object UciLiteral extends external.Literally[Uci]:
+  def validate(value: String)(using external.Quotes) =
+    Uci(value) match // positive-imported-companion-under-external-shape
+      case Some(_) => true
+      case _ => false
+
+object Tiebreak:
+  final case class Game(value: Int)
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("chess/Game.scala", "package chess\nfinal class Game\n"),
+        (
+            "chess/format/Uci.scala",
+            r#"package chess
+package format
+
+sealed trait Uci
+object Uci:
+  case class Move(value: Int) extends Uci
+  case class Drop(value: Boolean) extends Uci
+
+  def apply(value: String): Option[Uci] = None
+  def apply(value: Int): Move = Move(value)
+  def apply(value: Boolean): Drop = Drop(value)
+"#,
+        ),
+        ("app/Use.scala", consumer),
+    ]);
+
+    for marker in [
+        "positive-trait-return-type",
+        "positive-implementation-return-type",
+    ] {
+        let (line_index, line) = consumer
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains(marker))
+            .expect("marked Game type reference");
+        let column = line.find("Game").expect("Game token") + 1;
+        let response = brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "app/Use.scala".to_string(),
+                    line: Some(line_index + 1),
+                    column: Some(column),
+                }],
+            },
+        );
+        assert_eq!(response.results[0].status, "resolved", "{response:#?}");
+        assert_eq!(
+            response.results[0].definitions[0].fqn.as_deref(),
+            Some("chess.tiebreak.Tiebreak$.Game"),
+            "{response:#?}"
+        );
+    }
+
+    let imported = definition(&analyzer, "chess.format.Uci$.apply");
+    let imported_hits = authoritative_scala_reference_hits(&analyzer, &imported);
+    assert_hit_contains(&imported_hits, "positive-imported-overloaded-companion");
+    assert_hit_contains(
+        &imported_hits,
+        "positive-imported-companion-under-external-shape",
+    );
+    assert_no_hit_contains(&imported_hits, "positive-same-file-companion");
+
+    let same_file = definition(&analyzer, "chess.tiebreak.Tournament$.apply");
+    let same_file_hits = authoritative_scala_reference_hits(&analyzer, &same_file);
+    assert_hit_contains(&same_file_hits, "positive-same-file-companion");
+    assert_no_hit_contains(&same_file_hits, "positive-imported-overloaded-companion");
+
+    let game = definition(&analyzer, "chess.Game");
+    let game_hits = authoritative_scala_reference_hits(&analyzer, &game);
+    assert_no_hit_contains(&game_hits, "positive-trait-return-type");
+    assert_no_hit_contains(&game_hits, "positive-implementation-return-type");
+
+    let nested_game = definition(&analyzer, "chess.tiebreak.Tiebreak$.Game");
+    let nested_game_hits = authoritative_scala_reference_hits(&analyzer, &nested_game);
+    assert_hit_contains(&nested_game_hits, "positive-trait-return-type");
+    assert_hit_contains(&nested_game_hits, "positive-implementation-return-type");
+}
+
+#[test]
 fn scala_graph_resolves_wildcard_imported_nested_companion_apply() {
     let consumer_source = r#"package app
 

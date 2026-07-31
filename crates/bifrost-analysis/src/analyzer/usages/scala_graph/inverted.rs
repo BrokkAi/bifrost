@@ -2297,7 +2297,10 @@ impl ProjectTypes {
                 .as_ref()
                 .is_some_and(|resolved| resolved != &value)
             {
-                return ScalaCallableTierResolution::Applicable(None);
+                callable_targets.push(method.clone());
+                value_result = None;
+                saw_unknown_return = true;
+                continue;
             }
             value_result = Some(value);
             callable_targets.push(method.clone());
@@ -8512,7 +8515,24 @@ fn record_reference(
                     .parent()
                     .and_then(|expression| expression.child_by_field_name("value"))
             {
-                let method_value_shape = match companion_method_value_context(node, ctx, bindings) {
+                let method_value_expression = node.parent().filter(|expression| {
+                    expression.kind() == "field_expression"
+                        && expression.child_by_field_name("field") == Some(node)
+                });
+                let method_value_argument = method_value_expression.filter(|expression| {
+                    expression
+                        .parent()
+                        .is_some_and(|parent| parent.kind() == "arguments")
+                });
+                let method_value_context = companion_method_value_context(
+                    method_value_argument.unwrap_or(node),
+                    ctx,
+                    bindings,
+                );
+                let unshaped_argument_method_value =
+                    matches!(&method_value_context, ScalaMethodValueContext::Unknown)
+                        && method_value_argument.is_some();
+                let method_value_shape = match method_value_context {
                     ScalaMethodValueContext::Function(shape) => Some(shape),
                     ScalaMethodValueContext::Unknown | ScalaMethodValueContext::Incompatible => {
                         None
@@ -8560,6 +8580,22 @@ fn record_reference(
                                 return;
                             }
                             if let Some(exact_owner) = exact_owner.as_ref() {
+                                if unshaped_argument_method_value {
+                                    match ctx.types.exact_method_value_declaration_for_owner(
+                                        ctx.scala,
+                                        exact_owner,
+                                        name,
+                                    ) {
+                                        BareMemberResolution::Resolved(methods) => {
+                                            for method in methods {
+                                                ctx.record_exact_callable(method, node);
+                                            }
+                                            return;
+                                        }
+                                        BareMemberResolution::Unresolved => return,
+                                        BareMemberResolution::NoMatch => {}
+                                    }
+                                }
                                 let resolution = call_shape.as_ref().map_or_else(
                                     || {
                                         ctx.types.bare_member_declarations_for_owner(

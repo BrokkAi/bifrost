@@ -464,22 +464,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
             ScalaNameResolution::Resolved(_) | ScalaNameResolution::Unresolved => {}
         }
 
-        let mut wildcard_candidates = Vec::new();
-        for import in self.visible_imports().filter(|import| import.is_wildcard) {
-            let Some(path) = scala_import_path(import) else {
-                continue;
-            };
-            if scala_normalized_fq_name(&path) == "scala" {
-                continue;
-            }
-            wildcard_candidates.extend(
-                import_candidate_fq_names(&path, &self.package)
-                    .into_iter()
-                    .flat_map(|package| scala_nested_type_candidates(package, &segments, false)),
-            );
-        }
-        wildcard_candidates.extend(self.enclosing_owner_qualified_wildcard_candidates(&segments));
-        let wildcard = self.resolve_candidate_tier(wildcard_candidates, kind);
+        let wildcard = self.resolve_wildcard_owner_segments(&segments, kind);
         if wildcard != ScalaNameResolution::Unresolved {
             return wildcard;
         }
@@ -580,21 +565,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
             outcome => return outcome,
         }
 
-        let mut wildcard_candidates = Vec::new();
-        for import in self.visible_imports() {
-            let Some(path) = scala_import_path(import) else {
-                continue;
-            };
-            if import.is_wildcard {
-                wildcard_candidates.extend(
-                    import_candidate_fq_names(&path, &self.package)
-                        .into_iter()
-                        .flat_map(|package| scala_nested_type_candidates(package, segments, false)),
-                );
-            }
-        }
-        wildcard_candidates.extend(self.enclosing_owner_qualified_wildcard_candidates(segments));
-        let wildcard = self.resolve_candidate_tier(wildcard_candidates, kind);
+        let wildcard = self.resolve_wildcard_owner_segments(segments, kind);
         if wildcard != ScalaNameResolution::Unresolved {
             return wildcard;
         }
@@ -651,6 +622,27 @@ impl<'a> ForwardScalaNameResolver<'a> {
             );
         }
         ScalaNameResolution::Unresolved
+    }
+
+    fn resolve_wildcard_owner_segments(
+        &self,
+        segments: &[String],
+        kind: ScalaOwnerKind,
+    ) -> ScalaNameResolution {
+        let environment = self.wildcard_import_environment();
+        if environment.ambiguous {
+            return ScalaNameResolution::Ambiguous;
+        }
+        let mut candidates = environment
+            .owners
+            .into_iter()
+            .flat_map(|owner| {
+                let singleton = owner.is_singleton();
+                scala_nested_type_candidates(owner.fqn, segments, singleton)
+            })
+            .collect::<Vec<_>>();
+        candidates.extend(self.enclosing_owner_qualified_wildcard_candidates(segments));
+        self.resolve_candidate_tier(candidates, kind)
     }
 
     fn resolve_absolute_owner_segments(
