@@ -362,6 +362,72 @@ unrelated!();
 }
 
 #[test]
+fn rust_macro_repetition_where_clause_keeps_type_alias_inverse_hit() {
+    let builder_source = r#"
+use crate::{Adaptor, TestOutput};
+
+fn plain<EC>()
+where
+    TestOutput<EC>: Adaptor<EC>,
+{}
+
+macro_rules! gen_tuple {
+    ($($M:ident),*) => {
+        fn generated<$($M,)* EC>()
+        where
+            $(TestOutput<EC>: Adaptor<$M>,)*
+        {}
+    };
+}
+
+macro_rules! binds_alias_name {
+    ($TestOutput:ident) => { $TestOutput };
+}
+
+gen_tuple!(Metric);
+binds_alias_name!(Metric);
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"macro-alias\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "mod base;\npub use base::TestOutput;\npub trait Adaptor<T> {}\npub mod builder;\n",
+        ),
+        ("src/base.rs", "pub type TestOutput<EC> = EC;\n"),
+        ("src/builder.rs", builder_source),
+    ]);
+    let target = analyzer
+        .get_definitions("base.TestOutput")
+        .into_iter()
+        .find(|candidate| analyzer.is_type_alias(candidate))
+        .expect("type alias target");
+    let builder_file = project.file("src/builder.rs");
+    let hits = authoritative_hits(
+        &analyzer,
+        &target,
+        [builder_file.clone()].into_iter().collect(),
+    );
+    let plain_expected = builder_source
+        .find("TestOutput<EC>: Adaptor<EC>")
+        .expect("ordinary where-clause type alias");
+    let repeated_expected = builder_source
+        .find("$(TestOutput<EC>: Adaptor")
+        .expect("macro repetition where-clause type alias")
+        + 2;
+    assert_eq!(
+        vec![plain_expected, repeated_expected],
+        hits.iter()
+            .filter(|hit| hit.file == builder_file && hit.kind == UsageHitKind::Reference)
+            .map(|hit| hit.start_offset)
+            .collect::<Vec<_>>(),
+        "ordinary and repeated where-clause references must be retained while the macro binding decoy stays excluded: {hits:#?}"
+    );
+}
+
+#[test]
 fn rust_bare_token_tree_values_use_exact_forward_module_identity() {
     let source = r#"
 macro_rules! evaluate { ($expression:expr) => { $expression }; }
