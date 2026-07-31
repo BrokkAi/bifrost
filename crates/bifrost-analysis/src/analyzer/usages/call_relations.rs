@@ -8,11 +8,11 @@ use crate::analyzer::lexical_definitions::{
 };
 use crate::analyzer::structural::FileFacts;
 use crate::analyzer::usages::get_definition::{
-    CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC, CallSiteSyntax, CallSyntaxKind, DefinitionLookupOutcome,
+    CallSiteSyntax, CallSyntaxKind, CallTargetLookupOutcome, DefinitionLookupOutcome,
     DefinitionLookupRequest, DefinitionLookupStatus, ExactCallReference, ExactCallReferenceGap,
     call_reference_ranges_in_tree, call_reference_requires_point_lookup,
     call_site_syntax_for_reference, exact_call_reference_for_call, parse_tree_for_language,
-    resolve_definition_batch_with_source, resolve_definition_batch_with_source_and_cancellation,
+    resolve_call_target_batch_with_source, resolve_definition_batch_with_source,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
@@ -464,7 +464,7 @@ impl CallRelationService {
             }
             return lookup;
         };
-        apply_dispatch_outcome(&mut lookup, outcome, limits.max_candidates);
+        apply_call_target_outcome(&mut lookup, outcome, limits.max_candidates);
         lookup.cancelled |= cancellation.is_some_and(CancellationToken::is_cancelled);
         lookup
     }
@@ -725,7 +725,7 @@ impl CallRelationService {
         let candidate_limit = limits.max_candidates.saturating_add(1);
         let candidates =
             call_reference_ranges_in_tree(&tree, language, &caller_range, candidate_limit);
-        let truncated = candidates.len() > limits.max_candidates;
+        let mut truncated = candidates.len() > limits.max_candidates;
         let mut diagnostics = truncated
             .then(|| {
                 CallRelationDiagnostic::new(
@@ -757,12 +757,25 @@ impl CallRelationService {
         let mut ambiguous = 0usize;
         let mut retained_ambiguous = 0usize;
         let mut omitted = 0usize;
+        let mut navigation_truncated = false;
         for (candidate, outcome) in batch.resolved {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 break;
             }
-            let resolution =
-                resolve_outgoing_call_candidate(analyzer, outcome.status, outcome.definitions);
+            let uncertain_identity = outcome.structure_unavailable || outcome.unproven_link_unit;
+            if outcome.truncated {
+                navigation_truncated = true;
+                truncated = true;
+                omitted = omitted.saturating_add(1);
+            }
+            let mut resolution = resolve_outgoing_call_candidate(
+                analyzer,
+                outcome.outcome.status,
+                outcome.outcome.definitions,
+            );
+            if uncertain_identity && resolution.proof.is_some() {
+                resolution.proof = Some(UsageProof::Unproven);
+            }
             let Some(proof) = resolution.proof else {
                 omitted = omitted.saturating_add(resolution.omitted);
                 continue;
@@ -778,7 +791,7 @@ impl CallRelationService {
                 continue;
             };
             omitted = omitted.saturating_add(resolution.omitted);
-            if resolution.ambiguous && resolution.fully_retained {
+            if resolution.ambiguous && resolution.fully_retained && !outcome.truncated {
                 retained_ambiguous = retained_ambiguous.saturating_add(1);
             }
             for callee in resolution.callees {
@@ -790,6 +803,20 @@ impl CallRelationService {
                     proof,
                 ));
             }
+        }
+        if navigation_truncated
+            && !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == CallRelationDiagnosticCode::CandidateLimit)
+        {
+            diagnostics.push(CallRelationDiagnostic::new(
+                CallRelationDiagnosticCode::CandidateLimit,
+                format!(
+                    "call relation target navigation was truncated for {}",
+                    caller.fq_name()
+                ),
+                caller.fq_name().to_string(),
+            ));
         }
         append_outgoing_candidate_diagnostics(
             &mut diagnostics,
@@ -814,7 +841,7 @@ impl CallRelationService {
 }
 
 struct CallReferenceResolutionBatch {
-    resolved: Vec<(Range, DefinitionLookupOutcome)>,
+    resolved: Vec<(Range, CallTargetLookupOutcome)>,
     cancelled: bool,
 }
 
@@ -842,16 +869,13 @@ fn resolve_call_references_with_source(
                 .then_some(range.end_byte),
         })
         .collect();
-    let outcomes = match cancellation {
-        Some(cancellation) => resolve_definition_batch_with_source_and_cancellation(
-            analyzer,
-            requests,
-            file.clone(),
-            source,
-            cancellation,
-        ),
-        None => resolve_definition_batch_with_source(analyzer, requests, file.clone(), source),
-    };
+    let outcomes = resolve_call_target_batch_with_source(
+        analyzer,
+        requests,
+        file.clone(),
+        source,
+        cancellation,
+    );
     let resolved = references.iter().copied().zip(outcomes).collect::<Vec<_>>();
     CallReferenceResolutionBatch {
         resolved,
@@ -873,10 +897,37 @@ fn unresolved_dispatch_lookup(
     }
 }
 
+#[cfg(test)]
 fn apply_dispatch_outcome(
     lookup: &mut CallDispatchLookup,
     outcome: DefinitionLookupOutcome,
     max_targets: usize,
+) {
+    apply_dispatch_outcome_with_flags(lookup, outcome, max_targets, false, false, false);
+}
+
+fn apply_call_target_outcome(
+    lookup: &mut CallDispatchLookup,
+    outcome: CallTargetLookupOutcome,
+    max_targets: usize,
+) {
+    apply_dispatch_outcome_with_flags(
+        lookup,
+        outcome.outcome,
+        max_targets,
+        outcome.structure_unavailable,
+        outcome.unproven_link_unit,
+        outcome.truncated,
+    );
+}
+
+fn apply_dispatch_outcome_with_flags(
+    lookup: &mut CallDispatchLookup,
+    outcome: DefinitionLookupOutcome,
+    max_targets: usize,
+    structure_unavailable: bool,
+    unproven_link_unit: bool,
+    navigation_targets_truncated: bool,
 ) {
     let DefinitionLookupOutcome {
         status,
@@ -885,15 +936,18 @@ fn apply_dispatch_outcome(
         diagnostics,
         reference: _,
     } = outcome;
-    let unproven_target_identity = diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.kind == CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC);
+    let unproven_target_identity = structure_unavailable || unproven_link_unit;
     lookup.status = Some(status);
     lookup.diagnostics.extend(
         diagnostics
             .into_iter()
             .map(|diagnostic| format!("{}: {}", diagnostic.kind, diagnostic.message)),
     );
+    if navigation_targets_truncated {
+        lookup.truncated = true;
+        lookup.budget_exhausted = true;
+        lookup.boundaries.push(CallDispatchBoundaryKind::Truncated);
+    }
 
     definitions.sort();
     definitions.dedup();
@@ -908,7 +962,12 @@ fn apply_dispatch_outcome(
         definitions.truncate(max_targets);
         lookup.truncated = true;
         lookup.budget_exhausted = true;
-        lookup.boundaries.push(CallDispatchBoundaryKind::Truncated);
+        if !lookup
+            .boundaries
+            .contains(&CallDispatchBoundaryKind::Truncated)
+        {
+            lookup.boundaries.push(CallDispatchBoundaryKind::Truncated);
+        }
     }
     let proof = if status == DefinitionLookupStatus::Resolved && !unproven_target_identity {
         UsageProof::Proven
@@ -1510,6 +1569,141 @@ int caller() { return local_target(1); }
             std::path::Path::new("caller.c")
         );
         assert!(lookup.boundaries.is_empty(), "{lookup:#?}");
+    }
+
+    #[test]
+    fn exact_dispatch_projects_cpp_header_declarations_to_the_unique_body() {
+        let header_source = "int relay(int value);\n";
+        let body_source = "#include \"relay.h\"\nint relay(int value) { return value; }\n";
+        let caller_source =
+            "#include \"relay.h\"\nint caller(int value) { return relay(value); }\n";
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Cpp,
+            &[
+                ("relay.h", header_source),
+                ("relay.cpp", body_source),
+                ("caller.cpp", caller_source),
+            ],
+        );
+
+        let lookup = CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            &ExactCallLocation {
+                file: ProjectFile::new(fixture.project_root(), "caller.cpp"),
+                call_span: call_span(caller_source, "relay(value)"),
+            },
+            Arc::from(caller_source),
+            generous_limits(),
+            None,
+        );
+
+        assert_eq!(lookup.status, Some(DefinitionLookupStatus::Resolved));
+        assert_eq!(lookup.targets.len(), 1, "{lookup:#?}");
+        assert_eq!(
+            lookup.targets[0].definition.source().rel_path(),
+            std::path::Path::new("relay.cpp")
+        );
+        assert_eq!(lookup.targets[0].proof, UsageProof::Proven);
+        assert!(lookup.boundaries.is_empty(), "{lookup:#?}");
+    }
+
+    #[test]
+    fn exact_dispatch_preserves_cpp_navigation_uncertainty() {
+        let definition = CodeUnit::new(
+            ProjectFile::new(std::env::temp_dir(), "relay.cpp"),
+            CodeUnitType::Function,
+            "",
+            "relay",
+        );
+        let outcome = |status, structure_unavailable, truncated| CallTargetLookupOutcome {
+            outcome: DefinitionLookupOutcome {
+                status,
+                reference: None,
+                definitions: vec![definition.clone()],
+                lexical_definition: None,
+                diagnostics: Vec::new(),
+            },
+            structure_unavailable,
+            unproven_link_unit: false,
+            truncated,
+        };
+
+        let mut unavailable = CallDispatchLookup::default();
+        apply_call_target_outcome(
+            &mut unavailable,
+            outcome(DefinitionLookupStatus::Resolved, true, false),
+            8,
+        );
+        assert_eq!(unavailable.targets.len(), 1, "{unavailable:#?}");
+        assert_eq!(unavailable.targets[0].proof, UsageProof::Unproven);
+        assert!(
+            unavailable
+                .boundaries
+                .contains(&CallDispatchBoundaryKind::UnprovenTargetIdentity),
+            "{unavailable:#?}"
+        );
+
+        let mut truncated = CallDispatchLookup::default();
+        apply_call_target_outcome(
+            &mut truncated,
+            outcome(DefinitionLookupStatus::Ambiguous, false, true),
+            8,
+        );
+        assert!(truncated.targets.is_empty(), "{truncated:#?}");
+        assert!(truncated.truncated, "{truncated:#?}");
+        assert!(truncated.budget_exhausted, "{truncated:#?}");
+        assert!(
+            truncated
+                .boundaries
+                .contains(&CallDispatchBoundaryKind::Truncated),
+            "{truncated:#?}"
+        );
+    }
+
+    #[test]
+    fn exact_dispatch_keeps_multiple_cpp_bodies_unproven() {
+        let header_source = "int relay(int value);\n";
+        let first_body = "#include \"relay.h\"\nint relay(int value) { return value + 1; }\n";
+        let second_body = "#include \"relay.h\"\nint relay(int value) { return value + 2; }\n";
+        let caller_source =
+            "#include \"relay.h\"\nint caller(int value) { return relay(value); }\n";
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Cpp,
+            &[
+                ("relay.h", header_source),
+                ("first.cpp", first_body),
+                ("second.cpp", second_body),
+                ("caller.cpp", caller_source),
+            ],
+        );
+
+        let lookup = CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            &ExactCallLocation {
+                file: ProjectFile::new(fixture.project_root(), "caller.cpp"),
+                call_span: call_span(caller_source, "relay(value)"),
+            },
+            Arc::from(caller_source),
+            generous_limits(),
+            None,
+        );
+
+        assert_eq!(lookup.status, Some(DefinitionLookupStatus::Ambiguous));
+        assert!(lookup.targets.is_empty(), "{lookup:#?}");
+        assert!(
+            lookup
+                .boundaries
+                .contains(&CallDispatchBoundaryKind::UnprovenTargetIdentity),
+            "{lookup:#?}"
+        );
+        assert!(
+            lookup
+                .boundaries
+                .contains(&CallDispatchBoundaryKind::Unresolved(
+                    DefinitionLookupStatus::Ambiguous
+                )),
+            "{lookup:#?}"
+        );
     }
 
     #[test]

@@ -889,7 +889,7 @@ fn cpp_implicit_object_call_keeps_virtual_dispatch_open() {
 }
 
 #[test]
-fn cpp_default_argument_and_conversion_evaluation_keep_call_transfer_partial() {
+fn cpp_default_argument_binding_keeps_call_and_normal_return_partial() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
             "defaults.cpp",
@@ -932,12 +932,33 @@ fn cpp_default_argument_and_conversion_evaluation_keep_call_transfer_partial() {
                 .procedure("target")
                 .effect("entry"),
             ["target_call"],
+        )
+        .bind_node(
+            "target_exit",
+            "defaults.cpp",
+            PointSelector::new("int target(int value = hidden())")
+                .procedure("target")
+                .effect("normal_exit"),
+            ["target_call"],
+        )
+        .bind_node(
+            "continuation",
+            "defaults.cpp",
+            PointSelector::new("target()")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+            root(),
         );
 
-    let expected = icfg_edge("target_entry", IcfgEdgeKind::Call).originating_call("target_call");
+    let call = icfg_edge("target_entry", IcfgEdgeKind::Call).originating_call("target_call");
+    let normal_return =
+        icfg_edge("continuation", IcfgEdgeKind::NormalReturn).originating_call("target_call");
     graph.assert_outcome(IcfgOutcomeKind::Unproven);
-    graph.assert_successors("invoke", &[expected]);
-    graph.assert_edge_proven_partial("invoke", expected);
+    graph.assert_successors("invoke", &[call]);
+    graph.assert_edge_proven_partial("invoke", call);
+    graph.assert_successors("target_exit", &[normal_return]);
+    graph.assert_edge_unproven_partial("target_exit", normal_return);
     graph.assert_adjacency_symmetric();
 }
 
