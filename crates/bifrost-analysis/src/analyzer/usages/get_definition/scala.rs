@@ -7915,7 +7915,9 @@ fn scala_callable_matches_constructed_arguments(
                 ScalaParameterTypeIdentity::Declaration(expected) => {
                     scala_exact_subtype_relation(ctx, actual, expected)
                 }
-                ScalaParameterTypeIdentity::TypeParameter(_)
+                ScalaParameterTypeIdentity::Logical(_)
+                | ScalaParameterTypeIdentity::LogicalCandidates(_)
+                | ScalaParameterTypeIdentity::TypeParameter(_)
                 | ScalaParameterTypeIdentity::Unresolved(_) => ScalaTypedCandidateMatch::Unknown,
             };
             match relation {
