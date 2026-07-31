@@ -82,12 +82,11 @@ The observable outcomes are:
   resumable waves, official fresh-container scoring, load sampling, and report aggregation.
 - [ ] Run provider preflight and the no-semantic seed-0 baseline at concurrency 30. The first
   r1 wave was stopped and invalidated after leak audit found repository-history and web-search
-  use. The clean r3 wave produced 57 resumable cells before a deterministic Gitlink scrub
-  failure stopped its controller; brokkbench commit `a8012514ec6` fixes the root cause and the
-  exact formerly failing Vuls task completed with exit code zero in 744.9 seconds. Brokkbench
-  commit `58bb0a1b4e9` also cancels queued futures before executor shutdown instead of draining
-  the queue after a cell failure. All 57 completed cells with a generation exit code report
-  zero, so Bedrock remains healthy while the final old-store subset resumes at concurrency 30.
+  use. The r3 wave was subsequently invalidated after 71 cells: the container runner replaced
+  each image's OCI `PATH`, so Go tasks could not use their bundled toolchain during either
+  generation or scoring. Brokkbench commit `d508bd1c4a4` preserves image environments, its
+  focused suite passes, and a real Flipt image exposes Go 1.24.3. The clean r4 replacement is
+  prepared and a corrected Pro Go smoke is running before the full concurrency-30 wave.
 - [ ] Pass the baseline sanity gate, then run baseline seeds 1 and 2 with measured concurrency
   escalation.
 - [x] (2026-07-31 10:01Z) Precomputed all Granite indexes on the A4000 at repository concurrency
@@ -282,6 +281,14 @@ The observable outcomes are:
   while their first multi-gigabyte layers unpacked, despite 4.24 GB already present; committed
   image IDs then began appearing normally.
 
+- Observation: the initial r3 score of 15/71 resolved was invalid rather than a Luna capability
+  result. Direct Podman execution used `bash -lc`, which reset the task image's OCI `PATH`, and
+  the cimeval remote runner independently replaced `PATH` with a generic Unix path. Thirty-three
+  scored cells logged a missing Go command, and generation had the same environment defect.
+  Evidence: Flipt e2bd's score log says `go: command not found` despite its official image
+  containing `/usr/local/go/bin/go`; an OCI-preserving smoke reports Go 1.24.3. Brokkbench
+  commit `d508bd1c4a4` uses non-login direct shells and prepends the runtime paths instead.
+
 ## Decision Log
 
 - Decision: this delivery implements and evaluates Granite R2 only.
@@ -339,11 +346,12 @@ The observable outcomes are:
   relying on command-text filters, while physically removing all three observed leak paths.
   Date/Author: 2026-07-31, Codex.
 
-- Decision: r1 is an invalid diagnostic run and r2 is an unused preflight attempt. The first
-  reportable campaign identity is `granite-r2-cim-20260731-r3`, pinned to brokkbench
-  `ce8bea80e6d`, Anvil `b385af1636e`, Mjolnir `3e046fcaabb`, and Bifrost `d6ad48b2591`.
-  Rationale: completed cells and runtime bundles are immutable; a new identity prevents fixed
-  and contaminated artifacts from being silently mixed.
+- Decision: r1 is an invalid diagnostic run, r2 is an unused preflight attempt, and r3 is an
+  invalid task-environment run. The first reportable campaign identity is now
+  `granite-r2-cim-20260731-r4`, with brokkbench environment fix `d508bd1c4a4`; it reuses the
+  byte-identical r3 agent binary bundle but copies the corrected runner into every fresh cell.
+  Rationale: completed cells and runtime bundles are immutable; a new identity prevents fixed,
+  contaminated, and toolchain-deficient artifacts from being silently mixed.
   Date/Author: 2026-07-31, Codex.
 
 - Decision: use independent run replicates labeled seeds 0, 1, and 2; pass a provider sampling
