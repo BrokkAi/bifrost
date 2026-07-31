@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use semver::{Version, VersionReq};
 use sha2::{Digest, Sha256};
@@ -8,8 +8,8 @@ use sha2::{Digest, Sha256};
 use super::{
     ActivationSelector, CatalogCoordinate, CatalogMiss, CatalogPackSourceKind,
     CompiledPackManifest, CompiledProcedureSummary, CompiledShard, GeneratorRule, MemberFact,
-    PayloadKind, RelationFact, RuleTrigger, SemanticPackCatalog, SemanticPackSelectorQuery,
-    TypeFact,
+    PayloadKind, RelationFact, RuleTrigger, SemanticModelOverlay, SemanticModelOverlayBuildError,
+    SemanticPackCatalog, SemanticPackSelectorQuery, TypeFact,
 };
 use crate::CancellationToken;
 use crate::analyzer::IAnalyzer;
@@ -137,6 +137,7 @@ pub struct ActiveSemanticModelShard {
     pub shard: CompiledShard,
     pub source_kind: CatalogPackSourceKind,
     pub source_id: String,
+    pub matched_evidence: SemanticModelActivationEvidence,
     evidence_rank: EvidenceRank,
     source_rank: u8,
 }
@@ -219,6 +220,10 @@ impl ResolvedActiveSemanticModels {
         self.rule_match(posting)
     }
 
+    pub fn rules_with_id(&self, id: &str) -> SemanticModelMatch<'_, GeneratorRule> {
+        self.rule_match(self.indexes.rules_by_id.get(id))
+    }
+
     pub fn procedure_summaries_for(
         &self,
         target: ProcedureSummaryTargetKey<'_>,
@@ -288,10 +293,16 @@ pub enum SemanticModelMatchDisposition {
 
 #[derive(Debug)]
 pub struct SemanticModelMatch<'a, T> {
-    pub records: Vec<&'a T>,
+    pub records: Vec<ActivatedSemanticModelRecord<'a, T>>,
     pub disposition: SemanticModelMatchDisposition,
     pub candidates_examined: usize,
     pub fallback_candidates_examined: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ActivatedSemanticModelRecord<'a, T> {
+    pub record: &'a T,
+    pub shard: &'a ActiveSemanticModelShard,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -370,6 +381,7 @@ struct MatcherIndexes {
     relations_by_id: HashMap<String, Vec<RecordAddress>>,
     relations_by_from: HashMap<String, Vec<RecordAddress>>,
     relations_by_to: HashMap<String, Vec<RecordAddress>>,
+    rules_by_id: HashMap<String, Vec<RecordAddress>>,
     rules_by_language_construct: HashMap<String, Vec<RecordAddress>>,
     rules_by_annotation: HashMap<String, Vec<RecordAddress>>,
     rules_by_macro: HashMap<String, Vec<RecordAddress>>,
@@ -394,6 +406,7 @@ impl MatcherIndexes {
             relations_by_id: map_with_capacity(active.len()),
             relations_by_from: map_with_capacity(active.len()),
             relations_by_to: map_with_capacity(active.len()),
+            rules_by_id: map_with_capacity(active.len()),
             rules_by_language_construct: map_with_capacity(active.len()),
             rules_by_annotation: map_with_capacity(active.len()),
             rules_by_macro: map_with_capacity(active.len()),
@@ -506,6 +519,15 @@ impl MatcherIndexes {
                     poll_matcher_cancellation(cancellation, records_visited)?;
                     records_visited += 1;
                     let address = record_address(shard, record_index)?;
+                    insert_posting(
+                        &mut indexes.rules_by_id,
+                        rule.id.clone(),
+                        rule.id.len(),
+                        address,
+                        &mut entries,
+                        &mut working_bytes,
+                        limits,
+                    )?;
                     insert_rule_trigger(
                         &mut indexes,
                         &rule.trigger,
@@ -717,8 +739,11 @@ where
         }
         let record = resolve(shard, address.record as usize)
             .expect("semantic-model index address must resolve to its record kind");
-        if !records.contains(&record) {
-            records.push(record);
+        if !records
+            .iter()
+            .any(|candidate: &ActivatedSemanticModelRecord<'_, T>| candidate.record == record)
+        {
+            records.push(ActivatedSemanticModelRecord { record, shard });
         }
     }
     SemanticModelMatch {
@@ -825,6 +850,12 @@ pub enum SemanticModelRuntimeOutcome {
 
 pub(crate) struct SemanticModelRuntimeCache {
     values: CompleteValueCache<String, ResolvedActiveSemanticModels>,
+    overlay: Mutex<Option<PublishedSemanticModelOverlay>>,
+}
+
+struct PublishedSemanticModelOverlay {
+    active: Arc<ResolvedActiveSemanticModels>,
+    overlay: Arc<SemanticModelOverlay>,
 }
 
 #[derive(Clone, Copy)]
@@ -846,7 +877,56 @@ impl SemanticModelRuntimeCache {
                 max_retained_bytes,
                 |_, active| u32::try_from(active.retained_bytes()).unwrap_or(u32::MAX),
             ),
+            overlay: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn overlay(&self) -> Option<Arc<SemanticModelOverlay>> {
+        self.overlay
+            .lock()
+            .expect("semantic-model overlay mutex poisoned")
+            .as_ref()
+            .map(|published| Arc::clone(&published.overlay))
+    }
+
+    fn publish_overlay(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        active: &Arc<ResolvedActiveSemanticModels>,
+        cancellation: &CancellationToken,
+        max_combined_retained_bytes: u64,
+    ) -> Result<Arc<SemanticModelOverlay>, SemanticModelOverlayBuildError> {
+        {
+            let slot = self
+                .overlay
+                .lock()
+                .expect("semantic-model overlay mutex poisoned");
+            if let Some(published) = slot.as_ref()
+                && Arc::ptr_eq(&published.active, active)
+            {
+                return Ok(Arc::clone(&published.overlay));
+            }
+        }
+        let overlay = Arc::new(SemanticModelOverlay::build(
+            analyzer,
+            active,
+            cancellation,
+            max_combined_retained_bytes,
+        )?);
+        let mut slot = self
+            .overlay
+            .lock()
+            .expect("semantic-model overlay mutex poisoned");
+        if let Some(published) = slot.as_ref()
+            && Arc::ptr_eq(&published.active, active)
+        {
+            return Ok(Arc::clone(&published.overlay));
+        }
+        *slot = Some(PublishedSemanticModelOverlay {
+            active: Arc::clone(active),
+            overlay: Arc::clone(&overlay),
+        });
+        Ok(overlay)
     }
 }
 
@@ -1015,7 +1095,7 @@ pub fn resolve_active_semantic_models(
             return SemanticModelResolutionOutcome::Unavailable(report);
         }
 
-        let Some(evidence_rank) = strict_activation_rank(
+        let Some((evidence_rank, matched_evidence)) = strict_activation_match(
             &loaded.manifest,
             &loaded.shard,
             &evidence,
@@ -1078,6 +1158,7 @@ pub fn resolve_active_semantic_models(
                 shard: loaded.shard,
                 source_kind: loaded.source_kind,
                 source_id: loaded.source_id,
+                matched_evidence,
                 evidence_rank,
                 source_rank: source_rank(loaded.source_kind),
             },
@@ -1188,7 +1269,7 @@ pub fn acquire_active_semantic_models(
     request: &SemanticModelActivationRequest,
     cancellation: &CancellationToken,
 ) -> SemanticModelRuntimeOutcome {
-    let key = match runtime_request_key(request) {
+    let request_key = match runtime_request_key(request) {
         Ok(key) => key,
         Err(reason) => {
             let mut report = SemanticModelActivationReport::default();
@@ -1202,6 +1283,14 @@ pub fn acquire_active_semantic_models(
     {
         return catalog_lifecycle_error(request.limits, "reconcile", error);
     }
+    let catalog_identity = match catalog.cache_identity() {
+        Ok(identity) => identity,
+        Err(error) => return catalog_lifecycle_error(request.limits, "identify", error),
+    };
+    let key = format!(
+        "{request_key}:{}:{}",
+        catalog_identity.mutation_generation, catalog_identity.sqlite_data_version
+    );
     let generations = analyzer.snapshot_source_generations();
     let Some(caches) = analyzer.snapshot_caches() else {
         let outcome = resolve_active_semantic_models(catalog, request, cancellation);
@@ -1221,6 +1310,14 @@ pub fn acquire_active_semantic_models(
             if !analyzer.snapshot_generations_match(&generations) {
                 return stale_generation_outcome(request.limits);
             }
+            if let Err(error) = caches.semantic_models().publish_overlay(
+                analyzer,
+                &value,
+                cancellation,
+                request.limits.max_retained_bytes,
+            ) {
+                return overlay_build_outcome(&value, error, request.limits);
+            }
             if let Err(error) = publish_active_models(catalog, persistence, &value) {
                 return catalog_lifecycle_error(request.limits, "publish", error);
             }
@@ -1237,10 +1334,18 @@ pub fn acquire_active_semantic_models(
             if !analyzer.snapshot_generations_match(&generations) {
                 return stale_generation_outcome(request.limits);
             }
+            let active = Arc::new(active);
+            if let Err(error) = caches.semantic_models().publish_overlay(
+                analyzer,
+                &active,
+                cancellation,
+                request.limits.max_retained_bytes,
+            ) {
+                return overlay_build_outcome(&active, error, request.limits);
+            }
             if let Err(error) = publish_active_models(catalog, persistence, &active) {
                 return catalog_lifecycle_error(request.limits, "publish", error);
             }
-            let active = Arc::new(active);
             permit.publish_complete(Arc::clone(&active));
             SemanticModelRuntimeOutcome::Ready {
                 active,
@@ -1252,6 +1357,25 @@ pub fn acquire_active_semantic_models(
         }
         CompleteValueAcquisition::Rejected => {
             unreachable!("semantic-model runtime cache never publishes deterministic rejections")
+        }
+    }
+}
+
+fn overlay_build_outcome(
+    active: &ResolvedActiveSemanticModels,
+    error: SemanticModelOverlayBuildError,
+    limits: SemanticModelRuntimeLimits,
+) -> SemanticModelRuntimeOutcome {
+    let mut report = active.activation_report().clone();
+    match error {
+        SemanticModelOverlayBuildError::Cancelled => SemanticModelRuntimeOutcome::Cancelled(report),
+        SemanticModelOverlayBuildError::RetainedBytesExceeded => {
+            push_request_explanation(
+                &mut report,
+                limits,
+                "semantic-model overlay exceeds the combined retained-byte budget".to_string(),
+            );
+            SemanticModelRuntimeOutcome::Unavailable(report)
         }
     }
 }
@@ -1509,12 +1633,12 @@ fn evidence_query(
     }
 }
 
-fn strict_activation_rank(
+fn strict_activation_match(
     manifest: &CompiledPackManifest,
     shard: &CompiledShard,
     evidence: &[SemanticModelActivationEvidence],
     bifrost_version: &Version,
-) -> Option<EvidenceRank> {
+) -> Option<(EvidenceRank, SemanticModelActivationEvidence)> {
     let bifrost = VersionReq::parse(&manifest.compatibility.bifrost).ok()?;
     if !bifrost.matches(bifrost_version) {
         return None;
@@ -1548,7 +1672,7 @@ fn strict_activation_rank(
                         && row.ecosystem == manifest.ecosystem
                         && strict_selector_matches(selector, row)
                 })
-                .map(|_| selector_rank(selector))
+                .map(|row| (selector_rank(selector), row.clone()))
         })
         .max()
 }

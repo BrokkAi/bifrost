@@ -8,6 +8,7 @@ mod catalog;
 mod compiler;
 mod identity;
 mod model;
+mod overlay;
 mod producer;
 mod runtime;
 mod source;
@@ -26,6 +27,7 @@ pub use catalog::*;
 pub use compiler::{CompilerOptions, CompressionPolicy, compile_pack, compile_source};
 pub use identity::{MemberIdentity, TypeIdentity, member_declaration_id, type_declaration_id};
 pub use model::*;
+pub use overlay::*;
 pub use producer::{
     ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
     BoundedProducerDiagnostics, ExactArtifact, ExternalArtifactKind, ExternalArtifactPackProducer,

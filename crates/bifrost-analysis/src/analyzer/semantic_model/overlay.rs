@@ -1,0 +1,1580 @@
+use std::path::Path;
+
+use serde::Serialize;
+use url::Url;
+
+use super::{
+    ActiveSemanticModelShard, AsciiTransform, CaptureBinding, CaptureProjection, CaptureSource,
+    CatalogPackSourceKind, Completeness, EmittedDeclaration, GeneratorRule, HierarchyFact,
+    HierarchyKind, Locator, MemberFact, MemberKind, RelationFact, RelationKind,
+    ResolvedActiveSemanticModels, RuleEmission, RuleTrigger, SemanticModelActivationStatus,
+    SemanticModelMatchDisposition, TemplateExpression, TemplateSignature, TemplateTypeRef,
+    TypeFact, TypeKind, TypeRef,
+};
+use crate::analyzer::structural::{FileFacts, NormalizedKind, Role};
+use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
+use crate::hash::{HashMap, HashSet};
+
+const MODEL_URI_BASE: &str = "bifrost-model://v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticModelOriginKind {
+    WorkspaceSource,
+    ExactGeneratedOutput,
+    DependencySource,
+    DependencyBinary,
+    PrebuiltApiIndex,
+    DeclarativeModel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticModelProof {
+    AuthoredAnchor,
+    ExactArtifact,
+    PackFact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticModelCompleteness {
+    Partial,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticModelSymbolKind {
+    Class,
+    Annotation,
+    Delegate,
+    Interface,
+    Trait,
+    Struct,
+    Enum,
+    Record,
+    Module,
+    TypeAlias,
+    Constructor,
+    Method,
+    Function,
+    Field,
+    Property,
+    Constant,
+    Event,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SemanticModelRange {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+impl From<Range> for SemanticModelRange {
+    fn from(range: Range) -> Self {
+        Self {
+            start_byte: range.start_byte,
+            end_byte: range.end_byte,
+            start_line: range.start_line,
+            end_line: range.end_line,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SemanticModelAuthoredAnchor {
+    pub path: String,
+    pub symbol: String,
+    pub range: SemanticModelRange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SemanticModelVirtualLocation {
+    pub uri: String,
+    pub range: SemanticModelRange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SemanticModelLocation {
+    Authored(SemanticModelAuthoredAnchor),
+    Model(SemanticModelVirtualLocation),
+}
+
+impl SemanticModelLocation {
+    pub fn identity(&self) -> &str {
+        match self {
+            Self::Authored(anchor) => &anchor.path,
+            Self::Model(location) => &location.uri,
+        }
+    }
+
+    pub fn range(&self) -> &SemanticModelRange {
+        match self {
+            Self::Authored(anchor) => &anchor.range,
+            Self::Model(location) => &location.range,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SemanticModelActivationProvenance {
+    pub status: String,
+    pub reason: String,
+    pub source_kind: String,
+    pub source_id: String,
+    pub matched_evidence: SemanticModelMatchedEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SemanticModelMatchedCoordinate {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SemanticModelMatchedEvidence {
+    pub language: String,
+    pub ecosystem: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package: Option<SemanticModelMatchedCoordinate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module: Option<SemanticModelMatchedCoordinate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub toolchain: Option<SemanticModelMatchedCoordinate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SemanticModelProvenance {
+    pub active_model_set_hash: String,
+    pub pack_digest: String,
+    pub pack_id: String,
+    pub pack_version: String,
+    pub producer: String,
+    pub producer_version: String,
+    pub record_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    pub origin: SemanticModelOriginKind,
+    pub activation: SemanticModelActivationProvenance,
+    pub proof: SemanticModelProof,
+    pub completeness: SemanticModelCompleteness,
+    pub ambiguous: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SemanticModelSymbol {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
+    pub name: String,
+    pub qualified_name: String,
+    pub language: String,
+    pub kind: SemanticModelSymbolKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    pub aliases: Vec<String>,
+    pub location: SemanticModelLocation,
+    pub provenance: SemanticModelProvenance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SemanticModelRelation {
+    pub id: String,
+    pub kind: String,
+    pub from: String,
+    pub to: String,
+    pub provenance: SemanticModelProvenance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticModelOverlayDisposition {
+    Empty,
+    Unique,
+    Conflict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticModelOverlayBuildError {
+    Cancelled,
+    RetainedBytesExceeded,
+}
+
+#[derive(Debug)]
+pub struct SemanticModelOverlayMatch<'a, T> {
+    pub records: Vec<&'a T>,
+    pub disposition: SemanticModelOverlayDisposition,
+}
+
+#[derive(Debug)]
+pub struct SemanticModelOverlay {
+    active_model_set_hash: String,
+    symbols: Vec<SemanticModelSymbol>,
+    relations: Vec<SemanticModelRelation>,
+    symbols_by_id: HashMap<String, Vec<usize>>,
+    symbols_by_name: HashMap<String, Vec<usize>>,
+    symbols_by_uri: HashMap<String, Vec<usize>>,
+    symbols_by_owner: HashMap<String, Vec<usize>>,
+    relations_from: HashMap<String, Vec<usize>>,
+    relations_to: HashMap<String, Vec<usize>>,
+}
+
+impl SemanticModelOverlay {
+    pub(crate) fn build(
+        analyzer: &dyn IAnalyzer,
+        active: &ResolvedActiveSemanticModels,
+        cancellation: &crate::CancellationToken,
+        max_combined_retained_bytes: u64,
+    ) -> Result<Self, SemanticModelOverlayBuildError> {
+        let mut type_ids = Vec::new();
+        let mut member_ids = Vec::new();
+        let mut relation_ids = Vec::new();
+        for shard in active.shards() {
+            if cancellation.is_cancelled() {
+                return Err(SemanticModelOverlayBuildError::Cancelled);
+            }
+            if let Some((types, members, relations)) = shard.shard.payload().declaration_facts() {
+                type_ids.extend(types.iter().map(|record| record.id.clone()));
+                member_ids.extend(members.iter().map(|record| record.id.clone()));
+                relation_ids.extend(relations.iter().map(|record| record.id.clone()));
+            }
+        }
+        type_ids.sort_unstable();
+        type_ids.dedup();
+        member_ids.sort_unstable();
+        member_ids.dedup();
+        relation_ids.sort_unstable();
+        relation_ids.dedup();
+
+        let mut symbols = Vec::new();
+        let mut hierarchy_relations = Vec::new();
+        let mut qualified_types = HashMap::default();
+        for id in type_ids {
+            if cancellation.is_cancelled() {
+                return Err(SemanticModelOverlayBuildError::Cancelled);
+            }
+            let matched = active.types_with_id(&id);
+            let ambiguous = matched.disposition == SemanticModelMatchDisposition::Conflict;
+            for activated in matched.records {
+                let symbol = type_symbol(
+                    analyzer,
+                    active,
+                    activated.shard,
+                    activated.record,
+                    ambiguous,
+                );
+                if !ambiguous {
+                    qualified_types.insert(symbol.id.clone(), symbol.qualified_name.clone());
+                }
+                hierarchy_relations.extend(activated.record.hierarchy.iter().map(|hierarchy| {
+                    hierarchy_relation(
+                        active,
+                        activated.shard,
+                        &activated.record.id,
+                        hierarchy,
+                        ambiguous,
+                    )
+                }));
+                symbols.push(symbol);
+            }
+        }
+        for id in member_ids {
+            if cancellation.is_cancelled() {
+                return Err(SemanticModelOverlayBuildError::Cancelled);
+            }
+            let matched = active.members_with_id(&id);
+            let ambiguous = matched.disposition == SemanticModelMatchDisposition::Conflict;
+            for activated in matched.records {
+                symbols.push(member_symbol(
+                    analyzer,
+                    active,
+                    activated.shard,
+                    activated.record,
+                    qualified_types
+                        .get(&activated.record.owner)
+                        .map(String::as_str),
+                    ambiguous,
+                ));
+            }
+        }
+        let generated = generated_overlay_facts(analyzer, active, cancellation)?;
+        symbols.extend(generated.symbols);
+        mark_symbol_identity_conflicts(&mut symbols);
+        symbols.sort_by(|left, right| {
+            left.qualified_name
+                .cmp(&right.qualified_name)
+                .then_with(|| left.id.cmp(&right.id))
+                .then_with(|| {
+                    left.provenance
+                        .pack_digest
+                        .cmp(&right.provenance.pack_digest)
+                })
+        });
+
+        let mut relations = hierarchy_relations;
+        relations.extend(generated.relations);
+        for id in relation_ids {
+            if cancellation.is_cancelled() {
+                return Err(SemanticModelOverlayBuildError::Cancelled);
+            }
+            let matched = active.relations_with_id(&id);
+            let ambiguous = matched.disposition == SemanticModelMatchDisposition::Conflict;
+            for activated in matched.records {
+                relations.push(relation(
+                    active,
+                    activated.shard,
+                    activated.record,
+                    ambiguous,
+                ));
+            }
+        }
+        relations.sort_by(|left, right| {
+            left.from
+                .cmp(&right.from)
+                .then_with(|| left.to.cmp(&right.to))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        let mut overlay = Self {
+            active_model_set_hash: active.active_model_set_hash().to_string(),
+            symbols,
+            relations,
+            symbols_by_id: HashMap::default(),
+            symbols_by_name: HashMap::default(),
+            symbols_by_uri: HashMap::default(),
+            symbols_by_owner: HashMap::default(),
+            relations_from: HashMap::default(),
+            relations_to: HashMap::default(),
+        };
+        overlay.rebuild_indexes(cancellation)?;
+        if active
+            .retained_bytes()
+            .saturating_add(overlay.retained_bytes_lower_bound())
+            > max_combined_retained_bytes
+        {
+            return Err(SemanticModelOverlayBuildError::RetainedBytesExceeded);
+        }
+        Ok(overlay)
+    }
+
+    pub fn active_model_set_hash(&self) -> &str {
+        &self.active_model_set_hash
+    }
+
+    pub fn symbols(&self) -> &[SemanticModelSymbol] {
+        &self.symbols
+    }
+
+    pub fn relations(&self) -> &[SemanticModelRelation] {
+        &self.relations
+    }
+
+    pub fn symbols_with_id(&self, id: &str) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
+        self.symbol_match(self.symbols_by_id.get(id))
+    }
+
+    pub fn symbols_named(&self, name: &str) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
+        self.symbol_match(self.symbols_by_name.get(name))
+    }
+
+    pub fn symbols_at_uri(&self, uri: &str) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
+        self.symbol_match(self.symbols_by_uri.get(uri))
+    }
+
+    pub fn members_of(&self, owner_id: &str) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
+        self.symbol_match(self.symbols_by_owner.get(owner_id))
+    }
+
+    pub fn search<'a>(
+        &'a self,
+        patterns: &crate::analyzer::SearchSymbolPatternBatch,
+    ) -> Vec<&'a SemanticModelSymbol> {
+        self.search_with_limit(patterns, usize::MAX, None).0
+    }
+
+    pub fn search_with_limit<'a>(
+        &'a self,
+        patterns: &crate::analyzer::SearchSymbolPatternBatch,
+        limit: usize,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> (Vec<&'a SemanticModelSymbol>, usize, bool) {
+        self.search_with_limit_filter(patterns, limit, cancellation, |_| true)
+    }
+
+    pub fn search_with_limit_filter<'a>(
+        &'a self,
+        patterns: &crate::analyzer::SearchSymbolPatternBatch,
+        limit: usize,
+        cancellation: Option<&crate::CancellationToken>,
+        include: impl Fn(&SemanticModelSymbol) -> bool,
+    ) -> (Vec<&'a SemanticModelSymbol>, usize, bool) {
+        let mut records = Vec::new();
+        let mut total = 0usize;
+        for symbol in &self.symbols {
+            if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+                return (records, total, false);
+            }
+            let matched = patterns.is_match(&symbol.name)
+                || patterns.is_match(&symbol.qualified_name)
+                || symbol.aliases.iter().any(|alias| patterns.is_match(alias));
+            if matched && include(symbol) {
+                total = total.saturating_add(1);
+                if records.len() < limit {
+                    records.push(symbol);
+                }
+            }
+        }
+        (records, total, true)
+    }
+
+    pub fn relations_from(&self, id: &str) -> SemanticModelOverlayMatch<'_, SemanticModelRelation> {
+        self.relation_match(self.relations_from.get(id))
+    }
+
+    pub fn relations_to(&self, id: &str) -> SemanticModelOverlayMatch<'_, SemanticModelRelation> {
+        self.relation_match(self.relations_to.get(id))
+    }
+
+    fn rebuild_indexes(
+        &mut self,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<(), SemanticModelOverlayBuildError> {
+        for (index, symbol) in self.symbols.iter().enumerate() {
+            if cancellation.is_cancelled() {
+                return Err(SemanticModelOverlayBuildError::Cancelled);
+            }
+            push_unique_posting(&mut self.symbols_by_id, &symbol.id, index);
+            push_unique_posting(&mut self.symbols_by_name, &symbol.name, index);
+            push_unique_posting(&mut self.symbols_by_name, &symbol.qualified_name, index);
+            for alias in &symbol.aliases {
+                push_unique_posting(&mut self.symbols_by_name, alias, index);
+            }
+            if let Some(owner) = &symbol.owner_id {
+                self.symbols_by_owner
+                    .entry(owner.clone())
+                    .or_default()
+                    .push(index);
+            }
+            if let SemanticModelLocation::Model(location) = &symbol.location {
+                self.symbols_by_uri
+                    .entry(location.uri.clone())
+                    .or_default()
+                    .push(index);
+            }
+        }
+        for (index, relation) in self.relations.iter().enumerate() {
+            if cancellation.is_cancelled() {
+                return Err(SemanticModelOverlayBuildError::Cancelled);
+            }
+            self.relations_from
+                .entry(relation.from.clone())
+                .or_default()
+                .push(index);
+            self.relations_to
+                .entry(relation.to.clone())
+                .or_default()
+                .push(index);
+        }
+        Ok(())
+    }
+
+    fn retained_bytes_lower_bound(&self) -> u64 {
+        let symbol_bytes = self
+            .symbols
+            .iter()
+            .map(|symbol| {
+                std::mem::size_of::<SemanticModelSymbol>()
+                    .saturating_add(symbol.id.capacity())
+                    .saturating_add(symbol.owner_id.as_ref().map_or(0, String::capacity))
+                    .saturating_add(symbol.name.capacity())
+                    .saturating_add(symbol.qualified_name.capacity())
+                    .saturating_add(symbol.language.capacity())
+                    .saturating_add(symbol.signature.as_ref().map_or(0, String::capacity))
+                    .saturating_add(symbol.aliases.iter().map(String::capacity).sum::<usize>())
+                    .saturating_add(match &symbol.location {
+                        SemanticModelLocation::Authored(anchor) => anchor
+                            .path
+                            .capacity()
+                            .saturating_add(anchor.symbol.capacity()),
+                        SemanticModelLocation::Model(location) => location.uri.capacity(),
+                    })
+                    .saturating_add(symbol.provenance.retained_string_bytes())
+            })
+            .sum::<usize>();
+        let relation_bytes = self
+            .relations
+            .iter()
+            .map(|relation| {
+                std::mem::size_of::<SemanticModelRelation>()
+                    .saturating_add(relation.id.capacity())
+                    .saturating_add(relation.kind.capacity())
+                    .saturating_add(relation.from.capacity())
+                    .saturating_add(relation.to.capacity())
+                    .saturating_add(relation.provenance.retained_string_bytes())
+            })
+            .sum::<usize>();
+        let mut index_bytes = 0usize;
+        for map in [
+            &self.symbols_by_id,
+            &self.symbols_by_name,
+            &self.symbols_by_uri,
+            &self.symbols_by_owner,
+            &self.relations_from,
+            &self.relations_to,
+        ] {
+            for (key, posting) in map {
+                index_bytes = index_bytes.saturating_add(key.capacity()).saturating_add(
+                    posting
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<usize>()),
+                );
+            }
+        }
+        u64::try_from(
+            std::mem::size_of::<Self>()
+                .saturating_add(symbol_bytes)
+                .saturating_add(relation_bytes)
+                .saturating_add(index_bytes),
+        )
+        .unwrap_or(u64::MAX)
+    }
+
+    fn symbol_match(
+        &self,
+        posting: Option<&Vec<usize>>,
+    ) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
+        let records = posting
+            .into_iter()
+            .flatten()
+            .map(|index| &self.symbols[*index])
+            .collect::<Vec<_>>();
+        SemanticModelOverlayMatch {
+            disposition: disposition(&records, |record| record.provenance.ambiguous),
+            records,
+        }
+    }
+
+    fn relation_match(
+        &self,
+        posting: Option<&Vec<usize>>,
+    ) -> SemanticModelOverlayMatch<'_, SemanticModelRelation> {
+        let records = posting
+            .into_iter()
+            .flatten()
+            .map(|index| &self.relations[*index])
+            .collect::<Vec<_>>();
+        SemanticModelOverlayMatch {
+            disposition: if records.is_empty() {
+                SemanticModelOverlayDisposition::Empty
+            } else if records.iter().any(|record| record.provenance.ambiguous) {
+                SemanticModelOverlayDisposition::Conflict
+            } else {
+                SemanticModelOverlayDisposition::Unique
+            },
+            records,
+        }
+    }
+}
+
+impl SemanticModelProvenance {
+    fn retained_string_bytes(&self) -> usize {
+        let evidence = &self.activation.matched_evidence;
+        self.active_model_set_hash
+            .capacity()
+            .saturating_add(self.pack_digest.capacity())
+            .saturating_add(self.pack_id.capacity())
+            .saturating_add(self.pack_version.capacity())
+            .saturating_add(self.producer.capacity())
+            .saturating_add(self.producer_version.capacity())
+            .saturating_add(self.record_id.capacity())
+            .saturating_add(self.rule_id.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.activation.status.capacity())
+            .saturating_add(self.activation.reason.capacity())
+            .saturating_add(self.activation.source_kind.capacity())
+            .saturating_add(self.activation.source_id.capacity())
+            .saturating_add(evidence.language.capacity())
+            .saturating_add(evidence.ecosystem.capacity())
+            .saturating_add(coordinate_string_bytes(evidence.package.as_ref()))
+            .saturating_add(coordinate_string_bytes(evidence.module.as_ref()))
+            .saturating_add(coordinate_string_bytes(evidence.toolchain.as_ref()))
+            .saturating_add(evidence.target.as_ref().map_or(0, String::capacity))
+            .saturating_add(evidence.configuration.as_ref().map_or(0, String::capacity))
+            .saturating_add(
+                evidence
+                    .artifact_sha256
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+    }
+}
+
+fn coordinate_string_bytes(coordinate: Option<&SemanticModelMatchedCoordinate>) -> usize {
+    coordinate.map_or(0, |coordinate| {
+        coordinate
+            .name
+            .capacity()
+            .saturating_add(coordinate.version.as_ref().map_or(0, String::capacity))
+    })
+}
+
+fn disposition<T>(
+    records: &[&T],
+    ambiguous: impl Fn(&T) -> bool,
+) -> SemanticModelOverlayDisposition {
+    if records.is_empty() {
+        SemanticModelOverlayDisposition::Empty
+    } else if records.len() == 1 && !ambiguous(records[0]) {
+        SemanticModelOverlayDisposition::Unique
+    } else {
+        SemanticModelOverlayDisposition::Conflict
+    }
+}
+
+fn push_unique_posting(postings: &mut HashMap<String, Vec<usize>>, key: &str, index: usize) {
+    let posting = postings.entry(key.to_string()).or_default();
+    if posting.last() != Some(&index) {
+        posting.push(index);
+    }
+}
+
+fn mark_symbol_identity_conflicts(symbols: &mut [SemanticModelSymbol]) {
+    let mut identities: HashMap<String, Vec<usize>> = HashMap::default();
+    for (index, symbol) in symbols.iter().enumerate() {
+        let mut keys = HashSet::from_iter([
+            format!("id:{}", symbol.id),
+            format!("name:{}", symbol.name),
+            format!("name:{}", symbol.qualified_name),
+        ]);
+        keys.extend(symbol.aliases.iter().map(|alias| format!("name:{alias}")));
+        for key in keys {
+            identities.entry(key).or_default().push(index);
+        }
+    }
+    for posting in identities.values().filter(|posting| posting.len() > 1) {
+        for &index in posting {
+            symbols[index].provenance.ambiguous = true;
+        }
+    }
+}
+
+struct GeneratedOverlayFacts {
+    symbols: Vec<SemanticModelSymbol>,
+    relations: Vec<SemanticModelRelation>,
+}
+
+fn generated_overlay_facts(
+    analyzer: &dyn IAnalyzer,
+    active: &ResolvedActiveSemanticModels,
+    cancellation: &crate::CancellationToken,
+) -> Result<GeneratedOverlayFacts, SemanticModelOverlayBuildError> {
+    let mut rule_ids = active
+        .shards()
+        .iter()
+        .flat_map(|shard| {
+            shard
+                .shard
+                .payload()
+                .generator_rules()
+                .into_iter()
+                .flatten()
+                .map(|rule| rule.id.clone())
+        })
+        .collect::<Vec<_>>();
+    rule_ids.sort_unstable();
+    rule_ids.dedup();
+
+    let provider_files = analyzer
+        .structural_search_providers()
+        .into_iter()
+        .map(|provider| {
+            let mut files = provider.structural_files();
+            files.sort();
+            files.dedup();
+            (provider, files)
+        })
+        .collect::<Vec<_>>();
+
+    let mut symbols = Vec::new();
+    let mut relations = Vec::new();
+    let mut aliases = Vec::new();
+    for rule_id in rule_ids {
+        if cancellation.is_cancelled() {
+            return Err(SemanticModelOverlayBuildError::Cancelled);
+        }
+        let matched = active.rules_with_id(&rule_id);
+        if matched.disposition != SemanticModelMatchDisposition::Unique {
+            continue;
+        }
+        let activated = &matched.records[0];
+        for (provider, files) in provider_files.iter().filter(|(provider, _)| {
+            provider.structural_language().config_label() == activated.shard.manifest.language
+        }) {
+            for file in files {
+                if cancellation.is_cancelled() {
+                    return Err(SemanticModelOverlayBuildError::Cancelled);
+                }
+                let Some(facts) = provider.structural_facts(file) else {
+                    continue;
+                };
+                for (node_index, node) in facts.nodes().iter().enumerate() {
+                    if cancellation.is_cancelled() {
+                        return Err(SemanticModelOverlayBuildError::Cancelled);
+                    }
+                    let node_id = u32::try_from(node_index)
+                        .expect("structural fact IDs are bounded to u32 by FileFacts");
+                    if !rule_trigger_matches(&activated.record.trigger, &facts, node_id) {
+                        continue;
+                    }
+                    let enclosing = analyzer.enclosing_code_unit(file, &node.range);
+                    let Some(captures) = rule_capture_values(
+                        activated.record,
+                        &facts,
+                        node_id,
+                        file,
+                        enclosing.as_ref(),
+                    ) else {
+                        continue;
+                    };
+                    emit_rule_match(
+                        active,
+                        activated.shard,
+                        activated.record,
+                        &captures,
+                        &mut symbols,
+                        &mut relations,
+                        &mut aliases,
+                    );
+                }
+            }
+        }
+    }
+    for (alias, target) in aliases {
+        if let Some(symbol) = symbols
+            .iter_mut()
+            .find(|symbol| symbol.id == target || symbol.qualified_name == target)
+            && !symbol.aliases.contains(&alias)
+        {
+            symbol.aliases.push(alias);
+        }
+    }
+    Ok(GeneratedOverlayFacts { symbols, relations })
+}
+
+fn rule_trigger_matches(trigger: &RuleTrigger, facts: &FileFacts, node_id: u32) -> bool {
+    let node = facts.node(node_id);
+    let name = node.name.map(|span| span.text(facts.source()));
+    match trigger {
+        RuleTrigger::LanguageConstruct { construct } => {
+            NormalizedKind::from_label(construct).is_some_and(|kind| node.kind == kind)
+        }
+        RuleTrigger::Annotation { name: expected } => {
+            node.kind == NormalizedKind::Decorator
+                && (name.is_some_and(|actual| exact_trigger_name_matches(expected, actual))
+                    || qualified_decorator_matches(expected, node.span().text(facts.source())))
+        }
+        RuleTrigger::MacroInvocation { name: expected }
+        | RuleTrigger::GeneratorInvocation { name: expected } => {
+            node.kind == NormalizedKind::Call
+                && name.is_some_and(|actual| exact_trigger_name_matches(expected, actual))
+        }
+        RuleTrigger::ResolvedOwner { .. } | RuleTrigger::ResolvedCall { .. } => false,
+    }
+}
+
+fn qualified_decorator_matches(expected: &str, decorator_source: &str) -> bool {
+    if !expected.contains('.') && !expected.contains("::") {
+        return false;
+    }
+    let Some(body) = decorator_source.trim().strip_prefix('@') else {
+        return false;
+    };
+    body == expected
+        || body
+            .strip_prefix(expected)
+            .is_some_and(|suffix| suffix.starts_with('('))
+}
+
+fn exact_trigger_name_matches(expected: &str, actual: &str) -> bool {
+    if expected.contains('.') || expected.contains("::") {
+        actual == expected
+    } else {
+        terminal_name(actual.trim_end_matches('!')) == expected
+    }
+}
+
+fn rule_capture_values(
+    rule: &GeneratorRule,
+    facts: &FileFacts,
+    node_id: u32,
+    file: &ProjectFile,
+    enclosing: Option<&CodeUnit>,
+) -> Option<HashMap<String, String>> {
+    let mut values = HashMap::default();
+    for capture in &rule.captures {
+        let value = capture_value(&capture.binding, facts, node_id, file, enclosing);
+        match (capture.cardinality, value) {
+            (super::CaptureCardinality::One, None) => return None,
+            (super::CaptureCardinality::One | super::CaptureCardinality::Optional, Some(value)) => {
+                values.insert(capture.name.clone(), value);
+            }
+            (super::CaptureCardinality::Optional | super::CaptureCardinality::Many, None)
+            | (super::CaptureCardinality::Many, Some(_)) => {}
+        }
+    }
+    Some(values)
+}
+
+fn capture_value(
+    binding: &CaptureBinding,
+    facts: &FileFacts,
+    node_id: u32,
+    file: &ProjectFile,
+    enclosing: Option<&CodeUnit>,
+) -> Option<String> {
+    match &binding.source {
+        CaptureSource::MatchedNode => {
+            projected_node_value(binding.projection, facts, node_id, file, enclosing)
+        }
+        CaptureSource::EnclosingDeclaration => {
+            projected_declaration_value(binding.projection, file, enclosing?)
+        }
+        CaptureSource::Argument { index } => facts
+            .role_targets(node_id, Role::Arg)
+            .nth(*index as usize)
+            .and_then(|target| {
+                projected_role_value(binding.projection, facts, target, file, enclosing)
+            }),
+        CaptureSource::AnnotationArgument { name } => facts
+            .role_targets(node_id, Role::Kwarg)
+            .find(|target| {
+                target
+                    .keyword
+                    .is_some_and(|keyword| keyword.text(facts.source()) == name)
+            })
+            .and_then(|target| {
+                projected_role_value(binding.projection, facts, target, file, enclosing)
+            }),
+        CaptureSource::Arguments { .. } | CaptureSource::ResolvedOwner => None,
+    }
+}
+
+fn projected_node_value(
+    projection: CaptureProjection,
+    facts: &FileFacts,
+    node_id: u32,
+    file: &ProjectFile,
+    enclosing: Option<&CodeUnit>,
+) -> Option<String> {
+    let node = facts.node(node_id);
+    match projection {
+        CaptureProjection::Name => node
+            .name
+            .map(|name| name.text(facts.source()).trim_end_matches('!').to_string()),
+        CaptureProjection::Text => Some(node.span().text(facts.source()).to_string()),
+        CaptureProjection::Path => Some(file.rel_path().to_string_lossy().replace('\\', "/")),
+        CaptureProjection::StableId | CaptureProjection::Type => {
+            enclosing.map(|unit| unit.fq_name())
+        }
+    }
+}
+
+fn projected_declaration_value(
+    projection: CaptureProjection,
+    file: &ProjectFile,
+    declaration: &CodeUnit,
+) -> Option<String> {
+    Some(match projection {
+        CaptureProjection::Name => declaration.identifier().to_string(),
+        CaptureProjection::StableId | CaptureProjection::Type => declaration.fq_name(),
+        CaptureProjection::Path => file.rel_path().to_string_lossy().replace('\\', "/"),
+        CaptureProjection::Text => return None,
+    })
+}
+
+fn projected_role_value(
+    projection: CaptureProjection,
+    facts: &FileFacts,
+    target: &crate::analyzer::structural::RoleTarget,
+    file: &ProjectFile,
+    enclosing: Option<&CodeUnit>,
+) -> Option<String> {
+    match projection {
+        CaptureProjection::Name => Some(
+            target
+                .name
+                .unwrap_or(target.span)
+                .text(facts.source())
+                .to_string(),
+        ),
+        CaptureProjection::Text => Some(target.span.text(facts.source()).to_string()),
+        CaptureProjection::Path => Some(file.rel_path().to_string_lossy().replace('\\', "/")),
+        CaptureProjection::StableId | CaptureProjection::Type => {
+            enclosing.map(|unit| unit.fq_name())
+        }
+    }
+}
+
+fn emit_rule_match(
+    active: &ResolvedActiveSemanticModels,
+    shard: &ActiveSemanticModelShard,
+    rule: &GeneratorRule,
+    captures: &HashMap<String, String>,
+    symbols: &mut Vec<SemanticModelSymbol>,
+    relations: &mut Vec<SemanticModelRelation>,
+    aliases: &mut Vec<(String, String)>,
+) {
+    for emission in &rule.emissions {
+        match emission {
+            RuleEmission::Declaration {
+                id,
+                name,
+                declaration,
+            } => {
+                let (Some(id), Some(name)) = (
+                    evaluate_template(id, captures),
+                    evaluate_template(name, captures),
+                ) else {
+                    continue;
+                };
+                let location = model_location(shard, "generated", &format!("{}:{id}", rule.id));
+                let mut model_provenance = provenance(active, shard, &id, &location, None, false);
+                model_provenance.rule_id = Some(rule.id.clone());
+                let symbol = match declaration {
+                    EmittedDeclaration::Type {
+                        type_kind: emitted_kind,
+                        ..
+                    } => SemanticModelSymbol {
+                        id,
+                        owner_id: None,
+                        name: terminal_name(&name).to_string(),
+                        qualified_name: name,
+                        language: shard.manifest.language.clone(),
+                        kind: type_kind(*emitted_kind),
+                        signature: None,
+                        aliases: Vec::new(),
+                        location,
+                        provenance: model_provenance,
+                    },
+                    EmittedDeclaration::Member {
+                        owner,
+                        member_kind: emitted_kind,
+                        signature,
+                        ..
+                    } => {
+                        let Some(owner) = evaluate_template(owner, captures) else {
+                            continue;
+                        };
+                        SemanticModelSymbol {
+                            id,
+                            owner_id: Some(owner.clone()),
+                            name: name.clone(),
+                            qualified_name: format!("{owner}.{name}"),
+                            language: shard.manifest.language.clone(),
+                            kind: member_kind(*emitted_kind),
+                            signature: signature.as_ref().and_then(|signature| {
+                                render_template_signature(&name, signature, captures)
+                            }),
+                            aliases: Vec::new(),
+                            location,
+                            provenance: model_provenance,
+                        }
+                    }
+                };
+                symbols.push(symbol);
+            }
+            RuleEmission::Alias { from, to, .. } => {
+                if let (Some(from), Some(to)) = (
+                    evaluate_template(from, captures),
+                    evaluate_template(to, captures),
+                ) {
+                    aliases.push((from, to));
+                }
+            }
+            RuleEmission::Relation {
+                id,
+                relation_kind,
+                from,
+                to,
+            } => {
+                let (Some(id), Some(from), Some(to)) = (
+                    evaluate_template(id, captures),
+                    evaluate_template(from, captures),
+                    evaluate_template(to, captures),
+                ) else {
+                    continue;
+                };
+                let location =
+                    model_location(shard, "generated-relation", &format!("{}:{id}", rule.id));
+                let mut model_provenance = provenance(active, shard, &id, &location, None, false);
+                model_provenance.rule_id = Some(rule.id.clone());
+                relations.push(SemanticModelRelation {
+                    id,
+                    kind: relation_kind_label(*relation_kind).to_string(),
+                    from,
+                    to,
+                    provenance: model_provenance,
+                });
+            }
+        }
+    }
+}
+
+fn evaluate_template(
+    expression: &TemplateExpression,
+    captures: &HashMap<String, String>,
+) -> Option<String> {
+    match expression {
+        TemplateExpression::Literal { value } => Some(value.clone()),
+        TemplateExpression::Capture { name } => captures.get(name).cloned(),
+        TemplateExpression::Concat { values } => {
+            let mut rendered = String::new();
+            for value in values {
+                rendered.push_str(&evaluate_template(value, captures)?);
+            }
+            Some(rendered)
+        }
+        TemplateExpression::Transform { transform, value } => {
+            evaluate_template(value, captures).map(|value| ascii_transform(*transform, &value))
+        }
+    }
+}
+
+fn ascii_transform(transform: AsciiTransform, value: &str) -> String {
+    match transform {
+        AsciiTransform::Lowercase => value.to_ascii_lowercase(),
+        AsciiTransform::Uppercase => value.to_ascii_uppercase(),
+        AsciiTransform::SnakeCase => ascii_words(value).join("_"),
+        AsciiTransform::KebabCase => ascii_words(value).join("-"),
+        AsciiTransform::PascalCase => ascii_words(value)
+            .into_iter()
+            .map(|word| capitalize_ascii(&word))
+            .collect(),
+        AsciiTransform::CamelCase => {
+            let mut words = ascii_words(value).into_iter();
+            let Some(first) = words.next() else {
+                return String::new();
+            };
+            first
+                + &words
+                    .map(|word| capitalize_ascii(&word))
+                    .collect::<String>()
+        }
+    }
+}
+
+fn ascii_words(value: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut previous_lower = false;
+    for character in value.chars() {
+        if !character.is_ascii_alphanumeric() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current).to_ascii_lowercase());
+            }
+            previous_lower = false;
+            continue;
+        }
+        if character.is_ascii_uppercase() && previous_lower && !current.is_empty() {
+            words.push(std::mem::take(&mut current).to_ascii_lowercase());
+        }
+        previous_lower = character.is_ascii_lowercase() || character.is_ascii_digit();
+        current.push(character);
+    }
+    if !current.is_empty() {
+        words.push(current.to_ascii_lowercase());
+    }
+    words
+}
+
+fn capitalize_ascii(value: &str) -> String {
+    let mut characters = value.chars();
+    characters
+        .next()
+        .map(|first| first.to_ascii_uppercase().to_string() + characters.as_str())
+        .unwrap_or_default()
+}
+
+fn render_template_signature(
+    name: &str,
+    signature: &TemplateSignature,
+    captures: &HashMap<String, String>,
+) -> Option<String> {
+    let parameters = signature
+        .parameters
+        .iter()
+        .map(|parameter| {
+            Some(format!(
+                "{}: {}{}{}",
+                evaluate_template(&parameter.name, captures)?,
+                render_template_type(&parameter.r#type, captures)?,
+                if parameter.optional { "?" } else { "" },
+                if parameter.variadic { "..." } else { "" },
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let returns = match &signature.returns {
+        Some(returns) => format!(" -> {}", render_template_type(returns, captures)?),
+        None => String::new(),
+    };
+    Some(format!("{name}({}){returns}", parameters.join(", ")))
+}
+
+fn render_template_type(
+    reference: &TemplateTypeRef,
+    captures: &HashMap<String, String>,
+) -> Option<String> {
+    match reference {
+        TemplateTypeRef::Named {
+            name,
+            arguments,
+            nullable,
+        } => {
+            let mut rendered = evaluate_template(name, captures)?;
+            if !arguments.is_empty() {
+                rendered.push('<');
+                rendered.push_str(
+                    &arguments
+                        .iter()
+                        .map(|argument| render_template_type(argument, captures))
+                        .collect::<Option<Vec<_>>>()?
+                        .join(", "),
+                );
+                rendered.push('>');
+            }
+            if *nullable {
+                rendered.push('?');
+            }
+            Some(rendered)
+        }
+        TemplateTypeRef::Capture { name } => captures.get(name).cloned(),
+        TemplateTypeRef::Array { element } => {
+            render_template_type(element, captures).map(|element| format!("{element}[]"))
+        }
+    }
+}
+
+fn type_symbol(
+    analyzer: &dyn IAnalyzer,
+    active: &ResolvedActiveSemanticModels,
+    shard: &ActiveSemanticModelShard,
+    record: &TypeFact,
+    ambiguous: bool,
+) -> SemanticModelSymbol {
+    let location = location(
+        analyzer,
+        shard,
+        &record.locator,
+        &record.name,
+        "type",
+        &record.id,
+    );
+    SemanticModelSymbol {
+        id: record.id.clone(),
+        owner_id: None,
+        name: terminal_name(&record.name).to_string(),
+        qualified_name: record.name.clone(),
+        language: shard.manifest.language.clone(),
+        kind: type_kind(record.type_kind),
+        signature: None,
+        aliases: record.aliases.clone(),
+        provenance: provenance(
+            active,
+            shard,
+            &record.id,
+            &location,
+            Some(&record.locator),
+            ambiguous,
+        ),
+        location,
+    }
+}
+
+fn member_symbol(
+    analyzer: &dyn IAnalyzer,
+    active: &ResolvedActiveSemanticModels,
+    shard: &ActiveSemanticModelShard,
+    record: &MemberFact,
+    qualified_owner: Option<&str>,
+    ambiguous: bool,
+) -> SemanticModelSymbol {
+    let qualified_name = format!(
+        "{}.{}",
+        qualified_owner.unwrap_or(&record.owner),
+        record.name
+    );
+    let location = location(
+        analyzer,
+        shard,
+        &record.locator,
+        &qualified_name,
+        "member",
+        &record.id,
+    );
+    SemanticModelSymbol {
+        id: record.id.clone(),
+        owner_id: Some(record.owner.clone()),
+        name: record.name.clone(),
+        qualified_name,
+        language: shard.manifest.language.clone(),
+        kind: member_kind(record.member_kind),
+        signature: record
+            .signature
+            .as_ref()
+            .map(|signature| render_signature(&record.name, signature)),
+        aliases: record.aliases.clone(),
+        provenance: provenance(
+            active,
+            shard,
+            &record.id,
+            &location,
+            Some(&record.locator),
+            ambiguous,
+        ),
+        location,
+    }
+}
+
+fn relation(
+    active: &ResolvedActiveSemanticModels,
+    shard: &ActiveSemanticModelShard,
+    record: &RelationFact,
+    ambiguous: bool,
+) -> SemanticModelRelation {
+    let location = model_location(shard, "relation", &record.id);
+    SemanticModelRelation {
+        id: record.id.clone(),
+        kind: relation_kind_label(record.relation_kind).to_string(),
+        from: record.from.clone(),
+        to: record.to.clone(),
+        provenance: provenance(active, shard, &record.id, &location, None, ambiguous),
+    }
+}
+
+fn hierarchy_relation(
+    active: &ResolvedActiveSemanticModels,
+    shard: &ActiveSemanticModelShard,
+    owner_id: &str,
+    hierarchy: &HierarchyFact,
+    ambiguous: bool,
+) -> SemanticModelRelation {
+    let target = match &hierarchy.target {
+        TypeRef::Declared { id, .. } => id.clone(),
+        TypeRef::Named { name, .. } => name.clone(),
+        other => render_type_ref(other),
+    };
+    let kind = hierarchy_kind_label(hierarchy.hierarchy_kind).to_string();
+    let id = format!("hierarchy:{owner_id}:{kind}:{target}");
+    let location = model_location(shard, "hierarchy", &id);
+    SemanticModelRelation {
+        id: id.clone(),
+        kind,
+        from: owner_id.to_string(),
+        to: target,
+        provenance: provenance(active, shard, &id, &location, None, ambiguous),
+    }
+}
+
+fn relation_kind_label(kind: RelationKind) -> &'static str {
+    match kind {
+        RelationKind::NavigatesTo => "navigates_to",
+        RelationKind::References => "references",
+    }
+}
+
+fn hierarchy_kind_label(kind: HierarchyKind) -> &'static str {
+    match kind {
+        HierarchyKind::Extends => "extends",
+        HierarchyKind::Implements => "implements",
+        HierarchyKind::UsesTrait => "uses_trait",
+    }
+}
+
+fn location(
+    analyzer: &dyn IAnalyzer,
+    shard: &ActiveSemanticModelShard,
+    locator: &Locator,
+    fallback_symbol: &str,
+    record_kind: &str,
+    record_id: &str,
+) -> SemanticModelLocation {
+    authored_anchor(analyzer, locator, fallback_symbol)
+        .map(SemanticModelLocation::Authored)
+        .unwrap_or_else(|| model_location(shard, record_kind, record_id))
+}
+
+fn authored_anchor(
+    analyzer: &dyn IAnalyzer,
+    locator: &Locator,
+    fallback_symbol: &str,
+) -> Option<SemanticModelAuthoredAnchor> {
+    let Locator::Source { path, symbol } = locator else {
+        return None;
+    };
+    let symbol = symbol.as_deref().unwrap_or(fallback_symbol);
+    let path = Path::new(path);
+    let file = if path.is_absolute() {
+        analyzer.project().file_by_abs_path(path)
+    } else {
+        analyzer.project().file_by_rel_path(path)
+    }?;
+    let unit = analyzer.definitions(symbol).find(|unit| {
+        unit.source() == &file && (unit.fq_name() == symbol || unit.identifier() == symbol)
+    })?;
+    let range = analyzer
+        .ranges(&unit)
+        .into_iter()
+        .min_by_key(|range| (range.start_line, range.start_byte))?;
+    Some(SemanticModelAuthoredAnchor {
+        path: file.rel_path().to_string_lossy().replace('\\', "/"),
+        symbol: unit.fq_name(),
+        range: range.into(),
+    })
+}
+
+fn model_location(
+    shard: &ActiveSemanticModelShard,
+    record_kind: &str,
+    record_id: &str,
+) -> SemanticModelLocation {
+    let mut uri = Url::parse(MODEL_URI_BASE).expect("static Bifrost model URI base is valid");
+    uri.path_segments_mut()
+        .expect("Bifrost model URI base supports path segments")
+        .extend([
+            shard.manifest.semantic_sha256.as_str(),
+            record_kind,
+            record_id,
+        ]);
+    SemanticModelLocation::Model(SemanticModelVirtualLocation {
+        uri: uri.to_string(),
+        range: SemanticModelRange {
+            start_byte: 0,
+            end_byte: 0,
+            start_line: 1,
+            end_line: 1,
+        },
+    })
+}
+
+fn provenance(
+    active: &ResolvedActiveSemanticModels,
+    shard: &ActiveSemanticModelShard,
+    record_id: &str,
+    _location: &SemanticModelLocation,
+    locator: Option<&Locator>,
+    ambiguous: bool,
+) -> SemanticModelProvenance {
+    let activation = active
+        .activation_report()
+        .explanations
+        .iter()
+        .find(|explanation| {
+            explanation.status == SemanticModelActivationStatus::Active
+                && explanation.manifest_digest == shard.manifest.content_sha256
+                && explanation.shard_id == shard.shard.shard_id()
+                && explanation.source_kind == shard.source_kind
+                && explanation.source_id == shard.source_id
+        });
+    SemanticModelProvenance {
+        active_model_set_hash: active.active_model_set_hash().to_string(),
+        pack_digest: shard.manifest.semantic_sha256.clone(),
+        pack_id: shard.manifest.pack_id.clone(),
+        pack_version: shard.manifest.version.clone(),
+        producer: shard.manifest.producer.name.clone(),
+        producer_version: shard.manifest.producer.version.clone(),
+        record_id: record_id.to_string(),
+        rule_id: None,
+        origin: origin(shard, locator),
+        activation: SemanticModelActivationProvenance {
+            status: "active".to_string(),
+            reason: activation
+                .map(|explanation| explanation.reason.clone())
+                .unwrap_or_else(|| "selected by active semantic-model resolution".to_string()),
+            source_kind: source_kind(shard.source_kind).to_string(),
+            source_id: shard.source_id.clone(),
+            matched_evidence: matched_evidence(&shard.matched_evidence),
+        },
+        proof: if shard.matched_evidence.artifact_sha256.is_some() {
+            SemanticModelProof::ExactArtifact
+        } else {
+            SemanticModelProof::PackFact
+        },
+        completeness: match shard.manifest.completeness {
+            Completeness::Partial => SemanticModelCompleteness::Partial,
+            Completeness::Complete => SemanticModelCompleteness::Complete,
+        },
+        ambiguous,
+    }
+}
+
+fn origin(shard: &ActiveSemanticModelShard, locator: Option<&Locator>) -> SemanticModelOriginKind {
+    match shard.source_kind {
+        CatalogPackSourceKind::Generated | CatalogPackSourceKind::WorkspaceProduced => {
+            SemanticModelOriginKind::ExactGeneratedOutput
+        }
+        CatalogPackSourceKind::Installed => match locator {
+            Some(Locator::Source { .. }) => SemanticModelOriginKind::DependencySource,
+            Some(Locator::Artifact { .. }) => SemanticModelOriginKind::DependencyBinary,
+            None => SemanticModelOriginKind::PrebuiltApiIndex,
+        },
+        CatalogPackSourceKind::PreShipped => SemanticModelOriginKind::PrebuiltApiIndex,
+        CatalogPackSourceKind::Embedded | CatalogPackSourceKind::EphemeralWorkspace => {
+            SemanticModelOriginKind::DeclarativeModel
+        }
+    }
+}
+
+fn matched_evidence(
+    evidence: &super::SemanticModelActivationEvidence,
+) -> SemanticModelMatchedEvidence {
+    SemanticModelMatchedEvidence {
+        language: evidence.language.clone(),
+        ecosystem: evidence.ecosystem.clone(),
+        package: evidence.package.as_ref().map(matched_coordinate),
+        module: evidence.module.as_ref().map(matched_coordinate),
+        toolchain: evidence.toolchain.as_ref().map(matched_coordinate),
+        target: evidence.target.clone(),
+        configuration: evidence.configuration.clone(),
+        artifact_sha256: evidence.artifact_sha256.clone(),
+    }
+}
+
+fn matched_coordinate(coordinate: &super::CatalogCoordinate) -> SemanticModelMatchedCoordinate {
+    SemanticModelMatchedCoordinate {
+        name: coordinate.name.clone(),
+        version: coordinate.version.as_ref().map(ToString::to_string),
+    }
+}
+
+fn source_kind(kind: CatalogPackSourceKind) -> &'static str {
+    match kind {
+        CatalogPackSourceKind::Installed => "installed",
+        CatalogPackSourceKind::Generated => "generated",
+        CatalogPackSourceKind::PreShipped => "pre_shipped",
+        CatalogPackSourceKind::WorkspaceProduced => "workspace_produced",
+        CatalogPackSourceKind::Embedded => "embedded",
+        CatalogPackSourceKind::EphemeralWorkspace => "ephemeral_workspace",
+    }
+}
+
+fn type_kind(kind: TypeKind) -> SemanticModelSymbolKind {
+    match kind {
+        TypeKind::Class => SemanticModelSymbolKind::Class,
+        TypeKind::Annotation => SemanticModelSymbolKind::Annotation,
+        TypeKind::Delegate => SemanticModelSymbolKind::Delegate,
+        TypeKind::Interface => SemanticModelSymbolKind::Interface,
+        TypeKind::Trait => SemanticModelSymbolKind::Trait,
+        TypeKind::Struct => SemanticModelSymbolKind::Struct,
+        TypeKind::Enum => SemanticModelSymbolKind::Enum,
+        TypeKind::Record => SemanticModelSymbolKind::Record,
+        TypeKind::Module => SemanticModelSymbolKind::Module,
+        TypeKind::TypeAlias => SemanticModelSymbolKind::TypeAlias,
+    }
+}
+
+fn member_kind(kind: MemberKind) -> SemanticModelSymbolKind {
+    match kind {
+        MemberKind::Constructor => SemanticModelSymbolKind::Constructor,
+        MemberKind::Method => SemanticModelSymbolKind::Method,
+        MemberKind::Function => SemanticModelSymbolKind::Function,
+        MemberKind::Field => SemanticModelSymbolKind::Field,
+        MemberKind::Property => SemanticModelSymbolKind::Property,
+        MemberKind::Constant => SemanticModelSymbolKind::Constant,
+        MemberKind::Event => SemanticModelSymbolKind::Event,
+    }
+}
+
+fn terminal_name(name: &str) -> &str {
+    name.rsplit(['.', ':', '$'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(name)
+}
+
+fn render_signature(name: &str, signature: &super::Signature) -> String {
+    let parameters = signature
+        .parameters
+        .iter()
+        .map(|parameter| {
+            let ty = render_type_ref(&parameter.r#type);
+            parameter
+                .name
+                .as_deref()
+                .map(|name| format!("{name}: {ty}"))
+                .unwrap_or(ty)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    match &signature.returns {
+        Some(result) => format!("{name}({parameters}) -> {}", render_type_ref(result)),
+        None => format!("{name}({parameters})"),
+    }
+}
+
+fn render_type_ref(reference: &TypeRef) -> String {
+    match reference {
+        TypeRef::Named {
+            name,
+            arguments,
+            nullable,
+        } => render_named_type(name, arguments, *nullable),
+        TypeRef::Declared {
+            id,
+            arguments,
+            nullable,
+        } => render_named_type(id, arguments, *nullable),
+        TypeRef::TypeParameter { name } => name.clone(),
+        TypeRef::Array { element } => format!("{}[]", render_type_ref(element)),
+        TypeRef::ByRef { element } => format!("ref {}", render_type_ref(element)),
+        TypeRef::Wildcard { variance, bound } => match bound {
+            Some(bound) => {
+                format!("{:?} {}", variance, render_type_ref(bound)).to_ascii_lowercase()
+            }
+            None => "?".to_string(),
+        },
+        TypeRef::Tuple { elements } => format!(
+            "({})",
+            elements
+                .iter()
+                .map(render_type_ref)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        TypeRef::Function { parameters, result } => format!(
+            "({}) -> {}",
+            parameters
+                .iter()
+                .map(render_type_ref)
+                .collect::<Vec<_>>()
+                .join(", "),
+            render_type_ref(result)
+        ),
+    }
+}
+
+fn render_named_type(name: &str, arguments: &[TypeRef], nullable: bool) -> String {
+    let mut rendered = name.to_string();
+    if !arguments.is_empty() {
+        rendered.push('<');
+        rendered.push_str(
+            &arguments
+                .iter()
+                .map(render_type_ref)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        rendered.push('>');
+    }
+    if nullable {
+        rendered.push('?');
+    }
+    rendered
+}
