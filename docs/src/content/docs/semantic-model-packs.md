@@ -1,6 +1,6 @@
 ---
 title: Semantic-Model Packs
-description: Author versioned external declaration facts and generated-code rules, then compile them to deterministic, defensively decoded artifacts.
+description: Author, compile, install, select, and manage versioned semantic-model artifacts.
 ---
 
 Semantic-model packs are Bifrost's versioned interchange format for API facts
@@ -9,11 +9,10 @@ framework or generator behavior. A producer can construct the public Rust
 model directly or load reviewed YAML or JSON. Both paths compile through the
 same validation and canonicalization pipeline.
 
-> **Current runtime boundary:** compiling or decoding a semantic-model pack
-> does not install, store, match, or activate it in Java, C#, or any other
-> analyzer. This page documents the schema, artifact compiler, and exact Java
-> and C# artifact producers. Runtime matching and installation are separate
-> lifecycle work.
+> **Current runtime boundary:** Bifrost can compile, defensively decode,
+> install, select, activate, account for, quarantine, and garbage-collect
+> semantic-model packs. It does not yet build the generation-scoped matcher
+> that applies selected declarations or generator rules inside an analyzer.
 
 Packs do not contain executable code, arbitrary templates, fake source, or
 procedure-effect/data-flow summaries. Generator expressions are bounded trees
@@ -52,6 +51,57 @@ constraint. It may narrow activation by target, configuration, or a lowercase
 SHA-256 artifact digest. The compiler derives sorted routing keys from these
 selectors and, for rule shards, their trigger kinds. A later runtime can route
 without reading unrelated payloads.
+
+## Catalog and lifecycle
+
+`SemanticPackCatalog` stores durable packs beneath one caller-selected shared
+root. The caller chooses the root explicitly so a host can apply its own
+platform and configuration policy. Catalog metadata lives in a separately
+versioned SQLite database. Immutable shard bytes live once at
+`objects/sha256/<first-two-hex>/<remaining-hex>`, keyed by the SHA-256 of their
+exact stored representation. The manifest content digest identifies the
+complete pack; semantic and uncompressed-content digests retain their distinct
+artifact roles.
+
+Installation validates the canonical manifest and every manifest-bound shard
+before publishing anything discoverable. Files are staged, synchronized, and
+atomically moved into the content-addressed tree. A single metadata transaction
+then publishes the complete pack, its normalized selectors, and its source.
+Installing identical bytes from several workspaces or sources reuses the same
+physical object while retaining every durable source attribution. Startup
+reconciliation removes bounded abandoned staging and unreferenced final files;
+it never promotes an orphan into an installed pack.
+
+Candidate discovery narrows by language, ecosystem, and the populated package,
+module, toolchain, or artifact selector index without reading shard payloads.
+It then checks SemVer compatibility, target, configuration, and artifact
+identity from validated catalog metadata. Candidates are opaque catalog
+handles: callers can inspect their identity and source through accessors but
+cannot alter the descriptor or provenance used by verified loading. Loading
+rechecks the digest path, size, stored bytes, manifest envelope, and decoded
+shard. Missing or corrupt durable content becomes a safe miss and is
+quarantined in a writable catalog; a read-only catalog rejects durable
+mutations and suppresses repeated attempts only for that process.
+
+Durable source kinds are installed, generated, pre-shipped, and
+workspace-produced. Embedded release resources and ephemeral-workspace packs
+use the same complete validation and selector path but remain in the catalog
+instance's session memory, so they are never copied into durable storage.
+Persistent workspace active sets may reference only exact registered durable
+sources. In-memory workspaces may reference only exact session sources because
+they have no durable workspace identity that can own a cross-process
+activation. Their activation accounting is tied to the workspace store's
+lifetime. Active set identity is a domain-separated digest over the full sorted
+manifest and source references, and durable activation rows protect selected
+objects across processes.
+
+Accounting reports deduplicated installed and active bytes, physical objects,
+logical and active shards, sources, lookup hits and misses, quarantined packs,
+and activation counts by durable or session source. Pins, durable sources,
+workspace activations, reader leases, and in-flight installation reservations
+protect content from collection. Explicit bounded garbage collection removes
+only old packs with none of those roots, rechecks each object under the catalog
+write boundary, and reports bytes only when a file was actually removed.
 
 ## Exact-artifact producers
 

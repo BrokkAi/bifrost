@@ -1152,6 +1152,10 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     assert_eq!(structured["report"], expected_report, "{baseline}");
     assert_eq!(structured["report"]["schema_version"], 2);
     assert_eq!(
+        structured["report"]["execution"]["stage_timings"],
+        json!([])
+    );
+    assert_eq!(
         structured["report"]["evaluation"]["evaluation_date"],
         evaluation_date
     );

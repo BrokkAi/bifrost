@@ -17,6 +17,8 @@ pub struct CancellationToken {
     deadline: Option<Instant>,
     #[cfg(any(test, feature = "test-support"))]
     cancel_after_checks: Option<Arc<AtomicUsize>>,
+    #[cfg(any(test, feature = "test-support"))]
+    timeout_after_checks: Option<Arc<AtomicUsize>>,
 }
 
 impl CancellationToken {
@@ -54,6 +56,18 @@ impl CancellationToken {
     }
 
     pub fn is_cancelled(&self) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(remaining) = &self.timeout_after_checks {
+            let previous = remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    value.checked_sub(1)
+                })
+                .unwrap_or(0);
+            if previous <= 1 {
+                self.timed_out.store(true, Ordering::Release);
+                self.cancel();
+            }
+        }
         #[cfg(any(test, feature = "test-support"))]
         if let Some(remaining) = &self.cancel_after_checks {
             let previous = remaining
@@ -94,6 +108,19 @@ impl CancellationToken {
             timed_out: Arc::new(AtomicBool::new(false)),
             deadline: None,
             cancel_after_checks: Some(Arc::new(AtomicUsize::new(checks))),
+            timeout_after_checks: None,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn timeout_after_checks_for_test(checks: usize) -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            timed_out: Arc::new(AtomicBool::new(false)),
+            deadline: None,
+            cancel_after_checks: None,
+            timeout_after_checks: Some(Arc::new(AtomicUsize::new(checks))),
         }
     }
 }
