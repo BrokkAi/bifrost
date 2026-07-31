@@ -5533,6 +5533,376 @@ object HttpCodecError {
 }
 
 #[test]
+fn scala_http4s_inverse_handles_import_roots_and_callable_reference_shapes() {
+    let consumer = r#"package org.http4s
+
+import org.http4s.internal.parsing.{Query, Rfc3986}
+import org.http4s.EntityTag
+
+object Consumer {
+  import Rfc3986.{pctEncoded, subDelims, unreserved} // positive-rfc3986-owner
+  import Query.{parser => query} // positive-query-owner
+  import org.http4s.EntityTag.{parse => parseTag} // positive-entitytag-owner
+
+  val parsed = query // positive-query-selector
+  val username = oneOf(unreserved :: pctEncoded :: subDelims :: Nil).rep0.string // positive-pct-encoded
+  val parsedTag = parseTag // positive-entitytag-selector
+
+  def oneOf(value: List[String]): ParserBuilder = new ParserBuilder
+  final class ParserBuilder {
+    def rep0: ParserBuilder = this
+    def string: String = ""
+  }
+}
+
+object WrongOwner {
+  object Rfc3986 {
+    val pctEncoded: String = "wrong"
+    val subDelims: String = "wrong"
+    val unreserved: String = "wrong"
+  }
+  object Query { val parser: String = "wrong" }
+
+  import Rfc3986.{pctEncoded, subDelims, unreserved} // negative-wrong-rfc3986-owner
+  import Query.{parser => query} // negative-wrong-query-owner
+  import decoy.EntityTag.{parse => parseTag} // negative-wrong-entitytag-owner
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "org/http4s/internal/parsing/Defs.scala",
+            r#"package org.http4s.internal.parsing
+object Rfc3986 {
+  val pctEncoded: String = "pct"
+  val subDelims: String = "sub"
+  val unreserved: String = "unreserved"
+}
+object Query {
+  val parser: String = "parser"
+}
+"#,
+        ),
+        (
+            "org/http4s/EntityTag.scala",
+            r#"package org.http4s
+object EntityTag {
+  def parse(value: String): String = value
+}
+"#,
+        ),
+        (
+            "decoy/EntityTag.scala",
+            r#"package decoy
+object EntityTag {
+  def parse(value: String): String = value
+}
+"#,
+        ),
+        ("org/http4s/Consumer.scala", consumer),
+    ]);
+    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let inverse = ScalaUsageGraphStrategy::new();
+
+    for (target_fqn, line, token, positive, negative) in [
+        (
+            "org.http4s.internal.parsing.Rfc3986$",
+            "  import Rfc3986.{pctEncoded, subDelims, unreserved} // positive-rfc3986-owner",
+            "Rfc3986",
+            "positive-rfc3986-owner",
+            "negative-wrong-rfc3986-owner",
+        ),
+        (
+            "org.http4s.internal.parsing.Query$",
+            "  import Query.{parser => query} // positive-query-owner",
+            "Query",
+            "positive-query-owner",
+            "negative-wrong-query-owner",
+        ),
+        (
+            "org.http4s.EntityTag$",
+            "  import org.http4s.EntityTag.{parse => parseTag} // positive-entitytag-owner",
+            "EntityTag",
+            "positive-entitytag-owner",
+            "negative-wrong-entitytag-owner",
+        ),
+        (
+            "org.http4s.internal.parsing.Rfc3986$.pctEncoded",
+            "  val username = oneOf(unreserved :: pctEncoded :: subDelims :: Nil).rep0.string // positive-pct-encoded",
+            "pctEncoded",
+            "positive-pct-encoded",
+            "negative-wrong-rfc3986-owner",
+        ),
+        (
+            "org.http4s.internal.parsing.Query$.parser",
+            "  val parsed = query // positive-query-selector",
+            "query",
+            "positive-query-selector",
+            "negative-wrong-query-owner",
+        ),
+        (
+            "org.http4s.EntityTag$.parse",
+            "  val parsedTag = parseTag // positive-entitytag-selector",
+            "parseTag",
+            "positive-entitytag-selector",
+            "negative-wrong-entitytag-owner",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        let inverse_hits = reference_surface_hits(inverse.find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        let expected = exact_segment(consumer, line, token);
+        for bucket in [&targeted_hits, &inverse_hits] {
+            assert_hit_contains(bucket, positive);
+            assert_no_hit_contains(bucket, negative);
+            assert!(
+                bucket
+                    .iter()
+                    .any(|hit| hit.start_offset == expected.0 && hit.end_offset == expected.1),
+                "expected exact range {expected:?} for {target_fqn}: {bucket:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn scala_http4s_inverse_resolves_unqualified_companion_type_alias() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "org/http4s/EntityTag.scala",
+            "package org.http4s\nfinal case class EntityTag(value: String)\n",
+        ),
+        (
+            "org/http4s/headers/ETag.scala",
+            r#"package org.http4s
+package headers
+
+object ETag {
+  type EntityTag = http4s.EntityTag
+  val EntityTag: http4s.EntityTag.type = http4s.EntityTag
+}
+
+final case class ETag(tag: EntityTag) // positive-companion-type-alias
+"#,
+        ),
+    ]);
+    let target = analyzer
+        .get_definitions("org.http4s.headers.ETag$.EntityTag")
+        .into_iter()
+        .find(|candidate| analyzer.is_type_alias(candidate))
+        .expect("companion type alias target");
+    let target_hits = authoritative_scala_reference_hits(&analyzer, &target);
+    assert_hit_contains(&target_hits, "positive-companion-type-alias");
+}
+
+#[test]
+fn scala_http4s_inverse_handles_curried_same_class_partial_call() {
+    let source = r#"package org.http4s.client
+
+final class Request[F]
+final class Response[F]
+trait EntityDecoder[F, A]
+
+private[http4s] abstract class DefaultClient[F[_]] {
+  def expectOr[A](
+      req: Request[F]
+  )(onError: Response[F] => Throwable)(implicit d: EntityDecoder[F, A]): A
+
+  def expectOr[A](
+      req: String
+  )(onError: Response[F] => Throwable)(implicit d: EntityDecoder[F, A]): A
+
+  def expect[A](req: Request[F])(implicit d: EntityDecoder[F, A]): A =
+    expectOr(req)(defaultOnError(req)) // positive-default-on-error
+
+  def rejectWrongArity(req: Request[F])(implicit d: EntityDecoder[F, String]): String =
+    expectOr(req)(defaultOnError) // negative-partial-arity
+
+  def defaultOnError(req: Request[F])(resp: Response[F]): Throwable
+}
+"#;
+    let (_project, analyzer) =
+        scala_analyzer_with_files(&[("org/http4s/client/DefaultClient.scala", source)]);
+    let target = definition(&analyzer, "org.http4s.client.DefaultClient.defaultOnError");
+    let target_hits = authoritative_scala_reference_hits(&analyzer, &target);
+    assert_reference_hit_contains(&target_hits, "positive-default-on-error");
+    assert_no_hit_contains(&target_hits, "negative-partial-arity");
+}
+
+#[test]
+fn scala_http4s_inverse_handles_bare_method_argument_on_external_receiver() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "org/http4s/Message.scala",
+            r#"package org.http4s
+
+trait Header[A]
+object Header {
+  final class Raw
+}
+
+final class Response[F] {
+  def filterHeaders(predicate: Header.Raw => Boolean): Response[F] = this
+}
+"#,
+        ),
+        (
+            "org/http4s/client/middleware/GZip.scala",
+            r#"package org.http4s
+package client
+package middleware
+
+object GZip {
+  private def decompress[F](response: Response[F]): Response[F] =
+    response.filterHeaders(nonCompressionHeader) // positive-non-compression-header
+
+  private def nonCompressionHeader(header: Header.Raw): Boolean = true
+}
+
+object WrongOwner {
+  def nonCompressionHeader(header: Header.Raw): Boolean = false
+  val selected: Header.Raw => Boolean = nonCompressionHeader // negative-wrong-header-owner
+}
+"#,
+        ),
+    ]);
+    let target = definition(
+        &analyzer,
+        "org.http4s.client.middleware.GZip$.nonCompressionHeader",
+    );
+    let target_hits = authoritative_scala_reference_hits(&analyzer, &target);
+    assert_reference_hit_contains(&target_hits, "positive-non-compression-header");
+    assert_no_hit_contains(&target_hits, "negative-wrong-header-owner");
+}
+
+#[test]
+fn scala_inverse_does_not_force_package_object_collision_for_parameter_type() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "org/http4s/Message.scala",
+            r#"package org.http4s
+
+trait Header[A]
+object Header {
+  final class Raw
+}
+
+final class Response[F] {
+  def filterHeaders(predicate: Header.Raw => Boolean): Response[F] = this
+}
+"#,
+        ),
+        (
+            "org/http4s/Header/PackageRaw.scala",
+            r#"package org.http4s.Header
+
+final class Raw
+"#,
+        ),
+        (
+            "org/http4s/client/middleware/GZip.scala",
+            r#"package org.http4s
+package client
+package middleware
+
+object GZip {
+  private def decompress[F](response: Response[F]): Response[F] =
+    response.filterHeaders(nonCompressionHeader) // negative-ambiguous-header-root
+
+  private def nonCompressionHeader(header: Header.Raw): Boolean = true
+}
+"#,
+        ),
+    ]);
+    let target = definition(
+        &analyzer,
+        "org.http4s.client.middleware.GZip$.nonCompressionHeader",
+    );
+    let target_hits = authoritative_scala_reference_hits(&analyzer, &target);
+    assert_no_hit_contains(&target_hits, "negative-ambiguous-header-root");
+}
+
+#[test]
+fn scala_http4s_inverse_handles_eta_and_stable_root_shapes() {
+    let source = r#"package org.http4s
+
+object Forwarded extends ForwardedRenderers {
+  final case class Node(value: String)
+
+  object Node {
+    final case class Obfuscated(str: String)
+    final case class Port(value: Int)
+  }
+}
+
+object CallableShapes {
+  final class Response
+
+  def defaultLogAction[F](value: String): String = value
+  def defaultResponse[F](delay: Option[Int]): Response = new Response
+
+  def chooseLog[F](logAction: Option[String => String]): String => String =
+    logAction.getOrElse(defaultLogAction[F] _) // positive-default-log-action
+
+  def chooseResponse[F](
+      throttleResponse: Option[Option[Int] => Response]
+  ): Option[Int] => Response =
+    throttleResponse.getOrElse(defaultResponse[F] _) // positive-default-response
+
+}
+
+object WrongOwner {
+  def defaultLogAction[F](value: String): String = value
+  def defaultResponse[F](value: Option[Int]): String = value.toString
+
+  val log = defaultLogAction[String] _ // negative-wrong-log-owner
+  val response = defaultResponse[String] _ // negative-wrong-response-owner
+}
+
+trait ForwardedRenderers {
+  import Forwarded._
+
+  def extractor(value: Node.Obfuscated): String =
+    value match {
+      case Node.Obfuscated(str) => str // positive-node-obfuscated
+    }
+
+  implicit val nodePortRenderer: Renderer[Node.Port] =
+    new Renderer[Node.Port] {} // positive-node-port
+
+  trait Renderer[A]
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("org/http4s/Defs.scala", source)]);
+
+    for (target, positive, negative) in [
+        (
+            definition(&analyzer, "org.http4s.CallableShapes$.defaultLogAction"),
+            "positive-default-log-action",
+            "negative-wrong-log-owner",
+        ),
+        (
+            definition(&analyzer, "org.http4s.CallableShapes$.defaultResponse"),
+            "positive-default-response",
+            "negative-wrong-response-owner",
+        ),
+    ] {
+        let target_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        assert_reference_hit_contains(&target_hits, positive);
+        assert_no_hit_contains(&target_hits, negative);
+    }
+
+    let node_target = definition(&analyzer, "org.http4s.Forwarded$.Node$");
+    let node_hits = authoritative_scala_reference_hits(&analyzer, &node_target);
+    assert_hit_contains(&node_hits, "positive-node-obfuscated");
+    assert_hit_contains(&node_hits, "positive-node-port");
+}
+
+#[test]
 fn scala_inverse_records_wildcard_owner_import_token_references_exactly() {
     let consumer_source = r#"package app
 object DirectUse {

@@ -3848,7 +3848,7 @@ impl ProjectTypes {
                                         .zip(parameter_paths)
                                         .map(|(arity, paths)| {
                                             let arity = (*arity)?;
-                                            let mut parameter_types =
+                                            let parameter_types =
                                                 paths.as_ref().and_then(|paths| {
                                                     paths
                                                         .iter()
@@ -3871,15 +3871,14 @@ impl ProjectTypes {
                                                     !types.iter().any(|identity| {
                                                         matches!(
                                                             identity,
-                                                            ScalaParameterTypeIdentity::TypeParameter(
-                                                                _
-                                                            )
+                                                            ScalaParameterTypeIdentity::TypeParameter(_)
+                                                                | ScalaParameterTypeIdentity::Unresolved(_)
                                                         )
                                                     })
+                                                })
+                                                && paths.as_ref().is_some_and(|paths| {
+                                                    paths.iter().all(Option::is_some)
                                                 });
-                                            if !parameter_types_authoritative {
-                                                parameter_types = None;
-                                            }
                                             Some(ScalaFunctionParameterShape {
                                                 arity,
                                                 parameter_types,
@@ -4136,7 +4135,11 @@ impl ProjectTypes {
         if resolver.has_type_or_object_or_package_binding(simple) {
             return None;
         }
-        scala_builtin_type_name(simple).map(ScalaParameterTypeIdentity::Builtin)
+        Some(
+            scala_builtin_type_name(simple)
+                .map(ScalaParameterTypeIdentity::Builtin)
+                .unwrap_or_else(|| ScalaParameterTypeIdentity::Unresolved(path.to_vec())),
+        )
     }
 
     fn resolve_callable_parameter_type_unit(
@@ -4212,6 +4215,24 @@ impl ProjectTypes {
             scope = self.declaration_parent(scala, &owner);
         }
 
+        for candidate in scala_enclosing_package_root_candidates(&resolver.package_prefixes, first)
+        {
+            if self.index.package_exists(&candidate) {
+                continue;
+            }
+            let normalized = scala_normalized_fq_name(&candidate);
+            let Some(root) = self
+                .unique_object_by_normalized_fqn(scala, &normalized)
+                .cloned()
+            else {
+                continue;
+            };
+            if let Some(resolved) =
+                self.resolve_qualified_stable_type_unit_at(scala, resolver, path, false, Some(root))
+            {
+                return Some(resolved);
+            }
+        }
         self.resolve_qualified_stable_type_unit_at(scala, resolver, path, false, None)
     }
 
@@ -5146,6 +5167,10 @@ fn override_family_relation(
         }
         for (declared_type, ancestor_type) in declared_types.iter().zip(ancestor_types) {
             match (declared_type, ancestor_type) {
+                (Some(ScalaParameterTypeIdentity::Unresolved(_)), _)
+                | (_, Some(ScalaParameterTypeIdentity::Unresolved(_))) => {
+                    return OverrideFamilyRelation::Unknown;
+                }
                 (Some(declared_type), Some(ancestor_type)) if declared_type == ancestor_type => {}
                 (Some(_), Some(_)) => return OverrideFamilyRelation::Different,
                 _ => return OverrideFamilyRelation::Unknown,
@@ -5213,13 +5238,30 @@ fn method_value_parameter_types_match(
         // or otherwise lacks an exact physical identity.
         return true;
     };
+    let Some(declared) = alternative.parameter_types.get(list_index) else {
+        return false;
+    };
+    if declared
+        .iter()
+        .any(|identity| matches!(identity, Some(ScalaParameterTypeIdentity::Unresolved(_))))
+    {
+        return false;
+    }
+    if actual
+        .method_value_parameter_types
+        .as_ref()
+        .is_some_and(|types| {
+            types
+                .iter()
+                .any(|identity| matches!(identity, ScalaParameterTypeIdentity::Unresolved(_)))
+        })
+    {
+        return false;
+    }
     if !actual.method_value_parameter_types_authoritative {
         return true;
     }
     let Some(expected) = actual.method_value_parameter_types.as_ref() else {
-        return false;
-    };
-    let Some(declared) = alternative.parameter_types.get(list_index) else {
         return false;
     };
     declared.len() == expected.len()
@@ -6885,8 +6927,37 @@ impl ScalaScan<'_, '_> {
                 owners.push(owner);
             }
         }
-        self.types
-            .exact_lexical_type_namespace(self.scala, owners, root_name, false)
+        let lexical = self.types.exact_lexical_type_namespace(
+            self.scala,
+            owners.iter().cloned(),
+            root_name,
+            false,
+        );
+        match lexical {
+            ScalaTypeNamespaceResolution::NoMatch => {}
+            other => return other,
+        }
+        if self.imports.iter().any(|import| {
+            !import.is_wildcard
+                && scala_import_is_visible_at_byte(import, lookup_node.start_byte())
+                && import.local_name() == Some(root_name)
+        }) {
+            return ScalaTypeNamespaceResolution::NoMatch;
+        }
+        for owner in owners {
+            let companions = self.types.exact_companion_objects(self.scala, &owner);
+            if companions.is_empty() {
+                continue;
+            }
+            match self
+                .types
+                .exact_lexical_type_namespace(self.scala, companions, root_name, false)
+            {
+                ScalaTypeNamespaceResolution::NoMatch => {}
+                other => return other,
+            }
+        }
+        ScalaTypeNamespaceResolution::NoMatch
     }
 
     /// Resolve exact indexed type-member tiers encountered before an outer
@@ -7194,7 +7265,19 @@ impl ScalaScan<'_, '_> {
         node: Node<'_>,
         call_shape: &ScalaCallSiteShape,
     ) {
-        let hit_kind = self.callable_reference_hit_kind(node, &callee);
+        let hit_kind = if call_shape.method_value_arity.is_some()
+            && !call_shape
+                .method_value_parameter_types
+                .as_ref()
+                .is_some_and(|types| {
+                    types.iter().any(|identity| {
+                        matches!(identity, ScalaParameterTypeIdentity::Unresolved(_))
+                    })
+                }) {
+            UsageHitKind::Reference
+        } else {
+            self.callable_reference_hit_kind(node, &callee)
+        };
         self.sink.record_callable(
             ScalaResolvedReference::Exact(callee),
             ScalaReferenceRole::Callable,
@@ -7449,6 +7532,15 @@ fn record_exact_import_references(node: Node<'_>, ctx: &mut ScalaScan<'_, '_>) {
         .iter()
         .find(|child| child.kind() == "namespace_selectors")
     {
+        if let Some(name_node) = path_nodes.last().copied() {
+            record_exact_import_path_reference(
+                name_node,
+                &base_path,
+                node.start_byte(),
+                false,
+                ctx,
+            );
+        }
         let mut selector_cursor = selectors.walk();
         let base_name_node = path_nodes.last().copied();
         for selector in selectors.named_children(&mut selector_cursor) {
@@ -7469,6 +7561,15 @@ fn record_exact_import_references(node: Node<'_>, ctx: &mut ScalaScan<'_, '_>) {
             "namespace_wildcard" | "as_renamed_identifier" | "arrow_renamed_identifier"
         )
     }) {
+        if let Some(name_node) = path_nodes.last().copied() {
+            record_exact_import_path_reference(
+                name_node,
+                &base_path,
+                node.start_byte(),
+                false,
+                ctx,
+            );
+        }
         record_exact_import_selector_reference(
             *selector,
             path_nodes.last().copied(),
@@ -8384,6 +8485,26 @@ fn record_reference(
                 }
             }
             if !is_terminal_stable_field_reference(node)
+                && record_explicit_imported_member(node, name, ctx)
+            {
+                return;
+            }
+            if !is_terminal_stable_field_reference(node)
+                && !bare_companion_method_value
+                && let Some(imported) = ctx.resolver.resolve_explicit_member_unit(name)
+            {
+                ctx.record_exact(
+                    imported.clone(),
+                    if imported.is_field() {
+                        ScalaReferenceRole::Field
+                    } else {
+                        ScalaReferenceRole::Callable
+                    },
+                    node,
+                );
+                return;
+            }
+            if !is_terminal_stable_field_reference(node)
                 && ctx
                     .lexically_visible_object(node.start_byte(), name)
                     .is_none()
@@ -8729,7 +8850,18 @@ fn record_qualified_root_owner_reference(
         && (ctx.types.type_is_stable_owner(ctx.scala, &target)
             || ctx.types.type_accepts_object_roles(ctx.scala, &target))
     {
-        ctx.record_exact(target, ScalaReferenceRole::Type, node);
+        let companions = if target.is_class() && !target.short_name().ends_with('$') {
+            ctx.types.exact_companion_objects(ctx.scala, &target)
+        } else {
+            Vec::new()
+        };
+        if companions.is_empty() {
+            ctx.record_exact(target, ScalaReferenceRole::Type, node);
+        } else {
+            for companion in companions {
+                ctx.record_exact(companion, ScalaReferenceRole::StableObject, node);
+            }
+        }
         recorded = true;
     }
     recorded
@@ -8876,6 +9008,67 @@ fn record_local_stable_imported_member(
         ctx.record_exact(target, role, node);
     }
     true
+}
+
+fn record_explicit_imported_member(
+    node: Node<'_>,
+    visible_name: &str,
+    ctx: &mut ScalaScan<'_, '_>,
+) -> bool {
+    let mut matched_import = false;
+    let mut selected_targets: Option<Vec<CodeUnit>> = None;
+    for import in ctx.imports.iter().filter(|import| {
+        !import.is_wildcard
+            && scala_import_is_visible_at_byte(import, node.start_byte())
+            && import.local_name() == Some(visible_name)
+    }) {
+        let Some(path) = import.path.as_ref() else {
+            continue;
+        };
+        let mut targets = resolve_exact_import_path_references(
+            &path.segments,
+            path.declaration_start_byte,
+            true,
+            ctx,
+        );
+        targets.retain(|target| {
+            target.is_function()
+                || target.is_field()
+                || target.short_name().ends_with('$')
+                || (target.is_class() && ctx.types.type_accepts_object_roles(ctx.scala, target))
+        });
+        if is_bare_companion_method_value_reference(node) {
+            targets.retain(|target| !target.is_class() || target.short_name().ends_with('$'));
+            if targets.is_empty() {
+                continue;
+            }
+        }
+        matched_import = true;
+        targets.sort();
+        targets.dedup();
+        if selected_targets
+            .as_ref()
+            .is_some_and(|selected| selected != &targets)
+        {
+            return true;
+        }
+        selected_targets = Some(targets);
+    }
+
+    let Some(targets) = selected_targets else {
+        return matched_import;
+    };
+    for target in targets {
+        let role = if target.is_function() {
+            ScalaReferenceRole::Callable
+        } else if target.is_field() {
+            ScalaReferenceRole::Field
+        } else {
+            ScalaReferenceRole::StableObject
+        };
+        ctx.record_exact(target, role, node);
+    }
+    matched_import
 }
 
 fn record_union_receiver_parameterless_methods(
@@ -9650,10 +9843,27 @@ fn record_lexically_visible_field_reference(
 }
 
 fn companion_method_value_context(
-    node: Node<'_>,
+    mut node: Node<'_>,
     ctx: &ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> ScalaMethodValueContext {
+    if let Some(generic) = node.parent().filter(|parent| {
+        parent.kind() == "generic_function" && parent.child_by_field_name("function") == Some(node)
+    }) {
+        node = generic;
+    }
+    if let Some(postfix) = node.parent().filter(|parent| {
+        if parent.kind() != "postfix_expression" {
+            return false;
+        }
+        let Some(operator) = scala_postfix_operator_node(*parent) else {
+            return false;
+        };
+        node_text(operator, ctx.source).trim() == "_"
+            && scala_postfix_receiver_node(*parent, operator) == Some(node)
+    }) {
+        node = postfix;
+    }
     if let Some(expected_type) = node
         .parent()
         .and_then(|definition| match definition.kind() {
@@ -9856,13 +10066,40 @@ fn record_ordinary_class_methods(
     ) {
         BareMemberResolution::Resolved(methods) => {
             for method in methods {
-                ctx.record_exact_callable(method, node);
+                record_exact_callable_reference(method, node, ctx);
             }
             true
         }
         BareMemberResolution::Unresolved => true,
         BareMemberResolution::NoMatch => false,
     }
+}
+
+fn record_exact_callable_reference(method: CodeUnit, node: Node<'_>, ctx: &mut ScalaScan<'_, '_>) {
+    if is_explicit_eta_reference(node, ctx.source) {
+        ctx.record_exact(method, ScalaReferenceRole::Callable, node);
+    } else {
+        ctx.record_exact_callable(method, node);
+    }
+}
+
+fn is_explicit_eta_reference(mut node: Node<'_>, source: &str) -> bool {
+    if let Some(generic) = node.parent().filter(|parent| {
+        parent.kind() == "generic_function" && parent.child_by_field_name("function") == Some(node)
+    }) {
+        node = generic;
+    }
+    let Some(postfix) = node
+        .parent()
+        .filter(|parent| parent.kind() == "postfix_expression")
+    else {
+        return false;
+    };
+    let Some(operator) = scala_postfix_operator_node(postfix) else {
+        return false;
+    };
+    node_text(operator, source).trim() == "_"
+        && scala_postfix_receiver_node(postfix, operator) == Some(node)
 }
 
 fn record_lexically_visible_call(
@@ -9897,7 +10134,16 @@ fn record_lexically_visible_call(
                 }
                 BareMemberResolution::Unresolved => return true,
                 BareMemberResolution::NoMatch => {
-                    if call_shape.method_value_parameter_types_authoritative
+                    let expected_type_is_unresolved = call_shape
+                        .method_value_parameter_types
+                        .as_ref()
+                        .is_some_and(|types| {
+                            types.iter().any(|identity| {
+                                matches!(identity, ScalaParameterTypeIdentity::Unresolved(_))
+                            })
+                        });
+                    if (call_shape.method_value_parameter_types_authoritative
+                        || expected_type_is_unresolved)
                         && callable_name_is_bound_for_exact_owner(owner, member, ctx)
                     {
                         return true;
@@ -9975,7 +10221,7 @@ fn record_lexically_visible_parameterless_method(
             {
                 BareMemberResolution::Resolved(methods) => {
                     for method in methods {
-                        ctx.record_exact_callable(method, node);
+                        record_exact_callable_reference(method, node, ctx);
                     }
                     return true;
                 }
@@ -9986,7 +10232,7 @@ fn record_lexically_visible_parameterless_method(
         match ordinary_class_member_declarations_for_template(declaration, member, None, ctx) {
             BareMemberResolution::Resolved(methods) => {
                 for method in methods {
-                    ctx.record_exact_callable(method, node);
+                    record_exact_callable_reference(method, node, ctx);
                 }
                 return true;
             }

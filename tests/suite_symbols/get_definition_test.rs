@@ -27661,6 +27661,7 @@ fn scala_type_reference_keeps_supported_java_definition_resolution() {
         "package app\n",
         "object Use { ",
         "val explicit = new Greeter(1); ",
+        "val typed: Greeter = explicit; ",
         "val wrongExplicit = new Greeter(); ",
         "val implicitZero = new ImplicitGreeter(); ",
         "val wrongImplicit = new ImplicitGreeter(1); ",
@@ -27703,6 +27704,16 @@ fn scala_type_reference_keeps_supported_java_definition_resolution() {
         )
         .file("app/Use.scala", source)
         .build();
+
+    let type_start = source.find("typed: Greeter").expect("Java type annotation") + "typed: ".len();
+    let type_value = lookup(
+        project.root(),
+        &location_reference("app/Use.scala", source, type_start),
+    );
+    let type_result = &type_value["results"][0];
+    assert_eq!(type_result["status"], "resolved", "{type_value}");
+    assert_eq!(type_result["definitions"][0]["language"], "java");
+    assert_eq!(type_result["definitions"][0]["fqn"], "app.Greeter");
 
     for (needle, expected) in [
         ("new Greeter(1)", "app.Greeter.Greeter"),
@@ -29199,21 +29210,24 @@ object Consumer {
 
 #[test]
 fn scala_type_position_prefers_type_alias_over_same_named_value() {
-    let source = r#"
-package org.http4s.headers
+    let model = r#"
+package org.http4s
 
-object Shared {
-  class EntityTag
-}
+final case class EntityTag(value: String)
+"#;
+    let source = r#"
+package org.http4s
+package headers
 
 object ETag {
-  type EntityTag = Shared.EntityTag
-  val EntityTag: Shared.EntityTag = new Shared.EntityTag
+  type EntityTag = http4s.EntityTag
+  val EntityTag: http4s.EntityTag.type = http4s.EntityTag
 }
 
 final case class ETag(tag: EntityTag)
 "#;
     let project = InlineTestProject::with_language(Language::Scala)
+        .file("src/EntityTag.scala", model)
         .file("src/ETag.scala", source)
         .build();
     let start = source.rfind("EntityTag)").expect("case class type");
@@ -29228,7 +29242,7 @@ final case class ETag(tag: EntityTag)
         result["definitions"][0]["fqn"], "org.http4s.headers.ETag$.EntityTag",
         "{value}"
     );
-    assert_eq!(result["definitions"][0]["start_line"], 9, "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 6, "{value}");
 }
 
 #[test]
@@ -29236,15 +29250,90 @@ fn scala_nested_class_parameter_infix_operator_uses_parameter_type_owner() {
     let source = r#"
 package org.http4s
 
+final case class Uri(
+    scheme: Option[String] = None,
+    authority: Option[String] = None,
+    path: Uri.Path = Uri.Path.empty,
+    query: String = "",
+    fragment: Option[String] = None,
+) extends QueryOps
+    with Renderable {
+  def withPath(path: String): Uri = this
+  def withPath(path: Uri.Path): Uri = this
+
+  def add[A: Uri.Path.SegmentEncoder](newSegment: A): Uri =
+    copy(path = path / newSegment)
+  def /(segment: String): Uri = this
+  def /[A: Uri.Path.SegmentEncoder](segment: A): Uri = this
+}
+
+object Uri {
+  final case class Path(value: String) {
+    def /(segment: Path.Segment): Path = this
+    def /[A: Path.SegmentEncoder](segment: A): Path = this
+  }
+  object Path {
+    trait SegmentEncoder[A]
+    final case class Segment(value: String)
+    val empty: Path = Path("")
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("src/Uri.scala", source)
+        .build();
+    let path_type_start = source.find("path: Uri.Path").expect("path type") + "path: Uri.".len();
+    let path_type = lookup(
+        project.root(),
+        &location_reference("src/Uri.scala", source, path_type_start),
+    );
+    let path_type_result = &path_type["results"][0];
+    assert_eq!(path_type_result["status"], "resolved", "{path_type}");
+    assert_eq!(
+        path_type_result["definitions"][0]["fqn"], "org.http4s.Uri$.Path",
+        "{path_type}"
+    );
+    assert!(
+        !path_type.to_string().contains("org.http4s.Uri$.Path$"),
+        "ordinary type position must exclude the same-named companion object: {path_type}"
+    );
+
+    let start = source.rfind(" / ").expect("infix operator") + 1;
+    let value = lookup(
+        project.root(),
+        &location_reference("src/Uri.scala", source, start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "org.http4s.Uri$.Path./",
+        "{value}"
+    );
+
+    let term_start = source
+        .find("def /(segment: String): Uri =")
+        .expect("enclosing Uri slash");
+    assert_ne!(
+        result["definitions"][0]["start_byte"], term_start,
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_typed_receiver_infix_does_not_fall_back_to_enclosing_same_name_on_arity_mismatch() {
+    let source = r#"
+package org.http4s
+
 object Uri {
   class Path {
-    def /(segment: String): Path = this
+    def /(segment: String, suffix: String): Path = this
   }
 
   def /(segment: String): Uri.type = this
 
   final case class Holder(path: Uri.Path) {
-    def add(newSegment: String): Uri.Path = path / newSegment
+    def add(newSegment: String): Uri.Path = copy(path = path / newSegment).path
   }
 }
 "#;
@@ -29258,12 +29347,47 @@ object Uri {
     );
 
     let result = &value["results"][0];
-    assert_eq!(result["status"], "resolved", "{value}");
+    assert_ne!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "org.http4s.Uri$.Path./",
+        result["diagnostics"][0]["kind"], "no_applicable_scala_callable",
         "{value}"
     );
+    assert!(
+        !value.to_string().contains("org.http4s.Uri$./"),
+        "arity mismatch must not fall back to the enclosing Uri./ overload: {value}"
+    );
 }
+
+#[test]
+fn scala_unknown_receiver_infix_does_not_fall_back_to_enclosing_same_name_operator() {
+    let source = r#"
+package org.http4s
+
+object Uri {
+  def /(segment: String): Uri.type = this
+
+  object Holder {
+    def add(newSegment: String): Any = path / newSegment
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("src/Uri.scala", source)
+        .build();
+    let start = source.rfind(" / ").expect("infix operator") + 1;
+    let value = lookup(
+        project.root(),
+        &location_reference("src/Uri.scala", source, start),
+    );
+
+    let result = &value["results"][0];
+    assert_ne!(result["status"], "resolved", "{value}");
+    assert!(
+        !value.to_string().contains("org.http4s.Uri$./"),
+        "an unknown receiver must fail closed instead of resolving the enclosing Uri./: {value}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Kotlin definition navigation (issue #1238).
 //

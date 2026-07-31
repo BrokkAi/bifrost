@@ -692,6 +692,34 @@ local gate, but is not the focus.
   witnesses are exact import hits. Issue #1279 was closed only after that
   proof. Candidate diagnostics and generated caches were removed while the
   baseline and clean replay were retained.
+- [x] (2026-07-31 02:49Z) Finished Scala rank six `zio__zio-http`
+  depth-first at pushed head `2f6feb93`. The clean replay audited 433/433
+  files and 10,000 sites, queried all 928 targets, and reported zero missing,
+  truncation, candidate-limit overflow, or file errors. Assigned issue #1379
+  was closed only after the clean proof.
+- [x] (2026-07-31 04:19Z) Finished Scala rank seven
+  `lichess-org__scalachess` depth-first at pushed head `20f61961`. The clean
+  replay audited 108/108 files and 10,000 sites, queried all 687 targets, and
+  reported zero missing, truncation, candidate-limit overflow, or file
+  errors. Assigned issues #1380 and #1381 were closed after the proof; shared
+  cross-repository issues remain open until their remaining witnesses clear.
+- [x] (2026-07-31 05:23Z) Finished Scala rank eight
+  `lensesio__stream-reactor` depth-first at pushed merge head `ee8e114c`.
+  The clean replay audited 656/656 files and 10,000 sites, queried all 803
+  targets, and reported zero missing, truncation, candidate-limit overflow,
+  or file errors. Dedicated issue #1382 was closed; shared forward issue
+  #1284 received the final witness evidence and remains open. Disposable exact
+  and dirty artifacts were removed, retaining only the baseline and clean
+  replay.
+- [ ] (2026-07-31 05:34Z) Scala rank nine `http4s__http4s` is in progress
+  depth-first. Its clean `ee8e114c` baseline audited 425/425 files and 10,000
+  sites, queried 1,000 of 1,014 targets, and produced 12 raw missing rows with
+  no file or candidate-limit errors. All 12 reproduce exactly. Existing
+  assigned issues #1285, #1287, and #1316 own six rows; #1380 was reopened for
+  two additional root-owner shapes; new issues #1385 and #1386 were created
+  assigned to `jbellis` for selector-import owner references and typed-receiver
+  infix forward resolution. Implementation is delegated across non-overlapping
+  inverse and forward surfaces; clean pushed-head replay remains.
 - [x] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [x] Complete C++ and publish its evidence and user summary.
@@ -845,6 +873,14 @@ local gate, but is not the focus.
   0.07 seconds. A longer named watchdog preserves deadlock detection without
   asserting a performance guarantee that the test does not measure.
 
+- The current http4s sample compressed the historical 134-row triage set to 12
+  exact residuals after ranks six through eight fixes. Three selector-import
+  owner tokens expose a distinct inverse gap: the import walk records strict
+  prefixes and selector terminals, but not the complete base owner immediately
+  before a selector block. The `path / newSegment` row is instead a wrong
+  forward identity: the declared receiver type is `Uri.Path`, while forward
+  lookup selects the enclosing `Uri./`.
+
 ## Decision Log
 
 - Decision: Use the live `SFT_PREDICATES` selector and stable descending task
@@ -891,6 +927,14 @@ local gate, but is not the focus.
   safely and accelerates diagnosis. Root retains issue ownership checks, code
   review, gates, publication, and acceptance decisions.
   Date/Author: 2026-07-23 / Codex
+
+- Decision: Process Scala repositories six through ten strictly depth-first,
+  closing each repository's dedicated issue state and disposable artifacts
+  before starting the next repository.
+  Rationale: The user explicitly rejected pre-filing or batching issue work
+  across later repositories. Repository-local baselines, fixes, publication,
+  clean proof, issue updates, and cleanup now form one indivisible transition.
+  Date/Author: 2026-07-31 / Codex
 
 - Decision: Interrupt the `37412679` C run after it supplied reproducible
   #1165 baseline evidence, preserve it under an explicit `aborted` name, and
@@ -1230,3 +1274,8 @@ task asks only for ranks six through ten. Reopened eight language boundaries,
 changed acceptance from 110 rerun envelopes to 55 new envelopes, preserved the
 valid C/C++/Python top-ten evidence, and recorded the independently preflighted
 40 remaining repositories.
+
+Revision note (2026-07-31): Recorded the completed depth-first Scala ranks six
+through eight, the accepted http4s rank-nine baseline and exhaustive exact
+triage, the assigned issue map, and the repository-depth-first transition
+required before Guardian Grid may begin.

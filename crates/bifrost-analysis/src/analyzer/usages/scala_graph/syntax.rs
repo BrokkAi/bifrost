@@ -62,6 +62,7 @@ pub(crate) enum ScalaParameterTypeIdentity {
     Builtin(&'static str),
     Declaration(CodeUnit),
     TypeParameter(String),
+    Unresolved(Vec<String>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

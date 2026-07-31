@@ -57,6 +57,20 @@ enum ScalaOwnerKind {
     TypeNamespace,
 }
 
+fn scala_unit_matches_owner_kind(
+    scala: &ScalaAnalyzer,
+    unit: &CodeUnit,
+    kind: ScalaOwnerKind,
+) -> bool {
+    match kind {
+        ScalaOwnerKind::Class => unit.is_class() && !unit.short_name().ends_with('$'),
+        ScalaOwnerKind::SingletonObject => unit.is_class() && unit.short_name().ends_with('$'),
+        ScalaOwnerKind::TypeNamespace => {
+            unit.is_class() && !unit.short_name().ends_with('$') || scala.is_type_alias(unit)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ScalaOwnerIdentity {
     fqn: String,
@@ -936,9 +950,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
                     )
                     .filter(|unit| {
                         unit.fq_name() == exact
-                            && (unit.is_class()
-                                || (kind == ScalaOwnerKind::TypeNamespace
-                                    && self.scala.is_type_alias(unit)))
+                            && scala_unit_matches_owner_kind(self.scala, unit, kind)
                     })
                     .map(|unit| ScalaOwnerIdentity {
                         fqn: unit.fq_name(),
@@ -6428,7 +6440,7 @@ fn resolve_scala_type(
         );
     }
     if let Some(fqn) = scala_resolve_visible_type_node_after_lexical_miss(ctx, resolver, node) {
-        return scala_fqn_outcome(ctx.support, &fqn, text);
+        return scala_type_fqn_outcome(ctx, &fqn, text, scala_type_node_owner_kind(node));
     }
     gated_boundary(
         || {
@@ -7903,7 +7915,8 @@ fn scala_callable_matches_constructed_arguments(
                 ScalaParameterTypeIdentity::Declaration(expected) => {
                     scala_exact_subtype_relation(ctx, actual, expected)
                 }
-                ScalaParameterTypeIdentity::TypeParameter(_) => ScalaTypedCandidateMatch::Unknown,
+                ScalaParameterTypeIdentity::TypeParameter(_)
+                | ScalaParameterTypeIdentity::Unresolved(_) => ScalaTypedCandidateMatch::Unknown,
             };
             match relation {
                 ScalaTypedCandidateMatch::Match => {}
@@ -9566,9 +9579,7 @@ fn scala_resolve_visible_type_declaration(
                 ctx.support.fqn(&fqn).into_iter().filter(move |unit| {
                     unit.fq_name() == fqn
                         && unit.source() == ctx.file
-                        && (unit.is_class()
-                            || (kind == ScalaOwnerKind::TypeNamespace
-                                && ctx.scala.is_type_alias(unit)))
+                        && scala_unit_matches_owner_kind(ctx.scala, unit, kind)
                 })
             })
             .collect::<Vec<_>>();
@@ -9687,51 +9698,58 @@ fn scala_exact_lexical_type_namespace(
         return ScalaTypeNamespaceResolution::Resolved(owner.clone());
     }
     if segments.len() > 1 {
-        for owner in owners {
-            let mut candidates =
-                match scala_exact_owner_namespace_children(ctx, &owner, &segments[0]) {
-                    ScalaExactMemberResolution::Found(candidates) => candidates,
-                    ScalaExactMemberResolution::Ambiguous => {
-                        return ScalaTypeNamespaceResolution::Ambiguous;
-                    }
-                    ScalaExactMemberResolution::NoMatch => continue,
-                };
-            for (index, segment) in segments[1..].iter().enumerate() {
-                let terminal = index + 2 == segments.len();
-                let mut next = candidates
-                    .iter()
-                    .flat_map(|candidate| {
-                        scala_exact_direct_namespace_children(
-                            ctx,
-                            candidate,
-                            segment,
-                            terminal.then(|| scala_type_node_owner_kind(lookup_node)),
-                        )
+        if let Some(owner) = owners
+            .iter()
+            .find(|owner| owner.identifier().trim_end_matches('$') == root_name)
+        {
+            let mut roots = if owner.short_name().ends_with('$') {
+                vec![owner.clone()]
+            } else {
+                ctx.support
+                    .fqn(&format!("{}$", owner.fq_name()))
+                    .into_iter()
+                    .filter(|candidate| {
+                        candidate.is_class()
+                            && candidate.short_name().ends_with('$')
+                            && candidate.source() == owner.source()
                     })
-                    .collect::<Vec<_>>();
-                sort_units(&mut next);
-                next.dedup();
-                if next.is_empty() {
-                    // The lexical root is authoritative even when the selected
-                    // child is absent; an imported or package-level namesake
-                    // cannot replace it.
-                    return ScalaTypeNamespaceResolution::AuthoritativeMiss;
-                }
-                candidates = next;
-            }
-            return match candidates.as_slice() {
-                [declaration] => ScalaTypeNamespaceResolution::Resolved(declaration.clone()),
-                [_, _, ..] => ScalaTypeNamespaceResolution::Ambiguous,
-                [] => ScalaTypeNamespaceResolution::AuthoritativeMiss,
+                    .collect::<Vec<_>>()
             };
+            sort_units(&mut roots);
+            roots.dedup();
+            return match roots.as_slice() {
+                [] => ScalaTypeNamespaceResolution::AuthoritativeMiss,
+                [_] => scala_exact_namespace_descendant(
+                    ctx,
+                    roots,
+                    &segments[1..],
+                    scala_type_node_owner_kind(lookup_node),
+                ),
+                [_, _, ..] => ScalaTypeNamespaceResolution::Ambiguous,
+            };
+        }
+        for owner in owners {
+            let candidates = match scala_exact_owner_namespace_children(ctx, &owner, &segments[0]) {
+                ScalaExactMemberResolution::Found(candidates) => candidates,
+                ScalaExactMemberResolution::Ambiguous => {
+                    return ScalaTypeNamespaceResolution::Ambiguous;
+                }
+                ScalaExactMemberResolution::NoMatch => continue,
+            };
+            return scala_exact_namespace_descendant(
+                ctx,
+                candidates,
+                &segments[1..],
+                scala_type_node_owner_kind(lookup_node),
+            );
         }
         return ScalaTypeNamespaceResolution::NoMatch;
     }
     let [name] = segments.as_slice() else {
         return ScalaTypeNamespaceResolution::NoMatch;
     };
-    resolve_exact_lexical_type_namespace(
-        owners,
+    let lexical = resolve_exact_lexical_type_namespace(
+        owners.iter().cloned(),
         name,
         false,
         |owner, member| {
@@ -9747,7 +9765,88 @@ fn scala_exact_lexical_type_namespace(
                 .collect()
         },
         |owner| ctx.direct_ancestors_for_owner(owner),
-    )
+    );
+    match lexical {
+        ScalaTypeNamespaceResolution::NoMatch => {}
+        other => return other,
+    }
+    if !matches!(
+        resolver
+            .resolve_explicit_owner_segments(&segments, scala_type_node_owner_kind(lookup_node)),
+        ScalaNameResolution::Unresolved
+    ) {
+        return ScalaTypeNamespaceResolution::NoMatch;
+    }
+
+    for owner in owners {
+        if owner.short_name().ends_with('$') {
+            continue;
+        }
+        let companion_fqn = format!("{}$", owner.fq_name());
+        let mut companions = ctx
+            .support
+            .fqn(&companion_fqn)
+            .into_iter()
+            .filter(|candidate| {
+                candidate.is_class()
+                    && candidate.fq_name() == companion_fqn
+                    && candidate.source() == owner.source()
+            })
+            .collect::<Vec<_>>();
+        sort_units(&mut companions);
+        companions.dedup();
+        let [companion] = companions.as_slice() else {
+            if companions.is_empty() {
+                continue;
+            }
+            return ScalaTypeNamespaceResolution::Ambiguous;
+        };
+        let members = scala_exact_direct_namespace_children(
+            ctx,
+            companion,
+            name,
+            Some(ScalaOwnerKind::TypeNamespace),
+        );
+        match members.as_slice() {
+            [member] => return ScalaTypeNamespaceResolution::Resolved(member.clone()),
+            [_, _, ..] => return ScalaTypeNamespaceResolution::Ambiguous,
+            [] => {}
+        }
+    }
+    ScalaTypeNamespaceResolution::NoMatch
+}
+
+fn scala_exact_namespace_descendant(
+    ctx: ScalaLookupCtx<'_>,
+    mut candidates: Vec<CodeUnit>,
+    segments: &[String],
+    terminal_kind: ScalaOwnerKind,
+) -> ScalaTypeNamespaceResolution {
+    for (index, segment) in segments.iter().enumerate() {
+        let terminal = index + 1 == segments.len();
+        let mut next = candidates
+            .iter()
+            .flat_map(|candidate| {
+                scala_exact_direct_namespace_children(
+                    ctx,
+                    candidate,
+                    segment,
+                    terminal.then_some(terminal_kind),
+                )
+            })
+            .collect::<Vec<_>>();
+        sort_units(&mut next);
+        next.dedup();
+        if next.is_empty() {
+            return ScalaTypeNamespaceResolution::AuthoritativeMiss;
+        }
+        candidates = next;
+    }
+    match candidates.as_slice() {
+        [declaration] => ScalaTypeNamespaceResolution::Resolved(declaration.clone()),
+        [_, _, ..] => ScalaTypeNamespaceResolution::Ambiguous,
+        [] => ScalaTypeNamespaceResolution::AuthoritativeMiss,
+    }
 }
 
 fn scala_type_member_before_anonymous_refinement(
@@ -9881,16 +9980,11 @@ fn scala_exact_direct_namespace_children(
         .filter(|unit| unit.identifier().trim_end_matches('$') == name)
         .filter(|unit| unit.source() == owner.source())
         .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(owner))
-        .filter(|unit| match terminal_kind {
-            None => unit.is_class(),
-            Some(ScalaOwnerKind::Class) => unit.is_class() && !unit.short_name().ends_with('$'),
-            Some(ScalaOwnerKind::SingletonObject) => {
-                unit.is_class() && unit.short_name().ends_with('$')
-            }
-            Some(ScalaOwnerKind::TypeNamespace) => {
-                unit.is_class() && !unit.short_name().ends_with('$')
-                    || ctx.scala.is_type_alias(unit)
-            }
+        .filter(|unit| {
+            terminal_kind.map_or_else(
+                || unit.is_class() && !unit.is_synthetic(),
+                |kind| scala_unit_matches_owner_kind(ctx.scala, unit, kind),
+            )
         })
         .collect::<Vec<_>>();
     sort_units(&mut candidates);
@@ -9920,9 +10014,7 @@ fn scala_same_file_type_fqn(
                 .filter(|unit| {
                     unit.fq_name() == fqn
                         && unit.source() == ctx.file
-                        && (unit.is_class()
-                            || (kind == ScalaOwnerKind::TypeNamespace
-                                && ctx.scala.is_type_alias(unit)))
+                        && scala_unit_matches_owner_kind(ctx.scala, unit, kind)
                 })
                 .map(|unit| unit.fq_name()),
         );
@@ -10122,6 +10214,36 @@ fn scala_fqn_outcome(
     let mut candidates = support.fqn(fqn);
     if candidates.is_empty() {
         candidates = support.fqn_in_language(fqn, Language::Java);
+    }
+    if candidates.is_empty() {
+        no_definition(
+            "no_indexed_definition",
+            format!("`{reference}` resolved to `{fqn}`, but no indexed definition was found"),
+        )
+    } else {
+        candidates_outcome(candidates)
+    }
+}
+
+fn scala_type_fqn_outcome(
+    ctx: ScalaLookupCtx<'_>,
+    fqn: &str,
+    reference: &str,
+    kind: ScalaOwnerKind,
+) -> DefinitionLookupOutcome {
+    let mut candidates = ctx
+        .support
+        .fqn(fqn)
+        .into_iter()
+        .filter(|unit| scala_unit_matches_owner_kind(ctx.scala, unit, kind))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        candidates = ctx
+            .support
+            .fqn_in_language(fqn, Language::Java)
+            .into_iter()
+            .filter(|unit| scala_unit_matches_owner_kind(ctx.scala, unit, kind))
+            .collect();
     }
     if candidates.is_empty() {
         no_definition(
