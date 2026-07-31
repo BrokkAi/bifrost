@@ -120,6 +120,13 @@ The observable outcomes are:
   and reports accuracy/recall at 1, 3, 5, 10, and 20 plus edit precision/recall. The first 25
   completed r8 baseline cells localized with zero skips; their two views are identical and
   partial Acc@5 is 44%, close to CIM's published 44.3% no-index result.
+- [x] (2026-07-31 20:03Z) Repaired the r8 inline-scoring queue failure in brokkbench
+  `ba3c6d2f7b7`. SWE-bench Pro scoring had tried to check out hidden tests from a future commit
+  that is absent from some official images; scoring now overlays the dataset's `test_patch`
+  directly on the agent checkout. Unexpected scorer exceptions are published as explicit
+  `scorer_failed` cell results with tracebacks instead of escaping a worker and canceling every
+  queued future. All 24 cimeval tests and Ruff pass. The same immutable r8 run resumed with its
+  38 completed cells intact and refilled to 30 live task containers.
 - [ ] (2026-07-31 18:55Z) Prewarm dw10 serially on the A4000. The first attempt was stopped
   after 42 task revisions because it incorrectly selected stock Voyage's `parent_alpha=0.5`.
   Bifrost `bac89d82` adds an explicit fingerprinted `dw10` profile with the checkpoint's
@@ -179,6 +186,14 @@ The observable outcomes are:
   seeds. SC-OFF resolve is 43.9%, 41.5%, and 40.2%; OpenCode resolve is 44.4%, 45.7%, and
   45.7%. Their three-seed means are 41.9% and 45.3% respectively.
   Evidence: `supercoder-eval/paper/tables/tab-resolve-perseed.tex`.
+
+- Observation: one inline scorer exception canceled all tasks still queued in the original r8
+  `ThreadPoolExecutor`, leaving only the already-running tail to drain.
+  Evidence: the controller fell from 31 threads to two while only 50 of 91 cell directories had
+  started; its eventual traceback showed `git checkout <future-commit> -- <hidden-test>` failed
+  with exit 128 in an official Ansible image. The service's automatic retry was stopped before
+  it could repeat the expensive failure, and the corrected resume immediately created 30 live
+  task containers.
 
 - Observation: the WSL shim is available at `/usr/lib/wsl/lib/nvidia-smi`; the requested GPU is
   index 2, UUID `GPU-13db0817-4937-36dc-3061-d51b47799ce9`, model `NVIDIA RTX A4000`, with
