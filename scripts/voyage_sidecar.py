@@ -74,10 +74,20 @@ PROFILES = {
         "query_prefix": "Given a GitHub issue, retrieve code that must be changed to fix it.\nQuery: ",
         "pooling": "cls",
     },
+    "dw10": {
+        "name": "dw10",
+        "model_id": "voyageai/voyage-4-nano",
+        "dim": 512,
+        "max_seq": 8192,
+        "passage_prefix": "Represent the document for retrieval: ",
+        "query_prefix": "Represent the query for retrieving supporting documents: ",
+        "pooling": "mean-mrl",
+    },
 }
 if PROFILE_NAME not in PROFILES:
     raise RuntimeError(
-        f"unknown BIFROST_EMBED_PROFILE={PROFILE_NAME!r}; expected voyage-4-nano or granite-r2"
+        f"unknown BIFROST_EMBED_PROFILE={PROFILE_NAME!r}; "
+        "expected voyage-4-nano, granite-r2, or dw10"
     )
 PROFILE = PROFILES[PROFILE_NAME]
 PROFILE_NAME = PROFILE["name"]
@@ -224,7 +234,7 @@ class Embedder:
             self.device, self.dtype = torch.device("mps"), torch.float16
         else:
             self.device, self.dtype = torch.device("cpu"), torch.float32
-        self.is_voyage = PROFILE_NAME == "voyage-4-nano"
+        self.is_voyage = PROFILE["pooling"] == "mean-mrl"
         log(f"loading {MODEL_SOURCE} as {PROFILE_NAME} on {self.device} ({self.dtype})")
         model = AutoModel.from_pretrained(MODEL_SOURCE, trust_remote_code=True, dtype=self.dtype,
                                           attn_implementation="sdpa").eval()

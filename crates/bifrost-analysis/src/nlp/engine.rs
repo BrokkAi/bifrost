@@ -53,12 +53,24 @@ pub const GRANITE_R2_PROFILE: ModelProfile = ModelProfile {
     parent_alpha: 0.65,
 };
 
+pub const DW10_PROFILE: ModelProfile = ModelProfile {
+    name: "dw10",
+    model_id: "voyageai/voyage-4-nano",
+    dimension: 512,
+    query_prefix: "Represent the query for retrieving supporting documents: ",
+    passage_prefix: "Represent the document for retrieval: ",
+    pooling: "mean-mrl",
+    max_seq_tokens: 8192,
+    parent_alpha: 0.65,
+};
+
 pub fn selected_model_profile() -> Result<ModelProfile, String> {
     match std::env::var(EMBED_PROFILE_ENV).ok().as_deref() {
         None | Some("") | Some("voyage") | Some("voyage-4-nano") => Ok(VOYAGE_PROFILE),
         Some("granite-r2") => Ok(GRANITE_R2_PROFILE),
+        Some("dw10") => Ok(DW10_PROFILE),
         Some(value) => Err(format!(
-            "unknown {EMBED_PROFILE_ENV} value '{value}'; expected voyage-4-nano or granite-r2"
+            "unknown {EMBED_PROFILE_ENV} value '{value}'; expected voyage-4-nano, granite-r2, or dw10"
         )),
     }
 }
@@ -428,6 +440,19 @@ mod tests {
         assert_eq!(GRANITE_R2_PROFILE.parent_alpha, 0.65);
         assert!(GRANITE_R2_PROFILE.query_prefix.ends_with("Query: "));
         assert!(GRANITE_R2_PROFILE.passage_prefix.ends_with('\n'));
+    }
+
+    #[test]
+    fn dw10_profile_matches_serving_contract() {
+        assert_eq!(DW10_PROFILE.dimension, 512);
+        assert_eq!(DW10_PROFILE.pooling, "mean-mrl");
+        assert_eq!(DW10_PROFILE.parent_alpha, 0.65);
+        assert_eq!(DW10_PROFILE.query_prefix, VOYAGE_PROFILE.query_prefix);
+        assert_eq!(DW10_PROFILE.passage_prefix, VOYAGE_PROFILE.passage_prefix);
+        assert_ne!(
+            fingerprint_for("checkpoint", DW10_PROFILE),
+            fingerprint_for("checkpoint", VOYAGE_PROFILE)
+        );
     }
 
     #[test]
