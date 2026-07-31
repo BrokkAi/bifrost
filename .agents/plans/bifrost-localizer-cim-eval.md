@@ -85,8 +85,10 @@ The observable outcomes are:
   use. The r3 wave was subsequently invalidated after 71 cells: the container runner replaced
   each image's OCI `PATH`, so Go tasks could not use their bundled toolchain during either
   generation or scoring. Brokkbench commit `d508bd1c4a4` preserves image environments, its
-  focused suite passes, and a real Flipt image exposes Go 1.24.3. The clean r4 replacement is
-  prepared and a corrected Pro Go smoke is running before the full concurrency-30 wave.
+  focused suite passes, and a real Flipt image exposes Go 1.24.3. The r4 smoke proved fresh
+  scoring but exposed a remaining login shell in the provider-secret generation transport.
+  Brokkbench commit `6f80c498bc5` fixes that final entry point; the clean r5 replacement is
+  prepared for the corrected Pro Go smoke before the full concurrency-30 wave.
 - [ ] Pass the baseline sanity gate, then run baseline seeds 1 and 2 at concurrency 30.
 - [x] (2026-07-31 10:01Z) Precomputed all Granite indexes on the A4000 at repository concurrency
   one. Bifrost commit `e36d4e6e` parallelizes each 64-file extraction group while preserving
@@ -287,6 +289,13 @@ The observable outcomes are:
   containing `/usr/local/go/bin/go`; an OCI-preserving smoke reports Go 1.24.3. Brokkbench
   commit `d508bd1c4a4` uses non-login direct shells and prepends the runtime paths instead.
 
+- Observation: the r4 Flipt smoke's fresh official scorer successfully invoked Go and reported
+  real candidate-patch compilation errors, but its generation trace showed the first unqualified
+  `gofmt` still failed. Generation uniquely uses `DirectPodmanSandbox::run_with_secret_env`,
+  whose shell remained `bash -lc` after the ordinary run/popen fix; the agent recovered only by
+  exporting `/usr/local/go/bin` itself. Brokkbench commit `6f80c498bc5` makes that final transport
+  non-login too and extends the exact-argv regression test.
+
 ## Decision Log
 
 - Decision: this delivery implements and evaluates Granite R2 only.
@@ -344,10 +353,11 @@ The observable outcomes are:
   relying on command-text filters, while physically removing all three observed leak paths.
   Date/Author: 2026-07-31, Codex.
 
-- Decision: r1 is an invalid diagnostic run, r2 is an unused preflight attempt, and r3 is an
-  invalid task-environment run. The first reportable campaign identity is now
-  `granite-r2-cim-20260731-r4`, with brokkbench environment fix `d508bd1c4a4`; it reuses the
-  byte-identical r3 agent binary bundle but copies the corrected runner into every fresh cell.
+- Decision: r1 is an invalid diagnostic run, r2 is an unused preflight attempt, and r3/r4 are
+  invalid task-environment runs. The first reportable campaign identity is now
+  `granite-r2-cim-20260731-r5`, with brokkbench environment fixes `d508bd1c4a4` and
+  `6f80c498bc5`; it reuses the byte-identical r3 agent binary bundle but copies the corrected
+  runner and uses the corrected direct-Podman transport for every fresh cell.
   Rationale: completed cells and runtime bundles are immutable; a new identity prevents fixed,
   contaminated, and toolchain-deficient artifacts from being silently mixed.
   Date/Author: 2026-07-31, Codex.
