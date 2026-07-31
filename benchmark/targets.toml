@@ -287,6 +287,13 @@ scenarios = [
   "most_relevant_files",
   "scan_usages",
   "dead_code_smells",
+  "comment_density_files",
+  "comment_density_code_unit",
+  "exception_smells",
+  "test_assertion_smells",
+  "structural_clone_smells",
+  "long_method_smells",
+  "git_hotspots",
   "get_definition",
   "query_code",
 ]
@@ -297,6 +304,13 @@ seed_file_paths = ["src/click/core.py"]
 usage_symbols = ["click.core.Command.main"]
 code_quality_probes = [
   { scenario = "dead_code_smells", file_paths = ["src/click/core.py"], fq_names = ["click.core.Command.main"], expect_report_contains = ["Candidate symbols analyzed: 1"], expect_report_absent = ["no definition found", "not yet supported for smell analysis"] },
+  { scenario = "comment_density_files", file_paths = ["src/click/types.py", "src/click/globals.py"], expect_report_contains = ["### `src/click/types.py`", "| `click.types.Choice.convert` | 0 | 0 | 23 | 0 | 0 | 23 |"], expect_report_absent = ["(comment density unavailable; skipped)"] },
+  { scenario = "comment_density_code_unit", file_paths = ["src/click/types.py"], fq_names = ["click.types.ParamType"], expect_report_contains = ["- Symbol: `click.types.ParamType`", "- Own: header 0, inline 7, span 140"], expect_report_absent = ["Comment density is unavailable"] },
+  { scenario = "exception_smells", file_paths = ["src/click/core.py", "src/click/_termui_impl.py", "src/click/testing.py", "src/click/_compat.py"], expect_report_contains = ["| 10 | `Exception` | 0 | `click._compat._is_binary_writer` | `src/click/_compat.py` |", "empty-body"], expect_report_absent = ["unsupported"] },
+  { scenario = "test_assertion_smells", file_paths = ["tests/test_basic.py", "tests/test_termui.py", "tests/test_context.py", "tests/test_arguments.py"], expect_report_contains = ["| 5 | `no-assertions` | 0 | `tests/test_arguments.py::test_duplicate_names_warning` |"] },
+  { scenario = "structural_clone_smells", file_paths = ["src/click/types.py", "src/click/core.py", "src/click/decorators.py", "src/click/termui.py"], expect_report_contains = ["`click.core.Command.__repr__` (src/click/core.py) | `click.core.Parameter.__repr__` (src/click/core.py)", "token-similarity:100"] },
+  { scenario = "long_method_smells", file_paths = ["src/click/core.py", "src/click/_termui_impl.py"], expect_report_contains = ["- `click.core.Context` in `src/click/core.py:203-924` [score 413]", "contains high-complexity workflow (CC 36)"] },
+  { scenario = "git_hotspots", arguments = { since_iso = "2024-06-01T00:00:00Z", until_iso = "2026-05-29T00:00:00Z", max_files = 20 }, expect_report_contains = ["- Analyzed commits: 500", "| `src/click/core.py` | 125 | 40 | HOTSPOT |"] },
 ]
 definition_queries = [
   { path = "src/click/core.py", line = 1366, column = 42, symbol = "_complete_visible_commands", expected_status = "resolved", expected_fqn = "click.core._complete_visible_commands" },
@@ -319,11 +333,29 @@ scenarios = [
   "most_relevant_files",
   "get_definition",
   "query_code",
+  "dead_code_smells",
+  "comment_density_files",
+  "comment_density_code_unit",
+  "exception_smells",
+  "test_assertion_smells",
+  "structural_clone_smells",
+  "long_method_smells",
+  "git_hotspots",
 ]
 search_patterns = ["Value"]
 location_symbols = ["value.to_value"]
 summary_targets = ["src/value/mod.rs"]
 seed_file_paths = ["src/value/mod.rs"]
+code_quality_probes = [
+  { scenario = "dead_code_smells", file_paths = ["src/raw.rs"], fq_names = ["raw.to_raw_value"], expect_report_contains = ["Candidate symbols analyzed: 1", "| 31 | 0.95 | `function` | `raw.to_raw_value` | `src/raw.rs:292-298` |"], expect_report_absent = ["no definition found", "not yet supported for smell analysis"] },
+  { scenario = "comment_density_files", file_paths = ["src/de.rs", "src/ser.rs", "src/value/de.rs"], expect_report_contains = ["### `src/de.rs`", "| `de._module_.POW10` | 0 | 30 | 33 | 0 | 30 | 33 |"], expect_report_absent = ["(comment density unavailable; skipped)"] },
+  { scenario = "comment_density_code_unit", file_paths = ["src/raw.rs"], fq_names = ["raw.to_raw_value"], expect_report_contains = ["- Symbol: `raw.to_raw_value`", "- Own: header 104, inline 0, span 7"], expect_report_absent = ["Comment density is unavailable"] },
+  { scenario = "exception_smells", file_paths = ["src/de.rs", "src/error.rs", "src/read.rs"], expect_report_contains = ["`de.Deserializer.do_deserialize_i128` | `src/de.rs`", "generic-catch:Err"], expect_report_absent = ["unsupported"] },
+  { scenario = "test_assertion_smells", file_paths = ["tests/test.rs", "tests/stream.rs", "tests/map.rs"], expect_report_contains = ["| 5 | `no-assertions` | 0 | `tests/test.rs::test_boolean_key` |"] },
+  { scenario = "structural_clone_smells", file_paths = ["src/value/de.rs", "src/value/ser.rs", "src/value/from.rs", "src/number.rs"], expect_report_contains = ["`number.Number.as_str` (src/number.rs) | `raw.RawValue.get` (src/raw.rs)", "token-similarity:100"] },
+  { scenario = "long_method_smells", file_paths = ["src/de.rs", "src/read.rs"], expect_report_contains = ["- `de.Deserializer` in `src/de.rs:32-40` [score 350]", "helper sprawl around a 114-line workflow"] },
+  { scenario = "git_hotspots", arguments = { since_iso = "2024-05-01T00:00:00Z", until_iso = "2026-05-22T00:00:00Z", max_files = 20 }, expect_report_contains = ["- Analyzed commits: 249", "| `Cargo.toml` | 58 | 0 | ACTIVE |"] },
+]
 definition_queries = [
   { path = "src/value/mod.rs", line = 535, column = 20, symbol = "Number", expected_status = "resolved", expected_fqn = "value.Value.Number" },
 ]
@@ -346,6 +378,11 @@ scenarios = [
   "most_relevant_files",
   "scan_usages",
   "dead_code_smells",
+  "comment_density_files",
+  "comment_density_code_unit",
+  "structural_clone_smells",
+  "long_method_smells",
+  "git_hotspots",
   "get_definition",
   "query_code",
 ]
@@ -361,6 +398,11 @@ seed_file_paths = [
 usage_symbols = ["FastRoute.RouteCollector.addRoute"]
 code_quality_probes = [
   { scenario = "dead_code_smells", file_paths = ["src/RouteCollector.php"], fq_names = ["FastRoute.RouteCollector.addRoute"], expect_report_contains = ["Candidate symbols analyzed: 1"], expect_report_absent = ["no definition found", "not yet supported for smell analysis"] },
+  { scenario = "comment_density_files", file_paths = ["src/RouteCollector.php", "src/FastRoute.php", "src/RouteParser/Std.php"], expect_report_contains = ["### `src/RouteCollector.php`", "| `FastRoute.RouteCollector` | 7 | 0 | 123 | 26 | 0 | 211 |"], expect_report_absent = ["(comment density unavailable; skipped)"] },
+  { scenario = "comment_density_code_unit", file_paths = ["src/RouteCollector.php"], fq_names = ["FastRoute.RouteCollector"], expect_report_contains = ["- Symbol: `FastRoute.RouteCollector`", "- Own: header 7, inline 0, span 123"], expect_report_absent = ["Comment density is unavailable"] },
+  { scenario = "structural_clone_smells", file_paths = ["src/Dispatcher/GroupCountBased.php", "src/Dispatcher/GroupPosBased.php", "src/Dispatcher/CharCountBased.php", "src/Dispatcher/MarkBased.php"], expect_report_contains = ["`FastRoute.Dispatcher.GroupCountBased.dispatchVariableRoute` (src/Dispatcher/GroupCountBased.php) | `FastRoute.Dispatcher.MarkBased.dispatchVariableRoute` (src/Dispatcher/MarkBased.php)", "token-similarity:96"] },
+  { scenario = "long_method_smells", file_paths = ["src/RouteParser/Std.php", "src/Dispatcher/RegexBasedAbstract.php", "src/RouteCollector.php"], expect_report_contains = ["- `FastRoute.Dispatcher.RegexBasedAbstract.dispatch` in `src/Dispatcher/RegexBasedAbstract.php:39-123` [score 65]", "high cyclomatic complexity 17"] },
+  { scenario = "git_hotspots", arguments = { since_iso = "2023-06-01T00:00:00Z", until_iso = "2025-06-19T00:00:00Z", max_files = 20 }, expect_report_contains = ["- Analyzed commits: 74", "| `src/DataGenerator/RegexBasedAbstract.php` | 12 | 4 | ACTIVE |"] },
 ]
 definition_queries = [
   { path = "src/RouteCollector.php", line = 74, column = 16, symbol = "addRoute", expected_status = "resolved", expected_fqn = "FastRoute.RouteCollector.addRoute" },

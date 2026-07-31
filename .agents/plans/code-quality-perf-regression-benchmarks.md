@@ -321,6 +321,16 @@ regression.
   but worth a product look. All of these belong in the follow-up issue sweep after the corpus
   lands.
 
+- 2026-07-31 (Milestone 2, click/serde/fastroute findings): more latency evidence -- serde-json-rs
+  dead_code_smells p50 17.6 s for a single zero-usage symbol (the usage scan dominates), and
+  comment density stays 8-20 s wherever the probed file is large (click core.py exceeds the request
+  budget outright, so its probes pin types.py). fastroute-php has genuinely clean exception
+  handling and test assertions (zero findings at min_score 1), so those scenarios are off there;
+  same for secret_like_code on click/serde/fastroute. PHP parity note: a file containing only
+  free functions (fastroute src/functions.php) reports "(comment density unavailable; skipped)"
+  even though it parses -- density seems to require a top-level class-like declaration in PHP;
+  worth a product look alongside the Go testify note.
+
 ## Progress
 
 - [x] Milestone 1: scenario variants, generic probes, runner payloads and oracle, dead-code
