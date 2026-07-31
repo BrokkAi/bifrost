@@ -260,6 +260,15 @@ The observable outcomes are:
   verified tree with `git commit-tree`, repoints `HEAD`, and prunes old history. A Gitlink
   regression test and the exact official task both pass setup.
 
+- Observation: OpenLibrary's official images contain populated `vendor/infogami` and
+  `vendor/js/wmd` submodules whose worktrees can be dirty relative to an older selected task
+  base. The outer synthetic tree stayed exact, but the final clean-status invariant correctly
+  failed on `M vendor/infogami`. Brokkbench commit `25057197bb3` resets and cleans every
+  populated submodule to its recorded Gitlink, retains the dependency files, removes all
+  nested Git metadata and module object stores, and makes the outer status ignore those
+  metadata-free worktrees. A dirty real-submodule regression passes, and both formerly failing
+  official OpenLibrary cells now pass the scrub and reach Luna.
+
 - Observation: the run controller's exception handler attempted to cancel futures only after
   leaving the `ThreadPoolExecutor` context. Python's context manager waits for the queue before
   control reaches that handler, so the first scrub failure caused opaque queued work instead
