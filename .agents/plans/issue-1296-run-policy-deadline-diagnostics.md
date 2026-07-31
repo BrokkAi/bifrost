@@ -68,6 +68,9 @@ After this change, a caller can invoke the built-in `bifrost.code-smells` pack a
 - Observation: Client-supplied JSON-RPC IDs are not safe correlation labels.
   Evidence: Correlation now uses a fixed 71-byte `sha256:` token over the canonical request ID, including for queue, execution, response-queue, and writer-delivery profiling scopes. A one-megabyte request-ID regression verifies bounded, distinct, log-safe output.
 
+- Observation: The post-remediation installed-plugin gate still runs the pre-change binary.
+  Evidence: The required `bifrost.code-smells` rerun returned in 5.144 seconds with schema version 2, exit status 2, and status `unreliable`, but no execution metadata; the expensive nested-loop policy scanned 1,142 files and 1,979,574 facts before later policies reported `cancelled`. The local policy-specific stdio integration and all 105 MCP library tests exercise the worktree implementation and pass.
+
 ## Decision Log
 
 - Decision: Keep the five-second MCP request deadline and make bounded diagnostic output the deliberate product-level execution strategy for this issue.
@@ -108,7 +111,7 @@ After this change, a caller can invoke the built-in `bifrost.code-smells` pack a
 
 ## Outcomes & Retrospective
 
-The implementation and all accepted review remediation are complete. Schema-version-2 reports carry deadline-only stage timing and policy progress while successful reports remain deterministic. Coordinator boundaries latch deadlines across registration, preparation, evaluation, and report construction; any termination forces exit status 2. Execution metadata capacity is reserved before report retention, and the pre-snapshot report factory now belongs to the analysis layer. MCP correlation is bounded, log-safe, and present in every request timing scope. Formatting, task-scoped clippy, 1,889 analysis library tests, 105 MCP library tests, focused deadline tests, deterministic report comparisons, and the policy-specific stdio integration test pass. The live installed policy gate still needs its post-remediation rerun; five unrelated stdio tests remain blocked by a read-only SQLite environment failure.
+The implementation and all accepted review remediation are complete. Schema-version-2 reports carry deadline-only stage timing and policy progress while successful reports remain deterministic. Coordinator boundaries latch deadlines across registration, preparation, evaluation, and report construction; any termination forces exit status 2. Execution metadata capacity is reserved before report retention, and the pre-snapshot report factory now belongs to the analysis layer. MCP correlation is bounded, log-safe, and present in every request timing scope. Formatting, task-scoped clippy, 1,889 analysis library tests, 105 MCP library tests, focused deadline tests, deterministic report comparisons, and the policy-specific stdio integration test pass. The installed-plugin policy gate remains `unreliable` on its pre-change binary and is not treated as clean; five unrelated stdio tests remain blocked by a read-only SQLite environment failure.
 
 ## Context and Orientation
 
