@@ -80,9 +80,11 @@ The observable outcomes are:
 - [x] (2026-07-31, implementation) Finished the core `cimeval` campaign commands in
   brokkbench commits `ce64f24fbb8` and `1f1d708aba1`: serial production prewarm, concurrent
   resumable waves, official fresh-container scoring, load sampling, and report aggregation.
-- [ ] Run provider preflight and the no-semantic seed-0 baseline at concurrency 30 (two-family
-  Bedrock smoke complete with zero provider/trace failures; remaining 89 cells await official
-  image staging on the Optane-backed Podman store).
+- [ ] Run provider preflight and the no-semantic seed-0 baseline at concurrency 30. The first
+  r1 wave was stopped and invalidated after leak audit found repository-history and web-search
+  use. Brokkbench commits `842e59230ca` and `ce8bea80e6d` now use tree-identical synthetic-root
+  checkouts, an explicit no-web tool allowlist, trace audit, and Anvil's offline-shell boundary;
+  the formerly leaky RocketMQ 4122 cell is running as the r3 sanity gate.
 - [ ] Pass the baseline sanity gate, then run baseline seeds 1 and 2 with measured concurrency
   escalation.
 - [ ] Precompute all Granite indexes on the A4000 at concurrency one while baseline cells run.
@@ -191,6 +193,22 @@ The observable outcomes are:
   `/mnt/optane/bifrost-nlp-resources/podman-storage`; it is populated in parallel before the
   30-cell wave starts.
 
+- Observation: the initial r1 baseline wave was not sane: 6 of the first 17 completed traces
+  attempted either repository-history inspection or web search, including RocketMQ 4122.
+  Evidence: `/mnt/optane/bifrost-nlp-resources/runs/granite-r2-cim-20260731-r1/leak-audit.json`.
+  The wave was stopped immediately and its cells are excluded from reportable results.
+
+- Observation: container-wide network isolation is the wrong boundary because Anvil itself
+  runs inside the official task container and needs network access to Bedrock. The task images
+  do, however, provide `/usr/bin/unshare`, and a privileged official RocketMQ container
+  successfully ran a repository-local command inside a fresh network namespace while DNS was
+  unavailable.
+
+- Observation: the first long Granite prewarm reached 9 repository READY records before a
+  transient `cudaErrorUnknown` stopped the sidecar on Transformers. A direct A4000 tensor
+  allocation succeeded immediately afterward; the sidecar was restarted on the same UUID and
+  the serial prewarm resumed from the immutable READY records and shared SQLite caches.
+
 ## Decision Log
 
 - Decision: this delivery implements and evaluates Granite R2 only.
@@ -231,6 +249,21 @@ The observable outcomes are:
   Rationale: three full replicates are wasteful if seed 0 exposes provider, scorer, leak, or
   harness defects.
   Date/Author: 2026-07-31, user.
+
+- Decision: keep model-provider networking in the task container, but run every Anvil shell
+  child in a fresh Linux network namespace when `ANVIL_OFFLINE_SHELL` is set; reject any
+  outside-sandbox shell override in that mode. Also remove web tools and replace task Git
+  history with a single tree-identical root commit.
+  Rationale: this preserves arbitrary local build/test commands and Bedrock access without
+  relying on command-text filters, while physically removing all three observed leak paths.
+  Date/Author: 2026-07-31, Codex.
+
+- Decision: r1 is an invalid diagnostic run and r2 is an unused preflight attempt. The first
+  reportable campaign identity is `granite-r2-cim-20260731-r3`, pinned to brokkbench
+  `ce8bea80e6d`, Anvil `b385af1636e`, Mjolnir `3e046fcaabb`, and Bifrost `d6ad48b2591`.
+  Rationale: completed cells and runtime bundles are immutable; a new identity prevents fixed
+  and contaminated artifacts from being silently mixed.
+  Date/Author: 2026-07-31, Codex.
 
 - Decision: use independent run replicates labeled seeds 0, 1, and 2; pass a provider sampling
   seed only if both Luna provider paths support the same parameter.
