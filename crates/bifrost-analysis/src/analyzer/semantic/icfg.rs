@@ -949,6 +949,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                         origin: origin.clone(),
                         dispatch: DispatchBoundary {
                             kind: boundary_kind,
+                            exact_external_target: None,
                             proof: candidate.proof,
                             completeness,
                             provenance,

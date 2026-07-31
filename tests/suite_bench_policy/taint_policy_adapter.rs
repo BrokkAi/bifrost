@@ -2,9 +2,17 @@ use crate::common::InlineTestProject;
 use brokk_bifrost::analyzer::policy::{
     HumanRenderColor, HumanRenderDetail, HumanRenderOptions, PolicyEvaluationDate,
     PolicyEvaluationInput, PolicyEvaluationOptions, PolicyFindingEvidence, PolicyIncompleteReason,
-    PolicyRunCompletion, PolicySourceIdentity, SarifToolIdentity,
-    evaluate_policy_inputs_with_analyzer, write_policy_human, write_policy_json,
-    write_policy_sarif,
+    PolicyRunCompletion, PolicySemanticModelContext, PolicySourceIdentity, SarifToolIdentity,
+    evaluate_policy_inputs_with_analyzer, evaluate_policy_inputs_with_analyzer_and_semantic_models,
+    write_policy_human, write_policy_json, write_policy_sarif,
+};
+use brokk_bifrost::analyzer::semantic_model::{
+    CatalogCoordinate, CatalogOptions, CompiledSemanticModelPack, CompilerOptions,
+    SemanticModelActivationControl, SemanticModelActivationEvidence,
+    SemanticModelActivationRequest, SemanticModelControlAction, SemanticModelControlScope,
+    SemanticModelPackSelector, SemanticModelResolutionOutcome, SemanticModelRuntimeLimits,
+    SemanticPackCatalog, SessionPackSource, SessionPackSourceKind, SourceFormat, compile_source,
+    resolve_active_semantic_models,
 };
 use brokk_bifrost::analyzer::structural::{
     CodeQuery, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, ProtocolRegistrationSet,
@@ -14,8 +22,40 @@ use brokk_bifrost::analyzer::structural::{
     execute_workspace_request_with_all_analysis_registration_lease,
 };
 use brokk_bifrost::analyzer::typestate::ProductionTypestateSummaryRepository;
-use brokk_bifrost::{AnalyzerConfig, Language};
+use brokk_bifrost::{AnalyzerConfig, CancellationToken, Language};
+use semver::Version;
+use std::path::Path;
 use std::sync::Arc;
+
+const MODEL_ARTIFACT_SHA256: &str =
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+const JAVA_EXTERNAL_SOURCE: &str = r#"
+class App {
+    static native String attacker();
+    static native void sensitive(String value);
+    native String external(String value);
+
+    void run() {
+        sensitive(this.external(attacker()));
+    }
+}
+"#;
+
+const JAVA_BODY_SOURCE: &str = r#"
+class App {
+    static native String attacker();
+    static native void sensitive(String value);
+
+    String external(String value) {
+        return value;
+    }
+
+    void run() {
+        sensitive(this.external(attacker()));
+    }
+}
+"#;
 
 const SOURCE: &str = r#"
 def source_one():
@@ -169,6 +209,228 @@ fn single_policy(id: &str, source_selector: &str, source_binding: &str) -> Strin
     )
 }
 
+fn java_summary_policy(id: &str, message: &str) -> String {
+    format!(
+        r#"(policy
+          :schema-version 1
+          :id "{id}"
+          :name "Semantic-pack taint summary"
+          :message "{message}"
+          :severity warning
+          :analysis (analysis
+            :type taint
+            :mode may
+            :call-modeling (call-modeling :unmodeled require-model)
+            :sources (endpoint-set :entries [
+              (source :id attacker :display-name "attacker input" :categories [input.user]
+                :selector (rql :schema-version 6
+                  (language java (call :callee (name "attacker"))))
+                :bind return-value :labels [untrusted])])
+            :sinks (endpoint-set :entries [
+              (sink :id sensitive :display-name "sensitive sink" :categories [data.sensitive]
+                :selector (rql :schema-version 6
+                  (language java (call :callee (name "sensitive"))))
+                :dangerous-operand (argument :index 0) :accepts [untrusted])]))
+          :classification (classification
+            :fallback (classification-id :taxonomy "Test" :id "BROAD-TAINT")))"#
+    )
+}
+
+fn procedure_summary_pack(
+    pack_id: &str,
+    model_effect: Option<&str>,
+    include_unrelated: bool,
+) -> CompiledSemanticModelPack {
+    let mut summaries = vec![serde_json::json!({
+        "id": "summary.external",
+        "target": {
+            "path": "app.java",
+            "symbol": "external(String)",
+            "has_receiver": true,
+            "parameter_count": 1
+        },
+        "completeness": "complete",
+        "transfers": [{
+            "input": { "kind": "parameter", "ordinal": 0 },
+            "exit_kind": "normal",
+            "output": { "kind": "normal_return" }
+        }],
+        "effects": model_effect.into_iter().map(|event| serde_json::json!({
+            "kind": "unknown_call_boundary",
+            "event": event
+        })).collect::<Vec<_>>()
+    })];
+    if include_unrelated {
+        summaries.push(serde_json::json!({
+            "id": "summary.unrelated",
+            "target": {
+                "path": "other.java",
+                "symbol": "unrelated(String)",
+                "has_receiver": false,
+                "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [{
+                "input": { "kind": "parameter", "ordinal": 0 },
+                "exit_kind": "normal",
+                "output": { "kind": "normal_return" }
+            }],
+            "effects": []
+        }));
+    }
+    let source = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "pack_id": pack_id,
+        "version": "1.0.0",
+        "producer": { "name": "taint-summary-test", "version": "1.0.0" },
+        "language": "java",
+        "ecosystem": "maven",
+        "compatibility": {
+            "bifrost": ">=0.8.0, <1.0.0",
+            "toolchains": [{ "name": "jdk", "requirement": ">=17.0.0" }]
+        },
+        "provenance": { "source": "test:semantic-pack", "revision": "reviewed" },
+        "license": "Apache-2.0",
+        "completeness": "complete",
+        "safety": { "generated_code_only": false, "review_required": false },
+        "shards": [{
+            "id": "summaries.external",
+            "activation": [{
+                "package": { "name": "com.acme:external", "version": ">=1.0.0, <2.0.0" },
+                "targets": ["jvm"],
+                "configurations": ["release"],
+                "artifact_sha256": MODEL_ARTIFACT_SHA256
+            }],
+            "payload": { "kind": "procedure_summaries", "summaries": summaries }
+        }]
+    }))
+    .expect("semantic-pack source serialization");
+    compile_source(SourceFormat::Json, &source, &CompilerOptions::default())
+        .unwrap_or_else(|diagnostics| panic!("procedure-summary pack failed: {diagnostics:#?}"))
+}
+
+fn semantic_model_request(version: &str, artifact_sha256: &str) -> SemanticModelActivationRequest {
+    SemanticModelActivationRequest {
+        bifrost_version: Version::parse("0.8.17").unwrap(),
+        evidence: vec![SemanticModelActivationEvidence {
+            language: "java".to_owned(),
+            ecosystem: "maven".to_owned(),
+            package: Some(CatalogCoordinate {
+                name: "com.acme:external".to_owned(),
+                version: Some(Version::parse(version).unwrap()),
+            }),
+            module: None,
+            toolchain: Some(CatalogCoordinate {
+                name: "jdk".to_owned(),
+                version: Some(Version::parse("17.0.1").unwrap()),
+            }),
+            target: Some("jvm".to_owned()),
+            configuration: Some("release".to_owned()),
+            artifact_sha256: Some(artifact_sha256.to_owned()),
+        }],
+        controls: Vec::new(),
+        limits: SemanticModelRuntimeLimits::default(),
+    }
+}
+
+fn semantic_model_request_with_cache_key(cache_key: &str) -> SemanticModelActivationRequest {
+    let mut request = semantic_model_request("1.5.0", MODEL_ARTIFACT_SHA256);
+    request.controls.push(SemanticModelActivationControl {
+        scope: SemanticModelControlScope::User,
+        action: SemanticModelControlAction::Disable,
+        selector: SemanticModelPackSelector {
+            pack_id: format!("test.unused-{cache_key}"),
+            version: None,
+            manifest_digest: None,
+        },
+    });
+    request
+}
+
+fn register_pack(catalog: &SemanticPackCatalog, pack: &CompiledSemanticModelPack, source_id: &str) {
+    catalog
+        .register_session_pack(
+            pack,
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: source_id.to_owned(),
+            },
+        )
+        .expect("register procedure-summary pack");
+}
+
+fn evaluate_java_with_models(
+    source: &str,
+    policies: &[(&str, &str)],
+    catalog: &SemanticPackCatalog,
+    request: &SemanticModelActivationRequest,
+) -> brokk_bifrost::analyzer::policy::PolicyBatchOutcome {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("app.java", source)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    evaluate_java_workspace_with_models(project.root(), &workspace, policies, catalog, request)
+}
+
+fn evaluate_java_workspace_with_models(
+    root: &Path,
+    workspace: &brokk_bifrost::analyzer::WorkspaceAnalyzer,
+    policies: &[(&str, &str)],
+    catalog: &SemanticPackCatalog,
+    request: &SemanticModelActivationRequest,
+) -> brokk_bifrost::analyzer::policy::PolicyBatchOutcome {
+    let policy_sources = policies
+        .iter()
+        .map(|(id, message)| java_summary_policy(id, message))
+        .collect::<Vec<_>>();
+    let inputs = policy_sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            PolicyEvaluationInput::embedded(
+                PolicySourceIdentity::new(format!("test:semantic-summary-{index}.rqlp")),
+                source,
+            )
+        })
+        .collect::<Vec<_>>();
+    let options = PolicyEvaluationOptions::new(
+        PolicyEvaluationDate::from_ymd(2026, 7, 31).expect("fixed evaluation date"),
+    );
+    evaluate_policy_inputs_with_analyzer_and_semantic_models(
+        root,
+        &inputs,
+        workspace,
+        &options,
+        PolicySemanticModelContext {
+            catalog,
+            request,
+            persistence: None,
+        },
+        None,
+    )
+    .expect("production taint evaluation with semantic models")
+}
+
+fn propagation_identity(outcome: &brokk_bifrost::analyzer::policy::PolicyBatchOutcome) -> &str {
+    let [analysis] = outcome.taint_analysis_results() else {
+        panic!(
+            "expected one retained production analysis, got {}",
+            outcome.taint_analysis_results().len()
+        )
+    };
+    analysis.compatibility().propagation_semantics()
+}
+
+fn active_shard_count(
+    catalog: &SemanticPackCatalog,
+    request: &SemanticModelActivationRequest,
+) -> usize {
+    match resolve_active_semantic_models(catalog, request, &CancellationToken::default()) {
+        SemanticModelResolutionOutcome::Ready(active) => active.shards().len(),
+        other => panic!("expected complete activation result, got {other:#?}"),
+    }
+}
+
 fn evaluate_one(
     source: &str,
     policy_source: &str,
@@ -186,6 +448,341 @@ fn evaluate_one(
     );
     evaluate_policy_inputs_with_analyzer(project.root(), &input, &workspace, &options, None)
         .expect("production taint boundary evaluation")
+}
+
+#[test]
+fn activated_java_parameter_to_return_summary_reaches_sensitive_sink_under_require_model() {
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    register_pack(
+        &catalog,
+        &procedure_summary_pack("test.external-flow", None, false),
+        "external-flow",
+    );
+    let request = semantic_model_request("1.5.0", MODEL_ARTIFACT_SHA256);
+    let outcome = evaluate_java_with_models(
+        JAVA_EXTERNAL_SOURCE,
+        &[("test.semantic-summary-flow", "modeled external flow")],
+        &catalog,
+        &request,
+    );
+
+    assert_eq!(
+        outcome.report().runs().len(),
+        1,
+        "{:?}",
+        outcome.report().diagnostics()
+    );
+    let run = &outcome.report().runs()[0];
+    assert_eq!(
+        run.findings().len(),
+        1,
+        "completion={:?} diagnostics={:?} work={:?} public={:?}",
+        run.completion(),
+        run.diagnostics(),
+        run.work(),
+        outcome.taint_findings()
+    );
+    assert_eq!(
+        outcome.taint_findings().len(),
+        1,
+        "policy projection must retain the flow"
+    );
+    let finding = &run.findings()[0];
+    assert_eq!(
+        finding
+            .classification()
+            .broad()
+            .expect("broad fallback classification")
+            .identifier(),
+        "BROAD-TAINT"
+    );
+    assert!(
+        finding
+            .witnesses()
+            .iter()
+            .any(|witness| witness.steps().len() > 2),
+        "modeled external flow must retain a propagation witness: {:?}",
+        finding.witnesses()
+    );
+    let PolicyFindingEvidence::Taint { evidence } = finding.evidence() else {
+        panic!("expected taint policy projection")
+    };
+    assert_eq!(evidence.origins().len(), 1);
+    assert_eq!(
+        run.work()
+            .metrics()
+            .iter()
+            .find(|metric| metric.name() == "taint.propagation_solves")
+            .map(|metric| metric.value()),
+        Some(1)
+    );
+}
+
+#[test]
+fn wrong_semantic_pack_artifact_or_version_never_activates_the_external_flow() {
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    register_pack(
+        &catalog,
+        &procedure_summary_pack("test.external-near-miss", None, false),
+        "external-near-miss",
+    );
+    for request in [
+        semantic_model_request("2.5.0", MODEL_ARTIFACT_SHA256),
+        semantic_model_request(
+            "1.5.0",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
+    ] {
+        assert_eq!(active_shard_count(&catalog, &request), 0);
+        let outcome = evaluate_java_with_models(
+            JAVA_EXTERNAL_SOURCE,
+            &[("test.semantic-summary-near-miss", "inactive external flow")],
+            &catalog,
+            &request,
+        );
+        assert!(outcome.report().runs()[0].findings().is_empty());
+        assert!(outcome.taint_findings().is_empty());
+    }
+}
+
+#[test]
+fn conflicting_external_summary_targets_fail_closed() {
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    register_pack(
+        &catalog,
+        &procedure_summary_pack("test.external-conflict-a", None, false),
+        "external-conflict-a",
+    );
+    register_pack(
+        &catalog,
+        &procedure_summary_pack(
+            "test.external-conflict-b",
+            Some("event.conflicting-model"),
+            false,
+        ),
+        "external-conflict-b",
+    );
+    let outcome = evaluate_java_with_models(
+        JAVA_EXTERNAL_SOURCE,
+        &[(
+            "test.semantic-summary-conflict",
+            "conflicting external flow",
+        )],
+        &catalog,
+        &semantic_model_request("1.5.0", MODEL_ARTIFACT_SHA256),
+    );
+    let run = &outcome.report().runs()[0];
+    assert!(matches!(
+        run.completion(),
+        PolicyRunCompletion::Failed { .. }
+    ));
+    assert!(run.findings().is_empty());
+    assert!(run.diagnostics().iter().any(|diagnostic| {
+        diagnostic
+            .message()
+            .contains("conflicting activated procedure summaries")
+    }));
+}
+
+#[test]
+fn only_relevant_external_summaries_change_propagation_identity() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("app.java", JAVA_EXTERNAL_SOURCE)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let baseline_catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    register_pack(
+        &baseline_catalog,
+        &procedure_summary_pack("test.external-identity", None, false),
+        "identity-baseline",
+    );
+    let baseline = evaluate_java_workspace_with_models(
+        project.root(),
+        &workspace,
+        &[("test.semantic-summary-identity", "baseline")],
+        &baseline_catalog,
+        &semantic_model_request_with_cache_key("baseline"),
+    );
+
+    let changed_catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    register_pack(
+        &changed_catalog,
+        &procedure_summary_pack(
+            "test.external-identity",
+            Some("event.relevant-change"),
+            false,
+        ),
+        "identity-changed",
+    );
+    let changed = evaluate_java_workspace_with_models(
+        project.root(),
+        &workspace,
+        &[("test.semantic-summary-identity", "changed")],
+        &changed_catalog,
+        &semantic_model_request_with_cache_key("changed"),
+    );
+    assert_ne!(
+        propagation_identity(&baseline),
+        propagation_identity(&changed)
+    );
+
+    let unrelated_catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    register_pack(
+        &unrelated_catalog,
+        &procedure_summary_pack("test.external-identity", None, true),
+        "identity-unrelated",
+    );
+    let unrelated = evaluate_java_workspace_with_models(
+        project.root(),
+        &workspace,
+        &[("test.semantic-summary-identity", "unrelated")],
+        &unrelated_catalog,
+        &semantic_model_request_with_cache_key("unrelated"),
+    );
+    assert_eq!(
+        propagation_identity(&baseline),
+        propagation_identity(&unrelated),
+        "an unrelated activated record must not enter the plan identity"
+    );
+}
+
+#[test]
+fn materialized_java_body_overrides_activated_external_summary() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("app.java", JAVA_BODY_SOURCE)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let first_catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    register_pack(
+        &first_catalog,
+        &procedure_summary_pack("test.body-precedence", None, false),
+        "body-precedence-a",
+    );
+    let first = evaluate_java_workspace_with_models(
+        project.root(),
+        &workspace,
+        &[("test.body-precedence", "body precedence")],
+        &first_catalog,
+        &semantic_model_request_with_cache_key("body-a"),
+    );
+    assert_eq!(first.report().runs()[0].findings().len(), 1);
+
+    let second_catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    register_pack(
+        &second_catalog,
+        &procedure_summary_pack(
+            "test.body-precedence",
+            Some("event.model-change-hidden-by-body"),
+            false,
+        ),
+        "body-precedence-b",
+    );
+    let second = evaluate_java_workspace_with_models(
+        project.root(),
+        &workspace,
+        &[("test.body-precedence", "body precedence")],
+        &second_catalog,
+        &semantic_model_request_with_cache_key("body-b"),
+    );
+    assert_eq!(second.report().runs()[0].findings().len(), 1);
+    assert_eq!(
+        propagation_identity(&first),
+        propagation_identity(&second),
+        "a model for a materialized body must not affect propagation identity"
+    );
+}
+
+#[test]
+fn compatible_semantic_summary_policies_share_one_solve() {
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    register_pack(
+        &catalog,
+        &procedure_summary_pack("test.external-batch", None, false),
+        "external-batch",
+    );
+    let outcome = evaluate_java_with_models(
+        JAVA_EXTERNAL_SOURCE,
+        &[
+            ("test.semantic-summary-batch-a", "first presentation"),
+            ("test.semantic-summary-batch-b", "second presentation"),
+        ],
+        &catalog,
+        &semantic_model_request("1.5.0", MODEL_ARTIFACT_SHA256),
+    );
+    assert_eq!(outcome.report().runs().len(), 2);
+    assert_eq!(outcome.taint_analysis_results().len(), 1);
+    for run in outcome.report().runs() {
+        assert_eq!(run.findings().len(), 1, "{:?}", run.diagnostics());
+        assert_eq!(
+            run.work()
+                .metrics()
+                .iter()
+                .find(|metric| metric.name() == "taint.propagation_solves")
+                .map(|metric| metric.value()),
+            Some(1)
+        );
+        assert_eq!(
+            run.work()
+                .metrics()
+                .iter()
+                .find(|metric| metric.name() == "taint.propagation_shared_memberships")
+                .map(|metric| metric.value()),
+            Some(1)
+        );
+    }
+}
+
+#[test]
+fn warm_semantic_summary_execution_performs_no_per_call_catalog_lookup() {
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    register_pack(
+        &catalog,
+        &procedure_summary_pack("test.external-warm", None, false),
+        "external-warm",
+    );
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("app.java", JAVA_EXTERNAL_SOURCE)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let policy = java_summary_policy("test.semantic-summary-warm", "warm execution");
+    let inputs = [PolicyEvaluationInput::embedded(
+        PolicySourceIdentity::new("test:semantic-summary-warm.rqlp"),
+        &policy,
+    )];
+    let options = PolicyEvaluationOptions::new(
+        PolicyEvaluationDate::from_ymd(2026, 7, 31).expect("fixed evaluation date"),
+    );
+    let request = semantic_model_request("1.5.0", MODEL_ARTIFACT_SHA256);
+    let evaluate = || {
+        evaluate_policy_inputs_with_analyzer_and_semantic_models(
+            project.root(),
+            &inputs,
+            &workspace,
+            &options,
+            PolicySemanticModelContext {
+                catalog: &catalog,
+                request: &request,
+                persistence: None,
+            },
+            None,
+        )
+        .expect("warm semantic-summary evaluation")
+    };
+
+    let first = evaluate();
+    assert_eq!(first.report().runs()[0].findings().len(), 1);
+    let after_first = catalog.accounting().unwrap();
+    let first_lookup_counts = (after_first.lookup_hits, after_first.lookup_misses);
+    assert_eq!(first_lookup_counts, (1, 0));
+
+    let second = evaluate();
+    assert_eq!(second.report().runs()[0].findings().len(), 1);
+    let after_second = catalog.accounting().unwrap();
+    assert_eq!(
+        (after_second.lookup_hits, after_second.lookup_misses),
+        first_lookup_counts,
+        "cached acquisition and every per-call target lookup must stay in memory"
+    );
 }
 
 #[test]

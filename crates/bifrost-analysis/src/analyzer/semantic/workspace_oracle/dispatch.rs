@@ -13,13 +13,13 @@ use crate::analyzer::semantic::{
     CallSiteHandle, CancellationToken, CandidateCoverage, ContentIdentity, DeclarationLocator,
     DeclarationSegment, DeclarationSegmentKind, DispatchBoundary, DispatchBoundaryKind,
     DispatchCandidate, DispatchExtensibility, DispatchOracle, DispatchResult, EvidenceCompleteness,
-    EvidenceHandle, OracleLimits, OracleRelationArena, OracleRelationId, OracleRelationOwner,
-    OracleRelationRecord, OracleRelationSubject, ProcedureHandle, ProcedureKind,
-    ProcedureSemantics, ProofStatus, SemanticArtifact, SemanticBudgetExceeded, SemanticCallSite,
-    SemanticCapability, SemanticGap, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
-    SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticRole,
-    SemanticWork, SourceAnchor, SourcePosition, SourceSpan, StableDigest, WorkspaceMountId,
-    WorkspaceRelativePath,
+    EvidenceHandle, ExactExternalProcedureTarget, OracleLimits, OracleRelationArena,
+    OracleRelationId, OracleRelationOwner, OracleRelationRecord, OracleRelationSubject,
+    ProcedureHandle, ProcedureKind, ProcedureSemantics, ProofStatus, SemanticArtifact,
+    SemanticBudgetExceeded, SemanticCallSite, SemanticCapability, SemanticGap, SemanticGapImpact,
+    SemanticGapKind, SemanticGapSubject, SemanticLocator, SemanticOutcome, SemanticProviderError,
+    SemanticRequest, SemanticRole, SemanticWork, SourceAnchor, SourcePosition, SourceSpan,
+    StableDigest, WorkspaceMountId, WorkspaceRelativePath,
 };
 use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
 use crate::analyzer::usages::{
@@ -326,6 +326,8 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
                 materialized_files.insert(definition.source().clone(), outcome.clone());
                 outcome
             };
+            let exact_external_artifact =
+                outcome.available_value().map(|value| value.key().clone());
             match outcome {
                 SemanticOutcome::Complete { value, .. } => {
                     let (has_match, truncated) = retain_artifact_candidates(
@@ -492,11 +494,19 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
                 materialization_quality =
                     merge_dispatch_quality(materialization_quality, matched_quality);
             } else if interruption.is_none() {
+                let target =
+                    locator_for_definition(self.workspace.analyzer(), &group.representative)?;
                 boundaries.push(DispatchBoundary {
-                    kind: DispatchBoundaryKind::Unmaterialized(locator_for_definition(
-                        self.workspace.analyzer(),
-                        &group.representative,
-                    )?),
+                    kind: DispatchBoundaryKind::Unmaterialized(target.clone()),
+                    exact_external_target: exact_external_artifact.as_ref().and_then(|artifact| {
+                        exact_external_procedure_target(
+                            self.workspace.analyzer(),
+                            &group.representative,
+                            artifact,
+                            target.clone(),
+                            semantic_call.receiver.is_some(),
+                        )
+                    }),
                     proof: proof_from_usage(group.proof),
                     completeness: EvidenceCompleteness::Partial(
                         "equivalent callable declarations have no published workspace body".into(),
@@ -1085,6 +1095,7 @@ fn unmaterialized_target_boundary(
             analyzer,
             &target.representative,
         )?),
+        exact_external_target: None,
         proof: proof_from_usage(target.proof),
         completeness: EvidenceCompleteness::Partial(reason.into()),
         provenance: Box::new([]),
@@ -1274,7 +1285,21 @@ pub(in crate::analyzer::semantic) fn semantic_locator_work(
 }
 
 fn dispatch_boundary_locator_work(boundary: &DispatchBoundary) -> SemanticWork {
-    dispatch_boundary_kind_locator_work(&boundary.kind)
+    let mut work = dispatch_boundary_kind_locator_work(&boundary.kind);
+    if let Some(target) = boundary.exact_external_target() {
+        let procedure = semantic_locator_work(target.procedure());
+        work.nested_entries = work
+            .nested_entries
+            .saturating_add(1)
+            .saturating_add(procedure.nested_entries);
+        work.owned_text_bytes = work
+            .owned_text_bytes
+            .saturating_add(target.symbol().len())
+            .saturating_add(target.artifact().path().as_str().len())
+            .saturating_add(target.artifact().adapter().name().len())
+            .saturating_add(procedure.owned_text_bytes);
+    }
+    work
 }
 
 fn dispatch_boundary_kind_locator_work(kind: &DispatchBoundaryKind) -> SemanticWork {
@@ -1343,6 +1368,7 @@ fn low_level_boundary(boundary: &CallDispatchBoundaryKind) -> DispatchBoundary {
     match boundary {
         CallDispatchBoundaryKind::External => DispatchBoundary {
             kind: DispatchBoundaryKind::External(None),
+            exact_external_target: None,
             proof: ProofStatus::Proven,
             completeness: EvidenceCompleteness::Partial(
                 "external declaration body is outside the indexed workspace".into(),
@@ -1351,6 +1377,7 @@ fn low_level_boundary(boundary: &CallDispatchBoundaryKind) -> DispatchBoundary {
         },
         CallDispatchBoundaryKind::Unresolved(status) => DispatchBoundary {
             kind: DispatchBoundaryKind::Unresolved,
+            exact_external_target: None,
             proof: ProofStatus::Unproven(
                 format!("exact dispatch status is {}", status.as_str()).into(),
             ),
@@ -1361,6 +1388,7 @@ fn low_level_boundary(boundary: &CallDispatchBoundaryKind) -> DispatchBoundary {
         },
         CallDispatchBoundaryKind::UnprovenTargetIdentity => DispatchBoundary {
             kind: DispatchBoundaryKind::Unresolved,
+            exact_external_target: None,
             proof: ProofStatus::Unproven(
                 "C/C++ include evidence does not prove one link-unit target identity".into(),
             ),
@@ -1376,6 +1404,7 @@ fn low_level_boundary(boundary: &CallDispatchBoundaryKind) -> DispatchBoundary {
 fn truncated_dispatch_boundary() -> DispatchBoundary {
     DispatchBoundary {
         kind: DispatchBoundaryKind::Truncated,
+        exact_external_target: None,
         proof: ProofStatus::Unproven("dispatch candidate set was truncated".into()),
         completeness: EvidenceCompleteness::Partial(
             "not every dispatch candidate was retained".into(),
@@ -1508,6 +1537,7 @@ fn apply_dynamic_dispatch_gap(
     {
         boundaries.push(DispatchBoundary {
             kind: boundary_kind,
+            exact_external_target: None,
             proof: ProofStatus::Unproven(proof_reason.into()),
             completeness: EvidenceCompleteness::Partial(completeness_reason.into()),
             provenance: Box::new([]),
@@ -1541,6 +1571,7 @@ fn apply_procedure_call_gap(
     {
         boundaries.push(DispatchBoundary {
             kind: boundary_kind,
+            exact_external_target: None,
             proof: ProofStatus::Unproven(proof_reason.into()),
             completeness: EvidenceCompleteness::Partial(completeness_reason.into()),
             provenance: Box::new([]),
@@ -1961,6 +1992,30 @@ fn procedure_matches_definition(procedure: &ProcedureSemantics, definition: &Cod
         || (procedure.kind() == ProcedureKind::Constructor && name == definition.short_name())
 }
 
+fn exact_external_procedure_target(
+    analyzer: &dyn IAnalyzer,
+    definition: &CodeUnit,
+    artifact: &crate::analyzer::semantic::SemanticArtifactKey,
+    procedure: SemanticLocator,
+    has_receiver: bool,
+) -> Option<ExactExternalProcedureTarget> {
+    let mut metadata = analyzer.signature_metadata(definition).into_iter();
+    let parameter_count = u32::try_from(metadata.next()?.parameters().len()).ok()?;
+    if metadata
+        .any(|candidate| u32::try_from(candidate.parameters().len()).ok() != Some(parameter_count))
+    {
+        return None;
+    }
+    let symbol = format!("{}{}", definition.identifier(), definition.signature()?);
+    ExactExternalProcedureTarget::new(
+        artifact.clone(),
+        procedure,
+        symbol,
+        has_receiver,
+        parameter_count,
+    )
+}
+
 fn locator_for_definition(
     analyzer: &dyn IAnalyzer,
     definition: &CodeUnit,
@@ -2301,6 +2356,7 @@ mod tests {
 
         let boundary = |kind| DispatchBoundary {
             kind,
+            exact_external_target: None,
             proof: ProofStatus::Proven,
             completeness: EvidenceCompleteness::Complete,
             provenance: Box::new([]),
@@ -2692,6 +2748,7 @@ mod tests {
         let mut candidates = Vec::new();
         let mut boundaries = vec![DispatchBoundary {
             kind: DispatchBoundaryKind::Unresolved,
+            exact_external_target: None,
             proof: ProofStatus::Unproven("unresolved dispatch arm".into()),
             completeness: EvidenceCompleteness::Partial("open dispatch".into()),
             provenance: Box::new([]),
@@ -2910,12 +2967,14 @@ mod tests {
         let mut boundaries = vec![
             DispatchBoundary {
                 kind: DispatchBoundaryKind::Unresolved,
+                exact_external_target: None,
                 proof: ProofStatus::Unproven("unresolved dispatch arm".into()),
                 completeness: EvidenceCompleteness::Partial("open dispatch".into()),
                 provenance: Box::new([]),
             },
             DispatchBoundary {
                 kind: DispatchBoundaryKind::Truncated,
+                exact_external_target: None,
                 proof: ProofStatus::Unproven("dispatch limit reached".into()),
                 completeness: EvidenceCompleteness::Partial("targets were omitted".into()),
                 provenance: Box::new([]),
@@ -2953,6 +3012,7 @@ mod tests {
         let mut candidates = Vec::new();
         let mut boundaries = vec![DispatchBoundary {
             kind: DispatchBoundaryKind::Unmaterialized(locator),
+            exact_external_target: None,
             proof: ProofStatus::Proven,
             completeness: EvidenceCompleteness::Complete,
             provenance: Box::new([]),
