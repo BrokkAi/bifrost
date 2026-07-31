@@ -19,7 +19,7 @@ After this change, a caller can invoke the built-in `bifrost.code-smells` pack a
 - [x] (2026-07-31 07:13Z) Converted a pre-snapshot `run_policy` deadline into a canonical unreliable report while preserving invalid-parameter, explicit-cancellation, and internal-error behavior.
 - [x] (2026-07-31 07:13Z) Threaded MCP request correlation into `run_policy` output and added service plus background-dispatch deadline regressions.
 - [x] (2026-07-31 08:02Z) Ran formatting, task-scoped clippy, both affected crates' complete library suites, the focused MCP integration regression, and the live `bifrost.code-smells` policy gate.
-- [ ] Run the guided-issue specialist review, address accepted findings, and complete the retrospective.
+- [x] (2026-07-31 09:06Z) Ran all five guided-issue specialist reviews and remediated every security, correctness, operational, layering, DRY, and cleanup finding.
 
 ## Surprises & Discoveries
 
@@ -56,6 +56,18 @@ After this change, a caller can invoke the built-in `bifrost.code-smells` pack a
 - Observation: The broad MCP stdio integration binary has an unrelated persisted-store environment failure.
   Evidence: Five non-policy tests fail both in parallel and with `--test-threads=1` because their child servers report SQLite `attempt to write a readonly database`. The issue-specific policy integration passes independently, as do all 104 MCP library tests.
 
+- Observation: Volatile elapsed values cannot be part of every successful canonical report.
+  Evidence: Security, senior, and architecture review agreed that unconditional stage and per-policy elapsed values broke deterministic report equality. Successful reports now retain the deterministic default execution object; stage timings are populated only when a deadline makes them diagnostic evidence.
+
+- Observation: Reading the timeout latch without polling the token misses a deadline that crosses after the evaluator's last cooperative check.
+  Evidence: Every coordinator boundary now calls `is_cancelled()` before inspecting `is_timed_out()`, freezing the first observed stage and forcing an unreliable exit even when all policy runs happened to complete.
+
+- Observation: Execution metadata must be reserved before ordinary report retention consumes the batch budget.
+  Evidence: The builder now reserves a worst-case bounded execution allowance based on its input count, and a maximum-length 256-policy progress test proves the bound covers the canonical metadata. Pre-snapshot reports use the analysis-owned canonical constructor directly.
+
+- Observation: Client-supplied JSON-RPC IDs are not safe correlation labels.
+  Evidence: Correlation now uses a fixed 71-byte `sha256:` token over the canonical request ID, including for queue, execution, response-queue, and writer-delivery profiling scopes. A one-megabyte request-ID regression verifies bounded, distinct, log-safe output.
+
 ## Decision Log
 
 - Decision: Keep the five-second MCP request deadline and make bounded diagnostic output the deliberate product-level execution strategy for this issue.
@@ -82,9 +94,21 @@ After this change, a caller can invoke the built-in `bifrost.code-smells` pack a
   Rationale: A response cannot contain its own completed serialization/write duration without a second response or a misleading estimate. The MCP request correlation identifier joins the returned report to the existing writer timing scope.
   Date/Author: 2026-07-31 / Codex
 
+- Decision: Emit canonical elapsed timing only for deadline-terminated reports.
+  Rationale: Timing is necessary evidence when explaining an unreliable deadline, but it is volatile operational telemetry for successful evaluations and would break deterministic canonical output. Per-policy elapsed metrics were removed entirely; terminal stage, active policy ID, stage timing, and the evaluator's existing structural work counters provide the required deadline evidence without metric-capacity failure paths.
+  Date/Author: 2026-07-31 / Codex
+
+- Decision: Treat registration and evaluator preparation as independently observable deadline stages.
+  Rationale: Suppression/catalog loading, policy registration, analyzer construction, and taint preparation consume the request-wide budget before a policy body runs. Stopping at those boundaries prevents overshoot and avoids misidentifying pre-evaluation work as the slow policy.
+  Date/Author: 2026-07-31 / Codex
+
+- Decision: Keep explicit client cancellation as a transport error and remove the unused canonical `client_cancelled` termination variant.
+  Rationale: The host no longer needs a result after explicit cancellation. Advertising an unused report state weakened the model without providing a production path; deadline expiry remains the canonical incomplete-result case.
+  Date/Author: 2026-07-31 / Codex
+
 ## Outcomes & Retrospective
 
-The implementation milestones and task-scoped validation are complete. Schema-version-2 reports carry validated deadline, stage, timing, and policy-progress data; coordinator results merge MCP selection and snapshot timings; pre-snapshot expiry returns an empty canonical report with a diagnostic; and background MCP responses include request correlation. Formatting, task-scoped clippy, 1,886 analysis library tests, 104 MCP library tests, focused deadline tests, and the policy-specific stdio integration test pass. The live installed policy gate remains `unreliable`, and five unrelated stdio tests remain blocked by a read-only SQLite environment failure. Specialist review remains.
+The implementation and all accepted review remediation are complete. Schema-version-2 reports carry deadline-only stage timing and policy progress while successful reports remain deterministic. Coordinator boundaries latch deadlines across registration, preparation, evaluation, and report construction; any termination forces exit status 2. Execution metadata capacity is reserved before report retention, and the pre-snapshot report factory now belongs to the analysis layer. MCP correlation is bounded, log-safe, and present in every request timing scope. Formatting, task-scoped clippy, 1,889 analysis library tests, 105 MCP library tests, focused deadline tests, deterministic report comparisons, and the policy-specific stdio integration test pass. The live installed policy gate still needs its post-remediation rerun; five unrelated stdio tests remain blocked by a read-only SQLite environment failure.
 
 ## Context and Orientation
 
@@ -215,3 +239,5 @@ Revision note: Updated on 2026-07-31 after coordinator instrumentation to record
 Revision note: Updated on 2026-07-31 after MCP integration to record pre-snapshot suppression semantics, correlation behavior, and passing service/background deadline regressions.
 
 Revision note: Updated on 2026-07-31 after final validation to record timing normalization, the pinned clippy-driver requirement, passing broad library suites, and the two external validation limitations.
+
+Revision note: Updated on 2026-07-31 after specialist review to record the accepted findings and the corrected deterministic, bounded, stage-aware deadline design.

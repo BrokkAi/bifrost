@@ -1672,26 +1672,6 @@ impl PolicyWorkReport {
         &self.metrics
     }
 
-    fn try_add_metric(&mut self, metric: PolicyWorkMetric) -> Result<(), ReportValueError> {
-        if self.metrics.len() >= MAX_WORK_METRICS {
-            return Err(ReportValueError::TooManyItems {
-                field: "work_metrics",
-                max_items: MAX_WORK_METRICS,
-            });
-        }
-        match self
-            .metrics
-            .binary_search_by(|existing| existing.name.cmp(&metric.name))
-        {
-            Ok(_) => Err(ReportValueError::DuplicateWorkMetric),
-            Err(index) => {
-                self.metrics.insert(index, metric);
-                self.metrics.shrink_to_fit();
-                Ok(())
-            }
-        }
-    }
-
     pub(crate) fn set_retention(
         &mut self,
         retained_findings: u64,
@@ -1746,7 +1726,6 @@ pub enum PolicyWorkUnit {
     Count,
     Bytes,
     Rows,
-    Milliseconds,
 }
 
 /// One normalized finding in the canonical schema-version-2 report model.
@@ -2370,15 +2349,6 @@ impl PolicyRun {
     }
     pub const fn work(&self) -> &PolicyWorkReport {
         &self.work
-    }
-
-    pub(crate) fn try_add_work_metric(
-        &mut self,
-        metric: PolicyWorkMetric,
-    ) -> Result<(), ReportValueError> {
-        self.work.try_add_metric(metric)?;
-        self.refresh_retained_bytes();
-        Ok(())
     }
 
     pub(crate) fn replace_incomplete_reason(
@@ -3589,18 +3559,16 @@ mod tests {
     fn work_metrics_are_namespaced_sorted_and_unique() {
         let metrics = vec![
             PolicyWorkMetric::try_new("typestate.states", PolicyWorkUnit::Count, 2).unwrap(),
-            PolicyWorkMetric::try_new("policy.evaluation_elapsed", PolicyWorkUnit::Milliseconds, 4)
-                .unwrap(),
+            PolicyWorkMetric::try_new("policy.evaluation_steps", PolicyWorkUnit::Count, 4).unwrap(),
             PolicyWorkMetric::try_new("taint.propagation_states", PolicyWorkUnit::Count, 3)
                 .unwrap(),
         ];
         let work = PolicyWorkReport::try_new(1, 2, 3, 4, 5, 6, 7, 8, metrics).unwrap();
-        assert_eq!(work.metrics()[0].name(), "policy.evaluation_elapsed");
-        assert_eq!(work.metrics()[0].unit(), PolicyWorkUnit::Milliseconds);
+        assert_eq!(work.metrics()[0].name(), "policy.evaluation_steps");
+        assert_eq!(work.metrics()[0].unit(), PolicyWorkUnit::Count);
         assert!(PolicyWorkMetric::try_new("scanned_files", PolicyWorkUnit::Count, 1).is_err());
         let duplicate =
-            PolicyWorkMetric::try_new("policy.evaluation_elapsed", PolicyWorkUnit::Rows, 4)
-                .unwrap();
+            PolicyWorkMetric::try_new("policy.evaluation_steps", PolicyWorkUnit::Rows, 4).unwrap();
         assert!(
             PolicyWorkReport::try_new(
                 0,

@@ -7,6 +7,7 @@ use crate::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::{self, BufRead, Write};
@@ -216,6 +217,7 @@ struct OutboundMcpResponse {
 
 struct OutboundMcpResponseTiming {
     tool_name: String,
+    request_correlation_id: String,
     ready_at: Instant,
 }
 
@@ -234,6 +236,7 @@ impl OutboundMcpResponse {
         workspace_generation: u64,
         completion_id: Value,
         tool_name: String,
+        request_correlation_id: String,
     ) -> Self {
         Self {
             value,
@@ -241,6 +244,7 @@ impl OutboundMcpResponse {
             completion_id: Some(completion_id),
             timing: Some(OutboundMcpResponseTiming {
                 tool_name,
+                request_correlation_id,
                 ready_at: Instant::now(),
             }),
         }
@@ -267,9 +271,7 @@ fn request_id_key(id: &Value) -> String {
 }
 
 fn request_correlation_id(id: &Value) -> String {
-    id.as_str()
-        .map(str::to_string)
-        .unwrap_or_else(|| request_id_key(id))
+    format!("sha256:{:x}", Sha256::digest(request_id_key(id).as_bytes()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -410,12 +412,18 @@ pub fn run_stdio_server_with_build_identity(
             for response in response_receiver {
                 if let Some(timing) = &response.timing {
                     profiling::duration(
-                        format!("mcp_request.response_queue_wait[{}]", timing.tool_name),
+                        format!(
+                            "mcp_request.response_queue_wait[{}][{}]",
+                            timing.tool_name, timing.request_correlation_id
+                        ),
                         timing.ready_at.elapsed(),
                     );
                 }
                 let _delivery_scope = response.timing.as_ref().map(|timing| {
-                    profiling::scope(format!("mcp_request.writer_delivery[{}]", timing.tool_name))
+                    profiling::scope(format!(
+                        "mcp_request.writer_delivery[{}][{}]",
+                        timing.tool_name, timing.request_correlation_id
+                    ))
                 });
                 let stale_error = response.stale_workspace_error(writer_service.as_ref());
                 let response_value = stale_error.as_ref().unwrap_or(&response.value);
@@ -680,15 +688,16 @@ where
     let spawn_result = thread::Builder::new()
         .name("bifrost-mcp-tool".to_string())
         .spawn(move || {
+            let request_correlation_id = request_correlation_id(&id);
             profiling::duration(
-                format!("mcp_request.queue_wait[{tool_name}]"),
+                format!("mcp_request.queue_wait[{tool_name}][{request_correlation_id}]"),
                 accepted_at.elapsed(),
             );
             on_worker_start();
-            let request_correlation_id = request_correlation_id(&id);
             let response = {
-                let _execution_scope =
-                    profiling::scope(format!("mcp_request.execution[{tool_name}]"));
+                let _execution_scope = profiling::scope(format!(
+                    "mcp_request.execution[{tool_name}][{request_correlation_id}]"
+                ));
                 match execute_prepared_tool_call_with_correlation(
                     service.as_ref(),
                     call,
@@ -705,6 +714,7 @@ where
                     workspace_generation,
                     id.clone(),
                     tool_name,
+                    request_correlation_id,
                 ))
                 .is_err()
             {
@@ -2775,6 +2785,7 @@ mod uri_tests {
             accepted_generation,
             request_id,
             "query_code".to_string(),
+            "sha256:test".to_string(),
         );
         let stale_error = response
             .stale_workspace_error(&service)
@@ -3078,7 +3089,10 @@ mod uri_tests {
             structured["report"]["execution"]["termination"],
             "deadline_exceeded"
         );
-        assert_eq!(structured["request_correlation_id"], "issue-1296");
+        assert_eq!(
+            structured["request_correlation_id"],
+            request_correlation_id(&json!("issue-1296"))
+        );
         assert!(
             response.value["result"]["content"][0]["text"]
                 .as_str()
@@ -3086,5 +3100,20 @@ mod uri_tests {
             "{}",
             response.value
         );
+    }
+
+    #[test]
+    fn oversized_request_ids_produce_bounded_log_safe_correlation_ids() {
+        let first = request_correlation_id(&Value::String("x".repeat(1024 * 1024)));
+        let second = request_correlation_id(&Value::String("y".repeat(1024 * 1024)));
+
+        assert_eq!(first.len(), "sha256:".len() + 64);
+        assert!(first.starts_with("sha256:"));
+        assert!(
+            first["sha256:".len()..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        );
+        assert_ne!(first, second);
     }
 }

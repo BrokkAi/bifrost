@@ -1374,6 +1374,7 @@ pub enum PolicyExecutionStage {
     PolicySelection,
     WorkspaceSnapshot,
     PolicyRegistration,
+    PolicyPreparation,
     PolicyEvaluation,
     ReportConstruction,
 }
@@ -1382,7 +1383,6 @@ pub enum PolicyExecutionStage {
 #[serde(rename_all = "snake_case")]
 pub enum PolicyExecutionTermination {
     DeadlineExceeded,
-    ClientCancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1394,6 +1394,13 @@ pub struct PolicyStageTiming {
 impl PolicyStageTiming {
     pub const fn new(stage: PolicyExecutionStage, elapsed_ms: u64) -> Self {
         Self { stage, elapsed_ms }
+    }
+
+    pub fn from_duration(stage: PolicyExecutionStage, elapsed: std::time::Duration) -> Self {
+        Self::new(
+            stage,
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        )
     }
 
     pub const fn stage(&self) -> PolicyExecutionStage {
@@ -1417,6 +1424,18 @@ pub struct PolicyExecutionMetadata {
 }
 
 impl PolicyExecutionMetadata {
+    fn maximum_retained_size(policy_count: usize) -> usize {
+        size_of::<Self>()
+            .saturating_add(
+                MAX_POLICY_EXECUTION_STAGES.saturating_mul(size_of::<PolicyStageTiming>()),
+            )
+            .saturating_add(
+                policy_count
+                    .min(MAX_POLICY_EXECUTION_PROGRESS_IDS)
+                    .saturating_mul(size_of::<PolicyId>().saturating_add(200)),
+            )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         total_elapsed_ms: u64,
@@ -1951,8 +1970,13 @@ impl PolicyReportBuilder {
         }
         tighten_vec(&mut suppressions);
         let diagnostics = Vec::with_capacity(expected_inputs);
-        let outstanding_skeleton_allowance = expected_inputs
+        let input_skeleton_allowance = expected_inputs
             .checked_mul(SKELETON_ALLOWANCE_PER_INPUT)
+            .ok_or(PolicyReportBuilderError::RetainedSizeOverflow)?;
+        let outstanding_skeleton_allowance = input_skeleton_allowance
+            .checked_add(PolicyExecutionMetadata::maximum_retained_size(
+                expected_inputs,
+            ))
             .ok_or(PolicyReportBuilderError::RetainedSizeOverflow)?;
         let no_suppressions = Vec::new();
         let base_without_suppressions =
@@ -3395,6 +3419,39 @@ mod tests {
     }
 
     #[test]
+    fn execution_metadata_reservation_covers_maximum_policy_progress() {
+        let pending = (0..MAX_POLICY_EXECUTION_PROGRESS_IDS)
+            .map(|index| {
+                PolicyId::new(format!("test.policy{index:03}.{}", "x".repeat(180))).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let execution = PolicyExecutionMetadata::try_new(
+            6,
+            vec![
+                PolicyStageTiming::new(PolicyExecutionStage::PolicySelection, 1),
+                PolicyStageTiming::new(PolicyExecutionStage::WorkspaceSnapshot, 1),
+                PolicyStageTiming::new(PolicyExecutionStage::PolicyRegistration, 1),
+                PolicyStageTiming::new(PolicyExecutionStage::PolicyPreparation, 1),
+                PolicyStageTiming::new(PolicyExecutionStage::PolicyEvaluation, 1),
+                PolicyStageTiming::new(PolicyExecutionStage::ReportConstruction, 1),
+            ],
+            Some(PolicyExecutionTermination::DeadlineExceeded),
+            Some(PolicyExecutionStage::PolicyEvaluation),
+            None,
+            Vec::new(),
+            pending,
+        )
+        .unwrap();
+
+        assert!(
+            execution.retained_size()
+                <= PolicyExecutionMetadata::maximum_retained_size(
+                    MAX_POLICY_EXECUTION_PROGRESS_IDS
+                )
+        );
+    }
+
+    #[test]
     fn builder_distinguishes_suppression_audit_preflight_exhaustion() {
         let finding_id = "1".repeat(64);
         let source = format!(
@@ -3431,10 +3488,14 @@ mod tests {
         let diagnostics = Vec::new();
         let without_audit =
             report_storage_size(&evaluation, &rules, &runs, &Vec::new(), &diagnostics)
+                .checked_add(PolicyExecutionMetadata::maximum_retained_size(0))
+                .unwrap()
                 .checked_add(EMERGENCY_DIAGNOSTIC_ALLOWANCE)
                 .unwrap();
         let with_audit =
             report_storage_size(&evaluation, &rules, &runs, &suppressions, &diagnostics)
+                .checked_add(PolicyExecutionMetadata::maximum_retained_size(0))
+                .unwrap()
                 .checked_add(EMERGENCY_DIAGNOSTIC_ALLOWANCE)
                 .unwrap();
         assert!(with_audit > without_audit);

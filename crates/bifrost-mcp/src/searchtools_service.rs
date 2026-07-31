@@ -1,3 +1,8 @@
+#[cfg(test)]
+use crate::analyzer::policy::{
+    PolicyExecutionStage, PolicyExecutionTermination, PolicyReportDiagnosticCode,
+    PolicySuppressionDocumentState,
+};
 #[cfg(feature = "nlp")]
 use crate::nlp::{indexer::SemanticIndexer, query::semantic_search};
 use crate::{
@@ -5,12 +10,9 @@ use crate::{
     ProjectFile, WorkspaceAnalyzer,
     analyzer::policy::{
         BuiltInPolicySelection, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE,
-        PolicyBatchBudget, PolicyDiagnosticSeverity, PolicyEvaluationDate, PolicyEvaluationInput,
-        PolicyEvaluationOptions, PolicyExecutionMetadata, PolicyExecutionStage,
-        PolicyExecutionTermination, PolicyFailOn, PolicyId, PolicyReportBuilder,
-        PolicyReportDiagnostic, PolicyReportDiagnosticCode, PolicyReportDocument,
-        PolicyReportEvaluationContext, PolicyStageTiming, PolicySuppressionDocumentState,
-        PolicySuppressionOptions, PolicySuppressionSource, built_in_policy_catalog,
+        PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyFailOn,
+        PolicyId, PolicyReportDocument, PolicySuppressionOptions, PolicySuppressionSource,
+        built_in_policy_catalog, workspace_snapshot_deadline_outcome,
     },
     analyzer::semantic::WorkspaceRelativePath,
     code_intelligence::CodeIntelligenceRuntime,
@@ -146,86 +148,6 @@ pub(crate) struct RunPolicyToolResult {
     status: &'static str,
     exit_status: u8,
     report: PolicyReportDocument,
-}
-
-fn deadline_before_policy_snapshot(
-    options: &PolicyEvaluationOptions,
-    selected_policy_ids: Vec<PolicyId>,
-    selection_elapsed_ms: u64,
-    snapshot_elapsed_ms: u64,
-) -> Result<RunPolicyToolResult, SearchToolsServiceError> {
-    let evaluation = PolicyReportEvaluationContext::new(
-        options.evaluation_date(),
-        options.suppressions(),
-        PolicySuppressionDocumentState::NotEvaluated,
-    );
-    let mut builder = PolicyReportBuilder::new_with_suppression_audit(
-        PolicyBatchBudget::default(),
-        0,
-        evaluation,
-        Vec::new(),
-    )
-    .map_err(|error| {
-        SearchToolsServiceError::internal(format!(
-            "failed to initialize deadline policy report: {error}"
-        ))
-    })?;
-    let diagnostic = PolicyReportDiagnostic::try_new(
-        PolicyReportDiagnosticCode::WorkspaceSnapshotDeadlineExceeded,
-        PolicyDiagnosticSeverity::Warning,
-        "workspace snapshot was not ready within the request-wide time budget; retry after workspace initialization completes",
-        None,
-        None,
-        Vec::new(),
-    )
-    .map_err(|error| {
-        SearchToolsServiceError::internal(format!(
-            "failed to construct workspace deadline diagnostic: {error}"
-        ))
-    })?;
-    builder
-        .retain_report_diagnostic(diagnostic)
-        .map_err(|error| {
-            SearchToolsServiceError::internal(format!(
-                "failed to retain workspace deadline diagnostic: {error}"
-            ))
-        })?;
-    let execution = PolicyExecutionMetadata::try_new(
-        selection_elapsed_ms.saturating_add(snapshot_elapsed_ms),
-        vec![
-            PolicyStageTiming::new(PolicyExecutionStage::PolicySelection, selection_elapsed_ms),
-            PolicyStageTiming::new(PolicyExecutionStage::WorkspaceSnapshot, snapshot_elapsed_ms),
-        ],
-        Some(PolicyExecutionTermination::DeadlineExceeded),
-        Some(PolicyExecutionStage::WorkspaceSnapshot),
-        None,
-        Vec::new(),
-        selected_policy_ids,
-    )
-    .map_err(|error| {
-        SearchToolsServiceError::internal(format!(
-            "failed to construct workspace deadline execution metadata: {error}"
-        ))
-    })?;
-    builder.set_execution(execution).map_err(|error| {
-        SearchToolsServiceError::internal(format!(
-            "failed to retain workspace deadline execution metadata: {error}"
-        ))
-    })?;
-    let report = builder.finish().map_err(|error| {
-        SearchToolsServiceError::internal(format!(
-            "failed to finish workspace deadline policy report: {error}"
-        ))
-    })?;
-    Ok(RunPolicyToolResult {
-        status: "unreliable",
-        exit_status: POLICY_EXIT_UNRELIABLE,
-        report,
-    })
-}
-
-fn duration_ms(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[derive(Debug, Clone)]
@@ -401,8 +323,8 @@ pub(crate) struct PreparedRunPolicy {
     root: PathBuf,
     policy_inputs: Vec<PolicyEvaluationInput>,
     options: PolicyEvaluationOptions,
-    selection_elapsed_ms: u64,
-    snapshot_elapsed_ms: u64,
+    selection_elapsed: Duration,
+    snapshot_elapsed: Duration,
     #[cfg(test)]
     workspace_generation: u64,
 }
@@ -2893,11 +2815,11 @@ impl SearchToolsService {
         let options =
             PolicyEvaluationOptions::with_suppressions(params.evaluation_date, suppressions)
                 .with_fail_on(fail_on);
-        let selection_elapsed_ms = duration_ms(preparation_started.elapsed());
+        let selection_elapsed = preparation_started.elapsed();
+        let snapshot_started = Instant::now();
 
         loop {
             let workspace_generation = self.workspace_generation();
-            let snapshot_started = Instant::now();
             let snapshot_result = {
                 let _scope = profiling::scope("run_policy.snapshot_for_query");
                 self.snapshot_for_query_with_cancellation(cancellation)
@@ -2908,12 +2830,22 @@ impl SearchToolsService {
                     if error.code == SearchToolsServiceErrorCode::DeadlineExceeded
                         && cancellation.is_some_and(CancellationToken::is_timed_out) =>
                 {
-                    let result = deadline_before_policy_snapshot(
+                    let outcome = workspace_snapshot_deadline_outcome(
                         &options,
                         selected_policy_ids,
-                        selection_elapsed_ms,
-                        duration_ms(snapshot_started.elapsed()),
-                    )?;
+                        selection_elapsed,
+                        snapshot_started.elapsed(),
+                    )
+                    .map_err(|error| {
+                        SearchToolsServiceError::internal(format!(
+                            "failed to construct workspace deadline policy report: {error}"
+                        ))
+                    })?;
+                    let result = RunPolicyToolResult {
+                        status: "unreliable",
+                        exit_status: outcome.exit_status(),
+                        report: outcome.into_report(),
+                    };
                     return Ok(RunPolicyPreparation::Deadline(result));
                 }
                 Err(error) => return Err(error),
@@ -2927,8 +2859,8 @@ impl SearchToolsService {
                 root,
                 policy_inputs,
                 options,
-                selection_elapsed_ms,
-                snapshot_elapsed_ms: duration_ms(snapshot_started.elapsed()),
+                selection_elapsed,
+                snapshot_elapsed: snapshot_started.elapsed(),
                 #[cfg(test)]
                 workspace_generation,
             }));
@@ -2945,8 +2877,8 @@ impl SearchToolsService {
             root,
             policy_inputs,
             options,
-            selection_elapsed_ms,
-            snapshot_elapsed_ms,
+            selection_elapsed,
+            snapshot_elapsed,
             ..
         } = prepared;
         let result = (|| {
@@ -2958,13 +2890,7 @@ impl SearchToolsService {
                         "run_policy evaluation failed: {error}"
                     ))
                 })?;
-            outcome
-                .record_preparation_timings(selection_elapsed_ms, snapshot_elapsed_ms)
-                .map_err(|error| {
-                    SearchToolsServiceError::internal(format!(
-                        "run_policy timing assembly failed: {error}"
-                    ))
-                })?;
+            outcome.record_preparation_timings(selection_elapsed, snapshot_elapsed);
             let exit_status = outcome.exit_status();
             let status = match exit_status {
                 POLICY_EXIT_CLEAN => "clean",
@@ -3455,7 +3381,7 @@ mod watcher_startup_tests {
     }
 
     #[test]
-    fn issue_1296_evaluation_deadline_includes_preparation_timings() {
+    fn issue_1296_registration_deadline_includes_preparation_timings() {
         let (_temp, root) = workspace("Policy.java", "class Policy {}\n");
         let service =
             SearchToolsService::new_manual_without_semantic_index(root).expect("manual service");
@@ -3485,11 +3411,15 @@ mod watcher_startup_tests {
         );
         assert_eq!(
             structured["report"]["execution"]["terminal_stage"],
-            "policy_evaluation"
+            "policy_registration"
         );
         assert_eq!(
             structured["report"]["execution"]["active_policy_id"],
-            "bifrost.correctness.dynamic-evaluation"
+            Value::Null
+        );
+        assert_eq!(
+            structured["report"]["execution"]["pending_policy_ids"],
+            json!(["bifrost.correctness.dynamic-evaluation"])
         );
         let stages = structured["report"]["execution"]["stage_timings"]
             .as_array()
@@ -3498,8 +3428,6 @@ mod watcher_startup_tests {
             "policy_selection",
             "workspace_snapshot",
             "policy_registration",
-            "policy_evaluation",
-            "report_construction",
         ] {
             assert!(
                 stages.iter().any(|timing| timing["stage"] == expected),
