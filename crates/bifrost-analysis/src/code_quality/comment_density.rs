@@ -359,6 +359,28 @@ mod tests {
     }
 
     #[test]
+    fn comment_density_dense_file_rolls_up_all_methods() {
+        const METHOD_COUNT: u32 = 128;
+        let mut source = String::from("// class header\nclass Dense {\n");
+        for index in 0..METHOD_COUNT {
+            source.push_str(&format!(
+                "    // method header\n    void method_{index}() {{\n        // inline\n        int value_{index} = {index};\n    }}\n"
+            ));
+        }
+        source.push_str("}\n");
+        let fix = AnalyzerFixture::new(&[("Dense.java", &source)]);
+        let file = ProjectFile::new(fix.project_root(), "Dense.java");
+
+        let stats = fix.analyzer.analyzer().comment_density_by_top_level(&file);
+
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].header_comment_lines, 1);
+        assert_eq!(stats[0].inline_comment_lines, 0);
+        assert_eq!(stats[0].rolled_up_header_comment_lines, METHOD_COUNT + 1);
+        assert_eq!(stats[0].rolled_up_inline_comment_lines, METHOD_COUNT);
+    }
+
+    #[test]
     fn comment_density_for_files_missing_file_emits_skipped_line() {
         let fix = AnalyzerFixture::new(&[("Foo.java", SAMPLE_JAVA)]);
         let result = report_comment_density_for_files(
