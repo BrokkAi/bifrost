@@ -27,6 +27,28 @@ test("Cargo and workflow changes conservatively select the full matrix", () => {
   }
 });
 
+test("documentation-only changes select the docs baseline", () => {
+  const decision = classifyChangeSet({
+    eventName: "pull_request",
+    changedPaths: [
+      ".agents/plans/1387-antigravity-dynamic-workspace-plugin.md",
+      "docs/src/content/docs/antigravity.md",
+      "plugins/bifrost-agent/README.md",
+    ],
+  });
+  assert.equal(decision.mode, "docs");
+  assert.deepEqual(selected(decision), []);
+});
+
+test("documentation mixed with component changes retains component validation", () => {
+  const decision = classifyChangeSet({
+    eventName: "pull_request",
+    changedPaths: ["docs/src/content/docs/antigravity.md", "plugins/bifrost-agent/package.json"],
+  });
+  assert.equal(decision.mode, "impact");
+  assert.deepEqual(selected(decision), ["agent_plugin", "pi_package"]);
+});
+
 test("RQL changes select runtime, host, policy-pack, and editor coverage", () => {
   const decision = classifyChangeSet({ eventName: "pull_request", changedPaths: fixture("rql") });
   assert.equal(decision.mode, "impact");
