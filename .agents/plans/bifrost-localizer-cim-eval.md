@@ -105,9 +105,15 @@ The observable outcomes are:
   serial output order. The 15 repository `READY.json` records cover all 91 tasks. After resuming
   the partially warm Trino database, the remaining campaign completed in 366.4 seconds; the
   active CPU stages used roughly 30-45 cores instead of one.
-- [x] (2026-07-31 12:52Z) Started a replacement seed-0 baseline with GPT-5.6 Luna at maximum
-  reasoning effort as persistent user service `cimeval-r6-baseline-max.service`, still capped
-  at 30 concurrent cells and using inline scoring.
+- [x] (2026-07-31 13:32Z) Invalidated r6/r7 and started corrected r8 seed 0 with GPT-5.6 Luna
+  at maximum reasoning effort, still capped at 30 concurrent cells and using inline scoring.
+  r6 exposed that Mjolnir treated `+max` as part of the model ID; Mjolnir `f7ba210` now parses
+  it and Anvil `3885f50` advertises and forwards Bedrock GPT `max`. The r7 one-cell smoke proved
+  live `reasoning_effort=max` through 85 turns, then exposed that cimeval discarded 30-minute
+  timeouts. Brokkbench `680d628e53d` now terminates the exact runner, preserves patch/logs,
+  records `timed_out`, runs the inline scorer, and excludes scoring time from agent wall time.
+  Fresh r8 service `cimeval-r8-baseline-max.service` has all 30 workers active; a live turn-0
+  trace proves the corrected model and effort.
 - [ ] (2026-07-31 12:58Z) Prewarm dw10 serially on the A4000. The persistent sidecar and
   prewarm services are `cimeval-dw10-sidecar.service` and `cimeval-dw10-prewarm.service`.
   dw10 uses the separate per-repository `.bifrost/cache-dw10` namespace so changing embedding
@@ -233,6 +239,18 @@ The observable outcomes are:
   attempted either repository-history inspection or web search, including RocketMQ 4122.
   Evidence: `/mnt/optane/bifrost-nlp-resources/runs/granite-r2-cim-20260731-r1/leak-audit.json`.
   The wave was stopped immediately and its cells are excluded from reportable results.
+
+- Observation: cimeval's original max-reasoning launch was not actually using max. Mjolnir's
+  known `MODEL+effort` suffixes ended at `xhigh`, so `+max` remained attached to the model wire
+  ID and every r6 cell failed before its first LLM request. Anvil's Bedrock GPT metadata also
+  omitted the provider's `max` preset. Mjolnir `f7ba210` and Anvil `3885f50` fix both sides; r7
+  telemetry directly records Luna requests with `reasoning_effort: "max"`.
+
+- Observation: Python's outer `subprocess.run(timeout=1800)` raised before cimeval captured any
+  artifacts, and inline scoring made the recorded agent wall time include verifier time. This
+  contradicted CIM's fixed 30-minute generation cap and `unsolved_timeout` accounting.
+  Brokkbench `680d628e53d` makes the in-container runner PID explicit, captures timed-out cells
+  as immutable unresolved attempts, and freezes agent wall time before inline scoring.
 
 - Observation: container-wide network isolation is the wrong boundary because Anvil itself
   runs inside the official task container and needs network access to Bedrock. The task images
