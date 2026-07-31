@@ -86,7 +86,7 @@ The observable outcomes are:
   failure stopped its controller; brokkbench commit `a8012514ec6` fixes the root cause and the
   exact formerly failing Vuls task completed with exit code zero in 744.9 seconds. Brokkbench
   commit `58bb0a1b4e9` also cancels queued futures before executor shutdown instead of draining
-  the queue after a cell failure. All 56 completed cells with a generation exit code report
+  the queue after a cell failure. All 57 completed cells with a generation exit code report
   zero, so Bedrock remains healthy while the final old-store subset resumes at concurrency 30.
 - [ ] Pass the baseline sanity gate, then run baseline seeds 1 and 2 with measured concurrency
   escalation.
