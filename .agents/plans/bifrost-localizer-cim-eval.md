@@ -161,12 +161,25 @@ The observable outcomes are:
   `PRAGMA integrity_check` returned `ok`. This distinguishes raw Bifrost `k=20` (20 candidates
   per leg) from Anvil's tested final-`k` boundary, which forwards `2*k` to Bifrost before
   reranking.
-- [x] (2026-07-31, campaign launch) Started persistent unit
+- [x] (2026-07-31, first campaign launch) Started persistent unit
   `cimeval-r8-granite-grid.service` with one Cartesian queue containing all 819 Granite cells,
   fixed `--jobs 30`, max-reasoning Bedrock Luna, inline scoring, and resume enabled. It skipped
-  the two completed smoke cells, filled all 30 worker slots, and left both the scheduler and
-  Granite sidecar at zero restarts. Initial host load was 36.8 on 60 cores with 82 GiB memory
-  available, so concurrency remains pinned at 30 as requested.
+  the two completed smoke cells and filled all 30 worker slots. The first actual semantic trace
+  proved Anvil's contract (`requested_final_k=20`, `forwarded_base_k=40`, requested legs
+  40/40/40), but exposed a Bifrost startup race: its one-second readiness fallback fired before
+  any active index existed and returned zero candidates. The unit was stopped immediately;
+  zero additional cells had completed, and interrupted cells retained no frozen artifacts.
+- [x] (2026-07-31, readiness repair) Bifrost `fcaf3a78` makes the first semantic query wait for
+  the initial active index while preserving the one-second stale-index fallback during later
+  rebuilds. Behavior-focused tests cover both cases; the focused five-test semantic suite,
+  formatting, and Clippy pass. A cold one-shot Dubbo query with the rebuilt binary returned
+  40/40/40 candidates with no fallback note. Immutable bundle
+  `runtime-semantic-fcaf3a78.tgz` records the corrected Bifrost revision and unchanged Anvil,
+  Mjolnir, and brokkbench revisions.
+- [x] (2026-07-31, corrected campaign launch) Restarted the Cartesian queue as persistent unit
+  `cimeval-r8-granite-grid-fcaf3a78.service` with the corrected immutable bundle. It again filled
+  all 30 slots; scheduler and sidecar remained at zero restarts, initial load was 29 on 60 cores,
+  and concurrency remains pinned at 30 as requested.
 - [x] (2026-07-31, implementation) Brokkbench `64a2da6131f` extends the existing
   multi-arm scheduler with `--seeds`, so the full 91-task by three-arm by three-seed Granite
   matrix can enter one 819-cell queue. A single 30-worker pool now remains occupied through
