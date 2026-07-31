@@ -197,9 +197,10 @@ The observable outcomes are:
 
 - Observation: repository embedding and task-image staging are independent storage pipelines.
   Granite's shared SQLite indexes live with the 15 primary clones under
-  `/home/jonathan/Projects/brokkbench/clones/`, while Podman stores immutable task-image layers
-  in its configured graph root. Moving the graph root does not copy, invalidate, or rebuild an
-  embedding index.
+  `/mnt/T9/repo-clones/<repo>/.bifrost/cache/`; the prepared task worktrees under
+  `/home/jonathan/Projects/brokkbench/clones/` resolve each repository back to that primary
+  cache. Podman stores immutable task-image layers in its configured graph root. Moving the
+  graph root does not copy, invalidate, or rebuild an embedding index.
 
 - Observation: `/mnt/containers` is a large XFS filesystem with project quotas and native
   overlay support, but its top level is root-owned. The existing `/mnt/containers/podman`
