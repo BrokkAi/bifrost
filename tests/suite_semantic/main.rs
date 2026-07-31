@@ -35,6 +35,7 @@ mod measure_python_usage_graph_memory;
 mod measure_semantic_cfg;
 mod measure_semantic_cfg_persistence;
 mod measure_semantic_oracles;
+mod measure_semantic_pack_catalog;
 mod measure_structural_facts_memory;
 mod measure_structural_facts_persistence;
 mod measure_summary_lifecycle;
