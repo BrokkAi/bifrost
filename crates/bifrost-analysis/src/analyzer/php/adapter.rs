@@ -29,7 +29,7 @@ static PHP_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
     });
 
 #[derive(Debug, Clone, Default)]
-pub(super) struct PhpAdapter;
+pub(crate) struct PhpAdapter;
 
 impl LanguageAdapter for PhpAdapter {
     fn language(&self) -> Language {

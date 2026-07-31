@@ -16,7 +16,7 @@ pub use artifact_lifecycle::{
 };
 pub use manifest::{
     BenchmarkLocationSelector, BenchmarkManifest, BenchmarkRepoTarget, BenchmarkScenario,
-    DefinitionQueryTarget, HierarchyQueryTarget, InteractiveQueryBenchmarkCase,
+    CodeQualityProbe, DefinitionQueryTarget, HierarchyQueryTarget, InteractiveQueryBenchmarkCase,
     InteractiveQueryTool, ManifestLanguage, ManifestLoadError, ManifestValidationError,
     McpFairnessBenchmarkCase, QueryCodeBenchmarkCase, QueryCodeWorkload, ScanUsageQueryTarget,
 };

@@ -1,9 +1,14 @@
+use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{ProjectFile, TestAssertionSmell, TestAssertionWeights};
+use crate::hash::HashSet;
 use regex::Regex;
 use std::sync::LazyLock;
-use tree_sitter::Node;
+use tree_sitter::{Node, Parser};
 
-use super::declarations::go_node_text;
+use super::declarations::{collect_go_import_infos, go_node_text};
+
+const TESTIFY_ASSERT_PATH: &str = "github.com/stretchr/testify/assert";
+const TESTIFY_REQUIRE_PATH: &str = "github.com/stretchr/testify/require";
 
 static GO_TEST_FUNC_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -50,6 +55,7 @@ pub(super) fn detect_go_test_assertion_smells(
     source: &str,
     weights: &TestAssertionWeights,
 ) -> Vec<TestAssertionSmell> {
+    let testify_assertions = collect_testify_assertions(source);
     let mut findings = Vec::new();
     for captures in GO_TEST_FUNC_RE.captures_iter(source) {
         let Some(name_match) = captures.name("name") else {
@@ -63,6 +69,7 @@ pub(super) fn detect_go_test_assertion_smells(
             name_match.as_str(),
             body_match.as_str(),
             body_match.start(),
+            &testify_assertions,
             weights,
             &mut findings,
         );
@@ -75,10 +82,11 @@ fn analyze_go_test_case(
     name: &str,
     body: &str,
     start_byte: usize,
+    testify_assertions: &[GoAssertionSignal],
     weights: &TestAssertionWeights,
     out: &mut Vec<TestAssertionSmell>,
 ) {
-    let assertions = collect_go_assertions(body, weights);
+    let assertions = collect_go_assertions(body, start_byte, testify_assertions, weights);
     let assertion_count = assertions.len() as i32;
     let symbol = format!("{}::{}", file, name);
 
@@ -131,7 +139,12 @@ fn analyze_go_test_case(
     }
 }
 
-fn collect_go_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<GoAssertionSignal> {
+fn collect_go_assertions(
+    body: &str,
+    body_start_byte: usize,
+    testify_assertions: &[GoAssertionSignal],
+    weights: &TestAssertionWeights,
+) -> Vec<GoAssertionSignal> {
     let mut assertions = Vec::new();
 
     for captures in GO_ASSERT_EQUALITY_RE.captures_iter(body) {
@@ -285,6 +298,84 @@ fn collect_go_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<GoAs
         assertions.push(signal);
     }
 
+    let mut assertion_starts = assertions
+        .iter()
+        .map(|assertion| assertion.start_byte)
+        .collect::<HashSet<_>>();
+    let body_end_byte = body_start_byte + body.len();
+    for assertion in testify_assertions {
+        if assertion.start_byte < body_start_byte || assertion.start_byte >= body_end_byte {
+            continue;
+        }
+        let relative_start = assertion.start_byte - body_start_byte;
+        if assertion_starts.insert(relative_start) {
+            let mut assertion = assertion.clone();
+            assertion.start_byte = relative_start;
+            assertions.push(assertion);
+        }
+    }
+    assertions.sort_by_key(|assertion| assertion.start_byte);
+
+    assertions
+}
+
+fn collect_testify_assertions(source: &str) -> Vec<GoAssertionSignal> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_go::LANGUAGE.into())
+        .expect("failed to load go parser");
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let root = tree.root_node();
+    let testify_bindings = collect_go_import_infos(root, source)
+        .into_iter()
+        .filter(|import| {
+            import.path.as_ref().is_some_and(|path| {
+                matches!(
+                    path.render_segments("/").as_str(),
+                    TESTIFY_ASSERT_PATH | TESTIFY_REQUIRE_PATH
+                )
+            })
+        })
+        .filter_map(|import| import.local_name().map(str::to_string))
+        .filter(|binding| binding != "." && binding != "_")
+        .collect::<HashSet<_>>();
+    if testify_bindings.is_empty() {
+        return Vec::new();
+    }
+
+    let mut assertions = Vec::new();
+    walk_named_tree_preorder(root, true, |node| {
+        if node.kind() != "call_expression" {
+            return WalkControl::Continue;
+        }
+        let Some(function) = node.child_by_field_name("function") else {
+            return WalkControl::Continue;
+        };
+        if function.kind() != "selector_expression" {
+            return WalkControl::Continue;
+        }
+        let Some(operand) = function.child_by_field_name("operand") else {
+            return WalkControl::Continue;
+        };
+        if operand.kind() != "identifier"
+            || !testify_bindings.contains(go_node_text(operand, source).trim())
+        {
+            return WalkControl::Continue;
+        }
+
+        assertions.push(GoAssertionSignal {
+            kind: "meaningful-assertion".to_string(),
+            score: 0,
+            shallow: false,
+            meaningful: true,
+            reason: "meaningful-assertion".to_string(),
+            excerpt: compact_go_excerpt(go_node_text(node, source)),
+            start_byte: node.start_byte(),
+        });
+        WalkControl::SkipChildren
+    });
     assertions
 }
 

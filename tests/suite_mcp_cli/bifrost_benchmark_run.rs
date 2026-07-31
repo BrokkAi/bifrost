@@ -70,10 +70,9 @@ ancestor_symbols = ["XExtendsY"]
 summary_targets = ["A.java"]
 seed_file_paths = ["A.java"]
 usage_symbols = ["E.iMethod"]
-dead_code_file_paths = ["A.java"]
-dead_code_fq_names = ["A.method1"]
-dead_code_expect_report_contains = ["Candidate symbols analyzed: 1"]
-dead_code_expect_report_absent = ["no definition found", "not yet supported for smell analysis"]
+code_quality_probes = [
+  {{ scenario = "dead_code_smells", file_paths = ["A.java"], fq_names = ["A.method1"], expect_report_contains = ["Candidate symbols analyzed: 1"], expect_report_absent = ["no definition found", "not yet supported for smell analysis"] }},
+]
 definition_queries = [
   {{ path = "A.java", line = 8, column = 19, expected_status = "no_definition" }},
 ]

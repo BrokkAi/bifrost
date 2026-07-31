@@ -49,6 +49,7 @@ fn run() -> Result<(), String> {
         }
         "run" => {
             let mut selected_repo = None;
+            let mut selected_scenario = None;
             let mut output_dir = None;
             let mut max_files = None;
             let mut profile = false;
@@ -65,6 +66,15 @@ fn run() -> Result<(), String> {
                             args.next()
                                 .ok_or_else(|| "--repo requires a repo name".to_string())?,
                         );
+                    }
+                    "--scenario" => {
+                        let value = args
+                            .next()
+                            .ok_or_else(|| "--scenario requires a scenario name".to_string())?;
+                        let parsed: BenchmarkScenario =
+                            serde_json::from_value(serde_json::Value::String(value.clone()))
+                                .map_err(|_| format!("unknown scenario name `{value}`"))?;
+                        selected_scenario = Some(parsed);
                     }
                     "--output" => {
                         output_dir =
@@ -93,7 +103,14 @@ fn run() -> Result<(), String> {
                 }
             }
             validate_query_code_access_mode()?;
-            run_manifest(manifest_path, selected_repo, output_dir, max_files, profile)
+            run_manifest(
+                manifest_path,
+                selected_repo,
+                selected_scenario,
+                output_dir,
+                max_files,
+                profile,
+            )
         }
         "compare" => {
             let mut baseline_path = None;
@@ -183,6 +200,7 @@ fn validate_manifest(path: PathBuf) -> Result<(), String> {
 fn run_manifest(
     manifest_path: PathBuf,
     selected_repo: Option<String>,
+    selected_scenario: Option<BenchmarkScenario>,
     output_dir_override: Option<PathBuf>,
     max_files: Option<usize>,
     profile: bool,
@@ -214,6 +232,7 @@ fn run_manifest(
             manifest_path: manifest_path.clone(),
             repo_cache_dir,
             selected_repo,
+            selected_scenario,
             max_files,
             profile,
         },
@@ -468,7 +487,9 @@ fn print_help() {
     println!("Usage: bifrost_benchmark <subcommand> [options]");
     println!("Subcommands:");
     println!("  validate [--manifest PATH]");
-    println!("  run [--manifest PATH] [--repo NAME] [--output DIR] [--max-files N] [--profile]");
+    println!(
+        "  run [--manifest PATH] [--repo NAME] [--scenario NAME] [--output DIR] [--max-files N] [--profile]"
+    );
     println!("  compare --baseline PATH --candidate PATH [--output PATH] [--strict]");
 }
 
@@ -478,7 +499,7 @@ fn print_validate_help() {
 
 fn print_run_help() {
     println!(
-        "Usage: bifrost_benchmark run [--manifest PATH] [--repo NAME] [--output DIR] [--max-files N] [--profile]"
+        "Usage: bifrost_benchmark run [--manifest PATH] [--repo NAME] [--scenario NAME] [--output DIR] [--max-files N] [--profile]"
     );
     println!(
         "  BIFROST_BENCHMARK_QUERY_CODE_ACCESS=auto|scan_only selects the query_code reference access path"

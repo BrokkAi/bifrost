@@ -7681,6 +7681,7 @@ mod tests {
     use crate::analyzer::cpp::CppAdapter;
     use crate::analyzer::go::GoAdapter;
     use crate::analyzer::java::JavaAdapter;
+    use crate::analyzer::php::PhpAdapter;
     use crate::analyzer::python::PythonAdapter;
     use crate::analyzer::ruby::RubyAdapter;
     use crate::analyzer::scala::ScalaAdapter;
@@ -9341,6 +9342,46 @@ mod tests {
                 .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
                 .unwrap(),
             vec![(oid, "cpp".to_string())]
+        );
+    }
+
+    #[test]
+    fn php_conditional_free_function_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "functions.php",
+            "<?php\nnamespace FastRoute;\nif (true) { function route(): void {} }\n",
+        );
+        let state = Arc::new(parse_state(&PhpAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let prior_epoch = epoch::php_epoch_before_conditional_free_function_declarations();
+        let prior_generation = store
+            .ensure_language_epoch_value("php", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "php",
+                prior_generation,
+                &PhpAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "php").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::Php, &tree_sitter_php::LANGUAGE_PHP.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "php").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "php".to_string())])
+                .unwrap(),
+            vec![(oid, "php".to_string())]
         );
     }
 
