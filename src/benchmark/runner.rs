@@ -892,12 +892,23 @@ fn run_mcp_fairness_iteration(
                 session.receive_tool_response_with_timeout(source_id, response_timeout)?;
             let source_duration_ms = elapsed_ms(source_start);
             assert_fairness_source_result(case, &source_result)?;
+
+            // Cancelling is measured by how quickly the server serves the next
+            // request, not by waiting for the cancelled one to answer. MCP says
+            // a receiver SHOULD NOT respond to a request it was told to cancel,
+            // and the SDK-backed host obeys that -- the previous hand-written
+            // host replied with the analyzer's incomplete result, which was
+            // convenient to measure and not conformant. What the product
+            // actually promises is that cancelling a heavy scan leaves the
+            // session responsive, and that is what this now times.
             let cancellation_start = Instant::now();
             session.cancel_request(scan_id)?;
-            let scan_result =
-                session.receive_tool_response_with_timeout(scan_id, response_timeout)?;
+            let followup_id =
+                session.send_tool_call("get_symbol_sources", source_arguments.clone())?;
+            let followup_result =
+                session.receive_tool_response_with_timeout(followup_id, response_timeout)?;
             let cancellation_duration_ms = elapsed_ms(cancellation_start);
-            assert_fairness_scan_result(case, scan_arguments, &scan_result)?;
+            assert_fairness_source_result(case, &followup_result)?;
             Ok(McpFairnessIteration {
                 light_request_ms: source_duration_ms,
                 cancellation_ms: cancellation_duration_ms,
@@ -936,17 +947,6 @@ fn assert_fairness_source_result(
         ));
     }
     Ok(())
-}
-
-fn assert_fairness_scan_result(
-    case: &McpFairnessBenchmarkCase,
-    scan_arguments: &Value,
-    result: &Value,
-) -> Result<(), String> {
-    let expected_targets = scan_arguments["targets"]
-        .as_array()
-        .ok_or_else(|| format!("fairness case `{}` omitted target inputs", case.id))?;
-    assert_scan_results_are_complete_or_bounded(&case.id, result, false, Some(expected_targets))
 }
 
 fn assert_scan_results_are_complete_or_bounded(

@@ -107,6 +107,12 @@ fn normalize_tree_sitter_clone_source(
             if !token.is_empty() {
                 normalized_tokens.push(token);
             }
+            // Do not descend further: anonymous children of an emitted leaf
+            // would double-count it. Kotlin's soft-keyword identifiers
+            // (`value`, `field`) parse as a `simple_identifier` wrapping an
+            // anonymous keyword token, and emitting both breaks rename
+            // invariance against ordinary identifiers.
+            continue;
         }
         for index in (0..node.child_count()).rev() {
             if let Some(child) = node.child(index) {
