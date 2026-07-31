@@ -53,6 +53,8 @@ The observable success criteria are:
 - [x] (2026-07-31 09:21Z) Verified that rootless Podman cannot use the WSL GPU directly but can
   reach a host loopback embedding service through `pasta` TCP forwarding.
 - [x] (2026-07-31 09:21Z) Wrote this initial ExecPlan with the decisions reached with the user.
+- [x] (2026-07-31 09:38Z) Clarified that eval cells share Bifrost's real writable SQLite
+  database per instance/model; no per-cell copy or copy-on-write snapshot is used.
 - [ ] Implement and validate model-profile-driven local and TCP embedding in Bifrost.
 - [ ] Implement and validate the retrieval profiles and exact per-leg candidate budgets.
 - [ ] Create the clean Anvil worktree and implement the final-`k` contract and bounded reranker.
@@ -100,6 +102,13 @@ The observable success criteria are:
   process bundling and sandbox lifecycle are reusable.
   Evidence: `/home/jonathan/Projects/brokkbench/agenteval` binds its task loading and scoring to
   the brokkbench corpus and testsome metadata.
+
+- Observation: Bifrost's cache is intentionally safe to share across branches, worktrees, and
+  processes when every process opens the same underlying SQLite database and its WAL/SHM files.
+  Evidence: `crates/bifrost-analysis/src/nlp/store.rs` resolves worktrees to the primary-repo
+  cache, keeps active chunk membership in a connection-local temporary table, and stores
+  persisted vectors by content identity. `crates/bifrost-analysis/src/cache_db.rs` leaves
+  cross-process serialization to SQLite and configures the shared database for WAL operation.
 
 ## Decision Log
 
@@ -161,6 +170,14 @@ The observable success criteria are:
   Rationale: the requested checkpoints are local artifacts and no model-publication authority
   was given.
   Date/Author: 2026-07-31, Codex.
+
+- Decision: share one live read-write `bifrost_cache.db` per `(instance, embedding model)`
+  across all retrieval arms and seeds for that instance/model.
+  Rationale: this is Bifrost's intended branch/worktree cache model. All containers bind the
+  same host directory, so SQLite sees one database plus one WAL/SHM pair and provides real
+  cross-process locking. Per-cell copies or overlay copy-on-write layers add complexity without
+  improving the intended content-addressed isolation.
+  Date/Author: 2026-07-31, user and Codex.
 
 ## Outcomes & Retrospective
 
@@ -469,11 +486,35 @@ known forbidden gold/future objects. This is a fail-closed gate: if forbidden ob
 required base objects disappear, do not start the agent. Preserve the base commit's reachable
 history because the co-edit arm requires historical commits.
 
-Prewarm exactly one semantic cache per scrub-clean `(instance, embedding model)` pair, for 182
-potential caches. Store it under the run directory with the repository tree identity, model
-fingerprint, tokenizer profile, Bifrost commit, and cache checksum. Before each cell, restore
-that immutable cache into a fresh official task container. Bifrost must validate every identity
-and rebuild instead of trusting a mismatch.
+Prewarm exactly one unified Bifrost cache per scrub-clean `(instance, embedding model)` pair,
+for 182 potential databases. Store each cache in a stable host directory under the run
+directory, with the repository tree identity, model fingerprint, tokenizer profile, Bifrost
+commit, schema version, and initial database checksum in its preparation manifest. Finish
+migrations, the initial full index build, and compatibility validation before publishing a
+`READY` marker or starting any eval cell.
+
+Every arm/seed container for that instance/model bind-mounts the same host cache directory
+read-write at the workspace's `.bifrost/cache` path. Do not copy the database into containers,
+put it behind an overlay layer, hard-link it to per-cell names, or separate its `-wal` and
+`-shm` files. Every writer must reach the same host ext4 inode and the same adjacent WAL/SHM
+files so SQLite's normal cross-process locks remain authoritative. The official task containers
+share the host kernel, so ordinary SQLite file locking on that bind mount is the concurrency
+mechanism; the harness must not add an application-level fiction that treats copies as one DB.
+
+The database is deliberately writable and may accumulate content-addressed blobs from different
+cell worktrees. That is the same behavior Bifrost supports for ordinary branches and worktrees.
+Each Bifrost process builds its active chunk set in its own connection-local temporary table, so
+only blobs resolved from that cell's working tree participate in semantic retrieval. Keep the
+sharing boundary at one benchmark instance and embedding model: do not share across instances,
+because their permitted git histories differ, and do not share across models, because the
+database has one active embedding fingerprint.
+
+All cells use the exact Bifrost binary that initialized the database. Before mounting it, the
+harness verifies the `READY` manifest rather than re-hashing a database that legitimately
+changes during the run. Bifrost still validates its embedding, chunker, BM25 tokenizer, and
+schema identities on open. If any identity mismatches, abort that cell and drain all users of
+the database before rebuilding it; never allow one process to wipe or migrate a shared database
+while other cell processes have it open.
 
 The cell runner uses the same sanitized problem statement, system instructions, main model,
 reasoning effort, Mjolnir/Anvil configuration, timeout, and tool descriptions in every
@@ -719,6 +760,14 @@ declared host loopback test port, exchanges framed data, and an empty port tuple
 existing sandbox behavior. Existing agenteval targeted tests must pass without changed fixtures
 or expectations except where a shared helper's new optional default is represented.
 
+Shared-cache operation is accepted when two task containers concurrently bind the same prepared
+cache directory, open Bifrost with the same model fingerprint, independently change their
+working trees, rebuild their active indexes, and complete semantic searches without corruption,
+unrecovered `SQLITE_BUSY`/`SQLITE_LOCKED`, or results from blobs absent from the querying
+container's working tree. After both processes close, `PRAGMA integrity_check` must return
+`ok`. The test must confirm that the database, WAL, and SHM paths resolve to the same host files,
+not per-container copies.
+
 The benchmark pilot is accepted when one PolyBench and one Pro instance each complete all six
 model/profile combinations for seed 0, official scoring runs in fresh containers, every cell
 has a valid manifest and trace, hidden raw candidates do not enter localization View A, View B
@@ -738,13 +787,17 @@ policy success.
 
 ## Idempotence and Recovery
 
-Model serving and prewarming commands may be rerun. They bind new managed processes, validate
-existing fingerprints, and either reuse a complete matching cache or build into a temporary
-sibling followed by atomic rename. They must not mutate the localizer artifacts.
+Model serving and prewarming commands may be rerun. They bind new managed processes and reuse a
+shared database only when its `READY` manifest matches. A missing or mismatched database is
+built in a temporary sibling and atomically published before any cell opens it. Once published,
+the database remains a shared writable cache and must never be renamed, replaced, migrated, or
+fingerprint-invalidated while a cell is using it. They must not mutate the localizer artifacts.
 
-Each benchmark cell starts from a fresh official image and immutable prewarmed cache. An
-interrupted cell lacks `COMPLETE` and is safe to replace. A complete cell is immutable; if its
-input manifest changes, schedule a new cell/run identity rather than overwriting evidence.
+Each benchmark cell starts from a fresh official task image but bind-mounts the appropriate
+shared instance/model cache directory. An interrupted cell lacks `COMPLETE` and is safe to
+replace; its cached content may remain because it is content-addressed and inactive unless a
+later working tree resolves the same blobs. A complete cell artifact directory is immutable; if
+its input manifest changes, schedule a new cell/run identity rather than overwriting evidence.
 
 Keep provider attempts in distinct run directories. An abandoned Bedrock run remains evidence
 and is never merged into an OpenRouter grid.
@@ -833,3 +886,8 @@ dependency before use.
 Revision note, 2026-07-31: Initial self-contained plan created after repository and artifact
 inspection. It records the user's final decisions that Anvil uses multiplier two, documents a
 maximum `k` of 20, and may return fewer than `k` by design.
+
+Revision note, 2026-07-31: Replaced the underspecified immutable-cache restore language with
+Bifrost's intended shared-database design. All arm/seed containers for one instance/model now
+bind the same writable SQLite directory and rely on real SQLite WAL locking; initialization,
+migration, invalidation, and rebuild are forbidden while concurrent cell users are active.
