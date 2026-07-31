@@ -259,6 +259,7 @@ pub struct AnalyzerStore {
     conn: Mutex<Connection>,
     readers: ReaderPool,
     db_path: Option<PathBuf>,
+    lifetime: Arc<()>,
     _ephemeral: Option<EphemeralDb>,
     #[cfg(test)]
     parsed_blob_transaction_starts: AtomicUsize,
@@ -917,6 +918,7 @@ impl AnalyzerStore {
             conn: Mutex::new(conn),
             readers: ReaderPool::new(reader_source),
             db_path,
+            lifetime: Arc::new(()),
             _ephemeral: ephemeral,
             #[cfg(test)]
             parsed_blob_transaction_starts: AtomicUsize::new(0),
@@ -960,6 +962,10 @@ impl AnalyzerStore {
             Ok(store) => Ok(store),
             Err(_) => Self::open_in_memory_single_connection(),
         }
+    }
+
+    pub(crate) fn lifetime(&self) -> std::sync::Weak<()> {
+        Arc::downgrade(&self.lifetime)
     }
 
     pub fn semantic_pack_active_set(&self) -> Result<Option<SemanticPackActiveSet>> {

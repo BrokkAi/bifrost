@@ -52,8 +52,16 @@ belong to issues #1147 and later children of #1144.
   workspace schema 13 active-set authority, coordinated durable activation
   scopes, pins, expiring reader leases, install reservations, deduplicated
   active accounting, and bounded race-safe garbage collection.
-- [ ] Complete migration, read-only, downgrade, corruption, concurrency,
-  documentation, packaging, policy, and featureless Rust validation.
+- [x] (2026-07-31 09:21Z) Completed three specialist reviews and fixed the
+  resulting authority, source-validation, session-lifetime, install/GC race,
+  crash-reconciliation, filesystem-durability, repair, selector-index,
+  sub-second lease, and reclaimed-byte findings with adversarial regressions.
+- [x] (2026-07-31 10:08Z) Completed public/lifecycle documentation, confirmed
+  package inclusion for both catalog migrations and workspace migration 13,
+  passed 22 focused persistence tests, formatting, diff checks, and strict
+  featureless analysis-library Clippy, and completed the required policy run.
+  The policy result remains `unreliable` under #1296 rather than a false green;
+  the docs link checker could not run without the absent built `docs/dist`.
 
 ## Surprises & Discoveries
 
@@ -112,6 +120,27 @@ belong to issues #1147 and later children of #1144.
   existing version-1 catalog appear current while lacking required tables.
   The lifecycle schema therefore ships as forward-only migration 2, with a
   preservation test from version 1.
+
+- Observation: A candidate containing public descriptor and provenance fields
+  was not a safe catalog capability.
+  Evidence: changing a cloned candidate's non-key descriptor fields could make
+  verified bytes fail manifest-bound decode and authorize quarantine of the
+  genuine pack. Candidates now expose read-only accessors while their complete
+  load authority remains private.
+
+- Observation: A fixed install-reservation expiry is insufficient by itself.
+  Evidence: an installer stalled beyond the reservation TTL could otherwise
+  race GC after file publication. The final immediate install transaction now
+  re-verifies every exact CAS path, digest, and size before publishing metadata;
+  reconciliation and GC hold the same SQLite write boundary across their final
+  reachability check and filesystem deletion.
+
+- Observation: The repository policy pack still cannot produce a reliable
+  whole-workspace result for this revision.
+  Evidence: both final attempts returned `unreliable` because the nested-loop
+  policies exhausted their discovery budget over roughly 1,147 files and 29.8
+  MB. Existing findings were outside this change. Issue #1296 owns the policy
+  budget failure and received the first run's exact evidence.
 
 ## Decision Log
 
@@ -219,6 +248,31 @@ belong to issues #1147 and later children of #1144.
   has no embedded ownership, durable source pin, activation, or unexpired lease.
   Date/Author: 2026-07-31 / Codex
 
+- Decision: Treat catalog candidates as opaque read-only capabilities.
+  Rationale: Loading and quarantine must derive from catalog-validated
+  descriptor and source state, never caller-mutated copies. Accessors preserve
+  inspection without transferring authority to change the lookup key,
+  descriptor, or provenance.
+  Date/Author: 2026-07-31 / Codex
+
+- Decision: Validate an activation's exact manifest, source kind, and source ID
+  before changing workspace authority.
+  Rationale: Manifest existence alone permits fabricated attribution.
+  Persistent workspaces reject session-only sources because their bytes cannot
+  survive restart. In-memory workspaces accept only exact registered session
+  sources because they have no durable identity that can own a global
+  activation; their accounting is weakly tied to the store lifetime.
+  Date/Author: 2026-07-31 / Codex
+
+- Decision: Reconcile bounded abandoned storage on every writable open and
+  make reinstall authoritative repair.
+  Rationale: File-first publication intentionally makes an orphan, rather than
+  a partial pack, the only crash residue. Reconciliation removes old staging
+  files and unreserved digest-named objects under the catalog coordination
+  boundary. Reinstall atomically replaces corrupt exact-digest bytes and
+  refreshes canonical manifest metadata before restoring verified state.
+  Date/Author: 2026-07-31 / Codex
+
 - Decision: Make the inline payload threshold a catalog option and choose the
   production default only from the checked-in ignored benchmark.
   Rationale: The issue explicitly asks for measurement rather than an assumed
@@ -240,12 +294,20 @@ belong to issues #1147 and later children of #1144.
 
 ## Outcomes & Retrospective
 
-Milestone one established the physical payload decision. The ignored release
-benchmark passed at Bifrost `91357eec` and selected a zero-byte inline threshold,
-so production shard bytes will live only in the content-addressed object tree.
-The evidence is retained in
-`.agents/docs/semantic-pack-catalog-storage-benchmark-2026-07-31.md`. The
-durable catalog and lifecycle implementation remain.
+Issue #1146 now has a measured, independently migrated, content-addressed
+semantic-pack catalog. The ignored release benchmark at Bifrost `91357eec`
+selected a zero-byte inline threshold, so production shard bytes live only in
+the shared SHA-256 object tree. Complete manifest-bound validation precedes
+atomic installation; normalized indexed selectors discover candidates without
+payload reads; opaque candidates support verified load and safe quarantine.
+
+Workspace schema 13 persists deterministic active-set authority. Exact durable
+sources, session-only embedded and ephemeral sources, pins, expiring leases,
+install reservations, accounting, quarantine, repair, bounded crash
+reconciliation, and race-safe garbage collection now have behavior-focused
+coverage. Specialist review materially tightened the trust and concurrency
+boundaries before completion. Runtime matcher construction remains explicitly
+owned by #1147.
 
 ## Context and Orientation
 

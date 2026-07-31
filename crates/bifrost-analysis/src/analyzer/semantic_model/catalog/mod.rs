@@ -1,11 +1,11 @@
 mod db;
 mod storage;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, Weak};
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -95,6 +95,22 @@ pub enum CatalogPackSourceKind {
     EphemeralWorkspace,
 }
 
+impl CatalogPackSourceKind {
+    fn parse(value: &str) -> Result<Self, CatalogError> {
+        match value {
+            "installed" => Ok(Self::Installed),
+            "generated" => Ok(Self::Generated),
+            "pre_shipped" => Ok(Self::PreShipped),
+            "workspace_produced" => Ok(Self::WorkspaceProduced),
+            "embedded" => Ok(Self::Embedded),
+            "ephemeral_workspace" => Ok(Self::EphemeralWorkspace),
+            _ => Err(CatalogError::Integrity(format!(
+                "unknown catalog source kind {value:?}"
+            ))),
+        }
+    }
+}
+
 impl From<DurablePackSourceKind> for CatalogPackSourceKind {
     fn from(value: DurablePackSourceKind) -> Self {
         match value {
@@ -136,12 +152,34 @@ pub struct SemanticPackSelectorQuery {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogCandidate {
-    pub manifest_digest: String,
-    pub shard_id: String,
-    pub descriptor: CompiledShardDescriptor,
-    pub source_kind: CatalogPackSourceKind,
-    pub source_id: String,
+    manifest_digest: String,
+    shard_id: String,
+    descriptor: CompiledShardDescriptor,
+    source_kind: CatalogPackSourceKind,
+    source_id: String,
     location: CatalogCandidateLocation,
+}
+
+impl CatalogCandidate {
+    pub fn manifest_digest(&self) -> &str {
+        &self.manifest_digest
+    }
+
+    pub fn shard_id(&self) -> &str {
+        &self.shard_id
+    }
+
+    pub fn descriptor(&self) -> &CompiledShardDescriptor {
+        &self.descriptor
+    }
+
+    pub fn source_kind(&self) -> CatalogPackSourceKind {
+        self.source_kind
+    }
+
+    pub fn source_id(&self) -> &str {
+        &self.source_id
+    }
 }
 
 #[derive(Debug)]
@@ -175,7 +213,7 @@ pub struct CatalogAccounting {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivationSourceCount {
-    pub source_kind: DurablePackSourceKind,
+    pub source_kind: CatalogPackSourceKind,
     pub source_id: String,
     pub pack_count: u64,
 }
@@ -282,6 +320,7 @@ pub struct SemanticPackCatalog {
     options: CatalogOptions,
     connection: Mutex<Connection>,
     session_packs: Mutex<Vec<SessionPack>>,
+    session_activations: Mutex<HashMap<String, SessionActivation>>,
     rejected_manifests: Mutex<HashSet<String>>,
     lookup_hits: AtomicU64,
     lookup_misses: AtomicU64,
@@ -304,6 +343,11 @@ struct SessionPack {
     manifest: CompiledPackManifest,
     shards: Vec<ValidatedShard>,
     source: SessionPackSource,
+}
+
+struct SessionActivation {
+    active_set: SemanticPackActiveSet,
+    owner: Weak<()>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,13 +429,17 @@ impl SemanticPackCatalog {
             CatalogOpenMode::ReadWrite => storage::prepare_root(root)?,
             CatalogOpenMode::ReadOnly => storage::open_read_only_root(root)?,
         };
-        let connection = db::open(&root, mode)?;
+        let mut connection = db::open(&root, mode)?;
+        if mode == CatalogOpenMode::ReadWrite {
+            reconcile_storage(&root, &mut connection)?;
+        }
         Ok(Self {
             root,
             mode,
             options,
             connection: Mutex::new(connection),
             session_packs: Mutex::new(Vec::new()),
+            session_activations: Mutex::new(HashMap::new()),
             rejected_manifests: Mutex::new(HashSet::new()),
             lookup_hits: AtomicU64::new(0),
             lookup_misses: AtomicU64::new(0),
@@ -476,6 +524,14 @@ impl SemanticPackCatalog {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| CatalogError::sqlite("begin pack install", error))?;
+        for (shard, path) in validated.shards.iter().zip(published) {
+            storage::verify_existing(
+                &self.root,
+                path,
+                &shard.descriptor.stored_sha256,
+                shard.descriptor.stored_size,
+            )?;
+        }
         let inserted_manifest =
             insert_manifest(&transaction, &validated.manifest, &pack.manifest_bytes, now)?;
         for (ordinal, ((shard, path), descriptor)) in validated
@@ -755,9 +811,31 @@ impl SemanticPackCatalog {
         let desired = SemanticPackActiveSet::from_members(members)
             .map_err(|error| CatalogError::Integrity(error.to_string()))?;
         if store.is_in_memory() {
-            return store
+            if desired
+                .members
+                .iter()
+                .any(|member| durable_activation_kind(member.source_kind).is_some())
+            {
+                return Err(CatalogError::Integrity(
+                    "ephemeral workspaces can activate only session semantic packs".to_owned(),
+                ));
+            }
+            self.validate_active_members(&desired.members, true, None)?;
+            let stored = store
                 .replace_semantic_pack_active_set(&desired.members)
-                .map_err(|error| CatalogError::Integrity(error.to_string()));
+                .map_err(|error| CatalogError::Integrity(error.to_string()))?;
+            self.replace_session_activations(scope_id, &stored, store);
+            return Ok(stored);
+        }
+        self.validate_active_members(&desired.members, false, Some(scope_id))?;
+        if desired
+            .members
+            .iter()
+            .any(|member| durable_activation_kind(member.source_kind).is_none())
+        {
+            return Err(CatalogError::Integrity(
+                "persistent workspaces cannot activate session-only semantic packs".to_owned(),
+            ));
         }
         self.require_writable()?;
         let mut leases = self.activation_leases(scope_id, &desired.members)?;
@@ -775,12 +853,29 @@ impl SemanticPackCatalog {
         scope_id: &str,
         store: &AnalyzerStore,
     ) -> Result<Option<SemanticPackActiveSet>, CatalogError> {
-        self.require_writable()?;
         if store.is_in_memory() {
-            return store
+            let active_set = store
                 .semantic_pack_active_set()
-                .map_err(|error| CatalogError::Integrity(error.to_string()));
+                .map_err(|error| CatalogError::Integrity(error.to_string()))?;
+            let desired = match active_set {
+                Some(active_set) => active_set,
+                None => SemanticPackActiveSet::from_members(&[])
+                    .map_err(|error| CatalogError::Integrity(error.to_string()))?,
+            };
+            if desired
+                .members
+                .iter()
+                .any(|member| durable_activation_kind(member.source_kind).is_some())
+            {
+                return Err(CatalogError::Integrity(
+                    "ephemeral workspaces can activate only session semantic packs".to_owned(),
+                ));
+            }
+            self.validate_active_members(&desired.members, true, None)?;
+            self.replace_session_activations(scope_id, &desired, store);
+            return Ok((!desired.members.is_empty()).then_some(desired));
         }
+        self.require_writable()?;
         let active_set = store
             .semantic_pack_active_set()
             .map_err(|error| CatalogError::Integrity(error.to_string()))?;
@@ -789,10 +884,115 @@ impl SemanticPackCatalog {
             None => SemanticPackActiveSet::from_members(&[])
                 .map_err(|error| CatalogError::Integrity(error.to_string()))?,
         };
+        self.validate_active_members(&desired.members, false, Some(scope_id))?;
         let mut leases = self.activation_leases(scope_id, &desired.members)?;
         self.write_activation_rows(scope_id, &desired, true)?;
         release_leases(&mut leases)?;
         Ok((!desired.members.is_empty()).then_some(desired))
+    }
+
+    fn validate_active_members(
+        &self,
+        members: &[SemanticPackActiveReference],
+        allow_session: bool,
+        existing_scope: Option<&str>,
+    ) -> Result<(), CatalogError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        let session_packs = self
+            .session_packs
+            .lock()
+            .expect("semantic-pack session mutex poisoned");
+        for member in members {
+            if let Some(source_kind) = durable_activation_kind(member.source_kind) {
+                let exists: bool = connection
+                    .query_row(
+                        "SELECT EXISTS(
+                           SELECT 1
+                           FROM catalog_packs AS packs
+                           JOIN catalog_sources AS sources
+                             ON sources.manifest_digest = packs.manifest_digest
+                           WHERE packs.manifest_digest = ?1
+                             AND packs.state = 'verified'
+                             AND sources.source_kind = ?2
+                             AND sources.source_id = ?3
+                           UNION ALL
+                           SELECT 1
+                           FROM catalog_activations AS activations
+                           JOIN catalog_packs AS packs
+                             ON packs.manifest_digest = activations.manifest_digest
+                           WHERE activations.scope_id = ?4
+                             AND activations.manifest_digest = ?1
+                             AND activations.source_kind = ?2
+                             AND activations.source_id = ?3
+                             AND packs.state = 'verified'
+                         )",
+                        params![
+                            &member.manifest_digest,
+                            source_kind.as_str(),
+                            &member.source_id,
+                            existing_scope
+                        ],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| {
+                        CatalogError::sqlite("validate durable pack activation", error)
+                    })?;
+                if !exists {
+                    return Err(CatalogError::Unavailable);
+                }
+            } else {
+                if !allow_session {
+                    return Err(CatalogError::Integrity(
+                        "persistent workspaces cannot activate session-only semantic packs"
+                            .to_owned(),
+                    ));
+                }
+                let expected_kind = session_activation_kind(member.source_kind)
+                    .expect("non-durable activation kind must be session-scoped");
+                if !session_packs.iter().any(|pack| {
+                    pack.manifest.content_sha256 == member.manifest_digest
+                        && pack.source.kind == expected_kind
+                        && pack.source.source_id == member.source_id
+                }) {
+                    return Err(CatalogError::Unavailable);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn replace_session_activations(
+        &self,
+        scope_id: &str,
+        active_set: &SemanticPackActiveSet,
+        store: &AnalyzerStore,
+    ) {
+        let session_members = active_set
+            .members
+            .iter()
+            .filter(|member| durable_activation_kind(member.source_kind).is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut activations = self
+            .session_activations
+            .lock()
+            .expect("semantic-pack session activation mutex poisoned");
+        if session_members.is_empty() {
+            activations.remove(scope_id);
+        } else {
+            let session_set = SemanticPackActiveSet::from_members(&session_members)
+                .expect("validated session activations form a valid active set");
+            activations.insert(
+                scope_id.to_owned(),
+                SessionActivation {
+                    active_set: session_set,
+                    owner: store.lifetime(),
+                },
+            );
+        }
     }
 
     fn activation_leases(
@@ -827,14 +1027,6 @@ impl SemanticPackCatalog {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| CatalogError::sqlite("begin activation update", error))?;
-        if replace {
-            transaction
-                .execute(
-                    "DELETE FROM catalog_activations WHERE scope_id = ?1",
-                    [scope_id],
-                )
-                .map_err(|error| CatalogError::sqlite("replace activation scope", error))?;
-        }
         for member in &active_set.members {
             let Some(source_kind) = durable_activation_kind(member.source_kind) else {
                 continue;
@@ -845,9 +1037,25 @@ impl SemanticPackCatalog {
                        scope_id, active_set_digest, manifest_digest,
                        source_kind, source_id, activated_at
                      )
-                     SELECT ?1, ?2, manifest_digest, ?4, ?5, ?6
-                     FROM catalog_packs
-                     WHERE manifest_digest = ?3 AND state = 'verified'
+                     SELECT ?1, ?2, packs.manifest_digest, ?4, ?5, ?6
+                     FROM catalog_packs AS packs
+                     WHERE packs.manifest_digest = ?3
+                       AND packs.state = 'verified'
+                       AND (
+                         EXISTS(
+                           SELECT 1 FROM catalog_sources AS sources
+                           WHERE sources.manifest_digest = packs.manifest_digest
+                             AND sources.source_kind = ?4
+                             AND sources.source_id = ?5
+                         )
+                         OR EXISTS(
+                           SELECT 1 FROM catalog_activations AS active
+                           WHERE active.scope_id = ?1
+                             AND active.manifest_digest = packs.manifest_digest
+                             AND active.source_kind = ?4
+                             AND active.source_id = ?5
+                         )
+                       )
                      ON CONFLICT(scope_id, manifest_digest) DO UPDATE SET
                        active_set_digest = excluded.active_set_digest,
                        source_kind = excluded.source_kind,
@@ -867,6 +1075,15 @@ impl SemanticPackCatalog {
                 return Err(CatalogError::Unavailable);
             }
         }
+        if replace {
+            transaction
+                .execute(
+                    "DELETE FROM catalog_activations
+                     WHERE scope_id = ?1 AND active_set_digest <> ?2",
+                    params![scope_id, &active_set.active_set_digest],
+                )
+                .map_err(|error| CatalogError::sqlite("replace activation scope", error))?;
+        }
         transaction
             .commit()
             .map_err(|error| CatalogError::sqlite("commit activation update", error))
@@ -876,67 +1093,95 @@ impl SemanticPackCatalog {
         &self,
         query: &SemanticPackSelectorQuery,
     ) -> Result<Vec<CatalogCandidate>, CatalogError> {
+        let selector_source = if query.package.is_some() {
+            "SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_package
+             WHERE package_name IS NULL
+             UNION ALL
+             SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_package
+             WHERE package_name = ?3"
+        } else if query.module.is_some() {
+            "SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_module
+             WHERE module_name IS NULL
+             UNION ALL
+             SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_module
+             WHERE module_name = ?4"
+        } else if query.toolchain.is_some() {
+            "SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_toolchain
+             WHERE toolchain_name IS NULL
+             UNION ALL
+             SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_toolchain
+             WHERE toolchain_name = ?5"
+        } else if query.artifact_sha256.is_some() {
+            "SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_artifact
+             WHERE artifact_sha256 IS NULL
+             UNION ALL
+             SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_artifact
+             WHERE artifact_sha256 = ?8"
+        } else {
+            "SELECT * FROM catalog_selectors"
+        };
+        let candidate_sql = format!(
+            "SELECT p.manifest_digest, p.manifest_bytes, ps.shard_id,
+                    ps.descriptor_json, s.selector_json,
+                    source.source_kind, source.source_id
+             FROM catalog_packs AS p
+             JOIN catalog_pack_shards AS ps
+               ON ps.manifest_digest = p.manifest_digest
+             JOIN ({selector_source}) AS s
+               ON s.manifest_digest = ps.manifest_digest
+              AND s.shard_id = ps.shard_id
+             JOIN catalog_sources AS source
+               ON source.manifest_digest = p.manifest_digest
+             WHERE p.state = 'verified'
+               AND p.language = ?1
+               AND p.ecosystem = ?2
+               AND (?3 IS NULL OR s.package_name IS NULL OR s.package_name = ?3)
+               AND (?4 IS NULL OR s.module_name IS NULL OR s.module_name = ?4)
+               AND (?5 IS NULL OR s.toolchain_name IS NULL OR s.toolchain_name = ?5)
+               AND (
+                 ?6 IS NULL
+                 OR NOT EXISTS(
+                   SELECT 1 FROM catalog_selector_targets AS targets
+                   WHERE targets.manifest_digest = s.manifest_digest
+                     AND targets.shard_id = s.shard_id
+                     AND targets.selector_ordinal = s.selector_ordinal
+                 )
+                 OR EXISTS(
+                   SELECT 1 FROM catalog_selector_targets AS targets
+                   WHERE targets.manifest_digest = s.manifest_digest
+                     AND targets.shard_id = s.shard_id
+                     AND targets.selector_ordinal = s.selector_ordinal
+                     AND targets.target = ?6
+                 )
+               )
+               AND (
+                 ?7 IS NULL
+                 OR NOT EXISTS(
+                   SELECT 1 FROM catalog_selector_configurations AS configurations
+                   WHERE configurations.manifest_digest = s.manifest_digest
+                     AND configurations.shard_id = s.shard_id
+                     AND configurations.selector_ordinal = s.selector_ordinal
+                 )
+                 OR EXISTS(
+                   SELECT 1 FROM catalog_selector_configurations AS configurations
+                   WHERE configurations.manifest_digest = s.manifest_digest
+                     AND configurations.shard_id = s.shard_id
+                     AND configurations.selector_ordinal = s.selector_ordinal
+                     AND configurations.configuration = ?7
+                 )
+               )
+               AND (
+                 ?8 IS NULL OR s.artifact_sha256 IS NULL OR s.artifact_sha256 = ?8
+               )
+             ORDER BY p.manifest_digest, ps.shard_id,
+                      source.source_kind, source.source_id, s.selector_ordinal"
+        );
         let connection = self
             .connection
             .lock()
             .expect("semantic-pack catalog connection mutex poisoned");
         let mut statement = connection
-            .prepare(
-                "SELECT p.manifest_digest, p.manifest_bytes, ps.shard_id,
-                        ps.descriptor_json, s.selector_json,
-                        source.source_kind, source.source_id
-                 FROM catalog_packs AS p
-                 JOIN catalog_pack_shards AS ps
-                   ON ps.manifest_digest = p.manifest_digest
-                 JOIN catalog_selectors AS s INDEXED BY catalog_selectors_package
-                   ON s.manifest_digest = ps.manifest_digest
-                  AND s.shard_id = ps.shard_id
-                 JOIN catalog_sources AS source
-                   ON source.manifest_digest = p.manifest_digest
-                 WHERE p.state = 'verified'
-                   AND p.language = ?1
-                   AND p.ecosystem = ?2
-                   AND (?3 IS NULL OR s.package_name IS NULL OR s.package_name = ?3)
-                   AND (?4 IS NULL OR s.module_name IS NULL OR s.module_name = ?4)
-                   AND (?5 IS NULL OR s.toolchain_name IS NULL OR s.toolchain_name = ?5)
-                   AND (
-                     ?6 IS NULL
-                     OR NOT EXISTS(
-                       SELECT 1 FROM catalog_selector_targets AS targets
-                       WHERE targets.manifest_digest = s.manifest_digest
-                         AND targets.shard_id = s.shard_id
-                         AND targets.selector_ordinal = s.selector_ordinal
-                     )
-                     OR EXISTS(
-                       SELECT 1 FROM catalog_selector_targets AS targets
-                       WHERE targets.manifest_digest = s.manifest_digest
-                         AND targets.shard_id = s.shard_id
-                         AND targets.selector_ordinal = s.selector_ordinal
-                         AND targets.target = ?6
-                     )
-                   )
-                   AND (
-                     ?7 IS NULL
-                     OR NOT EXISTS(
-                       SELECT 1 FROM catalog_selector_configurations AS configurations
-                       WHERE configurations.manifest_digest = s.manifest_digest
-                         AND configurations.shard_id = s.shard_id
-                         AND configurations.selector_ordinal = s.selector_ordinal
-                     )
-                     OR EXISTS(
-                       SELECT 1 FROM catalog_selector_configurations AS configurations
-                       WHERE configurations.manifest_digest = s.manifest_digest
-                         AND configurations.shard_id = s.shard_id
-                         AND configurations.selector_ordinal = s.selector_ordinal
-                         AND configurations.configuration = ?7
-                     )
-                   )
-                   AND (
-                     ?8 IS NULL OR s.artifact_sha256 IS NULL OR s.artifact_sha256 = ?8
-                   )
-                 ORDER BY p.manifest_digest, ps.shard_id,
-                          source.source_kind, source.source_id, s.selector_ordinal",
-            )
+            .prepare(&candidate_sql)
             .map_err(|error| CatalogError::sqlite("prepare candidate lookup", error))?;
         let rows = statement
             .query_map(
@@ -1158,32 +1403,46 @@ impl SemanticPackCatalog {
                 |row| row.get::<_, u64>(0),
             )
             .map_err(|error| CatalogError::sqlite("account installed bytes", error))?;
-        let active_stored_bytes = connection
-            .query_row(
-                "SELECT COALESCE(SUM(stored_size), 0)
-                 FROM catalog_objects
-                 WHERE stored_digest IN (
-                   SELECT DISTINCT shards.stored_digest
-                   FROM catalog_pack_shards AS shards
-                   JOIN catalog_activations AS active
-                     ON active.manifest_digest = shards.manifest_digest
-                 )",
-                [],
-                |row| row.get::<_, u64>(0),
+        let mut active_object_sizes = HashMap::new();
+        let mut object_statement = connection
+            .prepare(
+                "SELECT DISTINCT objects.stored_digest, objects.stored_size
+                 FROM catalog_objects AS objects
+                 JOIN catalog_pack_shards AS shards
+                   ON shards.stored_digest = objects.stored_digest
+                 JOIN catalog_activations AS active
+                   ON active.manifest_digest = shards.manifest_digest",
             )
-            .map_err(|error| CatalogError::sqlite("account active bytes", error))?;
-        let active_shard_count = connection
-            .query_row(
-                "SELECT COUNT(*)
+            .map_err(|error| CatalogError::sqlite("prepare active byte accounting", error))?;
+        let object_rows = object_statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+            })
+            .map_err(|error| CatalogError::sqlite("query active byte accounting", error))?;
+        for row in object_rows {
+            let (digest, stored_size) =
+                row.map_err(|error| CatalogError::sqlite("read active byte accounting", error))?;
+            active_object_sizes.insert(digest, stored_size);
+        }
+        let mut active_shards = HashSet::new();
+        let mut shard_statement = connection
+            .prepare(
+                "SELECT DISTINCT shards.manifest_digest, shards.shard_id
                  FROM catalog_pack_shards AS shards
-                 WHERE EXISTS(
-                   SELECT 1 FROM catalog_activations AS active
-                   WHERE active.manifest_digest = shards.manifest_digest
-                 )",
-                [],
-                |row| row.get::<_, u64>(0),
+                 JOIN catalog_activations AS active
+                   ON active.manifest_digest = shards.manifest_digest",
             )
-            .map_err(|error| CatalogError::sqlite("account active shards", error))?;
+            .map_err(|error| CatalogError::sqlite("prepare active shard accounting", error))?;
+        let shard_rows = shard_statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| CatalogError::sqlite("query active shard accounting", error))?;
+        for row in shard_rows {
+            active_shards.insert(
+                row.map_err(|error| CatalogError::sqlite("read active shard accounting", error))?,
+            );
+        }
         let mut activation_statement = connection
             .prepare(
                 "SELECT source_kind, source_id, COUNT(*)
@@ -1201,16 +1460,73 @@ impl SemanticPackCatalog {
                 ))
             })
             .map_err(|error| CatalogError::sqlite("query activation accounting", error))?;
-        let mut activations = Vec::new();
+        let mut activation_counts = HashMap::new();
         for row in activation_rows {
             let (source_kind, source_id, pack_count) =
                 row.map_err(|error| CatalogError::sqlite("read activation accounting", error))?;
-            activations.push(ActivationSourceCount {
-                source_kind: DurablePackSourceKind::parse(&source_kind)?,
-                source_id,
+            activation_counts.insert(
+                (CatalogPackSourceKind::parse(&source_kind)?, source_id),
                 pack_count,
-            });
+            );
         }
+        let mut session_activations = self
+            .session_activations
+            .lock()
+            .expect("semantic-pack session activation mutex poisoned");
+        session_activations.retain(|_, activation| activation.owner.upgrade().is_some());
+        let mut active_session_digests = HashSet::new();
+        for activation in session_activations.values() {
+            for member in &activation.active_set.members {
+                let source_kind = activation_catalog_kind(member.source_kind);
+                *activation_counts
+                    .entry((source_kind, member.source_id.clone()))
+                    .or_insert(0) += 1;
+                active_session_digests.insert(member.manifest_digest.clone());
+            }
+        }
+        let session_packs = self
+            .session_packs
+            .lock()
+            .expect("semantic-pack session mutex poisoned");
+        for pack in session_packs.iter() {
+            if !active_session_digests.contains(&pack.manifest.content_sha256) {
+                continue;
+            }
+            for shard in &pack.shards {
+                active_shards.insert((
+                    pack.manifest.content_sha256.clone(),
+                    shard.descriptor.shard_id.clone(),
+                ));
+                active_object_sizes
+                    .entry(shard.descriptor.stored_sha256.clone())
+                    .or_insert(shard.descriptor.stored_size);
+            }
+        }
+        let active_stored_bytes =
+            active_object_sizes
+                .values()
+                .try_fold(0_u64, |total, stored_size| {
+                    total.checked_add(*stored_size).ok_or_else(|| {
+                        CatalogError::Integrity("active byte accounting overflowed".to_owned())
+                    })
+                })?;
+        let active_shard_count = u64::try_from(active_shards.len())
+            .map_err(|_| CatalogError::Integrity("active shard count exceeds u64".to_owned()))?;
+        let mut activations = activation_counts
+            .into_iter()
+            .map(
+                |((source_kind, source_id), pack_count)| ActivationSourceCount {
+                    source_kind,
+                    source_id,
+                    pack_count,
+                },
+            )
+            .collect::<Vec<_>>();
+        activations.sort_by(|left, right| {
+            source_precedence(left.source_kind)
+                .cmp(&source_precedence(right.source_kind))
+                .then_with(|| left.source_id.cmp(&right.source_id))
+        });
         Ok(CatalogAccounting {
             installed_stored_bytes,
             active_stored_bytes,
@@ -1520,7 +1836,7 @@ impl SemanticPackCatalog {
                 })?;
                 continue;
             }
-            storage::delete(&self.root, &relative_path, &digest)?;
+            let removed_file = storage::delete(&self.root, &relative_path, &digest)?;
             let deleted = transaction
                 .execute(
                     "DELETE FROM catalog_objects
@@ -1537,9 +1853,14 @@ impl SemanticPackCatalog {
                 .map_err(|error| CatalogError::sqlite("commit object GC", error))?;
             if deleted != 0 {
                 pruned_objects += 1;
-                reclaimed_bytes = reclaimed_bytes.checked_add(stored_size).ok_or_else(|| {
-                    CatalogError::Integrity("catalog GC reclaimed bytes overflowed".to_owned())
-                })?;
+                if removed_file {
+                    reclaimed_bytes =
+                        reclaimed_bytes.checked_add(stored_size).ok_or_else(|| {
+                            CatalogError::Integrity(
+                                "catalog GC reclaimed bytes overflowed".to_owned(),
+                            )
+                        })?;
+                }
             }
         }
         Ok(CatalogGcOutcome {
@@ -1649,15 +1970,61 @@ fn validate_pack(
     Ok(ValidatedPack { manifest, shards })
 }
 
+fn reconcile_storage(root: &Path, connection: &mut Connection) -> Result<(), CatalogError> {
+    const RECONCILIATION_LIMIT: usize = 4_096;
+    storage::cleanup_stale_staging(root, Duration::from_secs(60 * 60), RECONCILIATION_LIMIT)?;
+    let mut removed_objects = 0;
+    storage::visit_object_files(root, |relative_path, digest| {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| CatalogError::sqlite("begin catalog object reconciliation", error))?;
+        let protected: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM catalog_objects WHERE stored_digest = ?1
+                   UNION ALL
+                   SELECT 1 FROM catalog_install_object_reservations
+                   WHERE stored_digest = ?1 AND expires_at > ?2
+                 )",
+                params![&digest, crate::cache_db::now_unix_seconds()],
+                |row| row.get(0),
+            )
+            .map_err(|error| CatalogError::sqlite("reconcile catalog object", error))?;
+        if !protected {
+            storage::delete(
+                root,
+                relative_path.to_str().ok_or_else(|| {
+                    CatalogError::Integrity("catalog object path is not valid Unicode".to_owned())
+                })?,
+                &digest,
+            )?;
+            removed_objects += 1;
+        }
+        transaction
+            .commit()
+            .map_err(|error| CatalogError::sqlite("commit catalog object reconciliation", error))?;
+        Ok(removed_objects < RECONCILIATION_LIMIT)
+    })
+}
+
 fn insert_manifest(
     transaction: &Transaction<'_>,
     manifest: &CompiledPackManifest,
     bytes: &[u8],
     now: i64,
 ) -> Result<bool, CatalogError> {
-    let inserted = transaction
+    let existed: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM catalog_packs WHERE manifest_digest = ?1
+             )",
+            [&manifest.content_sha256],
+            |row| row.get(0),
+        )
+        .map_err(|error| CatalogError::sqlite("check existing pack manifest", error))?;
+    transaction
         .execute(
-            "INSERT OR IGNORE INTO catalog_packs(
+            "INSERT INTO catalog_packs(
                manifest_digest, semantic_digest, manifest_bytes, schema_version,
                pack_id, pack_version, producer_name, producer_version,
                language, ecosystem, bifrost_compatibility, provenance_json,
@@ -1665,7 +2032,23 @@ fn insert_manifest(
              ) VALUES(
                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                ?14, 'verified', ?15, ?15
-             )",
+             )
+             ON CONFLICT(manifest_digest) DO UPDATE SET
+               semantic_digest = excluded.semantic_digest,
+               manifest_bytes = excluded.manifest_bytes,
+               schema_version = excluded.schema_version,
+               pack_id = excluded.pack_id,
+               pack_version = excluded.pack_version,
+               producer_name = excluded.producer_name,
+               producer_version = excluded.producer_version,
+               language = excluded.language,
+               ecosystem = excluded.ecosystem,
+               bifrost_compatibility = excluded.bifrost_compatibility,
+               provenance_json = excluded.provenance_json,
+               license = excluded.license,
+               completeness = excluded.completeness,
+               state = 'verified',
+               verified_at = excluded.verified_at",
             params![
                 &manifest.content_sha256,
                 &manifest.semantic_sha256,
@@ -1686,7 +2069,7 @@ fn insert_manifest(
             ],
         )
         .map_err(|error| CatalogError::sqlite("insert pack manifest", error))?;
-    Ok(inserted == 1)
+    Ok(!existed)
 }
 
 fn insert_object(
@@ -1957,6 +2340,36 @@ fn durable_activation_kind(
     }
 }
 
+fn session_activation_kind(
+    kind: SemanticPackActivationSourceKind,
+) -> Option<SessionPackSourceKind> {
+    match kind {
+        SemanticPackActivationSourceKind::Embedded => Some(SessionPackSourceKind::Embedded),
+        SemanticPackActivationSourceKind::EphemeralWorkspace => {
+            Some(SessionPackSourceKind::EphemeralWorkspace)
+        }
+        SemanticPackActivationSourceKind::Installed
+        | SemanticPackActivationSourceKind::Generated
+        | SemanticPackActivationSourceKind::PreShipped
+        | SemanticPackActivationSourceKind::WorkspaceProduced => None,
+    }
+}
+
+fn activation_catalog_kind(kind: SemanticPackActivationSourceKind) -> CatalogPackSourceKind {
+    match kind {
+        SemanticPackActivationSourceKind::Installed => CatalogPackSourceKind::Installed,
+        SemanticPackActivationSourceKind::Generated => CatalogPackSourceKind::Generated,
+        SemanticPackActivationSourceKind::PreShipped => CatalogPackSourceKind::PreShipped,
+        SemanticPackActivationSourceKind::WorkspaceProduced => {
+            CatalogPackSourceKind::WorkspaceProduced
+        }
+        SemanticPackActivationSourceKind::Embedded => CatalogPackSourceKind::Embedded,
+        SemanticPackActivationSourceKind::EphemeralWorkspace => {
+            CatalogPackSourceKind::EphemeralWorkspace
+        }
+    }
+}
+
 fn lease_expiry(ttl: Duration) -> Result<i64, CatalogError> {
     if ttl.is_zero() {
         return Err(CatalogError::Integrity(
@@ -1965,6 +2378,9 @@ fn lease_expiry(ttl: Duration) -> Result<i64, CatalogError> {
     }
     let seconds = i64::try_from(ttl.as_secs())
         .map_err(|_| CatalogError::Integrity("semantic-pack lease TTL exceeds i64".to_owned()))?;
+    let seconds = seconds
+        .checked_add(i64::from(ttl.subsec_nanos() != 0))
+        .ok_or_else(|| CatalogError::Integrity("semantic-pack lease TTL overflowed".to_owned()))?;
     crate::cache_db::now_unix_seconds()
         .checked_add(seconds)
         .ok_or_else(|| CatalogError::Integrity("semantic-pack lease expiry overflowed".to_owned()))

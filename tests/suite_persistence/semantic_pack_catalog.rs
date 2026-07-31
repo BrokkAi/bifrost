@@ -13,7 +13,8 @@ use brokk_bifrost::analyzer::semantic_model::{CompiledSemanticModelPack, Compile
 use brokk_bifrost::analyzer::store::{
     AnalyzerStore, SemanticPackActivationSourceKind, SemanticPackActiveReference,
 };
-use rusqlite::Connection;
+use filetime::{FileTime, set_file_mtime};
+use rusqlite::{Connection, params};
 use semver::Version;
 use tempfile::TempDir;
 
@@ -85,9 +86,6 @@ fn indexed_lookup_and_verified_load_do_not_read_payload_during_discovery() {
     assert_eq!(catalog.candidates(&toolchain_query).unwrap().len(), 1);
     toolchain_query.toolchain.as_mut().unwrap().version = Some(Version::parse("11.0.1").unwrap());
     assert!(catalog.candidates(&toolchain_query).unwrap().is_empty());
-    let mut stale = candidates[0].clone();
-    stale.shard_id.push_str("-stale");
-    assert_eq!(catalog.load(&stale).unwrap_err(), CatalogMiss::NotFound);
     catalog.load(&candidates[0]).unwrap();
 
     let descriptor = &pack.shards[0].descriptor;
@@ -110,6 +108,132 @@ fn indexed_lookup_and_verified_load_do_not_read_payload_during_discovery() {
     let repaired = catalog.candidates(&matching_query()).unwrap();
     assert_eq!(repaired.len(), 1);
     catalog.load(&repaired[0]).unwrap();
+}
+
+#[test]
+fn populated_selector_dimensions_use_bounded_index_searches() {
+    let root = TempDir::new().unwrap();
+    drop(
+        SemanticPackCatalog::open(
+            root.path(),
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap(),
+    );
+    let connection = Connection::open(root.path().join("catalog.db")).unwrap();
+    for (column, index) in [
+        ("package_name", "catalog_selectors_package"),
+        ("module_name", "catalog_selectors_module"),
+        ("toolchain_name", "catalog_selectors_toolchain"),
+        ("artifact_sha256", "catalog_selectors_artifact"),
+    ] {
+        let sql = format!(
+            "EXPLAIN QUERY PLAN
+             SELECT * FROM (
+               SELECT * FROM catalog_selectors INDEXED BY {index}
+               WHERE {column} IS NULL
+               UNION ALL
+               SELECT * FROM catalog_selectors INDEXED BY {index}
+               WHERE {column} = ?1
+             )"
+        );
+        let mut statement = connection.prepare(&sql).unwrap();
+        let details = statement
+            .query_map(params!["selector"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .filter(|detail| detail
+                    .contains(&format!("SEARCH catalog_selectors USING INDEX {index}")))
+                .count()
+                >= 2,
+            "{column} plan did not use two bounded index searches: {details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .all(|detail| !detail.contains("SCAN catalog_selectors")),
+            "{column} plan performed a selector scan: {details:?}"
+        );
+    }
+}
+
+#[test]
+fn opening_catalog_removes_unreserved_cas_orphans() {
+    let root = TempDir::new().unwrap();
+    let pack = compiled_pack();
+    let descriptor = &pack.shards[0].descriptor;
+    let object_path = root
+        .path()
+        .join("objects/sha256")
+        .join(&descriptor.stored_sha256[..2])
+        .join(&descriptor.stored_sha256[2..]);
+    fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+    fs::write(&object_path, &pack.shards[0].bytes).unwrap();
+    let staging = root.path().join("staging");
+    fs::create_dir_all(&staging).unwrap();
+    let abandoned_stage = staging.join("abandoned");
+    fs::write(&abandoned_stage, b"partial").unwrap();
+    set_file_mtime(&abandoned_stage, FileTime::from_unix_time(1, 0)).unwrap();
+
+    let catalog = SemanticPackCatalog::open(
+        root.path(),
+        CatalogOpenMode::ReadWrite,
+        CatalogOptions::default(),
+    )
+    .unwrap();
+
+    assert!(!object_path.exists());
+    assert!(!abandoned_stage.exists());
+    assert_eq!(catalog.accounting().unwrap().object_count, 0);
+}
+
+#[test]
+fn reinstall_repairs_corrupt_object_and_manifest_metadata() {
+    let root = TempDir::new().unwrap();
+    let catalog = SemanticPackCatalog::open(
+        root.path(),
+        CatalogOpenMode::ReadWrite,
+        CatalogOptions::default(),
+    )
+    .unwrap();
+    let pack = compiled_pack();
+    let installed_source = source(DurablePackSourceKind::Installed, "repair");
+    catalog.install(&pack, &installed_source).unwrap();
+    let descriptor = &pack.shards[0].descriptor;
+    let object_path = root
+        .path()
+        .join("objects/sha256")
+        .join(&descriptor.stored_sha256[..2])
+        .join(&descriptor.stored_sha256[2..]);
+    let mut corrupted = fs::read(&object_path).unwrap();
+    corrupted[0] ^= 1;
+    fs::write(&object_path, corrupted).unwrap();
+    let connection = Connection::open(root.path().join("catalog.db")).unwrap();
+    connection
+        .execute(
+            "UPDATE catalog_packs
+             SET manifest_bytes = X'00', state = 'quarantined'
+             WHERE manifest_digest = ?1",
+            [&pack.manifest.content_sha256],
+        )
+        .unwrap();
+    drop(connection);
+
+    let outcome = catalog.install(&pack, &installed_source).unwrap();
+
+    assert!(!outcome.inserted_manifest);
+    assert_eq!(outcome.inserted_objects, 1);
+    let candidates = catalog.candidates(&matching_query()).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        catalog.load(&candidates[0]).unwrap().manifest,
+        pack.manifest
+    );
 }
 
 #[test]
@@ -236,13 +360,13 @@ fn concurrent_installers_publish_one_complete_pack() {
         let pack = Arc::clone(&pack);
         let barrier = Arc::clone(&barrier);
         workers.push(thread::spawn(move || {
+            barrier.wait();
             let catalog = SemanticPackCatalog::open(
                 &root,
                 CatalogOpenMode::ReadWrite,
                 CatalogOptions::default(),
             )
             .unwrap();
-            barrier.wait();
             catalog
                 .install(
                     &pack,
@@ -486,7 +610,7 @@ fn session_pack_is_selected_and_loaded_without_durable_accounting() {
 
     let candidates = catalog.candidates(&matching_query()).unwrap();
     assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].source_kind, CatalogPackSourceKind::Embedded);
+    assert_eq!(candidates[0].source_kind(), CatalogPackSourceKind::Embedded);
     assert_eq!(
         catalog.load(&candidates[0]).unwrap().manifest,
         pack.manifest
@@ -500,33 +624,277 @@ fn session_pack_is_selected_and_loaded_without_durable_accounting() {
 #[test]
 fn ephemeral_catalog_and_workspace_state_disappear_on_drop() {
     let pack = compiled_pack();
-    let root;
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let root = catalog.root().to_owned();
+    let store = AnalyzerStore::open_in_memory().unwrap();
+    catalog
+        .register_session_pack(
+            &pack,
+            &SessionPackSource {
+                kind: SessionPackSourceKind::EphemeralWorkspace,
+                source_id: "scratch".to_owned(),
+            },
+        )
+        .unwrap();
+    let reference = SemanticPackActiveReference {
+        manifest_digest: pack.manifest.content_sha256.clone(),
+        source_kind: SemanticPackActivationSourceKind::EphemeralWorkspace,
+        source_id: "scratch".to_owned(),
+        workspace_produced: true,
+    };
+    store
+        .replace_semantic_pack_active_set(&[reference])
+        .unwrap();
+    catalog
+        .reconcile_workspace_active_set("ephemeral", &store)
+        .unwrap();
+    assert_eq!(catalog.candidates(&matching_query()).unwrap().len(), 1);
+    assert_eq!(
+        catalog.accounting().unwrap().activations,
+        [
+            brokk_bifrost::analyzer::semantic_model::ActivationSourceCount {
+                source_kind: CatalogPackSourceKind::EphemeralWorkspace,
+                source_id: "scratch".to_owned(),
+                pack_count: 1,
+            }
+        ]
+    );
+    drop(store);
+    assert!(catalog.accounting().unwrap().activations.is_empty());
+    drop(catalog);
+    assert!(!root.exists());
+}
+
+#[test]
+fn activation_requires_exact_registered_source_and_compatible_store_lifetime() {
+    let root = TempDir::new().unwrap();
+    let catalog = SemanticPackCatalog::open(
+        root.path(),
+        CatalogOpenMode::ReadWrite,
+        CatalogOptions::default(),
+    )
+    .unwrap();
+    let pack = compiled_pack();
+    catalog
+        .install(&pack, &source(DurablePackSourceKind::Installed, "registry"))
+        .unwrap();
+    let persistent = AnalyzerStore::open_persistent(&root.path().join("workspace.db")).unwrap();
+    let fabricated = SemanticPackActiveReference {
+        manifest_digest: pack.manifest.content_sha256.clone(),
+        source_kind: SemanticPackActivationSourceKind::Generated,
+        source_id: "fabricated".to_owned(),
+        workspace_produced: false,
+    };
+
+    assert!(matches!(
+        catalog.replace_workspace_active_set("persistent", &persistent, &[fabricated]),
+        Err(CatalogError::Unavailable)
+    ));
+    assert!(persistent.semantic_pack_active_set().unwrap().is_none());
+    assert!(catalog.accounting().unwrap().activations.is_empty());
+
+    catalog
+        .register_session_pack(
+            &pack,
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: "embedded".to_owned(),
+            },
+        )
+        .unwrap();
+    let embedded = SemanticPackActiveReference {
+        manifest_digest: pack.manifest.content_sha256.clone(),
+        source_kind: SemanticPackActivationSourceKind::Embedded,
+        source_id: "embedded".to_owned(),
+        workspace_produced: false,
+    };
+    assert!(matches!(
+        catalog.replace_workspace_active_set("persistent", &persistent, &[embedded]),
+        Err(CatalogError::Integrity(_))
+    ));
+    assert!(persistent.semantic_pack_active_set().unwrap().is_none());
+}
+
+#[test]
+fn ephemeral_workspace_rejects_durable_pack_activation() {
+    let root = TempDir::new().unwrap();
+    let catalog = SemanticPackCatalog::open(
+        root.path(),
+        CatalogOpenMode::ReadWrite,
+        CatalogOptions::default(),
+    )
+    .unwrap();
+    let store = AnalyzerStore::open_in_memory().unwrap();
+    let pack = compiled_pack();
+    let installed_source = source(DurablePackSourceKind::Installed, "registry");
+    catalog.install(&pack, &installed_source).unwrap();
+    let reference = SemanticPackActiveReference {
+        manifest_digest: pack.manifest.content_sha256.clone(),
+        source_kind: SemanticPackActivationSourceKind::Installed,
+        source_id: "registry".to_owned(),
+        workspace_produced: false,
+    };
+    assert!(matches!(
+        catalog.replace_workspace_active_set("scratch", &store, &[reference]),
+        Err(CatalogError::Integrity(_))
+    ));
+    assert!(store.semantic_pack_active_set().unwrap().is_none());
+}
+
+#[test]
+fn read_only_catalog_activates_session_pack_without_durable_writes() {
+    let root = TempDir::new().unwrap();
+    drop(
+        SemanticPackCatalog::open(
+            root.path(),
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap(),
+    );
+    let catalog = SemanticPackCatalog::open(
+        root.path(),
+        CatalogOpenMode::ReadOnly,
+        CatalogOptions::default(),
+    )
+    .unwrap();
+    let store = AnalyzerStore::open_in_memory().unwrap();
+    let pack = compiled_pack();
+    catalog
+        .register_session_pack(
+            &pack,
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: "release".to_owned(),
+            },
+        )
+        .unwrap();
+    let reference = SemanticPackActiveReference {
+        manifest_digest: pack.manifest.content_sha256.clone(),
+        source_kind: SemanticPackActivationSourceKind::Embedded,
+        source_id: "release".to_owned(),
+        workspace_produced: false,
+    };
+
+    catalog
+        .replace_workspace_active_set("read-only-session", &store, &[reference])
+        .unwrap();
+
+    assert_eq!(
+        catalog.accounting().unwrap().activations[0].source_kind,
+        CatalogPackSourceKind::Embedded
+    );
+}
+
+#[test]
+fn source_removal_preserves_authoritative_workspace_reconciliation() {
+    let root = TempDir::new().unwrap();
+    let workspace_db = root.path().join("workspace.db");
+    let pack = compiled_pack();
+    let installed_source = source(DurablePackSourceKind::Installed, "registry");
     {
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
-        root = catalog.root().to_owned();
-        let store = AnalyzerStore::open_in_memory().unwrap();
-        catalog
-            .register_session_pack(
-                &pack,
-                &SessionPackSource {
-                    kind: SessionPackSourceKind::EphemeralWorkspace,
-                    source_id: "scratch".to_owned(),
-                },
-            )
-            .unwrap();
+        let catalog = SemanticPackCatalog::open(
+            root.path(),
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let store = AnalyzerStore::open_persistent(&workspace_db).unwrap();
+        catalog.install(&pack, &installed_source).unwrap();
         let reference = SemanticPackActiveReference {
             manifest_digest: pack.manifest.content_sha256.clone(),
-            source_kind: SemanticPackActivationSourceKind::EphemeralWorkspace,
-            source_id: "scratch".to_owned(),
-            workspace_produced: true,
+            source_kind: SemanticPackActivationSourceKind::Installed,
+            source_id: "registry".to_owned(),
+            workspace_produced: false,
         };
         catalog
-            .replace_workspace_active_set("ephemeral", &store, &[reference])
+            .replace_workspace_active_set("workspace", &store, &[reference])
             .unwrap();
-        assert!(store.semantic_pack_active_set().unwrap().is_some());
-        assert_eq!(catalog.candidates(&matching_query()).unwrap().len(), 1);
+        assert!(catalog.remove_source(&installed_source).unwrap());
     }
-    assert!(!root.exists());
+    let catalog = SemanticPackCatalog::open(
+        root.path(),
+        CatalogOpenMode::ReadWrite,
+        CatalogOptions::default(),
+    )
+    .unwrap();
+    let store = AnalyzerStore::open_persistent(&workspace_db).unwrap();
+
+    assert!(
+        catalog
+            .reconcile_workspace_active_set("workspace", &store)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        catalog
+            .garbage_collect(&CatalogGcOptions {
+                minimum_age: Duration::ZERO,
+                max_packs: 100,
+                max_objects: 100,
+            })
+            .unwrap()
+            .pruned_packs,
+        0
+    );
+}
+
+#[test]
+fn active_accounting_deduplicates_durable_and_session_bytes() {
+    let root = TempDir::new().unwrap();
+    let catalog = SemanticPackCatalog::open(
+        root.path(),
+        CatalogOpenMode::ReadWrite,
+        CatalogOptions::default(),
+    )
+    .unwrap();
+    let pack = compiled_pack();
+    catalog
+        .install(&pack, &source(DurablePackSourceKind::Installed, "registry"))
+        .unwrap();
+    catalog
+        .register_session_pack(
+            &pack,
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: "release".to_owned(),
+            },
+        )
+        .unwrap();
+    let persistent = AnalyzerStore::open_persistent(&root.path().join("workspace.db")).unwrap();
+    catalog
+        .replace_workspace_active_set(
+            "durable",
+            &persistent,
+            &[SemanticPackActiveReference {
+                manifest_digest: pack.manifest.content_sha256.clone(),
+                source_kind: SemanticPackActivationSourceKind::Installed,
+                source_id: "registry".to_owned(),
+                workspace_produced: false,
+            }],
+        )
+        .unwrap();
+    let ephemeral = AnalyzerStore::open_in_memory().unwrap();
+    catalog
+        .replace_workspace_active_set(
+            "session",
+            &ephemeral,
+            &[SemanticPackActiveReference {
+                manifest_digest: pack.manifest.content_sha256.clone(),
+                source_kind: SemanticPackActivationSourceKind::Embedded,
+                source_id: "release".to_owned(),
+                workspace_produced: false,
+            }],
+        )
+        .unwrap();
+
+    let accounting = catalog.accounting().unwrap();
+
+    assert_eq!(
+        accounting.active_stored_bytes,
+        pack.shards[0].descriptor.stored_size
+    );
+    assert_eq!(accounting.active_shard_count, 1);
 }
 
 #[test]
@@ -609,4 +977,49 @@ fn activation_pin_and_lease_independently_protect_garbage_collection() {
     let collected = catalog.garbage_collect(&collect_now).unwrap();
     assert_eq!(collected.pruned_packs, 1);
     assert_eq!(collected.pruned_objects, 1);
+}
+
+#[test]
+fn subsecond_lease_protects_pack_and_missing_object_reclaims_no_bytes() {
+    let root = TempDir::new().unwrap();
+    let catalog = SemanticPackCatalog::open(
+        root.path(),
+        CatalogOpenMode::ReadWrite,
+        CatalogOptions::default(),
+    )
+    .unwrap();
+    let pack = compiled_pack();
+    let installed_source = source(DurablePackSourceKind::Installed, "registry");
+    catalog.install(&pack, &installed_source).unwrap();
+    let lease = catalog
+        .lease(
+            &pack.manifest.content_sha256,
+            "subsecond-reader",
+            Duration::from_millis(500),
+        )
+        .unwrap();
+    assert!(catalog.remove_source(&installed_source).unwrap());
+    let collect_now = CatalogGcOptions {
+        minimum_age: Duration::ZERO,
+        max_packs: 100,
+        max_objects: 100,
+    };
+    assert_eq!(
+        catalog.garbage_collect(&collect_now).unwrap().pruned_packs,
+        0
+    );
+    lease.release().unwrap();
+    let descriptor = &pack.shards[0].descriptor;
+    let object_path = root
+        .path()
+        .join("objects/sha256")
+        .join(&descriptor.stored_sha256[..2])
+        .join(&descriptor.stored_sha256[2..]);
+    fs::remove_file(object_path).unwrap();
+
+    let outcome = catalog.garbage_collect(&collect_now).unwrap();
+
+    assert_eq!(outcome.pruned_packs, 1);
+    assert_eq!(outcome.pruned_objects, 1);
+    assert_eq!(outcome.reclaimed_bytes, 0);
 }
