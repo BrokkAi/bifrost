@@ -342,6 +342,20 @@ regression.
   comment-density latency, C++ clone budget, git-hotspots per-file complexity cost, dead-code
   usage-scan bounding, C++/C# parse failures, and secret-scan latency on large repos.
 
+- 2026-07-31 (post-fix sync): merged master with the five perf fixes (#1415 density, #1417
+  hotspots, #1418 dead-code bounds, #1420 exception parsing + PHP density, #1421 C++ clones).
+  Local sweep: gin density 20.7 s -> 172 ms, fmt density budget-exceeded -> 50 ms, gson hotspots
+  11.9 s -> 33 ms, gson dead-code 5.6 s -> 2.0 s. Re-enabled fmt structural clones (4.2 s, pinned)
+  and SqlMapper.cs in dapper's exception probe (now parses; MultiMapException row pinned). fmt
+  exception smells stay off, now because the corpus is genuinely clean (FMT_THROW, no catch
+  blocks, zero findings at min_score 1). fastroute src/functions.php still reports density
+  unavailable despite #1420, so it stays out of the probe. The gson density oracle caught a
+  Java-specific correctness regression in #1415 (class Javadoc header lines now attribute as 0;
+  Scala/PHP/C#/Rust header counts unaffected) -- the probe deliberately keeps the correct
+  pre-regression numbers and fails until that fix lands; spun off as a separate fix session.
+  Zero-usage dead-code scans remain slow (serde 16.8 s, dapper 11.3 s, exposed 14.5 s): #1418
+  bounded the hot-symbol path, not the zero-usage scan.
+
 ## Progress
 
 - [x] Milestone 1: scenario variants, generic probes, runner payloads and oracle, dead-code

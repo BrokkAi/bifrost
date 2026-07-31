@@ -677,11 +677,10 @@ code_quality_probes = [
 
 /// The achieved language-by-tool coverage matrix for the code-quality
 /// scenarios. Exclusions are deliberate, evidence-backed decisions recorded in
-/// .agents/plans/code-quality-perf-regression-benchmarks.md: cpp exception
-/// smells and comment-density on fmt's macro-heavy files fail to parse; cpp
-/// structural clones exceed the MCP request budget workspace-wide; kotlin
-/// clones are unimplemented (#1371); the javascript, php, and scala corpora
-/// have no true-positive exception/test-assertion findings to pin; and the secret
+/// .agents/plans/code-quality-perf-regression-benchmarks.md: the fmt-cpp,
+/// javascript, php, and scala corpora have no true-positive
+/// exception/test-assertion findings to pin (fmt uses FMT_THROW, no catch
+/// blocks); kotlin clones are unimplemented (#1371); and the secret
 /// scan exceeds the request budget on exposed-kotlin, leaving java,
 /// javascript, cpp, and csharp with pinnable secret findings. Shrinking any of these sets is a coverage regression.
 #[test]
@@ -713,7 +712,7 @@ fn code_quality_scenarios_cover_the_expected_language_matrix() {
         (
             BenchmarkScenario::StructuralCloneSmells,
             vec![
-                Java, Go, JavaScript, TypeScript, Python, Rust, Php, Scala, CSharp,
+                Java, Go, Cpp, JavaScript, TypeScript, Python, Rust, Php, Scala, CSharp,
             ],
         ),
         (BenchmarkScenario::LongMethodSmells, all.clone()),

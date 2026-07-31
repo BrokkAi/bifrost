@@ -52,13 +52,13 @@ Code-quality coverage matrix: `comment_density_files`,
 all eleven corpus repos. `dead_code_smells` runs everywhere except fmt-cpp.
 Exclusions are evidence-backed and enforced by the
 `code_quality_scenarios_cover_the_expected_language_matrix` test in
-`tests/suite_bench_policy/benchmark_manifest.rs`: fmt-cpp's macro-heavy C++
-fails to parse for `exception_smells`, and its workspace-wide clone comparison
-exceeds the MCP request budget, so C++ lacks exception and clone probes until
-those bugs are fixed; Kotlin clone smells are unimplemented (#1371); the
-express-js, fastroute-php, and scala-xml corpora have genuinely zero
-exception/test-assertion findings even at min_score 1, so those scenarios are
-off there rather than pinned to an empty report; only the java, javascript, cpp, and csharp repos have pinnable secret-like
+`tests/suite_bench_policy/benchmark_manifest.rs`: Kotlin clone smells are
+unimplemented (#1371); the express-js, fastroute-php, scala-xml, and (for
+exceptions) fmt-cpp corpora have genuinely zero exception/test-assertion
+findings even at min_score 1 -- fmt throws through FMT_THROW rather than
+catch blocks -- so those scenarios are off there rather than pinned to an
+empty report; fastroute's src/functions.php (namespaced free functions only)
+still reports comment density unavailable and stays out of the density probe; only the java, javascript, cpp, and csharp repos have pinnable secret-like
 findings (exposed-kotlin has real docker-compose password findings, but the
 scan exceeds the MCP request budget on that multi-module workspace, so the
 scenario is off there until the latency is fixed).
