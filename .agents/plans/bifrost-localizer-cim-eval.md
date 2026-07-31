@@ -59,18 +59,26 @@ The observable outcomes are:
   no-semantic baseline gate, A4000 indexing, clone-first sequencing, 15 repository-shared
   indexes, and 30/40/50 evaluation concurrency.
 - [x] (2026-07-31, implementation) Verified or completed all 15 upstream clones in parallel
-  under the established brokkbench clone root. Task-revision worktrees remain to be created.
+  under the established brokkbench clone root and materialized all 91 task revisions as clean,
+  detached worktrees. The immutable reportable manifest is
+  `/mnt/optane/bifrost-nlp-resources/runs/granite-r2-cim-20260731-r1/run-manifest.json`.
 - [x] (2026-07-31, implementation) Implemented the first Bifrost Granite checkpoint: exact
   profile, dynamic dimensions/composition/fingerprints, TCP sidecar transport, three retrieval
   profiles, and semantic-off tool suppression. NLP unit tests and the A4000 real-model smoke
   pass; broader validation remains.
 - [x] (2026-07-31, implementation) Implemented and committed Anvil's final-`k` contract in
-  worktree commit `e002ba4`, with focused tests and clippy passing.
-- [ ] Build the instance manifest, clone the 15 unique upstream repositories in parallel under
-  the brokkbench clone root, and materialize the 91 task revisions as worktrees.
-- [ ] Implement and validate Granite R2 serving and the three retrieval profiles in Bifrost.
-- [ ] Create a clean Anvil worktree and implement the final-`k` reranker contract.
-- [ ] Add the separate `cimeval` runner and minimal sandbox support in brokkbench.
+  worktree commits `e002ba4` and `71c6346`, with focused tests and clippy passing. The latter
+  also permits the container harness to set Anvil's bounded turn count through the environment.
+- [x] (2026-07-31, implementation) Added and committed the isolated `cimeval` foundation and
+  opt-in direct-Podman networking/mount support in brokkbench commit `e05760f759f`. It resolves
+  the released sample, prepares all clones/worktrees, builds immutable runtime bundles, and
+  launches a scrubbed task in its official image without changing agenteval defaults.
+- [ ] Finish reportable runtime validation (completed: official Ubuntu 20 images run the
+  bundled GNU Bifrost plus static Mjolnir/Anvil; remaining: rebuild with the Mjolnir explicit
+  Anvil-route fix and pass one PolyBench plus one Pro generation/scoring smoke).
+- [ ] Finish the `cimeval` campaign commands (completed: prepare, runtime preflight, one-cell
+  generation; remaining: sequential prewarm/readiness, concurrent resumable waves, official
+  fresh-container scoring, load sampling, gate, and report aggregation).
 - [ ] Run provider preflight and the no-semantic seed-0 baseline at concurrency 30.
 - [ ] Pass the baseline sanity gate, then run baseline seeds 1 and 2 with measured concurrency
   escalation.
@@ -136,6 +144,28 @@ The observable outcomes are:
   `BIFROST_NLP_MODEL_TESTS=1 cargo test --features nlp --test nlp_semantic_search_models --
   --ignored --nocapture`.
 
+- Observation: a one-shot `semantic_search` process is not a valid prewarm primitive because
+  the query's bounded readiness wait may expire and process exit then stops the background
+  indexer.
+  Evidence: the first Dubbo worktree returned the documented "index is still building" note
+  and exited without an active index. The existing `semantic_index_profile` binary instead
+  calls `SemanticIndexer::wait_ready` for up to 24 hours and reports final status, so the
+  campaign will use that production pipeline sequentially with a repository-shared cache.
+
+- Observation: the first official-container baseline smoke failed before any provider request
+  because Mjolnir rejected the explicit wire ID `bedrock::openai.gpt-5.6-luna` when Anvil's
+  discovery snapshot did not list it.
+  Evidence: `mj.stderr.log` says the model is not an eligible DeepSWE High/default model. A
+  Mjolnir worktree at `/mnt/optane/mjolnir-bifrost-nlp-ft` now has a focused fix that passes an
+  explicit provider-qualified selector to a ready Anvil server while preserving catalog-based
+  auto-selection; its focused tests pass and full validation is in progress.
+
+- Observation: `anvil.trace.jsonl` is legitimately absent when a run makes no semantic-search
+  call, including the baseline arm.
+  Evidence: the remote runner creates the trace only through Anvil semantic-search telemetry;
+  the cell collector now treats that trace and candidate telemetry as optional while retaining
+  Mjolnir and Anvil stderr/stream files as required core artifacts.
+
 ## Decision Log
 
 - Decision: this delivery implements and evaluates Granite R2 only.
@@ -152,6 +182,13 @@ The observable outcomes are:
   Rationale: extra repository indexers would contend for the already saturated A4000 rather
   than improve throughput.
   Date/Author: 2026-07-31, user.
+
+- Decision: use Bifrost's `semantic_index_profile` production-pipeline binary as the serial
+  prewarm worker rather than teaching the controller to infer readiness from a one-shot query.
+  Rationale: it already holds the process open, uses the same `SemanticIndexer`, waits for the
+  ready/failed terminal phase, emits progress, and honors `BIFROST_CACHE_DIR` plus the remote
+  Granite endpoint. This is the smallest reliable readiness contract.
+  Date/Author: 2026-07-31, Codex.
 
 - Decision: clone the 15 unique upstream benchmark repositories in parallel under
   `/home/jonathan/Projects/brokkbench/clones/` and materialize all 91 task revisions as
@@ -803,3 +840,9 @@ Added clone-first preparation, A4000/concurrency-one prewarming in parallel with
 no-semantic Luna baseline, adaptive 30/40/50 evaluation concurrency on the 60-core host, a
 1,092-cell maximum first delivery, 15 upstream clones with 91 task worktrees and repository-wide
 shared Bifrost DBs, and an explicit stop/report point before dw10.
+
+Revision note, 2026-07-31: Recorded the completed 91-worktree manifest, Bifrost/Anvil/brokkbench
+checkpoints, official-image runtime proof, and the two issues found by the first real smoke.
+Specified `semantic_index_profile` as the readiness-blocking serial prewarm primitive, the
+Mjolnir provider-qualified Anvil routing fix, and optional semantic trace collection for a
+baseline that may correctly make no semantic-search calls.
