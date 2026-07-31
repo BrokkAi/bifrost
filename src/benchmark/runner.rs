@@ -36,6 +36,10 @@ pub struct RunRequest {
     pub manifest_path: PathBuf,
     pub repo_cache_dir: PathBuf,
     pub selected_repo: Option<String>,
+    /// When set, each selected repo runs only this scenario (repos that do not
+    /// enable it are skipped). Intended for probe authoring and operator
+    /// spot-checks; baseline-quality reports come from unfiltered runs.
+    pub selected_scenario: Option<BenchmarkScenario>,
     pub max_files: Option<usize>,
     pub profile: Option<BenchmarkProfile>,
 }
@@ -55,12 +59,24 @@ pub fn run_benchmark(
         .repos
         .iter()
         .filter(|repo| selected_repo.is_none_or(|name| repo.name == name))
+        .filter(|repo| {
+            request
+                .selected_scenario
+                .is_none_or(|scenario| repo.scenario_set().contains(&scenario))
+        })
         .collect();
 
     if selected_targets.is_empty() {
-        return Err(match selected_repo {
-            Some(name) => format!("manifest contains no repo named `{name}`"),
-            None => "manifest contains no repos to run".to_string(),
+        return Err(match (selected_repo, request.selected_scenario) {
+            (Some(name), Some(scenario)) => format!(
+                "repo `{name}` does not enable scenario `{}` (or does not exist)",
+                scenario.label()
+            ),
+            (Some(name), None) => format!("manifest contains no repo named `{name}`"),
+            (None, Some(scenario)) => {
+                format!("no manifest repo enables scenario `{}`", scenario.label())
+            }
+            (None, None) => "manifest contains no repos to run".to_string(),
         });
     }
 
@@ -93,6 +109,17 @@ fn run_repo(
     manifest: &BenchmarkManifest,
     request: &RunRequest,
 ) -> Result<BenchmarkRepoReport, String> {
+    let scenario_filtered;
+    let target = match request.selected_scenario {
+        Some(scenario) => {
+            scenario_filtered = BenchmarkRepoTarget {
+                scenarios: vec![scenario],
+                ..target.clone()
+            };
+            &scenario_filtered
+        }
+        None => target,
+    };
     let checkout_path = prepare_repo(target, &request.repo_cache_dir)?;
     let workspace_path = match request.max_files {
         Some(max_files) => {
