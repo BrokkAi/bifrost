@@ -17,6 +17,7 @@ use super::REPRESENTATION_KIND;
 use super::keys::l2_normalize;
 
 pub const EMBED_PROFILE_ENV: &str = "BIFROST_EMBED_PROFILE";
+pub const EMBED_ENDPOINT_ENV: &str = "BIFROST_EMBED_ENDPOINT";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelProfile {
@@ -162,6 +163,9 @@ fn metal_present() -> bool {
 /// `false` — it must be force-enabled). The model runs in the PyTorch sidecar, which
 /// picks its own device at runtime; this only decides whether to advertise the tool.
 pub fn accelerator_available() -> bool {
+    if std::env::var_os(EMBED_ENDPOINT_ENV).is_some() {
+        return true;
+    }
     match accelerator_preference() {
         AcceleratorPreference::Cpu => false,
         AcceleratorPreference::Cuda => cuda_present(),

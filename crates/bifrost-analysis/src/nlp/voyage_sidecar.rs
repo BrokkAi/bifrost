@@ -23,13 +23,12 @@ use tokenizers::Tokenizer;
 #[cfg(all(test, unix))]
 use super::engine::VOYAGE_PROFILE;
 use super::engine::{
-    Embedder, ModelProfile, ScheduledEmbedder, embed_repo_id, fingerprint_for,
+    EMBED_ENDPOINT_ENV, Embedder, ModelProfile, ScheduledEmbedder, embed_repo_id, fingerprint_for,
     resolve_tokenizer_dir, selected_model_profile,
 };
 
 const SCRIPT_ENV: &str = "BIFROST_SIDECAR_SCRIPT";
 const DEVICES_ENV: &str = "BIFROST_SIDECAR_DEVICES";
-const ENDPOINT_ENV: &str = "BIFROST_EMBED_ENDPOINT";
 const READY_TIMEOUT_ENV: &str = "BIFROST_SIDECAR_READY_TIMEOUT_SECS";
 const DEFAULT_SCRIPT: &str = "scripts/embedding_sidecar.py";
 const DEFAULT_READY_TIMEOUT_SECS: u64 = 900;
@@ -407,7 +406,7 @@ fn connect_sidecar(
 ) -> Result<SingleSidecar, String> {
     let address = endpoint
         .strip_prefix("tcp://")
-        .ok_or_else(|| format!("{ENDPOINT_ENV} must use tcp://host:port"))?;
+        .ok_or_else(|| format!("{EMBED_ENDPOINT_ENV} must use tcp://host:port"))?;
     let stream = TcpStream::connect(address)
         .map_err(|err| format!("connect embedding sidecar at {endpoint}: {err}"))?;
     stream
@@ -436,7 +435,7 @@ pub fn load_sidecar_embedder() -> Result<Arc<dyn Embedder>, String> {
             .map_err(|e| format!("load tokenizer: {e}"))?,
     );
     let label = embed_repo_id();
-    if let Ok(endpoint) = std::env::var(ENDPOINT_ENV) {
+    if let Ok(endpoint) = std::env::var(EMBED_ENDPOINT_ENV) {
         let worker = connect_sidecar(&endpoint, tokenizer, label, profile)?;
         worker
             .embed_passages(&["warmup"])
