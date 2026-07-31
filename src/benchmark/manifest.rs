@@ -183,6 +183,22 @@ pub enum BenchmarkScenario {
     ScanUsages,
     #[serde(rename = "dead_code_smells")]
     DeadCodeSmells,
+    #[serde(rename = "comment_density_files")]
+    CommentDensityFiles,
+    #[serde(rename = "comment_density_code_unit")]
+    CommentDensityCodeUnit,
+    #[serde(rename = "exception_smells")]
+    ExceptionSmells,
+    #[serde(rename = "test_assertion_smells")]
+    TestAssertionSmells,
+    #[serde(rename = "structural_clone_smells")]
+    StructuralCloneSmells,
+    #[serde(rename = "long_method_smells")]
+    LongMethodSmells,
+    #[serde(rename = "secret_like_code")]
+    SecretLikeCode,
+    #[serde(rename = "git_hotspots")]
+    GitHotspots,
     #[serde(rename = "get_definition")]
     GetDefinition,
     #[serde(rename = "call_hierarchy")]
@@ -223,6 +239,14 @@ impl BenchmarkScenario {
             Self::MostRelevantFiles => "most_relevant_files",
             Self::ScanUsages => "scan_usages",
             Self::DeadCodeSmells => "dead_code_smells",
+            Self::CommentDensityFiles => "comment_density_files",
+            Self::CommentDensityCodeUnit => "comment_density_code_unit",
+            Self::ExceptionSmells => "exception_smells",
+            Self::TestAssertionSmells => "test_assertion_smells",
+            Self::StructuralCloneSmells => "structural_clone_smells",
+            Self::LongMethodSmells => "long_method_smells",
+            Self::SecretLikeCode => "secret_like_code",
+            Self::GitHotspots => "git_hotspots",
             Self::GetDefinition => "get_definition",
             Self::CallHierarchy => "call_hierarchy",
             Self::TypeHierarchy => "type_hierarchy",
@@ -236,11 +260,37 @@ impl BenchmarkScenario {
         match self {
             Self::ScanUsages => "scan_usages_by_reference",
             Self::DeadCodeSmells => "report_dead_code_and_unused_abstraction_smells",
+            Self::CommentDensityFiles => "report_comment_density_for_files",
+            Self::CommentDensityCodeUnit => "report_comment_density_for_code_unit",
+            Self::ExceptionSmells => "report_exception_handling_smells",
+            Self::TestAssertionSmells => "report_test_assertion_smells",
+            Self::StructuralCloneSmells => "report_structural_clone_smells",
+            Self::LongMethodSmells => "report_long_method_and_god_object_smells",
+            Self::SecretLikeCode => "report_secret_like_code",
+            Self::GitHotspots => "analyze_git_hotspots",
             Self::GetDefinition => "get_definitions_by_location",
             Self::CallHierarchy | Self::TypeHierarchy => self.label(),
             Self::InteractiveCodeIntelligence | Self::McpFairness => self.label(),
             _ => self.label(),
         }
+    }
+
+    /// Scenarios that time a SlopCop code-quality tool. They share the generic
+    /// `[[repos.code_quality_probes]]` probe-input shape and the markdown
+    /// report-substring oracle instead of per-scenario probe fields.
+    pub fn is_code_quality(self) -> bool {
+        matches!(
+            self,
+            Self::DeadCodeSmells
+                | Self::CommentDensityFiles
+                | Self::CommentDensityCodeUnit
+                | Self::ExceptionSmells
+                | Self::TestAssertionSmells
+                | Self::StructuralCloneSmells
+                | Self::LongMethodSmells
+                | Self::SecretLikeCode
+                | Self::GitHotspots
+        )
     }
 }
 
@@ -443,13 +493,7 @@ pub struct BenchmarkRepoTarget {
     #[serde(default)]
     pub usage_targets: Vec<BenchmarkLocationSelector>,
     #[serde(default)]
-    pub dead_code_file_paths: Vec<String>,
-    #[serde(default)]
-    pub dead_code_fq_names: Vec<String>,
-    #[serde(default)]
-    pub dead_code_expect_report_contains: Vec<String>,
-    #[serde(default)]
-    pub dead_code_expect_report_absent: Vec<String>,
+    pub code_quality_probes: Vec<CodeQualityProbe>,
     #[serde(default)]
     pub definition_queries: Vec<DefinitionQueryTarget>,
     #[serde(default)]
@@ -465,6 +509,103 @@ pub struct BenchmarkRepoTarget {
 }
 
 pub type ScanUsageQueryTarget = BenchmarkLocationSelector;
+
+/// One timed probe for a code-quality scenario: the exact tool inputs plus a
+/// markdown-report oracle. `expect_report_contains` is mandatory so a scenario
+/// can never pass by returning an empty-but-fast report; pick substrings that
+/// quote a specific finding line, not generic header text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CodeQualityProbe {
+    pub scenario: BenchmarkScenario,
+    #[serde(default)]
+    pub file_paths: Vec<String>,
+    #[serde(default)]
+    pub fq_names: Vec<String>,
+    /// Raw tool-argument overrides merged over the scenario's default payload,
+    /// so per-tool tuning knobs (min_score, shingle_size, since_iso, ...) need
+    /// no dedicated schema fields.
+    #[serde(default)]
+    pub arguments: serde_json::Map<String, Value>,
+    pub expect_report_contains: Vec<String>,
+    #[serde(default)]
+    pub expect_report_absent: Vec<String>,
+}
+
+impl CodeQualityProbe {
+    fn validate(
+        &self,
+        label: &str,
+        scenarios: &BTreeSet<BenchmarkScenario>,
+        errors: &mut Vec<String>,
+    ) {
+        let scenario = self.scenario;
+        if !scenario.is_code_quality() {
+            errors.push(format!(
+                "{label} names `{}`, which is not a code-quality scenario",
+                scenario.label()
+            ));
+            return;
+        }
+        if !scenarios.contains(&scenario) {
+            errors.push(format!(
+                "{label} targets `{}` but the repo does not enable that scenario",
+                scenario.label()
+            ));
+        }
+
+        if !has_non_blank_values(&self.expect_report_contains) {
+            errors.push(format!(
+                "{label} must define at least one expect_report_contains entry; an oracle that accepts an empty report cannot prove the tool did real work"
+            ));
+        }
+        for (field, values) in [
+            ("file_paths", &self.file_paths),
+            ("fq_names", &self.fq_names),
+            ("expect_report_contains", &self.expect_report_contains),
+            ("expect_report_absent", &self.expect_report_absent),
+        ] {
+            if values.iter().any(|value| value.trim().is_empty()) {
+                errors.push(format!("{label} has a blank {field} entry"));
+            }
+        }
+
+        let needs_file_paths = !matches!(
+            scenario,
+            BenchmarkScenario::GitHotspots | BenchmarkScenario::CommentDensityCodeUnit
+        );
+        if needs_file_paths && !has_non_blank_values(&self.file_paths) {
+            errors.push(format!(
+                "{label} enables `{}` but does not define file_paths",
+                scenario.label()
+            ));
+        }
+
+        match scenario {
+            BenchmarkScenario::CommentDensityCodeUnit => {
+                if self.fq_names.len() != 1 {
+                    errors.push(format!(
+                        "{label} must define exactly one fq_names entry for `comment_density_code_unit`"
+                    ));
+                }
+            }
+            BenchmarkScenario::DeadCodeSmells => {
+                if !has_non_blank_values(&self.fq_names) {
+                    errors.push(format!(
+                        "{label} enables `dead_code_smells` but does not define fq_names"
+                    ));
+                }
+            }
+            _ => {
+                if !self.fq_names.is_empty() {
+                    errors.push(format!(
+                        "{label} defines fq_names but `{}` does not take symbol inputs",
+                        scenario.label()
+                    ));
+                }
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BenchmarkLocationSelector {
@@ -572,6 +713,15 @@ impl BenchmarkRepoTarget {
 
     pub fn scenario_set(&self) -> BTreeSet<BenchmarkScenario> {
         dedupe_scenarios(&self.scenarios)
+    }
+
+    pub fn code_quality_probes_for(
+        &self,
+        scenario: BenchmarkScenario,
+    ) -> impl Iterator<Item = &CodeQualityProbe> {
+        self.code_quality_probes
+            .iter()
+            .filter(move |probe| probe.scenario == scenario)
     }
 
     fn validate(&self, errors: &mut Vec<String>) {
@@ -692,35 +842,21 @@ impl BenchmarkRepoTarget {
             query.validate(&label, false, errors);
         }
 
-        if scenarios.contains(&BenchmarkScenario::DeadCodeSmells) {
-            if !has_non_blank_values(&self.dead_code_fq_names) {
+        for scenario in scenarios
+            .iter()
+            .copied()
+            .filter(|scenario| scenario.is_code_quality())
+        {
+            if self.code_quality_probes_for(scenario).next().is_none() {
                 errors.push(format!(
-                    "repo `{name}` enables `dead_code_smells` but does not define dead_code_fq_names"
-                ));
-            }
-            if !has_non_blank_values(&self.dead_code_expect_report_contains)
-                && !has_non_blank_values(&self.dead_code_expect_report_absent)
-            {
-                errors.push(format!(
-                    "repo `{name}` enables `dead_code_smells` but does not define dead_code_expect_report_contains or dead_code_expect_report_absent"
+                    "repo `{name}` enables `{}` but defines no code_quality_probes entry for it",
+                    scenario.label()
                 ));
             }
         }
-        for (field, values) in [
-            ("dead_code_file_paths", &self.dead_code_file_paths),
-            ("dead_code_fq_names", &self.dead_code_fq_names),
-            (
-                "dead_code_expect_report_contains",
-                &self.dead_code_expect_report_contains,
-            ),
-            (
-                "dead_code_expect_report_absent",
-                &self.dead_code_expect_report_absent,
-            ),
-        ] {
-            if values.iter().any(|value| value.trim().is_empty()) {
-                errors.push(format!("repo `{name}` has a blank {field} entry"));
-            }
+        for (index, probe) in self.code_quality_probes.iter().enumerate() {
+            let label = format!("repo `{name}` code_quality_probes[{index}]");
+            probe.validate(&label, &scenarios, errors);
         }
 
         if scenarios.contains(&BenchmarkScenario::GetDefinition) {

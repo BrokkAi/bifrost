@@ -11,7 +11,8 @@ use crate::benchmark::report::{
 use crate::benchmark::subset_workspace::prepare_subset_workspace;
 use crate::benchmark::{
     BenchmarkLocationSelector, BenchmarkManifest, BenchmarkRepoTarget, BenchmarkScenario,
-    HierarchyQueryTarget, InteractiveQueryBenchmarkCase, McpFairnessBenchmarkCase,
+    CodeQualityProbe, HierarchyQueryTarget, InteractiveQueryBenchmarkCase,
+    McpFairnessBenchmarkCase,
 };
 use crate::lsp::benchmark_api::{call_hierarchy, type_hierarchy};
 use crate::lsp::conversion::path_to_uri_string;
@@ -1533,15 +1534,111 @@ fn run_mcp_iteration(
             iteration,
         },
         |session| {
-            session
-                .call_tool(
-                    scenario_tool_name(target, scenario),
-                    tool_arguments(target, scenario),
-                )
-                .and_then(|result| assert_scenario_result(target, scenario, &result))
+            if scenario.is_code_quality() {
+                run_code_quality_probes(target, session, scenario)
+            } else {
+                session
+                    .call_tool(
+                        scenario_tool_name(target, scenario),
+                        tool_arguments(target, scenario),
+                    )
+                    .and_then(|result| assert_scenario_result(target, scenario, &result))
+            }
         },
     );
     (outcome.map(|timed| timed.duration_ms), artifact)
+}
+
+/// Code-quality scenarios issue one tool call per manifest probe inside the
+/// timed iteration; the probe set is pinned, so the summed duration is a
+/// stable series. Each probe's report is checked against its own oracle.
+fn run_code_quality_probes(
+    target: &BenchmarkRepoTarget,
+    session: &mut McpSession,
+    scenario: BenchmarkScenario,
+) -> Result<(), String> {
+    let mut probes = target.code_quality_probes_for(scenario).peekable();
+    assert!(
+        probes.peek().is_some(),
+        "manifest validation guarantees at least one probe for `{}`",
+        scenario.label()
+    );
+    for probe in probes {
+        let result = session.call_tool(
+            scenario.tool_name(),
+            code_quality_arguments(scenario, probe),
+        )?;
+        assert_code_quality_report(target, scenario, probe, &result)?;
+    }
+    Ok(())
+}
+
+fn code_quality_arguments(scenario: BenchmarkScenario, probe: &CodeQualityProbe) -> Value {
+    let mut arguments = match scenario {
+        BenchmarkScenario::DeadCodeSmells => json!({
+            "fq_names": probe.fq_names,
+            "file_paths": probe.file_paths,
+            "max_usage_candidate_files": 2000,
+            "max_usages_per_symbol": 1000
+        }),
+        BenchmarkScenario::CommentDensityCodeUnit => json!({
+            "fq_name": probe.fq_names[0]
+        }),
+        BenchmarkScenario::GitHotspots => json!({}),
+        BenchmarkScenario::CommentDensityFiles
+        | BenchmarkScenario::ExceptionSmells
+        | BenchmarkScenario::TestAssertionSmells
+        | BenchmarkScenario::StructuralCloneSmells
+        | BenchmarkScenario::LongMethodSmells
+        | BenchmarkScenario::SecretLikeCode => json!({
+            "file_paths": probe.file_paths
+        }),
+        other => unreachable!("`{}` is not a code-quality scenario", other.label()),
+    };
+    let merged = arguments
+        .as_object_mut()
+        .expect("code-quality payloads are objects");
+    for (key, value) in &probe.arguments {
+        merged.insert(key.clone(), value.clone());
+    }
+    arguments
+}
+
+fn assert_code_quality_report(
+    target: &BenchmarkRepoTarget,
+    scenario: BenchmarkScenario,
+    probe: &CodeQualityProbe,
+    result: &Value,
+) -> Result<(), String> {
+    let structured = result
+        .get("structuredContent")
+        .ok_or_else(|| format!("tool `{}` returned no structuredContent", scenario.label()))?;
+    let report = structured["report"].as_str().ok_or_else(|| {
+        format!(
+            "{} result missing report string for `{}`",
+            scenario.label(),
+            target.name
+        )
+    })?;
+    for expected in &probe.expect_report_contains {
+        if !report.contains(expected) {
+            return Err(format!(
+                "{} report for `{}` did not contain expected text `{expected}`\n\nActual report:\n{report}",
+                scenario.label(),
+                target.name,
+            ));
+        }
+    }
+    for forbidden in &probe.expect_report_absent {
+        if report.contains(forbidden) {
+            return Err(format!(
+                "{} report for `{}` contained forbidden text `{forbidden}`\n\nActual report:\n{report}",
+                scenario.label(),
+                target.name,
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn scenario_tool_name(target: &BenchmarkRepoTarget, scenario: BenchmarkScenario) -> &'static str {
@@ -1601,12 +1698,6 @@ fn tool_arguments(target: &BenchmarkRepoTarget, scenario: BenchmarkScenario) -> 
             }
             args
         }
-        BenchmarkScenario::DeadCodeSmells => json!({
-            "fq_names": target.dead_code_fq_names,
-            "file_paths": target.dead_code_file_paths,
-            "max_usage_candidate_files": 2000,
-            "max_usages_per_symbol": 1000
-        }),
         BenchmarkScenario::GetDefinition => json!({
             "references": target.definition_queries.iter().map(|query| {
                 location_selector_arguments(&query.selector)
@@ -1617,6 +1708,17 @@ fn tool_arguments(target: &BenchmarkRepoTarget, scenario: BenchmarkScenario) -> 
         | BenchmarkScenario::QueryCode
         | BenchmarkScenario::InteractiveCodeIntelligence
         | BenchmarkScenario::McpFairness => json!({}),
+        BenchmarkScenario::DeadCodeSmells
+        | BenchmarkScenario::CommentDensityFiles
+        | BenchmarkScenario::CommentDensityCodeUnit
+        | BenchmarkScenario::ExceptionSmells
+        | BenchmarkScenario::TestAssertionSmells
+        | BenchmarkScenario::StructuralCloneSmells
+        | BenchmarkScenario::LongMethodSmells
+        | BenchmarkScenario::SecretLikeCode
+        | BenchmarkScenario::GitHotspots => {
+            unreachable!("code-quality scenarios build per-probe arguments")
+        }
     }
 }
 
@@ -1806,31 +1908,6 @@ fn assert_scenario_result(
             }
             Ok(())
         }
-        BenchmarkScenario::DeadCodeSmells => {
-            let report = structured["report"].as_str().ok_or_else(|| {
-                format!(
-                    "dead_code_smells result missing report string for `{}`",
-                    target.name
-                )
-            })?;
-            for expected in &target.dead_code_expect_report_contains {
-                if !report.contains(expected) {
-                    return Err(format!(
-                        "dead_code_smells report for `{}` did not contain expected text `{expected}`\n\nActual report:\n{report}",
-                        target.name,
-                    ));
-                }
-            }
-            for forbidden in &target.dead_code_expect_report_absent {
-                if report.contains(forbidden) {
-                    return Err(format!(
-                        "dead_code_smells report for `{}` contained forbidden text `{forbidden}`\n\nActual report:\n{report}",
-                        target.name,
-                    ));
-                }
-            }
-            Ok(())
-        }
         BenchmarkScenario::GetDefinition => {
             let results = structured["results"].as_array().ok_or_else(|| {
                 format!(
@@ -1894,6 +1971,17 @@ fn assert_scenario_result(
         | BenchmarkScenario::QueryCode
         | BenchmarkScenario::InteractiveCodeIntelligence
         | BenchmarkScenario::McpFairness => Ok(()),
+        BenchmarkScenario::DeadCodeSmells
+        | BenchmarkScenario::CommentDensityFiles
+        | BenchmarkScenario::CommentDensityCodeUnit
+        | BenchmarkScenario::ExceptionSmells
+        | BenchmarkScenario::TestAssertionSmells
+        | BenchmarkScenario::StructuralCloneSmells
+        | BenchmarkScenario::LongMethodSmells
+        | BenchmarkScenario::SecretLikeCode
+        | BenchmarkScenario::GitHotspots => {
+            unreachable!("code-quality scenarios assert per-probe reports")
+        }
     }
 }
 

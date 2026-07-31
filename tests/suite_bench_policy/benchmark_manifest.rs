@@ -70,16 +70,26 @@ fn checked_in_targets_manifest_loads_and_validates() {
             .scenario_set()
             .contains(&BenchmarkScenario::DeadCodeSmells)
         {
+            let mut probes = repo
+                .code_quality_probes_for(BenchmarkScenario::DeadCodeSmells)
+                .peekable();
             assert!(
-                !repo.dead_code_file_paths.is_empty(),
-                "{} must pin dead_code_file_paths for subset benchmark runs",
+                probes.peek().is_some(),
+                "{} must define a dead_code_smells probe",
                 repo.name
             );
-            assert!(
-                !repo.dead_code_fq_names.is_empty(),
-                "{} must define dead_code_fq_names",
-                repo.name
-            );
+            for probe in probes {
+                assert!(
+                    !probe.file_paths.is_empty(),
+                    "{} must pin dead_code_smells probe file_paths for subset benchmark runs",
+                    repo.name
+                );
+                assert!(
+                    !probe.fq_names.is_empty(),
+                    "{} must define dead_code_smells probe fq_names",
+                    repo.name
+                );
+            }
         }
     }
 
@@ -571,5 +581,96 @@ scenarios = ["workspace_build", "workspace_build"]
             .iter()
             .any(|message| message.contains("duplicate scenario `workspace_build`")),
         "{validation}"
+    );
+}
+
+#[test]
+fn manifest_validation_enforces_code_quality_probe_shapes() {
+    let manifest = r#"
+warmup_iterations = 1
+measured_iterations = 1
+required_languages = ["java"]
+required_scenarios = ["workspace_build"]
+
+[[repos]]
+name = "fixture"
+url = "https://example.com/fixture"
+commit = "deadbeef"
+languages = ["java"]
+extensions = ["java"]
+scenarios = ["workspace_build", "structural_clone_smells", "exception_smells", "comment_density_code_unit"]
+code_quality_probes = [
+  { scenario = "exception_smells", file_paths = ["src/A.java"], fq_names = ["com.example.A"], expect_report_contains = [] },
+  { scenario = "comment_density_code_unit", fq_names = ["com.example.A", "com.example.B"], expect_report_contains = ["- Symbol: `com.example.A`"] },
+  { scenario = "git_hotspots", expect_report_contains = ["src/A.java"] },
+  { scenario = "search_symbols", file_paths = ["src/A.java"], expect_report_contains = ["A"] },
+]
+"#;
+
+    let err = BenchmarkManifest::from_toml_str(manifest).expect_err("manifest should fail");
+    let ManifestLoadError::Validation(validation) = err else {
+        panic!("expected validation error");
+    };
+    let messages = validation.messages().join("\n");
+
+    for expected in [
+        "enables `structural_clone_smells` but defines no code_quality_probes entry",
+        "must define at least one expect_report_contains entry",
+        "defines fq_names but `exception_smells` does not take symbol inputs",
+        "must define exactly one fq_names entry for `comment_density_code_unit`",
+        "targets `git_hotspots` but the repo does not enable that scenario",
+        "names `search_symbols`, which is not a code-quality scenario",
+    ] {
+        assert!(
+            messages.contains(expected),
+            "missing `{expected}` in {messages}"
+        );
+    }
+}
+
+#[test]
+fn manifest_accepts_code_quality_probes_with_argument_overrides() {
+    let manifest = r#"
+warmup_iterations = 1
+measured_iterations = 1
+required_languages = ["java"]
+required_scenarios = ["workspace_build"]
+
+[[repos]]
+name = "fixture"
+url = "https://example.com/fixture"
+commit = "deadbeef"
+languages = ["java"]
+extensions = ["java"]
+scenarios = ["workspace_build", "structural_clone_smells", "git_hotspots"]
+code_quality_probes = [
+  { scenario = "structural_clone_smells", file_paths = ["src/A.java", "src/B.java"], arguments = { min_score = 45, shingle_size = 3 }, expect_report_contains = ["`com.example.A.render`"], expect_report_absent = ["not yet supported"] },
+  { scenario = "git_hotspots", arguments = { since_iso = "2020-01-01T00:00:00Z", until_iso = "2024-01-01T00:00:00Z" }, expect_report_contains = ["src/A.java"] },
+]
+"#;
+
+    let manifest = BenchmarkManifest::from_toml_str(manifest).expect("manifest should validate");
+    let repo = &manifest.repos[0];
+    let clone_probe = repo
+        .code_quality_probes_for(BenchmarkScenario::StructuralCloneSmells)
+        .next()
+        .expect("clone probe");
+    assert_eq!(clone_probe.file_paths, ["src/A.java", "src/B.java"]);
+    assert_eq!(
+        clone_probe.arguments.get("min_score"),
+        Some(&serde_json::json!(45))
+    );
+    assert_eq!(
+        clone_probe.arguments.get("shingle_size"),
+        Some(&serde_json::json!(3))
+    );
+    let hotspot_probe = repo
+        .code_quality_probes_for(BenchmarkScenario::GitHotspots)
+        .next()
+        .expect("hotspot probe");
+    assert!(hotspot_probe.file_paths.is_empty());
+    assert_eq!(
+        hotspot_probe.arguments.get("since_iso"),
+        Some(&serde_json::json!("2020-01-01T00:00:00Z"))
     );
 }

@@ -149,10 +149,9 @@ seed_file_paths = ["lib/application.js"]
 usage_targets = [
   { path = "lib/request.js", line = 16, column = 5 },
 ]
-dead_code_file_paths = ["lib/application.js"]
-dead_code_fq_names = ["tryRender"]
-dead_code_expect_report_contains = ["Candidate symbols analyzed: 1"]
-dead_code_expect_report_absent = ["no definition found", "not yet supported for smell analysis"]
+code_quality_probes = [
+  { scenario = "dead_code_smells", file_paths = ["lib/application.js"], fq_names = ["tryRender"], expect_report_contains = ["Candidate symbols analyzed: 1"], expect_report_absent = ["no definition found", "not yet supported for smell analysis"] },
+]
 definition_queries = [
   { path = "lib/application.js", line = 574, column = 3, symbol = "tryRender", expected_status = "resolved", expected_fqn = "tryRender" },
 ]
@@ -183,10 +182,9 @@ location_symbols = ["Ky.create$static"]
 summary_targets = ["source/core/Ky.ts"]
 seed_file_paths = ["source/core/Ky.ts"]
 usage_symbols = ["Ky"]
-dead_code_file_paths = ["source/core/Ky.ts"]
-dead_code_fq_names = ["Ky.create$static"]
-dead_code_expect_report_contains = ["Candidate symbols analyzed: 1"]
-dead_code_expect_report_absent = ["no definition found", "not yet supported for smell analysis"]
+code_quality_probes = [
+  { scenario = "dead_code_smells", file_paths = ["source/core/Ky.ts"], fq_names = ["Ky.create$static"], expect_report_contains = ["Candidate symbols analyzed: 1"], expect_report_absent = ["no definition found", "not yet supported for smell analysis"] },
+]
 definition_queries = [
   { path = "source/core/Ky.ts", line = 151, column = 18, symbol = "Ky", expected_status = "resolved", expected_fqn = "Ky" },
 ]
@@ -217,10 +215,9 @@ location_symbols = ["click.core.Command.main"]
 summary_targets = ["src/click/core.py"]
 seed_file_paths = ["src/click/core.py"]
 usage_symbols = ["click.core.Command.main"]
-dead_code_file_paths = ["src/click/core.py"]
-dead_code_fq_names = ["click.core.Command.main"]
-dead_code_expect_report_contains = ["Candidate symbols analyzed: 1"]
-dead_code_expect_report_absent = ["no definition found", "not yet supported for smell analysis"]
+code_quality_probes = [
+  { scenario = "dead_code_smells", file_paths = ["src/click/core.py"], fq_names = ["click.core.Command.main"], expect_report_contains = ["Candidate symbols analyzed: 1"], expect_report_absent = ["no definition found", "not yet supported for smell analysis"] },
+]
 definition_queries = [
   { path = "src/click/core.py", line = 1366, column = 42, symbol = "_complete_visible_commands", expected_status = "resolved", expected_fqn = "click.core._complete_visible_commands" },
 ]
@@ -282,10 +279,9 @@ seed_file_paths = [
   "src/Dispatcher/RegexBasedAbstract.php",
 ]
 usage_symbols = ["FastRoute.RouteCollector.addRoute"]
-dead_code_file_paths = ["src/RouteCollector.php"]
-dead_code_fq_names = ["FastRoute.RouteCollector.addRoute"]
-dead_code_expect_report_contains = ["Candidate symbols analyzed: 1"]
-dead_code_expect_report_absent = ["no definition found", "not yet supported for smell analysis"]
+code_quality_probes = [
+  { scenario = "dead_code_smells", file_paths = ["src/RouteCollector.php"], fq_names = ["FastRoute.RouteCollector.addRoute"], expect_report_contains = ["Candidate symbols analyzed: 1"], expect_report_absent = ["no definition found", "not yet supported for smell analysis"] },
+]
 definition_queries = [
   { path = "src/RouteCollector.php", line = 74, column = 16, symbol = "addRoute", expected_status = "resolved", expected_fqn = "FastRoute.RouteCollector.addRoute" },
 ]
@@ -315,10 +311,9 @@ location_symbols = ["scala.xml.Elem.copy"]
 summary_targets = ["shared/src/main/scala/scala/xml/Elem.scala"]
 seed_file_paths = ["shared/src/main/scala/scala/xml/Elem.scala"]
 usage_symbols = ["scala.xml.Elem.Elem"]
-dead_code_file_paths = ["shared/src/main/scala/scala/xml/Elem.scala"]
-dead_code_fq_names = ["scala.xml.Elem.copy"]
-dead_code_expect_report_contains = ["Candidate symbols analyzed: 1"]
-dead_code_expect_report_absent = ["no definition found", "not yet supported for smell analysis"]
+code_quality_probes = [
+  { scenario = "dead_code_smells", file_paths = ["shared/src/main/scala/scala/xml/Elem.scala"], fq_names = ["scala.xml.Elem.copy"], expect_report_contains = ["Candidate symbols analyzed: 1"], expect_report_absent = ["no definition found", "not yet supported for smell analysis"] },
+]
 definition_queries = [
   { path = "shared/src/main/scala/scala/xml/Elem.scala", line = 107, column = 13, symbol = "Elem", expected_status = "resolved", expected_fqn = "scala.xml.Elem$.apply" },
   { path = "shared/src/main/scala/scala/xml/Elem.scala", line = 107, column = 13, symbol = "Elem", expected_status = "resolved", expected_fqn = "scala.xml.Elem$.apply" },
@@ -381,10 +376,9 @@ search_patterns = ["Table"]
 location_symbols = ["org.jetbrains.exposed.v1.core.Table"]
 summary_targets = ["exposed-core/src/main/kotlin/org/jetbrains/exposed/v1/core/Table.kt"]
 usage_symbols = ["org.jetbrains.exposed.v1.exceptions.DuplicateColumnException.DuplicateColumnException"]
-dead_code_file_paths = ["exposed-core/src/main/kotlin/org/jetbrains/exposed/v1/core/Table.kt"]
-dead_code_fq_names = ["org.jetbrains.exposed.v1.core.isAlreadyQuoted"]
-dead_code_expect_report_contains = ["Candidate symbols analyzed: 1"]
-dead_code_expect_report_absent = ["no definition found", "not yet supported for smell analysis"]
+code_quality_probes = [
+  { scenario = "dead_code_smells", file_paths = ["exposed-core/src/main/kotlin/org/jetbrains/exposed/v1/core/Table.kt"], fq_names = ["org.jetbrains.exposed.v1.core.isAlreadyQuoted"], expect_report_contains = ["Candidate symbols analyzed: 1"], expect_report_absent = ["no definition found", "not yet supported for smell analysis"] },
+]
 definition_queries = [
   { path = "exposed-core/src/main/kotlin/org/jetbrains/exposed/v1/core/Table.kt", line = 614, column = 19, symbol = "DuplicateColumnException", expected_status = "resolved", expected_fqn = "org.jetbrains.exposed.v1.exceptions.DuplicateColumnException.DuplicateColumnException" },
 ]

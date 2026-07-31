@@ -291,10 +291,23 @@ regression.
   true positive; scenario-off is the only representation for "no signal available in this repo".
 
 
+- 2026-07-31 (Milestone 1): `BenchmarkScenario::ALL` stays at the original 12 entries during
+  Milestone 1 and grows only in Milestone 2. `ALL` doubles as the default `required_scenarios` and
+  the checked-in-manifest coverage assertion, so growing it before the corpus defines probes would
+  fail validation for every manifest built with defaults. The design section's statement that `ALL`
+  grows is therefore a Milestone 2 action.
+- 2026-07-31 (Milestone 1): `git_hotspots` probes must pin `since_iso`/`until_iso` through the
+  probe's `arguments` table: the tool's default window is "last 7 days from now", which a pinned
+  commit's history ages out of. Documented in `benchmark/README.md`.
+
 ## Progress
 
-- [ ] Milestone 1: scenario variants, generic probes, runner payloads and oracle, dead-code
-      migration, subset pinning, manifest tests, README probe docs.
+- [x] Milestone 1: scenario variants, generic probes, runner payloads and oracle, dead-code
+      migration, subset pinning, manifest tests, README probe docs. Validated 2026-07-31:
+      `cargo test --test suite_bench_policy` (201 passed, includes the two new probe-shape tests),
+      `cargo test --test suite_mcp_cli bifrost_benchmark` (12 passed, end-to-end run through the
+      per-probe runner path), `bifrost_benchmark validate` on the checked-in manifest, `cargo fmt`,
+      and `cargo clippy --all-targets --all-features -- -D warnings`.
 - [ ] Milestone 2: probes for all repos/languages with verified true signals; coverage matrix test;
       `required_scenarios` grown.
 - [ ] Milestone 3: workflow run verified, README coverage notes final, baseline promoted,
