@@ -154,6 +154,11 @@ The observable outcomes are:
   dw10 uses the separate per-repository `.bifrost/cache-dw10` namespace so changing embedding
   fingerprints cannot invalidate the completed `.bifrost/cache` Granite databases.
 - [ ] Run the three Granite retrieval arms over seeds 0, 1, and 2 at concurrency 30.
+- [x] (2026-07-31, implementation) Brokkbench `64a2da6131f` extends the existing
+  multi-arm scheduler with `--seeds`, so the full 91-task by three-arm by three-seed Granite
+  matrix can enter one 819-cell queue. A single 30-worker pool now remains occupied through
+  the campaign tail instead of draining once per seed; the legacy single-seed CLI and load-log
+  names remain unchanged. All 29 cimeval tests and Ruff checks on the touched files pass.
 - [ ] Score, leak-audit, analyze, and report the baseline and Granite results.
 - [ ] Run final validation, update this plan's retrospective, commit the Granite report, and
   stop before running any dw10 evaluation arms.
