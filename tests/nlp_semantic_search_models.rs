@@ -114,6 +114,12 @@ public class HttpFetcher {
         "expected no degraded-mode notes: {:?}",
         result.notes
     );
+    assert_eq!(result.retrieval_profile, "all-signals");
+    assert_eq!(result.requested_leg_counts.vector, 2);
+    assert_eq!(result.requested_leg_counts.bm25, 2);
+    assert_eq!(result.requested_leg_counts.coedit, 2);
+    assert!(result.timings.embedding_service_ms > 0.0);
+    assert!(result.timings.total_ms >= result.timings.embedding_service_ms);
     // The dense retriever should rank the settings-reading function first by fqfn.
     assert!(
         result
