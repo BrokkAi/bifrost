@@ -551,10 +551,12 @@ pub enum CodeQueryFlowSolverTermination {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CodeQueryFlowEvent {
     pub id: String,
+    pub site: CodeQueryFlowSymbolSite,
     pub path: String,
     pub range: CodeQueryRange,
     pub phase: &'static str,
     pub ordinal: u32,
+    pub carrier: CodeQueryFlowCarrierSymbol,
 }
 
 /// One stable source-backed locator used by a public value-flow symbol.
@@ -569,6 +571,9 @@ pub struct CodeQueryFlowSymbolSite {
     pub language: &'static str,
     pub declaration: Vec<CodeQueryFlowDeclarationSegment>,
     pub role: &'static str,
+    pub start_byte: u32,
+    pub end_byte: u32,
+    pub occurrence: u32,
     pub range: CodeQueryRange,
 }
 
@@ -699,9 +704,15 @@ pub struct CodeQueryFlowWitnessStep {
     pub kind: CodeQueryFlowWitnessStepKind,
     pub source: CodeQuerySourceSite,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_symbol: Option<CodeQueryFlowSymbolSite>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<CodeQuerySourceSite>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_symbol: Option<CodeQueryFlowSymbolSite>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<CodeQuerySourceSite>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_symbol: Option<CodeQueryFlowSymbolSite>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub boundary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

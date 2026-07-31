@@ -1,6 +1,3 @@
-#[path = "../common/value_flow_conformance.rs"]
-mod value_flow_conformance;
-
 use brokk_bifrost::Language;
 use brokk_bifrost::analyzer::dataflow::{PathQuality, SemanticInputStatus};
 use brokk_bifrost::analyzer::semantic::{IcfgEdgeKind, ProcedureKind, SemanticCapability};
@@ -8,95 +5,12 @@ use brokk_bifrost::analyzer::value_flow::{
     ValueFlowMayStatus, ValueFlowMustStatus, ValueFlowPortKey,
 };
 
-use value_flow_conformance::{
+use crate::value_flow_conformance::{
     CallArgumentSink, CallSelector, CarrierMilestone, ExpectedMeeting, ExpectedSinkOutcome,
     ExpectedWitness, InlineSourceFile, InterproceduralMilestone, ParameterSource,
     ProcedureSelector, ValueFlowConformanceCase, assert_value_flow_conformance,
 };
-
-const JAVA_SOURCE: &str = r#"
-final class ExactFlowFixture {
-  static String relay(String value) {
-    String relayed = value;
-    return relayed;
-  }
-
-  static void sink(String flowed, String clean) {}
-
-  static void run(String input) {
-    String copy = relay(input);
-    String clean = "clean";
-    sink(copy, clean);
-  }
-}
-"#;
-
-const JAVA_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
-    path: "src/ExactFlowFixture.java",
-    source: JAVA_SOURCE,
-}];
-
-const TYPESCRIPT_SOURCE: &str = r#"
-function relay(value: string): string {
-  const relayed = value;
-  return relayed;
-}
-
-function sink(flowed: string, clean: string): void {}
-
-function run(input: string): void {
-  const copy = relay(input);
-  const clean = "clean";
-  sink(copy, clean);
-}
-"#;
-
-const TYPESCRIPT_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
-    path: "src/exact_flow.ts",
-    source: TYPESCRIPT_SOURCE,
-}];
-
-const JAVA_PROCEDURES: &[ProcedureSelector<'_>] = &[
-    ProcedureSelector {
-        alias: "run",
-        path: "src/ExactFlowFixture.java",
-        name: "run",
-        kind: ProcedureKind::Method,
-    },
-    ProcedureSelector {
-        alias: "relay",
-        path: "src/ExactFlowFixture.java",
-        name: "relay",
-        kind: ProcedureKind::Method,
-    },
-    ProcedureSelector {
-        alias: "sink",
-        path: "src/ExactFlowFixture.java",
-        name: "sink",
-        kind: ProcedureKind::Method,
-    },
-];
-
-const TYPESCRIPT_PROCEDURES: &[ProcedureSelector<'_>] = &[
-    ProcedureSelector {
-        alias: "run",
-        path: "src/exact_flow.ts",
-        name: "run",
-        kind: ProcedureKind::Function,
-    },
-    ProcedureSelector {
-        alias: "relay",
-        path: "src/exact_flow.ts",
-        name: "relay",
-        kind: ProcedureKind::Function,
-    },
-    ProcedureSelector {
-        alias: "sink",
-        path: "src/exact_flow.ts",
-        name: "sink",
-        kind: ProcedureKind::Function,
-    },
-];
+use crate::value_flow_scenarios::{with_java_exact_helper, with_typescript_exact_helper};
 
 const CALLS: &[CallSelector<'_>] = &[
     CallSelector {
@@ -112,47 +26,6 @@ const CALLS: &[CallSelector<'_>] = &[
         occurrence: 0,
     },
 ];
-
-const JAVA_SINKS: &[CallArgumentSink<'_>] = &[
-    CallArgumentSink {
-        alias: "flowed",
-        call: "sink_call",
-        argument: 0,
-        outcome: ExpectedSinkOutcome::Reached,
-    },
-    CallArgumentSink {
-        alias: "clean",
-        call: "sink_call",
-        argument: 1,
-        outcome: ExpectedSinkOutcome::NotReached,
-    },
-];
-
-const TYPESCRIPT_SINKS: &[CallArgumentSink<'_>] = &[
-    CallArgumentSink {
-        alias: "flowed",
-        call: "sink_call",
-        argument: 0,
-        outcome: ExpectedSinkOutcome::Reached,
-    },
-    CallArgumentSink {
-        alias: "clean",
-        call: "sink_call",
-        argument: 1,
-        outcome: ExpectedSinkOutcome::Inconclusive,
-    },
-];
-
-fn expected_carriers(path: &str) -> Vec<CarrierMilestone> {
-    expected_carriers_for_calls(
-        path,
-        path,
-        "relay(input)",
-        "sink(copy, clean)",
-        "relayed",
-        "copy",
-    )
-}
 
 fn expected_carriers_for_calls(
     run_path: &str,
@@ -240,6 +113,7 @@ fn expected_meetings<'case>(
     [ExpectedMeeting {
         sink: "flowed",
         meeting_count,
+        public_endpoint_count: meeting_count,
         may_status: ValueFlowMayStatus::Proven,
         must_status: ValueFlowMustStatus::NotEstablished,
         uncertain: false,
@@ -374,48 +248,12 @@ fn assert_single_file_exact_helper_flow(
 
 #[test]
 fn java_exact_helper_flow() {
-    let expected_carriers = expected_carriers("src/ExactFlowFixture.java");
-    let expected_meetings = expected_meetings(&expected_carriers, 1);
-    assert_value_flow_conformance(&ValueFlowConformanceCase {
-        name: "java",
-        language: Language::Java,
-        files: JAVA_FILES,
-        procedures: JAVA_PROCEDURES,
-        root: "run",
-        calls: CALLS,
-        source: ParameterSource {
-            procedure: "run",
-            ordinal: 0,
-        },
-        sinks: JAVA_SINKS,
-        expected_discovery_status: SemanticInputStatus::Unknown,
-        expected_discovery_complete: false,
-        expected_result_complete: true,
-        expected_meetings: &expected_meetings,
-    });
+    with_java_exact_helper(assert_value_flow_conformance);
 }
 
 #[test]
 fn typescript_exact_helper_flow() {
-    let expected_carriers = expected_carriers("src/exact_flow.ts");
-    let expected_meetings = expected_meetings(&expected_carriers, 6);
-    assert_value_flow_conformance(&ValueFlowConformanceCase {
-        name: "typescript",
-        language: Language::TypeScript,
-        files: TYPESCRIPT_FILES,
-        procedures: TYPESCRIPT_PROCEDURES,
-        root: "run",
-        calls: CALLS,
-        source: ParameterSource {
-            procedure: "run",
-            ordinal: 0,
-        },
-        sinks: TYPESCRIPT_SINKS,
-        expected_discovery_status: SemanticInputStatus::Unknown,
-        expected_discovery_complete: false,
-        expected_result_complete: false,
-        expected_meetings: &expected_meetings,
-    });
+    with_typescript_exact_helper(assert_value_flow_conformance);
 }
 
 #[test]

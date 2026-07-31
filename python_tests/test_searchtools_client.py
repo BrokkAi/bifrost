@@ -607,21 +607,27 @@ class CodeQueryModelTest(unittest.TestCase):
                 }
             ],
             "role": "procedure",
+            "start_byte": 16,
+            "end_byte": 19,
+            "occurrence": 0,
             "range": source_range,
         }
         field_site = {**symbol_site, "id": "site-field", "role": "memory_location"}
+        parameter_carrier = {
+            "kind": "port",
+            "id": "carrier-parameter",
+            "procedure": symbol_site,
+            "port": {"kind": "parameter", "ordinal": 0},
+        }
+        event["carrier"] = parameter_carrier
+        event["site"] = symbol_site
         carrier_fact = {
             "kind": "carrier",
             "source": {**event, "phase": "before_effects"},
             "carrier": {
                 "kind": "location",
                 "id": "carrier-location",
-                "root": {
-                    "kind": "port",
-                    "id": "carrier-parameter",
-                    "procedure": symbol_site,
-                    "port": {"kind": "parameter", "ordinal": 0},
-                },
+                "root": parameter_carrier,
                 "selectors": [
                     {"kind": "field", "field": field_site},
                     {
@@ -679,7 +685,11 @@ class CodeQueryModelTest(unittest.TestCase):
                 {
                     "kind": {"type": "edge", "edge_kind": "normal"},
                     "source": {"path": "src/Flow.java", "range": source_range},
+                    "source_symbol": symbol_site,
                     "target": {"path": "src/Flow.java", "range": source_range},
+                    "target_symbol": field_site,
+                    "origin": {"path": "src/Flow.java", "range": source_range},
+                    "origin_symbol": symbol_site,
                     "boundary": "dispatch",
                     "input": carrier_fact,
                     "output": meeting_fact,
@@ -742,6 +752,9 @@ class CodeQueryModelTest(unittest.TestCase):
         self.assertIsInstance(result.results[1], CodeQueryFlowWitness)
         self.assertEqual(result.results[1].steps[0].boundary, "dispatch")
         self.assertIsInstance(result.results[1].steps[0].input, CodeQueryFlowFactSymbol)
+        self.assertEqual(result.results[1].steps[0].source_symbol.id, "site-run")
+        self.assertEqual(result.results[1].steps[0].target_symbol.id, "site-field")
+        self.assertEqual(result.results[1].steps[0].origin_symbol.id, "site-run")
         self.assertEqual(result.results[1].steps[0].input.kind, "carrier")
         self.assertEqual(
             result.results[1].steps[0].input.carrier.root.port.ordinal,

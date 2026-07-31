@@ -900,19 +900,23 @@ class CodeQueryFlowCompletion(StrEnum):
 @dataclass(frozen=True)
 class CodeQueryFlowEvent:
     id: str
+    site: CodeQueryFlowSymbolSite
     path: str
     range: CodeQueryRange
     phase: str
     ordinal: int
+    carrier: CodeQueryFlowCarrierSymbol
 
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryFlowEvent:
         return cls(
             id=data["id"],
+            site=CodeQueryFlowSymbolSite.from_dict(data["site"]),
             path=data["path"],
             range=CodeQueryRange.from_dict(data["range"]),
             phase=data["phase"],
             ordinal=_strict_nonnegative_int(data, "ordinal"),
+            carrier=CodeQueryFlowCarrierSymbol.from_dict(data["carrier"]),
         )
 
 
@@ -949,6 +953,9 @@ class CodeQueryFlowSymbolSite:
     language: str
     declaration: tuple[CodeQueryFlowDeclarationSegment, ...]
     role: str
+    start_byte: int
+    end_byte: int
+    occurrence: int
     range: CodeQueryRange
 
     @classmethod
@@ -962,6 +969,9 @@ class CodeQueryFlowSymbolSite:
                 for segment in _strict_list(data, "declaration")
             ),
             role=data["role"],
+            start_byte=_strict_nonnegative_int(data, "start_byte"),
+            end_byte=_strict_nonnegative_int(data, "end_byte"),
+            occurrence=_strict_nonnegative_int(data, "occurrence"),
             range=CodeQueryRange.from_dict(data["range"]),
         )
 
@@ -1182,6 +1192,9 @@ class CodeQueryFlowWitnessStep:
     target: CodeQuerySourceSite | None = None
     origin: CodeQuerySourceSite | None = None
     boundary: str | None = None
+    source_symbol: CodeQueryFlowSymbolSite | None = None
+    target_symbol: CodeQueryFlowSymbolSite | None = None
+    origin_symbol: CodeQueryFlowSymbolSite | None = None
     input: CodeQueryFlowFactSymbol | None = None
     output: CodeQueryFlowFactSymbol | None = None
 
@@ -1202,6 +1215,21 @@ class CodeQueryFlowWitnessStep:
                 else None
             ),
             boundary=data.get("boundary"),
+            source_symbol=(
+                CodeQueryFlowSymbolSite.from_dict(data["source_symbol"])
+                if "source_symbol" in data
+                else None
+            ),
+            target_symbol=(
+                CodeQueryFlowSymbolSite.from_dict(data["target_symbol"])
+                if "target_symbol" in data
+                else None
+            ),
+            origin_symbol=(
+                CodeQueryFlowSymbolSite.from_dict(data["origin_symbol"])
+                if "origin_symbol" in data
+                else None
+            ),
             input=(
                 CodeQueryFlowFactSymbol.from_dict(data["input"])
                 if "input" in data

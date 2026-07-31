@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use brokk_bifrost::analyzer::dataflow::{
     DataflowRequest, PathQuality, SemanticInputStatus, SolverBudget, SummaryWitnessStepKind,
@@ -13,10 +14,10 @@ use brokk_bifrost::analyzer::dataflow::{
 };
 use brokk_bifrost::analyzer::semantic::{
     CallBinding, CallBindings, CallSiteHandle, CancellationToken, DeclarationLocator,
-    DispatchOracle, EvidenceCompleteness, IcfgEdgeKind, OracleCallContext, ProcedureHandle,
-    ProcedureKind, ProcedurePortKind, ProgramPointHandle, ProofStatus, SemanticBudget,
-    SemanticLanguage, SemanticLocator, SemanticRequest, SemanticRole, SourceAnchor,
-    ValueFlowOracle, ValueFlowRelationKind, WorkspaceRelativePath,
+    DispatchBoundaryKind, DispatchOracle, EvidenceCompleteness, IcfgEdgeKind, OracleCallContext,
+    ProcedureHandle, ProcedureKind, ProcedurePortKind, ProgramPointHandle, ProofStatus,
+    ReturnTransferKind, SemanticBudget, SemanticLanguage, SemanticLocator, SemanticRequest,
+    SemanticRole, SourceAnchor, ValueFlowOracle, ValueFlowRelationKind, WorkspaceRelativePath,
 };
 use brokk_bifrost::analyzer::value_flow::{
     ValueFlowCarrier, ValueFlowCarrierKey, ValueFlowEventKey, ValueFlowEventKind, ValueFlowInput,
@@ -27,6 +28,7 @@ use brokk_bifrost::analyzer::value_flow::{
 };
 use brokk_bifrost::{AnalyzerConfig, Language, WorkspaceAnalyzer};
 use pretty_assertions::assert_eq;
+use serde_json::{Value, json};
 
 use crate::common::{BuiltInlineTestProject, InlineTestProject, semantic_graph::SemanticGraph};
 
@@ -129,6 +131,7 @@ pub struct ExpectedWitness<'case> {
 pub struct ExpectedMeeting<'case> {
     pub sink: &'case str,
     pub meeting_count: usize,
+    pub public_endpoint_count: usize,
     pub may_status: ValueFlowMayStatus,
     pub must_status: ValueFlowMustStatus,
     pub uncertain: bool,
@@ -298,21 +301,29 @@ struct ProjectedWitnessStep {
     completeness: EvidenceCompleteness,
 }
 
-struct ResolvedCase {
+pub struct ResolvedValueFlowConformanceCase {
     _project: BuiltInlineTestProject,
-    analyzer: WorkspaceAnalyzer,
+    pub analyzer: WorkspaceAnalyzer,
+    pub root: ProcedureHandle,
     procedures: HashMap<String, ProcedureHandle>,
     calls: HashMap<String, CallSiteHandle>,
     call_bindings: HashMap<String, CallBindings>,
-    plan: ValueFlowPlan,
-    witness_plan: ValueFlowPlan,
+    pub plan: Arc<ValueFlowPlan>,
+    pub witness_plan: Arc<ValueFlowPlan>,
     sink_ids: HashMap<String, brokk_bifrost::analyzer::value_flow::ValueFlowSinkId>,
     witness_sink_ids: HashMap<String, brokk_bifrost::analyzer::value_flow::ValueFlowSinkId>,
 }
 
 pub fn assert_value_flow_conformance(case: &ValueFlowConformanceCase<'_>) {
-    let resolved = build_case(case);
-    let root = procedure(&resolved.procedures, case.root);
+    let resolved = resolve_value_flow_conformance_case(case);
+    assert_resolved_value_flow_conformance(case, &resolved);
+}
+
+pub fn assert_resolved_value_flow_conformance(
+    case: &ValueFlowConformanceCase<'_>,
+    resolved: &ResolvedValueFlowConformanceCase,
+) {
+    let root = &resolved.root;
     let cancellation = CancellationToken::default();
     let mut solver_budget = SolverBudget::default();
     let mut semantic_budget = SemanticBudget::default();
@@ -349,7 +360,9 @@ pub fn assert_value_flow_conformance(case: &ValueFlowConformanceCase<'_>) {
     assert_witness(case, &resolved);
 }
 
-fn build_case(case: &ValueFlowConformanceCase<'_>) -> ResolvedCase {
+pub fn resolve_value_flow_conformance_case(
+    case: &ValueFlowConformanceCase<'_>,
+) -> ResolvedValueFlowConformanceCase {
     let mut builder = InlineTestProject::with_language(case.language);
     for file in case.files {
         builder = builder.file(file.path, file.source);
@@ -428,6 +441,7 @@ fn build_case(case: &ValueFlowConformanceCase<'_>) -> ResolvedCase {
     }
 
     let root = procedure(&procedures, case.root).clone();
+    let resolved_root = root.clone();
     let source_procedure = procedure(&procedures, case.source.procedure);
     let root_snapshot = snapshots
         .iter()
@@ -550,14 +564,15 @@ fn build_case(case: &ValueFlowConformanceCase<'_>) -> ResolvedCase {
             .unwrap_or_else(|error| panic!("{} witness plan failed: {error}", case.name));
     let sink_ids = resolve_sink_ids(&plan, &sink_keys);
     let witness_sink_ids = resolve_sink_ids(&witness_plan, &sink_keys);
-    ResolvedCase {
+    ResolvedValueFlowConformanceCase {
         _project: project,
         analyzer,
+        root: resolved_root,
         procedures,
         calls,
         call_bindings,
-        plan,
-        witness_plan,
+        plan: Arc::new(plan),
+        witness_plan: Arc::new(witness_plan),
         sink_ids,
         witness_sink_ids,
     }
@@ -670,7 +685,7 @@ fn select_call_and_bindings(
 
 fn assert_exact_meetings(
     case: &ValueFlowConformanceCase<'_>,
-    resolved: &ResolvedCase,
+    resolved: &ResolvedValueFlowConformanceCase,
     result: &ValueFlowSummaryResult,
 ) {
     let source = resolved.plan.sources().next().expect("configured source").1;
@@ -709,7 +724,7 @@ fn assert_exact_meetings(
 
 fn assert_sink_outcomes(
     case: &ValueFlowConformanceCase<'_>,
-    resolved: &ResolvedCase,
+    resolved: &ResolvedValueFlowConformanceCase,
     result: &ValueFlowSummaryResult,
 ) {
     let meeting_sinks = case
@@ -785,7 +800,10 @@ fn meeting_matches(meeting: &ValueFlowMeeting, expectation: &ExpectedMeeting<'_>
         && meeting.path_qualities().iter().collect::<Vec<_>>() == expectation.path_qualities
 }
 
-fn assert_witness(case: &ValueFlowConformanceCase<'_>, resolved: &ResolvedCase) {
+fn assert_witness(
+    case: &ValueFlowConformanceCase<'_>,
+    resolved: &ResolvedValueFlowConformanceCase,
+) {
     let root = procedure(&resolved.procedures, case.root);
     let cancellation = CancellationToken::default();
     let mut solver_budget = SolverBudget::default();
@@ -806,7 +824,7 @@ fn assert_witness(case: &ValueFlowConformanceCase<'_>, resolved: &ResolvedCase) 
 
 fn assert_meeting_witness(
     case: &ValueFlowConformanceCase<'_>,
-    resolved: &ResolvedCase,
+    resolved: &ResolvedValueFlowConformanceCase,
     result: &ValueFlowSummaryResult,
     expectation: &ExpectedMeeting<'_>,
 ) {
@@ -1160,7 +1178,7 @@ fn append_carrier_milestone(
 
 fn configured_call_for_origin<'resolved, 'case>(
     case: &'resolved ValueFlowConformanceCase<'case>,
-    resolved: &'resolved ResolvedCase,
+    resolved: &'resolved ResolvedValueFlowConformanceCase,
     step: &ProjectedWitnessStep,
 ) -> (&'resolved CallSelector<'case>, &'resolved CallSiteHandle) {
     let origin = step.origin.as_ref().expect("call edge has origin");
@@ -1175,7 +1193,7 @@ fn configured_call_for_origin<'resolved, 'case>(
 
 fn append_return_binding_milestone(
     case: &ValueFlowConformanceCase<'_>,
-    resolved: &ResolvedCase,
+    resolved: &ResolvedValueFlowConformanceCase,
     step: &ProjectedWitnessStep,
     milestones: &mut Vec<CarrierMilestone>,
 ) {
@@ -1252,6 +1270,299 @@ fn procedure_name(locator: &StableLocator) -> &str {
         .last()
         .and_then(|segment| segment.name())
         .expect("baseline locators belong to named procedures")
+}
+
+pub fn direct_witness_symbol_sequences(
+    case: &ValueFlowConformanceCase<'_>,
+    resolved: &ResolvedValueFlowConformanceCase,
+) -> BTreeSet<String> {
+    let cancellation = CancellationToken::default();
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let result = solve_value_flow_with_witnesses(
+        &resolved.root,
+        &resolved.analyzer.icfg_provider(),
+        &resolved.witness_plan,
+        WitnessRetentionLimits::new(8).expect("positive witness retention"),
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .unwrap_or_else(|error| panic!("{} direct symbol solve failed: {error}", case.name));
+    let mut sequences = BTreeSet::new();
+    for meeting in result.meetings() {
+        for quality in meeting.path_qualities().iter() {
+            let witness = result
+                .witness_for_meeting(meeting, quality, WitnessReconstructionLimits::default())
+                .unwrap_or_else(|error| {
+                    panic!("{} direct symbol witness failed: {error}", case.name)
+                });
+            let steps = witness
+                .steps()
+                .iter()
+                .map(|step| direct_step_symbol(&resolved.witness_plan, &result, step))
+                .collect::<Vec<_>>();
+            sequences.insert(serde_json::to_string(&steps).expect("canonical direct witness JSON"));
+        }
+    }
+    sequences
+}
+
+fn direct_step_symbol(
+    plan: &ValueFlowPlan,
+    result: &ValueFlowSummaryResult,
+    step: &brokk_bifrost::analyzer::dataflow::SummaryWitnessStep,
+) -> Value {
+    let kind = match step.kind() {
+        SummaryWitnessStepKind::Seed => json!({"type": "seed"}),
+        SummaryWitnessStepKind::Edge(kind) => {
+            json!({"type": "edge", "edge_kind": kind.label()})
+        }
+        SummaryWitnessStepKind::EndSummaryGap(kind) => json!({
+            "type": "end_summary_gap",
+            "return_kind": match kind {
+                ReturnTransferKind::Normal => "normal",
+                ReturnTransferKind::Exceptional => "exceptional",
+            },
+        }),
+    };
+    let mut symbol = serde_json::Map::from_iter([
+        ("kind".to_string(), kind),
+        (
+            "source_symbol".to_string(),
+            direct_locator_symbol(&point_locator(step.source())),
+        ),
+        (
+            "input".to_string(),
+            direct_fact_symbol(plan, result, step.input_fact()),
+        ),
+        (
+            "output".to_string(),
+            direct_fact_symbol(plan, result, step.output_fact()),
+        ),
+    ]);
+    if let Some(target) = step.target() {
+        symbol.insert(
+            "target_symbol".to_string(),
+            direct_locator_symbol(&point_locator(target)),
+        );
+    }
+    if let Some(origin) = step.origin() {
+        symbol.insert(
+            "origin_symbol".to_string(),
+            direct_locator_symbol(&call_locator(origin)),
+        );
+    }
+    if let Some(boundary) = step.boundary() {
+        symbol.insert(
+            "boundary".to_string(),
+            json!(match boundary {
+                DispatchBoundaryKind::External(_) => "external",
+                DispatchBoundaryKind::Unmaterialized(_) => "unmaterialized",
+                DispatchBoundaryKind::Deferred { .. } => "deferred",
+                DispatchBoundaryKind::Unresolved => "unresolved",
+                DispatchBoundaryKind::Truncated => "truncated",
+            }),
+        );
+    }
+    Value::Object(symbol)
+}
+
+fn direct_fact_symbol(
+    plan: &ValueFlowPlan,
+    result: &ValueFlowSummaryResult,
+    fact_id: brokk_bifrost::analyzer::dataflow::FactId,
+) -> Value {
+    let fact = *result
+        .result()
+        .fact(fact_id)
+        .expect("direct witness fact resolves");
+    let uncertain = !fact.uncertainty().is_empty();
+    let mut symbol = match (fact.source(), fact.carrier(), fact.sink()) {
+        (None, None, None) => return json!({"kind": "zero"}),
+        (Some(source), Some(carrier), None) => serde_json::Map::from_iter([
+            ("kind".to_string(), json!("carrier")),
+            (
+                "source".to_string(),
+                direct_source_event_symbol(
+                    plan.source(source).expect("direct witness source resolves"),
+                ),
+            ),
+            (
+                "carrier".to_string(),
+                direct_carrier_symbol(
+                    plan.carrier_key(carrier)
+                        .expect("direct witness carrier resolves"),
+                ),
+            ),
+        ]),
+        (Some(source), None, Some(sink)) => serde_json::Map::from_iter([
+            ("kind".to_string(), json!("meeting")),
+            (
+                "source".to_string(),
+                direct_source_event_symbol(
+                    plan.source(source).expect("direct meeting source resolves"),
+                ),
+            ),
+            (
+                "sink".to_string(),
+                direct_sink_event_symbol(plan.sink(sink).expect("direct meeting sink resolves")),
+            ),
+        ]),
+        shape => panic!("invalid direct witness fact shape: {shape:?}"),
+    };
+    if uncertain {
+        symbol.insert("uncertain".to_string(), json!(true));
+    }
+    Value::Object(symbol)
+}
+
+fn direct_source_event_symbol(source: &ValueFlowSourceSpec) -> Value {
+    direct_event_symbol(
+        source.key().site(),
+        source.key().ordinal(),
+        source.phase(),
+        source.carrier(),
+    )
+}
+
+fn direct_sink_event_symbol(sink: &ValueFlowSinkSpec) -> Value {
+    direct_event_symbol(
+        sink.key().site(),
+        sink.key().ordinal(),
+        sink.phase(),
+        sink.carrier(),
+    )
+}
+
+fn direct_event_symbol(
+    site: &SemanticLocator,
+    ordinal: u32,
+    phase: ValueFlowObservationPhase,
+    carrier: &ValueFlowCarrier,
+) -> Value {
+    json!({
+        "site": direct_locator_symbol(&site.into()),
+        "phase": match phase {
+            ValueFlowObservationPhase::BeforeEffects => "before_effects",
+            ValueFlowObservationPhase::AfterEffects => "after_effects",
+        },
+        "ordinal": ordinal,
+        "carrier": direct_carrier_symbol(
+            &carrier.stable_key().expect("direct event carrier has stable identity")
+        ),
+    })
+}
+
+fn direct_carrier_symbol(carrier: &ValueFlowCarrierKey) -> Value {
+    match carrier {
+        ValueFlowCarrierKey::Value {
+            locator,
+            role,
+            ordinal,
+        } => {
+            let mut symbol = serde_json::Map::from_iter([
+                ("kind".to_string(), json!("value")),
+                ("site".to_string(), direct_locator_symbol(&locator.into())),
+                ("role".to_string(), json!(role)),
+            ]);
+            if let Some(ordinal) = ordinal {
+                symbol.insert("ordinal".to_string(), json!(ordinal));
+            }
+            Value::Object(symbol)
+        }
+        ValueFlowCarrierKey::Port { procedure, kind } => json!({
+            "kind": "port",
+            "procedure": direct_locator_symbol(&procedure.into()),
+            "port": match kind {
+                brokk_bifrost::analyzer::value_flow::ValueFlowPortKey::Receiver => {
+                    json!({"kind": "receiver"})
+                }
+                brokk_bifrost::analyzer::value_flow::ValueFlowPortKey::Parameter { ordinal } => {
+                    json!({"kind": "parameter", "ordinal": ordinal})
+                }
+                brokk_bifrost::analyzer::value_flow::ValueFlowPortKey::NormalReturn => {
+                    json!({"kind": "normal_return"})
+                }
+                brokk_bifrost::analyzer::value_flow::ValueFlowPortKey::ExceptionalReturn => {
+                    json!({"kind": "exceptional_return"})
+                }
+                brokk_bifrost::analyzer::value_flow::ValueFlowPortKey::Capture { slot } => {
+                    json!({"kind": "capture", "slot": slot})
+                }
+            },
+        }),
+        ValueFlowCarrierKey::Allocation { locator } => json!({
+            "kind": "allocation",
+            "site": direct_locator_symbol(&locator.into()),
+        }),
+        ValueFlowCarrierKey::CallResult {
+            call,
+            result,
+            callee,
+        } => json!({
+            "kind": "call_result",
+            "call": direct_locator_symbol(&call.into()),
+            "result": direct_carrier_symbol(result),
+            "callee": direct_locator_symbol(&callee.into()),
+        }),
+        ValueFlowCarrierKey::ScopedRoot { kind, locator } => json!({
+            "kind": "scoped_root",
+            "root_kind": match kind {
+                ValueFlowScopedRootKind::Static => "static",
+                ValueFlowScopedRootKind::LexicalCell => "lexical_cell",
+                ValueFlowScopedRootKind::TypeSummary => "type_summary",
+                ValueFlowScopedRootKind::ModuleObject => "module_object",
+                ValueFlowScopedRootKind::External => "external",
+            },
+            "site": direct_locator_symbol(&locator.into()),
+        }),
+        ValueFlowCarrierKey::Location {
+            root,
+            selectors,
+            exact,
+        } => json!({
+            "kind": "location",
+            "root": direct_carrier_symbol(root),
+            "selectors": selectors.iter().map(|selector| match selector {
+                ValueFlowSelectorKey::Field(locator) => json!({
+                    "kind": "field",
+                    "field": direct_locator_symbol(&locator.into()),
+                }),
+                ValueFlowSelectorKey::ExactIndex(index) => json!({
+                    "kind": "exact_index",
+                    "index": direct_carrier_symbol(index),
+                }),
+                ValueFlowSelectorKey::AnyIndex => json!({"kind": "any_index"}),
+            }).collect::<Vec<_>>(),
+            "exact": exact,
+        }),
+    }
+}
+
+fn direct_locator_symbol(locator: &StableLocator) -> Value {
+    let span = locator.anchor.span();
+    json!({
+        "path": locator.path.as_str(),
+        "language": locator.language.stable_label(),
+        "declaration": locator.declaration.segments().iter().map(|segment| {
+            let span = segment.anchor().span();
+            let mut symbol = serde_json::Map::from_iter([
+                ("kind".to_string(), json!(segment.kind().stable_label())),
+                ("start_byte".to_string(), json!(span.start_byte())),
+                ("end_byte".to_string(), json!(span.end_byte())),
+                ("occurrence".to_string(), json!(segment.anchor().occurrence())),
+                ("sibling_ordinal".to_string(), json!(segment.sibling_ordinal())),
+            ]);
+            if let Some(name) = segment.name() {
+                symbol.insert("name".to_string(), json!(name));
+            }
+            Value::Object(symbol)
+        }).collect::<Vec<_>>(),
+        "role": locator.role.stable_label(),
+        "start_byte": span.start_byte(),
+        "end_byte": span.end_byte(),
+        "occurrence": locator.anchor.occurrence(),
+    })
 }
 
 fn procedure<'map>(

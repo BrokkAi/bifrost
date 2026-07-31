@@ -704,10 +704,18 @@ fn public_event(
     digest.push(&spec.ordinal().to_le_bytes());
     CodeQueryFlowEvent {
         id: digest.finish().to_string(),
+        site: public_symbol_site(workspace, locator),
         path: locator.path().as_str().to_string(),
         range: locator_range(workspace, locator),
         phase: spec.phase_label(),
         ordinal: spec.ordinal(),
+        carrier: public_carrier_symbol(
+            workspace,
+            &spec
+                .carrier()
+                .stable_key()
+                .expect("validated value-flow event carrier has stable identity"),
+        ),
     }
 }
 
@@ -715,6 +723,7 @@ trait FlowEventSpec {
     fn locator(&self) -> &SemanticLocator;
     fn ordinal(&self) -> u32;
     fn phase_label(&self) -> &'static str;
+    fn carrier(&self) -> &crate::analyzer::value_flow::ValueFlowCarrier;
 }
 
 impl FlowEventSpec for ValueFlowSourceSpec {
@@ -729,6 +738,10 @@ impl FlowEventSpec for ValueFlowSourceSpec {
     fn phase_label(&self) -> &'static str {
         phase_label(self.phase())
     }
+
+    fn carrier(&self) -> &crate::analyzer::value_flow::ValueFlowCarrier {
+        ValueFlowSourceSpec::carrier(self)
+    }
 }
 
 impl FlowEventSpec for crate::analyzer::value_flow::ValueFlowSinkSpec {
@@ -742,6 +755,10 @@ impl FlowEventSpec for crate::analyzer::value_flow::ValueFlowSinkSpec {
 
     fn phase_label(&self) -> &'static str {
         phase_label(self.phase())
+    }
+
+    fn carrier(&self) -> &crate::analyzer::value_flow::ValueFlowCarrier {
+        crate::analyzer::value_flow::ValueFlowSinkSpec::carrier(self)
     }
 }
 
@@ -960,8 +977,11 @@ pub(crate) fn public_witness_step(
     CodeQueryFlowWitnessStep {
         kind,
         source: point_site(workspace, step.source()),
+        source_symbol: None,
         target: step.target().map(|point| point_site(workspace, point)),
+        target_symbol: None,
         origin: step.origin().map(|call| call_site(workspace, call)),
+        origin_symbol: None,
         boundary: step.boundary().map(boundary_label),
         input: None,
         output: None,
@@ -977,6 +997,11 @@ fn public_value_flow_witness_step(
     step: &crate::analyzer::dataflow::SummaryWitnessStep,
 ) -> CodeQueryFlowWitnessStep {
     let mut public = public_witness_step(workspace, step);
+    public.source_symbol = Some(point_symbol_site(workspace, step.source()));
+    public.target_symbol = step
+        .target()
+        .map(|point| point_symbol_site(workspace, point));
+    public.origin_symbol = step.origin().map(|call| call_symbol_site(workspace, call));
     public.input = Some(public_fact_symbol(
         workspace,
         plan_ref,
@@ -1140,6 +1165,8 @@ fn public_symbol_site(
 ) -> CodeQueryFlowSymbolSite {
     let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.flow_symbol_site.v1");
     hash_public_locator(&mut digest, locator);
+    let anchor = locator.anchor();
+    let span = anchor.span();
     CodeQueryFlowSymbolSite {
         id: digest.finish().to_string(),
         path: locator.path().as_str().to_string(),
@@ -1161,6 +1188,9 @@ fn public_symbol_site(
             })
             .collect(),
         role: locator.role().stable_label(),
+        start_byte: span.start_byte(),
+        end_byte: span.end_byte(),
+        occurrence: anchor.occurrence(),
         range: locator_range(workspace, locator),
     }
 }
@@ -1191,6 +1221,24 @@ fn point_site(workspace: &WorkspaceAnalyzer, handle: &ProgramPointHandle) -> Cod
     public_site(workspace, locator)
 }
 
+fn point_symbol_site(
+    workspace: &WorkspaceAnalyzer,
+    handle: &ProgramPointHandle,
+) -> CodeQueryFlowSymbolSite {
+    let point = handle
+        .procedure()
+        .semantics()
+        .point(handle.id())
+        .expect("validated witness point resolves");
+    let locator = &handle
+        .procedure()
+        .semantics()
+        .source_mapping(point.source)
+        .expect("validated witness point has source mapping")
+        .locator;
+    public_symbol_site(workspace, locator)
+}
+
 fn call_site(
     workspace: &WorkspaceAnalyzer,
     handle: &crate::analyzer::semantic::CallSiteHandle,
@@ -1207,6 +1255,24 @@ fn call_site(
         .expect("validated witness call has source mapping")
         .locator;
     public_site(workspace, locator)
+}
+
+fn call_symbol_site(
+    workspace: &WorkspaceAnalyzer,
+    handle: &crate::analyzer::semantic::CallSiteHandle,
+) -> CodeQueryFlowSymbolSite {
+    let call = handle
+        .procedure()
+        .semantics()
+        .call_site(handle.id())
+        .expect("validated witness call resolves");
+    let locator = &handle
+        .procedure()
+        .semantics()
+        .source_mapping(call.source)
+        .expect("validated witness call has source mapping")
+        .locator;
+    public_symbol_site(workspace, locator)
 }
 
 fn public_site(workspace: &WorkspaceAnalyzer, locator: &SemanticLocator) -> CodeQuerySourceSite {

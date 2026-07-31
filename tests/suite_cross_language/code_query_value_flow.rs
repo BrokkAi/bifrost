@@ -1,5 +1,4 @@
-mod common;
-
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use brokk_bifrost::analyzer::dataflow::SemanticInputStatus;
@@ -20,11 +19,18 @@ use brokk_bifrost::analyzer::value_flow::{
 use brokk_bifrost::{AnalyzerConfig, Language, WorkspaceAnalyzer};
 use serde_json::json;
 
-use common::semantic_graph::SemanticGraph;
-use common::{BuiltInlineTestProject, InlineTestProject};
+use crate::common::semantic_graph::SemanticGraph;
+use crate::common::{BuiltInlineTestProject, InlineTestProject};
+use crate::value_flow_conformance::{
+    ExpectedSinkOutcome, ValueFlowConformanceCase, assert_resolved_value_flow_conformance,
+    direct_witness_symbol_sequences, resolve_value_flow_conformance_case,
+};
+use crate::value_flow_scenarios::{with_java_exact_helper, with_typescript_exact_helper};
 
 const WORKSPACE_GENERATION: u64 = 23;
 const PLAN_REF: &str = "test:request-to-sink";
+const SHARED_PLAN_REF: &str = "test:shared-helper-flow";
+const SHARED_WITNESS_PLAN_REF: &str = "test:shared-helper-flow-witness";
 const SOURCE: &str = r#"
 final class FlowFixture {
   static String run(String input) {
@@ -588,4 +594,399 @@ fn independently_allocated_equal_plans_share_registration_identity() {
     );
     assert_eq!(registrations.reference_count(), 2);
     assert_eq!(registrations.registration_count(), 1);
+}
+
+#[test]
+fn java_helper_scenario_runs_through_direct_and_public_queries() {
+    with_java_exact_helper(assert_shared_helper_scenario);
+}
+
+#[test]
+fn typescript_helper_scenario_runs_through_direct_and_public_queries() {
+    with_typescript_exact_helper(assert_shared_helper_scenario);
+}
+
+fn assert_shared_helper_scenario(case: &ValueFlowConformanceCase<'_>) {
+    let resolved = resolve_value_flow_conformance_case(case);
+    assert_resolved_value_flow_conformance(case, &resolved);
+
+    let mut registrations = ValueFlowPlanRegistrationSet::default();
+    registrations
+        .register(
+            SHARED_PLAN_REF.parse().unwrap(),
+            ValueFlowPlanRegistration::new(WORKSPACE_GENERATION, Arc::clone(&resolved.plan)),
+        )
+        .unwrap();
+    registrations
+        .register(
+            SHARED_WITNESS_PLAN_REF.parse().unwrap(),
+            ValueFlowPlanRegistration::new(
+                WORKSPACE_GENERATION,
+                Arc::clone(&resolved.witness_plan),
+            ),
+        )
+        .unwrap();
+    let summaries = Arc::new(ProductionTypestateSummaryRepository::new());
+
+    let endpoints = execute_workspace_request_with_analysis_registration_lease(
+        &resolved.analyzer,
+        WORKSPACE_GENERATION,
+        &ProtocolRegistrationSet::default(),
+        &registrations,
+        &shared_scenario_query(case, SHARED_PLAN_REF, false),
+        CodeQueryExecutionLimits::default(),
+        None,
+        summaries.lease(WORKSPACE_GENERATION).unwrap(),
+    );
+    let endpoints = serde_json::to_value(endpoints).unwrap();
+    assert_public_sink_outcomes(case, &endpoints);
+
+    let witnesses = execute_workspace_request_with_analysis_registration_lease(
+        &resolved.analyzer,
+        WORKSPACE_GENERATION,
+        &ProtocolRegistrationSet::default(),
+        &registrations,
+        &shared_scenario_query(case, SHARED_WITNESS_PLAN_REF, true),
+        CodeQueryExecutionLimits::default(),
+        None,
+        summaries.lease(WORKSPACE_GENERATION).unwrap(),
+    );
+    let witnesses = serde_json::to_value(witnesses).unwrap();
+    let rows = witnesses["results"].as_array().unwrap();
+    assert!(
+        !rows.is_empty(),
+        "{} public witness rows: {witnesses:#}",
+        case.name
+    );
+    for witness in rows {
+        assert_eq!(witness["result_type"], "flow_witness", "{witnesses:#}");
+        let steps = witness["steps"].as_array().unwrap();
+        assert!(!steps.is_empty(), "{} empty public witness", case.name);
+        assert!(
+            steps.iter().all(|step| step.get("input").is_some()
+                && step.get("output").is_some()
+                && step.get("source_symbol").is_some()
+                && (step.get("target").is_some() == step.get("target_symbol").is_some())
+                && (step.get("origin").is_some() == step.get("origin_symbol").is_some())),
+            "{} public witness lost fact symbols: {witnesses:#}",
+            case.name
+        );
+        for step in steps {
+            assert_public_symbol_site(&step["source_symbol"]);
+            if let Some(target) = step.get("target_symbol") {
+                assert_public_symbol_site(target);
+            }
+            if let Some(origin) = step.get("origin_symbol") {
+                assert_public_symbol_site(origin);
+            }
+            assert_public_fact_symbol(&step["input"]);
+            assert_public_fact_symbol(&step["output"]);
+        }
+    }
+    let actual_symbols = rows
+        .iter()
+        .map(public_witness_symbol_sequence)
+        .collect::<BTreeSet<_>>();
+    let expected_symbols = direct_witness_symbol_sequences(case, &resolved);
+    assert_eq!(
+        actual_symbols, expected_symbols,
+        "{} exact ordered public witness symbols",
+        case.name
+    );
+}
+
+fn shared_scenario_query(
+    case: &ValueFlowConformanceCase<'_>,
+    plan_ref: &str,
+    with_witness: bool,
+) -> CodeQuery {
+    let root = case
+        .procedures
+        .iter()
+        .find(|procedure| procedure.alias == case.root)
+        .expect("shared scenario root selector");
+    let kind = match root.kind {
+        ProcedureKind::Method => "method",
+        ProcedureKind::Function => "function",
+        other => panic!("unsupported shared scenario root kind {other:?}"),
+    };
+    let mut steps = vec![
+        json!({"op": "procedure_of"}),
+        json!({"op": "value_flow", "plan_ref": plan_ref}),
+    ];
+    if with_witness {
+        steps.push(json!({"op": "witness", "max_steps": 256, "max_bytes": 262_144}));
+    }
+    CodeQuery::from_json(&json!({
+        "schema_version": 6,
+        "match": {"kind": kind, "name": root.name},
+        "steps": steps,
+    }))
+    .unwrap()
+}
+
+fn assert_public_sink_outcomes(case: &ValueFlowConformanceCase<'_>, response: &serde_json::Value) {
+    let rows = response["results"].as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        case.expected_meetings
+            .iter()
+            .map(|meeting| meeting.public_endpoint_count)
+            .sum::<usize>()
+            + case
+                .sinks
+                .iter()
+                .filter(|sink| sink.outcome != ExpectedSinkOutcome::Reached)
+                .count(),
+        "{} exact public endpoint count: {response:#}",
+        case.name
+    );
+    for sink in case.sinks {
+        let matching = rows
+            .iter()
+            .filter(|row| row["sink"]["ordinal"] == sink.argument)
+            .collect::<Vec<_>>();
+        let expected_reachability = match sink.outcome {
+            ExpectedSinkOutcome::Reached => "reached",
+            ExpectedSinkOutcome::NotReached => "not_reached",
+            ExpectedSinkOutcome::Inconclusive => "inconclusive",
+        };
+        let expected_count = case
+            .expected_meetings
+            .iter()
+            .find(|meeting| meeting.sink == sink.alias)
+            .map_or(1, |meeting| meeting.public_endpoint_count);
+        assert_eq!(
+            matching.len(),
+            expected_count,
+            "{} {} public endpoint count: {response:#}",
+            case.name,
+            sink.alias
+        );
+        assert!(
+            matching
+                .iter()
+                .all(|row| row["reachability"] == expected_reachability),
+            "{} {} public reachability: {response:#}",
+            case.name,
+            sink.alias
+        );
+        assert_eq!(
+            matching
+                .iter()
+                .filter(|row| row["reachability"] == "reached")
+                .count(),
+            if sink.outcome == ExpectedSinkOutcome::Reached {
+                expected_count
+            } else {
+                0
+            },
+            "{} {} exact detected/absent meeting count",
+            case.name,
+            sink.alias
+        );
+    }
+}
+
+fn assert_public_fact_symbol(fact: &serde_json::Value) {
+    match fact["kind"].as_str().expect("public fact kind") {
+        "zero" => assert_eq!(fact.as_object().unwrap().len(), 1),
+        "carrier" => {
+            assert_public_event(&fact["source"]);
+            assert_public_carrier(&fact["carrier"]);
+            assert!(
+                fact.get("uncertain")
+                    .is_none_or(serde_json::Value::is_boolean)
+            );
+        }
+        "meeting" => {
+            assert_public_event(&fact["source"]);
+            assert_public_event(&fact["sink"]);
+            assert!(
+                fact.get("uncertain")
+                    .is_none_or(serde_json::Value::is_boolean)
+            );
+        }
+        other => panic!("unknown public fact kind {other}: {fact:#}"),
+    }
+}
+
+fn assert_public_event(event: &serde_json::Value) {
+    assert_eq!(event["id"].as_str().unwrap().len(), 64);
+    assert_public_symbol_site(&event["site"]);
+    assert!(event["path"].is_string());
+    assert!(event["phase"].is_string());
+    assert!(event["ordinal"].is_u64());
+    assert!(event["range"].is_object());
+    assert_public_carrier(&event["carrier"]);
+}
+
+fn assert_public_carrier(carrier: &serde_json::Value) {
+    assert_eq!(carrier["id"].as_str().unwrap().len(), 64);
+    match carrier["kind"].as_str().expect("public carrier kind") {
+        "value" | "allocation" => assert_public_symbol_site(&carrier["site"]),
+        "port" => {
+            assert_public_symbol_site(&carrier["procedure"]);
+            assert!(carrier["port"]["kind"].is_string());
+        }
+        "call_result" => {
+            assert_public_symbol_site(&carrier["call"]);
+            assert_public_carrier(&carrier["result"]);
+            assert_public_symbol_site(&carrier["callee"]);
+        }
+        "scoped_root" => {
+            assert!(carrier["root_kind"].is_string());
+            assert_public_symbol_site(&carrier["site"]);
+        }
+        "location" => {
+            assert_public_carrier(&carrier["root"]);
+            assert!(carrier["selectors"].is_array());
+            assert!(carrier["exact"].is_boolean());
+        }
+        other => panic!("unknown public carrier kind {other}: {carrier:#}"),
+    }
+}
+
+fn assert_public_symbol_site(site: &serde_json::Value) {
+    assert_eq!(site["id"].as_str().unwrap().len(), 64);
+    assert!(site["path"].is_string());
+    assert!(site["language"].is_string());
+    assert!(!site["declaration"].as_array().unwrap().is_empty());
+    assert!(site["role"].is_string());
+    assert!(site["start_byte"].is_u64());
+    assert!(site["end_byte"].is_u64());
+    assert!(site["occurrence"].is_u64());
+    assert!(site["range"].is_object());
+    assert!(site.get("mount").is_none());
+}
+
+fn public_witness_symbol_sequence(witness: &serde_json::Value) -> String {
+    let steps = witness["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(public_step_symbol)
+        .collect::<Vec<_>>();
+    serde_json::to_string(&steps).expect("canonical public witness JSON")
+}
+
+fn public_step_symbol(step: &serde_json::Value) -> serde_json::Value {
+    let mut symbol = serde_json::Map::from_iter([
+        ("kind".to_string(), step["kind"].clone()),
+        (
+            "source_symbol".to_string(),
+            public_locator_symbol(&step["source_symbol"]),
+        ),
+        ("input".to_string(), public_fact_symbol(&step["input"])),
+        ("output".to_string(), public_fact_symbol(&step["output"])),
+    ]);
+    for key in ["target_symbol", "origin_symbol"] {
+        if let Some(site) = step.get(key) {
+            symbol.insert(key.to_string(), public_locator_symbol(site));
+        }
+    }
+    if let Some(boundary) = step.get("boundary") {
+        symbol.insert("boundary".to_string(), boundary.clone());
+    }
+    serde_json::Value::Object(symbol)
+}
+
+fn public_fact_symbol(fact: &serde_json::Value) -> serde_json::Value {
+    let mut symbol = serde_json::Map::from_iter([("kind".to_string(), fact["kind"].clone())]);
+    match fact["kind"].as_str().unwrap() {
+        "zero" => {}
+        "carrier" => {
+            symbol.insert("source".to_string(), public_event_symbol(&fact["source"]));
+            symbol.insert(
+                "carrier".to_string(),
+                public_carrier_symbol(&fact["carrier"]),
+            );
+        }
+        "meeting" => {
+            symbol.insert("source".to_string(), public_event_symbol(&fact["source"]));
+            symbol.insert("sink".to_string(), public_event_symbol(&fact["sink"]));
+        }
+        other => panic!("unknown public fact kind {other}"),
+    }
+    if fact["uncertain"] == true {
+        symbol.insert("uncertain".to_string(), json!(true));
+    }
+    serde_json::Value::Object(symbol)
+}
+
+fn public_event_symbol(event: &serde_json::Value) -> serde_json::Value {
+    json!({
+        "site": public_locator_symbol(&event["site"]),
+        "phase": event["phase"],
+        "ordinal": event["ordinal"],
+        "carrier": public_carrier_symbol(&event["carrier"]),
+    })
+}
+
+fn public_carrier_symbol(carrier: &serde_json::Value) -> serde_json::Value {
+    match carrier["kind"].as_str().unwrap() {
+        "value" => {
+            let mut symbol = serde_json::Map::from_iter([
+                ("kind".to_string(), json!("value")),
+                ("site".to_string(), public_locator_symbol(&carrier["site"])),
+                ("role".to_string(), carrier["role"].clone()),
+            ]);
+            if let Some(ordinal) = carrier.get("ordinal") {
+                symbol.insert("ordinal".to_string(), ordinal.clone());
+            }
+            serde_json::Value::Object(symbol)
+        }
+        "port" => json!({
+            "kind": "port",
+            "procedure": public_locator_symbol(&carrier["procedure"]),
+            "port": carrier["port"],
+        }),
+        "allocation" => json!({
+            "kind": "allocation",
+            "site": public_locator_symbol(&carrier["site"]),
+        }),
+        "call_result" => json!({
+            "kind": "call_result",
+            "call": public_locator_symbol(&carrier["call"]),
+            "result": public_carrier_symbol(&carrier["result"]),
+            "callee": public_locator_symbol(&carrier["callee"]),
+        }),
+        "scoped_root" => json!({
+            "kind": "scoped_root",
+            "root_kind": carrier["root_kind"],
+            "site": public_locator_symbol(&carrier["site"]),
+        }),
+        "location" => json!({
+            "kind": "location",
+            "root": public_carrier_symbol(&carrier["root"]),
+            "selectors": carrier["selectors"].as_array().unwrap().iter().map(|selector| {
+                match selector["kind"].as_str().unwrap() {
+                    "field" => json!({
+                        "kind": "field",
+                        "field": public_locator_symbol(&selector["field"]),
+                    }),
+                    "exact_index" => json!({
+                        "kind": "exact_index",
+                        "index": public_carrier_symbol(&selector["index"]),
+                    }),
+                    "any_index" => json!({"kind": "any_index"}),
+                    other => panic!("unknown public selector kind {other}"),
+                }
+            }).collect::<Vec<_>>(),
+            "exact": carrier["exact"],
+        }),
+        other => panic!("unknown public carrier kind {other}"),
+    }
+}
+
+fn public_locator_symbol(site: &serde_json::Value) -> serde_json::Value {
+    json!({
+        "path": site["path"],
+        "language": site["language"],
+        "declaration": site["declaration"],
+        "role": site["role"],
+        "start_byte": site["start_byte"],
+        "end_byte": site["end_byte"],
+        "occurrence": site["occurrence"],
+    })
 }

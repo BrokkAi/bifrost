@@ -481,14 +481,56 @@ void test("renders diagnostic-neutral flow endpoints and navigable witnesses", (
     end_line: 12,
     end_column: 16
   };
+  const procedureSite = {
+    id: "site-run",
+    path: "src/run.ts",
+    language: "typescript",
+    declaration: [
+      {
+        kind: "function",
+        name: "run",
+        start_byte: 12,
+        end_byte: 96,
+        occurrence: 0,
+        sibling_ordinal: 0
+      }
+    ],
+    role: "procedure",
+    start_byte: 12,
+    end_byte: 96,
+    occurrence: 0,
+    range
+  };
+  const parameterCarrier = {
+    kind: "port" as const,
+    id: "carrier-parameter",
+    procedure: procedureSite,
+    port: { kind: "parameter" as const, ordinal: 0 }
+  };
   const endpoint: RqlFlowEndpointResult = {
     uri: "file:///workspace/src/run.ts",
     path: "src/run.ts",
     result_type: "flow_endpoint",
     id: "endpoint-a",
     plan_ref: "embedding:request-to-sink",
-    source: { id: "source-a", path: "src/run.ts", range, phase: "before_effects", ordinal: 0 },
-    sink: { id: "sink-a", path: "src/run.ts", range, phase: "after_effects", ordinal: 0 },
+    source: {
+      id: "source-a",
+      site: procedureSite,
+      path: "src/run.ts",
+      range,
+      phase: "before_effects",
+      ordinal: 0,
+      carrier: parameterCarrier
+    },
+    sink: {
+      id: "sink-a",
+      site: procedureSite,
+      path: "src/run.ts",
+      range,
+      phase: "after_effects",
+      ordinal: 0,
+      carrier: parameterCarrier
+    },
     reachability: "reached",
     certainty: "may",
     must: "not_established",
@@ -517,33 +559,13 @@ void test("renders diagnostic-neutral flow endpoints and navigable witnesses", (
       {
         kind: { type: "end_summary_gap", return_kind: "normal" },
         source: { path: endpoint.path, range },
+        source_symbol: procedureSite,
         evidence: { proof: "unproven", completeness: "partial" },
         boundary: "unmaterialized",
         input: {
           kind: "carrier",
           source: endpoint.source!,
-          carrier: {
-            kind: "port",
-            id: "carrier-parameter",
-            procedure: {
-              id: "site-run",
-              path: endpoint.path,
-              language: endpoint.language,
-              declaration: [
-                {
-                  kind: "function",
-                  name: "run",
-                  start_byte: 12,
-                  end_byte: 96,
-                  occurrence: 0,
-                  sibling_ordinal: 0
-                }
-              ],
-              role: "procedure",
-              range
-            },
-            port: { kind: "parameter", ordinal: 0 }
-          }
+          carrier: parameterCarrier
         },
         output: {
           kind: "meeting",

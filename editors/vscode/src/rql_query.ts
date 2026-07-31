@@ -198,10 +198,12 @@ export type RqlFlowCompletion =
 
 export interface RqlFlowEvent {
   id: string;
+  site: RqlFlowSymbolSite;
   path: string;
   range: RqlResultRange;
   phase: string;
   ordinal: number;
+  carrier: RqlFlowCarrierSymbol;
 }
 
 export interface RqlFlowDeclarationSegment {
@@ -219,6 +221,9 @@ export interface RqlFlowSymbolSite {
   language: string;
   declaration: RqlFlowDeclarationSegment[];
   role: string;
+  start_byte: number;
+  end_byte: number;
+  occurrence: number;
   range: RqlResultRange;
 }
 
@@ -307,6 +312,9 @@ export interface RqlFlowEndpointResult extends RqlQueryResultBase {
 
 export interface RqlFlowWitnessStep extends RqlTypestateWitnessStep {
   boundary?: string;
+  source_symbol?: RqlFlowSymbolSite;
+  target_symbol?: RqlFlowSymbolSite;
+  origin_symbol?: RqlFlowSymbolSite;
   input?: RqlFlowFactSymbol;
   output?: RqlFlowFactSymbol;
 }

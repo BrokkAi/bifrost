@@ -18,7 +18,8 @@ The observable proof is the consolidated Rust integration suite: it compares the
 - [x] (2026-07-31 09:30Z) Diagnosed the public projection gap and approved the milestone plan.
 - [x] (2026-07-31 10:25Z) Added stable public zero, carrier, and meeting fact symbols to flow witness steps.
 - [x] (2026-07-31 10:25Z) Carried the symbols through Python and VS Code models while leaving taint fact fields absent.
-- [ ] Consolidate `tests/code_query_value_flow.rs` into `suite_cross_language` and expose a reusable resolved conformance scenario.
+- [x] (2026-07-31 12:05Z) Consolidated `tests/code_query_value_flow.rs` into `suite_cross_language` and exposed a reusable resolved conformance scenario.
+- [x] (2026-07-31 12:05Z) Ran the shared Java and TypeScript helper scenario through direct and public executors with exact endpoint and ordered witness-symbol parity.
 - [ ] Run the existing Java and TypeScript helper scenario through direct, JSON, and RQL paths with exact endpoint and witness parity.
 - [ ] Add shared Java and TypeScript branch, loop, early-return, and matched-return scenarios.
 - [ ] Add shared Java and TypeScript exceptional cleanup, receiver, closure/capture, field/access-path, ambiguity, and unresolved-call scenarios.
@@ -42,6 +43,12 @@ The observable proof is the consolidated Rust integration suite: it compares the
 
 - Observation: structured input/output facts materially increase retained witness bytes, as intended.
   Evidence: the seven-step Java public fixture now retains 2,929 serialized step bytes while remaining below its 16,384-byte query cap; the existing byte-clamp regression still truncates cleanly at a one-byte limit.
+
+- Observation: a fact's carrier alone cannot recover the configured source or sink carrier, and simple path/range step sites cannot prove declaration identity or matched call origins.
+  Evidence: the first shared Java run exposed a temporary carrier as the first non-zero witness fact even though the configured source is the `run` parameter. Exact direct/public parity required source/sink events to carry their configured carrier and full site, plus full source/target/origin symbols on each flow step.
+
+- Observation: public endpoints intentionally deduplicate semantically identical solver meetings while merging provenance.
+  Evidence: the TypeScript helper produces six raw solver meetings but four distinct public endpoints; two public rows retain two provenance paths. The shared scenario records both the raw meeting count and the exact projected endpoint count.
 
 ## Decision Log
 
@@ -67,7 +74,9 @@ The observable proof is the consolidated Rust integration suite: it compares the
 
 ## Outcomes & Retrospective
 
-The first implementation milestone is complete. Public value-flow witness steps now preserve zero, carrier, and meeting facts; carriers contain stable source-backed value, port, allocation, call-result, scoped-root, and bounded location structures; and run-local IDs and workspace mounts remain absent. Python parses the tagged shape strictly, VS Code preserves and renders concise fact transitions, and shared taint steps continue to omit flow-only facts. Focused validation passed 16 Rust public-query tests, 62 Python tests, and 80 VS Code tests. The shared cross-language scenario harness and adapter matrix remain in progress.
+The first two implementation milestones are complete. Public value-flow witness steps now preserve zero, carrier, and meeting facts; carriers contain stable source-backed value, port, allocation, call-result, scoped-root, and bounded location structures; source/sink events retain their configured carrier and full site; and every flow step retains full source/target/origin symbols. Run-local IDs and workspace mounts remain absent. Python parses the tagged shape strictly, VS Code preserves and renders concise fact transitions, and shared taint steps continue to omit flow-only facts.
+
+The former root public-query test is now part of `suite_cross_language`. One shared Java/TypeScript helper description drives the direct solver and public CodeQuery paths. The harness compares exact detected and absent sink projections, raw versus deduplicated meeting counts, and the complete ordered witness-symbol sequences after removing only generated IDs and redundant display ranges. Focused validation passed all 14 public-query module tests and the two direct Java/TypeScript baseline tests. The broader control-flow, heap, uncertainty, budget, and remaining-adapter matrix remains in progress.
 
 ## Context and Orientation
 
@@ -184,3 +193,5 @@ No new third-party dependency is needed. Serde supplies the Rust tagged represen
 Revision note (2026-07-31): Initial ExecPlan created after the user approved the diagnosis and milestone plan for issue #1393.
 
 Revision note (2026-07-31): Recorded the completed public symbol and transport milestone, including the expected serialized-byte increase and validation evidence.
+
+Revision note (2026-07-31): Recorded public event/step symbol completion, root-test consolidation, shared Java/TypeScript scenario execution, and exact direct/public canonical parity.
