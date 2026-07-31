@@ -9,7 +9,7 @@
 //!
 //! See `.agents/plans/issue-1328-rmcp-3-adoption.md` for the migration plan.
 
-use crate::analyzer_pool::AnalyzerExecutionPool;
+use crate::analyzer_pool::{ANALYZER_POOL_CAPACITY, Admission, AnalyzerExecutionPool};
 use crate::mcp_common::{
     AGENTS_GUIDANCE_MIME_TYPE, AGENTS_GUIDANCE_TEXT, AGENTS_GUIDANCE_URI,
     BENCHMARK_PROFILE_BOUNDARY_MARKER, BENCHMARK_PROFILE_BOUNDARY_METHOD, CODEX_MCP_CLIENT_NAME,
@@ -43,6 +43,7 @@ use rmcp::transport::IntoTransport;
 use rmcp::{RoleServer, ServerHandler, ServiceExt};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -58,6 +59,13 @@ use tokio_util::sync::CancellationToken as McpCancellationToken;
 /// identity moves here. Consumers: `tests/mcp_build_identity_facade.rs` and
 /// `src/benchmark/mcp_session.rs`.
 pub const BUILD_IDENTITY_META_KEY: &str = "io.bifrost/build-identity";
+
+/// Env var selecting how much of `rmcp`'s diagnostic stream reaches stderr.
+///
+/// Defaults to warnings and errors: enough to see a transport failure or a
+/// rejected request without narrating every message on a busy session.
+#[doc(hidden)]
+pub const MCP_LOG_LEVEL_ENV: &str = "BIFROST_MCP_LOG";
 
 /// Two runtime workers are enough: no Bifrost work runs on them. Protocol
 /// handling is trivial, and every analyzer call goes to the blocking pool.
@@ -760,10 +768,13 @@ impl BifrostMcpHandler {
         name: String,
         arguments: Value,
         workspace_scope: Option<u64>,
+        deadline: Instant,
         mcp_cancellation: McpCancellationToken,
     ) -> Result<CallToolResult, ErrorData> {
-        let bifrost_cancellation = crate::CancellationToken::default()
-            .with_deadline(Instant::now() + mcp_analyzer_request_budget());
+        // The deadline was set when the request was accepted, not when it
+        // reached the analyzer, so time already spent queueing counts against
+        // it. A request that waited most of its budget gets what remains.
+        let bifrost_cancellation = crate::CancellationToken::default().with_deadline(deadline);
         let _in_flight = self.in_flight.register(
             workspace_scope.unwrap_or_else(|| self.service.workspace_generation()),
             bifrost_cancellation.clone(),
@@ -1129,12 +1140,48 @@ impl ServerHandler for BifrostMcpHandler {
         };
         let _serial_guard = serial_tool_request(&name).then_some(state);
 
+        // One deadline spans admission and execution. Starting the clock after
+        // admission would make the request budget mean "time spent analyzing"
+        // while a client experiences queue wait plus a full budget -- and the
+        // `mcp_fairness` p95 gate in benchmark/interactive-latency.toml is
+        // written against what the client experiences.
         let accepted_at = Instant::now();
-        let Some(_permit) = self.analyzer_pool.acquire(&context.ct).await else {
-            return Err(ErrorData::internal_error(
-                "the tool call was cancelled while waiting for analyzer capacity",
-                None,
-            ));
+        let deadline = accepted_at + mcp_analyzer_request_budget();
+        let admission = tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            self.analyzer_pool.acquire(&context.ct),
+        )
+        .await;
+        let _permit = match admission {
+            Ok(Admission::Granted(permit)) => permit,
+            Ok(Admission::Cancelled) => {
+                return Err(ErrorData::internal_error(
+                    "the tool call was cancelled while waiting for analyzer capacity",
+                    None,
+                ));
+            }
+            Ok(Admission::Saturated) => {
+                eprintln!(
+                    "bifrost: refusing {name}; more than {} analyzer requests are already queued",
+                    crate::analyzer_pool::MAX_QUEUED_ANALYZER_REQUESTS
+                );
+                return Err(ErrorData::internal_error(
+                    format!(
+                        "too many analyzer requests are queued; retry {name} once earlier calls complete"
+                    ),
+                    None,
+                ));
+            }
+            Err(_elapsed) => {
+                eprintln!(
+                    "bifrost: {name} exhausted its {:?} budget waiting for analyzer capacity",
+                    mcp_analyzer_request_budget()
+                );
+                return Err(ErrorData::internal_error(
+                    format!("{name} timed out waiting for analyzer capacity"),
+                    None,
+                ));
+            }
         };
         profiling::duration(
             format!("mcp_request.queue_wait[{name}]"),
@@ -1152,7 +1199,13 @@ impl ServerHandler for BifrostMcpHandler {
         }
 
         Ok(self
-            .execute_tool(name, arguments, workspace_scope, context.ct.clone())
+            .execute_tool(
+                name,
+                arguments,
+                workspace_scope,
+                deadline,
+                context.ct.clone(),
+            )
             .await?
             .into())
     }
@@ -1185,6 +1238,34 @@ impl ServerHandler for BifrostMcpHandler {
     }
 }
 
+/// Route `rmcp`'s `tracing` events to stderr.
+///
+/// Without this every event the SDK emits is discarded, including the ones an
+/// operator most needs: transport send failures, requests rejected for
+/// lifecycle violations, and join errors. stdout is the protocol channel, so
+/// diagnostics must go to stderr and nowhere else.
+fn install_protocol_diagnostics(level: Option<&OsStr>) -> Result<(), String> {
+    let level = match level.map(OsStr::to_string_lossy).as_deref() {
+        None | Some("warn") => tracing::Level::WARN,
+        Some("off") => return Ok(()),
+        Some("error") => tracing::Level::ERROR,
+        Some("info") => tracing::Level::INFO,
+        Some("debug") => tracing::Level::DEBUG,
+        Some("trace") => tracing::Level::TRACE,
+        Some(other) => {
+            return Err(format!(
+                "{MCP_LOG_LEVEL_ENV} must be off, error, warn, info, debug, or trace, not `{other}`"
+            ));
+        }
+    };
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(level)
+        .with_ansi(false)
+        .try_init()
+        .map_err(|error| format!("Failed to install MCP diagnostics: {error}"))
+}
+
 /// Serve MCP over this process's standard input and output until the client
 /// disconnects.
 ///
@@ -1199,6 +1280,8 @@ pub fn run_stdio_server_with_build_identity(
     // Explicit roots build in the background. Rootless servers answer
     // initialize without touching process cwd and bind only from a
     // client-provided workspace.
+    install_protocol_diagnostics(std::env::var_os(MCP_LOG_LEVEL_ENV).as_deref())?;
+
     let accepts_client_roots = root.is_none();
     let watch_files = file_watching_enabled(std::env::var_os(MCP_FILE_WATCHER_ENV).as_deref())?;
     let service = Arc::new(match (root, watch_files) {
@@ -1224,6 +1307,11 @@ pub fn run_stdio_server_with_build_identity(
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_time()
         .worker_threads(RUNTIME_WORKER_THREADS)
+        // The analyzer pool bounds concurrent analyzer executions, so this is
+        // a backstop rather than the operative limit: it keeps any future
+        // `spawn_blocking` outside the pool from quietly growing toward
+        // tokio's default of 512, each of which fans out onto rayon.
+        .max_blocking_threads(ANALYZER_POOL_CAPACITY + RUNTIME_WORKER_THREADS)
         .thread_name("bifrost-mcp")
         .build()
         .map_err(|error| format!("Failed to start the MCP runtime: {error}"))?;
@@ -1242,6 +1330,14 @@ pub fn run_stdio_server_with_build_identity(
             .map(|_| ())
             .map_err(|error| format!("MCP session ended abnormally: {error}"))
     });
+    // Never drop the runtime implicitly. `tokio::io::stdin` reads on a blocking
+    // thread that cannot be cancelled, and rmcp's serve loop polls it in a
+    // `select!`, so a losing branch leaves a read parked in the pool. The
+    // runtime's `Drop` waits for blocking work forever, which on any exit that
+    // is not a clean EOF would leave a zombie process holding the whole
+    // in-memory index and the file watcher. The process is exiting either way.
+    runtime.shutdown_background();
+
     if result.is_ok() {
         // Normal shutdown (stdin reached EOF): the process is about to exit, so
         // skip the service's destructor. Dropping it would walk the whole

@@ -38,6 +38,12 @@ tokio = { version = "1", default-features = false, features = ["rt-multi-thread"
 # `RequestContext::ct` is a tokio_util CancellationToken and rmcp does not
 # re-export the type, so awaiting MCP cancellation needs the crate directly.
 tokio-util = { version = "0.7", default-features = false }
+# rmcp reports transport failures, rejected requests, and lifecycle violations
+# through `tracing`. With no subscriber registered those events are dropped at
+# the macro site, which would leave an MCP stdio server -- whose only
+# diagnostic channel is stderr -- silent about the failures it now delegates.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 url = { version = "2.5.8", default-features = false, features = ["std"] }
 xee-xpath = "0.1.5"
 xot = "0.31"

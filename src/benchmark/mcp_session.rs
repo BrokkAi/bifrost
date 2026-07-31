@@ -756,11 +756,20 @@ impl McpSession {
 }
 
 fn validate_server_build_identity(response: &Value) -> Result<(), String> {
+    // Two locations during the issue #1328 MCP host migration. The rmcp host
+    // publishes the identity in the initialize result's `_meta`, because
+    // rmcp's `serverInfo` is a closed struct with no room for a vendor field;
+    // the hand-written host still puts it on `serverInfo` itself. Accepting
+    // either is what lets the latency benchmark run against both hosts -- and
+    // the analyzer pool's capacity is only allowed to change on evidence from
+    // that benchmark, so it has to be runnable against the host that has the
+    // pool.
     let server_identity = response
         .pointer("/result/serverInfo/buildIdentity")
+        .or_else(|| response.pointer("/result/_meta/io.bifrost~1build-identity"))
         .and_then(Value::as_str)
         .ok_or_else(|| {
-            "bifrost MCP initialize response omitted serverInfo.buildIdentity; rebuild the server binary"
+            "bifrost MCP initialize response omitted its build identity; rebuild the server binary"
                 .to_string()
         })?;
     if server_identity != crate::BIFROST_BUILD_IDENTITY {
