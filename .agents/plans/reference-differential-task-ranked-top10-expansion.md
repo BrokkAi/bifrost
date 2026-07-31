@@ -711,15 +711,18 @@ local gate, but is not the focus.
   #1284 received the final witness evidence and remains open. Disposable exact
   and dirty artifacts were removed, retaining only the baseline and clean
   replay.
-- [ ] (2026-07-31 05:34Z) Scala rank nine `http4s__http4s` is in progress
-  depth-first. Its clean `ee8e114c` baseline audited 425/425 files and 10,000
-  sites, queried 1,000 of 1,014 targets, and produced 12 raw missing rows with
-  no file or candidate-limit errors. All 12 reproduce exactly. Existing
-  assigned issues #1285, #1287, and #1316 own six rows; #1380 was reopened for
-  two additional root-owner shapes; new issues #1385 and #1386 were created
-  assigned to `jbellis` for selector-import owner references and typed-receiver
-  infix forward resolution. Implementation is delegated across non-overlapping
-  inverse and forward surfaces; clean pushed-head replay remains.
+- [x] (2026-07-31 08:34Z) Finished Scala rank nine `http4s__http4s`
+  depth-first at pushed head `8e87a39c`. The clean replay audited 425/425
+  files and 10,000 sites, queried 1,000 of 1,015 targets, and reported zero
+  missing, candidate-limit overflow, or file errors. The accepted artifact is
+  `/mnt/optane/tmp/bifrost-fird/scala-r9-http4s-clean-8e87a39c.jsonl`
+  (SHA-256
+  `0d50cfd962e46ec94f8295cc3a65dbdb7c4335349e9735570a8f9bfa047a6a66`).
+  Dedicated issues #1385 and #1386 and the completed shared root-owner issue
+  #1380 were closed after proof. Shared issues #1285, #1287, and #1316 received
+  the clean http4s evidence and remain open only for their stated Guardian Grid
+  witnesses. Disposable exact, dirty, and Cargo-log artifacts were removed,
+  retaining the baseline and clean replay.
 - [x] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [x] Complete C++ and publish its evidence and user summary.
