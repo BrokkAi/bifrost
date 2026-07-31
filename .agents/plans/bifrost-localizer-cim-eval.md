@@ -89,7 +89,9 @@ The observable outcomes are:
   escalation.
 - [ ] Precompute all Granite indexes on the A4000 at concurrency one while baseline cells run.
   Fourteen of the 15 repository-shared indexes have immutable `READY.json` records; the final
-  `trinodb/trino` profiler remains active against the healthy Granite sidecar.
+  `trinodb/trino` repository remains active against the healthy Granite sidecar. Its first task
+  revision completed in 2710.3 seconds with 55,633 indexed chunks; the resumable worker is now
+  materializing the next revision against the same shared cache.
 - [ ] Run the three Granite retrieval arms over seeds 0, 1, and 2 with measured concurrency
   escalation.
 - [ ] Score, leak-audit, analyze, and report the baseline and Granite results.
@@ -223,6 +225,14 @@ The observable outcomes are:
   transient `cudaErrorUnknown` stopped the sidecar on Transformers. A direct A4000 tensor
   allocation succeeded immediately afterward; the sidecar was restarted on the same UUID and
   the serial prewarm resumed from the immutable READY records and shared SQLite caches.
+
+- Observation: Bifrost already exposes semantic materialization counters through
+  `SemanticIndexer::status`, but the profiling harness printed only the active-index chunk count
+  (which remains zero until publication), and `cimeval` buffered that output until process exit.
+  Bifrost commit `501f21e6` now adds the existing file numerator/denominator to the two-second
+  profiler line; brokkbench commit `f91062e16bb` streams profiler output directly to the task
+  logs. The resumed Trino revision exposed a live denominator of 1,291 missing files without a
+  new progress protocol.
 
 ## Decision Log
 
