@@ -88,7 +88,12 @@ The observable outcomes are:
   focused suite passes, and a real Flipt image exposes Go 1.24.3. The r4 smoke proved fresh
   scoring but exposed a remaining login shell in the provider-secret generation transport.
   Brokkbench commit `6f80c498bc5` fixes that final entry point; the clean r5 replacement is
-  prepared for the corrected Pro Go smoke before the full concurrency-30 wave.
+  valid. Its queue produced 87 of 91 cells; four interrupted cells remain to be resumed.
+- [x] (2026-07-31, implementation) Changed later cimeval waves to score each result immediately
+  in its generation sandbox, matching agenteval's faster lifecycle. The held-out patch and
+  official test command run only after the agent patch and artifacts are captured. The prior
+  separate pristine scorer remains available as `--scoring-mode pristine`; r5's already-closed
+  generation sandboxes necessarily use it for their one-time score pass.
 - [ ] Pass the baseline sanity gate, then run baseline seeds 1 and 2 at concurrency 30.
 - [x] (2026-07-31 10:01Z) Precomputed all Granite indexes on the A4000 at repository concurrency
   one. Bifrost commit `e36d4e6e` parallelizes each 64-file extraction group while preserving
@@ -375,6 +380,14 @@ The observable outcomes are:
   serialized, and load sampling remains diagnostic rather than an escalation trigger.
   Date/Author: 2026-07-31, user.
 
+- Decision: default cimeval to inline scoring in the live generation sandbox, while retaining
+  the separate pristine-container scorer as an explicit mode and for older completed cells.
+  Rationale: avoiding a second container provision per cell materially reduces campaign wall
+  time and eliminates a separate scoring tail. The user accepts the corner-case accuracy risk
+  from verifier setup observing agent-mutated container state or a hidden patch interacting
+  differently with the live checkout. Total worker concurrency remains capped at 30.
+  Date/Author: 2026-07-31, user and Codex.
+
 - Decision: Anvil uses retrieval overfetch multiplier `m=2`; model-facing `k` has minimum 1,
   maximum 20, and default 20.
   Rationale: `k` is the final reranked-result ceiling. Bifrost needs a wider candidate pool for
@@ -630,10 +643,12 @@ Use `/mnt/optane/bifrost-nlp-resources/runs/<run-id>` for generated state. Build
 runtime bundles recording exact Bifrost, Anvil, Mjolnir, and brokkbench commits. Task containers
 receive binaries and tokenizer/config metadata, not model weights.
 
-Use official frozen task images and image-defined working directories. Generation happens in a
-fresh official task container; official scoring happens in a second fresh container. Preserve
-manifests, scrub reports, Mjolnir streams, Anvil traces, patches, usage, candidate telemetry,
-leak audits, official scores, load samples, and an atomically written `COMPLETE` marker.
+Use official frozen task images and image-defined working directories. Generation and scoring
+normally happen sequentially in the same fresh official task container: capture the agent patch
+and artifacts, apply held-out tests, run the official scorer, then destroy the sandbox. Retain
+an explicit pristine-container scoring mode for diagnostic replay and older completed cells.
+Preserve manifests, scrub reports, Mjolnir streams, Anvil traces, patches, usage, candidate
+telemetry, leak audits, official scores, load samples, and atomically written `COMPLETE` markers.
 
 Acceptance: one PolyBench and one Pro no-semantic smoke produce replayable official scores, and
 existing sandbox/agenteval targeted tests demonstrate no default behavior change.
@@ -900,9 +915,9 @@ initial indexing remains concurrency one, and saved load samples document any in
 from the other workstation workload.
 
 The Granite evaluation passes when 819 expected cells are complete or outcome-blind excluded,
-all use one provider and main-model configuration, official scorers run in fresh containers,
-leak audits are reviewed, result counts respect k, and the report regenerates without rerunning
-an LLM.
+all use one provider and main-model configuration, official scorers run after artifact capture
+in the task sandbox, leak audits are reviewed, result counts respect k, and the report
+regenerates without rerunning an LLM.
 
 Before completing Bifrost code changes, run the repository policy skill only if
 `bifrost-policy-checking` and its policy tools are actually installed. If absent, record that
