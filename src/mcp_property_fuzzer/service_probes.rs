@@ -1647,13 +1647,19 @@ pub fn check_i1c(
 /// own keyword. `expected` stays a line vector so a trailing blank line at
 /// the range end is not lost to a join/re-split round trip.
 fn text_matches_reported_lines(expected: &[&str], text: &str) -> bool {
-    // CRLF files: `str::lines` strips `\r` only from `\r\n` pairs, so a
-    // block whose range ends between them keeps a lone trailing `\r`
-    // (brpc's rapidjson third-party headers). Normalize per line.
-    let text_lines: Vec<&str> = text
-        .lines()
-        .map(|line| line.trim_end_matches('\r'))
-        .collect();
+    // Split the returned text with the same mixed-ending convention as
+    // line_slice: `str::lines` splits on `\n` alone, so a CR-only file's
+    // block reads as one line and never matches its multi-row range
+    // (erupt's EruptModifyController.java, #1431).
+    let mut text_lines: Vec<&str> = Vec::new();
+    let mut rest = text;
+    while let Some((line, remaining)) = split_mixed_line(rest) {
+        text_lines.push(line);
+        rest = remaining;
+    }
+    if !rest.is_empty() {
+        text_lines.push(rest);
+    }
     let expected: Vec<&str> = expected
         .iter()
         .map(|line| line.trim_end_matches('\r'))
@@ -2667,5 +2673,22 @@ mod tests {
         assert!(claims_non_indexed(
             "`SimpleReferenceType` appears to cross a C# using boundary not indexed in this workspace"
         ));
+    }
+
+    #[test]
+    fn text_matches_reported_lines_accepts_cr_only_terminators() {
+        // #1431: a CR-only file's returned block spans multiple rows separated
+        // by lone carriage returns; splitting on `\n` alone reads it as one
+        // line and falsely reports source-text-differs-from-range.
+        let expected = vec![
+            "    @PostMapping(\"/{erupt}/delete\")",
+            "    @EruptRouter(skipAuthIndex = 3)",
+            "    public void deleteEruptData() {",
+        ];
+        let returned = "@PostMapping(\"/{erupt}/delete\")\r    @EruptRouter(skipAuthIndex = 3)\r    public void deleteEruptData() {";
+        assert!(text_matches_reported_lines(&expected, returned));
+        // CRLF keeps working, including a block ending between the pair.
+        let returned_crlf = "@PostMapping(\"/{erupt}/delete\")\r\n    @EruptRouter(skipAuthIndex = 3)\r\n    public void deleteEruptData() {\r";
+        assert!(text_matches_reported_lines(&expected, returned_crlf));
     }
 }

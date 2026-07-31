@@ -571,7 +571,9 @@ fn source_blocks_for_code_unit_with_cache(
                 label: display_symbol_for_target(code_unit),
                 path: rel_path_string(code_unit.source()),
                 start_line,
-                end_line: start_line + text.lines().count().saturating_sub(1),
+                // Same CR-aware line table as start_line: text.lines() counts
+                // only \n, which undercounts rows on CR-only files (#1431).
+                end_line: line_number_at_offset(&content, range.end_byte.saturating_sub(1)),
                 text,
                 canonical_selector: canonical_selector.clone(),
                 occurrence_role,

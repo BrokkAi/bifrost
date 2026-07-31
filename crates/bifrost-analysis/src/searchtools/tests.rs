@@ -271,6 +271,46 @@ return 0
 }
 
 #[test]
+fn issue_1431_source_block_end_line_counts_cr_only_terminators() {
+    use crate::analyzer::{JavaAnalyzer, Language, TestProject};
+
+    // CR-only line endings (\r with no \n, classic Mac convention) surfaced the
+    // text.lines() undercount in SourceBlock end_line: lines() splits on \n
+    // alone, so a multi-row declaration read as one line and end_line collapsed
+    // onto start_line (#1431).
+    let source = "public class A {\r    @Deprecated\r    public void m() {\r    }\r}\r";
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    ProjectFile::new(root.clone(), std::path::PathBuf::from("A.java"))
+        .write(source)
+        .unwrap();
+    let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
+
+    let unit = analyzer
+        .search_definitions("m", false)
+        .into_iter()
+        .find(|unit| unit.fq_name().contains(".m"))
+        .expect("method unit");
+    let blocks = super::sources::source_blocks_for_resolved_units(&analyzer, &[unit]);
+    let block = blocks
+        .iter()
+        .find(|block| block.text.contains("public void m"))
+        .expect("source block for m");
+
+    assert!(block.text.contains('\r'), "{block:#?}");
+    let expected_rows = block.text.trim_end_matches('\r').split('\r').count();
+    assert!(
+        expected_rows > 1,
+        "test needs a multi-row declaration, got {block:#?}"
+    );
+    assert_eq!(
+        block.end_line - block.start_line + 1,
+        expected_rows,
+        "end_line must count CR-only terminators like start_line does: {block:#?}"
+    );
+}
+
+#[test]
 fn literal_file_pattern_uses_project_lookup_without_scanning_analyzed_files() {
     let root = std::env::current_dir().unwrap();
     let analyzer = CountingAnalyzer::new(root, &["A.java", "nested/B.java"]);
