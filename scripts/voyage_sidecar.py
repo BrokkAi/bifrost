@@ -8,7 +8,8 @@ bifrost's Rust side spawns this behind the Embedder seam (one per CUDA device, p
 via CUDA_VISIBLE_DEVICES) and talks a small binary protocol over stdin/stdout:
 
   request  : u32_le length + JSON {"kind": "passage"|"query", "texts": [str, ...]}
-  response : u32_le length + [u32_le n][u32_le dim] + n*dim float32 (little-endian)
+  response : u32_le length + [u32_le n][u32_le dim][f64 queue_s][f64 service_s]
+             + n*dim float32 (little-endian)
 
 After model load it emits one ready frame: JSON {"ready": true, "dim": 512}.
 fd 1 is redirected to stderr so library logging can't corrupt the protocol; frames go
@@ -139,7 +140,9 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, seq, head_dim)
 
 
-def _slice_attention_mask(mask: torch.Tensor | None, start: int, end: int) -> torch.Tensor | None:
+def _slice_attention_mask(
+    mask: torch.Tensor | None, start: int, end: int
+) -> torch.Tensor | None:
     if mask is None or mask.dim() < 4 or mask.shape[-2] == 1:
         return mask
     return mask[..., start:end, :]
@@ -193,7 +196,9 @@ def bifrost_attention_forward(
     **kwargs,
 ) -> tuple[torch.Tensor, None]:
     if dropout != 0.0:
-        raise RuntimeError("voyage sidecar attention is inference-only; dropout must be zero")
+        raise RuntimeError(
+            "voyage sidecar attention is inference-only; dropout must be zero"
+        )
     scaling = scaling if scaling is not None else getattr(module, "scaling", None)
 
     # Repeat K/V to full head count on every backend. Never pass enable_gqa: with an
@@ -236,11 +241,16 @@ class Embedder:
             self.device, self.dtype = torch.device("cpu"), torch.float32
         self.is_voyage = PROFILE["pooling"] == "mean-mrl"
         log(f"loading {MODEL_SOURCE} as {PROFILE_NAME} on {self.device} ({self.dtype})")
-        model = AutoModel.from_pretrained(MODEL_SOURCE, trust_remote_code=True, dtype=self.dtype,
-                                          attn_implementation="sdpa").eval()
+        model = AutoModel.from_pretrained(
+            MODEL_SOURCE,
+            trust_remote_code=True,
+            dtype=self.dtype,
+            attn_implementation="sdpa",
+        ).eval()
         # WSL CUDA context creation can transiently fail ("CUDA driver error: unknown
         # error") when spawned under load; retry a few times before giving up.
         import time
+
         for attempt in range(5):
             try:
                 self.model = model.to(self.device)
@@ -281,10 +291,12 @@ class Embedder:
         if now - self._t_report < 20:
             return
         self._t_report = now
-        log(f"PROF texts={self._n_texts} calls={self._n_calls} batches={self._n_batches} "
+        log(
+            f"PROF texts={self._n_texts} calls={self._n_calls} batches={self._n_batches} "
             f"avg_texts/call={self._n_texts / max(self._n_calls, 1):.1f} "
             f"avg_batch={self._sum_b / max(self._n_batches, 1):.1f} max_batch={self._max_b} "
-            f"tok_s={self._tok_s:.1f} fwd_s={self._fwd_s:.1f}")
+            f"tok_s={self._tok_s:.1f} fwd_s={self._fwd_s:.1f}"
+        )
 
     @torch.no_grad()
     def embed(self, texts: list[str], prefix: str) -> np.ndarray:
@@ -364,7 +376,10 @@ class Embedder:
             out[i] = vecs[j]
         if self.mps:
             del input_ids, attention_mask, hidden, v
-            if torch.mps.driver_allocated_memory() > MPS_CACHE_DRAIN_FRACTION * torch.mps.recommended_max_memory():
+            if (
+                torch.mps.driver_allocated_memory()
+                > MPS_CACHE_DRAIN_FRACTION * torch.mps.recommended_max_memory()
+            ):
                 torch.mps.empty_cache()
         if self._prof:
             self._fwd_s += time.time() - _t
@@ -393,7 +408,9 @@ def start_parent_watchdog() -> None:
 
     def watch() -> None:
         poller = select.poll()
-        poller.register(0, 0)  # eventmask 0: only POLLHUP/POLLERR/POLLNVAL, no POLLIN wakeups
+        poller.register(
+            0, 0
+        )  # eventmask 0: only POLLHUP/POLLERR/POLLNVAL, no POLLIN wakeups
         while True:
             for _fd, event in poller.poll(2000):
                 if event & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
@@ -436,18 +453,29 @@ def serve_stream(emb: Embedder, stdin, send, model_lock=None) -> None:
             return
         req = json.loads(body)
         prefix = QUERY_PREFIX if req.get("kind") == "query" else PASSAGE_PREFIX
-        if model_lock is None:
-            vecs = emb.embed(req["texts"], prefix)
+        queue_started = time.perf_counter()
+        if model_lock is not None:
+            model_lock.acquire()
+            queue_seconds = time.perf_counter() - queue_started
         else:
-            with model_lock:
-                vecs = emb.embed(req["texts"], prefix)
+            queue_seconds = 0.0
+        service_started = time.perf_counter()
+        try:
+            vecs = emb.embed(req["texts"], prefix)
+        finally:
+            if model_lock is not None:
+                model_lock.release()
+        service_seconds = time.perf_counter() - service_started
         n, dim = vecs.shape
-        send(struct.pack("<II", n, dim) + vecs.tobytes())
+        send(
+            struct.pack("<IIdd", n, dim, queue_seconds, service_seconds)
+            + vecs.tobytes()
+        )
 
 
 def serve(emb: Embedder) -> None:
-    proto_fd = os.dup(1)   # real stdout for protocol frames
-    os.dup2(2, 1)          # fd1 -> stderr so logging can't corrupt the channel
+    proto_fd = os.dup(1)  # real stdout for protocol frames
+    os.dup2(2, 1)  # fd1 -> stderr so logging can't corrupt the channel
     stdin = sys.stdin.buffer
 
     def send(payload: bytes) -> None:
@@ -504,7 +532,9 @@ def selftest(emb: Embedder) -> None:
             cos = float(np.dot(g, e) / (np.linalg.norm(g) * np.linalg.norm(e) + 1e-12))
             worst = min(worst, cos)
             print(f"[{kind}] cos={cos:.6f} {t[:48]!r}")
-    print(f"\nworst cosine = {worst:.6f} ({'PASS' if worst > 0.999 else 'FAIL'} @ >0.999)")
+    print(
+        f"\nworst cosine = {worst:.6f} ({'PASS' if worst > 0.999 else 'FAIL'} @ >0.999)"
+    )
 
 
 def main() -> None:

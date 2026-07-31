@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
@@ -91,12 +92,33 @@ pub trait Embedder: Send + Sync {
     /// Embed a search query; the query prefix is applied here, exactly once.
     fn embed_query(&self, text: &str) -> Result<Vec<f32>, String>;
 
+    /// Embed a search query and report time waiting for the serving queue separately
+    /// from model service time. In-process and test embedders have no distinct queue,
+    /// so the default attributes the entire call to service time.
+    fn embed_query_timed(&self, text: &str) -> Result<(Vec<f32>, EmbeddingTiming), String> {
+        let started = Instant::now();
+        let vector = self.embed_query(text)?;
+        Ok((
+            vector,
+            EmbeddingTiming {
+                queue_wait: Duration::ZERO,
+                service: started.elapsed(),
+            },
+        ))
+    }
+
     /// Token count under the embedding model's tokenizer (no special tokens).
     fn count_tokens(&self, text: &str) -> usize;
 
     /// Identifies the model + text contract; a change invalidates all cached
     /// vectors (checked against the index's meta table on every open).
     fn fingerprint(&self) -> String;
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EmbeddingTiming {
+    pub queue_wait: Duration,
+    pub service: Duration,
 }
 
 /// Fingerprint recipe shared by all embedders: model label + dimensionality +

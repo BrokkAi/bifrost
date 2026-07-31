@@ -8,7 +8,7 @@
 //!
 //! Wire protocol (little-endian), one frame each way:
 //!   request : u32 len + JSON {"kind":"passage"|"query","texts":[...]}
-//!   response: u32 len + [u32 n][u32 dim] + n*dim f32
+//!   response: u32 len + [u32 n][u32 dim][f64 queue_s][f64 service_s] + n*dim f32
 //! The child emits one ready frame (`{"ready":true,"dim":512}`) after model load.
 
 use std::io::{BufReader, Read, Write};
@@ -23,8 +23,8 @@ use tokenizers::Tokenizer;
 #[cfg(all(test, unix))]
 use super::engine::VOYAGE_PROFILE;
 use super::engine::{
-    EMBED_ENDPOINT_ENV, Embedder, ModelProfile, ScheduledEmbedder, embed_repo_id, fingerprint_for,
-    resolve_tokenizer_dir, selected_model_profile,
+    EMBED_ENDPOINT_ENV, Embedder, EmbeddingTiming, ModelProfile, ScheduledEmbedder, embed_repo_id,
+    fingerprint_for, resolve_tokenizer_dir, selected_model_profile,
 };
 
 const SCRIPT_ENV: &str = "BIFROST_SIDECAR_SCRIPT";
@@ -131,9 +131,12 @@ pub struct SingleSidecar {
 }
 
 impl SingleSidecar {
-    fn embed(&self, texts: &[&str], kind: &str) -> Result<Vec<Vec<f32>>, String> {
+    fn embed(&self, texts: &[&str], kind: &str) -> Result<SidecarEmbedding, String> {
         if texts.is_empty() {
-            return Ok(Vec::new());
+            return Ok(SidecarEmbedding {
+                vectors: Vec::new(),
+                timing: EmbeddingTiming::default(),
+            });
         }
         let req = serde_json::json!({ "kind": kind, "texts": texts });
         let body = serde_json::to_vec(&req).map_err(|e| format!("encode request: {e}"))?;
@@ -152,11 +155,20 @@ impl Embedder for SingleSidecar {
 
     fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
         self.embed(texts, "passage")
+            .map(|response| response.vectors)
     }
 
     fn embed_query(&self, text: &str) -> Result<Vec<f32>, String> {
-        let mut out = self.embed(&[text], "query")?;
-        out.pop().ok_or_else(|| "empty query embedding".to_string())
+        self.embed_query_timed(text).map(|(vector, _)| vector)
+    }
+
+    fn embed_query_timed(&self, text: &str) -> Result<(Vec<f32>, EmbeddingTiming), String> {
+        let mut response = self.embed(&[text], "query")?;
+        let vector = response
+            .vectors
+            .pop()
+            .ok_or_else(|| "empty query embedding".to_string())?;
+        Ok((vector, response.timing))
     }
 
     fn count_tokens(&self, text: &str) -> usize {
@@ -176,13 +188,19 @@ impl Embedder for SingleSidecar {
     }
 }
 
-/// Decode a response frame ([u32 n][u32 dim] + f32 matrix) into row vectors.
+struct SidecarEmbedding {
+    vectors: Vec<Vec<f32>>,
+    timing: EmbeddingTiming,
+}
+
+/// Decode a response frame and its server-side queue/service timings.
 fn decode_matrix(
     buf: &[u8],
     expected_rows: usize,
     expected_dim: usize,
-) -> Result<Vec<Vec<f32>>, String> {
-    if buf.len() < 8 {
+) -> Result<SidecarEmbedding, String> {
+    const HEADER_BYTES: usize = 24;
+    if buf.len() < HEADER_BYTES {
         return Err("sidecar response too short".to_string());
     }
     let n = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
@@ -192,7 +210,16 @@ fn decode_matrix(
             "sidecar returned {n}x{dim}, expected {expected_rows}x{expected_dim}"
         ));
     }
-    let floats = &buf[8..];
+    let queue_seconds = f64::from_le_bytes(buf[8..16].try_into().unwrap());
+    let service_seconds = f64::from_le_bytes(buf[16..24].try_into().unwrap());
+    if !queue_seconds.is_finite()
+        || queue_seconds < 0.0
+        || !service_seconds.is_finite()
+        || service_seconds < 0.0
+    {
+        return Err("sidecar returned invalid timing values".to_string());
+    }
+    let floats = &buf[HEADER_BYTES..];
     if floats.len() != n * dim * 4 {
         return Err("sidecar response payload size mismatch".to_string());
     }
@@ -204,7 +231,13 @@ fn decode_matrix(
                 .collect(),
         );
     }
-    Ok(out)
+    Ok(SidecarEmbedding {
+        vectors: out,
+        timing: EmbeddingTiming {
+            queue_wait: Duration::from_secs_f64(queue_seconds),
+            service: Duration::from_secs_f64(service_seconds),
+        },
+    })
 }
 
 /// The CUDA_VISIBLE_DEVICES value for each sidecar: `BIFROST_SIDECAR_DEVICES`
@@ -479,6 +512,22 @@ mod tests {
             .split_once(')')
             .expect("timeout error terminates pid");
         pid.parse().expect("pid is numeric")
+    }
+
+    #[test]
+    fn response_decodes_vectors_and_server_timings() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.extend_from_slice(&2_u32.to_le_bytes());
+        payload.extend_from_slice(&0.25_f64.to_le_bytes());
+        payload.extend_from_slice(&0.5_f64.to_le_bytes());
+        payload.extend_from_slice(&1.0_f32.to_le_bytes());
+        payload.extend_from_slice(&2.0_f32.to_le_bytes());
+
+        let response = decode_matrix(&payload, 1, 2).unwrap();
+        assert_eq!(response.vectors, vec![vec![1.0, 2.0]]);
+        assert_eq!(response.timing.queue_wait, Duration::from_millis(250));
+        assert_eq!(response.timing.service, Duration::from_millis(500));
     }
 
     #[test]
