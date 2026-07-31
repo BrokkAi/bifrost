@@ -144,6 +144,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `code_query_tutorials`
 - `code_query_typestate`
 - `code_query_typestate_context`
+- `code_query_value_flow`
 - `cross_language_attribute_target_declarations`
 - `cross_language_import_hits`
 - `cross_language_receiver_definition`

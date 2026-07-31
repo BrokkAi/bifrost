@@ -198,11 +198,97 @@ export type RqlFlowCompletion =
 
 export interface RqlFlowEvent {
   id: string;
+  site: RqlFlowSymbolSite;
   path: string;
   range: RqlResultRange;
   phase: string;
   ordinal: number;
+  carrier: RqlFlowCarrierSymbol;
 }
+
+export interface RqlFlowDeclarationSegment {
+  kind: string;
+  name?: string;
+  start_byte: number;
+  end_byte: number;
+  occurrence: number;
+  sibling_ordinal: number;
+}
+
+export interface RqlFlowSymbolSite {
+  id: string;
+  path: string;
+  language: string;
+  declaration: RqlFlowDeclarationSegment[];
+  role: string;
+  start_byte: number;
+  end_byte: number;
+  occurrence: number;
+  range: RqlResultRange;
+}
+
+export type RqlFlowPortSymbol =
+  | { kind: "receiver" }
+  | { kind: "parameter"; ordinal: number }
+  | { kind: "normal_return" }
+  | { kind: "exceptional_return" }
+  | { kind: "capture"; slot: number };
+
+export type RqlFlowSelectorSymbol =
+  | { kind: "field"; field: RqlFlowSymbolSite }
+  | { kind: "exact_index"; index: RqlFlowCarrierSymbol }
+  | { kind: "any_index" };
+
+export type RqlFlowCarrierSymbol =
+  | {
+      kind: "value";
+      id: string;
+      site: RqlFlowSymbolSite;
+      role: string;
+      ordinal?: number;
+    }
+  | {
+      kind: "port";
+      id: string;
+      procedure: RqlFlowSymbolSite;
+      port: RqlFlowPortSymbol;
+    }
+  | { kind: "allocation"; id: string; site: RqlFlowSymbolSite }
+  | {
+      kind: "call_result";
+      id: string;
+      call: RqlFlowSymbolSite;
+      result: RqlFlowCarrierSymbol;
+      callee: RqlFlowSymbolSite;
+    }
+  | {
+      kind: "scoped_root";
+      id: string;
+      root_kind: string;
+      site: RqlFlowSymbolSite;
+    }
+  | {
+      kind: "location";
+      id: string;
+      root: RqlFlowCarrierSymbol;
+      selectors: RqlFlowSelectorSymbol[];
+      exact: boolean;
+    };
+
+export type RqlFlowFactSymbol =
+  | { kind: "zero" }
+  | {
+      kind: "carrier";
+      source: RqlFlowEvent;
+      carrier: RqlFlowCarrierSymbol;
+      uncertain?: boolean;
+    }
+  | {
+      kind: "meeting";
+      source: RqlFlowEvent;
+      sink: RqlFlowEvent;
+      uncertain?: boolean;
+    };
 
 export interface RqlFlowEndpointResult extends RqlQueryResultBase {
   result_type: "flow_endpoint";
@@ -226,6 +312,11 @@ export interface RqlFlowEndpointResult extends RqlQueryResultBase {
 
 export interface RqlFlowWitnessStep extends RqlTypestateWitnessStep {
   boundary?: string;
+  source_symbol?: RqlFlowSymbolSite;
+  target_symbol?: RqlFlowSymbolSite;
+  origin_symbol?: RqlFlowSymbolSite;
+  input?: RqlFlowFactSymbol;
+  output?: RqlFlowFactSymbol;
 }
 
 export interface RqlFlowWitnessResult extends RqlQueryResultBase {
@@ -767,8 +858,22 @@ export function flowWitnessStepTargets(
       `**${typestateWitnessStepKindLabel(step.kind)}** at ` +
       `${step.source.path}:${step.source.range.start_line}:${step.source.range.start_column}` +
       `\n\nEvidence: ${semanticEvidenceLabel(step.evidence)}` +
-      (step.boundary ? `\n\nBoundary: ${step.boundary}` : "")
+      (step.boundary ? `\n\nBoundary: ${step.boundary}` : "") +
+      (step.input && step.output
+        ? `\n\nFacts: ${flowFactLabel(step.input)} -> ${flowFactLabel(step.output)}`
+        : "")
   }));
+}
+
+function flowFactLabel(fact: RqlFlowFactSymbol): string {
+  switch (fact.kind) {
+    case "zero":
+      return "zero";
+    case "carrier":
+      return `${fact.source.id} on ${fact.carrier.kind}:${fact.carrier.id}`;
+    case "meeting":
+      return `${fact.source.id} meets ${fact.sink.id}`;
+  }
 }
 
 function semanticEvidenceLabel(evidence: RqlSemanticEvidence): string {

@@ -8,6 +8,10 @@
 
 #[path = "../common/mod.rs"]
 mod common;
+#[path = "../common/value_flow_conformance.rs"]
+pub mod value_flow_conformance;
+#[path = "../common/value_flow_scenarios.rs"]
+pub mod value_flow_scenarios;
 
 // Shared support modules, loaded once for the whole harness: several member
 // modules used to `#[path]`-include these privately, which loads the same file
