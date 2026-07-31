@@ -25,8 +25,9 @@ The observable proof is the consolidated Rust integration suite: it compares the
 - [x] (2026-07-31 12:30Z) Added receiver, exceptional, cleanup, capture, field-store/load, bounded-access-path, and alias scenarios with exact positive or typed-inconclusive expectations.
 - [x] (2026-07-31 14:15Z) Added unresolved-call and same-name ambiguous-dispatch scenarios with exact reached/inconclusive endpoint sets and public ambiguity assertions.
 - [x] (2026-07-31 14:15Z) Classified all fact-only and IDE-only solver dimensions and proved every applicable public solver boundary, including the minimum witness-relation limit.
-- [ ] Add the complete cancellation, truncation, and budget inventory.
-- [ ] Reuse the scenarios across the remaining adapters with explicit readiness outcomes.
+- [x] (2026-07-31 16:05Z) Added exact and one-beyond coverage for all outer, semantic, retention, endpoint, witness, aggregate, query-local, and applicable solver budgets plus phase-targeted cancellation.
+- [x] (2026-07-31 16:05Z) Added exact index selectors and strict over-bound access-path readiness probes; filed structured adapter owner #1407.
+- [x] (2026-07-31 16:05Z) Reused the exact-helper scenario across JavaScript, Go, PHP, Ruby, and the remaining single-file direct adapters; JavaScript, Go, and PHP pass the public runner and Ruby remains a strict #1408 readiness probe.
 - [ ] Run focused and broad validation, the required policy selection, and specialist review; resolve all blocking findings.
 
 ## Surprises & Discoveries
@@ -76,6 +77,15 @@ The observable proof is the consolidated Rust integration suite: it compares the
 - Observation: public endpoint solving intentionally retains at most one witness relation per meeting.
   Evidence: `ValueFlowQueryState` constructs `WitnessRetentionLimits::best_effort(1, ...)`, so the exact public witness-relation solver limit is the minimum valid value `1`; `0` is rejected as an invalid plan before execution.
 
+- Observation: witness reconstruction and solver-retention truncation set the public witness's partial quality but previously did not set the profile truncation flag or emit the typed witness diagnostic.
+  Evidence: `ValueFlowQueryState::witnesses` only recorded truncation when byte-prefix projection removed steps. It now records every truncated witness consistently, and all six per/aggregate step, expansion, and byte boundaries prove the behavior.
+
+- Observation: Java and TypeScript preserve exact array indices but flatten nested field receiver chains before the semantic access-path bound is applied.
+  Evidence: index `0` and index `1` remain distinct exact `ExactIndex` selectors in store/load relations. A nine-field path becomes an exact temporary root containing the whole receiver expression plus only the final field, rather than root `box`, eight selectors, and a summary tail. Follow-up #1407 owns the adapter fix and the full expected paths remain ignored readiness probes.
+
+- Observation: Ruby direct value-flow conformance is ready, but public structural seeds do not bridge to its semantic method procedures.
+  Evidence: the shared Ruby helper produces six direct meetings while both method and function public seeds produce zero rows and no typed unsupported result. Follow-up #1408 owns the bridge; the public scenario remains an ignored readiness probe.
+
 ## Decision Log
 
 - Decision: add optional `input` and `output` fields to `CodeQueryFlowWitnessStep`, populated for public value-flow witnesses and omitted for the currently shared taint projection.
@@ -108,7 +118,9 @@ The first control-flow matrix is also complete. Shared Java and TypeScript descr
 
 The next boundary slice is source-backed and exact. Receiver propagation reaches the callee receiver port in both adapters. TypeScript exceptional continuation reaches its catch sink; Java exceptional flow and both cleanup variants remain typed incomplete negatives. Capture invocation, field propagation, and receiver aliases are also explicit incomplete negatives, while the field scenarios separately prove exact structured `MemoryStore` and `MemoryLoad` relations over the same bounded access path. Every shared case now executes equivalent JSON and RQL and compares the complete serialized response. Over-bound access paths, full budgets, and adapter expansion remain in progress.
 
-Ambiguous and unresolved dispatch are now explicit shared scenarios. An unresolved external result remains inconclusive while a source observed before the call still reaches its sink. Java preserves same-name dispatch ambiguity without inventing a target; TypeScript preserves the inconclusive negative but exposes a production resolver gap tracked by #1406. The solver-budget matrix classifies all seventeen dimensions and proves exact public boundaries for the eleven applicable fact-only dimensions, with the minimum-valid witness-relation boundary handled separately. Outer, semantic, retention, projection, and aggregate witness budgets remain in progress.
+Ambiguous and unresolved dispatch are now explicit shared scenarios. An unresolved external result remains inconclusive while a source observed before the call still reaches its sink. Java preserves same-name dispatch ambiguity without inventing a target; TypeScript preserves the inconclusive negative but exposes a production resolver gap tracked by #1406. The solver-budget matrix classifies all seventeen dimensions and proves exact public boundaries for the eleven applicable fact-only dimensions, with the minimum-valid witness-relation boundary handled separately.
+
+The complete public limit inventory is now table-driven. It finds the minimum passing boundary and executes one unit below for scanned files/source bytes/facts/pipeline rows, all five semantic controls, retained relations/bytes, endpoint and witness counts, all six per/aggregate witness dimensions, and both query-local clamps. Every partial witness is checked against the exact witness as a deterministic contiguous prefix. Cancellation is deterministically observed before execution, during semantic materialization, during solving, and between solving and witness reconstruction. The remaining adapter slice reuses the common exact-helper description: JavaScript, Go, and PHP pass direct plus JSON/RQL public execution; Ruby is direct-ready but public-blocked by #1408; the other single-file adapters now consume the same common builder in the direct matrix.
 
 ## Context and Orientation
 
@@ -233,3 +245,5 @@ Revision note (2026-07-31): Recorded the Java/TypeScript branch, loop, early-ret
 Revision note (2026-07-31): Recorded JSON/RQL response parity and the receiver, exceptional, cleanup, capture, field/access-path, and alias readiness outcomes.
 
 Revision note (2026-07-31): Recorded ambiguous/unresolved dispatch, TypeScript follow-up #1406, and the complete solver-dimension classification and boundary coverage.
+
+Revision note (2026-07-31): Recorded the complete public budget/cancellation matrix, exact index coverage, over-bound follow-up #1407, and cross-adapter reuse with Ruby follow-up #1408.

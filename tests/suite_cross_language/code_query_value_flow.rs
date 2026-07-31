@@ -27,16 +27,19 @@ use crate::value_flow_conformance::{
     resolve_value_flow_conformance_case,
 };
 use crate::value_flow_scenarios::{
-    with_java_ambiguous_call_negative, with_java_branch_merge, with_java_capture_flow,
-    with_java_cleanup_flow, with_java_early_return, with_java_exact_helper,
+    with_go_exact_helper, with_java_ambiguous_call_negative, with_java_branch_merge,
+    with_java_capture_flow, with_java_cleanup_flow, with_java_early_return, with_java_exact_helper,
     with_java_exceptional_flow, with_java_field_access_flow, with_java_field_alias_flow,
-    with_java_loop_exit, with_java_receiver_flow, with_java_two_matched_calls,
-    with_java_unresolved_call_negative, with_typescript_ambiguous_call_negative,
-    with_typescript_branch_merge, with_typescript_capture_flow, with_typescript_cleanup_flow,
-    with_typescript_early_return, with_typescript_exact_helper, with_typescript_exceptional_flow,
-    with_typescript_field_access_flow, with_typescript_field_alias_flow, with_typescript_loop_exit,
-    with_typescript_receiver_flow, with_typescript_two_matched_calls,
-    with_typescript_unresolved_call_negative,
+    with_java_index_access_flow, with_java_loop_exit, with_java_over_bound_field_flow,
+    with_java_receiver_flow, with_java_split_exact_helper, with_java_two_matched_calls,
+    with_java_unresolved_call_negative, with_javascript_exact_helper, with_php_exact_helper,
+    with_ruby_exact_helper, with_typescript_ambiguous_call_negative, with_typescript_branch_merge,
+    with_typescript_capture_flow, with_typescript_cleanup_flow, with_typescript_early_return,
+    with_typescript_exact_helper, with_typescript_exceptional_flow,
+    with_typescript_field_access_flow, with_typescript_field_alias_flow,
+    with_typescript_index_access_flow, with_typescript_loop_exit,
+    with_typescript_over_bound_field_flow, with_typescript_receiver_flow,
+    with_typescript_two_matched_calls, with_typescript_unresolved_call_negative,
 };
 
 const WORKSPACE_GENERATION: u64 = 23;
@@ -643,6 +646,780 @@ fn witness_relation_solver_budget_proves_its_minimum_public_boundary() {
     });
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RequestBudgetDimension {
+    ScannedFiles,
+    ScannedSourceBytes,
+    FactNodes,
+    PipelineRows,
+    SemanticMaterializedFiles,
+    SemanticSourceBytes,
+    SemanticRows,
+    SemanticRetainedBytes,
+    SemanticTraversalSteps,
+}
+
+impl RequestBudgetDimension {
+    const ALL: [Self; 9] = [
+        Self::ScannedFiles,
+        Self::ScannedSourceBytes,
+        Self::FactNodes,
+        Self::PipelineRows,
+        Self::SemanticMaterializedFiles,
+        Self::SemanticSourceBytes,
+        Self::SemanticRows,
+        Self::SemanticRetainedBytes,
+        Self::SemanticTraversalSteps,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::ScannedFiles => "scanned files",
+            Self::ScannedSourceBytes => "scanned source bytes",
+            Self::FactNodes => "fact nodes",
+            Self::PipelineRows => "pipeline rows",
+            Self::SemanticMaterializedFiles => "semantic materialized files",
+            Self::SemanticSourceBytes => "semantic source bytes",
+            Self::SemanticRows => "semantic rows per dimension",
+            Self::SemanticRetainedBytes => "semantic retained bytes",
+            Self::SemanticTraversalSteps => "semantic traversal steps",
+        }
+    }
+
+    const fn expected_diagnostic(self) -> &'static str {
+        match self {
+            Self::ScannedFiles | Self::ScannedSourceBytes | Self::FactNodes => {
+                "execution_budget_exhausted"
+            }
+            Self::PipelineRows => "pipeline_budget_exhausted",
+            Self::SemanticMaterializedFiles
+            | Self::SemanticSourceBytes
+            | Self::SemanticRows
+            | Self::SemanticRetainedBytes
+            | Self::SemanticTraversalSteps => "semantic_budget_exhausted",
+        }
+    }
+
+    const fn upper_limit(self, limits: &CodeQueryExecutionLimits) -> usize {
+        match self {
+            Self::ScannedFiles => limits.max_scanned_files,
+            Self::ScannedSourceBytes => limits.max_scanned_source_bytes,
+            Self::FactNodes => limits.max_fact_nodes,
+            Self::PipelineRows => limits.max_pipeline_rows,
+            Self::SemanticMaterializedFiles => limits.semantic.max_materialized_files,
+            Self::SemanticSourceBytes => limits.semantic.max_source_bytes,
+            Self::SemanticRows => limits.semantic.max_rows_per_dimension,
+            Self::SemanticRetainedBytes => limits.semantic.max_retained_bytes,
+            Self::SemanticTraversalSteps => limits.semantic.max_traversal_steps,
+        }
+    }
+
+    fn set_limit(self, limits: &mut CodeQueryExecutionLimits, limit: usize) {
+        match self {
+            Self::ScannedFiles => limits.max_scanned_files = limit,
+            Self::ScannedSourceBytes => limits.max_scanned_source_bytes = limit,
+            Self::FactNodes => limits.max_fact_nodes = limit,
+            Self::PipelineRows => limits.max_pipeline_rows = limit,
+            Self::SemanticMaterializedFiles => limits.semantic.max_materialized_files = limit,
+            Self::SemanticSourceBytes => limits.semantic.max_source_bytes = limit,
+            Self::SemanticRows => limits.semantic.max_rows_per_dimension = limit,
+            Self::SemanticRetainedBytes => limits.semantic.max_retained_bytes = limit,
+            Self::SemanticTraversalSteps => limits.semantic.max_traversal_steps = limit,
+        }
+    }
+
+    const fn is_semantic(self) -> bool {
+        matches!(
+            self,
+            Self::SemanticMaterializedFiles
+                | Self::SemanticSourceBytes
+                | Self::SemanticRows
+                | Self::SemanticRetainedBytes
+                | Self::SemanticTraversalSteps
+        )
+    }
+}
+
+#[test]
+fn outer_and_semantic_budget_inventory_has_exact_public_boundaries() {
+    with_java_split_exact_helper(|case| {
+        let resolved = resolve_value_flow_conformance_case(case);
+        let mut registrations = ValueFlowPlanRegistrationSet::default();
+        registrations
+            .register(
+                PLAN_REF.parse().unwrap(),
+                ValueFlowPlanRegistration::new(WORKSPACE_GENERATION, Arc::clone(&resolved.plan)),
+            )
+            .unwrap();
+        let summaries = Arc::new(ProductionTypestateSummaryRepository::new());
+        let query = profiled_shared_scenario_query(case, PLAN_REF, false);
+
+        for dimension in RequestBudgetDimension::ALL {
+            let defaults = CodeQueryExecutionLimits::default();
+            let upper_limit = dimension.upper_limit(&defaults);
+            let mut low = 1;
+            let mut high = upper_limit;
+            while low < high {
+                let middle = low + (high - low) / 2;
+                let response = execute_request_budget_limit(
+                    &resolved,
+                    &registrations,
+                    &summaries,
+                    &query,
+                    dimension,
+                    middle,
+                );
+                if has_diagnostic(&response["result"], dimension.expected_diagnostic()) {
+                    low = middle + 1;
+                } else {
+                    high = middle;
+                }
+            }
+            let boundary = low;
+            assert!(
+                boundary > 0,
+                "{} must have a positive boundary",
+                dimension.label()
+            );
+            let exact = execute_request_budget_limit(
+                &resolved,
+                &registrations,
+                &summaries,
+                &query,
+                dimension,
+                boundary,
+            );
+            assert!(
+                !has_diagnostic(&exact["result"], dimension.expected_diagnostic()),
+                "{} exact boundary {boundary}: {exact:#}",
+                dimension.label()
+            );
+
+            if boundary == 1 && dimension.is_semantic() {
+                let invalid = execute_request_budget_limit(
+                    &resolved,
+                    &registrations,
+                    &summaries,
+                    &query,
+                    dimension,
+                    0,
+                );
+                assert!(
+                    has_diagnostic(&invalid, dimension.expected_diagnostic()),
+                    "{} one below the minimum valid limit: {invalid:#}",
+                    dimension.label()
+                );
+                assert!(invalid["results"].as_array().unwrap().is_empty());
+                assert_eq!(invalid["truncated"], true);
+                continue;
+            }
+
+            let exceeded = execute_request_budget_limit(
+                &resolved,
+                &registrations,
+                &summaries,
+                &query,
+                dimension,
+                boundary - 1,
+            );
+            assert!(
+                has_diagnostic(&exceeded["result"], dimension.expected_diagnostic()),
+                "{} one beyond {}: {exceeded:#}",
+                dimension.label(),
+                boundary - 1
+            );
+            assert!(
+                exceeded["result"]["results"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row["reachability"] != "not_reached"
+                        || row["completion"] != "complete"),
+                "{} exhaustion became a clean negative: {exceeded:#}",
+                dimension.label()
+            );
+            if dimension.is_semantic() {
+                assert_eq!(
+                    exceeded.pointer("/work/semantic/budget_exhausted"),
+                    Some(&json!(true))
+                );
+            } else {
+                assert_eq!(exceeded["result"]["truncated"], true);
+            }
+        }
+    });
+}
+
+fn execute_request_budget_limit(
+    resolved: &ResolvedValueFlowConformanceCase,
+    registrations: &ValueFlowPlanRegistrationSet,
+    summaries: &Arc<ProductionTypestateSummaryRepository>,
+    query: &CodeQuery,
+    dimension: RequestBudgetDimension,
+    limit: usize,
+) -> serde_json::Value {
+    let mut limits = CodeQueryExecutionLimits::default();
+    dimension.set_limit(&mut limits, limit);
+    let result = execute_workspace_request_with_analysis_registration_lease(
+        &resolved.analyzer,
+        WORKSPACE_GENERATION,
+        &ProtocolRegistrationSet::default(),
+        registrations,
+        query,
+        limits,
+        None,
+        summaries.lease(WORKSPACE_GENERATION).unwrap(),
+    );
+    serde_json::to_value(result).unwrap()
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RetentionBudgetDimension {
+    Relations,
+    Bytes,
+}
+
+impl RetentionBudgetDimension {
+    const ALL: [Self; 2] = [Self::Relations, Self::Bytes];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Relations => "retained witness relations",
+            Self::Bytes => "retained witness bytes",
+        }
+    }
+
+    const fn upper_limit(self, limits: &CodeQueryExecutionLimits) -> usize {
+        match self {
+            Self::Relations => limits.value_flow.max_retained_relations,
+            Self::Bytes => limits.value_flow.max_retained_bytes,
+        }
+    }
+
+    fn set_limit(self, limits: &mut CodeQueryExecutionLimits, limit: usize) {
+        match self {
+            Self::Relations => limits.value_flow.max_retained_relations = limit,
+            Self::Bytes => limits.value_flow.max_retained_bytes = limit,
+        }
+    }
+}
+
+#[test]
+fn retained_witness_budget_inventory_has_exact_contiguous_boundaries() {
+    with_java_exact_helper(|case| {
+        let resolved = resolve_value_flow_conformance_case(case);
+        let mut registrations = ValueFlowPlanRegistrationSet::default();
+        registrations
+            .register(
+                PLAN_REF.parse().unwrap(),
+                ValueFlowPlanRegistration::new(
+                    WORKSPACE_GENERATION,
+                    Arc::clone(&resolved.witness_plan),
+                ),
+            )
+            .unwrap();
+        let summaries = Arc::new(ProductionTypestateSummaryRepository::new());
+        let query = profiled_shared_scenario_query(case, PLAN_REF, true);
+
+        for dimension in RetentionBudgetDimension::ALL {
+            let defaults = CodeQueryExecutionLimits::default();
+            let mut low = 1;
+            let mut high = dimension.upper_limit(&defaults);
+            while low < high {
+                let middle = low + (high - low) / 2;
+                let response = execute_retention_budget_limit(
+                    &resolved,
+                    &registrations,
+                    &summaries,
+                    &query,
+                    dimension,
+                    middle,
+                );
+                if public_witnesses_complete(&response) {
+                    high = middle;
+                } else {
+                    low = middle + 1;
+                }
+            }
+            let boundary = low;
+            assert!(
+                boundary > 1,
+                "{} must have a truncating one-beyond limit",
+                dimension.label()
+            );
+            let exact = execute_retention_budget_limit(
+                &resolved,
+                &registrations,
+                &summaries,
+                &query,
+                dimension,
+                boundary,
+            );
+            assert!(
+                public_witnesses_complete(&exact),
+                "{} exact boundary {boundary}: {exact:#}",
+                dimension.label()
+            );
+
+            let exceeded = execute_retention_budget_limit(
+                &resolved,
+                &registrations,
+                &summaries,
+                &query,
+                dimension,
+                boundary - 1,
+            );
+            let exact_steps = &exact["result"]["results"][0]["steps"];
+            let exceeded_rows = exceeded["result"]["results"].as_array().unwrap();
+            assert!(
+                !exceeded_rows.is_empty(),
+                "{} must retain a deterministic partial witness: {exceeded:#}",
+                dimension.label()
+            );
+            for witness in exceeded_rows {
+                assert_eq!(witness["retention_truncated"], true, "{exceeded:#}");
+                assert_eq!(witness["truncated"], true, "{exceeded:#}");
+                assert_eq!(witness["quality"]["completeness"], "partial");
+                assert_contiguous_step_prefix(exact_steps, &witness["steps"]);
+            }
+            assert!(
+                has_diagnostic(&exceeded["result"], "value_flow_analysis_partial"),
+                "{} truncation diagnostic: {exceeded:#}",
+                dimension.label()
+            );
+            assert!(
+                has_diagnostic(&exceeded["result"], "value_flow_witness_truncated"),
+                "{} typed witness diagnostic: {exceeded:#}",
+                dimension.label()
+            );
+            assert_eq!(
+                exceeded.pointer("/work/semantic/value_flow/witness_truncated"),
+                Some(&json!(true))
+            );
+            assert!(
+                exceeded["result"]["results"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row["reachability"] != "not_reached"
+                        || row["completion"] != "complete"),
+                "{} retention exhaustion became a clean negative: {exceeded:#}",
+                dimension.label()
+            );
+        }
+    });
+}
+
+fn execute_retention_budget_limit(
+    resolved: &ResolvedValueFlowConformanceCase,
+    registrations: &ValueFlowPlanRegistrationSet,
+    summaries: &Arc<ProductionTypestateSummaryRepository>,
+    query: &CodeQuery,
+    dimension: RetentionBudgetDimension,
+    limit: usize,
+) -> serde_json::Value {
+    let mut limits = CodeQueryExecutionLimits::default();
+    dimension.set_limit(&mut limits, limit);
+    let result = execute_workspace_request_with_analysis_registration_lease(
+        &resolved.analyzer,
+        WORKSPACE_GENERATION,
+        &ProtocolRegistrationSet::default(),
+        registrations,
+        query,
+        limits,
+        None,
+        summaries.lease(WORKSPACE_GENERATION).unwrap(),
+    );
+    serde_json::to_value(result).unwrap()
+}
+
+fn public_witnesses_complete(response: &serde_json::Value) -> bool {
+    response["result"]["results"]
+        .as_array()
+        .is_some_and(|rows| {
+            !rows.is_empty()
+                && rows.iter().all(|row| {
+                    !row["truncated"].as_bool().unwrap_or(false)
+                        && !row["retention_truncated"].as_bool().unwrap_or(false)
+                })
+        })
+}
+
+fn assert_contiguous_step_prefix(full: &serde_json::Value, retained: &serde_json::Value) {
+    let full = full.as_array().unwrap();
+    let retained = retained.as_array().unwrap();
+    assert!(retained.len() <= full.len());
+    assert_eq!(retained, &full[..retained.len()]);
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProjectionBudgetDimension {
+    Endpoints,
+    Witnesses,
+    WitnessSteps,
+    WitnessExpansions,
+    WitnessBytes,
+    TotalWitnessSteps,
+    TotalWitnessExpansions,
+    TotalWitnessBytes,
+}
+
+impl ProjectionBudgetDimension {
+    const ALL: [Self; 8] = [
+        Self::Endpoints,
+        Self::Witnesses,
+        Self::WitnessSteps,
+        Self::WitnessExpansions,
+        Self::WitnessBytes,
+        Self::TotalWitnessSteps,
+        Self::TotalWitnessExpansions,
+        Self::TotalWitnessBytes,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Endpoints => "endpoint count",
+            Self::Witnesses => "witness count",
+            Self::WitnessSteps => "per-witness steps",
+            Self::WitnessExpansions => "per-witness expansions",
+            Self::WitnessBytes => "per-witness bytes",
+            Self::TotalWitnessSteps => "aggregate witness steps",
+            Self::TotalWitnessExpansions => "aggregate witness expansions",
+            Self::TotalWitnessBytes => "aggregate witness bytes",
+        }
+    }
+
+    const fn upper_limit(self, limits: &CodeQueryExecutionLimits) -> usize {
+        match self {
+            Self::Endpoints => limits.value_flow.max_endpoints,
+            Self::Witnesses => limits.value_flow.max_witnesses,
+            Self::WitnessSteps => limits.value_flow.max_witness_steps,
+            Self::WitnessExpansions => limits.value_flow.max_witness_expansions,
+            Self::WitnessBytes => limits.value_flow.max_witness_bytes,
+            Self::TotalWitnessSteps => limits.value_flow.max_total_witness_steps,
+            Self::TotalWitnessExpansions => limits.value_flow.max_total_witness_expansions,
+            Self::TotalWitnessBytes => limits.value_flow.max_total_witness_bytes,
+        }
+    }
+
+    fn set_limit(self, limits: &mut CodeQueryExecutionLimits, limit: usize) {
+        match self {
+            Self::Endpoints => limits.value_flow.max_endpoints = limit,
+            Self::Witnesses => limits.value_flow.max_witnesses = limit,
+            Self::WitnessSteps => limits.value_flow.max_witness_steps = limit,
+            Self::WitnessExpansions => limits.value_flow.max_witness_expansions = limit,
+            Self::WitnessBytes => limits.value_flow.max_witness_bytes = limit,
+            Self::TotalWitnessSteps => limits.value_flow.max_total_witness_steps = limit,
+            Self::TotalWitnessExpansions => limits.value_flow.max_total_witness_expansions = limit,
+            Self::TotalWitnessBytes => limits.value_flow.max_total_witness_bytes = limit,
+        }
+    }
+
+    const fn expected_diagnostic(self) -> &'static str {
+        match self {
+            Self::Endpoints => "pipeline_budget_exhausted",
+            Self::Witnesses
+            | Self::WitnessSteps
+            | Self::WitnessExpansions
+            | Self::WitnessBytes
+            | Self::TotalWitnessSteps
+            | Self::TotalWitnessExpansions
+            | Self::TotalWitnessBytes => "value_flow_witness_truncated",
+        }
+    }
+
+    const fn uses_witness_query(self) -> bool {
+        !matches!(self, Self::Endpoints)
+    }
+}
+
+#[test]
+fn endpoint_and_witness_budget_inventory_has_exact_contiguous_boundaries() {
+    let fixture = Fixture::with_shape(
+        ProofStatus::Proven,
+        EvidenceCompleteness::Complete,
+        Some(SemanticInputStatus::Complete),
+        true,
+        2,
+    );
+
+    for dimension in ProjectionBudgetDimension::ALL {
+        let query = profiled_query(dimension.uses_witness_query());
+        let defaults = CodeQueryExecutionLimits::default();
+        let mut low = 1;
+        let mut high = dimension.upper_limit(&defaults);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let response = execute_projection_budget_limit(&fixture, &query, dimension, middle);
+            if projection_is_complete(&response, dimension, 2) {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        let boundary = low;
+        assert!(
+            boundary > 1,
+            "{} must permit a truncating one-beyond limit",
+            dimension.label()
+        );
+        let exact = execute_projection_budget_limit(&fixture, &query, dimension, boundary);
+        assert!(
+            projection_is_complete(&exact, dimension, 2),
+            "{} exact boundary {boundary}: {exact:#}",
+            dimension.label()
+        );
+
+        let exceeded = execute_projection_budget_limit(&fixture, &query, dimension, boundary - 1);
+        assert!(
+            has_diagnostic(&exceeded["result"], dimension.expected_diagnostic()),
+            "{} one beyond {}: {exceeded:#}",
+            dimension.label(),
+            boundary - 1
+        );
+        assert!(
+            !projection_is_complete(&exceeded, dimension, 2),
+            "{} one-beyond limit remained complete: {exceeded:#}",
+            dimension.label()
+        );
+        if matches!(dimension, ProjectionBudgetDimension::Endpoints) {
+            assert_eq!(
+                exceeded.pointer("/work/semantic/value_flow/endpoint_truncated"),
+                Some(&json!(true))
+            );
+            assert!(
+                exceeded
+                    .pointer("/work/semantic/value_flow/omitted_endpoints")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|omitted| omitted >= 1)
+            );
+            continue;
+        }
+
+        assert_eq!(
+            exceeded.pointer("/work/semantic/value_flow/witness_truncated"),
+            Some(&json!(true))
+        );
+        let exact_rows = exact["result"]["results"].as_array().unwrap();
+        let exceeded_rows = exceeded["result"]["results"].as_array().unwrap();
+        for witness in exceeded_rows {
+            let full = exact_rows
+                .iter()
+                .find(|row| row["endpoint_id"] == witness["endpoint_id"])
+                .expect("same endpoint in exact witness set");
+            assert_contiguous_step_prefix(&full["steps"], &witness["steps"]);
+            if witness["truncated"].as_bool().unwrap_or(false) {
+                assert!(
+                    witness["omitted_steps_lower_bound"]
+                        .as_u64()
+                        .is_some_and(|omitted| omitted >= 1),
+                    "{} omitted step lower bound: {witness:#}",
+                    dimension.label()
+                );
+            }
+        }
+        if matches!(dimension, ProjectionBudgetDimension::Witnesses) {
+            assert!(
+                exceeded
+                    .pointer("/work/semantic/value_flow/omitted_witnesses")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|omitted| omitted >= 1)
+            );
+        }
+    }
+}
+
+fn execute_projection_budget_limit(
+    fixture: &Fixture,
+    query: &CodeQuery,
+    dimension: ProjectionBudgetDimension,
+    limit: usize,
+) -> serde_json::Value {
+    let mut limits = CodeQueryExecutionLimits::default();
+    dimension.set_limit(&mut limits, limit);
+    fixture.execute(query, limits)
+}
+
+fn projection_is_complete(
+    response: &serde_json::Value,
+    dimension: ProjectionBudgetDimension,
+    expected_rows: usize,
+) -> bool {
+    let Some(rows) = response["result"]["results"].as_array() else {
+        return false;
+    };
+    if rows.len() != expected_rows {
+        return false;
+    }
+    if matches!(dimension, ProjectionBudgetDimension::Endpoints) {
+        return !response["result"]["truncated"].as_bool().unwrap_or(false);
+    }
+    !response
+        .pointer("/work/semantic/value_flow/witness_truncated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        && rows
+            .iter()
+            .all(|row| !row["truncated"].as_bool().unwrap_or(false))
+}
+
+#[test]
+fn query_local_witness_clamps_have_exact_contiguous_boundaries() {
+    let fixture = Fixture::new(ProofStatus::Proven, EvidenceCompleteness::Complete);
+    let baseline = fixture.execute(
+        &profiled_witness_query(16_384, 16 * 1024 * 1024),
+        CodeQueryExecutionLimits::default(),
+    );
+    let baseline_witness = &baseline["result"]["results"][0];
+    let exact_steps = baseline_witness["steps"].as_array().unwrap().len();
+    let exact_bytes = baseline_witness["retained_bytes"].as_u64().unwrap() as usize;
+    assert!(exact_steps > 1);
+    assert!(exact_bytes > 1);
+
+    for (label, exact_limit, query) in [
+        (
+            "query-local witness steps",
+            exact_steps,
+            profiled_witness_query(exact_steps, 16 * 1024 * 1024),
+        ),
+        (
+            "query-local witness bytes",
+            exact_bytes,
+            profiled_witness_query(16_384, exact_bytes),
+        ),
+    ] {
+        let exact = fixture.execute(&query, CodeQueryExecutionLimits::default());
+        assert!(
+            !exact["result"]["results"][0]["truncated"]
+                .as_bool()
+                .unwrap_or(false),
+            "{label}: {exact:#}"
+        );
+        assert_eq!(
+            exact["result"]["results"][0]["steps"], baseline_witness["steps"],
+            "{label} exact boundary"
+        );
+
+        let exceeded_query = if label.ends_with("steps") {
+            profiled_witness_query(exact_limit - 1, 16 * 1024 * 1024)
+        } else {
+            profiled_witness_query(16_384, exact_limit - 1)
+        };
+        let exceeded = fixture.execute(&exceeded_query, CodeQueryExecutionLimits::default());
+        let witness = &exceeded["result"]["results"][0];
+        assert_eq!(witness["truncated"], true, "{label}: {exceeded:#}");
+        assert_eq!(witness["quality"]["completeness"], "partial");
+        assert!(
+            witness["omitted_steps_lower_bound"]
+                .as_u64()
+                .is_some_and(|omitted| omitted >= 1)
+        );
+        assert_contiguous_step_prefix(&baseline_witness["steps"], &witness["steps"]);
+        assert!(has_diagnostic(
+            &exceeded["result"],
+            "value_flow_witness_truncated"
+        ));
+        assert_eq!(
+            exceeded.pointer("/work/semantic/value_flow/witness_truncated"),
+            Some(&json!(true))
+        );
+    }
+}
+
+fn profiled_witness_query(max_steps: usize, max_bytes: usize) -> CodeQuery {
+    CodeQuery::from_json(&json!({
+        "schema_version": 6,
+        "execution_mode": "profile",
+        "match": {"kind": "method", "name": "run"},
+        "steps": [
+            {"op": "procedure_of"},
+            {"op": "value_flow", "plan_ref": PLAN_REF},
+            {"op": "witness", "max_steps": max_steps, "max_bytes": max_bytes}
+        ]
+    }))
+    .unwrap()
+}
+
+#[test]
+fn cancellation_checkpoints_preserve_typed_phase_evidence() {
+    let fixture = Fixture::new(ProofStatus::Proven, EvidenceCompleteness::Complete);
+    let query = profiled_query(true);
+    let mut semantic_cancelled = None;
+    let mut solver_cancelled = None;
+    let mut before_witness_cancelled = None;
+
+    for checks in 1..=256 {
+        let cancellation = CancellationToken::cancel_after_checks_for_test(checks);
+        let response = fixture.execute_with_cancellation(
+            &query,
+            CodeQueryExecutionLimits::default(),
+            Some(&cancellation),
+        );
+        let result = &response["result"];
+        if !has_diagnostic(result, "cancelled") {
+            continue;
+        }
+        let solves = profile_u64(&response, "/work/semantic/value_flow/solves");
+        let cancelled_solves = profile_u64(&response, "/work/semantic/value_flow/cancelled_solves");
+        let fixed_point_solves =
+            profile_u64(&response, "/work/semantic/value_flow/fixed_point_solves");
+        let witnesses = profile_u64(&response, "/work/semantic/value_flow/witnesses");
+        let materialization_attempts =
+            profile_u64(&response, "/work/semantic/materialization_attempts");
+
+        if semantic_cancelled.is_none() && materialization_attempts > 0 && solves == 0 {
+            semantic_cancelled = Some(response.clone());
+        }
+        if solver_cancelled.is_none() && cancelled_solves == 1 {
+            solver_cancelled = Some(response.clone());
+        }
+        if before_witness_cancelled.is_none() && fixed_point_solves == 1 && witnesses == 0 {
+            before_witness_cancelled = Some(response);
+        }
+        if semantic_cancelled.is_some()
+            && solver_cancelled.is_some()
+            && before_witness_cancelled.is_some()
+        {
+            break;
+        }
+    }
+
+    for (phase, response) in [
+        (
+            "semantic materialization",
+            semantic_cancelled.expect("deterministic semantic cancellation checkpoint"),
+        ),
+        (
+            "solver",
+            solver_cancelled.expect("deterministic solver cancellation checkpoint"),
+        ),
+        (
+            "between solving and witness reconstruction",
+            before_witness_cancelled.expect("deterministic witness cancellation checkpoint"),
+        ),
+    ] {
+        assert!(
+            has_diagnostic(&response["result"], "cancelled"),
+            "{phase}: {response:#}"
+        );
+        assert!(
+            response["result"]["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["reachability"] != "not_reached" || row["completion"] != "complete"),
+            "{phase} cancellation became a clean negative: {response:#}"
+        );
+    }
+}
+
+fn profile_u64(response: &serde_json::Value, pointer: &str) -> u64 {
+    response
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+}
+
 fn assert_solver_budget_boundaries(
     case: &ValueFlowConformanceCase<'_>,
     dimensions: &[SolverBudgetDimension],
@@ -876,6 +1653,27 @@ fn typescript_helper_scenario_runs_through_direct_and_public_queries() {
 }
 
 #[test]
+fn javascript_helper_scenario_runs_through_direct_and_public_queries() {
+    with_javascript_exact_helper(assert_shared_helper_scenario);
+}
+
+#[test]
+fn go_helper_scenario_runs_through_direct_and_public_queries() {
+    with_go_exact_helper(assert_shared_helper_scenario);
+}
+
+#[test]
+fn php_helper_scenario_runs_through_direct_and_public_queries() {
+    with_php_exact_helper(assert_shared_helper_scenario);
+}
+
+#[test]
+#[ignore = "readiness probe for #1408: Ruby structural seeds do not bridge to semantic methods"]
+fn ruby_helper_scenario_runs_through_direct_and_public_queries() {
+    with_ruby_exact_helper(assert_shared_helper_scenario);
+}
+
+#[test]
 fn java_branch_merge_runs_through_direct_and_public_queries() {
     with_java_branch_merge(assert_shared_helper_scenario);
 }
@@ -963,6 +1761,28 @@ fn java_field_access_preserves_public_location_symbols() {
 #[test]
 fn typescript_field_access_preserves_public_location_symbols() {
     with_typescript_field_access_flow(assert_shared_helper_scenario);
+}
+
+#[test]
+fn java_exact_indices_preserve_distinct_public_location_symbols() {
+    with_java_index_access_flow(assert_shared_helper_scenario);
+}
+
+#[test]
+fn typescript_exact_indices_preserve_distinct_public_location_symbols() {
+    with_typescript_index_access_flow(assert_shared_helper_scenario);
+}
+
+#[test]
+#[ignore = "readiness probe for #1407: Java flattens nested field access paths"]
+fn java_over_bound_access_path_preserves_public_summary_negative() {
+    with_java_over_bound_field_flow(assert_shared_helper_scenario);
+}
+
+#[test]
+#[ignore = "readiness probe for #1407: TypeScript flattens nested field access paths"]
+fn typescript_over_bound_access_path_preserves_public_summary_negative() {
+    with_typescript_over_bound_field_flow(assert_shared_helper_scenario);
 }
 
 #[test]
@@ -1157,6 +1977,16 @@ fn shared_scenario_query(
         "steps": steps,
     }))
     .unwrap()
+}
+
+fn profiled_shared_scenario_query(
+    case: &ValueFlowConformanceCase<'_>,
+    plan_ref: &str,
+    with_witness: bool,
+) -> CodeQuery {
+    let mut value = shared_scenario_query(case, plan_ref, with_witness).to_canonical_json();
+    value["execution_mode"] = json!("profile");
+    CodeQuery::from_json(&value).unwrap()
 }
 
 fn shared_scenario_rql_query(

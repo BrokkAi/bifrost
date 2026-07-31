@@ -11,16 +11,19 @@ use crate::value_flow_conformance::{
     ProcedureSelector, ValueFlowConformanceCase, assert_value_flow_conformance,
 };
 use crate::value_flow_scenarios::{
-    with_java_ambiguous_call_negative, with_java_branch_merge, with_java_capture_flow,
-    with_java_cleanup_flow, with_java_early_return, with_java_exact_helper,
+    with_go_exact_helper, with_java_ambiguous_call_negative, with_java_branch_merge,
+    with_java_capture_flow, with_java_cleanup_flow, with_java_early_return, with_java_exact_helper,
     with_java_exceptional_flow, with_java_field_access_flow, with_java_field_alias_flow,
-    with_java_loop_exit, with_java_receiver_flow, with_java_two_matched_calls,
-    with_java_unresolved_call_negative, with_typescript_ambiguous_call_negative,
+    with_java_index_access_flow, with_java_loop_exit, with_java_over_bound_field_flow,
+    with_java_receiver_flow, with_java_split_exact_helper, with_java_two_matched_calls,
+    with_java_unresolved_call_negative, with_javascript_exact_helper, with_php_exact_helper,
+    with_ruby_exact_helper, with_single_file_exact_helper, with_typescript_ambiguous_call_negative,
     with_typescript_branch_merge, with_typescript_capture_flow, with_typescript_cleanup_flow,
     with_typescript_early_return, with_typescript_exact_helper, with_typescript_exceptional_flow,
-    with_typescript_field_access_flow, with_typescript_field_alias_flow, with_typescript_loop_exit,
-    with_typescript_receiver_flow, with_typescript_two_matched_calls,
-    with_typescript_unresolved_call_negative,
+    with_typescript_field_access_flow, with_typescript_field_alias_flow,
+    with_typescript_index_access_flow, with_typescript_loop_exit,
+    with_typescript_over_bound_field_flow, with_typescript_receiver_flow,
+    with_typescript_two_matched_calls, with_typescript_unresolved_call_negative,
 };
 
 const CALLS: &[CallSelector<'_>] = &[
@@ -243,30 +246,37 @@ fn assert_single_file_exact_helper_flow(
     expected_result_complete: bool,
     meeting_count: usize,
 ) {
-    let files = [InlineSourceFile { path, source }];
-    assert_multi_file_exact_helper_flow(
+    assert_eq!(flowed_outcome, ExpectedSinkOutcome::Reached);
+    assert!(!expected_discovery_complete);
+    with_single_file_exact_helper(
         name,
         language,
-        &files,
         path,
-        path,
+        source,
         procedure_kind,
         relay_call,
         sink_call,
         relay_local,
         run_local,
-        flowed_outcome,
         clean_outcome,
         expected_discovery_status,
-        expected_discovery_complete,
         expected_result_complete,
         meeting_count,
+        meeting_count,
+        0,
+        0,
+        assert_value_flow_conformance,
     );
 }
 
 #[test]
 fn java_exact_helper_flow() {
     with_java_exact_helper(assert_value_flow_conformance);
+}
+
+#[test]
+fn java_split_file_exact_helper_flow() {
+    with_java_split_exact_helper(assert_value_flow_conformance);
 }
 
 #[test]
@@ -365,6 +375,28 @@ fn typescript_field_store_load_preserves_bounded_access_path() {
 }
 
 #[test]
+fn java_exact_indices_remain_distinct_in_memory_relations() {
+    with_java_index_access_flow(assert_value_flow_conformance);
+}
+
+#[test]
+fn typescript_exact_indices_remain_distinct_in_memory_relations() {
+    with_typescript_index_access_flow(assert_value_flow_conformance);
+}
+
+#[test]
+#[ignore = "readiness probe for #1407: Java flattens nested field access paths"]
+fn java_over_bound_access_path_is_an_explicit_summary() {
+    with_java_over_bound_field_flow(assert_value_flow_conformance);
+}
+
+#[test]
+#[ignore = "readiness probe for #1407: TypeScript flattens nested field access paths"]
+fn typescript_over_bound_access_path_is_an_explicit_summary() {
+    with_typescript_over_bound_field_flow(assert_value_flow_conformance);
+}
+
+#[test]
 fn java_alias_field_flow_is_an_inconclusive_negative() {
     with_java_field_alias_flow(assert_value_flow_conformance);
 }
@@ -441,36 +473,7 @@ fn csharp_exact_helper_flow() {
 
 #[test]
 fn javascript_exact_helper_flow() {
-    assert_single_file_exact_helper_flow(
-        "javascript",
-        Language::JavaScript,
-        "src/exact_flow.js",
-        r#"
-            function relay(value) {
-              const relayed = value;
-              return relayed;
-            }
-
-            function sink(flowed, clean) {}
-
-            function run(input) {
-              const copy = relay(input);
-              const clean = "clean";
-              sink(copy, clean);
-            }
-        "#,
-        ProcedureKind::Function,
-        "relay(input)",
-        "sink(copy, clean)",
-        "relayed",
-        "copy",
-        ExpectedSinkOutcome::Reached,
-        ExpectedSinkOutcome::Inconclusive,
-        SemanticInputStatus::Unknown,
-        false,
-        false,
-        6,
-    );
+    with_javascript_exact_helper(assert_value_flow_conformance);
 }
 
 #[test]
@@ -544,73 +547,12 @@ fn python_exact_helper_flow() {
 
 #[test]
 fn php_exact_helper_flow() {
-    assert_single_file_exact_helper_flow(
-        "php",
-        Language::Php,
-        "src/exact_flow.php",
-        r#"
-            <?php
-
-            function relay(string $value): string {
-                $relayed = $value;
-                return $relayed;
-            }
-
-            function sink(string $flowed, string $clean): void {}
-
-            function run(string $input): void {
-                $copy = relay($input);
-                $clean = "clean";
-                sink($copy, $clean);
-            }
-        "#,
-        ProcedureKind::Function,
-        "relay($input)",
-        "sink($copy, $clean)",
-        "$relayed",
-        "$copy",
-        ExpectedSinkOutcome::Reached,
-        ExpectedSinkOutcome::NotReached,
-        SemanticInputStatus::Unknown,
-        false,
-        true,
-        1,
-    );
+    with_php_exact_helper(assert_value_flow_conformance);
 }
 
 #[test]
 fn ruby_exact_helper_flow() {
-    assert_single_file_exact_helper_flow(
-        "ruby",
-        Language::Ruby,
-        "exact_flow.rb",
-        r#"
-            def relay(value)
-              relayed = value
-              relayed
-            end
-
-            def sink(flowed, clean)
-            end
-
-            def run(input)
-              copy = relay(input)
-              clean = "clean"
-              sink(copy, clean)
-            end
-        "#,
-        ProcedureKind::Method,
-        "relay(input)",
-        "sink(copy, clean)",
-        "relayed",
-        "copy",
-        ExpectedSinkOutcome::Reached,
-        ExpectedSinkOutcome::Inconclusive,
-        SemanticInputStatus::Unknown,
-        false,
-        false,
-        6,
-    );
+    with_ruby_exact_helper(assert_value_flow_conformance);
 }
 
 #[test]
@@ -801,36 +743,5 @@ fn cpp_exact_helper_flow_through_header_declaration() {
 
 #[test]
 fn go_exact_helper_flow() {
-    assert_single_file_exact_helper_flow(
-        "go",
-        Language::Go,
-        "exact_flow.go",
-        r#"
-            package conformance
-
-            func relay(value string) string {
-                relayed := value
-                return relayed
-            }
-
-            func sink(flowed string, clean string) {}
-
-            func run(input string) {
-                copy := relay(input)
-                clean := "clean"
-                sink(copy, clean)
-            }
-        "#,
-        ProcedureKind::Function,
-        "relay(input)",
-        "sink(copy, clean)",
-        "relayed",
-        "copy",
-        ExpectedSinkOutcome::Reached,
-        ExpectedSinkOutcome::Inconclusive,
-        SemanticInputStatus::Unknown,
-        false,
-        false,
-        1,
-    );
+    with_go_exact_helper(assert_value_flow_conformance);
 }

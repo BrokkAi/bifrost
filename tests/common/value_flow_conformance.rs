@@ -728,7 +728,17 @@ fn assert_expected_location_relations(
     procedures: &HashMap<String, ProcedureHandle>,
     snapshots: &[ValueFlowInput<ValueFlowSnapshot>],
 ) {
-    for expected in case.expected_location_relations {
+    for (index, expected) in case.expected_location_relations.iter().enumerate() {
+        if case.expected_location_relations[..index]
+            .iter()
+            .any(|earlier| {
+                earlier.procedure == expected.procedure
+                    && earlier.kind == expected.kind
+                    && earlier.side == expected.side
+            })
+        {
+            continue;
+        }
         let procedure = procedure(procedures, expected.procedure);
         let snapshot = snapshots
             .iter()
@@ -749,10 +759,32 @@ fn assert_expected_location_relations(
                 Some(carrier_milestone(case, &stable))
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            actual_locations,
-            [expected.location.clone()],
-            "{} exact {:?} relation {:?} location",
+        let expected_locations = case
+            .expected_location_relations
+            .iter()
+            .filter(|candidate| {
+                candidate.procedure == expected.procedure
+                    && candidate.kind == expected.kind
+                    && candidate.side == expected.side
+            })
+            .map(|candidate| candidate.location.clone())
+            .collect::<Vec<_>>();
+        let mut unmatched = actual_locations;
+        for expected_location in &expected_locations {
+            let position = unmatched
+                .iter()
+                .position(|actual| actual == expected_location)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} missing {:?} relation {:?} location {expected_location:#?}; actual={unmatched:#?}",
+                        case.name, expected.kind, expected.side
+                    )
+                });
+            unmatched.remove(position);
+        }
+        assert!(
+            unmatched.is_empty(),
+            "{} unexpected {:?} relation {:?} locations: {unmatched:#?}; expected={expected_locations:#?}",
             case.name,
             expected.kind,
             expected.side,

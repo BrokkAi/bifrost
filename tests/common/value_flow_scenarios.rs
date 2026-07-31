@@ -50,6 +50,27 @@ function run(input: string): void {
 }
 "#;
 
+const JAVA_SPLIT_RELAY_SOURCE: &str = r#"
+final class SplitRelay {
+  static String relay(String value) {
+    String relayed = value;
+    return relayed;
+  }
+}
+"#;
+
+const JAVA_SPLIT_CALLER_SOURCE: &str = r#"
+final class SplitFlowFixture {
+  static void sink(String flowed, String clean) {}
+
+  static void run(String input) {
+    String copy = SplitRelay.relay(input);
+    String clean = "clean";
+    sink(copy, clean);
+  }
+}
+"#;
+
 const JAVA_BRANCH_SOURCE: &str = r#"
 final class BranchFlowFixture {
   static void sink(String flowed, String clean) {}
@@ -383,6 +404,68 @@ function run(input: string): void {
 }
 "#;
 
+const JAVA_OVER_BOUND_FIELD_SOURCE: &str = r#"
+final class OverBoundFieldFlowFixture {
+  static final class Box {
+    Box next;
+    String value;
+  }
+
+  static void sink(String flowed, String clean) {}
+
+  static void run(String input) {
+    Box box = new Box();
+    box.next.next.next.next.next.next.next.next.value = input;
+    String copy = box.next.next.next.next.next.next.next.next.value;
+    String clean = "clean";
+    sink(copy, clean);
+  }
+}
+"#;
+
+const TYPESCRIPT_OVER_BOUND_FIELD_SOURCE: &str = r#"
+class OverBoundBox {
+  next!: OverBoundBox;
+  value: string = "clean";
+}
+
+function sink(flowed: string, clean: string): void {}
+
+function run(input: string): void {
+  const box = new OverBoundBox();
+  box.next.next.next.next.next.next.next.next.value = input;
+  const copy = box.next.next.next.next.next.next.next.next.value;
+  const clean = "clean";
+  sink(copy, clean);
+}
+"#;
+
+const JAVA_INDEX_ACCESS_SOURCE: &str = r#"
+final class IndexFlowFixture {
+  static void sink(String flowed, String wrong) {}
+
+  static void run(String input) {
+    String[] values = new String[2];
+    values[0] = input;
+    String copy = values[0];
+    String wrong = values[1];
+    sink(copy, wrong);
+  }
+}
+"#;
+
+const TYPESCRIPT_INDEX_ACCESS_SOURCE: &str = r#"
+function sink(flowed: string, wrong: string): void {}
+
+function run(input: string): void {
+  const values = ["clean", "clean"];
+  values[0] = input;
+  const copy = values[0];
+  const wrong = values[1];
+  sink(copy, wrong);
+}
+"#;
+
 const JAVA_UNRESOLVED_CALL_SOURCE: &str = r#"
 interface ExternalWork {
   String relay(String value);
@@ -472,6 +555,17 @@ const TYPESCRIPT_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
     path: "src/exact_flow.ts",
     source: TYPESCRIPT_SOURCE,
 }];
+
+const JAVA_SPLIT_FILES: &[InlineSourceFile<'_>] = &[
+    InlineSourceFile {
+        path: "src/SplitRelay.java",
+        source: JAVA_SPLIT_RELAY_SOURCE,
+    },
+    InlineSourceFile {
+        path: "src/SplitFlowFixture.java",
+        source: JAVA_SPLIT_CALLER_SOURCE,
+    },
+];
 
 const JAVA_BRANCH_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
     path: "src/BranchFlowFixture.java",
@@ -652,6 +746,27 @@ const TYPESCRIPT_PROCEDURES: &[ProcedureSelector<'_>] = &[
         path: "src/exact_flow.ts",
         name: "sink",
         kind: ProcedureKind::Function,
+    },
+];
+
+const JAVA_SPLIT_PROCEDURES: &[ProcedureSelector<'_>] = &[
+    ProcedureSelector {
+        alias: "run",
+        path: "src/SplitFlowFixture.java",
+        name: "run",
+        kind: ProcedureKind::Method,
+    },
+    ProcedureSelector {
+        alias: "relay",
+        path: "src/SplitRelay.java",
+        name: "relay",
+        kind: ProcedureKind::Method,
+    },
+    ProcedureSelector {
+        alias: "sink",
+        path: "src/SplitFlowFixture.java",
+        name: "sink",
+        kind: ProcedureKind::Method,
     },
 ];
 
@@ -1319,6 +1434,29 @@ pub fn with_java_exact_helper<T>(execute: impl FnOnce(&ValueFlowConformanceCase<
         JAVA_PROCEDURES,
         JAVA_SINKS,
         "src/ExactFlowFixture.java",
+        "src/ExactFlowFixture.java",
+        "relay(input)",
+        1,
+        1,
+        SemanticInputStatus::Unknown,
+        false,
+        true,
+        execute,
+    )
+}
+
+pub fn with_java_split_exact_helper<T>(
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    with_exact_helper(
+        "java-split",
+        Language::Java,
+        JAVA_SPLIT_FILES,
+        JAVA_SPLIT_PROCEDURES,
+        JAVA_SINKS,
+        "src/SplitFlowFixture.java",
+        "src/SplitRelay.java",
+        "SplitRelay.relay(input)",
         1,
         1,
         SemanticInputStatus::Unknown,
@@ -1338,6 +1476,8 @@ pub fn with_typescript_exact_helper<T>(
         TYPESCRIPT_PROCEDURES,
         TYPESCRIPT_SINKS,
         "src/exact_flow.ts",
+        "src/exact_flow.ts",
+        "relay(input)",
         6,
         4,
         SemanticInputStatus::Unknown,
@@ -1721,6 +1861,142 @@ pub fn with_typescript_field_access_flow<T>(
         TYPESCRIPT_FIELD_ACCESS_PROCEDURES,
         "src/field_flow.ts",
         false,
+        execute,
+    )
+}
+
+pub fn with_java_over_bound_field_flow<T>(
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    let files = [InlineSourceFile {
+        path: "src/OverBoundFieldFlowFixture.java",
+        source: JAVA_OVER_BOUND_FIELD_SOURCE,
+    }];
+    let procedures = [
+        ProcedureSelector {
+            alias: "run",
+            path: files[0].path,
+            name: "run",
+            kind: ProcedureKind::Method,
+        },
+        ProcedureSelector {
+            alias: "sink",
+            path: files[0].path,
+            name: "sink",
+            kind: ProcedureKind::Method,
+        },
+    ];
+    with_over_bound_field_access_flow(
+        "java-over-bound-field-flow",
+        Language::Java,
+        &files,
+        &procedures,
+        files[0].path,
+        SemanticInputStatus::Unsupported {
+            capability: SemanticCapability::ExceptionalControlFlow,
+        },
+        execute,
+    )
+}
+
+pub fn with_typescript_over_bound_field_flow<T>(
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    let files = [InlineSourceFile {
+        path: "src/over_bound_field_flow.ts",
+        source: TYPESCRIPT_OVER_BOUND_FIELD_SOURCE,
+    }];
+    let procedures = [
+        ProcedureSelector {
+            alias: "run",
+            path: files[0].path,
+            name: "run",
+            kind: ProcedureKind::Function,
+        },
+        ProcedureSelector {
+            alias: "sink",
+            path: files[0].path,
+            name: "sink",
+            kind: ProcedureKind::Function,
+        },
+    ];
+    with_over_bound_field_access_flow(
+        "typescript-over-bound-field-flow",
+        Language::TypeScript,
+        &files,
+        &procedures,
+        files[0].path,
+        SemanticInputStatus::Unsupported {
+            capability: SemanticCapability::ExceptionalControlFlow,
+        },
+        execute,
+    )
+}
+
+pub fn with_java_index_access_flow<T>(
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    let files = [InlineSourceFile {
+        path: "src/IndexFlowFixture.java",
+        source: JAVA_INDEX_ACCESS_SOURCE,
+    }];
+    let procedures = [
+        ProcedureSelector {
+            alias: "run",
+            path: files[0].path,
+            name: "run",
+            kind: ProcedureKind::Method,
+        },
+        ProcedureSelector {
+            alias: "sink",
+            path: files[0].path,
+            name: "sink",
+            kind: ProcedureKind::Method,
+        },
+    ];
+    with_index_access_flow(
+        "java-index-access-flow",
+        Language::Java,
+        &files,
+        &procedures,
+        files[0].path,
+        SemanticInputStatus::Unsupported {
+            capability: SemanticCapability::ExceptionalControlFlow,
+        },
+        execute,
+    )
+}
+
+pub fn with_typescript_index_access_flow<T>(
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    let files = [InlineSourceFile {
+        path: "src/index_flow.ts",
+        source: TYPESCRIPT_INDEX_ACCESS_SOURCE,
+    }];
+    let procedures = [
+        ProcedureSelector {
+            alias: "run",
+            path: files[0].path,
+            name: "run",
+            kind: ProcedureKind::Function,
+        },
+        ProcedureSelector {
+            alias: "sink",
+            path: files[0].path,
+            name: "sink",
+            kind: ProcedureKind::Function,
+        },
+    ];
+    with_index_access_flow(
+        "typescript-index-access-flow",
+        Language::TypeScript,
+        &files,
+        &procedures,
+        files[0].path,
+        SemanticInputStatus::Unsupported {
+            capability: SemanticCapability::ExceptionalControlFlow,
+        },
         execute,
     )
 }
@@ -2500,6 +2776,170 @@ fn with_field_access_flow<T>(
     })
 }
 
+fn with_over_bound_field_access_flow<T>(
+    name: &str,
+    language: Language,
+    files: &[InlineSourceFile<'_>],
+    procedures: &[ProcedureSelector<'_>],
+    path: &str,
+    expected_discovery_status: SemanticInputStatus,
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    let sinks = [
+        CallArgumentSink {
+            alias: "flowed",
+            call: "sink_call",
+            argument: 0,
+            outcome: ExpectedSinkOutcome::Inconclusive,
+        },
+        CallArgumentSink {
+            alias: "clean",
+            call: "sink_call",
+            argument: 1,
+            outcome: ExpectedSinkOutcome::Inconclusive,
+        },
+    ];
+    let location = CarrierMilestone::Location {
+        root: Box::new(CarrierMilestone::Value {
+            path: path.into(),
+            procedure: "run".into(),
+            role: "temporary".into(),
+            ordinal: None,
+            snippet: "box".into(),
+        }),
+        selectors: (0..8)
+            .map(|_| SelectorMilestone::Field {
+                path: path.into(),
+                procedure: "run".into(),
+                snippet: "next".into(),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+        exact: false,
+    };
+    let expected_location_relations = [
+        ExpectedLocationRelation {
+            procedure: "run",
+            kind: brokk_bifrost::analyzer::semantic::ValueFlowRelationKind::MemoryStore,
+            side: RelationLocationSide::Target,
+            location: &location,
+        },
+        ExpectedLocationRelation {
+            procedure: "run",
+            kind: brokk_bifrost::analyzer::semantic::ValueFlowRelationKind::MemoryLoad,
+            side: RelationLocationSide::Source,
+            location: &location,
+        },
+    ];
+    execute(&ValueFlowConformanceCase {
+        name,
+        language,
+        files,
+        procedures,
+        root: "run",
+        calls: BRANCH_CALLS,
+        unmodeled_call_behavior: brokk_bifrost::analyzer::dataflow::UnmodeledCallBehavior::Paranoid,
+        source: ParameterSource::Parameter {
+            procedure: "run",
+            ordinal: 0,
+        },
+        sinks: &sinks,
+        expected_discovery_status,
+        expected_discovery_complete: false,
+        expected_result_complete: false,
+        expected_public_ambiguous: false,
+        expected_location_relations: &expected_location_relations,
+        expected_meetings: &[],
+    })
+}
+
+fn with_index_access_flow<T>(
+    name: &str,
+    language: Language,
+    files: &[InlineSourceFile<'_>],
+    procedures: &[ProcedureSelector<'_>],
+    path: &str,
+    expected_discovery_status: SemanticInputStatus,
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    let sinks = [
+        CallArgumentSink {
+            alias: "flowed",
+            call: "sink_call",
+            argument: 0,
+            outcome: ExpectedSinkOutcome::Inconclusive,
+        },
+        CallArgumentSink {
+            alias: "wrong",
+            call: "sink_call",
+            argument: 1,
+            outcome: ExpectedSinkOutcome::Inconclusive,
+        },
+    ];
+    let index_location = |snippet: &str| CarrierMilestone::Location {
+        root: Box::new(CarrierMilestone::Value {
+            path: path.into(),
+            procedure: "run".into(),
+            role: "temporary".into(),
+            ordinal: None,
+            snippet: "values".into(),
+        }),
+        selectors: vec![SelectorMilestone::ExactIndex(Box::new(
+            CarrierMilestone::Value {
+                path: path.into(),
+                procedure: "run".into(),
+                role: "constant".into(),
+                ordinal: None,
+                snippet: snippet.into(),
+            },
+        ))]
+        .into_boxed_slice(),
+        exact: true,
+    };
+    let index_zero = index_location("0");
+    let index_one = index_location("1");
+    let expected_location_relations = [
+        ExpectedLocationRelation {
+            procedure: "run",
+            kind: brokk_bifrost::analyzer::semantic::ValueFlowRelationKind::MemoryStore,
+            side: RelationLocationSide::Target,
+            location: &index_zero,
+        },
+        ExpectedLocationRelation {
+            procedure: "run",
+            kind: brokk_bifrost::analyzer::semantic::ValueFlowRelationKind::MemoryLoad,
+            side: RelationLocationSide::Source,
+            location: &index_zero,
+        },
+        ExpectedLocationRelation {
+            procedure: "run",
+            kind: brokk_bifrost::analyzer::semantic::ValueFlowRelationKind::MemoryLoad,
+            side: RelationLocationSide::Source,
+            location: &index_one,
+        },
+    ];
+    execute(&ValueFlowConformanceCase {
+        name,
+        language,
+        files,
+        procedures,
+        root: "run",
+        calls: BRANCH_CALLS,
+        unmodeled_call_behavior: brokk_bifrost::analyzer::dataflow::UnmodeledCallBehavior::Paranoid,
+        source: ParameterSource::Parameter {
+            procedure: "run",
+            ordinal: 0,
+        },
+        sinks: &sinks,
+        expected_discovery_status,
+        expected_discovery_complete: false,
+        expected_result_complete: false,
+        expected_public_ambiguous: false,
+        expected_location_relations: &expected_location_relations,
+        expected_meetings: &[],
+    })
+}
+
 fn with_unresolved_call_negative<T>(
     name: &str,
     language: Language,
@@ -2672,7 +3112,9 @@ fn with_exact_helper<T>(
     files: &[InlineSourceFile<'_>],
     procedures: &[ProcedureSelector<'_>],
     sinks: &[CallArgumentSink<'_>],
-    path: &str,
+    run_path: &str,
+    relay_path: &str,
+    relay_call: &str,
     meeting_count: usize,
     public_endpoint_count: usize,
     expected_discovery_status: SemanticInputStatus,
@@ -2683,50 +3125,50 @@ fn with_exact_helper<T>(
     let public_may_complete_count = usize::from(language == Language::TypeScript);
     let carriers = vec![
         CarrierMilestone::Port {
-            path: path.into(),
+            path: run_path.into(),
             procedure: "run".into(),
             kind: ValueFlowPortKey::Parameter { ordinal: 0 },
         },
         CarrierMilestone::CallArgument {
-            path: path.into(),
+            path: run_path.into(),
             caller: "run".into(),
             callee: "relay".into(),
-            call: "relay(input)".into(),
+            call: relay_call.into(),
             ordinal: 0,
         },
         CarrierMilestone::Port {
-            path: path.into(),
+            path: relay_path.into(),
             procedure: "relay".into(),
             kind: ValueFlowPortKey::Parameter { ordinal: 0 },
         },
         CarrierMilestone::Value {
-            path: path.into(),
+            path: relay_path.into(),
             procedure: "relay".into(),
             role: "local".into(),
             ordinal: None,
             snippet: "relayed".into(),
         },
         CarrierMilestone::Port {
-            path: path.into(),
+            path: relay_path.into(),
             procedure: "relay".into(),
             kind: ValueFlowPortKey::NormalReturn,
         },
         CarrierMilestone::CallResult {
-            path: path.into(),
+            path: run_path.into(),
             caller: "run".into(),
             callee: "relay".into(),
-            call: "relay(input)".into(),
+            call: relay_call.into(),
             result: ValueFlowPortKey::NormalReturn,
         },
         CarrierMilestone::Value {
-            path: path.into(),
+            path: run_path.into(),
             procedure: "run".into(),
             role: "local".into(),
             ordinal: None,
             snippet: "copy".into(),
         },
         CarrierMilestone::SinkArgument {
-            path: path.into(),
+            path: run_path.into(),
             caller: "run".into(),
             callee: "sink".into(),
             call: "sink(copy, clean)".into(),
@@ -2775,4 +3217,302 @@ fn with_exact_helper<T>(
         expected_location_relations: &[],
         expected_meetings: &meetings,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn with_single_file_exact_helper<T>(
+    name: &str,
+    language: Language,
+    path: &str,
+    source: &str,
+    procedure_kind: ProcedureKind,
+    relay_call: &str,
+    sink_call: &str,
+    relay_local: &str,
+    run_local: &str,
+    clean_outcome: ExpectedSinkOutcome,
+    expected_discovery_status: SemanticInputStatus,
+    expected_result_complete: bool,
+    meeting_count: usize,
+    public_endpoint_count: usize,
+    public_may_complete_count: usize,
+    public_may_partial_count: usize,
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    let files = [InlineSourceFile { path, source }];
+    let procedures = [
+        ProcedureSelector {
+            alias: "run",
+            path,
+            name: "run",
+            kind: procedure_kind,
+        },
+        ProcedureSelector {
+            alias: "relay",
+            path,
+            name: "relay",
+            kind: procedure_kind,
+        },
+        ProcedureSelector {
+            alias: "sink",
+            path,
+            name: "sink",
+            kind: procedure_kind,
+        },
+    ];
+    let calls = [
+        CallSelector {
+            alias: "relay_call",
+            caller: "run",
+            callee: "relay",
+            occurrence: 0,
+        },
+        CallSelector {
+            alias: "sink_call",
+            caller: "run",
+            callee: "sink",
+            occurrence: 0,
+        },
+    ];
+    let sinks = [
+        CallArgumentSink {
+            alias: "flowed",
+            call: "sink_call",
+            argument: 0,
+            outcome: ExpectedSinkOutcome::Reached,
+        },
+        CallArgumentSink {
+            alias: "clean",
+            call: "sink_call",
+            argument: 1,
+            outcome: clean_outcome,
+        },
+    ];
+    let carriers = vec![
+        CarrierMilestone::Port {
+            path: path.into(),
+            procedure: "run".into(),
+            kind: ValueFlowPortKey::Parameter { ordinal: 0 },
+        },
+        CarrierMilestone::CallArgument {
+            path: path.into(),
+            caller: "run".into(),
+            callee: "relay".into(),
+            call: relay_call.into(),
+            ordinal: 0,
+        },
+        CarrierMilestone::Port {
+            path: path.into(),
+            procedure: "relay".into(),
+            kind: ValueFlowPortKey::Parameter { ordinal: 0 },
+        },
+        CarrierMilestone::Value {
+            path: path.into(),
+            procedure: "relay".into(),
+            role: "local".into(),
+            ordinal: None,
+            snippet: relay_local.into(),
+        },
+        CarrierMilestone::Port {
+            path: path.into(),
+            procedure: "relay".into(),
+            kind: ValueFlowPortKey::NormalReturn,
+        },
+        CarrierMilestone::CallResult {
+            path: path.into(),
+            caller: "run".into(),
+            callee: "relay".into(),
+            call: relay_call.into(),
+            result: ValueFlowPortKey::NormalReturn,
+        },
+        CarrierMilestone::Value {
+            path: path.into(),
+            procedure: "run".into(),
+            role: "local".into(),
+            ordinal: None,
+            snippet: run_local.into(),
+        },
+        CarrierMilestone::SinkArgument {
+            path: path.into(),
+            caller: "run".into(),
+            callee: "sink".into(),
+            call: sink_call.into(),
+            ordinal: 0,
+        },
+    ];
+    let interprocedural = [
+        InterproceduralMilestone {
+            kind: IcfgEdgeKind::Call,
+            source_procedure: "run",
+            target_procedure: "relay",
+            origin_call: "relay_call",
+        },
+        InterproceduralMilestone {
+            kind: IcfgEdgeKind::NormalReturn,
+            source_procedure: "relay",
+            target_procedure: "run",
+            origin_call: "relay_call",
+        },
+    ];
+    let meetings = [ExpectedMeeting {
+        sink: "flowed",
+        meeting_count,
+        public_endpoint_count,
+        may_status: ValueFlowMayStatus::Proven,
+        public_may_complete_count,
+        public_may_partial_count,
+        must_status: ValueFlowMustStatus::NotEstablished,
+        uncertain: false,
+        path_qualities: EXPECTED_PATH_QUALITIES,
+        witness: ExpectedWitness {
+            truncated: false,
+            may_status: ValueFlowMayStatus::Proven,
+            path_quality: PathQuality::PROVEN_COMPLETE,
+            carriers: &carriers,
+            interprocedural: &interprocedural,
+        },
+    }];
+    execute(&ValueFlowConformanceCase {
+        name,
+        language,
+        files: &files,
+        procedures: &procedures,
+        root: "run",
+        calls: &calls,
+        unmodeled_call_behavior: brokk_bifrost::analyzer::dataflow::UnmodeledCallBehavior::Paranoid,
+        source: ParameterSource::Parameter {
+            procedure: "run",
+            ordinal: 0,
+        },
+        sinks: &sinks,
+        expected_discovery_status,
+        expected_discovery_complete: false,
+        expected_result_complete,
+        expected_public_ambiguous: false,
+        expected_location_relations: &[],
+        expected_meetings: &meetings,
+    })
+}
+
+pub fn with_javascript_exact_helper<T>(
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    with_single_file_exact_helper(
+        "javascript",
+        Language::JavaScript,
+        "src/exact_flow.js",
+        r#"
+function relay(value) {
+  const relayed = value;
+  return relayed;
+}
+function sink(flowed, clean) {}
+function run(input) {
+  const copy = relay(input);
+  const clean = "clean";
+  sink(copy, clean);
+}
+"#,
+        ProcedureKind::Function,
+        "relay(input)",
+        "sink(copy, clean)",
+        "relayed",
+        "copy",
+        ExpectedSinkOutcome::Inconclusive,
+        SemanticInputStatus::Unknown,
+        false,
+        6,
+        4,
+        1,
+        2,
+        execute,
+    )
+}
+
+pub fn with_go_exact_helper<T>(execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T) -> T {
+    with_single_file_exact_helper(
+        "go",
+        Language::Go,
+        "exact_flow.go",
+        r#"
+package conformance
+func relay(value string) string { relayed := value; return relayed }
+func sink(flowed string, clean string) {}
+func run(input string) { copy := relay(input); clean := "clean"; sink(copy, clean) }
+"#,
+        ProcedureKind::Function,
+        "relay(input)",
+        "sink(copy, clean)",
+        "relayed",
+        "copy",
+        ExpectedSinkOutcome::Inconclusive,
+        SemanticInputStatus::Unknown,
+        false,
+        1,
+        1,
+        0,
+        0,
+        execute,
+    )
+}
+
+pub fn with_php_exact_helper<T>(execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T) -> T {
+    with_single_file_exact_helper(
+        "php",
+        Language::Php,
+        "src/exact_flow.php",
+        r#"
+<?php
+function relay(string $value): string { $relayed = $value; return $relayed; }
+function sink(string $flowed, string $clean): void {}
+function run(string $input): void { $copy = relay($input); $clean = "clean"; sink($copy, $clean); }
+"#,
+        ProcedureKind::Function,
+        "relay($input)",
+        "sink($copy, $clean)",
+        "$relayed",
+        "$copy",
+        ExpectedSinkOutcome::NotReached,
+        SemanticInputStatus::Unknown,
+        true,
+        1,
+        1,
+        0,
+        0,
+        execute,
+    )
+}
+
+pub fn with_ruby_exact_helper<T>(execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T) -> T {
+    with_single_file_exact_helper(
+        "ruby",
+        Language::Ruby,
+        "exact_flow.rb",
+        r#"
+def relay(value)
+  relayed = value
+  relayed
+end
+def sink(flowed, clean)
+end
+def run(input)
+  copy = relay(input)
+  clean = "clean"
+  sink(copy, clean)
+end
+"#,
+        ProcedureKind::Method,
+        "relay(input)",
+        "sink(copy, clean)",
+        "relayed",
+        "copy",
+        ExpectedSinkOutcome::Inconclusive,
+        SemanticInputStatus::Unknown,
+        false,
+        6,
+        4,
+        1,
+        2,
+        execute,
+    )
 }

@@ -428,12 +428,22 @@ impl ValueFlowQueryState {
                 |step| serde_json::to_vec(step).map_or(usize::MAX, |bytes| bytes.len()),
             );
             let truncated = witness.truncated() || removed_steps > 0;
-            if removed_steps > 0 {
+            if truncated {
                 self.work.witness_truncated = true;
+            }
+            if removed_steps > 0 {
                 self.push_diagnostic(
                     CodeQueryDiagnosticCode::ValueFlowWitnessTruncated,
                     format!(
                         "value-flow witness projection omitted at least {removed_steps} step(s)"
+                    ),
+                );
+            } else if witness.truncated() {
+                self.push_diagnostic(
+                    CodeQueryDiagnosticCode::ValueFlowWitnessTruncated,
+                    format!(
+                        "value-flow witness reconstruction or retention omitted at least {} step(s)",
+                        witness.omitted_steps_lower_bound()
                     ),
                 );
             }
