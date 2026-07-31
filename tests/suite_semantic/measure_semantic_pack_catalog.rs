@@ -85,8 +85,10 @@ struct Samples {
 fn measure_inline_and_file_storage() {
     let fixture_source =
         include_bytes!("../fixtures/semantic-model-packs/declarations-v1.json").as_slice();
-    let mut raw_options = CompilerOptions::default();
-    raw_options.compression = CompressionPolicy::AlwaysRaw;
+    let raw_options = CompilerOptions {
+        compression: CompressionPolicy::AlwaysRaw,
+        ..CompilerOptions::default()
+    };
     let fixture_pack = compile_source(SourceFormat::Json, fixture_source, &raw_options)
         .unwrap_or_else(|diagnostics| panic!("compile raw fixture pack: {diagnostics:#?}"));
     assert_eq!(fixture_pack.shards.len(), 1);
@@ -189,8 +191,10 @@ fn compiled_pack_at_least(target_raw_bytes: usize) -> CompiledSemanticModelPack 
             }]
         }))
         .expect("serialize benchmark source");
-        let mut options = CompilerOptions::default();
-        options.compression = CompressionPolicy::Automatic;
+        let options = CompilerOptions {
+            compression: CompressionPolicy::Automatic,
+            ..CompilerOptions::default()
+        };
         let pack = compile_source(SourceFormat::Json, &source, &options)
             .unwrap_or_else(|diagnostics| panic!("compile benchmark pack: {diagnostics:#?}"));
         assert_eq!(pack.shards.len(), 1);
