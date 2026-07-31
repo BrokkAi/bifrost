@@ -251,6 +251,48 @@ impl KotlinAnalyzer {
         self.resolve_type_name_in_scope(raw_name, &scope, realm)
     }
 
+    /// Whether `raw_name`, looked up against a caller-supplied `scope`, is
+    /// unambiguously unknown to every tier of Kotlin's resolution ladder: the
+    /// scope's imports, the file's own package, star imports, default
+    /// imports, the wider JVM source realm (when `realm` is supplied), and
+    /// the external dependency index.
+    ///
+    /// Returns `false` for anything the ladder resolves *or* for a genuinely
+    /// ambiguous star-import collision — [`KotlinTypeName::Ambiguous`] is a
+    /// real answer (Kotlin itself rejects the reference), not evidence that a
+    /// declaration is missing, so it must never be reported as unrecognized.
+    /// This is the tri-state-preserving sibling of
+    /// [`Self::resolve_type_name_in_scope`]: that method folds `Ambiguous`
+    /// into `None` because a caller just wants "the" resolved unit, but a
+    /// diagnostic collector must not conflate the two.
+    pub(crate) fn type_name_definitely_unresolved_in_realm(
+        &self,
+        scope: &KotlinNameScope<'_>,
+        raw_name: &str,
+        realm: Option<&JvmSourceRealm<'_>>,
+    ) -> bool {
+        let source_first = resolve_kotlin_type_name(raw_name, scope, |candidate| {
+            self.realm_type_exists(candidate, realm)
+        });
+        if !matches!(source_first, KotlinTypeName::Unresolved) {
+            return false;
+        }
+
+        let external = self.external_declaration_index();
+        if external.is_empty() {
+            return true;
+        }
+        let access_package = scope.package_name;
+        matches!(
+            resolve_kotlin_type_name(raw_name, scope, |candidate| {
+                external
+                    .resolve_qualified_name(candidate, access_package)
+                    .is_some()
+            }),
+            KotlinTypeName::Unresolved
+        )
+    }
+
     fn resolve_type_name_in_scope(
         &self,
         raw_name: &str,

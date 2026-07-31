@@ -12,7 +12,9 @@ mod semantic;
 pub(crate) mod structural;
 mod tests;
 
-use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
+use crate::analyzer::clone_detection::{
+    CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
+};
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::fq_name::{SegmentKind, segment_interner};
 use crate::analyzer::js_ts::{build_weighted_cache, weight_code_unit_vec_by_unit};
@@ -32,7 +34,7 @@ use std::sync::{Arc, OnceLock};
 
 pub(crate) use adapter::CppAdapter;
 use cache::{weight_code_unit_set_by_file, weight_code_unit_vec_by_file, weight_project_file_set};
-use clones::{build_clone_candidate_data, refine_cpp_clone_similarity};
+use clones::build_clone_candidate_data;
 use compile_context::{CppCompileContext, CppCompileContexts};
 use tests::detect_cpp_test_assertion_smells;
 
@@ -974,7 +976,7 @@ impl IAnalyzer for CppAnalyzer {
             &requested_files,
             all_candidates,
             weights,
-            refine_cpp_clone_similarity,
+            refine_clone_similarity_with_ast,
         )
     }
 

@@ -11,9 +11,9 @@ use crate::analyzer::usages::js_ts_graph::JsTsScopedNodeStatus;
 use crate::analyzer::usages::{
     CSharpUsageGraphStrategy, CandidateFileProvider, FallbackCandidateProvider, FuzzyResult,
     GoUsageGraphStrategy, JavaUsageGraphStrategy, JsTsExportUsageGraphStrategy,
-    PhpUsageGraphStrategy, RubyUsageGraphStrategy, RustExportUsageGraphStrategy,
-    ScalaUsageGraphStrategy, TextSearchCandidateProvider, UsageAnalyzer, UsageHit, UsageHitKind,
-    UsageHitSurface,
+    KotlinUsageGraphStrategy, PhpUsageGraphStrategy, RubyUsageGraphStrategy,
+    RustExportUsageGraphStrategy, ScalaUsageGraphStrategy, TextSearchCandidateProvider,
+    UsageAnalyzer, UsageHit, UsageHitKind, UsageHitSurface,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range, RustAnalyzer};
 use crate::hash::{HashMap, HashSet};
@@ -615,6 +615,9 @@ fn is_dead_code_candidate(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> boo
     if language == Language::Go && go_implicit_entry_point(code_unit) {
         return false;
     }
+    if language == Language::Kotlin && kotlin_implicit_entry_point(analyzer, code_unit) {
+        return false;
+    }
     if analyzer
         .signature_metadata(code_unit)
         .iter()
@@ -635,7 +638,34 @@ fn is_dead_code_candidate(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> boo
             | Language::Cpp
             | Language::Php
             | Language::Ruby
+            | Language::Kotlin
     ) && (code_unit.is_function() || code_unit.is_class() || code_unit.is_field())
+}
+
+/// Whether `candidate` is a Kotlin/JVM program entry point invoked by the
+/// runtime rather than from within the analyzed workspace: a top-level `fun
+/// main()`/`fun main(args: Array<String>)` (never called from within the
+/// workspace, so it would otherwise always read as zero-usage dead code), or
+/// a `main` inside a singleton `object`/companion annotated `@JvmStatic`,
+/// which the Kotlin compiler also recognizes as an entry point. An ordinary
+/// class's instance method named `main` is neither shape and stays eligible
+/// — unlike Go's exclusion, which keys off the enclosing file declaring
+/// `package main`, Kotlin has no per-file entry-point marker, so the check
+/// keys off the declaration's own shape instead: top-level (no owner) or
+/// `@JvmStatic`.
+fn kotlin_implicit_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+    if !candidate.is_function() || candidate.identifier() != "main" {
+        return false;
+    }
+    if analyzer.parent_of(candidate).is_none() {
+        return true;
+    }
+    kotlin_jvm_static_declaration(analyzer, candidate)
+}
+
+fn kotlin_jvm_static_declaration(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+    let source = analyzer.get_source(candidate, true).unwrap_or_default();
+    declaration_header(&source).contains("@JvmStatic")
 }
 
 fn analyze_candidate(
@@ -2378,6 +2408,9 @@ fn graph_strategy_for(candidate: &CodeUnit) -> Option<Box<dyn UsageAnalyzer>> {
     if RubyUsageGraphStrategy::can_handle(candidate) {
         return Some(Box::new(RubyUsageGraphStrategy::new()));
     }
+    if KotlinUsageGraphStrategy::can_handle(candidate) {
+        return Some(Box::new(KotlinUsageGraphStrategy::new()));
+    }
     None
 }
 
@@ -2398,6 +2431,7 @@ fn language_label(language: Language) -> &'static str {
         Language::Cpp => "C++",
         Language::Php => "PHP",
         Language::Ruby => "Ruby",
+        Language::Kotlin => "Kotlin",
         _ => "graph-backed",
     }
 }

@@ -18,6 +18,14 @@ fn definition(analyzer: &JavaAnalyzer, fq_name: &str) -> CodeUnit {
         .unwrap_or_else(|| panic!("missing definition for {fq_name}"))
 }
 
+fn definition_with_signature(analyzer: &JavaAnalyzer, fq_name: &str, signature: &str) -> CodeUnit {
+    analyzer
+        .get_definitions(fq_name)
+        .into_iter()
+        .find(|unit| unit.signature() == Some(signature))
+        .unwrap_or_else(|| panic!("missing definition for {fq_name}{signature}"))
+}
+
 fn java_analyzer_with_files(
     files: &[(&str, &str)],
 ) -> (crate::common::BuiltInlineTestProject, JavaAnalyzer) {
@@ -4365,6 +4373,248 @@ class Imported {
     assert_no_hit_line(&hits, line_of(same_package_source, "plain: Inner"));
     assert_hit_contains(&hits, "qualified: Outer.Inner");
     assert_hit_contains(&hits, "imported: Inner");
+}
+
+#[test]
+fn java_static_member_usage_lookup_finds_exact_scala_receivers() {
+    let consumer_source = r#"
+package app
+
+import com.example.RetryConfig
+import com.example.OtherRetryConfig
+import com.example.RetryConfig.withDefaults
+
+class Builder {
+  def withDefaults(value: String): Int = 0
+}
+
+class Consumer {
+  val fieldHit = RetryConfig.DEFAULT_RETRIES
+  val methodHit = RetryConfig.withDefaults("ok")
+  val negativeWrongOwner = OtherRetryConfig.withDefaults("ok")
+  val RetryConfig = new Builder()
+  val negativeShadow = RetryConfig.withDefaults("shadow")
+}
+"#;
+    let (project, java, _scala, multi) = mixed_jvm_analyzer_with_files(&[
+        (
+            "com/example/RetryConfig.java",
+            r#"
+package com.example;
+
+public class RetryConfig {
+    public static final int DEFAULT_RETRIES = 3;
+    public static int withDefaults(String value) { return 1; }
+    public static int withDefaults(String value, int retries) { return 2; }
+}
+"#,
+        ),
+        (
+            "com/example/OtherRetryConfig.java",
+            r#"
+package com.example;
+
+public class OtherRetryConfig {
+    public static int withDefaults(String value) { return 0; }
+}
+"#,
+        ),
+        ("app/Consumer.scala", consumer_source),
+    ]);
+
+    let field_target = definition(&java, "com.example.RetryConfig.DEFAULT_RETRIES");
+    let field_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &multi,
+        std::slice::from_ref(&field_target),
+        &multi.get_analyzed_files().into_iter().collect(),
+        1000,
+    ));
+    assert_hit_contains(&field_hits, "RetryConfig.DEFAULT_RETRIES");
+
+    let type_target = definition(&java, "com.example.RetryConfig");
+    let type_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &multi,
+        std::slice::from_ref(&type_target),
+        &multi.get_analyzed_files().into_iter().collect(),
+        1000,
+    ));
+    assert_hit_line(&type_hits, line_of(consumer_source, "val fieldHit"));
+    assert_hit_line(&type_hits, line_of(consumer_source, "val methodHit"));
+    assert_hit_line(
+        &type_hits,
+        line_of(
+            consumer_source,
+            "import com.example.RetryConfig.withDefaults",
+        ),
+    );
+    assert_no_hit_line(
+        &type_hits,
+        line_of(consumer_source, "val negativeWrongOwner"),
+    );
+    assert_no_hit_line(&type_hits, line_of(consumer_source, "val negativeShadow"));
+
+    let method_target =
+        definition_with_signature(&java, "com.example.RetryConfig.withDefaults", "(String)");
+    let method_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &multi,
+        std::slice::from_ref(&method_target),
+        &multi.get_analyzed_files().into_iter().collect(),
+        1000,
+    ));
+    assert_hit_contains(&method_hits, "methodHit = RetryConfig.withDefaults(\"ok\")");
+    assert_hit_line(&method_hits, line_of(consumer_source, "val methodHit"));
+    assert_no_hit_line(
+        &method_hits,
+        line_of(consumer_source, "val negativeWrongOwner"),
+    );
+    assert_no_hit_line(&method_hits, line_of(consumer_source, "val negativeShadow"));
+
+    let default_hits =
+        hits(UsageFinder::new().find_usages_default(&multi, std::slice::from_ref(&method_target)));
+    assert_hit_line(&default_hits, line_of(consumer_source, "val methodHit"));
+
+    let consumer = project.file("app/Consumer.scala");
+    let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer).collect()));
+    let scoped = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &multi,
+            std::slice::from_ref(&method_target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    assert_hit_line(
+        &hits(scoped.result),
+        line_of(consumer_source, "val methodHit"),
+    );
+}
+
+#[test]
+fn java_static_method_usage_lookup_keeps_scala_overloads_and_nested_receivers_exact() {
+    let consumer_source = r#"
+package app
+
+import com.example.JarManifest
+import com.example.JarManifest.Section
+
+class Consumer {
+  val qualifiedOwner = com.example.JarManifest.load("manifest")
+  val nestedCall = Wrapper.unpack(JarManifest.loadClass(getClass))
+  val importedNested = Section.read("named")
+  val qualifiedNested = com.example.JarManifest.Section.read("qualified")
+  val wrongArity = com.example.JarManifest.load("manifest", "extra")
+  val sectionValue = new com.example.JarManifest.Section()
+  val negativeInstance = sectionValue.read("instance")
+}
+"#;
+    let (_project, java, _scala, multi) = mixed_jvm_analyzer_with_files(&[
+        (
+            "com/example/JarManifest.java",
+            r#"
+package com.example;
+
+public class JarManifest {
+    public static JarManifest load(String path) { return new JarManifest(); }
+    public static JarManifest load(String path, String extra) { return new JarManifest(); }
+    public static JarManifest loadClass(Class<?> type) { return new JarManifest(); }
+
+    public static class Section {
+        public static String read(String name) { return name; }
+        public String read(int index) { return Integer.toString(index); }
+    }
+}
+"#,
+        ),
+        (
+            "app/Wrapper.java",
+            r#"
+package app;
+
+public class Wrapper {
+    public static <T> T unpack(T value) { return value; }
+}
+"#,
+        ),
+        ("app/Consumer.scala", consumer_source),
+    ]);
+
+    let load_target = definition_with_signature(&java, "com.example.JarManifest.load", "(String)");
+    let load_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &multi,
+        std::slice::from_ref(&load_target),
+        &multi.get_analyzed_files().into_iter().collect(),
+        1000,
+    ));
+    assert_hit_contains(
+        &load_hits,
+        "qualifiedOwner = com.example.JarManifest.load(\"manifest\")",
+    );
+    assert_no_hit_line(&load_hits, line_of(consumer_source, "val wrongArity"));
+
+    let load_class_target =
+        definition_with_signature(&java, "com.example.JarManifest.loadClass", "(Class<?>)");
+    let load_class_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &multi,
+        std::slice::from_ref(&load_class_target),
+        &multi.get_analyzed_files().into_iter().collect(),
+        1000,
+    ));
+    assert_hit_contains(
+        &load_class_hits,
+        "nestedCall = Wrapper.unpack(JarManifest.loadClass(getClass))",
+    );
+
+    let owner_type_target = definition(&java, "com.example.JarManifest");
+    let owner_type_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &multi,
+        std::slice::from_ref(&owner_type_target),
+        &multi.get_analyzed_files().into_iter().collect(),
+        1000,
+    ));
+    assert_hit_line(
+        &owner_type_hits,
+        line_of(consumer_source, "val qualifiedOwner"),
+    );
+    assert_no_hit_line(
+        &owner_type_hits,
+        line_of(consumer_source, "val negativeInstance"),
+    );
+
+    let read_target =
+        definition_with_signature(&java, "com.example.JarManifest.Section.read", "(String)");
+    let read_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &multi,
+        std::slice::from_ref(&read_target),
+        &multi.get_analyzed_files().into_iter().collect(),
+        1000,
+    ));
+    assert_hit_contains(&read_hits, "importedNested = Section.read(\"named\")");
+    assert_hit_contains(
+        &read_hits,
+        "qualifiedNested = com.example.JarManifest.Section.read(\"qualified\")",
+    );
+    assert_no_hit_line(&read_hits, line_of(consumer_source, "val negativeInstance"));
+
+    let nested_type_target = definition(&java, "com.example.JarManifest.Section");
+    let nested_type_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &multi,
+        std::slice::from_ref(&nested_type_target),
+        &multi.get_analyzed_files().into_iter().collect(),
+        1000,
+    ));
+    assert_hit_line(
+        &nested_type_hits,
+        line_of(consumer_source, "val importedNested"),
+    );
+    assert_hit_line(
+        &nested_type_hits,
+        line_of(consumer_source, "val qualifiedNested"),
+    );
+    assert_no_hit_line(
+        &nested_type_hits,
+        line_of(consumer_source, "val negativeInstance"),
+    );
 }
 
 #[test]

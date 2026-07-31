@@ -113,10 +113,12 @@ pub enum ManifestLanguage {
     Scala,
     #[serde(rename = "csharp")]
     CSharp,
+    #[serde(rename = "kotlin")]
+    Kotlin,
 }
 
 impl ManifestLanguage {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Java,
         Self::Go,
         Self::Cpp,
@@ -127,6 +129,7 @@ impl ManifestLanguage {
         Self::Php,
         Self::Scala,
         Self::CSharp,
+        Self::Kotlin,
     ];
 
     pub fn label(self) -> &'static str {
@@ -141,6 +144,7 @@ impl ManifestLanguage {
             Self::Php => "php",
             Self::Scala => "scala",
             Self::CSharp => "csharp",
+            Self::Kotlin => "kotlin",
         }
     }
 
@@ -156,6 +160,7 @@ impl ManifestLanguage {
             Self::Php => Language::Php,
             Self::Scala => Language::Scala,
             Self::CSharp => Language::CSharp,
+            Self::Kotlin => Language::Kotlin,
         }
     }
 }
@@ -1304,7 +1309,7 @@ fn manifest_language_from_analyzer(language: Language) -> Option<ManifestLanguag
         Language::Php => Some(ManifestLanguage::Php),
         Language::Scala => Some(ManifestLanguage::Scala),
         Language::CSharp => Some(ManifestLanguage::CSharp),
-        // Kotlin benchmark manifests are issue #1244.
-        Language::Ruby | Language::Kotlin | Language::None => None,
+        Language::Kotlin => Some(ManifestLanguage::Kotlin),
+        Language::Ruby | Language::None => None,
     }
 }

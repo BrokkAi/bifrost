@@ -3,8 +3,9 @@ use crate::analyzer::usages::java_graph::extractor::ScanState;
 use crate::analyzer::usages::java_graph::resolver::{TargetKind, TargetSpec};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::scala_graph::syntax::{
-    has_ancestor_kind, is_identifier_node, is_type_like_reference, member_qualifier, node_text,
-    scala_import_path, stable_type_qualifier,
+    call_site_shape_for_reference, has_ancestor_kind, is_identifier_node, is_type_like_reference,
+    member_qualifier, member_qualifier_node, node_text, scala_import_path,
+    scala_pattern_binder_names, stable_type_qualifier,
 };
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile, Range, ScalaAnalyzer,
@@ -16,14 +17,14 @@ use crate::text_utils::{compute_line_starts, find_line_index_for_offset, snippet
 use std::collections::BTreeSet;
 use tree_sitter::{Node, Parser};
 
-pub(super) fn scan_scala_files_for_java_type(
+pub(super) fn scan_scala_files_for_java_target(
     analyzer: &dyn IAnalyzer,
     candidate_files: &HashSet<ProjectFile>,
     spec: &TargetSpec,
     state: &mut ScanState<'_>,
     cancellation: Option<&CancellationToken>,
 ) {
-    if *state.limit_exceeded || spec.kind != TargetKind::Type {
+    if *state.limit_exceeded || matches!(spec.kind, TargetKind::Constructor) {
         return;
     }
     let Some(scala) = resolve_analyzer::<ScalaAnalyzer>(analyzer) else {
@@ -92,6 +93,7 @@ fn scan_scala_file(
         spec,
         visibility,
         type_shadow_scopes: vec![HashSet::default()],
+        term_shadow_scopes: vec![HashSet::default()],
         max_usages: state.max_usages,
         hits: state.hits,
         raw_match_count: state.raw_match_count,
@@ -155,6 +157,7 @@ struct ScalaJavaScanCtx<'a, 'state> {
     spec: &'a TargetSpec,
     visibility: Visibility,
     type_shadow_scopes: Vec<HashSet<String>>,
+    term_shadow_scopes: Vec<HashSet<String>>,
     max_usages: usize,
     hits: &'state mut BTreeSet<UsageHit>,
     raw_match_count: &'state mut usize,
@@ -166,12 +169,19 @@ fn scan_node(node: Node<'_>, ctx: &mut ScalaJavaScanCtx<'_, '_>) {
         return;
     }
     seed_type_shadow(node, ctx);
+    seed_term_shadow(node, ctx);
     let enters_scope = enters_local_scope(node);
     if enters_scope {
         ctx.type_shadow_scopes.push(HashSet::default());
+        ctx.term_shadow_scopes.push(HashSet::default());
     }
     if is_identifier_node(node) {
-        maybe_record_java_type_hit(node, ctx);
+        match ctx.spec.kind {
+            TargetKind::Type => maybe_record_java_type_hit(node, ctx),
+            TargetKind::Method => maybe_record_java_static_method_hit(node, ctx),
+            TargetKind::Field => maybe_record_java_static_field_hit(node, ctx),
+            TargetKind::Constructor => {}
+        }
     }
 
     let mut cursor = node.walk();
@@ -183,11 +193,18 @@ fn scan_node(node: Node<'_>, ctx: &mut ScalaJavaScanCtx<'_, '_>) {
     }
     if enters_scope {
         ctx.type_shadow_scopes.pop();
+        ctx.term_shadow_scopes.pop();
     }
 }
 
 fn maybe_record_java_type_hit(node: Node<'_>, ctx: &mut ScalaJavaScanCtx<'_, '_>) {
-    if has_ancestor_kind(node, "import_declaration") || is_declaration_name(node) {
+    if has_ancestor_kind(node, "import_declaration") {
+        if java_type_import_owner_matches_target(node, ctx) {
+            push_scala_hit(node, ctx);
+        }
+        return;
+    }
+    if is_declaration_name(node) {
         return;
     }
 
@@ -202,6 +219,8 @@ fn maybe_record_java_type_hit(node: Node<'_>, ctx: &mut ScalaJavaScanCtx<'_, '_>
             member_qualifier(node, ctx.source).or_else(|| stable_type_qualifier(node, ctx.source))
         {
             qualifier_matches_target_owner(&qualifier, ctx.spec)
+        } else if is_explicit_static_receiver_simple_name(node, ctx) {
+            true
         } else {
             ctx.visibility.contains(text)
                 && !is_type_shadowed(ctx, text)
@@ -216,6 +235,125 @@ fn maybe_record_java_type_hit(node: Node<'_>, ctx: &mut ScalaJavaScanCtx<'_, '_>
     if proven {
         push_scala_hit(node, ctx);
     }
+}
+
+fn java_type_import_owner_matches_target(node: Node<'_>, ctx: &ScalaJavaScanCtx<'_, '_>) -> bool {
+    if node_text(node, ctx.source).trim_end_matches('$') != ctx.spec.owner.identifier() {
+        return false;
+    }
+    let mut ancestor = node.parent();
+    let import = loop {
+        let Some(current) = ancestor else {
+            return false;
+        };
+        if current.kind() == "import_declaration" {
+            break current;
+        }
+        ancestor = current.parent();
+    };
+    let mut segments = Vec::new();
+    let mut cursor = import.walk();
+    for child in import.named_children(&mut cursor).filter(|child| {
+        matches!(
+            child.kind(),
+            "identifier" | "type_identifier" | "operator_identifier"
+        )
+    }) {
+        let segment = node_text(child, ctx.source).trim();
+        if segment.is_empty() {
+            return false;
+        }
+        if segment != "_root_" {
+            segments.push(segment.to_string());
+        }
+        if child == node {
+            let path = segments.join(".");
+            return path == ctx.spec.owner.fq_name()
+                || scala_file_package(ctx.scala, ctx.file).is_some_and(|package| {
+                    format!("{package}.{path}") == ctx.spec.owner.fq_name()
+                });
+        }
+    }
+    false
+}
+
+fn is_explicit_static_receiver_simple_name(node: Node<'_>, ctx: &ScalaJavaScanCtx<'_, '_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "field_expression"
+            && parent.child_by_field_name("value") == Some(node)
+            && ctx
+                .visibility
+                .contains(node_text(node, ctx.source).trim_end_matches('$'))
+            && !is_type_shadowed(ctx, node_text(node, ctx.source).trim_end_matches('$'))
+            && !is_term_shadowed(ctx, node_text(node, ctx.source).trim_end_matches('$'))
+    })
+}
+
+fn maybe_record_java_static_field_hit(node: Node<'_>, ctx: &mut ScalaJavaScanCtx<'_, '_>) {
+    if is_target_member_identifier(node, ctx)
+        && scala_static_receiver_matches_target_owner(node, ctx)
+    {
+        push_scala_hit(node, ctx);
+    }
+}
+
+fn maybe_record_java_static_method_hit(node: Node<'_>, ctx: &mut ScalaJavaScanCtx<'_, '_>) {
+    if !is_target_member_identifier(node, ctx)
+        || !scala_static_receiver_matches_target_owner(node, ctx)
+    {
+        return;
+    }
+    let Some(call_shape) = call_site_shape_for_reference(node) else {
+        return;
+    };
+    if call_shape.type_arguments_only || call_shape.lists.len() != 1 {
+        return;
+    }
+    let Some(expected_arities) = ctx.spec.callable_arities.as_ref() else {
+        return;
+    };
+    let actual_arity = call_shape.lists[0].arity;
+    if expected_arities
+        .iter()
+        .copied()
+        .any(|expected| expected.accepts(actual_arity))
+    {
+        push_scala_hit(node, ctx);
+    }
+}
+
+fn is_target_member_identifier(node: Node<'_>, ctx: &ScalaJavaScanCtx<'_, '_>) -> bool {
+    if has_ancestor_kind(node, "import_declaration") || is_declaration_name(node) {
+        return false;
+    }
+    if node_text(node, ctx.source).trim_end_matches('$') != ctx.spec.member_name {
+        return false;
+    }
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "field_expression" && parent.child_by_field_name("field") == Some(node)
+    })
+}
+
+fn scala_static_receiver_matches_target_owner(
+    node: Node<'_>,
+    ctx: &ScalaJavaScanCtx<'_, '_>,
+) -> bool {
+    let Some(receiver) = member_qualifier_node(node) else {
+        return false;
+    };
+    let receiver_text = node_text(receiver, ctx.source)
+        .trim()
+        .trim_end_matches('$')
+        .to_string();
+    if receiver_text.is_empty() {
+        return false;
+    }
+    if receiver_text == ctx.spec.owner.fq_name() {
+        return true;
+    }
+    ctx.visibility.contains(&receiver_text)
+        && !is_term_shadowed(ctx, &receiver_text)
+        && !is_type_shadowed(ctx, &receiver_text)
 }
 
 fn push_scala_hit(node: Node<'_>, ctx: &mut ScalaJavaScanCtx<'_, '_>) {
@@ -303,6 +441,37 @@ fn seed_type_shadow(node: Node<'_>, ctx: &mut ScalaJavaScanCtx<'_, '_>) {
     }
 }
 
+fn seed_term_shadow(node: Node<'_>, ctx: &mut ScalaJavaScanCtx<'_, '_>) {
+    match node.kind() {
+        "parameter" | "class_parameter" | "function_definition" => {
+            let Some(name) = node.child_by_field_name("name") else {
+                return;
+            };
+            insert_term_shadow(name, ctx);
+        }
+        "val_definition" | "var_definition" => {
+            let Some(pattern) = node.child_by_field_name("pattern") else {
+                return;
+            };
+            for name in scala_pattern_binder_names(pattern, ctx.source) {
+                if let Some(scope) = ctx.term_shadow_scopes.last_mut() {
+                    scope.insert(name.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn insert_term_shadow(node: Node<'_>, ctx: &mut ScalaJavaScanCtx<'_, '_>) {
+    let name = node_text(node, ctx.source).trim();
+    if !name.is_empty()
+        && let Some(scope) = ctx.term_shadow_scopes.last_mut()
+    {
+        scope.insert(name.to_string());
+    }
+}
+
 fn enters_local_scope(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
@@ -321,6 +490,13 @@ fn enters_local_scope(node: Node<'_>) -> bool {
 
 fn is_type_shadowed(ctx: &ScalaJavaScanCtx<'_, '_>, name: &str) -> bool {
     ctx.type_shadow_scopes
+        .iter()
+        .rev()
+        .any(|scope| scope.contains(name))
+}
+
+fn is_term_shadowed(ctx: &ScalaJavaScanCtx<'_, '_>, name: &str) -> bool {
+    ctx.term_shadow_scopes
         .iter()
         .rev()
         .any(|scope| scope.contains(name))

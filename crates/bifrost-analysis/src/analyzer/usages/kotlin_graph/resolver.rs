@@ -19,17 +19,17 @@
 use super::extractor::ScanCtx;
 use crate::analyzer::kotlin::declarations::kotlin_package_name;
 use crate::analyzer::kotlin::syntax::{
-    kotlin_call_arity, kotlin_callee, kotlin_declaration_node, kotlin_is_navigation_kind,
-    kotlin_navigation_member, kotlin_navigation_receiver, kotlin_type_spelling,
-    kotlin_unwrap_receiver,
+    kotlin_call_arity, kotlin_callee, kotlin_is_navigation_kind, kotlin_navigation_member,
+    kotlin_navigation_receiver, kotlin_type_spelling, kotlin_unwrap_receiver,
 };
 use crate::analyzer::kotlin::types::{KotlinNameScope, KotlinTypeName, resolve_kotlin_type_name};
 use crate::analyzer::tree_walk::named_children;
 use crate::analyzer::usages::common::node_text;
+use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::{
     CallableArity, CodeUnit, IAnalyzer, ImportInfo, ProjectFile, Range, SignatureMetadata,
 };
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use std::cell::RefCell;
 use tree_sitter::Node;
 
@@ -239,41 +239,42 @@ pub(super) fn kotlin_callable_arities(
         .collect()
 }
 
+/// Whether `unit` is a Kotlin `companion object`.
+///
+/// Read from the published `SignatureMetadata` marker rather than from the
+/// declaring file's syntax. Companion-ness is not derivable from the identity —
+/// a companion and an ordinary nested `object` are both nested classes, and the
+/// `Companion` default name is a name-resolution rule a source file may
+/// override — so before milestone 3 this question cost one *parse* of the
+/// declaring file. That was bounded for a query (one target, asked once) but not
+/// for the whole-workspace edge builder, which asks it per callee owner. The
+/// Kotlin declaration walk now publishes it, at the cost of one signature-blob
+/// field, and the epoch salt carries `kotlin-companion-object-marker-2026-07` so
+/// a warm workspace re-indexes rather than reading every companion as an
+/// ordinary object.
+pub(crate) fn is_companion_object(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
+    unit.is_class()
+        && analyzer
+            .signature_metadata(unit)
+            .iter()
+            .any(SignatureMetadata::is_companion_object)
+}
+
 /// The class a companion object is declared inside, or `None` when `unit` is not
 /// a companion.
-///
-/// Companion-ness is not published by the index — a companion and an ordinary
-/// nested `object` are both nested classes — so it is read from the declaring
-/// file's syntax, which is the structured check (`companion_object` versus
-/// `object_declaration`) rather than a guess from the `Companion` default name,
-/// which a source file is free to override.
-///
-/// This costs one parse per *query*, not per reference: a query has one target,
-/// so it asks this once. The whole-workspace edge builder asks it per callee
-/// owner instead, which is why publishing the flag is recorded as a follow-up in
-/// the plan rather than done here.
 fn companion_host_of(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<String> {
-    if !unit.is_class() {
-        return None;
-    }
-    let host = analyzer.parent_of(unit)?;
-    let range = analyzer.ranges(unit).into_iter().min()?;
-    let source = analyzer
-        .indexed_source(unit.source())
-        .or_else(|| analyzer.project().read_source(unit.source()).ok())?;
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&crate::analyzer::kotlin::language::LANGUAGE.into())
-        .ok()?;
-    let tree = parser.parse(source.as_str(), None)?;
-    kotlin_declaration_node(tree.root_node(), &range)
-        .filter(|node| node.kind() == "companion_object")
-        .map(|_| host.fq_name())
+    is_companion_object(analyzer, unit)
+        .then(|| analyzer.parent_of(unit))
+        .flatten()
+        .map(|host| host.fq_name())
 }
 
 /// The fully-qualified name of the type `unit` extends, when `unit` is a Kotlin
 /// extension.
-fn extension_receiver_fq_name(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<String> {
+pub(super) fn extension_receiver_fq_name(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+) -> Option<String> {
     let spelled = analyzer
         .signature_metadata(unit)
         .into_iter()
@@ -295,6 +296,48 @@ use crate::analyzer::usages::java_graph::return_type::METHOD_RECEIVER_CHAIN_LIMI
 
 /// How many ancestors deep a member lookup walks before giving up.
 const MAX_MEMBER_HIERARCHY_DEPTH: usize = 8;
+
+/// What Kotlin receiver typing needs from whichever usage path is driving it.
+///
+/// `usages/traits.rs` requires the query path and the edge path to share one
+/// resolver, and this trait is where that sharing is real rather than asserted:
+/// everything below it — how a receiver is typed, which member a name binds to,
+/// what a declaration declares — has exactly one implementation, used by
+/// [`super::extractor::ScanCtx`] when answering "who uses *this* declaration?"
+/// and by [`super::inverted`]'s scan when answering "what does this reference
+/// name?". Only the two questions differ; the machinery does not.
+///
+/// The two paths do differ in how they answer the *lexical* questions, which is
+/// why those are methods rather than fields. A query resolves a reference's
+/// enclosing declaration through `IAnalyzer::enclosing_code_unit`, because it
+/// has to attribute the hit to a caller anyway; the whole-workspace builder
+/// already holds a per-file `ClassRangeIndex` and would pay for the same answer
+/// twice by asking the analyzer again.
+pub(super) trait KotlinResolutionCtx {
+    fn analyzer(&self) -> &dyn IAnalyzer;
+
+    /// The source text of the file being scanned.
+    fn source(&self) -> &str;
+
+    /// Value bindings visible at the node being visited.
+    fn bindings(&self) -> &LocalInferenceEngine<String>;
+
+    /// The fully-qualified name the *type* `spelled` denotes at `byte`.
+    fn resolve_type_fqn(&self, spelled: &str, byte: usize) -> Option<String>;
+
+    /// The fully-qualified name the receiver-less *callable or property*
+    /// `spelled` denotes at `byte`.
+    fn resolve_callable_fqn(&self, spelled: &str, byte: usize) -> Option<String>;
+
+    /// Fully-qualified names of the class-like declarations lexically enclosing
+    /// `node`, innermost first.
+    fn enclosing_owner_fq_names(&mut self, node: Node<'_>) -> Vec<String>;
+
+    /// The type each declaration declares, memoized for the duration of one file
+    /// scan: a chain expression asks the same question of the same callee once
+    /// per link.
+    fn declared_type_cache(&mut self) -> &mut HashMap<String, Option<String>>;
+}
 
 /// Whether a reference through `receiver` names the target.
 pub(super) fn receiver_matches_target(
@@ -418,45 +461,34 @@ fn receiver_type_matches_target_uncached(
 /// that merely happens to have the same type. That is the uniform cross-language
 /// policy of #1014 facet B, enforced here so "is this Kotlin declaration dead?"
 /// means what it means for the Java neighbours in the same workspace.
-pub(super) fn receiver_is_same_owner(receiver: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
+pub(super) fn receiver_is_same_owner(
+    receiver: Node<'_>,
+    ctx: &mut impl KotlinResolutionCtx,
+) -> bool {
     let receiver = kotlin_unwrap_receiver(receiver);
     match receiver.kind() {
         "this_expression" => true,
         "super_expression" => false,
         "simple_identifier" => {
-            let name = node_text(receiver, ctx.source);
+            let name = node_text(receiver, ctx.source()).to_string();
             // A value binding of the owner's type is a different object, so it
             // stays external even though its type matches.
-            if name.is_empty() || ctx.bindings.is_shadowed(name) {
+            if name.is_empty() || ctx.bindings().is_shadowed(&name) {
                 return false;
             }
-            let Some(fqn) = ctx.names.resolve_type_fqn(name, receiver.start_byte()) else {
+            let Some(fqn) = ctx.resolve_type_fqn(&name, receiver.start_byte()) else {
                 return false;
             };
-            enclosing_owner_fq_names(receiver, ctx).contains(&fqn)
+            ctx.enclosing_owner_fq_names(receiver).contains(&fqn)
         }
         _ => false,
     }
 }
 
-/// Fully-qualified names of the class-like declarations lexically enclosing
-/// `node`, innermost first.
-pub(super) fn enclosing_owner_fq_names(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> Vec<String> {
-    let mut owners = Vec::new();
-    let mut current = super::hits::enclosing_context(node, ctx).enclosing;
-    while let Some(unit) = current {
-        if unit.is_class() {
-            owners.push(unit.fq_name());
-        }
-        current = ctx.analyzer.parent_of(&unit);
-    }
-    owners
-}
-
 /// The fully-qualified name of the type the expression `node` evaluates to.
 pub(super) fn receiver_type_fq_name(
     node: Node<'_>,
-    ctx: &mut ScanCtx<'_>,
+    ctx: &mut impl KotlinResolutionCtx,
     depth: usize,
 ) -> Option<String> {
     if depth > METHOD_RECEIVER_CHAIN_LIMIT {
@@ -468,37 +500,37 @@ pub(super) fn receiver_type_fq_name(
     match node.kind() {
         "this_expression" => this_receiver_fq_name(node, ctx),
         "super_expression" => {
-            let owner = enclosing_owner_fq_names(node, ctx).into_iter().next()?;
-            let unit = type_unit(ctx.analyzer, &owner)?;
-            ctx.analyzer
+            let owner = ctx.enclosing_owner_fq_names(node).into_iter().next()?;
+            let unit = type_unit(ctx.analyzer(), &owner)?;
+            ctx.analyzer()
                 .type_hierarchy_provider()?
                 .get_direct_ancestors(&unit)
                 .first()
                 .map(CodeUnit::fq_name)
         }
         "simple_identifier" => {
-            let name = node_text(node, ctx.source);
+            let name = node_text(node, ctx.source()).to_string();
             if name.is_empty() {
                 return None;
             }
-            if let Some(bound) = ctx.bindings.resolve_symbol(name).as_precise()
+            if let Some(bound) = ctx.bindings().resolve_symbol(&name).as_precise()
                 && bound.len() == 1
             {
                 return bound.iter().next().cloned();
             }
-            if ctx.bindings.is_shadowed(name) {
+            if ctx.bindings().is_shadowed(&name) {
                 // A binding is in scope but its type is not known — a lambda
                 // parameter, an inferred local, a smart cast. Deliberately not
                 // resolved as a type name: doing so would read a local as the
                 // class it shadows.
                 return None;
             }
-            ctx.names.resolve_type_fqn(name, node.start_byte())
+            ctx.resolve_type_fqn(&name, node.start_byte())
         }
         "call_expression" => call_result_type_fq_name(node, ctx, depth),
         kind if kotlin_is_navigation_kind(kind) => {
             let member = kotlin_navigation_member(node)?;
-            let member_name = node_text(member, ctx.source).to_string();
+            let member_name = node_text(member, ctx.source()).to_string();
             let receiver = kotlin_navigation_receiver(node)?;
             // A dotted qualifier (`lib.Base`) is a type name, not a member
             // access on a value, so it is tried as a whole first.
@@ -510,16 +542,16 @@ pub(super) fn receiver_type_fq_name(
         }
         "as_expression" => named_children(node)
             .into_iter()
-            .find_map(|child| kotlin_type_spelling(child, ctx.source))
-            .and_then(|spelled| ctx.names.resolve_type_fqn(&spelled, node.start_byte())),
+            .find_map(|child| kotlin_type_spelling(child, ctx.source()))
+            .and_then(|spelled| ctx.resolve_type_fqn(&spelled, node.start_byte())),
         _ => None,
     }
 }
 
 /// The type `this` denotes at `node`, honouring a `this@Outer` label.
-fn this_receiver_fq_name(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> Option<String> {
-    let owners = enclosing_owner_fq_names(node, ctx);
-    let label = node_text(node, ctx.source)
+fn this_receiver_fq_name(node: Node<'_>, ctx: &mut impl KotlinResolutionCtx) -> Option<String> {
+    let owners = ctx.enclosing_owner_fq_names(node);
+    let label = node_text(node, ctx.source())
         .strip_prefix("this@")
         .map(str::to_string);
     match label {
@@ -537,17 +569,20 @@ fn this_receiver_fq_name(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> Option<String
 
 /// The whole of a dotted qualifier (`lib.Base` in `lib.Base.of()`) read as a type
 /// name.
-fn navigation_type_fq_name(navigation: Node<'_>, ctx: &mut ScanCtx<'_>) -> Option<String> {
+fn navigation_type_fq_name(
+    navigation: Node<'_>,
+    ctx: &mut impl KotlinResolutionCtx,
+) -> Option<String> {
     let mut segments = Vec::new();
     let mut current = navigation;
     loop {
         let member = kotlin_navigation_member(current)?;
-        segments.push(node_text(member, ctx.source).to_string());
+        segments.push(node_text(member, ctx.source()).to_string());
         let receiver = kotlin_navigation_receiver(current)?;
         match receiver.kind() {
             kind if kotlin_is_navigation_kind(kind) => current = receiver,
             "simple_identifier" => {
-                segments.push(node_text(receiver, ctx.source).to_string());
+                segments.push(node_text(receiver, ctx.source()).to_string());
                 break;
             }
             _ => return None,
@@ -557,25 +592,28 @@ fn navigation_type_fq_name(navigation: Node<'_>, ctx: &mut ScanCtx<'_>) -> Optio
     if segments.iter().any(String::is_empty) {
         return None;
     }
-    ctx.names
-        .resolve_type_fqn(&segments.join("."), navigation.start_byte())
+    ctx.resolve_type_fqn(&segments.join("."), navigation.start_byte())
 }
 
 /// The type a call evaluates to: the constructed type for a constructor call,
 /// otherwise the callee's declared return type.
-fn call_result_type_fq_name(call: Node<'_>, ctx: &mut ScanCtx<'_>, depth: usize) -> Option<String> {
+fn call_result_type_fq_name(
+    call: Node<'_>,
+    ctx: &mut impl KotlinResolutionCtx,
+    depth: usize,
+) -> Option<String> {
     let callee = kotlin_callee(call)?;
     let arity = kotlin_call_arity(call);
     match callee.kind() {
         "simple_identifier" => {
-            let name = node_text(callee, ctx.source).to_string();
+            let name = node_text(callee, ctx.source()).to_string();
             if name.is_empty() {
                 return None;
             }
             // `Base()` constructs a `Base`. Tried first because a constructor
             // call and a function call are spelled identically.
-            if !ctx.bindings.is_shadowed(&name)
-                && let Some(fqn) = ctx.names.resolve_type_fqn(&name, callee.start_byte())
+            if !ctx.bindings().is_shadowed(&name)
+                && let Some(fqn) = ctx.resolve_type_fqn(&name, callee.start_byte())
             {
                 return Some(fqn);
             }
@@ -584,7 +622,7 @@ fn call_result_type_fq_name(call: Node<'_>, ctx: &mut ScanCtx<'_>, depth: usize)
         }
         kind if kotlin_is_navigation_kind(kind) => {
             let member = kotlin_navigation_member(callee)?;
-            let member_name = node_text(member, ctx.source).to_string();
+            let member_name = node_text(member, ctx.source()).to_string();
             let receiver = kotlin_navigation_receiver(callee)?;
             // `lib.Base()` — a fully-qualified constructor call.
             if let Some(fqn) = navigation_type_fq_name(callee, ctx) {
@@ -604,23 +642,20 @@ pub(super) fn bare_callable_unit(
     name: &str,
     arity: usize,
     node: Node<'_>,
-    ctx: &mut ScanCtx<'_>,
+    ctx: &mut impl KotlinResolutionCtx,
 ) -> Option<CodeUnit> {
-    for owner in enclosing_owner_fq_names(node, ctx) {
+    for owner in ctx.enclosing_owner_fq_names(node) {
         if let Some(unit) = member_unit(&owner, name, Some(arity), ctx) {
             return Some(unit);
         }
     }
-    ctx.names
-        .resolve_callable_fqn(name, node.start_byte())
-        .and_then(|fqn| {
-            ctx.analyzer
-                .global_usage_definition_index()
-                .by_fqn(&fqn)
-                .iter()
-                .find(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field()))
-                .cloned()
-        })
+    let fqn = ctx.resolve_callable_fqn(name, node.start_byte())?;
+    ctx.analyzer()
+        .global_usage_definition_index()
+        .by_fqn(&fqn)
+        .iter()
+        .find(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field()))
+        .cloned()
 }
 
 /// The member declaration `member_name` names on a receiver of type
@@ -629,27 +664,26 @@ pub(super) fn member_unit(
     owner_fqn: &str,
     member_name: &str,
     arity: Option<usize>,
-    ctx: &mut ScanCtx<'_>,
+    ctx: &mut impl KotlinResolutionCtx,
 ) -> Option<CodeUnit> {
-    if let Some(unit) = declared_member_unit(ctx.analyzer, owner_fqn, member_name, arity) {
+    let analyzer = ctx.analyzer();
+    if let Some(unit) = declared_member_unit(analyzer, owner_fqn, member_name, arity) {
         return Some(unit);
     }
-    let owner_unit = type_unit(ctx.analyzer, owner_fqn)?;
+    let owner_unit = type_unit(analyzer, owner_fqn)?;
     // A companion's members answer to the enclosing class's name.
-    for child in ctx
-        .analyzer
+    for child in analyzer
         .global_usage_definition_index()
         .fqn_direct_children(owner_fqn)
     {
         if child.is_class()
-            && let Some(unit) =
-                declared_member_unit(ctx.analyzer, &child.fq_name(), member_name, arity)
-            && companion_host_of(ctx.analyzer, &child).is_some()
+            && is_companion_object(analyzer, &child)
+            && let Some(unit) = declared_member_unit(analyzer, &child.fq_name(), member_name, arity)
         {
             return Some(unit);
         }
     }
-    let provider = ctx.analyzer.type_hierarchy_provider()?;
+    let provider = analyzer.type_hierarchy_provider()?;
     let mut frontier = vec![owner_unit];
     let mut seen: Vec<String> = Vec::new();
     for _ in 0..MAX_MEMBER_HIERARCHY_DEPTH {
@@ -661,7 +695,7 @@ pub(super) fn member_unit(
                     continue;
                 }
                 seen.push(fqn.clone());
-                if let Some(found) = declared_member_unit(ctx.analyzer, &fqn, member_name, arity) {
+                if let Some(found) = declared_member_unit(analyzer, &fqn, member_name, arity) {
                     return Some(found);
                 }
                 next.push(ancestor);
@@ -699,18 +733,50 @@ fn declared_member_unit(
         .cloned()
 }
 
+/// The extension declaration `member_name` names on a receiver of type
+/// `owner_fqn`, when one is visible at `byte`.
+///
+/// An extension is *not* a member of the type it extends: the index records it
+/// where it is written, as a top-level callable of its own file's package or as
+/// a member of the class that declares it. So `member_unit` cannot find it, and
+/// the visibility rule that does is the one for any receiver-less name — the
+/// declaring file's package, or an import that names it — which is exactly what
+/// [`KotlinResolutionCtx::resolve_callable_fqn`] answers.
+///
+/// The receiver type must match the extended type *exactly*, not merely conform
+/// to it. That is deliberately the same bar the query path applies through
+/// `TargetSpec::receiver_owner_fq_names`: if one direction accepted a subtype
+/// receiver and the other did not, `scan_usages` and `usage_graph` would
+/// disagree about whether a call is a usage of the extension.
+pub(super) fn visible_extension_unit(
+    member_name: &str,
+    owner_fqn: &str,
+    byte: usize,
+    ctx: &mut impl KotlinResolutionCtx,
+) -> Option<CodeUnit> {
+    let fqn = ctx.resolve_callable_fqn(member_name, byte)?;
+    let analyzer = ctx.analyzer();
+    let unit = analyzer
+        .global_usage_definition_index()
+        .by_fqn(&fqn)
+        .iter()
+        .find(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field()))
+        .cloned()?;
+    (extension_receiver_fq_name(analyzer, &unit)? == owner_fqn).then_some(unit)
+}
+
 /// The declared type of the member `member_name` on a receiver of type
 /// `owner_fqn`.
 fn member_declared_type(
     owner_fqn: &str,
     member_name: &str,
     arity: Option<usize>,
-    ctx: &mut ScanCtx<'_>,
+    ctx: &mut impl KotlinResolutionCtx,
 ) -> Option<String> {
     // A nested type reached through its owner's name (`Outer.Inner`) is a type,
     // not a member with a type.
     let nested = format!("{owner_fqn}.{member_name}");
-    if type_unit(ctx.analyzer, &nested).is_some() {
+    if type_unit(ctx.analyzer(), &nested).is_some() {
         return Some(nested);
     }
     let unit = member_unit(owner_fqn, member_name, arity, ctx)?;
@@ -722,13 +788,16 @@ fn member_declared_type(
 ///
 /// Cached per declaration for the duration of one file scan: a chain expression
 /// asks the same question of the same callee once per link.
-pub(super) fn declared_type_of(unit: &CodeUnit, ctx: &mut ScanCtx<'_>) -> Option<String> {
+pub(super) fn declared_type_of(
+    unit: &CodeUnit,
+    ctx: &mut impl KotlinResolutionCtx,
+) -> Option<String> {
     let key = unit.fq_name();
-    if let Some(cached) = ctx.declared_type_cache.get(&key) {
+    if let Some(cached) = ctx.declared_type_cache().get(&key) {
         return cached.clone();
     }
-    let resolved = declared_type_of_uncached(unit, ctx.analyzer);
-    ctx.declared_type_cache.insert(key, resolved.clone());
+    let resolved = declared_type_of_uncached(unit, ctx.analyzer());
+    ctx.declared_type_cache().insert(key, resolved.clone());
     resolved
 }
 

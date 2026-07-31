@@ -8441,6 +8441,185 @@ impl From<u8> for NetError {
 }
 
 #[test]
+fn rust_function_local_type_shadows_module_import_for_scoped_owner() {
+    let source = r#"
+mod types;
+use types::RecordType;
+
+fn run() {
+    enum RecordType {
+        Svcb,
+        Https,
+    }
+
+    let _ = RecordType::Https;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .file("src/types.rs", "pub enum RecordType { A, Aaaa }\n")
+        .build();
+
+    let start = source
+        .find("RecordType::Https")
+        .expect("function-local enum owner");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(
+        result["definitions"].is_null(),
+        "the unindexed function-local enum must block the shadowed module import: {value}"
+    );
+}
+
+#[test]
+fn rust_macro_token_tuple_constructor_prefers_imported_type_over_enum_variant() {
+    let source = r#"
+use crate::rr::{
+    Name,
+    rdata::{A, PTR},
+};
+
+enum RData {
+    PTR(PTR),
+}
+
+fn run() {
+    let _ = vec![RData::PTR(PTR(Name)), RData::A(A)];
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "pub mod rr;\n")
+        .file(
+            "src/rr/mod.rs",
+            "pub mod rdata;\npub mod record_data;\npub struct Name;\n",
+        )
+        .file(
+            "src/rr/rdata/mod.rs",
+            "mod name;\npub use name::PTR;\npub struct A;\n",
+        )
+        .file(
+            "src/rr/rdata/name.rs",
+            "pub struct PTR(pub super::super::Name);\n",
+        )
+        .file("src/rr/record_data.rs", source)
+        .build();
+
+    let start = source
+        .rfind("PTR(Name)")
+        .expect("macro-token tuple constructor");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/rr/record_data.rs", source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "rr.rdata.name.PTR",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["kind"], "class", "{value}");
+}
+
+#[test]
+fn rust_glob_import_keeps_reexported_enum_variant_route_exact() {
+    let source = r#"
+fn run(value: crate::actual::State) {
+    use crate::exports::*;
+    assert!(matches!(value, Ready));
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "pub mod actual;\npub mod decoy;\npub mod exports;\npub mod consumer;\n",
+        )
+        .file("src/actual.rs", "pub enum State { Ready }\n")
+        .file("src/decoy.rs", "pub enum OtherState { Ready }\n")
+        .file("src/exports.rs", "pub use crate::actual::State::Ready;\n")
+        .file("src/consumer.rs", source)
+        .build();
+
+    let start = source
+        .rfind("Ready")
+        .expect("reexported enum variant pattern");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/consumer.rs", source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "actual.State.Ready",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["kind"], "field", "{value}");
+}
+
+#[test]
+fn rust_prelude_owner_is_not_stolen_by_unrelated_workspace_impl() {
+    let source = r#"
+use alloc::{string::String, vec::Vec};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run() {
+        let _: Option<String> = None;
+        let _ = Vec::from([1_u8, 2_u8]);
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"proto\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            "extern crate alloc;\npub mod dnssec;\npub mod rr;\n",
+        )
+        .file("src/dnssec/mod.rs", "pub mod supported_algorithm;\n")
+        .file(
+            "src/dnssec/supported_algorithm.rs",
+            r#"
+use alloc::vec::Vec;
+
+pub struct SupportedAlgorithms;
+
+impl From<&SupportedAlgorithms> for Vec<u8> {
+    fn from(_: &SupportedAlgorithms) -> Self {
+        Vec::new()
+    }
+}
+"#,
+        )
+        .file("src/rr/mod.rs", "pub mod domain;\n")
+        .file("src/rr/domain/mod.rs", "pub mod name;\n")
+        .file("src/rr/domain/name.rs", source)
+        .build();
+
+    let start = source.find("Vec::from").expect("prelude Vec call") + "Vec::".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/rr/domain/name.rs", source, start),
+    );
+    let result = &value["results"][0];
+    assert_ne!(
+        result["status"], "resolved",
+        "an unrelated workspace impl must not make the prelude owner look indexed: {value}"
+    );
+    assert!(
+        result["definitions"].is_null(),
+        "no workspace declaration owns this prelude Vec reference: {value}"
+    );
+}
+
+#[test]
 fn rust_unindexed_imports_are_not_stolen_by_enclosing_enum_variants() {
     let source = r#"
 use external_crate::{NetError, PTR, ResponseCode};
@@ -24800,6 +24979,43 @@ object App:
 }
 
 #[test]
+fn scala_uppercase_import_selector_resolves_to_companion_nested_type() {
+    let source = r#"
+package app
+
+sealed trait Route {
+  import Route.{Augmented, Handled, Provided, Unhandled}
+}
+
+object Route {
+  private final case class Augmented(value: Int)
+  private final case class Handled(value: Int)
+  private final case class Provided(value: Int)
+  private final case class Unhandled(value: Int)
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Route.scala", source)
+        .build();
+
+    let handled_start = source
+        .find("{Augmented, Handled, Provided, Unhandled}")
+        .expect("uppercase selector list")
+        + "{Augmented, ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Route.scala", source, handled_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Route$.Handled",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_member_import_alias_does_not_shadow_its_own_qualifier() {
     let source = r#"
 package app
@@ -25441,6 +25657,94 @@ object Definitions {
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
         result["definitions"][0]["fqn"], "app.Symbol.entered",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_constructor_named_argument_bypasses_the_preceding_binding_prefix() {
+    const PRECEDING_VALUES: usize = 128;
+
+    let mut generated = String::from("package app\n\nobject Generated {\n");
+    for index in 0..PRECEDING_VALUES {
+        generated.push_str(&format!(
+            "  lazy val item{index}: MediaType = new MediaType(compressible = false)\n"
+        ));
+    }
+    generated.push_str("}\n");
+
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/MediaType.scala",
+            "package app\nfinal case class MediaType(compressible: Boolean)\n",
+        )
+        .file("app/Generated.scala", generated.clone())
+        .build();
+    let label_start = generated
+        .rfind("compressible = false")
+        .expect("last constructor named argument");
+
+    brokk_bifrost::usages::get_definition::reset_scala_active_path_node_visits_for_test();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Generated.scala", &generated, label_start),
+    );
+    let node_visits =
+        brokk_bifrost::usages::get_definition::scala_active_path_node_visits_for_test();
+
+    assert_eq!(
+        node_visits, 0,
+        "constructor named arguments must resolve from their structured invocation owner \
+         without seeding every preceding local binding: {value}"
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.MediaType.compressible",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_enclosing_object_member_bypasses_unrelated_binding_type_inference() {
+    const PRECEDING_VALUES: usize = 128;
+
+    let mut generated = String::from("package app\n\nobject Generated {\n");
+    for index in 0..PRECEDING_VALUES {
+        generated.push_str(&format!(
+            "  lazy val item{index}: MediaType = new MediaType(compressible = false)\n"
+        ));
+    }
+    generated.push_str("  val all = List(item127)\n}\n");
+
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/MediaType.scala",
+            "package app\nfinal case class MediaType(compressible: Boolean)\n",
+        )
+        .file("app/Generated.scala", generated.clone())
+        .build();
+    let member_start = generated
+        .rfind("item127")
+        .expect("enclosing object member reference");
+
+    brokk_bifrost::usages::get_definition::reset_scala_active_path_node_visits_for_test();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Generated.scala", &generated, member_start),
+    );
+    let node_visits =
+        brokk_bifrost::usages::get_definition::scala_active_path_node_visits_for_test();
+
+    assert_eq!(
+        node_visits, 0,
+        "an enclosing object member must resolve from its indexed owner without inferring the \
+         types of every preceding member: {value}"
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Generated$.item127",
         "{value}"
     );
 }
@@ -28835,6 +29139,61 @@ object WebSocketHelpers {
         result["definitions"][0]["fqn"],
         "org.http4s.ember.server.internal.WebSocketHelpers$.WebSocketHelpers",
         "the wildcard owner must not collapse to a same-named child: {value}"
+    );
+}
+
+#[test]
+fn scala_import_owner_prefers_companion_object_over_constructor_only_same_name() {
+    let source = r#"
+package app
+
+final class MqttWriter
+
+object MqttWriter {
+  private val TargetFromFieldProperty = "mqtt.target.from.field"
+}
+
+object Consumer {
+  import MqttWriter.TargetFromFieldProperty
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("src/MqttWriter.scala", source)
+        .build();
+
+    let owner = source
+        .find("import MqttWriter.TargetFromFieldProperty")
+        .expect("import owner")
+        + "import ".len();
+    let owner_value = lookup(
+        project.root(),
+        &location_reference("src/MqttWriter.scala", source, owner),
+    );
+    let owner_result = &owner_value["results"][0];
+    assert_eq!(owner_result["status"], "resolved", "{owner_value}");
+    assert_eq!(
+        owner_result["definitions"][0]["fqn"], "app.MqttWriter$",
+        "{owner_value}"
+    );
+    assert_eq!(
+        owner_result["definitions"][0]["kind"], "class",
+        "{owner_value}"
+    );
+    assert_ne!(
+        owner_result["definitions"][0]["fqn"], "app.MqttWriter.MqttWriter",
+        "the import owner must not collapse to the synthetic constructor: {owner_value}"
+    );
+
+    let terminal = owner + "MqttWriter.".len();
+    let terminal_value = lookup(
+        project.root(),
+        &location_reference("src/MqttWriter.scala", source, terminal),
+    );
+    let terminal_result = &terminal_value["results"][0];
+    assert_eq!(terminal_result["status"], "resolved", "{terminal_value}");
+    assert_eq!(
+        terminal_result["definitions"][0]["fqn"], "app.MqttWriter$.TargetFromFieldProperty",
+        "{terminal_value}"
     );
 }
 

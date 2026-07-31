@@ -673,7 +673,7 @@ pub(super) fn resolve_non_nested_type_from_node(
     }
 
     let type_name = java_type_name_from_node(node, ctx.source)?;
-    ctx.java.resolve_usage_type_name(ctx.file, &type_name)
+    ctx.resolve_realm_type_name(&type_name)
 }
 
 /// Resolves each semantic class segment in a Java type reference, preserving the

@@ -1429,6 +1429,150 @@ object Use {
 }
 
 #[test]
+fn scala_inverse_records_bare_companion_calls_for_imported_and_same_file_types() {
+    let consumer = r#"package chess
+package tiebreak
+
+import chess.format.Uci
+import Tiebreak.*
+
+trait Tournament:
+  def players: Set[Player]
+  def gamesById(id: PlayerId): List[Game] // positive-trait-return-type
+  def opponentsOf: PlayerId => List[Player]
+  def scoreOf: PlayerId => TournamentScore
+  def lastRoundId: Option[String]
+
+  lazy val perfectTournamentPerformance: PlayerId => TiebreakPoint = memoize: id =>
+    val oppRatings: Seq[Int] =
+      gamesById(id).flatMap(_.opponent.rating.map(_.value))
+    if oppRatings.isEmpty then TiebreakPoint.zero
+    else
+      val myScore = scoreOf(id)
+      val minR = oppRatings.min - 800
+      val maxR = oppRatings.max + 800
+      if myScore == TournamentScore(0f) then TiebreakPoint(minR)
+      else TiebreakPoint(Tournament.binarySearch(oppRatings, myScore)(minR, maxR))
+
+  lazy val tournamentPerformance: PlayerId => TiebreakPoint = memoize: id =>
+    Elo
+      .computePerformanceRating:
+        gamesById(id)
+          .flatMap: game =>
+            game.opponent.rating.map(r => Elo.Game(game.points, r))
+      .map(elo => TiebreakPoint(elo.value)) | TiebreakPoint.zero
+
+  lazy val maxRounds = players.map(p => gamesById(p.id).size).maxOption.getOrElse(0)
+
+  lazy val directScore: Set[Player] => Map[PlayerId, Float] = memoize: tiedPlayers =>
+    tiedPlayers
+      .map: p =>
+        p.id -> gamesById(p.id)
+          .filter(g => tiedPlayers.excl(p).contains(g.opponent))
+          .groupBy(_.opponent.id)
+          .map: (_, games) =>
+            games.nonEmpty.so(games.score.value / games.size)
+          .sum
+      .toMap
+
+object Tournament:
+  private final class Impl extends Tournament:
+    override def gamesById(id: PlayerId): List[Game] = // positive-implementation-return-type
+      Nil
+
+  def apply(games: Map[String, Int], lastRound: Option[String]): Tournament =
+    new Tournament {}
+
+object Use:
+  def parse(value: String): Option[Uci] =
+    Uci(value) // positive-imported-overloaded-companion
+
+  def compute(games: Map[String, Int]): Tournament =
+    Tournament(games, None) // positive-same-file-companion
+
+object UciLiteral extends external.Literally[Uci]:
+  def validate(value: String)(using external.Quotes) =
+    Uci(value) match // positive-imported-companion-under-external-shape
+      case Some(_) => true
+      case _ => false
+
+object Tiebreak:
+  final case class Game(value: Int)
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("chess/Game.scala", "package chess\nfinal class Game\n"),
+        (
+            "chess/format/Uci.scala",
+            r#"package chess
+package format
+
+sealed trait Uci
+object Uci:
+  case class Move(value: Int) extends Uci
+  case class Drop(value: Boolean) extends Uci
+
+  def apply(value: String): Option[Uci] = None
+  def apply(value: Int): Move = Move(value)
+  def apply(value: Boolean): Drop = Drop(value)
+"#,
+        ),
+        ("app/Use.scala", consumer),
+    ]);
+
+    for marker in [
+        "positive-trait-return-type",
+        "positive-implementation-return-type",
+    ] {
+        let (line_index, line) = consumer
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains(marker))
+            .expect("marked Game type reference");
+        let column = line.find("Game").expect("Game token") + 1;
+        let response = brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "app/Use.scala".to_string(),
+                    line: Some(line_index + 1),
+                    column: Some(column),
+                }],
+            },
+        );
+        assert_eq!(response.results[0].status, "resolved", "{response:#?}");
+        assert_eq!(
+            response.results[0].definitions[0].fqn.as_deref(),
+            Some("chess.tiebreak.Tiebreak$.Game"),
+            "{response:#?}"
+        );
+    }
+
+    let imported = definition(&analyzer, "chess.format.Uci$.apply");
+    let imported_hits = authoritative_scala_reference_hits(&analyzer, &imported);
+    assert_hit_contains(&imported_hits, "positive-imported-overloaded-companion");
+    assert_hit_contains(
+        &imported_hits,
+        "positive-imported-companion-under-external-shape",
+    );
+    assert_no_hit_contains(&imported_hits, "positive-same-file-companion");
+
+    let same_file = definition(&analyzer, "chess.tiebreak.Tournament$.apply");
+    let same_file_hits = authoritative_scala_reference_hits(&analyzer, &same_file);
+    assert_hit_contains(&same_file_hits, "positive-same-file-companion");
+    assert_no_hit_contains(&same_file_hits, "positive-imported-overloaded-companion");
+
+    let game = definition(&analyzer, "chess.Game");
+    let game_hits = authoritative_scala_reference_hits(&analyzer, &game);
+    assert_no_hit_contains(&game_hits, "positive-trait-return-type");
+    assert_no_hit_contains(&game_hits, "positive-implementation-return-type");
+
+    let nested_game = definition(&analyzer, "chess.tiebreak.Tiebreak$.Game");
+    let nested_game_hits = authoritative_scala_reference_hits(&analyzer, &nested_game);
+    assert_hit_contains(&nested_game_hits, "positive-trait-return-type");
+    assert_hit_contains(&nested_game_hits, "positive-implementation-return-type");
+}
+
+#[test]
 fn scala_graph_resolves_wildcard_imported_nested_companion_apply() {
     let consumer_source = r#"package app
 
@@ -5293,6 +5437,102 @@ object Tokens {
 }
 
 #[test]
+fn scala_inverse_records_selector_tokens_from_imported_and_companion_roots() {
+    let consumer = r#"package app
+
+import model.codec._
+
+object Use {
+  import HttpCodecError.asHttpCodecError // positive-imported-root-selector
+}
+
+sealed trait Route[-Env, +Err] { self =>
+  import Route.{Augmented, Handled, Provided, Unhandled} // positive-companion-root-selector
+}
+
+object Route {
+  private final case class Augmented[-Env, Params](value: Int)
+  private final case class Handled[-Env, Params](value: Int)
+  private final case class Provided[-Env, Params](value: Int)
+  private final case class Unhandled[-Env, Params](value: Int)
+}
+
+object WrongOwner {
+  object HttpCodecError {
+    def asHttpCodecError(value: String): String = value
+  }
+  import HttpCodecError.asHttpCodecError // negative-wrong-imported-root
+}
+
+object WrongRouteOwner {
+  import decoy.Route.{Augmented, Handled, Provided, Unhandled} // negative-wrong-companion-root
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/codec/HttpCodecError.scala",
+            r#"package model.codec
+object HttpCodecError {
+  def asHttpCodecError(value: Throwable): Option[Throwable] = Some(value)
+}
+"#,
+        ),
+        (
+            "decoy/Route.scala",
+            "package decoy\nobject Route { final case class Augmented(value: String); final case class Handled(value: String); final case class Provided(value: String); final case class Unhandled(value: String) }\n",
+        ),
+        ("app/Use.scala", consumer),
+    ]);
+    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let inverse = ScalaUsageGraphStrategy::new();
+
+    for (target_fqn, line, token, positive, negative) in [
+        (
+            "model.codec.HttpCodecError$.asHttpCodecError",
+            "  import HttpCodecError.asHttpCodecError // positive-imported-root-selector",
+            "asHttpCodecError",
+            "positive-imported-root-selector",
+            "negative-wrong-imported-root",
+        ),
+        (
+            "app.Route$.Handled",
+            "  import Route.{Augmented, Handled, Provided, Unhandled} // positive-companion-root-selector",
+            "Handled",
+            "positive-companion-root-selector",
+            "negative-wrong-companion-root",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        let inverse_hits = reference_surface_hits(inverse.find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        let expected = exact_segment(consumer, line, token);
+        for (surface, bucket) in [("targeted", &targeted_hits), ("file-major", &inverse_hits)] {
+            assert!(
+                bucket.iter().any(|hit| hit.snippet.contains(positive)),
+                "expected {surface} hit containing {positive:?}, got {bucket:#?}"
+            );
+            assert!(
+                bucket.iter().all(|hit| !hit.snippet.contains(negative)),
+                "unexpected {surface} hit containing {negative:?}: {bucket:#?}"
+            );
+            assert!(
+                bucket.iter().any(|hit| {
+                    hit.start_offset == expected.0
+                        && hit.end_offset == expected.1
+                        && matches!(hit.kind, UsageHitKind::Import | UsageHitKind::Reference)
+                }),
+                "expected exact {surface} selector range {expected:?} for {target_fqn}: {bucket:#?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn scala_inverse_records_wildcard_owner_import_token_references_exactly() {
     let consumer_source = r#"package app
 object DirectUse {
@@ -5898,6 +6138,17 @@ trait Platform {
   def default: Int = sink(fromConfig) // positive-from-config-method-value
 }
 
+final case class SerializableJsonSchema(
+  additionalProperties: Option[BoolOrSchema] = None,
+  optionalKeySchema: Option[String] = None,
+)
+
+sealed trait BoolOrSchema
+object BoolOrSchema {
+  final case class SchemaWrapper(schema: SerializableJsonSchema) extends BoolOrSchema
+  final case class BooleanWrapper(value: Boolean) extends BoolOrSchema
+}
+
 final case class JsonSchemas(root: String, children: List[String])
 
 sealed trait JsonSchema {
@@ -5910,7 +6161,29 @@ trait OtherJsonSchema {
 
 object OpenApi {
   private def fromSerializableSchema(schema: String): JsonSchema = new JsonSchema {}
-  private def fromZSchemaMultiple(schema: String): JsonSchemas = JsonSchemas(schema, List(schema))
+  private def fromSerializableSchema(schema: SerializableJsonSchema): JsonSchema = new JsonSchema {}
+  private def fromZSchemaMultiple(schema: Schema): JsonSchemas = schema match {
+    case Schema.Leaf(value) =>
+      JsonSchemas(value, List(value))
+    case Schema.Fallback(left, right, fullDecode) =>
+      val leftSchema = fromZSchemaMultiple(left)
+      val rightSchema = fromZSchemaMultiple(right)
+      val candidates =
+        if (fullDecode)
+          List(
+            leftSchema.root,
+            rightSchema.root, // positive-right-schema-root
+          )
+        else
+          List(
+            leftSchema.root,
+            rightSchema.root,
+          )
+      JsonSchemas(
+        candidates.mkString(":"),
+        leftSchema.children ++ rightSchema.children, // positive-right-schema-children
+      )
+  }
   private def reconcileIfBothDefined[T](left: Option[T], right: Option[T])(combine: (T, T) => Option[T]): Option[T] =
     for {
       l <- left
@@ -5919,25 +6192,32 @@ object OpenApi {
     } yield c
   private def combinePatterns(left: String, right: String): Option[String] = Some(left + right)
 
-  def annotateValues(schema: String): JsonSchema = {
-    val valuesSchema = fromSerializableSchema(schema)
-    valuesSchema.annotate("value") // positive-values-schema-annotate
+  def annotateValues(schema: SerializableJsonSchema): Either[Boolean, JsonSchema] = {
+    val additionalProperties = schema.additionalProperties match {
+      case Some(BoolOrSchema.BooleanWrapper(bool)) => Left(bool)
+      case Some(BoolOrSchema.SchemaWrapper(schema)) =>
+        val valuesSchema = fromSerializableSchema(schema)
+        Right(
+          schema.optionalKeySchema.fold(valuesSchema)(keySchema =>
+            valuesSchema.annotate(keySchema) // positive-values-schema-annotate
+          ),
+        )
+      case None => Left(true)
+    }
+    additionalProperties
   }
 
-  def selectRoot(left: String, right: String): String = {
-    val leftSchema = fromZSchemaMultiple(left)
-    val rightSchema = fromZSchemaMultiple(right)
-    rightSchema.root // positive-right-schema-root
-  }
-
-  def selectChildren(left: String, right: String): List[String] = {
-    val leftSchema = fromZSchemaMultiple(left)
-    val rightSchema = fromZSchemaMultiple(right)
-    rightSchema.children // positive-right-schema-children
-  }
+  def combineSchemas(left: Schema, right: Schema): JsonSchemas =
+    fromZSchemaMultiple(Schema.Fallback(left, right, fullDecode = true))
 
   def combine(left: Option[String], right: Option[String]): Option[String] =
     reconcileIfBothDefined(left, right)(combinePatterns) // positive-combine-patterns
+}
+
+sealed trait Schema
+object Schema {
+  final case class Leaf(value: String) extends Schema
+  final case class Fallback(left: Schema, right: Schema, fullDecode: Boolean) extends Schema
 }
 
 object Decoys {
@@ -5982,21 +6262,21 @@ object Decoys {
             "app.JsonSchema.annotate",
             "positive-values-schema-annotate",
             vec!["negative-other-annotate"],
-            "    valuesSchema.annotate(\"value\") // positive-values-schema-annotate",
+            "            valuesSchema.annotate(keySchema) // positive-values-schema-annotate",
             "annotate",
         ),
         (
             "app.JsonSchemas.root",
             "positive-right-schema-root",
             vec!["negative-other-root"],
-            "    rightSchema.root // positive-right-schema-root",
+            "            rightSchema.root, // positive-right-schema-root",
             "root",
         ),
         (
             "app.JsonSchemas.children",
             "positive-right-schema-children",
             vec!["negative-other-children"],
-            "    rightSchema.children // positive-right-schema-children",
+            "        leftSchema.children ++ rightSchema.children, // positive-right-schema-children",
             "children",
         ),
         (
@@ -6100,6 +6380,56 @@ object MatchFields {
             assert_hit_contains(bucket, positive);
             assert_no_hit_contains(bucket, negative);
         }
+    }
+}
+
+#[test]
+fn scala_inverse_records_exact_plain_object_import_paths() {
+    let consumer = r#"package app
+
+import model.netty.NettyConfig // positive-full-object-import
+
+object Use {
+  val defaultConfig = NettyConfig.default // positive-object-member-use
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/netty/NettyConfig.scala",
+            r#"package model.netty
+object NettyConfig {
+  val default: Int = 1
+}
+"#,
+        ),
+        ("app/Use.scala", consumer),
+    ]);
+    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let inverse = ScalaUsageGraphStrategy::new();
+
+    let target = definition(&analyzer, "model.netty.NettyConfig$");
+    let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+    let inverse_hits = reference_surface_hits(inverse.find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    ));
+    let expected = exact_segment(
+        consumer,
+        "import model.netty.NettyConfig // positive-full-object-import",
+        "NettyConfig",
+    );
+    for (surface, bucket) in [("targeted", &targeted_hits), ("file-major", &inverse_hits)] {
+        assert_hit_contains(bucket, "positive-full-object-import");
+        assert!(
+            bucket.iter().any(|hit| {
+                hit.kind == UsageHitKind::Import
+                    && hit.start_offset == expected.0
+                    && hit.end_offset == expected.1
+            }),
+            "expected exact {surface} import range {expected:?}: {bucket:#?}"
+        );
     }
 }
 
@@ -7466,6 +7796,497 @@ object Shadow {
         let target_hits = authoritative_scala_hits(&analyzer, &target);
         assert_hit_contains(&target_hits, marker);
         assert_no_hit_contains(&target_hits, "negative-shadowed-intermediate");
+    }
+}
+
+#[test]
+fn scala_inverse_records_intermediate_type_owners_in_stable_paths() {
+    let consumer = r#"package app
+
+import model.WebSocketConfig
+
+object Use {
+  def classify(status: WebSocketConfig.CloseStatus): Int =
+    status match {
+      case WebSocketConfig.CloseStatus.NormalClosure => 1 // positive-intermediate-type-owner
+    }
+}
+
+object WrongOwner {
+  object CloseStatus {
+    case object NormalClosure
+  }
+  val value = CloseStatus.NormalClosure // negative-wrong-owner
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/WebSocketConfig.scala",
+            r#"package model
+
+object WebSocketConfig {
+  sealed trait CloseStatus
+  object CloseStatus {
+    case object NormalClosure extends CloseStatus
+  }
+}
+"#,
+        ),
+        ("app/Use.scala", consumer),
+    ]);
+    let target = definition(&analyzer, "model.WebSocketConfig$.CloseStatus$");
+    let target_hits = authoritative_scala_hits(&analyzer, &target);
+    let line = "      case WebSocketConfig.CloseStatus.NormalClosure => 1 // positive-intermediate-type-owner";
+    let expected = exact_segment(consumer, line, "CloseStatus");
+
+    assert_hit_contains(&target_hits, "positive-intermediate-type-owner");
+    assert_no_hit_contains(&target_hits, "negative-wrong-owner");
+    assert!(
+        target_hits.iter().any(|hit| {
+            hit.kind == UsageHitKind::Reference
+                && hit.start_offset == expected.0
+                && hit.end_offset == expected.1
+        }),
+        "expected exact intermediate owner range {expected:?}: {target_hits:#?}"
+    );
+}
+
+#[test]
+fn scala_inverse_records_qualified_root_owners_across_namespace_roles() {
+    let source = r#"package app
+
+enum Color {
+  case White
+}
+object Color
+
+case object Crazy {
+  class Data
+}
+
+case class Built(value: Int)
+
+object BinaryFen {
+  object implementation {
+    val marker = 1
+  }
+}
+
+object OtherColor {
+  object White
+}
+object OtherCrazy {
+  class Data
+}
+case class OtherBuilt(value: Int)
+
+object Use {
+  val color = Color.White // positive-root-color
+  val crazy: Crazy.Data = null // positive-root-crazy
+  val built = List(1).map(Built.apply) // positive-root-built
+  import BinaryFen.implementation.* // positive-root-import
+
+  val otherColor = OtherColor.White // negative-root-color
+  val otherCrazy: OtherCrazy.Data = null // negative-root-crazy
+  val otherBuilt = List(1).map(OtherBuilt.apply) // negative-root-built
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/QualifiedRoots.scala", source)]);
+
+    for (target_fqn, positive, negative) in [
+        ("app.Color$", "positive-root-color", "negative-root-color"),
+        ("app.Crazy$", "positive-root-crazy", "negative-root-crazy"),
+        ("app.Built", "positive-root-built", "negative-root-built"),
+        (
+            "app.BinaryFen$",
+            "positive-root-import",
+            "negative-root-import",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, positive);
+        assert_no_hit_contains(&target_hits, negative);
+    }
+}
+
+#[test]
+fn scala_inverse_seeds_extension_receivers_for_fields_and_methods() {
+    let source = r#"package app
+
+class Game(val position: Int)
+
+trait HasPosition[A]:
+  extension (value: A) def position: Int
+
+object Position:
+  case class Wrapped(position: Int)
+
+  given HasPosition[Wrapped]:
+    extension (position: Wrapped) def position: Int =
+      position.position // positive-extension-shadowed-field
+
+class Node {
+  def mapAccumlOption_(context: Int): Int = context
+}
+class Tree {
+  def isVariation: Boolean = true
+}
+
+extension (game: Game)
+  def readPosition: Int =
+    game.position // positive-extension-game-field
+
+extension (node: Node)
+  def encode(context: Int): Int =
+    node.mapAccumlOption_(context) // positive-extension-method
+
+extension (tree: Tree)
+  def variation: Boolean =
+    tree.isVariation // positive-extension-parameterless-method
+
+class OtherGame(val position: Int)
+extension (game: OtherGame)
+  def wrongPosition: Int =
+    game.position // negative-extension-game-field
+"#;
+    let (_project, analyzer) =
+        scala_analyzer_with_files(&[("app/ExtensionReceivers.scala", source)]);
+
+    for (target_fqn, positive, negative) in [
+        (
+            "app.Game.position",
+            "positive-extension-game-field",
+            "negative-extension-game-field",
+        ),
+        (
+            "app.Position$.Wrapped.position",
+            "positive-extension-shadowed-field",
+            "negative-extension-game-field",
+        ),
+        (
+            "app.Node.mapAccumlOption_",
+            "positive-extension-method",
+            "negative-extension-game-field",
+        ),
+        (
+            "app.Tree.isVariation",
+            "positive-extension-parameterless-method",
+            "negative-extension-game-field",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, positive);
+        assert_no_hit_contains(&target_hits, negative);
+    }
+}
+
+#[test]
+fn scala_inverse_records_intermediate_owners_in_stable_type_paths() {
+    let consumer = r#"package model
+
+object Use {
+  def examples(schema: Int): Map[String, OpenAPI.ReferenceOr.Or[Int]] = Map.empty // positive-referenceor-owner
+  val optional = null.asInstanceOf[HttpCodec.Metadata.Optional[Int]] // positive-metadata-owner
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/OpenAPI.scala",
+            r#"package model
+
+final case class OpenAPI()
+
+object OpenAPI {
+  final case class Example(value: Int)
+  sealed trait ReferenceOr[+T]
+  object ReferenceOr {
+    final case class Reference(ref: String) extends ReferenceOr[Nothing]
+    final case class Or[A](value: A) extends ReferenceOr[A]
+  }
+}
+"#,
+        ),
+        (
+            "model/HttpCodec.scala",
+            r#"package model
+
+sealed trait HttpCodec[-AtomTypes, Value]
+
+object HttpCodec {
+  sealed trait Metadata[Value]
+  object Metadata {
+    final case class Optional[A]() extends Metadata[A]
+  }
+}
+"#,
+        ),
+        ("model/Use.scala", consumer),
+        (
+            "shadow/WrongOwner.scala",
+            r#"package shadow
+
+object WrongOwner {
+  object ReferenceOr {
+    final case class Or[A](value: A)
+  }
+  object Metadata {
+    final case class Optional[A](value: A)
+  }
+  val wrongA: ReferenceOr.Or[Int] = ReferenceOr.Or(1) // negative-wrong-referenceor
+  val wrongB: Metadata.Optional[Int] = Metadata.Optional(1) // negative-wrong-metadata
+}
+"#,
+        ),
+    ]);
+
+    for (target_fqn, marker, negative_marker, line, segment) in [
+        (
+            "model.OpenAPI$.ReferenceOr$",
+            "positive-referenceor-owner",
+            "negative-wrong-referenceor",
+            "  def examples(schema: Int): Map[String, OpenAPI.ReferenceOr.Or[Int]] = Map.empty // positive-referenceor-owner",
+            "ReferenceOr",
+        ),
+        (
+            "model.HttpCodec$.Metadata$",
+            "positive-metadata-owner",
+            "negative-wrong-metadata",
+            "  val optional = null.asInstanceOf[HttpCodec.Metadata.Optional[Int]] // positive-metadata-owner",
+            "Metadata",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        let expected = exact_segment(consumer, line, segment);
+
+        assert_hit_contains(&target_hits, marker);
+        assert_no_hit_contains(&target_hits, negative_marker);
+        assert!(
+            target_hits.iter().any(|hit| {
+                hit.kind == UsageHitKind::Reference
+                    && hit.start_offset == expected.0
+                    && hit.end_offset == expected.1
+            }),
+            "expected exact intermediate owner range {expected:?} for {target_fqn}: {target_hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn scala_inverse_records_intermediate_owners_before_extractor_invocation_short_circuit() {
+    let consumer = r#"package model
+
+object Use {
+  def metadata(pathCodec: String): String =
+    pathCodec match {
+      case PathCodec.MetaData.Examples(examples) => examples // positive-extractor-owner
+      case _                                     => pathCodec
+    }
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/PathCodec.scala",
+            r#"package model
+
+sealed trait PathCodec[A]
+
+object PathCodec {
+  sealed trait MetaData[A]
+  object MetaData {
+    final case class Examples[A](examples: Map[String, A]) extends MetaData[A]
+  }
+}
+"#,
+        ),
+        ("model/Use.scala", consumer),
+        (
+            "shadow/WrongOwner.scala",
+            r#"package shadow
+
+object WrongOwner {
+  object MetaData {
+    final case class Examples(value: String)
+  }
+  val wrong = MetaData.Examples("x") // negative-wrong-extractor-owner
+}
+"#,
+        ),
+    ]);
+    let target = definition(&analyzer, "model.PathCodec$.MetaData$");
+    let target_hits = authoritative_scala_hits(&analyzer, &target);
+    let line =
+        "      case PathCodec.MetaData.Examples(examples) => examples // positive-extractor-owner";
+    let expected = exact_segment(consumer, line, "MetaData");
+
+    assert_hit_contains(&target_hits, "positive-extractor-owner");
+    assert_no_hit_contains(&target_hits, "negative-wrong-extractor-owner");
+    assert!(
+        target_hits.iter().any(|hit| {
+            hit.kind == UsageHitKind::Reference
+                && hit.start_offset == expected.0
+                && hit.end_offset == expected.1
+        }),
+        "expected exact extractor owner range {expected:?}: {target_hits:#?}"
+    );
+}
+
+#[test]
+fn scala_inverse_records_zio_synthetic_apply_nested_singleton_and_same_owner_helper() {
+    let source = r#"package app
+
+trait Middleware[-Env]
+
+final case class ProtocolStack[-Env](value: Int) {
+  def mapIncoming(f: ((Int, Int)) => (Int, Int)): ProtocolStack[Env] = this
+  def provideEnvironment(env: Int): ProtocolStack[Any] = this
+}
+
+final case class HandlerAspect[-Env, +CtxOut](protocol: ProtocolStack[Env]) extends Middleware[Env] { self =>
+  def apply(routes: Int): Int = routes
+  def map[CtxOut2](f: CtxOut => CtxOut2): HandlerAspect[Env, CtxOut2] =
+    HandlerAspect(protocol.mapIncoming { case (request, ctx) => (request, 1) }) // positive-synthetic-case-class-apply
+
+  def provideEnvironment(env: Int): HandlerAspect[Any, CtxOut] =
+    HandlerAspect(protocol.provideEnvironment(env)) // positive-synthetic-class-method
+}
+
+object HandlerAspect extends HandlerAspects
+
+trait HandlerAspects {
+  def interceptHandler[Env](value: Int)(f: Int => Int): ProtocolStack[Env] =
+    ProtocolStack(f(value))
+
+  def whenResponseZIO[Env](condition: Int => Either[String, Boolean])(
+    f: Int => Either[String, Int],
+  ): HandlerAspect[Env, Unit] =
+    HandlerAspect(
+      interceptHandler(1) { response =>
+        condition(response)
+          .flatMap(bool => if (bool) f(response) else Right(response))
+          .fold(_ => response, identity)
+      },
+    ) // positive-synthetic-companion-method
+}
+
+object Header {
+  sealed trait AuthenticationScheme
+  object AuthenticationScheme {
+    case object HOBA extends AuthenticationScheme
+  }
+  val selected: AuthenticationScheme = AuthenticationScheme.HOBA // positive-nested-singleton
+}
+
+object Doc {
+  object Span {
+    def empty: String = ""
+    def spans(values: List[String]): String =
+      values.foldLeft(empty)(_ + _) // positive-same-owner-helper
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("app/ZioShapes.scala", source),
+        (
+            "decoy/ZioShapes.scala",
+            r#"package decoy
+final case class HandlerAspect[-Env, +CtxOut](protocol: String) {
+  def apply(routes: String): String = routes
+  def mapped = HandlerAspect(protocol) // negative-synthetic-case-class-apply
+  def provideEnvironment = HandlerAspect[Any, CtxOut](protocol) // negative-synthetic-class-method
+}
+object HandlerAspect extends HandlerAspects
+trait HandlerAspects {
+  def apply[Env](protocol: String): HandlerAspect[Env, Unit] =
+    new HandlerAspect(protocol)
+  def whenResponseZIO[Env](condition: String => Boolean)(
+    f: String => String,
+  ): HandlerAspect[Env, Unit] =
+    HandlerAspect(
+      if (condition("x")) f("x") else "x",
+    ) // negative-synthetic-companion-method
+}
+object AuthenticationScheme {
+  case object HOBA
+}
+object Use {
+  val selected = AuthenticationScheme.HOBA // negative-nested-singleton
+  def empty: String = "decoy"
+  val helper = List("x").foldLeft(empty)(_ + _) // negative-same-owner-helper
+}
+"#,
+        ),
+    ]);
+    let candidates: rustc_hash::FxHashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let inverse = ScalaUsageGraphStrategy::new();
+
+    for (target_fqn, line, token, positive, negative) in [
+        (
+            "app.HandlerAspect.HandlerAspect",
+            "    HandlerAspect(protocol.mapIncoming { case (request, ctx) => (request, 1) }) // positive-synthetic-case-class-apply",
+            "HandlerAspect",
+            "positive-synthetic-case-class-apply",
+            "negative-synthetic-case-class-apply",
+        ),
+        (
+            "app.HandlerAspect.HandlerAspect",
+            "    HandlerAspect(protocol.provideEnvironment(env)) // positive-synthetic-class-method",
+            "HandlerAspect",
+            "positive-synthetic-class-method",
+            "negative-synthetic-class-method",
+        ),
+        (
+            "app.HandlerAspect.HandlerAspect",
+            "    HandlerAspect(",
+            "HandlerAspect",
+            "HandlerAspect(",
+            "negative-synthetic-companion-method",
+        ),
+        (
+            "app.Header$.AuthenticationScheme$.HOBA$",
+            "  val selected: AuthenticationScheme = AuthenticationScheme.HOBA // positive-nested-singleton",
+            "HOBA",
+            "positive-nested-singleton",
+            "negative-nested-singleton",
+        ),
+        (
+            "app.Doc$.Span$.empty",
+            "      values.foldLeft(empty)(_ + _) // positive-same-owner-helper",
+            "empty",
+            "positive-same-owner-helper",
+            "negative-same-owner-helper",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let targeted_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        let inverse_hits = reference_surface_hits(inverse.find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        let expected = exact_segment(source, line, token);
+        for (surface, bucket) in [("targeted", &targeted_hits), ("file-major", &inverse_hits)] {
+            assert!(
+                bucket.iter().any(|hit| hit.snippet.contains(positive)),
+                "expected {surface} hit containing {positive:?}, got {bucket:#?}"
+            );
+            assert!(
+                bucket.iter().all(|hit| !hit.snippet.contains(negative)),
+                "unexpected {surface} hit containing {negative:?}: {bucket:#?}"
+            );
+            assert!(
+                bucket.iter().any(|hit| {
+                    hit.kind == UsageHitKind::Reference
+                        && hit.start_offset == expected.0
+                        && hit.end_offset == expected.1
+                }),
+                "expected exact {surface} range {expected:?} for {target_fqn}: {bucket:#?}"
+            );
+        }
     }
 }
 
@@ -10616,6 +11437,8 @@ package app
 
 object Role {
   def promotable(value: Char): Option[Int] = Some(value.toInt)
+  def promotable(value: String): Option[Int] = None
+  def promotable(value: Option[String]): Option[Int] = None
 }
 
 object OtherRole {
@@ -10624,6 +11447,8 @@ object OtherRole {
 
 object Tree {
   def build(value: String): Int = value.length
+  def build(value: Int): Int = value
+  def build(value: String, index: Int): Int = value.length + index
 }
 
 object OtherTree {

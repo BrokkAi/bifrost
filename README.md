@@ -115,8 +115,8 @@ MCP for shell scripts and reproducible analysis workflows.
 
 ## Language Coverage
 
-Bifrost includes analyzers for C, C++, C#, Go, Java, JavaScript, PHP, Python,
-Ruby, Rust, Scala, and TypeScript. See the [capability
+Bifrost includes analyzers for C, C++, C#, Go, Java, JavaScript, Kotlin, PHP,
+Python, Ruby, Rust, Scala, and TypeScript. See the [capability
 matrix](https://bifrost.brokk.ai/capabilities/) for the supported
 analysis and precision boundaries in each language.
 

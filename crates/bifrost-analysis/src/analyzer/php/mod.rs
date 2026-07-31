@@ -8,7 +8,9 @@ mod semantic;
 pub(crate) mod structural;
 mod tests;
 
-use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
+use crate::analyzer::clone_detection::{
+    CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
+};
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::{build_weighted_cache, weight_code_unit_vec_by_unit};
 use crate::analyzer::store::LimitedQueryRows;
@@ -35,7 +37,7 @@ pub use aliases::{
     PhpUseAliases, parse_php_use_aliases, parse_php_use_aliases_by_kind,
     parse_php_use_aliases_from_source, php_namespace_to_fq,
 };
-use clones::{build_php_clone_candidate_data, refine_php_clone_similarity};
+use clones::build_php_clone_candidate_data;
 use composer::PhpComposerAutoload;
 use tests::detect_php_test_assertion_smells;
 
@@ -681,7 +683,7 @@ impl IAnalyzer for PhpAnalyzer {
             &requested_files,
             all_candidates,
             weights,
-            refine_php_clone_similarity,
+            refine_clone_similarity_with_ast,
         )
     }
 

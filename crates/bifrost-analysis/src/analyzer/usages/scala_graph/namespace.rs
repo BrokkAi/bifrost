@@ -74,6 +74,7 @@ pub(crate) enum ScalaQualifiedTypeRootResolution {
     AuthoritativeMiss,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ScalaDirectAncestorResolution {
     Resolved(Vec<CodeUnit>),
     Ambiguous,

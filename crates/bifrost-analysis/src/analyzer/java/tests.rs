@@ -1,5 +1,6 @@
 use super::exceptions::named_child_by_kind;
 use super::*;
+use crate::analyzer::test_assertions::compact_assertion_excerpt;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::path_utils::rel_path_string;
 use tree_sitter::Node;
@@ -84,40 +85,7 @@ const TEST_ASSERTION_KIND_ANONYMOUS_TEST_DOUBLE: &str = "anonymous-test-double";
 const TEST_ASSERTION_REASON_REUSABLE_TEST_DOUBLE: &str = "reusable-test-double-candidate";
 
 fn compact_test_assertion_excerpt(text: &str) -> String {
-    let compact = compact_whitespace_for_excerpt(text);
-    if compact.chars().count() <= TEST_ASSERTION_EXCERPT_MAX_LEN {
-        return compact;
-    }
-    let mut truncated: String = compact
-        .chars()
-        .take(TEST_ASSERTION_EXCERPT_MAX_LEN)
-        .collect();
-    truncated.push_str("...");
-    truncated
-}
-
-fn compact_whitespace_for_excerpt(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut seen_non_ws = false;
-    let mut pending_space = false;
-    for ch in text.chars() {
-        if ch.is_whitespace() {
-            if seen_non_ws {
-                pending_space = true;
-            }
-            continue;
-        }
-        if pending_space && !out.is_empty() {
-            out.push(' ');
-        }
-        out.push(ch);
-        pending_space = false;
-        seen_non_ws = true;
-    }
-    while out.ends_with(' ') {
-        out.pop();
-    }
-    out
+    compact_assertion_excerpt(text, TEST_ASSERTION_EXCERPT_MAX_LEN)
 }
 
 pub(super) fn java_source_contains_tests(root: Node<'_>, source: &str) -> bool {

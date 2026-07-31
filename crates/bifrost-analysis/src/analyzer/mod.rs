@@ -16,6 +16,7 @@ mod csharp;
 pub mod dataflow;
 pub mod declaration_range;
 mod dense_id;
+pub(crate) mod exception_handling;
 pub(crate) mod fq_name;
 mod global_usage_definition_index;
 mod go;
@@ -46,6 +47,7 @@ pub mod store;
 pub mod structural;
 pub(crate) mod symbol_lookup;
 pub mod taint;
+pub(crate) mod test_assertions;
 pub mod test_paths;
 pub mod tree_sitter_analyzer;
 pub(crate) mod tree_walk;
@@ -122,11 +124,12 @@ pub use model::SemanticDiagnostic;
 pub use model::{
     CallableArity, CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType,
     CommentDensityStats, DeclarationInfo, DeclarationKind, DispatchExtensibility,
-    ExceptionHandlingSmell, ExceptionSmellWeights, ImportInfo, Language, MaintainabilitySizeSmell,
-    MaintainabilitySizeSmellWeights, ParameterMetadata, ParseError, ParseErrorKind, ProjectFile,
-    Range, RubyMethodDispatchMode, SearchSymbolCandidate, SignatureMetadata, StructuredImportPath,
-    StructuredImportPathKind, StructuredImportScope, StructuredTypeIdentity, StructuredTypeName,
-    SummaryFileProjection, TestAssertionSmell, TestAssertionWeights, metrics_from_declarations,
+    ExceptionHandlingAnalysis, ExceptionHandlingSmell, ExceptionSmellWeights, ImportInfo, Language,
+    MaintainabilitySizeSmell, MaintainabilitySizeSmellWeights, ParameterMetadata, ParseError,
+    ParseErrorKind, ProjectFile, Range, RubyMethodDispatchMode, SearchSymbolCandidate,
+    SignatureMetadata, StructuredImportPath, StructuredImportPathKind, StructuredImportScope,
+    StructuredTypeIdentity, StructuredTypeName, SummaryFileProjection, TestAssertionAnalysis,
+    TestAssertionSmell, TestAssertionWeights, metrics_from_declarations,
 };
 pub(crate) use model::{
     CallableLinkage, CppTemplateAliasTargetMetadata, CppTemplateExpression, CppTemplateMetadata,

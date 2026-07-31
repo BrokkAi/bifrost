@@ -2,12 +2,13 @@ use crate::analyzer::common::language_for_file;
 use crate::analyzer::jvm::realm::JvmSourceRealm;
 use crate::analyzer::{
     CSharpAnalyzer, CloneSmell, CloneSmellWeights, CodeUnit, CommentDensityStats, CppAnalyzer,
-    DeclarationInfo, ExceptionHandlingSmell, ExceptionSmellWeights, GlobalUsageDefinitionIndex,
+    DeclarationInfo, ExceptionHandlingAnalysis, ExceptionSmellWeights, GlobalUsageDefinitionIndex,
     GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer,
     KotlinAnalyzer, Language, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range,
     RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, SearchSymbolCandidates, SearchSymbolPatternBatch,
-    SemanticDiagnostic, SignatureMetadata, SummaryFileProjection, TestDetectionProvider,
-    TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
+    SemanticDiagnostic, SignatureMetadata, SummaryFileProjection, TestAssertionAnalysis,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TypeAliasProvider,
+    TypeHierarchyProvider, TypescriptAnalyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use rayon::prelude::*;
@@ -182,8 +183,7 @@ impl AnalyzerDelegate {
             Self::Rust(analyzer) => Some(analyzer),
             Self::Scala(analyzer) => Some(analyzer),
             Self::Ruby(analyzer) => Some(analyzer),
-            // Kotlin AST-backed test detection is issue #1243.
-            Self::Kotlin(analyzer) => analyzer.test_detection_provider(),
+            Self::Kotlin(analyzer) => Some(analyzer),
         }
     }
 
@@ -524,9 +524,20 @@ impl TypeHierarchyProvider for MultiAnalyzer {
         // language's own descendant index, which only walks its own
         // declarations. Kotlin's realm-aware index does resolve across the
         // realm, so folding it in is what makes `Api`'s Kotlin implementors
-        // show up. The reverse direction — Java and Scala subclasses of a
-        // Kotlin type — needs those languages' resolvers to become
-        // realm-aware, which belongs to #1239.
+        // show up.
+        //
+        // The reverse direction — Java and Scala subclasses of a *Kotlin* type
+        // — is still missing, and cannot be fixed here. Each language's
+        // descendant index is the inverse of its own ancestor resolution, and
+        // Java's and Scala's resolve a spelled supertype against their own
+        // declarations only; folding their indexes in for a Kotlin unit would
+        // fold in indexes that never saw the Kotlin declaration in the first
+        // place. Closing it means giving those two hierarchy resolvers the
+        // realm-aware existence predicate Kotlin's already has (`realm_type_exists`
+        // / `realm_type_by_fqn` in `kotlin/hierarchy.rs`) — a change to those
+        // analyzers, not to this dispatch. Issue #1239 made *usage* resolution
+        // realm-aware in both directions; hierarchy resolution is a separate
+        // seam and remains one-directional.
         if language_for_file(code_unit.source()) != Language::Kotlin
             && let Some((kotlin, realm)) = self.kotlin_realm()
         {
@@ -914,6 +925,25 @@ impl IAnalyzer for MultiAnalyzer {
     }
 
     fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
+        // A Kotlin file's unresolved-type diagnostics must see the same
+        // wider JVM source realm its import and hierarchy resolution do:
+        // otherwise a type declared in a Java or Scala sibling file would be
+        // misreported as unrecognized. Only `MultiAnalyzer` can construct
+        // that realm view (see `kotlin_realm`), so this is the one place the
+        // widening happens rather than inside `KotlinAnalyzer` itself.
+        if language_for_file(file) == Language::Kotlin
+            && let Some((kotlin, realm)) = self.kotlin_realm()
+        {
+            return crate::analyzer::kotlin::diagnostics::collect_kotlin_semantic_diagnostics(
+                kotlin,
+                file,
+                source,
+                Some(&realm),
+            )
+            .into_iter()
+            .map(SemanticDiagnostic::from)
+            .collect();
+        }
         self.delegate_for_file(file)
             .map(|delegate| delegate.analyzer().semantic_diagnostics(file, source))
             .unwrap_or_default()
@@ -1015,14 +1045,53 @@ impl IAnalyzer for MultiAnalyzer {
         &self,
         file: &ProjectFile,
         weights: ExceptionSmellWeights,
-    ) -> Vec<ExceptionHandlingSmell> {
+    ) -> ExceptionHandlingAnalysis {
+        let Some(delegate) = self.delegate_for_file(file) else {
+            return ExceptionHandlingAnalysis::Unsupported {
+                reason: format!(
+                    "no analyzer delegate is available for {}",
+                    file.rel_path().display()
+                ),
+            };
+        };
+        delegate
+            .analyzer()
+            .find_exception_handling_smells(file, weights)
+    }
+
+    fn find_test_assertion_smells(
+        &self,
+        file: &ProjectFile,
+        weights: TestAssertionWeights,
+    ) -> Vec<TestAssertionSmell> {
         self.delegate_for_file(file)
             .map(|delegate| {
                 delegate
                     .analyzer()
-                    .find_exception_handling_smells(file, weights)
+                    .find_test_assertion_smells(file, weights)
             })
             .unwrap_or_default()
+    }
+
+    fn find_test_assertion_smells_limited(
+        &self,
+        file: &ProjectFile,
+        weights: TestAssertionWeights,
+        max_candidates: usize,
+    ) -> TestAssertionAnalysis {
+        self.delegate_for_file(file)
+            .map(|delegate| {
+                delegate.analyzer().find_test_assertion_smells_limited(
+                    file,
+                    weights,
+                    max_candidates,
+                )
+            })
+            .unwrap_or(TestAssertionAnalysis {
+                findings: Vec::new(),
+                inspected_candidates: None,
+                truncated: false,
+            })
     }
 
     fn find_structural_clone_smells(

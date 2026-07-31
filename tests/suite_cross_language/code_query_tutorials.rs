@@ -115,6 +115,11 @@ fn ruby_tutorial() {
 }
 
 #[test]
+fn kotlin_tutorial() {
+    verify_tutorial("docs/src/content/docs/code-query-tutorials/kotlin.md");
+}
+
+#[test]
 fn reference_traversal_tutorial() {
     verify_tutorial("docs/src/content/docs/code-query-tutorials/reference-traversal.md");
 }
@@ -185,6 +190,7 @@ fn tutorials_cover_all_public_kinds_roles_and_pages() {
         "scala",
         "csharp",
         "ruby",
+        "kotlin",
     ];
     const ROLES: &[&str] = &[
         "callee",

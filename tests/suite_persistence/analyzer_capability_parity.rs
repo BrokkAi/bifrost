@@ -70,6 +70,7 @@ fn direct_analyzers_match_brokk_capability_matrix() {
     assert!(scala.type_hierarchy_provider().is_some());
     assert!(kotlin.type_hierarchy_provider().is_some());
     assert!(kotlin.type_alias_provider().is_some());
+    assert!(kotlin.test_detection_provider().is_some());
 }
 
 #[test]
