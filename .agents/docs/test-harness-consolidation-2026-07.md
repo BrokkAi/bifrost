@@ -215,7 +215,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `lsp_click_around_regression`
 - `lsp_parameter_definition`
 
-### `suite_persistence` (14 modules)
+### `suite_persistence` (15 modules)
 
 - `analyzer_capability_parity`
 - `analyzer_query_parity`
@@ -228,6 +228,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `multi_analyzer_routing`
 - `multi_analyzer_test`
 - `parse_errors_cache`
+- `semantic_pack_catalog`
 - `structural_facts_persistence`
 - `unified_cache`
 - `workspace_analyzer_test`

@@ -44,8 +44,10 @@ belong to issues #1147 and later children of #1144.
 - [x] (2026-07-31 07:06Z) Implemented and ran the release storage prototype,
   retained raw and DEFLATE evidence, and selected a zero-byte inline threshold
   because the 8 KiB candidate failed the preregistered cold-read gate.
-- [ ] Implement the durable catalog schema, atomic content-addressed
-  installation, selector lookup, verified loading, quarantine, and accounting.
+- [x] (2026-07-31 07:31Z) Implemented the independent catalog migration,
+  file-backed SHA-256 CAS, fully validated and atomic concurrent installation,
+  indexed selector discovery, verified loading, durable/read-only quarantine
+  behavior, source attribution, and deduplicated accounting.
 - [ ] Implement session-only embedded/ephemeral entries, workspace active-set
   references, durable activation scopes, leases, and garbage collection.
 - [ ] Complete migration, read-only, downgrade, corruption, concurrency,
@@ -85,6 +87,14 @@ belong to issues #1147 and later children of #1144.
   Evidence: one `get_summaries` call cancelled after 13.1 seconds and one
   `get_symbol_sources` call cancelled after 10.9 seconds; single-symbol source
   calls returned in roughly 7-11 milliseconds.
+
+- Observation: This host has Rust 1.96 installed through both rustup and
+  Homebrew, while `cargo-clippy` resolves to Homebrew.
+  Evidence: invoking rustup Cargo with Homebrew Clippy produced incompatible
+  compiler metadata. Pinning Homebrew `cargo`, `rustc`, and `rustdoc` made the
+  new library pass with `-D warnings`. The broader all-target gate remains
+  blocked by three unrelated `unnecessary_to_owned` warnings in
+  `analyzer/usages/workspace_graph.rs`.
 
 ## Decision Log
 
@@ -157,6 +167,15 @@ belong to issues #1147 and later children of #1144.
   future candidate results. Compatibility can legitimately change with a
   different Bifrost version, toolchain, target, or configuration; persisting it
   as global corruption would be incorrect.
+  Date/Author: 2026-07-31 / Codex
+
+- Decision: Keep a per-catalog rejected-manifest set in read-write and
+  read-only modes, and distinguish an unavailable stale candidate from
+  intrinsic stored-pack corruption.
+  Rationale: Read-only mode cannot persist a quarantine row but must not retry
+  a known-corrupt payload on every lookup. Conversely, a stale or
+  caller-altered candidate must be a plain safe miss rather than an authority
+  to quarantine an otherwise valid manifest.
   Date/Author: 2026-07-31 / Codex
 
 - Decision: Use durable activation scopes and expiring reader leases as
