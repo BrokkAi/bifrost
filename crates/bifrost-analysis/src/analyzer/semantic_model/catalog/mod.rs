@@ -85,7 +85,7 @@ pub struct SessionPackSource {
     pub source_id: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum CatalogPackSourceKind {
     Installed,
     Generated,
@@ -131,7 +131,7 @@ impl From<SessionPackSourceKind> for CatalogPackSourceKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CatalogCoordinate {
     pub name: String,
     pub version: Option<Version>,
@@ -1093,6 +1093,14 @@ impl SemanticPackCatalog {
         &self,
         query: &SemanticPackSelectorQuery,
     ) -> Result<Vec<CatalogCandidate>, CatalogError> {
+        self.candidates_bounded(query, usize::MAX)
+    }
+
+    pub fn candidates_bounded(
+        &self,
+        query: &SemanticPackSelectorQuery,
+        max_rows: usize,
+    ) -> Result<Vec<CatalogCandidate>, CatalogError> {
         let selector_source = if query.package.is_some() {
             "SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_package
              WHERE package_name IS NULL
@@ -1174,7 +1182,8 @@ impl SemanticPackCatalog {
                  ?8 IS NULL OR s.artifact_sha256 IS NULL OR s.artifact_sha256 = ?8
                )
              ORDER BY p.manifest_digest, ps.shard_id,
-                      source.source_kind, source.source_id, s.selector_ordinal"
+                      source.source_kind, source.source_id, s.selector_ordinal
+             LIMIT ?9"
         );
         let connection = self
             .connection
@@ -1202,7 +1211,8 @@ impl SemanticPackCatalog {
                         .map(|coordinate| coordinate.name.as_str()),
                     query.target.as_deref(),
                     query.configuration.as_deref(),
-                    query.artifact_sha256.as_deref()
+                    query.artifact_sha256.as_deref(),
+                    i64::try_from(max_rows).unwrap_or(i64::MAX)
                 ],
                 |row| {
                     Ok((
@@ -1312,6 +1322,9 @@ impl SemanticPackCatalog {
             .lock()
             .expect("semantic-pack session mutex poisoned");
         for (pack_ordinal, pack) in session_packs.iter().enumerate() {
+            if candidates.len() >= max_rows {
+                break;
+            }
             if pack.manifest.language != query.language
                 || pack.manifest.ecosystem != query.ecosystem
                 || !manifest_compatible(&pack.manifest, query)?
@@ -1319,6 +1332,9 @@ impl SemanticPackCatalog {
                 continue;
             }
             for (shard_ordinal, shard) in pack.shards.iter().enumerate() {
+                if candidates.len() >= max_rows {
+                    break;
+                }
                 let mut matches = false;
                 for selector in &shard.selectors {
                     if selector_matches(selector, query)? {

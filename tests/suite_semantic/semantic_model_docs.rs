@@ -49,6 +49,7 @@ fn documented_source_examples_match_checked_fixtures() {
         document
             .contains("install, select, activate, account for, quarantine, and garbage-collect")
     );
-    assert!(document.contains("does not yet build the generation-scoped matcher"));
+    assert!(document.contains("strictly activate, and match semantic-model packs"));
+    assert!(document.contains("Projection into synthetic analyzer declarations and model URIs"));
     assert!(document.contains("Every source pack must contain `schema_version: 1`"));
 }

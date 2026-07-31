@@ -9,6 +9,7 @@ mod compiler;
 mod identity;
 mod model;
 mod producer;
+mod runtime;
 mod source;
 mod validate;
 
@@ -26,6 +27,7 @@ pub use producer::{
     BoundedProducerDiagnostics, ExactArtifact, ExternalArtifactKind, ExternalArtifactPackProducer,
     ProducerDiagnostic, ProducerDiagnosticSeverity, read_exact_artifact,
 };
+pub use runtime::*;
 pub use source::SourceFormat;
 pub use validate::{Diagnostic, DiagnosticSeverity};
 

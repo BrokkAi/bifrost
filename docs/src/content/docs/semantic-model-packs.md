@@ -9,10 +9,15 @@ framework or generator behavior. A producer can construct the public Rust
 model directly or load reviewed YAML or JSON. Both paths compile through the
 same validation and canonicalization pipeline.
 
+Compilation alone does not install, store, match, or activate a pack; those
+operations belong to the catalog and generation-scoped runtime described below.
+
 > **Current runtime boundary:** Bifrost can compile, defensively decode,
-> install, select, activate, account for, quarantine, and garbage-collect
-> semantic-model packs. It does not yet build the generation-scoped matcher
-> that applies selected declarations or generator rules inside an analyzer.
+> install, strictly activate, and match semantic-model packs for one analyzer
+> generation. Projection into synthetic analyzer declarations and model URIs
+> remains a separate overlay step.
+
+Together, the catalog and runtime can install, select, activate, account for, quarantine, and garbage-collect packs while keeping matching generation-local.
 
 Packs do not contain executable code, arbitrary templates, fake source, or
 procedure-effect/data-flow summaries. Generator expressions are bounded trees
@@ -49,8 +54,27 @@ Each shard has one or more activation selectors. A selector can identify a
 package, module, or declared toolchain using an exact name and optional SemVer
 constraint. It may narrow activation by target, configuration, or a lowercase
 SHA-256 artifact digest. The compiler derives sorted routing keys from these
-selectors and, for rule shards, their trigger kinds. A later runtime can route
-without reading unrelated payloads.
+selectors and, for rule shards, their trigger kinds. The runtime uses the keys
+to avoid reading unrelated payloads, then strictly rechecks every populated
+selector field. Missing evidence never satisfies a constraint.
+
+Activation evidence is supplied as complete rows so a package, module,
+toolchain, target, configuration, and artifact digest from different resolved
+artifacts cannot be combined accidentally. Exact artifact evidence outranks
+versioned coordinates, which outrank named coordinates and language-only
+selectors. Ephemeral and durable workspace-produced sources outrank generated,
+installed, pre-shipped, and embedded sources in that order. A workspace control
+outranks a user control, but neither can bypass compatibility. Packs marked
+`review_required` need an explicit compatible enable. Equal-rank conflicting
+facts remain conflicts instead of becoming a last-write-wins answer.
+
+The generation-scoped runtime owns every selected decoded shard and builds
+exact-key postings for type and member IDs and names, aliases, relation IDs and
+directions, and every schema-version-one generator trigger. Lookups do not read
+SQLite, pack files, or unrelated postings; schema version one has no wildcard
+fallback path. Work, index entries, working bytes, retained bytes, and
+explanations are bounded. Cancellation, corruption, stale generations, and
+exhausted budgets never publish a complete cached value.
 
 ## Catalog and lifecycle
 
@@ -91,9 +115,18 @@ Persistent workspace active sets may reference only exact registered durable
 sources. In-memory workspaces may reference only exact session sources because
 they have no durable workspace identity that can own a cross-process
 activation. Their activation accounting is tied to the workspace store's
-lifetime. Active set identity is a domain-separated digest over the full sorted
-manifest and source references, and durable activation rows protect selected
-objects across processes.
+lifetime. Catalog active-set identity is a domain-separated digest over the
+full sorted manifest and source references, and durable activation rows protect
+selected objects across processes.
+
+That catalog identity is deliberately distinct from the runtime
+`active_model_set_hash`. The runtime hash covers selected semantic shard
+digests, payload kinds, and the matcher representation version but not
+equivalent source attribution or storage encoding. Analyzer-snapshot caches use
+a canonical activation-request key and retain only complete immutable
+runtimes. Before publication, the runtime rechecks source generations and
+coordinates selected catalog references with the workspace store. A failed or
+incomplete build preserves the previous active set.
 
 Accounting reports deduplicated installed and active bytes, physical objects,
 logical and active shards, sources, lookup hits and misses, quarantined packs,

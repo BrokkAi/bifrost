@@ -201,6 +201,7 @@ pub struct AnalyzerQueryContext {
 pub struct AnalyzerSnapshotCaches {
     derived_layers: crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache,
     usage_graphs: crate::analyzer::usages::workspace_graph_cache::SnapshotWorkspaceUsageGraphCache,
+    semantic_models: crate::analyzer::semantic_model::SemanticModelRuntimeCache,
 }
 
 impl AnalyzerSnapshotCaches {
@@ -211,6 +212,9 @@ impl AnalyzerSnapshotCaches {
                     derived_layer_budget_bytes,
                 ),
             usage_graphs: crate::analyzer::usages::workspace_graph_cache::SnapshotWorkspaceUsageGraphCache::new(
+                derived_layer_budget_bytes,
+            ),
+            semantic_models: crate::analyzer::semantic_model::SemanticModelRuntimeCache::new(
                 derived_layer_budget_bytes,
             ),
         }
@@ -226,6 +230,12 @@ impl AnalyzerSnapshotCaches {
         &self,
     ) -> &crate::analyzer::usages::workspace_graph_cache::SnapshotWorkspaceUsageGraphCache {
         &self.usage_graphs
+    }
+
+    pub(crate) fn semantic_models(
+        &self,
+    ) -> &crate::analyzer::semantic_model::SemanticModelRuntimeCache {
+        &self.semantic_models
     }
 }
 
