@@ -1,7 +1,7 @@
 //! Embedding engine.
 //!
 //! `Embedder` is the seam the indexer and query pipeline depend on; the production impl
-//! ([`super::voyage_sidecar`]) runs voyageai/voyage-4-nano in a PyTorch SDPA sidecar
+//! ([`super::voyage_sidecar`]) runs the selected model profile in a PyTorch SDPA sidecar
 //! (one process per device, fused attention on CUDA/Metal/CPU), and a deterministic fake
 //! backs the model-free tests. Model files resolve from an env-pointed local directory
 //! first (fine-tune escape hatch), then the HF hub cache. The sidecar selects its device
@@ -13,11 +13,63 @@ use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
+use super::REPRESENTATION_KIND;
 use super::keys::l2_normalize;
-use super::{PARENT_ALPHA, PASSAGE_PREFIX, QUERY_PREFIX, REPRESENTATION_KIND};
+
+pub const EMBED_PROFILE_ENV: &str = "BIFROST_EMBED_PROFILE";
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelProfile {
+    pub name: &'static str,
+    pub model_id: &'static str,
+    pub dimension: usize,
+    pub query_prefix: &'static str,
+    pub passage_prefix: &'static str,
+    pub pooling: &'static str,
+    pub max_seq_tokens: usize,
+    pub parent_alpha: f64,
+}
+
+pub const VOYAGE_PROFILE: ModelProfile = ModelProfile {
+    name: "voyage-4-nano",
+    model_id: "voyageai/voyage-4-nano",
+    dimension: 512,
+    query_prefix: "Represent the query for retrieving supporting documents: ",
+    passage_prefix: "Represent the document for retrieval: ",
+    pooling: "mean-mrl",
+    max_seq_tokens: 8192,
+    parent_alpha: 0.5,
+};
+
+pub const GRANITE_R2_PROFILE: ModelProfile = ModelProfile {
+    name: "granite-r2",
+    model_id: "ibm-granite/granite-embedding-small-english-r2",
+    dimension: 384,
+    query_prefix: "Given a GitHub issue, retrieve code that must be changed to fix it.\nQuery: ",
+    passage_prefix: "Passage: Code chunk from repository.\n",
+    pooling: "cls",
+    max_seq_tokens: 8192,
+    parent_alpha: 0.65,
+};
+
+pub fn selected_model_profile() -> Result<ModelProfile, String> {
+    match std::env::var(EMBED_PROFILE_ENV).ok().as_deref() {
+        None | Some("") | Some("voyage") | Some("voyage-4-nano") => Ok(VOYAGE_PROFILE),
+        Some("granite-r2") => Ok(GRANITE_R2_PROFILE),
+        Some(value) => Err(format!(
+            "unknown {EMBED_PROFILE_ENV} value '{value}'; expected voyage-4-nano or granite-r2"
+        )),
+    }
+}
 
 pub trait Embedder: Send + Sync {
-    fn dim(&self) -> usize;
+    fn profile(&self) -> ModelProfile {
+        VOYAGE_PROFILE
+    }
+
+    fn dim(&self) -> usize {
+        self.profile().dimension
+    }
 
     /// Embed document texts; the passage prefix is applied here, exactly once.
     /// Outputs are L2-normalized.
@@ -36,15 +88,18 @@ pub trait Embedder: Send + Sync {
 
 /// Fingerprint recipe shared by all embedders: model label + dimensionality +
 /// the exact prefix strings + vector representation contract.
-pub(crate) fn fingerprint_for(label: &str, dim: usize) -> String {
+pub(crate) fn fingerprint_for(label: &str, profile: ModelProfile) -> String {
     let mut hasher = Sha256::new();
     for part in [
         label,
-        &dim.to_string(),
-        QUERY_PREFIX,
-        PASSAGE_PREFIX,
+        profile.name,
+        &profile.dimension.to_string(),
+        profile.query_prefix,
+        profile.passage_prefix,
+        profile.pooling,
+        &format!("max_seq_tokens={}", profile.max_seq_tokens),
         REPRESENTATION_KIND,
-        &format!("alpha={PARENT_ALPHA}"),
+        &format!("alpha={}", profile.parent_alpha),
         // Stored-vector format. Bumping this invalidates caches written in a prior
         // format (e.g. raw f32 before fastrq) without changing the content keys.
         "storage=rq8_v1",
@@ -61,9 +116,8 @@ pub(crate) fn fingerprint_for(label: &str, dim: usize) -> String {
 // Model resolution
 // ---------------------------------------------------------------------------
 
-pub const DEFAULT_EMBED_MODEL_ID: &str = "voyageai/voyage-4-nano";
-
 pub const EMBED_MODEL_DIR_ENV: &str = "BIFROST_EMBED_MODEL_DIR";
+pub const EMBED_TOKENIZER_DIR_ENV: &str = "BIFROST_EMBED_TOKENIZER_DIR";
 pub const EMBED_MODEL_ID_ENV: &str = "BIFROST_EMBED_MODEL_ID";
 const ACCELERATOR_ENV: &str = "BIFROST_ACCELERATOR";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,7 +171,12 @@ pub fn accelerator_available() -> bool {
 }
 
 pub(crate) fn embed_repo_id() -> String {
-    std::env::var(EMBED_MODEL_ID_ENV).unwrap_or_else(|_| DEFAULT_EMBED_MODEL_ID.to_string())
+    std::env::var(EMBED_MODEL_ID_ENV).unwrap_or_else(|_| {
+        selected_model_profile()
+            .unwrap_or(VOYAGE_PROFILE)
+            .model_id
+            .to_string()
+    })
 }
 
 /// Directory holding the model's `config.json`, `tokenizer.json`, and
@@ -140,6 +199,13 @@ pub(crate) fn resolve_embed_model_dir() -> Result<PathBuf, String> {
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| "model weights have no parent directory".to_string())
+}
+
+pub(crate) fn resolve_tokenizer_dir() -> Result<PathBuf, String> {
+    if let Ok(dir) = std::env::var(EMBED_TOKENIZER_DIR_ENV) {
+        return Ok(PathBuf::from(dir));
+    }
+    resolve_embed_model_dir()
 }
 
 pub fn load_production_embedder() -> Result<Arc<dyn Embedder>, String> {
@@ -173,8 +239,8 @@ impl ScheduledEmbedder {
 }
 
 impl Embedder for ScheduledEmbedder {
-    fn dim(&self) -> usize {
-        self.workers[0].dim()
+    fn profile(&self) -> ModelProfile {
+        self.workers[0].profile()
     }
 
     fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
@@ -288,8 +354,11 @@ impl FakeHashEmbedder {
 }
 
 impl Embedder for FakeHashEmbedder {
-    fn dim(&self) -> usize {
-        self.dim
+    fn profile(&self) -> ModelProfile {
+        ModelProfile {
+            dimension: self.dim,
+            ..VOYAGE_PROFILE
+        }
     }
 
     fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
@@ -307,7 +376,7 @@ impl Embedder for FakeHashEmbedder {
     }
 
     fn fingerprint(&self) -> String {
-        fingerprint_for("fake-hash-embedder", self.dim)
+        fingerprint_for("fake-hash-embedder", self.profile())
     }
 }
 
@@ -336,8 +405,25 @@ mod tests {
 
     #[test]
     fn fingerprint_changes_with_label_and_dim() {
-        assert_ne!(fingerprint_for("a", 16), fingerprint_for("b", 16));
-        assert_ne!(fingerprint_for("a", 16), fingerprint_for("a", 32));
+        let p16 = ModelProfile {
+            dimension: 16,
+            ..VOYAGE_PROFILE
+        };
+        let p32 = ModelProfile {
+            dimension: 32,
+            ..VOYAGE_PROFILE
+        };
+        assert_ne!(fingerprint_for("a", p16), fingerprint_for("b", p16));
+        assert_ne!(fingerprint_for("a", p16), fingerprint_for("a", p32));
+    }
+
+    #[test]
+    fn granite_profile_matches_serving_contract() {
+        assert_eq!(GRANITE_R2_PROFILE.dimension, 384);
+        assert_eq!(GRANITE_R2_PROFILE.pooling, "cls");
+        assert_eq!(GRANITE_R2_PROFILE.parent_alpha, 0.65);
+        assert!(GRANITE_R2_PROFILE.query_prefix.ends_with("Query: "));
+        assert!(GRANITE_R2_PROFILE.passage_prefix.ends_with('\n'));
     }
 
     #[test]

@@ -12,6 +12,7 @@
 //! The child emits one ready frame (`{"ready":true,"dim":512}`) after model load.
 
 use std::io::{BufReader, Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
@@ -19,13 +20,18 @@ use std::time::Duration;
 
 use tokenizers::Tokenizer;
 
-use super::engine::{Embedder, ScheduledEmbedder, fingerprint_for, resolve_embed_model_dir};
+#[cfg(all(test, unix))]
+use super::engine::VOYAGE_PROFILE;
+use super::engine::{
+    Embedder, ModelProfile, ScheduledEmbedder, embed_repo_id, fingerprint_for,
+    resolve_tokenizer_dir, selected_model_profile,
+};
 
-const OUT_DIM: usize = 512;
 const SCRIPT_ENV: &str = "BIFROST_SIDECAR_SCRIPT";
 const DEVICES_ENV: &str = "BIFROST_SIDECAR_DEVICES";
+const ENDPOINT_ENV: &str = "BIFROST_EMBED_ENDPOINT";
 const READY_TIMEOUT_ENV: &str = "BIFROST_SIDECAR_READY_TIMEOUT_SECS";
-const DEFAULT_SCRIPT: &str = "scripts/voyage_sidecar.py";
+const DEFAULT_SCRIPT: &str = "scripts/embedding_sidecar.py";
 const DEFAULT_READY_TIMEOUT_SECS: u64 = 900;
 
 /// One sidecar child process bound to one device.
@@ -33,6 +39,49 @@ struct SidecarProc {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+}
+
+enum SidecarConnection {
+    Process(SidecarProc),
+    Tcp(BufReader<TcpStream>),
+}
+
+impl SidecarConnection {
+    fn write_frame(&mut self, payload: &[u8]) -> Result<(), String> {
+        match self {
+            Self::Process(proc) => proc.write_frame(payload),
+            Self::Tcp(stream) => write_frame(stream.get_mut(), payload),
+        }
+    }
+
+    fn read_frame(&mut self) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Process(proc) => proc.read_frame(),
+            Self::Tcp(stream) => read_frame(stream),
+        }
+    }
+}
+
+fn write_frame(stream: &mut impl Write, payload: &[u8]) -> Result<(), String> {
+    let len = u32::try_from(payload.len()).map_err(|_| "frame too large".to_string())?;
+    stream
+        .write_all(&len.to_le_bytes())
+        .and_then(|()| stream.write_all(payload))
+        .and_then(|()| stream.flush())
+        .map_err(|e| format!("sidecar write: {e}"))
+}
+
+fn read_frame(stream: &mut impl Read) -> Result<Vec<u8>, String> {
+    let mut head = [0u8; 4];
+    stream
+        .read_exact(&mut head)
+        .map_err(|e| format!("sidecar read len: {e}"))?;
+    let len = u32::from_le_bytes(head) as usize;
+    let mut buf = vec![0u8; len];
+    stream
+        .read_exact(&mut buf)
+        .map_err(|e| format!("sidecar read body: {e}"))?;
+    Ok(buf)
 }
 
 impl SidecarProc {
@@ -75,9 +124,11 @@ impl Drop for SidecarProc {
 
 /// Embedder backed by a single sidecar process (one GPU).
 pub struct SingleSidecar {
-    proc: Mutex<SidecarProc>,
+    connection: Mutex<SidecarConnection>,
     tokenizer: Arc<Tokenizer>,
     label: String,
+    model_fingerprint: String,
+    profile: ModelProfile,
 }
 
 impl SingleSidecar {
@@ -87,17 +138,17 @@ impl SingleSidecar {
         }
         let req = serde_json::json!({ "kind": kind, "texts": texts });
         let body = serde_json::to_vec(&req).map_err(|e| format!("encode request: {e}"))?;
-        let mut proc = self.proc.lock().expect("sidecar mutex poisoned");
-        proc.write_frame(&body)?;
-        let resp = proc.read_frame()?;
-        drop(proc);
-        decode_matrix(&resp, texts.len())
+        let mut connection = self.connection.lock().expect("sidecar mutex poisoned");
+        connection.write_frame(&body)?;
+        let resp = connection.read_frame()?;
+        drop(connection);
+        decode_matrix(&resp, texts.len(), self.profile.dimension)
     }
 }
 
 impl Embedder for SingleSidecar {
-    fn dim(&self) -> usize {
-        OUT_DIM
+    fn profile(&self) -> ModelProfile {
+        self.profile
     }
 
     fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
@@ -119,20 +170,27 @@ impl Embedder for SingleSidecar {
     fn fingerprint(&self) -> String {
         // bf16 sidecar vectors differ slightly from the fp32 reference, so use a
         // distinct contract id — switching backends rebuilds the cache.
-        fingerprint_for(&format!("{}:sidecar-bf16", self.label), OUT_DIM)
+        fingerprint_for(
+            &format!("{}:{}:sidecar-bf16", self.label, self.model_fingerprint),
+            self.profile,
+        )
     }
 }
 
 /// Decode a response frame ([u32 n][u32 dim] + f32 matrix) into row vectors.
-fn decode_matrix(buf: &[u8], expected_rows: usize) -> Result<Vec<Vec<f32>>, String> {
+fn decode_matrix(
+    buf: &[u8],
+    expected_rows: usize,
+    expected_dim: usize,
+) -> Result<Vec<Vec<f32>>, String> {
     if buf.len() < 8 {
         return Err("sidecar response too short".to_string());
     }
     let n = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
     let dim = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
-    if n != expected_rows || dim != OUT_DIM {
+    if n != expected_rows || dim != expected_dim {
         return Err(format!(
-            "sidecar returned {n}x{dim}, expected {expected_rows}x{OUT_DIM}"
+            "sidecar returned {n}x{dim}, expected {expected_rows}x{expected_dim}"
         ));
     }
     let floats = &buf[8..];
@@ -223,11 +281,13 @@ fn spawn_sidecar(
     device: &str,
     tokenizer: Arc<Tokenizer>,
     label: String,
+    profile: ModelProfile,
 ) -> Result<SingleSidecar, String> {
     spawn_sidecar_with_timeout(
         device,
         tokenizer,
         label,
+        profile,
         script_path(),
         ready_timeout(),
         None,
@@ -238,6 +298,7 @@ fn spawn_sidecar_with_timeout(
     device: &str,
     tokenizer: Arc<Tokenizer>,
     label: String,
+    profile: ModelProfile,
     script: PathBuf,
     timeout: Duration,
     uv_cache_dir: Option<&Path>,
@@ -248,6 +309,7 @@ fn spawn_sidecar_with_timeout(
         cmd.env("UV_CACHE_DIR", cache_dir);
     }
     cmd.env("CUDA_VISIBLE_DEVICES", device);
+    cmd.env(super::engine::EMBED_PROFILE_ENV, profile.name);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -280,12 +342,13 @@ fn spawn_sidecar_with_timeout(
                 if info.get("ready").and_then(|v| v.as_bool()) != Some(true) {
                     return Err(format!("sidecar did not report ready: {info}"));
                 }
-                Ok(proc)
+                let model_fingerprint = validate_ready(&info, profile)?;
+                Ok((proc, model_fingerprint))
             });
             tx.send(result).ok();
         })
         .map_err(|err| format!("spawn sidecar ready thread: {err}"))?;
-    let proc = match rx.recv_timeout(timeout) {
+    let (proc, model_fingerprint) = match rx.recv_timeout(timeout) {
         Ok(result) => {
             handle
                 .join()
@@ -309,24 +372,81 @@ fn spawn_sidecar_with_timeout(
         }
     };
     Ok(SingleSidecar {
-        proc: Mutex::new(proc),
+        connection: Mutex::new(SidecarConnection::Process(proc)),
         tokenizer,
         label,
+        model_fingerprint,
+        profile,
+    })
+}
+
+fn validate_ready(info: &serde_json::Value, profile: ModelProfile) -> Result<String, String> {
+    if info.get("ready").and_then(|v| v.as_bool()) != Some(true) {
+        return Err(format!("sidecar did not report ready: {info}"));
+    }
+    let dim = info.get("dim").and_then(|v| v.as_u64());
+    let reported_profile = info.get("profile").and_then(|v| v.as_str());
+    if dim != Some(profile.dimension as u64) || reported_profile != Some(profile.name) {
+        return Err(format!(
+            "sidecar contract mismatch: reported profile={reported_profile:?} dim={dim:?}, expected profile={} dim={}",
+            profile.name, profile.dimension
+        ));
+    }
+    info.get("model_fingerprint")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "sidecar ready frame omitted model_fingerprint".to_string())
+}
+
+fn connect_sidecar(
+    endpoint: &str,
+    tokenizer: Arc<Tokenizer>,
+    label: String,
+    profile: ModelProfile,
+) -> Result<SingleSidecar, String> {
+    let address = endpoint
+        .strip_prefix("tcp://")
+        .ok_or_else(|| format!("{ENDPOINT_ENV} must use tcp://host:port"))?;
+    let stream = TcpStream::connect(address)
+        .map_err(|err| format!("connect embedding sidecar at {endpoint}: {err}"))?;
+    stream
+        .set_nodelay(true)
+        .map_err(|err| format!("configure embedding sidecar TCP: {err}"))?;
+    let mut connection = SidecarConnection::Tcp(BufReader::new(stream));
+    let ready = connection.read_frame()?;
+    let info: serde_json::Value =
+        serde_json::from_slice(&ready).map_err(|err| format!("sidecar ready frame: {err}"))?;
+    let model_fingerprint = validate_ready(&info, profile)?;
+    Ok(SingleSidecar {
+        connection: Mutex::new(connection),
+        tokenizer,
+        label,
+        model_fingerprint,
+        profile,
     })
 }
 
 /// Spawn one sidecar per device and fan a batch across them via `ScheduledEmbedder`.
 pub fn load_sidecar_embedder() -> Result<Arc<dyn Embedder>, String> {
-    let dir = resolve_embed_model_dir()?;
+    let profile = selected_model_profile()?;
+    let dir = resolve_tokenizer_dir()?;
     let tokenizer = Arc::new(
         Tokenizer::from_file(dir.join("tokenizer.json"))
             .map_err(|e| format!("load tokenizer: {e}"))?,
     );
-    let label = super::engine::embed_repo_id();
+    let label = embed_repo_id();
+    if let Ok(endpoint) = std::env::var(ENDPOINT_ENV) {
+        let worker = connect_sidecar(&endpoint, tokenizer, label, profile)?;
+        worker
+            .embed_passages(&["warmup"])
+            .map_err(|err| format!("sidecar warmup failed at '{endpoint}': {err}"))?;
+        return Ok(Arc::new(worker));
+    }
     let devices = sidecar_devices();
     let mut workers: Vec<Arc<dyn Embedder>> = Vec::with_capacity(devices.len());
     for device in &devices {
-        let worker = spawn_sidecar(device, tokenizer.clone(), label.clone())?;
+        let worker = spawn_sidecar(device, tokenizer.clone(), label.clone(), profile)?;
         worker
             .embed_passages(&["warmup"])
             .map_err(|err| format!("sidecar warmup failed on device '{device}': {err}"))?;
@@ -375,6 +495,7 @@ mod tests {
             "",
             empty_tokenizer(),
             "test-sidecar".to_string(),
+            VOYAGE_PROFILE,
             script,
             Duration::from_secs(1),
             Some(&uv_cache_dir),

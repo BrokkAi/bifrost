@@ -58,6 +58,14 @@ The observable outcomes are:
 - [x] (2026-07-31, current revision) Narrowed the first delivery to Granite R2, added the
   no-semantic baseline gate, A4000 indexing, clone-first sequencing, 15 repository-shared
   indexes, and 30/40/50 evaluation concurrency.
+- [x] (2026-07-31, implementation) Verified or completed all 15 upstream clones in parallel
+  under the established brokkbench clone root. Task-revision worktrees remain to be created.
+- [x] (2026-07-31, implementation) Implemented the first Bifrost Granite checkpoint: exact
+  profile, dynamic dimensions/composition/fingerprints, TCP sidecar transport, three retrieval
+  profiles, and semantic-off tool suppression. NLP unit tests and the A4000 real-model smoke
+  pass; broader validation remains.
+- [x] (2026-07-31, implementation) Implemented and committed Anvil's final-`k` contract in
+  worktree commit `e002ba4`, with focused tests and clippy passing.
 - [ ] Build the instance manifest, clone the 15 unique upstream repositories in parallel under
   the brokkbench clone root, and materialize the 91 task revisions as worktrees.
 - [ ] Implement and validate Granite R2 serving and the three retrieval profiles in Bifrost.
@@ -111,11 +119,22 @@ The observable outcomes are:
   45.7%. Their three-seed means are 41.9% and 45.3% respectively.
   Evidence: `supercoder-eval/paper/tables/tab-resolve-perseed.tex`.
 
-- Observation: the current execution environment does not expose `nvidia-smi`, so the A4000
-  device UUID cannot be recorded in this plan yet.
-  Evidence: `nvidia-smi` and `nvidia-smi.exe` were not present during the plan revision.
-  Resolve the GPU identity from the host execution context before starting the embedding
-  service; do not assume a CUDA ordinal.
+- Observation: the WSL shim is available at `/usr/lib/wsl/lib/nvidia-smi`; the requested GPU is
+  index 2, UUID `GPU-13db0817-4937-36dc-3061-d51b47799ce9`, model `NVIDIA RTX A4000`, with
+  16,376 MiB reported memory.
+  Evidence: the host query returned all four installed GPUs and this exact UUID/name pair.
+
+- Observation: `/home/jonathan/Projects/brokkbench/clones` is an existing symlink to
+  `/mnt/T9/repo-clones`, and 14 of the 15 required upstreams were already valid full clones.
+  Evidence: resolved-path inspection and `git rev-parse` over the clone inventory. The missing
+  Transformers clone was created there without replacing the symlink or existing repositories.
+
+- Observation: the Granite TCP service matches SentenceTransformers at cosine 0.9999676 for a
+  fixed prefixed query, returns a 384-dimensional unit vector, and passes Bifrost's opt-in
+  end-to-end real-model semantic-search smoke.
+  Evidence: the service/reference parity command and
+  `BIFROST_NLP_MODEL_TESTS=1 cargo test --features nlp --test nlp_semantic_search_models --
+  --ignored --nocapture`.
 
 ## Decision Log
 

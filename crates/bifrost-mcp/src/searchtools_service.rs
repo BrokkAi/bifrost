@@ -437,7 +437,7 @@ impl WorkspaceSession {
 
 /// Semantic indexing is off by default. Set `BIFROST_SEMANTIC_INDEX=auto`
 /// (or `on`/`1`/`enabled`) to opt in when semantic_search is needed.
-fn semantic_indexing_enabled() -> bool {
+pub(crate) fn semantic_indexing_enabled() -> bool {
     if cfg!(not(feature = "nlp")) {
         return false;
     }

@@ -14,7 +14,6 @@ use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::path_utils::rel_path_string;
 use crate::searchtools::{SummaryBlock, summarize_files, summary_block_for_code_unit};
 
-use super::MAX_SEQ_TOKENS;
 use super::keys::{Key, component_key};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,12 +59,13 @@ pub fn extract_file_chunks(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     count_tokens: &dyn Fn(&str) -> usize,
+    max_seq_tokens: usize,
 ) -> FileChunks {
     let file_path = rel_path_string(file);
     // Minified/generated bundles (single 100KB+ lines) are rejected upstream at the
     // tree-sitter parse site (`is_unparseable_source`), so they reach here with no
     // declarations and naturally produce zero chunks — no special-casing needed.
-    let summary_text = file_summary_or_symbols(analyzer, file, count_tokens);
+    let summary_text = file_summary_or_symbols(analyzer, file, count_tokens, max_seq_tokens);
 
     let mut chunks = Vec::new();
     if let Some(summary) = &summary_text {
@@ -133,7 +133,7 @@ pub fn extract_file_chunks(
             .and_then(|class| {
                 class_summaries
                     .entry(class.fq_name())
-                    .or_insert_with(|| class_summary(analyzer, class, count_tokens))
+                    .or_insert_with(|| class_summary(analyzer, class, count_tokens, max_seq_tokens))
                     .clone()
             })
             .or_else(|| summary_text.clone());
@@ -163,13 +163,14 @@ fn file_summary_or_symbols(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     count_tokens: &dyn Fn(&str) -> usize,
+    max_seq_tokens: usize,
 ) -> Option<String> {
     if let Some(block) = summarize_files(analyzer, vec![file.clone()])
         .summaries
         .pop()
     {
         let text = flatten_summary_block(&block);
-        if !text.is_empty() && count_tokens(&text) <= MAX_SEQ_TOKENS {
+        if !text.is_empty() && count_tokens(&text) <= max_seq_tokens {
             return Some(text);
         }
     }
@@ -178,17 +179,18 @@ fn file_summary_or_symbols(
     if symbols.is_empty() {
         return None;
     }
-    Some(truncate_to_budget(symbols, count_tokens))
+    Some(truncate_to_budget(symbols, count_tokens, max_seq_tokens))
 }
 
 fn class_summary(
     analyzer: &dyn IAnalyzer,
     class: &CodeUnit,
     count_tokens: &dyn Fn(&str) -> usize,
+    max_seq_tokens: usize,
 ) -> Option<String> {
     let block = summary_block_for_code_unit(analyzer, class)?;
     let text = flatten_summary_block(&block);
-    (!text.is_empty() && count_tokens(&text) <= MAX_SEQ_TOKENS).then_some(text)
+    (!text.is_empty() && count_tokens(&text) <= max_seq_tokens).then_some(text)
 }
 
 fn flatten_summary_block(block: &SummaryBlock) -> String {
@@ -201,8 +203,12 @@ fn flatten_summary_block(block: &SummaryBlock) -> String {
 }
 
 /// Halve the line count until the text fits the embedding budget.
-fn truncate_to_budget(text: &str, count_tokens: &dyn Fn(&str) -> usize) -> String {
-    if count_tokens(text) <= MAX_SEQ_TOKENS {
+fn truncate_to_budget(
+    text: &str,
+    count_tokens: &dyn Fn(&str) -> usize,
+    max_seq_tokens: usize,
+) -> String {
+    if count_tokens(text) <= max_seq_tokens {
         return text.to_string();
     }
     let lines: Vec<&str> = text.lines().collect();
@@ -210,7 +216,7 @@ fn truncate_to_budget(text: &str, count_tokens: &dyn Fn(&str) -> usize) -> Strin
     while keep > 1 {
         keep /= 2;
         let candidate = lines[..keep].join("\n");
-        if count_tokens(&candidate) <= MAX_SEQ_TOKENS {
+        if count_tokens(&candidate) <= max_seq_tokens {
             return candidate;
         }
     }
@@ -255,7 +261,7 @@ mod tests {
             .into_iter()
             .find(|file| rel_path_string(file) == name)
             .unwrap_or_else(|| panic!("fixture file {name} not analyzed"));
-        extract_file_chunks(analyzer, &file, &word_count)
+        extract_file_chunks(analyzer, &file, &word_count, 8192)
     }
 
     #[test]
@@ -332,7 +338,7 @@ export function loadRoutes(routes: number): number {
         let analyzer =
             TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
 
-        let result = extract_file_chunks(&analyzer, &file, &word_count);
+        let result = extract_file_chunks(&analyzer, &file, &word_count, 8192);
         let function = result
             .chunks
             .iter()
@@ -362,7 +368,7 @@ export function loadRoutes(routes: number): number {
             .collect::<Vec<_>>()
             .join("\n");
         let tight = |t: &str| t.split_whitespace().count() * 100;
-        let truncated = truncate_to_budget(&text, &tight);
+        let truncated = truncate_to_budget(&text, &tight, 8);
         assert!(truncated.starts_with("line 0"));
         assert!(truncated.lines().count() < 64);
     }

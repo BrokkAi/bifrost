@@ -11,9 +11,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use brokk_bifrost::nlp::indexer::SemanticIndexer;
+use brokk_bifrost::nlp::indexer::{DEFAULT_READY_TIMEOUT, SemanticIndexer};
 use brokk_bifrost::nlp::query::{SemanticSearchParams, semantic_search};
 use brokk_bifrost::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
+use git2::{IndexAddOption, Repository, Signature};
 
 fn write_java(dir: &Path, name: &str, body: &str) {
     std::fs::write(dir.join(name), body).unwrap();
@@ -82,10 +83,21 @@ public class HttpFetcher {
 "#,
     );
 
+    let repo = Repository::init(dir.path()).unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_all(["*"], IndexAddOption::DEFAULT, None).unwrap();
+    index.write().unwrap();
+    let tree_oid = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_oid).unwrap();
+    let signature = Signature::now("Bifrost model smoke", "bifrost@example.invalid").unwrap();
+    repo.commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+        .unwrap();
+
     let project: Arc<dyn Project> =
         Arc::new(FilesystemProject::new(dir.path().to_path_buf()).unwrap());
     let snapshot = Arc::new(WorkspaceAnalyzer::build(project, AnalyzerConfig::default()));
     let indexer = SemanticIndexer::start(dir.path().to_path_buf(), snapshot.clone());
+    indexer.wait_ready(DEFAULT_READY_TIMEOUT).unwrap();
 
     let result = semantic_search(
         &snapshot,

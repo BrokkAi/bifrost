@@ -103,7 +103,12 @@ pub fn extract_group(
             "extract file {}",
             target.file.rel_path().display()
         ));
-        let extracted = extract_file_chunks(analyzer, &target.file, &count_tokens);
+        let extracted = extract_file_chunks(
+            analyzer,
+            &target.file,
+            &count_tokens,
+            embedder.profile().max_seq_tokens,
+        );
         metrics::trace(format_args!(
             "extract done {} ({} chunks)",
             target.file.rel_path().display(),
@@ -122,7 +127,7 @@ pub fn extract_group(
                 component_texts.push((key, text.to_string()));
             }
             let composed_hash = match parent_hash {
-                Some(parent) => composed_key(&hash, &parent),
+                Some(parent) => composed_key(&hash, &parent, embedder.profile().parent_alpha),
                 None => hash,
             };
             chunks.push(PendingChunk {
@@ -286,7 +291,7 @@ pub fn embed_group(
                             let parent_vec = available
                                 .get(&parent)
                                 .ok_or_else(|| "parent vector missing after embed".to_string())?;
-                            compose(child, parent_vec)
+                            compose(child, parent_vec, embedder.profile().parent_alpha)
                         }
                         None => child.clone(),
                     };

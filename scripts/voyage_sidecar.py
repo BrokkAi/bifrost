@@ -2,7 +2,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["torch>=2.5", "transformers>=4.53", "numpy"]
 # ///
-"""voyage-4-nano embedding sidecar — one process per GPU, fused (SDPA) attention.
+"""Profile-driven embedding sidecar with subprocess and loopback TCP transports.
 
 bifrost's Rust side spawns this behind the Embedder seam (one per CUDA device, pinned
 via CUDA_VISIBLE_DEVICES) and talks a small binary protocol over stdin/stdout:
@@ -33,7 +33,9 @@ Self-test parity:  uv run scripts/voyage_sidecar.py --selftest
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import socket
 import struct
 import sys
 import time
@@ -43,16 +45,73 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-MODEL_ID = "voyageai/voyage-4-nano"
-OUT_DIM = 512
-MAX_SEQ = 8192
+PROFILE_NAME = os.environ.get("BIFROST_EMBED_PROFILE", "voyage-4-nano")
+PROFILES = {
+    "voyage": {
+        "name": "voyage-4-nano",
+        "model_id": "voyageai/voyage-4-nano",
+        "dim": 512,
+        "max_seq": 8192,
+        "passage_prefix": "Represent the document for retrieval: ",
+        "query_prefix": "Represent the query for retrieving supporting documents: ",
+        "pooling": "mean-mrl",
+    },
+    "voyage-4-nano": {
+        "name": "voyage-4-nano",
+        "model_id": "voyageai/voyage-4-nano",
+        "dim": 512,
+        "max_seq": 8192,
+        "passage_prefix": "Represent the document for retrieval: ",
+        "query_prefix": "Represent the query for retrieving supporting documents: ",
+        "pooling": "mean-mrl",
+    },
+    "granite-r2": {
+        "name": "granite-r2",
+        "model_id": "ibm-granite/granite-embedding-small-english-r2",
+        "dim": 384,
+        "max_seq": 8192,
+        "passage_prefix": "Passage: Code chunk from repository.\n",
+        "query_prefix": "Given a GitHub issue, retrieve code that must be changed to fix it.\nQuery: ",
+        "pooling": "cls",
+    },
+}
+if PROFILE_NAME not in PROFILES:
+    raise RuntimeError(
+        f"unknown BIFROST_EMBED_PROFILE={PROFILE_NAME!r}; expected voyage-4-nano or granite-r2"
+    )
+PROFILE = PROFILES[PROFILE_NAME]
+PROFILE_NAME = PROFILE["name"]
+MODEL_ID = PROFILE["model_id"]
+MODEL_SOURCE = os.environ.get("BIFROST_EMBED_MODEL_DIR", MODEL_ID)
+OUT_DIM = PROFILE["dim"]
+MAX_SEQ = PROFILE["max_seq"]
 MPS_SDPA_QUERY_BLOCK = 512
 MPS_CACHE_DRAIN_FRACTION = 0.80
 # Max padded tokens (batch * longest_seq) per forward — bounds activation memory so a
 # few long chunks can't balloon a batch. Mem-efficient SDPA lets this exceed candle's.
 PADDED_TOKEN_BUDGET = 16384
-PASSAGE_PREFIX = "Represent the document for retrieval: "
-QUERY_PREFIX = "Represent the query for retrieving supporting documents: "
+PASSAGE_PREFIX = PROFILE["passage_prefix"]
+QUERY_PREFIX = PROFILE["query_prefix"]
+
+
+def model_fingerprint() -> str:
+    hasher = hashlib.sha256()
+    hasher.update(PROFILE_NAME.encode())
+    hasher.update(b"\0")
+    if os.path.isdir(MODEL_SOURCE):
+        for name in ("config.json", "model.safetensors"):
+            path = os.path.join(MODEL_SOURCE, name)
+            if not os.path.isfile(path):
+                raise RuntimeError(f"embedding artifact is missing {path}")
+            with open(path, "rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    hasher.update(chunk)
+    else:
+        hasher.update(MODEL_SOURCE.encode())
+    return hasher.hexdigest()
+
+
+MODEL_FINGERPRINT = model_fingerprint()
 
 
 def log(*a):
@@ -165,8 +224,9 @@ class Embedder:
             self.device, self.dtype = torch.device("mps"), torch.float16
         else:
             self.device, self.dtype = torch.device("cpu"), torch.float32
-        log(f"loading {MODEL_ID} on {self.device} ({self.dtype})")
-        model = AutoModel.from_pretrained(MODEL_ID, trust_remote_code=True, dtype=self.dtype,
+        self.is_voyage = PROFILE_NAME == "voyage-4-nano"
+        log(f"loading {MODEL_SOURCE} as {PROFILE_NAME} on {self.device} ({self.dtype})")
+        model = AutoModel.from_pretrained(MODEL_SOURCE, trust_remote_code=True, dtype=self.dtype,
                                           attn_implementation="sdpa").eval()
         # WSL CUDA context creation can transiently fail ("CUDA driver error: unknown
         # error") when spawned under load; retry a few times before giving up.
@@ -181,13 +241,18 @@ class Embedder:
                 log(f"CUDA init failed (attempt {attempt + 1}): {e}; retrying")
                 torch.cuda.empty_cache()
                 time.sleep(2.0)
-        ALL_ATTENTION_FUNCTIONS.register("bifrost_sdpa", bifrost_attention_forward)
-        self.model.config._attn_implementation = "bifrost_sdpa"
-        self.model.model.config._attn_implementation = "bifrost_sdpa"
-        self.tok = AutoTokenizer.from_pretrained(MODEL_ID)
-        layer_types = self.model.model.config.layer_types[: self.model.model.config.num_hidden_layers]
-        if any(t != "full_attention" for t in layer_types):
-            raise RuntimeError(f"voyage sidecar only supports full attention layers: {layer_types}")
+        self.tok = AutoTokenizer.from_pretrained(MODEL_SOURCE)
+        if self.is_voyage:
+            ALL_ATTENTION_FUNCTIONS.register("bifrost_sdpa", bifrost_attention_forward)
+            self.model.config._attn_implementation = "bifrost_sdpa"
+            self.model.model.config._attn_implementation = "bifrost_sdpa"
+            layer_types = self.model.model.config.layer_types[
+                : self.model.model.config.num_hidden_layers
+            ]
+            if any(t != "full_attention" for t in layer_types):
+                raise RuntimeError(
+                    f"voyage sidecar only supports full attention layers: {layer_types}"
+                )
         # Enable the fused SDPA kernels (CUDA only; MPS selects its own fused kernel).
         if self.cuda:
             torch.backends.cuda.enable_flash_sdp(True)
@@ -258,25 +323,37 @@ class Embedder:
         input_ids = input_ids.to(self.device)
         attention_mask = attention_mask.to(self.device)
 
-        inner = self.model.model  # Qwen3Model
-        embeds = inner.embed_tokens(input_ids)
-        # Pass an explicit full-attention mask mapping so HF Qwen does not synthesize a
-        # causal mask. The registered attention implementation handles MPS query blocking.
-        min_val = torch.finfo(self.dtype).min
-        key_valid = attention_mask[:, None, None, :].to(torch.bool)
-        attention_bias = torch.zeros_like(key_valid, dtype=self.dtype).masked_fill(~key_valid, min_val)
-        o = inner(inputs_embeds=embeds, attention_mask={"full_attention": attention_bias}, use_cache=False)
-        hidden = self.model.linear(o.last_hidden_state)
-
-        m = attention_mask[:, :, None].to(dtype=self.dtype)
-        pooled = (hidden * m).sum(1) / m.sum(1)        # masked mean -> (b,2048)
-        v = pooled[:, :OUT_DIM].float()                 # MRL truncate, then fp32
+        if self.is_voyage:
+            inner = self.model.model  # Qwen3Model
+            embeds = inner.embed_tokens(input_ids)
+            # Prevent HF Qwen from synthesizing a causal mask.
+            min_val = torch.finfo(self.dtype).min
+            key_valid = attention_mask[:, None, None, :].to(torch.bool)
+            attention_bias = torch.zeros_like(key_valid, dtype=self.dtype).masked_fill(
+                ~key_valid, min_val
+            )
+            o = inner(
+                inputs_embeds=embeds,
+                attention_mask={"full_attention": attention_bias},
+                use_cache=False,
+            )
+            hidden = self.model.linear(o.last_hidden_state)
+            m = attention_mask[:, :, None].to(dtype=self.dtype)
+            pooled = (hidden * m).sum(1) / m.sum(1)
+            v = pooled[:, :OUT_DIM].float()
+        else:
+            hidden = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_dict=True,
+            ).last_hidden_state
+            v = hidden[:, 0, :OUT_DIM].float()
         v = v / (v.norm(dim=-1, keepdim=True) + 1e-12)  # renorm
         vecs = v.cpu().numpy().astype(np.float32)
         for j, i in enumerate(idxs):
             out[i] = vecs[j]
         if self.mps:
-            del input_ids, attention_mask, attention_bias, hidden, m, pooled, v
+            del input_ids, attention_mask, hidden, v
             if torch.mps.driver_allocated_memory() > MPS_CACHE_DRAIN_FRACTION * torch.mps.recommended_max_memory():
                 torch.mps.empty_cache()
         if self._prof:
@@ -326,6 +403,38 @@ def _read_exact(stream, n: int) -> bytes | None:
     return buf
 
 
+def serve_stream(emb: Embedder, stdin, send, model_lock=None) -> None:
+    send(
+        json.dumps(
+            {
+                "ready": True,
+                "dim": OUT_DIM,
+                "profile": PROFILE_NAME,
+                "model_fingerprint": MODEL_FINGERPRINT,
+            }
+        ).encode()
+    )
+    log("client ready")
+
+    while True:
+        head = _read_exact(stdin, 4)
+        if head is None:
+            return
+        (rlen,) = struct.unpack("<I", head)
+        body = _read_exact(stdin, rlen)
+        if body is None:
+            return
+        req = json.loads(body)
+        prefix = QUERY_PREFIX if req.get("kind") == "query" else PASSAGE_PREFIX
+        if model_lock is None:
+            vecs = emb.embed(req["texts"], prefix)
+        else:
+            with model_lock:
+                vecs = emb.embed(req["texts"], prefix)
+        n, dim = vecs.shape
+        send(struct.pack("<II", n, dim) + vecs.tobytes())
+
+
 def serve(emb: Embedder) -> None:
     proto_fd = os.dup(1)   # real stdout for protocol frames
     os.dup2(2, 1)          # fd1 -> stderr so logging can't corrupt the channel
@@ -340,23 +449,34 @@ def serve(emb: Embedder) -> None:
 
             os.killpg(0, signal.SIGKILL)
 
-    send(json.dumps({"ready": True, "dim": OUT_DIM}).encode())
-    log("ready")
+    serve_stream(emb, stdin, send)
+
+
+def serve_tcp(emb: Embedder, address: str) -> None:
+    import threading
+
+    host, port_text = address.rsplit(":", 1)
+    lock = threading.Lock()
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind((host, int(port_text)))
+    listener.listen()
+    log(f"listening on {host}:{port_text}")
+
+    def handle(conn: socket.socket) -> None:
+        with conn:
+            stream = conn.makefile("rb")
+
+            def send(payload: bytes) -> None:
+                conn.sendall(struct.pack("<I", len(payload)) + payload)
+
+            # Serialize model forwards across clients. Prewarming intentionally has one
+            # caller; eval query requests are tiny and queue here without duplicating the model.
+            serve_stream(emb, stream, send, lock)
 
     while True:
-        head = _read_exact(stdin, 4)
-        if head is None:
-            log("stdin closed; exiting")
-            return
-        (rlen,) = struct.unpack("<I", head)
-        body = _read_exact(stdin, rlen)
-        if body is None:
-            return
-        req = json.loads(body)
-        prefix = QUERY_PREFIX if req.get("kind") == "query" else PASSAGE_PREFIX
-        vecs = emb.embed(req["texts"], prefix)
-        n, dim = vecs.shape
-        send(struct.pack("<II", n, dim) + vecs.tobytes())
+        conn, _ = listener.accept()
+        threading.Thread(target=handle, args=(conn,), daemon=True).start()
 
 
 def selftest(emb: Embedder) -> None:
@@ -377,11 +497,18 @@ def selftest(emb: Embedder) -> None:
     print(f"\nworst cosine = {worst:.6f} ({'PASS' if worst > 0.999 else 'FAIL'} @ >0.999)")
 
 
-if __name__ == "__main__":
+def main() -> None:
     if "--selftest" in sys.argv:
         selftest(Embedder())
+    elif "--listen" in sys.argv:
+        address = sys.argv[sys.argv.index("--listen") + 1]
+        serve_tcp(Embedder(), address)
     else:
         # Watchdog first: the parent can die during the (potentially minutes-long)
         # model load below, and only serve() would otherwise notice via stdin EOF.
         start_parent_watchdog()
         serve(Embedder())
+
+
+if __name__ == "__main__":
+    main()

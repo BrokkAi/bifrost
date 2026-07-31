@@ -36,6 +36,35 @@ const SEMANTIC_SEARCH_READY_TIMEOUT: Duration = Duration::from_secs(1);
 /// positive for `most_relevant_files`, and callers fusing symbol legs should not
 /// see a selected result collapse to zero.
 const MIN_NORMALIZED_SCORE: f64 = 0.01;
+const SEARCH_PROFILE_ENV: &str = "BIFROST_SEMANTIC_SEARCH_PROFILE";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchProfile {
+    AllSignals,
+    SemanticOnly,
+    SemanticCoeditTwoToOne,
+}
+
+impl SearchProfile {
+    fn selected() -> Result<Self, String> {
+        match std::env::var(SEARCH_PROFILE_ENV).ok().as_deref() {
+            None | Some("") | Some("all-signals") => Ok(Self::AllSignals),
+            Some("semantic-only") => Ok(Self::SemanticOnly),
+            Some("semantic-coedit-2-1") => Ok(Self::SemanticCoeditTwoToOne),
+            Some(value) => Err(format!(
+                "unknown {SEARCH_PROFILE_ENV} value '{value}'; expected all-signals, semantic-only, or semantic-coedit-2-1"
+            )),
+        }
+    }
+
+    fn leg_limits(self, base: usize) -> (usize, usize, usize) {
+        match self {
+            Self::AllSignals => (base, base, base),
+            Self::SemanticOnly => (3 * base, 0, 0),
+            Self::SemanticCoeditTwoToOne => (2 * base, 0, base),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SemanticSearchParams {
@@ -95,6 +124,8 @@ pub fn semantic_search(
         return Err("query must not be empty".to_string());
     }
     let k = params.k.clamp(1, MAX_K);
+    let profile = SearchProfile::selected()?;
+    let (vector_limit, bm25_limit, coedit_limit) = profile.leg_limits(k);
 
     let mut notes = Vec::new();
     let timed_out = match indexer.wait_ready(SEMANTIC_SEARCH_READY_TIMEOUT) {
@@ -168,14 +199,18 @@ pub fn semantic_search(
                 .or_insert(*score);
         }
     }
-    let mut vector_ranked = top_ranked_symbols(&vector_by_symbol, k);
+    let mut vector_ranked = top_ranked_symbols(&vector_by_symbol, vector_limit);
     normalize_ranked_symbol_scores(&mut vector_ranked);
 
     // 2. Grounded-strings BM25 over the in-memory active corpus.
-    let bm25_scores = bm25_symbol_candidates(analyzer, active, query, k).unwrap_or_else(|err| {
-        notes.push(format!("bm25 retrieval skipped: {err}"));
+    let bm25_scores = if bm25_limit == 0 {
         Vec::new()
-    });
+    } else {
+        bm25_symbol_candidates(analyzer, active, query, bm25_limit).unwrap_or_else(|err| {
+            notes.push(format!("bm25 retrieval skipped: {err}"));
+            Vec::new()
+        })
+    };
     let mut bm25_ranked: Vec<RankedSymbol> = bm25_scores
         .iter()
         .map(|(fqfn, score)| RankedSymbol {
@@ -201,7 +236,7 @@ pub fn semantic_search(
         &symbol_file,
     );
     let (seed_paths, seed_weights) = build_seeds(&vector_files, &bm25_files, k);
-    let coedit_ranked = if seed_paths.is_empty() {
+    let coedit_ranked = if coedit_limit == 0 || seed_paths.is_empty() {
         Vec::new()
     } else {
         match most_relevant_files(
@@ -211,7 +246,7 @@ pub fn semantic_search(
                 seed_weights: Some(seed_weights),
                 recency_half_life: Some(COEDIT_HALF_LIFE),
                 ranking_mode: MostRelevantFilesRankingMode::HistoryImports,
-                limit: k,
+                limit: coedit_limit,
             },
         ) {
             Ok(result) => result
@@ -492,5 +527,15 @@ mod tests {
             aggregate_symbols_to_files(scored.iter().map(|(s, sc)| (*s, *sc)), &symbol_file);
         assert_eq!(files.get("a.rs"), Some(&0.8));
         assert_eq!(files.get("b.rs"), Some(&0.5));
+    }
+
+    #[test]
+    fn retrieval_profiles_hold_nominal_pool_size_constant() {
+        assert_eq!(SearchProfile::AllSignals.leg_limits(40), (40, 40, 40));
+        assert_eq!(SearchProfile::SemanticOnly.leg_limits(40), (120, 0, 0));
+        assert_eq!(
+            SearchProfile::SemanticCoeditTwoToOne.leg_limits(40),
+            (80, 0, 40)
+        );
     }
 }
