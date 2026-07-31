@@ -33,6 +33,7 @@ const LSP_COMPONENTS = new Set(["rql_runtime", "lsp_contract"]);
 const RUNTIME_COMPONENTS = new Set(["rql_runtime", "mcp_contract", "lsp_contract"]);
 const EDITOR_COMPONENTS = new Set(["vscode"]);
 const PLUGIN_COMPONENTS = new Set(["pi_package", "agent_plugin"]);
+const NO_COMPONENTS = new Set();
 
 function startsWithAny(path, prefixes) {
   return prefixes.some((prefix) => path.startsWith(prefix));
@@ -73,7 +74,29 @@ function isPluginPath(path) {
   );
 }
 
+function isDocumentationPath(path) {
+  return (
+    startsWithAny(path, [".agents/docs/", ".agents/plans/", "docs/"]) ||
+    [
+      ".agents/PLANS.md",
+      "AGENTS.md",
+      "CODE_OF_CONDUCT.md",
+      "CONTRIBUTING.md",
+      "README.md",
+      "SECURITY.md",
+      "plugins/bifrost-agent/README.md",
+    ].includes(path)
+  );
+}
+
 function classifyPath(path) {
+  if (isDocumentationPath(path)) {
+    return {
+      components: NO_COMPONENTS,
+      documentation: true,
+      reason: "documentation-only surface",
+    };
+  }
   if (isRqlPath(path)) {
     return { components: RQL_COMPONENTS, reason: "RQL, structural-query, or policy surface" };
   }
@@ -121,11 +144,13 @@ export function classifyChangeSet({ eventName, ref = "", changedPaths = [], diff
 
   const selected = new Set();
   const reasons = [];
+  let documentationOnly = changedPaths.length > 0;
   for (const path of changedPaths) {
     const decision = classifyPath(path);
     if (!decision) {
       return fullDecision(`unmapped or safety-critical path: ${path}`, changedPaths);
     }
+    documentationOnly &&= decision.documentation === true;
     for (const component of decision.components) {
       selected.add(component);
     }
@@ -134,7 +159,7 @@ export function classifyChangeSet({ eventName, ref = "", changedPaths = [], diff
 
   return {
     schemaVersion: SCHEMA_VERSION,
-    mode: "impact",
+    mode: documentationOnly ? "docs" : "impact",
     changedPaths,
     reasons: reasons.length === 0 ? ["no changed paths; run the always-on baseline"] : reasons,
     selected,
