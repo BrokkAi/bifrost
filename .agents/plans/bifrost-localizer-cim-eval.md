@@ -151,7 +151,9 @@ The observable outcomes are:
   readiness so Granite could reuse the A4000 and port 18765. dw10 uses the separate
   per-repository `.bifrost/cache-dw10` namespace, so changing embedding fingerprints did not
   invalidate the completed `.bifrost/cache` Granite databases. No dw10 evaluation was run.
-- [ ] Run the three Granite retrieval arms over seeds 0, 1, and 2 at concurrency 30.
+- [ ] Run the three Granite retrieval arms over seeds 0, 1, and 2 at concurrency 30. The final
+  819-cell queue is active as `cimeval-r8-granite-grid-final.service` and started from exactly
+  the 273 baseline completions.
 - [x] (2026-07-31, campaign gate) Validated the immutable semantic runtime before the full
   queue. Two official Flipt sandbox cells ran concurrently against one shared repository DB;
   both completed and scored, both transient units exited successfully with zero restarts, and
@@ -179,7 +181,22 @@ The observable outcomes are:
 - [x] (2026-07-31, corrected campaign launch) Restarted the Cartesian queue as persistent unit
   `cimeval-r8-granite-grid-fcaf3a78.service` with the corrected immutable bundle. It again filled
   all 30 slots; scheduler and sidecar remained at zero restarts, initial load was 29 on 60 cores,
-  and concurrency remains pinned at 30 as requested.
+  and concurrency remained pinned at 30 as requested. The first real rerank then exposed a
+  separate validity failure: retrieval produced 120 distinct candidates, but Anvil sent a
+  symbol batch above Bifrost's 64-item schema limit and ignored Bifrost's compact degraded file
+  outlines, leaving `context_bytes=0`. The unit was stopped before accepting this runtime.
+- [x] (2026-07-31, reranker-context repair) Anvil `c4483eb` fetches candidate context in bounded
+  RRF-order batches, retries individual requests only after a batch error, and accepts both full
+  summaries and compact degraded file outlines. Its 13 focused tests, formatting, and Clippy
+  pass. Brokkbench `6c62b71b247` records each cell's runtime path, SHA-256, and revision metadata,
+  rejects resume under a different bundle, and reports runtime identities and zero-context
+  candidate calls. All 31 cimeval tests and focused Ruff checks pass.
+- [x] (2026-07-31, final campaign launch) Published and preflighted immutable bundle
+  `runtime-semantic-context-c4483eb-6c62b71.tgz`, pinning Anvil `c4483eb`, Bifrost `378652eb`,
+  Mjolnir `f7ba210`, and brokkbench `6c62b71`. The three semantic completions from superseded
+  runtimes were moved, without deletion, to `invalidated/pre-final-runtime`; the reportable cell
+  directory therefore returned to exactly 273 baseline completions. The final 819-cell queue is
+  active at fixed concurrency 30 and uses max-reasoning Bedrock Luna with inline scoring.
 - [x] (2026-07-31, implementation) Brokkbench `64a2da6131f` extends the existing
   multi-arm scheduler with `--seeds`, so the full 91-task by three-arm by three-seed Granite
   matrix can enter one 819-cell queue. A single 30-worker pool now remains occupied through
@@ -287,6 +304,12 @@ The observable outcomes are:
   and exited without an active index. The existing `semantic_index_profile` binary instead
   calls `SemanticIndexer::wait_ready` for up to 24 hours and reports final status, so the
   campaign will use that production pipeline sequentially with a repository-shared cache.
+
+- Observation: valid retrieval counts do not prove that the reranker received source context.
+  Evidence: the first readiness-fixed live trace realized 80 vector and 40 co-edit candidates
+  and deduplicated them to 120, yet recorded `context_bytes=0`. The symbol request exceeded
+  Bifrost's 64-symbol schema ceiling, while a large file-summary response degraded to
+  `compact_symbols.files`, which the old Anvil parser did not consume.
 
 - Observation: the first official-container baseline smoke failed before any provider request
   because Mjolnir rejected the explicit wire ID `bedrock::openai.gpt-5.6-luna` when Anvil's
@@ -565,6 +588,13 @@ The observable outcomes are:
   not refill it.
   Rationale: relevance filtering should be allowed to reject irrelevant candidates.
   Date/Author: 2026-07-31, user.
+
+- Decision: freeze runtime identity in every reportable semantic cell and treat a candidate
+  rerank with zero attached context as a campaign validity failure, not merely a quality metric.
+  Rationale: immutable bundle names alone do not prevent resume from accepting an older completed
+  cell, and names-only reranking is materially different from the intended source-aware Anvil
+  design even when retrieval counts and final `k` appear correct.
+  Date/Author: 2026-07-31, Codex.
 
 - Decision: every Granite retrieval arm presents a nominal `6k` pre-rerank pool.
   Rationale: this holds reranker opportunity approximately constant while ablating retrieval
