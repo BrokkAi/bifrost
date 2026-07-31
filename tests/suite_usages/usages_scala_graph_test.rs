@@ -3616,6 +3616,94 @@ object Yaml {
 }
 
 #[test]
+fn scala_usage_finder_resolves_unqualified_companion_method_value_argument() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "org/http4s/Header.scala",
+            r#"package org.http4s
+
+import cats.syntax.all._
+
+trait Header[A, T]
+trait Renderer[A]
+class ParseFailure
+
+object Header {
+  def createRendered[A, T <: Header.Type, B: Renderer](
+      name: String,
+      render: A => B,
+      parse: String => Either[ParseFailure, A],
+  ): Header[A, T] = ???
+  sealed trait Type
+  sealed trait Single extends Type
+}
+"#,
+        ),
+        (
+            "org/http4s/package.scala",
+            r#"package org
+
+package object http4s {
+  type ParseResult[+A] = Either[ParseFailure, A]
+}
+"#,
+        ),
+        (
+            "org/http4s/headers/Deprecation.scala",
+            r#"package org.http4s
+package headers
+
+import org.http4s.Header
+
+final case class Deprecation(value: String)
+
+object Deprecation {
+  def parse(s: String): ParseResult[Deprecation] = Right(Deprecation(s))
+  def wrong(s: Int): ParseResult[Deprecation] = Right(Deprecation(s.toString))
+
+  implicit val headerInstance: Unit = Header.createRendered(
+    "Deprecation",
+    _.value,
+    parse, // positive-unqualified-companion-parse
+  )
+
+  val wrongHeader: Unit = Header.createRendered(
+    "Deprecation",
+    _.value,
+    wrong, // negative-unqualified-companion-parse-wrong-type
+  )
+
+  object ExplicitLogical {
+    import external.String
+
+    def consume(run: String => Unit): Unit = run(null)
+    def source(value: String): Unit = ()
+    val use = consume(source) // positive-explicit-logical-import
+  }
+}
+"#,
+        ),
+    ]);
+
+    let parse = definition(&analyzer, "org.http4s.headers.Deprecation$.parse");
+    let parse_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&parse)));
+    assert_hit_contains(&parse_hits, "positive-unqualified-companion-parse");
+    assert_no_hit_contains(
+        &parse_hits,
+        "negative-unqualified-companion-parse-wrong-type",
+    );
+
+    let source = definition(
+        &analyzer,
+        "org.http4s.headers.Deprecation$.ExplicitLogical.source",
+    );
+    let source_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&source)));
+    assert_hit_contains(&source_hits, "positive-explicit-logical-import");
+}
+
+#[test]
 fn scala_usage_finder_shares_structured_call_list_semantics() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "app/Calls.scala",

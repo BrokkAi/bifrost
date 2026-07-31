@@ -4132,8 +4132,11 @@ impl ProjectTypes {
         if generic_type_parameters.contains(simple) {
             return Some(ScalaParameterTypeIdentity::TypeParameter(simple.clone()));
         }
+        let builtin = scala_builtin_type_name(simple);
         let logical_candidates = resolver.logical_type_import_candidates(simple);
-        if !logical_candidates.is_empty()
+        let explicit_logical_import = resolver.has_explicit_logical_type_import(simple);
+        if (builtin.is_none() || explicit_logical_import)
+            && !logical_candidates.is_empty()
             && logical_candidates.iter().all(|logical| {
                 self.index
                     .by_normalized_fqn(&scala_normalized_fq_name(logical))
@@ -4149,7 +4152,7 @@ impl ProjectTypes {
             return None;
         }
         Some(
-            scala_builtin_type_name(simple)
+            builtin
                 .map(ScalaParameterTypeIdentity::Builtin)
                 .unwrap_or_else(|| ScalaParameterTypeIdentity::Unresolved(path.to_vec())),
         )
@@ -6272,6 +6275,10 @@ impl NameResolver {
         candidates.sort();
         candidates.dedup();
         candidates
+    }
+
+    fn has_explicit_logical_type_import(&self, raw: &str) -> bool {
+        simple_type_name(raw).is_some_and(|simple| self.logical_type_names.contains(simple))
     }
 
     pub(crate) fn type_binding_is_ambiguous(&self, raw: &str) -> bool {
