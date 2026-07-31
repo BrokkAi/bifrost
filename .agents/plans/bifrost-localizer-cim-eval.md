@@ -24,9 +24,9 @@ and provider capacity, use one Bifrost indexing process at a time to saturate th
 precompute Granite indexes.
 
 After a sane three-seed baseline, run Granite R2 over the three requested retrieval arms and
-three seeds. Start each evaluation phase at 30 concurrent cells, observe the 60-core host, and
-raise the next seed to 40 and then 50 only when measured load has headroom. When Granite scoring
-and analysis are complete, stop. Report the commits and behavior changed in Bifrost, Anvil, and
+three seeds. Keep every evaluation and scoring phase pinned at 30 concurrent cells and observe
+the 60-core host for contention with the user's other workload. When Granite scoring and
+analysis are complete, stop. Report the commits and behavior changed in Bifrost, Anvil, and
 brokkbench, all validation performed, the baseline comparison, and the Granite results. Do not
 begin dw10 implementation or evaluation in this delivery.
 
@@ -57,7 +57,7 @@ The observable outcomes are:
 - [x] (2026-07-31 09:38Z) Recorded the shared writable SQLite design for eval indexes.
 - [x] (2026-07-31, current revision) Narrowed the first delivery to Granite R2, added the
   no-semantic baseline gate, A4000 indexing, clone-first sequencing, 15 repository-shared
-  indexes, and 30/40/50 evaluation concurrency.
+  indexes, and evaluation concurrency pinned at 30.
 - [x] (2026-07-31, implementation) Verified or completed all 15 upstream clones in parallel
   under the established brokkbench clone root and materialized all 91 task revisions as clean,
   detached worktrees. The immutable reportable manifest is
@@ -87,15 +87,13 @@ The observable outcomes are:
   generation or scoring. Brokkbench commit `d508bd1c4a4` preserves image environments, its
   focused suite passes, and a real Flipt image exposes Go 1.24.3. The clean r4 replacement is
   prepared and a corrected Pro Go smoke is running before the full concurrency-30 wave.
-- [ ] Pass the baseline sanity gate, then run baseline seeds 1 and 2 with measured concurrency
-  escalation.
+- [ ] Pass the baseline sanity gate, then run baseline seeds 1 and 2 at concurrency 30.
 - [x] (2026-07-31 10:01Z) Precomputed all Granite indexes on the A4000 at repository concurrency
   one. Bifrost commit `e36d4e6e` parallelizes each 64-file extraction group while preserving
   serial output order. The 15 repository `READY.json` records cover all 91 tasks. After resuming
   the partially warm Trino database, the remaining campaign completed in 366.4 seconds; the
   active CPU stages used roughly 30-45 cores instead of one.
-- [ ] Run the three Granite retrieval arms over seeds 0, 1, and 2 with measured concurrency
-  escalation.
+- [ ] Run the three Granite retrieval arms over seeds 0, 1, and 2 at concurrency 30.
 - [ ] Score, leak-audit, analyze, and report the baseline and Granite results.
 - [ ] Run final validation, update this plan's retrospective, commit the report, and stop before
   dw10.
@@ -360,10 +358,11 @@ The observable outcomes are:
   harness does not document an exact provider seed knob.
   Date/Author: 2026-07-31, user and Codex.
 
-- Decision: evaluation concurrency starts at 30, may rise to 40 for the next seed, and may rise
-  to 50 for the following seed only when measured host/provider load is low.
-  Rationale: the workstation has 60 CPU cores and should be utilized rather than running a
-  four-cell GPU-shaped schedule. Granite index construction remains separately serialized.
+- Decision: pin all remaining generation and scoring waves at concurrency 30; do not escalate
+  later seeds even when the current wave has temporary headroom.
+  Rationale: another workstation workload is expected to spin up and may create higher
+  contention after the current measurements. Granite index construction remains separately
+  serialized, and load sampling remains diagnostic rather than an escalation trigger.
   Date/Author: 2026-07-31, user.
 
 - Decision: Anvil uses retrieval overfetch multiplier `m=2`; model-facing `k` has minimum 1,
@@ -685,14 +684,9 @@ desired outcomes. If an apparently genuine Luna capability difference alone puts
 outside the band, document leak/scorer validation and ask the user before changing the gate.
 
 If seed 0 passes, run seeds 1 and 2. Each is another clean independent replicate of the same 91
-cells. Determine concurrency for the next seed from load samples of the completed seed:
-
-    start seed 0 at 30
-    use 40 for seed 1 only if seed 0 had low load
-    use 50 for seed 2 only if seed 1 ran at 40 and had low load
-    otherwise retain the last safe concurrency; never exceed 50
-
-“Low load” means all of the following during the steady-state middle 80% of the seed wave:
+cells, and each runs at concurrency 30. Continue recording the following load signals to detect
+interference from the user's other workstation workload, but do not use temporary headroom to
+raise jobs:
 
     one-minute load average below 42 on the 60-core host
     mean CPU utilization below 70%
@@ -702,7 +696,7 @@ cells. Determine concurrency for the next seed from load samples of the complete
     no sustained scorer backlog longer than 60 seconds
 
 Sample load at least every 30 seconds. If CPU, memory, or disk exceeds 90% for five minutes,
-pause new launches and resume at the prior safe level, never below 30 unless continuing would
+pause new launches and resume at 30, never below 30 unless continuing would
 damage the host. Record every chosen concurrency and reason.
 
 Acceptance: 273 expected baseline cells are complete or outcome-blind excluded, all use the same
@@ -716,9 +710,9 @@ eligible Granite DB has a matching ready manifest. Run all three retrieval arms 
 seed wave, balancing their order by deterministic instance hash so time/provider drift is not
 aligned with an arm.
 
-Start Granite seed 0 at concurrency 30 even if baseline safely reached 50, because semantic
-queries add A4000 service traffic and shared-DB writers. Use the same low-load rules to raise
-seed 1 to 40 and seed 2 to 50. Granite initial indexing remains complete; query embeddings share
+Run every Granite seed at concurrency 30 because semantic queries add A4000 service traffic and
+shared-DB writers and the workstation is shared with another workload. Granite initial
+indexing remains complete; query embeddings share
 the one A4000 service, which must batch or queue requests rather than spawn per-cell models.
 
 For every semantic-search call record final k, candidate budgets, realized and deduplicated
@@ -844,8 +838,8 @@ The intended campaign commands are:
 
 Only after the gate passes:
 
-    uv run cimeval run --run-dir <run-dir> --arm baseline --seed 1 --jobs <30-or-40> --resume
-    uv run cimeval run --run-dir <run-dir> --arm baseline --seed 2 --jobs <last-safe> --resume
+    uv run cimeval run --run-dir <run-dir> --arm baseline --seed 1 --jobs 30 --resume
+    uv run cimeval run --run-dir <run-dir> --arm baseline --seed 2 --jobs 30 --resume
 
 After all Granite DBs are ready:
 
@@ -854,10 +848,10 @@ After all Granite DBs are ready:
       --profile granite-r2 --seed 0 --jobs 30 --resume
     uv run cimeval run --run-dir <run-dir> \
       --arms all-signals,semantic-only,semantic-coedit-2-1 \
-      --profile granite-r2 --seed 1 --jobs <30-or-40> --resume
+      --profile granite-r2 --seed 1 --jobs 30 --resume
     uv run cimeval run --run-dir <run-dir> \
       --arms all-signals,semantic-only,semantic-coedit-2-1 \
-      --profile granite-r2 --seed 2 --jobs <last-safe> --resume
+      --profile granite-r2 --seed 2 --jobs 30 --resume
     uv run cimeval score --run-dir <run-dir>
     uv run cimeval report --run-dir <run-dir> --final
 
@@ -891,9 +885,9 @@ fallback.
 Baseline seed 0 passes only through the five-part sanity gate in Milestone 7. The other baseline
 seeds and every Granite cell remain blocked until it passes.
 
-Concurrency escalation passes when seed 0 starts at 30, every increase is supported by saved
-30-second load samples and the stated thresholds, no phase exceeds 50, and Granite initial
-indexing never exceeds one repository at a time.
+Concurrency control passes when every generation and scoring phase uses 30 jobs, Granite
+initial indexing remains concurrency one, and saved load samples document any interference
+from the other workstation workload.
 
 The Granite evaluation passes when 819 expected cells are complete or outcome-blind excluded,
 all use one provider and main-model configuration, official scorers run in fresh containers,
@@ -994,7 +988,7 @@ Revision note, 2026-07-31: Clarified shared live SQLite caches rather than per-c
 
 Revision note, 2026-07-31: Replaced the two-model campaign with a Granite-only first delivery.
 Added clone-first preparation, A4000/concurrency-one prewarming in parallel with a gated
-no-semantic Luna baseline, adaptive 30/40/50 evaluation concurrency on the 60-core host, a
+no-semantic Luna baseline, evaluation concurrency pinned at 30 on the shared 60-core host, a
 1,092-cell maximum first delivery, 15 upstream clones with 91 task worktrees and repository-wide
 shared Bifrost DBs, and an explicit stop/report point before dw10.
 
