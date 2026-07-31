@@ -2428,6 +2428,7 @@ fn payload_kind_name(kind: PayloadKind) -> &'static str {
     match kind {
         PayloadKind::DeclarationFacts => "declaration_facts",
         PayloadKind::GeneratorRules => "generator_rules",
+        PayloadKind::ProcedureSummaries => "procedure_summaries",
     }
 }
 

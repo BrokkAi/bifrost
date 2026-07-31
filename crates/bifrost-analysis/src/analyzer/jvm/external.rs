@@ -379,7 +379,8 @@ impl JvmExternalDeclarationIndex {
             .flat_map(|pack| pack.shards)
             .flat_map(|shard| match shard.payload {
                 AuthoredPayload::DeclarationFacts { types, .. } => types,
-                AuthoredPayload::GeneratorRules { .. } => Vec::new(),
+                AuthoredPayload::GeneratorRules { .. }
+                | AuthoredPayload::ProcedureSummaries { .. } => Vec::new(),
             })
             .map(|fact| (fact.name.clone(), fact))
             .collect()

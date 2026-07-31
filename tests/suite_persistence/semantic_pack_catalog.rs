@@ -20,11 +20,22 @@ use tempfile::TempDir;
 
 const DECLARATIONS_JSON: &[u8] =
     include_bytes!("../fixtures/semantic-model-packs/declarations-v1.json");
+const PROCEDURE_SUMMARIES_JSON: &[u8] =
+    include_bytes!("../fixtures/semantic-model-packs/procedure-summaries-v1.json");
 
 fn compiled_pack() -> CompiledSemanticModelPack {
     compile_source(
         SourceFormat::Json,
         DECLARATIONS_JSON,
+        &CompilerOptions::default(),
+    )
+    .unwrap_or_else(|diagnostics| panic!("fixture compilation failed: {diagnostics:#?}"))
+}
+
+fn compiled_procedure_pack() -> CompiledSemanticModelPack {
+    compile_source(
+        SourceFormat::Json,
+        PROCEDURE_SUMMARIES_JSON,
         &CompilerOptions::default(),
     )
     .unwrap_or_else(|diagnostics| panic!("fixture compilation failed: {diagnostics:#?}"))
@@ -60,6 +71,66 @@ fn matching_query() -> SemanticPackSelectorQuery {
         artifact_sha256: None,
         bifrost_version: Version::parse("0.8.17").unwrap(),
     }
+}
+
+fn procedure_matching_query() -> SemanticPackSelectorQuery {
+    SemanticPackSelectorQuery {
+        language: "java".to_owned(),
+        ecosystem: "maven".to_owned(),
+        package: Some(CatalogCoordinate {
+            name: "com.acme:flows".to_owned(),
+            version: Some(Version::parse("1.5.0").unwrap()),
+        }),
+        module: None,
+        toolchain: None,
+        target: Some("jvm".to_owned()),
+        configuration: Some("release".to_owned()),
+        artifact_sha256: None,
+        bifrost_version: Version::parse("0.8.17").unwrap(),
+    }
+}
+
+#[test]
+fn procedure_summary_shards_install_select_load_and_account_without_activation() {
+    let root = TempDir::new().unwrap();
+    let catalog = SemanticPackCatalog::open(
+        root.path(),
+        CatalogOpenMode::ReadWrite,
+        CatalogOptions::default(),
+    )
+    .unwrap();
+    let pack = compiled_procedure_pack();
+    let descriptor = &pack.shards[0].descriptor;
+
+    catalog
+        .install(
+            &pack,
+            &source(DurablePackSourceKind::Installed, "procedure-fixture"),
+        )
+        .unwrap();
+    let object_path = root
+        .path()
+        .join("objects/sha256")
+        .join(&descriptor.stored_sha256[..2])
+        .join(&descriptor.stored_sha256[2..]);
+    assert_eq!(fs::read(object_path).unwrap(), pack.shards[0].bytes);
+
+    let candidates = catalog.candidates(&procedure_matching_query()).unwrap();
+    assert_eq!(candidates.len(), 1);
+    let loaded = catalog.load(&candidates[0]).unwrap();
+    assert_eq!(loaded.shard.payload_kind(), descriptor.payload_kind);
+    assert_eq!(loaded.shard.record_count(), 2);
+    assert_eq!(
+        loaded.shard.payload().procedure_summaries().unwrap().len(),
+        2
+    );
+
+    let accounting = catalog.accounting().unwrap();
+    assert_eq!(accounting.object_count, 1);
+    assert_eq!(accounting.logical_shard_count, 1);
+    assert_eq!(accounting.active_shard_count, 0);
+    assert_eq!(accounting.installed_stored_bytes, descriptor.stored_size);
+    assert_eq!(accounting.active_stored_bytes, 0);
 }
 
 #[test]
@@ -471,7 +542,7 @@ fn newer_catalog_schema_is_rejected_without_mutation() {
     );
     let database = root.path().join("catalog.db");
     let connection = Connection::open(&database).unwrap();
-    connection.pragma_update(None, "user_version", 3).unwrap();
+    connection.pragma_update(None, "user_version", 4).unwrap();
     drop(connection);
     let before = fs::read(&database).unwrap();
 
@@ -485,15 +556,15 @@ fn newer_catalog_schema_is_rejected_without_mutation() {
     assert!(matches!(
         error,
         CatalogError::CatalogTooNew {
-            found: 3,
-            supported: 2
+            found: 4,
+            supported: 3
         }
     ));
     assert_eq!(fs::read(database).unwrap(), before);
 }
 
 #[test]
-fn lifecycle_migration_preserves_existing_catalog_rows() {
+fn catalog_migrations_preserve_existing_catalog_rows() {
     let root = TempDir::new().unwrap();
     let database = root.path().join("catalog.db");
     let connection = Connection::open(&database).unwrap();
@@ -527,7 +598,7 @@ fn lifecycle_migration_preserves_existing_catalog_rows() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
     assert_eq!(
         connection
@@ -546,6 +617,57 @@ fn lifecycle_migration_preserves_existing_catalog_rows() {
             )
             .unwrap(),
         1
+    );
+}
+
+#[test]
+fn procedure_summary_migration_preserves_version_two_pack_rows() {
+    let root = TempDir::new().unwrap();
+    let pack = compiled_pack();
+    {
+        let catalog = SemanticPackCatalog::open(
+            root.path(),
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        catalog
+            .install(
+                &pack,
+                &source(DurablePackSourceKind::Installed, "pre-migration"),
+            )
+            .unwrap();
+    }
+
+    let database = root.path().join("catalog.db");
+    let connection = Connection::open(&database).unwrap();
+    connection.pragma_update(None, "user_version", 2).unwrap();
+    drop(connection);
+
+    let catalog = SemanticPackCatalog::open(
+        root.path(),
+        CatalogOpenMode::ReadWrite,
+        CatalogOptions::default(),
+    )
+    .unwrap();
+    let candidates = catalog.candidates(&matching_query()).unwrap();
+    assert_eq!(candidates.len(), 1);
+    let loaded = catalog.load(&candidates[0]).unwrap();
+    assert_eq!(
+        loaded.shard.payload_kind(),
+        pack.shards[0].descriptor.payload_kind
+    );
+    assert_eq!(
+        loaded.shard.record_count() as u64,
+        pack.shards[0].descriptor.record_count
+    );
+
+    let connection = Connection::open(database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        3
     );
 }
 

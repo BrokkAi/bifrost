@@ -14,22 +14,6 @@ fn analyze_pair(
         .file(path_b, source_b)
         .build();
     let analyzer = CppAnalyzer::from_project(project.project().clone());
-    let requested = vec![project.file(path_a)];
-    analyzer.find_structural_clone_smells_for_files(&requested, weights)
-}
-
-fn analyze_both_requested(
-    path_a: &str,
-    source_a: &str,
-    path_b: &str,
-    source_b: &str,
-    weights: CloneSmellWeights,
-) -> Vec<brokk_bifrost::CloneSmell> {
-    let project = InlineTestProject::with_language(Language::Cpp)
-        .file(path_a, source_a)
-        .file(path_b, source_b)
-        .build();
-    let analyzer = CppAnalyzer::from_project(project.project().clone());
     let requested = vec![project.file(path_a), project.file(path_b)];
     analyzer.find_structural_clone_smells_for_files(&requested, weights)
 }
@@ -192,6 +176,31 @@ fn treats_extra_logging_as_equivalent_clone_in_cpp() {
 }
 
 #[test]
+fn does_not_compare_requested_cpp_files_with_workspace_wide_peers() {
+    let clone_body = r#"
+        int clone(int value) {
+          int total = value + 2;
+          if (total > 20) {
+            return total * 3;
+          }
+          return total - 4;
+        }
+    "#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("src/requested.cpp", clone_body)
+        .file("src/peer.cpp", clone_body)
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+
+    let findings = analyzer.find_structural_clone_smells_for_files(
+        &[project.file("src/requested.cpp")],
+        default_weights(),
+    );
+
+    assert!(findings.is_empty(), "{findings:#?}");
+}
+
+#[test]
 fn does_not_return_symmetric_pairs_when_both_cpp_files_are_requested() {
     let alpha = r#"
         int alpha(int value) {
@@ -212,7 +221,7 @@ fn does_not_return_symmetric_pairs_when_both_cpp_files_are_requested() {
         }
     "#;
 
-    let findings = analyze_both_requested("src/a.cpp", alpha, "src/b.cpp", beta, default_weights());
+    let findings = analyze_pair("src/a.cpp", alpha, "src/b.cpp", beta, default_weights());
 
     let forward = findings
         .iter()

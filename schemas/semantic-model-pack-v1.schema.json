@@ -184,7 +184,94 @@
             "kind",
             "rules"
           ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "procedure_summaries"
+            },
+            "summaries": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/AuthoredProcedureSummary"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "summaries"
+          ]
         }
+      ]
+    },
+    "AuthoredProcedureSummary": {
+      "type": "object",
+      "properties": {
+        "completeness": {
+          "$ref": "#/$defs/Completeness"
+        },
+        "effects": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/AuthoredSummaryEffect"
+          }
+        },
+        "id": {
+          "type": "string"
+        },
+        "locations": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/AuthoredSummaryLocation"
+          }
+        },
+        "target": {
+          "$ref": "#/$defs/AuthoredProcedureTarget"
+        },
+        "transfers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthoredSummaryTransfer"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "target",
+        "completeness",
+        "transfers"
+      ]
+    },
+    "AuthoredProcedureTarget": {
+      "type": "object",
+      "properties": {
+        "has_receiver": {
+          "type": "boolean",
+          "default": false
+        },
+        "parameter_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "path": {
+          "type": "string"
+        },
+        "symbol": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "symbol",
+        "parameter_count"
       ]
     },
     "AuthoredShard": {
@@ -208,6 +295,303 @@
         "id",
         "activation",
         "payload"
+      ]
+    },
+    "AuthoredSummaryEffect": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "allocation"
+            },
+            "output": {
+              "$ref": "#/$defs/AuthoredSummaryOutput"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "event",
+            "output"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "callee": {
+              "type": "string"
+            },
+            "event": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "call"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "event",
+            "callee"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string"
+            },
+            "input": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            },
+            "kind": {
+              "type": "string",
+              "const": "escape"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "event",
+            "input"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string"
+            },
+            "input": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            },
+            "kind": {
+              "type": "string",
+              "const": "unknown_call"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "event",
+            "input"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "unknown_call_boundary"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "event"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "candidates": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "event": {
+              "type": "string"
+            },
+            "input": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            },
+            "kind": {
+              "type": "string",
+              "const": "ambiguous_call"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "event",
+            "input",
+            "candidates"
+          ]
+        }
+      ]
+    },
+    "AuthoredSummaryExitKind": {
+      "type": "string",
+      "enum": [
+        "normal",
+        "exceptional"
+      ]
+    },
+    "AuthoredSummaryInput": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "receiver"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "parameter"
+            },
+            "ordinal": {
+              "type": "integer",
+              "format": "uint32",
+              "maximum": 65535,
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "ordinal"
+          ]
+        }
+      ]
+    },
+    "AuthoredSummaryLocation": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "location_kind": {
+          "$ref": "#/$defs/AuthoredSummaryLocationKind"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "location_kind"
+      ]
+    },
+    "AuthoredSummaryLocationKind": {
+      "type": "string",
+      "enum": [
+        "capture",
+        "heap"
+      ]
+    },
+    "AuthoredSummaryOutput": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "normal_return"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "receiver"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "capture"
+            },
+            "location": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "location"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "heap"
+            },
+            "location": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "location"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "exceptional_return"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "AuthoredSummaryTransfer": {
+      "type": "object",
+      "properties": {
+        "exit_kind": {
+          "$ref": "#/$defs/AuthoredSummaryExitKind"
+        },
+        "input": {
+          "$ref": "#/$defs/AuthoredSummaryInput"
+        },
+        "output": {
+          "$ref": "#/$defs/AuthoredSummaryOutput"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "input",
+        "exit_kind",
+        "output"
       ]
     },
     "CaptureBinding": {

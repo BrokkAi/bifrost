@@ -165,10 +165,11 @@ impl<'a> UsageQueryResolver<'a> for PythonQueryResolver<'a> {
             .filter(|hit| &hit.enclosing != target)
             .collect();
 
-        if hits.len() > max_usages {
+        let external_callsites = crate::analyzer::usages::common::external_usage_hit_count(&hits);
+        if external_callsites > max_usages {
             return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
                 short_name: target.short_name().to_string(),
-                total_callsites: hits.len(),
+                total_callsites: external_callsites,
                 limit: max_usages,
                 sample_hits: hits,
             });

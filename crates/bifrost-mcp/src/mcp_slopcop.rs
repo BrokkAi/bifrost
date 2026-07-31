@@ -386,8 +386,9 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
                     },
                     "max_usages_per_symbol": {
                         "type": "integer",
-                        "default": 100,
-                        "description": "Maximum usage hits per symbol before the guardrail returns an inconclusive skip; values <= 0 default to 100."
+                        "default": 1,
+                        "maximum": 1,
+                        "description": "Maximum usage hits per symbol before the guardrail returns an inconclusive skip; the dead-code smell threshold caps this at 1, and values <= 0 default to 1."
                     }
                 },
                 "required": ["file_paths"]

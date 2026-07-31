@@ -71,10 +71,12 @@ impl<'a> UsageQueryResolver<'a> for PhpQueryResolver<'a> {
                 break;
             }
             scan_file(self.php, analyzer, &file, &spec, hierarchy, &mut hits);
-            if hits.len() > max_usages {
+            let external_callsites =
+                crate::analyzer::usages::common::external_usage_hit_count(&hits);
+            if external_callsites > max_usages {
                 return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
                     short_name: target.short_name().to_string(),
-                    total_callsites: hits.len(),
+                    total_callsites: external_callsites,
                     limit: max_usages,
                     sample_hits: hits,
                 });

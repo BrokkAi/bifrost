@@ -4,10 +4,10 @@ description: Author, compile, install, select, and manage versioned semantic-mod
 ---
 
 Semantic-model packs are Bifrost's versioned interchange format for API facts
-that do not come from workspace source and for declarative facts emitted by
-framework or generator behavior. A producer can construct the public Rust
-model directly or load reviewed YAML or JSON. Both paths compile through the
-same validation and canonicalization pipeline.
+that do not come from workspace source, declarative facts emitted by framework
+or generator behavior, and reviewed external procedure behavior. A producer
+can construct the public Rust model directly or load reviewed YAML or JSON.
+Both paths compile through the same validation and canonicalization pipeline.
 
 Compilation alone does not install, store, match, or activate a pack; those
 operations belong to the catalog and generation-scoped runtime described below.
@@ -15,14 +15,17 @@ operations belong to the catalog and generation-scoped runtime described below.
 > **Current runtime boundary:** Bifrost can compile, defensively decode,
 > install, strictly activate, and match semantic-model packs for one analyzer
 > generation. Projection into synthetic analyzer declarations and model URIs
-> remains a separate overlay step.
+> remains a separate overlay step. Procedure-summary payloads are
+> activation-neutral: compiling, installing, selecting, loading, or activating
+> one does not yet change value-flow results.
 
 Together, the catalog and runtime can install, select, activate, account for, quarantine, and garbage-collect packs while keeping matching generation-local.
 
 Packs do not contain executable code, arbitrary templates, fake source, or
-procedure-effect/data-flow summaries. Generator expressions are bounded trees
-of literals, declared scalar captures, ordered concatenation, and named ASCII
-case transforms.
+unbounded evaluator inputs. Generator expressions are bounded trees of
+literals, declared scalar captures, ordered concatenation, and named ASCII case
+transforms. Procedure summaries are bounded typed records, not executable
+models or source-text matching rules.
 
 ## Version and extension rules
 
@@ -366,6 +369,62 @@ shards:
                   returns:
                     kind: capture
                     name: entity_type
+```
+
+## Procedure-summary payload
+
+A procedure-summary shard describes externally reviewed behavior without
+activating it. Each record has a stable ID and a structured target consisting
+of a canonical artifact-relative path, an exact symbol, receiver availability,
+and parameter count. The compiler derives a pack-scoped model ID, a summary
+contract version, and a content digest for every record; the defensive decoder
+recomputes and verifies those fields.
+
+Transfers connect a receiver or zero-based parameter to a normal return,
+receiver, exceptional return, declared capture, or declared heap location.
+Each transfer carries an explicit normal or exceptional exit kind, matching the
+reusable-summary contract even when an exceptional exit writes a heap or
+capture location.
+Effects represent allocation, calls to another summary in the same pack,
+escapes, unknown calls, unknown-call boundaries, and explicitly ambiguous call
+sets. Inputs must exist on the target, outputs must reference a location of the
+right kind, call targets must exist, and all collections have fixed validation
+budgets. Duplicate targets and duplicate IDs are rejected across shards.
+
+Completeness is explicit at both levels. A `partial` record remains partial
+after compilation and decoding; a partial pack cannot claim a `complete`
+record. Completeness is evidence metadata only and does not enable matching or
+flow application.
+
+```yaml
+payload:
+  kind: procedure_summaries
+  summaries:
+    - id: summary.helper
+      target:
+        path: com/acme/Flows.class
+        symbol: helper(java.lang.String)
+        has_receiver: true
+        parameter_count: 1
+      completeness: partial
+      locations:
+        - id: location.receiver-field
+          location_kind: heap
+      transfers:
+        - input:
+            kind: parameter
+            ordinal: 0
+          exit_kind: normal
+          output:
+            kind: normal_return
+      effects:
+        - kind: allocation
+          event: event.helper.allocate
+          output:
+            kind: heap
+            location: location.receiver-field
+        - kind: unknown_call_boundary
+          event: event.helper.unknown-boundary
 ```
 
 ## Canonical artifacts and digests

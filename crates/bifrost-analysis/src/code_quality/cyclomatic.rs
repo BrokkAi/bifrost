@@ -4,14 +4,15 @@
 //! exceeds the supplied threshold. Output format mirrors brokk-core's
 //! `CodeQualityToolsMcp.computeCyclomaticComplexity` byte-for-byte.
 
+#[cfg(test)]
+use super::cyclomatic_complexity_for;
 use super::{
-    MAX_REPORT_LINES, ReportLines, append_ambiguous_path_notes, cyclomatic_complexity_for,
+    MAX_REPORT_LINES, ReportLines, append_ambiguous_path_notes, cyclomatic_complexities_for_file,
     resolve_project_files,
 };
-use crate::analyzer::{CodeUnit, IAnalyzer};
+use crate::analyzer::IAnalyzer;
 use crate::path_utils::{AmbiguousPathInput, rel_path_string};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
 
 const DEFAULT_CYCLOMATIC_THRESHOLD: i32 = 10;
 
@@ -53,31 +54,22 @@ pub fn compute_cyclomatic_complexity(
     let mut report_full = false;
 
     'outer: for file in &resolved.files {
-        // Iterative DFS over the code-unit tree to avoid unbounded
-        // recursion on pathological inputs (deeply nested generated code,
-        // for example).
-        let mut work: VecDeque<CodeUnit> = analyzer.top_level_declarations(file).into();
-        while let Some(cu) = work.pop_front() {
-            if cu.is_function() {
-                let complexity = cyclomatic_complexity_for(analyzer, &cu) as i32;
-                if complexity > limit {
-                    // `lines` always carries the leading header, so the
-                    // count of flagged functions equals `lines.len() - 1`.
-                    if lines.len() > MAX_REPORT_LINES {
-                        truncated = true;
-                        report_full = true;
-                        break 'outer;
-                    }
-                    lines.line(format!(
-                        "- {fq}: {complexity} (in {src})",
-                        fq = cu.fq_name(),
-                        src = rel_path_string(cu.source()),
-                    ));
-                    found_any = true;
+        for (cu, complexity) in cyclomatic_complexities_for_file(analyzer, file) {
+            let complexity = complexity as i32;
+            if complexity > limit {
+                // `lines` always carries the leading header, so the
+                // count of flagged functions equals `lines.len() - 1`.
+                if lines.len() > MAX_REPORT_LINES {
+                    truncated = true;
+                    report_full = true;
+                    break 'outer;
                 }
-            }
-            for child in analyzer.direct_children(&cu) {
-                work.push_back(child);
+                lines.line(format!(
+                    "- {fq}: {complexity} (in {src})",
+                    fq = cu.fq_name(),
+                    src = rel_path_string(cu.source()),
+                ));
+                found_any = true;
             }
         }
     }
