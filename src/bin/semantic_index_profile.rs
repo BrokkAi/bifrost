@@ -83,11 +83,12 @@ fn main() -> Result<(), String> {
                 let rss = rss_kb();
                 peak_rss.fetch_max(rss, Ordering::Relaxed);
                 let elapsed = start.elapsed().as_secs_f64();
-                let rate = status.indexed_chunks as f64 / elapsed.max(1e-3);
                 eprintln!(
-                    "[profile] {elapsed:.0}s phase={} indexed_chunks={} ({rate:.0}/s) pending={} \
-                     rss_mib={:.0} db_mib={:.0}",
+                    "[profile] {elapsed:.0}s phase={} materialized_files={}/{} indexed_chunks={} \
+                     pending={} rss_mib={:.0} db_mib={:.0}",
                     status.phase,
+                    status.materialized_files,
+                    status.materialize_total_files,
                     status.indexed_chunks,
                     status.pending_batches,
                     rss as f64 / 1024.0,
