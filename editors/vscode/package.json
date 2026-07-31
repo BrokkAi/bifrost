@@ -6,11 +6,11 @@
   "bifrost": {
     "binaryVersion": "0.8.17",
     "archiveSha256": {
-      "aarch64-pc-windows-msvc": "9a5414c14cce8267025590ef63473863c59b71206cc262293cf134592745821f",
-      "aarch64-unknown-linux-gnu": "2e7b0df3cc3a9fbef9e82570d411eeede679b2ca01f0503e5631455de4be9103",
-      "universal-apple-darwin": "48ea117f1f6ee391972b771ec41662713c0e07ff9d67af9a58c089589aeb93a1",
-      "x86_64-pc-windows-msvc": "52222eb729c09fb6b523da0fdb07582cc66cf72aa5840c67017e7bbda52d6013",
-      "x86_64-unknown-linux-gnu": "c56ad84241a914e1a0f13e3bfd52a3ceccda54622a3a1bb07b449cdde9d6707f"
+      "aarch64-pc-windows-msvc": "1bd4b8fb000462fab6b08f0d5d825584d8fad3fbbb6ee05d9074137225dea5c4",
+      "aarch64-unknown-linux-gnu": "2e58b1a05a64df9ea8c88732e88ee5421d08c8f10a8b5484bdc19ce2212aac8b",
+      "universal-apple-darwin": "f9730a9084567bebc997f5f3ea50c1c030cd7fe6c8d3a629a5c1b8317355a1aa",
+      "x86_64-pc-windows-msvc": "b1d362defc275d49a85dc69e0193283e8c2950fba1ec750ba2160ce80ed2a11e",
+      "x86_64-unknown-linux-gnu": "af43762321f595b06296836062d740e4356566e614d42ec41924e323505be891"
     }
   },
   "publisher": "brokk",
