@@ -9,9 +9,11 @@
 //! `searchtools_service.rs` (and any future caller) stay flat:
 //! `crate::code_quality::compute_cyclomatic_complexity` etc.
 
-use crate::analyzer::{CodeUnit, IAnalyzer, Project, ProjectFile};
+use crate::analyzer::{CodeUnit, IAnalyzer, Project, ProjectFile, SummaryFileProjection};
+use crate::hash::HashMap;
 use crate::path_utils::{AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver};
 use regex::Regex;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::LazyLock;
 
 // Bound MCP-supplied path lists so a single call cannot allocate an
@@ -172,13 +174,100 @@ pub fn cyclomatic_complexity_for(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit)
         return 0;
     }
     let source = analyzer.get_source(code_unit, false).unwrap_or_default();
-    if source.len() > MAX_SOURCE_BYTES {
+    cyclomatic_complexity_for_sources(std::iter::once(source.as_str()))
+}
+
+/// Compute every function's cyclomatic complexity from one lightweight file
+/// projection and one source read. The fallback preserves support for analyzer
+/// implementations that do not expose summary projections.
+pub(crate) fn cyclomatic_complexities_for_file(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+) -> Vec<(CodeUnit, u32)> {
+    match (
+        analyzer.summary_file_projection(file),
+        analyzer.indexed_source(file),
+    ) {
+        (Some(projection), Some(source)) => {
+            cyclomatic_complexities_from_projection(&projection, &source)
+        }
+        _ => cyclomatic_complexities_from_analyzer(analyzer, file),
+    }
+}
+
+fn cyclomatic_complexities_from_projection(
+    projection: &SummaryFileProjection,
+    source: &str,
+) -> Vec<(CodeUnit, u32)> {
+    // `get_source` groups same-file overload ranges by fully-qualified name.
+    // Build those groups once so this batch preserves the existing scores
+    // without repeating a definition lookup for every function.
+    let mut sources_by_fq_name: HashMap<String, BTreeSet<&str>> = HashMap::default();
+    for (code_unit, ranges) in &projection.ranges {
+        if !code_unit.is_function() {
+            continue;
+        }
+        let sources = sources_by_fq_name.entry(code_unit.fq_name()).or_default();
+        for range in ranges {
+            if let Some(fragment) = source.get(range.start_byte..range.end_byte) {
+                sources.insert(fragment);
+            }
+        }
+    }
+
+    let mut result = Vec::new();
+    let mut work: VecDeque<CodeUnit> = projection
+        .top_level_declarations
+        .iter()
+        .filter(|code_unit| !code_unit.is_file_scope())
+        .cloned()
+        .collect();
+    while let Some(code_unit) = work.pop_front() {
+        if code_unit.is_function() {
+            let complexity = sources_by_fq_name
+                .get(&code_unit.fq_name())
+                .map(|sources| cyclomatic_complexity_for_sources(sources.iter().copied()))
+                .unwrap_or(1);
+            result.push((code_unit.clone(), complexity));
+        }
+        if let Some(children) = projection.children.get(&code_unit) {
+            work.extend(children.iter().cloned());
+        }
+    }
+    result
+}
+
+fn cyclomatic_complexities_from_analyzer(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+) -> Vec<(CodeUnit, u32)> {
+    let mut result = Vec::new();
+    let mut work: VecDeque<CodeUnit> = analyzer.top_level_declarations(file).into();
+    while let Some(code_unit) = work.pop_front() {
+        if code_unit.is_function() {
+            let complexity = cyclomatic_complexity_for(analyzer, &code_unit);
+            result.push((code_unit.clone(), complexity));
+        }
+        work.extend(analyzer.direct_children(&code_unit));
+    }
+    result
+}
+
+fn cyclomatic_complexity_for_sources<'a>(sources: impl Iterator<Item = &'a str>) -> u32 {
+    let sources = sources.collect::<Vec<_>>();
+    let total_bytes = sources
+        .iter()
+        .map(|source| source.len())
+        .fold(0usize, usize::saturating_add)
+        .saturating_add(sources.len().saturating_sub(1).saturating_mul(2));
+    if total_bytes > MAX_SOURCE_BYTES {
         return 1;
     }
-    let mut complexity: u32 = 1;
-    complexity += COMPLEXITY_KEYWORDS.find_iter(&source).count() as u32;
-    complexity += COMPLEXITY_OPERATORS.find_iter(&source).count() as u32;
-    complexity
+    sources.iter().fold(1u32, |complexity, source| {
+        complexity
+            .saturating_add(COMPLEXITY_KEYWORDS.find_iter(source).count() as u32)
+            .saturating_add(COMPLEXITY_OPERATORS.find_iter(source).count() as u32)
+    })
 }
 
 /// Pick `candidate` when non-negative, otherwise fall back to `fallback`.
