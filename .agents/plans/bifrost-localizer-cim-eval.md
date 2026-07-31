@@ -80,7 +80,8 @@ The observable outcomes are:
 - [x] (2026-07-31, implementation) Finished the core `cimeval` campaign commands in
   brokkbench commits `ce64f24fbb8` and `1f1d708aba1`: serial production prewarm, concurrent
   resumable waves, official fresh-container scoring, load sampling, and report aggregation.
-- [ ] Run provider preflight and the no-semantic seed-0 baseline at concurrency 30. The first
+- [x] (2026-07-31, r5) Ran provider preflight and the no-semantic seed-0 baseline at concurrency
+  30. The first
   r1 wave was stopped and invalidated after leak audit found repository-history and web-search
   use. The r3 wave was subsequently invalidated after 71 cells: the container runner replaced
   each image's OCI `PATH`, so Go tasks could not use their bundled toolchain during either
@@ -88,13 +89,17 @@ The observable outcomes are:
   focused suite passes, and a real Flipt image exposes Go 1.24.3. The r4 smoke proved fresh
   scoring but exposed a remaining login shell in the provider-secret generation transport.
   Brokkbench commit `6f80c498bc5` fixes that final entry point; the clean r5 replacement is
-  valid. Its queue produced 87 of 91 cells; four interrupted cells remain to be resumed.
+  valid. Its queue and resume completed all 91 cells, all of which were scored with the
+  pristine scorer for a uniform seed-0 method.
 - [x] (2026-07-31, implementation) Changed later cimeval waves to score each result immediately
   in its generation sandbox, matching agenteval's faster lifecycle. The held-out patch and
   official test command run only after the agent patch and artifacts are captured. The prior
   separate pristine scorer remains available as `--scoring-mode pristine`; r5's already-closed
   generation sandboxes necessarily use it for their one-time score pass.
-- [ ] Pass the baseline sanity gate, then run baseline seeds 1 and 2 at concurrency 30.
+- [ ] Pass the baseline sanity gate, then run baseline seeds 1 and 2 at concurrency 30. Seed 0
+  resolves 31/91 (34.1%), has zero unmitigated leak findings, and passes the legitimate-count,
+  resolve-band, and tool-call checks. New scheduling is stopped because mean uncached tokens
+  are 49.6k against the precommitted 5k-30k band; this must be resolved before seeds 1 and 2.
 - [x] (2026-07-31 10:01Z) Precomputed all Granite indexes on the A4000 at repository concurrency
   one. Bifrost commit `e36d4e6e` parallelizes each 64-file extraction group while preserving
   serial output order. The 15 repository `READY.json` records cover all 91 tasks. After resuming
@@ -300,6 +305,16 @@ The observable outcomes are:
   whose shell remained `bash -lc` after the ordinary run/popen fix; the agent recovered only by
   exporting `/usr/local/go/bin` itself. Brokkbench commit `6f80c498bc5` makes that final transport
   non-login too and extends the exact-argv regression test.
+
+- Observation: the corrected r5 baseline is operationally clean but fails the precommitted
+  token-effort gate. It completes and scores all 91 cells, resolves 31 (34.1%), averages 47.5
+  tool calls and 444.4 seconds, and has no provider terminal errors or unmitigated leak-audit
+  findings. Mean uncached usage is 49.6k tokens (median 46.0k; 81/91 exceed 30k), compared with
+  CIM SC-OFF's published roughly 11.1k input-plus-output mean on Claude Opus 4.7. Mjolnir's
+  mean components are 42.0k input, 4.8k output, and 2.8k thought tokens, so this is not caused
+  by accidentally counting the 862k mean cached reads as uncached usage.
+  Evidence: r5 `report.json`, `leak-audit.json`, all terminal Mjolnir usage records, and the
+  released CIM `results_public.csv`. Per the hard gate, no later seed has been scheduled.
 
 ## Decision Log
 
