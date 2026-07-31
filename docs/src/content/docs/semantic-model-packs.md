@@ -19,8 +19,7 @@ operations belong to the catalog and generation-scoped runtime described below.
 > activation-neutral: compiling, installing, selecting, loading, or activating
 > one does not yet change value-flow results.
 
-Together, the catalog and runtime can install, select, activate, account for,
-quarantine, and garbage-collect packs while keeping matching generation-local.
+Together, the catalog and runtime can install, select, activate, account for, quarantine, and garbage-collect packs while keeping matching generation-local.
 
 Packs do not contain executable code, arbitrary templates, fake source, or
 unbounded evaluator inputs. Generator expressions are bounded trees of

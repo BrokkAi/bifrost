@@ -24,7 +24,10 @@ This is deliberately an activation-neutral transport slice. A later #1147 change
 - [x] (2026-07-31T15:31Z) Updated issue #1402 with the delivered boundary and #1147 follow-up; after explicit user authorization, attached the worktree to `dave/issue-1402-procedure-summaries` for publication.
 - [x] (2026-07-31T15:39Z) Committed the issue-scoped files and rebased onto `origin/master` at `bb708002`, which included the newly merged generation-scoped semantic-model runtime.
 - [x] (2026-07-31T15:44Z) Reconciled catalog initialization and documentation conflicts, assigned procedure summaries a distinct active-set hash discriminator without adding matcher postings, and passed post-rebase procedure, runtime, migration, concurrent-installer, formatting, and diff checks.
-- [ ] Push `dave/issue-1402-procedure-summaries` and open a ready pull request.
+- [x] (2026-07-31T15:37Z) Pushed `dave/issue-1402-procedure-summaries` and opened ready pull request #1410.
+- [x] (2026-07-31T16:06Z) Fixed the Windows Rust CI documentation assertion, rebased onto `origin/master` at `6e6cf22c`, and passed the exact failing test, formatting, and diff checks. The required `bifrost.code-smells` run remained `unreliable` (exit 2); its broad pre-existing findings do not touch the documentation-only correction.
+- [x] (2026-07-31T16:09Z) Committed and pushed the CI correction on the synced branch; every refreshed PR check, including the Windows Rust lane and final PR verification, passed.
+- [x] (2026-07-31T16:48Z) Fetched again after CI, rebased cleanly onto the then-current `origin/master` at `07a7ba49`, and prepared the final synchronized head for publication.
 
 ## Surprises & Discoveries
 
@@ -82,7 +85,7 @@ Catalog schema v3 widens only the generic payload-kind constraint through a forw
 
 Validation passed: 23 focused semantic-pack tests, 24 catalog tests (with the pre-existing 500 ms lease test also passing alone after one parallel-load expiry), documentation checks, artifact tamper/inventory regressions, `cargo fmt --all -- --check`, and isolated all-target/all-feature Clippy with warnings denied. Five specialist reviews are clean after all findings were fixed. The only failed gate is the repository policy service itself: two identical combined runs returned canonical `unreliable` reports because broad queries exhausted discovery budgets; their findings were reviewed and are not introduced defects.
 
-Publication is authorized on `dave/issue-1402-procedure-summaries`. The branch is rebased onto `origin/master` at `bb708002` and conflict-sensitive validation passes; only push and ready pull-request creation remain. The generation-scoped semantic-model runtime is now present, but a later value-flow integration must still bind procedure records into reusable runtime summaries.
+Ready pull request #1410 is open from `dave/issue-1402-procedure-summaries`. Its first CI run exposed a documentation-contract regression from the prior conflict resolution: a tested lifecycle phrase was wrapped across lines. The branch restores the public lifecycle phrase as contiguous text, the exact failing test passes locally, and every refreshed GitHub check passed. A final clean rebase synchronized the branch with `origin/master` at `07a7ba49`; that new head requires the same refreshed checks before merge. The generation-scoped semantic-model runtime is present, but a later value-flow integration must still bind procedure records into reusable runtime summaries.
 
 ## Context and Orientation
 
