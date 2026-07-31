@@ -17,7 +17,7 @@ The observable proof is a Java vertical test. It activates one reviewed procedur
 - [x] (2026-07-31 19:52 SAST) Milestone 1: retained validated exact external procedure descriptors on unmaterialized dispatch boundaries, sourced only from resolved `CodeUnit`, signature metadata, semantic call receiver metadata, and mounted artifact identity.
 - [x] (2026-07-31 19:52 SAST) Milestone 2: added explicit policy-batch activation authority, one generation-cached acquisition, plan-local exact lookup, iterative family dependency closure, Handoff B binding, and `ValueFlowPlan::with_external_summaries` installation.
 - [x] (2026-07-31 19:52 SAST) Milestone 3: added the required Java `RequireModel` vertical and regressions for activation near misses, body precedence, target conflicts, relevant/unrelated identity, shared solves, and warm catalog accounting.
-- [ ] Milestone 4: run focused suites, formatting, strict featureless Clippy, the repository policy gate, review the diff, and complete the retrospective. Focused production/oracle/runtime/binder/value-flow suites and formatting are green; Clippy and policy validation remain.
+- [x] (2026-07-31 20:12 SAST) Milestone 4: focused production/oracle/runtime/binder/value-flow suites, formatting, strict featureless Clippy, and diff review are green. The required combined `bifrost.code-smells` MCP request completed in 4.7 seconds but returned `unreliable` with exit status 2, so the repository policy gate is explicitly recorded as failed rather than treated as a clean result.
 
 ## Surprises & Discoveries
 
@@ -39,6 +39,9 @@ The observable proof is a Java vertical test. It activates one reviewed procedur
 - Observation: propagation identity comparisons require one mounted analyzer snapshot.
   Evidence: independent inline projects intentionally produce different workspace mount identities. The relevant/unrelated and body-precedence regressions therefore reuse one snapshot and vary only generation-cache request keys and active catalog content.
 
+- Observation: the combined repository code-smell gate did not produce a reliable validation result.
+  Evidence: the single `run_policy` request selected `bifrost.code-smells`, evaluation date `2026-07-31`, and `fail_on: warning`; it completed in 4.7 seconds with canonical report status `unreliable` and exit status 2. Its output contained complete findings, but the aggregate result cannot be interpreted as a passing gate.
+
 ## Decision Log
 
 - Decision: add a semantic-oracle external procedure descriptor instead of teaching the policy compiler to interpret locators, signatures, or source text.
@@ -59,7 +62,9 @@ The observable proof is a Java vertical test. It activates one reviewed procedur
 
 ## Outcomes & Retrospective
 
-Milestones one through three are implemented. The production route now acquires active semantic models once, keeps structured exact targets on normal dispatch discovery, selects only matching summary families and closure, binds them through the existing pure binder, and installs the canonical plan-local set before the existing taint batch planner solves. No policy vocabulary, solver, secondary propagation route, presentation rerun, or global active-set hash was added. The Java vertical and all requested negative/cache/identity/batching regressions pass. Final Clippy and repository policy validation remain.
+All implementation milestones are complete. The production route now acquires active semantic models once, keeps structured exact targets on normal dispatch discovery, selects only matching summary families and closure, binds them through the existing pure binder, and installs the canonical plan-local set before the existing taint batch planner solves. No policy vocabulary, solver, secondary propagation route, presentation rerun, or global active-set hash was added.
+
+The Java vertical and all requested negative/cache/identity/batching regressions pass: 12 focused production taint adapter tests, 17 workspace dispatch tests, and 7 runtime/binder/value-flow tests. `cargo fmt --all -- --check` passes. Strict featureless Clippy passes for every `brokk-bifrost-analysis` target through the isolated target helper. The repository policy request completed within the latency threshold but returned `unreliable`/exit 2; per project rules this remains a failed validation result and is not represented as clean.
 
 ## Context and Orientation
 
@@ -127,3 +132,5 @@ The policy coordinator will expose an analyzer-backed entry point that accepts `
 Revision note (2026-07-31 18:25 SAST): created the initial self-contained plan after tracing both handoffs, production dispatch/taint/value-flow code, tests, and current repository state. The plan keeps activation authority explicit, summary sets plan-local, policy syntax unchanged, and all propagation/presentation work on the existing route.
 
 Revision note (2026-07-31 19:52 SAST): completed the structured dispatch, activation/binding, and vertical-test milestones; recorded receiver-metadata and mount-identity discoveries; and left only final Clippy, policy, and retrospective gates open.
+
+Revision note (2026-07-31 20:12 SAST): closed the implementation and local compiler/test gates, recorded the exact unreliable combined policy result, and completed the retrospective without misclassifying that MCP result as a clean policy scan.
