@@ -9345,6 +9345,97 @@ mod tests {
     }
 
     #[test]
+    fn scala_scalachess_fqn_recovery_epoch_invalidates_stale_rows_and_reuses_current() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "src/main/scala/chess/tiebreak/Tiebreak.scala",
+            "package chess\npackage tiebreak\n\nimport Tiebreak.*\n\ntrait Tournament:\n  def players: Set[String]\n  def gamesById(id: String): List[String]\n  def opponentsOf: String => List[String]\n  def scoreOf: String => Float\n  def lastRoundId: Option[String]\n\n  lazy val maxRounds = players.map(_.length).maxOption.getOrElse(0)\n\nobject Tournament:\n  private final class Impl extends Tournament:\n    override def players: Set[String] = Set.empty\n    override def gamesById(id: String): List[String] = Nil\n    override def opponentsOf: String => List[String] = _ => Nil\n    override def scoreOf: String => Float = _ => 0f\n    override def lastRoundId: Option[String] = None\n\n  def apply(value: Int): Tournament =\n    new Tournament {}\n\nobject Tiebreak:\n  def compute(value: Int): Tournament =\n    Tournament(value)\n",
+        );
+        let state = Arc::new(parse_state(&ScalaAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+
+        // Commit 20f61961 recovered declarations that tree-sitter attaches to
+        // malformed significant-indentation template bodies. That changed
+        // Scala FQNs without changing the grammar vocabulary covered by the
+        // automatic epoch fingerprint.
+        let prior_epoch = epoch::scala_epoch_before_scalachess_fqn_recovery();
+        assert_eq!(
+            prior_epoch,
+            "3b2bc096d66a98af42bd82ebe5549c4697601996ad439f6189dcf81a602b953a"
+        );
+        let prior_generation = store
+            .ensure_language_epoch_value("scala", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "scala",
+                prior_generation,
+                &ScalaAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "scala").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(
+                Language::Scala,
+                &crate::analyzer::scala::language::LANGUAGE.into(),
+            )
+            .unwrap();
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "scala").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "scala".to_string())])
+                .unwrap(),
+            vec![(oid, "scala".to_string())]
+        );
+
+        // Once the current epoch has been populated, reopening the same
+        // version must reuse its generation and keep the semantic state warm.
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "scala",
+                current_generation,
+                &ScalaAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        let reused_generation = store
+            .ensure_language_epoch(
+                Language::Scala,
+                &crate::analyzer::scala::language::LANGUAGE.into(),
+            )
+            .unwrap();
+        assert_eq!(reused_generation, current_generation);
+        assert!(store.contains_parsed_blob(oid, "scala").unwrap());
+        let hydrated = store
+            .hydrate_file_state(oid, "scala", &ScalaAdapter, &file)
+            .unwrap()
+            .expect("current-generation Scala rows should hydrate");
+        assert!(
+            hydrated
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "chess.tiebreak.Tournament$.apply"),
+            "hydrated declarations should retain the top-level companion apply: {:?}",
+            hydrated.declarations
+        );
+        assert!(
+            hydrated
+                .declarations
+                .iter()
+                .all(|unit| unit.fq_name() != "chess.tiebreak.Tournament.Tournament$.apply"),
+            "hydrated declarations must not retain the stale duplicate owner: {:?}",
+            hydrated.declarations
+        );
+    }
+
+    #[test]
     fn parsed_blob_presence_allows_zero_persisted_units() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path();
