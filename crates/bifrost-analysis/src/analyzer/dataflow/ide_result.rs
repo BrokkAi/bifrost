@@ -1,6 +1,6 @@
 //! Deterministic public results for IDE summary propagation.
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, mem::size_of_val};
 
 use crate::analyzer::dense_id::define_dense_id;
 use crate::analyzer::semantic::{ProgramPointHandle, SemanticWork};
@@ -317,5 +317,35 @@ impl<Fact, Value, EdgeFunction> IdeSummaryDataflowResult<Fact, Value, EdgeFuncti
 
     pub fn is_complete(&self) -> bool {
         self.termination.is_fixed_point() && self.fact_result.coverage().is_complete()
+    }
+
+    /// Conservative bytes owned directly by this immutable IDE result.
+    /// Shared semantic artifacts behind handles and `Arc`s are excluded and
+    /// must be charged separately by the owner retaining those artifacts.
+    pub(crate) fn retained_bytes_with(
+        &self,
+        value_heap_bytes: impl Fn(&Value) -> usize,
+        edge_function_heap_bytes: impl Fn(&EdgeFunction) -> usize,
+    ) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.fact_result.retained_bytes())
+            .saturating_add(size_of_val(&*self.edge_functions))
+            .saturating_add(size_of_val(&*self.values))
+            .saturating_add(size_of_val(&*self.reached_jump_functions))
+            .saturating_add(size_of_val(&*self.end_summary_jump_functions))
+            .saturating_add(size_of_val(&*self.entry_transfers))
+            .saturating_add(size_of_val(&*self.point_values))
+            .saturating_add(
+                self.values
+                    .iter()
+                    .map(value_heap_bytes)
+                    .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(
+                self.edge_functions
+                    .iter()
+                    .map(edge_function_heap_bytes)
+                    .fold(0usize, usize::saturating_add),
+            )
     }
 }

@@ -149,6 +149,7 @@ impl RetainedSize for PolicyEvaluationOptions {
 pub struct PolicyBatchOutcome {
     report: PolicyReportDocument,
     taint_findings: Vec<crate::analyzer::structural::CodeQueryTaintFinding>,
+    taint_analysis_results: Vec<Arc<super::taint_policy::ProductionTaintAnalysisResult>>,
     exit_status: u8,
     max_serialized_report_bytes: usize,
 }
@@ -166,6 +167,14 @@ impl PolicyBatchOutcome {
     /// runs that produced the policy report.
     pub fn taint_findings(&self) -> &[crate::analyzer::structural::CodeQueryTaintFinding] {
         &self.taint_findings
+    }
+
+    /// Immutable production plan/report pairs retained from the propagation
+    /// runs that produced this policy outcome.
+    pub fn taint_analysis_results(
+        &self,
+    ) -> &[Arc<super::taint_policy::ProductionTaintAnalysisResult>] {
+        &self.taint_analysis_results
     }
 
     pub fn taint_query_results(
@@ -750,10 +759,12 @@ fn evaluate_prepared_policy_inputs(
         PolicyCoordinatorError::new(format!("failed to finish policy report: {error}"))
     })?;
     let taint_findings = taint.take_public_findings();
+    let taint_analysis_results = taint.take_retained_analyses();
     let exit_status = report_exit_status(&report, threshold_exceeded);
     Ok(PolicyBatchOutcome {
         report,
         taint_findings,
+        taint_analysis_results,
         exit_status,
         max_serialized_report_bytes: batch_budget.max_serialized_report_bytes(),
     })

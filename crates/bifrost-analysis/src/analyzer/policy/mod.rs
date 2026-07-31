@@ -58,3 +58,4 @@ pub use resolved::*;
 pub use source::rqlp_source_completion_at;
 pub use source::*;
 pub use suppression::*;
+pub use taint_policy::ProductionTaintAnalysisResult;

@@ -396,6 +396,7 @@ impl TypestateQueryState {
             QueryAnalysisContextError::GenerationExhausted
             | QueryAnalysisContextError::TooManyResolvedProtocols
             | QueryAnalysisContextError::TooManyResolvedValueFlowPlans
+            | QueryAnalysisContextError::TooManyResolvedTaintResults
             | QueryAnalysisContextError::WorkspaceGenerationMismatch { .. }
             | QueryAnalysisContextError::StaleArtifact { .. }
             | QueryAnalysisContextError::ArtifactIdentityUnavailable { .. }
@@ -403,6 +404,13 @@ impl TypestateQueryState {
             | QueryAnalysisContextError::UnresolvedValueFlowPlanReference { .. }
             | QueryAnalysisContextError::ValueFlowRootMismatch
             | QueryAnalysisContextError::StaleValueFlowPlanHandle => {
+                CodeQueryDiagnosticCode::TypestateRegistrationStale
+            }
+            QueryAnalysisContextError::UnresolvedTaintResultReference { .. }
+            | QueryAnalysisContextError::TaintRegistrationInvalid { .. }
+            | QueryAnalysisContextError::TaintResultRootMismatch
+            | QueryAnalysisContextError::TaintPlanReportMismatch
+            | QueryAnalysisContextError::StaleTaintResultHandle => {
                 CodeQueryDiagnosticCode::TypestateRegistrationStale
             }
         };

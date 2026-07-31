@@ -13,6 +13,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::identifier::define_identifier;
+use crate::analyzer::policy::ProductionTaintAnalysisResult;
 use crate::analyzer::semantic::{
     LengthDelimitedDigest, ProcedureHandle, SemanticArtifact, SemanticArtifactKey,
 };
@@ -41,11 +42,22 @@ pub const MAX_RETAINED_VALUE_FLOW_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_VALUE_FLOW_PLAN_REF_BYTES: usize = 192;
 pub const MAX_VALUE_FLOW_PLAN_NAMESPACE_BYTES: usize = 63;
 pub const MAX_VALUE_FLOW_PLAN_NAME_BYTES: usize = 128;
+pub const MAX_TAINT_RESULT_REFS: usize = 256;
+pub const MAX_TAINT_RESULT_REGISTRATIONS: usize = 128;
+pub const MAX_TAINT_RESULTS_PER_REGISTRATION: usize = 256;
+pub const MAX_RETAINED_TAINT_PLAN_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_RETAINED_TAINT_REPORT_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_RETAINED_TAINT_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_TAINT_RESULT_REF_BYTES: usize = 192;
+pub const MAX_TAINT_RESULT_NAMESPACE_BYTES: usize = 63;
+pub const MAX_TAINT_RESULT_NAME_BYTES: usize = 128;
 
 pub type ProtocolNamespaceError = crate::analyzer::identifier::IdentifierError;
 pub type ProtocolNameError = crate::analyzer::identifier::IdentifierError;
 pub type ValueFlowPlanNamespaceError = crate::analyzer::identifier::IdentifierError;
 pub type ValueFlowPlanNameError = crate::analyzer::identifier::IdentifierError;
+pub type TaintResultNamespaceError = crate::analyzer::identifier::IdentifierError;
+pub type TaintResultNameError = crate::analyzer::identifier::IdentifierError;
 
 define_identifier! {
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -53,6 +65,24 @@ define_identifier! {
         max_bytes: MAX_PROTOCOL_NAMESPACE_BYTES,
         allow_dot: true,
         error: ProtocolNamespaceError,
+    }
+}
+
+define_identifier! {
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct TaintResultNamespace {
+        max_bytes: MAX_TAINT_RESULT_NAMESPACE_BYTES,
+        allow_dot: true,
+        error: TaintResultNamespaceError,
+    }
+}
+
+define_identifier! {
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct TaintResultName {
+        max_bytes: MAX_TAINT_RESULT_NAME_BYTES,
+        allow_dot: true,
+        error: TaintResultNameError,
     }
 }
 
@@ -236,6 +266,19 @@ define_bounded_registration_ref! {
     MAX_PROTOCOL_REF_BYTES,
     "protocol",
     "a bounded protocol reference in namespace:name form"
+}
+
+define_bounded_registration_ref! {
+    /// A bounded host-defined alias for retained production taint results.
+    TaintResultRef,
+    TaintResultRefError,
+    TaintResultNamespace,
+    TaintResultNamespaceError,
+    TaintResultName,
+    TaintResultNameError,
+    MAX_TAINT_RESULT_REF_BYTES,
+    "taint result",
+    "a bounded taint result reference in namespace:name form"
 }
 
 define_bounded_registration_ref! {
@@ -1005,9 +1048,453 @@ impl fmt::Display for ValueFlowPlanRegistrationSetError {
 
 impl std::error::Error for ValueFlowPlanRegistrationSetError {}
 
+/// One immutable host registration containing retained production taint
+/// results for one or more exact procedure roots.
+#[derive(Debug)]
+pub struct TaintResultRegistration {
+    workspace_generation: u64,
+    results: Box<[Arc<ProductionTaintAnalysisResult>]>,
+    identity: TaintResultRegistrationIdentity,
+    artifact_keys: Box<[SemanticArtifactKey]>,
+    retained_plan_bytes: usize,
+    retained_report_bytes: usize,
+    retained_artifact_bytes: usize,
+}
+
+impl TaintResultRegistration {
+    pub fn new(
+        workspace_generation: u64,
+        mut results: Vec<Arc<ProductionTaintAnalysisResult>>,
+    ) -> Result<Self, TaintResultRegistrationError> {
+        if results.is_empty() {
+            return Err(TaintResultRegistrationError::Empty);
+        }
+        if results.len() > MAX_TAINT_RESULTS_PER_REGISTRATION {
+            return Err(TaintResultRegistrationError::TooManyResults {
+                maximum: MAX_TAINT_RESULTS_PER_REGISTRATION,
+            });
+        }
+        if results.iter().any(|result| !result.plan_report_match()) {
+            return Err(TaintResultRegistrationError::PlanReportMismatch);
+        }
+        results.sort_unstable_by(|left, right| {
+            procedure_identity_cmp(left.expected_root(), right.expected_root())
+        });
+        if results
+            .windows(2)
+            .any(|pair| same_procedure_identity(pair[0].expected_root(), pair[1].expected_root()))
+        {
+            return Err(TaintResultRegistrationError::DuplicateRoot);
+        }
+
+        let mut artifact_keys = results
+            .iter()
+            .flat_map(|result| result.artifact_keys().iter().cloned())
+            .collect::<Vec<_>>();
+        artifact_keys.sort_unstable();
+        artifact_keys.dedup();
+        let retained_plan_bytes =
+            checked_sum(results.iter().map(|result| result.retained_plan_bytes()))?;
+        let retained_report_bytes =
+            checked_sum(results.iter().map(|result| result.retained_report_bytes()))?;
+        let retained_artifact_bytes = checked_sum(
+            results
+                .iter()
+                .map(|result| result.retained_artifact_bytes()),
+        )?;
+        let identity = TaintResultRegistrationIdentity {
+            workspace_generation,
+            results: results
+                .iter()
+                .map(|result| result.registration_digest().to_owned().into_boxed_str())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        };
+        Ok(Self {
+            workspace_generation,
+            results: results.into_boxed_slice(),
+            identity,
+            artifact_keys: artifact_keys.into_boxed_slice(),
+            retained_plan_bytes,
+            retained_report_bytes,
+            retained_artifact_bytes,
+        })
+    }
+
+    pub const fn workspace_generation(&self) -> u64 {
+        self.workspace_generation
+    }
+
+    pub fn results(&self) -> &[Arc<ProductionTaintAnalysisResult>] {
+        &self.results
+    }
+
+    pub fn artifact_keys(&self) -> &[SemanticArtifactKey] {
+        &self.artifact_keys
+    }
+
+    pub const fn retained_plan_bytes(&self) -> usize {
+        self.retained_plan_bytes
+    }
+
+    pub const fn retained_report_bytes(&self) -> usize {
+        self.retained_report_bytes
+    }
+
+    pub const fn retained_artifact_bytes(&self) -> usize {
+        self.retained_artifact_bytes
+    }
+
+    fn identity(&self) -> &TaintResultRegistrationIdentity {
+        &self.identity
+    }
+
+    fn result_for_root(
+        &self,
+        expected_root: &ProcedureHandle,
+    ) -> Option<&ProductionTaintAnalysisResult> {
+        self.results
+            .iter()
+            .find(|result| same_procedure_identity(result.expected_root(), expected_root))
+            .map(Arc::as_ref)
+    }
+}
+
+fn checked_sum(
+    mut values: impl Iterator<Item = usize>,
+) -> Result<usize, TaintResultRegistrationError> {
+    values.try_fold(0usize, |total, value| {
+        total
+            .checked_add(value)
+            .ok_or(TaintResultRegistrationError::RetainedBytesOverflow)
+    })
+}
+
+fn procedure_identity_cmp(left: &ProcedureHandle, right: &ProcedureHandle) -> std::cmp::Ordering {
+    left.artifact()
+        .key()
+        .cmp(right.artifact().key())
+        .then_with(|| left.semantics().locator().cmp(right.semantics().locator()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TaintResultRegistrationIdentity {
+    workspace_generation: u64,
+    results: Box<[Box<str>]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaintResultRegistrationError {
+    Empty,
+    TooManyResults { maximum: usize },
+    DuplicateRoot,
+    PlanReportMismatch,
+    RetainedBytesOverflow,
+}
+
+impl fmt::Display for TaintResultRegistrationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("taint result registration must not be empty"),
+            Self::TooManyResults { maximum } => write!(
+                formatter,
+                "taint result registration exceeds {maximum} procedure results"
+            ),
+            Self::DuplicateRoot => {
+                formatter.write_str("taint result registration contains a duplicate procedure root")
+            }
+            Self::PlanReportMismatch => formatter
+                .write_str("taint result registration contains a mismatched plan and report"),
+            Self::RetainedBytesOverflow => {
+                formatter.write_str("taint result retained-byte accounting overflowed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TaintResultRegistrationError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaintResultRegistrationOutcome {
+    Inserted,
+    Aliased,
+    Unchanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaintResultRegistrationLimits {
+    references: usize,
+    registrations: usize,
+    plan_bytes: usize,
+    report_bytes: usize,
+    artifact_bytes: usize,
+}
+
+impl TaintResultRegistrationLimits {
+    pub const fn bounded(
+        references: usize,
+        registrations: usize,
+        plan_bytes: usize,
+        report_bytes: usize,
+        artifact_bytes: usize,
+    ) -> Self {
+        Self {
+            references: if references < MAX_TAINT_RESULT_REFS {
+                references
+            } else {
+                MAX_TAINT_RESULT_REFS
+            },
+            registrations: if registrations < MAX_TAINT_RESULT_REGISTRATIONS {
+                registrations
+            } else {
+                MAX_TAINT_RESULT_REGISTRATIONS
+            },
+            plan_bytes: if plan_bytes < MAX_RETAINED_TAINT_PLAN_BYTES {
+                plan_bytes
+            } else {
+                MAX_RETAINED_TAINT_PLAN_BYTES
+            },
+            report_bytes: if report_bytes < MAX_RETAINED_TAINT_REPORT_BYTES {
+                report_bytes
+            } else {
+                MAX_RETAINED_TAINT_REPORT_BYTES
+            },
+            artifact_bytes: if artifact_bytes < MAX_RETAINED_TAINT_ARTIFACT_BYTES {
+                artifact_bytes
+            } else {
+                MAX_RETAINED_TAINT_ARTIFACT_BYTES
+            },
+        }
+    }
+}
+
+impl Default for TaintResultRegistrationLimits {
+    fn default() -> Self {
+        Self::bounded(
+            MAX_TAINT_RESULT_REFS,
+            MAX_TAINT_RESULT_REGISTRATIONS,
+            MAX_RETAINED_TAINT_PLAN_BYTES,
+            MAX_RETAINED_TAINT_REPORT_BYTES,
+            MAX_RETAINED_TAINT_ARTIFACT_BYTES,
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TaintResultRegistrationSet {
+    by_ref: HashMap<TaintResultRef, Arc<TaintResultRegistration>>,
+    by_identity: HashMap<TaintResultRegistrationIdentity, Arc<TaintResultRegistration>>,
+    retained_plan_bytes: usize,
+    retained_report_bytes: usize,
+    retained_artifact_bytes: usize,
+    limits: TaintResultRegistrationLimits,
+}
+
+impl Default for TaintResultRegistrationSet {
+    fn default() -> Self {
+        Self::with_limits(TaintResultRegistrationLimits::default())
+    }
+}
+
+impl TaintResultRegistrationSet {
+    pub fn with_limits(limits: TaintResultRegistrationLimits) -> Self {
+        Self {
+            by_ref: HashMap::new(),
+            by_identity: HashMap::new(),
+            retained_plan_bytes: 0,
+            retained_report_bytes: 0,
+            retained_artifact_bytes: 0,
+            limits,
+        }
+    }
+
+    pub fn register(
+        &mut self,
+        taint_ref: TaintResultRef,
+        registration: TaintResultRegistration,
+    ) -> Result<TaintResultRegistrationOutcome, TaintResultRegistrationSetError> {
+        let identity = registration.identity().clone();
+        if let Some(existing) = self.by_ref.get(&taint_ref) {
+            return if existing.identity() == &identity {
+                Ok(TaintResultRegistrationOutcome::Unchanged)
+            } else {
+                Err(TaintResultRegistrationSetError::ReferenceConflict { taint_ref })
+            };
+        }
+        if self.by_ref.len() >= self.limits.references {
+            return Err(TaintResultRegistrationSetError::TooManyReferences {
+                maximum: self.limits.references,
+            });
+        }
+        if let Some(existing) = self.by_identity.get(&identity) {
+            self.by_ref.insert(taint_ref, Arc::clone(existing));
+            return Ok(TaintResultRegistrationOutcome::Aliased);
+        }
+        if self.by_identity.len() >= self.limits.registrations {
+            return Err(TaintResultRegistrationSetError::TooManyRegistrations {
+                maximum: self.limits.registrations,
+            });
+        }
+        let retained_plan_bytes = checked_registration_total(
+            self.retained_plan_bytes,
+            registration.retained_plan_bytes(),
+            self.limits.plan_bytes,
+            TaintResultRegistrationSetError::RetainedPlanBytes,
+        )?;
+        let retained_report_bytes = checked_registration_total(
+            self.retained_report_bytes,
+            registration.retained_report_bytes(),
+            self.limits.report_bytes,
+            TaintResultRegistrationSetError::RetainedReportBytes,
+        )?;
+        let retained_artifact_bytes = checked_registration_total(
+            self.retained_artifact_bytes,
+            registration.retained_artifact_bytes(),
+            self.limits.artifact_bytes,
+            TaintResultRegistrationSetError::RetainedArtifactBytes,
+        )?;
+        let registration = Arc::new(registration);
+        self.by_ref.insert(taint_ref, Arc::clone(&registration));
+        self.by_identity.insert(identity, registration);
+        self.retained_plan_bytes = retained_plan_bytes;
+        self.retained_report_bytes = retained_report_bytes;
+        self.retained_artifact_bytes = retained_artifact_bytes;
+        Ok(TaintResultRegistrationOutcome::Inserted)
+    }
+
+    pub fn get(&self, taint_ref: &TaintResultRef) -> Option<&Arc<TaintResultRegistration>> {
+        self.by_ref.get(taint_ref)
+    }
+
+    pub fn unregister(&mut self, taint_ref: &TaintResultRef) -> bool {
+        let Some(registration) = self.by_ref.remove(taint_ref) else {
+            return false;
+        };
+        if self
+            .by_ref
+            .values()
+            .any(|candidate| Arc::ptr_eq(candidate, &registration))
+        {
+            return true;
+        }
+        let removed = self
+            .by_identity
+            .remove(registration.identity())
+            .expect("registered taint alias retains its identity entry");
+        self.retained_plan_bytes = self
+            .retained_plan_bytes
+            .checked_sub(removed.retained_plan_bytes())
+            .expect("retained plan bytes cover every taint registration");
+        self.retained_report_bytes = self
+            .retained_report_bytes
+            .checked_sub(removed.retained_report_bytes())
+            .expect("retained report bytes cover every taint registration");
+        self.retained_artifact_bytes = self
+            .retained_artifact_bytes
+            .checked_sub(removed.retained_artifact_bytes())
+            .expect("retained artifact bytes cover every taint registration");
+        true
+    }
+
+    pub fn clear(&mut self) {
+        self.by_ref.clear();
+        self.by_identity.clear();
+        self.retained_plan_bytes = 0;
+        self.retained_report_bytes = 0;
+        self.retained_artifact_bytes = 0;
+    }
+
+    pub fn reference_count(&self) -> usize {
+        self.by_ref.len()
+    }
+
+    pub fn registration_count(&self) -> usize {
+        self.by_identity.len()
+    }
+
+    pub const fn retained_plan_bytes(&self) -> usize {
+        self.retained_plan_bytes
+    }
+
+    pub const fn retained_report_bytes(&self) -> usize {
+        self.retained_report_bytes
+    }
+
+    pub const fn retained_artifact_bytes(&self) -> usize {
+        self.retained_artifact_bytes
+    }
+}
+
+fn checked_registration_total(
+    current: usize,
+    additional: usize,
+    maximum: usize,
+    error: fn(usize) -> TaintResultRegistrationSetError,
+) -> Result<usize, TaintResultRegistrationSetError> {
+    let total = current
+        .checked_add(additional)
+        .ok_or_else(|| error(maximum))?;
+    if total > maximum {
+        return Err(error(maximum));
+    }
+    Ok(total)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaintResultRegistrationSetError {
+    ReferenceConflict { taint_ref: TaintResultRef },
+    TooManyReferences { maximum: usize },
+    TooManyRegistrations { maximum: usize },
+    RetainedPlanBytes(usize),
+    RetainedReportBytes(usize),
+    RetainedArtifactBytes(usize),
+}
+
+impl fmt::Display for TaintResultRegistrationSetError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReferenceConflict { taint_ref } => {
+                write!(
+                    formatter,
+                    "taint result reference `{taint_ref}` is already registered"
+                )
+            }
+            Self::TooManyReferences { maximum } => write!(
+                formatter,
+                "taint result registration set exceeds {maximum} references"
+            ),
+            Self::TooManyRegistrations { maximum } => write!(
+                formatter,
+                "taint result registration set exceeds {maximum} unique registrations"
+            ),
+            Self::RetainedPlanBytes(maximum) => write!(
+                formatter,
+                "taint result registration set exceeds {maximum} retained plan bytes"
+            ),
+            Self::RetainedReportBytes(maximum) => write!(
+                formatter,
+                "taint result registration set exceeds {maximum} retained report bytes"
+            ),
+            Self::RetainedArtifactBytes(maximum) => write!(
+                formatter,
+                "taint result registration set exceeds {maximum} retained semantic-artifact bytes"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TaintResultRegistrationSetError {}
+
 /// An opaque value-flow capability valid only inside its issuing query context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ValueFlowPlanHandle {
+    context_generation: NonZeroU64,
+    slot: u32,
+}
+
+/// An opaque retained-taint capability valid only inside its issuing query context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TaintResultHandle {
     context_generation: NonZeroU64,
     slot: u32,
 }
@@ -1029,6 +1516,8 @@ pub struct QueryAnalysisContext {
     registrations: Box<[Arc<ProtocolRegistration>]>,
     value_flow_by_ref: HashMap<ValueFlowPlanRef, ValueFlowPlanHandle>,
     value_flow_registrations: Box<[Arc<ValueFlowPlanRegistration>]>,
+    taint_by_ref: HashMap<TaintResultRef, TaintResultHandle>,
+    taint_registrations: Box<[Arc<TaintResultRegistration>]>,
     summary_lease: ProductionTypestateSummaryLease,
 }
 
@@ -1166,12 +1655,15 @@ impl QueryAnalysisContext {
         summary_lease: ProductionTypestateSummaryLease,
     ) -> Result<Self, QueryAnalysisContextError> {
         let value_flow_registrations = ValueFlowPlanRegistrationSet::default();
+        let taint_registrations = TaintResultRegistrationSet::default();
         Self::new_with_all_registrations_and_summaries(
             workspace,
             workspace_generation,
             registrations,
             requested,
             &value_flow_registrations,
+            &[],
+            &taint_registrations,
             &[],
             validation_limits,
             cancellation,
@@ -1187,6 +1679,8 @@ impl QueryAnalysisContext {
         requested: &[ProtocolRef],
         value_flow_registrations: &ValueFlowPlanRegistrationSet,
         requested_value_flows: &[ValueFlowPlanRef],
+        taint_registrations: &TaintResultRegistrationSet,
+        requested_taint_results: &[TaintResultRef],
         validation_limits: QueryAnalysisValidationLimits,
         cancellation: Option<&CancellationToken>,
         summary_lease: ProductionTypestateSummaryLease,
@@ -1294,6 +1788,48 @@ impl QueryAnalysisContext {
                 },
             );
         }
+        let mut taint_by_ref = HashMap::with_capacity(requested_taint_results.len());
+        let mut dense_taint_results = HashMap::<*const TaintResultRegistration, u32>::new();
+        let mut imported_taint_results = Vec::new();
+        for taint_ref in requested_taint_results {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(QueryAnalysisContextError::Cancelled);
+            }
+            if taint_by_ref.contains_key(taint_ref) {
+                continue;
+            }
+            let registration = taint_registrations.get(taint_ref).ok_or_else(|| {
+                QueryAnalysisContextError::UnresolvedTaintResultReference {
+                    taint_ref: taint_ref.clone(),
+                }
+            })?;
+            let pointer = Arc::as_ptr(registration);
+            let slot = match dense_taint_results.get(&pointer).copied() {
+                Some(slot) => slot,
+                None => {
+                    validate_taint_registration(
+                        workspace,
+                        workspace_generation,
+                        registration,
+                        &mut validation_budget,
+                        cancellation,
+                    )
+                    .map_err(taint_registration_error)?;
+                    let slot = u32::try_from(imported_taint_results.len())
+                        .map_err(|_| QueryAnalysisContextError::TooManyResolvedTaintResults)?;
+                    imported_taint_results.push(Arc::clone(registration));
+                    dense_taint_results.insert(pointer, slot);
+                    slot
+                }
+            };
+            taint_by_ref.insert(
+                taint_ref.clone(),
+                TaintResultHandle {
+                    context_generation: generation,
+                    slot,
+                },
+            );
+        }
         Ok(Self {
             generation,
             workspace_generation,
@@ -1301,6 +1837,8 @@ impl QueryAnalysisContext {
             registrations: imported.into_boxed_slice(),
             value_flow_by_ref,
             value_flow_registrations: imported_value_flows.into_boxed_slice(),
+            taint_by_ref,
+            taint_registrations: imported_taint_results.into_boxed_slice(),
             summary_lease,
         })
     }
@@ -1371,6 +1909,38 @@ impl QueryAnalysisContext {
             return Err(QueryAnalysisContextError::ValueFlowRootMismatch);
         }
         Ok(registration)
+    }
+
+    pub fn taint_result_handle(&self, taint_ref: &TaintResultRef) -> Option<TaintResultHandle> {
+        self.taint_by_ref.get(taint_ref).copied()
+    }
+
+    pub fn resolve_taint_result(
+        &self,
+        workspace_generation: u64,
+        expected_root: &ProcedureHandle,
+        handle: TaintResultHandle,
+    ) -> Result<&ProductionTaintAnalysisResult, QueryAnalysisContextError> {
+        if handle.context_generation != self.generation {
+            return Err(QueryAnalysisContextError::StaleTaintResultHandle);
+        }
+        if workspace_generation != self.workspace_generation {
+            return Err(QueryAnalysisContextError::WorkspaceGenerationMismatch {
+                registered: self.workspace_generation,
+                current: workspace_generation,
+            });
+        }
+        let registration = self
+            .taint_registrations
+            .get(handle.slot as usize)
+            .ok_or(QueryAnalysisContextError::StaleTaintResultHandle)?;
+        let result = registration
+            .result_for_root(expected_root)
+            .ok_or(QueryAnalysisContextError::TaintResultRootMismatch)?;
+        if !result.plan_report_match() {
+            return Err(QueryAnalysisContextError::TaintPlanReportMismatch);
+        }
+        Ok(result)
     }
 }
 
@@ -1475,12 +2045,51 @@ fn value_flow_registration_error(error: QueryAnalysisContextError) -> QueryAnaly
     }
 }
 
+fn validate_taint_registration(
+    workspace: &WorkspaceAnalyzer,
+    workspace_generation: u64,
+    registration: &TaintResultRegistration,
+    validation_budget: &mut QueryAnalysisValidationBudget,
+    cancellation: Option<&CancellationToken>,
+) -> Result<(), QueryAnalysisContextError> {
+    if registration.workspace_generation() != workspace_generation {
+        return Err(QueryAnalysisContextError::WorkspaceGenerationMismatch {
+            registered: registration.workspace_generation(),
+            current: workspace_generation,
+        });
+    }
+    if registration
+        .results()
+        .iter()
+        .any(|result| !result.plan_report_match())
+    {
+        return Err(QueryAnalysisContextError::TaintPlanReportMismatch);
+    }
+    validate_artifact_keys(
+        workspace,
+        registration.artifact_keys(),
+        validation_budget,
+        cancellation,
+    )
+}
+
+fn taint_registration_error(error: QueryAnalysisContextError) -> QueryAnalysisContextError {
+    match error {
+        QueryAnalysisContextError::Cancelled
+        | QueryAnalysisContextError::ValidationBudgetExceeded { .. } => error,
+        _ => QueryAnalysisContextError::TaintRegistrationInvalid {
+            detail: Box::new(error),
+        },
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryAnalysisContextError {
     GenerationExhausted,
     Cancelled,
     TooManyResolvedProtocols,
     TooManyResolvedValueFlowPlans,
+    TooManyResolvedTaintResults,
     ValidationBudgetExceeded {
         resource: &'static str,
         maximum: usize,
@@ -1490,6 +2099,9 @@ pub enum QueryAnalysisContextError {
     },
     UnresolvedValueFlowPlanReference {
         plan_ref: ValueFlowPlanRef,
+    },
+    UnresolvedTaintResultReference {
+        taint_ref: TaintResultRef,
     },
     WorkspaceGenerationMismatch {
         registered: u64,
@@ -1509,10 +2121,16 @@ pub enum QueryAnalysisContextError {
     ValueFlowRegistrationInvalid {
         detail: Box<QueryAnalysisContextError>,
     },
+    TaintRegistrationInvalid {
+        detail: Box<QueryAnalysisContextError>,
+    },
     AnalysisRootMismatch,
     StaleHandle,
     ValueFlowRootMismatch,
     StaleValueFlowPlanHandle,
+    TaintResultRootMismatch,
+    TaintPlanReportMismatch,
+    StaleTaintResultHandle,
 }
 
 impl fmt::Display for QueryAnalysisContextError {
@@ -1530,6 +2148,9 @@ impl fmt::Display for QueryAnalysisContextError {
             Self::TooManyResolvedValueFlowPlans => {
                 formatter.write_str("query resolved too many value-flow plans for dense handles")
             }
+            Self::TooManyResolvedTaintResults => {
+                formatter.write_str("query resolved too many taint results for dense handles")
+            }
             Self::ValidationBudgetExceeded { resource, maximum } => {
                 write!(
                     formatter,
@@ -1545,6 +2166,10 @@ impl fmt::Display for QueryAnalysisContextError {
             Self::UnresolvedValueFlowPlanReference { plan_ref } => write!(
                 formatter,
                 "value-flow plan reference `{plan_ref}` is not registered"
+            ),
+            Self::UnresolvedTaintResultReference { taint_ref } => write!(
+                formatter,
+                "taint result reference `{taint_ref}` is not registered"
             ),
             Self::WorkspaceGenerationMismatch {
                 registered,
@@ -1575,6 +2200,9 @@ impl fmt::Display for QueryAnalysisContextError {
             Self::ValueFlowRegistrationInvalid { detail } => {
                 write!(formatter, "invalid value-flow registration: {detail}")
             }
+            Self::TaintRegistrationInvalid { detail } => {
+                write!(formatter, "invalid taint result registration: {detail}")
+            }
             Self::AnalysisRootMismatch => {
                 formatter.write_str("typestate query procedure is not the registered analysis root")
             }
@@ -1583,6 +2211,15 @@ impl fmt::Display for QueryAnalysisContextError {
                 .write_str("value-flow query procedure is not the registered analysis root"),
             Self::StaleValueFlowPlanHandle => {
                 formatter.write_str("value-flow plan handle belongs to another context")
+            }
+            Self::TaintResultRootMismatch => {
+                formatter.write_str("taint query procedure is not a registered analysis root")
+            }
+            Self::TaintPlanReportMismatch => {
+                formatter.write_str("taint result report does not belong to its analysis plan")
+            }
+            Self::StaleTaintResultHandle => {
+                formatter.write_str("taint result handle belongs to another context")
             }
         }
     }

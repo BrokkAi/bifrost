@@ -255,3 +255,12 @@ void test("highlights schema-v6 value-flow forms and plan references", async () 
   assertScoped(tokens, "value-flow", "support.function.wrapper.bifrost-rql");
   assertScoped(tokens, ":plan-ref", "variable.parameter.role.bifrost-rql");
 });
+
+void test("highlights schema-v7 taint forms and retained-result references", async () => {
+  const tokens = tokenizeGrammar(
+    await grammar(),
+    '(taint :taint-ref "request:http-to-database" (procedure-of (function)))'
+  );
+  assertScoped(tokens, "taint", "support.function.wrapper.bifrost-rql");
+  assertScoped(tokens, ":taint-ref", "variable.parameter.role.bifrost-rql");
+});
