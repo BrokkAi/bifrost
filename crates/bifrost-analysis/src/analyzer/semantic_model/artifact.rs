@@ -13,7 +13,7 @@ use std::io::{Cursor, Read};
 const MANIFEST_HASH_DOMAIN: &[u8] = b"bifrost.semantic-model.manifest.v1";
 const SEMANTIC_HASH_DOMAIN: &[u8] = b"bifrost.semantic-model.shard.semantic.v1";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PayloadKind {
     DeclarationFacts,
@@ -104,6 +104,22 @@ impl CompiledShard {
 
     pub fn payload(&self) -> &CompiledPayload {
         &self.payload
+    }
+
+    pub fn compatibility(&self) -> &Compatibility {
+        &self.compatibility
+    }
+
+    pub fn activation(&self) -> &[ActivationSelector] {
+        &self.activation
+    }
+
+    pub fn completeness(&self) -> Completeness {
+        self.completeness
+    }
+
+    pub fn safety(&self) -> &Safety {
+        &self.safety
     }
 }
 

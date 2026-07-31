@@ -17,10 +17,10 @@ This issue stops at selection and matching. Issue #1148 will project matched fac
 - [x] (2026-07-31 10:22Z) Verified the attached issue branch, clean worktree, current `origin/master`, live issue #1147, and completed prerequisites #1145, #1146, and #1149.
 - [x] (2026-07-31 10:22Z) Read `.agents/PLANS.md`, the #1145/#1146 plans, semantic-model schema/compiler/catalog/store code, snapshot cache patterns from #920, and the exact issue acceptance criteria.
 - [x] (2026-07-31 10:22Z) Resolved the activation, identity, precedence, matching, cancellation, persistence, and validation design in this initial ExecPlan.
-- [ ] Milestone 1: implement strict activation evidence, catalog candidate evaluation, deterministic selection, explanations, and semantic active-set hashing.
-- [ ] Milestone 2: build bounded immutable declaration and generator-rule exact-key indexes with conflict-preserving query outcomes.
-- [ ] Milestone 3: integrate the runtime with analyzer-snapshot caches, complete-value single flight, active-set reconciliation/publication, cancellation, budgets, and stale-generation protection.
-- [ ] Milestone 4: update public documentation, add observability and no-SQL proof, run focused and repository validation, run policy checks, review the complete diff, and close out the plan.
+- [x] (2026-07-31 13:42Z) Milestone 1: implemented strict activation evidence, bounded catalog candidate evaluation, deterministic selection, explanations, controls, and semantic active-set hashing.
+- [x] (2026-07-31 13:42Z) Milestone 2: built bounded immutable declaration and generator-rule exact-key indexes with conflict-preserving query outcomes and allocation-free key probes.
+- [x] (2026-07-31 13:42Z) Milestone 3: integrated the runtime with analyzer-snapshot caches, complete-value single flight, active-set reconciliation/publication, cancellation, budgets, and stale-generation protection.
+- [ ] Milestone 4: documentation, focused tests, formatting, strict library Clippy, and diff review are complete. The repository-wide policy run is unreliable because nine rules were cancelled after the nested-loop rule scanned 1,201,813 fact nodes, and all-targets Clippy also reports three pre-existing `unnecessary_to_owned` findings in `workspace_graph.rs`.
 
 ## Surprises & Discoveries
 
@@ -38,6 +38,12 @@ This issue stops at selection and matching. Issue #1148 will project matched fac
 
 - Observation: Initial broad Bifrost MCP discovery was unreliable in this worktree.
   Evidence: a parallel `list_files`/`get_summaries`/`search_symbols` request cancelled after about 56 seconds with request-wide budget errors; later exact `get_symbol_sources` requests remained pending beyond 90 seconds and beyond 20 seconds respectively until terminated. Narrow warm symbol searches and source reads often completed in under four seconds. Repository issue search found no open issue matching these exact symptoms; preserve the minimized draft in `Artifacts and Notes` for user-confirmed filing.
+
+- Observation: The required whole-workspace policy gate did not produce a trustworthy result.
+  Evidence: `run_policy` for `bifrost.code-smells` on 2026-07-31 returned `status: unreliable` and `exit_status: 2`. Three existing dynamic-evaluation findings completed, then the nested-loop rule examined 1,201,813 fact nodes and nine remaining performance rules were cancelled. No finding points at the issue #1147 files.
+
+- Observation: Strict all-targets Clippy currently has unrelated baseline failures.
+  Evidence: after fixing the new runtime's `filter_map_bool_then` finding, the isolated `cargo clippy -p brokk-bifrost-analysis --all-targets -- -D warnings` run reported three `unnecessary_to_owned` findings in pre-existing `analyzer/usages/workspace_graph.rs` test fixtures. The isolated library-only strict Clippy gate passed, and a second warmed library-only strict gate passed after the final activation changes.
 
 ## Decision Log
 
@@ -75,7 +81,7 @@ This issue stops at selection and matching. Issue #1148 will project matched fac
 
 ## Outcomes & Retrospective
 
-Planning is complete. Implementation has not started. The plan narrows #1147 to an activation/runtime layer that is independently observable and leaves overlay integration, ecosystem discovery, authoring UX, and release performance gates with their owning issues.
+The strict activation runtime, immutable exact matcher, snapshot-owned cache, active-set publication, public documentation, and focused validation are implemented. Nine runtime integration tests cover strict near misses and explanations, controls, semantic hash stability, every schema-v1 trigger, allocation-free exact lookups after catalog drop, equal-rank conflict preservation, source shadowing, bounded failure, and warm `Arc` reuse with store publication. Existing semantic-model/compiler/docs tests (30), catalog tests (22), and complete-value-cache unit tests (8) pass. The implementation-specific strict Clippy gate passes. Final repository-wide validation remains explicitly incomplete because the policy runner returned an unreliable report and unrelated all-targets Clippy baseline findings remain outside this issue.
 
 ## Context and Orientation
 
@@ -290,3 +296,5 @@ Use `SemanticPackCatalog`, `AnalyzerStore`, `IAnalyzer::snapshot_source_generati
 `SemanticModelRuntimeLimits` must bound catalog evaluations, unique candidates, loaded shards, decoded records, index entries, working bytes, retained bytes, and explanation records. Cancellation polling must be based on deterministic work batches, not wall-clock sleeps. Public diagnostics include the complete bounded collections and suppressed counts when limits truncate reporting.
 
 Plan revision note (2026-07-31 10:22Z): Created the initial self-contained plan after live dependency verification and source/history discovery. It separates catalog ownership from semantic runtime identity, requires strict row-based activation evidence, resolves deterministic precedence and conflicts, reuses snapshot-owned complete-value single flight, confines schema-v1 matching to exact indexes, and defines four independently verifiable implementation milestones.
+
+Plan revision note (2026-07-31 13:42Z): Implemented milestones 1-3 and the code/documentation portions of milestone 4. Recorded 9 new runtime tests, 60 passing compatibility tests, two passing strict library Clippy runs, the unrelated all-targets Clippy baseline failures, and the required policy run's unreliable cancellation result. Kept the MCP responsiveness follow-up as a user-confirmed draft rather than filing it automatically.
