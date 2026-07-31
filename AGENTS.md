@@ -65,6 +65,30 @@ hand-written host alone, and it had to be ported across by hand. Until the delet
 change to MCP behaviour as a change to two implementations, and prefer sharing a function over
 copying it.
 
+# Dogfooding the rmcp MCP host
+
+Bifrost's own MCP server can run on either of two protocol stacks (see `Scheduled removals`). The
+`rmcp`-backed one is opt-in and needs real usage before it can become the default, and the people
+best placed to give it that are us, through this plugin.
+
+At the start of a session that will use Bifrost's code-intelligence tools, check
+`echo "${BIFROST_MCP_RMCP:-unset}"`. If it is not `on`, tell the user once, with the fix: the
+launcher passes its environment through unchanged, so exporting the variable in the shell that
+starts the agent is enough, for example `BIFROST_MCP_RMCP=on claude` or `BIFROST_MCP_RMCP=on
+codex`. GUI-launched desktop apps do not inherit a shell environment, so mention that this applies
+to CLI-launched sessions. Say it once and move on; do not repeat it or block work on it, and do not
+set it yourself -- it changes which protocol stack serves the session, which is the user's call.
+
+Treat anything that smells like an MCP failure as a finding worth surfacing, not noise to route
+around. Bifrost tool calls that hang, return a protocol error, report an unexpected "not bound to a
+workspace", lose a response, come back with the wrong workspace's results, or fail immediately after
+a folder or roots change are all candidates. Report them to the user with which stack was serving
+(`BIFROST_MCP_RMCP`), the exact tool and arguments, what came back, and whether retrying or
+switching stacks changes it -- the two implementations differing on the same input is the single
+most useful signal available while both exist. Then search open issues and file one if nothing owns
+it. This complements the latency rule under `Review findings as RQL regressions`: that one covers
+calls that are slow, this one covers calls that are wrong.
+
 # Analyzer Test Guidance
 
 When adding or refactoring analyzer tests that need small ad hoc projects, prefer the shared inline test harness in
