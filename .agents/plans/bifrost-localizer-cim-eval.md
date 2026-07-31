@@ -5,8 +5,8 @@ This ExecPlan is a living document. The sections `Progress`, `Surprises & Discov
 
 This document must be maintained in accordance with `.agents/PLANS.md`. It describes the first
 delivery of a larger localizer evaluation: implement and evaluate the smaller Granite R2
-fine-tune, then stop and report. The dw10 model is deliberately deferred until the user reviews
-the Granite result and gives further direction.
+fine-tune, then stop and report. The dw10 evaluation remains deferred, but its repository
+indexes are now being prepared in parallel at the user's direction.
 
 ## Purpose / Big Picture
 
@@ -28,7 +28,7 @@ three seeds. Keep every evaluation and scoring phase pinned at 30 concurrent cel
 the 60-core host for contention with the user's other workload. When Granite scoring and
 analysis are complete, stop. Report the commits and behavior changed in Bifrost, Anvil, and
 brokkbench, all validation performed, the baseline comparison, and the Granite results. Do not
-begin dw10 implementation or evaluation in this delivery.
+begin dw10 evaluation in this delivery; the user separately authorized prewarming its indexes.
 
 The observable outcomes are:
 
@@ -105,10 +105,17 @@ The observable outcomes are:
   serial output order. The 15 repository `READY.json` records cover all 91 tasks. After resuming
   the partially warm Trino database, the remaining campaign completed in 366.4 seconds; the
   active CPU stages used roughly 30-45 cores instead of one.
+- [x] (2026-07-31 12:52Z) Started a replacement seed-0 baseline with GPT-5.6 Luna at maximum
+  reasoning effort as persistent user service `cimeval-r6-baseline-max.service`, still capped
+  at 30 concurrent cells and using inline scoring.
+- [ ] (2026-07-31 12:58Z) Prewarm dw10 serially on the A4000. The persistent sidecar and
+  prewarm services are `cimeval-dw10-sidecar.service` and `cimeval-dw10-prewarm.service`.
+  dw10 uses the separate per-repository `.bifrost/cache-dw10` namespace so changing embedding
+  fingerprints cannot invalidate the completed `.bifrost/cache` Granite databases.
 - [ ] Run the three Granite retrieval arms over seeds 0, 1, and 2 at concurrency 30.
 - [ ] Score, leak-audit, analyze, and report the baseline and Granite results.
-- [ ] Run final validation, update this plan's retrospective, commit the report, and stop before
-  dw10.
+- [ ] Run final validation, update this plan's retrospective, commit the Granite report, and
+  stop before running any dw10 evaluation arms.
 
 ## Surprises & Discoveries
 
@@ -450,15 +457,23 @@ The observable outcomes are:
 - Decision: stop after the Granite report and inventory changes across Bifrost, Anvil, and
   brokkbench.
   Rationale: the user wants to review the first model and implementation before authorizing the
-  dw10 phase.
+  dw10 evaluation phase. On 2026-07-31 the user separately authorized dw10 prewarming, which
+  does not authorize its evaluation arms.
   Date/Author: 2026-07-31, user.
+
+- Decision: store dw10 and Granite embeddings in distinct per-repository cache namespaces.
+  Rationale: a Bifrost database is safely shared across branches and worktrees, but its semantic
+  tables intentionally support only one embedding fingerprint at a time. Reusing Granite's
+  database for dw10 would wipe the completed Granite vectors during compatibility checking.
+  Date/Author: 2026-07-31, Codex.
 
 ## Outcomes & Retrospective
 
 No implementation or evaluation outcome exists yet. At completion, record the three repository
 commit IDs, exact files/behavior changed, validation evidence, selected provider, concurrency
 observations, baseline sanity comparison, Granite arm results, exclusions, and remaining work.
-The final entry must explicitly state that dw10 was not started.
+The final entry must distinguish the authorized dw10 prewarm from the still-deferred dw10
+evaluation.
 
 ## Context and Orientation
 
