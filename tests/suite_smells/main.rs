@@ -19,6 +19,7 @@ mod exception_handling_smells;
 mod go_dead_code_smells;
 mod go_rust_ruby_structural_clone_smells;
 mod go_structural_clone_smells;
+mod java_comment_density;
 mod java_dead_code_smells;
 mod java_structural_clone_smells;
 mod java_test_assertion_smells;
