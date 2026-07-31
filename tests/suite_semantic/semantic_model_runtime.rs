@@ -12,6 +12,8 @@ const DECLARATIONS_JSON: &[u8] =
     include_bytes!("../fixtures/semantic-model-packs/declarations-v1.json");
 const RULES_JSON: &[u8] =
     include_bytes!("../fixtures/semantic-model-packs/generator-rules-v1.json");
+const PROCEDURES_JSON: &[u8] =
+    include_bytes!("../fixtures/semantic-model-packs/procedure-summaries-v1.json");
 
 fn compile(source: &[u8]) -> CompiledSemanticModelPack {
     compile_source(SourceFormat::Json, source, &CompilerOptions::default())
@@ -44,6 +46,49 @@ fn request(evidence: Vec<SemanticModelActivationEvidence>) -> SemanticModelActiv
         controls: Vec::new(),
         limits: SemanticModelRuntimeLimits::default(),
     }
+}
+
+fn procedure_evidence() -> SemanticModelActivationEvidence {
+    SemanticModelActivationEvidence {
+        language: "java".to_owned(),
+        ecosystem: "maven".to_owned(),
+        package: Some(CatalogCoordinate {
+            name: "com.acme:flows".to_owned(),
+            version: Some(Version::parse("1.5.0").unwrap()),
+        }),
+        module: None,
+        toolchain: Some(CatalogCoordinate {
+            name: "jdk".to_owned(),
+            version: Some(Version::parse("17.0.1").unwrap()),
+        }),
+        target: Some("jvm".to_owned()),
+        configuration: Some("release".to_owned()),
+        artifact_sha256: None,
+    }
+}
+
+fn procedure_request() -> SemanticModelActivationRequest {
+    let mut activation = request(vec![procedure_evidence()]);
+    activation.controls.push(SemanticModelActivationControl {
+        scope: SemanticModelControlScope::Workspace,
+        action: SemanticModelControlAction::Enable,
+        selector: SemanticModelPackSelector {
+            pack_id: "acme.procedure-summaries".to_owned(),
+            version: None,
+            manifest_digest: None,
+        },
+    });
+    activation
+}
+
+fn wrapper_target() -> ProcedureSummaryTargetKey<'static> {
+    ProcedureSummaryTargetKey::new(
+        "java",
+        "com/acme/Flows.class",
+        "wrapper(java.lang.String)",
+        false,
+        1,
+    )
 }
 
 fn ready(outcome: SemanticModelResolutionOutcome) -> ResolvedActiveSemanticModels {
@@ -381,6 +426,229 @@ fn matcher_indexes_every_schema_v1_rule_trigger_without_fallback_scans() {
             .candidates_examined,
         0
     );
+}
+
+#[test]
+fn procedure_summary_lookup_is_exact_in_memory_and_retains_owning_payload() {
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let pack = compile(PROCEDURES_JSON);
+    catalog
+        .register_session_pack(
+            &pack,
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: "procedures".to_owned(),
+            },
+        )
+        .unwrap();
+    let active = ready(resolve_active_semantic_models(
+        &catalog,
+        &procedure_request(),
+        &CancellationToken::default(),
+    ));
+    let lookup_counters = {
+        let accounting = catalog.accounting().unwrap();
+        (accounting.lookup_hits, accounting.lookup_misses)
+    };
+    assert_eq!(lookup_counters, (1, 0), "only activation loads the catalog");
+    // No catalog handle survives this point, so every target and callee lookup below is in memory.
+    drop(catalog);
+
+    let matched = active.procedure_summaries_for(wrapper_target());
+    assert_eq!(matched.disposition, SemanticModelMatchDisposition::Unique);
+    assert_eq!(matched.candidates_examined, 1);
+    assert_eq!(matched.fallback_candidates_examined, 0);
+    let selected = matched.records[0];
+    assert_eq!(selected.record.id, "summary.wrapper");
+    assert_eq!(selected.shard.source_id, "procedures");
+    assert_eq!(selected.payload.len(), 2);
+    let callee = selected
+        .record
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            CompiledSummaryEffect::Call { callee, .. } => Some(callee.as_str()),
+            _ => None,
+        })
+        .expect("wrapper fixture must reference an internal callee");
+    assert_eq!(
+        selected
+            .summary_with_id(callee)
+            .expect("internal callee must resolve in the owning compiled payload")
+            .target
+            .symbol,
+        "helper(java.lang.String)"
+    );
+    assert!(selected.summary_with_id("summary.missing").is_none());
+
+    let baseline = wrapper_target();
+    for near_miss in [
+        ProcedureSummaryTargetKey {
+            language: "kotlin",
+            ..baseline
+        },
+        ProcedureSummaryTargetKey {
+            path: "com/acme/Other.class",
+            ..baseline
+        },
+        ProcedureSummaryTargetKey {
+            symbol: "other(java.lang.String)",
+            ..baseline
+        },
+        ProcedureSummaryTargetKey {
+            has_receiver: true,
+            ..baseline
+        },
+        ProcedureSummaryTargetKey {
+            parameter_count: 2,
+            ..baseline
+        },
+    ] {
+        let missed = active.procedure_summaries_for(near_miss);
+        assert_eq!(missed.disposition, SemanticModelMatchDisposition::Empty);
+        assert_eq!(missed.candidates_examined, 0);
+        assert_eq!(missed.fallback_candidates_examined, 0);
+    }
+}
+
+#[test]
+fn procedure_summary_conflicts_and_source_shadowing_are_deterministic() {
+    let mut first_source: Value = serde_json::from_slice(PROCEDURES_JSON).unwrap();
+    first_source["safety"]["review_required"] = Value::Bool(false);
+    let first = compile(&serde_json::to_vec(&first_source).unwrap());
+    let mut second_source = first_source;
+    second_source["pack_id"] = Value::String("acme.procedure-summaries.alternate".to_owned());
+    second_source["shards"][0]["payload"]["summaries"][1]["completeness"] =
+        Value::String("partial".to_owned());
+    let second = compile(&serde_json::to_vec(&second_source).unwrap());
+
+    let conflicting_catalog =
+        SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    for (pack, source_id) in [(&first, "first"), (&second, "second")] {
+        conflicting_catalog
+            .register_session_pack(
+                pack,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::Embedded,
+                    source_id: source_id.to_owned(),
+                },
+            )
+            .unwrap();
+    }
+    let conflict = ready(resolve_active_semantic_models(
+        &conflicting_catalog,
+        &request(vec![procedure_evidence()]),
+        &CancellationToken::default(),
+    ));
+    let matched = conflict.procedure_summaries_for(wrapper_target());
+    assert_eq!(matched.disposition, SemanticModelMatchDisposition::Conflict);
+    assert_eq!(matched.candidates_examined, 2);
+    assert_eq!(matched.fallback_candidates_examined, 0);
+    assert_eq!(
+        matched
+            .records
+            .iter()
+            .map(|selected| selected.record.model_id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "acme.procedure-summaries#summary.wrapper",
+            "acme.procedure-summaries.alternate#summary.wrapper",
+        ]
+    );
+
+    let shadowing_catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    shadowing_catalog
+        .register_session_pack(
+            &first,
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: "shipped".to_owned(),
+            },
+        )
+        .unwrap();
+    shadowing_catalog
+        .register_session_pack(
+            &second,
+            &SessionPackSource {
+                kind: SessionPackSourceKind::EphemeralWorkspace,
+                source_id: "workspace".to_owned(),
+            },
+        )
+        .unwrap();
+    let shadowed = ready(resolve_active_semantic_models(
+        &shadowing_catalog,
+        &request(vec![procedure_evidence()]),
+        &CancellationToken::default(),
+    ));
+    let matched = shadowed.procedure_summaries_for(wrapper_target());
+    assert_eq!(matched.disposition, SemanticModelMatchDisposition::Unique);
+    assert_eq!(matched.candidates_examined, 2);
+    assert_eq!(
+        matched.records[0].record.model_id,
+        "acme.procedure-summaries.alternate#summary.wrapper"
+    );
+    assert_eq!(matched.records[0].shard.source_id, "workspace");
+}
+
+#[test]
+fn procedure_summary_activation_observes_record_index_and_byte_budgets() {
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let pack = compile(PROCEDURES_JSON);
+    catalog
+        .register_session_pack(
+            &pack,
+            &SessionPackSource {
+                kind: SessionPackSourceKind::Embedded,
+                source_id: "procedures".to_owned(),
+            },
+        )
+        .unwrap();
+    let baseline = ready(resolve_active_semantic_models(
+        &catalog,
+        &procedure_request(),
+        &CancellationToken::default(),
+    ));
+    assert_eq!(baseline.activation_report().loaded_records, 2);
+    assert_eq!(baseline.activation_report().index_entries, 2);
+    assert!(baseline.activation_report().working_bytes > 0);
+    assert!(baseline.retained_bytes() > baseline.activation_report().working_bytes);
+
+    for (reason, limit) in [
+        ("decoded shard budget exceeded", "records"),
+        ("index-entry budget exceeded", "index"),
+        ("working-byte budget exceeded", "working"),
+        ("retained-byte budget exceeded", "retained"),
+    ] {
+        let mut bounded = procedure_request();
+        match limit {
+            "records" => bounded.limits.max_records = 1,
+            "index" => bounded.limits.max_index_entries = 1,
+            "working" => {
+                bounded.limits.max_working_bytes = baseline.activation_report().working_bytes - 1
+            }
+            "retained" => bounded.limits.max_retained_bytes = baseline.retained_bytes() - 1,
+            _ => unreachable!(),
+        }
+        let SemanticModelResolutionOutcome::Unavailable(report) =
+            resolve_active_semantic_models(&catalog, &bounded, &CancellationToken::default())
+        else {
+            panic!("{limit} budget must fail explicitly");
+        };
+        assert!(
+            report
+                .explanations
+                .iter()
+                .any(|explanation| explanation.reason.contains(reason)),
+            "missing `{reason}` explanation: {report:#?}"
+        );
+    }
+
+    let cancelled = CancellationToken::default();
+    cancelled.cancel();
+    assert!(matches!(
+        resolve_active_semantic_models(&catalog, &procedure_request(), &cancelled),
+        SemanticModelResolutionOutcome::Cancelled(_)
+    ));
 }
 
 #[test]

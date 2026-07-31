@@ -7,8 +7,9 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ActivationSelector, CatalogCoordinate, CatalogMiss, CatalogPackSourceKind,
-    CompiledPackManifest, CompiledShard, GeneratorRule, MemberFact, PayloadKind, RelationFact,
-    RuleTrigger, SemanticPackCatalog, SemanticPackSelectorQuery, TypeFact,
+    CompiledPackManifest, CompiledProcedureSummary, CompiledShard, GeneratorRule, MemberFact,
+    PayloadKind, RelationFact, RuleTrigger, SemanticPackCatalog, SemanticPackSelectorQuery,
+    TypeFact,
 };
 use crate::CancellationToken;
 use crate::analyzer::IAnalyzer;
@@ -218,6 +219,20 @@ impl ResolvedActiveSemanticModels {
         self.rule_match(posting)
     }
 
+    pub fn procedure_summaries_for(
+        &self,
+        target: ProcedureSummaryTargetKey<'_>,
+    ) -> ProcedureSummaryMatch<'_> {
+        let posting = self
+            .indexes
+            .procedure_summaries_by_target
+            .get(target.language)
+            .and_then(|paths| paths.get(target.path))
+            .and_then(|symbols| symbols.get(target.symbol))
+            .and_then(|shapes| shapes.get(&(target.has_receiver, target.parameter_count)));
+        resolve_procedure_posting(&self.shards, posting)
+    }
+
     fn type_match(&self, posting: Option<&Vec<RecordAddress>>) -> SemanticModelMatch<'_, TypeFact> {
         resolve_posting(&self.shards, posting, |shard, record| {
             shard
@@ -279,6 +294,54 @@ pub struct SemanticModelMatch<'a, T> {
     pub fallback_candidates_examined: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProcedureSummaryTargetKey<'a> {
+    pub language: &'a str,
+    pub path: &'a str,
+    pub symbol: &'a str,
+    pub has_receiver: bool,
+    pub parameter_count: u32,
+}
+
+impl<'a> ProcedureSummaryTargetKey<'a> {
+    pub fn new(
+        language: &'a str,
+        path: &'a str,
+        symbol: &'a str,
+        has_receiver: bool,
+        parameter_count: u32,
+    ) -> Self {
+        Self {
+            language,
+            path,
+            symbol,
+            has_receiver,
+            parameter_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ActivatedProcedureSummary<'a> {
+    pub record: &'a CompiledProcedureSummary,
+    pub shard: &'a ActiveSemanticModelShard,
+    pub payload: &'a [CompiledProcedureSummary],
+}
+
+impl<'a> ActivatedProcedureSummary<'a> {
+    pub fn summary_with_id(&self, id: &str) -> Option<&'a CompiledProcedureSummary> {
+        self.payload.iter().find(|summary| summary.id == id)
+    }
+}
+
+#[derive(Debug)]
+pub struct ProcedureSummaryMatch<'a> {
+    pub records: Vec<ActivatedProcedureSummary<'a>>,
+    pub disposition: SemanticModelMatchDisposition,
+    pub candidates_examined: usize,
+    pub fallback_candidates_examined: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleTriggerKey<'a> {
     LanguageConstruct(&'a str),
@@ -295,6 +358,9 @@ struct RecordAddress {
     record: u32,
 }
 
+type ProcedureSummaryTargetPostings =
+    HashMap<String, HashMap<String, HashMap<String, HashMap<(bool, u32), Vec<RecordAddress>>>>>;
+
 #[derive(Debug, Default)]
 struct MatcherIndexes {
     types_by_id: HashMap<String, Vec<RecordAddress>>,
@@ -310,6 +376,7 @@ struct MatcherIndexes {
     rules_by_generator: HashMap<String, Vec<RecordAddress>>,
     rules_by_owner: HashMap<String, Vec<RecordAddress>>,
     rules_by_call: HashMap<String, HashMap<String, Vec<RecordAddress>>>,
+    procedure_summaries_by_target: ProcedureSummaryTargetPostings,
 }
 
 impl MatcherIndexes {
@@ -333,6 +400,7 @@ impl MatcherIndexes {
             rules_by_generator: map_with_capacity(active.len()),
             rules_by_owner: map_with_capacity(active.len()),
             rules_by_call: map_with_capacity(active.len()),
+            procedure_summaries_by_target: map_with_capacity(active.len()),
         };
         let mut entries = 0usize;
         let mut working_bytes = 0u64;
@@ -441,6 +509,37 @@ impl MatcherIndexes {
                     insert_rule_trigger(
                         &mut indexes,
                         &rule.trigger,
+                        address,
+                        &mut entries,
+                        &mut working_bytes,
+                        limits,
+                    )?;
+                }
+            }
+            if let Some(summaries) = selection.active.shard.payload().procedure_summaries() {
+                for (record_index, summary) in summaries.iter().enumerate() {
+                    poll_matcher_cancellation(cancellation, records_visited)?;
+                    records_visited += 1;
+                    let address = record_address(shard, record_index)?;
+                    let key_bytes = selection
+                        .active
+                        .manifest
+                        .language
+                        .len()
+                        .saturating_add(summary.target.path.len())
+                        .saturating_add(summary.target.symbol.len())
+                        .saturating_add(size_of::<bool>())
+                        .saturating_add(size_of::<u32>());
+                    let paths = indexes
+                        .procedure_summaries_by_target
+                        .entry(selection.active.manifest.language.clone())
+                        .or_default();
+                    let symbols = paths.entry(summary.target.path.clone()).or_default();
+                    let shapes = symbols.entry(summary.target.symbol.clone()).or_default();
+                    insert_posting(
+                        shapes,
+                        (summary.target.has_receiver, summary.target.parameter_count),
+                        key_bytes,
                         address,
                         &mut entries,
                         &mut working_bytes,
@@ -623,6 +722,64 @@ where
         }
     }
     SemanticModelMatch {
+        disposition: if records.len() == 1 {
+            SemanticModelMatchDisposition::Unique
+        } else {
+            SemanticModelMatchDisposition::Conflict
+        },
+        records,
+        candidates_examined: posting.len(),
+        fallback_candidates_examined: 0,
+    }
+}
+
+fn resolve_procedure_posting<'a>(
+    shards: &'a [ActiveSemanticModelShard],
+    posting: Option<&Vec<RecordAddress>>,
+) -> ProcedureSummaryMatch<'a> {
+    let Some(posting) = posting else {
+        return ProcedureSummaryMatch {
+            records: Vec::new(),
+            disposition: SemanticModelMatchDisposition::Empty,
+            candidates_examined: 0,
+            fallback_candidates_examined: 0,
+        };
+    };
+    let best_rank = posting
+        .iter()
+        .map(|address| {
+            let shard = &shards[address.shard as usize];
+            (shard.evidence_rank, shard.source_rank)
+        })
+        .max()
+        .expect("non-empty procedure-summary posting");
+    let mut records = Vec::<ActivatedProcedureSummary<'a>>::new();
+    for address in posting {
+        let shard = &shards[address.shard as usize];
+        if (shard.evidence_rank, shard.source_rank) != best_rank {
+            continue;
+        }
+        let payload = shard
+            .shard
+            .payload()
+            .procedure_summaries()
+            .expect("procedure-summary index address must resolve to its payload kind");
+        let record = payload
+            .get(address.record as usize)
+            .expect("procedure-summary index address must resolve to its record");
+        if records
+            .iter()
+            .any(|candidate| candidate.record == record && candidate.payload == payload)
+        {
+            continue;
+        }
+        records.push(ActivatedProcedureSummary {
+            record,
+            shard,
+            payload,
+        });
+    }
+    ProcedureSummaryMatch {
         disposition: if records.len() == 1 {
             SemanticModelMatchDisposition::Unique
         } else {
