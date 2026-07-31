@@ -56,10 +56,11 @@ existing owner.
 
 The final Scala code head `f5d7ba67` passed formatting, strict
 all-target/all-feature Clippy, focused regressions, and the featureless Cargo
-suite's substantive tests. The documented one-millisecond C# wall-clock-budget
-test exceeded its budget only under loaded full-suite execution and passed in
-isolation. Earlier fixing heads received the corresponding local gates recorded
-in the ExecPlan and language summaries. Cargo and Bifrost used normal
+suite's substantive tests. On the final merged-head gate, two C# wall-clock-
+budget tests exhausted their time budget only under the loaded 1,443-test usage
+suite; both passed immediately when rerun exactly and serially. Earlier fixing
+heads received the corresponding local gates recorded in the ExecPlan and
+language summaries. Cargo and Bifrost used normal
 repository storage outside the sandbox at niceness 10; no Cargo target was
 redirected into `/tmp`.
 
