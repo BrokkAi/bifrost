@@ -25,9 +25,10 @@ You can see it working three ways. First, the existing wire-level integration su
 - [x] (2026-07-30 16:20Z) Milestone 1 complete and checkpointed as `07238afb`: rmcp 3.0.1 and a Tokio runtime boundary are in, `crates/bifrost-mcp/src/rmcp_host.rs` serves identity, ping, tools/list, resources/list, resources/read and the benchmark profile-boundary method, and `crates/bifrost-mcp/src/analyzer_pool.rs` holds the awaiting, cancellation-aware four-slot pool. Verified by hand over real stdio pipes for both `2025-11-25` and stateless `2026-07-28` sessions.
 - [x] (2026-07-30 17:35Z) Milestones 2 through 4 implemented and checkpointed as `06e96fd2` and its follow-up: tools/call executes on the blocking pool behind the analyzer pool with the cancellation bridge, workspace authorization covers explicit roots plus legacy client roots plus Codex sandbox metadata, and MRTR rootless activation is in place for `2026-07-28`. All 24 wire contract tests pass against `BIFROST_MCP_RMCP=on` on a quiet machine.
 - [x] (2026-07-30 20:10Z) Roots ordering resolved end to end. The exchange moved into the request that needs it (owner's decision), and `crates/bifrost-mcp/src/ordered_transport.rs` restores wire-order observation of revocations through the transport seam. 15 consecutive clean full-suite runs; crate clippy with `--all-targets` clean. Milestones 2 through 4 are complete.
-- [ ] Milestone 5: discovery, `resultType`, and cache hints (discovery and `resultType` already verified working with no Bifrost code; only the cache-hint values remain).
-- [ ] Milestone 6: delete the hand-written protocol stack and flip every entry point.
-- [ ] Milestone 7: full validation, benchmark gate, adapter exercise, and documentation.
+- [x] (2026-07-31) Milestone 5 complete as `fb149810`: discovery and `resultType` needed no Bifrost code, cache hints added with conservative scopes, and all three now have wire tests asserting both presence for `2026-07-28` and absence for `2025-11-25`. The absence half matters: `rmcp` strips `resultType` for a legacy peer but leaves the cache hints alone.
+- [x] (2026-07-31) Milestone 6 complete as `906debfb`, with a scope change the owner approved: the default flipped to `rmcp` but the hand-written stack was **kept** behind `BIFROST_MCP_RMCP=off` as a rollback lever rather than deleted. See the Decision Log.
+- [ ] Follow-up (not this issue): delete the switch, `mcp_common`'s protocol half, and the `McpHost` matrix in the contract suite together.
+- [ ] Milestone 7 in progress: documentation updated (`docs/src/content/docs/mcp.md` gained a Protocol Revisions section and the corrected rootless flow); adapters reviewed; benchmark gate outstanding.
 
 ## Surprises & Discoveries
 
@@ -111,13 +112,25 @@ You can see it working three ways. First, the existing wire-level integration su
   Rationale: The old host got preparation ordering for free from its single reader thread, and workspace-mutating tools got mutual exclusion the same way. Under `rmcp` every request is concurrent, so both properties have to become explicit. Making preparation the critical section preserves the old semantics exactly while still letting four analyzer executions overlap. A single lock with a stated order removes any possibility of a lock-order deadlock.
   Date/Author: 2026-07-30, David Baker Effendi (via Claude).
 
+- Decision: Milestone 6 flips the default to `rmcp` but keeps the hand-written host behind `BIFROST_MCP_RMCP=off` instead of deleting it. The switch changes character: it was a migration toggle defaulting to the old path and is now a rollback lever defaulting to the new one.
+  Rationale: the repository owner asked for it, and the reasoning holds -- `rmcp` 3.0 was days old when Bifrost adopted it, so an operator hitting a protocol regression against some client should be able to restore the previous implementation without waiting for a release. This does mean the branch does not literally satisfy issue #1328's "do not retain parallel hand-written MCP dispatch" criterion; it satisfies it on a stated schedule instead. The cost is real and was raised explicitly before the decision: while both hosts exist the Codex sandbox authorization boundary has two copies that must be fixed in lockstep, which is precisely how the pre-handshake bypass in `09e37dd1` happened. The mitigation is the `McpHost` matrix in the contract suite, which runs the rootless scenarios against both hosts so neither can rot silently.
+  Date/Author: 2026-07-31, David Baker Effendi (decision), Claude (implementation).
+
 - Decision: Keep the analyzer synchronous. Analyzer work runs on `tokio::task::spawn_blocking`, not by making `SearchToolsService` async.
   Rationale: The analyzer is CPU-bound and uses rayon internally; making it async would be a far larger and riskier change than this issue asks for, and issue #1328 explicitly says the integration needs "a Tokio runtime boundary without forcing analyzer internals to become async unnecessarily."
   Date/Author: 2026-07-30, David Baker Effendi (via Claude).
 
 ## Outcomes & Retrospective
 
-Not yet started. To be written at the end of each milestone and summarized at completion.
+Milestones 1 through 6 are complete; milestone 7 is partly done. `rmcp` serves every MCP session by default, both revisions pass wire-level contract coverage, and the hand-written stack survives only as an explicit rollback lever.
+
+What this migration actually cost, and what is worth carrying forward:
+
+The dangerous part was never the protocol translation. It was the security-relevant state that had to move with it. A guided review found an authorization bypass introduced by this work: `accepts_codex_sandbox_state` lost an `initialize_received` conjunct during the port, and because `rmcp` implements the stateless SEP-2575 lifecycle, a single first message could bind and index an arbitrary directory. The predicate was hand-copied from the old host, and the assertion that would have caught it had been rewritten in the same change. Two independent mistakes, each locally reasonable, that only combine into a hole. The fix was not to restore the missing conjunct but to make handshake state a phase that must be destructured to reach, so the same mistake becomes a compile error.
+
+The second lesson is that adding the missing tests found a bug the five reviewers did not. Writing the MRTR coverage exposed that a `2026-07-28` client activating over MRTR does not advertise the Roots capability, so it was bound from its own roots and then immediately refused for missing Codex metadata on the same call. No amount of reading found it; one test did.
+
+The third is that `rmcp` gives no ordering guarantee between handlers, and that this matters more than it sounds for anything security-relevant. Bifrost's revocation rule needed arrival order, which the old single-reader-thread host had for free. The recovery was not an upstream request but the one seam where order still exists: `Transport::receive`. That is worth remembering the next time an SDK appears to have removed a guarantee.
 
 ## Context and Orientation
 
