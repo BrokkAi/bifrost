@@ -16,8 +16,8 @@ After this change, a caller can invoke the built-in `bifrost.code-smells` pack a
 - [x] (2026-07-31 06:45Z) Wrote this ExecPlan and fixed the implementation boundary around canonical deadline diagnostics rather than structural-query optimization.
 - [x] (2026-07-31 06:58Z) Added canonical deadline origin, stage timing, policy-progress types, millisecond work metrics, retained-size accounting, and behavior-focused schema-version-2 tests.
 - [x] (2026-07-31 07:04Z) Captured coordinator registration/evaluation/report timings, per-policy elapsed work, deadline-specific completion, and active/completed/pending policy identifiers.
-- [ ] Convert a pre-snapshot `run_policy` deadline into a canonical unreliable report while preserving ordinary errors.
-- [ ] Thread an MCP correlation identifier through `run_policy` and add end-to-end deadline regressions.
+- [x] (2026-07-31 07:13Z) Converted a pre-snapshot `run_policy` deadline into a canonical unreliable report while preserving invalid-parameter, explicit-cancellation, and internal-error behavior.
+- [x] (2026-07-31 07:13Z) Threaded MCP request correlation into `run_policy` output and added service plus background-dispatch deadline regressions.
 - [ ] Run formatting, focused tests, the repository policy selection, and a live `bifrost.code-smells` validation.
 - [ ] Run the guided-issue specialist review, address accepted findings, and complete the retrospective.
 
@@ -40,6 +40,9 @@ After this change, a caller can invoke the built-in `bifrost.code-smells` pack a
 
 - Observation: Policies after the first evaluator that observes the expired request token still need canonical rule/run skeletons even though they were pending at the deadline boundary.
   Evidence: The coordinator continues its collect-and-return loop with the expired token, records the first deadline-incomplete policy as active, records later identifiers as pending-at-deadline, and retains zero/partial work from the evaluator for report join correctness.
+
+- Observation: A pre-snapshot result cannot truthfully claim that the suppression document was absent.
+  Evidence: Snapshot acquisition ends before workspace document access, so `PolicySuppressionDocumentState::NotEvaluated` was added and asserted instead of reusing `NotFound`.
 
 ## Decision Log
 
@@ -65,7 +68,7 @@ After this change, a caller can invoke the built-in `bifrost.code-smells` pack a
 
 ## Outcomes & Retrospective
 
-The first two implementation milestones are complete. Schema-version-2 reports have a validated `execution` object, deadline expiry has its own incomplete reason, and the coordinator now populates registration, evaluation, report, and per-policy timing data with policy progress at the deadline boundary. MCP preparation does not yet merge selection/snapshot timing or convert the pre-snapshot error.
+The implementation milestones are complete. Schema-version-2 reports carry validated deadline, stage, timing, and policy-progress data; coordinator results merge MCP selection and snapshot timings; pre-snapshot expiry returns an empty canonical report with a diagnostic; and background MCP responses include request correlation. Focused issue regressions pass. Full integration, lint, live policy validation, and specialist review remain.
 
 ## Context and Orientation
 
@@ -192,3 +195,5 @@ Revision note: Initial ExecPlan written on 2026-07-31 after live reproduction an
 Revision note: Updated on 2026-07-31 after the report-model milestone to record the completed canonical types, tests, and bounded retained-size strategy.
 
 Revision note: Updated on 2026-07-31 after coordinator instrumentation to record deadline-specific policy completion, progress semantics, and focused `issue_1306` test evidence.
+
+Revision note: Updated on 2026-07-31 after MCP integration to record pre-snapshot suppression semantics, correlation behavior, and passing service/background deadline regressions.

@@ -266,6 +266,12 @@ fn request_id_key(id: &Value) -> String {
     serde_json::to_string(id).expect("JSON-RPC request IDs always serialize")
 }
 
+fn request_correlation_id(id: &Value) -> String {
+    id.as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| request_id_key(id))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspaceBindingSource {
     None,
@@ -679,10 +685,16 @@ where
                 accepted_at.elapsed(),
             );
             on_worker_start();
+            let request_correlation_id = request_correlation_id(&id);
             let response = {
                 let _execution_scope =
                     profiling::scope(format!("mcp_request.execution[{tool_name}]"));
-                match execute_prepared_tool_call(service.as_ref(), call, Some(&cancellation)) {
+                match execute_prepared_tool_call_with_correlation(
+                    service.as_ref(),
+                    call,
+                    Some(&cancellation),
+                    Some(&request_correlation_id),
+                ) {
                     Ok(result) => success_response(id.clone(), result),
                     Err((code, message)) => error_response(id.clone(), code, message),
                 }
@@ -1249,6 +1261,15 @@ fn execute_prepared_tool_call(
     call: PreparedToolCall,
     cancellation: Option<&CancellationToken>,
 ) -> Result<Value, (i64, String)> {
+    execute_prepared_tool_call_with_correlation(service, call, cancellation, None)
+}
+
+fn execute_prepared_tool_call_with_correlation(
+    service: &SearchToolsService,
+    call: PreparedToolCall,
+    cancellation: Option<&CancellationToken>,
+    request_correlation_id: Option<&str>,
+) -> Result<Value, (i64, String)> {
     let (name, render_options, output) = match call {
         #[cfg(test)]
         PreparedToolCall::QueryCode(prepared) => (
@@ -1285,6 +1306,11 @@ fn execute_prepared_tool_call(
             } else {
                 output
             };
+            let output = if name == "run_policy" {
+                attach_run_policy_correlation(output, request_correlation_id)
+            } else {
+                output
+            };
             Ok(tool_success_result(output))
         }
         Err(err) => {
@@ -1292,6 +1318,37 @@ fn execute_prepared_tool_call(
                 return Ok(tool_error_result(err.message));
             }
             Err(map_service_error(err.code, err.message))
+        }
+    }
+}
+
+fn attach_run_policy_correlation(
+    output: ToolOutput,
+    request_correlation_id: Option<&str>,
+) -> ToolOutput {
+    let Some(request_correlation_id) = request_correlation_id else {
+        return output;
+    };
+    match output {
+        ToolOutput::Structured {
+            mut structured,
+            rendered_text,
+        } => {
+            structured
+                .as_object_mut()
+                .expect("run_policy structured output must be an object")
+                .insert(
+                    "request_correlation_id".to_string(),
+                    Value::String(request_correlation_id.to_string()),
+                );
+            ToolOutput::Structured {
+                structured,
+                rendered_text,
+            }
+        }
+        output => {
+            debug_assert!(false, "run_policy output must be structured");
+            output
         }
     }
 }
@@ -1437,6 +1494,7 @@ fn map_service_error(code: SearchToolsServiceErrorCode, message: String) -> (i64
     let jsonrpc_code = match code {
         SearchToolsServiceErrorCode::InvalidParams => INVALID_PARAMS,
         SearchToolsServiceErrorCode::UnknownTool => METHOD_NOT_FOUND,
+        SearchToolsServiceErrorCode::DeadlineExceeded => INTERNAL_ERROR,
         SearchToolsServiceErrorCode::Internal => INTERNAL_ERROR,
     };
     (jsonrpc_code, message)
@@ -2914,7 +2972,7 @@ mod uri_tests {
         let service =
             SearchToolsService::new_manual_without_semantic_index(dir.path().to_path_buf())
                 .expect("service");
-        let prepared = service
+        let preparation = service
             .prepare_run_policy_with_cancellation(
                 json!({
                     "policy_files": ["policies/dynamic-eval.rqlp"],
@@ -2923,6 +2981,9 @@ mod uri_tests {
                 None,
             )
             .expect("prepare policy request");
+        let crate::searchtools_service::RunPolicyPreparation::Ready(prepared) = preparation else {
+            panic!("ready workspace should prepare policy evaluation");
+        };
         let cancellation = CancellationToken::default();
         cancellation.cancel();
 
@@ -2934,5 +2995,96 @@ mod uri_tests {
         .expect_err("pre-cancelled policy request must stop");
         assert_eq!(error.0, INTERNAL_ERROR);
         assert!(error.1.contains("policy evaluation cancelled"), "{error:?}");
+    }
+
+    #[test]
+    fn issue_1296_deadline_returns_structured_mcp_report_with_correlation() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("Policy.java"), "class Policy {}\n").expect("write source");
+        let service = Arc::new(
+            SearchToolsService::new_manual_without_semantic_index(dir.path().to_path_buf())
+                .expect("service"),
+        );
+        let spec = build_server_spec(
+            "test",
+            vec![json!({
+                "name": "run_policy",
+                "description": "test",
+                "inputSchema": { "type": "object" }
+            })],
+        )
+        .expect("server spec");
+        let message = json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "id": "issue-1296",
+            "method": "tools/call",
+            "params": {
+                "name": "run_policy",
+                "arguments": {
+                    "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
+                    "evaluation_date": "2026-07-31",
+                    "fail_on": "warning"
+                }
+            }
+        });
+        let (request_id, params) =
+            background_tool_request(&message, &spec).expect("run_policy runs in background");
+        let mut connection = McpConnectionState::new(false);
+        let call = match prepare_tool_call(
+            service.as_ref(),
+            &mut connection,
+            params,
+            McpRenderOptions::default(),
+            &spec,
+        )
+        .expect("prepare run_policy")
+        {
+            ToolCallPreparation::Ready(call) => call,
+            ToolCallPreparation::Reply(reply) => panic!("unexpected immediate reply: {reply}"),
+        };
+        let workspace_generation = call
+            .workspace_generation()
+            .expect("run_policy is workspace scoped");
+        let cancellations = McpRequestCancellations::default();
+        let cancellation = cancellations
+            .register_at(
+                &request_id,
+                workspace_generation,
+                service.workspace_generation(),
+                Instant::now() - MCP_ANALYZER_REQUEST_BUDGET,
+            )
+            .expect("request registers");
+        let (response_sender, response_receiver) = mpsc::sync_channel(1);
+
+        spawn_cancellable_tool_call(
+            service,
+            *call,
+            request_id,
+            cancellation,
+            cancellations,
+            response_sender,
+        )
+        .expect("background request starts");
+        let response = response_receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("background request responds");
+
+        assert!(response.value.get("error").is_none(), "{}", response.value);
+        let structured = &response.value["result"]["structuredContent"];
+        assert_eq!(structured["status"], "unreliable");
+        assert_eq!(structured["exit_status"], 2);
+        assert_eq!(structured["report"]["schema_version"], 2);
+        assert_eq!(
+            structured["report"]["execution"]["termination"],
+            "deadline_exceeded"
+        );
+        assert_eq!(structured["request_correlation_id"], "issue-1296");
+        assert!(
+            response.value["result"]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("request_correlation_id")),
+            "{}",
+            response.value
+        );
     }
 }

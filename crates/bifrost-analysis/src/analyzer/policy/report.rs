@@ -1620,6 +1620,7 @@ impl PolicyReportDocument {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn try_new_with_suppression_audit(
         evaluation: PolicyReportEvaluationContext,
         rules: Vec<PolicyRuleDescriptor>,
@@ -1696,6 +1697,10 @@ impl PolicyReportDocument {
 
     pub const fn execution(&self) -> &PolicyExecutionMetadata {
         &self.execution
+    }
+
+    pub(crate) fn replace_execution(&mut self, execution: PolicyExecutionMetadata) {
+        self.execution = execution;
     }
 
     pub fn rules(&self) -> &[PolicyRuleDescriptor] {

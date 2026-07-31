@@ -154,6 +154,7 @@ pub struct PolicyBatchOutcome {
     taint_findings: Vec<crate::analyzer::structural::CodeQueryTaintFinding>,
     taint_analysis_results: Vec<Arc<super::taint_policy::ProductionTaintAnalysisResult>>,
     exit_status: u8,
+    max_retained_report_bytes: usize,
     max_serialized_report_bytes: usize,
 }
 
@@ -164,6 +165,53 @@ impl PolicyBatchOutcome {
 
     pub fn into_report(self) -> PolicyReportDocument {
         self.report
+    }
+
+    pub fn record_preparation_timings(
+        &mut self,
+        selection_elapsed_ms: u64,
+        snapshot_elapsed_ms: u64,
+    ) -> Result<(), PolicyCoordinatorError> {
+        let current = self.report.execution();
+        let mut stage_timings = current.stage_timings().to_vec();
+        stage_timings.push(PolicyStageTiming::new(
+            PolicyExecutionStage::PolicySelection,
+            selection_elapsed_ms,
+        ));
+        stage_timings.push(PolicyStageTiming::new(
+            PolicyExecutionStage::WorkspaceSnapshot,
+            snapshot_elapsed_ms,
+        ));
+        let execution = PolicyExecutionMetadata::try_new(
+            current
+                .total_elapsed_ms()
+                .saturating_add(selection_elapsed_ms)
+                .saturating_add(snapshot_elapsed_ms),
+            stage_timings,
+            current.termination(),
+            current.terminal_stage(),
+            current.active_policy_id().cloned(),
+            current.completed_policy_ids().to_vec(),
+            current.pending_policy_ids().to_vec(),
+        )
+        .map_err(|error| {
+            PolicyCoordinatorError::new(format!(
+                "failed to merge policy preparation timing: {error}"
+            ))
+        })?;
+        let retained_bytes = self
+            .report
+            .retained_size()
+            .saturating_sub(retained_extra(current))
+            .saturating_add(retained_extra(&execution));
+        if retained_bytes > self.max_retained_report_bytes {
+            return Err(PolicyCoordinatorError::new(format!(
+                "policy preparation timing grows the report to {retained_bytes} retained bytes, exceeding {}",
+                self.max_retained_report_bytes
+            )));
+        }
+        self.report.replace_execution(execution);
+        Ok(())
     }
 
     /// Diagnostic-neutral taint query rows retained by the same propagation
@@ -862,6 +910,7 @@ fn evaluate_prepared_policy_inputs(
         taint_findings,
         taint_analysis_results,
         exit_status,
+        max_retained_report_bytes: batch_budget.max_retained_report_bytes(),
         max_serialized_report_bytes: batch_budget.max_serialized_report_bytes(),
     })
 }
