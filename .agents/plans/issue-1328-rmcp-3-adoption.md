@@ -28,7 +28,7 @@ You can see it working three ways. First, the existing wire-level integration su
 - [x] (2026-07-31) Milestone 5 complete as `fb149810`: discovery and `resultType` needed no Bifrost code, cache hints added with conservative scopes, and all three now have wire tests asserting both presence for `2026-07-28` and absence for `2025-11-25`. The absence half matters: `rmcp` strips `resultType` for a legacy peer but leaves the cache hints alone.
 - [x] (2026-07-31) Milestone 6 complete as `906debfb`, with a scope change the owner approved: the default flipped to `rmcp` but the hand-written stack was **kept** behind `BIFROST_MCP_RMCP=off` as a rollback lever rather than deleted. See the Decision Log.
 - [ ] Follow-up (not this issue): delete the switch, `mcp_common`'s protocol half, and the `McpHost` matrix in the contract suite together.
-- [ ] Milestone 7 in progress: documentation updated (`docs/src/content/docs/mcp.md` gained a Protocol Revisions section and the corrected rootless flow); adapters reviewed; benchmark gate outstanding.
+- [x] (2026-07-31) Milestone 7 complete: documentation updated, adapters reviewed, and the release-mode latency benchmark run head to head against both hosts. See `Artifacts and Notes` for the numbers and the one conformance change they exposed.
 
 ## Surprises & Discoveries
 
@@ -541,7 +541,27 @@ The files that matter most for this plan:
     tests/test_mrtr_behavior.rs  a worked stateless MRTR server
     tests/test_stdio_response_concurrency.rs  a minimal manual ServerHandler over real pipes
 
-Benchmark and profiling transcripts, the before/after fairness numbers, and any wire transcripts that prove a milestone are to be appended here as work proceeds.
+### Release-mode latency benchmark, 2026-07-31
+
+Both hosts, same commit, same machine, `bifrost_benchmark run --manifest benchmark/interactive-latency.toml`. p95 in milliseconds against a 5,000 ms budget:
+
+    case                                    rmcp   legacy
+    search-common-symbols                    166      166
+    source-semantic-summary                    3        3
+    source-search-service                      2        2
+    source-usage-scan                          3        3
+    source-symbol-search                       3        3
+    definition-by-location                    15       15
+    summary-semantic-procedure                 3        3
+    scan-semantic-procedure-exact           5621     5808   FAIL both
+    scan-semantic-procedure-line            5555     5809   FAIL both
+    heavy-scan-does-not-block-source          10       28
+
+The fairness scenario, which is the one issue #1328 names as the gate, passes at 10 ms against a 5,000 ms budget -- better than the host it replaces. The seven interactive cases are identical between hosts.
+
+The two `scan-semantic-procedure-*` cases fail on **both** hosts, so they are not a regression from this migration; `rmcp` is in fact marginally faster on both. They are budget-bound: all twenty iterations report `bounded_incomplete_iterations`, meaning the scan hit its own 5,000 ms request budget and returned an explicitly incomplete result, which the manifest allows. A case whose work exceeds its budget cannot have a p95 below that budget, so the 5,000 ms gate is structurally unsatisfiable for it on a machine this slow. These runs were taken on a developer laptop under continuous build load; the gate belongs on the stable Benchmark workflow lane, and reconciling that threshold is separate work.
+
+The fairness run also exposed a conformance difference worth recording. The benchmark used to cancel the heavy scan and wait for its response. MCP says a receiver SHOULD NOT respond to a request it was told to cancel; `rmcp` obeys, the hand-written host did not, and the benchmark had been written against the non-conformant behavior. Cancellation is now measured by how quickly the session serves the *next* request, which is both conformant and a truer proxy for the product promise.
 
 ## Revision Notes
 
