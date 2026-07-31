@@ -36,7 +36,19 @@ pub const MAX_QUEUED_ANALYZER_REQUESTS: usize = 32;
 ///
 /// The wrapped permit is never read; holding it *is* the whole contract, and
 /// `SemaphorePermit` releases on drop.
-pub struct AnalyzerPermit<'pool>(#[allow(dead_code)] SemaphorePermit<'pool>);
+pub struct AnalyzerPermit<'pool>(#[allow(dead_code)] Option<SemaphorePermit<'pool>>);
+
+impl AnalyzerPermit<'_> {
+    /// A permit for work that is bounded by something other than this pool.
+    ///
+    /// Workspace-mutating tools hold the connection's workspace lock for their
+    /// whole execution, so they are already serialized against everything else;
+    /// making them queue here as well would let a trivial call block on four
+    /// long scans while holding that lock.
+    pub fn exempt() -> Self {
+        Self(None)
+    }
+}
 
 /// The outcome of asking for analyzer capacity.
 pub enum Admission<'pool> {
@@ -69,15 +81,15 @@ impl AnalyzerExecutionPool {
         // Free capacity is taken without ever entering the queue, so ordinary
         // traffic cannot exhaust the backlog allowance.
         if let Ok(permit) = self.slots.try_acquire() {
-            return Admission::Granted(AnalyzerPermit(permit));
+            return Admission::Granted(AnalyzerPermit(Some(permit)));
         }
         let Ok(_queued) = self.queue.try_acquire() else {
             return Admission::Saturated;
         };
         tokio::select! {
-            permit = self.slots.acquire() => Admission::Granted(AnalyzerPermit(
+            permit = self.slots.acquire() => Admission::Granted(AnalyzerPermit(Some(
                 permit.expect("the analyzer pool semaphore is never closed"),
-            )),
+            ))),
             () = cancelled.cancelled() => Admission::Cancelled,
         }
     }

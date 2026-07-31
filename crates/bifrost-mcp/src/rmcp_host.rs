@@ -9,7 +9,10 @@
 //!
 //! See `.agents/plans/issue-1328-rmcp-3-adoption.md` for the migration plan.
 
-use crate::analyzer_pool::{ANALYZER_POOL_CAPACITY, Admission, AnalyzerExecutionPool};
+use crate::analyzer_pool::{
+    ANALYZER_POOL_CAPACITY, Admission, AnalyzerExecutionPool, AnalyzerPermit,
+    MAX_QUEUED_ANALYZER_REQUESTS,
+};
 use crate::mcp_common::{
     AGENTS_GUIDANCE_MIME_TYPE, AGENTS_GUIDANCE_TEXT, AGENTS_GUIDANCE_URI,
     BENCHMARK_PROFILE_BOUNDARY_MARKER, BENCHMARK_PROFILE_BOUNDARY_METHOD, CODEX_MCP_CLIENT_NAME,
@@ -66,6 +69,10 @@ pub const BUILD_IDENTITY_META_KEY: &str = "io.bifrost/build-identity";
 /// rejected request without narrating every message on a busy session.
 #[doc(hidden)]
 pub const MCP_LOG_LEVEL_ENV: &str = "BIFROST_MCP_LOG";
+
+/// How long a request may queue for analyzer capacity before it is worth
+/// telling an operator about.
+const ANALYZER_QUEUE_WAIT_REPORT_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Two runtime workers are enough: no Bifrost work runs on them. Protocol
 /// handling is trivial, and every analyzer call goes to the blocking pool.
@@ -148,10 +155,19 @@ impl ConnectionState {
     }
 
     /// Codex sandbox metadata is only honored after a handshake, for a rootless
-    /// server whose client did not advertise MCP Roots. A client that speaks
-    /// Roots must use Roots, and an explicitly rooted server ignores client
-    /// scope entirely.
+    /// server whose client has not supplied roots by some other route. An
+    /// explicitly rooted server ignores client scope entirely.
+    ///
+    /// Both roots routes disqualify it, and for the same reason: an approved
+    /// filesystem root outranks per-call metadata. The capability check alone
+    /// is not enough, because a `2026-07-28` client activates over MRTR without
+    /// advertising the Roots capability at all -- so keying only off that flag
+    /// left such a client bound from its own roots and then immediately
+    /// refused for "workspace metadata missing".
     fn accepts_codex_sandbox_state(&self) -> bool {
+        if self.workspace_binding_source == WorkspaceBindingSource::ClientRoots {
+            return false;
+        }
         self.accepts_client_roots
             && self
                 .negotiated
@@ -228,9 +244,15 @@ impl Drop for InFlightGuard {
 /// `inputResponses` of an MRTR retry.
 const ROOTS_INPUT_REQUEST_KEY: &str = "roots";
 
-/// How many roots activations may be outstanding at once. A client that asks
-/// for activation and never retries must not be able to grow server memory.
-const MAX_OUTSTANDING_ROOTS_ACTIVATIONS: usize = 8;
+/// How many roots activations may be outstanding at once.
+///
+/// A client that asks for activation and never retries must not grow server
+/// memory, but the bound also has to sit above any plausible number of
+/// concurrently unbound calls -- evicting a nonce a client is still going to
+/// use turns a legitimate retry into an unexplainable "not bound to a
+/// workspace". Tied to the analyzer backlog for that reason, and eviction is
+/// logged so the residual case is diagnosable rather than silent.
+const MAX_OUTSTANDING_ROOTS_ACTIVATIONS: usize = MAX_QUEUED_ANALYZER_REQUESTS;
 
 /// Nonces for outstanding MRTR roots activations.
 ///
@@ -261,6 +283,9 @@ impl RootsActivations {
             .lock()
             .expect("roots activation lock poisoned");
         if outstanding.len() == MAX_OUTSTANDING_ROOTS_ACTIVATIONS {
+            eprintln!(
+                "bifrost: dropping the oldest of {MAX_OUTSTANDING_ROOTS_ACTIVATIONS} outstanding MCP roots activations; a retry against it will be refused"
+            );
             outstanding.pop_front();
         }
         outstanding.push_back(nonce.clone());
@@ -559,11 +584,14 @@ impl BifrostMcpHandler {
             }
         };
 
-        if state.workspace_binding_source == WorkspaceBindingSource::CodexSandboxState {
-            self.revoke_codex_sandbox_workspace(state, thread_id, "metadata changed");
-        }
-
-        if self.service.active_workspace_root().is_some() {
+        // One teardown, not two. This used to be a Codex-scoped revoke followed
+        // by a near-identical "is anything bound?" revoke; the second was
+        // unreachable given the first (reaching this function already implies
+        // the binding can only be Codex or nothing), and two adjacent copies of
+        // a security teardown guarded differently is how they drift apart.
+        if self.service.active_workspace_root().is_some()
+            || state.workspace_binding_source != WorkspaceBindingSource::None
+        {
             self.revoke_workspace(state, "the previous workspace reason=metadata changed");
             log_codex_workspace_event(
                 "revoked previous workspace reason=metadata changed",
@@ -668,20 +696,26 @@ impl BifrostMcpHandler {
             eprintln!("bifrost: ignoring MCP roots activation with an unrecognized requestState");
             return None;
         }
-        let roots = request
+        match request
             .input_responses
             .as_ref()
             .and_then(|responses| responses.get(ROOTS_INPUT_REQUEST_KEY))
-            .and_then(|value| {
-                serde_json::from_value::<rmcp::model::ListRootsResult>(value.clone()).ok()
-            });
-        match roots {
-            Some(result) => {
-                self.bind_first_usable_root(state, &result.roots);
-            }
+        {
             None => eprintln!(
-                "bifrost: MCP roots activation retry carried no usable {ROOTS_INPUT_REQUEST_KEY} response"
+                "bifrost: MCP roots activation retry carried no `{ROOTS_INPUT_REQUEST_KEY}` response"
             ),
+            Some(value) => {
+                match serde_json::from_value::<rmcp::model::ListRootsResult>(value.clone()) {
+                    Ok(result) => {
+                        self.bind_first_usable_root(state, &result.roots);
+                    }
+                    // The error names the offending field; "no usable response"
+                    // alone leaves a client author nothing to act on.
+                    Err(error) => eprintln!(
+                        "bifrost: MCP roots activation retry carried an unreadable `{ROOTS_INPUT_REQUEST_KEY}` response: {error}"
+                    ),
+                }
+            }
         }
         None
     }
@@ -1019,7 +1053,7 @@ impl ServerHandler for BifrostMcpHandler {
                 "codex-sandbox-state"
             };
             eprintln!(
-                "bifrost: MCP initialize client={} roots_supported={client_supports_roots} workspace_protocol={protocol}",
+                "bifrost: MCP host=rmcp client={} roots_supported={client_supports_roots} workspace_protocol={protocol}",
                 if client_is_codex {
                     CODEX_MCP_CLIENT_NAME
                 } else {
@@ -1101,15 +1135,25 @@ impl ServerHandler for BifrostMcpHandler {
                     None,
                 ));
             }
-            let output = self
-                .service
-                .call_tool_output_with_cancellation(
-                    &name,
+            // Onto the blocking pool like every other tool: the first call
+            // parses the built-in policy packs, and RUNTIME_WORKER_THREADS is
+            // only defensible while no Bifrost work runs on a runtime worker.
+            // Two concurrent calls here would otherwise occupy both workers and
+            // stop the serve loop from reading the transport at all.
+            let service = Arc::clone(&self.service);
+            let output = tokio::task::spawn_blocking(move || {
+                service.call_tool_output_with_cancellation(
+                    "list_policies",
                     arguments,
                     RenderOptions::default(),
                     None,
                 )
-                .map_err(|error| map_service_error(error.code, error.message))?;
+            })
+            .await
+            .map_err(|error| {
+                ErrorData::internal_error(format!("list_policies panicked: {error}"), None)
+            })?
+            .map_err(|error| map_service_error(error.code, error.message))?;
             return Ok(tool_success_result(output).into());
         }
 
@@ -1122,6 +1166,14 @@ impl ServerHandler for BifrostMcpHandler {
         // holding the workspace lock across execution; ordinary tools release
         // it once their scope and arguments are settled.
         let mut state = self.workspace.lock().await;
+        // Revocation is tested before MRTR activation, not after. A stale
+        // client-roots binding still reads as "bound", so checking it later
+        // would make `activate_workspace_over_mrtr` return early and send a
+        // 2026-07-28 client a flat unbound error where it should have been
+        // offered another activation round.
+        if self.client_roots_binding_is_stale(&state) {
+            self.revoke_client_roots(&mut state);
+        }
         if let Some(input_required) = self
             .activate_workspace_over_mrtr(&mut state, &request, &context)
             .await
@@ -1138,7 +1190,14 @@ impl ServerHandler for BifrostMcpHandler {
                 workspace_scope,
             } => (arguments, workspace_scope),
         };
-        let _serial_guard = serial_tool_request(&name).then_some(state);
+        // Workspace-mutating tools keep the workspace lock for their whole
+        // execution, which already bounds them to one at a time. Making them
+        // also queue for an analyzer permit would let a trivial call like
+        // `get_active_workspace` sit behind four long scans *while holding the
+        // lock*, stalling every other request's preparation -- the opposite of
+        // what the pool exists to protect.
+        let serial = serial_tool_request(&name);
+        let _serial_guard = serial.then_some(state);
 
         // One deadline spans admission and execution. Starting the clock after
         // admission would make the request budget mean "time spent analyzing"
@@ -1147,11 +1206,15 @@ impl ServerHandler for BifrostMcpHandler {
         // written against what the client experiences.
         let accepted_at = Instant::now();
         let deadline = accepted_at + mcp_analyzer_request_budget();
-        let admission = tokio::time::timeout(
-            deadline.saturating_duration_since(Instant::now()),
-            self.analyzer_pool.acquire(&context.ct),
-        )
-        .await;
+        let admission = if serial {
+            Ok(Admission::Granted(AnalyzerPermit::exempt()))
+        } else {
+            tokio::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                self.analyzer_pool.acquire(&context.ct),
+            )
+            .await
+        };
         let _permit = match admission {
             Ok(Admission::Granted(permit)) => permit,
             Ok(Admission::Cancelled) => {
@@ -1183,10 +1246,15 @@ impl ServerHandler for BifrostMcpHandler {
                 ));
             }
         };
-        profiling::duration(
-            format!("mcp_request.queue_wait[{name}]"),
-            accepted_at.elapsed(),
-        );
+        let queue_wait = accepted_at.elapsed();
+        profiling::duration(format!("mcp_request.queue_wait[{name}]"), queue_wait);
+        if queue_wait >= ANALYZER_QUEUE_WAIT_REPORT_THRESHOLD {
+            // Otherwise a saturated pool is invisible without BIFROST_TIMING,
+            // and every client just appears slow for no stated reason.
+            eprintln!(
+                "bifrost: {name} waited {queue_wait:?} for one of {ANALYZER_POOL_CAPACITY} analyzer slots"
+            );
+        }
 
         // Admission can take arbitrarily long, and the workspace may have been
         // rebound in the meantime. Re-check before spending a slot on a scope

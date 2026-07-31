@@ -31,7 +31,12 @@ quick-xml = "0.40"
 # features are off deliberately: `macros`/`schemars` exist to generate tool
 # schemas from Rust types, and Bifrost's tool schemas are hand-written JSON
 # built by mcp_registry, so pulling them in would add build weight for nothing.
-rmcp = { version = "3.0.1", default-features = false, features = ["server", "transport-io"] }
+# Pinned exactly, not by caret. `ordered_transport.rs` depends on the serve
+# loop pulling one message at a time from `Transport::receive` -- documented on
+# the trait as sequential, but the security rule Bifrost builds on it would
+# break silently, with no compile error, if a future 3.x prefetched or
+# pipelined receives. Re-verify that property when raising this.
+rmcp = { version = "=3.0.1", default-features = false, features = ["server", "transport-io"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "io-std", "sync", "time", "macros"] }
