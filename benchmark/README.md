@@ -57,11 +57,10 @@ unimplemented (#1371); the express-js, fastroute-php, scala-xml, and (for
 exceptions) fmt-cpp corpora have genuinely zero exception/test-assertion
 findings even at min_score 1 -- fmt throws through FMT_THROW rather than
 catch blocks -- so those scenarios are off there rather than pinned to an
-empty report; fastroute's src/functions.php (namespaced free functions only)
-still reports comment density unavailable and stays out of the density probe; only the java, javascript, cpp, and csharp repos have pinnable secret-like
-findings (exposed-kotlin has real docker-compose password findings, but the
-scan exceeds the MCP request budget on that multi-module workspace, so the
-scenario is off there until the latency is fixed).
+empty report; only the java, javascript, cpp, and csharp repos have pinnable
+secret-like findings (exposed-kotlin has real docker-compose password findings,
+but the scan exceeds the MCP request budget on that multi-module workspace, so
+the scenario is off there until the latency is fixed).
 Ruby is intentionally absent from all scenarios because the pinned corpus
 does not include a Ruby repo.
 

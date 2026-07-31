@@ -555,13 +555,28 @@ mod tests {
         let fix = AnalyzerFixture::new(&[(
             "functions.php",
             r#"<?php
+declare(strict_types=1);
+
 namespace FastRoute;
+
+use FastRoute\Cache\FileCache;
+use LogicException;
+
+use function function_exists;
+use function is_string;
 
 if (! function_exists('FastRoute\simpleDispatcher')) {
     /** Header for the conditional free function. */
     function simpleDispatcher(): void
     {
         // Inline implementation note.
+        work();
+    }
+
+    /** Header for the second conditional free function. */
+    function cachedDispatcher(): void
+    {
+        // Second inline implementation note.
         work();
     }
 }
@@ -582,6 +597,11 @@ $factory = static function (): void {
         );
         assert!(
             file_result.report.contains("`FastRoute.simpleDispatcher`"),
+            "{}",
+            file_result.report
+        );
+        assert!(
+            file_result.report.contains("`FastRoute.cachedDispatcher`"),
             "{}",
             file_result.report
         );

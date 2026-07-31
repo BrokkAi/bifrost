@@ -27,8 +27,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Parser};
 
-use adapter::PhpAdapter;
-pub(crate) use adapter::php_signature_return_type_text;
+pub(crate) use adapter::{PhpAdapter, php_signature_return_type_text};
 pub(crate) use aliases::{
     PhpFileContext, php_file_context_from_tree_at, resolve_php_constant, resolve_php_constant_node,
     resolve_php_function, resolve_php_function_node, resolve_php_type, resolve_php_type_node,

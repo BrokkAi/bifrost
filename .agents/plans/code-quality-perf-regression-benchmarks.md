@@ -321,6 +321,12 @@ regression.
   but worth a product look. All of these belong in the follow-up issue sweep after the corpus
   lands.
 
+- 2026-07-31 (Milestone 2, gin assertion follow-up): Go assertion-smell analysis now recognizes
+  calls through imports of Testify's `assert` and `require` packages, including aliased imports,
+  while retaining the existing specialized classifications. The gin probe moved off the fixed
+  `TestContextGetFloat64` false positive and now pins the genuine assertion-free
+  `TestTreeCatchMaxParams` row.
+
 - 2026-07-31 (Milestone 2, click/serde/fastroute findings): more latency evidence -- serde-json-rs
   dead_code_smells p50 17.6 s for a single zero-usage symbol (the usage scan dominates), and
   comment density stays 8-20 s wherever the probed file is large (click core.py exceeds the request

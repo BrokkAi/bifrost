@@ -424,6 +424,69 @@ func TestVerify(t *testing.T) {
 }
 
 #[test]
+fn go_testify_assert_and_require_calls_count_as_assertion_equivalents() {
+    let report = language_report(
+        Language::Go,
+        "sample_test.go",
+        r#"
+package sample
+
+import (
+    "testing"
+    "github.com/stretchr/testify/assert"
+    must "github.com/stretchr/testify/require"
+)
+
+func TestTestify(t *testing.T) {
+    values := []string{"one", "two"}
+    assert.Len(t, values, 2)
+    assert.Contains(t, values, "one")
+    assert.InDelta(t, 2.0, len(values), 0.01)
+    must.ElementsMatch(t, []string{"two", "one"}, values)
+    assert.True(t, true)
+}
+"#,
+        ReportTestAssertionSmellsParams {
+            file_paths: vec!["sample_test.go".to_string()],
+            ..Default::default()
+        },
+    );
+
+    let rows = finding_rows(&report);
+    assert_eq!(rows.len(), 1, "{report}");
+    assert!(rows[0].contains("`constant-truth`"), "{report}");
+    assert!(rows[0].contains("| 5 |"), "{report}");
+}
+
+#[test]
+fn go_non_testify_selector_calls_do_not_count_as_assertions() {
+    let report = language_report(
+        Language::Go,
+        "sample_test.go",
+        r#"
+package sample
+
+import "testing"
+
+type localAssertions struct{}
+
+func (localAssertions) Len(*testing.T, []string, int) {}
+
+func TestLocalHelper(t *testing.T) {
+    assert := localAssertions{}
+    assert.Len(t, []string{"one"}, 1)
+}
+"#,
+        ReportTestAssertionSmellsParams {
+            file_paths: vec!["sample_test.go".to_string()],
+            ..Default::default()
+        },
+    );
+
+    assert!(report.contains("no-assertions"), "{report}");
+}
+
+#[test]
 fn rust_assertion_count_uses_total_recognized_macros() {
     let literal = "a".repeat(120);
     let source = format!(
