@@ -321,6 +321,7 @@ impl CertaintyReason {
 #[serde(rename_all = "snake_case")]
 pub enum PolicyIncompleteReason {
     Cancelled,
+    DeadlineExceeded,
     QueryResultLimit,
     BatchFindingLimit,
     ScannedFileBudget,
@@ -1725,6 +1726,7 @@ pub enum PolicyWorkUnit {
     Count,
     Bytes,
     Rows,
+    Milliseconds,
 }
 
 /// One normalized finding in the canonical schema-version-2 report model.
@@ -3542,14 +3544,18 @@ mod tests {
     fn work_metrics_are_namespaced_sorted_and_unique() {
         let metrics = vec![
             PolicyWorkMetric::try_new("typestate.states", PolicyWorkUnit::Count, 2).unwrap(),
+            PolicyWorkMetric::try_new("policy.evaluation_elapsed", PolicyWorkUnit::Milliseconds, 4)
+                .unwrap(),
             PolicyWorkMetric::try_new("taint.propagation_states", PolicyWorkUnit::Count, 3)
                 .unwrap(),
         ];
         let work = PolicyWorkReport::try_new(1, 2, 3, 4, 5, 6, 7, 8, metrics).unwrap();
-        assert_eq!(work.metrics()[0].name(), "taint.propagation_states");
+        assert_eq!(work.metrics()[0].name(), "policy.evaluation_elapsed");
+        assert_eq!(work.metrics()[0].unit(), PolicyWorkUnit::Milliseconds);
         assert!(PolicyWorkMetric::try_new("scanned_files", PolicyWorkUnit::Count, 1).is_err());
         let duplicate =
-            PolicyWorkMetric::try_new("taint.propagation_states", PolicyWorkUnit::Rows, 4).unwrap();
+            PolicyWorkMetric::try_new("policy.evaluation_elapsed", PolicyWorkUnit::Rows, 4)
+                .unwrap();
         assert!(
             PolicyWorkReport::try_new(
                 0,

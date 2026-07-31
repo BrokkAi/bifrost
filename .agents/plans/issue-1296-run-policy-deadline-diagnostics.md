@@ -14,7 +14,7 @@ After this change, a caller can invoke the built-in `bifrost.code-smells` pack a
 
 - [x] (2026-07-31 06:45Z) Verified the clean issue branch, fetched current remote state, reproduced the five-second `bifrost.code-smells` deadline, and diagnosed the current cross-layer behavior.
 - [x] (2026-07-31 06:45Z) Wrote this ExecPlan and fixed the implementation boundary around canonical deadline diagnostics rather than structural-query optimization.
-- [ ] Add canonical deadline origin, stage timing, and policy-progress types to the schema-version-2 report model.
+- [x] (2026-07-31 06:58Z) Added canonical deadline origin, stage timing, policy-progress types, millisecond work metrics, retained-size accounting, and behavior-focused schema-version-2 tests.
 - [ ] Capture coordinator stage timings, per-policy elapsed work, and active/completed/pending policy identifiers.
 - [ ] Convert a pre-snapshot `run_policy` deadline into a canonical unreliable report while preserving ordinary errors.
 - [ ] Thread an MCP correlation identifier through `run_policy` and add end-to-end deadline regressions.
@@ -34,6 +34,9 @@ After this change, a caller can invoke the built-in `bifrost.code-smells` pack a
 
 - Observation: Existing `BIFROST_TIMING` scopes are operational stderr diagnostics, not part of the result contract.
   Evidence: `crates/bifrost-analysis/src/profiling.rs` prints begin/end records only when the environment variable is set; the values are not retained by `PolicyReportDocument`.
+
+- Observation: The report builder can account for execution metadata at the point it is installed without perturbing every incremental retention calculation.
+  Evidence: Execution metadata is bounded to eight stages and 256 policy identifiers, and `PolicyReportBuilder::set_execution` performs the batch retention check before `finish` performs the final exact retained-size check.
 
 ## Decision Log
 
@@ -59,7 +62,7 @@ After this change, a caller can invoke the built-in `bifrost.code-smells` pack a
 
 ## Outcomes & Retrospective
 
-Implementation has not started. The current outcome is a diagnosed and reproducible contract gap with an approved cross-layer implementation boundary.
+The first implementation milestone is complete. Schema-version-2 reports now have a validated `execution` object, deadline expiry has its own incomplete reason, and policy work metrics can use integer milliseconds. Coordinator and MCP paths do not populate the new metadata yet.
 
 ## Context and Orientation
 
@@ -182,3 +185,5 @@ Coordinator evaluation must accept or construct an execution trace that records 
 The MCP wrapper must contain the canonical `PolicyReportDocument` unchanged plus transport correlation. Do not duplicate report timing fields in the wrapper.
 
 Revision note: Initial ExecPlan written on 2026-07-31 after live reproduction and guided diagnosis. It records the approved boundary, the remaining contract gaps, and the decision to leave structural seed reuse to issue #1246.
+
+Revision note: Updated on 2026-07-31 after the report-model milestone to record the completed canonical types, tests, and bounded retained-size strategy.

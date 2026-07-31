@@ -35,6 +35,8 @@ use super::suppression::{PolicyReportEvaluationContext, PolicySuppressionReview}
 
 const MAX_REPORT_TEXT_BYTES: usize = 4_096;
 const MAX_REPORT_RELATED_DIAGNOSTICS: usize = 64;
+const MAX_POLICY_EXECUTION_STAGES: usize = 8;
+const MAX_POLICY_EXECUTION_PROGRESS_IDS: usize = 256;
 
 /// Resolved RQL schema provenance for one selector retained by a rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1013,6 +1015,7 @@ impl PolicyReportDiagnostic {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PolicyReportDiagnosticCode {
+    WorkspaceSnapshotDeadlineExceeded,
     SuppressionLoadFailed,
     SuppressionAuditRetentionExceeded,
     PolicyLoadFailed,
@@ -1362,13 +1365,219 @@ fixed_report_type_retained_size!(
     EndpointRole,
     PolicyReportDiagnosticCode,
     PolicySourceRange,
+    PolicyStageTiming,
 );
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyExecutionStage {
+    PolicySelection,
+    WorkspaceSnapshot,
+    PolicyRegistration,
+    PolicyEvaluation,
+    ReportConstruction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyExecutionTermination {
+    DeadlineExceeded,
+    ClientCancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PolicyStageTiming {
+    stage: PolicyExecutionStage,
+    elapsed_ms: u64,
+}
+
+impl PolicyStageTiming {
+    pub const fn new(stage: PolicyExecutionStage, elapsed_ms: u64) -> Self {
+        Self { stage, elapsed_ms }
+    }
+
+    pub const fn stage(&self) -> PolicyExecutionStage {
+        self.stage
+    }
+
+    pub const fn elapsed_ms(&self) -> u64 {
+        self.elapsed_ms
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PolicyExecutionMetadata {
+    total_elapsed_ms: u64,
+    stage_timings: Vec<PolicyStageTiming>,
+    termination: Option<PolicyExecutionTermination>,
+    terminal_stage: Option<PolicyExecutionStage>,
+    active_policy_id: Option<PolicyId>,
+    completed_policy_ids: Vec<PolicyId>,
+    pending_policy_ids: Vec<PolicyId>,
+}
+
+impl PolicyExecutionMetadata {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        total_elapsed_ms: u64,
+        mut stage_timings: Vec<PolicyStageTiming>,
+        termination: Option<PolicyExecutionTermination>,
+        terminal_stage: Option<PolicyExecutionStage>,
+        active_policy_id: Option<PolicyId>,
+        mut completed_policy_ids: Vec<PolicyId>,
+        mut pending_policy_ids: Vec<PolicyId>,
+    ) -> Result<Self, PolicyExecutionMetadataError> {
+        if stage_timings.len() > MAX_POLICY_EXECUTION_STAGES {
+            return Err(PolicyExecutionMetadataError::TooManyStageTimings {
+                max: MAX_POLICY_EXECUTION_STAGES,
+            });
+        }
+        stage_timings.sort_by_key(PolicyStageTiming::stage);
+        if stage_timings
+            .windows(2)
+            .any(|pair| pair[0].stage == pair[1].stage)
+        {
+            return Err(PolicyExecutionMetadataError::DuplicateStageTiming);
+        }
+        if termination.is_some() != terminal_stage.is_some() {
+            return Err(PolicyExecutionMetadataError::InconsistentTermination);
+        }
+        if termination.is_none() && (active_policy_id.is_some() || !pending_policy_ids.is_empty()) {
+            return Err(PolicyExecutionMetadataError::IncompleteProgressWithoutTermination);
+        }
+
+        completed_policy_ids.sort();
+        pending_policy_ids.sort();
+        if completed_policy_ids
+            .windows(2)
+            .any(|pair| pair[0] == pair[1])
+            || pending_policy_ids.windows(2).any(|pair| pair[0] == pair[1])
+        {
+            return Err(PolicyExecutionMetadataError::DuplicatePolicyProgress);
+        }
+        let progress_count = completed_policy_ids
+            .len()
+            .saturating_add(pending_policy_ids.len())
+            .saturating_add(usize::from(active_policy_id.is_some()));
+        if progress_count > MAX_POLICY_EXECUTION_PROGRESS_IDS {
+            return Err(PolicyExecutionMetadataError::TooManyPolicyProgressIds {
+                max: MAX_POLICY_EXECUTION_PROGRESS_IDS,
+            });
+        }
+        if completed_policy_ids
+            .iter()
+            .any(|policy_id| pending_policy_ids.binary_search(policy_id).is_ok())
+            || active_policy_id.as_ref().is_some_and(|policy_id| {
+                completed_policy_ids.binary_search(policy_id).is_ok()
+                    || pending_policy_ids.binary_search(policy_id).is_ok()
+            })
+        {
+            return Err(PolicyExecutionMetadataError::OverlappingPolicyProgress);
+        }
+
+        tighten_vec(&mut stage_timings);
+        tighten_vec(&mut completed_policy_ids);
+        tighten_vec(&mut pending_policy_ids);
+        Ok(Self {
+            total_elapsed_ms,
+            stage_timings,
+            termination,
+            terminal_stage,
+            active_policy_id,
+            completed_policy_ids,
+            pending_policy_ids,
+        })
+    }
+
+    pub const fn total_elapsed_ms(&self) -> u64 {
+        self.total_elapsed_ms
+    }
+
+    pub fn stage_timings(&self) -> &[PolicyStageTiming] {
+        &self.stage_timings
+    }
+
+    pub const fn termination(&self) -> Option<PolicyExecutionTermination> {
+        self.termination
+    }
+
+    pub const fn terminal_stage(&self) -> Option<PolicyExecutionStage> {
+        self.terminal_stage
+    }
+
+    pub const fn active_policy_id(&self) -> Option<&PolicyId> {
+        self.active_policy_id.as_ref()
+    }
+
+    pub fn completed_policy_ids(&self) -> &[PolicyId] {
+        &self.completed_policy_ids
+    }
+
+    pub fn pending_policy_ids(&self) -> &[PolicyId] {
+        &self.pending_policy_ids
+    }
+}
+
+impl RetainedSize for PolicyExecutionMetadata {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(retained_extra(&self.active_policy_id))
+            .saturating_add(retained_extra(&self.stage_timings))
+            .saturating_add(retained_extra(&self.completed_policy_ids))
+            .saturating_add(retained_extra(&self.pending_policy_ids))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyExecutionMetadataError {
+    TooManyStageTimings { max: usize },
+    DuplicateStageTiming,
+    InconsistentTermination,
+    IncompleteProgressWithoutTermination,
+    DuplicatePolicyProgress,
+    TooManyPolicyProgressIds { max: usize },
+    OverlappingPolicyProgress,
+}
+
+impl fmt::Display for PolicyExecutionMetadataError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooManyStageTimings { max } => {
+                write!(
+                    formatter,
+                    "policy execution accepts at most {max} stage timings"
+                )
+            }
+            Self::DuplicateStageTiming => {
+                formatter.write_str("policy execution stage timings must be unique")
+            }
+            Self::InconsistentTermination => formatter.write_str(
+                "policy execution termination and terminal stage must be present together",
+            ),
+            Self::IncompleteProgressWithoutTermination => formatter
+                .write_str("active or pending policy progress requires an execution termination"),
+            Self::DuplicatePolicyProgress => {
+                formatter.write_str("policy execution progress IDs must be unique")
+            }
+            Self::TooManyPolicyProgressIds { max } => write!(
+                formatter,
+                "policy execution accepts at most {max} progress policy IDs"
+            ),
+            Self::OverlappingPolicyProgress => formatter.write_str(
+                "policy execution completed, active, and pending policy IDs must not overlap",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PolicyExecutionMetadataError {}
 
 /// The sole canonical input to every policy-report renderer.
 #[derive(Debug, Clone)]
 pub struct PolicyReportDocument {
     schema_version: u32,
     evaluation: PolicyReportEvaluationContext,
+    execution: PolicyExecutionMetadata,
     rules: Vec<PolicyRuleDescriptor>,
     runs: Vec<PolicyRun>,
     suppressions: Vec<PolicySuppressionReview>,
@@ -1413,6 +1622,31 @@ impl PolicyReportDocument {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new_with_suppression_audit(
         evaluation: PolicyReportEvaluationContext,
+        rules: Vec<PolicyRuleDescriptor>,
+        runs: Vec<PolicyRun>,
+        suppressions: Vec<PolicySuppressionReview>,
+        diagnostics: Vec<PolicyReportDiagnostic>,
+        diagnostics_truncated: bool,
+        omitted_diagnostics_lower_bound: u64,
+        worst_omitted_diagnostic_severity: Option<PolicyDiagnosticSeverity>,
+    ) -> Result<Self, PolicyReportDocumentError> {
+        Self::try_new_with_execution(
+            evaluation,
+            PolicyExecutionMetadata::default(),
+            rules,
+            runs,
+            suppressions,
+            diagnostics,
+            diagnostics_truncated,
+            omitted_diagnostics_lower_bound,
+            worst_omitted_diagnostic_severity,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new_with_execution(
+        evaluation: PolicyReportEvaluationContext,
+        execution: PolicyExecutionMetadata,
         mut rules: Vec<PolicyRuleDescriptor>,
         mut runs: Vec<PolicyRun>,
         mut suppressions: Vec<PolicySuppressionReview>,
@@ -1441,6 +1675,7 @@ impl PolicyReportDocument {
         Ok(Self {
             schema_version: Self::SCHEMA_VERSION,
             evaluation,
+            execution,
             rules,
             runs,
             suppressions,
@@ -1457,6 +1692,10 @@ impl PolicyReportDocument {
 
     pub const fn evaluation(&self) -> &PolicyReportEvaluationContext {
         &self.evaluation
+    }
+
+    pub const fn execution(&self) -> &PolicyExecutionMetadata {
+        &self.execution
     }
 
     pub fn rules(&self) -> &[PolicyRuleDescriptor] {
@@ -1493,9 +1732,10 @@ impl Serialize for PolicyReportDocument {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("PolicyReportDocument", 9)?;
+        let mut state = serializer.serialize_struct("PolicyReportDocument", 10)?;
         state.serialize_field("schema_version", &self.schema_version)?;
         state.serialize_field("evaluation", &self.evaluation)?;
+        state.serialize_field("execution", &self.execution)?;
         state.serialize_field("rules", &self.rules)?;
         state.serialize_field("runs", &self.runs)?;
         state.serialize_field("suppressions", &self.suppressions)?;
@@ -1517,6 +1757,7 @@ impl RetainedSize for PolicyReportDocument {
     fn retained_size(&self) -> usize {
         size_of::<Self>()
             .saturating_add(retained_extra(&self.evaluation))
+            .saturating_add(retained_extra(&self.execution))
             .saturating_add(retained_extra(&self.rules))
             .saturating_add(retained_extra(&self.runs))
             .saturating_add(retained_extra(&self.suppressions))
@@ -1647,6 +1888,7 @@ const PER_POLICY_INCOMPLETE_REASON_ALLOWANCE: usize = 256;
 pub struct PolicyReportBuilder {
     budget: PolicyBatchBudget,
     evaluation: PolicyReportEvaluationContext,
+    execution: PolicyExecutionMetadata,
     expected_inputs: usize,
     registered_inputs: usize,
     outstanding_skeleton_allowance: usize,
@@ -1739,6 +1981,7 @@ impl PolicyReportBuilder {
         Ok(Self {
             budget,
             evaluation,
+            execution: PolicyExecutionMetadata::default(),
             expected_inputs,
             registered_inputs: 0,
             outstanding_skeleton_allowance,
@@ -2062,8 +2305,9 @@ impl PolicyReportBuilder {
                 registered: self.registered_inputs,
             });
         }
-        let document = PolicyReportDocument::try_new_with_suppression_audit(
+        let document = PolicyReportDocument::try_new_with_execution(
             self.evaluation,
+            self.execution,
             self.rules,
             self.runs,
             self.suppressions,
@@ -2079,6 +2323,28 @@ impl PolicyReportBuilder {
             });
         }
         Ok(document)
+    }
+
+    pub fn set_execution(
+        &mut self,
+        execution: PolicyExecutionMetadata,
+    ) -> Result<(), PolicyReportBuilderError> {
+        let retained = report_storage_size(
+            &self.evaluation,
+            &self.rules,
+            &self.runs,
+            &self.suppressions,
+            &self.diagnostics,
+        )
+        .saturating_add(retained_extra(&execution));
+        if retained > self.budget.max_retained_report_bytes() {
+            return Err(PolicyReportBuilderError::BatchRetentionExceeded {
+                retained_bytes: retained,
+                max_bytes: self.budget.max_retained_report_bytes(),
+            });
+        }
+        self.execution = execution;
+        Ok(())
     }
 
     fn ensure_input_slot(&self) -> Result<(), PolicyReportBuilderError> {
@@ -2858,6 +3124,11 @@ mod tests {
                 .unwrap(),
             json!("explicit-rql-schema-version-required")
         );
+        assert_eq!(
+            serde_json::to_value(PolicyReportDiagnosticCode::WorkspaceSnapshotDeadlineExceeded)
+                .unwrap(),
+            json!("workspace-snapshot-deadline-exceeded")
+        );
     }
 
     #[test]
@@ -3046,6 +3317,75 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&document).unwrap()["rules"][0]["analysis_type"],
             "match"
+        );
+    }
+
+    #[test]
+    fn schema_two_report_exposes_bounded_deadline_execution_metadata() {
+        let first = PolicyId::new("test.first").unwrap();
+        let second = PolicyId::new("test.second").unwrap();
+        let execution = PolicyExecutionMetadata::try_new(
+            5_000,
+            vec![
+                PolicyStageTiming::new(PolicyExecutionStage::WorkspaceSnapshot, 4_990),
+                PolicyStageTiming::new(PolicyExecutionStage::PolicySelection, 10),
+            ],
+            Some(PolicyExecutionTermination::DeadlineExceeded),
+            Some(PolicyExecutionStage::WorkspaceSnapshot),
+            None,
+            Vec::new(),
+            vec![second.clone(), first.clone()],
+        )
+        .unwrap();
+        let mut builder = PolicyReportBuilder::new(PolicyBatchBudget::default(), 0).unwrap();
+        builder.set_execution(execution).unwrap();
+        let document = builder.finish().unwrap();
+
+        let json = serde_json::to_value(&document).unwrap();
+        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["execution"]["termination"], "deadline_exceeded");
+        assert_eq!(json["execution"]["terminal_stage"], "workspace_snapshot");
+        assert_eq!(
+            json["execution"]["stage_timings"][0]["stage"],
+            "policy_selection"
+        );
+        assert_eq!(
+            json["execution"]["pending_policy_ids"],
+            serde_json::json!([first.as_str(), second.as_str()])
+        );
+        assert!(document.rules().is_empty());
+        assert!(document.runs().is_empty());
+    }
+
+    #[test]
+    fn execution_metadata_rejects_ambiguous_progress_and_stage_timings() {
+        let policy_id = PolicyId::new("test.duplicate").unwrap();
+        assert_eq!(
+            PolicyExecutionMetadata::try_new(
+                1,
+                vec![
+                    PolicyStageTiming::new(PolicyExecutionStage::PolicySelection, 1),
+                    PolicyStageTiming::new(PolicyExecutionStage::PolicySelection, 1),
+                ],
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+            ),
+            Err(PolicyExecutionMetadataError::DuplicateStageTiming)
+        );
+        assert_eq!(
+            PolicyExecutionMetadata::try_new(
+                1,
+                Vec::new(),
+                Some(PolicyExecutionTermination::DeadlineExceeded),
+                Some(PolicyExecutionStage::PolicyEvaluation),
+                Some(policy_id.clone()),
+                vec![policy_id],
+                Vec::new(),
+            ),
+            Err(PolicyExecutionMetadataError::OverlappingPolicyProgress)
         );
     }
 
