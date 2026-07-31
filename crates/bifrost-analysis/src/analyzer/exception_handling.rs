@@ -65,12 +65,9 @@ pub(crate) fn analyze_for_file(
             message: format!("failed to parse {}", file.rel_path().display()),
         };
     };
-    if tree.root_node().has_error() {
-        return ExceptionHandlingAnalysis::Failed {
-            message: format!("failed to parse {}", file.rel_path().display()),
-        };
-    }
-
+    // Tree-sitter error nodes are recoverable syntax, not a failed parse. Real
+    // C++ headers and C# files with preprocessor branches routinely contain
+    // them while still exposing usable catch-clause fields elsewhere in the tree.
     let findings = match language {
         Language::Cpp => analyze_cpp(analyzer, file, &source, tree.root_node(), &weights),
         Language::JavaScript | Language::TypeScript => {

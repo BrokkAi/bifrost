@@ -551,6 +551,66 @@ mod tests {
     }
 
     #[test]
+    fn php_conditional_free_functions_have_file_and_symbol_density() {
+        let fix = AnalyzerFixture::new(&[(
+            "functions.php",
+            r#"<?php
+namespace FastRoute;
+
+if (! function_exists('FastRoute\simpleDispatcher')) {
+    /** Header for the conditional free function. */
+    function simpleDispatcher(): void
+    {
+        // Inline implementation note.
+        work();
+    }
+}
+
+$factory = static function (): void {
+    function deferredUntilInvocation(): void {}
+};
+"#,
+        )]);
+        let analyzer = fix.analyzer.analyzer();
+        let file_result = report_comment_density_for_files(
+            analyzer,
+            ReportCommentDensityForFilesParams {
+                file_paths: vec!["functions.php".to_string()],
+                max_top_level_rows: 0,
+                max_files: 0,
+            },
+        );
+        assert!(
+            file_result.report.contains("`FastRoute.simpleDispatcher`"),
+            "{}",
+            file_result.report
+        );
+        assert!(
+            !file_result.report.contains("comment density unavailable"),
+            "{}",
+            file_result.report
+        );
+        assert!(
+            !file_result.report.contains("deferredUntilInvocation"),
+            "{}",
+            file_result.report
+        );
+
+        let symbol_result = report_comment_density_for_code_unit(
+            analyzer,
+            ReportCommentDensityForCodeUnitParams {
+                fq_name: "FastRoute.simpleDispatcher".to_string(),
+                max_lines: 0,
+            },
+        );
+        assert!(
+            symbol_result.report.contains("- Own: header 1, inline 1,"),
+            "{}",
+            symbol_result.report
+        );
+    }
+
+    #[test]
     fn comment_density_for_files_file_cap_truncates_list() {
         let fix = AnalyzerFixture::new(&[
             ("A.java", SAMPLE_JAVA.replace("Foo", "A").as_str()),

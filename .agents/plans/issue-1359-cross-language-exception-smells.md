@@ -18,6 +18,7 @@ The implementation uses the current Brokk Java analyzers and their tests as the 
 - [x] (2026-07-30 21:04Z) Milestone 2: ported Brokk behavior for C/C++, JavaScript/JSX, TypeScript/TSX, Python, PHP, Scala, C#, Go, and Rust; nine focused cross-language tests pass with positive and propagation/rethrow near-miss coverage.
 - [x] (2026-07-30 21:24Z) Milestone 3: added structured Ruby `rescue`/`rescue_modifier` and Kotlin `catch_block` semantics; all eleven focused language tests pass, including meaningful rethrow near misses.
 - [x] (2026-07-30 23:18Z) Milestone 4: completed mixed-language MCP/report integration, capability documentation, focused and full executable-test validation, and five-role specialist review; resolved the substantive semantic findings and recorded the unavailable policy tools and doc-test cache issue.
+- [x] (2026-07-31 15:12Z) Milestone 5 follow-up: fixed recoverable C++/C# parse rejection plus PHP conditional free-function discovery; verified the three pinned real-world repositories, 329 smell tests, 31 PHP-focused analyzer tests, focused density coverage, formatting, strict featureless Clippy, and the required policy attempt.
 
 ## Surprises & Discoveries
 
@@ -45,6 +46,15 @@ The implementation uses the current Brokk Java analyzers and their tests as the 
 - Observation: the shared target directory contained artifacts that rustc described as incompatible despite displaying the same compiler version.
   Evidence: all 1,836 executable analysis tests passed, after which doc tests and the first Clippy attempt failed with E0514 for cached dependencies. The required Clippy retry uses `scripts/with-isolated-cargo-target.sh` to avoid the contaminated shared target.
 
+- Observation: tree-sitter's `Tree::root_node().has_error()` is not equivalent to parser failure for production C++ and C#.
+  Evidence: fourteen of fmt's fifteen pinned headers and Dapper's pinned `Dapper/SqlMapper.cs` had recoverable error nodes, while Dapper still exposed ten complete `catch_clause` nodes and the surrounding analyzers indexed the files. Rejecting the whole tree made exception smells disagree with the other parser-backed tools.
+
+- Observation: FastRoute declares namespace-level functions under a top-level `if (! function_exists(...))` guard.
+  Evidence: the pinned `src/functions.php` initially produced zero top-level density rows even though its `simpleDispatcher` and `cachedDispatcher` nodes are ordinary named `function_definition` nodes.
+
+- Observation: the required code-smell policy run remains incapable of producing a trustworthy repository-wide result within the interactive budget.
+  Evidence: `bifrost.code-smells` returned schema-2 status `unreliable`/exit 2 after the nested-loop rule exhausted its execution budget and the remaining performance rules were cancelled. Three pre-existing dynamic-evaluation findings completed outside the changed files. Open issue #1398 owns this deadline behavior.
+
 ## Decision Log
 
 - Decision: keep `ExceptionSmellWeights` and `ExceptionHandlingSmell` compatible with Brokk instead of replacing them with a new language-neutral scoring model.
@@ -71,9 +81,19 @@ The implementation uses the current Brokk Java analyzers and their tests as the 
   Rationale: C has no catch syntax and the issue's capability-honesty criterion forbids silently applying the C++ catch detector to C return-code/errno handling. The MCP description states this boundary.
   Date/Author: 2026-07-30 / Codex
 
+- Decision: treat `Parser::parse` returning a tree as a successful tolerant parse even when that tree contains error nodes.
+  Rationale: tree-sitter deliberately recovers around unsupported macros and preprocessor shapes. The smell extractors consume structured, complete handler nodes, while binary/pathological input and an actual `None` parse remain explicit failures. This matches the parser contract used by adjacent analyzer tools and fixes the real fmt and Dapper inputs without source-text fallback logic.
+  Date/Author: 2026-07-31 / Codex
+
+- Decision: let the PHP declaration visitor traverse namespace-level structural containers until it reaches a named or anonymous callable/type boundary.
+  Rationale: PHP permits named free functions under control-flow guards. A stack-safe general traversal finds those declarations without scanning text and without misclassifying declarations inside anonymous function bodies or class members.
+  Date/Author: 2026-07-31 / Codex
+
 ## Outcomes & Retrospective
 
-All four milestones are complete. Java, Go, C++, JS/JSX, TS/TSX, Python, Rust, PHP, Scala, C#, Ruby, and Kotlin use structured parser nodes; lowercase C is explicit unsupported until native return-code/errno semantics exist. The final focused suite covers fifteen cases, including canonical Go/Rust propagation, nested Go ownership, exact broad-type classification, non-logging similarly named identifiers, C++ nested statement credit, mixed findings plus unsupported/failure notes, and malformed syntax. The final full smell suite passed 276 tests, the MCP server suite passed 24 tests, and all 1,836 executable analysis tests passed. Policy validation could not run because the installed skill's `list_policies` and `run_policy` tools were not registered. The shared-target doc-test phase hit E0514 cache incompatibility after the executable suite; task-scoped Clippy passed after pinning `PATH` to the repository's rustup toolchain so Cargo and Clippy did not mix Homebrew's LLVM-distinct binaries.
+The original four milestones are complete. Java, Go, C++, JS/JSX, TS/TSX, Python, Rust, PHP, Scala, C#, Ruby, and Kotlin use structured parser nodes; lowercase C is explicit unsupported until native return-code/errno semantics exist. The original focused suite covered fifteen cases, including canonical Go/Rust propagation, nested Go ownership, exact broad-type classification, non-logging similarly named identifiers, C++ nested statement credit, and mixed findings plus unsupported/failure notes. Its full smell suite passed 276 tests, the MCP server suite passed 24 tests, and all 1,836 executable analysis tests passed. Policy validation could not run because the installed skill's `list_policies` and `run_policy` tools were not registered. The shared-target doc-test phase hit E0514 cache incompatibility after the executable suite; task-scoped Clippy passed after pinning `PATH` to the repository's rustup toolchain so Cargo and Clippy did not mix Homebrew's LLVM-distinct binaries.
+
+The July 31 follow-up removes a false failure boundary around recoverable tree-sitter error nodes and discovers PHP free functions declared beneath namespace-level control flow while preserving anonymous-callable boundaries. The pinned fmt, Dapper, and FastRoute reproductions pass. The complete smell harness passed 329 tests, 31 PHP-focused analyzer tests passed, the focused density regression passed after its anonymous-function near miss was added, formatting and diff checks passed, and strict featureless Clippy passed in a self-cleaning isolated target with the Rustup toolchain pinned consistently. The required `bifrost.code-smells` run was `unreliable` for the existing #1398 budget boundary; its only completed findings were three pre-existing dynamic-evaluation sites outside this change.
 
 ## Context and Orientation
 
@@ -93,9 +113,11 @@ Milestone 3 adds the two languages without a Brokk reference. Ruby iteratively v
 
 Milestone 4 completes the public contract. Update MCP descriptions to name native Go/Rust behavior and explicit unsupported/failure reporting. Add mixed-language tests proving that supported findings are retained while unsupported files never create findings or false-clean text. Run focused analysis and MCP tests, the full featureless smell suite, task-scoped Clippy, and `cargo fmt`. Attempt the required Bifrost code-smell policy run; if policy tools remain absent, record that registration failure rather than claiming a clean run. Review the complete diff with the guided-issue specialist reviewers, resolve substantive findings, update this plan, and commit the final milestone.
 
+Milestone 5 is a correctness follow-up driven by real repositories. Remove the whole-tree `has_error` rejection from shared and Java exception analysis while retaining unsafe-source and actual parser-return failure states. Add fmt-shaped C++ and Dapper-shaped C# tests proving that complete catch clauses survive unrelated parser recovery. Extend the stack-safe PHP declaration visitor through namespace-level structural containers, stopping at callable and type boundaries, and prove both file-level and symbol-level density for a FastRoute-shaped conditional free function. Re-run the exact pinned repository inputs and the task-scoped gates.
+
 ## Concrete Steps
 
-Run commands from `/Users/dave/.codex/worktrees/8d5d/bifrost`.
+Run commands from `/Users/dave/.codex/worktrees/4bce/bifrost`.
 
 For Milestone 1:
 
@@ -116,11 +138,18 @@ For the final task-scoped gate, without the `nlp` feature:
     cargo test -p bifrost-mcp --test bifrost_mcp_server
     cargo clippy --all-targets -- -D warnings
 
+For the Milestone 5 focused regressions:
+
+    cargo test --test suite_smells -- exception_handling_smells::
+    cargo test -p brokk-bifrost-analysis php_conditional_free_functions_have_file_and_symbol_density
+
 If an all-feature pre-push gate is later explicitly required, first check disk space and run it through `scripts/with-isolated-cargo-target.sh` as required by `AGENTS.md`.
 
 ## Validation and Acceptance
 
 Every claimed language and dialect must have at least one positive finding and a realistic near miss. The positive must exercise the structured AST shape that owns the semantics, not merely a matching identifier. Go near misses include ordinary error propagation; Rust near misses include `?`; catch-family near misses include meaningful recovery or rethrowing. Nested constructs must be attributed only to the owning handler.
+
+Recoverable syntax errors outside a complete exception handler must not fail the file. The pinned fmt headers and Dapper `SqlMapper.cs` must return no failed files, and FastRoute `src/functions.php` must render `FastRoute.simpleDispatcher` in file density while its symbol density includes its own header and inline comments.
 
 The report must distinguish these observations: a supported file with no findings, an unsupported file, and a failed source/parser analysis. A request containing only unsupported or failed files must not say that no smells were found. A mixed request must render findings only from analyzed languages while explicitly listing the other inputs. Existing Java score, reason, ordering, truncation, and table tests must continue to pass.
 
@@ -147,3 +176,7 @@ Revision note (2026-07-30): Marked Milestone 2 complete and recorded the decisio
 Revision note (2026-07-30): Marked Milestone 3 complete and recorded the Kotlin grammar shape that determined empty-body and rethrow handling.
 
 Revision note (2026-07-30): Marked Milestone 4 complete after mixed-language integration, specialist review fixes, full executable-test validation, and explicit recording of unavailable policy tools and shared-target E0514 failures.
+
+Revision note (2026-07-31): Added Milestone 5 after pinned fmt, Dapper, and FastRoute inputs exposed recoverable-parse rejection and conditional PHP free-function discovery gaps; recorded the fixes, focused evidence, and remaining validation.
+
+Revision note (2026-07-31): Marked Milestone 5 complete after pinned-corpus verification, full smell and PHP-focused tests, strict Clippy, formatting, final diff review, and the required policy attempt.
