@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
@@ -21,15 +22,17 @@ use super::definition::{FindingSeverity, PolicyId, RqlpDocument};
 use super::evaluator::{DefaultPolicyEvaluator, PolicyEvaluationContext, PolicyEvaluator};
 use super::finding::{
     PolicyDiagnostic, PolicyDiagnosticCode, PolicyDiagnosticImpact, PolicyDiagnosticSeverity,
-    PolicyFailureReason, PolicyRun, PolicyRunCompletion, PolicyWorkReport,
+    PolicyFailureReason, PolicyIncompleteReason, PolicyRun, PolicyRunCompletion, PolicyWorkMetric,
+    PolicyWorkReport, PolicyWorkUnit,
 };
 use super::finding_identity::FindingIdentityStability;
 use super::loading::{PolicyDocumentLoadError, read_rqlp_document};
 use super::registry::{PolicyRegistry, PolicyRegistryError, PolicyRegistryLimits};
 use super::report::{
-    PolicyReportBuilder, PolicyReportBuilderError, PolicyReportDiagnostic,
-    PolicyReportDiagnosticCode, PolicyReportDocument, PolicyRetentionOutcome, PolicyRuleDescriptor,
-    PolicySourceRange,
+    PolicyExecutionMetadata, PolicyExecutionStage, PolicyExecutionTermination, PolicyReportBuilder,
+    PolicyReportBuilderError, PolicyReportDiagnostic, PolicyReportDiagnosticCode,
+    PolicyReportDocument, PolicyRetentionOutcome, PolicyRuleDescriptor, PolicySourceRange,
+    PolicyStageTiming,
 };
 use super::resolved::{
     EndpointDefinitionSchemaResolution, EndpointOrigin, LoadedPolicy, ResolvedEndpointIdentity,
@@ -462,6 +465,8 @@ fn evaluate_prepared_policy_inputs(
     supplied_workspace: Option<&WorkspaceAnalyzer>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
+    let coordinator_started = Instant::now();
+    let registration_started = Instant::now();
     check_policy_cancellation(cancellation)?;
     let mut secondary_diagnostics = Vec::new();
     let (suppression_document, suppression_document_state) =
@@ -595,9 +600,20 @@ fn evaluate_prepared_policy_inputs(
     let evaluator = DefaultPolicyEvaluator::new()
         .with_taint(&taint)
         .with_typestate(&typestate);
-    for policy in registry
+    let evaluation_policy_ids = registry
         .policies()
         .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id))
+        .map(|policy| policy.definition().metadata.id.clone())
+        .collect::<Vec<_>>();
+    let registration_elapsed = registration_started.elapsed();
+    let evaluation_started = Instant::now();
+    let mut completed_policy_ids = Vec::with_capacity(evaluation_policy_ids.len());
+    let mut active_policy_id = None;
+    let mut pending_policy_ids = Vec::new();
+    for (policy_index, policy) in registry
+        .policies()
+        .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id))
+        .enumerate()
     {
         check_policy_cancellation(cancellation)?;
         let mut evaluation_budget = *batch_budget.per_policy();
@@ -613,12 +629,55 @@ fn evaluate_prepared_policy_inputs(
             cvss_overlays: &[],
             organizational_risk: &[],
         };
-        let run = match evaluator.evaluate(policy, &context, &mut evaluation_budget) {
+        let policy_started = Instant::now();
+        let mut run = match evaluator.evaluate(policy, &context, &mut evaluation_budget) {
             Ok(run) => run,
             Err(error) => failed_evaluation_run(policy, error.to_string(), &evaluation_budget)?,
         };
+        run.try_add_work_metric(
+            PolicyWorkMetric::try_new(
+                "policy.evaluation_elapsed",
+                PolicyWorkUnit::Milliseconds,
+                duration_ms(policy_started.elapsed()),
+            )
+            .map_err(|error| {
+                PolicyCoordinatorError::new(format!(
+                    "failed to record policy evaluation timing: {error}"
+                ))
+            })?,
+        )
+        .map_err(|error| {
+            PolicyCoordinatorError::new(format!(
+                "failed to attach policy evaluation timing: {error}"
+            ))
+        })?;
+        let deadline_exceeded = cancellation.is_some_and(CancellationToken::is_timed_out)
+            && matches!(
+                run.completion(),
+                PolicyRunCompletion::Inconclusive { reasons }
+                    if reasons.contains(&PolicyIncompleteReason::Cancelled)
+            );
+        if deadline_exceeded {
+            run.replace_incomplete_reason(
+                PolicyIncompleteReason::Cancelled,
+                PolicyIncompleteReason::DeadlineExceeded,
+            )
+            .map_err(|error| {
+                PolicyCoordinatorError::new(format!(
+                    "failed to retain deadline completion reason: {error}"
+                ))
+            })?;
+            if active_policy_id.is_none() {
+                active_policy_id = Some(policy.definition().metadata.id.clone());
+                pending_policy_ids.extend_from_slice(&evaluation_policy_ids[policy_index + 1..]);
+            }
+        } else if active_policy_id.is_none() {
+            completed_policy_ids.push(policy.definition().metadata.id.clone());
+        }
         runs.insert(policy.definition().metadata.id.clone(), run);
     }
+    let evaluation_elapsed = evaluation_started.elapsed();
+    let report_started = Instant::now();
 
     let suppression_reviews = match suppression_document.as_ref() {
         Some(document) => {
@@ -755,6 +814,43 @@ fn evaluate_prepared_policy_inputs(
             })?;
     }
 
+    let deadline_exceeded = cancellation.is_some_and(CancellationToken::is_timed_out);
+    let execution = PolicyExecutionMetadata::try_new(
+        duration_ms(coordinator_started.elapsed()),
+        vec![
+            PolicyStageTiming::new(
+                PolicyExecutionStage::PolicyRegistration,
+                duration_ms(registration_elapsed),
+            ),
+            PolicyStageTiming::new(
+                PolicyExecutionStage::PolicyEvaluation,
+                duration_ms(evaluation_elapsed),
+            ),
+            PolicyStageTiming::new(
+                PolicyExecutionStage::ReportConstruction,
+                duration_ms(report_started.elapsed()),
+            ),
+        ],
+        deadline_exceeded.then_some(PolicyExecutionTermination::DeadlineExceeded),
+        deadline_exceeded.then_some(if active_policy_id.is_some() {
+            PolicyExecutionStage::PolicyEvaluation
+        } else {
+            PolicyExecutionStage::ReportConstruction
+        }),
+        active_policy_id,
+        completed_policy_ids,
+        pending_policy_ids,
+    )
+    .map_err(|error| {
+        PolicyCoordinatorError::new(format!(
+            "failed to record policy execution metadata: {error}"
+        ))
+    })?;
+    builder.set_execution(execution).map_err(|error| {
+        PolicyCoordinatorError::new(format!(
+            "failed to retain policy execution metadata: {error}"
+        ))
+    })?;
     let report = builder.finish().map_err(|error| {
         PolicyCoordinatorError::new(format!("failed to finish policy report: {error}"))
     })?;
@@ -768,6 +864,10 @@ fn evaluate_prepared_policy_inputs(
         exit_status,
         max_serialized_report_bytes: batch_budget.max_serialized_report_bytes(),
     })
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn apply_policy_suppressions(
@@ -1624,8 +1724,31 @@ mod tests {
         assert!(matches!(
             outcome.report().runs()[0].completion(),
             PolicyRunCompletion::Inconclusive { reasons }
-                if reasons.contains(&crate::analyzer::policy::PolicyIncompleteReason::Cancelled)
+                if reasons.contains(
+                    &crate::analyzer::policy::PolicyIncompleteReason::DeadlineExceeded
+                )
         ));
+        assert_eq!(
+            outcome.report().execution().termination(),
+            Some(PolicyExecutionTermination::DeadlineExceeded)
+        );
+        assert_eq!(
+            outcome.report().execution().terminal_stage(),
+            Some(PolicyExecutionStage::PolicyEvaluation)
+        );
+        assert_eq!(
+            outcome.report().execution().active_policy_id(),
+            Some(&PolicyId::new("test.timed-out").unwrap())
+        );
+        assert_eq!(
+            outcome.report().runs()[0]
+                .work()
+                .metrics()
+                .iter()
+                .find(|metric| metric.name() == "policy.evaluation_elapsed")
+                .map(PolicyWorkMetric::unit),
+            Some(PolicyWorkUnit::Milliseconds)
+        );
     }
 
     #[test]
@@ -1650,6 +1773,10 @@ mod tests {
         .expect("an expired deadline must not become a cancellation error");
 
         assert_eq!(outcome.exit_status(), POLICY_EXIT_UNRELIABLE);
+        assert_eq!(
+            outcome.report().execution().termination(),
+            Some(PolicyExecutionTermination::DeadlineExceeded)
+        );
     }
 
     #[test]

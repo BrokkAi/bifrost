@@ -15,7 +15,7 @@ After this change, a caller can invoke the built-in `bifrost.code-smells` pack a
 - [x] (2026-07-31 06:45Z) Verified the clean issue branch, fetched current remote state, reproduced the five-second `bifrost.code-smells` deadline, and diagnosed the current cross-layer behavior.
 - [x] (2026-07-31 06:45Z) Wrote this ExecPlan and fixed the implementation boundary around canonical deadline diagnostics rather than structural-query optimization.
 - [x] (2026-07-31 06:58Z) Added canonical deadline origin, stage timing, policy-progress types, millisecond work metrics, retained-size accounting, and behavior-focused schema-version-2 tests.
-- [ ] Capture coordinator stage timings, per-policy elapsed work, and active/completed/pending policy identifiers.
+- [x] (2026-07-31 07:04Z) Captured coordinator registration/evaluation/report timings, per-policy elapsed work, deadline-specific completion, and active/completed/pending policy identifiers.
 - [ ] Convert a pre-snapshot `run_policy` deadline into a canonical unreliable report while preserving ordinary errors.
 - [ ] Thread an MCP correlation identifier through `run_policy` and add end-to-end deadline regressions.
 - [ ] Run formatting, focused tests, the repository policy selection, and a live `bifrost.code-smells` validation.
@@ -37,6 +37,9 @@ After this change, a caller can invoke the built-in `bifrost.code-smells` pack a
 
 - Observation: The report builder can account for execution metadata at the point it is installed without perturbing every incremental retention calculation.
   Evidence: Execution metadata is bounded to eight stages and 256 policy identifiers, and `PolicyReportBuilder::set_execution` performs the batch retention check before `finish` performs the final exact retained-size check.
+
+- Observation: Policies after the first evaluator that observes the expired request token still need canonical rule/run skeletons even though they were pending at the deadline boundary.
+  Evidence: The coordinator continues its collect-and-return loop with the expired token, records the first deadline-incomplete policy as active, records later identifiers as pending-at-deadline, and retains zero/partial work from the evaluator for report join correctness.
 
 ## Decision Log
 
@@ -62,7 +65,7 @@ After this change, a caller can invoke the built-in `bifrost.code-smells` pack a
 
 ## Outcomes & Retrospective
 
-The first implementation milestone is complete. Schema-version-2 reports now have a validated `execution` object, deadline expiry has its own incomplete reason, and policy work metrics can use integer milliseconds. Coordinator and MCP paths do not populate the new metadata yet.
+The first two implementation milestones are complete. Schema-version-2 reports have a validated `execution` object, deadline expiry has its own incomplete reason, and the coordinator now populates registration, evaluation, report, and per-policy timing data with policy progress at the deadline boundary. MCP preparation does not yet merge selection/snapshot timing or convert the pre-snapshot error.
 
 ## Context and Orientation
 
@@ -187,3 +190,5 @@ The MCP wrapper must contain the canonical `PolicyReportDocument` unchanged plus
 Revision note: Initial ExecPlan written on 2026-07-31 after live reproduction and guided diagnosis. It records the approved boundary, the remaining contract gaps, and the decision to leave structural seed reuse to issue #1246.
 
 Revision note: Updated on 2026-07-31 after the report-model milestone to record the completed canonical types, tests, and bounded retained-size strategy.
+
+Revision note: Updated on 2026-07-31 after coordinator instrumentation to record deadline-specific policy completion, progress semantics, and focused `issue_1306` test evidence.

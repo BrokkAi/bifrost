@@ -1672,6 +1672,26 @@ impl PolicyWorkReport {
         &self.metrics
     }
 
+    fn try_add_metric(&mut self, metric: PolicyWorkMetric) -> Result<(), ReportValueError> {
+        if self.metrics.len() >= MAX_WORK_METRICS {
+            return Err(ReportValueError::TooManyItems {
+                field: "work_metrics",
+                max_items: MAX_WORK_METRICS,
+            });
+        }
+        match self
+            .metrics
+            .binary_search_by(|existing| existing.name.cmp(&metric.name))
+        {
+            Ok(_) => Err(ReportValueError::DuplicateWorkMetric),
+            Err(index) => {
+                self.metrics.insert(index, metric);
+                self.metrics.shrink_to_fit();
+                Ok(())
+            }
+        }
+    }
+
     pub(crate) fn set_retention(
         &mut self,
         retained_findings: u64,
@@ -2350,6 +2370,31 @@ impl PolicyRun {
     }
     pub const fn work(&self) -> &PolicyWorkReport {
         &self.work
+    }
+
+    pub(crate) fn try_add_work_metric(
+        &mut self,
+        metric: PolicyWorkMetric,
+    ) -> Result<(), ReportValueError> {
+        self.work.try_add_metric(metric)?;
+        self.refresh_retained_bytes();
+        Ok(())
+    }
+
+    pub(crate) fn replace_incomplete_reason(
+        &mut self,
+        from: PolicyIncompleteReason,
+        to: PolicyIncompleteReason,
+    ) -> Result<(), CompletionReasonError> {
+        let PolicyRunCompletion::Inconclusive { reasons } = &mut self.completion else {
+            return Ok(());
+        };
+        for reason in reasons.iter_mut().filter(|reason| **reason == from) {
+            *reason = to;
+        }
+        normalize_nonempty(reasons)?;
+        self.refresh_retained_bytes();
+        Ok(())
     }
 
     pub(crate) fn validate_against_budget(
