@@ -1,4 +1,4 @@
-use super::super::analysis_context::{ProtocolRef, ValueFlowPlanRef};
+use super::super::analysis_context::{ProtocolRef, TaintResultRef, ValueFlowPlanRef};
 use super::super::kinds::{NormalizedKind, Role};
 use super::schema::{CallTraversalCompleteness, CodeQueryExecutionMode, QueryStepOp};
 use crate::analyzer::Language;
@@ -24,7 +24,7 @@ pub const MAX_QUERY_STEPS: usize = 16;
 pub const MAX_QUERY_BRANCHES: usize = 16;
 pub const MAX_QUERY_PLAN_DEPTH: usize = 16;
 pub const MAX_QUERY_PLAN_NODES: usize = 64;
-pub const SCHEMA_VERSION: u64 = 6;
+pub const SCHEMA_VERSION: u64 = 7;
 pub const DECLARATION_CONTAINMENT_SCHEMA_VERSION: u64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +38,7 @@ pub enum QueryValueKind {
     TypestateWitness,
     FlowEndpoint,
     FlowWitness,
+    TaintFinding,
     ReferenceSite,
     CallSite,
     ExpressionSite,
@@ -57,6 +58,7 @@ impl QueryValueKind {
             Self::TypestateWitness => "typestate_witness",
             Self::FlowEndpoint => "flow_endpoint",
             Self::FlowWitness => "flow_witness",
+            Self::TaintFinding => "taint_finding",
             Self::ReferenceSite => "reference_site",
             Self::CallSite => "call_site",
             Self::ExpressionSite => "expression_site",
@@ -110,6 +112,11 @@ pub struct ValueFlowTraversal {
     pub plan_ref: ValueFlowPlanRef,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaintTraversal {
+    pub taint_ref: TaintResultRef,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WitnessTraversal {
     pub max_steps: Option<usize>,
@@ -142,6 +149,7 @@ pub enum QueryStep {
     CfgEdgeTarget,
     Typestate(TypestateTraversal),
     ValueFlow(ValueFlowTraversal),
+    Taint(TaintTraversal),
     Witness(WitnessTraversal),
     FileOf,
     ImportsOf,
@@ -180,6 +188,7 @@ impl QueryStep {
             Self::CfgEdgeTarget => QueryStepOp::CfgEdgeTarget,
             Self::Typestate(_) => QueryStepOp::Typestate,
             Self::ValueFlow(_) => QueryStepOp::ValueFlow,
+            Self::Taint(_) => QueryStepOp::Taint,
             Self::Witness(_) => QueryStepOp::Witness,
             Self::FileOf => QueryStepOp::FileOf,
             Self::ImportsOf => QueryStepOp::ImportsOf,
@@ -212,7 +221,10 @@ impl QueryStep {
             QueryStepOp::CfgPredecessorEdges => Some(Self::CfgPredecessorEdges),
             QueryStepOp::CfgEdgeSource => Some(Self::CfgEdgeSource),
             QueryStepOp::CfgEdgeTarget => Some(Self::CfgEdgeTarget),
-            QueryStepOp::Typestate | QueryStepOp::ValueFlow | QueryStepOp::Witness => None,
+            QueryStepOp::Typestate
+            | QueryStepOp::ValueFlow
+            | QueryStepOp::Taint
+            | QueryStepOp::Witness => None,
             QueryStepOp::FileOf => Some(Self::FileOf),
             QueryStepOp::ImportsOf => Some(Self::ImportsOf),
             QueryStepOp::ImportersOf => Some(Self::ImportersOf),
@@ -263,6 +275,7 @@ impl QueryStep {
                 Some(QueryValueKind::TypestateFinding)
             }
             (Self::ValueFlow(_), QueryValueKind::Procedure) => Some(QueryValueKind::FlowEndpoint),
+            (Self::Taint(_), QueryValueKind::Procedure) => Some(QueryValueKind::TaintFinding),
             (Self::Witness(_), QueryValueKind::TypestateFinding) => {
                 Some(QueryValueKind::TypestateWitness)
             }
@@ -278,6 +291,7 @@ impl QueryStep {
                 | QueryValueKind::TypestateWitness
                 | QueryValueKind::FlowEndpoint
                 | QueryValueKind::FlowWitness
+                | QueryValueKind::TaintFinding
                 | QueryValueKind::ReferenceSite
                 | QueryValueKind::CallSite
                 | QueryValueKind::ExpressionSite
@@ -375,9 +389,10 @@ pub(super) fn validate_query_steps(
             QueryStep::CfgEdgeSource | QueryStep::CfgEdgeTarget => "control_edge",
             QueryStep::Typestate(_) => "procedure",
             QueryStep::ValueFlow(_) => "procedure",
+            QueryStep::Taint(_) => "procedure",
             QueryStep::Witness(_) => "typestate_finding or flow_endpoint",
             QueryStep::FileOf => {
-                "structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, flow_endpoint, flow_witness, reference_site, call_site, expression_site, or receiver_analysis"
+                "structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, flow_endpoint, flow_witness, taint_finding, reference_site, call_site, expression_site, or receiver_analysis"
             }
             QueryStep::ImportsOf | QueryStep::ImportersOf => "file",
             QueryStep::Supertypes(_)

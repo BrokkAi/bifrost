@@ -33,6 +33,13 @@ const LSP_COMPONENTS = new Set(["rql_runtime", "lsp_contract"]);
 const RUNTIME_COMPONENTS = new Set(["rql_runtime", "mcp_contract", "lsp_contract"]);
 const EDITOR_COMPONENTS = new Set(["vscode"]);
 const PLUGIN_COMPONENTS = new Set(["pi_package", "agent_plugin"]);
+const RUST_COMPONENTS = new Set(["rust"]);
+const PYTHON_COMPONENTS = new Set(["python"]);
+const PYTHON_BINDING_COMPONENTS = new Set(["python", "rust"]);
+const RQL_TEST_COMPONENTS = new Set([...RQL_COMPONENTS, "rust"]);
+const MCP_TEST_COMPONENTS = new Set([...MCP_COMPONENTS, "rust"]);
+const EXTERNAL_FIXTURE_COMPONENTS = new Set(["external_fixture", "rust"]);
+const NO_COMPONENTS = new Set();
 
 function startsWithAny(path, prefixes) {
   return prefixes.some((prefix) => path.startsWith(prefix));
@@ -52,9 +59,36 @@ function isRqlPath(path) {
   );
 }
 
+function isRqlTestPath(path) {
+  return (
+    startsWithAny(path, [
+      "tests/fixtures/policies/",
+      "tests/fixtures/policy-cli/",
+      "tests/suite_bench_policy/",
+    ]) ||
+    path === "tests/suite_cross_language/code_query_docs.rs"
+  );
+}
+
 function isMcpPath(path) {
   return (
     startsWithAny(path, ["crates/bifrost-mcp/", "crates/bifrost-analysis/src/searchtools/"])
+  );
+}
+
+function isExternalFixturePath(path) {
+  return (
+    startsWithAny(path, [
+      "tests/fixtures/csharp-external/",
+      "tests/fixtures/testcode-java/",
+    ]) ||
+    [
+      "scripts/java-class-fixture-lib.sh",
+      "scripts/regenerate-csharp-external-fixture.sh",
+      "scripts/regenerate-java-class-fixture.sh",
+      "scripts/verify-csharp-external-fixture.sh",
+      "scripts/verify-java-class-fixture.sh",
+    ].includes(path)
   );
 }
 
@@ -73,7 +107,51 @@ function isPluginPath(path) {
   );
 }
 
+function isPythonPath(path) {
+  return (
+    startsWithAny(path, ["bifrost_searchtools/", "python_tests/"]) ||
+    path === "scripts/test_python.sh"
+  );
+}
+
+function isRustPath(path) {
+  return startsWithAny(path, [
+    "src/",
+    "crates/bifrost-analysis/src/",
+    "tests/",
+    "examples/",
+  ]);
+}
+
+function isDocumentationPath(path) {
+  return (
+    startsWithAny(path, [".agents/docs/", ".agents/plans/", "docs/"]) ||
+    [
+      ".agents/PLANS.md",
+      "AGENTS.md",
+      "CODE_OF_CONDUCT.md",
+      "CONTRIBUTING.md",
+      "README.md",
+      "SECURITY.md",
+      "plugins/bifrost-agent/README.md",
+    ].includes(path)
+  );
+}
+
 function classifyPath(path) {
+  if (isDocumentationPath(path)) {
+    return {
+      components: NO_COMPONENTS,
+      documentation: true,
+      reason: "documentation-only surface",
+    };
+  }
+  if (isRqlTestPath(path)) {
+    return {
+      components: RQL_TEST_COMPONENTS,
+      reason: "RQL or policy integration test surface",
+    };
+  }
   if (isRqlPath(path)) {
     return { components: RQL_COMPONENTS, reason: "RQL, structural-query, or policy surface" };
   }
@@ -83,14 +161,35 @@ function classifyPath(path) {
   if (isMcpPath(path)) {
     return { components: MCP_COMPONENTS, reason: "MCP host contract" };
   }
+  if (path === "tests/suite_mcp_cli/bifrost_tool_cli.rs") {
+    return { components: MCP_TEST_COMPONENTS, reason: "MCP integration test surface" };
+  }
   if (isLspPath(path)) {
     return { components: LSP_COMPONENTS, reason: "LSP host contract" };
+  }
+  if (isExternalFixturePath(path)) {
+    return {
+      components: EXTERNAL_FIXTURE_COMPONENTS,
+      reason: "external fixture provenance surface",
+    };
   }
   if (startsWithAny(path, ["editors/vscode/", "editors/zed/"])) {
     return { components: EDITOR_COMPONENTS, reason: "editor-only surface" };
   }
   if (isPluginPath(path)) {
     return { components: PLUGIN_COMPONENTS, reason: "agent-plugin surface" };
+  }
+  if (path === "src/python_module.rs") {
+    return {
+      components: PYTHON_BINDING_COMPONENTS,
+      reason: "Rust-backed Python binding surface",
+    };
+  }
+  if (isPythonPath(path)) {
+    return { components: PYTHON_COMPONENTS, reason: "Python package or test surface" };
+  }
+  if (isRustPath(path)) {
+    return { components: RUST_COMPONENTS, reason: "Rust analyzer or test surface" };
   }
   return null;
 }
@@ -121,11 +220,13 @@ export function classifyChangeSet({ eventName, ref = "", changedPaths = [], diff
 
   const selected = new Set();
   const reasons = [];
+  let documentationOnly = changedPaths.length > 0;
   for (const path of changedPaths) {
     const decision = classifyPath(path);
     if (!decision) {
       return fullDecision(`unmapped or safety-critical path: ${path}`, changedPaths);
     }
+    documentationOnly &&= decision.documentation === true;
     for (const component of decision.components) {
       selected.add(component);
     }
@@ -134,7 +235,7 @@ export function classifyChangeSet({ eventName, ref = "", changedPaths = [], diff
 
   return {
     schemaVersion: SCHEMA_VERSION,
-    mode: "impact",
+    mode: documentationOnly ? "docs" : "impact",
     changedPaths,
     reasons: reasons.length === 0 ? ["no changed paths; run the always-on baseline"] : reasons,
     selected,

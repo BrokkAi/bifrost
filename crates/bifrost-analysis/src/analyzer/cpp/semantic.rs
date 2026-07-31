@@ -412,21 +412,11 @@ fn callable_preflight(
             result.has_vla_boundaries = true;
         }
         if !is_c_source {
-            result.has_raii_boundaries |= matches!(
-                node.kind(),
-                "declaration"
-                    | "field_declaration"
-                    | "init_declarator"
-                    | "call_expression"
-                    | "new_expression"
-                    | "compound_literal_expression"
-            );
-            if node.kind() == "parameter_declaration" {
-                let ty = node
-                    .child_by_field_name("type")
-                    .or_else(|| first_named_child(node));
-                result.has_raii_boundaries |= ty.is_none_or(|ty| ty.kind() != "primitive_type");
-            }
+            result.has_raii_boundaries |= declaration_may_construct_object(node)
+                || matches!(
+                    node.kind(),
+                    "call_expression" | "new_expression" | "compound_literal_expression"
+                );
         }
         stack.extend(named_children(node));
     }
@@ -3325,28 +3315,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.edge(builder, normal, next)?;
         self.abrupt(builder, exceptional, scope, CompletionKind::Throw, None)?;
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
-        for (capability, detail) in [
-            (
-                SemanticCapability::ExceptionalControlFlow,
-                "caller-side default arguments, implicit conversions, and copy/move construction may throw before callee entry",
-            ),
-            (
-                SemanticCapability::CleanupControlFlow,
-                "temporaries created by default arguments and implicit conversions may require cleanup before or after the represented call",
-            ),
-        ] {
-            let subject = SemanticGapSubject::CallSite(call_site);
-            self.add_gap_with_impacts(
-                builder,
-                invoke,
-                subject,
-                capability,
-                SemanticGapImpacts::for_gap(capability, subject)
-                    .with(SemanticGapImpact::CallEvaluation),
-                SemanticGapKind::Unknown,
-                detail,
-            )?;
-        }
 
         if indirect {
             self.add_gap(
@@ -4417,13 +4385,35 @@ fn declaration_may_construct_object(node: Node<'_>) -> bool {
     if matches!(node.kind(), "field_initializer" | "field_initializer_list") {
         return true;
     }
-    if !matches!(node.kind(), "declaration" | "field_declaration") {
+    if !matches!(
+        node.kind(),
+        "declaration" | "field_declaration" | "parameter_declaration"
+    ) {
         return false;
     }
     let type_node = node
         .child_by_field_name("type")
         .or_else(|| first_named_child(node));
-    type_node.is_none_or(|ty| ty.kind() != "primitive_type")
+    if type_node.is_some_and(|ty| ty.kind() == "primitive_type") {
+        return false;
+    }
+
+    let mut cursor = node.walk();
+    let declarators = node
+        .children_by_field_name("declarator", &mut cursor)
+        .collect::<Vec<_>>();
+    declarators.is_empty()
+        || declarators.into_iter().any(|declarator| {
+            let indirect = [
+                "pointer_declarator",
+                "reference_declarator",
+                "abstract_pointer_declarator",
+                "abstract_reference_declarator",
+            ]
+            .into_iter()
+            .any(|kind| cpp_declarator_contains_kind(declarator, kind));
+            !indirect
+        })
 }
 
 fn condition_value_declaration(condition: Node<'_>) -> Option<Node<'_>> {

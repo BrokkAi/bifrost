@@ -6,7 +6,16 @@ use brokk_bifrost::analyzer::policy::{
     evaluate_policy_inputs_with_analyzer, write_policy_human, write_policy_json,
     write_policy_sarif,
 };
+use brokk_bifrost::analyzer::structural::{
+    CodeQuery, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, ProtocolRegistrationSet,
+    TaintResultRef, TaintResultRegistration, TaintResultRegistrationError,
+    TaintResultRegistrationLimits, TaintResultRegistrationOutcome, TaintResultRegistrationSet,
+    TaintResultRegistrationSetError, ValueFlowPlanRegistrationSet,
+    execute_workspace_request_with_all_analysis_registration_lease,
+};
+use brokk_bifrost::analyzer::typestate::ProductionTypestateSummaryRepository;
 use brokk_bifrost::{AnalyzerConfig, Language};
+use std::sync::Arc;
 
 const SOURCE: &str = r#"
 def source_one():
@@ -367,6 +376,237 @@ fn production_taint_policies_share_a_batch_and_all_renderers_keep_the_same_evide
     }
 
     assert_eq!(outcome.taint_findings().len(), 2);
+    assert_eq!(outcome.taint_analysis_results().len(), 1);
+    let retained = &outcome.taint_analysis_results()[0];
+    assert!(retained.plan_report_match());
+    assert!(retained.retained_plan_bytes() > 0);
+    assert!(retained.retained_report_bytes() > 0);
+    assert!(!retained.artifact_keys().is_empty());
+    assert!(retained.retained_artifact_bytes() > 0);
+    assert_eq!(
+        retained
+            .project_findings(&workspace, retained.projection_limits())
+            .expect("retained production taint projection"),
+        outcome.taint_findings()
+    );
+    assert_eq!(
+        retained
+            .project_findings(
+                &workspace,
+                brokk_bifrost::analyzer::structural::CodeQueryTaintProjectionLimits::new(
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                    usize::MAX,
+                ),
+            )
+            .expect("projection cannot exceed retained production authority"),
+        outcome.taint_findings()
+    );
+    let first_ref = TaintResultRef::new("request", "primary").expect("bounded taint ref");
+    let alias_ref = TaintResultRef::new("request", "alias").expect("bounded taint ref");
+    let registration = TaintResultRegistration::new(7, vec![Arc::clone(retained)])
+        .expect("valid retained taint registration");
+    let mut registrations = TaintResultRegistrationSet::default();
+    assert_eq!(
+        registrations
+            .register(first_ref.clone(), registration)
+            .expect("insert retained taint result"),
+        TaintResultRegistrationOutcome::Inserted
+    );
+    assert_eq!(
+        registrations
+            .register(
+                alias_ref.clone(),
+                TaintResultRegistration::new(7, vec![Arc::clone(retained)])
+                    .expect("valid taint alias"),
+            )
+            .expect("alias retained taint result"),
+        TaintResultRegistrationOutcome::Aliased
+    );
+    assert!(matches!(
+        registrations.register(
+            first_ref.clone(),
+            TaintResultRegistration::new(8, vec![Arc::clone(retained)])
+                .expect("different-generation registration"),
+        ),
+        Err(TaintResultRegistrationSetError::ReferenceConflict { .. })
+    ));
+    assert_eq!(registrations.reference_count(), 2);
+    assert_eq!(registrations.registration_count(), 1);
+
+    let json_query = CodeQuery::from_json(&serde_json::json!({
+        "schema_version": 7,
+        "match": { "kind": "function", "name": "run" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "taint", "taint_ref": "request:primary" }
+        ]
+    }))
+    .expect("schema-v7 taint JSON query");
+    let rql_query = CodeQuery::from_sexp(
+        r#"(taint :taint-ref request:alias (procedure-of (function :name "run")))"#,
+    )
+    .expect("schema-v7 taint RQL query");
+    let execute = |query: &CodeQuery,
+                   generation: u64,
+                   taint_registrations: &TaintResultRegistrationSet,
+                   limits: CodeQueryExecutionLimits| {
+        let summaries = Arc::new(ProductionTypestateSummaryRepository::new());
+        let lease = summaries
+            .lease(generation)
+            .expect("generation-scoped summary lease");
+        execute_workspace_request_with_all_analysis_registration_lease(
+            &workspace,
+            generation,
+            &ProtocolRegistrationSet::default(),
+            &ValueFlowPlanRegistrationSet::default(),
+            taint_registrations,
+            query,
+            limits,
+            None,
+            lease,
+        )
+    };
+    let json_response = execute(
+        &json_query,
+        7,
+        &registrations,
+        CodeQueryExecutionLimits::default(),
+    );
+    let rql_response = execute(
+        &rql_query,
+        7,
+        &registrations,
+        CodeQueryExecutionLimits::default(),
+    );
+    let json_result = json_response.result().expect("executed JSON result");
+    let rql_result = rql_response.result().expect("executed RQL result");
+    assert!(
+        json_result.diagnostics.is_empty(),
+        "{:?}",
+        json_result.diagnostics
+    );
+    assert!(
+        rql_result.diagnostics.is_empty(),
+        "{:?}",
+        rql_result.diagnostics
+    );
+    assert_eq!(
+        serde_json::to_value(&json_result.results).expect("JSON result serialization"),
+        serde_json::to_value(&rql_result.results).expect("RQL result serialization")
+    );
+    assert_eq!(json_result.results.len(), outcome.taint_findings().len());
+
+    let mut row_limited = CodeQueryExecutionLimits::default();
+    row_limited.taint.max_findings = 1;
+    let row_limited = execute(&json_query, 7, &registrations, row_limited);
+    let row_limited = row_limited.result().expect("row-limited taint result");
+    assert_eq!(row_limited.results.len(), 1);
+    assert!(
+        row_limited.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::TaintFindingTruncated
+        })
+    );
+
+    let mut byte_limited = CodeQueryExecutionLimits::default();
+    byte_limited.taint.max_projected_bytes = 1;
+    let byte_limited = execute(&json_query, 7, &registrations, byte_limited);
+    let byte_limited = byte_limited.result().expect("byte-limited taint result");
+    assert!(byte_limited.results.is_empty());
+    assert!(
+        byte_limited.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::TaintFindingTruncated
+        })
+    );
+
+    let missing_query = CodeQuery::from_json(&serde_json::json!({
+        "schema_version": 7,
+        "match": { "kind": "function", "name": "run" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "taint", "taint_ref": "request:missing" }
+        ]
+    }))
+    .expect("missing-ref taint query");
+    let missing = execute(
+        &missing_query,
+        7,
+        &registrations,
+        CodeQueryExecutionLimits::default(),
+    );
+    assert!(
+        missing
+            .result()
+            .expect("missing-ref result")
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code
+                == CodeQueryDiagnosticCode::UnresolvedTaintResultReference)
+    );
+
+    let wrong_root_query = CodeQuery::from_json(&serde_json::json!({
+        "schema_version": 7,
+        "match": { "kind": "function", "name": "source_one" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "taint", "taint_ref": "request:primary" }
+        ]
+    }))
+    .expect("wrong-root taint query");
+    let wrong_root = execute(
+        &wrong_root_query,
+        7,
+        &registrations,
+        CodeQueryExecutionLimits::default(),
+    );
+    assert!(
+        wrong_root
+            .result()
+            .expect("wrong-root result")
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::TaintRootMismatch)
+    );
+
+    let stale = execute(
+        &json_query,
+        8,
+        &registrations,
+        CodeQueryExecutionLimits::default(),
+    );
+    assert!(
+        stale
+            .result()
+            .expect("stale result")
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::TaintRegistrationStale)
+    );
+
+    assert!(registrations.unregister(&first_ref));
+    assert_eq!(registrations.reference_count(), 1);
+    assert_eq!(registrations.registration_count(), 1);
+    assert!(registrations.unregister(&alias_ref));
+    assert_eq!(registrations.registration_count(), 0);
+
+    assert!(matches!(
+        TaintResultRegistration::new(7, vec![Arc::clone(retained), Arc::clone(retained)]),
+        Err(TaintResultRegistrationError::DuplicateRoot)
+    ));
+    let mut bounded = TaintResultRegistrationSet::with_limits(
+        TaintResultRegistrationLimits::bounded(1, 1, 0, usize::MAX, usize::MAX),
+    );
+    assert!(matches!(
+        bounded.register(
+            first_ref,
+            TaintResultRegistration::new(7, vec![Arc::clone(retained)])
+                .expect("valid bounded registration"),
+        ),
+        Err(TaintResultRegistrationSetError::RetainedPlanBytes(0))
+    ));
+    assert_eq!(bounded.reference_count(), 0);
+    assert_eq!(bounded.registration_count(), 0);
     assert_eq!(outcome.taint_query_results().len(), 2);
     for result in outcome.taint_query_results() {
         let value = serde_json::to_value(result).expect("public taint query serialization");

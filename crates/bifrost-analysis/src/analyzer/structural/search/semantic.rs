@@ -1,6 +1,7 @@
 use std::mem::size_of;
 use std::sync::Arc;
 
+use super::taint::{SemanticTaintFindingValue, TaintQueryState};
 use super::typestate::{SemanticTypestateFindingValue, TypestateQueryState};
 use super::value_flow::{SemanticFlowEndpointValue, SemanticFlowWitnessValue, ValueFlowQueryState};
 use super::{
@@ -23,7 +24,7 @@ use crate::analyzer::semantic::{
     SourceMapping,
 };
 use crate::analyzer::structural::analysis_context::{
-    ProtocolRef, QueryAnalysisContext, ValueFlowPlanRef,
+    ProtocolRef, QueryAnalysisContext, TaintResultRef, ValueFlowPlanRef,
 };
 use crate::analyzer::structural::query::WitnessTraversal;
 use crate::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
@@ -135,6 +136,7 @@ pub(super) struct SemanticQueryContext<'a> {
     limits: CodeQuerySemanticLimits,
     typestate_limits: super::CodeQueryTypestateLimits,
     value_flow_limits: super::CodeQueryValueFlowLimits,
+    taint_limits: super::CodeQueryTaintLimits,
     workspace_generation: u64,
     analysis_context: Option<&'a QueryAnalysisContext>,
     budget: SemanticBudget,
@@ -150,6 +152,7 @@ pub(super) struct SemanticQueryContext<'a> {
     budget_exhausted: bool,
     typestate: TypestateQueryState,
     value_flow: ValueFlowQueryState,
+    taint: TaintQueryState,
 }
 
 impl<'a> SemanticQueryContext<'a> {
@@ -165,17 +168,20 @@ impl<'a> SemanticQueryContext<'a> {
             limits,
             super::CodeQueryTypestateLimits::default(),
             super::CodeQueryValueFlowLimits::default(),
+            super::CodeQueryTaintLimits::default(),
             0,
             None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new_with_analysis(
         workspace: &'a WorkspaceAnalyzer,
         cancellation: Option<&'a CancellationToken>,
         limits: CodeQuerySemanticLimits,
         typestate_limits: super::CodeQueryTypestateLimits,
         value_flow_limits: super::CodeQueryValueFlowLimits,
+        taint_limits: super::CodeQueryTaintLimits,
         workspace_generation: u64,
         analysis_context: Option<&'a QueryAnalysisContext>,
     ) -> Self {
@@ -187,6 +193,7 @@ impl<'a> SemanticQueryContext<'a> {
             limits,
             typestate_limits,
             value_flow_limits,
+            taint_limits,
             workspace_generation,
             analysis_context,
             budget: SemanticBudget::new(semantic_budget_limits(limits))
@@ -203,6 +210,7 @@ impl<'a> SemanticQueryContext<'a> {
             budget_exhausted: false,
             typestate: TypestateQueryState::default(),
             value_flow: ValueFlowQueryState::default(),
+            taint: TaintQueryState::default(),
         }
     }
 
@@ -414,6 +422,7 @@ impl<'a> SemanticQueryContext<'a> {
         let mut diagnostics = std::mem::take(&mut self.diagnostics);
         diagnostics.extend(self.typestate.take_diagnostics());
         diagnostics.extend(self.value_flow.take_diagnostics());
+        diagnostics.extend(self.taint.take_diagnostics());
         diagnostics
     }
 
@@ -498,6 +507,25 @@ impl<'a> SemanticQueryContext<'a> {
     ) -> Vec<SemanticFlowWitnessValue> {
         self.value_flow
             .witnesses(self.workspace, endpoint, traversal, self.value_flow_limits)
+    }
+
+    pub(super) fn taint_findings(
+        &mut self,
+        procedure: &SemanticProcedureValue,
+        taint_ref: &TaintResultRef,
+        max_findings: usize,
+    ) -> Vec<SemanticTaintFindingValue> {
+        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
+        self.taint.findings(
+            self.workspace,
+            self.workspace_generation,
+            self.analysis_context,
+            procedure,
+            taint_ref,
+            self.taint_limits,
+            max_findings,
+            cancellation,
+        )
     }
 
     fn finish_procedure_lookup(

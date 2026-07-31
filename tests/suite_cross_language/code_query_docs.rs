@@ -189,12 +189,12 @@ fn query_documentation_tracks_public_contracts() {
     let python_client = fs::read_to_string(root.join("docs/src/content/docs/python-client.md"))
         .expect("read Python client documentation");
     for required in [
-        "compatible-head version-6",
+        "compatible-head version-7",
         "schema_version=2",
         "schema_version=3",
         "schema_version=4",
         "inside_decl",
-        "fourteen possible classes",
+        "fifteen possible classes",
         "CodeQueryProcedure",
         "CodeQueryProgramPoint",
         "CodeQueryControlEdge",
@@ -202,24 +202,27 @@ fn query_documentation_tracks_public_contracts() {
         "CodeQueryTypestateWitness",
         "CodeQueryFlowEndpoint",
         "CodeQueryFlowWitness",
+        "CodeQueryTaintFinding",
         "CodeQueryReceiverAnalysis",
     ] {
         assert!(
             python_client.contains(required),
-            "Python client documentation must track the schema-v6 result contract: missing {required:?}"
+            "Python client documentation must track the schema-v7 result contract: missing {required:?}"
         );
     }
 
     let python_client_source = fs::read_to_string(root.join("bifrost_searchtools/client.py"))
         .expect("read Python client source");
     for required in [
-        "schema version 6",
+        "schema version 7",
         "cfg_successor_edges",
         "cfg_edge_target",
         "typestate",
         "witness",
         "value_flow",
         "plan_ref",
+        "taint",
+        "taint_ref",
     ] {
         assert!(
             python_client_source.contains(required),

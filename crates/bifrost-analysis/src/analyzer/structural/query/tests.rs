@@ -674,6 +674,67 @@ fn value_flow_plan_ref_is_required_and_operation_specific() {
 }
 
 #[test]
+fn schema_version_seven_adds_retained_taint_findings() {
+    let query = parse_ok(json!({
+        "schema_version": 7,
+        "match": { "kind": "function", "name": "run" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "taint", "taint_ref": "test:request-to-sink" },
+            { "op": "file_of" }
+        ]
+    }));
+    assert!(matches!(
+        &query.plan.steps[1],
+        QueryStep::Taint(TaintTraversal { taint_ref })
+            if taint_ref.to_string() == "test:request-to-sink"
+    ));
+    assert_eq!(query.validate_steps().unwrap(), QueryValueKind::File);
+
+    let rql = CodeQuery::from_sexp(
+        "(file-of (taint :taint-ref test:request-to-sink (procedure-of (function :name \"run\"))))",
+    )
+    .expect("schema-seven taint RQL should lower");
+    assert_eq!(rql.schema_version, SCHEMA_VERSION);
+    assert_eq!(rql.plan.steps, query.plan.steps);
+
+    let error = error_of(json!({
+        "schema_version": 6,
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "taint", "taint_ref": "test:request-to-sink" }
+        ]
+    }));
+    assert_eq!(error.path, "steps[1].op");
+    assert!(error.message.contains("requires schema version 7"));
+}
+
+#[test]
+fn taint_ref_is_required_and_operation_specific() {
+    let missing = error_of(json!({
+        "match": { "kind": "function" },
+        "steps": [{ "op": "procedure_of" }, { "op": "taint" }]
+    }));
+    assert_eq!(missing.path, "steps[1].taint_ref");
+
+    let invalid = error_of(json!({
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "taint", "taint_ref": "missing-separator" }
+        ]
+    }));
+    assert_eq!(invalid.path, "steps[1].taint_ref");
+
+    let wrong_operation = error_of(json!({
+        "match": { "kind": "function" },
+        "steps": [{ "op": "procedure_of", "taint_ref": "test:taint" }]
+    }));
+    assert_eq!(wrong_operation.path, "steps[0].taint_ref");
+}
+
+#[test]
 fn typed_cfg_algebra_validates_each_domain_transition() {
     for (steps, expected) in [
         (

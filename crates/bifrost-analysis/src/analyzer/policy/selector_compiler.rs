@@ -366,6 +366,7 @@ impl<'a> PolicySelectorSession<'a> {
             semantic,
             typestate: self.query_limits.typestate,
             value_flow: self.query_limits.value_flow,
+            taint: self.query_limits.taint,
         })
     }
 

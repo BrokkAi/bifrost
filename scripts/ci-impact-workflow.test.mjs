@@ -13,9 +13,12 @@ test("CI is unconditional for pull requests and covers merge queues", () => {
 test("CI has the classifier, canonical lint gate, and stable aggregation check", () => {
   assert.match(workflow, /^  ci-impact:\n    name: ci impact$/mu);
   assert.match(workflow, /^  lint:\n    name: lint$/mu);
+  assert.match(workflow, /^    needs: \[ci-impact, quick-policy\]\n    if: needs\.ci-impact\.outputs\.mode != 'docs'$/mu);
   assert.match(workflow, /cargo clippy --all-targets --all-features -- -D warnings/u);
   assert.match(workflow, /^  pr-verification:\n    name: PR verification$/mu);
   assert.match(workflow, /if: \$\{\{ always\(\) \}\}/u);
+  assert.match(workflow, /LINT_SELECTED: \$\{\{ needs\.ci-impact\.outputs\.mode != 'docs' \}\}/u);
+  assert.match(workflow, /check_result 'lint' "\$LINT_SELECTED" "\$LINT_RESULT"/u);
 });
 
 test("selected component jobs are gated only by the classifier outputs", () => {

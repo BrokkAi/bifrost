@@ -5,7 +5,7 @@ description: Use the canonical JSON representation for Bifrost's query_code engi
 
 JSON `CodeQuery` is the canonical machine-facing representation accepted by Bifrost's `query_code` tool. MCP hosts and the Python client send this shape directly. The RQL REPL prints the same representation with `:json`.
 
-The compatible head is schema version 6. It retains version 3's source-backed procedure-local CFG surface and version 2's structural/declaration/reference/call/import/hierarchy/receiver vocabulary, adds host-registered diagnostic-neutral typestate findings and bounded witnesses in version 4, declaration-bounded containment in version 5, and host-registered diagnostic-neutral value-flow endpoints and witnesses in version 6. Explicit version pins keep their old meanings and reject later operations. Schema version 6 does not load plans from a query, classify policy findings, or expose taint-policy semantics.
+The compatible head is schema version 7. It retains the version 2-6 vocabulary and adds projection of host-retained production taint findings. Explicit version pins keep their old meanings and reject later operations. A schema-v7 query names only a registered immutable result; it cannot load a policy, compile selectors, run propagation, reconstruct witnesses, or perform policy classification.
 
 ## Minimal Query
 
@@ -28,7 +28,7 @@ The `match` object is the root pattern. It must constrain at least one of `kind`
 
 | Field | Shape | Meaning |
 | --- | --- | --- |
-| `schema_version` | integer | Optional. Omit it for compatible head version 6; pass `2` to pin the pre-CFG vocabulary, `3` for CFG without typestate, `4` for typestate, `5` for declaration-bounded containment without value flow, or `6` explicitly. Other versions are rejected. |
+| `schema_version` | integer | Optional. Omit it for compatible head version 7; pass `2` through `6` to pin an earlier vocabulary, or `7` explicitly. Other versions are rejected. |
 | `match` | pattern | Required root pattern. |
 | `where` | string array | Optional project-relative globs. Absolute paths or globs inside the active workspace are normalized by MCP and CLI entrypoints. |
 | `languages` | string array | Optional language labels such as `python`, `typescript`, `cpp`, or `csharp`. Empty means every structural adapter. |
@@ -186,6 +186,7 @@ Steps execute in array order and are validated before the workspace is searched:
 | `cfg_edge_target` (v3) | control edge | program point | Target endpoint of an edge. |
 | `typestate` (v4) | procedure | typestate finding | Run the host-registered protocol/binding pair named by `protocol_ref` once for the exact procedure. |
 | `value_flow` (v6) | procedure | flow endpoint | Run the host-registered `ValueFlowPlan` named by `plan_ref` once for the exact procedure. |
+| `taint` (v7) | procedure | taint finding | Project the retained production `TaintFindingReport` named by `taint_ref` for the exact procedure. |
 | `witness` (v4/v6) | typestate finding or flow endpoint | matching witness domain | Project already-retained evidence, optionally reducing it with non-negative `max_steps` and `max_bytes`. |
 | `references_of` | declaration | reference site | Exact structured source sites targeting the declaration. |
 | `used_by` | declaration | declaration | Smallest exact declaration enclosing each matching site. |
@@ -272,6 +273,23 @@ The host registers an already-built `ValueFlowPlan` under a namespaced reference
 ```
 
 `flow_endpoint` rows keep reachability (`reached`, `not_reached`, or `inconclusive`), exact/may certainty, ambiguity, completion, must-status (`not_established`), and solver termination as separate fields. `flow_witness` rows contain bounded ordered source-backed steps plus truncation metadata. The adapter consumes the existing plan and solver, caches one solve per procedure/plan tuple within the request, and never performs policy classification.
+
+### Retained production taint findings (schema v7)
+
+The host registers immutable results produced by the production taint policy compiler, batch planner, solver, collector, and public projector. A query selects the exact procedure root and projects only retained evidence:
+
+```json
+{
+  "schema_version": 7,
+  "match": {"kind": "method", "name": "run"},
+  "steps": [
+    {"op": "procedure_of"},
+    {"op": "taint", "taint_ref": "request:http-to-database"}
+  ]
+}
+```
+
+`taint_finding` rows preserve stable IDs, reached labels, origins, witnesses, proof/completeness, ambiguity, and truncation metadata. Registration aliases never enter those IDs. Matching projection limits produce rows field-for-field equal to the production policy outcome's public taint findings.
 
 ```json
 {
