@@ -756,11 +756,20 @@ impl McpSession {
 }
 
 fn validate_server_build_identity(response: &Value) -> Result<(), String> {
+    // Two locations during the issue #1328 MCP host migration. The rmcp host
+    // publishes the identity in the initialize result's `_meta`, because
+    // rmcp's `serverInfo` is a closed struct with no room for a vendor field;
+    // the hand-written host still puts it on `serverInfo` itself. Accepting
+    // either is what lets the latency benchmark run against both hosts -- and
+    // the analyzer pool's capacity is only allowed to change on evidence from
+    // that benchmark, so it has to be runnable against the host that has the
+    // pool.
     let server_identity = response
         .pointer("/result/serverInfo/buildIdentity")
+        .or_else(|| response.pointer("/result/_meta/io.bifrost~1build-identity"))
         .and_then(Value::as_str)
         .ok_or_else(|| {
-            "bifrost MCP initialize response omitted serverInfo.buildIdentity; rebuild the server binary"
+            "bifrost MCP initialize response omitted its build identity; rebuild the server binary"
                 .to_string()
         })?;
     if server_identity != crate::BIFROST_BUILD_IDENTITY {
@@ -1044,10 +1053,7 @@ mod tests {
         let missing = json!({"result": {"serverInfo": {}}});
         let error = validate_server_build_identity(&missing)
             .expect_err("missing identity must be rejected");
-        assert!(
-            error.contains("omitted serverInfo.buildIdentity"),
-            "{error}"
-        );
+        assert!(error.contains("omitted its build identity"), "{error}");
 
         let stale = json!({
             "result": {"serverInfo": {"buildIdentity": "stale-binary"}}
@@ -1057,9 +1063,34 @@ mod tests {
         assert!(error.contains("stale-binary"), "{error}");
         assert!(error.contains(crate::BIFROST_BUILD_IDENTITY), "{error}");
 
-        let current = json!({
+        // Both hosts must satisfy this. The hand-written stack reports the
+        // identity on `serverInfo`; the rmcp host reports it in the initialize
+        // result's `_meta`, because rmcp's `serverInfo` has no vendor field.
+        let legacy_location = json!({
             "result": {"serverInfo": {"buildIdentity": crate::BIFROST_BUILD_IDENTITY}}
         });
-        validate_server_build_identity(&current).expect("matching server identity");
+        validate_server_build_identity(&legacy_location).expect("matching server identity");
+
+        let meta_location = json!({
+            "result": {
+                "serverInfo": {"name": "bifrost"},
+                "_meta": {"io.bifrost/build-identity": crate::BIFROST_BUILD_IDENTITY}
+            }
+        });
+        validate_server_build_identity(&meta_location)
+            .expect("matching server identity reported through _meta");
+
+        // A stale identity in the new location must be caught too, or the
+        // benchmark would silently measure whatever binary happened to be on
+        // disk.
+        let stale_meta = json!({
+            "result": {
+                "serverInfo": {"name": "bifrost"},
+                "_meta": {"io.bifrost/build-identity": "stale-binary"}
+            }
+        });
+        let error = validate_server_build_identity(&stale_meta)
+            .expect_err("stale server must be rejected through _meta too");
+        assert!(error.contains("stale-binary"), "{error}");
     }
 }

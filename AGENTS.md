@@ -29,6 +29,66 @@ When there is a clear next step towards your goal (in or out of ExecPlan), you a
 stopping to ask. If you have made material progress, commit a multiline checkpoint first explaining changes-so-far
 in detail, especially the "why", I can get the "what" from the diff.
 
+# Scheduled removals
+
+Carry these out when the stated release has shipped. They are recorded here rather than as
+tracker items because development here is agentic: an agent reads this file every session and
+will not go looking for an issue it was never told about.
+
+## After v0.9.0: delete the hand-written MCP stack
+
+`crates/bifrost-mcp/src/mcp_common.rs` still contains Bifrost's pre-`rmcp` MCP implementation.
+It is currently the default; `BIFROST_MCP_RMCP=on` selects the `rmcp` host. Two steps precede the
+removal below: flip the default to `on`, then let it ride. Both exist because `rmcp` 3.0 was days
+old when issue #1328 adopted it, and neither is meant to outlive that caution.
+
+Remove the protocol half: `dispatch_message`, `dispatch_request`, `handle_notification`,
+`handle_response`, `McpConnectionState`, `McpRequestCancellations`, `OutboundMcpResponse` and
+`try_queue_response`, `initialize_result`, `success_response`/`error_response`, the duplicated
+`prepare_tool_call` and `reconcile_codex_sandbox_workspace`, the JSON-RPC constants,
+`run_stdio_server_with_build_identity` and the `MCP_RMCP_HOST_ENV` switch, their unit tests, and
+the `McpHost` matrix in `crates/bifrost-mcp/tests/bifrost_mcp_server.rs`.
+
+Keep the Bifrost half, which the `rmcp` host already calls rather than copies: `McpServerSpec`,
+`McpRenderOptions`, `build_server_spec*`, the `tool_descriptor` family,
+`fit_get_summaries_output_to_budget` and its budgeting block, `client_root_to_path`,
+`file_uri_to_path`, `serial_tool_request`, `mcp_analyzer_request_budget`, and the benchmark
+constants. The crate's entry point currently dispatches *from* the old module *into*
+`rmcp_host`, so deletion also means moving that entry point and re-homing the kept helpers.
+
+Do this promptly rather than when convenient. While both hosts exist the Codex sandbox
+authorization boundary has two copies that must be fixed in lockstep, and that duplication is
+exactly how the pre-handshake bypass in `09e37dd1` reached a green test suite: a security
+predicate was hand-copied and quietly lost a conjunct. It is not a one-off risk either: the very
+first upstream sync after the hosts diverged landed a `run_policy` feature (#1394) on the
+hand-written host alone, and it had to be ported across by hand. Until the deletion, treat any
+change to MCP behaviour as a change to two implementations, and prefer sharing a function over
+copying it.
+
+# Dogfooding the rmcp MCP host
+
+Bifrost's own MCP server can run on either of two protocol stacks (see `Scheduled removals`). The
+`rmcp`-backed one is opt-in and needs real usage before it can become the default, and the people
+best placed to give it that are us, through this plugin.
+
+At the start of a session that will use Bifrost's code-intelligence tools, check
+`echo "${BIFROST_MCP_RMCP:-unset}"`. If it is not `on`, tell the user once, with the fix: the
+launcher passes its environment through unchanged, so exporting the variable in the shell that
+starts the agent is enough, for example `BIFROST_MCP_RMCP=on claude` or `BIFROST_MCP_RMCP=on
+codex`. GUI-launched desktop apps do not inherit a shell environment, so mention that this applies
+to CLI-launched sessions. Say it once and move on; do not repeat it or block work on it, and do not
+set it yourself -- it changes which protocol stack serves the session, which is the user's call.
+
+Treat anything that smells like an MCP failure as a finding worth surfacing, not noise to route
+around. Bifrost tool calls that hang, return a protocol error, report an unexpected "not bound to a
+workspace", lose a response, come back with the wrong workspace's results, or fail immediately after
+a folder or roots change are all candidates. Report them to the user with which stack was serving
+(`BIFROST_MCP_RMCP`), the exact tool and arguments, what came back, and whether retrying or
+switching stacks changes it -- the two implementations differing on the same input is the single
+most useful signal available while both exist. Then search open issues and file one if nothing owns
+it. This complements the latency rule under `Review findings as RQL regressions`: that one covers
+calls that are slow, this one covers calls that are wrong.
+
 # Analyzer Test Guidance
 
 When adding or refactoring analyzer tests that need small ad hoc projects, prefer the shared inline test harness in

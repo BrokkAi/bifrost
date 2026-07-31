@@ -41,9 +41,18 @@ fn root_binary_injects_its_build_identity_into_the_mcp_host() {
         .read_line(&mut line)
         .expect("read initialize response");
     let response: Value = serde_json::from_str(&line).expect("valid JSON response");
+    // The rmcp host reports build identity in the initialize result's `_meta`
+    // (rmcp's `serverInfo` has no vendor field); the hand-written host uses
+    // `serverInfo.buildIdentity`. The contract is that the facade's identity
+    // reaches the client, not which of the two carries it.
+    let reported = response
+        .pointer("/result/serverInfo/buildIdentity")
+        .or_else(|| response.pointer("/result/_meta/io.bifrost~1build-identity"))
+        .and_then(Value::as_str);
     assert_eq!(
-        response["result"]["serverInfo"]["buildIdentity"],
-        brokk_bifrost::BIFROST_BUILD_IDENTITY
+        reported,
+        Some(brokk_bifrost::BIFROST_BUILD_IDENTITY),
+        "{response}"
     );
 
     drop(stdin);
