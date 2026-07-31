@@ -107,6 +107,7 @@ const fn incomplete_reason_label(reason: super::PolicyIncompleteReason) -> &'sta
     use super::PolicyIncompleteReason as R;
     match reason {
         R::Cancelled => b"cancelled",
+        R::DeadlineExceeded => b"deadline-exceeded",
         R::QueryResultLimit => b"query-result-limit",
         R::BatchFindingLimit => b"batch-finding-limit",
         R::ScannedFileBudget => b"scanned-file-budget",

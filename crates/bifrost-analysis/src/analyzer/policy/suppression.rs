@@ -323,6 +323,7 @@ impl std::error::Error for PolicySuppressionSourceError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicySuppressionDocumentState {
+    NotEvaluated,
     NotFound,
     Loaded,
     Invalid,
