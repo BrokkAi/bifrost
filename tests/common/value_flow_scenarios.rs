@@ -6,15 +6,16 @@
 
 use brokk_bifrost::Language;
 use brokk_bifrost::analyzer::dataflow::{PathQuality, SemanticInputStatus};
-use brokk_bifrost::analyzer::semantic::{IcfgEdgeKind, ProcedureKind};
+use brokk_bifrost::analyzer::semantic::{IcfgEdgeKind, ProcedureKind, SemanticCapability};
 use brokk_bifrost::analyzer::value_flow::{
     ValueFlowMayStatus, ValueFlowMustStatus, ValueFlowPortKey,
 };
 
 use crate::value_flow_conformance::{
-    CallArgumentSink, CallSelector, CarrierMilestone, ExpectedMeeting, ExpectedSinkOutcome,
-    ExpectedWitness, InlineSourceFile, InterproceduralMilestone, ParameterSource,
-    ProcedureSelector, ValueFlowConformanceCase,
+    CallArgumentSink, CallSelector, CarrierMilestone, ExpectedLocationRelation, ExpectedMeeting,
+    ExpectedSinkOutcome, ExpectedWitness, InlineSourceFile, InterproceduralMilestone,
+    ParameterSource, ProcedureSelector, RelationLocationSide, SelectorMilestone,
+    ValueFlowConformanceCase,
 };
 
 const JAVA_SOURCE: &str = r#"
@@ -173,6 +174,215 @@ function run(input: string): void {
 }
 "#;
 
+const JAVA_RECEIVER_SOURCE: &str = r#"
+final class ReceiverFlowFixture {
+  ReceiverFlowFixture relay() {
+    return this;
+  }
+
+  static void sink(ReceiverFlowFixture flowed, Object clean) {}
+
+  static void run(ReceiverFlowFixture input) {
+    ReceiverFlowFixture copy = input.relay();
+    Object clean = new Object();
+    sink(copy, clean);
+  }
+}
+"#;
+
+const TYPESCRIPT_RECEIVER_SOURCE: &str = r#"
+class ReceiverFlowFixture {
+  relay(): ReceiverFlowFixture {
+    return this;
+  }
+}
+
+function sink(flowed: ReceiverFlowFixture, clean: object): void {}
+
+function run(input: ReceiverFlowFixture): void {
+  const copy = input.relay();
+  const clean = {};
+  sink(copy, clean);
+}
+"#;
+
+const JAVA_EXCEPTIONAL_SOURCE: &str = r#"
+final class ExceptionalFlowFixture {
+  static RuntimeException fail(RuntimeException value) {
+    throw value;
+  }
+
+  static void sink(RuntimeException flowed, Object clean) {}
+
+  static void run(RuntimeException input) {
+    Object clean = new Object();
+    try {
+      fail(input);
+    } catch (RuntimeException failure) {
+      sink(input, clean);
+    }
+  }
+}
+"#;
+
+const TYPESCRIPT_EXCEPTIONAL_SOURCE: &str = r#"
+function fail(value: Error): never {
+  throw value;
+}
+
+function sink(flowed: Error, clean: object): void {}
+
+function run(input: Error): void {
+  const clean = {};
+  try {
+    fail(input);
+  } catch (failure) {
+    sink(input, clean);
+  }
+}
+"#;
+
+const JAVA_CLEANUP_SOURCE: &str = r#"
+final class CleanupFlowFixture {
+  static String relay(String value) {
+    String relayed = value;
+    return relayed;
+  }
+
+  static void sink(String flowed, String clean) {}
+
+  static void run(String input) {
+    String copy = "clean";
+    String clean = "clean";
+    try {
+      copy = relay(input);
+    } finally {
+      sink(copy, clean);
+    }
+  }
+}
+"#;
+
+const TYPESCRIPT_CLEANUP_SOURCE: &str = r#"
+function relay(value: string): string {
+  const relayed = value;
+  return relayed;
+}
+
+function sink(flowed: string, clean: string): void {}
+
+function run(input: string): void {
+  let copy = "clean";
+  const clean = "clean";
+  try {
+    copy = relay(input);
+  } finally {
+    sink(copy, clean);
+  }
+}
+"#;
+
+const JAVA_CAPTURE_SOURCE: &str = r#"
+final class CaptureFlowFixture {
+  static void sink(String flowed, String clean) {}
+
+  static void run(String input) {
+    String anchor = input;
+    Runnable callback = () -> {
+      String copy = input;
+      String clean = "clean";
+      sink(copy, clean);
+    };
+    callback.run();
+  }
+}
+"#;
+
+const TYPESCRIPT_CAPTURE_SOURCE: &str = r#"
+function sink(flowed: string, clean: string): void {}
+
+function run(input: string): void {
+  const anchor = input;
+  const callback = () => {
+    const copy = input;
+    const clean = "clean";
+    sink(copy, clean);
+  };
+  callback();
+  void anchor;
+}
+"#;
+
+const JAVA_FIELD_ACCESS_SOURCE: &str = r#"
+final class FieldFlowFixture {
+  static final class Box {
+    String value;
+  }
+
+  static void sink(String flowed, String clean) {}
+
+  static void run(String input) {
+    Box box = new Box();
+    box.value = input;
+    String copy = box.value;
+    String clean = "clean";
+    sink(copy, clean);
+  }
+}
+"#;
+
+const TYPESCRIPT_FIELD_ACCESS_SOURCE: &str = r#"
+class Box {
+  value: string = "clean";
+}
+
+function sink(flowed: string, clean: string): void {}
+
+function run(input: string): void {
+  const box = new Box();
+  box.value = input;
+  const copy = box.value;
+  const clean = "clean";
+  sink(copy, clean);
+}
+"#;
+
+const JAVA_FIELD_ALIAS_SOURCE: &str = r#"
+final class FieldAliasFlowFixture {
+  static final class Box {
+    String value;
+  }
+
+  static void sink(String flowed, String clean) {}
+
+  static void run(String input) {
+    Box box = new Box();
+    Box alias = box;
+    alias.value = input;
+    String copy = box.value;
+    String clean = "clean";
+    sink(copy, clean);
+  }
+}
+"#;
+
+const TYPESCRIPT_FIELD_ALIAS_SOURCE: &str = r#"
+class Box {
+  value: string = "clean";
+}
+
+function sink(flowed: string, clean: string): void {}
+
+function run(input: string): void {
+  const box = new Box();
+  const alias = box;
+  alias.value = input;
+  const copy = box.value;
+  const clean = "clean";
+  sink(copy, clean);
+}
+"#;
+
 const JAVA_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
     path: "src/ExactFlowFixture.java",
     source: JAVA_SOURCE,
@@ -221,6 +431,66 @@ const JAVA_TWO_CALL_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
 const TYPESCRIPT_TWO_CALL_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
     path: "src/two_call_flow.ts",
     source: TYPESCRIPT_TWO_CALL_SOURCE,
+}];
+
+const JAVA_RECEIVER_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
+    path: "src/ReceiverFlowFixture.java",
+    source: JAVA_RECEIVER_SOURCE,
+}];
+
+const TYPESCRIPT_RECEIVER_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
+    path: "src/receiver_flow.ts",
+    source: TYPESCRIPT_RECEIVER_SOURCE,
+}];
+
+const JAVA_EXCEPTIONAL_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
+    path: "src/ExceptionalFlowFixture.java",
+    source: JAVA_EXCEPTIONAL_SOURCE,
+}];
+
+const TYPESCRIPT_EXCEPTIONAL_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
+    path: "src/exceptional_flow.ts",
+    source: TYPESCRIPT_EXCEPTIONAL_SOURCE,
+}];
+
+const JAVA_CLEANUP_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
+    path: "src/CleanupFlowFixture.java",
+    source: JAVA_CLEANUP_SOURCE,
+}];
+
+const TYPESCRIPT_CLEANUP_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
+    path: "src/cleanup_flow.ts",
+    source: TYPESCRIPT_CLEANUP_SOURCE,
+}];
+
+const JAVA_CAPTURE_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
+    path: "src/CaptureFlowFixture.java",
+    source: JAVA_CAPTURE_SOURCE,
+}];
+
+const TYPESCRIPT_CAPTURE_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
+    path: "src/capture_flow.ts",
+    source: TYPESCRIPT_CAPTURE_SOURCE,
+}];
+
+const JAVA_FIELD_ACCESS_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
+    path: "src/FieldFlowFixture.java",
+    source: JAVA_FIELD_ACCESS_SOURCE,
+}];
+
+const TYPESCRIPT_FIELD_ACCESS_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
+    path: "src/field_flow.ts",
+    source: TYPESCRIPT_FIELD_ACCESS_SOURCE,
+}];
+
+const JAVA_FIELD_ALIAS_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
+    path: "src/FieldAliasFlowFixture.java",
+    source: JAVA_FIELD_ALIAS_SOURCE,
+}];
+
+const TYPESCRIPT_FIELD_ALIAS_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
+    path: "src/field_alias_flow.ts",
+    source: TYPESCRIPT_FIELD_ALIAS_SOURCE,
 }];
 
 const JAVA_PROCEDURES: &[ProcedureSelector<'_>] = &[
@@ -397,6 +667,234 @@ const TYPESCRIPT_TWO_CALL_PROCEDURES: &[ProcedureSelector<'_>] = &[
     },
 ];
 
+const JAVA_RECEIVER_PROCEDURES: &[ProcedureSelector<'_>] = &[
+    ProcedureSelector {
+        alias: "run",
+        path: "src/ReceiverFlowFixture.java",
+        name: "run",
+        kind: ProcedureKind::Method,
+    },
+    ProcedureSelector {
+        alias: "relay",
+        path: "src/ReceiverFlowFixture.java",
+        name: "relay",
+        kind: ProcedureKind::Method,
+    },
+    ProcedureSelector {
+        alias: "sink",
+        path: "src/ReceiverFlowFixture.java",
+        name: "sink",
+        kind: ProcedureKind::Method,
+    },
+];
+
+const TYPESCRIPT_RECEIVER_PROCEDURES: &[ProcedureSelector<'_>] = &[
+    ProcedureSelector {
+        alias: "run",
+        path: "src/receiver_flow.ts",
+        name: "run",
+        kind: ProcedureKind::Function,
+    },
+    ProcedureSelector {
+        alias: "relay",
+        path: "src/receiver_flow.ts",
+        name: "relay",
+        kind: ProcedureKind::Method,
+    },
+    ProcedureSelector {
+        alias: "sink",
+        path: "src/receiver_flow.ts",
+        name: "sink",
+        kind: ProcedureKind::Function,
+    },
+];
+
+const JAVA_EXCEPTIONAL_PROCEDURES: &[ProcedureSelector<'_>] = &[
+    ProcedureSelector {
+        alias: "run",
+        path: "src/ExceptionalFlowFixture.java",
+        name: "run",
+        kind: ProcedureKind::Method,
+    },
+    ProcedureSelector {
+        alias: "fail",
+        path: "src/ExceptionalFlowFixture.java",
+        name: "fail",
+        kind: ProcedureKind::Method,
+    },
+    ProcedureSelector {
+        alias: "sink",
+        path: "src/ExceptionalFlowFixture.java",
+        name: "sink",
+        kind: ProcedureKind::Method,
+    },
+];
+
+const TYPESCRIPT_EXCEPTIONAL_PROCEDURES: &[ProcedureSelector<'_>] = &[
+    ProcedureSelector {
+        alias: "run",
+        path: "src/exceptional_flow.ts",
+        name: "run",
+        kind: ProcedureKind::Function,
+    },
+    ProcedureSelector {
+        alias: "fail",
+        path: "src/exceptional_flow.ts",
+        name: "fail",
+        kind: ProcedureKind::Function,
+    },
+    ProcedureSelector {
+        alias: "sink",
+        path: "src/exceptional_flow.ts",
+        name: "sink",
+        kind: ProcedureKind::Function,
+    },
+];
+
+const JAVA_CLEANUP_PROCEDURES: &[ProcedureSelector<'_>] = &[
+    ProcedureSelector {
+        alias: "run",
+        path: "src/CleanupFlowFixture.java",
+        name: "run",
+        kind: ProcedureKind::Method,
+    },
+    ProcedureSelector {
+        alias: "relay",
+        path: "src/CleanupFlowFixture.java",
+        name: "relay",
+        kind: ProcedureKind::Method,
+    },
+    ProcedureSelector {
+        alias: "sink",
+        path: "src/CleanupFlowFixture.java",
+        name: "sink",
+        kind: ProcedureKind::Method,
+    },
+];
+
+const TYPESCRIPT_CLEANUP_PROCEDURES: &[ProcedureSelector<'_>] = &[
+    ProcedureSelector {
+        alias: "run",
+        path: "src/cleanup_flow.ts",
+        name: "run",
+        kind: ProcedureKind::Function,
+    },
+    ProcedureSelector {
+        alias: "relay",
+        path: "src/cleanup_flow.ts",
+        name: "relay",
+        kind: ProcedureKind::Function,
+    },
+    ProcedureSelector {
+        alias: "sink",
+        path: "src/cleanup_flow.ts",
+        name: "sink",
+        kind: ProcedureKind::Function,
+    },
+];
+
+const JAVA_CAPTURE_PROCEDURES: &[ProcedureSelector<'_>] = &[
+    ProcedureSelector {
+        alias: "run",
+        path: "src/CaptureFlowFixture.java",
+        name: "run",
+        kind: ProcedureKind::Method,
+    },
+    ProcedureSelector {
+        alias: "callback",
+        path: "src/CaptureFlowFixture.java",
+        name: "callback",
+        kind: ProcedureKind::Lambda,
+    },
+    ProcedureSelector {
+        alias: "sink",
+        path: "src/CaptureFlowFixture.java",
+        name: "sink",
+        kind: ProcedureKind::Method,
+    },
+];
+
+const TYPESCRIPT_CAPTURE_PROCEDURES: &[ProcedureSelector<'_>] = &[
+    ProcedureSelector {
+        alias: "run",
+        path: "src/capture_flow.ts",
+        name: "run",
+        kind: ProcedureKind::Function,
+    },
+    ProcedureSelector {
+        alias: "callback",
+        path: "src/capture_flow.ts",
+        name: "callback",
+        kind: ProcedureKind::Lambda,
+    },
+    ProcedureSelector {
+        alias: "sink",
+        path: "src/capture_flow.ts",
+        name: "sink",
+        kind: ProcedureKind::Function,
+    },
+];
+
+const JAVA_FIELD_ACCESS_PROCEDURES: &[ProcedureSelector<'_>] = &[
+    ProcedureSelector {
+        alias: "run",
+        path: "src/FieldFlowFixture.java",
+        name: "run",
+        kind: ProcedureKind::Method,
+    },
+    ProcedureSelector {
+        alias: "sink",
+        path: "src/FieldFlowFixture.java",
+        name: "sink",
+        kind: ProcedureKind::Method,
+    },
+];
+
+const TYPESCRIPT_FIELD_ACCESS_PROCEDURES: &[ProcedureSelector<'_>] = &[
+    ProcedureSelector {
+        alias: "run",
+        path: "src/field_flow.ts",
+        name: "run",
+        kind: ProcedureKind::Function,
+    },
+    ProcedureSelector {
+        alias: "sink",
+        path: "src/field_flow.ts",
+        name: "sink",
+        kind: ProcedureKind::Function,
+    },
+];
+
+const JAVA_FIELD_ALIAS_PROCEDURES: &[ProcedureSelector<'_>] = &[
+    ProcedureSelector {
+        alias: "run",
+        path: "src/FieldAliasFlowFixture.java",
+        name: "run",
+        kind: ProcedureKind::Method,
+    },
+    ProcedureSelector {
+        alias: "sink",
+        path: "src/FieldAliasFlowFixture.java",
+        name: "sink",
+        kind: ProcedureKind::Method,
+    },
+];
+
+const TYPESCRIPT_FIELD_ALIAS_PROCEDURES: &[ProcedureSelector<'_>] = &[
+    ProcedureSelector {
+        alias: "run",
+        path: "src/field_alias_flow.ts",
+        name: "run",
+        kind: ProcedureKind::Function,
+    },
+    ProcedureSelector {
+        alias: "sink",
+        path: "src/field_alias_flow.ts",
+        name: "sink",
+        kind: ProcedureKind::Function,
+    },
+];
+
 const CALLS: &[CallSelector<'_>] = &[
     CallSelector {
         alias: "relay_call",
@@ -454,6 +952,43 @@ const TWO_CALLS: &[CallSelector<'_>] = &[
         occurrence: 0,
     },
 ];
+
+const RECEIVER_CALLS: &[CallSelector<'_>] = &[
+    CallSelector {
+        alias: "relay_call",
+        caller: "run",
+        callee: "relay",
+        occurrence: 0,
+    },
+    CallSelector {
+        alias: "sink_call",
+        caller: "run",
+        callee: "sink",
+        occurrence: 0,
+    },
+];
+
+const EXCEPTIONAL_CALLS: &[CallSelector<'_>] = &[
+    CallSelector {
+        alias: "fail_call",
+        caller: "run",
+        callee: "fail",
+        occurrence: 0,
+    },
+    CallSelector {
+        alias: "sink_call",
+        caller: "run",
+        callee: "sink",
+        occurrence: 0,
+    },
+];
+
+const CAPTURE_CALLS: &[CallSelector<'_>] = &[CallSelector {
+    alias: "sink_call",
+    caller: "callback",
+    callee: "sink",
+    occurrence: 0,
+}];
 
 const JAVA_SINKS: &[CallArgumentSink<'_>] = &[
     CallArgumentSink {
@@ -558,6 +1093,13 @@ const TWO_CALL_INTERPROCEDURAL: &[InterproceduralMilestone<'_>] = &[
         origin_call: "relay_second",
     },
 ];
+
+const EXCEPTIONAL_INTERPROCEDURAL: &[InterproceduralMilestone<'_>] = &[InterproceduralMilestone {
+    kind: IcfgEdgeKind::CallToExceptionalContinuation,
+    source_procedure: "run",
+    target_procedure: "run",
+    origin_call: "fail_call",
+}];
 
 pub fn with_java_exact_helper<T>(execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T) -> T {
     with_exact_helper(
@@ -725,6 +1267,284 @@ pub fn with_typescript_two_matched_calls<T>(
     )
 }
 
+pub fn with_java_receiver_flow<T>(execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T) -> T {
+    with_receiver_flow(
+        "java-receiver-flow",
+        Language::Java,
+        JAVA_RECEIVER_FILES,
+        JAVA_RECEIVER_PROCEDURES,
+        "src/ReceiverFlowFixture.java",
+        ExpectedSinkOutcome::Inconclusive,
+        1,
+        1,
+        ValueFlowMayStatus::Proven,
+        EXPECTED_PATH_QUALITIES,
+        ValueFlowMayStatus::Unproven,
+        PathQuality::UNPROVEN_PARTIAL,
+        SemanticInputStatus::Unknown,
+        false,
+        execute,
+    )
+}
+
+pub fn with_typescript_receiver_flow<T>(
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    with_receiver_flow(
+        "typescript-receiver-flow",
+        Language::TypeScript,
+        TYPESCRIPT_RECEIVER_FILES,
+        TYPESCRIPT_RECEIVER_PROCEDURES,
+        "src/receiver_flow.ts",
+        ExpectedSinkOutcome::Inconclusive,
+        6,
+        4,
+        ValueFlowMayStatus::Proven,
+        EXPECTED_PATH_QUALITIES,
+        ValueFlowMayStatus::Proven,
+        PathQuality::PROVEN_COMPLETE,
+        SemanticInputStatus::Unsupported {
+            capability: SemanticCapability::ExceptionalControlFlow,
+        },
+        false,
+        execute,
+    )
+}
+
+pub fn with_java_exceptional_flow<T>(
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    let sinks = [
+        CallArgumentSink {
+            alias: "flowed",
+            call: "sink_call",
+            argument: 0,
+            outcome: ExpectedSinkOutcome::Inconclusive,
+        },
+        CallArgumentSink {
+            alias: "clean",
+            call: "sink_call",
+            argument: 1,
+            outcome: ExpectedSinkOutcome::Inconclusive,
+        },
+    ];
+    execute(&ValueFlowConformanceCase {
+        name: "java-exceptional-flow-unsupported",
+        language: Language::Java,
+        files: JAVA_EXCEPTIONAL_FILES,
+        procedures: JAVA_EXCEPTIONAL_PROCEDURES,
+        root: "run",
+        calls: EXCEPTIONAL_CALLS,
+        source: ParameterSource::Parameter {
+            procedure: "run",
+            ordinal: 0,
+        },
+        sinks: &sinks,
+        expected_discovery_status: SemanticInputStatus::Unknown,
+        expected_discovery_complete: false,
+        expected_result_complete: false,
+        expected_location_relations: &[],
+        expected_meetings: &[],
+    })
+}
+
+pub fn with_typescript_exceptional_flow<T>(
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    let sinks = [
+        CallArgumentSink {
+            alias: "flowed",
+            call: "sink_call",
+            argument: 0,
+            outcome: ExpectedSinkOutcome::Reached,
+        },
+        CallArgumentSink {
+            alias: "clean",
+            call: "sink_call",
+            argument: 1,
+            outcome: ExpectedSinkOutcome::Inconclusive,
+        },
+    ];
+    with_exceptional_flow(
+        "typescript-exceptional-flow",
+        Language::TypeScript,
+        TYPESCRIPT_EXCEPTIONAL_FILES,
+        TYPESCRIPT_EXCEPTIONAL_PROCEDURES,
+        &sinks,
+        "src/exceptional_flow.ts",
+        3,
+        3,
+        false,
+        execute,
+    )
+}
+
+pub fn with_java_cleanup_flow<T>(execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T) -> T {
+    let sinks = [
+        CallArgumentSink {
+            alias: "flowed",
+            call: "sink_call",
+            argument: 0,
+            outcome: ExpectedSinkOutcome::Inconclusive,
+        },
+        CallArgumentSink {
+            alias: "clean",
+            call: "sink_call",
+            argument: 1,
+            outcome: ExpectedSinkOutcome::Inconclusive,
+        },
+    ];
+    execute(&ValueFlowConformanceCase {
+        name: "java-cleanup-flow-unsupported",
+        language: Language::Java,
+        files: JAVA_CLEANUP_FILES,
+        procedures: JAVA_CLEANUP_PROCEDURES,
+        root: "run",
+        calls: CALLS,
+        source: ParameterSource::Parameter {
+            procedure: "run",
+            ordinal: 0,
+        },
+        sinks: &sinks,
+        expected_discovery_status: SemanticInputStatus::Unknown,
+        expected_discovery_complete: false,
+        expected_result_complete: false,
+        expected_location_relations: &[],
+        expected_meetings: &[],
+    })
+}
+
+pub fn with_typescript_cleanup_flow<T>(
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    let sinks = [
+        CallArgumentSink {
+            alias: "flowed",
+            call: "sink_call",
+            argument: 0,
+            outcome: ExpectedSinkOutcome::Inconclusive,
+        },
+        CallArgumentSink {
+            alias: "clean",
+            call: "sink_call",
+            argument: 1,
+            outcome: ExpectedSinkOutcome::Inconclusive,
+        },
+    ];
+    execute(&ValueFlowConformanceCase {
+        name: "typescript-cleanup-flow-unsupported",
+        language: Language::TypeScript,
+        files: TYPESCRIPT_CLEANUP_FILES,
+        procedures: TYPESCRIPT_CLEANUP_PROCEDURES,
+        root: "run",
+        calls: CALLS,
+        source: ParameterSource::Parameter {
+            procedure: "run",
+            ordinal: 0,
+        },
+        sinks: &sinks,
+        expected_discovery_status: SemanticInputStatus::Unknown,
+        expected_discovery_complete: false,
+        expected_result_complete: false,
+        expected_location_relations: &[],
+        expected_meetings: &[],
+    })
+}
+
+pub fn with_java_capture_flow<T>(execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T) -> T {
+    with_capture_flow(
+        "java-capture-flow",
+        Language::Java,
+        JAVA_CAPTURE_FILES,
+        JAVA_CAPTURE_PROCEDURES,
+        "src/CaptureFlowFixture.java",
+        SemanticInputStatus::Unknown,
+        false,
+        execute,
+    )
+}
+
+pub fn with_typescript_capture_flow<T>(
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    with_capture_flow(
+        "typescript-capture-flow",
+        Language::TypeScript,
+        TYPESCRIPT_CAPTURE_FILES,
+        TYPESCRIPT_CAPTURE_PROCEDURES,
+        "src/capture_flow.ts",
+        SemanticInputStatus::Unsupported {
+            capability: SemanticCapability::ExceptionalControlFlow,
+        },
+        false,
+        execute,
+    )
+}
+
+pub fn with_java_field_access_flow<T>(
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    with_field_access_flow(
+        "java-field-access-flow",
+        Language::Java,
+        JAVA_FIELD_ACCESS_FILES,
+        JAVA_FIELD_ACCESS_PROCEDURES,
+        "src/FieldFlowFixture.java",
+        false,
+        execute,
+    )
+}
+
+pub fn with_typescript_field_access_flow<T>(
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    with_field_access_flow(
+        "typescript-field-access-flow",
+        Language::TypeScript,
+        TYPESCRIPT_FIELD_ACCESS_FILES,
+        TYPESCRIPT_FIELD_ACCESS_PROCEDURES,
+        "src/field_flow.ts",
+        false,
+        execute,
+    )
+}
+
+pub fn with_java_field_alias_flow<T>(
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    with_inconclusive_parameter_flow(
+        "java-field-alias-flow",
+        Language::Java,
+        JAVA_FIELD_ALIAS_FILES,
+        JAVA_FIELD_ALIAS_PROCEDURES,
+        "run",
+        BRANCH_CALLS,
+        SemanticInputStatus::Unsupported {
+            capability: SemanticCapability::ExceptionalControlFlow,
+        },
+        false,
+        execute,
+    )
+}
+
+pub fn with_typescript_field_alias_flow<T>(
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    with_inconclusive_parameter_flow(
+        "typescript-field-alias-flow",
+        Language::TypeScript,
+        TYPESCRIPT_FIELD_ALIAS_FILES,
+        TYPESCRIPT_FIELD_ALIAS_PROCEDURES,
+        "run",
+        BRANCH_CALLS,
+        SemanticInputStatus::Unsupported {
+            capability: SemanticCapability::ExceptionalControlFlow,
+        },
+        false,
+        execute,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn with_branch_merge<T>(
     name: &str,
@@ -764,11 +1584,19 @@ fn with_branch_merge<T>(
         meeting_count,
         public_endpoint_count,
         may_status: ValueFlowMayStatus::Proven,
+        public_may_complete_count: 0,
+        public_may_partial_count: if language == Language::TypeScript {
+            public_endpoint_count.saturating_sub(1)
+        } else {
+            0
+        },
         must_status: ValueFlowMustStatus::NotEstablished,
         uncertain: false,
         path_qualities: EXPECTED_PATH_QUALITIES,
         witness: ExpectedWitness {
             truncated: false,
+            may_status: ValueFlowMayStatus::Proven,
+            path_quality: PathQuality::PROVEN_COMPLETE,
             carriers: &carriers,
             interprocedural: &[],
         },
@@ -780,7 +1608,7 @@ fn with_branch_merge<T>(
         procedures,
         root: "run",
         calls: BRANCH_CALLS,
-        source: ParameterSource {
+        source: ParameterSource::Parameter {
             procedure: "run",
             ordinal: 0,
         },
@@ -788,6 +1616,7 @@ fn with_branch_merge<T>(
         expected_discovery_status: SemanticInputStatus::Unknown,
         expected_discovery_complete: false,
         expected_result_complete,
+        expected_location_relations: &[],
         expected_meetings: &meetings,
     })
 }
@@ -852,11 +1681,19 @@ fn with_early_return<T>(
         meeting_count,
         public_endpoint_count,
         may_status: ValueFlowMayStatus::Proven,
+        public_may_complete_count: 0,
+        public_may_partial_count: if language == Language::TypeScript {
+            public_endpoint_count.saturating_sub(1)
+        } else {
+            0
+        },
         must_status: ValueFlowMustStatus::NotEstablished,
         uncertain: false,
         path_qualities: EXPECTED_PATH_QUALITIES,
         witness: ExpectedWitness {
             truncated: false,
+            may_status: ValueFlowMayStatus::Proven,
+            path_quality: PathQuality::PROVEN_COMPLETE,
             carriers: &carriers,
             interprocedural: &[],
         },
@@ -868,7 +1705,7 @@ fn with_early_return<T>(
         procedures,
         root: "run",
         calls: EARLY_RETURN_CALLS,
-        source: ParameterSource {
+        source: ParameterSource::Parameter {
             procedure: "run",
             ordinal: 0,
         },
@@ -876,6 +1713,7 @@ fn with_early_return<T>(
         expected_discovery_status: SemanticInputStatus::Unknown,
         expected_discovery_complete: false,
         expected_result_complete,
+        expected_location_relations: &[],
         expected_meetings: &meetings,
     })
 }
@@ -893,6 +1731,7 @@ fn with_two_matched_calls<T>(
     expected_result_complete: bool,
     execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
 ) -> T {
+    let public_may_complete_count = usize::from(language == Language::TypeScript);
     let sinks = [
         CallArgumentSink {
             alias: "flowed",
@@ -1002,11 +1841,19 @@ fn with_two_matched_calls<T>(
         meeting_count,
         public_endpoint_count,
         may_status: ValueFlowMayStatus::Proven,
+        public_may_complete_count,
+        public_may_partial_count: if language == Language::TypeScript {
+            public_endpoint_count.saturating_sub(1 + public_may_complete_count)
+        } else {
+            0
+        },
         must_status: ValueFlowMustStatus::NotEstablished,
         uncertain: false,
         path_qualities: EXPECTED_PATH_QUALITIES,
         witness: ExpectedWitness {
             truncated: false,
+            may_status: ValueFlowMayStatus::Proven,
+            path_quality: PathQuality::PROVEN_COMPLETE,
             carriers: &carriers,
             interprocedural: TWO_CALL_INTERPROCEDURAL,
         },
@@ -1018,7 +1865,7 @@ fn with_two_matched_calls<T>(
         procedures,
         root: "run",
         calls: TWO_CALLS,
-        source: ParameterSource {
+        source: ParameterSource::Parameter {
             procedure: "run",
             ordinal: 0,
         },
@@ -1026,7 +1873,342 @@ fn with_two_matched_calls<T>(
         expected_discovery_status: SemanticInputStatus::Unknown,
         expected_discovery_complete: false,
         expected_result_complete,
+        expected_location_relations: &[],
         expected_meetings: &meetings,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn with_receiver_flow<T>(
+    name: &str,
+    language: Language,
+    files: &[InlineSourceFile<'_>],
+    procedures: &[ProcedureSelector<'_>],
+    path: &str,
+    clean_outcome: ExpectedSinkOutcome,
+    meeting_count: usize,
+    public_endpoint_count: usize,
+    may_status: ValueFlowMayStatus,
+    path_qualities: &[PathQuality],
+    witness_may_status: ValueFlowMayStatus,
+    witness_path_quality: PathQuality,
+    expected_discovery_status: SemanticInputStatus,
+    expected_result_complete: bool,
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    let public_may_complete_count = usize::from(language == Language::TypeScript);
+    let sinks = [
+        CallArgumentSink {
+            alias: "flowed",
+            call: "sink_call",
+            argument: 0,
+            outcome: ExpectedSinkOutcome::Reached,
+        },
+        CallArgumentSink {
+            alias: "clean",
+            call: "sink_call",
+            argument: 1,
+            outcome: clean_outcome,
+        },
+    ];
+    let carriers = [
+        CarrierMilestone::Port {
+            path: path.into(),
+            procedure: "run".into(),
+            kind: ValueFlowPortKey::Parameter { ordinal: 0 },
+        },
+        CarrierMilestone::CallReceiver {
+            path: path.into(),
+            caller: "run".into(),
+            callee: "relay".into(),
+            call: "input.relay()".into(),
+        },
+        CarrierMilestone::Port {
+            path: path.into(),
+            procedure: "relay".into(),
+            kind: ValueFlowPortKey::Receiver,
+        },
+        CarrierMilestone::Port {
+            path: path.into(),
+            procedure: "relay".into(),
+            kind: ValueFlowPortKey::NormalReturn,
+        },
+        CarrierMilestone::CallResult {
+            path: path.into(),
+            caller: "run".into(),
+            callee: "relay".into(),
+            call: "input.relay()".into(),
+            result: ValueFlowPortKey::NormalReturn,
+        },
+        CarrierMilestone::Value {
+            path: path.into(),
+            procedure: "run".into(),
+            role: "local".into(),
+            ordinal: None,
+            snippet: "copy".into(),
+        },
+        CarrierMilestone::SinkArgument {
+            path: path.into(),
+            caller: "run".into(),
+            callee: "sink".into(),
+            call: "sink(copy, clean)".into(),
+            ordinal: 0,
+        },
+    ];
+    let meetings = [ExpectedMeeting {
+        sink: "flowed",
+        meeting_count,
+        public_endpoint_count,
+        may_status,
+        public_may_complete_count,
+        public_may_partial_count: if language == Language::TypeScript {
+            public_endpoint_count.saturating_sub(1 + public_may_complete_count)
+        } else {
+            0
+        },
+        must_status: ValueFlowMustStatus::NotEstablished,
+        uncertain: false,
+        path_qualities,
+        witness: ExpectedWitness {
+            truncated: false,
+            may_status: witness_may_status,
+            path_quality: witness_path_quality,
+            carriers: &carriers,
+            interprocedural: EXPECTED_INTERPROCEDURAL,
+        },
+    }];
+    execute(&ValueFlowConformanceCase {
+        name,
+        language,
+        files,
+        procedures,
+        root: "run",
+        calls: RECEIVER_CALLS,
+        source: ParameterSource::Parameter {
+            procedure: "run",
+            ordinal: 0,
+        },
+        sinks: &sinks,
+        expected_discovery_status,
+        expected_discovery_complete: false,
+        expected_result_complete,
+        expected_location_relations: &[],
+        expected_meetings: &meetings,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn with_exceptional_flow<T>(
+    name: &str,
+    language: Language,
+    files: &[InlineSourceFile<'_>],
+    procedures: &[ProcedureSelector<'_>],
+    sinks: &[CallArgumentSink<'_>],
+    path: &str,
+    meeting_count: usize,
+    public_endpoint_count: usize,
+    expected_result_complete: bool,
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    let carriers = [
+        CarrierMilestone::Port {
+            path: path.into(),
+            procedure: "run".into(),
+            kind: ValueFlowPortKey::Parameter { ordinal: 0 },
+        },
+        CarrierMilestone::SinkArgument {
+            path: path.into(),
+            caller: "run".into(),
+            callee: "sink".into(),
+            call: "sink(input, clean)".into(),
+            ordinal: 0,
+        },
+    ];
+    let meetings = [ExpectedMeeting {
+        sink: "flowed",
+        meeting_count,
+        public_endpoint_count,
+        may_status: ValueFlowMayStatus::Proven,
+        public_may_complete_count: 0,
+        public_may_partial_count: if language == Language::TypeScript {
+            public_endpoint_count.saturating_sub(1)
+        } else {
+            0
+        },
+        must_status: ValueFlowMustStatus::NotEstablished,
+        uncertain: false,
+        path_qualities: EXPECTED_PATH_QUALITIES,
+        witness: ExpectedWitness {
+            truncated: false,
+            may_status: ValueFlowMayStatus::Unproven,
+            path_quality: PathQuality::UNPROVEN_PARTIAL,
+            carriers: &carriers,
+            interprocedural: EXCEPTIONAL_INTERPROCEDURAL,
+        },
+    }];
+    execute(&ValueFlowConformanceCase {
+        name,
+        language,
+        files,
+        procedures,
+        root: "run",
+        calls: EXCEPTIONAL_CALLS,
+        source: ParameterSource::Parameter {
+            procedure: "run",
+            ordinal: 0,
+        },
+        sinks,
+        expected_discovery_status: SemanticInputStatus::Unknown,
+        expected_discovery_complete: false,
+        expected_result_complete,
+        expected_location_relations: &[],
+        expected_meetings: &meetings,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn with_capture_flow<T>(
+    name: &str,
+    language: Language,
+    files: &[InlineSourceFile<'_>],
+    procedures: &[ProcedureSelector<'_>],
+    _path: &str,
+    expected_discovery_status: SemanticInputStatus,
+    expected_result_complete: bool,
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    with_inconclusive_parameter_flow(
+        name,
+        language,
+        files,
+        procedures,
+        "run",
+        CAPTURE_CALLS,
+        expected_discovery_status,
+        expected_result_complete,
+        execute,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn with_inconclusive_parameter_flow<T>(
+    name: &str,
+    language: Language,
+    files: &[InlineSourceFile<'_>],
+    procedures: &[ProcedureSelector<'_>],
+    root: &str,
+    calls: &[CallSelector<'_>],
+    expected_discovery_status: SemanticInputStatus,
+    expected_result_complete: bool,
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    let sinks = [
+        CallArgumentSink {
+            alias: "flowed",
+            call: "sink_call",
+            argument: 0,
+            outcome: ExpectedSinkOutcome::Inconclusive,
+        },
+        CallArgumentSink {
+            alias: "clean",
+            call: "sink_call",
+            argument: 1,
+            outcome: ExpectedSinkOutcome::Inconclusive,
+        },
+    ];
+    execute(&ValueFlowConformanceCase {
+        name,
+        language,
+        files,
+        procedures,
+        root,
+        calls,
+        source: ParameterSource::Parameter {
+            procedure: "run",
+            ordinal: 0,
+        },
+        sinks: &sinks,
+        expected_discovery_status,
+        expected_discovery_complete: false,
+        expected_result_complete,
+        expected_location_relations: &[],
+        expected_meetings: &[],
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn with_field_access_flow<T>(
+    name: &str,
+    language: Language,
+    files: &[InlineSourceFile<'_>],
+    procedures: &[ProcedureSelector<'_>],
+    path: &str,
+    expected_result_complete: bool,
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    let sinks = [
+        CallArgumentSink {
+            alias: "flowed",
+            call: "sink_call",
+            argument: 0,
+            outcome: ExpectedSinkOutcome::Inconclusive,
+        },
+        CallArgumentSink {
+            alias: "clean",
+            call: "sink_call",
+            argument: 1,
+            outcome: ExpectedSinkOutcome::Inconclusive,
+        },
+    ];
+    let location = CarrierMilestone::Location {
+        root: Box::new(CarrierMilestone::Value {
+            path: path.into(),
+            procedure: "run".into(),
+            role: "temporary".into(),
+            ordinal: None,
+            snippet: "box".into(),
+        }),
+        selectors: vec![SelectorMilestone::Field {
+            path: path.into(),
+            procedure: "run".into(),
+            snippet: "value".into(),
+        }]
+        .into_boxed_slice(),
+        exact: true,
+    };
+    let expected_location_relations = [
+        ExpectedLocationRelation {
+            procedure: "run",
+            kind: brokk_bifrost::analyzer::semantic::ValueFlowRelationKind::MemoryStore,
+            side: RelationLocationSide::Target,
+            location: &location,
+        },
+        ExpectedLocationRelation {
+            procedure: "run",
+            kind: brokk_bifrost::analyzer::semantic::ValueFlowRelationKind::MemoryLoad,
+            side: RelationLocationSide::Source,
+            location: &location,
+        },
+    ];
+    execute(&ValueFlowConformanceCase {
+        name,
+        language,
+        files,
+        procedures,
+        root: "run",
+        calls: BRANCH_CALLS,
+        source: ParameterSource::Parameter {
+            procedure: "run",
+            ordinal: 0,
+        },
+        sinks: &sinks,
+        expected_discovery_status: SemanticInputStatus::Unsupported {
+            capability: SemanticCapability::ExceptionalControlFlow,
+        },
+        expected_discovery_complete: false,
+        expected_result_complete,
+        expected_location_relations: &expected_location_relations,
+        expected_meetings: &[],
     })
 }
 
@@ -1045,6 +2227,7 @@ fn with_exact_helper<T>(
     expected_result_complete: bool,
     execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
 ) -> T {
+    let public_may_complete_count = usize::from(language == Language::TypeScript);
     let carriers = vec![
         CarrierMilestone::Port {
             path: path.into(),
@@ -1102,11 +2285,19 @@ fn with_exact_helper<T>(
         meeting_count,
         public_endpoint_count,
         may_status: ValueFlowMayStatus::Proven,
+        public_may_complete_count,
+        public_may_partial_count: if language == Language::TypeScript {
+            public_endpoint_count.saturating_sub(1 + public_may_complete_count)
+        } else {
+            0
+        },
         must_status: ValueFlowMustStatus::NotEstablished,
         uncertain: false,
         path_qualities: EXPECTED_PATH_QUALITIES,
         witness: ExpectedWitness {
             truncated: false,
+            may_status: ValueFlowMayStatus::Proven,
+            path_quality: PathQuality::PROVEN_COMPLETE,
             carriers: &carriers,
             interprocedural: EXPECTED_INTERPROCEDURAL,
         },
@@ -1118,7 +2309,7 @@ fn with_exact_helper<T>(
         procedures,
         root: "run",
         calls: CALLS,
-        source: ParameterSource {
+        source: ParameterSource::Parameter {
             procedure: "run",
             ordinal: 0,
         },
@@ -1126,6 +2317,7 @@ fn with_exact_helper<T>(
         expected_discovery_status,
         expected_discovery_complete,
         expected_result_complete,
+        expected_location_relations: &[],
         expected_meetings: &meetings,
     })
 }

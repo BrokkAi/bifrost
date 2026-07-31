@@ -17,13 +17,14 @@ use brokk_bifrost::analyzer::semantic::{
     DispatchBoundaryKind, DispatchOracle, EvidenceCompleteness, IcfgEdgeKind, OracleCallContext,
     ProcedureHandle, ProcedureKind, ProcedurePortKind, ProgramPointHandle, ProofStatus,
     ReturnTransferKind, SemanticBudget, SemanticLanguage, SemanticLocator, SemanticRequest,
-    SemanticRole, SourceAnchor, ValueFlowOracle, ValueFlowRelationKind, WorkspaceRelativePath,
+    SemanticRole, SourceAnchor, ValueFlowOracle, ValueFlowRelationKind, ValueFlowSnapshot,
+    WorkspaceRelativePath,
 };
 use brokk_bifrost::analyzer::value_flow::{
     ValueFlowCarrier, ValueFlowCarrierKey, ValueFlowEventKey, ValueFlowEventKind, ValueFlowInput,
     ValueFlowMayStatus, ValueFlowMeeting, ValueFlowMustStatus, ValueFlowObservationPhase,
-    ValueFlowPlan, ValueFlowScopedRootKind, ValueFlowSelectorKey, ValueFlowSinkOutcome,
-    ValueFlowSinkSpec, ValueFlowSourceSpec, ValueFlowSummaryResult,
+    ValueFlowPlan, ValueFlowPortKey, ValueFlowScopedRootKind, ValueFlowSelectorKey,
+    ValueFlowSinkOutcome, ValueFlowSinkSpec, ValueFlowSourceSpec, ValueFlowSummaryResult,
     solve_value_flow_with_witnesses,
 };
 use brokk_bifrost::{AnalyzerConfig, Language, WorkspaceAnalyzer};
@@ -55,9 +56,39 @@ pub struct CallSelector<'case> {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct ParameterSource<'case> {
-    pub procedure: &'case str,
-    pub ordinal: u32,
+pub enum ParameterSource<'case> {
+    Parameter {
+        procedure: &'case str,
+        ordinal: u32,
+    },
+    Port {
+        procedure: &'case str,
+        kind: ValueFlowPortKey,
+    },
+    CaptureBinding {
+        procedure: &'case str,
+        slot: u32,
+    },
+}
+
+impl ParameterSource<'_> {
+    fn procedure(&self) -> &str {
+        match self {
+            Self::Parameter { procedure, .. }
+            | Self::Port { procedure, .. }
+            | Self::CaptureBinding { procedure, .. } => procedure,
+        }
+    }
+
+    fn port_kind(&self) -> Option<ValueFlowPortKey> {
+        match self {
+            Self::Parameter { ordinal, .. } => {
+                Some(ValueFlowPortKey::Parameter { ordinal: *ordinal })
+            }
+            Self::Port { kind, .. } => Some(*kind),
+            Self::CaptureBinding { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +134,35 @@ pub enum CarrierMilestone {
         call: Box<str>,
         ordinal: usize,
     },
+    CallReceiver {
+        path: Box<str>,
+        caller: Box<str>,
+        callee: Box<str>,
+        call: Box<str>,
+    },
+    CallCapture {
+        path: Box<str>,
+        caller: Box<str>,
+        callee: Box<str>,
+        call: Box<str>,
+        slot: u32,
+    },
+    Allocation {
+        path: Box<str>,
+        procedure: Box<str>,
+        snippet: Box<str>,
+    },
+    ScopedRoot {
+        path: Box<str>,
+        procedure: Box<str>,
+        kind: ValueFlowScopedRootKind,
+        snippet: Box<str>,
+    },
+    Location {
+        root: Box<CarrierMilestone>,
+        selectors: Box<[SelectorMilestone]>,
+        exact: bool,
+    },
     SinkArgument {
         path: Box<str>,
         caller: Box<str>,
@@ -110,6 +170,31 @@ pub enum CarrierMilestone {
         call: Box<str>,
         ordinal: usize,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectorMilestone {
+    Field {
+        path: Box<str>,
+        procedure: Box<str>,
+        snippet: Box<str>,
+    },
+    ExactIndex(Box<CarrierMilestone>),
+    AnyIndex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationLocationSide {
+    Source,
+    Target,
+}
+
+#[derive(Debug)]
+pub struct ExpectedLocationRelation<'case> {
+    pub procedure: &'case str,
+    pub kind: ValueFlowRelationKind,
+    pub side: RelationLocationSide,
+    pub location: &'case CarrierMilestone,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +208,8 @@ pub struct InterproceduralMilestone<'case> {
 #[derive(Debug)]
 pub struct ExpectedWitness<'case> {
     pub truncated: bool,
+    pub may_status: ValueFlowMayStatus,
+    pub path_quality: PathQuality,
     pub carriers: &'case [CarrierMilestone],
     pub interprocedural: &'case [InterproceduralMilestone<'case>],
 }
@@ -133,6 +220,8 @@ pub struct ExpectedMeeting<'case> {
     pub meeting_count: usize,
     pub public_endpoint_count: usize,
     pub may_status: ValueFlowMayStatus,
+    pub public_may_complete_count: usize,
+    pub public_may_partial_count: usize,
     pub must_status: ValueFlowMustStatus,
     pub uncertain: bool,
     pub path_qualities: &'case [PathQuality],
@@ -152,6 +241,7 @@ pub struct ValueFlowConformanceCase<'case> {
     pub expected_discovery_status: SemanticInputStatus,
     pub expected_discovery_complete: bool,
     pub expected_result_complete: bool,
+    pub expected_location_relations: &'case [ExpectedLocationRelation<'case>],
     pub expected_meetings: &'case [ExpectedMeeting<'case>],
 }
 
@@ -417,6 +507,7 @@ pub fn resolve_value_flow_conformance_case(
             SemanticInputStatus::from_outcome(&outcome),
         ));
     }
+    assert_expected_location_relations(case, &procedures, &snapshots);
 
     let mut calls = HashMap::new();
     let mut call_bindings = HashMap::new();
@@ -449,7 +540,7 @@ pub fn resolve_value_flow_conformance_case(
 
     let root = procedure(&procedures, case.root).clone();
     let resolved_root = root.clone();
-    let source_procedure = procedure(&procedures, case.source.procedure);
+    let source_procedure = procedure(&procedures, case.source.procedure());
     let root_snapshot = snapshots
         .iter()
         .find(|input| input.value().procedure() == source_procedure)
@@ -459,22 +550,42 @@ pub fn resolve_value_flow_conformance_case(
         .relations()
         .iter()
         .find(|relation| {
-            if relation.kind != ValueFlowRelationKind::Parameter {
-                return false;
+            let port_key =
+                |port: &brokk_bifrost::analyzer::semantic::ProcedurePortHandle| match port.kind() {
+                    ProcedurePortKind::Receiver => ValueFlowPortKey::Receiver,
+                    ProcedurePortKind::Parameter { ordinal } => {
+                        ValueFlowPortKey::Parameter { ordinal }
+                    }
+                    ProcedurePortKind::NormalReturn => ValueFlowPortKey::NormalReturn,
+                    ProcedurePortKind::ExceptionalReturn => ValueFlowPortKey::ExceptionalReturn,
+                    ProcedurePortKind::Capture { slot } => {
+                        ValueFlowPortKey::Capture { slot: slot.get() }
+                    }
+                };
+            match case.source {
+                ParameterSource::Parameter { .. } | ParameterSource::Port { .. } => {
+                    matches!(
+                        ValueFlowCarrier::from(&relation.source),
+                        ValueFlowCarrier::Port(port)
+                            if Some(port_key(&port)) == case.source.port_kind()
+                    )
+                }
+                ParameterSource::CaptureBinding { slot, .. } => {
+                    relation.kind == ValueFlowRelationKind::Capture
+                        && matches!(
+                            ValueFlowCarrier::from(&relation.target),
+                            ValueFlowCarrier::Port(port)
+                                if port_key(&port) == ValueFlowPortKey::Capture { slot }
+                        )
+                }
             }
-            matches!(
-                ValueFlowCarrier::from(&relation.source),
-                ValueFlowCarrier::Port(port)
-                    if port.kind()
-                        == (ProcedurePortKind::Parameter {
-                            ordinal: case.source.ordinal,
-                        })
-            )
         })
         .unwrap_or_else(|| {
             panic!(
-                "missing parameter {} in {}",
-                case.source.ordinal, case.source.procedure
+                "missing source {:?} in {}; relations: {:#?}",
+                case.source,
+                case.source.procedure(),
+                root_snapshot.value().relations(),
             )
         });
     let source = ValueFlowSourceSpec::new(
@@ -582,6 +693,43 @@ pub fn resolve_value_flow_conformance_case(
         witness_plan: Arc::new(witness_plan),
         sink_ids,
         witness_sink_ids,
+    }
+}
+
+fn assert_expected_location_relations(
+    case: &ValueFlowConformanceCase<'_>,
+    procedures: &HashMap<String, ProcedureHandle>,
+    snapshots: &[ValueFlowInput<ValueFlowSnapshot>],
+) {
+    for expected in case.expected_location_relations {
+        let procedure = procedure(procedures, expected.procedure);
+        let snapshot = snapshots
+            .iter()
+            .find(|input| input.value().procedure() == procedure)
+            .expect("expected relation procedure snapshot");
+        let actual_locations = snapshot
+            .value()
+            .relations()
+            .iter()
+            .filter(|relation| relation.kind == expected.kind)
+            .filter_map(|relation| {
+                let endpoint = match expected.side {
+                    RelationLocationSide::Source => &relation.source,
+                    RelationLocationSide::Target => &relation.target,
+                };
+                let key = ValueFlowCarrier::from(endpoint).stable_key().ok()?;
+                let stable = StableCarrier::from(&key);
+                Some(carrier_milestone(case, &stable))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual_locations,
+            [expected.location.clone()],
+            "{} exact {:?} relation {:?} location",
+            case.name,
+            expected.kind,
+            expected.side,
+        );
     }
 }
 
@@ -767,7 +915,7 @@ fn assert_sink_outcomes(
                     meetings
                         .iter()
                         .any(|meeting| meeting_matches(meeting, expectation)),
-                    "{} {} has no meeting matching the expected status and path quality",
+                    "{} {} has no meeting matching the expected status and path quality: {meetings:#?}",
                     case.name,
                     expected.alias,
                 );
@@ -844,22 +992,34 @@ fn assert_meeting_witness(
     let meeting = result
         .meetings()
         .iter()
-        .find(|meeting| meeting.sink() == sink_id && meeting_matches(meeting, expectation))
-        .expect("positive meeting");
-    let quality = *expectation
-        .path_qualities
-        .first()
-        .expect("meeting has an expected path quality");
-    assert_eq!(
-        expectation.path_qualities.len(),
-        1,
-        "{} {} baseline witness expectation is singular",
-        case.name,
-        expectation.sink
-    );
+        .find(|meeting| {
+            meeting.sink() == sink_id
+                && meeting.may_status() == expectation.witness.may_status
+                && meeting.must_status() == expectation.must_status
+                && meeting.is_uncertain() == expectation.uncertain
+                && meeting.path_qualities().iter().collect::<Vec<_>>()
+                    == [expectation.witness.path_quality]
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "{} {} has no witness meeting matching {:?}: {:#?}",
+                case.name,
+                expectation.sink,
+                expectation.witness.path_quality,
+                result.meetings()
+            )
+        });
+    let quality = expectation.witness.path_quality;
     let witness = result
         .witness_for_meeting(meeting, quality, WitnessReconstructionLimits::default())
         .unwrap_or_else(|error| panic!("{} witness reconstruction failed: {error}", case.name));
+    assert_eq!(
+        witness.quality(),
+        quality,
+        "{} {} witness path quality",
+        case.name,
+        expectation.sink
+    );
     assert_eq!(
         witness.truncated(),
         expectation.witness.truncated,
@@ -872,24 +1032,24 @@ fn assert_meeting_witness(
         .iter()
         .map(|step| project_step(case, &resolved.witness_plan, result, step))
         .collect::<Vec<_>>();
-    for step in &projected {
-        assert_eq!(
-            step.proof,
-            ProofStatus::Proven,
-            "{} {} witness proof at {:?}",
-            case.name,
-            expectation.sink,
-            step.kind
-        );
-        assert_eq!(
-            step.completeness,
-            EvidenceCompleteness::Complete,
-            "{} {} witness completeness at {:?}",
-            case.name,
-            expectation.sink,
-            step.kind
-        );
-    }
+    assert_eq!(
+        projected
+            .iter()
+            .all(|step| step.proof == ProofStatus::Proven),
+        quality.is_proven(),
+        "{} {} witness proof axis",
+        case.name,
+        expectation.sink
+    );
+    assert_eq!(
+        projected
+            .iter()
+            .all(|step| step.completeness == EvidenceCompleteness::Complete),
+        quality.is_complete(),
+        "{} {} witness completeness axis",
+        case.name,
+        expectation.sink
+    );
 
     let source_carrier_key = resolved
         .witness_plan
@@ -907,23 +1067,49 @@ fn assert_meeting_witness(
     for step in &projected {
         if matches!(step.kind, SummaryWitnessStepKind::Edge(IcfgEdgeKind::Call)) {
             let (selector, call) = configured_call_for_origin(case, resolved, step);
-            let ordinal = call_argument_ordinal(call, step.input.as_ref().expect("call input"));
+            let input = step.input.as_ref().expect("call input");
             let origin = step.origin.as_ref().expect("call edge has origin");
             entered_calls.push(origin.clone());
-            actual_carriers.push(CarrierMilestone::CallArgument {
-                path: origin.path.as_str().into(),
-                caller: procedure_name(&step.source).into(),
-                callee: selector.callee.into(),
-                call: source_snippet(case, origin),
-                ordinal,
-            });
+            if let Some(slot) = step.output.as_ref().and_then(|carrier| match carrier {
+                StableCarrier::Port {
+                    kind: ValueFlowPortKey::Capture { slot },
+                    ..
+                } => Some(*slot),
+                _ => None,
+            }) {
+                actual_carriers.push(CarrierMilestone::CallCapture {
+                    path: origin.path.as_str().into(),
+                    caller: procedure_name(&step.source).into(),
+                    callee: selector.callee.into(),
+                    call: source_snippet(case, origin),
+                    slot,
+                });
+            } else if call_receiver_matches(call, input) {
+                actual_carriers.push(CarrierMilestone::CallReceiver {
+                    path: origin.path.as_str().into(),
+                    caller: procedure_name(&step.source).into(),
+                    callee: selector.callee.into(),
+                    call: source_snippet(case, origin),
+                });
+            } else {
+                let ordinal = call_argument_ordinal(call, input);
+                actual_carriers.push(CarrierMilestone::CallArgument {
+                    path: origin.path.as_str().into(),
+                    caller: procedure_name(&step.source).into(),
+                    callee: selector.callee.into(),
+                    call: source_snippet(case, origin),
+                    ordinal,
+                });
+            }
         }
         if let Some(carrier) = &step.input {
             append_carrier_milestone(case, &mut actual_carriers, carrier);
         }
         if matches!(
             step.kind,
-            SummaryWitnessStepKind::Edge(IcfgEdgeKind::NormalReturn)
+            SummaryWitnessStepKind::Edge(
+                IcfgEdgeKind::NormalReturn | IcfgEdgeKind::ExceptionalReturn
+            )
         ) {
             let origin = step
                 .origin
@@ -932,7 +1118,7 @@ fn assert_meeting_witness(
             let entered = entered_calls.pop().expect("normal return follows a call");
             assert_eq!(
                 origin, &entered,
-                "{} normal return must match its exact entering call",
+                "{} return must match its exact entering call",
                 case.name
             );
             append_return_binding_milestone(case, resolved, step, &mut actual_carriers);
@@ -974,21 +1160,24 @@ fn assert_meeting_witness(
     let interprocedural = projected
         .iter()
         .filter_map(|step| match step.kind {
-            SummaryWitnessStepKind::Edge(IcfgEdgeKind::Call | IcfgEdgeKind::NormalReturn) => {
-                Some(InterproceduralMilestone {
-                    kind: match step.kind {
-                        SummaryWitnessStepKind::Edge(kind) => kind,
-                        _ => unreachable!(),
-                    },
-                    source_procedure: procedure_name(&step.source),
-                    target_procedure: procedure_name(
-                        step.target
-                            .as_ref()
-                            .expect("interprocedural edge has target"),
-                    ),
-                    origin_call: configured_call_for_origin(case, resolved, step).0.alias,
-                })
-            }
+            SummaryWitnessStepKind::Edge(
+                IcfgEdgeKind::Call
+                | IcfgEdgeKind::NormalReturn
+                | IcfgEdgeKind::ExceptionalReturn
+                | IcfgEdgeKind::CallToExceptionalContinuation,
+            ) => Some(InterproceduralMilestone {
+                kind: match step.kind {
+                    SummaryWitnessStepKind::Edge(kind) => kind,
+                    _ => unreachable!(),
+                },
+                source_procedure: procedure_name(&step.source),
+                target_procedure: procedure_name(
+                    step.target
+                        .as_ref()
+                        .expect("interprocedural edge has target"),
+                ),
+                origin_call: configured_call_for_origin(case, resolved, step).0.alias,
+            }),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -1141,8 +1330,20 @@ fn append_carrier_milestone(
     milestones: &mut Vec<CarrierMilestone>,
     carrier: &StableCarrier,
 ) {
-    let milestone = match carrier {
-        StableCarrier::Value { role, .. } if role.as_ref() == "temporary" => return,
+    if matches!(carrier, StableCarrier::Value { role, .. } if role.as_ref() == "temporary") {
+        return;
+    }
+    let milestone = carrier_milestone(case, carrier);
+    if milestones.last() != Some(&milestone) {
+        milestones.push(milestone);
+    }
+}
+
+fn carrier_milestone(
+    case: &ValueFlowConformanceCase<'_>,
+    carrier: &StableCarrier,
+) -> CarrierMilestone {
+    match carrier {
         StableCarrier::Value {
             locator,
             role,
@@ -1176,10 +1377,40 @@ fn append_carrier_milestone(
                 result,
             }
         }
-        other => panic!("baseline witness contains unexpected carrier {other:?}"),
-    };
-    if milestones.last() != Some(&milestone) {
-        milestones.push(milestone);
+        StableCarrier::Allocation { locator } => CarrierMilestone::Allocation {
+            path: locator.path.as_str().into(),
+            procedure: procedure_name(locator).into(),
+            snippet: source_snippet(case, locator),
+        },
+        StableCarrier::ScopedRoot { kind, locator } => CarrierMilestone::ScopedRoot {
+            path: locator.path.as_str().into(),
+            procedure: procedure_name(locator).into(),
+            kind: *kind,
+            snippet: source_snippet(case, locator),
+        },
+        StableCarrier::Location {
+            root,
+            selectors,
+            exact,
+        } => CarrierMilestone::Location {
+            root: Box::new(carrier_milestone(case, root)),
+            selectors: selectors
+                .iter()
+                .map(|selector| match selector {
+                    StableSelector::Field(locator) => SelectorMilestone::Field {
+                        path: locator.path.as_str().into(),
+                        procedure: procedure_name(locator).into(),
+                        snippet: source_snippet(case, locator),
+                    },
+                    StableSelector::ExactIndex(index) => {
+                        SelectorMilestone::ExactIndex(Box::new(carrier_milestone(case, index)))
+                    }
+                    StableSelector::AnyIndex => SelectorMilestone::AnyIndex,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            exact: *exact,
+        },
     }
 }
 
@@ -1217,8 +1448,29 @@ fn append_return_binding_milestone(
         .output
         .as_ref()
         .expect("normal return has an output fact");
+    let return_kind = match step.kind {
+        SummaryWitnessStepKind::Edge(IcfgEdgeKind::NormalReturn) => ValueFlowPortKey::NormalReturn,
+        SummaryWitnessStepKind::Edge(IcfgEdgeKind::ExceptionalReturn) => {
+            ValueFlowPortKey::ExceptionalReturn
+        }
+        other => panic!("return binding requested for non-return step {other:?}"),
+    };
     let mut matches = bindings.bindings().iter().filter(|binding| match binding {
-        CallBinding::NormalReturn { formal, result, .. } => {
+        CallBinding::NormalReturn { formal, result, .. }
+            if return_kind == ValueFlowPortKey::NormalReturn =>
+        {
+            let formal = ValueFlowCarrier::Port(formal.clone())
+                .stable_key()
+                .map(|key| StableCarrier::from(&key));
+            let result = ValueFlowCarrier::Value(result.clone())
+                .stable_key()
+                .map(|key| StableCarrier::from(&key));
+            formal.as_ref().is_ok_and(|carrier| carrier == input)
+                && result.as_ref().is_ok_and(|carrier| carrier == output)
+        }
+        CallBinding::ExceptionalReturn { formal, result, .. }
+            if return_kind == ValueFlowPortKey::ExceptionalReturn =>
+        {
             let formal = ValueFlowCarrier::Port(formal.clone())
                 .stable_key()
                 .map(|key| StableCarrier::from(&key));
@@ -1232,21 +1484,18 @@ fn append_return_binding_milestone(
     });
     matches
         .next()
-        .expect("normal-return witness follows one structured call binding");
+        .expect("return witness follows one structured call binding");
     assert!(
         matches.next().is_none(),
-        "normal-return witness follows one unambiguous call binding"
+        "return witness follows one unambiguous call binding"
     );
-    let origin = step
-        .origin
-        .as_ref()
-        .expect("normal-return edge has call origin");
+    let origin = step.origin.as_ref().expect("return edge has call origin");
     milestones.push(CarrierMilestone::CallResult {
         path: origin.path.as_str().into(),
         caller: procedure_name(origin).into(),
         callee: selector.callee.into(),
         call: source_snippet(case, origin),
-        result: brokk_bifrost::analyzer::value_flow::ValueFlowPortKey::NormalReturn,
+        result: return_kind,
     });
 }
 
@@ -1268,6 +1517,18 @@ fn call_argument_ordinal(call: &CallSiteHandle, carrier: &StableCarrier) -> usiz
                 .is_ok_and(|key| StableCarrier::from(&key) == *carrier)
         })
         .expect("call-edge input is one structured actual argument")
+}
+
+fn call_receiver_matches(call: &CallSiteHandle, carrier: &StableCarrier) -> bool {
+    let row = call
+        .procedure()
+        .semantics()
+        .call_site(call.id())
+        .expect("witness call remains live");
+    row.receiver
+        .and_then(|receiver| call.procedure().value_handle(receiver))
+        .and_then(|receiver| ValueFlowCarrier::Value(receiver).stable_key().ok())
+        .is_some_and(|key| StableCarrier::from(&key) == *carrier)
 }
 
 fn procedure_name(locator: &StableLocator) -> &str {

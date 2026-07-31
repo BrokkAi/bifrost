@@ -27,9 +27,14 @@ use crate::value_flow_conformance::{
     resolve_value_flow_conformance_case,
 };
 use crate::value_flow_scenarios::{
-    with_java_branch_merge, with_java_early_return, with_java_exact_helper, with_java_loop_exit,
-    with_java_two_matched_calls, with_typescript_branch_merge, with_typescript_early_return,
-    with_typescript_exact_helper, with_typescript_loop_exit, with_typescript_two_matched_calls,
+    with_java_branch_merge, with_java_capture_flow, with_java_cleanup_flow, with_java_early_return,
+    with_java_exact_helper, with_java_exceptional_flow, with_java_field_access_flow,
+    with_java_field_alias_flow, with_java_loop_exit, with_java_receiver_flow,
+    with_java_two_matched_calls, with_typescript_branch_merge, with_typescript_capture_flow,
+    with_typescript_cleanup_flow, with_typescript_early_return, with_typescript_exact_helper,
+    with_typescript_exceptional_flow, with_typescript_field_access_flow,
+    with_typescript_field_alias_flow, with_typescript_loop_exit, with_typescript_receiver_flow,
+    with_typescript_two_matched_calls,
 };
 
 const WORKSPACE_GENERATION: u64 = 23;
@@ -651,6 +656,66 @@ fn typescript_two_call_sites_preserve_matched_returns_in_public_query() {
     with_typescript_two_matched_calls(assert_shared_helper_scenario);
 }
 
+#[test]
+fn java_receiver_flow_preserves_public_receiver_symbols() {
+    with_java_receiver_flow(assert_shared_helper_scenario);
+}
+
+#[test]
+fn typescript_receiver_flow_preserves_public_receiver_symbols() {
+    with_typescript_receiver_flow(assert_shared_helper_scenario);
+}
+
+#[test]
+fn java_exceptional_flow_preserves_public_inconclusive_negative() {
+    with_java_exceptional_flow(assert_shared_helper_scenario);
+}
+
+#[test]
+fn typescript_exceptional_flow_preserves_public_exceptional_continuation_symbols() {
+    with_typescript_exceptional_flow(assert_shared_helper_scenario);
+}
+
+#[test]
+fn java_cleanup_flow_preserves_public_inconclusive_negative() {
+    with_java_cleanup_flow(assert_shared_helper_scenario);
+}
+
+#[test]
+fn typescript_cleanup_flow_preserves_public_inconclusive_negative() {
+    with_typescript_cleanup_flow(assert_shared_helper_scenario);
+}
+
+#[test]
+fn java_unresolved_capture_invocation_preserves_public_inconclusive_negative() {
+    with_java_capture_flow(assert_shared_helper_scenario);
+}
+
+#[test]
+fn typescript_unresolved_capture_invocation_preserves_public_inconclusive_negative() {
+    with_typescript_capture_flow(assert_shared_helper_scenario);
+}
+
+#[test]
+fn java_field_access_preserves_public_location_symbols() {
+    with_java_field_access_flow(assert_shared_helper_scenario);
+}
+
+#[test]
+fn typescript_field_access_preserves_public_location_symbols() {
+    with_typescript_field_access_flow(assert_shared_helper_scenario);
+}
+
+#[test]
+fn java_alias_field_flow_preserves_public_inconclusive_negative() {
+    with_java_field_alias_flow(assert_shared_helper_scenario);
+}
+
+#[test]
+fn typescript_alias_field_flow_preserves_public_inconclusive_negative() {
+    with_typescript_field_alias_flow(assert_shared_helper_scenario);
+}
+
 fn assert_shared_helper_scenario(case: &ValueFlowConformanceCase<'_>) {
     let resolved = resolve_value_flow_conformance_case(case);
     assert_resolved_value_flow_conformance(case, &resolved);
@@ -684,6 +749,22 @@ fn assert_shared_helper_scenario(case: &ValueFlowConformanceCase<'_>) {
         summaries.lease(WORKSPACE_GENERATION).unwrap(),
     );
     let endpoints = serde_json::to_value(endpoints).unwrap();
+    let endpoints_rql = execute_workspace_request_with_analysis_registration_lease(
+        &resolved.analyzer,
+        WORKSPACE_GENERATION,
+        &ProtocolRegistrationSet::default(),
+        &registrations,
+        &shared_scenario_rql_query(case, SHARED_PLAN_REF, false),
+        CodeQueryExecutionLimits::default(),
+        None,
+        summaries.lease(WORKSPACE_GENERATION).unwrap(),
+    );
+    let endpoints_rql = serde_json::to_value(endpoints_rql).unwrap();
+    assert_eq!(
+        endpoints_rql, endpoints,
+        "{} RQL and JSON endpoint responses",
+        case.name
+    );
     assert_public_sink_outcomes(case, &resolved, &endpoints);
 
     let witnesses = execute_workspace_request_with_analysis_registration_lease(
@@ -697,7 +778,37 @@ fn assert_shared_helper_scenario(case: &ValueFlowConformanceCase<'_>) {
         summaries.lease(WORKSPACE_GENERATION).unwrap(),
     );
     let witnesses = serde_json::to_value(witnesses).unwrap();
+    let witnesses_rql = execute_workspace_request_with_analysis_registration_lease(
+        &resolved.analyzer,
+        WORKSPACE_GENERATION,
+        &ProtocolRegistrationSet::default(),
+        &registrations,
+        &shared_scenario_rql_query(case, SHARED_WITNESS_PLAN_REF, true),
+        CodeQueryExecutionLimits::default(),
+        None,
+        summaries.lease(WORKSPACE_GENERATION).unwrap(),
+    );
+    let witnesses_rql = serde_json::to_value(witnesses_rql).unwrap();
+    assert_eq!(
+        witnesses_rql, witnesses,
+        "{} RQL and JSON witness responses",
+        case.name
+    );
     let rows = witnesses["results"].as_array().unwrap();
+    let expected_symbols = direct_witness_symbol_sequences(case, &resolved);
+    if case.expected_meetings.is_empty() {
+        assert!(
+            rows.is_empty(),
+            "{} absent meetings must not produce public witnesses: {witnesses:#}",
+            case.name
+        );
+        assert!(
+            expected_symbols.is_empty(),
+            "{} absent direct meetings must not produce witnesses",
+            case.name
+        );
+        return;
+    }
     assert!(
         !rows.is_empty(),
         "{} public witness rows: {witnesses:#}",
@@ -732,7 +843,6 @@ fn assert_shared_helper_scenario(case: &ValueFlowConformanceCase<'_>) {
         .iter()
         .map(public_witness_symbol_sequence)
         .collect::<BTreeSet<_>>();
-    let expected_symbols = direct_witness_symbol_sequences(case, &resolved);
     assert_eq!(
         actual_symbols, expected_symbols,
         "{} exact ordered public witness symbols",
@@ -768,6 +878,32 @@ fn shared_scenario_query(
         "steps": steps,
     }))
     .unwrap()
+}
+
+fn shared_scenario_rql_query(
+    case: &ValueFlowConformanceCase<'_>,
+    plan_ref: &str,
+    with_witness: bool,
+) -> CodeQuery {
+    let root = case
+        .procedures
+        .iter()
+        .find(|procedure| procedure.alias == case.root)
+        .expect("shared scenario root selector");
+    let kind = match root.kind {
+        ProcedureKind::Method => "method",
+        ProcedureKind::Function => "function",
+        other => panic!("unsupported shared scenario root kind {other:?}"),
+    };
+    let root_name = serde_json::to_string(root.name).expect("RQL root name");
+    let value_flow =
+        format!("(value-flow :plan-ref {plan_ref} (procedure-of ({kind} :name {root_name})))");
+    let source = if with_witness {
+        format!("(witness :max-steps 256 :max-bytes 262144 {value_flow})")
+    } else {
+        value_flow
+    };
+    CodeQuery::from_sexp(&source).unwrap_or_else(|error| panic!("{} RQL: {error}", case.name))
 }
 
 fn assert_public_sink_outcomes(
@@ -852,6 +988,155 @@ fn assert_public_sink_outcomes(
             case.name,
             sink.alias
         );
+        let meeting = case
+            .expected_meetings
+            .iter()
+            .find(|meeting| meeting.sink == sink.alias);
+        let mut exact_complete_count = 0;
+        let mut may_complete_count = 0;
+        let mut may_partial_count = 0;
+        for row in matching {
+            assert_eq!(
+                row["must"], "not_established",
+                "{} {} must",
+                case.name, sink.alias
+            );
+            assert_eq!(
+                row["semantic_status"],
+                case.expected_discovery_status.label(),
+                "{} {} semantic status",
+                case.name,
+                sink.alias
+            );
+            assert_eq!(
+                row["completion"],
+                expected_public_completion(case),
+                "{} {} completion",
+                case.name,
+                sink.alias
+            );
+            assert_eq!(
+                row["solver_termination"], "fixed_point",
+                "{} {} solver termination",
+                case.name, sink.alias
+            );
+            assert_eq!(
+                row.get("ambiguous")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                matches!(
+                    case.expected_discovery_status,
+                    SemanticInputStatus::Ambiguous
+                ),
+                "{} {} ambiguity",
+                case.name,
+                sink.alias
+            );
+            if meeting.is_some() {
+                assert!(
+                    row["source"].is_object(),
+                    "{} {} source symbol",
+                    case.name,
+                    sink.alias
+                );
+                match (row["certainty"].as_str(), row["path_qualities"].as_array()) {
+                    (Some("exact"), Some(qualities))
+                        if qualities
+                            == &[json!({"proof": "proven", "completeness": "complete"})] =>
+                    {
+                        exact_complete_count += 1;
+                    }
+                    (Some("may"), Some(qualities))
+                        if qualities
+                            == &[json!({"proof": "proven", "completeness": "complete"})] =>
+                    {
+                        may_complete_count += 1;
+                    }
+                    (Some("may"), Some(qualities))
+                        if qualities
+                            == &[json!({"proof": "unproven", "completeness": "partial"})] =>
+                    {
+                        may_partial_count += 1;
+                    }
+                    _ => panic!(
+                        "{} {} unexpected public meeting evidence: {row:#}",
+                        case.name, sink.alias
+                    ),
+                }
+                assert_eq!(
+                    row["retained_witnesses"], 1,
+                    "{} {} retained witnesses",
+                    case.name, sink.alias
+                );
+            } else {
+                assert!(
+                    row.get("source").is_none(),
+                    "{} {} absent source",
+                    case.name,
+                    sink.alias
+                );
+                assert!(
+                    row.get("certainty").is_none(),
+                    "{} {} absent certainty",
+                    case.name,
+                    sink.alias
+                );
+                assert!(
+                    row.get("path_qualities")
+                        .is_none_or(|value| value == &json!([])),
+                    "{} {} absent path qualities",
+                    case.name,
+                    sink.alias
+                );
+                assert_eq!(
+                    row["retained_witnesses"], 0,
+                    "{} {} retained witnesses",
+                    case.name, sink.alias
+                );
+            }
+            assert_eq!(
+                row["omitted_witnesses"], 0,
+                "{} {} omitted witnesses",
+                case.name, sink.alias
+            );
+        }
+        if let Some(meeting) = meeting {
+            assert_eq!(
+                may_complete_count, meeting.public_may_complete_count,
+                "{} {} exact may/complete endpoint count",
+                case.name, sink.alias
+            );
+            assert_eq!(
+                may_partial_count, meeting.public_may_partial_count,
+                "{} {} exact may/partial endpoint count",
+                case.name, sink.alias
+            );
+            assert_eq!(
+                exact_complete_count,
+                meeting
+                    .public_endpoint_count
+                    .saturating_sub(meeting.public_may_complete_count)
+                    .saturating_sub(meeting.public_may_partial_count),
+                "{} {} exact exact/complete endpoint count",
+                case.name,
+                sink.alias
+            );
+        }
+    }
+}
+
+fn expected_public_completion(case: &ValueFlowConformanceCase<'_>) -> &'static str {
+    if case.expected_result_complete && case.expected_discovery_status.is_complete() {
+        return "complete";
+    }
+    match case.expected_discovery_status {
+        SemanticInputStatus::Cancelled => "cancelled",
+        SemanticInputStatus::ExceededBudget { .. } => "budget_exhausted",
+        SemanticInputStatus::Unsupported { .. } => "unsupported",
+        SemanticInputStatus::Complete
+        | SemanticInputStatus::Ambiguous
+        | SemanticInputStatus::Unknown
+        | SemanticInputStatus::Unproven => "incomplete",
     }
 }
 

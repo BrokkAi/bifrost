@@ -11,9 +11,14 @@ use crate::value_flow_conformance::{
     ProcedureSelector, ValueFlowConformanceCase, assert_value_flow_conformance,
 };
 use crate::value_flow_scenarios::{
-    with_java_branch_merge, with_java_early_return, with_java_exact_helper, with_java_loop_exit,
-    with_java_two_matched_calls, with_typescript_branch_merge, with_typescript_early_return,
-    with_typescript_exact_helper, with_typescript_loop_exit, with_typescript_two_matched_calls,
+    with_java_branch_merge, with_java_capture_flow, with_java_cleanup_flow, with_java_early_return,
+    with_java_exact_helper, with_java_exceptional_flow, with_java_field_access_flow,
+    with_java_field_alias_flow, with_java_loop_exit, with_java_receiver_flow,
+    with_java_two_matched_calls, with_typescript_branch_merge, with_typescript_capture_flow,
+    with_typescript_cleanup_flow, with_typescript_early_return, with_typescript_exact_helper,
+    with_typescript_exceptional_flow, with_typescript_field_access_flow,
+    with_typescript_field_alias_flow, with_typescript_loop_exit, with_typescript_receiver_flow,
+    with_typescript_two_matched_calls,
 };
 
 const CALLS: &[CallSelector<'_>] = &[
@@ -119,11 +124,15 @@ fn expected_meetings<'case>(
         meeting_count,
         public_endpoint_count: meeting_count,
         may_status: ValueFlowMayStatus::Proven,
+        public_may_complete_count: 0,
+        public_may_partial_count: 0,
         must_status: ValueFlowMustStatus::NotEstablished,
         uncertain: false,
         path_qualities: EXPECTED_PATH_QUALITIES,
         witness: ExpectedWitness {
             truncated: false,
+            may_status: ValueFlowMayStatus::Proven,
+            path_quality: PathQuality::PROVEN_COMPLETE,
             carriers,
             interprocedural: EXPECTED_INTERPROCEDURAL,
         },
@@ -199,7 +208,7 @@ fn assert_multi_file_exact_helper_flow(
         procedures: &procedures,
         root: "run",
         calls: CALLS,
-        source: ParameterSource {
+        source: ParameterSource::Parameter {
             procedure: "run",
             ordinal: 0,
         },
@@ -207,6 +216,7 @@ fn assert_multi_file_exact_helper_flow(
         expected_discovery_status,
         expected_discovery_complete,
         expected_result_complete,
+        expected_location_relations: &[],
         expected_meetings: &expected_meetings,
     });
 }
@@ -298,6 +308,66 @@ fn java_two_call_sites_match_returns() {
 #[test]
 fn typescript_two_call_sites_match_returns() {
     with_typescript_two_matched_calls(assert_value_flow_conformance);
+}
+
+#[test]
+fn java_receiver_flows_through_callee_receiver_port() {
+    with_java_receiver_flow(assert_value_flow_conformance);
+}
+
+#[test]
+fn typescript_receiver_flows_through_callee_receiver_port() {
+    with_typescript_receiver_flow(assert_value_flow_conformance);
+}
+
+#[test]
+fn java_exceptional_completion_is_an_inconclusive_negative() {
+    with_java_exceptional_flow(assert_value_flow_conformance);
+}
+
+#[test]
+fn typescript_exceptional_completion_reaches_catch_sink() {
+    with_typescript_exceptional_flow(assert_value_flow_conformance);
+}
+
+#[test]
+fn java_cleanup_flow_is_an_inconclusive_negative() {
+    with_java_cleanup_flow(assert_value_flow_conformance);
+}
+
+#[test]
+fn typescript_cleanup_flow_is_an_inconclusive_negative() {
+    with_typescript_cleanup_flow(assert_value_flow_conformance);
+}
+
+#[test]
+fn java_unresolved_capture_invocation_is_an_inconclusive_negative() {
+    with_java_capture_flow(assert_value_flow_conformance);
+}
+
+#[test]
+fn typescript_unresolved_capture_invocation_is_an_inconclusive_negative() {
+    with_typescript_capture_flow(assert_value_flow_conformance);
+}
+
+#[test]
+fn java_field_store_load_preserves_bounded_access_path() {
+    with_java_field_access_flow(assert_value_flow_conformance);
+}
+
+#[test]
+fn typescript_field_store_load_preserves_bounded_access_path() {
+    with_typescript_field_access_flow(assert_value_flow_conformance);
+}
+
+#[test]
+fn java_alias_field_flow_is_an_inconclusive_negative() {
+    with_java_field_alias_flow(assert_value_flow_conformance);
+}
+
+#[test]
+fn typescript_alias_field_flow_is_an_inconclusive_negative() {
+    with_typescript_field_alias_flow(assert_value_flow_conformance);
 }
 
 #[test]

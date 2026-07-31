@@ -21,7 +21,8 @@ The observable proof is the consolidated Rust integration suite: it compares the
 - [x] (2026-07-31 12:05Z) Consolidated `tests/code_query_value_flow.rs` into `suite_cross_language` and exposed a reusable resolved conformance scenario.
 - [x] (2026-07-31 12:05Z) Ran the shared Java and TypeScript helper scenario through direct and public executors with exact endpoint and ordered witness-symbol parity.
 - [x] (2026-07-31 13:10Z) Added shared Java and TypeScript branch/merge, loop/exit, early-return/unreachable, and two-call matched-return scenarios with exact direct/public parity.
-- [ ] Run the existing Java and TypeScript helper scenario through direct, JSON, and RQL paths with exact endpoint and witness parity.
+- [x] (2026-07-31 12:30Z) Ran every shared scenario through equivalent JSON and RQL queries and asserted identical complete responses.
+- [x] (2026-07-31 12:30Z) Added receiver, exceptional, cleanup, capture, field-store/load, bounded-access-path, and alias scenarios with exact positive or typed-inconclusive expectations.
 - [ ] Add shared Java and TypeScript exceptional cleanup, receiver, closure/capture, field/access-path, ambiguity, and unresolved-call scenarios.
 - [ ] Add the complete cancellation, truncation, and budget inventory.
 - [ ] Reuse the scenarios across the remaining adapters with explicit readiness outcomes.
@@ -56,6 +57,15 @@ The observable proof is the consolidated Rust integration suite: it compares the
 - Observation: TypeScript's multiple structured provenance paths recur across intraprocedural control flow.
   Evidence: branch, loop, and early-return scenarios each retain three raw meetings and three distinct public endpoints for the reached sink, while Java retains one. Exact canonical witness-set parity confirms these are real paths rather than duplicated envelopes.
 
+- Observation: the current Java and TypeScript adapters lower field stores and loads to exact structured memory relations but do not propagate a meeting through the location.
+  Evidence: both field scenarios contain exactly one `MemoryStore` into and one `MemoryLoad` from the same stable `box.value` location, while the direct and public sink outcomes remain explicitly inconclusive. Receiver-alias variants are likewise inconclusive.
+
+- Observation: callable capture relations are materialized, but invocation resolution does not connect the selected callback call to the lambda body in either initial adapter.
+  Evidence: the Java and TypeScript capture scenarios preserve typed incomplete discovery and emit no meeting or public witness rather than manufacturing a cross-closure flow.
+
+- Observation: TypeScript public endpoints retain a deterministic mixed evidence multiset.
+  Evidence: intraprocedural scenarios project one exact/complete endpoint plus may/partial alternatives; interprocedural helper, receiver, and matched-call scenarios additionally retain one may/complete endpoint. The shared expectation asserts each variant count rather than accepting any matching row.
+
 ## Decision Log
 
 - Decision: add optional `input` and `output` fields to `CodeQueryFlowWitnessStep`, populated for public value-flow witnesses and omitted for the currently shared taint projection.
@@ -85,6 +95,8 @@ The first two implementation milestones are complete. Public value-flow witness 
 The former root public-query test is now part of `suite_cross_language`. One shared Java/TypeScript helper description drives the direct solver and public CodeQuery paths. The harness compares exact detected and absent sink projections, raw versus deduplicated meeting counts, and the complete ordered witness-symbol sequences after removing only generated IDs and redundant display ranges. Focused validation passed all 14 public-query module tests and the two direct Java/TypeScript baseline tests.
 
 The first control-flow matrix is also complete. Shared Java and TypeScript descriptions now prove branch joins, loop exits, early returns, an unreachable post-return call, and two call sites whose normal returns preserve their respective call origins. Public negative assertions identify sinks by full stable event identity, so same-ordinal arguments at different calls cannot alias in the test. Focused direct and public validation passes all eight new control-flow cases. Exceptional flow, heap/alias behavior, uncertainty, budgets, and remaining adapters remain in progress.
+
+The next boundary slice is source-backed and exact. Receiver propagation reaches the callee receiver port in both adapters. TypeScript exceptional continuation reaches its catch sink; Java exceptional flow and both cleanup variants remain typed incomplete negatives. Capture invocation, field propagation, and receiver aliases are also explicit incomplete negatives, while the field scenarios separately prove exact structured `MemoryStore` and `MemoryLoad` relations over the same bounded access path. Every shared case now executes equivalent JSON and RQL and compares the complete serialized response. Ambiguous/unresolved dispatch, over-bound access paths, full budgets, and adapter expansion remain in progress.
 
 ## Context and Orientation
 
@@ -205,3 +217,5 @@ Revision note (2026-07-31): Recorded the completed public symbol and transport m
 Revision note (2026-07-31): Recorded public event/step symbol completion, root-test consolidation, shared Java/TypeScript scenario execution, and exact direct/public canonical parity.
 
 Revision note (2026-07-31): Recorded the Java/TypeScript branch, loop, early-return/unreachable, and matched-return milestone plus full sink-event negative matching.
+
+Revision note (2026-07-31): Recorded JSON/RQL response parity and the receiver, exceptional, cleanup, capture, field/access-path, and alias readiness outcomes.
