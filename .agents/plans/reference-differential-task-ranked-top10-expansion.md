@@ -739,20 +739,47 @@ local gate, but is not the focus.
   `564df755693285750559763f6f3ef2eeb177479fe81ab59a114230020c14e2cc`).
   Issues #1284 through #1292 and #1316 were closed only after this proof;
   no open `FIRD: Scala` issues remain.
+- [x] (2026-07-31) Reconciled Scala ranks six through ten on one final pushed
+  Bifrost head, `f5d7ba67`. Fresh strict persisted replays for zio-http,
+  scalachess, and stream-reactor joined the same-head http4s and Guardian Grid
+  records. The five completed clean envelopes cover 1,980/1,980 audited files,
+  50,000 sampled sites, and 4,362 queried targets. They contain zero
+  legitimate missing rows; Guardian Grid's sole raw row was reproduced exactly
+  and checksummed as nonactionable physical-replica ambiguity. The combined
+  artifact is
+  `/mnt/optane/tmp/bifrost-fird/scala-task-ranks6-10-f5d7ba67-final.jsonl`
+  (SHA-256
+  `5799c415ef571672cf0fc4f2cf66f6d6c98964c95f8b6379d30bfee85efd5eee`),
+  and its one-row missing ledger has SHA-256
+  `c67b6e44a1a555ab37640c5d3cd28da9aeb34a89dbef2dc3be363697d9eb4a40`.
+  Assigned follow-ups #1409 and #1414 were fixed, pushed, replayed clean, and
+  closed. Provisional #1422 was closed `NOT_PLANNED` without product edits
+  after the replica ambiguity was confirmed.
+- [x] (2026-07-31) Reconciled the accepted C#, Go, Java, JavaScript,
+  TypeScript, PHP, Rust, and Scala raw artifacts with the already durable C,
+  C++, and Python summaries. Added a compact 11-language manifest and campaign
+  summary under `.agents/docs/reference-differential/`. The manifest contains
+  exactly 11 language records and 55 repository ranks, pins every repository
+  and acceptance head, and accounts for 520,969 sampled sites, 40,252 queried
+  targets, 117 exhaustively audited raw rows, and zero actionable residuals.
+- [x] (2026-07-31) Re-audited the complete GitHub `FIRD:` issue ledger outside
+  the sandbox. Every campaign issue is assigned to `jbellis` and closed;
+  #1422 alone is intentionally `NOT_PLANNED`. There are zero open `FIRD:`
+  issues globally.
 - [x] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [x] Complete C++ and publish its evidence and user summary.
-- [ ] Complete C# ranks six through ten and publish its evidence and user
+- [x] Complete C# ranks six through ten and publish its evidence and user
   summary.
-- [ ] Complete Go ranks six through ten and publish its evidence and user
+- [x] Complete Go ranks six through ten and publish its evidence and user
   summary.
-- [ ] Complete Java ranks six through ten and publish its evidence and user
+- [x] Complete Java ranks six through ten and publish its evidence and user
   summary.
-- [ ] Complete JavaScript ranks six through ten and publish its evidence and
+- [x] Complete JavaScript ranks six through ten and publish its evidence and
   user summary.
-- [ ] Complete TypeScript ranks six through ten and publish its evidence and
+- [x] Complete TypeScript ranks six through ten and publish its evidence and
   user summary.
-- [ ] Complete PHP ranks six through ten and publish its evidence and user
+- [x] Complete PHP ranks six through ten and publish its evidence and user
   summary.
 - [x] Complete Rust ranks six through ten and publish its evidence and user
   summary.
@@ -1012,20 +1039,24 @@ local gate, but is not the focus.
 
 ## Outcomes & Retrospective
 
-The ranks-six-through-ten expansion is in progress. C, C++, and Python have
-durable top-ten evidence, so 15 of the required 55 new repository envelopes
-are complete. C# through Scala, excluding Python, currently have only their
-accepted historical top-five evidence; their 40 rank-six-through-ten
-repositories remain to be run and audited.
+The distinct ranks-six-through-ten expansion is complete. All eleven
+languages have five new completed repository envelopes selected from
+`tasks.py` slice `[5:10]`, for 55 new records in total; no historical
+rank-one-through-five envelope substitutes for a new-rank record. The compact
+campaign manifest pins every selected repository, task count, repository head,
+language acceptance head, aggregate counter, raw artifact path, and SHA-256.
+It records the shared run fingerprint directly where one exists; the C record
+delegates its per-envelope fingerprints to the referenced durable manifest.
 
-The earlier statement that all 110 combined envelopes were complete was a
-scope error: it treated the user's “finished” status for the prior task as
-evidence for the new task. The selector, issue, publication, test, and cleanup
-audits performed during that close-out remain valid within their actual scope,
-but cannot substitute for missing corpus envelopes. This plan now uses the
-user's explicit boundary: preserve ranks one through five, add ranks six
-through ten, and claim completion only after all 55 new records have durable
-evidence.
+Across the 55 new envelopes, the campaign sampled 520,969 structured sites and
+queried 40,252 inverse target groups. Configured caps account for every skipped
+target and affected site. The accepted records have no file errors or
+candidate-limit exclusions. Their 117 raw missing rows are exactly the
+exhaustively audited C++, Python, and Guardian Grid nonactionable partitions;
+zero actionable discrepancy remains. Every legitimate defect was assigned to
+`jbellis` before implementation, fixed and locally tested, pushed directly to
+`origin/master`, replayed depth-first, and closed. The final tracker audit has
+zero open `FIRD:` issues.
 
 C++ closed its new ranks with 72,177 sites across its full top-ten run, 58
 exhaustively audited non-actionable raw rows, and no actionable residual.
@@ -1303,3 +1334,8 @@ Revision note (2026-07-31): Recorded the pushed Guardian Grid repair, clean
 rank-ten proof and intentional physical-replica ambiguity, closure of every
 remaining assigned Scala FIRD issue, and completion of Scala ranks six through
 ten.
+
+Revision note (2026-07-31): Reconciled all eleven ranks-six-through-ten
+languages into one 55-repository compact manifest, superseded stale completion
+checkboxes and outcomes, recorded the final same-head Scala certification and
+missing ledger, and confirmed the global `FIRD:` issue set has no open owner.
