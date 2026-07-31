@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use brokk_bifrost::analyzer::dataflow::SemanticInputStatus;
+use brokk_bifrost::analyzer::dataflow::{SemanticInputStatus, SolverBudgetDimension, SolverWork};
 use brokk_bifrost::analyzer::semantic::{
     CancellationToken, EvidenceCompleteness, OracleCallContext, ProcedureHandle, ProcedureKind,
     ProofStatus, SemanticBudget, SemanticRequest, ValueFlowOracle, ValueFlowRelationKind,
@@ -23,18 +23,20 @@ use crate::common::semantic_graph::SemanticGraph;
 use crate::common::{BuiltInlineTestProject, InlineTestProject};
 use crate::value_flow_conformance::{
     ExpectedSinkOutcome, ResolvedValueFlowConformanceCase, ValueFlowConformanceCase,
-    assert_resolved_value_flow_conformance, direct_witness_symbol_sequences,
+    assert_resolved_value_flow_conformance, direct_solver_work, direct_witness_symbol_sequences,
     resolve_value_flow_conformance_case,
 };
 use crate::value_flow_scenarios::{
-    with_java_branch_merge, with_java_capture_flow, with_java_cleanup_flow, with_java_early_return,
-    with_java_exact_helper, with_java_exceptional_flow, with_java_field_access_flow,
-    with_java_field_alias_flow, with_java_loop_exit, with_java_receiver_flow,
-    with_java_two_matched_calls, with_typescript_branch_merge, with_typescript_capture_flow,
-    with_typescript_cleanup_flow, with_typescript_early_return, with_typescript_exact_helper,
-    with_typescript_exceptional_flow, with_typescript_field_access_flow,
-    with_typescript_field_alias_flow, with_typescript_loop_exit, with_typescript_receiver_flow,
-    with_typescript_two_matched_calls,
+    with_java_ambiguous_call_negative, with_java_branch_merge, with_java_capture_flow,
+    with_java_cleanup_flow, with_java_early_return, with_java_exact_helper,
+    with_java_exceptional_flow, with_java_field_access_flow, with_java_field_alias_flow,
+    with_java_loop_exit, with_java_receiver_flow, with_java_two_matched_calls,
+    with_java_unresolved_call_negative, with_typescript_ambiguous_call_negative,
+    with_typescript_branch_merge, with_typescript_capture_flow, with_typescript_cleanup_flow,
+    with_typescript_early_return, with_typescript_exact_helper, with_typescript_exceptional_flow,
+    with_typescript_field_access_flow, with_typescript_field_alias_flow, with_typescript_loop_exit,
+    with_typescript_receiver_flow, with_typescript_two_matched_calls,
+    with_typescript_unresolved_call_negative,
 };
 
 const WORKSPACE_GENERATION: u64 = 23;
@@ -535,6 +537,263 @@ fn endpoint_and_aggregate_witness_budgets_stop_before_excess_projection() {
 }
 
 #[test]
+fn fact_only_solver_budget_inventory_classifies_every_dimension() {
+    with_java_exact_helper(|case| {
+        let resolved = resolve_value_flow_conformance_case(case);
+        let exact_work = direct_solver_work(&resolved);
+        let incomplete_work = with_java_unresolved_call_negative(|case| {
+            direct_solver_work(&resolve_value_flow_conformance_case(case))
+        });
+        let fact_only = [
+            SolverBudgetDimension::InternedFacts,
+            SolverBudgetDimension::ReachedStates,
+            SolverBudgetDimension::FlowEvaluations,
+            SolverBudgetDimension::CallbackRows,
+            SolverBudgetDimension::PropagatedOutputs,
+            SolverBudgetDimension::EndSummaries,
+            SolverBudgetDimension::IncomingCalls,
+            SolverBudgetDimension::ProviderMaterializations,
+            SolverBudgetDimension::SummaryApplications,
+            SolverBudgetDimension::CoverageRows,
+            SolverBudgetDimension::WitnessRelations,
+        ];
+        let ide_only = [
+            SolverBudgetDimension::IdeRelations,
+            SolverBudgetDimension::EdgeFunctions,
+            SolverBudgetDimension::EdgeFunctionOperations,
+            SolverBudgetDimension::IdeValues,
+            SolverBudgetDimension::ValueOperations,
+            SolverBudgetDimension::IdePropagations,
+        ];
+        assert!(
+            fact_only.into_iter().all(|dimension| {
+                exact_work.get(dimension) > 0 || incomplete_work.get(dimension) > 0
+            }),
+            "fact-only value-flow scenarios must charge every applicable dimension: exact={exact_work:#?}; incomplete={incomplete_work:#?}"
+        );
+        assert!(
+            ide_only.into_iter().all(|dimension| {
+                exact_work.get(dimension) == 0 && incomplete_work.get(dimension) == 0
+            }),
+            "fact-only value flow must explicitly leave IDE-only dimensions unused: exact={exact_work:#?}; incomplete={incomplete_work:#?}"
+        );
+    });
+}
+
+#[test]
+fn every_fact_only_solver_budget_has_an_exact_public_boundary() {
+    with_java_exact_helper(|case| {
+        assert_solver_budget_boundaries(
+            case,
+            &[
+                SolverBudgetDimension::InternedFacts,
+                SolverBudgetDimension::ReachedStates,
+                SolverBudgetDimension::FlowEvaluations,
+                SolverBudgetDimension::CallbackRows,
+                SolverBudgetDimension::PropagatedOutputs,
+                SolverBudgetDimension::EndSummaries,
+                SolverBudgetDimension::IncomingCalls,
+                SolverBudgetDimension::ProviderMaterializations,
+                SolverBudgetDimension::SummaryApplications,
+            ],
+        );
+    });
+    with_java_unresolved_call_negative(|case| {
+        assert_solver_budget_boundaries(case, &[SolverBudgetDimension::CoverageRows]);
+    });
+}
+
+#[test]
+fn witness_relation_solver_budget_proves_its_minimum_public_boundary() {
+    with_java_exact_helper(|case| {
+        let resolved = resolve_value_flow_conformance_case(case);
+        let mut registrations = ValueFlowPlanRegistrationSet::default();
+        registrations
+            .register(
+                PLAN_REF.parse().unwrap(),
+                ValueFlowPlanRegistration::new(WORKSPACE_GENERATION, Arc::clone(&resolved.plan)),
+            )
+            .unwrap();
+        let summaries = Arc::new(ProductionTypestateSummaryRepository::new());
+
+        let exact = execute_solver_limit(
+            &resolved,
+            &registrations,
+            &summaries,
+            SolverBudgetDimension::WitnessRelations,
+            1,
+        );
+        assert!(
+            !has_diagnostic(&exact["result"], "value_flow_solver_budget_exhausted"),
+            "minimum positive witness-relation boundary: {exact:#}"
+        );
+
+        let invalid = execute_solver_limit(
+            &resolved,
+            &registrations,
+            &summaries,
+            SolverBudgetDimension::WitnessRelations,
+            0,
+        );
+        assert!(
+            has_diagnostic(&invalid, "invalid_plan"),
+            "one step beyond the minimum valid witness-relation limit: {invalid:#}"
+        );
+        assert!(invalid["results"].as_array().unwrap().is_empty());
+    });
+}
+
+fn assert_solver_budget_boundaries(
+    case: &ValueFlowConformanceCase<'_>,
+    dimensions: &[SolverBudgetDimension],
+) {
+    let resolved = resolve_value_flow_conformance_case(case);
+    let used = direct_solver_work(&resolved);
+    let mut registrations = ValueFlowPlanRegistrationSet::default();
+    registrations
+        .register(
+            PLAN_REF.parse().unwrap(),
+            ValueFlowPlanRegistration::new(WORKSPACE_GENERATION, Arc::clone(&resolved.plan)),
+        )
+        .unwrap();
+    let summaries = Arc::new(ProductionTypestateSummaryRepository::new());
+    for &dimension in dimensions {
+        let upper_bound = used.get(dimension);
+        assert!(
+            upper_bound > 1,
+            "{} {} must have a positive search bound: {used:#?}",
+            case.name,
+            dimension.label()
+        );
+        let upper = execute_solver_limit(
+            &resolved,
+            &registrations,
+            &summaries,
+            dimension,
+            upper_bound,
+        );
+        assert!(
+            !has_diagnostic(&upper["result"], "value_flow_solver_budget_exhausted"),
+            "{} {} direct-work upper bound: {upper:#}",
+            case.name,
+            dimension.label()
+        );
+        let mut low = 1;
+        let mut high = upper_bound;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let result =
+                execute_solver_limit(&resolved, &registrations, &summaries, dimension, middle);
+            if has_diagnostic(&result["result"], "value_flow_solver_budget_exhausted") {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        let boundary = low;
+        assert!(
+            boundary > 1,
+            "{} {} has no valid one-beyond limit",
+            case.name,
+            dimension.label()
+        );
+        let exact =
+            execute_solver_limit(&resolved, &registrations, &summaries, dimension, boundary);
+        assert!(
+            !has_diagnostic(&exact["result"], "value_flow_solver_budget_exhausted"),
+            "{} {} exact boundary: {exact:#}",
+            case.name,
+            dimension.label()
+        );
+
+        let exceeded = execute_solver_limit(
+            &resolved,
+            &registrations,
+            &summaries,
+            dimension,
+            boundary - 1,
+        );
+        assert!(
+            has_diagnostic(&exceeded["result"], "value_flow_solver_budget_exhausted"),
+            "{} {} one beyond: {exceeded:#}",
+            case.name,
+            dimension.label()
+        );
+        assert_eq!(
+            exceeded.pointer("/work/semantic/value_flow/budget_exhausted_solves"),
+            Some(&json!(1)),
+            "{} {} profile counter",
+            case.name,
+            dimension.label()
+        );
+        assert!(
+            exceeded["result"]["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["reachability"] != "not_reached" || row["completion"] != "complete"),
+            "{} {} exhaustion became a clean negative: {exceeded:#}",
+            case.name,
+            dimension.label()
+        );
+    }
+}
+
+fn execute_solver_limit(
+    resolved: &ResolvedValueFlowConformanceCase,
+    registrations: &ValueFlowPlanRegistrationSet,
+    summaries: &Arc<ProductionTypestateSummaryRepository>,
+    dimension: SolverBudgetDimension,
+    limit: usize,
+) -> serde_json::Value {
+    let mut limits = CodeQueryExecutionLimits::default();
+    set_solver_limit(&mut limits.value_flow.solver_work, dimension, limit);
+    let result = execute_workspace_request_with_analysis_registration_lease(
+        &resolved.analyzer,
+        WORKSPACE_GENERATION,
+        &ProtocolRegistrationSet::default(),
+        registrations,
+        &profiled_query(false),
+        limits,
+        None,
+        summaries.lease(WORKSPACE_GENERATION).unwrap(),
+    );
+    serde_json::to_value(result).unwrap()
+}
+
+fn has_diagnostic(response: &serde_json::Value, code: &str) -> bool {
+    response["diagnostics"]
+        .as_array()
+        .is_some_and(|diagnostics| {
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == code)
+        })
+}
+
+fn set_solver_limit(work: &mut SolverWork, dimension: SolverBudgetDimension, limit: usize) {
+    match dimension {
+        SolverBudgetDimension::InternedFacts => work.interned_facts = limit,
+        SolverBudgetDimension::ReachedStates => work.reached_states = limit,
+        SolverBudgetDimension::FlowEvaluations => work.flow_evaluations = limit,
+        SolverBudgetDimension::CallbackRows => work.callback_rows = limit,
+        SolverBudgetDimension::PropagatedOutputs => work.propagated_outputs = limit,
+        SolverBudgetDimension::EndSummaries => work.end_summaries = limit,
+        SolverBudgetDimension::IncomingCalls => work.incoming_calls = limit,
+        SolverBudgetDimension::ProviderMaterializations => work.provider_materializations = limit,
+        SolverBudgetDimension::SummaryApplications => work.summary_applications = limit,
+        SolverBudgetDimension::CoverageRows => work.coverage_rows = limit,
+        SolverBudgetDimension::WitnessRelations => work.witness_relations = limit,
+        SolverBudgetDimension::IdeRelations => work.ide_relations = limit,
+        SolverBudgetDimension::EdgeFunctions => work.edge_functions = limit,
+        SolverBudgetDimension::EdgeFunctionOperations => work.edge_function_operations = limit,
+        SolverBudgetDimension::IdeValues => work.ide_values = limit,
+        SolverBudgetDimension::ValueOperations => work.value_operations = limit,
+        SolverBudgetDimension::IdePropagations => work.ide_propagations = limit,
+    }
+}
+
+#[test]
 fn duplicate_analysis_branches_share_one_solve() {
     let fixture = Fixture::new(ProofStatus::Proven, EvidenceCompleteness::Complete);
     let branch = json!({
@@ -714,6 +973,26 @@ fn java_alias_field_flow_preserves_public_inconclusive_negative() {
 #[test]
 fn typescript_alias_field_flow_preserves_public_inconclusive_negative() {
     with_typescript_field_alias_flow(assert_shared_helper_scenario);
+}
+
+#[test]
+fn java_unresolved_call_preserves_public_inconclusive_negative() {
+    with_java_unresolved_call_negative(assert_shared_helper_scenario);
+}
+
+#[test]
+fn typescript_unresolved_call_preserves_public_inconclusive_negative() {
+    with_typescript_unresolved_call_negative(assert_shared_helper_scenario);
+}
+
+#[test]
+fn java_ambiguous_call_preserves_public_inconclusive_negative() {
+    with_java_ambiguous_call_negative(assert_shared_helper_scenario);
+}
+
+#[test]
+fn typescript_ambiguous_call_preserves_public_inconclusive_negative() {
+    with_typescript_ambiguous_call_negative(assert_shared_helper_scenario);
 }
 
 fn assert_shared_helper_scenario(case: &ValueFlowConformanceCase<'_>) {
@@ -1024,10 +1303,7 @@ fn assert_public_sink_outcomes(
                 row.get("ambiguous")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
-                matches!(
-                    case.expected_discovery_status,
-                    SemanticInputStatus::Ambiguous
-                ),
+                case.expected_public_ambiguous,
                 "{} {} ambiguity",
                 case.name,
                 sink.alias

@@ -9,8 +9,9 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use brokk_bifrost::analyzer::dataflow::{
-    DataflowRequest, PathQuality, SemanticInputStatus, SolverBudget, SummaryWitnessStepKind,
-    WitnessReconstructionLimits, WitnessRetentionLimits,
+    DataflowRequest, PathQuality, SemanticInputStatus, SolverBudget, SolverWork,
+    SummaryWitnessStepKind, UnmodeledCallBehavior, WitnessReconstructionLimits,
+    WitnessRetentionLimits,
 };
 use brokk_bifrost::analyzer::semantic::{
     CallBinding, CallBindings, CallSiteHandle, CancellationToken, DeclarationLocator,
@@ -236,11 +237,13 @@ pub struct ValueFlowConformanceCase<'case> {
     pub procedures: &'case [ProcedureSelector<'case>],
     pub root: &'case str,
     pub calls: &'case [CallSelector<'case>],
+    pub unmodeled_call_behavior: UnmodeledCallBehavior,
     pub source: ParameterSource<'case>,
     pub sinks: &'case [CallArgumentSink<'case>],
     pub expected_discovery_status: SemanticInputStatus,
     pub expected_discovery_complete: bool,
     pub expected_result_complete: bool,
+    pub expected_public_ambiguous: bool,
     pub expected_location_relations: &'case [ExpectedLocationRelation<'case>],
     pub expected_meetings: &'case [ExpectedMeeting<'case>],
 }
@@ -414,6 +417,23 @@ impl ResolvedValueFlowConformanceCase {
 pub fn assert_value_flow_conformance(case: &ValueFlowConformanceCase<'_>) {
     let resolved = resolve_value_flow_conformance_case(case);
     assert_resolved_value_flow_conformance(case, &resolved);
+}
+
+pub fn direct_solver_work(resolved: &ResolvedValueFlowConformanceCase) -> SolverWork {
+    let cancellation = CancellationToken::default();
+    let mut solver_budget = SolverBudget::default();
+    let mut semantic_budget = SemanticBudget::default();
+    solve_value_flow_with_witnesses(
+        &resolved.root,
+        &resolved.analyzer.icfg_provider(),
+        &resolved.plan,
+        WitnessRetentionLimits::best_effort(1, 262_144, 16 * 1024 * 1024)
+            .expect("public default retention limits"),
+        &mut semantic_budget,
+        &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+    )
+    .expect("baseline direct value-flow solve");
+    solver_budget.used()
 }
 
 pub fn assert_resolved_value_flow_conformance(
@@ -669,17 +689,24 @@ pub fn resolve_value_flow_conformance_case(
         ));
     }
 
-    let plan = ValueFlowPlan::try_new(
+    let plan = ValueFlowPlan::with_call_behavior(
         root.clone(),
         snapshots.clone(),
         bindings.clone(),
         vec![source.clone()],
         sinks,
+        case.unmodeled_call_behavior,
     )
     .unwrap_or_else(|error| panic!("{} plan failed: {error}", case.name));
-    let witness_plan =
-        ValueFlowPlan::try_new(root, snapshots, bindings, vec![source], witness_sinks)
-            .unwrap_or_else(|error| panic!("{} witness plan failed: {error}", case.name));
+    let witness_plan = ValueFlowPlan::with_call_behavior(
+        root,
+        snapshots,
+        bindings,
+        vec![source],
+        witness_sinks,
+        case.unmodeled_call_behavior,
+    )
+    .unwrap_or_else(|error| panic!("{} witness plan failed: {error}", case.name));
     let sink_ids = resolve_sink_ids(&plan, &sink_keys);
     let witness_sink_ids = resolve_sink_ids(&witness_plan, &sink_keys);
     ResolvedValueFlowConformanceCase {

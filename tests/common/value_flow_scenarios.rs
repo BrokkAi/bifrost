@@ -383,6 +383,86 @@ function run(input: string): void {
 }
 "#;
 
+const JAVA_UNRESOLVED_CALL_SOURCE: &str = r#"
+interface ExternalWork {
+  String relay(String value);
+}
+
+final class UnresolvedCallFlowFixture {
+  static void sink(String flowed, String unresolved) {}
+
+  static void run(ExternalWork work, String input) {
+    sink(input, "clean");
+    String copy = work.relay(input);
+    sink("clean", copy);
+  }
+}
+"#;
+
+const TYPESCRIPT_UNRESOLVED_CALL_SOURCE: &str = r#"
+interface ExternalWork {
+  relay(value: string): string;
+}
+
+function sink(flowed: string, unresolved: string): void {}
+
+function run(work: ExternalWork, input: string): void {
+  sink(input, "clean");
+  const copy = work.relay(input);
+  sink("clean", copy);
+}
+"#;
+
+const JAVA_AMBIGUOUS_A_SOURCE: &str = r#"
+package a;
+public final class A {
+  public static String relay(String value) { return value; }
+}
+"#;
+
+const JAVA_AMBIGUOUS_B_SOURCE: &str = r#"
+package b;
+public final class B {
+  public static String relay(String value) { return value; }
+}
+"#;
+
+const JAVA_AMBIGUOUS_CALL_SOURCE: &str = r#"
+import static a.A.relay;
+import static b.B.relay;
+
+final class AmbiguousCallFlowFixture {
+  static void sink(String flowed, String ambiguous) {}
+
+  static void run(String input) {
+    sink(input, "clean");
+    String copy = relay("clean");
+    sink("clean", copy);
+  }
+}
+"#;
+
+const TYPESCRIPT_AMBIGUOUS_A_SOURCE: &str = r#"
+export function relay(value: string): string { return value; }
+"#;
+
+const TYPESCRIPT_AMBIGUOUS_B_SOURCE: &str = r#"
+export function relay(value: string): string { return value; }
+"#;
+
+const TYPESCRIPT_AMBIGUOUS_CALL_SOURCE: &str = r#"
+import { relay } from "./a";
+import { relay } from "./b";
+
+function sink(flowed: string, ambiguous: string): void {}
+
+function run(input: string): void {
+  sink(input, "clean");
+  const copy = relay("clean");
+  sink("clean", copy);
+}
+"#;
+
 const JAVA_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
     path: "src/ExactFlowFixture.java",
     source: JAVA_SOURCE,
@@ -492,6 +572,46 @@ const TYPESCRIPT_FIELD_ALIAS_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile
     path: "src/field_alias_flow.ts",
     source: TYPESCRIPT_FIELD_ALIAS_SOURCE,
 }];
+
+const JAVA_UNRESOLVED_CALL_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
+    path: "src/UnresolvedCallFlowFixture.java",
+    source: JAVA_UNRESOLVED_CALL_SOURCE,
+}];
+
+const TYPESCRIPT_UNRESOLVED_CALL_FILES: &[InlineSourceFile<'_>] = &[InlineSourceFile {
+    path: "src/unresolved_call_flow.ts",
+    source: TYPESCRIPT_UNRESOLVED_CALL_SOURCE,
+}];
+
+const JAVA_AMBIGUOUS_CALL_FILES: &[InlineSourceFile<'_>] = &[
+    InlineSourceFile {
+        path: "src/a/A.java",
+        source: JAVA_AMBIGUOUS_A_SOURCE,
+    },
+    InlineSourceFile {
+        path: "src/b/B.java",
+        source: JAVA_AMBIGUOUS_B_SOURCE,
+    },
+    InlineSourceFile {
+        path: "src/AmbiguousCallFlowFixture.java",
+        source: JAVA_AMBIGUOUS_CALL_SOURCE,
+    },
+];
+
+const TYPESCRIPT_AMBIGUOUS_CALL_FILES: &[InlineSourceFile<'_>] = &[
+    InlineSourceFile {
+        path: "src/a.ts",
+        source: TYPESCRIPT_AMBIGUOUS_A_SOURCE,
+    },
+    InlineSourceFile {
+        path: "src/b.ts",
+        source: TYPESCRIPT_AMBIGUOUS_B_SOURCE,
+    },
+    InlineSourceFile {
+        path: "src/ambiguous_call_flow.ts",
+        source: TYPESCRIPT_AMBIGUOUS_CALL_SOURCE,
+    },
+];
 
 const JAVA_PROCEDURES: &[ProcedureSelector<'_>] = &[
     ProcedureSelector {
@@ -895,6 +1015,66 @@ const TYPESCRIPT_FIELD_ALIAS_PROCEDURES: &[ProcedureSelector<'_>] = &[
     },
 ];
 
+const JAVA_UNRESOLVED_CALL_PROCEDURES: &[ProcedureSelector<'_>] = &[
+    ProcedureSelector {
+        alias: "run",
+        path: "src/UnresolvedCallFlowFixture.java",
+        name: "run",
+        kind: ProcedureKind::Method,
+    },
+    ProcedureSelector {
+        alias: "sink",
+        path: "src/UnresolvedCallFlowFixture.java",
+        name: "sink",
+        kind: ProcedureKind::Method,
+    },
+];
+
+const TYPESCRIPT_UNRESOLVED_CALL_PROCEDURES: &[ProcedureSelector<'_>] = &[
+    ProcedureSelector {
+        alias: "run",
+        path: "src/unresolved_call_flow.ts",
+        name: "run",
+        kind: ProcedureKind::Function,
+    },
+    ProcedureSelector {
+        alias: "sink",
+        path: "src/unresolved_call_flow.ts",
+        name: "sink",
+        kind: ProcedureKind::Function,
+    },
+];
+
+const JAVA_AMBIGUOUS_CALL_PROCEDURES: &[ProcedureSelector<'_>] = &[
+    ProcedureSelector {
+        alias: "run",
+        path: "src/AmbiguousCallFlowFixture.java",
+        name: "run",
+        kind: ProcedureKind::Method,
+    },
+    ProcedureSelector {
+        alias: "sink",
+        path: "src/AmbiguousCallFlowFixture.java",
+        name: "sink",
+        kind: ProcedureKind::Method,
+    },
+];
+
+const TYPESCRIPT_AMBIGUOUS_CALL_PROCEDURES: &[ProcedureSelector<'_>] = &[
+    ProcedureSelector {
+        alias: "run",
+        path: "src/ambiguous_call_flow.ts",
+        name: "run",
+        kind: ProcedureKind::Function,
+    },
+    ProcedureSelector {
+        alias: "sink",
+        path: "src/ambiguous_call_flow.ts",
+        name: "sink",
+        kind: ProcedureKind::Function,
+    },
+];
+
 const CALLS: &[CallSelector<'_>] = &[
     CallSelector {
         alias: "relay_call",
@@ -989,6 +1169,36 @@ const CAPTURE_CALLS: &[CallSelector<'_>] = &[CallSelector {
     callee: "sink",
     occurrence: 0,
 }];
+
+const UNRESOLVED_CALLS: &[CallSelector<'_>] = &[
+    CallSelector {
+        alias: "preserved_sink_call",
+        caller: "run",
+        callee: "sink",
+        occurrence: 0,
+    },
+    CallSelector {
+        alias: "unresolved_sink_call",
+        caller: "run",
+        callee: "sink",
+        occurrence: 1,
+    },
+];
+
+const AMBIGUOUS_CALLS: &[CallSelector<'_>] = &[
+    CallSelector {
+        alias: "preserved_sink_call",
+        caller: "run",
+        callee: "sink",
+        occurrence: 0,
+    },
+    CallSelector {
+        alias: "ambiguous_sink_call",
+        caller: "run",
+        callee: "sink",
+        occurrence: 1,
+    },
+];
 
 const JAVA_SINKS: &[CallArgumentSink<'_>] = &[
     CallArgumentSink {
@@ -1335,6 +1545,7 @@ pub fn with_java_exceptional_flow<T>(
         procedures: JAVA_EXCEPTIONAL_PROCEDURES,
         root: "run",
         calls: EXCEPTIONAL_CALLS,
+        unmodeled_call_behavior: brokk_bifrost::analyzer::dataflow::UnmodeledCallBehavior::Paranoid,
         source: ParameterSource::Parameter {
             procedure: "run",
             ordinal: 0,
@@ -1343,6 +1554,7 @@ pub fn with_java_exceptional_flow<T>(
         expected_discovery_status: SemanticInputStatus::Unknown,
         expected_discovery_complete: false,
         expected_result_complete: false,
+        expected_public_ambiguous: false,
         expected_location_relations: &[],
         expected_meetings: &[],
     })
@@ -1401,6 +1613,7 @@ pub fn with_java_cleanup_flow<T>(execute: impl FnOnce(&ValueFlowConformanceCase<
         procedures: JAVA_CLEANUP_PROCEDURES,
         root: "run",
         calls: CALLS,
+        unmodeled_call_behavior: brokk_bifrost::analyzer::dataflow::UnmodeledCallBehavior::Paranoid,
         source: ParameterSource::Parameter {
             procedure: "run",
             ordinal: 0,
@@ -1409,6 +1622,7 @@ pub fn with_java_cleanup_flow<T>(execute: impl FnOnce(&ValueFlowConformanceCase<
         expected_discovery_status: SemanticInputStatus::Unknown,
         expected_discovery_complete: false,
         expected_result_complete: false,
+        expected_public_ambiguous: false,
         expected_location_relations: &[],
         expected_meetings: &[],
     })
@@ -1438,6 +1652,7 @@ pub fn with_typescript_cleanup_flow<T>(
         procedures: TYPESCRIPT_CLEANUP_PROCEDURES,
         root: "run",
         calls: CALLS,
+        unmodeled_call_behavior: brokk_bifrost::analyzer::dataflow::UnmodeledCallBehavior::Paranoid,
         source: ParameterSource::Parameter {
             procedure: "run",
             ordinal: 0,
@@ -1446,6 +1661,7 @@ pub fn with_typescript_cleanup_flow<T>(
         expected_discovery_status: SemanticInputStatus::Unknown,
         expected_discovery_complete: false,
         expected_result_complete: false,
+        expected_public_ambiguous: false,
         expected_location_relations: &[],
         expected_meetings: &[],
     })
@@ -1545,6 +1761,64 @@ pub fn with_typescript_field_alias_flow<T>(
     )
 }
 
+pub fn with_java_unresolved_call_negative<T>(
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    with_unresolved_call_negative(
+        "java-unresolved-call-negative",
+        Language::Java,
+        JAVA_UNRESOLVED_CALL_FILES,
+        JAVA_UNRESOLVED_CALL_PROCEDURES,
+        "src/UnresolvedCallFlowFixture.java",
+        SemanticInputStatus::Unknown,
+        execute,
+    )
+}
+
+pub fn with_typescript_unresolved_call_negative<T>(
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    with_unresolved_call_negative(
+        "typescript-unresolved-call-negative",
+        Language::TypeScript,
+        TYPESCRIPT_UNRESOLVED_CALL_FILES,
+        TYPESCRIPT_UNRESOLVED_CALL_PROCEDURES,
+        "src/unresolved_call_flow.ts",
+        SemanticInputStatus::Unsupported {
+            capability: SemanticCapability::ExceptionalControlFlow,
+        },
+        execute,
+    )
+}
+
+pub fn with_java_ambiguous_call_negative<T>(
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    with_ambiguous_call_negative(
+        "java-ambiguous-call-negative",
+        Language::Java,
+        JAVA_AMBIGUOUS_CALL_FILES,
+        JAVA_AMBIGUOUS_CALL_PROCEDURES,
+        "src/AmbiguousCallFlowFixture.java",
+        SemanticInputStatus::Unknown,
+        execute,
+    )
+}
+
+pub fn with_typescript_ambiguous_call_negative<T>(
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    with_ambiguous_call_negative(
+        "typescript-ambiguous-call-negative",
+        Language::TypeScript,
+        TYPESCRIPT_AMBIGUOUS_CALL_FILES,
+        TYPESCRIPT_AMBIGUOUS_CALL_PROCEDURES,
+        "src/ambiguous_call_flow.ts",
+        SemanticInputStatus::Unknown,
+        execute,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn with_branch_merge<T>(
     name: &str,
@@ -1608,6 +1882,7 @@ fn with_branch_merge<T>(
         procedures,
         root: "run",
         calls: BRANCH_CALLS,
+        unmodeled_call_behavior: brokk_bifrost::analyzer::dataflow::UnmodeledCallBehavior::Paranoid,
         source: ParameterSource::Parameter {
             procedure: "run",
             ordinal: 0,
@@ -1616,6 +1891,7 @@ fn with_branch_merge<T>(
         expected_discovery_status: SemanticInputStatus::Unknown,
         expected_discovery_complete: false,
         expected_result_complete,
+        expected_public_ambiguous: false,
         expected_location_relations: &[],
         expected_meetings: &meetings,
     })
@@ -1705,6 +1981,7 @@ fn with_early_return<T>(
         procedures,
         root: "run",
         calls: EARLY_RETURN_CALLS,
+        unmodeled_call_behavior: brokk_bifrost::analyzer::dataflow::UnmodeledCallBehavior::Paranoid,
         source: ParameterSource::Parameter {
             procedure: "run",
             ordinal: 0,
@@ -1713,6 +1990,7 @@ fn with_early_return<T>(
         expected_discovery_status: SemanticInputStatus::Unknown,
         expected_discovery_complete: false,
         expected_result_complete,
+        expected_public_ambiguous: false,
         expected_location_relations: &[],
         expected_meetings: &meetings,
     })
@@ -1865,6 +2143,7 @@ fn with_two_matched_calls<T>(
         procedures,
         root: "run",
         calls: TWO_CALLS,
+        unmodeled_call_behavior: brokk_bifrost::analyzer::dataflow::UnmodeledCallBehavior::Paranoid,
         source: ParameterSource::Parameter {
             procedure: "run",
             ordinal: 0,
@@ -1873,6 +2152,7 @@ fn with_two_matched_calls<T>(
         expected_discovery_status: SemanticInputStatus::Unknown,
         expected_discovery_complete: false,
         expected_result_complete,
+        expected_public_ambiguous: false,
         expected_location_relations: &[],
         expected_meetings: &meetings,
     })
@@ -1984,6 +2264,7 @@ fn with_receiver_flow<T>(
         procedures,
         root: "run",
         calls: RECEIVER_CALLS,
+        unmodeled_call_behavior: brokk_bifrost::analyzer::dataflow::UnmodeledCallBehavior::Paranoid,
         source: ParameterSource::Parameter {
             procedure: "run",
             ordinal: 0,
@@ -1992,6 +2273,7 @@ fn with_receiver_flow<T>(
         expected_discovery_status,
         expected_discovery_complete: false,
         expected_result_complete,
+        expected_public_ambiguous: false,
         expected_location_relations: &[],
         expected_meetings: &meetings,
     })
@@ -2053,6 +2335,7 @@ fn with_exceptional_flow<T>(
         procedures,
         root: "run",
         calls: EXCEPTIONAL_CALLS,
+        unmodeled_call_behavior: brokk_bifrost::analyzer::dataflow::UnmodeledCallBehavior::Paranoid,
         source: ParameterSource::Parameter {
             procedure: "run",
             ordinal: 0,
@@ -2061,6 +2344,7 @@ fn with_exceptional_flow<T>(
         expected_discovery_status: SemanticInputStatus::Unknown,
         expected_discovery_complete: false,
         expected_result_complete,
+        expected_public_ambiguous: false,
         expected_location_relations: &[],
         expected_meetings: &meetings,
     })
@@ -2123,6 +2407,7 @@ fn with_inconclusive_parameter_flow<T>(
         procedures,
         root,
         calls,
+        unmodeled_call_behavior: brokk_bifrost::analyzer::dataflow::UnmodeledCallBehavior::Paranoid,
         source: ParameterSource::Parameter {
             procedure: "run",
             ordinal: 0,
@@ -2131,6 +2416,7 @@ fn with_inconclusive_parameter_flow<T>(
         expected_discovery_status,
         expected_discovery_complete: false,
         expected_result_complete,
+        expected_public_ambiguous: false,
         expected_location_relations: &[],
         expected_meetings: &[],
     })
@@ -2197,6 +2483,7 @@ fn with_field_access_flow<T>(
         procedures,
         root: "run",
         calls: BRANCH_CALLS,
+        unmodeled_call_behavior: brokk_bifrost::analyzer::dataflow::UnmodeledCallBehavior::Paranoid,
         source: ParameterSource::Parameter {
             procedure: "run",
             ordinal: 0,
@@ -2207,8 +2494,174 @@ fn with_field_access_flow<T>(
         },
         expected_discovery_complete: false,
         expected_result_complete,
+        expected_public_ambiguous: false,
         expected_location_relations: &expected_location_relations,
         expected_meetings: &[],
+    })
+}
+
+fn with_unresolved_call_negative<T>(
+    name: &str,
+    language: Language,
+    files: &[InlineSourceFile<'_>],
+    procedures: &[ProcedureSelector<'_>],
+    path: &str,
+    expected_discovery_status: SemanticInputStatus,
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    let meeting_count = if language == Language::TypeScript {
+        3
+    } else {
+        1
+    };
+    let sinks = [
+        CallArgumentSink {
+            alias: "preserved",
+            call: "preserved_sink_call",
+            argument: 0,
+            outcome: ExpectedSinkOutcome::Reached,
+        },
+        CallArgumentSink {
+            alias: "unresolved",
+            call: "unresolved_sink_call",
+            argument: 1,
+            outcome: ExpectedSinkOutcome::Inconclusive,
+        },
+    ];
+    let carriers = [
+        CarrierMilestone::Port {
+            path: path.into(),
+            procedure: "run".into(),
+            kind: ValueFlowPortKey::Parameter { ordinal: 1 },
+        },
+        CarrierMilestone::SinkArgument {
+            path: path.into(),
+            caller: "run".into(),
+            callee: "sink".into(),
+            call: "sink(input, \"clean\")".into(),
+            ordinal: 0,
+        },
+    ];
+    let meetings = [ExpectedMeeting {
+        sink: "preserved",
+        meeting_count,
+        public_endpoint_count: meeting_count,
+        may_status: ValueFlowMayStatus::Proven,
+        public_may_complete_count: 0,
+        public_may_partial_count: meeting_count.saturating_sub(1),
+        must_status: ValueFlowMustStatus::NotEstablished,
+        uncertain: false,
+        path_qualities: EXPECTED_PATH_QUALITIES,
+        witness: ExpectedWitness {
+            truncated: false,
+            may_status: ValueFlowMayStatus::Proven,
+            path_quality: PathQuality::PROVEN_COMPLETE,
+            carriers: &carriers,
+            interprocedural: &[],
+        },
+    }];
+    execute(&ValueFlowConformanceCase {
+        name,
+        language,
+        files,
+        procedures,
+        root: "run",
+        calls: UNRESOLVED_CALLS,
+        unmodeled_call_behavior:
+            brokk_bifrost::analyzer::dataflow::UnmodeledCallBehavior::RequireModel,
+        source: ParameterSource::Parameter {
+            procedure: "run",
+            ordinal: 1,
+        },
+        sinks: &sinks,
+        expected_discovery_status,
+        expected_discovery_complete: false,
+        expected_result_complete: false,
+        expected_public_ambiguous: false,
+        expected_location_relations: &[],
+        expected_meetings: &meetings,
+    })
+}
+
+fn with_ambiguous_call_negative<T>(
+    name: &str,
+    language: Language,
+    files: &[InlineSourceFile<'_>],
+    procedures: &[ProcedureSelector<'_>],
+    path: &str,
+    expected_discovery_status: SemanticInputStatus,
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    let meeting_count = if language == Language::TypeScript {
+        3
+    } else {
+        1
+    };
+    let sinks = [
+        CallArgumentSink {
+            alias: "preserved",
+            call: "preserved_sink_call",
+            argument: 0,
+            outcome: ExpectedSinkOutcome::Reached,
+        },
+        CallArgumentSink {
+            alias: "ambiguous",
+            call: "ambiguous_sink_call",
+            argument: 1,
+            outcome: ExpectedSinkOutcome::Inconclusive,
+        },
+    ];
+    let carriers = [
+        CarrierMilestone::Port {
+            path: path.into(),
+            procedure: "run".into(),
+            kind: ValueFlowPortKey::Parameter { ordinal: 0 },
+        },
+        CarrierMilestone::SinkArgument {
+            path: path.into(),
+            caller: "run".into(),
+            callee: "sink".into(),
+            call: "sink(input, \"clean\")".into(),
+            ordinal: 0,
+        },
+    ];
+    let meetings = [ExpectedMeeting {
+        sink: "preserved",
+        meeting_count,
+        public_endpoint_count: meeting_count,
+        may_status: ValueFlowMayStatus::Proven,
+        public_may_complete_count: 0,
+        public_may_partial_count: meeting_count.saturating_sub(1),
+        must_status: ValueFlowMustStatus::NotEstablished,
+        uncertain: false,
+        path_qualities: EXPECTED_PATH_QUALITIES,
+        witness: ExpectedWitness {
+            truncated: false,
+            may_status: ValueFlowMayStatus::Proven,
+            path_quality: PathQuality::PROVEN_COMPLETE,
+            carriers: &carriers,
+            interprocedural: &[],
+        },
+    }];
+    execute(&ValueFlowConformanceCase {
+        name,
+        language,
+        files,
+        procedures,
+        root: "run",
+        calls: AMBIGUOUS_CALLS,
+        unmodeled_call_behavior: brokk_bifrost::analyzer::dataflow::UnmodeledCallBehavior::Paranoid,
+        source: ParameterSource::Parameter {
+            procedure: "run",
+            ordinal: 0,
+        },
+        sinks: &sinks,
+        expected_discovery_status,
+        expected_discovery_complete: false,
+        expected_result_complete: false,
+        expected_public_ambiguous: language == Language::Java,
+        expected_location_relations: &[],
+        expected_meetings: &meetings,
     })
 }
 
@@ -2309,6 +2762,7 @@ fn with_exact_helper<T>(
         procedures,
         root: "run",
         calls: CALLS,
+        unmodeled_call_behavior: brokk_bifrost::analyzer::dataflow::UnmodeledCallBehavior::Paranoid,
         source: ParameterSource::Parameter {
             procedure: "run",
             ordinal: 0,
@@ -2317,6 +2771,7 @@ fn with_exact_helper<T>(
         expected_discovery_status,
         expected_discovery_complete,
         expected_result_complete,
+        expected_public_ambiguous: false,
         expected_location_relations: &[],
         expected_meetings: &meetings,
     })

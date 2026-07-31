@@ -23,7 +23,8 @@ The observable proof is the consolidated Rust integration suite: it compares the
 - [x] (2026-07-31 13:10Z) Added shared Java and TypeScript branch/merge, loop/exit, early-return/unreachable, and two-call matched-return scenarios with exact direct/public parity.
 - [x] (2026-07-31 12:30Z) Ran every shared scenario through equivalent JSON and RQL queries and asserted identical complete responses.
 - [x] (2026-07-31 12:30Z) Added receiver, exceptional, cleanup, capture, field-store/load, bounded-access-path, and alias scenarios with exact positive or typed-inconclusive expectations.
-- [ ] Add shared Java and TypeScript exceptional cleanup, receiver, closure/capture, field/access-path, ambiguity, and unresolved-call scenarios.
+- [x] (2026-07-31 14:15Z) Added unresolved-call and same-name ambiguous-dispatch scenarios with exact reached/inconclusive endpoint sets and public ambiguity assertions.
+- [x] (2026-07-31 14:15Z) Classified all fact-only and IDE-only solver dimensions and proved every applicable public solver boundary, including the minimum witness-relation limit.
 - [ ] Add the complete cancellation, truncation, and budget inventory.
 - [ ] Reuse the scenarios across the remaining adapters with explicit readiness outcomes.
 - [ ] Run focused and broad validation, the required policy selection, and specialist review; resolve all blocking findings.
@@ -66,6 +67,15 @@ The observable proof is the consolidated Rust integration suite: it compares the
 - Observation: TypeScript public endpoints retain a deterministic mixed evidence multiset.
   Evidence: intraprocedural scenarios project one exact/complete endpoint plus may/partial alternatives; interprocedural helper, receiver, and matched-call scenarios additionally retain one may/complete endpoint. The shared expectation asserts each variant count rather than accepting any matching row.
 
+- Observation: Java same-name static imports preserve ambiguous result coverage even when plan discovery is unknown, while TypeScript drops both same-name imported candidates before dispatch projection.
+  Evidence: the shared Java case exposes `ambiguous: true` and an inconclusive negative; the TypeScript case remains unknown and inconclusive but cannot expose ambiguity. Follow-up #1406 owns the TypeScript resolver gap.
+
+- Observation: the fact-only value-flow client charges eleven solver dimensions and leaves all six IDE-only dimensions at zero.
+  Evidence: exact helper and unresolved-call direct solves jointly charge interned facts, reached states, flow evaluations, callback rows, propagated outputs, end summaries, incoming calls, provider materializations, summary applications, coverage rows, and witness relations. IDE relations, edge functions and operations, IDE values, value operations, and IDE propagations remain zero.
+
+- Observation: public endpoint solving intentionally retains at most one witness relation per meeting.
+  Evidence: `ValueFlowQueryState` constructs `WitnessRetentionLimits::best_effort(1, ...)`, so the exact public witness-relation solver limit is the minimum valid value `1`; `0` is rejected as an invalid plan before execution.
+
 ## Decision Log
 
 - Decision: add optional `input` and `output` fields to `CodeQueryFlowWitnessStep`, populated for public value-flow witnesses and omitted for the currently shared taint projection.
@@ -96,7 +106,9 @@ The former root public-query test is now part of `suite_cross_language`. One sha
 
 The first control-flow matrix is also complete. Shared Java and TypeScript descriptions now prove branch joins, loop exits, early returns, an unreachable post-return call, and two call sites whose normal returns preserve their respective call origins. Public negative assertions identify sinks by full stable event identity, so same-ordinal arguments at different calls cannot alias in the test. Focused direct and public validation passes all eight new control-flow cases. Exceptional flow, heap/alias behavior, uncertainty, budgets, and remaining adapters remain in progress.
 
-The next boundary slice is source-backed and exact. Receiver propagation reaches the callee receiver port in both adapters. TypeScript exceptional continuation reaches its catch sink; Java exceptional flow and both cleanup variants remain typed incomplete negatives. Capture invocation, field propagation, and receiver aliases are also explicit incomplete negatives, while the field scenarios separately prove exact structured `MemoryStore` and `MemoryLoad` relations over the same bounded access path. Every shared case now executes equivalent JSON and RQL and compares the complete serialized response. Ambiguous/unresolved dispatch, over-bound access paths, full budgets, and adapter expansion remain in progress.
+The next boundary slice is source-backed and exact. Receiver propagation reaches the callee receiver port in both adapters. TypeScript exceptional continuation reaches its catch sink; Java exceptional flow and both cleanup variants remain typed incomplete negatives. Capture invocation, field propagation, and receiver aliases are also explicit incomplete negatives, while the field scenarios separately prove exact structured `MemoryStore` and `MemoryLoad` relations over the same bounded access path. Every shared case now executes equivalent JSON and RQL and compares the complete serialized response. Over-bound access paths, full budgets, and adapter expansion remain in progress.
+
+Ambiguous and unresolved dispatch are now explicit shared scenarios. An unresolved external result remains inconclusive while a source observed before the call still reaches its sink. Java preserves same-name dispatch ambiguity without inventing a target; TypeScript preserves the inconclusive negative but exposes a production resolver gap tracked by #1406. The solver-budget matrix classifies all seventeen dimensions and proves exact public boundaries for the eleven applicable fact-only dimensions, with the minimum-valid witness-relation boundary handled separately. Outer, semantic, retention, projection, and aggregate witness budgets remain in progress.
 
 ## Context and Orientation
 
@@ -219,3 +231,5 @@ Revision note (2026-07-31): Recorded public event/step symbol completion, root-t
 Revision note (2026-07-31): Recorded the Java/TypeScript branch, loop, early-return/unreachable, and matched-return milestone plus full sink-event negative matching.
 
 Revision note (2026-07-31): Recorded JSON/RQL response parity and the receiver, exceptional, cleanup, capture, field/access-path, and alias readiness outcomes.
+
+Revision note (2026-07-31): Recorded ambiguous/unresolved dispatch, TypeScript follow-up #1406, and the complete solver-dimension classification and boundary coverage.
