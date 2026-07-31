@@ -46,11 +46,11 @@ use super::syntax::{
     invocation_function_reference, is_bare_companion_method_value_reference,
     is_call_function_reference, is_constructor_like_reference, is_declaration_name,
     is_extractor_reference, is_field_expression_value, is_identifier_node,
-    is_infix_pattern_operator, is_owner_qualified_this, is_scala_case_pattern_binder,
-    is_scala_class_reference, is_scala_named_argument_assignment, is_scala_object_reference,
-    is_semantic_call_argument, is_stable_type_qualifier, is_terminal_stable_field_reference,
-    named_argument_invocation_owner, node_text, parenthesized_arity,
-    qualified_stable_type_reference, resolve_stable_object_expression,
+    is_infix_pattern_operator, is_owner_qualified_this, is_qualified_stable_root,
+    is_scala_case_pattern_binder, is_scala_class_reference, is_scala_named_argument_assignment,
+    is_scala_object_reference, is_semantic_call_argument, is_stable_type_qualifier,
+    is_terminal_stable_field_reference, named_argument_invocation_owner, node_text,
+    parenthesized_arity, qualified_stable_type_reference, resolve_stable_object_expression,
     scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
     scala_callable_shape_matches, scala_import_is_visible_at_byte, scala_pattern_binder_names,
     scala_source_facts, scala_union_type_alternative_paths, stable_identifier_prefix_reference,
@@ -1540,6 +1540,61 @@ impl ProjectTypes {
             member,
             ScalaCallMatch::Arities(call_arities),
         )
+    }
+
+    fn exact_method_value_declaration_for_owner(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+        member: &str,
+    ) -> BareMemberResolution {
+        if !owner.is_class() {
+            return BareMemberResolution::NoMatch;
+        }
+        let mut owners = vec![owner.clone()];
+        let mut seen = HashSet::default();
+        while !owners.is_empty() {
+            let mut matched = Vec::new();
+            let mut declaring_owners = HashSet::default();
+            let mut next = Vec::new();
+            for owner in owners {
+                if !seen.insert(owner.clone()) {
+                    continue;
+                }
+                let members = self
+                    .members_for_exact_owner_name(&owner.fq_name(), member)
+                    .into_iter()
+                    .filter(|unit| unit.source() == owner.source())
+                    .collect::<Vec<_>>();
+                if members
+                    .iter()
+                    .any(|member| self.member_blocks_callable_lookup(scala, member))
+                {
+                    return BareMemberResolution::Unresolved;
+                }
+                let mut methods = members
+                    .into_iter()
+                    .filter(|unit| unit.is_function())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                methods.sort();
+                methods.dedup();
+                if !methods.is_empty() {
+                    declaring_owners.insert(owner.clone());
+                    matched.extend(methods);
+                }
+                next.extend(self.direct_ancestors_for_declaration(scala, &owner));
+            }
+            if declaring_owners.len() > 1 {
+                return BareMemberResolution::Unresolved;
+            }
+            match matched.as_slice() {
+                [method] => return BareMemberResolution::Resolved(vec![method.clone()]),
+                [] => owners = next,
+                _ => return BareMemberResolution::Unresolved,
+            }
+        }
+        BareMemberResolution::NoMatch
     }
 
     fn bare_member_declarations_for_owner_matching(
@@ -7216,6 +7271,7 @@ const SCOPE_NODES: &[&str] = &[
     "object_definition",
     "trait_definition",
     "enum_definition",
+    "extension_definition",
     "function_definition",
     "block",
     "block_expression",
@@ -7373,6 +7429,15 @@ fn record_exact_import_references(node: Node<'_>, ctx: &mut ScalaScan<'_, '_>) {
         .collect::<Vec<_>>();
     if base_path.iter().any(|segment| segment.is_empty()) {
         return;
+    }
+    for end in 1..path_nodes.len() {
+        record_exact_import_path_reference(
+            path_nodes[end - 1],
+            &base_path[..end],
+            node.start_byte(),
+            true,
+            ctx,
+        );
     }
 
     let mut cursor = node.walk();
@@ -7700,13 +7765,16 @@ fn record_reference(
         // and the type child of `new Foo()`. Construction is covered here without
         // a separate `instance_expression` case (avoids double counting).
         "type_identifier" => {
+            let text = node_text(node, ctx.source);
+            if record_qualified_root_owner_reference(node, text, ctx, bindings) {
+                return;
+            }
             if record_intermediate_stable_object_reference(node, ctx, bindings) {
                 return;
             }
             if record_qualified_stable_reference(node, ctx, bindings) {
                 return;
             }
-            let text = node_text(node, ctx.source);
             if is_stable_type_qualifier(node)
                 && bindings.resolve_symbol(text).is_unknown()
                 && !bindings.is_shadowed(text)
@@ -8182,6 +8250,9 @@ fn record_reference(
             if is_declaration_name(node) {
                 return;
             }
+            if record_qualified_root_owner_reference(node, name, ctx, bindings) {
+                return;
+            }
             if record_intermediate_stable_object_reference(node, ctx, bindings) {
                 return;
             }
@@ -8586,6 +8657,46 @@ fn record_reference(
         }
         _ => {}
     }
+}
+
+fn record_qualified_root_owner_reference(
+    node: Node<'_>,
+    name: &str,
+    ctx: &mut ScalaScan<'_, '_>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
+) -> bool {
+    if !is_qualified_stable_root(node)
+        || !bindings.resolve_symbol(name).is_unknown()
+        || bindings.is_shadowed(name)
+    {
+        return false;
+    }
+    let mut recorded = false;
+    if let Some(ScalaResolvedReference::Exact(target)) =
+        ctx.visible_object_reference(node.start_byte(), name)
+    {
+        let companions = if target.is_class() && !target.short_name().ends_with('$') {
+            ctx.types.exact_companion_objects(ctx.scala, &target)
+        } else {
+            Vec::new()
+        };
+        if companions.is_empty() {
+            ctx.record_exact(target, ScalaReferenceRole::StableObject, node);
+        } else {
+            for companion in companions {
+                ctx.record_exact(companion, ScalaReferenceRole::StableObject, node);
+            }
+        }
+        recorded = true;
+    }
+    if let Some(ScalaResolvedReference::Exact(target)) = ctx.visible_type_reference(node, name)
+        && (ctx.types.type_is_stable_owner(ctx.scala, &target)
+            || ctx.types.type_accepts_object_roles(ctx.scala, &target))
+    {
+        ctx.record_exact(target, ScalaReferenceRole::Type, node);
+        recorded = true;
+    }
+    recorded
 }
 
 fn reference_lookup_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
@@ -10221,6 +10332,7 @@ fn seed_declaration(
             seed_class_parameters(node, ctx, bindings);
             preseed_direct_owner_fields(node, ctx, bindings);
         }
+        "extension_definition" => seed_parameters(node, ctx, bindings),
         "function_definition" => {
             if let Some(name) = node.child_by_field_name("name") {
                 let name = node_text(name, ctx.source).trim();
@@ -10229,6 +10341,15 @@ fn seed_declaration(
                 }
             }
             preseed_enclosing_owner_fields(node, ctx, bindings);
+            if let Some(extension) = node
+                .parent()
+                .filter(|parent| parent.kind() == "extension_definition")
+            {
+                // An extension receiver is an implicit parameter of every
+                // directly enclosed method. It therefore wins over a method
+                // with the same term name inside that method's body.
+                seed_parameters(extension, ctx, bindings);
+            }
             seed_parameters(node, ctx, bindings);
         }
         "val_definition" | "var_definition" => seed_value_definition(node, ctx, bindings),

@@ -1600,6 +1600,35 @@ pub(crate) fn is_field_expression_value(node: Node<'_>) -> bool {
     })
 }
 
+pub(crate) fn is_qualified_stable_root(node: Node<'_>) -> bool {
+    if is_field_expression_value(node) {
+        return true;
+    }
+    let Some(mut path) = node.parent().filter(|parent| {
+        matches!(
+            parent.kind(),
+            "stable_identifier" | "stable_type_identifier"
+        )
+    }) else {
+        return false;
+    };
+    loop {
+        let Some(first) = path.named_child(0) else {
+            return false;
+        };
+        if matches!(
+            first.kind(),
+            "identifier" | "operator_identifier" | "type_identifier"
+        ) {
+            return first == node;
+        }
+        if !matches!(first.kind(), "stable_identifier" | "stable_type_identifier") {
+            return false;
+        }
+        path = first;
+    }
+}
+
 pub(crate) fn is_constructor_like_reference(node: Node<'_>, source: &str) -> bool {
     let prefix = source[..node.start_byte()].trim_end();
     prefix.ends_with("new")

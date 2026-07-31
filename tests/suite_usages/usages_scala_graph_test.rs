@@ -7708,6 +7708,137 @@ object WebSocketConfig {
 }
 
 #[test]
+fn scala_inverse_records_qualified_root_owners_across_namespace_roles() {
+    let source = r#"package app
+
+enum Color {
+  case White
+}
+object Color
+
+case object Crazy {
+  class Data
+}
+
+case class Built(value: Int)
+
+object BinaryFen {
+  object implementation {
+    val marker = 1
+  }
+}
+
+object OtherColor {
+  object White
+}
+object OtherCrazy {
+  class Data
+}
+case class OtherBuilt(value: Int)
+
+object Use {
+  val color = Color.White // positive-root-color
+  val crazy: Crazy.Data = null // positive-root-crazy
+  val built = List(1).map(Built.apply) // positive-root-built
+  import BinaryFen.implementation.* // positive-root-import
+
+  val otherColor = OtherColor.White // negative-root-color
+  val otherCrazy: OtherCrazy.Data = null // negative-root-crazy
+  val otherBuilt = List(1).map(OtherBuilt.apply) // negative-root-built
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/QualifiedRoots.scala", source)]);
+
+    for (target_fqn, positive, negative) in [
+        ("app.Color$", "positive-root-color", "negative-root-color"),
+        ("app.Crazy$", "positive-root-crazy", "negative-root-crazy"),
+        ("app.Built", "positive-root-built", "negative-root-built"),
+        (
+            "app.BinaryFen$",
+            "positive-root-import",
+            "negative-root-import",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, positive);
+        assert_no_hit_contains(&target_hits, negative);
+    }
+}
+
+#[test]
+fn scala_inverse_seeds_extension_receivers_for_fields_and_methods() {
+    let source = r#"package app
+
+class Game(val position: Int)
+
+trait HasPosition[A]:
+  extension (value: A) def position: Int
+
+object Position:
+  case class Wrapped(position: Int)
+
+  given HasPosition[Wrapped]:
+    extension (position: Wrapped) def position: Int =
+      position.position // positive-extension-shadowed-field
+
+class Node {
+  def mapAccumlOption_(context: Int): Int = context
+}
+class Tree {
+  def isVariation: Boolean = true
+}
+
+extension (game: Game)
+  def readPosition: Int =
+    game.position // positive-extension-game-field
+
+extension (node: Node)
+  def encode(context: Int): Int =
+    node.mapAccumlOption_(context) // positive-extension-method
+
+extension (tree: Tree)
+  def variation: Boolean =
+    tree.isVariation // positive-extension-parameterless-method
+
+class OtherGame(val position: Int)
+extension (game: OtherGame)
+  def wrongPosition: Int =
+    game.position // negative-extension-game-field
+"#;
+    let (_project, analyzer) =
+        scala_analyzer_with_files(&[("app/ExtensionReceivers.scala", source)]);
+
+    for (target_fqn, positive, negative) in [
+        (
+            "app.Game.position",
+            "positive-extension-game-field",
+            "negative-extension-game-field",
+        ),
+        (
+            "app.Position$.Wrapped.position",
+            "positive-extension-shadowed-field",
+            "negative-extension-game-field",
+        ),
+        (
+            "app.Node.mapAccumlOption_",
+            "positive-extension-method",
+            "negative-extension-game-field",
+        ),
+        (
+            "app.Tree.isVariation",
+            "positive-extension-parameterless-method",
+            "negative-extension-game-field",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_reference_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, positive);
+        assert_no_hit_contains(&target_hits, negative);
+    }
+}
+
+#[test]
 fn scala_inverse_records_intermediate_owners_in_stable_type_paths() {
     let consumer = r#"package model
 
@@ -11162,6 +11293,8 @@ package app
 
 object Role {
   def promotable(value: Char): Option[Int] = Some(value.toInt)
+  def promotable(value: String): Option[Int] = None
+  def promotable(value: Option[String]): Option[Int] = None
 }
 
 object OtherRole {
@@ -11170,6 +11303,8 @@ object OtherRole {
 
 object Tree {
   def build(value: String): Int = value.length
+  def build(value: Int): Int = value
+  def build(value: String, index: Int): Int = value.length + index
 }
 
 object OtherTree {
