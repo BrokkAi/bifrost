@@ -723,6 +723,22 @@ local gate, but is not the focus.
   the clean http4s evidence and remain open only for their stated Guardian Grid
   witnesses. Disposable exact, dirty, and Cargo-log artifacts were removed,
   retaining the baseline and clean replay.
+- [x] (2026-07-31) Finished Scala rank ten `guardian__grid` depth-first at
+  pushed merge head `02962cae` (implementation `cde27679`). The clean replay
+  audited 358/358 files and 10,000 sites, queried all 935 targets, and had no
+  skipped/truncated targets, candidate-limit overflow, or file errors. Five
+  actionable witnesses were repaired: companion objects used as stable list
+  values, nested stable fields rooted in typed constructor parameters, and
+  exact method values whose parameter types cross external import boundaries.
+  The one remaining `missing` row is exhaustively dispositioned as
+  nonactionable: the import site forward-resolves to two physical
+  `lib.elasticsearch.ElasticSearch` declarations in different Grid modules, so
+  inverse lookup correctly remains fail-closed. The accepted artifact is
+  `/mnt/optane/tmp/bifrost-fird/scala-r10-grid-clean-02962cae.jsonl`
+  (SHA-256
+  `564df755693285750559763f6f3ef2eeb177479fe81ab59a114230020c14e2cc`).
+  Issues #1284 through #1292 and #1316 were closed only after this proof;
+  no open `FIRD: Scala` issues remain.
 - [x] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [x] Complete C++ and publish its evidence and user summary.
@@ -740,7 +756,7 @@ local gate, but is not the focus.
   summary.
 - [x] Complete Rust ranks six through ten and publish its evidence and user
   summary.
-- [ ] Complete Scala ranks six through ten and publish its evidence and user
+- [x] Complete Scala ranks six through ten and publish its evidence and user
   summary.
 - [x] Complete Python and publish its evidence and user summary.
 - [ ] Prove all 55 new ranks-six-through-ten envelopes and every fixing head
@@ -1282,3 +1298,8 @@ Revision note (2026-07-31): Recorded the completed depth-first Scala ranks six
 through eight, the accepted http4s rank-nine baseline and exhaustive exact
 triage, the assigned issue map, and the repository-depth-first transition
 required before Guardian Grid may begin.
+
+Revision note (2026-07-31): Recorded the pushed Guardian Grid repair, clean
+rank-ten proof and intentional physical-replica ambiguity, closure of every
+remaining assigned Scala FIRD issue, and completion of Scala ranks six through
+ten.
