@@ -83,6 +83,7 @@ mod issue_1228_response_budget_tests {
                 occurrence_role: None,
                 presentation: None,
                 note: None,
+                semantic_model: None,
             }],
             not_found: Vec::new(),
             ambiguous: Vec::new(),
