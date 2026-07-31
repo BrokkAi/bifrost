@@ -152,6 +152,21 @@ The observable outcomes are:
   per-repository `.bifrost/cache-dw10` namespace, so changing embedding fingerprints did not
   invalidate the completed `.bifrost/cache` Granite databases. No dw10 evaluation was run.
 - [ ] Run the three Granite retrieval arms over seeds 0, 1, and 2 at concurrency 30.
+- [x] (2026-07-31, campaign gate) Validated the immutable semantic runtime before the full
+  queue. Two official Flipt sandbox cells ran concurrently against one shared repository DB;
+  both completed and scored, both transient units exited successfully with zero restarts, and
+  one resolved. The agents did not elect to call `semantic_search`, so a separate deterministic
+  pair of concurrent Bifrost calls exercised two Flipt revisions against the same DB. Both
+  returned Granite results with the `all-signals` profile and per-leg diagnostics, then
+  `PRAGMA integrity_check` returned `ok`. This distinguishes raw Bifrost `k=20` (20 candidates
+  per leg) from Anvil's tested final-`k` boundary, which forwards `2*k` to Bifrost before
+  reranking.
+- [x] (2026-07-31, campaign launch) Started persistent unit
+  `cimeval-r8-granite-grid.service` with one Cartesian queue containing all 819 Granite cells,
+  fixed `--jobs 30`, max-reasoning Bedrock Luna, inline scoring, and resume enabled. It skipped
+  the two completed smoke cells, filled all 30 worker slots, and left both the scheduler and
+  Granite sidecar at zero restarts. Initial host load was 36.8 on 60 cores with 82 GiB memory
+  available, so concurrency remains pinned at 30 as requested.
 - [x] (2026-07-31, implementation) Brokkbench `64a2da6131f` extends the existing
   multi-arm scheduler with `--seeds`, so the full 91-task by three-arm by three-seed Granite
   matrix can enter one 819-cell queue. A single 30-worker pool now remains occupied through
