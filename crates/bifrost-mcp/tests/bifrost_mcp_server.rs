@@ -3569,6 +3569,113 @@ fn mcp_2026_07_28_clients_get_result_types() {
 }
 
 #[test]
+fn cache_hints_reach_new_clients_and_stay_off_the_legacy_wire() {
+    let workspace = InlineTestProject::new()
+        .file("Cacheable.java", "class Cacheable {}\n")
+        .build();
+
+    let mut child = spawn_server_on(McpHost::Rmcp, workspace.root(), "searchtools");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2026-07-28",
+                "capabilities": {},
+                "clientInfo": { "name": "modern", "version": "1" }
+            }
+        }),
+    );
+    write_line(
+        &mut stdin,
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    );
+
+    let tools = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
+    );
+    assert_eq!(tools["result"]["ttlMs"], 300_000, "{tools}");
+    // Two servers started in different modes publish different tool lists and
+    // nothing in the response says which, so this must not be shared.
+    assert_eq!(tools["result"]["cacheScope"], "private", "{tools}");
+
+    let resource = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "resources/read",
+            "params": { "uri": "bifrost://agent-guidance/agents.md" }
+        }),
+    );
+    // Compiled into the binary, so identical for every client of this build.
+    assert_eq!(resource["result"]["ttlMs"], 3_600_000, "{resource}");
+    assert_eq!(resource["result"]["cacheScope"], "public", "{resource}");
+
+    // Tool results are never cacheable: every one depends on the bound
+    // workspace and the current state of the files in it.
+    let call = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": { "name": "search_symbols", "arguments": { "patterns": ["Cacheable"] } }
+        }),
+    );
+    assert!(call["result"]["ttlMs"].is_null(), "{call}");
+    assert!(call["result"]["cacheScope"].is_null(), "{call}");
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+
+    // A 2025-11-25 client has no schema for these fields; rmcp strips
+    // `resultType` for legacy peers but not the cache hints, so Bifrost has to.
+    let mut child = spawn_server_on(McpHost::Rmcp, workspace.root(), "searchtools");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    let tools = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
+    );
+    assert!(tools["result"]["ttlMs"].is_null(), "{tools}");
+    assert!(tools["result"]["cacheScope"].is_null(), "{tools}");
+    let resource = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "resources/read",
+            "params": { "uri": "bifrost://agent-guidance/agents.md" }
+        }),
+    );
+    assert!(resource["result"]["ttlMs"].is_null(), "{resource}");
+    assert!(resource["result"]["cacheScope"].is_null(), "{resource}");
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+#[test]
 fn legacy_clients_never_see_a_result_type() {
     let workspace = InlineTestProject::new()
         .file("LegacyOnly.java", "class LegacyOnly {}\n")

@@ -27,7 +27,7 @@ use crate::{
     profiling, searchtools_render::RenderOptions,
 };
 use rmcp::model::{
-    Annotations, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+    Annotations, CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
     CustomRequest, CustomResult, ErrorData, Implementation, InitializeRequestParams,
     InitializeResult, ListResourcesResult, ListToolsResult, MetaObject, PaginatedRequestParams,
     ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
@@ -69,6 +69,23 @@ pub const BUILD_IDENTITY_META_KEY: &str = "io.bifrost/build-identity";
 /// rejected request without narrating every message on a busy session.
 #[doc(hidden)]
 pub const MCP_LOG_LEVEL_ENV: &str = "BIFROST_MCP_LOG";
+
+/// How long a client may treat the tool list as fresh.
+///
+/// The registry is fixed when the process starts -- it depends only on the
+/// server mode and whether the workspace was a Git repository at launch --
+/// so this is bounded by process lifetime, not by anything a client does.
+/// Scoped private rather than public because two Bifrost servers started in
+/// different modes publish different tools, and nothing in the response
+/// identifies which mode produced it.
+const TOOL_LIST_CACHE_TTL_MS: u64 = 300_000;
+
+/// How long a client may treat the agent-guidance resource as fresh.
+///
+/// Its bytes are compiled into the binary with `include_str!`, so they are
+/// identical for every client of a given build and cannot change while the
+/// process lives. That makes it genuinely shareable, hence public.
+const AGENTS_GUIDANCE_CACHE_TTL_MS: u64 = 3_600_000;
 
 /// How long a request may queue for analyzer capacity before it is worth
 /// telling an operator about.
@@ -665,10 +682,7 @@ impl BifrostMcpHandler {
         // Gate on the negotiated revision rather than letting rmcp reject the
         // result for older peers: a legacy client should read Bifrost's plain
         // "not bound to a workspace" message, not an opaque protocol error.
-        let speaks_mrtr = context.protocol_version().is_some_and(|version| {
-            version.as_str() >= rmcp::model::ProtocolVersion::V_2026_07_28.as_str()
-        });
-        if !speaks_mrtr {
+        if !speaks_2026_07_28(context) {
             return None;
         }
 
@@ -934,6 +948,17 @@ fn map_service_error(code: SearchToolsServiceErrorCode, message: String) -> Erro
     }
 }
 
+/// Whether this request's peer negotiated MCP `2026-07-28` or newer.
+///
+/// Gates every field that revision added. `rmcp` strips `resultType` for a
+/// legacy peer but not the cache hints, so emitting those unconditionally
+/// would put fields on the wire that a `2025-11-25` client has no schema for.
+fn speaks_2026_07_28(context: &RequestContext<RoleServer>) -> bool {
+    context
+        .protocol_version()
+        .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28)
+}
+
 /// Echo the client's requested revision when it is one the SDK knows, and
 /// otherwise fall back to the server's own. This mirrors what `rmcp`'s default
 /// `initialize` does; Bifrost overrides `initialize` only to record
@@ -995,7 +1020,14 @@ impl ServerHandler for BifrostMcpHandler {
         // Bifrost's tool list is small, fixed at process start, and
         // deliberately unpaginated: clients depend on seeing the whole
         // registry in one response.
-        Ok(ListToolsResult::with_all_items(self.tools.clone()))
+        let result = ListToolsResult::with_all_items(self.tools.clone());
+        Ok(if speaks_2026_07_28(&_context) {
+            result
+                .with_ttl_ms(TOOL_LIST_CACHE_TTL_MS)
+                .with_cache_scope(CacheScope::Private)
+        } else {
+            result
+        })
     }
 
     async fn list_resources(
@@ -1003,9 +1035,14 @@ impl ServerHandler for BifrostMcpHandler {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        Ok(ListResourcesResult::with_all_items(vec![
-            agents_guidance_resource(),
-        ]))
+        let result = ListResourcesResult::with_all_items(vec![agents_guidance_resource()]);
+        Ok(if speaks_2026_07_28(&_context) {
+            result
+                .with_ttl_ms(AGENTS_GUIDANCE_CACHE_TTL_MS)
+                .with_cache_scope(CacheScope::Public)
+        } else {
+            result
+        })
     }
 
     async fn read_resource(
@@ -1019,11 +1056,18 @@ impl ServerHandler for BifrostMcpHandler {
                 None,
             ));
         }
-        Ok(ReadResourceResult::new(vec![
+        let result = ReadResourceResult::new(vec![
             ResourceContents::text(AGENTS_GUIDANCE_TEXT, AGENTS_GUIDANCE_URI)
                 .with_mime_type(AGENTS_GUIDANCE_MIME_TYPE),
-        ])
-        .into())
+        ]);
+        Ok(if speaks_2026_07_28(&_context) {
+            result
+                .with_ttl_ms(AGENTS_GUIDANCE_CACHE_TTL_MS)
+                .with_cache_scope(CacheScope::Public)
+                .into()
+        } else {
+            result.into()
+        })
     }
 
     async fn initialize(
