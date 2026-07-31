@@ -7,7 +7,7 @@ use crate::analyzer::policy::{
 use crate::nlp::{indexer::SemanticIndexer, query::semantic_search};
 use crate::{
     AnalyzerConfig, CancellationToken, FilesystemProject, Project, ProjectChangeWatcher,
-    ProjectFile, WorkspaceAnalyzer,
+    ProjectFile, WorkspaceAnalyzer, WorkspaceFileListingCache,
     analyzer::policy::{
         BuiltInPolicySelection, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE,
         PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyFailOn,
@@ -23,7 +23,6 @@ use crate::{
         report_long_method_and_god_object_smells, report_secret_like_code,
         report_structural_clone_smells, report_test_assertion_smells,
     },
-    collect_workspace_files,
     diff_analysis::{AnalyzeDiffParams, DiffAnalysisOptions, analyze_diff_at_root},
     file_tools::{
         FindFilenamesParams, find_filenames, find_filenames_in_files, find_files_containing,
@@ -273,6 +272,13 @@ pub struct SearchToolsService {
     /// Records a deferred-build failure (e.g. the workspace walk hit an IO
     /// error) so every access after the first surfaces it instead of hanging.
     build_error: Mutex<Option<String>>,
+    /// Watcher-invalidated cache of the active workspace's file listing
+    /// (#1401). `Some` exactly when a `WatchFiles` root is bound; the session
+    /// project shares the same handle so every `all_files` consumer and the
+    /// session-free `find_filenames` fast path answer from one listing.
+    /// Deliberately outside the session lock: reads must not wait behind
+    /// watcher-delta re-analysis or the initial index build (#1388).
+    file_listing: RwLock<Option<Arc<WorkspaceFileListingCache>>>,
     update_strategy: UpdateStrategy,
     semantic_indexing: bool,
     watcher_starter: WatcherStarter,
@@ -588,6 +594,7 @@ impl SearchToolsService {
             )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
+            file_listing: RwLock::new(None),
             update_strategy: UpdateStrategy::Manual,
             semantic_indexing: false,
             watcher_starter,
@@ -651,6 +658,7 @@ impl SearchToolsService {
             )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
+            file_listing: RwLock::new(None),
             update_strategy: UpdateStrategy::Manual,
             semantic_indexing: false,
             watcher_starter,
@@ -1520,7 +1528,9 @@ impl SearchToolsService {
         semantic_indexing: bool,
         watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
-        let (project, workspace) = build_persisted_workspace(root)?;
+        let canonical = canonical_service_root(root)?;
+        let file_listing = listing_cache_for(update_strategy, &canonical);
+        let (project, workspace) = build_persisted_workspace(canonical, file_listing.clone())?;
         let root = project.root().to_path_buf();
         let session = assemble_session(
             project,
@@ -1542,6 +1552,7 @@ impl SearchToolsService {
             )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
+            file_listing: RwLock::new(file_listing),
             update_strategy,
             semantic_indexing,
             watcher_starter,
@@ -1568,7 +1579,9 @@ impl SearchToolsService {
         semantic_indexing: bool,
         watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
-        let (project, workspace) = build_transient_workspace(root)?;
+        let canonical = canonical_service_root(root)?;
+        let file_listing = listing_cache_for(update_strategy, &canonical);
+        let (project, workspace) = build_transient_workspace(canonical, file_listing.clone())?;
         let root = project.root().to_path_buf();
         let session = assemble_session(
             project,
@@ -1590,6 +1603,7 @@ impl SearchToolsService {
             )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
+            file_listing: RwLock::new(file_listing),
             update_strategy,
             semantic_indexing,
             watcher_starter,
@@ -1616,16 +1630,8 @@ impl SearchToolsService {
         semantic_indexing: bool,
         watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
-        let canonical = root
-            .canonicalize()
-            .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?
-            .normalize();
-        if !canonical.is_dir() {
-            return Err(format!(
-                "project root is not a directory: {}",
-                canonical.display()
-            ));
-        }
+        let canonical = canonical_service_root(root)?;
+        let file_listing = listing_cache_for(update_strategy, &canonical);
         Ok(Self {
             root: RwLock::new(Some(canonical)),
             session: RwLock::new(None),
@@ -1638,6 +1644,7 @@ impl SearchToolsService {
             )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
+            file_listing: RwLock::new(file_listing),
             update_strategy,
             semantic_indexing,
             watcher_starter,
@@ -1701,6 +1708,7 @@ impl SearchToolsService {
             )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
+            file_listing: RwLock::new(None),
             update_strategy,
             semantic_indexing: semantic_indexing_enabled(),
             watcher_starter: production_watcher_starter(),
@@ -1742,12 +1750,19 @@ impl SearchToolsService {
         let update_strategy = self.update_strategy;
         let semantic_indexing = self.semantic_indexing;
         let watcher_starter = Arc::clone(&self.watcher_starter);
+        // Created before the deferred build so listing-backed fast paths can
+        // fill it while indexing is pending; installed below alongside `root`.
+        let file_listing = listing_cache_for(update_strategy, &canonical);
+        let build_file_listing = file_listing.clone();
         let handle = std::thread::Builder::new()
             .name("bifrost-index-build".to_string())
             .spawn(
                 move || -> Result<(u64, PathBuf, WorkspaceSession), String> {
-                    let (project, workspace) =
-                        build_persisted_workspace_at(build_root.clone(), &build_cache_db_path)?;
+                    let (project, workspace) = build_persisted_workspace_at(
+                        build_root.clone(),
+                        &build_cache_db_path,
+                        build_file_listing,
+                    )?;
                     let session = assemble_session(
                         project,
                         workspace,
@@ -1784,6 +1799,11 @@ impl SearchToolsService {
         let old_session = session.take();
         *active_root = Some(canonical.clone());
         *self
+            .file_listing
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))? =
+            file_listing;
+        *self
             .build_error
             .lock()
             .map_err(|_| SearchToolsServiceError::internal("index build lock poisoned"))? = None;
@@ -1819,6 +1839,10 @@ impl SearchToolsService {
         let old_pending = pending.take();
         let old_session = session.take();
         active_root.take();
+        self.file_listing
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
+            .take();
         drop(active_root);
         drop(session);
         drop(pending);
@@ -1846,26 +1870,18 @@ impl SearchToolsService {
         watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
         let semantic_indexing = semantic_indexing_enabled();
-        let canonical = root
-            .canonicalize()
-            .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?
-            .normalize();
-        if !canonical.is_dir() {
-            return Err(format!(
-                "project root is not a directory: {}",
-                canonical.display()
-            ));
-        }
+        let canonical = canonical_service_root(root)?;
+        // Created before the deferred build so listing-backed fast paths
+        // (`find_filenames`, #1388) can fill it while indexing is pending.
+        let file_listing = listing_cache_for(update_strategy, &canonical);
         let handle = std::thread::Builder::new()
             .name("bifrost-index-build".to_string())
             .spawn({
                 let canonical = canonical.clone();
                 let watcher_starter = Arc::clone(&watcher_starter);
+                let file_listing = file_listing.clone();
                 move || -> Result<(u64, PathBuf, WorkspaceSession), String> {
-                    let project: Arc<dyn Project> = Arc::new(
-                        FilesystemProject::new(canonical.clone())
-                            .map_err(|err| format!("Failed to initialize project root: {err}"))?,
-                    );
+                    let project = build_project(canonical.clone(), file_listing)?;
                     let workspace = WorkspaceAnalyzer::build_persisted(
                         Arc::clone(&project),
                         AnalyzerConfig::default(),
@@ -1895,6 +1911,7 @@ impl SearchToolsService {
             )),
             pending_build: Mutex::new(Some(handle)),
             build_error: Mutex::new(None),
+            file_listing: RwLock::new(file_listing),
             update_strategy,
             semantic_indexing,
             watcher_starter,
@@ -1953,16 +1970,22 @@ impl SearchToolsService {
             .is_none()
         {
             let root = self.service_root()?;
-            let built = build_persisted_workspace(root).and_then(|(project, workspace)| {
-                assemble_session(
-                    project,
-                    workspace,
-                    self.update_strategy,
-                    self.semantic_indexing,
-                    &self.watcher_starter,
-                    None,
-                )
-            });
+            let file_listing = self
+                .file_listing
+                .read()
+                .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
+                .clone();
+            let built =
+                build_persisted_workspace(root, file_listing).and_then(|(project, workspace)| {
+                    assemble_session(
+                        project,
+                        workspace,
+                        self.update_strategy,
+                        self.semantic_indexing,
+                        &self.watcher_starter,
+                        None,
+                    )
+                });
             let session = match built {
                 Ok(session) => session,
                 Err(err) => {
@@ -2071,6 +2094,14 @@ impl SearchToolsService {
         })?;
         let mut guard = self.write_session()?;
         let session = guard.as_mut().ok_or_else(Self::closed_error)?;
+        // `refresh` promises a from-disk rebuild: drop the cached workspace
+        // listing so `update_all`'s file discovery re-walks the tree and
+        // re-unions the git index instead of reusing a cached listing.
+        session
+            .snapshot
+            .analyzer()
+            .project()
+            .invalidate_cached_file_listing();
         let next = session.snapshot.update_all();
         session.snapshot = Arc::new(next);
         #[cfg(feature = "nlp")]
@@ -2102,6 +2133,14 @@ impl SearchToolsService {
             .map(|rel| ProjectFile::new(root.clone(), rel.as_str()))
             .collect();
         if !changed.is_empty() {
+            // The caller is telling us these paths changed on disk; created or
+            // deleted files must show up in listing-backed tools, so any
+            // cached workspace listing is stale.
+            session
+                .snapshot
+                .analyzer()
+                .project()
+                .invalidate_cached_file_listing();
             let next = session.snapshot.update(&changed);
             session.snapshot = Arc::new(next);
         }
@@ -2141,13 +2180,16 @@ impl SearchToolsService {
 
         // Fully assemble the replacement before mutating either active field so
         // analyzer-store or watcher startup failure leaves the old session usable.
+        let new_file_listing = listing_cache_for(self.update_strategy, &resolved);
         let (new_project, new_workspace) =
-            build_persisted_workspace(resolved.clone()).map_err(|err| {
-                SearchToolsServiceError::internal(format!(
-                    "Failed to activate workspace {}: {err}",
-                    resolved.display()
-                ))
-            })?;
+            build_persisted_workspace(resolved.clone(), new_file_listing.clone()).map_err(
+                |err| {
+                    SearchToolsServiceError::internal(format!(
+                        "Failed to activate workspace {}: {err}",
+                        resolved.display()
+                    ))
+                },
+            )?;
         #[cfg(feature = "nlp")]
         let semantic_indexing = session.semantic.is_some();
         #[cfg(not(feature = "nlp"))]
@@ -2173,6 +2215,11 @@ impl SearchToolsService {
         self.advance_workspace_generation();
         let old_session = std::mem::replace(session, new_session);
         *root = Some(resolved.clone());
+        *self
+            .file_listing
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))? =
+            new_file_listing;
         drop(guard);
         drop(root);
         old_session.close_semantic();
@@ -2261,10 +2308,12 @@ impl SearchToolsService {
     /// `find_filenames` needs only the ignore-aware workspace file listing,
     /// never the analyzed snapshot, so it must not wait behind the initial
     /// index build or watcher-delta application: both can consume the entire
-    /// request-wide time budget (#1388). Answer from a fresh filesystem walk
-    /// of the active workspace root instead. Only `WatchFiles` services take
-    /// this path; their session project is always a `FilesystemProject` over
-    /// the active root, so the walk is exactly the session listing.
+    /// request-wide time budget (#1388). Answer from the shared
+    /// watcher-invalidated listing cache instead (#1401): the cache holds no
+    /// session lock, so a cold cache fills from a walk without waiting on the
+    /// analyzer, and a warm one skips the walk entirely. Only `WatchFiles`
+    /// services take this path; their session project shares the same cache
+    /// handle, so this is exactly the session listing.
     fn handle_find_filenames(
         &self,
         arguments: Value,
@@ -2277,7 +2326,19 @@ impl SearchToolsService {
         let params = serde_json::from_value::<FindFilenamesParams>(arguments).map_err(|err| {
             SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
         })?;
-        let files = collect_workspace_files(&root).map_err(|err| {
+        let listing = self
+            .file_listing
+            .read()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
+            .clone()
+            .ok_or_else(|| {
+                // Every constructor that binds a `WatchFiles` root installs the
+                // cache alongside it, so this indicates broken service wiring.
+                SearchToolsServiceError::internal(
+                    "workspace file listing cache is not initialized for the active workspace",
+                )
+            })?;
+        let files = listing.files().map_err(|err| {
             SearchToolsServiceError::internal(format!(
                 "Failed to list workspace files under {}: {err}",
                 root.display()
@@ -2288,7 +2349,7 @@ impl SearchToolsService {
                 "find_filenames was cancelled or exceeded its request-wide time budget",
             ));
         }
-        Self::structured_only(find_filenames_in_files(files, params))
+        Self::structured_only(find_filenames_in_files(files.iter(), params))
     }
 
     fn handle_get_symbol_sources(
@@ -3044,16 +3105,55 @@ fn strip_legacy_kind_filter(mut arguments: Value) -> Value {
     arguments
 }
 
-fn build_project(root: PathBuf) -> Result<Arc<dyn Project>, String> {
-    Ok(Arc::new(FilesystemProject::new(root).map_err(|err| {
-        format!("Failed to initialize project root: {err}")
-    })?))
+/// The shared workspace file listing cache for a root about to be bound, or
+/// `None` under `Manual`: manual sessions have no watcher to invalidate a
+/// cache, so they keep answering listing-backed tools from a fresh walk.
+fn listing_cache_for(
+    update_strategy: UpdateStrategy,
+    root: &Path,
+) -> Option<Arc<WorkspaceFileListingCache>> {
+    match update_strategy {
+        UpdateStrategy::WatchFiles => {
+            Some(Arc::new(WorkspaceFileListingCache::new(root.to_path_buf())))
+        }
+        UpdateStrategy::Manual => None,
+    }
+}
+
+/// Canonicalize and validate a service root eagerly, so a listing cache
+/// created before the project build carries exactly the root the built
+/// `FilesystemProject` will canonicalize to.
+fn canonical_service_root(root: PathBuf) -> Result<PathBuf, String> {
+    let canonical = root
+        .canonicalize()
+        .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?
+        .normalize();
+    if !canonical.is_dir() {
+        return Err(format!(
+            "project root is not a directory: {}",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+fn build_project(
+    root: PathBuf,
+    listing: Option<Arc<WorkspaceFileListingCache>>,
+) -> Result<Arc<dyn Project>, String> {
+    let project = match listing {
+        Some(listing) => FilesystemProject::with_cached_listing(root, listing),
+        None => FilesystemProject::new(root),
+    }
+    .map_err(|err| format!("Failed to initialize project root: {err}"))?;
+    Ok(Arc::new(project))
 }
 
 fn build_persisted_workspace(
     root: PathBuf,
+    listing: Option<Arc<WorkspaceFileListingCache>>,
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
-    let project = build_project(root)?;
+    let project = build_project(root, listing)?;
     let workspace = WorkspaceAnalyzer::build_persisted_for_service(
         Arc::clone(&project),
         AnalyzerConfig::default(),
@@ -3071,8 +3171,9 @@ fn client_cache_db_path(root: &Path) -> PathBuf {
 fn build_persisted_workspace_at(
     root: PathBuf,
     db_path: &Path,
+    listing: Option<Arc<WorkspaceFileListingCache>>,
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
-    let project = build_project(root)?;
+    let project = build_project(root, listing)?;
     let workspace = WorkspaceAnalyzer::build_persisted_at_for_service(
         Arc::clone(&project),
         AnalyzerConfig::default(),
@@ -3084,8 +3185,9 @@ fn build_persisted_workspace_at(
 
 fn build_transient_workspace(
     root: PathBuf,
+    listing: Option<Arc<WorkspaceFileListingCache>>,
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
-    let project = build_project(root)?;
+    let project = build_project(root, listing)?;
     let workspace =
         WorkspaceAnalyzer::build_for_service(Arc::clone(&project), AnalyzerConfig::default());
     Ok((project, workspace))
@@ -3214,6 +3316,7 @@ mod watcher_startup_tests {
             )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
+            file_listing: RwLock::new(None),
             update_strategy: UpdateStrategy::WatchFiles,
             semantic_indexing: false,
             watcher_starter: starter,
@@ -3782,7 +3885,7 @@ mod analyzer_failure_boundary_tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         std::fs::write(root.join("Model.java"), "class Model {}\n").unwrap();
-        let (_project, workspace) = build_transient_workspace(root).unwrap();
+        let (_project, workspace) = build_transient_workspace(root, None).unwrap();
         let document_root =
             Arc::new(WorkspaceRoot::open(workspace.analyzer().project().root()).unwrap());
         let scope = WorkspaceQueryScope::new(Arc::new(workspace), document_root);
@@ -3859,7 +3962,7 @@ public partial class MudDialogContainer
     }
 
     fn watching_service_without_watcher(root: PathBuf) -> SearchToolsService {
-        let (project, workspace) = build_transient_workspace(root).unwrap();
+        let (project, workspace) = build_transient_workspace(root, None).unwrap();
         SearchToolsService {
             root: RwLock::new(Some(project.root().to_path_buf())),
             session: RwLock::new(Some(WorkspaceSession {
@@ -3878,6 +3981,7 @@ public partial class MudDialogContainer
             )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
+            file_listing: RwLock::new(None),
             update_strategy: UpdateStrategy::WatchFiles,
             semantic_indexing: false,
             watcher_starter: production_watcher_starter(),
@@ -3935,7 +4039,7 @@ public partial class MudDialogContainer
     #[test]
     fn candidate_files_are_rechecked_after_the_source_changes() {
         let (_temp, root) = write_project();
-        let (_project, workspace) = build_transient_workspace(root.clone()).unwrap();
+        let (_project, workspace) = build_transient_workspace(root.clone(), None).unwrap();
         let result = get_symbol_sources(
             workspace.analyzer(),
             SymbolLookupParams {
@@ -3979,7 +4083,7 @@ public partial class MudDialogContainer
     #[test]
     fn stale_analyzer_and_manual_service_keep_generation_consistent_source() {
         let (_temp, root) = write_project();
-        let (project, workspace) = build_transient_workspace(root.clone()).unwrap();
+        let (project, workspace) = build_transient_workspace(root.clone(), None).unwrap();
         let manual = SearchToolsService::new_manual_for_project(project).unwrap();
         fs::write(root.join("MudDialogContainer.cs"), SHIFTED_SOURCE).unwrap();
 
@@ -4120,6 +4224,7 @@ mod client_roots_tests {
             )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
+            file_listing: RwLock::new(None),
             update_strategy: UpdateStrategy::Manual,
             semantic_indexing: false,
             watcher_starter: production_watcher_starter(),
@@ -4162,6 +4267,7 @@ mod issue_1388_find_filenames_tests {
                 Err("test build released without producing a session".to_string())
             })
             .unwrap();
+        let file_listing = Arc::new(WorkspaceFileListingCache::new(root.clone()));
         let service = SearchToolsService {
             root: RwLock::new(Some(root)),
             session: RwLock::new(None),
@@ -4174,6 +4280,7 @@ mod issue_1388_find_filenames_tests {
             )),
             pending_build: Mutex::new(Some(handle)),
             build_error: Mutex::new(None),
+            file_listing: RwLock::new(Some(file_listing)),
             update_strategy: UpdateStrategy::WatchFiles,
             semantic_indexing: false,
             watcher_starter: production_watcher_starter(),
@@ -4237,6 +4344,64 @@ mod issue_1388_find_filenames_tests {
             "{}",
             error.message
         );
+    }
+
+    /// One workspace listing serves the whole session (#1401): repeated file
+    /// tools reuse the cached walk while the workspace is quiet, and watcher
+    /// events refresh it so new files appear without a per-call walk.
+    #[test]
+    fn file_tools_share_one_watcher_invalidated_listing() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("lib.rs"), "pub fn a() {}\n").unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        let service = SearchToolsService::new_with_strategy_and_watcher_starter(
+            root.clone(),
+            UpdateStrategy::WatchFiles,
+            false,
+            Arc::new(ProjectChangeWatcher::start_polling_for_tests),
+        )
+        .unwrap();
+        let cache = service
+            .file_listing
+            .read()
+            .unwrap()
+            .clone()
+            .expect("a bound WatchFiles service must own a listing cache");
+
+        let result = service
+            .call_tool_value("find_filenames", json!({"patterns": ["*.rs"]}))
+            .unwrap();
+        assert_eq!(result["files"], json!(["lib.rs"]), "{result:#}");
+        let walks = cache.walk_count();
+        // Quiet workspace: neither the fast path nor snapshot-backed file
+        // tools may re-walk.
+        service
+            .call_tool_value("find_filenames", json!({"patterns": ["*.rs"]}))
+            .unwrap();
+        service
+            .call_tool_value("list_files", json!({"directory_path": ""}))
+            .unwrap();
+        assert_eq!(
+            cache.walk_count(),
+            walks,
+            "file tools on a quiet workspace must reuse the cached listing"
+        );
+
+        std::fs::write(root.join("extra.rs"), "pub fn b() {}\n").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let result = service
+                .call_tool_value("find_filenames", json!({"patterns": ["*.rs"]}))
+                .unwrap();
+            if result["files"] == json!(["extra.rs", "lib.rs"]) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "watcher never refreshed the cached listing: {result:#}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Manual sessions may be scoped to an explicit file set (CLI subset
@@ -4733,6 +4898,7 @@ mod tests {
             )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
+            file_listing: RwLock::new(None),
             update_strategy: UpdateStrategy::WatchFiles,
             semantic_indexing: true,
             watcher_starter: production_watcher_starter(),

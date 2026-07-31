@@ -167,6 +167,12 @@ pub trait Project: Send + Sync {
         false
     }
 
+    /// Drop any cached whole-workspace file listing so the next `all_files`
+    /// reflects the filesystem again. Observers of workspace change (the
+    /// session file watcher, explicit refresh paths) call this; projects
+    /// without a listing cache ignore it.
+    fn invalidate_cached_file_listing(&self) {}
+
     /// Read the source text of `file`. Default reads from disk. The LSP server
     /// overrides this via `OverlayProject` to serve unsaved buffer content
     /// pushed in by `textDocument/did{Open,Change}` notifications.
@@ -352,11 +358,99 @@ impl Project for TestProject {
     }
 }
 
+/// Watcher-invalidated cache for the whole-workspace file listing produced by
+/// [`collect_workspace_files`] (issue #1401). One instance is shared between a
+/// session's [`FilesystemProject`] (serving every `all_files` consumer) and any
+/// caller that must answer from the listing without touching session state,
+/// such as the `find_filenames` fast path from #1388.
+///
+/// The cache owns only its own mutex, held for at most one walk's duration, so
+/// readers never block behind session write locks held during watcher-delta
+/// re-analysis, and a cold cache fills without waiting for the analyzer index
+/// build. `invalidate` touches only an atomic and never blocks. Refills go
+/// through [`collect_workspace_files`], so the git-index union is recomputed
+/// together with the ignore-aware walk: tracked files shadowed by broad ignore
+/// patterns stay listed after invalidation.
+#[derive(Debug)]
+pub struct WorkspaceFileListingCache {
+    root: PathBuf,
+    generation: AtomicU64,
+    walks: AtomicUsize,
+    cached: Mutex<Option<CachedFileListing>>,
+}
+
+#[derive(Debug)]
+struct CachedFileListing {
+    generation: u64,
+    files: Arc<BTreeSet<ProjectFile>>,
+}
+
+impl WorkspaceFileListingCache {
+    pub fn new(root: PathBuf) -> Self {
+        assert!(
+            root.is_absolute(),
+            "workspace file listing cache root must be absolute: {}",
+            root.display()
+        );
+        Self {
+            root,
+            generation: AtomicU64::new(0),
+            walks: AtomicUsize::new(0),
+            cached: Mutex::new(None),
+        }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Drop the cached listing. The next `files` call re-walks the root and
+    /// re-unions the git index. Never blocks, so watcher event handlers can
+    /// call it inline.
+    pub fn invalidate(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// The current listing, walking the root only when no fresh listing is
+    /// cached. Concurrent callers serialize on the internal mutex, so a cold
+    /// cache is filled by exactly one walk. The generation is sampled before
+    /// the walk: an `invalidate` racing with the fill leaves the stored entry
+    /// stale-marked, so the next call re-walks instead of serving a listing
+    /// that may predate the change.
+    pub fn files(&self) -> io::Result<Arc<BTreeSet<ProjectFile>>> {
+        let mut slot = self
+            .cached
+            .lock()
+            .expect("workspace file listing cache poisoned");
+        let generation = self.generation.load(Ordering::Acquire);
+        if let Some(cached) = slot.as_ref()
+            && cached.generation == generation
+        {
+            return Ok(Arc::clone(&cached.files));
+        }
+        self.walks.fetch_add(1, Ordering::Relaxed);
+        let files = Arc::new(collect_workspace_files(&self.root)?);
+        *slot = Some(CachedFileListing {
+            generation,
+            files: Arc::clone(&files),
+        });
+        Ok(files)
+    }
+
+    /// Number of filesystem walks this cache has performed. The observable
+    /// complexity signal for regression tests: calls minus walks is the cache's
+    /// hit count.
+    pub fn walk_count(&self) -> usize {
+        self.walks.load(Ordering::Relaxed)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FilesystemProject {
     root: PathBuf,
     languages: BTreeSet<Language>,
     listing_count: Arc<AtomicUsize>,
+    cached_listing: Option<Arc<WorkspaceFileListingCache>>,
 }
 
 impl FilesystemProject {
@@ -374,7 +468,26 @@ impl FilesystemProject {
             root,
             languages,
             listing_count: Arc::new(AtomicUsize::new(0)),
+            cached_listing: None,
         })
+    }
+
+    /// Construct a project whose `all_files` listing is served from `listing`
+    /// instead of a fresh walk per call. The caller owns invalidation: wire
+    /// the same cache handle to whatever observes workspace changes (the
+    /// session file watcher) via [`Project::invalidate_cached_file_listing`].
+    pub fn with_cached_listing(
+        root: impl Into<PathBuf>,
+        listing: Arc<WorkspaceFileListingCache>,
+    ) -> io::Result<Self> {
+        let mut project = Self::new(root)?;
+        assert_eq!(
+            project.root,
+            listing.root(),
+            "cached listing root must match the canonical project root"
+        );
+        project.cached_listing = Some(listing);
+        Ok(project)
     }
 
     pub fn root_path(&self) -> &Path {
@@ -397,7 +510,16 @@ impl Project for FilesystemProject {
 
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
         self.listing_count.fetch_add(1, Ordering::Relaxed);
-        collect_workspace_files(&self.root)
+        match &self.cached_listing {
+            Some(cache) => cache.files().map(|files| (*files).clone()),
+            None => collect_workspace_files(&self.root),
+        }
+    }
+
+    fn invalidate_cached_file_listing(&self) {
+        if let Some(cache) = &self.cached_listing {
+            cache.invalidate();
+        }
     }
 
     /// A `stat` instead of a whole-tree walk. Every file this project reports
@@ -633,6 +755,12 @@ impl Project for MultiRootProject {
             }
         }
         None
+    }
+
+    fn invalidate_cached_file_listing(&self) {
+        for root in &self.roots {
+            root.invalidate_cached_file_listing();
+        }
     }
 
     fn persistence_root(&self) -> Option<&Path> {
@@ -964,6 +1092,10 @@ impl Project for OverlayProject {
         self.delegate.is_gitignored(rel_path)
     }
 
+    fn invalidate_cached_file_listing(&self) {
+        self.delegate.invalidate_cached_file_listing();
+    }
+
     fn read_source(&self, file: &ProjectFile) -> io::Result<String> {
         self.read_source_snapshot(file)
             .map(|snapshot| snapshot.source().to_owned())
@@ -1206,6 +1338,91 @@ mod tests {
             .collect();
 
         assert_eq!(rels, BTreeSet::from(["src/db/mod.rs".to_string()]));
+    }
+
+    #[test]
+    fn workspace_file_listing_cache_serves_repeated_reads_from_one_walk() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        write_file(&root, "a.rs", "fn a() {}\n");
+        let cache = WorkspaceFileListingCache::new(root.clone());
+
+        let first = cache.files().unwrap();
+        let second = cache.files().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(cache.walk_count(), 1);
+
+        // New files stay invisible until the owner invalidates: the cache is
+        // refreshed by workspace-change observers, never by time.
+        write_file(&root, "b.rs", "fn b() {}\n");
+        assert!(
+            !cache
+                .files()
+                .unwrap()
+                .contains(&ProjectFile::new(&root, "b.rs"))
+        );
+        cache.invalidate();
+        assert!(
+            cache
+                .files()
+                .unwrap()
+                .contains(&ProjectFile::new(&root, "b.rs"))
+        );
+        assert_eq!(cache.walk_count(), 2);
+    }
+
+    #[test]
+    fn workspace_file_listing_cache_refreshes_git_index_union_on_invalidate() {
+        // Tracked files shadowed by broad ignore patterns are listed via the
+        // git-index union, not the walk; invalidation must recompute both.
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        let repo = crate::gitblob::tests::init_repo(&root);
+        write_file(&root, "src/db/mod.rs", "pub fn connection() {}\n");
+        crate::gitblob::tests::commit_all(&repo, "tracked source");
+        write_file(&root, ".gitignore", "db/\n");
+
+        let cache = WorkspaceFileListingCache::new(root.clone());
+        let tracked = ProjectFile::new(&root, "src/db/mod.rs");
+        assert!(cache.files().unwrap().contains(&tracked));
+
+        // Ignored and untracked: hidden even after invalidation.
+        let generated = write_file(&root, "generated/db/new.rs", "fn generated() {}\n");
+        cache.invalidate();
+        assert!(!cache.files().unwrap().contains(&generated));
+        assert!(cache.files().unwrap().contains(&tracked));
+
+        // Staging the ignored file makes it tracked; the refreshed index
+        // union must list it after the next invalidation.
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("generated/db/new.rs")).unwrap();
+        index.write().unwrap();
+        cache.invalidate();
+        assert!(cache.files().unwrap().contains(&generated));
+    }
+
+    #[test]
+    fn filesystem_project_with_cached_listing_serves_all_files_from_cache() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        write_file(&root, "a.rs", "fn a() {}\n");
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project = FilesystemProject::with_cached_listing(&root, Arc::clone(&cache)).unwrap();
+
+        project.all_files().unwrap();
+        project.all_files().unwrap();
+        assert_eq!(cache.walk_count(), 1);
+        assert_eq!(project.workspace_file_listing_count(), 2);
+
+        write_file(&root, "b.rs", "fn b() {}\n");
+        project.invalidate_cached_file_listing();
+        assert!(
+            project
+                .all_files()
+                .unwrap()
+                .contains(&ProjectFile::new(&root, "b.rs"))
+        );
+        assert_eq!(cache.walk_count(), 2);
     }
 
     #[test]

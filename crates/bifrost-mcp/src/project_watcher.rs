@@ -98,7 +98,10 @@ fn event_handler(
     let project_for_callback = Arc::clone(project);
     move |result: notify::Result<Event>| match result {
         Ok(event) => handle_event(&project_for_callback, &pending_for_callback, event),
-        Err(_) => mark_full_refresh(&pending_for_callback),
+        Err(_) => {
+            project_for_callback.invalidate_cached_file_listing();
+            mark_full_refresh(&pending_for_callback);
+        }
     }
 }
 
@@ -106,6 +109,13 @@ fn handle_event(project: &Arc<dyn Project>, pending: &Arc<Mutex<PendingChanges>>
     if matches!(event.kind, EventKind::Access(_)) {
         return;
     }
+
+    // Any real change may add or remove listed paths, or alter what the
+    // listing means (`.gitignore` edits, git index updates), so drop the
+    // session's cached workspace listing before classification below --
+    // `classify_project_path` consults `is_gitignored`, which refills the
+    // cache from the now-current filesystem state.
+    project.invalidate_cached_file_listing();
 
     if event.paths.is_empty() {
         mark_full_refresh(pending);
@@ -416,6 +426,40 @@ mod tests {
             );
             assert!(!state.requires_full_refresh);
         }
+    }
+
+    #[test]
+    fn events_invalidate_the_projects_cached_file_listing() {
+        use crate::WorkspaceFileListingCache;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project: Arc<dyn crate::Project> = Arc::new(
+            FilesystemProject::with_cached_listing(root.clone(), Arc::clone(&cache)).unwrap(),
+        );
+
+        cache.files().unwrap();
+        let extra = ProjectFile::new(root.clone(), "src/extra.rs");
+        fs::write(extra.abs_path(), "fn extra() {}\n").unwrap();
+        assert!(
+            !cache.files().unwrap().contains(&extra),
+            "listing must be cached until an event invalidates it"
+        );
+
+        let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        handle_event(
+            &project,
+            &pending,
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(extra.abs_path()),
+        );
+
+        assert!(
+            cache.files().unwrap().contains(&extra),
+            "a watcher event must drop the cached listing"
+        );
     }
 
     #[test]
