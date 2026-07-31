@@ -33,6 +33,16 @@ Install the released bifrost binary.
 Usage:
   curl -fsSL https://raw.githubusercontent.com/BrokkAi/bifrost/master/install.sh | bash
 
+Platforms:
+  macOS            Apple Silicon and Intel, via the universal binary.
+  Linux            x86-64 with glibc or musl, and ARM64 with glibc.
+  WSL              Supported as Linux. Installs the Linux binary, which runs
+                   inside WSL and is not callable from Windows-native tools.
+  Android          ARM64 under Termux.
+  Windows          Not installed by this script. Its release assets are .zip
+                   archives; use 'cargo install brokk-bifrost --locked' or
+                   download the archive from the releases page.
+
 Environment:
   INSTALL_DIR              Install directory. Defaults to ~/.local/bin.
   BIFROST_INSTALL_DIR      Same as INSTALL_DIR, with higher precedence.
@@ -114,16 +124,24 @@ detect_platform() {
       OS_FAMILY="macos"
       ;;
     Linux)
+      # WSL reports Linux and takes the Linux binary, which is correct: the
+      # installed binary runs inside WSL, not in Windows-native tooling.
       if [[ "$uname_o" == "Android" || "${PREFIX:-}" == *com.termux* ]]; then
         OS_FAMILY="android"
-        [[ "$ARCH" == "aarch64" ]] || die "unsupported Android architecture: ${uname_m}"
+        [[ "$ARCH" == "aarch64" ]] || die "no Android build is published for ${uname_m}; only aarch64-linux-android is released"
       else
         OS_FAMILY="linux"
         LIBC="$(detect_linux_libc)"
+        if [[ "$ARCH" == "aarch64" && "$LIBC" == "musl" ]]; then
+          die "no aarch64 musl build is published, and the glibc build would not run here (this looks like Alpine or another musl distro on ARM64). Build from source instead: cargo install brokk-bifrost --locked"
+        fi
       fi
       ;;
+    MINGW* | MSYS* | CYGWIN*)
+      die "Git Bash, MSYS2, and Cygwin run on Windows, whose release assets are .zip archives this script does not install. Build from source with 'cargo install brokk-bifrost --locked', or download the Windows archive from https://github.com/${OWNER}/${REPO}/releases. To install the Linux build instead, run this script from a WSL shell."
+      ;;
     *)
-      die "unsupported OS: ${uname_s}. Windows builds are published as .zip assets on the release page."
+      die "unsupported OS: ${uname_s}"
       ;;
   esac
 }

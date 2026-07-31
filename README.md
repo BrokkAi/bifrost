@@ -59,10 +59,12 @@ cd bifrost/docs/fixtures/ten-minute-evaluation
 bifrost --root . --query-file queries/find-audit.rql
 ```
 
-The installer downloads the checksum-verified release binary for macOS, Linux,
-or Android into `~/.local/bin`. To build from source instead, use `cargo install
-brokk-bifrost --locked`. See [Install Bifrost](docs/src/content/docs/install.md)
-for both paths in full.
+The installer downloads the checksum-verified release binary into `~/.local/bin`
+on macOS (Apple Silicon and Intel), Linux (x86-64 glibc or musl, ARM64 glibc),
+WSL, and Android under Termux. On Windows, and on ARM64 musl distributions such
+as Alpine, build from source with `cargo install brokk-bifrost --locked`
+instead. See [Install Bifrost](docs/src/content/docs/install.md) for the full
+platform table.
 
 The result identifies the normalized Python call and its exact source location:
 
