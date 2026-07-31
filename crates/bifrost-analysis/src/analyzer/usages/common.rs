@@ -1,5 +1,5 @@
 use crate::analyzer::common as analyzer_common;
-use crate::analyzer::usages::model::UsageHit;
+use crate::analyzer::usages::model::{UsageHit, UsageHitSurface};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use std::collections::BTreeSet;
 use tree_sitter::Node;
@@ -8,6 +8,15 @@ use tree_sitter::Node;
 pub(super) const GRAPH_HIT_CONFIDENCE: f64 = 1.0;
 /// Lines of context to include before/after a match in [`UsageHit::snippet`].
 pub(super) const SNIPPET_CONTEXT_LINES: usize = 1;
+
+/// Count the proven hits that are visible to agent/search consumers. Binding,
+/// definition, and same-owner sites remain available to editor consumers but
+/// must not consume the external-usage budget.
+pub(crate) fn external_usage_hit_count(hits: &BTreeSet<UsageHit>) -> usize {
+    hits.iter()
+        .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))
+        .count()
+}
 
 pub(crate) fn language_for_target(target: &CodeUnit) -> Language {
     language_for_file(target.source())

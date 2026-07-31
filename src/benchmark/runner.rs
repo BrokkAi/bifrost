@@ -1604,8 +1604,7 @@ fn tool_arguments(target: &BenchmarkRepoTarget, scenario: BenchmarkScenario) -> 
         BenchmarkScenario::DeadCodeSmells => json!({
             "fq_names": target.dead_code_fq_names,
             "file_paths": target.dead_code_file_paths,
-            "max_usage_candidate_files": 2000,
-            "max_usages_per_symbol": 1000
+            "max_usage_candidate_files": 2000
         }),
         BenchmarkScenario::GetDefinition => json!({
             "references": target.definition_queries.iter().map(|query| {

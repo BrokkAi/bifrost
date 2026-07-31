@@ -30,7 +30,10 @@ const DEFAULT_MAX_FINDINGS: usize = 40;
 const DEFAULT_MAX_INPUT_FILES: usize = 25;
 const DEFAULT_MAX_CANDIDATE_SYMBOLS: usize = 200;
 const DEFAULT_MAX_USAGE_CANDIDATE_FILES: usize = 1000;
-const DEFAULT_MAX_USAGES_PER_SYMBOL: usize = 100;
+/// Findings are emitted only for symbols with zero or one inbound usage. Stop
+/// precise usage scans as soon as a second site proves that the symbol cannot be
+/// a dead-code or one-call-abstraction smell.
+const MAX_USAGES_FOR_SMELL: usize = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ReportDeadCodeAndUnusedAbstractionSmellsParams {
@@ -97,11 +100,9 @@ pub fn report_dead_code_and_unused_abstraction_smells(
         params.max_usage_candidate_files,
         DEFAULT_MAX_USAGE_CANDIDATE_FILES as i32,
     ) as usize;
-    let requested_usage_cap = positive_or(
-        params.max_usages_per_symbol,
-        DEFAULT_MAX_USAGES_PER_SYMBOL as i32,
-    ) as usize;
-    let usage_cap = requested_usage_cap.min(crate::analyzer::usages::inverted_edges::MAX_CALLSITES);
+    let requested_usage_cap =
+        positive_or(params.max_usages_per_symbol, MAX_USAGES_FOR_SMELL as i32) as usize;
+    let usage_cap = requested_usage_cap.min(MAX_USAGES_FOR_SMELL);
 
     let resolved = resolve_project_files(analyzer.project(), params.file_paths);
     let ambiguous_paths = resolved.ambiguous_paths.clone();
@@ -394,7 +395,7 @@ pub fn report_dead_code_and_unused_abstraction_smells(
         lines.line(format!("- Usage cap per symbol: {usage_cap}"));
     } else {
         lines.line(format!(
-            "- Usage cap per symbol: {usage_cap} (clamped from {requested_usage_cap} by graph call-site cap)"
+            "- Usage cap per symbol: {usage_cap} (clamped from {requested_usage_cap} by smell relevance threshold)"
         ));
     }
     lines.line("- Analysis mode: graph-backed tree-sitter usage analysis (best-effort).");

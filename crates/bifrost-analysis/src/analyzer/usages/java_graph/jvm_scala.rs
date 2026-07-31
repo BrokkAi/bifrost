@@ -385,7 +385,7 @@ fn push_scala_hit(node: Node<'_>, ctx: &mut ScalaJavaScanCtx<'_, '_>) {
         enclosing,
         snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
     ));
-    if ctx.hits.len() > ctx.max_usages {
+    if crate::analyzer::usages::common::external_usage_hit_count(ctx.hits) > ctx.max_usages {
         *ctx.limit_exceeded = true;
     }
 }
