@@ -2898,10 +2898,11 @@ impl SearchToolsService {
         loop {
             let workspace_generation = self.workspace_generation();
             let snapshot_started = Instant::now();
-            let snapshot = match {
+            let snapshot_result = {
                 let _scope = profiling::scope("run_policy.snapshot_for_query");
                 self.snapshot_for_query_with_cancellation(cancellation)
-            } {
+            };
+            let snapshot = match snapshot_result {
                 Ok(snapshot) => snapshot,
                 Err(error)
                     if error.code == SearchToolsServiceErrorCode::DeadlineExceeded

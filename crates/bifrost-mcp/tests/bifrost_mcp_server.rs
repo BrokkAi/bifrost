@@ -44,6 +44,19 @@ fn assert_same_canonical_path(actual: &str, expected: &std::path::Path) {
     );
 }
 
+fn strip_policy_report_timings(report: &mut Value) {
+    report
+        .as_object_mut()
+        .expect("policy report object")
+        .remove("execution");
+    for run in report["runs"].as_array_mut().expect("policy runs") {
+        run["work"]["metrics"]
+            .as_array_mut()
+            .expect("policy work metrics")
+            .retain(|metric| metric["name"] != "policy.evaluation_elapsed");
+    }
+}
+
 #[test]
 fn bifrost_searchtools_server_speaks_mcp_stdio() {
     let fixture_root = TempDir::new().expect("temp dir");
@@ -1078,7 +1091,9 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     )
     .expect("direct policy evaluation");
     assert_eq!(expected.exit_status(), 1);
-    let expected_report = serde_json::to_value(expected.report()).expect("serialize direct report");
+    let mut expected_report =
+        serde_json::to_value(expected.report()).expect("serialize direct report");
+    strip_policy_report_timings(&mut expected_report);
 
     let mut child = spawn_server(initial.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
@@ -1149,8 +1164,18 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     let structured = &baseline["result"]["structuredContent"];
     assert_eq!(structured["status"], "finding", "{baseline}");
     assert_eq!(structured["exit_status"], 1, "{baseline}");
-    assert_eq!(structured["report"], expected_report, "{baseline}");
+    let mut actual_report = structured["report"].clone();
+    strip_policy_report_timings(&mut actual_report);
+    assert_eq!(actual_report, expected_report, "{baseline}");
     assert_eq!(structured["report"]["schema_version"], 2);
+    assert_eq!(
+        structured["report"]["execution"]["stage_timings"][0]["stage"],
+        "policy_selection"
+    );
+    assert_eq!(
+        structured["report"]["execution"]["stage_timings"][1]["stage"],
+        "workspace_snapshot"
+    );
     assert_eq!(
         structured["report"]["evaluation"]["evaluation_date"],
         evaluation_date

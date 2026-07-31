@@ -1595,7 +1595,7 @@ mod tests {
         assert_eq!(sources.len(), outcome.report().diagnostics().len());
     }
 
-    fn canonical_report_bytes(outcome: &PolicyBatchOutcome) -> Vec<u8> {
+    fn canonical_report_bytes_with_normalized_timings(outcome: &PolicyBatchOutcome) -> Vec<u8> {
         let mut output = Vec::new();
         write_policy_json(
             outcome.report(),
@@ -1603,7 +1603,26 @@ mod tests {
             outcome.max_serialized_report_bytes(),
         )
         .expect("bounded canonical policy report");
-        output
+        let mut report: serde_json::Value =
+            serde_json::from_slice(&output).expect("canonical report JSON");
+        report["execution"]["total_elapsed_ms"] = json!(0);
+        for timing in report["execution"]["stage_timings"]
+            .as_array_mut()
+            .expect("stage timings")
+        {
+            timing["elapsed_ms"] = json!(0);
+        }
+        for run in report["runs"].as_array_mut().expect("policy runs") {
+            for metric in run["work"]["metrics"]
+                .as_array_mut()
+                .expect("policy work metrics")
+            {
+                if metric["name"] == "policy.evaluation_elapsed" {
+                    metric["value"] = json!(0);
+                }
+            }
+        }
+        serde_json::to_vec(&report).expect("normalized canonical policy report")
     }
 
     fn write_test_suppression(root: &Path, policy_id: &str, policy_hash: &str, finding_id: &str) {
@@ -1856,8 +1875,8 @@ mod tests {
         assert_eq!(forward.exit_status(), POLICY_EXIT_UNRELIABLE);
         assert_eq!(reversed.exit_status(), POLICY_EXIT_UNRELIABLE);
         assert_eq!(
-            canonical_report_bytes(&forward),
-            canonical_report_bytes(&reversed)
+            canonical_report_bytes_with_normalized_timings(&forward),
+            canonical_report_bytes_with_normalized_timings(&reversed)
         );
         assert!(forward.report().rules().is_empty());
         assert!(forward.report().runs().is_empty());
@@ -1921,8 +1940,8 @@ mod tests {
                 .contains("policy source identity must be at most 1024 bytes")
         }));
         assert_eq!(
-            canonical_report_bytes(&forward),
-            canonical_report_bytes(&reversed)
+            canonical_report_bytes_with_normalized_timings(&forward),
+            canonical_report_bytes_with_normalized_timings(&reversed)
         );
     }
 
@@ -1968,8 +1987,8 @@ mod tests {
             );
         }
         assert_eq!(
-            canonical_report_bytes(&forward),
-            canonical_report_bytes(&reversed)
+            canonical_report_bytes_with_normalized_timings(&forward),
+            canonical_report_bytes_with_normalized_timings(&reversed)
         );
     }
 
@@ -2012,8 +2031,8 @@ mod tests {
 
         assert_eq!(reversed.exit_status(), POLICY_EXIT_UNRELIABLE);
         assert_eq!(
-            canonical_report_bytes(&reversed),
-            canonical_report_bytes(&forward)
+            canonical_report_bytes_with_normalized_timings(&reversed),
+            canonical_report_bytes_with_normalized_timings(&forward)
         );
         assert_eq!(reversed.report().rules().len(), 1);
         assert_eq!(reversed.report().rules()[0].policy_id().as_str(), "test.a");

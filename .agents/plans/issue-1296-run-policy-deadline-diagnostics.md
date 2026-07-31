@@ -18,7 +18,7 @@ After this change, a caller can invoke the built-in `bifrost.code-smells` pack a
 - [x] (2026-07-31 07:04Z) Captured coordinator registration/evaluation/report timings, per-policy elapsed work, deadline-specific completion, and active/completed/pending policy identifiers.
 - [x] (2026-07-31 07:13Z) Converted a pre-snapshot `run_policy` deadline into a canonical unreliable report while preserving invalid-parameter, explicit-cancellation, and internal-error behavior.
 - [x] (2026-07-31 07:13Z) Threaded MCP request correlation into `run_policy` output and added service plus background-dispatch deadline regressions.
-- [ ] Run formatting, focused tests, the repository policy selection, and a live `bifrost.code-smells` validation.
+- [x] (2026-07-31 08:02Z) Ran formatting, task-scoped clippy, both affected crates' complete library suites, the focused MCP integration regression, and the live `bifrost.code-smells` policy gate.
 - [ ] Run the guided-issue specialist review, address accepted findings, and complete the retrospective.
 
 ## Surprises & Discoveries
@@ -44,6 +44,18 @@ After this change, a caller can invoke the built-in `bifrost.code-smells` pack a
 - Observation: A pre-snapshot result cannot truthfully claim that the suppression document was absent.
   Evidence: Snapshot acquisition ends before workspace document access, so `PolicySuppressionDocumentState::NotEvaluated` was added and asserted instead of reusing `NotFound`.
 
+- Observation: Real elapsed timings make otherwise canonical reports differ across repeated executions.
+  Evidence: Two argument-order independence tests and the direct-versus-MCP integration comparison differed only in execution milliseconds and the `policy.evaluation_elapsed` metric. Their comparison helpers now normalize or omit only those explicitly nondeterministic timing fields while continuing to compare all semantic report content.
+
+- Observation: The pinned rustup compiler and Homebrew's same-version clippy driver are binary-incompatible on this host.
+  Evidence: The initial clippy runs failed with E0514 because rustup rustc uses LLVM 22.1.2 while `/opt/homebrew/bin/clippy-driver` uses LLVM 22.1.6. Prepending the pinned toolchain directory and using the isolated-target helper produced a clean task-scoped clippy run.
+
+- Observation: The live installed policy gate completed within the MCP budget but remained unreliable.
+  Evidence: `bifrost.code-smells` returned in 4.086 seconds with schema version 2, exit status 2, and status `unreliable`. Under repository rules this is a failed validation result, not a clean policy pass; the installed plugin does not contain this worktree's changes.
+
+- Observation: The broad MCP stdio integration binary has an unrelated persisted-store environment failure.
+  Evidence: Five non-policy tests fail both in parallel and with `--test-threads=1` because their child servers report SQLite `attempt to write a readonly database`. The issue-specific policy integration passes independently, as do all 104 MCP library tests.
+
 ## Decision Log
 
 - Decision: Keep the five-second MCP request deadline and make bounded diagnostic output the deliberate product-level execution strategy for this issue.
@@ -66,9 +78,13 @@ After this change, a caller can invoke the built-in `bifrost.code-smells` pack a
   Rationale: Monotonic timing avoids clock changes, while exact elapsed values would make tests flaky.
   Date/Author: 2026-07-31 / Codex
 
+- Decision: Stop canonical request timing at report construction and keep response-write timing in the existing correlated operational log.
+  Rationale: A response cannot contain its own completed serialization/write duration without a second response or a misleading estimate. The MCP request correlation identifier joins the returned report to the existing writer timing scope.
+  Date/Author: 2026-07-31 / Codex
+
 ## Outcomes & Retrospective
 
-The implementation milestones are complete. Schema-version-2 reports carry validated deadline, stage, timing, and policy-progress data; coordinator results merge MCP selection and snapshot timings; pre-snapshot expiry returns an empty canonical report with a diagnostic; and background MCP responses include request correlation. Focused issue regressions pass. Full integration, lint, live policy validation, and specialist review remain.
+The implementation milestones and task-scoped validation are complete. Schema-version-2 reports carry validated deadline, stage, timing, and policy-progress data; coordinator results merge MCP selection and snapshot timings; pre-snapshot expiry returns an empty canonical report with a diagnostic; and background MCP responses include request correlation. Formatting, task-scoped clippy, 1,886 analysis library tests, 104 MCP library tests, focused deadline tests, and the policy-specific stdio integration test pass. The live installed policy gate remains `unreliable`, and five unrelated stdio tests remain blocked by a read-only SQLite environment failure. Specialist review remains.
 
 ## Context and Orientation
 
@@ -82,7 +98,7 @@ The coordinator loads policy sources, registers them, evaluates policies sequent
 
 A deadline and an explicit cancellation have different meanings. A deadline means the server used the entire admitted interactive budget and should return a normal, incomplete result. An explicit client cancellation means the caller no longer wants the result and may remain an error. Current code distinguishes these states internally through `CancellationToken::is_timed_out`, but the public incomplete reason is only `cancelled`.
 
-A stage is a stable phase of the request lifecycle. This plan uses bounded, explicitly enumerated stages rather than arbitrary strings: policy selection, workspace snapshot acquisition, policy registration, policy evaluation, report construction, and response serialization. A terminal stage is the stage in progress when the request became incomplete.
+A stage is a stable phase of the request lifecycle. This plan uses bounded, explicitly enumerated stages rather than arbitrary strings: policy selection, workspace snapshot acquisition, policy registration, policy evaluation, and report construction. Response serialization remains an operational writer timing because a response cannot truthfully include its own completed write duration. A terminal stage is the stage in progress when the request became incomplete.
 
 ## Plan of Work
 
@@ -197,3 +213,5 @@ Revision note: Updated on 2026-07-31 after the report-model milestone to record 
 Revision note: Updated on 2026-07-31 after coordinator instrumentation to record deadline-specific policy completion, progress semantics, and focused `issue_1306` test evidence.
 
 Revision note: Updated on 2026-07-31 after MCP integration to record pre-snapshot suppression semantics, correlation behavior, and passing service/background deadline regressions.
+
+Revision note: Updated on 2026-07-31 after final validation to record timing normalization, the pinned clippy-driver requirement, passing broad library suites, and the two external validation limitations.
