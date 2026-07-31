@@ -1,0 +1,117 @@
+schema_version: 1
+pack_id: acme.procedure-summaries
+version: "1.0.0"
+producer:
+  name: summary-compiler
+  version: "1.0.0"
+language: java
+ecosystem: maven
+compatibility:
+  bifrost: ">=0.8.0, <1.0.0"
+  toolchains:
+    - name: jdk
+      requirement: ">=17.0.0"
+provenance:
+  source: "https://models.example/acme/flows"
+  revision: "reviewed-2026-07-31"
+license: Apache-2.0
+completeness: complete
+safety:
+  generated_code_only: false
+  review_required: true
+shards:
+  - id: summaries.flows
+    activation:
+      - package:
+          name: com.acme:flows
+          version: ">=1.0.0, <2.0.0"
+        targets: [jvm]
+        configurations: [release]
+    payload:
+      kind: procedure_summaries
+      summaries:
+        - id: summary.helper
+          target:
+            path: com/acme/Flows.class
+            symbol: helper(java.lang.String)
+            has_receiver: true
+            parameter_count: 1
+          completeness: partial
+          locations:
+            - id: location.captured-input
+              location_kind: capture
+            - id: location.receiver-field
+              location_kind: heap
+          transfers:
+            - input:
+                kind: receiver
+              exit_kind: normal
+              output:
+                kind: receiver
+            - input:
+                kind: parameter
+                ordinal: 0
+              exit_kind: normal
+              output:
+                kind: normal_return
+            - input:
+                kind: parameter
+                ordinal: 0
+              exit_kind: normal
+              output:
+                kind: capture
+                location: location.captured-input
+            - input:
+                kind: parameter
+                ordinal: 0
+              exit_kind: normal
+              output:
+                kind: heap
+                location: location.receiver-field
+            - input:
+                kind: parameter
+                ordinal: 0
+              exit_kind: exceptional
+              output:
+                kind: exceptional_return
+          effects:
+            - kind: allocation
+              event: event.helper.allocate
+              output:
+                kind: heap
+                location: location.receiver-field
+            - kind: escape
+              event: event.helper.escape
+              input:
+                kind: parameter
+                ordinal: 0
+            - kind: unknown_call
+              event: event.helper.unknown-call
+              input:
+                kind: receiver
+            - kind: unknown_call_boundary
+              event: event.helper.unknown-boundary
+        - id: summary.wrapper
+          target:
+            path: com/acme/Flows.class
+            symbol: wrapper(java.lang.String)
+            has_receiver: false
+            parameter_count: 1
+          completeness: complete
+          transfers:
+            - input:
+                kind: parameter
+                ordinal: 0
+              exit_kind: normal
+              output:
+                kind: normal_return
+          effects:
+            - kind: call
+              event: event.wrapper.helper
+              callee: summary.helper
+            - kind: ambiguous_call
+              event: event.wrapper.dispatch
+              input:
+                kind: parameter
+                ordinal: 0
+              candidates: [summary.wrapper, summary.helper]

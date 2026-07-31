@@ -15,8 +15,11 @@ mod validate;
 
 pub use artifact::{
     ArtifactEncoding, ArtifactError, CompiledPackManifest, CompiledPayload,
-    CompiledSemanticModelPack, CompiledShard, CompiledShardDescriptor, DecodeLimits, PayloadKind,
-    decode_manifest, decode_shard, decode_shard_for_manifest,
+    CompiledProcedureSummary, CompiledProcedureTarget, CompiledSemanticModelPack, CompiledShard,
+    CompiledShardDescriptor, CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
+    CompiledSummaryLocation, CompiledSummaryLocationKind, CompiledSummaryOutput,
+    CompiledSummaryTransfer, DecodeLimits, PayloadKind, decode_manifest, decode_shard,
+    decode_shard_for_manifest,
 };
 pub use catalog::*;
 pub use compiler::{CompilerOptions, CompressionPolicy, compile_pack, compile_source};
