@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
+use std::{collections::BTreeMap, error::Error, fmt, mem::size_of_val, sync::Arc};
 
 use crate::analyzer::dataflow::UnmodeledCallBehavior;
 use crate::analyzer::semantic::ProgramPointHandle;
@@ -417,6 +417,67 @@ impl TaintAnalysisPlan {
 
     pub(crate) fn owner(&self) -> &Arc<()> {
         &self.owner
+    }
+
+    pub(crate) fn for_each_retained_artifact(
+        &self,
+        visit: impl FnMut(&Arc<crate::analyzer::semantic::SemanticArtifact>),
+    ) {
+        self.value_flow.for_each_retained_artifact(visit);
+    }
+
+    pub(crate) fn for_each_retained_artifact_key(
+        &self,
+        visit: impl FnMut(&crate::analyzer::semantic::SemanticArtifactKey),
+    ) {
+        self.value_flow.for_each_retained_artifact_key(visit);
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.value_flow.retained_bytes())
+            .saturating_add(self.universe.retained_bytes())
+            .saturating_add(size_of_val(&*self.sources))
+            .saturating_add(size_of_val(&*self.sinks))
+            .saturating_add(size_of_val(&*self.sanitizers))
+            .saturating_add(size_of_val(&*self.transforms))
+            .saturating_add(size_of_val(&*self.phase_transfers))
+            .saturating_add(
+                self.sources
+                    .iter()
+                    .map(|source| {
+                        source
+                            .classes
+                            .retained_heap_bytes()
+                            .saturating_add(source.origin.value_flow_key().retained_bytes())
+                    })
+                    .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(
+                self.sinks
+                    .iter()
+                    .map(|sink| sink.accepted.retained_heap_bytes())
+                    .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(
+                self.sanitizers
+                    .iter()
+                    .map(|sanitizer| sanitizer.removed.retained_heap_bytes())
+                    .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(
+                self.transforms
+                    .iter()
+                    .map(|transform| transform.function.retained_heap_bytes())
+                    .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(self.identity.retained_heap_bytes())
+            .saturating_add(
+                self.phase_transfers
+                    .iter()
+                    .map(|transfer| transfer.function.retained_heap_bytes())
+                    .fold(0usize, usize::saturating_add),
+            )
     }
 
     pub(crate) fn source(&self, id: ValueFlowSourceId) -> Option<&TaintSourceBinding> {

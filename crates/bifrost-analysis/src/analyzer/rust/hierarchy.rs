@@ -61,6 +61,29 @@ impl RustAnalyzer {
             .as_slice()
     }
 
+    pub(crate) fn rust_trait_for_impl_member(&self, member: &CodeUnit) -> Option<CodeUnit> {
+        let source = self.project().read_source(member.source()).ok()?;
+        let tree = parse_rust_tree(&source)?;
+        let declaration = self.rust_named_declaration_node(member, tree.root_node(), &source)?;
+        let mut ancestor = declaration.parent();
+        let impl_item = loop {
+            let candidate = ancestor?;
+            if candidate.kind() == "impl_item" {
+                break candidate;
+            }
+            ancestor = candidate.parent();
+        };
+        let (trait_ref, _) = trait_impl_parts(impl_item, &source)?;
+        let binder = visible_import_binder_at(&source, impl_item.start_byte());
+        self.resolve_rust_hierarchy_trait_ref(
+            member.source(),
+            &source,
+            impl_item,
+            &binder,
+            trait_ref,
+        )
+    }
+
     fn resolve_rust_hierarchy_trait_ref(
         &self,
         file: &ProjectFile,

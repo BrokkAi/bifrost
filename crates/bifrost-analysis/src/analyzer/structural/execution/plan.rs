@@ -684,6 +684,7 @@ pub struct CodeQuerySemanticRequest {
     pub control_edges: bool,
     pub typestate: bool,
     pub value_flow: bool,
+    pub taint: bool,
 }
 
 impl CodeQuerySemanticRequest {
@@ -699,6 +700,7 @@ impl CodeQuerySemanticRequest {
                 QuerySemanticFacet::ControlEdges => request.control_edges = true,
                 QuerySemanticFacet::Typestate => request.typestate = true,
                 QuerySemanticFacet::ValueFlow => request.value_flow = true,
+                QuerySemanticFacet::Taint => request.taint = true,
             }
         }
         Some(request)
@@ -1086,6 +1088,7 @@ mod tests {
                     control_edges: false,
                     typestate: false,
                     value_flow: false,
+                    taint: false,
                 },
                 CodeQuerySemanticRequest {
                     procedures: true,
@@ -1093,6 +1096,7 @@ mod tests {
                     control_edges: false,
                     typestate: false,
                     value_flow: false,
+                    taint: false,
                 },
                 CodeQuerySemanticRequest {
                     procedures: true,
@@ -1100,6 +1104,7 @@ mod tests {
                     control_edges: true,
                     typestate: false,
                     value_flow: false,
+                    taint: false,
                 },
             ]
         );
@@ -1136,6 +1141,7 @@ mod tests {
                     control_edges: false,
                     typestate: false,
                     value_flow: false,
+                    taint: false,
                 },
                 CodeQuerySemanticRequest {
                     procedures: true,
@@ -1143,6 +1149,7 @@ mod tests {
                     control_edges: false,
                     typestate: true,
                     value_flow: false,
+                    taint: false,
                 },
             ]
         );
@@ -1179,6 +1186,7 @@ mod tests {
                     control_edges: false,
                     typestate: false,
                     value_flow: false,
+                    taint: false,
                 },
                 CodeQuerySemanticRequest {
                     procedures: true,
@@ -1186,6 +1194,7 @@ mod tests {
                     control_edges: false,
                     typestate: false,
                     value_flow: true,
+                    taint: false,
                 },
             ]
         );

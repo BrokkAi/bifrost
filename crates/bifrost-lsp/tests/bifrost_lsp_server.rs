@@ -1908,7 +1908,7 @@ fn bifrost_lsp_server_completes_optional_schema_versions_from_unsaved_rqlp_sourc
     );
     let completion = &response["result"]["items"][0];
     assert_eq!(
-        completion["textEdit"]["newText"], ":schema-version 6",
+        completion["textEdit"]["newText"], ":schema-version 7",
         "{response}"
     );
     assert_eq!(
@@ -8217,6 +8217,90 @@ fn bifrost_lsp_server_ruby_semantic_diagnostics_are_constant_only() {
     );
 
     server.notify_value(json!({"jsonrpc": "2.0", "id": 5, "method": "shutdown"}));
+    let _ = server.read_message();
+    server.exit();
+}
+
+#[test]
+fn bifrost_lsp_server_kotlin_semantic_diagnostics_are_runtime_opt_in() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(
+        temp_root.join("Consumer.kt"),
+        "package app\n\nclass Consumer(value: MissingType)\n",
+    )
+    .expect("write Kotlin fixture");
+
+    let mut server = LspServer::start(&temp_root);
+    let uri = uri_for(&temp_root.join("Consumer.kt"));
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": uri}}
+    }));
+    let disabled = server.read_message();
+    assert!(
+        disabled["result"]["items"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "Kotlin semantic diagnostics must be disabled by default: {disabled}"
+    );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": uri}}
+    }));
+    let initially_published = server.read_notification("textDocument/publishDiagnostics");
+    assert!(
+        initially_published["params"]["diagnostics"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "default-off Kotlin diagnostics must publish an empty report: {initially_published}"
+    );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeConfiguration",
+        "params": {"settings": {"unrecognizedSymbolDiagnostics": true}}
+    }));
+    let published = server.read_notification("textDocument/publishDiagnostics");
+    assert!(
+        published["params"]["diagnostics"]
+            .as_array()
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item["source"] == "bifrost-kotlin"
+                        && item["code"] == "kotlin_unrecognized_symbol"
+                })
+            }),
+        "expected Kotlin unknown-type publish diagnostic: {published}"
+    );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": uri}}
+    }));
+    let enabled = server.read_message();
+    let items = enabled["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected diagnostics after enabling Kotlin linting: {enabled}"));
+    assert!(
+        items.iter().any(|item| {
+            item["source"] == "bifrost-kotlin"
+                && item["code"] == "kotlin_unrecognized_symbol"
+                && item["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("MissingType"))
+        }),
+        "expected Kotlin unknown-type diagnostic: {enabled}"
+    );
+
+    server.notify_value(json!({"jsonrpc": "2.0", "id": 4, "method": "shutdown"}));
     let _ = server.read_message();
     server.exit();
 }

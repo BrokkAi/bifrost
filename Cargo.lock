@@ -248,7 +248,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost"
-version = "0.8.16"
+version = "0.8.17"
 dependencies = [
  "bincode",
  "brokk-bifrost-analysis",
@@ -323,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-analysis"
-version = "0.8.16"
+version = "0.8.17"
 dependencies = [
  "bincode",
  "cap-fs-ext",
@@ -394,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-lsp"
-version = "0.8.16"
+version = "0.8.17"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-runtime",
@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-mcp"
-version = "0.8.16"
+version = "0.8.17"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-runtime",
@@ -427,6 +427,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -439,7 +440,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-runtime"
-version = "0.8.16"
+version = "0.8.17"
 dependencies = [
  "brokk-bifrost-analysis",
  "serde_json",

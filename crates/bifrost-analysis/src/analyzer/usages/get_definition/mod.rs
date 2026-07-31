@@ -66,6 +66,7 @@ use crate::analyzer::usages::ruby_graph::{
     ruby_seed_assignment, ruby_seed_parameter_shadows, ruby_type_owner,
     symbol_or_string_value as ruby_symbol_or_string_value,
 };
+use crate::analyzer::usages::scala_graph::syntax::ScalaPackageContextIndex;
 use crate::analyzer::usages::scala_graph::{
     import_candidate_fq_names, import_candidate_owner_fq_names,
     package_name_of as scala_package_name_of, scala_builtin_type_name,
@@ -89,11 +90,15 @@ use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 pub(crate) use rust::{
     AnalyzerRustDefinitionProvider, RustTypeLookupCache, resolve_rust_bounded,
     rust_expression_type_definition_candidates_cached, rust_expression_type_definition_fqn_cached,
-    rust_field_definition_type_candidates_cached, rust_forward_bare_token_reference_fqn,
-    rust_is_type_definition, rust_resolve_type_node_fqn,
+    rust_field_definition_type_candidates_cached, rust_is_type_definition,
+    rust_resolve_type_node_fqn,
 };
 use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Parser, Tree};
+
+pub(crate) const NAVIGATION_TARGETS_TRUNCATED_DIAGNOSTIC: &str = "navigation_targets_truncated";
+pub(crate) const CPP_NAVIGATION_STRUCTURE_UNAVAILABLE_DIAGNOSTIC: &str =
+    "cpp_navigation_structure_unavailable";
 
 mod call_sites;
 mod cpp;
@@ -115,9 +120,7 @@ pub(crate) use call_sites::{
     call_reference_ranges_in_tree, call_reference_requires_point_lookup,
     call_site_syntax_for_reference, exact_call_reference_for_call, is_call_reference_range_in_tree,
 };
-pub(crate) use cpp::{
-    CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC, cpp_type_lookup_resolution_in_session, resolve_cpp_bounded,
-};
+pub(crate) use cpp::{cpp_type_lookup_resolution_in_session, resolve_cpp_bounded};
 pub(crate) use csharp::{
     CSharpTypeLookupResolution, csharp_type_lookup_resolution,
     csharp_type_lookup_resolution_in_session, resolve_csharp_bounded,
@@ -382,6 +385,17 @@ pub struct NavigationLookupOutcome {
     pub targets: Vec<NavigationTarget>,
     pub lexical_definition: Option<LexicalDefinition>,
     pub diagnostics: Vec<DefinitionLookupDiagnostic>,
+    pub(crate) structure_unavailable: bool,
+    pub(crate) unproven_link_unit: bool,
+    pub(crate) truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CallTargetLookupOutcome {
+    pub outcome: DefinitionLookupOutcome,
+    pub structure_unavailable: bool,
+    pub unproven_link_unit: bool,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -600,6 +614,65 @@ pub fn resolve_definition_batch_with_source_and_cancellation(
     )
 }
 
+pub(crate) fn resolve_call_target_batch_with_source(
+    analyzer: &dyn IAnalyzer,
+    requests: Vec<DefinitionLookupRequest>,
+    file: ProjectFile,
+    source: Arc<str>,
+    cancellation: Option<&CancellationToken>,
+) -> Vec<CallTargetLookupOutcome> {
+    if language_for_file(&file) != Language::Cpp {
+        let outcomes = match cancellation {
+            Some(cancellation) => resolve_definition_batch_with_source_and_cancellation(
+                analyzer,
+                requests,
+                file,
+                source,
+                cancellation,
+            ),
+            None => resolve_definition_batch_with_source(analyzer, requests, file, source),
+        };
+        return outcomes
+            .into_iter()
+            .map(|outcome| CallTargetLookupOutcome {
+                outcome,
+                structure_unavailable: false,
+                unproven_link_unit: false,
+                truncated: false,
+            })
+            .collect();
+    }
+
+    let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
+    context.sources.insert(file, Ok(source));
+    resolve_navigation_requests(
+        analyzer,
+        &mut context,
+        requests,
+        NavigationOperation::Definition,
+        cancellation,
+        true,
+    )
+    .into_iter()
+    .map(|outcome| CallTargetLookupOutcome {
+        structure_unavailable: outcome.structure_unavailable,
+        unproven_link_unit: outcome.unproven_link_unit,
+        truncated: outcome.truncated,
+        outcome: DefinitionLookupOutcome {
+            status: outcome.status,
+            reference: outcome.reference,
+            definitions: outcome
+                .targets
+                .into_iter()
+                .map(|target| target.code_unit)
+                .collect(),
+            lexical_definition: outcome.lexical_definition,
+            diagnostics: outcome.diagnostics,
+        },
+    })
+    .collect()
+}
+
 pub fn resolve_call_reference_definition_with_source(
     analyzer: &dyn IAnalyzer,
     request: DefinitionLookupRequest,
@@ -663,6 +736,8 @@ struct DefinitionBatchContext<'a> {
     js_ts_contexts: HashMap<(ProjectFile, Language), JsTsDefinitionContext>,
     go_contexts: HashMap<ProjectFile, GoDefinitionContext>,
     scala_contexts: HashMap<ProjectFile, ScalaDefinitionContext>,
+    scala_package_contexts: HashMap<ProjectFile, ScalaPackageContextIndex>,
+    scala_lookup_cache: scala::ScalaLookupCache,
     sources: HashMap<ProjectFile, Result<Arc<str>, String>>,
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
     line_starts: HashMap<ProjectFile, Arc<Vec<usize>>>,
@@ -694,6 +769,8 @@ impl<'a> DefinitionBatchContext<'a> {
             js_ts_contexts: HashMap::default(),
             go_contexts: HashMap::default(),
             scala_contexts: HashMap::default(),
+            scala_package_contexts: HashMap::default(),
+            scala_lookup_cache: scala::ScalaLookupCache::default(),
             sources: HashMap::default(),
             trees: HashMap::default(),
             line_starts: HashMap::default(),
@@ -798,6 +875,20 @@ impl<'a> DefinitionBatchContext<'a> {
             .clone()
     }
 
+    fn scala_package_prefixes(
+        &mut self,
+        file: &ProjectFile,
+        root: Node<'_>,
+        source: &str,
+        byte: usize,
+    ) -> Vec<String> {
+        self.scala_package_contexts
+            .entry(file.clone())
+            .or_insert_with(|| ScalaPackageContextIndex::new(root, source))
+            .prefixes_at(byte)
+            .to_vec()
+    }
+
     fn cpp_visibility(
         &mut self,
         cpp: &'a crate::analyzer::CppAnalyzer,
@@ -819,6 +910,14 @@ impl<'a> DefinitionBatchContext<'a> {
             .entry(file.clone())
             .or_insert_with(|| self.analyzer.indexed_source(file).map(Arc::new))
             .clone()
+    }
+
+    #[cfg(test)]
+    fn scala_lookup_cache_counts(&self) -> (usize, usize) {
+        (
+            self.scala_lookup_cache.direct_children_builds_for_test(),
+            self.scala_lookup_cache.direct_ancestor_builds_for_test(),
+        )
     }
 
     fn cpp_indexed_tree(&mut self, file: &ProjectFile) -> Option<Tree> {
@@ -1379,9 +1478,9 @@ fn navigation_lookup_outcome(
             diagnostic.kind.as_str(),
             "no_definition"
                 | "no_declaration"
-                | "navigation_targets_truncated"
+                | NAVIGATION_TARGETS_TRUNCATED_DIAGNOSTIC
                 | cpp::CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC
-                | "cpp_navigation_structure_unavailable"
+                | CPP_NAVIGATION_STRUCTURE_UNAVAILABLE_DIAGNOSTIC
         )
     });
 
@@ -1432,7 +1531,7 @@ fn navigation_lookup_outcome(
 
     if structure_unavailable {
         diagnostics.push(DefinitionLookupDiagnostic {
-            kind: "cpp_navigation_structure_unavailable".to_string(),
+            kind: CPP_NAVIGATION_STRUCTURE_UNAVAILABLE_DIAGNOSTIC.to_string(),
             message: "one or more C/C++ candidates could not be classified from indexed syntax"
                 .to_string(),
         });
@@ -1447,7 +1546,7 @@ fn navigation_lookup_outcome(
     }
     if truncated {
         diagnostics.push(DefinitionLookupDiagnostic {
-            kind: "navigation_targets_truncated".to_string(),
+            kind: NAVIGATION_TARGETS_TRUNCATED_DIAGNOSTIC.to_string(),
             message: format!(
                 "{} navigation targets were truncated to the request budget of {}",
                 match operation {
@@ -1465,6 +1564,9 @@ fn navigation_lookup_outcome(
         targets,
         lexical_definition,
         diagnostics,
+        structure_unavailable,
+        unproven_link_unit,
+        truncated,
     }
 }
 
@@ -1790,14 +1892,48 @@ mod tests {
         let file = ProjectFile::new(fixture.project_root(), "main.scala");
         let analyzer = fixture.analyzer.analyzer();
         let scala = resolve_analyzer::<ScalaAnalyzer>(analyzer).expect("Scala analyzer");
+        let tree =
+            parse_tree_for_language(&file, Language::Scala, source).expect("parse Scala source");
         let mut context = DefinitionBatchContext::new(analyzer, true);
 
         let first = context.scala_context(scala, &file);
         let second = context.scala_context(scala, &file);
+        let first_prefixes =
+            context.scala_package_prefixes(&file, tree.root_node(), source, source.len());
+        let second_prefixes = context.scala_package_prefixes(&file, tree.root_node(), source, 0);
 
         assert_eq!(context.scala_contexts.len(), 1);
+        assert_eq!(context.scala_package_contexts.len(), 1);
         assert_eq!(first.package.as_ref(), "demo");
         assert_eq!(first.imports, second.imports);
+        assert_eq!(first_prefixes, ["demo"]);
+        assert_eq!(second_prefixes, ["demo"]);
+    }
+
+    #[test]
+    fn scala_batch_context_reuses_direct_children_for_named_arguments() {
+        let source = "package demo\nobject Main {\n  class Widget(val alpha: Boolean, val beta: Boolean)\n  val widget = new Widget(alpha = true, beta = false)\n}\n";
+        let fixture = AnalyzerFixture::new_for_language(Language::Scala, &[("main.scala", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "main.scala");
+        let analyzer = fixture.analyzer.analyzer();
+        let mut context = DefinitionBatchContext::new(analyzer, true);
+        let requests = ["alpha", "beta"]
+            .into_iter()
+            .map(|needle| {
+                let start_byte = source.rfind(needle).expect("named argument in source");
+                DefinitionLookupRequest {
+                    file: file.clone(),
+                    line: None,
+                    column: None,
+                    start_byte: Some(start_byte),
+                    end_byte: Some(start_byte + needle.len()),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let _outcomes =
+            resolve_definition_requests(analyzer, &mut context, requests, None, None, true);
+        assert_eq!(context.scala_lookup_cache_counts(), (1, 0));
     }
 
     #[test]

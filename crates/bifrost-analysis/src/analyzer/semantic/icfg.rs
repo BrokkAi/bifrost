@@ -21,12 +21,13 @@ use super::workspace_oracle::{
 use super::{
     CallContinuationKind, CallSiteHandle, CallSiteId, ControlContinuation, ControlEdgeKind,
     DeferredInvocationKind, DispatchBoundary, DispatchBoundaryKind, DispatchOracle, DispatchResult,
-    EvidenceCompleteness, EvidenceHandle, OracleLimits, OracleRelationArena, OracleRelationHandle,
-    OracleRelationId, OracleRelationKind, OracleRelationOwner, OracleRelationRecord,
-    OracleRelationSubject, ProcedureHandle, ProcedureInvocationKind, ProgramPointHandle,
-    ProgramPointId, ProofStatus, SemanticBudgetExceeded, SemanticCallSite, SemanticCapability,
-    SemanticGap, SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticOutcome,
-    SemanticProviderError, SemanticRequest, SemanticWork,
+    EvidenceCompleteness, EvidenceHandle, FormalMultiplicity, OracleLimits, OracleRelationArena,
+    OracleRelationHandle, OracleRelationId, OracleRelationKind, OracleRelationOwner,
+    OracleRelationRecord, OracleRelationSubject, ProcedureHandle, ProcedureInvocationKind,
+    ProgramPointHandle, ProgramPointId, ProofStatus, SemanticBudgetExceeded, SemanticCallSite,
+    SemanticCapability, SemanticGap, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
+    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValue, SemanticValueKind,
+    SemanticWork,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -112,6 +113,8 @@ pub struct IcfgExitProfile {
     callee_exit: ProgramPointHandle,
     kind: ReturnTransferKind,
     gap_reason: Option<Box<str>>,
+    matched_return_has_gaps: bool,
+    matched_return_gap_reason: Option<Box<str>>,
     // `SemanticOutcome` has no representation for a retained payload whose
     // quality is specifically truncated without attributing that truncation
     // to the current request budget. Keep the exact local quality so the
@@ -133,13 +136,30 @@ impl IcfgExitProfile {
         self.kind
     }
 
-    pub const fn has_return_affecting_gaps(&self) -> bool {
+    /// Whether this exit contributes any gaps to the aggregate profile outcome.
+    pub const fn has_aggregate_return_affecting_gaps(&self) -> bool {
         self.gap_reason.is_some()
     }
 
-    /// Exact structured reason this exit cannot prove a complete matched return.
-    pub fn return_affecting_gap_reason(&self) -> Option<&str> {
+    /// Whether gaps weaken this exit's concrete matched-return projection.
+    pub const fn has_matched_return_affecting_gaps(&self) -> bool {
+        self.matched_return_has_gaps
+    }
+
+    /// Exact structured gaps contributing to the aggregate profile outcome.
+    pub fn aggregate_return_affecting_gap_reason(&self) -> Option<&str> {
         self.gap_reason.as_deref()
+    }
+
+    /// Exact structured reason this exit cannot prove a complete matched return.
+    pub fn matched_return_affecting_gap_reason(&self) -> Option<&str> {
+        if !self.matched_return_has_gaps {
+            None
+        } else {
+            self.matched_return_gap_reason
+                .as_deref()
+                .or(self.gap_reason.as_deref())
+        }
     }
 
     /// Project this callee-local exit through one exact incoming call.
@@ -962,6 +982,18 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                 else {
                     continue;
                 };
+                let (completeness, added_reason_bytes) = call_binding_completeness(
+                    &semantic_call,
+                    candidate.target.semantics().values(),
+                    candidate.completeness,
+                );
+                additional_work = sum_semantic_work(
+                    additional_work,
+                    SemanticWork {
+                        owned_text_bytes: added_reason_bytes,
+                        ..SemanticWork::default()
+                    },
+                );
                 transfers.push(CallTransfer {
                     origin: origin.clone(),
                     callee: candidate.target,
@@ -969,7 +1001,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                     normal_continuation: semantic_call.normal_continuation,
                     exceptional_continuation: semantic_call.exceptional_continuation,
                     proof: candidate.proof,
-                    completeness: candidate.completeness,
+                    completeness,
                 });
             }
             let mut transfer_set = CallTransferSet {
@@ -1208,6 +1240,53 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         *request.budget = staged_budget;
         Ok(finish_snapshot_outcome(snapshot, quality, exceeded, work))
     }
+}
+
+fn call_binding_completeness(
+    call: &SemanticCallSite,
+    callee_values: &[SemanticValue],
+    completeness: EvidenceCompleteness,
+) -> (EvidenceCompleteness, usize) {
+    let mut fixed_formals = 0usize;
+    let mut has_rest_formal = false;
+    for value in callee_values {
+        match &value.kind {
+            SemanticValueKind::Parameter {
+                multiplicity: FormalMultiplicity::One,
+                ..
+            } => fixed_formals = fixed_formals.saturating_add(1),
+            SemanticValueKind::Parameter {
+                multiplicity: FormalMultiplicity::Rest(_),
+                ..
+            } => has_rest_formal = true,
+            _ => {}
+        }
+    }
+    let bindings_complete = if has_rest_formal {
+        call.arguments.len() >= fixed_formals
+    } else {
+        call.arguments.len() == fixed_formals
+    };
+    if bindings_complete {
+        return (completeness, 0);
+    }
+
+    let previous_reason_bytes = completeness_reason_bytes(&completeness);
+    let completeness = EvidenceCompleteness::Partial(match completeness {
+        EvidenceCompleteness::Complete => format!(
+            "caller supplies {} arguments for {fixed_formals} fixed formal parameters; omitted/default or variadic binding effects are incomplete",
+            call.arguments.len()
+        )
+        .into(),
+        EvidenceCompleteness::Partial(existing) => format!(
+            "{existing}; caller supplies {} arguments for {fixed_formals} fixed formal parameters; omitted/default or variadic binding effects are incomplete",
+            call.arguments.len()
+        )
+        .into(),
+    });
+    let added_reason_bytes =
+        completeness_reason_bytes(&completeness).saturating_sub(previous_reason_bytes);
+    (completeness, added_reason_bytes)
 }
 
 fn charge_call_transfer_projection(
@@ -1743,9 +1822,13 @@ fn materialize_exit_profile(
         };
         return_affecting && scoped_to_return_path
     };
+    let is_matched_return_gap =
+        |gap: &SemanticGap| is_return_gap(gap) && gap_affects_matched_return(gap, kind);
     let mut return_gap_count = 0usize;
+    let mut matched_return_gap_count = 0usize;
     let mut quality = SnapshotQuality::Complete;
     let mut gap_reason_bytes = 0usize;
+    let mut matched_return_gap_reason_bytes = 0usize;
     for gap in semantics.gaps() {
         if request.cancellation.is_cancelled() {
             return Ok(SemanticOutcome::Cancelled {
@@ -1758,13 +1841,14 @@ fn materialize_exit_profile(
         }
         quality = merge_quality(quality, semantic_gap_quality(gap));
         gap_reason_bytes = gap_reason_bytes
-            .saturating_add(usize::from(return_gap_count > 0).saturating_mul(2))
-            .saturating_add(gap.kind.label().len())
-            .saturating_add(1)
-            .saturating_add(gap.capability.label().len())
-            .saturating_add(2)
-            .saturating_add(gap.detail.len());
+            .saturating_add(semantic_gap_reason_entry_bytes(gap, return_gap_count > 0));
         return_gap_count = return_gap_count.saturating_add(1);
+        if is_matched_return_gap(gap) {
+            matched_return_gap_reason_bytes = matched_return_gap_reason_bytes.saturating_add(
+                semantic_gap_reason_entry_bytes(gap, matched_return_gap_count > 0),
+            );
+            matched_return_gap_count = matched_return_gap_count.saturating_add(1);
+        }
     }
     if request.cancellation.is_cancelled() {
         return Ok(SemanticOutcome::Cancelled {
@@ -1772,8 +1856,14 @@ fn materialize_exit_profile(
             work: scan_work,
         });
     }
+    let distinct_matched_reason_bytes =
+        if matched_return_gap_count > 0 && matched_return_gap_count != return_gap_count {
+            matched_return_gap_reason_bytes
+        } else {
+            0
+        };
     let text_work = SemanticWork {
-        owned_text_bytes: gap_reason_bytes,
+        owned_text_bytes: gap_reason_bytes.saturating_add(distinct_matched_reason_bytes),
         ..SemanticWork::default()
     };
     if let Err(exceeded) = request.budget.charge(text_work) {
@@ -1799,20 +1889,36 @@ fn materialize_exit_profile(
             if !is_return_gap(gap) {
                 continue;
             }
-            if written > 0 {
-                reason.push_str("; ");
-            }
-            reason.push_str(gap.kind.label());
-            reason.push(' ');
-            reason.push_str(gap.capability.label());
-            reason.push_str(": ");
-            reason.push_str(&gap.detail);
+            append_semantic_gap_reason_entry(&mut reason, gap, written > 0);
             written = written.saturating_add(1);
         }
         debug_assert_eq!(written, return_gap_count);
         debug_assert_eq!(reason.len(), gap_reason_bytes);
         Some(reason.into_boxed_str())
     };
+    let matched_return_gap_reason =
+        if matched_return_gap_count == 0 || matched_return_gap_count == return_gap_count {
+            None
+        } else {
+            let mut reason = String::with_capacity(matched_return_gap_reason_bytes);
+            let mut written = 0usize;
+            for gap in semantics.gaps() {
+                if request.cancellation.is_cancelled() {
+                    return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work: total_work,
+                    });
+                }
+                if !is_matched_return_gap(gap) {
+                    continue;
+                }
+                append_semantic_gap_reason_entry(&mut reason, gap, written > 0);
+                written = written.saturating_add(1);
+            }
+            debug_assert_eq!(written, matched_return_gap_count);
+            debug_assert_eq!(reason.len(), matched_return_gap_reason_bytes);
+            Some(reason.into_boxed_str())
+        };
     if request.cancellation.is_cancelled() {
         return Ok(SemanticOutcome::Cancelled {
             partial: None,
@@ -1824,9 +1930,41 @@ fn materialize_exit_profile(
         callee_exit: callee_exit.clone(),
         kind,
         gap_reason,
+        matched_return_has_gaps: matched_return_gap_count > 0,
+        matched_return_gap_reason,
         quality,
     };
     Ok(exit_profile_outcome(profile, quality, total_work))
+}
+
+fn semantic_gap_reason_entry_bytes(gap: &SemanticGap, has_prior: bool) -> usize {
+    usize::from(has_prior)
+        .saturating_mul(2)
+        .saturating_add(gap.kind.label().len())
+        .saturating_add(1)
+        .saturating_add(gap.capability.label().len())
+        .saturating_add(2)
+        .saturating_add(gap.detail.len())
+}
+
+fn append_semantic_gap_reason_entry(reason: &mut String, gap: &SemanticGap, has_prior: bool) {
+    if has_prior {
+        reason.push_str("; ");
+    }
+    reason.push_str(gap.kind.label());
+    reason.push(' ');
+    reason.push_str(gap.capability.label());
+    reason.push_str(": ");
+    reason.push_str(&gap.detail);
+}
+
+fn gap_affects_matched_return(gap: &SemanticGap, kind: ReturnTransferKind) -> bool {
+    // An unsupported exceptional alternative does not weaken the explicitly
+    // represented normal route through the same operation. Unknown exceptional
+    // behavior can still make that concrete route itself uncertain.
+    kind != ReturnTransferKind::Normal
+        || gap.capability != SemanticCapability::ExceptionalControlFlow
+        || gap.kind != SemanticGapKind::Unsupported
 }
 
 fn exit_profile_outcome(
@@ -2052,7 +2190,7 @@ fn return_evidence(
     exit: &IcfgExitProfile,
     incoming: &CallTransfer,
 ) -> (ProofStatus, EvidenceCompleteness) {
-    let Some(gap_reason) = &exit.gap_reason else {
+    let Some(gap_reason) = exit.matched_return_affecting_gap_reason() else {
         return (incoming.proof.clone(), incoming.completeness.clone());
     };
     let proof = match &incoming.proof {
@@ -2876,7 +3014,7 @@ mod tests {
     }
 
     #[test]
-    fn cpp_header_definition_coalescing_is_unproven_and_excludes_unrelated_link_unit() {
+    fn cpp_header_definition_coalescing_is_proven_and_excludes_unrelated_link_unit() {
         let header = "#pragma once\nnamespace api { int target(int value); }\n";
         let definition = concat!(
             "#include \"target.h\"\n",
@@ -2946,16 +3084,13 @@ mod tests {
             .expect("C++ exact dispatch");
         let dispatch = outcome.available_value().expect("dispatch payload");
 
-        assert!(matches!(&outcome, SemanticOutcome::Unproven { .. }));
+        assert!(matches!(&outcome, SemanticOutcome::Complete { .. }));
         assert_eq!(dispatch.candidates().len(), 1, "{dispatch:#?}");
-        assert!(matches!(
-            &dispatch.candidates()[0].proof,
-            ProofStatus::Unproven(_)
-        ));
-        assert!(matches!(
-            &dispatch.candidates()[0].completeness,
-            EvidenceCompleteness::Partial(_)
-        ));
+        assert_eq!(dispatch.candidates()[0].proof, ProofStatus::Proven);
+        assert_eq!(
+            dispatch.candidates()[0].completeness,
+            EvidenceCompleteness::Complete
+        );
         assert_eq!(
             dispatch.candidates()[0]
                 .target
@@ -2965,11 +3100,7 @@ mod tests {
                 .as_str(),
             "target.cpp"
         );
-        assert!(dispatch.boundaries().iter().any(|boundary| {
-            boundary.kind == DispatchBoundaryKind::Unresolved
-                && matches!(&boundary.proof, ProofStatus::Unproven(_))
-                && matches!(&boundary.completeness, EvidenceCompleteness::Partial(_))
-        }));
+        assert!(dispatch.boundaries().is_empty(), "{dispatch:#?}");
 
         let pre_cancelled = CancellationToken::default();
         pre_cancelled.cancel();
@@ -3293,11 +3424,11 @@ int invoke_direct(Base* receiver) {
                 && (gap.subject == SemanticGapSubject::Point
                     || gap.subject == SemanticGapSubject::CallSite(direct_call.id))
         }));
-        assert!(direct_caller.semantics().gaps().iter().any(|gap| {
+        assert!(!direct_caller.semantics().gaps().iter().any(|gap| {
             gap.point == direct_call.point
                 && gap.subject == SemanticGapSubject::CallSite(direct_call.id)
-                && gap.impacts.contains(SemanticGapImpact::CallEvaluation)
-                && !gap.impacts.contains(SemanticGapImpact::DispatchCoverage)
+                && (gap.impacts.contains(SemanticGapImpact::CallEvaluation)
+                    || gap.impacts.contains(SemanticGapImpact::DispatchCoverage))
         }));
 
         let provider = fixture.analyzer.icfg_provider();
@@ -3383,13 +3514,12 @@ int invoke_direct(Base* receiver) {
             .expect("virtual dispatch transfers");
         assert_eq!(dynamic.transfers.len(), 1, "{dynamic:#?}");
         assert!(matches!(&dynamic.transfers[0].proof, ProofStatus::Proven));
-        assert!(matches!(
-            &dynamic.transfers[0].completeness,
-            // The open virtual target set does not weaken this retained
-            // candidate's proof. Independent caller-side evaluation gaps do
-            // still make the executable transfer incomplete.
-            EvidenceCompleteness::Partial(_)
-        ));
+        // The open virtual target set does not weaken this retained
+        // candidate's proof or its represented normal call mechanics.
+        assert_eq!(
+            dynamic.transfers[0].completeness,
+            EvidenceCompleteness::Complete
+        );
         assert!(dynamic.boundaries.iter().any(|boundary| {
             boundary.dispatch.kind == DispatchBoundaryKind::Unresolved
                 && matches!(&boundary.dispatch.proof, ProofStatus::Unproven(_))
@@ -3407,21 +3537,17 @@ int invoke_direct(Base* receiver) {
                 &mut SemanticRequest::new(&mut direct_budget, &cancellation),
             )
             .expect("explicitly qualified C++ call transfers");
-        assert!(matches!(&direct_outcome, SemanticOutcome::Unproven { .. }));
+        assert!(matches!(&direct_outcome, SemanticOutcome::Complete { .. }));
         let direct = direct_outcome
             .available_value()
             .expect("non-virtual dispatch transfers");
         assert_eq!(direct.transfers.len(), 1, "{direct:#?}");
         assert!(matches!(&direct.transfers[0].proof, ProofStatus::Proven));
-        assert!(matches!(
-            &direct.transfers[0].completeness,
-            EvidenceCompleteness::Partial(_)
-        ));
-        assert!(direct.boundaries.is_empty(), "{direct:#?}");
-        assert!(
-            direct_outcome.work().owned_text_bytes > direct_dispatch_work.owned_text_bytes,
-            "call-evaluation reason text must be retained and charged only by call transfer"
+        assert_eq!(
+            direct.transfers[0].completeness,
+            EvidenceCompleteness::Complete
         );
+        assert!(direct.boundaries.is_empty(), "{direct:#?}");
         assert_eq!(direct_budget.used(), direct_outcome.work());
     }
 
@@ -3576,6 +3702,17 @@ struct Guard {
     ~Guard();
 };
 
+Guard make_guard();
+
+void temporary_target() {
+    make_guard();
+}
+
+Guard *pointer_target(Guard *value) {
+    Guard *copy = value;
+    return copy;
+}
+
 void raii_target() {
     Guard guard;
 }
@@ -3601,20 +3738,33 @@ void raii_caller() {
             .available_value()
             .cloned()
             .expect("RAII artifact");
-        let caller = artifact
-            .procedures()
-            .iter()
-            .find(|procedure| {
-                procedure
-                    .locator()
-                    .declaration()
-                    .segments()
-                    .last()
-                    .and_then(DeclarationSegment::name)
-                    == Some("raii_caller")
-            })
-            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
-            .expect("RAII caller procedure");
+        let procedure = |name: &str| {
+            artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(DeclarationSegment::name)
+                        == Some(name)
+                })
+                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                .unwrap_or_else(|| panic!("missing {name} procedure"))
+        };
+        let caller = procedure("raii_caller");
+        let temporary_target = procedure("temporary_target");
+        let pointer_target = procedure("pointer_target");
+        assert!(temporary_target.semantics().gaps().iter().any(|gap| {
+            gap.point == temporary_target.semantics().normal_exit_point()
+                && gap.capability == SemanticCapability::ResourceManagement
+        }));
+        assert!(!pointer_target.semantics().gaps().iter().any(|gap| {
+            gap.point == pointer_target.semantics().normal_exit_point()
+                && gap.capability == SemanticCapability::ResourceManagement
+        }));
 
         let mut snapshot_budget = SemanticBudget::default();
         let outcome = fixture
@@ -3642,7 +3792,7 @@ void raii_caller() {
     }
 
     #[test]
-    fn cpp_bodyless_callable_identity_emits_one_unmaterialized_boundary() {
+    fn cpp_bodyless_callable_identity_emits_one_unresolved_boundary() {
         let header = "#pragma once\nint target(int value);\n";
         let caller = "#include \"target.h\"\nint caller() { return target(1); }\n";
         let fixture = AnalyzerFixture::new_for_language(
@@ -3694,11 +3844,21 @@ void raii_caller() {
             .expect("C++ exact dispatch");
         let dispatch = outcome.available_value().expect("dispatch payload");
 
+        assert!(!matches!(&outcome, SemanticOutcome::Complete { .. }));
         assert!(dispatch.candidates().is_empty(), "{dispatch:#?}");
         assert_eq!(dispatch.boundaries().len(), 1, "{dispatch:#?}");
-        assert!(matches!(
+        assert_eq!(
             dispatch.boundaries()[0].kind,
-            DispatchBoundaryKind::Unmaterialized(_)
+            DispatchBoundaryKind::Unresolved,
+            "{dispatch:#?}"
+        );
+        assert!(matches!(
+            dispatch.boundaries()[0].proof,
+            ProofStatus::Unproven(_)
+        ));
+        assert!(matches!(
+            dispatch.boundaries()[0].completeness,
+            EvidenceCompleteness::Partial(_)
         ));
     }
 
@@ -3941,7 +4101,7 @@ void raii_caller() {
         let profile = exit_outcome.available_value().expect("target exit payload");
         assert_eq!(profile.callee_entry(), &incoming.callee_entry);
         assert_eq!(profile.kind(), ReturnTransferKind::Normal);
-        assert!(!profile.has_return_affecting_gaps());
+        assert!(!profile.has_aggregate_return_affecting_gaps());
 
         let mut mismatched_profile_budget = SemanticBudget::default();
         assert!(
@@ -3997,6 +4157,136 @@ void raii_caller() {
                 state: ControlContinuation::Unknown,
             }
         );
+    }
+
+    #[test]
+    fn python_mixed_return_gaps_retain_only_matched_normal_reason() {
+        let fixture = AnalyzerFixture::new_for_language(
+            crate::analyzer::Language::Python,
+            &[(
+                "mixed_return_gaps.py",
+                "async def target(value):\n    result = value\n    return result\n",
+            )],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "mixed_return_gaps.py");
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("Python materialization")
+            .available_value()
+            .cloned()
+            .expect("Python artifact");
+        let target = artifact
+            .procedures()
+            .first()
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("target procedure");
+        let semantics = target.semantics();
+        let return_gaps = semantics
+            .gaps()
+            .iter()
+            .filter(|gap| gap.impacts.contains(SemanticGapImpact::ReturnTransfer))
+            .collect::<Vec<_>>();
+        assert!(
+            return_gaps.iter().any(|gap| {
+                gap.capability == SemanticCapability::AsyncSuspendResume
+                    && gap.kind == SemanticGapKind::Unsupported
+            }),
+            "async lowering must retain its suspension gap: {return_gaps:#?}"
+        );
+        assert!(
+            return_gaps.iter().any(|gap| {
+                gap.capability == SemanticCapability::ExceptionalControlFlow
+                    && gap.kind == SemanticGapKind::Unsupported
+            }),
+            "assignment must retain its exceptional-flow gap: {return_gaps:#?}"
+        );
+        let aggregate_reason = return_gaps
+            .iter()
+            .map(|gap| {
+                format!(
+                    "{} {}: {}",
+                    gap.kind.label(),
+                    gap.capability.label(),
+                    gap.detail,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let matched_reason = return_gaps
+            .iter()
+            .filter(|gap| gap_affects_matched_return(gap, ReturnTransferKind::Normal))
+            .map(|gap| {
+                format!(
+                    "{} {}: {}",
+                    gap.kind.label(),
+                    gap.capability.label(),
+                    gap.detail,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(!matched_reason.is_empty());
+        assert!(!matched_reason.contains(SemanticCapability::ExceptionalControlFlow.label()));
+
+        let entry = target
+            .point_handle(semantics.entry_point())
+            .expect("target entry");
+        let exit = target
+            .point_handle(semantics.normal_exit_point())
+            .expect("target normal exit");
+        let provider = fixture.analyzer.icfg_provider();
+        let mut budget = SemanticBudget::default();
+        let outcome = provider
+            .exit_profile(
+                &entry,
+                &exit,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("target exit profile");
+        let profile = outcome.available_value().expect("retained profile");
+        assert_eq!(
+            profile.aggregate_return_affecting_gap_reason(),
+            Some(aggregate_reason.as_str())
+        );
+        assert_eq!(
+            profile.matched_return_affecting_gap_reason(),
+            Some(matched_reason.as_str())
+        );
+        let expected_text_bytes = aggregate_reason.len().saturating_add(matched_reason.len());
+        assert_eq!(outcome.work().owned_text_bytes, expected_text_bytes);
+        assert_eq!(budget.used(), outcome.work());
+
+        let mut limited_work = SemanticBudget::default().limits();
+        limited_work.owned_text_bytes = expected_text_bytes
+            .checked_sub(1)
+            .expect("mixed return-gap reasons are non-empty");
+        let mut limited_budget =
+            SemanticBudget::new(limited_work).expect("all semantic limits remain positive");
+        let limited = provider
+            .exit_profile(
+                &entry,
+                &exit,
+                &mut SemanticRequest::new(&mut limited_budget, &cancellation),
+            )
+            .expect("owned-text boundary is a typed semantic outcome");
+        assert!(matches!(
+            limited,
+            SemanticOutcome::ExceededBudget {
+                partial: None,
+                exceeded,
+                work,
+            } if exceeded.dimension()
+                == crate::analyzer::semantic::SemanticBudgetDimension::OwnedTextBytes
+                && exceeded.limit() == expected_text_bytes - 1
+                && exceeded.attempted() == expected_text_bytes
+                && work.owned_text_bytes == 0
+        ));
     }
 
     #[test]
@@ -4070,7 +4360,7 @@ void raii_caller() {
             .expect("canonical entry profile payload");
         assert_eq!(canonical_profile.callee_entry(), &canonical_entry);
         assert!(
-            canonical_profile.has_return_affecting_gaps(),
+            canonical_profile.has_aggregate_return_affecting_gaps(),
             "canonical entry-to-exit topology crosses the defer gap"
         );
         let expected_reason = semantics
@@ -4147,7 +4437,7 @@ void raii_caller() {
             .expect("alternate entry profile payload");
         assert_eq!(alternate_profile.callee_entry(), &alternate_entry);
         assert!(
-            !alternate_profile.has_return_affecting_gaps(),
+            !alternate_profile.has_aggregate_return_affecting_gaps(),
             "starting at the exit must exclude the earlier point-scoped defer gap"
         );
         assert!(

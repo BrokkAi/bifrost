@@ -133,7 +133,26 @@ impl JavaScan<'_, '_> {
             LexicalTypeResolution::NotFound => {}
         }
         let type_name = java_type_name_from_node(node, self.source)?;
-        self.java.resolve_usage_type_name(self.file, &type_name)
+        self.resolve_realm_type_name(&type_name)
+    }
+
+    /// Resolve a spelled type name through Java's own import and package tiers,
+    /// but against the *realm-aware* declaration index.
+    ///
+    /// `JavaAnalyzer::resolve_usage_type_name` resolves against the Java-only
+    /// index, so a Java file naming a Kotlin or Scala class declared in the same
+    /// workspace resolves to nothing and the reference is silently lost. Kotlin
+    /// source could already resolve onto Java declarations; passing the merged
+    /// index here is the return direction, and it is what makes a mixed
+    /// Java/Kotlin workspace report call relationships both ways (#1239
+    /// milestone 4). Java's visibility rules are unchanged — only the universe
+    /// of declarations those rules search.
+    fn resolve_realm_type_name(&self, type_name: &str) -> Option<CodeUnit> {
+        self.java.resolve_usage_type_name_in(
+            self.analyzer.global_usage_definition_index(),
+            self.file,
+            type_name,
+        )
     }
 
     fn resolve_nested_type(&self, owner: &CodeUnit, name: &str) -> Option<CodeUnit> {
@@ -346,7 +365,7 @@ fn record_constructor_reference_for_type(
     ctx.record(owner.fq_name().to_string(), type_node);
     let constructor_fqn = format!("{}.{}", owner.fq_name(), owner.identifier());
     let declared = ctx
-        .java
+        .analyzer
         .global_usage_definition_index()
         .by_fqn(&constructor_fqn)
         .iter()
@@ -369,20 +388,18 @@ fn method_reference_callee(
     member: &str,
     ctx: &JavaScan<'_, '_>,
 ) -> Option<String> {
-    let mut candidates = ctx
-        .java
-        .global_usage_definition_index()
+    let index = ctx.analyzer.global_usage_definition_index();
+    let mut candidates = index
         .by_fqn(&format!("{owner_fq_name}.{member}"))
         .iter()
         .filter(|unit| unit.is_function())
         .cloned()
         .collect::<Vec<_>>();
-    let owner = ctx.java.definitions(owner_fq_name).next()?;
-    let provider = ctx.java.type_hierarchy_provider()?;
+    let owner = ctx.analyzer.definitions(owner_fq_name).next()?;
+    let provider = ctx.analyzer.type_hierarchy_provider()?;
     for ancestor in provider.get_ancestors(&owner) {
         candidates.extend(
-            ctx.java
-                .global_usage_definition_index()
+            index
                 .by_fqn(&format!("{}.{}", ancestor.fq_name(), member))
                 .iter()
                 .filter(|unit| unit.is_function())
@@ -497,7 +514,7 @@ fn receiver_type_fqn_at_depth(
                     Ok(ctx.resolve_type(base))
                 }
             },
-            |qualified| ctx.java.resolve_usage_type_name(ctx.file, qualified),
+            |qualified| ctx.resolve_realm_type_name(qualified),
             |owner, name| ctx.resolve_nested_type(owner, name),
         )
         .map(|owner| owner.fq_name()),

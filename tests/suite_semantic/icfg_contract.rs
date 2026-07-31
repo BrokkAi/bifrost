@@ -889,7 +889,7 @@ fn cpp_implicit_object_call_keeps_virtual_dispatch_open() {
 }
 
 #[test]
-fn cpp_default_argument_and_conversion_evaluation_keep_call_transfer_partial() {
+fn cpp_default_argument_binding_keeps_call_and_normal_return_partial() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
             "defaults.cpp",
@@ -932,12 +932,33 @@ fn cpp_default_argument_and_conversion_evaluation_keep_call_transfer_partial() {
                 .procedure("target")
                 .effect("entry"),
             ["target_call"],
+        )
+        .bind_node(
+            "target_exit",
+            "defaults.cpp",
+            PointSelector::new("int target(int value = hidden())")
+                .procedure("target")
+                .effect("normal_exit"),
+            ["target_call"],
+        )
+        .bind_node(
+            "continuation",
+            "defaults.cpp",
+            PointSelector::new("target()")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+            root(),
         );
 
-    let expected = icfg_edge("target_entry", IcfgEdgeKind::Call).originating_call("target_call");
+    let call = icfg_edge("target_entry", IcfgEdgeKind::Call).originating_call("target_call");
+    let normal_return =
+        icfg_edge("continuation", IcfgEdgeKind::NormalReturn).originating_call("target_call");
     graph.assert_outcome(IcfgOutcomeKind::Unproven);
-    graph.assert_successors("invoke", &[expected]);
-    graph.assert_edge_proven_partial("invoke", expected);
+    graph.assert_successors("invoke", &[call]);
+    graph.assert_edge_proven_partial("invoke", call);
+    graph.assert_successors("target_exit", &[normal_return]);
+    graph.assert_edge_unproven_partial("target_exit", normal_return);
     graph.assert_adjacency_symmetric();
 }
 
@@ -1200,6 +1221,136 @@ fn rust_non_dropping_reference_bindings_keep_matched_normal_return_complete() {
         icfg_edge("continuation", IcfgEdgeKind::NormalReturn).originating_call("target_call");
     graph.assert_successors("target_exit", &[expected]);
     graph.assert_edge_proven_complete("target_exit", expected);
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn python_exception_gap_keeps_matched_normal_return_complete() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "normal.py",
+            r#"
+                def relay(value):
+                    relayed = value
+                    return relayed
+
+                def caller(input):
+                    return relay(input)
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut semantics = SemanticGraph::materialize(&project, &analyzer, "normal.py");
+    semantics.bind(
+        "assignment_gap",
+        PointSelector::new("relayed = value")
+            .procedure("relay")
+            .effect("gap"),
+    );
+    semantics.assert_point_gap(
+        "assignment_gap",
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticGapKind::Unsupported,
+    );
+
+    let mut graph = IcfgGraph::materialize(
+        &project,
+        &analyzer,
+        "normal.py",
+        PointSelector::new("def caller(input):")
+            .procedure("caller")
+            .effect("entry"),
+    );
+    graph
+        .bind_call(
+            "relay_call",
+            "normal.py",
+            PointSelector::new("relay(input)")
+                .procedure("caller")
+                .effect("invoke"),
+        )
+        .bind_node(
+            "relay_exit",
+            "normal.py",
+            PointSelector::new("def relay(value):")
+                .procedure("relay")
+                .effect("normal_exit"),
+            ["relay_call"],
+        )
+        .bind_node(
+            "continuation",
+            "normal.py",
+            PointSelector::new("relay(input)")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+            root(),
+        );
+    let expected =
+        icfg_edge("continuation", IcfgEdgeKind::NormalReturn).originating_call("relay_call");
+    graph.assert_outcome(IcfgOutcomeKind::Unsupported);
+    graph.assert_successors("relay_exit", &[expected]);
+    graph.assert_edge_proven_complete("relay_exit", expected);
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn python_exception_gap_still_downgrades_matched_exceptional_return() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "exceptional.py",
+            r#"
+                def fail(value):
+                    relayed = value
+                    raise relayed
+
+                def caller(input):
+                    try:
+                        fail(input)
+                    except Exception:
+                        return 1
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = IcfgGraph::materialize(
+        &project,
+        &analyzer,
+        "exceptional.py",
+        PointSelector::new("def caller(input):")
+            .procedure("caller")
+            .effect("entry"),
+    );
+    graph
+        .bind_call(
+            "fail_call",
+            "exceptional.py",
+            PointSelector::new("fail(input)")
+                .procedure("caller")
+                .effect("invoke"),
+        )
+        .bind_node(
+            "fail_exit",
+            "exceptional.py",
+            PointSelector::new("def fail(value):")
+                .procedure("fail")
+                .effect("exceptional_exit"),
+            ["fail_call"],
+        )
+        .bind_node(
+            "handler",
+            "exceptional.py",
+            PointSelector::new("fail(input)")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+            root(),
+        );
+    let expected =
+        icfg_edge("handler", IcfgEdgeKind::ExceptionalReturn).originating_call("fail_call");
+    graph.assert_outcome(IcfgOutcomeKind::Unsupported);
+    graph.assert_successors("fail_exit", &[expected]);
+    graph.assert_edge_unproven_partial("fail_exit", expected);
     graph.assert_adjacency_symmetric();
 }
 

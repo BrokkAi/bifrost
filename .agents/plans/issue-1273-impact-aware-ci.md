@@ -15,6 +15,7 @@ Pull requests currently wait for the same cross-platform test matrix regardless 
 - [x] (2026-07-29 06:10Z) Passed the Node policy suite, locked Actions security scan, YAML parsing, pinned actionlint, JavaScript syntax checks, Rust formatting, and whitespace validation.
 - [x] (2026-07-29 06:10Z) Attempted the required built-in policy-pack MCP validation; the installed server exposes `run_policy` only and does not expose the required `list_policies` discovery tool, so this cannot be reported as a policy-pack pass.
 - [x] (2026-07-29 06:20Z) Gated Rust-dependent and matrix-heavy selected jobs on lint while retaining direct Node-only feedback after `quick-policy`; the combined workflow suite passed 34 tests.
+- [x] (2026-07-31 09:25Z) Added the missing generic PR fallback for ordinary Rust analyzer/tests, Python package/tests, Python bindings, policy/MCP integration tests, and external-fixture provenance while preserving full merge-queue/master selection and fail-closed unknown paths.
 
 ## Surprises & Discoveries
 
@@ -29,6 +30,9 @@ Pull requests currently wait for the same cross-platform test matrix regardless 
 
 - Observation: Deleted pull-request paths must participate in impact selection.
   Evidence: the first classifier command used `--diff-filter=ACMR`, which omitted deletions; it was corrected to `--diff-filter=ACMRD` and guarded by a classifier source test.
+
+- Observation: The initial implementation never added the planned generic analyzer/test/build fallback, so any ordinary analyzer or Python path forced full mode.
+  Evidence: applying the classifier to PR #1383 selected all twelve components; after adding the generic mappings, the same 55 paths select only Rust, Python, RQL runtime, MCP/LSP contracts, policy-pack, and VS Code validation.
 
 ## Decision Log
 
@@ -52,9 +56,13 @@ Pull requests currently wait for the same cross-platform test matrix regardless 
   Rationale: A Clippy failure must stop expensive matrix allocation, while editor and plugin authors should retain feedback that does not depend on Rust linting.
   Date/Author: 2026-07-29 / Codex and user.
 
+- Decision: Keep merge groups and `master` pushes full, but map ordinary pull-request Rust source/tests to the Rust matrix and Python package/tests to the Python matrix.
+  Rationale: The user wants full post-merge validation while avoiding unrelated package, plugin, provenance, and license lanes on pull requests. Python binding changes select both matrices; policy/MCP integration tests and external fixtures retain their owning specialized checks plus Rust coverage. Cargo manifests, workflows, resources, build inputs, and unknown paths remain fail-closed full.
+  Date/Author: 2026-07-31 / Codex and user.
+
 ## Outcomes & Retrospective
 
-The implementation adds a versioned, fixture-tested impact classifier and a timing wrapper, then uses them to make the CI fast lane observable and safe. The final combined Node suite passed 34 tests, locked zizmor reported no findings, and pinned actionlint reported no workflow diagnostics. YAML parsing, Rust formatting, JavaScript syntax checks, and whitespace validation also passed. Canonical all-feature lint now fails before any Rust-dependent or matrix-heavy selected job starts, while VS Code and agent-plugin checks retain direct quick-policy feedback. The only incomplete validation surface is the built-in policy pack because this task’s MCP server registration lacks `list_policies`; no clean policy result is claimed. A normal pushed PR is still needed to observe the GitHub-hosted timing summaries and a merge-queue run is needed to observe GitHub’s merge-group event.
+The implementation adds a versioned, fixture-tested impact classifier and a timing wrapper, then uses them to make the CI fast lane observable and safe. After adding generic Rust and Python pull-request mappings, the final combined Node suite passed 57 tests, locked zizmor reported no findings, and pinned actionlint reported no workflow diagnostics. YAML parsing, Rust formatting, release-version consistency, and whitespace validation also passed. Canonical all-feature lint now fails before any Rust-dependent or matrix-heavy selected job starts, while VS Code and agent-plugin checks retain direct quick-policy feedback. The built-in `bifrost.code-smells` pack completed in 4.5 seconds but returned `unreliable`: two whole-workspace policies exhausted their execution budgets, and the remaining findings are pre-existing and outside the three changed files. No clean policy result is claimed. A normal pushed PR is still needed to observe the GitHub-hosted timing summaries and a merge-queue run is needed to observe GitHub’s merge-group event.
 
 ## Context and Orientation
 
@@ -110,3 +118,7 @@ Revision note (2026-07-29): Recorded the implemented classifier/workflow design,
 Revision note (2026-07-29): Recorded final 33-test, zizmor, YAML, actionlint, formatting, and whitespace evidence after adding deleted-path coverage.
 
 Revision note (2026-07-29): Added the lint dependency boundary requested during implementation and recorded 34-test, zizmor, YAML, actionlint, and whitespace validation.
+
+Revision note (2026-07-31): Added the missing generic PR path mappings, kept merge-queue/master behavior unchanged, and used PR #1383 plus narrow analyzer, Python, binding, and external-fixture cases as behavior-focused regressions.
+
+Revision note (2026-07-31): Recorded the 57-test validation result and the built-in policy pack's whole-workspace execution-budget limitation before publishing the follow-up PR.

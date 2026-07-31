@@ -35,13 +35,24 @@
 //! versioned `ProgramSemanticsProvider`, and its module header documents the
 //! source-level constructs that stay capability-scoped.
 //!
-//! Capabilities owned by sibling issues stay explicitly unsupported here:
-//! usage graphs (#1239 — Kotlin is a member of the shared JVM usage-candidate
-//! realm but has no edge builder yet, so find-references and reference-rewriting
-//! rename abstain).
+//! Reference, usage, and call graphs are live (#1239). Both usage paths answer
+//! for Kotlin: `crate::analyzer::usages::kotlin_graph` resolves "who uses this
+//! declaration?" for `scan_usages`, LSP references, and reference-rewriting
+//! rename, and builds the whole-workspace `caller -> callee` edge set behind
+//! `usage_graph`, `callers`/`callees`, relevance ranking, and dead-code
+//! detection. The shared JVM realm is symmetric for Kotlin: a Kotlin reference
+//! resolves onto Java and Scala declarations, and a Java or Scala reference onto
+//! Kotlin ones, in both usage paths.
+//!
+//! One realm asymmetry is *not* Kotlin's and is not closed here: Scala's own
+//! edge builder resolves type names against the Scala-only declaration index, so
+//! Scala source contributes no edges onto Java or Kotlin declarations. Java had
+//! the same gap until #1239 milestone 4 gave its builder the realm-aware index;
+//! Scala's resolver is structured differently and needs its own change.
 
 mod adapter;
 pub(crate) mod declarations;
+pub(crate) mod diagnostics;
 mod hierarchy;
 pub(crate) mod imports;
 pub(crate) mod language;
@@ -49,8 +60,10 @@ mod semantic;
 pub(crate) mod structural;
 mod supertypes;
 pub(crate) mod syntax;
+mod tests;
 pub(crate) mod types;
 
+use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::cache::{
     build_weighted_cache, weight_code_unit_set, weight_code_unit_vec_by_unit,
     weight_project_file_set,
@@ -61,13 +74,14 @@ use crate::analyzer::pool_memo::PoolSafeMemo;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer,
     ImportAnalysisProvider, JvmAnalyzerConfig, Language, Project, ProjectFile, SemanticDiagnostic,
-    SignatureMetadata, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
-    UsageFactsIndex,
+    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, UsageFactsIndex,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
+use tests::detect_kotlin_test_assertion_smells;
 
 pub(crate) use adapter::KotlinAdapter;
 
@@ -103,6 +117,36 @@ crate::analyzer::impl_forward_query_provider!(KotlinAnalyzer);
 impl KotlinAnalyzer {
     pub fn new(project: Arc<dyn Project>) -> Self {
         Self::new_with_config(project, AnalyzerConfig::default())
+    }
+
+    /// Hydrate many files' indexed state in one store round-trip.
+    ///
+    /// The whole-workspace usage-edge builder needs every Kotlin file's
+    /// declarations and ranges at once. Pulling them one file at a time would go
+    /// through the per-file LRU and evict the entries a user's interactive
+    /// queries depend on, so the build would leave every subsequent `scan_usages`
+    /// cold. Mirrors Java's and Scala's builders for the same reason.
+    pub(crate) fn bulk_file_states(
+        &self,
+        files: impl IntoIterator<Item = ProjectFile>,
+        source_mode: crate::analyzer::BulkFileStateSource,
+    ) -> crate::hash::HashMap<ProjectFile, crate::analyzer::tree_sitter_analyzer::FileState> {
+        self.inner.bulk_file_states(files, source_mode)
+    }
+
+    #[doc(hidden)]
+    pub fn reset_full_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    #[doc(hidden)]
+    pub fn full_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test()
+    }
+
+    #[doc(hidden)]
+    pub fn bulk_hydration_count_for_test(&self) -> usize {
+        self.inner.bulk_hydration_count_for_test()
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
@@ -355,7 +399,10 @@ impl IAnalyzer for KotlinAnalyzer {
     }
 
     fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
-        self.inner.semantic_diagnostics(file, source)
+        diagnostics::collect_kotlin_semantic_diagnostics(self, file, source, None)
+            .into_iter()
+            .map(SemanticDiagnostic::from)
+            .collect()
     }
 
     fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
@@ -502,4 +549,24 @@ impl IAnalyzer for KotlinAnalyzer {
     fn in_test_region(&self, code_unit: &CodeUnit) -> bool {
         self.inner.in_test_region(code_unit)
     }
+
+    fn find_test_assertion_smells(
+        &self,
+        file: &ProjectFile,
+        weights: TestAssertionWeights,
+    ) -> Vec<TestAssertionSmell> {
+        if file_language(file) != Language::Kotlin || !self.contains_tests(file) {
+            return Vec::new();
+        }
+        let Ok(source) = self.inner.project().read_source(file) else {
+            return Vec::new();
+        };
+        detect_kotlin_test_assertion_smells(self, file, &source, &weights)
+    }
+
+    fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
+        Some(self)
+    }
 }
+
+impl TestDetectionProvider for KotlinAnalyzer {}

@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, error::Error, fmt, sync::Arc};
+use std::{collections::BTreeSet, error::Error, fmt, mem::size_of_val, sync::Arc};
 
 use crate::analyzer::dataflow::{
     PathQualityFrontier, SummaryWitness, SummaryWitnessError, WitnessReconstructionLimits,
@@ -6,7 +6,9 @@ use crate::analyzer::dataflow::{
 use crate::analyzer::semantic::{
     ProcedureHandle, ProgramPointHandle, SemanticArtifactKey, SemanticLocator,
 };
-use crate::analyzer::value_flow::{ValueFlowCarrierKey, ValueFlowEventKey, ValueFlowSinkId};
+use crate::analyzer::value_flow::{
+    ValueFlowCarrierKey, ValueFlowEventKey, ValueFlowSinkId, semantic_locator_heap_bytes,
+};
 
 use super::{
     SourceEventKey, TaintAnalysisPlan, TaintClassSet, TaintSummaryResult, TaintUniverseHash,
@@ -211,6 +213,69 @@ impl TaintFindingReport {
 
     pub const fn retained_witness_bytes(&self) -> usize {
         self.retained_witness_bytes
+    }
+
+    pub(crate) fn belongs_to(&self, plan: &TaintAnalysisPlan) -> bool {
+        Arc::ptr_eq(plan.owner(), self.result.owner())
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.result.retained_bytes())
+            .saturating_add(size_of_val(&*self.findings))
+            .saturating_add(
+                self.findings
+                    .iter()
+                    .map(|finding| {
+                        finding
+                            .key
+                            .sink
+                            .retained_bytes()
+                            .saturating_add(semantic_locator_heap_bytes(&finding.key.entry))
+                            .saturating_add(
+                                finding
+                                    .key
+                                    .entry_carrier
+                                    .as_ref()
+                                    .map_or(0, ValueFlowCarrierKey::retained_bytes),
+                            )
+                            .saturating_add(semantic_locator_heap_bytes(&finding.key.meeting_site))
+                            .saturating_add(finding.classes.retained_heap_bytes())
+                            .saturating_add(size_of_val(&*finding.origins.origins))
+                            .saturating_add(size_of_val(&*finding.origins.evidence))
+                            .saturating_add(
+                                finding
+                                    .origins
+                                    .origins
+                                    .iter()
+                                    .map(|origin| origin.value_flow_key().retained_bytes())
+                                    .fold(0usize, usize::saturating_add),
+                            )
+                            .saturating_add(
+                                finding
+                                    .origins
+                                    .evidence
+                                    .iter()
+                                    .map(|evidence| {
+                                        evidence
+                                            .origin
+                                            .value_flow_key()
+                                            .retained_bytes()
+                                            .saturating_add(evidence.classes.retained_heap_bytes())
+                                            .saturating_add(size_of_val(&*evidence.witnesses))
+                                            .saturating_add(
+                                                evidence
+                                                    .witnesses
+                                                    .iter()
+                                                    .map(|witness| witness.retained_bytes())
+                                                    .fold(0usize, usize::saturating_add),
+                                            )
+                                    })
+                                    .fold(0usize, usize::saturating_add),
+                            )
+                    })
+                    .fold(0usize, usize::saturating_add),
+            )
     }
 }
 

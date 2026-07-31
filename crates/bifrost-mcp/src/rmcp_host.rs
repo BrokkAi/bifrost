@@ -17,8 +17,9 @@ use crate::mcp_common::{
     AGENTS_GUIDANCE_MIME_TYPE, AGENTS_GUIDANCE_TEXT, AGENTS_GUIDANCE_URI,
     BENCHMARK_PROFILE_BOUNDARY_MARKER, BENCHMARK_PROFILE_BOUNDARY_METHOD, CODEX_MCP_CLIENT_NAME,
     CODEX_SANDBOX_STATE_META_CAPABILITY, MCP_FILE_WATCHER_ENV, McpRenderOptions, McpServerSpec,
-    UNBOUND_WORKSPACE_MESSAGE, client_root_to_path, file_uri_to_path, file_watching_enabled,
-    fit_get_summaries_output_to_budget, mcp_analyzer_request_budget, serial_tool_request,
+    UNBOUND_WORKSPACE_MESSAGE, attach_run_policy_correlation, client_root_to_path,
+    file_uri_to_path, file_watching_enabled, fit_get_summaries_output_to_budget,
+    mcp_analyzer_request_budget, request_correlation_id, serial_tool_request,
 };
 use crate::ordered_transport::{RootsOrderedTransport, RootsRevocations};
 use crate::tool_arguments::normalize_tool_arguments;
@@ -817,6 +818,7 @@ impl BifrostMcpHandler {
         arguments: Value,
         workspace_scope: Option<u64>,
         deadline: Instant,
+        request_correlation_id: Option<String>,
         mcp_cancellation: McpCancellationToken,
     ) -> Result<CallToolResult, ErrorData> {
         // The deadline was set when the request was accepted, not when it
@@ -852,11 +854,21 @@ impl BifrostMcpHandler {
                 render_options,
                 Some(&bifrost_cancellation),
             )?;
-            if name == "get_summaries" {
-                fit_get_summaries_output_to_budget(service.as_ref(), output, render_options)
+            let output = if name == "get_summaries" {
+                fit_get_summaries_output_to_budget(service.as_ref(), output, render_options)?
             } else {
-                Ok(output)
-            }
+                output
+            };
+            // run_policy reports carry a hash of the request id so a policy
+            // report in a log can be tied back to the call that produced it
+            // without the raw id, which is client-controlled, ever being
+            // logged. Shared with the fallback host so both emit the same
+            // value for the same wire id.
+            Ok::<_, crate::SearchToolsServiceError>(if name == "run_policy" {
+                attach_run_policy_correlation(output, request_correlation_id.as_deref())
+            } else {
+                output
+            })
         })
         .await
         .map_err(|error| {
@@ -944,6 +956,9 @@ fn map_service_error(code: SearchToolsServiceErrorCode, message: String) -> Erro
         SearchToolsServiceErrorCode::UnknownTool => {
             ErrorData::new(rmcp::model::ErrorCode::METHOD_NOT_FOUND, message, None)
         }
+        // A request that ran out of its budget is a server-side condition, not
+        // a malformed request; the message already says which deadline.
+        SearchToolsServiceErrorCode::DeadlineExceeded => ErrorData::internal_error(message, None),
         SearchToolsServiceErrorCode::Internal => ErrorData::internal_error(message, None),
     }
 }
@@ -1240,6 +1255,11 @@ impl ServerHandler for BifrostMcpHandler {
         // `get_active_workspace` sit behind four long scans *while holding the
         // lock*, stalling every other request's preparation -- the opposite of
         // what the pool exists to protect.
+        // Derived from the wire id the same way the fallback host derives it,
+        // so the two never disagree about a report's correlation value.
+        let correlation_id = serde_json::to_value(&context.id)
+            .ok()
+            .map(|id| request_correlation_id(&id));
         let serial = serial_tool_request(&name);
         let _serial_guard = serial.then_some(state);
 
@@ -1316,6 +1336,7 @@ impl ServerHandler for BifrostMcpHandler {
                 arguments,
                 workspace_scope,
                 deadline,
+                correlation_id,
                 context.ct.clone(),
             )
             .await?

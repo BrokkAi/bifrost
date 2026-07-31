@@ -18,8 +18,8 @@ use std::thread;
 use std::time::Instant;
 
 const SCHEMA_VERSION: u32 = 1;
-const CORPUS_LANGUAGES: [&str; 11] = [
-    "c", "cpp", "csharp", "go", "java", "js", "php", "py", "rust", "scala", "ts",
+const CORPUS_LANGUAGES: [&str; 12] = [
+    "c", "cpp", "csharp", "go", "java", "js", "kotlin", "php", "py", "rust", "scala", "ts",
 ];
 
 const DEFAULT_MAX_FILES: usize = 1_000;
@@ -384,6 +384,7 @@ fn normalize_language(value: &str) -> Result<String, String> {
         "go" => "go",
         "java" => "java",
         "js" | "javascript" => "js",
+        "kotlin" | "kt" => "kotlin",
         "php" => "php",
         "py" | "python" => "py",
         "rust" => "rust",
@@ -1026,6 +1027,7 @@ fn analyzer_language(corpus_language: &str) -> &'static str {
         "ts" => "typescript",
         "go" => "go",
         "java" => "java",
+        "kotlin" => "kotlin",
         "php" => "php",
         "rust" => "rust",
         "scala" => "scala",

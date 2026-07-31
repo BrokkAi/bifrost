@@ -64,6 +64,17 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     )
     .expect("write java fixture");
     fs::write(
+        fixture_root.path().join("sample_spec.rb"),
+        r#"
+        RSpec.describe Widget do
+          it "compares itself" do
+            expect(value).to eq(value)
+          end
+        end
+        "#,
+    )
+    .expect("write ruby fixture");
+    fs::write(
         fixture_root.path().join("SampleClone.java"),
         r#"
         public class SampleClone {
@@ -398,7 +409,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "params": {
                 "name": "report_test_assertion_smells",
                 "arguments": {
-                    "file_paths": ["SampleTest.java"]
+                    "file_paths": ["SampleTest.java", "sample_spec.rb"]
                 }
             }
         }),
@@ -409,6 +420,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     assert!(report.starts_with("## Test assertion smells"), "{report}");
     assert!(report.contains("self-comparison"), "{report}");
     assert!(report.contains("SampleTest.java"), "{report}");
+    assert!(report.contains("sample_spec.rb"), "{report}");
 
     let symbol_sources = round_trip(
         &mut stdin,
@@ -676,6 +688,118 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         !secret_report.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
         "{secret_report}"
     );
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn cognitive_complexity_reports_every_supported_language_in_one_mcp_call() {
+    let workspace = InlineTestProject::new()
+        .file(
+            "main.go",
+            "package main\nfunc goBusy(a, b bool) { if a { if b {} } }\n",
+        )
+        .file(
+            "main.c",
+            "int cBusy(int a, int b) { if (a) { if (b) return 1; } return 0; }\n",
+        )
+        .file(
+            "main.cpp",
+            "int cppBusy(int a, int b) { if (a) { if (b) return 1; } return 0; }\n",
+        )
+        .file(
+            "main.js",
+            "function jsBusy(a, b) { if (a) { if (b) return 1; } return 0; }\n",
+        )
+        .file(
+            "view.jsx",
+            "function jsxBusy(a, b) { if (a) { if (b) return <span />; } return null; }\n",
+        )
+        .file(
+            "main.ts",
+            "function tsBusy(a: boolean, b: boolean) { if (a) { if (b) return 1; } return 0; }\n",
+        )
+        .file(
+            "view.tsx",
+            "function tsxBusy(a: boolean, b: boolean) { if (a) { if (b) return <span />; } return null; }\n",
+        )
+        .file(
+            "main.php",
+            "<?php function phpBusy($a, $b) { if ($a) { if ($b) return 1; } return 0; }\n",
+        )
+        .file(
+            "Main.scala",
+            "def scalaBusy(a: Boolean, b: Boolean): Int = { if (a) { if (b) 1 else 0 } else 0 }\n",
+        )
+        .file(
+            "Service.cs",
+            "class Service { int csharpBusy(bool a, bool b) { if (a) { if (b) return 1; } return 0; } }\n",
+        )
+        .build();
+    let file_paths = [
+        "main.go",
+        "main.c",
+        "main.cpp",
+        "main.js",
+        "view.jsx",
+        "main.ts",
+        "view.tsx",
+        "main.php",
+        "Main.scala",
+        "Service.cs",
+    ];
+
+    let mut child = spawn_server(workspace.root(), "slopcop", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "compute_cognitive_complexity",
+                "arguments": {
+                    "file_paths": file_paths,
+                    "threshold": 1
+                }
+            }
+        }),
+    );
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    assert_eq!(
+        response["result"]["structuredContent"]["truncated"], false,
+        "{response}"
+    );
+    let report = response["result"]["structuredContent"]["report"]
+        .as_str()
+        .expect("cognitive complexity report");
+    for function in [
+        "goBusy",
+        "cBusy",
+        "cppBusy",
+        "jsBusy",
+        "jsxBusy",
+        "tsBusy",
+        "tsxBusy",
+        "phpBusy",
+        "scalaBusy",
+        "csharpBusy",
+    ] {
+        assert!(
+            report.contains(&format!("{function}: 3")),
+            "missing {function} from report:\n{report}"
+        );
+    }
 
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
@@ -1023,10 +1147,26 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     );
     assert_eq!(baseline["result"]["isError"], false, "{baseline}");
     let structured = &baseline["result"]["structuredContent"];
+    // A log-safe hash of the request id, so a policy report found in a log can
+    // be traced back to the call that produced it without the raw
+    // client-controlled id ever being written down. Asserted here, over the
+    // wire, because the feature landed as a unit test against one host while
+    // the other host serves by default -- which is how it would go missing.
+    let correlation = structured["request_correlation_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("run_policy must report a correlation id: {baseline}"));
+    assert!(
+        correlation.starts_with("sha256:") && correlation.len() > "sha256:".len(),
+        "correlation id must be a hash, not the raw request id: {correlation}"
+    );
     assert_eq!(structured["status"], "finding", "{baseline}");
     assert_eq!(structured["exit_status"], 1, "{baseline}");
     assert_eq!(structured["report"], expected_report, "{baseline}");
     assert_eq!(structured["report"]["schema_version"], 2);
+    assert_eq!(
+        structured["report"]["execution"]["stage_timings"],
+        json!([])
+    );
     assert_eq!(
         structured["report"]["evaluation"]["evaluation_date"],
         evaluation_date

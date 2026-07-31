@@ -29,7 +29,7 @@ void test("registers distinct RQL, policy, and Rune IR languages", () => {
     fs.readFileSync(path.join(extensionRoot, "package.json"), "utf8")
   ) as ExtensionManifest;
   const runeIrSourceContext =
-    "resourceLangId == java || resourceLangId == javascript || resourceLangId == javascriptreact || resourceLangId == typescript || resourceLangId == typescriptreact || resourceLangId == rust || resourceLangId == go || resourceLangId == python || resourceLangId == c || resourceLangId == cpp || resourceLangId == csharp || resourceLangId == php || resourceLangId == scala || resourceLangId == ruby";
+    "resourceLangId == java || resourceLangId == javascript || resourceLangId == javascriptreact || resourceLangId == typescript || resourceLangId == typescriptreact || resourceLangId == rust || resourceLangId == go || resourceLangId == python || resourceLangId == c || resourceLangId == cpp || resourceLangId == csharp || resourceLangId == php || resourceLangId == scala || resourceLangId == kotlin || resourceLangId == ruby";
   assert.ok(manifest.activationEvents.includes("onLanguage:bifrost-rql"));
   assert.ok(manifest.activationEvents.includes("onLanguage:bifrost-rql-policy"));
   assert.ok(manifest.activationEvents.includes("onLanguage:bifrost-rune-ir"));
@@ -254,4 +254,13 @@ void test("highlights schema-v6 value-flow forms and plan references", async () 
   );
   assertScoped(tokens, "value-flow", "support.function.wrapper.bifrost-rql");
   assertScoped(tokens, ":plan-ref", "variable.parameter.role.bifrost-rql");
+});
+
+void test("highlights schema-v7 taint forms and retained-result references", async () => {
+  const tokens = tokenizeGrammar(
+    await grammar(),
+    '(taint :taint-ref "request:http-to-database" (procedure-of (function)))'
+  );
+  assertScoped(tokens, "taint", "support.function.wrapper.bifrost-rql");
+  assertScoped(tokens, ":taint-ref", "variable.parameter.role.bifrost-rql");
 });

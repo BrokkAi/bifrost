@@ -902,8 +902,10 @@ pub(super) fn trait_member_for_impl_member(
     if !is_trait_impl_member_target(rust, target, &owner) {
         return None;
     }
+    let structural = rust.rust_trait_for_impl_member(target);
     rust.get_direct_ancestors(&owner)
         .into_iter()
+        .chain(structural)
         .filter(|trait_unit| rust.is_rust_trait_declaration(trait_unit))
         .find_map(|trait_unit| trait_member(rust, &trait_unit, target))
 }

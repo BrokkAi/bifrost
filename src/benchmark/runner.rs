@@ -1902,7 +1902,10 @@ fn elapsed_ms(start: Instant) -> f64 {
 }
 
 fn current_bifrost_commit() -> Option<String> {
-    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    current_bifrost_commit_at(Path::new(env!("CARGO_MANIFEST_DIR")))
+}
+
+fn current_bifrost_commit_at(repo_root: &Path) -> Option<String> {
     let output = std::process::Command::new("git")
         .arg("rev-parse")
         .arg("HEAD")
@@ -1924,6 +1927,7 @@ fn current_bifrost_commit() -> Option<String> {
             "HEAD",
             "--",
             "src",
+            "crates",
             "Cargo.toml",
             "Cargo.lock",
             "build.rs",
@@ -1949,6 +1953,61 @@ fn current_bifrost_commit() -> Option<String> {
     }
     let fingerprint = String::from_utf8(hash.stdout).ok()?;
     Some(format!("{trimmed}-dirty.{}", fingerprint.trim()))
+}
+
+#[cfg(test)]
+mod issue_1375_tests {
+    use super::current_bifrost_commit_at;
+    use std::fs;
+    use std::process::Command;
+
+    fn git(root: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn runtime_identity_includes_crates_only_dirty_changes() {
+        let temp = tempfile::tempdir().expect("temp repo");
+        let root = temp.path();
+        fs::create_dir(root.join("src")).expect("src directory");
+        fs::create_dir(root.join("crates")).expect("crates directory");
+        fs::write(root.join("src/lib.rs"), "pub fn stable() {}\n").expect("write src");
+        fs::write(root.join("crates/lib.rs"), "pub fn original() {}\n").expect("write crate");
+
+        git(root, &["init"]);
+        git(root, &["add", "src/lib.rs", "crates/lib.rs"]);
+        git(
+            root,
+            &[
+                "-c",
+                "user.name=Bifrost Test",
+                "-c",
+                "user.email=bifrost@example.invalid",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+
+        let clean_identity = current_bifrost_commit_at(root).expect("clean identity");
+        fs::write(root.join("crates/lib.rs"), "pub fn changed() {}\n").expect("change crate");
+        let dirty_identity = current_bifrost_commit_at(root).expect("dirty identity");
+
+        assert!(
+            dirty_identity.starts_with(&format!("{clean_identity}-dirty.")),
+            "crates-only edits must dirty the runtime identity: {dirty_identity}"
+        );
+    }
 }
 
 #[cfg(test)]

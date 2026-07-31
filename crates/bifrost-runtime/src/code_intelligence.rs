@@ -17,7 +17,9 @@ use crate::analyzer::policy::{
 };
 use crate::analyzer::structural::{
     CodeQuery, CodeQueryExecutionLimits, CodeQueryResponse, ProtocolRegistrationSet,
-    ValueFlowPlanRegistrationSet, execute_workspace_request_with_analysis_registration_lease,
+    TaintResultRegistrationSet, ValueFlowPlanRegistrationSet,
+    execute_workspace_request_with_all_analysis_registration_lease,
+    execute_workspace_request_with_analysis_registration_lease,
     execute_workspace_request_with_cancellation, execute_workspace_request_with_limits,
     execute_workspace_request_with_registration_lease,
 };
@@ -101,6 +103,31 @@ impl<'a> CodeIntelligenceRuntime<'a> {
             workspace_generation,
             registrations,
             value_flow_registrations,
+            query,
+            limits,
+            self.cancellation,
+            summary_lease,
+        )
+    }
+
+    /// Execute a query with every caller-owned immutable analysis registration.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_query_with_all_analysis_registration_lease(
+        &self,
+        workspace_generation: u64,
+        registrations: &ProtocolRegistrationSet,
+        value_flow_registrations: &ValueFlowPlanRegistrationSet,
+        taint_registrations: &TaintResultRegistrationSet,
+        query: &CodeQuery,
+        limits: CodeQueryExecutionLimits,
+        summary_lease: ProductionTypestateSummaryLease,
+    ) -> CodeQueryResponse {
+        execute_workspace_request_with_all_analysis_registration_lease(
+            self.workspace,
+            workspace_generation,
+            registrations,
+            value_flow_registrations,
+            taint_registrations,
             query,
             limits,
             self.cancellation,

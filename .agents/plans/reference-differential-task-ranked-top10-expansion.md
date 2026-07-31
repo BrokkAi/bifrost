@@ -628,6 +628,101 @@ local gate, but is not the focus.
   receiver-identity issue #1276 and namespace-assignment issue #1277. The
   language remains open pending their completed structured fixes and a new
   clean five-repository replay.
+- [x] (2026-07-30) Resumed Rust ranks six through ten as a strictly
+  repository-depth-first campaign. QWED completed with zero missing. Wealthfolio
+  then received its owned fix, direct `origin/master` publication, clean
+  pushed-head replay with zero missing, and issue closure before Burn began.
+  Burn's 14 genuine rows under assigned issues #1279 and #1280 reduced to four
+  structured gaps: canonical re-export identity, glob-inherited module aliases,
+  `#[path]` local-module routing, and associated trait-member owner resolution.
+  The dirty-tree full Burn proof completed all 1,178 inverse targets across
+  10,000 sampled sites with zero missing; focused faithful regressions and
+  sibling-owner negatives pass. The complete usage gate then exposed three
+  crate/orphan isolation regressions in the initial alias collapse. Cross-target
+  admission is now limited to exact dependency-provenance routes whose Cargo
+  root owns the target, all 1,380 usage tests pass, and a second full Burn
+  replay again reports zero missing.
+- [x] (2026-07-30) Finished Burn depth-first at pushed merge head `976f80d9`.
+  The authoritative clean replay audited all 1,164 eligible files, sampled
+  10,000 sites, queried all 1,178 inverse targets, and reported zero missing,
+  truncation, candidate-limit errors, or file errors. Focused regressions,
+  1,380 usage tests, the featureless full test gate, formatting, and strict
+  all-target/all-feature Clippy passed; assigned issues #1279 and #1280 were
+  closed only after the pushed-head replay.
+- [x] (2026-07-30) Finished Hickory DNS rank nine depth-first at pushed merge
+  head `418429bf`.
+  Its clean `976f80d9` baseline audited all 314 files and all 1,142 targets,
+  reducing the historical 23 rows to eight exact residuals. Reopened assigned
+  cross-repository inverse tickets #1278 and #1279 before edits; open assigned
+  forward tickets #1282 and #1283 already owned the other families. Structured
+  fixes now preserve macro-token calls/patterns, nested grouped-`self` imports,
+  function-local type shadowing, external-owner boundaries, and exact glob
+  re-export routes without leaking parent imports. Oldskool review found and
+  the implementation closed a glob-re-export false-negative before
+  publication. The final dirty-head replay audited all 314 files, sampled
+  exactly 10,000 sites, queried 1,000 of 1,140 distinct targets, and reported
+  zero missing, file errors, or candidate-limit overflow. Validation exposed
+  benchmark runtime identity omitting `crates/`; assigned issue #1375 was
+  created before its fix and now has a behavior regression. The complete
+  featureless Cargo suite passes with the known one-millisecond C# wall-clock
+  test isolated and passing separately; formatting, diff hygiene, and strict
+  all-target/all-feature Clippy also pass. The authoritative clean pushed-head
+  replay audited all 314 files and 10,000 sites, queried 1,000 of 1,140
+  distinct targets, and reported zero missing, file errors, or candidate-limit
+  overflow. Assigned issues #1278, #1279, #1282, #1283, and #1375 were closed
+  only after that proof; intermediate outputs and generated caches were
+  removed while retaining the baseline, clean replay, and final test log.
+- [x] (2026-07-30) Finished nmstate rank ten and the Rust ranks-six-through-ten
+  campaign depth-first at pushed code head `4718a30c`. Its
+  clean `418429bf` baseline audited all 346 files and 10,000 sites, queried all
+  575 distinct targets without truncation or file errors, and found exactly
+  two reproducible terminal type misses in
+  `pub use crate::{ dispatch::DispatchConfig, ..., hostname::HostNameState }`.
+  Reopened assigned issue #1279 before implementation. The structured fix now
+  routes scoped type terminals through the exact import matcher and resolves
+  rooted inverse paths from Cargo target roots, including explicit
+  `[lib] path = "lib.rs"` workspace layouts, while retaining same-named
+  sibling and grouped-`self` namespace negatives. Both production witnesses
+  are exact import hits on the dirty candidate. Formatting, strict
+  all-target/all-feature Clippy, the complete featureless Cargo gate, and all
+  1,420 non-timing usage tests pass; the single one-millisecond C# budget test
+  passes in isolation. The authoritative clean pushed-head replay audited all
+  346 files and 10,000 sites, queried all 575 targets, and reported zero
+  missing, truncation, candidate-limit overflow, or file errors; both original
+  witnesses are exact import hits. Issue #1279 was closed only after that
+  proof. Candidate diagnostics and generated caches were removed while the
+  baseline and clean replay were retained.
+- [x] (2026-07-31 02:49Z) Finished Scala rank six `zio__zio-http`
+  depth-first at pushed head `2f6feb93`. The clean replay audited 433/433
+  files and 10,000 sites, queried all 928 targets, and reported zero missing,
+  truncation, candidate-limit overflow, or file errors. Assigned issue #1379
+  was closed only after the clean proof.
+- [x] (2026-07-31 04:19Z) Finished Scala rank seven
+  `lichess-org__scalachess` depth-first at pushed head `20f61961`. The clean
+  replay audited 108/108 files and 10,000 sites, queried all 687 targets, and
+  reported zero missing, truncation, candidate-limit overflow, or file
+  errors. Assigned issues #1380 and #1381 were closed after the proof; shared
+  cross-repository issues remain open until their remaining witnesses clear.
+- [x] (2026-07-31 05:23Z) Finished Scala rank eight
+  `lensesio__stream-reactor` depth-first at pushed merge head `ee8e114c`.
+  The clean replay audited 656/656 files and 10,000 sites, queried all 803
+  targets, and reported zero missing, truncation, candidate-limit overflow,
+  or file errors. Dedicated issue #1382 was closed; shared forward issue
+  #1284 received the final witness evidence and remains open. Disposable exact
+  and dirty artifacts were removed, retaining only the baseline and clean
+  replay.
+- [x] (2026-07-31 08:34Z) Finished Scala rank nine `http4s__http4s`
+  depth-first at pushed head `8e87a39c`. The clean replay audited 425/425
+  files and 10,000 sites, queried 1,000 of 1,015 targets, and reported zero
+  missing, candidate-limit overflow, or file errors. The accepted artifact is
+  `/mnt/optane/tmp/bifrost-fird/scala-r9-http4s-clean-8e87a39c.jsonl`
+  (SHA-256
+  `0d50cfd962e46ec94f8295cc3a65dbdb7c4335349e9735570a8f9bfa047a6a66`).
+  Dedicated issues #1385 and #1386 and the completed shared root-owner issue
+  #1380 were closed after proof. Shared issues #1285, #1287, and #1316 received
+  the clean http4s evidence and remain open only for their stated Guardian Grid
+  witnesses. Disposable exact, dirty, and Cargo-log artifacts were removed,
+  retaining the baseline and clean replay.
 - [x] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [x] Complete C++ and publish its evidence and user summary.
@@ -643,7 +738,7 @@ local gate, but is not the focus.
   user summary.
 - [ ] Complete PHP ranks six through ten and publish its evidence and user
   summary.
-- [ ] Complete Rust ranks six through ten and publish its evidence and user
+- [x] Complete Rust ranks six through ten and publish its evidence and user
   summary.
 - [ ] Complete Scala ranks six through ten and publish its evidence and user
   summary.
@@ -781,6 +876,14 @@ local gate, but is not the focus.
   0.07 seconds. A longer named watchdog preserves deadlock detection without
   asserting a performance guarantee that the test does not measure.
 
+- The current http4s sample compressed the historical 134-row triage set to 12
+  exact residuals after ranks six through eight fixes. Three selector-import
+  owner tokens expose a distinct inverse gap: the import walk records strict
+  prefixes and selector terminals, but not the complete base owner immediately
+  before a selector block. The `path / newSegment` row is instead a wrong
+  forward identity: the declared receiver type is `Uri.Path`, while forward
+  lookup selects the enclosing `Uri./`.
+
 ## Decision Log
 
 - Decision: Use the live `SFT_PREDICATES` selector and stable descending task
@@ -827,6 +930,14 @@ local gate, but is not the focus.
   safely and accelerates diagnosis. Root retains issue ownership checks, code
   review, gates, publication, and acceptance decisions.
   Date/Author: 2026-07-23 / Codex
+
+- Decision: Process Scala repositories six through ten strictly depth-first,
+  closing each repository's dedicated issue state and disposable artifacts
+  before starting the next repository.
+  Rationale: The user explicitly rejected pre-filing or batching issue work
+  across later repositories. Repository-local baselines, fixes, publication,
+  clean proof, issue updates, and cleanup now form one indivisible transition.
+  Date/Author: 2026-07-31 / Codex
 
 - Decision: Interrupt the `37412679` C run after it supplied reproducible
   #1165 baseline evidence, preserve it under an explicit `aborted` name, and
@@ -1166,3 +1277,8 @@ task asks only for ranks six through ten. Reopened eight language boundaries,
 changed acceptance from 110 rerun envelopes to 55 new envelopes, preserved the
 valid C/C++/Python top-ten evidence, and recorded the independently preflighted
 40 remaining repositories.
+
+Revision note (2026-07-31): Recorded the completed depth-first Scala ranks six
+through eight, the accepted http4s rank-nine baseline and exhaustive exact
+triage, the assigned issue map, and the repository-depth-first transition
+required before Guardian Grid may begin.

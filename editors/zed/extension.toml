@@ -42,6 +42,10 @@ language = "C#"
 name = "Bifrost"
 language = "Scala"
 
+[language_servers.bifrost-kotlin]
+name = "Bifrost"
+language = "Kotlin"
+
 [language_servers.bifrost-java]
 name = "Bifrost"
 language = "Java"

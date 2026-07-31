@@ -102,6 +102,18 @@ impl TaintEdgeFunction {
         &self.overrides
     }
 
+    pub(crate) fn retained_heap_bytes(&self) -> usize {
+        self.generated
+            .retained_heap_bytes()
+            .saturating_add(std::mem::size_of_val(&*self.overrides))
+            .saturating_add(
+                self.overrides
+                    .iter()
+                    .map(|(_, targets)| targets.retained_heap_bytes())
+                    .fold(0usize, usize::saturating_add),
+            )
+    }
+
     pub(crate) fn from_canonical_parts(
         universe: &TaintUniverse,
         generated: TaintClassSet,
@@ -1218,6 +1230,13 @@ impl TaintSummaryResult {
 
     pub(crate) fn owner(&self) -> &Arc<()> {
         &self.owner
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(self.result.retained_bytes_with(
+            TaintClassSet::retained_heap_bytes,
+            TaintEdgeFunction::retained_heap_bytes,
+        ))
     }
 }
 

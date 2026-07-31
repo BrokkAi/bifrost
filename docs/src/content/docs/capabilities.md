@@ -27,6 +27,7 @@ Named arguments refer to call-site syntax represented by the normalized `kwargs`
 | Scala | Yes | Yes | Receiver and overload resolution across methods, fields, types, and inheritance | Yes | Yes | Yes |
 | C# | Yes | Yes | Receiver and overload resolution across methods, constructors, fields, and types | Yes | Yes | Yes |
 | Ruby | Yes | Yes | Resolved methods, fields, and constants; dynamic candidates may be `unproven` | Yes | Yes, for conservative static imports | Yes |
+| Kotlin | Yes | Yes | Functions, methods, real constructors, properties, and types resolved through inheritance, companion objects, extensions, and receiver chains | Yes | Yes | Yes |
 
 ### Bounded Receiver Provenance
 

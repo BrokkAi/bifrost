@@ -209,7 +209,7 @@ class SearchToolsClient:
     ) -> CodeQueryResponse:
         """Query normalized code structure across supported languages.
 
-        The compatible head is schema version 6; pass ``schema_version=2`` to
+        The compatible head is schema version 7; pass ``schema_version=2`` to
         pin the pre-CFG vocabulary or ``schema_version=3`` for CFG without
         typestate. A query starts with normalized syntactic
         structure or a typed set of complete query branches, then optionally
@@ -228,6 +228,9 @@ class SearchToolsClient:
         retained flow paths. Callers send only ``plan_ref``; reachability,
         exact/may certainty, ambiguity, completion, and budget status remain
         separate typed result fields.
+        Version 7 adds ``taint`` with a host-registered ``taint_ref``. It only
+        projects retained production taint findings and never compiles or
+        solves taint, reconstructs witnesses, or performs policy classification.
         Hierarchy steps are direct by default and accept a positive ``depth`` or
         ``transitive=True``. Declaration results are limited to declarations
         indexed by the workspace analyzer. Pass exactly one of ``pattern``,

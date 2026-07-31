@@ -1,3 +1,8 @@
+#[cfg(test)]
+use crate::analyzer::policy::{
+    PolicyExecutionStage, PolicyExecutionTermination, PolicyReportDiagnosticCode,
+    PolicySuppressionDocumentState,
+};
 #[cfg(feature = "nlp")]
 use crate::nlp::{indexer::SemanticIndexer, query::semantic_search};
 use crate::{
@@ -6,8 +11,8 @@ use crate::{
     analyzer::policy::{
         BuiltInPolicySelection, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE,
         PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyFailOn,
-        PolicyReportDocument, PolicySuppressionOptions, PolicySuppressionSource,
-        built_in_policy_catalog,
+        PolicyId, PolicyReportDocument, PolicySuppressionOptions, PolicySuppressionSource,
+        built_in_policy_catalog, workspace_snapshot_deadline_outcome,
     },
     analyzer::semantic::WorkspaceRelativePath,
     code_intelligence::CodeIntelligenceRuntime,
@@ -18,7 +23,7 @@ use crate::{
         report_long_method_and_god_object_smells, report_secret_like_code,
         report_structural_clone_smells, report_test_assertion_smells,
     },
-    diff_analysis::{AnalyzeDiffParams, analyze_diff_at_root},
+    diff_analysis::{AnalyzeDiffParams, DiffAnalysisOptions, analyze_diff_at_root},
     file_tools::{
         find_filenames, find_files_containing, get_file_contents, list_files, search_file_contents,
     },
@@ -49,11 +54,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchToolsServiceErrorCode {
     InvalidParams,
     UnknownTool,
+    DeadlineExceeded,
     Internal,
 }
 
@@ -137,7 +144,7 @@ impl From<RunPolicyFailOn> for PolicyFailOn {
 }
 
 #[derive(Serialize)]
-struct RunPolicyToolResult {
+pub(crate) struct RunPolicyToolResult {
     status: &'static str,
     exit_status: u8,
     report: PolicyReportDocument,
@@ -167,6 +174,13 @@ impl SearchToolsServiceError {
     fn internal(message: impl Into<String>) -> Self {
         Self {
             code: SearchToolsServiceErrorCode::Internal,
+            message: message.into(),
+        }
+    }
+
+    fn deadline_exceeded(message: impl Into<String>) -> Self {
+        Self {
+            code: SearchToolsServiceErrorCode::DeadlineExceeded,
             message: message.into(),
         }
     }
@@ -244,6 +258,7 @@ pub struct SearchToolsService {
     workspace_generation: AtomicU64,
     query_protocols: RwLock<crate::analyzer::structural::ProtocolRegistrationSet>,
     query_value_flows: RwLock<crate::analyzer::structural::ValueFlowPlanRegistrationSet>,
+    query_taint_results: RwLock<crate::analyzer::structural::TaintResultRegistrationSet>,
     typestate_summaries:
         RwLock<Arc<crate::analyzer::typestate::ProductionTypestateSummaryRepository>>,
     /// A deferred workspace build (file discovery + parse) runs on a background
@@ -259,6 +274,7 @@ pub struct SearchToolsService {
     update_strategy: UpdateStrategy,
     semantic_indexing: bool,
     watcher_starter: WatcherStarter,
+    diff_snapshot_object_dir: Option<PathBuf>,
 }
 
 struct WorkspaceSession {
@@ -291,6 +307,7 @@ pub(crate) struct PreparedQueryCode {
     workspace_generation: u64,
     query_protocols: crate::analyzer::structural::ProtocolRegistrationSet,
     query_value_flows: crate::analyzer::structural::ValueFlowPlanRegistrationSet,
+    query_taint_results: crate::analyzer::structural::TaintResultRegistrationSet,
     typestate_summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
 }
 
@@ -306,8 +323,15 @@ pub(crate) struct PreparedRunPolicy {
     root: PathBuf,
     policy_inputs: Vec<PolicyEvaluationInput>,
     options: PolicyEvaluationOptions,
+    selection_elapsed: Duration,
+    snapshot_elapsed: Duration,
     #[cfg(test)]
     workspace_generation: u64,
+}
+
+pub(crate) enum RunPolicyPreparation {
+    Ready(PreparedRunPolicy),
+    Deadline(RunPolicyToolResult),
 }
 
 impl PreparedRunPolicy {
@@ -497,6 +521,14 @@ fn maybe_start_semantic_checked(
 }
 
 impl SearchToolsService {
+    /// Configure trusted Git objects that immutable `analyze_diff` endpoints
+    /// may resolve. This is host configuration, never a tool argument.
+    #[must_use]
+    pub fn with_diff_snapshot_object_dir(mut self, dir: PathBuf) -> Self {
+        self.diff_snapshot_object_dir = Some(dir);
+        self
+    }
+
     pub fn new(root: PathBuf) -> Result<Self, String> {
         Self::new_with_strategy(
             root,
@@ -548,6 +580,7 @@ impl SearchToolsService {
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -556,6 +589,7 @@ impl SearchToolsService {
             update_strategy: UpdateStrategy::Manual,
             semantic_indexing: false,
             watcher_starter,
+            diff_snapshot_object_dir: None,
         })
     }
 
@@ -609,6 +643,7 @@ impl SearchToolsService {
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -617,6 +652,7 @@ impl SearchToolsService {
             update_strategy: UpdateStrategy::Manual,
             semantic_indexing: false,
             watcher_starter,
+            diff_snapshot_object_dir: None,
         })
     }
 
@@ -725,6 +761,52 @@ impl SearchToolsService {
             .unregister(plan_ref))
     }
 
+    /// Register retained production taint results for in-process CodeQuery callers.
+    pub fn register_query_taint_results(
+        &self,
+        taint_ref: crate::analyzer::structural::TaintResultRef,
+        results: Vec<Arc<crate::analyzer::policy::ProductionTaintAnalysisResult>>,
+    ) -> Result<crate::analyzer::structural::TaintResultRegistrationOutcome, SearchToolsServiceError>
+    {
+        let workspace_generation = {
+            let session = self.read_session()?;
+            session.as_ref().ok_or_else(Self::closed_error)?;
+            self.workspace_generation()
+        };
+        let registration = crate::analyzer::structural::TaintResultRegistration::new(
+            workspace_generation,
+            results,
+        )
+        .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
+        let session = self.read_session()?;
+        session.as_ref().ok_or_else(Self::closed_error)?;
+        if self.workspace_generation() != workspace_generation {
+            return Err(SearchToolsServiceError::invalid_params(
+                "workspace generation changed while preparing the taint result registration",
+            ));
+        }
+        let outcome = self
+            .query_taint_results
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
+            .register(taint_ref, registration)
+            .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
+        drop(session);
+        Ok(outcome)
+    }
+
+    /// Remove one host-defined retained taint-result alias.
+    pub fn unregister_query_taint_results(
+        &self,
+        taint_ref: &crate::analyzer::structural::TaintResultRef,
+    ) -> Result<bool, SearchToolsServiceError> {
+        Ok(self
+            .query_taint_results
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
+            .unregister(taint_ref))
+    }
+
     /// Construct with no file watcher and no semantic indexer: the caller drives
     /// updates via the incremental `update_paths` tool. For batch consumers that
     /// re-use one session across many revisions of one worktree.
@@ -811,7 +893,14 @@ impl SearchToolsService {
             })?;
             let root = self.service_root()?;
             return Self::structured_only(
-                analyze_diff_at_root(&root, params).map_err(SearchToolsServiceError::internal)?,
+                analyze_diff_at_root(
+                    &root,
+                    params,
+                    &DiffAnalysisOptions {
+                        snapshot_object_dir: self.diff_snapshot_object_dir.clone(),
+                    },
+                )
+                .map_err(SearchToolsServiceError::internal)?,
             );
         }
         if name == "query_code" {
@@ -827,8 +916,12 @@ impl SearchToolsService {
             return Self::structured_only(catalog.manifest());
         }
         if name == "run_policy" {
-            let prepared = self.prepare_run_policy_with_cancellation(arguments, cancellation)?;
-            return self.execute_prepared_run_policy(prepared, cancellation);
+            return match self.prepare_run_policy_with_cancellation(arguments, cancellation)? {
+                RunPolicyPreparation::Ready(prepared) => {
+                    self.execute_prepared_run_policy(prepared, cancellation)
+                }
+                RunPolicyPreparation::Deadline(result) => Self::structured_only(result),
+            };
         }
 
         let arguments = self.normalize_arguments_for_current_workspace(name, arguments)?;
@@ -1111,6 +1204,7 @@ impl SearchToolsService {
             workspace_generation,
             query_protocols,
             query_value_flows,
+            query_taint_results,
             typestate_summary_lease,
         } = self.prepare_query_code(arguments)?;
         let result = self.query_code_result_for_snapshot(
@@ -1120,6 +1214,7 @@ impl SearchToolsService {
             workspace_generation,
             &query_protocols,
             &query_value_flows,
+            &query_taint_results,
             typestate_summary_lease,
         );
         snapshot.finish("query_code", result)
@@ -1143,6 +1238,7 @@ impl SearchToolsService {
             let snapshot = self.snapshot_for_query()?;
             let query_protocols = self.query_protocol_snapshot()?;
             let query_value_flows = self.query_value_flow_snapshot()?;
+            let query_taint_results = self.query_taint_result_snapshot()?;
             if generation != self.workspace_generation() {
                 continue;
             }
@@ -1159,6 +1255,7 @@ impl SearchToolsService {
                 workspace_generation: generation,
                 query_protocols,
                 query_value_flows,
+                query_taint_results,
                 typestate_summary_lease,
             });
         }
@@ -1175,6 +1272,7 @@ impl SearchToolsService {
             workspace_generation,
             query_protocols,
             query_value_flows,
+            query_taint_results,
             typestate_summary_lease,
         } = prepared;
         let result = (|| {
@@ -1185,6 +1283,7 @@ impl SearchToolsService {
                 workspace_generation,
                 &query_protocols,
                 &query_value_flows,
+                &query_taint_results,
                 typestate_summary_lease,
             )?;
             let rendered_text = output.render_text();
@@ -1208,14 +1307,16 @@ impl SearchToolsService {
         workspace_generation: u64,
         query_protocols: &crate::analyzer::structural::ProtocolRegistrationSet,
         query_value_flows: &crate::analyzer::structural::ValueFlowPlanRegistrationSet,
+        query_taint_results: &crate::analyzer::structural::TaintResultRegistrationSet,
         typestate_summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
     ) -> Result<crate::analyzer::structural::CodeQueryResponse, SearchToolsServiceError> {
         let query = Self::decode_query_code_input(snapshot, arguments)?;
         Ok(CodeIntelligenceRuntime::new(snapshot, cancellation)
-            .execute_query_with_analysis_registration_lease(
+            .execute_query_with_all_analysis_registration_lease(
                 workspace_generation,
                 query_protocols,
                 query_value_flows,
+                query_taint_results,
                 &query,
                 crate::analyzer::structural::CodeQueryExecutionLimits::default(),
                 typestate_summary_lease,
@@ -1349,6 +1450,16 @@ impl SearchToolsService {
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))
     }
 
+    fn query_taint_result_snapshot(
+        &self,
+    ) -> Result<crate::analyzer::structural::TaintResultRegistrationSet, SearchToolsServiceError>
+    {
+        self.query_taint_results
+            .read()
+            .map(|registrations| registrations.clone())
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))
+    }
+
     fn advance_workspace_generation(&self) {
         let mut summaries = self
             .typestate_summaries
@@ -1359,6 +1470,10 @@ impl SearchToolsService {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
         self.query_value_flows
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.query_taint_results
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
@@ -1411,6 +1526,7 @@ impl SearchToolsService {
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -1419,6 +1535,7 @@ impl SearchToolsService {
             update_strategy,
             semantic_indexing,
             watcher_starter,
+            diff_snapshot_object_dir: None,
         })
     }
 
@@ -1457,6 +1574,7 @@ impl SearchToolsService {
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -1465,6 +1583,7 @@ impl SearchToolsService {
             update_strategy,
             semantic_indexing,
             watcher_starter,
+            diff_snapshot_object_dir: None,
         })
     }
 
@@ -1503,6 +1622,7 @@ impl SearchToolsService {
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -1511,6 +1631,7 @@ impl SearchToolsService {
             update_strategy,
             semantic_indexing,
             watcher_starter,
+            diff_snapshot_object_dir: None,
         })
     }
 
@@ -1564,6 +1685,7 @@ impl SearchToolsService {
             workspace_generation: AtomicU64::new(0),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -1572,6 +1694,7 @@ impl SearchToolsService {
             update_strategy,
             semantic_indexing: semantic_indexing_enabled(),
             watcher_starter: production_watcher_starter(),
+            diff_snapshot_object_dir: None,
         }
     }
 
@@ -1756,6 +1879,7 @@ impl SearchToolsService {
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -1764,6 +1888,7 @@ impl SearchToolsService {
             update_strategy,
             semantic_indexing,
             watcher_starter,
+            diff_snapshot_object_dir: None,
         })
     }
 
@@ -1871,12 +1996,14 @@ impl SearchToolsService {
                 return self.ensure_ready();
             }
             if cancellation.is_cancelled() {
-                let message = if cancellation.is_timed_out() {
-                    "workspace snapshot was not ready within the request-wide time budget; retry after workspace initialization completes"
-                } else {
-                    "workspace snapshot acquisition was cancelled"
-                };
-                return Err(SearchToolsServiceError::internal(message));
+                if cancellation.is_timed_out() {
+                    return Err(SearchToolsServiceError::deadline_exceeded(
+                        "workspace snapshot was not ready within the request-wide time budget; retry after workspace initialization completes",
+                    ));
+                }
+                return Err(SearchToolsServiceError::internal(
+                    "workspace snapshot acquisition was cancelled",
+                ));
             }
             std::thread::park_timeout(std::time::Duration::from_millis(5));
         }
@@ -2554,7 +2681,8 @@ impl SearchToolsService {
         &self,
         arguments: Value,
         cancellation: Option<&CancellationToken>,
-    ) -> Result<PreparedRunPolicy, SearchToolsServiceError> {
+    ) -> Result<RunPolicyPreparation, SearchToolsServiceError> {
+        let preparation_started = Instant::now();
         let params = serde_json::from_value::<RunPolicyParams>(arguments).map_err(|error| {
             SearchToolsServiceError::invalid_params(format!(
                 "Invalid run_policy arguments: {error}"
@@ -2649,6 +2777,12 @@ impl SearchToolsService {
             })?
             .select(&selection)
             .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
+        let selected_policy_ids = selected
+            .iter()
+            .map(|policy| {
+                PolicyId::new(&policy.manifest().id).expect("built-in policy IDs are validated")
+            })
+            .collect::<Vec<_>>();
         let mut built_in_inputs = selected
             .into_iter()
             .map(|policy| {
@@ -2681,25 +2815,55 @@ impl SearchToolsService {
         let options =
             PolicyEvaluationOptions::with_suppressions(params.evaluation_date, suppressions)
                 .with_fail_on(fail_on);
+        let selection_elapsed = preparation_started.elapsed();
+        let snapshot_started = Instant::now();
 
         loop {
             let workspace_generation = self.workspace_generation();
-            let snapshot = {
+            let snapshot_result = {
                 let _scope = profiling::scope("run_policy.snapshot_for_query");
-                self.snapshot_for_query_with_cancellation(cancellation)?
+                self.snapshot_for_query_with_cancellation(cancellation)
+            };
+            let snapshot = match snapshot_result {
+                Ok(snapshot) => snapshot,
+                Err(error)
+                    if error.code == SearchToolsServiceErrorCode::DeadlineExceeded
+                        && cancellation.is_some_and(CancellationToken::is_timed_out) =>
+                {
+                    let outcome = workspace_snapshot_deadline_outcome(
+                        &options,
+                        selected_policy_ids,
+                        selection_elapsed,
+                        snapshot_started.elapsed(),
+                    )
+                    .map_err(|error| {
+                        SearchToolsServiceError::internal(format!(
+                            "failed to construct workspace deadline policy report: {error}"
+                        ))
+                    })?;
+                    let result = RunPolicyToolResult {
+                        status: "unreliable",
+                        exit_status: outcome.exit_status(),
+                        report: outcome.into_report(),
+                    };
+                    return Ok(RunPolicyPreparation::Deadline(result));
+                }
+                Err(error) => return Err(error),
             };
             if workspace_generation != self.workspace_generation() {
                 continue;
             }
             let root = snapshot.analyzer().project().root().to_path_buf();
-            return Ok(PreparedRunPolicy {
+            return Ok(RunPolicyPreparation::Ready(PreparedRunPolicy {
                 snapshot,
                 root,
                 policy_inputs,
                 options,
+                selection_elapsed,
+                snapshot_elapsed: snapshot_started.elapsed(),
                 #[cfg(test)]
                 workspace_generation,
-            });
+            }));
         }
     }
 
@@ -2713,17 +2877,20 @@ impl SearchToolsService {
             root,
             policy_inputs,
             options,
+            selection_elapsed,
+            snapshot_elapsed,
             ..
         } = prepared;
         let result = (|| {
             let _scope = profiling::scope("run_policy.evaluate_policy_inputs");
-            let outcome = CodeIntelligenceRuntime::new(&snapshot, cancellation)
+            let mut outcome = CodeIntelligenceRuntime::new(&snapshot, cancellation)
                 .evaluate_policy_inputs(&root, &policy_inputs, &options)
                 .map_err(|error| {
                     SearchToolsServiceError::internal(format!(
                         "run_policy evaluation failed: {error}"
                     ))
                 })?;
+            outcome.record_preparation_timings(selection_elapsed, snapshot_elapsed);
             let exit_status = outcome.exit_status();
             let status = match exit_status {
                 POLICY_EXIT_CLEAN => "clean",
@@ -2998,6 +3165,7 @@ mod watcher_startup_tests {
             workspace_generation: AtomicU64::new(0),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -3006,6 +3174,7 @@ mod watcher_startup_tests {
             update_strategy: UpdateStrategy::WatchFiles,
             semantic_indexing: false,
             watcher_starter: starter,
+            diff_snapshot_object_dir: None,
         }
     }
 
@@ -3141,7 +3310,7 @@ mod watcher_startup_tests {
     }
 
     #[test]
-    fn issue_1306_run_policy_deadline_does_not_block_on_deferred_workspace_startup() {
+    fn issue_1296_run_policy_snapshot_deadline_returns_canonical_report() {
         let (_temp, root) = workspace("DeferredPolicy.java", "class DeferredPolicy {}\n");
         let (startup_started_tx, startup_started_rx) = mpsc::channel();
         let (release_startup_tx, release_startup_rx) = mpsc::sync_channel(1);
@@ -3166,7 +3335,7 @@ mod watcher_startup_tests {
             .expect("deferred build should reach watcher startup");
         let cancellation = CancellationToken::default().with_timeout(Duration::ZERO);
 
-        let error = match service.prepare_run_policy_with_cancellation(
+        let result = match service.prepare_run_policy_with_cancellation(
             json!({
                 "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
                 "evaluation_date": "2026-07-29",
@@ -3174,16 +3343,97 @@ mod watcher_startup_tests {
             }),
             Some(&cancellation),
         ) {
-            Ok(_) => panic!("expired request should not join the deferred build"),
-            Err(error) => error,
+            Ok(RunPolicyPreparation::Deadline(result)) => result,
+            Ok(RunPolicyPreparation::Ready(_)) => {
+                panic!("expired request should not join the deferred build")
+            }
+            Err(error) => panic!("deadline should return a canonical policy report: {error}"),
         };
 
-        assert_eq!(error.code, SearchToolsServiceErrorCode::Internal);
-        assert!(error.message.contains("workspace snapshot was not ready"));
-        assert!(error.message.contains("retry"));
+        assert_eq!(result.status, "unreliable");
+        assert_eq!(result.exit_status, POLICY_EXIT_UNRELIABLE);
+        assert_eq!(result.report.schema_version(), 2);
+        assert!(result.report.rules().is_empty());
+        assert!(result.report.runs().is_empty());
+        assert_eq!(
+            result.report.execution().termination(),
+            Some(PolicyExecutionTermination::DeadlineExceeded)
+        );
+        assert_eq!(
+            result.report.execution().terminal_stage(),
+            Some(PolicyExecutionStage::WorkspaceSnapshot)
+        );
+        assert_eq!(
+            result.report.execution().pending_policy_ids(),
+            &[PolicyId::new("bifrost.correctness.dynamic-evaluation").unwrap()]
+        );
+        assert_eq!(
+            result.report.diagnostics()[0].code(),
+            PolicyReportDiagnosticCode::WorkspaceSnapshotDeadlineExceeded
+        );
+        assert_eq!(
+            result.report.evaluation().suppression_document_state(),
+            PolicySuppressionDocumentState::NotEvaluated
+        );
         release_startup_tx
             .send(())
             .expect("release deferred watcher startup");
+    }
+
+    #[test]
+    fn issue_1296_registration_deadline_includes_preparation_timings() {
+        let (_temp, root) = workspace("Policy.java", "class Policy {}\n");
+        let service =
+            SearchToolsService::new_manual_without_semantic_index(root).expect("manual service");
+        let cancellation = CancellationToken::default().with_timeout(Duration::ZERO);
+
+        let output = service
+            .call_tool_output_with_cancellation(
+                "run_policy",
+                json!({
+                    "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
+                    "evaluation_date": "2026-07-31",
+                    "fail_on": "warning"
+                }),
+                RenderOptions::default(),
+                Some(&cancellation),
+            )
+            .expect("expired evaluation should retain structured output");
+        let ToolOutput::Structured { structured, .. } = output else {
+            panic!("run_policy must return structured output");
+        };
+
+        assert_eq!(structured["status"], "unreliable");
+        assert_eq!(structured["report"]["schema_version"], 2);
+        assert_eq!(
+            structured["report"]["execution"]["termination"],
+            "deadline_exceeded"
+        );
+        assert_eq!(
+            structured["report"]["execution"]["terminal_stage"],
+            "policy_registration"
+        );
+        assert_eq!(
+            structured["report"]["execution"]["active_policy_id"],
+            Value::Null
+        );
+        assert_eq!(
+            structured["report"]["execution"]["pending_policy_ids"],
+            json!(["bifrost.correctness.dynamic-evaluation"])
+        );
+        let stages = structured["report"]["execution"]["stage_timings"]
+            .as_array()
+            .expect("stage timings");
+        for expected in [
+            "policy_selection",
+            "workspace_snapshot",
+            "policy_registration",
+        ] {
+            assert!(
+                stages.iter().any(|timing| timing["stage"] == expected),
+                "missing stage {expected}: {stages:?}"
+            );
+        }
     }
 
     #[test]
@@ -3579,6 +3829,7 @@ public partial class MudDialogContainer
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -3587,6 +3838,7 @@ public partial class MudDialogContainer
             update_strategy: UpdateStrategy::WatchFiles,
             semantic_indexing: false,
             watcher_starter: production_watcher_starter(),
+            diff_snapshot_object_dir: None,
         }
     }
 
@@ -3819,6 +4071,7 @@ mod client_roots_tests {
             workspace_generation: AtomicU64::new(0),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -3827,6 +4080,7 @@ mod client_roots_tests {
             update_strategy: UpdateStrategy::Manual,
             semantic_indexing: false,
             watcher_starter: production_watcher_starter(),
+            diff_snapshot_object_dir: None,
         };
         let canonical_linked = linked_root.canonicalize().unwrap();
         service
@@ -4311,6 +4565,7 @@ mod tests {
             workspace_generation: AtomicU64::new(1),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
+            query_taint_results: RwLock::new(Default::default()),
             typestate_summaries: RwLock::new(Arc::new(
                 crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
             )),
@@ -4319,6 +4574,7 @@ mod tests {
             update_strategy: UpdateStrategy::WatchFiles,
             semantic_indexing: true,
             watcher_starter: production_watcher_starter(),
+            diff_snapshot_object_dir: None,
         };
 
         service.close().unwrap();

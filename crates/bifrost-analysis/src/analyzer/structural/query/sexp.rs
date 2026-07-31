@@ -423,6 +423,42 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 .push(Value::Object(step));
             Ok(Some(Value::Object(query)))
         }
+        RqlForm::Taint => {
+            let option = items
+                .get(1)
+                .and_then(Expr::as_symbol)
+                .and_then(|label| QueryStepOp::Taint.option_for_rql_label(label));
+            if items.len() != 4
+                || option.is_none_or(|option| option.field() != QueryStepField::TaintRef)
+            {
+                return Err(lower_error(
+                    expr,
+                    "(taint ...) expects :taint-ref namespace:name followed by a query",
+                ));
+            }
+            let taint_ref = symbol_or_string(&items[2])?;
+            let mut step = Map::new();
+            step.insert(
+                "op".to_string(),
+                Value::String(QueryStepOp::Taint.label().to_string()),
+            );
+            step.insert(
+                option
+                    .expect("validated taint option")
+                    .field()
+                    .label()
+                    .to_string(),
+                Value::String(taint_ref),
+            );
+            let mut query = query_object(&items[3])?;
+            query
+                .entry("steps".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
+                .push(Value::Object(step));
+            Ok(Some(Value::Object(query)))
+        }
         RqlForm::Witness => {
             if items.len() < 2 || !(items.len() - 2).is_multiple_of(2) {
                 return Err(lower_error(
@@ -858,6 +894,7 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::CfgEdgeTarget
         | RqlForm::Typestate
         | RqlForm::ValueFlow
+        | RqlForm::Taint
         | RqlForm::Witness
         | RqlForm::FileOf
         | RqlForm::ImportsOf

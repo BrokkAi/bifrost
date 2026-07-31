@@ -67,6 +67,10 @@ language-servers = ["bifrost"]
 [[language]]
 name = "scala"
 language-servers = ["bifrost"]
+
+[[language]]
+name = "kotlin"
+language-servers = ["bifrost"]
 ```
 
 This assumes `bifrost` is installed on `PATH`:

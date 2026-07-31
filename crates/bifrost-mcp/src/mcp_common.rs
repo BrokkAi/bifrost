@@ -7,6 +7,7 @@ use crate::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::{self, BufRead, Write};
@@ -217,6 +218,7 @@ struct OutboundMcpResponse {
 
 struct OutboundMcpResponseTiming {
     tool_name: String,
+    request_correlation_id: String,
     ready_at: Instant,
 }
 
@@ -235,6 +237,7 @@ impl OutboundMcpResponse {
         workspace_generation: u64,
         completion_id: Value,
         tool_name: String,
+        request_correlation_id: String,
     ) -> Self {
         Self {
             value,
@@ -242,6 +245,7 @@ impl OutboundMcpResponse {
             completion_id: Some(completion_id),
             timing: Some(OutboundMcpResponseTiming {
                 tool_name,
+                request_correlation_id,
                 ready_at: Instant::now(),
             }),
         }
@@ -265,6 +269,10 @@ impl OutboundMcpResponse {
 
 fn request_id_key(id: &Value) -> String {
     serde_json::to_string(id).expect("JSON-RPC request IDs always serialize")
+}
+
+pub(crate) fn request_correlation_id(id: &Value) -> String {
+    format!("sha256:{:x}", Sha256::digest(request_id_key(id).as_bytes()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,8 +367,15 @@ pub fn run_stdio_server(
     root: Option<PathBuf>,
     render_options: McpRenderOptions,
     spec: &McpServerSpec,
+    diff_snapshot_object_dir: Option<PathBuf>,
 ) -> Result<(), String> {
-    run_stdio_server_with_build_identity(root, render_options, spec, env!("CARGO_PKG_VERSION"))
+    run_stdio_server_with_build_identity(
+        root,
+        render_options,
+        spec,
+        diff_snapshot_object_dir,
+        env!("CARGO_PKG_VERSION"),
+    )
 }
 
 /// Falls back to the hand-written MCP stack below instead of the `rmcp` host.
@@ -396,6 +411,7 @@ pub fn run_stdio_server_with_build_identity(
     root: Option<PathBuf>,
     render_options: McpRenderOptions,
     spec: &McpServerSpec,
+    diff_snapshot_object_dir: Option<PathBuf>,
     build_identity: &str,
 ) -> Result<(), String> {
     if rmcp_host_enabled(std::env::var_os(MCP_RMCP_HOST_ENV).as_deref())? {
@@ -410,12 +426,17 @@ pub fn run_stdio_server_with_build_identity(
     // without touching process cwd and bind only from a client-provided workspace.
     let accepts_client_roots = root.is_none();
     let watch_files = file_watching_enabled(std::env::var_os(MCP_FILE_WATCHER_ENV).as_deref())?;
-    let service = Arc::new(match (root, watch_files) {
+    let service = match (root, watch_files) {
         (Some(root), true) => SearchToolsService::new_deferred(root)?,
         (Some(root), false) => SearchToolsService::new_deferred_manual(root)?,
         (None, true) => SearchToolsService::new_unbound(),
         (None, false) => SearchToolsService::new_unbound_manual(),
-    });
+    };
+    let service = match diff_snapshot_object_dir {
+        Some(dir) => service.with_diff_snapshot_object_dir(dir),
+        None => service,
+    };
+    let service = Arc::new(service);
     let mut connection = McpConnectionState::new(accepts_client_roots);
     let cancellations = McpRequestCancellations::default();
     let (response_sender, response_receiver) =
@@ -429,12 +450,18 @@ pub fn run_stdio_server_with_build_identity(
             for response in response_receiver {
                 if let Some(timing) = &response.timing {
                     profiling::duration(
-                        format!("mcp_request.response_queue_wait[{}]", timing.tool_name),
+                        format!(
+                            "mcp_request.response_queue_wait[{}][{}]",
+                            timing.tool_name, timing.request_correlation_id
+                        ),
                         timing.ready_at.elapsed(),
                     );
                 }
                 let _delivery_scope = response.timing.as_ref().map(|timing| {
-                    profiling::scope(format!("mcp_request.writer_delivery[{}]", timing.tool_name))
+                    profiling::scope(format!(
+                        "mcp_request.writer_delivery[{}][{}]",
+                        timing.tool_name, timing.request_correlation_id
+                    ))
                 });
                 let stale_error = response.stale_workspace_error(writer_service.as_ref());
                 let response_value = stale_error.as_ref().unwrap_or(&response.value);
@@ -699,15 +726,22 @@ where
     let spawn_result = thread::Builder::new()
         .name("bifrost-mcp-tool".to_string())
         .spawn(move || {
+            let request_correlation_id = request_correlation_id(&id);
             profiling::duration(
-                format!("mcp_request.queue_wait[{tool_name}]"),
+                format!("mcp_request.queue_wait[{tool_name}][{request_correlation_id}]"),
                 accepted_at.elapsed(),
             );
             on_worker_start();
             let response = {
-                let _execution_scope =
-                    profiling::scope(format!("mcp_request.execution[{tool_name}]"));
-                match execute_prepared_tool_call(service.as_ref(), call, Some(&cancellation)) {
+                let _execution_scope = profiling::scope(format!(
+                    "mcp_request.execution[{tool_name}][{request_correlation_id}]"
+                ));
+                match execute_prepared_tool_call_with_correlation(
+                    service.as_ref(),
+                    call,
+                    Some(&cancellation),
+                    Some(&request_correlation_id),
+                ) {
                     Ok(result) => success_response(id.clone(), result),
                     Err((code, message)) => error_response(id.clone(), code, message),
                 }
@@ -718,6 +752,7 @@ where
                     workspace_generation,
                     id.clone(),
                     tool_name,
+                    request_correlation_id,
                 ))
                 .is_err()
             {
@@ -1274,6 +1309,15 @@ fn execute_prepared_tool_call(
     call: PreparedToolCall,
     cancellation: Option<&CancellationToken>,
 ) -> Result<Value, (i64, String)> {
+    execute_prepared_tool_call_with_correlation(service, call, cancellation, None)
+}
+
+fn execute_prepared_tool_call_with_correlation(
+    service: &SearchToolsService,
+    call: PreparedToolCall,
+    cancellation: Option<&CancellationToken>,
+    request_correlation_id: Option<&str>,
+) -> Result<Value, (i64, String)> {
     let (name, render_options, output) = match call {
         #[cfg(test)]
         PreparedToolCall::QueryCode(prepared) => (
@@ -1310,6 +1354,11 @@ fn execute_prepared_tool_call(
             } else {
                 output
             };
+            let output = if name == "run_policy" {
+                attach_run_policy_correlation(output, request_correlation_id)
+            } else {
+                output
+            };
             Ok(tool_success_result(output))
         }
         Err(err) => {
@@ -1317,6 +1366,37 @@ fn execute_prepared_tool_call(
                 return Ok(tool_error_result(err.message));
             }
             Err(map_service_error(err.code, err.message))
+        }
+    }
+}
+
+pub(crate) fn attach_run_policy_correlation(
+    output: ToolOutput,
+    request_correlation_id: Option<&str>,
+) -> ToolOutput {
+    let Some(request_correlation_id) = request_correlation_id else {
+        return output;
+    };
+    match output {
+        ToolOutput::Structured {
+            mut structured,
+            rendered_text,
+        } => {
+            structured
+                .as_object_mut()
+                .expect("run_policy structured output must be an object")
+                .insert(
+                    "request_correlation_id".to_string(),
+                    Value::String(request_correlation_id.to_string()),
+                );
+            ToolOutput::Structured {
+                structured,
+                rendered_text,
+            }
+        }
+        output => {
+            debug_assert!(false, "run_policy output must be structured");
+            output
         }
     }
 }
@@ -1460,6 +1540,7 @@ fn map_service_error(code: SearchToolsServiceErrorCode, message: String) -> (i64
     let jsonrpc_code = match code {
         SearchToolsServiceErrorCode::InvalidParams => INVALID_PARAMS,
         SearchToolsServiceErrorCode::UnknownTool => METHOD_NOT_FOUND,
+        SearchToolsServiceErrorCode::DeadlineExceeded => INTERNAL_ERROR,
         SearchToolsServiceErrorCode::Internal => INTERNAL_ERROR,
     };
     (jsonrpc_code, message)
@@ -2754,6 +2835,7 @@ mod uri_tests {
             accepted_generation,
             request_id,
             "query_code".to_string(),
+            "sha256:test".to_string(),
         );
         let stale_error = response
             .stale_workspace_error(&service)
@@ -2951,7 +3033,7 @@ mod uri_tests {
         let service =
             SearchToolsService::new_manual_without_semantic_index(dir.path().to_path_buf())
                 .expect("service");
-        let prepared = service
+        let preparation = service
             .prepare_run_policy_with_cancellation(
                 json!({
                     "policy_files": ["policies/dynamic-eval.rqlp"],
@@ -2960,6 +3042,9 @@ mod uri_tests {
                 None,
             )
             .expect("prepare policy request");
+        let crate::searchtools_service::RunPolicyPreparation::Ready(prepared) = preparation else {
+            panic!("ready workspace should prepare policy evaluation");
+        };
         let cancellation = CancellationToken::default();
         cancellation.cancel();
 
@@ -2971,5 +3056,114 @@ mod uri_tests {
         .expect_err("pre-cancelled policy request must stop");
         assert_eq!(error.0, INTERNAL_ERROR);
         assert!(error.1.contains("policy evaluation cancelled"), "{error:?}");
+    }
+
+    #[test]
+    fn issue_1296_deadline_returns_structured_mcp_report_with_correlation() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("Policy.java"), "class Policy {}\n").expect("write source");
+        let service = Arc::new(
+            SearchToolsService::new_manual_without_semantic_index(dir.path().to_path_buf())
+                .expect("service"),
+        );
+        let spec = build_server_spec(
+            "test",
+            vec![json!({
+                "name": "run_policy",
+                "description": "test",
+                "inputSchema": { "type": "object" }
+            })],
+        )
+        .expect("server spec");
+        let message = json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "id": "issue-1296",
+            "method": "tools/call",
+            "params": {
+                "name": "run_policy",
+                "arguments": {
+                    "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
+                    "evaluation_date": "2026-07-31",
+                    "fail_on": "warning"
+                }
+            }
+        });
+        let (request_id, params) =
+            background_tool_request(&message, &spec).expect("run_policy runs in background");
+        let mut connection = McpConnectionState::new(false);
+        let call = match prepare_tool_call(
+            service.as_ref(),
+            &mut connection,
+            params,
+            McpRenderOptions::default(),
+            &spec,
+        )
+        .expect("prepare run_policy")
+        {
+            ToolCallPreparation::Ready(call) => call,
+            ToolCallPreparation::Reply(reply) => panic!("unexpected immediate reply: {reply}"),
+        };
+        let workspace_generation = call
+            .workspace_generation()
+            .expect("run_policy is workspace scoped");
+        let cancellations = McpRequestCancellations::default();
+        let cancellation = cancellations
+            .register_at(
+                &request_id,
+                workspace_generation,
+                service.workspace_generation(),
+                Instant::now() - MCP_ANALYZER_REQUEST_BUDGET,
+            )
+            .expect("request registers");
+        let (response_sender, response_receiver) = mpsc::sync_channel(1);
+
+        spawn_cancellable_tool_call(
+            service,
+            *call,
+            request_id,
+            cancellation,
+            cancellations,
+            response_sender,
+        )
+        .expect("background request starts");
+        let response = response_receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("background request responds");
+
+        assert!(response.value.get("error").is_none(), "{}", response.value);
+        let structured = &response.value["result"]["structuredContent"];
+        assert_eq!(structured["status"], "unreliable");
+        assert_eq!(structured["exit_status"], 2);
+        assert_eq!(structured["report"]["schema_version"], 2);
+        assert_eq!(
+            structured["report"]["execution"]["termination"],
+            "deadline_exceeded"
+        );
+        assert_eq!(
+            structured["request_correlation_id"],
+            request_correlation_id(&json!("issue-1296"))
+        );
+        assert!(
+            response.value["result"]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("request_correlation_id")),
+            "{}",
+            response.value
+        );
+    }
+
+    #[test]
+    fn oversized_request_ids_produce_bounded_log_safe_correlation_ids() {
+        let first = request_correlation_id(&Value::String("x".repeat(1024 * 1024)));
+        let second = request_correlation_id(&Value::String("y".repeat(1024 * 1024)));
+
+        assert_eq!(first.len(), "sha256:".len() + 64);
+        assert!(first.starts_with("sha256:"));
+        assert!(
+            first["sha256:".len()..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        );
+        assert_ne!(first, second);
     }
 }

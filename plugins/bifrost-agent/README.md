@@ -123,7 +123,7 @@ pi install "$(pwd)"
 After `@brokk/bifrost-agent` is published to npm, install a pinned release with:
 
 ```bash
-pi install npm:@brokk/bifrost-agent@0.8.16
+pi install npm:@brokk/bifrost-agent@0.8.17
 ```
 
 Run `/bifrost` in Pi's interactive TUI to configure Bifrost for the current
@@ -406,11 +406,12 @@ To publish publicly, submit the repository URL at
 
 ## Antigravity Install and Local Testing
 
-Antigravity 2.2.1 can load Bifrost through a manual MCP entry in
-`~/.gemini/config/mcp_config.json`. The visible **Add MCP** flow is a curated
-marketplace, but the local config file accepts the standard `mcpServers` shape:
-see Antigravity's official [MCP](https://antigravity.google/docs/mcp)
-documentation for the host-side convention.
+Antigravity can load Bifrost through manual MCP configuration. The visible
+**Add MCP** flow is a curated marketplace, but Antigravity accepts the standard
+`mcpServers` shape in global `~/.gemini/config/mcp_config.json` and
+workspace-local `.agents/mcp_config.json` files. See Antigravity's official
+[MCP](https://antigravity.google/docs/mcp) documentation for the host-side
+convention.
 
 ```json
 {
@@ -428,8 +429,33 @@ documentation for the host-side convention.
 }
 ```
 
-Restart Antigravity or click **Refresh** in **Settings -> Customizations**. The
-tested app showed `bifrost` with 21 enabled tools after reading this file.
+This global entry is suitable only for one fixed workspace: it does not follow
+Antigravity's active Project or Git worktree. For worktrees, add a separate
+uncommitted `.agents/mcp_config.json` in each worktree. Set `cwd` to that
+worktree's absolute path and pass `--root .`, for example:
+
+```json
+{
+  "mcpServers": {
+    "bifrost": {
+      "command": "/absolute/path/to/bifrost",
+      "cwd": "/absolute/path/to/this/worktree",
+      "args": ["--root", ".", "--mcp", "symbol|extended"]
+    }
+  }
+}
+```
+
+Bifrost requires that explicit binding because Antigravity does not currently
+provide a dynamic MCP workspace root. Do not use the installed plugin
+directory, the process CWD, or the selected Project as an inferred root. A
+per-worktree installer may derive the path with `git rev-parse --show-toplevel`,
+but it must merge only Bifrost's entry and leave every other MCP server intact.
+
+Click **Refresh** in **Settings -> Customizations** after creating or changing
+the file. Refresh normally reloads the MCP connection without restarting the
+whole application; use a fresh conversation to validate its tool surface. If
+the app still displays an old root after Refresh, fully quit and reopen it.
 
 Antigravity documents skills under workspace and global skill directories; see
 the official [Skills](https://antigravity.google/docs/skills) documentation for

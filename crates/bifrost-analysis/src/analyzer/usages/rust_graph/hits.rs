@@ -86,7 +86,10 @@ fn record_token_tree_qualified_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
 fn record_scoped_identifier_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let in_use_declaration = has_ancestor_kind(node, "use_declaration");
-    if ctx.target_is_module || ctx.target_is_path_qualifier {
+    if ctx.target_is_module
+        || ctx.target_is_path_qualifier
+        || (in_use_declaration && node.kind() == "scoped_type_identifier")
+    {
         record_scoped_target_segment_hit(node, in_use_declaration, ctx);
         return;
     }

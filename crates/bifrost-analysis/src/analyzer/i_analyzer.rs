@@ -3,11 +3,11 @@ use crate::analyzer::store::StoreError;
 use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder};
 use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
-    DeclarationInfo, ExceptionHandlingSmell, ExceptionSmellWeights, GlobalUsageDefinitionIndex,
+    DeclarationInfo, ExceptionHandlingAnalysis, ExceptionSmellWeights, GlobalUsageDefinitionIndex,
     ImportAnalysisProvider, Language, ParseError, Project, ProjectFile, Range,
     SearchSymbolCandidate, SemanticDiagnostic, SignatureMetadata, SummaryFileProjection,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TypeAliasProvider,
-    TypeHierarchyProvider, UsageFactsIndex, metrics_from_declarations,
+    TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TypeAliasProvider, TypeHierarchyProvider, UsageFactsIndex, metrics_from_declarations,
 };
 use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use std::any::Any;
@@ -857,15 +857,14 @@ pub trait IAnalyzer: Send + Sync + Any {
     }
 
     /// Detect suspicious exception-handling sites in `file` using `weights`.
-    /// Default is an empty vector so analyzers without a port of the
-    /// heuristic stay silent. Mirrors brokk-shared
-    /// `IAnalyzer.findExceptionHandlingSmells`.
+    /// Analyzers without an implementation return an explicit unsupported
+    /// result so callers cannot mistake missing semantics for a clean file.
     fn find_exception_handling_smells(
         &self,
-        _file: &ProjectFile,
-        _weights: ExceptionSmellWeights,
-    ) -> Vec<ExceptionHandlingSmell> {
-        Vec::new()
+        file: &ProjectFile,
+        weights: ExceptionSmellWeights,
+    ) -> ExceptionHandlingAnalysis {
+        crate::analyzer::exception_handling::analyze_for_file(self, file, weights)
     }
 
     /// Detect suspicious low-value or brittle test assertions in `file`
@@ -877,6 +876,22 @@ pub trait IAnalyzer: Send + Sync + Any {
         _weights: TestAssertionWeights,
     ) -> Vec<TestAssertionSmell> {
         Vec::new()
+    }
+
+    /// Detect assertion-smell candidates with an optional work budget.
+    /// Structured bounded implementations should override this method. The
+    /// default preserves complete legacy analysis without candidate accounting.
+    fn find_test_assertion_smells_limited(
+        &self,
+        file: &ProjectFile,
+        weights: TestAssertionWeights,
+        _max_candidates: usize,
+    ) -> TestAssertionAnalysis {
+        TestAssertionAnalysis {
+            findings: self.find_test_assertion_smells(file, weights),
+            inspected_candidates: None,
+            truncated: false,
+        }
     }
 
     fn find_structural_clone_smells(

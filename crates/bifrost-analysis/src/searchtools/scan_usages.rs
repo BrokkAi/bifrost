@@ -2483,11 +2483,11 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         );
     }
     {
-        // One JVM realm, several resolvers: Java, Scala, and Kotlin
-        // declarations share one candidate space, so both builders run over the
-        // same fqn set and merge into it. Each resolver only scans files of its
-        // own language, so the passes cover disjoint call sites and cannot
-        // double count. Kotlin's own builder arrives with #1239.
+        // One JVM realm, three resolvers: Java, Scala, and Kotlin declarations
+        // share one candidate space, so all three builders run over the same fqn
+        // set and merge into it. Each resolver only scans files of its own
+        // language, so the passes cover disjoint call sites and cannot double
+        // count.
         let _scope = profiling::scope("usage_graph::resolve_jvm");
         let java_edges = crate::analyzer::usages::java_graph::build_java_usage_edges(
             analyzer,
@@ -2508,6 +2508,17 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         record_inverted(
             UsageEcosystem::Jvm,
             scala_edges,
+            &mut edge_sites,
+            &mut truncated_symbols,
+        );
+        let kotlin_edges = crate::analyzer::usages::kotlin_graph::build_kotlin_usage_edges(
+            analyzer,
+            catalog.fqns(UsageEcosystem::Jvm),
+            keep_file,
+        );
+        record_inverted(
+            UsageEcosystem::Jvm,
+            kotlin_edges,
             &mut edge_sites,
             &mut truncated_symbols,
         );

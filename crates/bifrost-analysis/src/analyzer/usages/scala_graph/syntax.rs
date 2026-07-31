@@ -62,6 +62,7 @@ pub(crate) enum ScalaParameterTypeIdentity {
     Builtin(&'static str),
     Declaration(CodeUnit),
     TypeParameter(String),
+    Unresolved(Vec<String>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -866,6 +867,14 @@ impl ScalaPackageContextIndex {
         }
         &self.segments[*cursor].prefixes
     }
+
+    pub(crate) fn prefixes_at(&self, byte: usize) -> &[String] {
+        let index = self
+            .segments
+            .partition_point(|segment| segment.start_byte <= byte)
+            .saturating_sub(1);
+        &self.segments[index].prefixes
+    }
 }
 
 pub(crate) fn scala_import_is_visible_at_byte(import: &ImportInfo, byte: usize) -> bool {
@@ -1469,6 +1478,55 @@ pub(crate) fn stable_identifier_prefix_reference<'tree>(
     }
 }
 
+/// Return the parser-backed stable type path ending at an intermediate
+/// qualifier. For example, visiting `ReferenceOr` in
+/// `OpenAPI.ReferenceOr.Or[Int]` yields `[OpenAPI, ReferenceOr]`.
+pub(crate) fn stable_type_prefix_reference<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<ScalaStableIdentifierReference> {
+    let mut stable = node
+        .parent()
+        .filter(|parent| parent.kind() == "stable_type_identifier")?;
+    while let Some(parent) = stable
+        .parent()
+        .filter(|parent| parent.kind() == "stable_type_identifier")
+    {
+        let mut cursor = parent.walk();
+        if parent.named_children(&mut cursor).last() != Some(stable) {
+            break;
+        }
+        stable = parent;
+    }
+
+    let mut leaves = Vec::new();
+    let mut stack = vec![stable];
+    while let Some(current) = stack.pop() {
+        if matches!(current.kind(), "identifier" | "type_identifier") {
+            leaves.push(current);
+            continue;
+        }
+        if current.kind() != "stable_type_identifier" {
+            return None;
+        }
+        for index in (0..current.named_child_count()).rev() {
+            stack.push(current.named_child(index)?);
+        }
+    }
+    let node_index = leaves.iter().position(|leaf| *leaf == node)?;
+    if node_index == 0 || node_index + 1 >= leaves.len() {
+        return None;
+    }
+    let segments = leaves[..=node_index]
+        .iter()
+        .map(|leaf| node_text(*leaf, source).trim().to_string())
+        .collect::<Vec<_>>();
+    if segments.iter().any(String::is_empty) {
+        return None;
+    }
+    Some(ScalaStableIdentifierReference { segments })
+}
+
 /// Return the parser-backed stable field path whose terminal leaf is an
 /// intermediate qualifier of a longer selection. For example, visiting `Sink`
 /// in `scaladsl.Sink.foreachAsync` yields `[scaladsl, Sink]`. Requiring the
@@ -1541,6 +1599,35 @@ pub(crate) fn is_field_expression_value(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
         parent.kind() == "field_expression" && parent.child_by_field_name("value") == Some(node)
     })
+}
+
+pub(crate) fn is_qualified_stable_root(node: Node<'_>) -> bool {
+    if is_field_expression_value(node) {
+        return true;
+    }
+    let Some(mut path) = node.parent().filter(|parent| {
+        matches!(
+            parent.kind(),
+            "stable_identifier" | "stable_type_identifier"
+        )
+    }) else {
+        return false;
+    };
+    loop {
+        let Some(first) = path.named_child(0) else {
+            return false;
+        };
+        if matches!(
+            first.kind(),
+            "identifier" | "operator_identifier" | "type_identifier"
+        ) {
+            return first == node;
+        }
+        if !matches!(first.kind(), "stable_identifier" | "stable_type_identifier") {
+            return false;
+        }
+        path = first;
+    }
 }
 
 pub(crate) fn is_constructor_like_reference(node: Node<'_>, source: &str) -> bool {

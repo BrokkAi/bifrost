@@ -15,7 +15,7 @@ More complex static analysis runs on demand when a tool call needs it. Results c
 
 ## Language Coverage
 
-Bifrost includes analyzers for Java, JavaScript, TypeScript, Rust, Go, Python, C, C++, C#, PHP, Scala, and Ruby.
+Bifrost includes analyzers for Java, JavaScript, TypeScript, Rust, Go, Python, C, C++, C#, PHP, Scala, Ruby, and Kotlin.
 
 Bifrost uses Tree-sitter parsers as the common syntax foundation across those
 languages. The parsed trees are adapted into reusable analyzer concepts where

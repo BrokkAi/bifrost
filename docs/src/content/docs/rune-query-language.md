@@ -17,7 +17,7 @@ RQL is only a query language. It is not a second matcher or query engine.
 
 Every RQL expression lowers into [JSON `CodeQuery`](/code-query-json/) before validation and execution. MCP hosts with `query_code` call the same engine using canonical JSON inline, or they can load a complete saved `.rql` file through the exclusive `query_file` argument. MCP does not accept raw inline RQL, and the `core` toolset does not expose `query_code`; use `symbol|extended` or `searchtools`. See [MCP query and RQL availability](/mcp/#query-and-rql-availability) for the complete surface matrix and [Code Querying](/code-querying/) for the schema and engine overview.
 
-RQL omits a schema version by default and therefore targets the compatible head, currently CodeQuery schema version 6. Use a root `:schema-version 2` option for the pre-CFG vocabulary, `:schema-version 3` for CFG without typestate, `:schema-version 4` for typestate, or `:schema-version 5` for declaration-bounded containment without value flow; explicit older versions reject later forms.
+RQL omits a schema version by default and therefore targets the compatible head, currently CodeQuery schema version 7. Use a root `:schema-version 2` through `:schema-version 6` option to pin an earlier vocabulary; explicit older versions reject later forms.
 
 Save a complete RQL expression in a workspace `.rql` file and run it without opening the REPL:
 
@@ -203,6 +203,15 @@ Schema v6 adds `(value-flow :plan-ref namespace:name query)`, mapping procedure 
   (value-flow :plan-ref "embedding:request-to-sink"
     (procedure-of (method :name "run"))))
 ```
+
+Schema v7 adds `(taint :taint-ref namespace:name query)`. It maps exact procedure rows to `taint_finding` rows by projecting an immutable production result already registered by the host:
+
+```lisp
+(taint :taint-ref "request:http-to-database"
+  (procedure-of (method :name "run")))
+```
+
+The form cannot load or compile policies, invoke propagation, reconstruct witnesses, or add classification. With matching limits its rows are field-for-field equal to the production outcome's public taint findings.
 
 ## Registered Typestate Findings and Witnesses
 

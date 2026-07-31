@@ -10,16 +10,18 @@ mod semantic;
 pub(crate) mod structural;
 mod tests;
 
-use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
+use crate::analyzer::clone_detection::{
+    CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
+};
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BuildProgressEvent, BulkFileStateSource,
     CallableArity, CloneSmell, CloneSmellWeights, CodeUnit, CommentDensityStats, DeclarationInfo,
-    DeclarationKind, ExceptionHandlingSmell, ExceptionSmellWeights, IAnalyzer,
-    ImportAnalysisProvider, Language, Project, ProjectFile, SignatureMetadata, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
-    UsageFactsIndex,
+    DeclarationKind, ExceptionHandlingAnalysis, ExceptionHandlingSmell, ExceptionSmellWeights,
+    IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile, SignatureMetadata,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
+    TypeHierarchyProvider, UsageFactsIndex,
 };
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
@@ -29,7 +31,7 @@ use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
 pub(crate) use adapter::JavaAdapter;
 use cache::JavaMemoCaches;
-use clones::{build_clone_candidate_data, refine_java_clone_similarity};
+use clones::build_clone_candidate_data;
 use comments::{build_java_roll_up_stats, collect_java_comment_aggregates};
 use declarations::{
     collect_type_identifiers, find_nearest_declaration_from_node, is_comment_node,
@@ -667,14 +669,29 @@ impl IAnalyzer for JavaAnalyzer {
         &self,
         file: &ProjectFile,
         weights: ExceptionSmellWeights,
-    ) -> Vec<ExceptionHandlingSmell> {
+    ) -> ExceptionHandlingAnalysis {
         if file_language(file) != Language::Java {
-            return Vec::new();
+            return ExceptionHandlingAnalysis::Unsupported {
+                reason: format!(
+                    "Java exception semantics do not apply to {}",
+                    file.rel_path().display()
+                ),
+            };
         }
-        let Ok(source) = self.inner.project().read_source(file) else {
-            return Vec::new();
+        let source = match self.inner.project().read_source(file) {
+            Ok(source) => source,
+            Err(error) => {
+                return ExceptionHandlingAnalysis::Failed {
+                    message: format!("failed to read {}: {error}", file.rel_path().display()),
+                };
+            }
         };
-        detect_exception_handling_smells_java(self, file, &source, &weights)
+        match detect_exception_handling_smells_java(self, file, &source, &weights) {
+            Some(findings) => ExceptionHandlingAnalysis::Analyzed(findings),
+            None => ExceptionHandlingAnalysis::Failed {
+                message: format!("failed to parse {}", file.rel_path().display()),
+            },
+        }
     }
 
     fn find_test_assertion_smells(
@@ -730,7 +747,7 @@ impl IAnalyzer for JavaAnalyzer {
             &requested_files,
             all_candidates,
             weights,
-            refine_java_clone_similarity,
+            refine_clone_similarity_with_ast,
         )
     }
 }

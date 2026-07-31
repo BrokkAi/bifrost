@@ -2200,7 +2200,7 @@ where
     where
         P: DistributiveDataflowProblem<Fact = Fact>,
     {
-        let quality = if exit.has_return_affecting_gaps() {
+        let quality = if exit.has_matched_return_affecting_gaps() {
             predecessor_quality.conjoin(PathQuality::UNPROVEN_PARTIAL)
         } else {
             predecessor_quality

@@ -9638,6 +9638,70 @@ fn consume(_: QuicStream) {}
 }
 
 #[test]
+fn rust_nested_grouped_self_import_keeps_module_namespace_exact() {
+    let consumer = r#"
+    use super::{
+        quic_config,
+        quic_stream::{self, QuicStream},
+    };
+
+    fn consume(_: QuicStream) {
+        let _ = quic_stream::DOQ_ALPN;
+        quic_config::configure();
+    }
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod quic;\n"),
+        (
+            "src/quic/mod.rs",
+            "pub mod quic_config;\npub mod quic_stream;\nmod quic_server;\nfn quic_stream() {}\n",
+        ),
+        ("src/quic/quic_config.rs", "pub fn configure() {}\n"),
+        (
+            "src/quic/quic_stream.rs",
+            "pub struct QuicStream;\npub const DOQ_ALPN: &[u8] = b\"doq\";\n",
+        ),
+        ("src/quic/quic_server.rs", consumer),
+    ]);
+    let module_target = analyzer
+        .get_definitions("quic.quic_stream")
+        .into_iter()
+        .find(CodeUnit::is_module)
+        .expect("quic_stream module");
+    let value_target = analyzer
+        .get_definitions("quic.quic_stream")
+        .into_iter()
+        .find(CodeUnit::is_function)
+        .expect("quic_stream function");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[module_target])
+        .all_hits_including_imports();
+    let expected = consumer
+        .find("quic_stream::{self")
+        .expect("nested grouped self import module path")
+        + "quic_stream::{".len();
+    let value_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[value_target])
+        .all_hits_including_imports();
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/quic/quic_server.rs")
+                && hit.start_offset == expected
+                && hit.end_offset == expected + "self".len()
+                && hit.kind == UsageHitKind::Import
+        }),
+        "expected exact nested grouped self module-prefix import hit: {hits:#?}"
+    );
+    assert!(
+        value_hits.iter().all(|hit| {
+            hit.file != project.file("src/quic/quic_server.rs") || hit.start_offset != expected
+        }),
+        "same-spelled value namespace must not capture nested grouped self import: {value_hits:#?}"
+    );
+}
+
+#[test]
 fn rust_grouped_same_crate_use_prefix_keeps_module_namespace_exact() {
     let source = r#"
 mod error {
@@ -9680,6 +9744,219 @@ fn consume(_: ApiResult, _: OtherApiResult) {}
         hits.iter()
             .all(|hit| { hit.file != project.file("src/lib.rs") || hit.start_offset != unrelated }),
         "unrelated grouped module prefix must stay unmatched: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_macro_token_tree_imported_uppercase_free_function_call_stays_exact() {
+    let source = r#"
+mod api {
+    pub struct FQDN {
+        raw: String,
+    }
+
+    #[allow(non_snake_case)]
+    pub fn FQDN(input: &str) -> FQDN {
+        FQDN {
+            raw: input.to_string(),
+        }
+    }
+}
+
+macro_rules! wrap {
+    ($value:expr) => { $value };
+}
+
+use crate::api::FQDN;
+
+pub fn run() {
+    let _ = wrap!(FQDN("example.testing."));
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let function_target = analyzer
+        .get_definitions("api.FQDN")
+        .into_iter()
+        .find(CodeUnit::is_function)
+        .expect("uppercase function target");
+    let type_target = analyzer
+        .get_definitions("api.FQDN")
+        .into_iter()
+        .find(CodeUnit::is_class)
+        .expect("same-named type target");
+
+    let function_hits = authoritative_hits(
+        &analyzer,
+        &function_target,
+        [project.file("src/lib.rs")].into_iter().collect(),
+    );
+    let expected = source
+        .find("FQDN(\"example.testing.\")")
+        .expect("macro token-tree uppercase call");
+    let type_hits = authoritative_hits(
+        &analyzer,
+        &type_target,
+        [project.file("src/lib.rs")].into_iter().collect(),
+    );
+
+    assert!(
+        function_hits
+            .iter()
+            .any(|hit| hit.file == project.file("src/lib.rs") && hit.start_offset == expected),
+        "expected exact macro token-tree uppercase function call: {function_hits:#?}"
+    );
+    assert!(
+        type_hits
+            .iter()
+            .all(|hit| hit.file != project.file("src/lib.rs") || hit.start_offset != expected),
+        "same-named type must not capture the macro token-tree call: {type_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_macro_token_tree_prefers_same_module_function_over_imported_module_name() {
+    let source = r#"
+mod tests {
+    use std::cmp;
+
+    macro_rules! wrap {
+        ($value:expr) => { $value };
+    }
+
+    fn cmp(a: i32, b: i32) -> cmp::Ordering {
+        a.cmp(&b)
+    }
+
+    pub fn run() {
+        let _ = wrap!(cmp(1, 2));
+    }
+}
+
+mod other {
+    pub fn cmp(_: i32, _: i32) {}
+}
+"#;
+    let (_project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let local_target = definition(&analyzer, "tests.cmp");
+    let other_target = definition(&analyzer, "other.cmp");
+
+    let local_hits = rust_graph_hits_for_target(&analyzer, local_target);
+    let other_hits = rust_graph_hits_for_target(&analyzer, other_target);
+
+    assert!(
+        local_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("cmp(1, 2)")),
+        "expected the same-module macro token-tree cmp() call to resolve locally: {local_hits:#?}"
+    );
+    assert!(
+        other_hits.is_empty(),
+        "same-named function in another module must stay unmatched: {other_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_macro_token_tree_tuple_constructor_beats_same_named_enum_variant() {
+    let source = r#"
+mod types {
+    pub struct PTR(pub u8);
+}
+
+use types::PTR;
+
+enum RData {
+    PTR(PTR),
+}
+
+fn run() {
+    let _ = vec![RData::PTR(PTR(1))];
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let file = project.file("src/lib.rs");
+    let constructor = definition(&analyzer, "types.PTR");
+    let variant = member(&analyzer, &file, "RData", "PTR");
+    let inner = source
+        .find("PTR(1)")
+        .expect("tuple constructor inside vec token tree");
+
+    let constructor_hits = authoritative_hits(
+        &analyzer,
+        &constructor,
+        [file.clone()].into_iter().collect(),
+    );
+    assert!(
+        constructor_hits
+            .iter()
+            .any(|hit| hit.file == file && hit.start_offset == inner),
+        "the imported tuple constructor must own the inner macro-token call: {constructor_hits:#?}"
+    );
+
+    let variant_hits =
+        authoritative_hits(&analyzer, &variant, [file.clone()].into_iter().collect());
+    assert!(
+        variant_hits
+            .iter()
+            .all(|hit| hit.file != file || hit.start_offset != inner),
+        "the enclosing enum's same-named variant must not steal the constructor call: {variant_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_macro_token_tree_unqualified_local_enum_variant_pattern_stays_exact() {
+    let source = r#"
+enum ParseState {
+    Start { id: u8 },
+}
+
+enum OtherState {
+    Start { id: u8 },
+}
+
+use ParseState::*;
+
+fn run(state: ParseState, other: OtherState) {
+    let _ = matches!(state, Start { .. });
+    let _ = matches!(other, OtherState::Start { .. });
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let target = member(
+        &analyzer,
+        &project.file("src/lib.rs"),
+        "ParseState",
+        "Start",
+    );
+    let other_target = member(
+        &analyzer,
+        &project.file("src/lib.rs"),
+        "OtherState",
+        "Start",
+    );
+    let hits = authoritative_hits(
+        &analyzer,
+        &target,
+        [project.file("src/lib.rs")].into_iter().collect(),
+    );
+    let expected = source
+        .find("Start { .. })")
+        .expect("unqualified local enum variant token-tree pattern");
+    let other_hits = authoritative_hits(
+        &analyzer,
+        &other_target,
+        [project.file("src/lib.rs")].into_iter().collect(),
+    );
+
+    assert!(
+        hits.iter()
+            .any(|hit| { hit.file == project.file("src/lib.rs") && hit.start_offset == expected }),
+        "expected exact local enum-variant pattern hit inside macro token tree: {hits:#?}"
+    );
+    assert!(
+        other_hits
+            .iter()
+            .all(|hit| hit.file != project.file("src/lib.rs") || hit.start_offset != expected),
+        "same-named sibling enum variant must stay unmatched: {other_hits:#?}"
     );
 }
 
@@ -9832,6 +10109,68 @@ fn consume(_: CommitActivityDraft) {}
             .iter()
             .all(|hit| hit.file != project.file("src/lib.rs") || hit.start_offset != expected),
         "same-spelled value namespace must not capture the re-export: {value_hits:#?}"
+    );
+}
+
+#[test]
+fn rust_grouped_pub_use_scoped_type_terminal_keeps_exact_identity() {
+    let source = r#"
+mod dispatch;
+mod hostname;
+pub use crate::{
+    dispatch::DispatchConfig,
+    hostname::{DispatchConfig as OtherDispatchConfig, HostNameState},
+};
+
+fn consume(_: DispatchConfig, _: OtherDispatchConfig, _: HostNameState) {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "rust/Cargo.toml",
+            "[workspace]\nresolver = \"2\"\nmembers = [\"src/lib\"]\n",
+        ),
+        (
+            "rust/src/lib/Cargo.toml",
+            "[package]\nname = \"nmstate\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\npath = \"lib.rs\"\n",
+        ),
+        ("rust/src/lib/lib.rs", source),
+        ("rust/src/lib/dispatch.rs", "pub struct DispatchConfig;\n"),
+        (
+            "rust/src/lib/hostname.rs",
+            "pub struct HostNameState;\npub struct DispatchConfig;\n",
+        ),
+    ]);
+    let target = definition(&analyzer, "rust.src.lib.dispatch.DispatchConfig");
+    let hits = authoritative_hits(
+        &analyzer,
+        &target,
+        HashSet::from_iter([project.file("rust/src/lib/lib.rs")]),
+    );
+    let expected = source
+        .find("dispatch::DispatchConfig")
+        .expect("grouped public re-export terminal")
+        + "dispatch::".len();
+    let unrelated = source
+        .find("hostname::{DispatchConfig")
+        .expect("same-named sibling public re-export")
+        + "hostname::{".len();
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("rust/src/lib/lib.rs")
+                && (hit.start_offset, hit.end_offset)
+                    == (expected, expected + "DispatchConfig".len())
+                && hit.kind == UsageHitKind::Import
+        }),
+        "grouped public re-export must retain the physical type terminal: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            hit.file != project.file("rust/src/lib/lib.rs")
+                || (hit.start_offset, hit.end_offset)
+                    != (unrelated, unrelated + "DispatchConfig".len())
+        }),
+        "same-named grouped sibling re-export must remain unrelated: {hits:#?}"
     );
 }
 
@@ -11174,60 +11513,101 @@ fn backward(checkpointer: &mut Checkpointer, state: usize) {
 #[test]
 fn rust_graph_associated_paths_keep_owner_type_hits() {
     let consumer = r#"
-use burn_std::distribution::Distribution;
-use hickory_proto::op::ResponseCode;
+use burn_core as burn;
+use burn_std::{bf16, f16};
 
-fn build() {
-    let _ = Distribution::Default;
-    let _ = ResponseCode::NXDomain;
+fn takes(_f: fn(&f16) -> f32) {}
+fn takes_bf16(_f: fn(&bf16) -> f32) {}
+
+fn sort() {
+    takes(f16::to_f32);
+    takes_bf16(bf16::to_f32);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::decoy::Distribution as OtherDistribution;
+    use burn::tensor::Distribution;
+    use burn::tensor::TensorData;
+    use burn::tensor::Tolerance;
+
+    fn build() {
+        let _ = Distribution::Default;
+        let _ = OtherDistribution::Default;
+        let _ = TensorData::zeros();
+        let _ = Tolerance::default();
+        takes(burn::tensor::f16::to_f32);
+    }
 }
 "#;
     let (project, analyzer) = rust_analyzer_with_files(&[
         (
             "Cargo.toml",
-            "[workspace]\nmembers = [\"burn-std\", \"hickory-proto\", \"app\"]\nresolver = \"2\"\n",
+            "[workspace]\nmembers = [\"crates/burn-std\", \"crates/burn-core\", \"crates/burn-nn\"]\nresolver = \"2\"\n",
         ),
         (
-            "burn-std/Cargo.toml",
+            "crates/burn-std/Cargo.toml",
             "[package]\nname = \"burn-std\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
         ),
-        ("burn-std/src/lib.rs", "pub mod distribution;\n"),
         (
-            "burn-std/src/distribution.rs",
+            "crates/burn-std/src/lib.rs",
+            "pub mod decoy;\npub mod distribution;\npub mod tensor;\npub use half::{bf16, f16};\nmod cast;\n",
+        ),
+        (
+            "crates/burn-std/src/decoy.rs",
             "pub enum Distribution { Default }\n",
         ),
         (
-            "hickory-proto/Cargo.toml",
-            "[package]\nname = \"hickory-proto\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        ),
-        ("hickory-proto/src/lib.rs", "pub mod op;\n"),
-        (
-            "hickory-proto/src/op.rs",
-            "pub enum ResponseCode { NXDomain }\n",
+            "crates/burn-std/src/distribution.rs",
+            "pub enum Distribution { Default }\n",
         ),
         (
-            "app/Cargo.toml",
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nburn_std = { package = \"burn-std\", path = \"../burn-std\" }\nhickory_proto = { package = \"hickory-proto\", path = \"../hickory-proto\" }\n",
+            "crates/burn-std/src/tensor.rs",
+            "pub struct TensorData;\nimpl TensorData { pub fn zeros() -> Self { Self } }\npub struct Tolerance;\nimpl Tolerance { pub fn default() -> Self { Self } }\n",
         ),
-        ("app/src/lib.rs", consumer),
+        (
+            "crates/burn-std/src/cast.rs",
+            "use crate::{bf16, f16};\npub trait ToElement { fn to_f32(&self) -> f32; }\nimpl ToElement for f16 { fn to_f32(&self) -> f32 { Self::to_f32(*self) } }\nimpl ToElement for bf16 { fn to_f32(&self) -> f32 { Self::to_f32(*self) } }\n",
+        ),
+        (
+            "crates/burn-core/Cargo.toml",
+            "[package]\nname = \"burn-core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nburn_std = { package = \"burn-std\", path = \"../burn-std\" }\n",
+        ),
+        (
+            "crates/burn-core/src/lib.rs",
+            "pub mod decoy {\n    pub use burn_std::decoy::Distribution;\n}\npub mod tensor {\n    pub use burn_std::distribution::Distribution;\n    pub use burn_std::tensor::{TensorData, Tolerance};\n}\n",
+        ),
+        (
+            "crates/burn-nn/Cargo.toml",
+            "[package]\nname = \"burn-nn\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nburn_core = { package = \"burn-core\", path = \"../burn-core\" }\nburn_std = { package = \"burn-std\", path = \"../burn-std\" }\n",
+        ),
+        ("crates/burn-nn/src/lib.rs", consumer),
     ]);
-    let candidate = project.file("app/src/lib.rs");
+    let candidate = project.file("crates/burn-nn/src/lib.rs");
     for (target_fqn, marker, owner_len) in [
         (
-            "burn-std.src.distribution.Distribution",
+            "crates.burn-std.src.distribution.Distribution",
             "Distribution::Default",
             "Distribution".len(),
         ),
         (
-            "hickory-proto.src.op.ResponseCode",
-            "ResponseCode::NXDomain",
-            "ResponseCode".len(),
+            "crates.burn-std.src.tensor.TensorData",
+            "TensorData::zeros",
+            "TensorData".len(),
+        ),
+        (
+            "crates.burn-std.src.tensor.Tolerance",
+            "Tolerance::default",
+            "Tolerance".len(),
         ),
     ] {
         let target = definition(&analyzer, target_fqn);
-        let hits = UsageFinder::new()
-            .find_usages_default(&analyzer, &[target])
-            .all_hits();
+        let hits = authoritative_hits(
+            &analyzer,
+            &target,
+            [candidate.clone()].into_iter().collect(),
+        );
         let expected = consumer.find(marker).expect("associated owner path");
 
         assert!(
@@ -11239,6 +11619,145 @@ fn build() {
             "associated value paths must retain an owner-type hit for {target_fqn}: {hits:#?}"
         );
     }
+
+    let f16_target = member(
+        &analyzer,
+        &project.file("crates/burn-std/src/cast.rs"),
+        "f16",
+        "to_f32",
+    );
+    let f16_hits = authoritative_hits(
+        &analyzer,
+        &f16_target,
+        [candidate.clone()].into_iter().collect(),
+    );
+    let f16_expected = consumer
+        .find("to_f32")
+        .expect("qualified function value terminal");
+    assert!(
+        f16_hits.iter().any(|hit| {
+            hit.file == candidate
+                && (hit.start_offset, hit.end_offset)
+                    == (f16_expected, f16_expected + "to_f32".len())
+                && hit.kind == UsageHitKind::Reference
+        }),
+        "re-exported associated function values must retain the terminal member hit: {f16_hits:#?}"
+    );
+    let bf16_decoy = consumer
+        .find("bf16::to_f32")
+        .expect("same-named trait member on a sibling implementer")
+        + "bf16::".len();
+    assert!(
+        f16_hits
+            .iter()
+            .all(|hit| hit.file != candidate || hit.start_offset != bf16_decoy),
+        "a same-named trait member on a sibling implementer must stay unrelated: {f16_hits:#?}"
+    );
+
+    let distribution_target =
+        definition(&analyzer, "crates.burn-std.src.distribution.Distribution");
+    let distribution_hits = authoritative_hits(
+        &analyzer,
+        &distribution_target,
+        [candidate.clone()].into_iter().collect(),
+    );
+    let decoy = consumer
+        .find("OtherDistribution::Default")
+        .expect("same-named sibling reexport");
+    assert!(
+        distribution_hits
+            .iter()
+            .all(|hit| hit.file != candidate || hit.start_offset != decoy),
+        "a same-named sibling reexport must not be attributed to the physical owner: {distribution_hits:#?}"
+    );
+
+    let tensor_target = definition(&analyzer, "crates.burn-core.src.tensor");
+    let tensor_hits = authoritative_hits(
+        &analyzer,
+        &tensor_target,
+        [candidate.clone()].into_iter().collect(),
+    );
+    let tensor_expected = consumer
+        .find("burn::tensor::Distribution")
+        .expect("facade module qualifier")
+        + "burn::".len();
+    assert!(
+        tensor_hits.iter().any(|hit| {
+            hit.file == candidate
+                && (hit.start_offset, hit.end_offset)
+                    == (tensor_expected, tensor_expected + "tensor".len())
+                && hit.kind == UsageHitKind::Import
+        }),
+        "a facade module qualifier inside an import must retain the module hit: {tensor_hits:#?}"
+    );
+}
+
+#[test]
+fn authoritative_rust_path_attribute_module_keeps_terminal_trait_import() {
+    let bench = r#"
+#[path = "common/mod.rs"]
+mod common;
+#[path = "other/mod.rs"]
+mod other;
+
+use common::BencherExt;
+use other::BencherExt as OtherBencherExt;
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/burn-backend-tests\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "crates/burn-backend-tests/Cargo.toml",
+            "[package]\nname = \"burn-backend-tests\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bench]]\nname = \"conv\"\npath = \"benches/conv.rs\"\nharness = false\n",
+        ),
+        (
+            "crates/burn-backend-tests/src/lib.rs",
+            "pub fn placeholder() {}\n",
+        ),
+        (
+            "crates/burn-backend-tests/benches/common/mod.rs",
+            "pub trait BencherExt {}\n",
+        ),
+        (
+            "crates/burn-backend-tests/benches/other/mod.rs",
+            "pub trait BencherExt {}\n",
+        ),
+        ("crates/burn-backend-tests/benches/conv.rs", bench),
+    ]);
+    let candidate = project.file("crates/burn-backend-tests/benches/conv.rs");
+    let target = definition(
+        &analyzer,
+        "crates.burn-backend-tests.benches.common.BencherExt",
+    );
+    let hits = authoritative_hits(
+        &analyzer,
+        &target,
+        [candidate.clone()].into_iter().collect(),
+    );
+    let expected = bench
+        .find("common::BencherExt")
+        .expect("path module trait import")
+        + "common::".len();
+    let decoy = bench
+        .find("other::BencherExt")
+        .expect("same-named sibling trait import")
+        + "other::".len();
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == candidate
+                && (hit.start_offset, hit.end_offset) == (expected, expected + "BencherExt".len())
+                && hit.kind == UsageHitKind::Import
+        }),
+        "a #[path] module must retain the terminal trait import: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file != candidate || hit.start_offset != decoy),
+        "a same-named trait from a sibling #[path] module must stay unrelated: {hits:#?}"
+    );
 }
 
 #[test]

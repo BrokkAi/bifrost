@@ -1,4 +1,4 @@
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, mem::size_of_val};
 
 use sha2::{Digest, Sha256};
 
@@ -111,6 +111,28 @@ impl TaintUniverse {
         &self.classes
     }
 
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(size_of_val(&*self.classes))
+            .saturating_add(
+                self.classes
+                    .iter()
+                    .map(|class| class.as_str().len())
+                    .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(
+                self.ids
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(SourceClassId, TaintClassId)>()),
+            )
+            .saturating_add(
+                self.ids
+                    .keys()
+                    .map(|class| class.as_str().len())
+                    .fold(0usize, usize::saturating_add),
+            )
+    }
+
     pub const fn hash(&self) -> TaintUniverseHash {
         self.hash
     }
@@ -194,6 +216,10 @@ impl TaintClassSet {
 
     pub const fn universe(&self) -> TaintUniverseHash {
         self.universe
+    }
+
+    pub(crate) fn retained_heap_bytes(&self) -> usize {
+        size_of_val(&*self.words)
     }
 
     pub(crate) fn empty_like(&self) -> Self {

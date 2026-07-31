@@ -54,6 +54,7 @@ export const RUNE_IR_SOURCE_LANGUAGE_IDS = [
   "csharp",
   "php",
   "scala",
+  "kotlin",
   "ruby"
 ] as const;
 

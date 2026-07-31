@@ -303,8 +303,22 @@ impl<'a> KotlinVisitor<'a> {
         // (`object Catalog : Shelver`) survives and an anonymous companion
         // renders as written. The `Companion` identity default above is a
         // name-resolution rule and must not leak into rendered source text.
-        self.parsed
-            .add_signature(code_unit.clone(), kotlin_class_signature(node, self.source));
+        let signature = kotlin_class_signature(node, self.source);
+        if companion {
+            // Companion-ness is not derivable from the indexed identity: a
+            // companion and an ordinary nested `object` are both nested classes,
+            // and the `Companion` name is a default a source file may override.
+            // Publishing it here is what lets the usage graphs answer
+            // "`Base.of()` and `Base.Companion.of()` are the same call" from the
+            // index rather than by re-parsing the declaring file once per callee
+            // owner.
+            self.parsed.add_signature_with_metadata(
+                code_unit.clone(),
+                SignatureMetadata::new(signature, Vec::new()).with_companion_object(true),
+            );
+        } else {
+            self.parsed.add_signature(code_unit.clone(), signature);
+        }
         self.record_supertypes(&code_unit, node);
 
         if let Some(body) = first_named_child(node, "class_body") {

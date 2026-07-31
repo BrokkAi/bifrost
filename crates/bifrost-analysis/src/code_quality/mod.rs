@@ -243,8 +243,8 @@ pub use dead_code_smells::{
     report_dead_code_and_unused_abstraction_smells,
 };
 pub use exception_smells::{
-    ReportExceptionHandlingSmellsParams, ReportExceptionHandlingSmellsResult,
-    report_exception_handling_smells,
+    ExceptionAnalysisNote, ReportExceptionHandlingSmellsParams,
+    ReportExceptionHandlingSmellsResult, report_exception_handling_smells,
 };
 pub use git_hotspots::{AnalyzeGitHotspotsParams, AnalyzeGitHotspotsResult, analyze_git_hotspots};
 pub use maintainability_size::{

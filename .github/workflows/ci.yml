@@ -102,7 +102,8 @@ jobs:
 
   lint:
     name: lint
-    needs: quick-policy
+    needs: [ci-impact, quick-policy]
+    if: needs.ci-impact.outputs.mode != 'docs'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -629,6 +630,7 @@ jobs:
     env:
       CI_IMPACT_RESULT: ${{ needs.ci-impact.result }}
       QUICK_POLICY_RESULT: ${{ needs.quick-policy.result }}
+      LINT_SELECTED: ${{ needs.ci-impact.outputs.mode != 'docs' }}
       LINT_RESULT: ${{ needs.lint.result }}
       DEPENDENCY_LICENSES_SELECTED: ${{ needs.ci-impact.outputs.dependency_licenses }}
       DEPENDENCY_LICENSES_RESULT: ${{ needs.dependency-licenses.result }}
@@ -688,7 +690,7 @@ jobs:
 
           check_result 'ci impact' true "$CI_IMPACT_RESULT"
           check_result 'quick policy' true "$QUICK_POLICY_RESULT"
-          check_result 'lint' true "$LINT_RESULT"
+          check_result 'lint' "$LINT_SELECTED" "$LINT_RESULT"
           check_result 'dependency licenses' "$DEPENDENCY_LICENSES_SELECTED" "$DEPENDENCY_LICENSES_RESULT"
           check_result 'crate package' "$CRATE_PACKAGE_SELECTED" "$CRATE_PACKAGE_RESULT"
           check_result 'RQL runtime' "$RQL_RUNTIME_SELECTED" "$RQL_RUNTIME_RESULT"

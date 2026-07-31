@@ -306,6 +306,17 @@ pub struct SignatureMetadata {
     extension_receiver_type_identity: Option<StructuredTypeIdentity>,
     #[serde(default)]
     extension_receiver_is_unconstrained_type_parameter: bool,
+    /// Whether this class-like declaration is a Kotlin `companion object`.
+    ///
+    /// A companion and an ordinary nested `object` are both nested classes, and
+    /// the `Companion` default name is a name-resolution rule a source file is
+    /// free to override, so companion-ness cannot be read off the declaration's
+    /// identity. Publishing it here is what lets a consumer ask "are this
+    /// owner's members reachable through the enclosing class's own name?"
+    /// without re-parsing the declaring file — the question the whole-workspace
+    /// usage-edge builder asks once per callee owner.
+    #[serde(default)]
+    companion_object: bool,
 }
 
 /// A parser-derived nominal type name, including the lexical scope in which an
@@ -1481,6 +1492,7 @@ impl SignatureMetadata {
             extension_receiver_type: None,
             extension_receiver_type_identity: None,
             extension_receiver_is_unconstrained_type_parameter: false,
+            companion_object: false,
         }
     }
 
@@ -1526,6 +1538,7 @@ impl SignatureMetadata {
             extension_receiver_type: None,
             extension_receiver_type_identity: None,
             extension_receiver_is_unconstrained_type_parameter: false,
+            companion_object: false,
         }
     }
 
@@ -1612,6 +1625,12 @@ impl SignatureMetadata {
         self
     }
 
+    /// Mark this as the signature of a Kotlin `companion object`.
+    pub fn with_companion_object(mut self, companion_object: bool) -> Self {
+        self.companion_object = companion_object;
+        self
+    }
+
     pub fn label(&self) -> &str {
         &self.label
     }
@@ -1666,6 +1685,11 @@ impl SignatureMetadata {
 
     pub const fn extension_receiver_is_unconstrained_type_parameter(&self) -> bool {
         self.extension_receiver_is_unconstrained_type_parameter
+    }
+
+    /// Whether this is the signature of a Kotlin `companion object`.
+    pub const fn is_companion_object(&self) -> bool {
+        self.companion_object
     }
 }
 
@@ -2267,6 +2291,15 @@ pub struct TestAssertionSmell {
     pub start_byte: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestAssertionAnalysis {
+    pub findings: Vec<TestAssertionSmell>,
+    /// Candidates consumed from an explicit work budget. `None` means the
+    /// analyzer preserves its legacy unbounded implementation.
+    pub inspected_candidates: Option<usize>,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloneSmellWeights {
     pub min_normalized_tokens: i32,
@@ -2359,6 +2392,16 @@ pub struct ExceptionHandlingSmell {
     /// Not surfaced in the markdown report — kept here so callers ranking or
     /// deduping can stay stable.
     pub start_byte: usize,
+}
+
+/// Capability-honest result of analyzing one file for exception-handling
+/// smells. An empty [`Self::Analyzed`] result is authoritative; unsupported
+/// semantics and analysis failures must never be represented as clean files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExceptionHandlingAnalysis {
+    Analyzed(Vec<ExceptionHandlingSmell>),
+    Unsupported { reason: String },
+    Failed { message: String },
 }
 
 impl Range {

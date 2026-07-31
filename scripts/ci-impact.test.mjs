@@ -20,11 +20,42 @@ test("unmapped paths conservatively select the full matrix", () => {
   assert.deepEqual(selected(decision), [...COMPONENTS].sort());
 });
 
-test("Cargo and workflow changes conservatively select the full matrix", () => {
-  for (const changedPaths of [fixture("cargo"), [".github/workflows/ci.yml"]]) {
+test("build, packaging, dependency, and workflow changes conservatively select the full matrix", () => {
+  for (const changedPaths of [
+    fixture("cargo"),
+    ["crates/bifrost-analysis/Cargo.toml"],
+    ["crates/bifrost-analysis/resources/treesitter/java/definitions.scm"],
+    ["schemas/semantic-model-pack-v1.schema.json"],
+    ["pyproject.toml"],
+    ["uv.lock"],
+    ["build.rs"],
+    [".github/workflows/ci.yml"],
+  ]) {
     const decision = classifyChangeSet({ eventName: "pull_request", changedPaths });
     assert.equal(decision.mode, "full");
   }
+});
+
+test("documentation-only changes select the docs baseline", () => {
+  const decision = classifyChangeSet({
+    eventName: "pull_request",
+    changedPaths: [
+      ".agents/plans/1387-antigravity-dynamic-workspace-plugin.md",
+      "docs/src/content/docs/antigravity.md",
+      "plugins/bifrost-agent/README.md",
+    ],
+  });
+  assert.equal(decision.mode, "docs");
+  assert.deepEqual(selected(decision), []);
+});
+
+test("documentation mixed with component changes retains component validation", () => {
+  const decision = classifyChangeSet({
+    eventName: "pull_request",
+    changedPaths: ["docs/src/content/docs/antigravity.md", "plugins/bifrost-agent/package.json"],
+  });
+  assert.equal(decision.mode, "impact");
+  assert.deepEqual(selected(decision), ["agent_plugin", "pi_package"]);
 });
 
 test("RQL changes select runtime, host, policy-pack, and editor coverage", () => {
@@ -56,6 +87,84 @@ test("runtime and individual host paths select their contracts", () => {
     ),
     ["lsp_contract", "rql_runtime"],
   );
+});
+
+test("ordinary analyzer and test changes select the Rust matrix only", () => {
+  const decision = classifyChangeSet({
+    eventName: "pull_request",
+    changedPaths: [
+      "crates/bifrost-analysis/src/analyzer/javascript/semantic.rs",
+      "tests/fixtures/testcode-js/FeaturesTest.jsx",
+      "tests/suite_analyzers/language_behavior.rs",
+    ],
+  });
+  assert.equal(decision.mode, "impact");
+  assert.deepEqual(selected(decision), ["rust"]);
+});
+
+test("Python package changes select Python validation without unrelated lanes", () => {
+  const decision = classifyChangeSet({
+    eventName: "pull_request",
+    changedPaths: [
+      "bifrost_searchtools/client.py",
+      "bifrost_searchtools/models.py",
+      "python_tests/test_searchtools_client.py",
+    ],
+  });
+  assert.equal(decision.mode, "impact");
+  assert.deepEqual(selected(decision), ["python"]);
+
+  assert.deepEqual(
+    selected(
+      classifyChangeSet({
+        eventName: "pull_request",
+        changedPaths: ["src/python_module.rs"],
+      }),
+    ),
+    ["python", "rust"],
+  );
+});
+
+test("external fixture changes retain provenance and Rust validation", () => {
+  const decision = classifyChangeSet({
+    eventName: "pull_request",
+    changedPaths: [
+      "scripts/verify-java-class-fixture.sh",
+      "tests/fixtures/testcode-java/A.java",
+    ],
+  });
+  assert.equal(decision.mode, "impact");
+  assert.deepEqual(selected(decision), ["external_fixture", "rust"]);
+});
+
+test("broad analyzer PRs avoid unrelated packaging and plugin lanes", () => {
+  const decision = classifyChangeSet({
+    eventName: "pull_request",
+    changedPaths: [
+      ".agents/plans/issue-1364-standalone-taint-codequery.md",
+      "bifrost_searchtools/client.py",
+      "crates/bifrost-analysis/src/analyzer/taint/client.rs",
+      "crates/bifrost-analysis/src/analyzer/policy/taint_policy.rs",
+      "crates/bifrost-mcp/src/mcp_extended.rs",
+      "crates/bifrost-runtime/src/code_intelligence.rs",
+      "docs/src/content/docs/code-querying.md",
+      "editors/vscode/syntaxes/bifrost-rql.tmLanguage.json",
+      "tests/fixtures/policies/dynamic-eval.normalized.json",
+      "tests/suite_bench_policy/taint_policy_adapter.rs",
+      "tests/suite_cross_language/code_query_docs.rs",
+      "tests/suite_mcp_cli/bifrost_tool_cli.rs",
+    ],
+  });
+  assert.equal(decision.mode, "impact");
+  assert.deepEqual(selected(decision), [
+    "lsp_contract",
+    "mcp_contract",
+    "policy_pack",
+    "python",
+    "rql_runtime",
+    "rust",
+    "vscode",
+  ]);
 });
 
 test("editor-only and plugin-only changes select only their Node checks", () => {

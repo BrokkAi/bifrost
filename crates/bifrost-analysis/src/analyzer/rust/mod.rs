@@ -1,6 +1,7 @@
 mod adapter;
 mod cache;
 mod cargo_routes;
+mod clones;
 mod declarations;
 mod diagnostics;
 pub(crate) mod field_roles;
@@ -13,12 +14,13 @@ pub(crate) mod structural;
 mod tests;
 mod usage_index;
 
+use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer,
-    ImportAnalysisProvider, Language, PoolSafeMemo, Project, ProjectFile, Range,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
+    IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo, Project, ProjectFile, Range,
     SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
 };
@@ -35,6 +37,7 @@ use cache::{
     weight_code_unit_set, weight_export_index, weight_project_file_set, weight_reference_context,
 };
 use cargo_routes::{RustCargoRouteIndex, RustCargoTargetRelation};
+use clones::build_rust_clone_candidate_data;
 use declarations::collect_rust_type_identifiers;
 pub(crate) use declarations::rust_package_name;
 pub use field_roles::rust_is_field_declaration_name;
@@ -711,6 +714,24 @@ impl IAnalyzer for RustAnalyzer {
 
     fn in_test_region(&self, code_unit: &crate::analyzer::CodeUnit) -> bool {
         self.inner.in_test_region(code_unit)
+    }
+
+    fn find_structural_clone_smells(
+        &self,
+        file: &ProjectFile,
+        weights: CloneSmellWeights,
+    ) -> Vec<CloneSmell> {
+        self.find_structural_clone_smells_for_files(std::slice::from_ref(file), weights)
+    }
+
+    fn find_structural_clone_smells_for_files(
+        &self,
+        files: &[ProjectFile],
+        weights: CloneSmellWeights,
+    ) -> Vec<CloneSmell> {
+        detect_language_structural_clone_smells(self, files, weights, Language::Rust, |code_unit| {
+            build_rust_clone_candidate_data(self, code_unit, weights)
+        })
     }
 
     fn find_test_assertion_smells(
