@@ -13,6 +13,10 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 use crate::CancellationToken;
+use crate::analyzer::semantic_model::{
+    SemanticModelActivationPersistence, SemanticModelActivationRequest,
+    SemanticModelRuntimeOutcome, SemanticPackCatalog, acquire_active_semantic_models,
+};
 use crate::analyzer::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
 use crate::schema_version::SchemaVersionOrigin;
 use crate::workspace_document::WorkspaceRoot;
@@ -378,6 +382,7 @@ pub fn evaluate_policy_inputs(
         PolicyRegistryLimits::default(),
         None,
         None,
+        None,
     )
 }
 
@@ -396,6 +401,36 @@ pub fn evaluate_policy_inputs_with_analyzer(
         PolicyBatchBudget::default(),
         PolicyRegistryLimits::default(),
         Some(workspace),
+        None,
+        cancellation,
+    )
+}
+
+/// Explicit semantic-pack authority for one analyzer-backed policy batch.
+#[derive(Clone, Copy)]
+pub struct PolicySemanticModelContext<'a> {
+    pub catalog: &'a SemanticPackCatalog,
+    pub request: &'a SemanticModelActivationRequest,
+    pub persistence: Option<SemanticModelActivationPersistence<'a>>,
+}
+
+/// Evaluate mixed policy inputs with one generation-cached semantic-model acquisition.
+pub fn evaluate_policy_inputs_with_analyzer_and_semantic_models(
+    root: impl AsRef<Path>,
+    policy_inputs: &[PolicyEvaluationInput],
+    workspace: &WorkspaceAnalyzer,
+    options: &PolicyEvaluationOptions,
+    semantic_models: PolicySemanticModelContext<'_>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
+    evaluate_policy_inputs_with_limits(
+        root.as_ref(),
+        policy_inputs,
+        options,
+        PolicyBatchBudget::default(),
+        PolicyRegistryLimits::default(),
+        Some(workspace),
+        Some(semantic_models),
         cancellation,
     )
 }
@@ -551,6 +586,7 @@ fn evaluate_policy_files_with_limits(
         registry_limits,
         None,
         None,
+        None,
     )
 }
 
@@ -562,6 +598,7 @@ fn evaluate_policy_inputs_with_limits(
     batch_budget: PolicyBatchBudget,
     registry_limits: PolicyRegistryLimits,
     supplied_workspace: Option<&WorkspaceAnalyzer>,
+    semantic_models: Option<PolicySemanticModelContext<'_>>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
     if policy_inputs.is_empty() {
@@ -596,6 +633,7 @@ fn evaluate_policy_inputs_with_limits(
         batch_budget,
         registry_limits,
         supplied_workspace,
+        semantic_models,
         cancellation,
     )
 }
@@ -609,6 +647,7 @@ fn evaluate_prepared_policy_inputs(
     batch_budget: PolicyBatchBudget,
     registry_limits: PolicyRegistryLimits,
     supplied_workspace: Option<&WorkspaceAnalyzer>,
+    semantic_models: Option<PolicySemanticModelContext<'_>>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
     let registration_started = Instant::now();
@@ -832,12 +871,43 @@ fn evaluate_prepared_policy_inputs(
 
     let mut runs = HashMap::with_capacity(runnable_ids.len());
     let workspace = supplied_workspace.or(owned_analyzer.as_ref());
+    let uncancelled = CancellationToken::default();
+    let semantic_cancellation = cancellation.unwrap_or(&uncancelled);
+    let active_semantic_models = match semantic_models {
+        None => Ok(None),
+        Some(context) => {
+            let workspace = workspace.ok_or_else(|| {
+                PolicyCoordinatorError::new(
+                    "semantic-model policy evaluation requires an analyzer snapshot",
+                )
+            })?;
+            match acquire_active_semantic_models(
+                workspace.analyzer(),
+                context.catalog,
+                context.persistence,
+                context.request,
+                semantic_cancellation,
+            ) {
+                SemanticModelRuntimeOutcome::Ready { active, .. } => Ok(Some(active)),
+                SemanticModelRuntimeOutcome::Incomplete { report, .. } => Err(format!(
+                    "semantic-model activation was incomplete: {report:?}"
+                )),
+                SemanticModelRuntimeOutcome::Cancelled(report) => Err(format!(
+                    "semantic-model activation was cancelled: {report:?}"
+                )),
+                SemanticModelRuntimeOutcome::Unavailable(report) => Err(format!(
+                    "semantic-model activation was unavailable: {report:?}"
+                )),
+            }
+        }
+    };
     let taint = workspace.map_or_else(ProductionTaintPolicyEvaluator::default, |workspace| {
         ProductionTaintPolicyEvaluator::prepare(
             registry
                 .policies()
                 .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id)),
             workspace,
+            active_semantic_models,
             cancellation,
             batch_budget.per_policy(),
         )

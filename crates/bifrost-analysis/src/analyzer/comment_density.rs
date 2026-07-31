@@ -132,6 +132,14 @@ fn collect_declarations(
         .map(|code_unit| (code_unit, 0, None))
         .collect();
     while let Some((code_unit, depth, parent)) = pending.pop() {
+        // A package/namespace unit reachable from this file can fan out to
+        // declarations in other files (Java package members). Their ranges are
+        // byte offsets into those files' sources, so containment checks
+        // against this file's comments are meaningless; skip them and their
+        // (equally foreign) subtrees.
+        if code_unit.source() != file {
+            continue;
+        }
         let raw_ranges = analyzer.ranges(&code_unit);
         let span_lines = raw_ranges
             .iter()

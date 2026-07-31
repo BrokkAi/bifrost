@@ -1,4 +1,4 @@
-use super::super::ids::SemanticLocator;
+use super::super::ids::{SemanticArtifactKey, SemanticLocator, SemanticRole};
 use super::super::ir::{CallSiteHandle, EvidenceCompleteness, ProcedureHandle, ProofStatus};
 use super::error::OracleContractError;
 use super::limits::OracleLimits;
@@ -99,6 +99,11 @@ impl DispatchCandidate {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DispatchBoundary {
     pub kind: DispatchBoundaryKind,
+    /// Exact resolver-owned metadata for a named procedure whose body is not
+    /// materialized in the workspace. This remains absent when dispatch lacks
+    /// any one of the exact artifact, declaration, symbol, receiver, or formal
+    /// parameter facts required to bind an external procedure summary.
+    pub exact_external_target: Option<ExactExternalProcedureTarget>,
     pub proof: ProofStatus,
     pub completeness: EvidenceCompleteness,
     pub provenance: Box<[OracleRelationHandle]>,
@@ -107,6 +112,10 @@ pub struct DispatchBoundary {
 impl DispatchBoundary {
     pub(crate) fn target_locator(&self) -> Option<&SemanticLocator> {
         self.kind.target_locator()
+    }
+
+    pub fn exact_external_target(&self) -> Option<&ExactExternalProcedureTarget> {
+        self.exact_external_target.as_ref()
     }
 
     /// Validate one retained boundary independently of the dispatch result
@@ -119,6 +128,21 @@ impl DispatchBoundary {
         &self,
         call: &CallSiteHandle,
     ) -> Result<(), OracleContractError> {
+        let exact_target_is_valid = match (&self.kind, &self.exact_external_target) {
+            (DispatchBoundaryKind::Unmaterialized(locator), Some(target)) => {
+                locator == target.procedure()
+                    && call
+                        .procedure()
+                        .semantics()
+                        .call_site(call.id())
+                        .is_some_and(|row| row.receiver.is_some() == target.has_receiver())
+            }
+            (_, None) => true,
+            _ => false,
+        };
+        if !exact_target_is_valid {
+            return Err(OracleContractError::InvalidRelationIdentity);
+        }
         let owner = OracleRelationOwner::Dispatch(call.clone());
         let Some(first) = self.provenance.first() else {
             return Err(OracleContractError::InvalidRelationIdentity);
@@ -142,6 +166,63 @@ impl DispatchBoundary {
             return Err(OracleContractError::InvalidRelationQuality);
         }
         Ok(())
+    }
+}
+
+/// Structured resolver output for one exact external procedure target.
+///
+/// The symbol and boundary shape are retained from analyzer metadata. Clients
+/// must not reconstruct them from the locator or source text.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExactExternalProcedureTarget {
+    artifact: SemanticArtifactKey,
+    procedure: SemanticLocator,
+    symbol: Box<str>,
+    has_receiver: bool,
+    parameter_count: u32,
+}
+
+impl ExactExternalProcedureTarget {
+    pub(crate) fn new(
+        artifact: SemanticArtifactKey,
+        procedure: SemanticLocator,
+        symbol: impl Into<Box<str>>,
+        has_receiver: bool,
+        parameter_count: u32,
+    ) -> Option<Self> {
+        let symbol = symbol.into();
+        (procedure.role() == SemanticRole::Procedure
+            && artifact.mount() == procedure.mount()
+            && artifact.path() == procedure.path()
+            && artifact.language() == procedure.language()
+            && !symbol.is_empty())
+        .then_some(Self {
+            artifact,
+            procedure,
+            symbol,
+            has_receiver,
+            parameter_count,
+        })
+    }
+
+    pub const fn artifact(&self) -> &SemanticArtifactKey {
+        &self.artifact
+    }
+
+    pub const fn procedure(&self) -> &SemanticLocator {
+        &self.procedure
+    }
+
+    pub fn symbol(&self) -> &str {
+        &self.symbol
+    }
+
+    pub const fn has_receiver(&self) -> bool {
+        self.has_receiver
+    }
+
+    pub const fn parameter_count(&self) -> u32 {
+        self.parameter_count
     }
 }
 

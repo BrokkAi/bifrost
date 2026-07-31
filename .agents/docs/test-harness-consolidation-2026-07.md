@@ -283,7 +283,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `value_flow_client`
 - `value_flow_language_conformance`
 
-### `suite_smells` (22 modules)
+### `suite_smells` (23 modules)
 
 - `cpp_dead_code_smells`
 - `cpp_structural_clone_smells`
@@ -292,6 +292,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `csharp_go_rust_test_assertion_smells`
 - `csharp_structural_clone_smells`
 - `go_dead_code_smells`
+- `java_comment_density`
 - `java_dead_code_smells`
 - `java_structural_clone_smells`
 - `java_test_assertion_smells`

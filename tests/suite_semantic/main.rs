@@ -54,6 +54,7 @@ mod semantic_language_conformance;
 mod semantic_model_docs;
 mod semantic_model_pack;
 mod semantic_model_runtime;
+mod semantic_model_summary_binding;
 mod semantic_oracle_contract;
 mod semantic_provider_contract;
 #[cfg(feature = "nlp")]
