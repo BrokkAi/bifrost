@@ -102,6 +102,14 @@ scenarios = [
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
+  "dead_code_smells",
+  "comment_density_files",
+  "comment_density_code_unit",
+  "exception_smells",
+  "test_assertion_smells",
+  "structural_clone_smells",
+  "long_method_smells",
+  "git_hotspots",
   "get_definition",
   "query_code",
 ]
@@ -110,6 +118,16 @@ location_symbols = ["gin.New"]
 summary_targets = ["gin.go"]
 seed_file_paths = ["gin.go"]
 usage_symbols = ["gin.New"]
+code_quality_probes = [
+  { scenario = "dead_code_smells", file_paths = ["deprecated.go"], fq_names = ["github.com/gin-gonic/gin.Context.BindWith"], expect_report_contains = ["Candidate symbols analyzed: 1", "| 8 | 0.45 | `function` | `github.com/gin-gonic/gin.Context.BindWith` | `deprecated.go:18-24` |"], expect_report_absent = ["no definition found", "not yet supported for smell analysis"] },
+  { scenario = "comment_density_files", file_paths = ["context.go", "gin.go", "tree.go", "routergroup.go", "utils.go"], expect_report_contains = ["### `context.go`", "| `github.com/gin-gonic/gin._module_.MIMEJSON` | 0 | 0 | 1 | 0 | 0 | 1 |"], expect_report_absent = ["(comment density unavailable; skipped)"] },
+  { scenario = "comment_density_code_unit", file_paths = ["gin.go"], fq_names = ["github.com/gin-gonic/gin.New"], expect_report_contains = ["- Symbol: `github.com/gin-gonic/gin.New`", "- Own: header 9, inline 0, span 32"], expect_report_absent = ["Comment density is unavailable"] },
+  { scenario = "exception_smells", file_paths = ["context.go", "tree.go", "recovery.go", "render/json.go"], expect_report_contains = ["`github.com/gin-gonic/gin.CustomRecoveryWithWriter` | `recovery.go`", "generic-catch:recover()"], expect_report_absent = ["unsupported"] },
+  { scenario = "test_assertion_smells", file_paths = ["context_test.go", "gin_test.go", "tree_test.go", "auth_test.go", "routergroup_test.go"], expect_report_contains = ["| 5 | `no-assertions` | 0 | `context_test.go::TestContextGetFloat64` |"] },
+  { scenario = "structural_clone_smells", file_paths = ["context.go", "tree.go", "routergroup.go", "gin.go", "render/json.go"], expect_report_contains = ["`github.com/gin-gonic/gin.Context.AbortWithStatusJSON` (context.go) | `github.com/gin-gonic/gin.Context.AbortWithStatusPureJSON` (context.go)", "token-similarity:100"] },
+  { scenario = "long_method_smells", file_paths = ["tree.go", "context.go", "gin.go"], expect_report_contains = ["- `github.com/gin-gonic/gin.node.getValue` in `tree.go:419-666` [score 528]", "high cyclomatic complexity 77"] },
+  { scenario = "git_hotspots", arguments = { since_iso = "2024-06-01T00:00:00Z", until_iso = "2026-06-03T00:00:00Z", max_files = 20 }, expect_report_contains = ["- Analyzed commits: 220", "| `go.mod` | 52 | 0 | ACTIVE |"] },
+]
 definition_queries = [
   { path = "gin.go", line = 238, column = 12, symbol = "New", expected_status = "resolved", expected_fqn = "github.com/gin-gonic/gin.New" },
 ]
@@ -129,6 +147,12 @@ scenarios = [
   "get_symbol_locations",
   "get_summaries",
   "most_relevant_files",
+  "comment_density_files",
+  "comment_density_code_unit",
+  "test_assertion_smells",
+  "long_method_smells",
+  "secret_like_code",
+  "git_hotspots",
   "get_definition",
   "query_code",
 ]
@@ -136,6 +160,14 @@ search_patterns = ["format"]
 location_symbols = ["vformat"]
 summary_targets = ["include/fmt/base.h"]
 seed_file_paths = ["include/fmt/base.h"]
+code_quality_probes = [
+  { scenario = "comment_density_files", file_paths = ["include/fmt/args.h", "include/fmt/color.h"], expect_report_contains = ["### `include/fmt/color.h`", "| `terminal_color` | 0 | 0 | 18 | 0 | 0 | 34 |"], expect_report_absent = ["(comment density unavailable; skipped)"] },
+  { scenario = "comment_density_code_unit", file_paths = ["include/fmt/xchar.h"], fq_names = ["detail.vformat_to"], expect_report_contains = ["- Symbol: `detail.vformat_to`", "- Own: header 0, inline 0, span 8"], expect_report_absent = ["Comment density is unavailable"] },
+  { scenario = "test_assertion_smells", file_paths = ["test/format-test.cc", "test/chrono-test.cc", "test/base-test.cc", "test/color-test.cc"], expect_report_contains = ["| 5 | `no-assertions` | 0 | `test/base-test.cc` |"] },
+  { scenario = "long_method_smells", file_paths = ["include/fmt/format.h", "include/fmt/base.h", "include/fmt/chrono.h"], expect_report_contains = ["- `detail.parse_chrono_format` in `include/fmt/chrono.h:631-773` [score 448]", "high cyclomatic complexity 82"] },
+  { scenario = "secret_like_code", file_paths = ["include/fmt/base.h"], expect_report_contains = ["| MEDIUM | `Credential assignment` | `support/docopt.py:336` |"] },
+  { scenario = "git_hotspots", arguments = { since_iso = "2025-06-01T00:00:00Z", until_iso = "2026-06-03T00:00:00Z", max_files = 20 }, expect_report_contains = ["- Analyzed commits: 361", "| `include/fmt/base.h` | 75 | 19 | HOTSPOT |"] },
+]
 definition_queries = [
   { path = "include/fmt/base.h", line = 2798, column = 11, symbol = "vformat_to", expected_status = "resolved", expected_fqn = "detail.vformat_to" },
   { path = "include/fmt/base.h", line = 2798, column = 11, symbol = "vformat_to", expected_status = "resolved", expected_fqn = "detail.vformat_to" },
@@ -208,6 +240,13 @@ scenarios = [
   "most_relevant_files",
   "scan_usages",
   "dead_code_smells",
+  "comment_density_files",
+  "comment_density_code_unit",
+  "exception_smells",
+  "test_assertion_smells",
+  "structural_clone_smells",
+  "long_method_smells",
+  "git_hotspots",
   "get_definition",
   "query_code",
 ]
@@ -218,6 +257,13 @@ seed_file_paths = ["source/core/Ky.ts"]
 usage_symbols = ["Ky"]
 code_quality_probes = [
   { scenario = "dead_code_smells", file_paths = ["source/core/Ky.ts"], fq_names = ["Ky.create$static"], expect_report_contains = ["Candidate symbols analyzed: 1"], expect_report_absent = ["no definition found", "not yet supported for smell analysis"] },
+  { scenario = "comment_density_files", file_paths = ["source/core/Ky.ts", "source/index.ts", "source/core/constants.ts", "source/utils/merge.ts", "source/utils/options.ts"], expect_report_contains = ["### `source/core/Ky.ts`", "| `cloneRetryOptions` | 0 | 0 | 13 | 0 | 0 | 13 |"], expect_report_absent = ["(comment density unavailable; skipped)"] },
+  { scenario = "comment_density_code_unit", file_paths = ["source/core/Ky.ts"], fq_names = ["Ky"], expect_report_contains = ["- Symbol: `Ky`", "- Own: header 0, inline 0, span 901"], expect_report_absent = ["Comment density is unavailable"] },
+  { scenario = "exception_smells", file_paths = ["source/core/Ky.ts", "source/index.ts", "source/utils/options.ts"], expect_report_contains = ["| 10 | `<untyped>` | 0 | `Ky.constructor` | `source/core/Ky.ts` |", "empty-body"], expect_report_absent = ["unsupported"] },
+  { scenario = "test_assertion_smells", file_paths = ["test/main.ts", "test/retry.ts", "test/hooks.ts", "test/headers.ts"], expect_report_contains = ["| 5 | `no-assertions` | 0 | `test/headers.ts::"] },
+  { scenario = "structural_clone_smells", file_paths = ["source/core/Ky.ts", "source/index.ts", "test/main.ts", "test/retry.ts", "test/hooks.ts"], expect_report_contains = ["`isRequestInstance` (source/core/Ky.ts) | `isResponseInstance` (source/core/Ky.ts)", "token-similarity:100"] },
+  { scenario = "long_method_smells", file_paths = ["source/core/Ky.ts", "source/utils/options.ts"], expect_report_contains = ["- `Ky.create$static` in `source/core/Ky.ts:144-338` [score 380]", "high cyclomatic complexity 58"] },
+  { scenario = "git_hotspots", arguments = { since_iso = "2024-05-01T00:00:00Z", until_iso = "2026-05-09T00:00:00Z", max_files = 20 }, expect_report_contains = ["- Analyzed commits: 165", "| `source/core/Ky.ts` | 74 | 62 | HOTSPOT |"] },
 ]
 definition_queries = [
   { path = "source/core/Ky.ts", line = 151, column = 18, symbol = "Ky", expected_status = "resolved", expected_fqn = "Ky" },

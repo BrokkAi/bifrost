@@ -308,6 +308,19 @@ regression.
   corpus lands, cross-check these against open latency issues and file/annotate per the project's
   five-second rule, with release-build timings.
 
+- 2026-07-31 (Milestone 2, gin/fmt/ky findings): comment_density_files stays the slowest tool
+  everywhere (gin p50 20.7 s over five small Go files; fmt exceeds the request budget on
+  base.h/format.h-sized headers, so its probe pins args.h/color.h). fmt's macro-heavy C++
+  (format-inl.h, os.h, os.cc, std.h, format.cc) fails to parse in exception_smells and comment
+  density, so exception_smells is off for fmt. structural_clone_smells compares probes against
+  workspace-wide peers and cold calls exceed the request budget on the fmt corpus even with a
+  two-small-header probe, so the scenario is off for fmt and C++ clone coverage is an explicit gap
+  until that latency bug is fixed. gin and ky have no secret-like findings, so secret_like_code is
+  off there. Go testify assert.* calls are counted as zero assertions by test_assertion_smells
+  (rows say `no-assertions` with assert.Len/Contains present) -- deterministic, so pinned as-is,
+  but worth a product look. All of these belong in the follow-up issue sweep after the corpus
+  lands.
+
 ## Progress
 
 - [x] Milestone 1: scenario variants, generic probes, runner payloads and oracle, dead-code
