@@ -13,7 +13,7 @@ mod tests;
 use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
 };
-use crate::analyzer::common::language_for_file as file_language;
+use crate::analyzer::common::{is_unparseable_source, language_for_file as file_language};
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BuildProgressEvent, BulkFileStateSource,
@@ -686,6 +686,11 @@ impl IAnalyzer for JavaAnalyzer {
                 };
             }
         };
+        if is_unparseable_source(&source) {
+            return ExceptionHandlingAnalysis::Failed {
+                message: format!("failed to parse {}", file.rel_path().display()),
+            };
+        }
         match detect_exception_handling_smells_java(self, file, &source, &weights) {
             Some(findings) => ExceptionHandlingAnalysis::Analyzed(findings),
             None => ExceptionHandlingAnalysis::Failed {
