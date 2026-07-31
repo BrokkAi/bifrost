@@ -114,8 +114,13 @@ The observable outcomes are:
   records `timed_out`, runs the inline scorer, and excludes scoring time from agent wall time.
   Fresh r8 service `cimeval-r8-baseline-max.service` has all 30 workers active; a live turn-0
   trace proves the corrected model and effort.
-- [ ] (2026-07-31 12:58Z) Prewarm dw10 serially on the A4000. The persistent sidecar and
-  prewarm services are `cimeval-dw10-sidecar.service` and `cimeval-dw10-prewarm.service`.
+- [ ] (2026-07-31 18:55Z) Prewarm dw10 serially on the A4000. The first attempt was stopped
+  after 42 task revisions because it incorrectly selected stock Voyage's `parent_alpha=0.5`.
+  Bifrost `bac89d82` adds an explicit fingerprinted `dw10` profile with the checkpoint's
+  `parent_alpha=0.65` and the shared Voyage prompt/pooling contract. The corrected fresh run is
+  `/mnt/optane/bifrost-nlp-resources/runs/dw10-cim-20260731-r2`; persistent services
+  `cimeval-dw10-r2-sidecar.service` and `cimeval-dw10-r2-prewarm.service` are active, and the
+  first profiler restarted materialization at 0/1316 while the A4000 reported 99% utilization.
   dw10 uses the separate per-repository `.bifrost/cache-dw10` namespace so changing embedding
   fingerprints cannot invalidate the completed `.bifrost/cache` Granite databases.
 - [ ] Run the three Granite retrieval arms over seeds 0, 1, and 2 at concurrency 30.
@@ -129,6 +134,14 @@ The observable outcomes are:
   `scripts/voyage_sidecar.py`; the Python side always loads `voyageai/voyage-4-nano` and emits
   512 values.
   Evidence: the model ID and output dimension are module constants in the current sidecar.
+
+- Observation: a model directory alone is not an adequate index compatibility identity for
+  the dw10 fine-tune because it keeps Voyage's architecture, dimension, prompts, and pooling
+  while changing the parent/child blend from 0.5 to 0.65.
+  Evidence: the artifact's `run_metadata.json` records `parent_alpha=0.65`; the initial
+  stock-Voyage prewarm reached 42 task revisions before this mismatch was found. The corrected
+  `dw10` profile changes Bifrost's semantic fingerprint, causing each stale cache to be
+  invalidated and rebuilt rather than reused.
 
 - Observation: Granite R2 uses a materially different representation contract from Voyage.
   Evidence: its artifact declares `ModernBertModel`, CLS pooling, width 384, maximum sequence
@@ -483,6 +496,13 @@ The observable outcomes are:
   Rationale: a Bifrost database is safely shared across branches and worktrees, but its semantic
   tables intentionally support only one embedding fingerprint at a time. Reusing Granite's
   database for dw10 would wipe the completed Granite vectors during compatibility checking.
+  Date/Author: 2026-07-31, Codex.
+
+- Decision: represent dw10 as an explicit Bifrost/sidecar model profile rather than serving it
+  through the stock Voyage profile.
+  Rationale: the fine-tune deliberately uses `parent_alpha=0.65`, whereas stock Voyage uses
+  0.5. The profile is part of the semantic-index fingerprint, so this makes incompatible
+  vectors self-invalidating and keeps serving and indexing on the same contract.
   Date/Author: 2026-07-31, Codex.
 
 ## Outcomes & Retrospective
