@@ -674,3 +674,80 @@ code_quality_probes = [
         Some(&serde_json::json!("2020-01-01T00:00:00Z"))
     );
 }
+
+/// The achieved language-by-tool coverage matrix for the code-quality
+/// scenarios. Exclusions are deliberate, evidence-backed decisions recorded in
+/// .agents/plans/code-quality-perf-regression-benchmarks.md: cpp exception
+/// smells and comment-density on fmt's macro-heavy files fail to parse; cpp
+/// structural clones exceed the MCP request budget workspace-wide; kotlin
+/// clones are unimplemented (#1371); the javascript, php, and scala corpora
+/// have no true-positive exception/test-assertion findings to pin; and the secret
+/// scan exceeds the request budget on exposed-kotlin, leaving java,
+/// javascript, cpp, and csharp with pinnable secret findings. Shrinking any of these sets is a coverage regression.
+#[test]
+fn code_quality_scenarios_cover_the_expected_language_matrix() {
+    let manifest = BenchmarkManifest::load_from_path(checked_in_manifest_path())
+        .expect("checked-in benchmark manifest should validate");
+
+    use ManifestLanguage::*;
+    let all = ManifestLanguage::ALL.to_vec();
+    let expected: &[(BenchmarkScenario, Vec<ManifestLanguage>)] = &[
+        (
+            BenchmarkScenario::DeadCodeSmells,
+            vec![
+                Java, Go, JavaScript, TypeScript, Python, Rust, Php, Scala, CSharp, Kotlin,
+            ],
+        ),
+        (BenchmarkScenario::CommentDensityFiles, all.clone()),
+        (BenchmarkScenario::CommentDensityCodeUnit, all.clone()),
+        (
+            BenchmarkScenario::ExceptionSmells,
+            vec![
+                Java, Go, JavaScript, TypeScript, Python, Rust, CSharp, Kotlin,
+            ],
+        ),
+        (
+            BenchmarkScenario::TestAssertionSmells,
+            vec![Java, Go, Cpp, TypeScript, Python, Rust, CSharp, Kotlin],
+        ),
+        (
+            BenchmarkScenario::StructuralCloneSmells,
+            vec![
+                Java, Go, JavaScript, TypeScript, Python, Rust, Php, Scala, CSharp,
+            ],
+        ),
+        (BenchmarkScenario::LongMethodSmells, all.clone()),
+        (
+            BenchmarkScenario::SecretLikeCode,
+            vec![Java, Cpp, JavaScript, CSharp],
+        ),
+        (BenchmarkScenario::GitHotspots, all.clone()),
+    ];
+
+    for (scenario, languages) in expected {
+        let covered = manifest
+            .repos
+            .iter()
+            .filter(|repo| repo.scenario_set().contains(scenario))
+            .flat_map(|repo| repo.language_set())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            covered,
+            languages.iter().copied().collect(),
+            "language coverage drifted for `{}`",
+            scenario.label()
+        );
+        for repo in manifest
+            .repos
+            .iter()
+            .filter(|repo| repo.scenario_set().contains(scenario))
+        {
+            assert!(
+                repo.code_quality_probes_for(*scenario).next().is_some(),
+                "{} enables `{}` without a probe",
+                repo.name,
+                scenario.label()
+            );
+        }
+    }
+}

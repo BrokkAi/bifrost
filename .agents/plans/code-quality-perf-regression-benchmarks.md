@@ -331,6 +331,17 @@ regression.
   even though it parses -- density seems to require a top-level class-like declaration in PHP;
   worth a product look alongside the Go testify note.
 
+- 2026-07-31 (Milestone 2, final batch): scala-xml is clean for exceptions/test assertions and
+  secrets (scenarios off); dapper-csharp pins the SqlBuilder join-family clones, the
+  SqlMapper.Async comment-only catches, and the SqlMapper god object (CC 109), with SqlMapper.cs
+  excluded from exception probes because that path fails to parse it while long-method parses it
+  fine; exposed-kotlin pins the docker-compose password secret findings during harvest, but the
+  secret scan runs at p50 47.5 s and intermittently exceeds the request budget on that multi-module
+  workspace even with max_commits=200, so secret_like_code is off for exposed-kotlin and the
+  latency is a recorded follow-up. Six follow-up fix tasks were spun off to separate sessions:
+  comment-density latency, C++ clone budget, git-hotspots per-file complexity cost, dead-code
+  usage-scan bounding, C++/C# parse failures, and secret-scan latency on large repos.
+
 ## Progress
 
 - [x] Milestone 1: scenario variants, generic probes, runner payloads and oracle, dead-code
@@ -339,8 +350,13 @@ regression.
       `cargo test --test suite_mcp_cli bifrost_benchmark` (12 passed, end-to-end run through the
       per-probe runner path), `bifrost_benchmark validate` on the checked-in manifest, `cargo fmt`,
       and `cargo clippy --all-targets --all-features -- -D warnings`.
-- [ ] Milestone 2: probes for all repos/languages with verified true signals; coverage matrix test;
-      `required_scenarios` grown.
+- [x] Milestone 2: probes for all eleven repos with verified true signals (express-js,
+      google-gson, gin-go, fmt-cpp, ky-ts, click-py, serde-json-rs, fastroute-php, scala-xml,
+      dapper-csharp, exposed-kotlin); per-repo exclusions recorded in the decision log and README;
+      coverage matrix test `code_quality_scenarios_cover_the_expected_language_matrix` added;
+      `required_scenarios` and `BenchmarkScenario::ALL` grown to include all eight new scenarios;
+      README coverage notes updated. A `--scenario` filter was added to `bifrost_benchmark run`
+      to make probe authoring and spot-checks cheap.
 - [ ] Milestone 3: workflow run verified, README coverage notes final, baseline promoted,
       induced-regression check performed.
 - [ ] Follow-up issue filed for `analyze_diff` performance scenario design.

@@ -47,9 +47,23 @@ one tool call per probe inside each timed iteration.
 pinned commit's history ages out of it. An explicit window bracketing the
 pinned history keeps the churn report deterministic.
 
-The checked-in corpus currently covers Python, JavaScript, TypeScript, PHP,
-Scala, and Kotlin dead-code probes. Ruby is intentionally absent because the
-pinned benchmark corpus does not include a Ruby repo.
+Code-quality coverage matrix: `comment_density_files`,
+`comment_density_code_unit`, `long_method_smells`, and `git_hotspots` run on
+all eleven corpus repos. `dead_code_smells` runs everywhere except fmt-cpp.
+Exclusions are evidence-backed and enforced by the
+`code_quality_scenarios_cover_the_expected_language_matrix` test in
+`tests/suite_bench_policy/benchmark_manifest.rs`: fmt-cpp's macro-heavy C++
+fails to parse for `exception_smells`, and its workspace-wide clone comparison
+exceeds the MCP request budget, so C++ lacks exception and clone probes until
+those bugs are fixed; Kotlin clone smells are unimplemented (#1371); the
+express-js, fastroute-php, and scala-xml corpora have genuinely zero
+exception/test-assertion findings even at min_score 1, so those scenarios are
+off there rather than pinned to an empty report; only the java, javascript, cpp, and csharp repos have pinnable secret-like
+findings (exposed-kotlin has real docker-compose password findings, but the
+scan exceeds the MCP request budget on that multi-module workspace, so the
+scenario is off there until the latency is fixed).
+Ruby is intentionally absent from all scenarios because the pinned corpus
+does not include a Ruby repo.
 
 `definition_queries` entries are source-location probes. Each entry defines a
 project-relative `path`, either `line` plus `column` or a byte range, optional

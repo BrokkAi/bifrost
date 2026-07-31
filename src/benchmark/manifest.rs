@@ -214,7 +214,7 @@ pub enum BenchmarkScenario {
 }
 
 impl BenchmarkScenario {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 20] = [
         Self::WorkspaceBuild,
         Self::SearchSymbols,
         Self::GetSymbolLocations,
@@ -223,6 +223,14 @@ impl BenchmarkScenario {
         Self::MostRelevantFiles,
         Self::ScanUsages,
         Self::DeadCodeSmells,
+        Self::CommentDensityFiles,
+        Self::CommentDensityCodeUnit,
+        Self::ExceptionSmells,
+        Self::TestAssertionSmells,
+        Self::StructuralCloneSmells,
+        Self::LongMethodSmells,
+        Self::SecretLikeCode,
+        Self::GitHotspots,
         Self::GetDefinition,
         Self::CallHierarchy,
         Self::TypeHierarchy,

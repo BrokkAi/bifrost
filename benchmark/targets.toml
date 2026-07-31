@@ -24,6 +24,14 @@ required_scenarios = [
   "most_relevant_files",
   "scan_usages",
   "dead_code_smells",
+  "comment_density_files",
+  "comment_density_code_unit",
+  "exception_smells",
+  "test_assertion_smells",
+  "structural_clone_smells",
+  "long_method_smells",
+  "secret_like_code",
+  "git_hotspots",
   "get_definition",
   "call_hierarchy",
   "type_hierarchy",
@@ -425,6 +433,11 @@ scenarios = [
   "most_relevant_files",
   "scan_usages",
   "dead_code_smells",
+  "comment_density_files",
+  "comment_density_code_unit",
+  "structural_clone_smells",
+  "long_method_smells",
+  "git_hotspots",
   "get_definition",
   "query_code",
 ]
@@ -435,6 +448,11 @@ seed_file_paths = ["shared/src/main/scala/scala/xml/Elem.scala"]
 usage_symbols = ["scala.xml.Elem.Elem"]
 code_quality_probes = [
   { scenario = "dead_code_smells", file_paths = ["shared/src/main/scala/scala/xml/Elem.scala"], fq_names = ["scala.xml.Elem.copy"], expect_report_contains = ["Candidate symbols analyzed: 1"], expect_report_absent = ["no definition found", "not yet supported for smell analysis"] },
+  { scenario = "comment_density_files", file_paths = ["shared/src/main/scala/scala/xml/Node.scala", "shared/src/main/scala/scala/xml/NodeSeq.scala", "shared/src/main/scala/scala/xml/MetaData.scala"], expect_report_contains = ["### `shared/src/main/scala/scala/xml/Node.scala`", "| `scala.xml.Node` | 13 | 2 | 162 | 106 | 3 | 232 |"], expect_report_absent = ["(comment density unavailable; skipped)"] },
+  { scenario = "comment_density_code_unit", file_paths = ["shared/src/main/scala/scala/xml/Elem.scala"], fq_names = ["scala.xml.Elem"], expect_report_contains = ["- Symbol: `scala.xml.Elem`", "- Own: header 20, inline 3, span 57"], expect_report_absent = ["Comment density is unavailable"] },
+  { scenario = "structural_clone_smells", file_paths = ["shared/src/main/scala/scala/xml/Atom.scala", "shared/src/main/scala/scala/xml/Comment.scala", "shared/src/main/scala/scala/xml/EntityRef.scala", "shared/src/main/scala/scala/xml/MetaData.scala", "shared/src/main/scala/scala/xml/Attribute.scala"], expect_report_contains = ["`scala.xml.Comment.buildString` (shared/src/main/scala/scala/xml/Comment.scala) | `scala.xml.EntityRef.buildString` (shared/src/main/scala/scala/xml/EntityRef.scala)", "token-similarity:100"] },
+  { scenario = "long_method_smells", file_paths = ["shared/src/main/scala/scala/xml/Utility.scala", "shared/src/main/scala/scala/xml/NodeSeq.scala"], expect_report_contains = ["- `scala.xml.Utility$` in `shared/src/main/scala/scala/xml/Utility.scala:29-436` [score 127]", "contains high-complexity workflow (CC 18)"] },
+  { scenario = "git_hotspots", arguments = { since_iso = "2023-06-01T00:00:00Z", until_iso = "2026-05-25T00:00:00Z", max_files = 20 }, expect_report_contains = ["- Analyzed commits: 242", "| `build.sbt` | 68 | 0 | ACTIVE |"] },
 ]
 definition_queries = [
   { path = "shared/src/main/scala/scala/xml/Elem.scala", line = 107, column = 13, symbol = "Elem", expected_status = "resolved", expected_fqn = "scala.xml.Elem$.apply" },
@@ -460,12 +478,32 @@ scenarios = [
   "scan_usages",
   "get_definition",
   "query_code",
+  "dead_code_smells",
+  "comment_density_files",
+  "comment_density_code_unit",
+  "exception_smells",
+  "test_assertion_smells",
+  "structural_clone_smells",
+  "long_method_smells",
+  "secret_like_code",
+  "git_hotspots",
 ]
 search_patterns = ["SqlMapper"]
 location_symbols = ["Dapper.SqlMapper$CacheInfo"]
 summary_targets = ["Dapper/SqlMapper.cs"]
 seed_file_paths = ["Dapper/SqlMapper.cs"]
 usage_symbols = ["Dapper.SqlMapper$CacheInfo"]
+code_quality_probes = [
+  { scenario = "dead_code_smells", file_paths = ["Dapper/DbString.cs"], fq_names = ["Dapper.DbString"], expect_report_contains = ["Candidate symbols analyzed: 1"], expect_report_absent = ["no definition found", "not yet supported for smell analysis"] },
+  { scenario = "comment_density_files", file_paths = ["Dapper/CommandDefinition.cs", "Dapper/DbString.cs", "Dapper/DynamicParameters.cs"], expect_report_contains = ["| `Dapper.DynamicParameters` | 3 | 1 | 476 | 85 | 37 | 873 |"], expect_report_absent = ["(comment density unavailable; skipped)"] },
+  { scenario = "comment_density_code_unit", file_paths = ["Dapper/DbString.cs"], fq_names = ["Dapper.DbString"], expect_report_contains = ["- Symbol: `Dapper.DbString`", "- Own: header 3, inline 0, span 97"], expect_report_absent = ["Comment density is unavailable"] },
+  { scenario = "exception_smells", file_paths = ["Dapper/DynamicParameters.cs", "Dapper/SqlMapper.Async.cs"], expect_report_contains = ["`Dapper.SqlMapper.QueryMultipleAsync` | `Dapper/SqlMapper.Async.cs`", "comment-only-body"], expect_report_absent = ["failed to parse"] },
+  { scenario = "test_assertion_smells", file_paths = ["tests/Dapper.Tests/MiscTests.cs", "tests/Dapper.Tests/AsyncTests.cs", "tests/Dapper.Tests/SqlBuilderTests.cs"], arguments = { min_score = 1 }, expect_report_contains = ["| 2 | `nullness-only` | 178 | `tests/Dapper.Tests/AsyncTests.cs::TestBasicStringUsageAsync` |"] },
+  { scenario = "structural_clone_smells", file_paths = ["Dapper/CommandDefinition.cs", "Dapper/DbString.cs", "Dapper/DynamicParameters.cs", "Dapper.SqlBuilder/SqlBuilder.cs"], expect_report_contains = ["`Dapper.SqlBuilder.GroupBy` (Dapper.SqlBuilder/SqlBuilder.cs) | `Dapper.SqlBuilder.Having` (Dapper.SqlBuilder/SqlBuilder.cs)", "token-similarity:100"] },
+  { scenario = "long_method_smells", file_paths = ["Dapper/SqlMapper.cs", "Dapper/DynamicParameters.cs"], expect_report_contains = ["- `Dapper.SqlMapper` in `Dapper/SqlMapper.cs:31-4114` [score 2113]", "contains high-complexity workflow (CC 109)"] },
+  { scenario = "secret_like_code", file_paths = ["Dapper/DbString.cs"], expect_report_contains = ["| `Credential assignment` | `Dapper/CommandDefinition.cs:95` |"] },
+  { scenario = "git_hotspots", arguments = { since_iso = "2023-06-01T00:00:00Z", until_iso = "2026-05-17T00:00:00Z", max_files = 20 }, expect_report_contains = ["- Analyzed commits: 102", "| `Dapper/SqlMapper.cs` | 24 | 109 | HOTSPOT |"] },
+]
 definition_queries = [
   { path = "Dapper/SqlMapper.cs", line = 1862, column = 28, symbol = "CacheInfo", expected_status = "resolved", expected_fqn = "Dapper.SqlMapper$CacheInfo" },
 ]
@@ -487,6 +525,12 @@ scenarios = [
   "get_summaries",
   "scan_usages",
   "dead_code_smells",
+  "comment_density_files",
+  "comment_density_code_unit",
+  "exception_smells",
+  "test_assertion_smells",
+  "long_method_smells",
+  "git_hotspots",
   "get_definition",
   "query_code",
 ]
@@ -500,6 +544,12 @@ summary_targets = ["exposed-core/src/main/kotlin/org/jetbrains/exposed/v1/core/T
 usage_symbols = ["org.jetbrains.exposed.v1.exceptions.DuplicateColumnException.DuplicateColumnException"]
 code_quality_probes = [
   { scenario = "dead_code_smells", file_paths = ["exposed-core/src/main/kotlin/org/jetbrains/exposed/v1/core/Table.kt"], fq_names = ["org.jetbrains.exposed.v1.core.isAlreadyQuoted"], expect_report_contains = ["Candidate symbols analyzed: 1"], expect_report_absent = ["no definition found", "not yet supported for smell analysis"] },
+  { scenario = "comment_density_files", file_paths = ["exposed-core/src/main/kotlin/org/jetbrains/exposed/v1/core/Op.kt", "exposed-core/src/main/kotlin/org/jetbrains/exposed/v1/core/ResultRow.kt", "exposed-core/src/main/kotlin/org/jetbrains/exposed/v1/core/Expression.kt"], expect_report_contains = ["| `org.jetbrains.exposed.v1.core.Op` | 3 | 0 | 60 | 15 | 0 | 132 |"], expect_report_absent = ["(comment density unavailable; skipped)"] },
+  { scenario = "comment_density_code_unit", file_paths = ["exposed-core/src/main/kotlin/org/jetbrains/exposed/v1/core/ResultRow.kt"], fq_names = ["org.jetbrains.exposed.v1.core.ResultRow"], expect_report_contains = ["- Symbol: `org.jetbrains.exposed.v1.core.ResultRow`", "- Own: header 1, inline 9, span 319"], expect_report_absent = ["Comment density is unavailable"] },
+  { scenario = "exception_smells", file_paths = ["exposed-core/src/main/kotlin/org/jetbrains/exposed/v1/core/Exceptions.kt", "exposed-core/src/main/kotlin/org/jetbrains/exposed/v1/core/DatabaseConfig.kt", "exposed-core/src/main/kotlin/org/jetbrains/exposed/v1/core/statements/InsertStatement.kt"], expect_report_contains = ["`org.jetbrains.exposed.v1.exceptions.ExposedSQLException.causedByQueries`", "generic-catch:Throwable"], expect_report_absent = ["unsupported"] },
+  { scenario = "test_assertion_smells", file_paths = ["exposed-json/src/test/kotlin/org/jetbrains/exposed/v1/json/JsonColumnTests.kt", "exposed-json/src/test/kotlin/org/jetbrains/exposed/v1/json/JsonBColumnTests.kt"], expect_report_contains = ["| 5 | `no-assertions` | 0 | `org.jetbrains.exposed.v1.json.JsonColumnTests` |"] },
+  { scenario = "long_method_smells", file_paths = ["exposed-core/src/main/kotlin/org/jetbrains/exposed/v1/core/Table.kt", "exposed-core/src/main/kotlin/org/jetbrains/exposed/v1/core/FunctionBuilder.kt"], expect_report_contains = ["- `org.jetbrains.exposed.v1.core.Table` in `exposed-core/src/main/kotlin/org/jetbrains/exposed/v1/core/Table.kt:410-2217` [score 849]", "contains high-complexity workflow (CC 16)"] },
+  { scenario = "git_hotspots", arguments = { since_iso = "2025-08-01T00:00:00Z", until_iso = "2026-07-31T00:00:00Z", max_files = 20 }, expect_report_contains = ["- Analyzed commits: 243", "| `gradle/libs.versions.toml` | 83 | 0 | ACTIVE |"] },
 ]
 definition_queries = [
   { path = "exposed-core/src/main/kotlin/org/jetbrains/exposed/v1/core/Table.kt", line = 614, column = 19, symbol = "DuplicateColumnException", expected_status = "resolved", expected_fqn = "org.jetbrains.exposed.v1.exceptions.DuplicateColumnException.DuplicateColumnException" },
