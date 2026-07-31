@@ -51,6 +51,7 @@
 //! Scala's resolver is structured differently and needs its own change.
 
 mod adapter;
+mod clones;
 pub(crate) mod declarations;
 pub(crate) mod diagnostics;
 mod hierarchy;
@@ -63,6 +64,7 @@ pub(crate) mod syntax;
 mod tests;
 pub(crate) mod types;
 
+use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::cache::{
     build_weighted_cache, weight_code_unit_set, weight_code_unit_vec_by_unit,
@@ -72,10 +74,11 @@ use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
 use crate::analyzer::pool_memo::PoolSafeMemo;
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer,
-    ImportAnalysisProvider, JvmAnalyzerConfig, Language, Project, ProjectFile, SemanticDiagnostic,
-    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, UsageFactsIndex,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
+    IAnalyzer, ImportAnalysisProvider, JvmAnalyzerConfig, Language, Project, ProjectFile,
+    SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
+    UsageFactsIndex,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -84,6 +87,7 @@ use std::sync::{Arc, OnceLock};
 use tests::detect_kotlin_test_assertion_smells;
 
 pub(crate) use adapter::KotlinAdapter;
+use clones::build_kotlin_clone_candidate_data;
 
 #[derive(Clone)]
 pub struct KotlinAnalyzer {
@@ -548,6 +552,28 @@ impl IAnalyzer for KotlinAnalyzer {
 
     fn in_test_region(&self, code_unit: &CodeUnit) -> bool {
         self.inner.in_test_region(code_unit)
+    }
+
+    fn find_structural_clone_smells(
+        &self,
+        file: &ProjectFile,
+        weights: CloneSmellWeights,
+    ) -> Vec<CloneSmell> {
+        self.find_structural_clone_smells_for_files(std::slice::from_ref(file), weights)
+    }
+
+    fn find_structural_clone_smells_for_files(
+        &self,
+        files: &[ProjectFile],
+        weights: CloneSmellWeights,
+    ) -> Vec<CloneSmell> {
+        detect_language_structural_clone_smells(
+            self,
+            files,
+            weights,
+            Language::Kotlin,
+            |code_unit| build_kotlin_clone_candidate_data(self, code_unit, weights),
+        )
     }
 
     fn find_test_assertion_smells(
