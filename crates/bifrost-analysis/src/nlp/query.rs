@@ -24,13 +24,15 @@ use crate::searchtools::{
 
 use super::active_index::ActiveIndex;
 use super::bm25::{RepoEntityUniverse, build_match_query, grounded_prompt_text, tokenize};
-use super::indexer::{READY_TIMEOUT_MESSAGE, SemanticIndexer};
+use super::indexer::{DEFAULT_READY_TIMEOUT, READY_TIMEOUT_MESSAGE, SemanticIndexer};
 use super::{COEDIT_HALF_LIFE, RRF_K};
 
 /// Rows decoded per scan batch.
 const SCAN_BATCH: usize = 8192;
 const MAX_K: usize = 100;
-const SEMANTIC_SEARCH_READY_TIMEOUT: Duration = Duration::from_secs(1);
+/// Once an active index exists, keep interactive queries responsive while a
+/// newer snapshot is building by falling back to that active index promptly.
+const SEMANTIC_SEARCH_STALE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Floor for min-max normalized retrieval scores. Co-edit seed weights must be
 /// positive for `most_relevant_files`, and callers fusing symbol legs should not
 /// see a selected result collapse to zero.
@@ -172,9 +174,20 @@ pub fn semantic_search(
         coedit: coedit_limit,
     };
 
+    let has_active_index = indexer
+        .active_index()
+        .read()
+        .map_err(|_| "semantic active index lock poisoned".to_string())?
+        .is_some();
+    let ready_timeout = if has_active_index {
+        SEMANTIC_SEARCH_STALE_TIMEOUT
+    } else {
+        DEFAULT_READY_TIMEOUT
+    };
+
     let mut notes = Vec::new();
     let wait_started = Instant::now();
-    let timed_out = match indexer.wait_ready(SEMANTIC_SEARCH_READY_TIMEOUT) {
+    let timed_out = match indexer.wait_ready(ready_timeout) {
         Ok(()) => false,
         Err(err) if err == READY_TIMEOUT_MESSAGE => {
             notes.push(
