@@ -24979,6 +24979,43 @@ object App:
 }
 
 #[test]
+fn scala_uppercase_import_selector_resolves_to_companion_nested_type() {
+    let source = r#"
+package app
+
+sealed trait Route {
+  import Route.{Augmented, Handled, Provided, Unhandled}
+}
+
+object Route {
+  private final case class Augmented(value: Int)
+  private final case class Handled(value: Int)
+  private final case class Provided(value: Int)
+  private final case class Unhandled(value: Int)
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Route.scala", source)
+        .build();
+
+    let handled_start = source
+        .find("{Augmented, Handled, Provided, Unhandled}")
+        .expect("uppercase selector list")
+        + "{Augmented, ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Route.scala", source, handled_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Route$.Handled",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_member_import_alias_does_not_shadow_its_own_qualifier() {
     let source = r#"
 package app
@@ -25620,6 +25657,94 @@ object Definitions {
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
         result["definitions"][0]["fqn"], "app.Symbol.entered",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_constructor_named_argument_bypasses_the_preceding_binding_prefix() {
+    const PRECEDING_VALUES: usize = 128;
+
+    let mut generated = String::from("package app\n\nobject Generated {\n");
+    for index in 0..PRECEDING_VALUES {
+        generated.push_str(&format!(
+            "  lazy val item{index}: MediaType = new MediaType(compressible = false)\n"
+        ));
+    }
+    generated.push_str("}\n");
+
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/MediaType.scala",
+            "package app\nfinal case class MediaType(compressible: Boolean)\n",
+        )
+        .file("app/Generated.scala", generated.clone())
+        .build();
+    let label_start = generated
+        .rfind("compressible = false")
+        .expect("last constructor named argument");
+
+    brokk_bifrost::usages::get_definition::reset_scala_active_path_node_visits_for_test();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Generated.scala", &generated, label_start),
+    );
+    let node_visits =
+        brokk_bifrost::usages::get_definition::scala_active_path_node_visits_for_test();
+
+    assert_eq!(
+        node_visits, 0,
+        "constructor named arguments must resolve from their structured invocation owner \
+         without seeding every preceding local binding: {value}"
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.MediaType.compressible",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_enclosing_object_member_bypasses_unrelated_binding_type_inference() {
+    const PRECEDING_VALUES: usize = 128;
+
+    let mut generated = String::from("package app\n\nobject Generated {\n");
+    for index in 0..PRECEDING_VALUES {
+        generated.push_str(&format!(
+            "  lazy val item{index}: MediaType = new MediaType(compressible = false)\n"
+        ));
+    }
+    generated.push_str("  val all = List(item127)\n}\n");
+
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/MediaType.scala",
+            "package app\nfinal case class MediaType(compressible: Boolean)\n",
+        )
+        .file("app/Generated.scala", generated.clone())
+        .build();
+    let member_start = generated
+        .rfind("item127")
+        .expect("enclosing object member reference");
+
+    brokk_bifrost::usages::get_definition::reset_scala_active_path_node_visits_for_test();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Generated.scala", &generated, member_start),
+    );
+    let node_visits =
+        brokk_bifrost::usages::get_definition::scala_active_path_node_visits_for_test();
+
+    assert_eq!(
+        node_visits, 0,
+        "an enclosing object member must resolve from its indexed owner without inferring the \
+         types of every preceding member: {value}"
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Generated$.item127",
         "{value}"
     );
 }
