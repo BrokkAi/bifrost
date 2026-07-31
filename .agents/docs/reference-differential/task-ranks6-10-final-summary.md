@@ -73,6 +73,6 @@ counters, raw artifact paths and SHA-256 values, and Scala's missing ledger.
 The C record delegates per-envelope fingerprints to its referenced durable
 manifest; the other language records pin their shared run fingerprint directly.
 The previously checked-in C, C++, and Python summaries remain authoritative
-for their exhaustive residual ledgers. Once this compact evidence is
-published, the large raw artifacts under `/mnt/optane/tmp/bifrost-fird/` are
-disposable and should be removed as the campaign's final cleanup step.
+for their exhaustive residual ledgers. After this compact evidence was pushed,
+all 259 campaign files (approximately 1.1 GB) under
+`/mnt/optane/tmp/bifrost-fird/` were removed; the dedicated directory is empty.

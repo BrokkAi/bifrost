@@ -766,6 +766,14 @@ local gate, but is not the focus.
   the sandbox. Every campaign issue is assigned to `jbellis` and closed;
   #1422 alone is intentionally `NOT_PLANNED`. There are zero open `FIRD:`
   issues globally.
+- [x] (2026-07-31) Published the durable evidence through merged checkpoint
+  `b306c3ee` after incorporating six intervening `origin/master` commits. The
+  merged head passed `cargo fmt -- --check`; the featureless Cargo suite passed
+  every substantive assertion, with its two load-sensitive C# wall-clock tests
+  passing immediately in exact serial reruns. A final live GitHub query again
+  returned zero open `FIRD:` issues. Removed all 259 files and approximately
+  1.1 GB of campaign scratch data from `/mnt/optane/tmp/bifrost-fird/`, leaving
+  the dedicated directory empty.
 - [x] Publish the remaining mapped C++ semantic issue families and run one final
   task-selected top-ten certification.
 - [x] Complete C++ and publish its evidence and user summary.
@@ -786,7 +794,7 @@ local gate, but is not the focus.
 - [x] Complete Scala ranks six through ten and publish its evidence and user
   summary.
 - [x] Complete Python and publish its evidence and user summary.
-- [ ] Prove all 55 new ranks-six-through-ten envelopes and every fixing head
+- [x] Prove all 55 new ranks-six-through-ten envelopes and every fixing head
   are present on final `origin/master`, run the final local gate, and remove
   temporary diagnostics while retaining the compact checked-in evidence.
 
@@ -1339,3 +1347,8 @@ Revision note (2026-07-31): Reconciled all eleven ranks-six-through-ten
 languages into one 55-repository compact manifest, superseded stale completion
 checkboxes and outcomes, recorded the final same-head Scala certification and
 missing ledger, and confirmed the global `FIRD:` issue set has no open owner.
+
+Revision note (2026-07-31): Recorded the final upstream merge, merged-head
+format and Cargo gates, exact serial disposition of two load-sensitive C#
+tests, repeated zero-open-issue audit, and removal of the 1.1 GB campaign
+scratch directory contents.
