@@ -209,6 +209,12 @@ The observable outcomes are:
   table recorded Luna and `max` on both Mjolnir and Anvil. The smoke was stopped before freezing
   a result because it had not elected semantic search, and the final queue then started with all
   30 slots available. The first elected semantic trace remains a live context/budget gate.
+- [x] (2026-07-31, final live retrieval gate) A live official Dubbo task under the final
+  30-worker queue elected `semantic_search` in the semantic-only arm. It requested and realized
+  exactly 120 vector, zero BM25, and zero co-edit candidates; deduplicated to 120; attached
+  89,166 bytes of source context; selected 12 results beneath final `k=20`; and did not fall
+  back. Retrieval took 84.9 ms, including 18.6 ms of Granite service time. This proves that the
+  context repair is active in the immutable runtime rather than merely covered by unit tests.
 - [x] (2026-07-31, implementation) Brokkbench `64a2da6131f` extends the existing
   multi-arm scheduler with `--seeds`, so the full 91-task by three-arm by three-seed Granite
   matrix can enter one 819-cell queue. A single 30-worker pool now remains occupied through
