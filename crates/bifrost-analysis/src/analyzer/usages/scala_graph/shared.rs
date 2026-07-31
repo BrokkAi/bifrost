@@ -733,7 +733,9 @@ impl ScalaQueryHitSink<'_> {
             }
             if self.hits[target_id].insert(hit.clone()) {
                 self.observed_hits.insert(hit.clone());
-                if self.observed_hits.len() > self.max_usages {
+                if crate::analyzer::usages::common::external_usage_hit_count(self.observed_hits)
+                    > self.max_usages
+                {
                     self.limit_exceeded = true;
                     break;
                 }
@@ -1047,10 +1049,12 @@ impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
             observed_hits.extend(hits[0].iter().cloned());
         }
 
-        if limit_exceeded || observed_hits.len() > max_usages {
+        let external_callsites =
+            crate::analyzer::usages::common::external_usage_hit_count(&observed_hits);
+        if limit_exceeded || external_callsites > max_usages {
             return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
                 short_name: overloads[0].short_name().to_string(),
-                total_callsites: observed_hits.len(),
+                total_callsites: external_callsites,
                 limit: max_usages,
                 sample_hits: observed_hits,
             });

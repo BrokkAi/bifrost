@@ -323,14 +323,14 @@ fn entry() {
         result.report
     );
     assert!(
-        !result.report.contains("Skipped symbols"),
+        result.report.contains("too many call sites (2, limit 1)"),
         "{}",
         result.report
     );
 }
 
 #[test]
-fn rust_dead_code_smell_clamps_usage_cap_to_graph_callsite_limit() {
+fn rust_dead_code_smell_clamps_usage_cap_to_smell_threshold() {
     let (_project, analyzer) =
         rust_analyzer_with_files(&[("src/helpers.rs", "pub fn helper() {}\n")]);
 
@@ -347,7 +347,7 @@ fn rust_dead_code_smell_clamps_usage_cap_to_graph_callsite_limit() {
     assert!(
         result
             .report
-            .contains("Usage cap per symbol: 1000 (clamped from 2000 by graph call-site cap)"),
+            .contains("Usage cap per symbol: 1 (clamped from 2000 by smell relevance threshold)"),
         "{}",
         result.report
     );
