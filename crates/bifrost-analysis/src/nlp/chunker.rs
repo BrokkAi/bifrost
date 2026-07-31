@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::path_utils::rel_path_string;
-use crate::searchtools::{SummaryBlock, summarize_files, summary_block_for_code_unit};
+use crate::searchtools::{SummaryBlock, summary_block_for_code_unit, summary_block_for_file};
 
 use super::keys::{Key, component_key};
 
@@ -165,10 +165,7 @@ fn file_summary_or_symbols(
     count_tokens: &dyn Fn(&str) -> usize,
     max_seq_tokens: usize,
 ) -> Option<String> {
-    if let Some(block) = summarize_files(analyzer, vec![file.clone()])
-        .summaries
-        .pop()
-    {
+    if let Some(block) = summary_block_for_file(analyzer, file) {
         let text = flatten_summary_block(&block);
         if !text.is_empty() && count_tokens(&text) <= max_seq_tokens {
             return Some(text);

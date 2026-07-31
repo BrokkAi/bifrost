@@ -6,7 +6,9 @@
 //! cached (by content hash), and a blob whose OID is already present is never
 //! re-materialized. A group is materialized together so embedding batches well.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+use rayon::prelude::*;
 
 use crate::analyzer::{IAnalyzer, ProjectFile};
 
@@ -24,6 +26,7 @@ pub struct BlobTarget {
     pub language: Option<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct PendingChunk {
     chunk_ord: i64,
     kind: &'static str,
@@ -36,16 +39,23 @@ struct PendingChunk {
     composed_hash: Key,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct PendingBlob {
     oid: String,
     language: Option<String>,
     chunks: Vec<PendingChunk>,
 }
 
+struct ExtractedBlob {
+    pending_blob: PendingBlob,
+    component_texts: Vec<(Key, String)>,
+}
+
 /// Phase 1 of materialization (CPU only): tree-sitter extraction + content hashing.
 /// Carries no store/embedder handles, so it can run on a producer thread ahead of
 /// the GPU embed (see the indexer pipeline). `count_tokens` uses the embedder's
 /// tokenizer (cheap, CPU) to size chunks.
+#[derive(Debug, PartialEq, Eq)]
 pub struct ExtractedGroup {
     pending_blobs: Vec<PendingBlob>,
     component_texts: Vec<(Key, String)>,
@@ -92,69 +102,157 @@ pub fn extract_group(
     analyzer: &dyn IAnalyzer,
     group: &[BlobTarget],
 ) -> ExtractedGroup {
-    let count_tokens = |text: &str| embedder.count_tokens(text);
+    let extracted = group
+        .par_iter()
+        .map(|target| extract_blob(embedder, analyzer, target))
+        .collect();
+    assemble_group(extracted)
+}
 
-    let mut pending_blobs: Vec<PendingBlob> = Vec::with_capacity(group.len());
+#[cfg(test)]
+fn extract_group_serial(
+    embedder: &dyn Embedder,
+    analyzer: &dyn IAnalyzer,
+    group: &[BlobTarget],
+) -> ExtractedGroup {
+    let extracted = group
+        .iter()
+        .map(|target| extract_blob(embedder, analyzer, target))
+        .collect();
+    assemble_group(extracted)
+}
+
+fn assemble_group(extracted: Vec<ExtractedBlob>) -> ExtractedGroup {
+    // IndexedParallelIterator preserves the input order. Merge and globally
+    // deduplicate components in that order so batching and persisted output remain
+    // deterministic regardless of worker scheduling.
+    let mut pending_blobs: Vec<PendingBlob> = Vec::with_capacity(extracted.len());
     let mut component_texts: Vec<(Key, String)> = Vec::new();
-    let mut seen_components: BTreeSet<Key> = BTreeSet::new();
-
-    for target in group {
-        metrics::trace(format_args!(
-            "extract file {}",
-            target.file.rel_path().display()
-        ));
-        let extracted = extract_file_chunks(
-            analyzer,
-            &target.file,
-            &count_tokens,
-            embedder.profile().max_seq_tokens,
-        );
-        metrics::trace(format_args!(
-            "extract done {} ({} chunks)",
-            target.file.rel_path().display(),
-            extracted.chunks.len()
-        ));
-        let mut chunks = Vec::with_capacity(extracted.chunks.len());
-        for chunk in extracted.chunks {
-            let hash = component_key(&chunk.text);
-            if seen_components.insert(hash) {
-                component_texts.push((hash, chunk.text.clone()));
+    let mut seen_components: HashSet<Key> = HashSet::new();
+    for extracted_blob in extracted {
+        pending_blobs.push(extracted_blob.pending_blob);
+        for (key, text) in extracted_blob.component_texts {
+            if seen_components.insert(key) {
+                component_texts.push((key, text));
             }
-            let parent_hash = chunk.parent_text.as_deref().map(component_key);
-            if let (Some(key), Some(text)) = (parent_hash, chunk.parent_text.as_deref())
-                && seen_components.insert(key)
-            {
-                component_texts.push((key, text.to_string()));
-            }
-            let composed_hash = match parent_hash {
-                Some(parent) => composed_key(&hash, &parent, embedder.profile().parent_alpha),
-                None => hash,
-            };
-            chunks.push(PendingChunk {
-                chunk_ord: chunk.ord,
-                kind: chunk.kind.as_str(),
-                symbol: chunk.symbol,
-                start_line: chunk.start_line,
-                end_line: chunk.end_line,
-                fts_tokens: fts_text(&chunk.text),
-                hash,
-                parent_summary_hash: parent_hash,
-                composed_hash,
-            });
         }
-        metrics::trace(format_args!(
-            "fts/hash done {}",
-            target.file.rel_path().display()
-        ));
-        pending_blobs.push(PendingBlob {
-            oid: target.oid.clone(),
-            language: target.language.clone(),
-            chunks,
-        });
     }
 
     ExtractedGroup {
         pending_blobs,
+        component_texts,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{JavaAnalyzer, Language, TestProject};
+    use crate::nlp::engine::FakeHashEmbedder;
+
+    #[test]
+    fn parallel_extraction_preserves_serial_chunk_and_component_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let files = [
+            ProjectFile::new(root.clone(), "Alpha.java"),
+            ProjectFile::new(root.clone(), "Beta.java"),
+            ProjectFile::new(root.clone(), "Gamma.java"),
+        ];
+        files[0]
+            .write("class Alpha { void shared() {} void alpha() {} }\n")
+            .unwrap();
+        files[1]
+            .write("class Beta { void shared() {} void beta() {} }\n")
+            .unwrap();
+        files[2].write("class Gamma { void gamma() {} }\n").unwrap();
+        let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
+        let embedder = FakeHashEmbedder::new(16);
+        let targets: Vec<_> = files
+            .into_iter()
+            .enumerate()
+            .map(|(index, file)| BlobTarget {
+                file,
+                oid: format!("oid-{index}"),
+                language: Some("java".to_string()),
+            })
+            .collect();
+
+        let serial = extract_group_serial(&embedder, &analyzer, &targets);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap();
+        let parallel = pool.install(|| extract_group(&embedder, &analyzer, &targets));
+
+        assert_eq!(parallel, serial);
+    }
+}
+
+fn extract_blob(
+    embedder: &dyn Embedder,
+    analyzer: &dyn IAnalyzer,
+    target: &BlobTarget,
+) -> ExtractedBlob {
+    let count_tokens = |text: &str| embedder.count_tokens(text);
+    let mut component_texts: Vec<(Key, String)> = Vec::new();
+    let mut seen_components: HashSet<Key> = HashSet::new();
+
+    metrics::trace(format_args!(
+        "extract file {}",
+        target.file.rel_path().display()
+    ));
+    let extracted = extract_file_chunks(
+        analyzer,
+        &target.file,
+        &count_tokens,
+        embedder.profile().max_seq_tokens,
+    );
+    metrics::trace(format_args!(
+        "extract done {} ({} chunks)",
+        target.file.rel_path().display(),
+        extracted.chunks.len()
+    ));
+    let mut chunks = Vec::with_capacity(extracted.chunks.len());
+    for chunk in extracted.chunks {
+        let hash = component_key(&chunk.text);
+        let parent_hash = chunk.parent_text.as_deref().map(component_key);
+        let composed_hash = match parent_hash {
+            Some(parent) => composed_key(&hash, &parent, embedder.profile().parent_alpha),
+            None => hash,
+        };
+        let fts_tokens = fts_text(&chunk.text);
+        if seen_components.insert(hash) {
+            component_texts.push((hash, chunk.text));
+        }
+        if let (Some(key), Some(text)) = (parent_hash, chunk.parent_text)
+            && seen_components.insert(key)
+        {
+            component_texts.push((key, text));
+        }
+        chunks.push(PendingChunk {
+            chunk_ord: chunk.ord,
+            kind: chunk.kind.as_str(),
+            symbol: chunk.symbol,
+            start_line: chunk.start_line,
+            end_line: chunk.end_line,
+            fts_tokens,
+            hash,
+            parent_summary_hash: parent_hash,
+            composed_hash,
+        });
+    }
+    metrics::trace(format_args!(
+        "fts/hash done {}",
+        target.file.rel_path().display()
+    ));
+
+    ExtractedBlob {
+        pending_blob: PendingBlob {
+            oid: target.oid.clone(),
+            language: target.language.clone(),
+            chunks,
+        },
         component_texts,
     }
 }

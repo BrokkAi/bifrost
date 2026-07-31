@@ -210,10 +210,10 @@ pub use summaries::most_relevant_files_with_cancellation;
 pub(crate) use scan_usages::ScanUsagesSurface;
 pub use scan_usages::scan_usages_target_label;
 pub use sources::symbol_source_candidate_files;
-#[cfg(any(feature = "nlp", test))]
+#[cfg(test)]
 pub(crate) use summaries::summarize_files;
 #[cfg(feature = "nlp")]
-pub(crate) use summaries::summary_block_for_code_unit;
+pub(crate) use summaries::{summary_block_for_code_unit, summary_block_for_file};
 
 const FILE_SEARCH_LIMIT: usize = 100;
 

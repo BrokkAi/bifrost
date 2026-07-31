@@ -560,9 +560,61 @@ pub(super) fn skim_files_note(truncated: bool, shown: usize, total: usize) -> Op
     })
 }
 
-#[cfg(any(test, feature = "nlp"))]
+#[cfg(test)]
 pub(crate) fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> SummaryResult {
     summarize_files_with_cancellation(analyzer, files, None)
+}
+
+#[cfg(any(test, feature = "nlp"))]
+pub(crate) fn summary_block_for_file(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+) -> Option<SummaryBlock> {
+    summary_block_for_file_with_cancellation(analyzer, file, None)
+}
+
+fn summary_block_for_file_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    cancellation: Option<&crate::CancellationToken>,
+) -> Option<SummaryBlock> {
+    if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+        return None;
+    }
+    let mut elements = analyzer
+        .summary_file_projection(file)
+        .map(|projection| summary_elements_from_file_projection(&projection, file))
+        .unwrap_or_else(|| {
+            let mut elements = Vec::new();
+            for code_unit in analyzer.top_level_declarations(file) {
+                elements.extend(summary_elements_for_code_unit_in_file(
+                    analyzer, &code_unit, file,
+                ));
+            }
+            elements
+        });
+
+    // A module-level declaration can appear both as its own entry in
+    // top_level_declarations and as a child of the synthetic module unit
+    // (which is itself top-level), so the recursion above emits it twice.
+    let mut seen = HashSet::default();
+    elements.retain(|element| {
+        seen.insert((element.symbol.clone(), element.start_line, element.end_line))
+    });
+
+    let (elements, fallback_reason) = if elements.is_empty() {
+        summary_fallback_for_file(analyzer, file)?
+    } else {
+        (elements, None)
+    };
+
+    Some(SummaryBlock {
+        label: rel_path_string(file),
+        path: rel_path_string(file),
+        preamble: file_preamble(analyzer, file, &elements),
+        fallback_reason,
+        elements,
+    })
 }
 
 fn summarize_files_with_cancellation(
@@ -573,49 +625,7 @@ fn summarize_files_with_cancellation(
     let _scope = profiling::scope("searchtools::summarize_files");
     let mut summaries: Vec<_> = files
         .into_par_iter()
-        .filter_map(|file| {
-            if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
-                return None;
-            }
-            let mut elements = analyzer
-                .summary_file_projection(&file)
-                .map(|projection| summary_elements_from_file_projection(&projection, &file))
-                .unwrap_or_else(|| {
-                    let mut elements = Vec::new();
-                    for code_unit in analyzer.top_level_declarations(&file) {
-                        elements.extend(summary_elements_for_code_unit_in_file(
-                            analyzer, &code_unit, &file,
-                        ));
-                    }
-                    elements
-                });
-
-            // A module-level declaration can appear both as its own entry in
-            // top_level_declarations and as a child of the synthetic module unit
-            // (which is itself top-level), so the recursion above emits it twice --
-            // for Python this doubles every module-level `def`. Collapse to one
-            // element per (symbol, line span) so each declaration is summarized
-            // exactly once; this feeds both the structured `elements` and the
-            // derived render_text.
-            let mut seen = HashSet::default();
-            elements.retain(|element| {
-                seen.insert((element.symbol.clone(), element.start_line, element.end_line))
-            });
-
-            let (elements, fallback_reason) = if elements.is_empty() {
-                summary_fallback_for_file(analyzer, &file)?
-            } else {
-                (elements, None)
-            };
-
-            Some(SummaryBlock {
-                label: rel_path_string(&file),
-                path: rel_path_string(&file),
-                preamble: file_preamble(analyzer, &file, &elements),
-                fallback_reason,
-                elements,
-            })
-        })
+        .filter_map(|file| summary_block_for_file_with_cancellation(analyzer, &file, cancellation))
         .collect();
     summaries.sort_by(|left, right| {
         left.path
