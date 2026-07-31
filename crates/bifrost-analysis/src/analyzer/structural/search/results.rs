@@ -653,14 +653,14 @@ pub enum CodeQueryFlowCarrierSymbol {
 pub enum CodeQueryFlowFactSymbol {
     Zero,
     Carrier {
-        source: CodeQueryFlowEvent,
-        carrier: CodeQueryFlowCarrierSymbol,
+        source: Box<CodeQueryFlowEvent>,
+        carrier: Box<CodeQueryFlowCarrierSymbol>,
         #[serde(skip_serializing_if = "is_false")]
         uncertain: bool,
     },
     Meeting {
-        source: CodeQueryFlowEvent,
-        sink: CodeQueryFlowEvent,
+        source: Box<CodeQueryFlowEvent>,
+        sink: Box<CodeQueryFlowEvent>,
         #[serde(skip_serializing_if = "is_false")]
         uncertain: bool,
     },

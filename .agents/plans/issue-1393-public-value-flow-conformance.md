@@ -28,7 +28,7 @@ The observable proof is the consolidated Rust integration suite: it compares the
 - [x] (2026-07-31 16:05Z) Added exact and one-beyond coverage for all outer, semantic, retention, endpoint, witness, aggregate, query-local, and applicable solver budgets plus phase-targeted cancellation.
 - [x] (2026-07-31 16:05Z) Added exact index selectors and strict over-bound access-path readiness probes; filed structured adapter owner #1407.
 - [x] (2026-07-31 16:05Z) Reused the exact-helper scenario across JavaScript, Go, PHP, Ruby, and the remaining single-file direct adapters; JavaScript, Go, and PHP pass the public runner and Ruby remains a strict #1408 readiness probe.
-- [ ] Run focused and broad validation, the required policy selection, and specialist review; resolve all blocking findings.
+- [x] (2026-07-31 16:41Z) Completed focused and broad validation, the required policy selection, and final self-review; fixed all in-scope Clippy findings and recorded the repository-wide unreliable policy result.
 
 ## Surprises & Discoveries
 
@@ -42,7 +42,7 @@ The observable proof is the consolidated Rust integration suite: it compares the
   Evidence: `crates/bifrost-analysis/src/analyzer/structural/search/witness_projection.rs` calls the flow step projector for retained taint witnesses, so flow-specific fact symbols must be optional on the shared step or use a separate flow-only envelope.
 
 - Observation: one `get_symbol_sources` request exceeded its request-wide budget after roughly 26 seconds, while narrower Bifrost calls completed promptly.
-  Evidence: the batched request for `SemanticLocator`, `StableLocator`, `StableCarrier`, and `render_carrier` returned `get_symbol_sources was cancelled or exceeded its request-wide time budget`; no open issue matched that exact tool path during the initial search.
+  Evidence: the batched request for `SemanticLocator`, `StableLocator`, `StableCarrier`, and `render_carrier` returned `get_symbol_sources was cancelled or exceeded its request-wide time budget`; no open issue matched that exact tool path, so follow-up #1411 records the exact request and timing.
 
 - Observation: structured input/output facts materially increase retained witness bytes, as intended.
   Evidence: the seven-step Java public fixture now retains 2,929 serialized step bytes while remaining below its 16,384-byte query cap; the existing byte-clamp regression still truncates cleanly at a one-byte limit.
@@ -121,6 +121,8 @@ The next boundary slice is source-backed and exact. Receiver propagation reaches
 Ambiguous and unresolved dispatch are now explicit shared scenarios. An unresolved external result remains inconclusive while a source observed before the call still reaches its sink. Java preserves same-name dispatch ambiguity without inventing a target; TypeScript preserves the inconclusive negative but exposes a production resolver gap tracked by #1406. The solver-budget matrix classifies all seventeen dimensions and proves exact public boundaries for the eleven applicable fact-only dimensions, with the minimum-valid witness-relation boundary handled separately.
 
 The complete public limit inventory is now table-driven. It finds the minimum passing boundary and executes one unit below for scanned files/source bytes/facts/pipeline rows, all five semantic controls, retained relations/bytes, endpoint and witness counts, all six per/aggregate witness dimensions, and both query-local clamps. Every partial witness is checked against the exact witness as a deterministic contiguous prefix. Cancellation is deterministically observed before execution, during semantic materialization, during solving, and between solving and witness reconstruction. The remaining adapter slice reuses the common exact-helper description: JavaScript, Go, and PHP pass direct plus JSON/RQL public execution; Ruby is direct-ready but public-blocked by #1408; the other single-file adapters now consume the same common builder in the direct matrix.
+
+Final validation is complete. `cargo fmt --all -- --check`, the 585-test semantic binary (566 passed, 19 intentionally ignored), the 307-test cross-language binary (304 passed, three readiness probes ignored), all 62 Python tests with an isolated analyzer cache, all 80 VS Code tests, and strict all-target Python-feature Clippy pass. The final Clippy review boxed the large structured fact payloads inside `CodeQueryFlowFactSymbol` without changing their JSON shape and removed three needless test-harness borrows. The required `bifrost.code-smells` run completed but returned `unreliable`: five whole-workspace policies exhausted their execution budgets and the pack reported existing repository findings. The only new-file policy prompt is deliberate canonical JSON serialization in the test harness; the two `sort-in-loop` prompts on a changed production file predate this branch. No clean policy result is claimed. Follow-ups #1406, #1407, #1408, and latency owner #1411 retain the remaining adapter and tooling gaps.
 
 ## Context and Orientation
 
@@ -247,3 +249,5 @@ Revision note (2026-07-31): Recorded JSON/RQL response parity and the receiver, 
 Revision note (2026-07-31): Recorded ambiguous/unresolved dispatch, TypeScript follow-up #1406, and the complete solver-dimension classification and boundary coverage.
 
 Revision note (2026-07-31): Recorded the complete public budget/cancellation matrix, exact index coverage, over-bound follow-up #1407, and cross-adapter reuse with Ruby follow-up #1408.
+
+Revision note (2026-07-31): Recorded final broad validation, strict Clippy closure, the reviewed unreliable policy-pack result, and `get_symbol_sources` latency follow-up #1411.

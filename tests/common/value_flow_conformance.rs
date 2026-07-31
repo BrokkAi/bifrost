@@ -472,9 +472,9 @@ pub fn assert_resolved_value_flow_conformance(
         "{} aggregate completeness",
         case.name
     );
-    assert_exact_meetings(case, &resolved, &result);
-    assert_sink_outcomes(case, &resolved, &result);
-    assert_witness(case, &resolved);
+    assert_exact_meetings(case, resolved, &result);
+    assert_sink_outcomes(case, resolved, &result);
+    assert_witness(case, resolved);
 }
 
 pub fn resolve_value_flow_conformance_case(

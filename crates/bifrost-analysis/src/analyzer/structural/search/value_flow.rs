@@ -1044,35 +1044,35 @@ fn public_fact_symbol(
     match (fact.source(), fact.carrier(), fact.sink()) {
         (None, None, None) => CodeQueryFlowFactSymbol::Zero,
         (Some(source_id), Some(carrier_id), None) => CodeQueryFlowFactSymbol::Carrier {
-            source: public_event(
+            source: Box::new(public_event(
                 workspace,
                 plan_ref,
                 "source",
                 plan.source(source_id)
                     .expect("validated value-flow witness source resolves"),
-            ),
-            carrier: public_carrier_symbol(
+            )),
+            carrier: Box::new(public_carrier_symbol(
                 workspace,
                 plan.carrier_key(carrier_id)
                     .expect("validated value-flow witness carrier resolves"),
-            ),
+            )),
             uncertain,
         },
         (Some(source_id), None, Some(sink_id)) => CodeQueryFlowFactSymbol::Meeting {
-            source: public_event(
+            source: Box::new(public_event(
                 workspace,
                 plan_ref,
                 "source",
                 plan.source(source_id)
                     .expect("validated value-flow witness source resolves"),
-            ),
-            sink: public_event(
+            )),
+            sink: Box::new(public_event(
                 workspace,
                 plan_ref,
                 "sink",
                 plan.sink(sink_id)
                     .expect("validated value-flow witness sink resolves"),
-            ),
+            )),
             uncertain,
         },
         shape => panic!("invalid value-flow witness fact shape: {shape:?}"),
