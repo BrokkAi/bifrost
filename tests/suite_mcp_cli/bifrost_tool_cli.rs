@@ -1347,7 +1347,10 @@ fn query_code_help_includes_boundary_example_and_guide() {
     );
     assert!(stdout.contains("typed semantic steps"), "{stdout}");
     assert!(stdout.contains("imports_of"), "{stdout}");
-    assert!(stdout.contains(r#"{"match":{"kind":"call""#), "{stdout}");
+    assert!(
+        stdout.contains(r#"{"schema_version":7,"match":{"kind":"method","name":"run"}"#),
+        "{stdout}"
+    );
     assert!(!stdout.contains("search_ast"), "{stdout}");
     assert!(
         stdout.contains("https://bifrost.brokk.ai/code-querying/"),

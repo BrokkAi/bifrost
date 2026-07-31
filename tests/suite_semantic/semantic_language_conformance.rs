@@ -670,7 +670,7 @@ fn assert_declared_cpp_direct_call_conformance(
         &project,
         fixture,
         DirectCallExpectations {
-            unproven_link_unit: true,
+            unproven_return: true,
             ..DirectCallExpectations::default()
         },
     );

@@ -28,6 +28,7 @@ notify = "6.1.1"
 quick-xml = "0.40"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+sha2 = "0.10.8"
 url = { version = "2.5.8", default-features = false, features = ["std"] }
 xee-xpath = "0.1.5"
 xot = "0.31"

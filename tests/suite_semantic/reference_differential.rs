@@ -1,8 +1,10 @@
-use crate::common::InlineTestProject;
+use crate::common::{InlineTestProject, call_search_tool_json};
 use brokk_bifrost::reference_differential::{
-    ReferenceClassification, ReferenceDifferentialConfig, run_reference_differential,
+    ExactReferenceSite, ReferenceClassification, ReferenceDifferentialConfig,
+    run_reference_differential,
 };
 use brokk_bifrost::{AnalyzerConfig, Language};
+use serde_json::json;
 
 fn rust_differential(
     files: &[(&str, &str)],
@@ -80,6 +82,61 @@ fn go_differential(
         },
     )
     .expect("run inline Go reference differential")
+}
+
+fn scala_exact_site_differential(
+    files: &[(&str, &str)],
+    path: &str,
+    start_byte: usize,
+    end_byte: usize,
+) -> brokk_bifrost::reference_differential::ReferenceDifferentialReport {
+    let mut project = InlineTestProject::with_language(Language::Scala);
+    for (file_path, source) in files {
+        project = project.file(file_path, *source);
+    }
+    let project = project.build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    run_reference_differential(
+        workspace.analyzer(),
+        &ReferenceDifferentialConfig {
+            corpus_language: "scala".to_string(),
+            max_files: 20,
+            max_sites: 1_000,
+            max_candidates_per_file: 1_000,
+            max_source_bytes: 100_000,
+            max_targets: 1_000,
+            max_usage_files: 20,
+            max_usages: 1_000,
+            exact_site: Some(ExactReferenceSite {
+                path: path.to_string(),
+                start_byte,
+                end_byte: Some(end_byte),
+            }),
+            ..ReferenceDifferentialConfig::default()
+        },
+    )
+    .expect("run inline Scala exact-site reference differential")
+}
+
+fn lookup_by_location(
+    root: &std::path::Path,
+    path: &str,
+    source: &str,
+    start: usize,
+) -> serde_json::Value {
+    let prefix = &source[..start];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix, |(_, current_line)| current_line)
+        .chars()
+        .count()
+        + 1;
+    call_search_tool_json(
+        root,
+        "get_definitions_by_location",
+        &json!({"references": [{"path": path, "line": line, "column": column}]}).to_string(),
+    )
 }
 
 #[test]
@@ -440,6 +497,89 @@ impl<T> crate::arena_tree::Node<T> {
             "{site:#?}"
         );
     }
+}
+
+#[test]
+fn scala_exact_site_round_trips_an_intermediate_nested_owner() {
+    let api = r#"package zio.http
+
+final case class WebSocketConfig(sendCloseFrame: WebSocketConfig.CloseStatus)
+
+object WebSocketConfig {
+  sealed trait CloseStatus
+
+  object CloseStatus {
+    case object NormalClosure extends CloseStatus
+    case object EndpointUnavailable extends CloseStatus
+  }
+}
+"#;
+    let consumer = r#"package zio.http.netty.socket
+
+import zio.http.WebSocketConfig
+
+private object NettySocketProtocol {
+  private def closeStatusToNetty(closeStatus: WebSocketConfig.CloseStatus): Int =
+    closeStatus match {
+      case WebSocketConfig.CloseStatus.NormalClosure       => 0
+      case WebSocketConfig.CloseStatus.EndpointUnavailable => 1
+    }
+}
+"#;
+    let files = [
+        ("zio/http/WebSocketConfig.scala", api),
+        ("zio/http/netty/socket/NettySocketProtocol.scala", consumer),
+    ];
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(files[0].0, files[0].1)
+        .file(files[1].0, files[1].1)
+        .build();
+
+    let needle = "WebSocketConfig.CloseStatus.NormalClosure";
+    let start = consumer.find(needle).expect("qualified match owner") + "WebSocketConfig.".len();
+    let end = start + "CloseStatus".len();
+    let public = lookup_by_location(
+        project.root(),
+        "zio/http/netty/socket/NettySocketProtocol.scala",
+        consumer,
+        start,
+    );
+    let public_result = &public["results"][0];
+    assert_eq!(public_result["status"], "resolved", "{public}");
+    assert_eq!(
+        public_result["definitions"][0]["fqn"], "zio.http.WebSocketConfig$.CloseStatus$",
+        "{public}"
+    );
+
+    let report = scala_exact_site_differential(
+        &files,
+        "zio/http/netty/socket/NettySocketProtocol.scala",
+        start,
+        end,
+    );
+    assert_eq!(report.summary.sampled_sites, 1, "{report:#?}");
+    let site = &report.sites[0];
+    assert_eq!(site.path, "zio/http/netty/socket/NettySocketProtocol.scala");
+    assert_eq!(site.forward_status, "resolved", "{site:#?}");
+    assert_eq!(
+        site.targets.first().map(|target| target.fq_name.as_str()),
+        Some("zio.http.WebSocketConfig$.CloseStatus$"),
+        "exact-site differential must agree with public lookup on the sampled middle owner: {site:#?}"
+    );
+    assert_eq!(
+        site.classification,
+        ReferenceClassification::Consistent,
+        "{site:#?}"
+    );
+    assert!(
+        site.inverse_hit.as_ref().is_some_and(|hit| {
+            hit.path == "zio/http/netty/socket/NettySocketProtocol.scala"
+                && hit.start_byte == start
+                && hit.end_byte == end
+                && hit.exact_range
+        }),
+        "{site:#?}"
+    );
 }
 
 #[test]

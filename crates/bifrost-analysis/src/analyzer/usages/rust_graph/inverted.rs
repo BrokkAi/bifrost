@@ -27,7 +27,9 @@ use super::extractor::{
 use super::hits::{rust_path_is_leading_absolute, rust_path_segments};
 use crate::analyzer::rust::lexical_scope::RustLexicalScopeIndex;
 use crate::analyzer::rust::rust_focused_use_path;
-use crate::analyzer::rust::{RustBindingSeeds, RustReferenceNamespace};
+use crate::analyzer::rust::{
+    RustBindingSeeds, RustReferenceNamespace, resolve_rust_import_package_scoped,
+};
 use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     EdgeCollector, UsageEdgeBuildOutput, UsageReferenceKind, build_edge_output,
@@ -478,8 +480,17 @@ impl RustScan<'_, '_> {
         explicit_namespace: Option<RustReferenceNamespace>,
     ) -> Option<String> {
         let path = rust_focused_use_path(focused, self.source)?;
-        let candidate = if explicit_namespace == Some(RustReferenceNamespace::PathPrefix) {
-            self.refs.resolve_scoped_owner(&path.full_path)
+        let candidate = if explicit_namespace == Some(RustReferenceNamespace::PathPrefix)
+            || focused.kind() == "self"
+        {
+            resolve_rust_import_package_scoped(
+                self.rust,
+                self.file,
+                self.source,
+                focused.start_byte(),
+                &path.full_path,
+            )
+            .or_else(|| self.refs.resolve_scoped_owner(&path.full_path))
         } else {
             let (name, prefix) = path.segments.split_last()?;
             if prefix.is_empty() {

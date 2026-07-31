@@ -2660,6 +2660,7 @@ const fn cvss_severity(value: CvssSeverity) -> &'static str {
 const fn incomplete_reason(value: PolicyIncompleteReason) -> &'static str {
     match value {
         PolicyIncompleteReason::Cancelled => "cancelled",
+        PolicyIncompleteReason::DeadlineExceeded => "deadline_exceeded",
         PolicyIncompleteReason::QueryResultLimit => "query_result_limit",
         PolicyIncompleteReason::BatchFindingLimit => "batch_finding_limit",
         PolicyIncompleteReason::ScannedFileBudget => "scanned_file_budget",
@@ -2716,6 +2717,7 @@ const fn finding_incomplete_reason(value: FindingIncompleteReason) -> &'static s
 fn report_diagnostic_code(value: super::super::PolicyReportDiagnosticCode) -> &'static str {
     use super::super::PolicyReportDiagnosticCode as Code;
     match value {
+        Code::WorkspaceSnapshotDeadlineExceeded => "workspace-snapshot-deadline-exceeded",
         Code::SuppressionLoadFailed => "suppression-load-failed",
         Code::SuppressionAuditRetentionExceeded => "suppression-audit-retention-exceeded",
         Code::PolicyLoadFailed => "policy-load-failed",

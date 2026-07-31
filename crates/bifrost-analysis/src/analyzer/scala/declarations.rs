@@ -130,7 +130,7 @@ enum ScalaWork<'tree> {
         recovery_owners: Vec<ScalaRecoveryOwner>,
     },
     TemplateBody {
-        node: Node<'tree>,
+        children: Vec<Node<'tree>>,
         package_name: String,
         package_prefixes: Vec<String>,
         parent: CodeUnit,
@@ -170,12 +170,12 @@ impl<'a> ScalaVisitor<'a> {
                     &mut stack,
                 ),
                 ScalaWork::TemplateBody {
-                    node,
+                    children,
                     package_name,
                     package_prefixes,
                     parent,
                 } => self.process_template_body(
-                    node,
+                    children,
                     &package_name,
                     &package_prefixes,
                     &parent,
@@ -507,12 +507,40 @@ impl<'a> ScalaVisitor<'a> {
         }
 
         if let Some(body) = node.child_by_field_name("body") {
-            stack.push(ScalaWork::TemplateBody {
-                node: body,
-                package_name: package_name.to_string(),
-                package_prefixes: package_prefixes.to_vec(),
-                parent: code_unit.clone(),
-            });
+            let mut cursor = body.walk();
+            let mut children = body.named_children(&mut cursor).collect::<Vec<_>>();
+            let braced = {
+                let mut cursor = body.walk();
+                body.children(&mut cursor).any(|child| child.kind() == "{")
+            };
+            let promoted = (!braced)
+                .then(|| {
+                    children
+                        .iter()
+                        .position(|child| {
+                            child.start_position().column <= node.start_position().column
+                        })
+                        .map(|split| children.split_off(split))
+                })
+                .flatten()
+                .unwrap_or_default();
+            if !promoted.is_empty() {
+                stack.push(ScalaWork::CompilationUnit {
+                    children: promoted,
+                    index: 0,
+                    package_name: package_name.to_string(),
+                    package_prefixes: package_prefixes.to_vec(),
+                    recovery_owners: Vec::new(),
+                });
+            }
+            if !children.is_empty() {
+                stack.push(ScalaWork::TemplateBody {
+                    children,
+                    package_name: package_name.to_string(),
+                    package_prefixes: package_prefixes.to_vec(),
+                    parent: code_unit.clone(),
+                });
+            }
         }
         Some(code_unit)
     }
@@ -568,14 +596,12 @@ impl<'a> ScalaVisitor<'a> {
 
     fn process_template_body<'tree>(
         &mut self,
-        body: Node<'tree>,
+        children: Vec<Node<'tree>>,
         package_name: &str,
         package_prefixes: &[String],
         parent: &CodeUnit,
         stack: &mut Vec<ScalaWork<'tree>>,
     ) {
-        let mut cursor = body.walk();
-        let children = body.named_children(&mut cursor).collect::<Vec<_>>();
         for child in children {
             match child.kind() {
                 "function_definition" | "function_declaration" => {
@@ -624,8 +650,9 @@ impl<'a> ScalaVisitor<'a> {
                     );
                 }
                 "enum_case_definitions" | "enum_body" => {
+                    let mut cursor = child.walk();
                     stack.push(ScalaWork::TemplateBody {
-                        node: child,
+                        children: child.named_children(&mut cursor).collect(),
                         package_name: package_name.to_string(),
                         package_prefixes: package_prefixes.to_vec(),
                         parent: parent.clone(),

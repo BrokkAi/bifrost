@@ -3,7 +3,7 @@ title: Antigravity
 description: Install and validate Bifrost MCP tools and skills in Google Antigravity.
 ---
 
-Google Antigravity can use Bifrost through a manual MCP server entry. Antigravity's visible **Add MCP** flow is a curated marketplace, but the app also reads local MCP configuration from `~/.gemini/config/mcp_config.json`.
+Google Antigravity can use Bifrost through a manual MCP server entry. Antigravity's visible **Add MCP** flow is a curated marketplace, but the app also reads global MCP configuration from `~/.gemini/config/mcp_config.json` and workspace-local configuration from `<workspace>/.agents/mcp_config.json`.
 
 For Antigravity's underlying host conventions, see the official [MCP](https://antigravity.google/docs/mcp) and [Skills](https://antigravity.google/docs/skills) documentation.
 
@@ -17,9 +17,13 @@ command -v bifrost
 bifrost --version
 ```
 
-The version check should print `bifrost 0.8.9`. Add a `bifrost` entry to the
-global `~/.gemini/config/mcp_config.json`, using the absolute binary path
-reported by `command -v bifrost`:
+The version check should print `bifrost 0.8.9`.
+
+### One fixed workspace
+
+For a single fixed workspace, add a `bifrost` entry to the global
+`~/.gemini/config/mcp_config.json`, using the absolute binary path reported by
+`command -v bifrost`:
 
 ```json
 {
@@ -37,10 +41,43 @@ reported by `command -v bifrost`:
 }
 ```
 
-Antigravity also accepts a project-local MCP configuration at
-`<workspace>/.agents/mcp_config.json`. Whichever scope you use, pass the exact
-workspace path to `--root`; do not rely on Antigravity's subprocess working
-directory.
+This global configuration is not dynamic. It always starts Bifrost for the
+same path, even when Antigravity opens another Project or Git worktree.
+
+### Git worktrees and multiple projects
+
+Use workspace-local MCP configuration for worktrees and whenever you regularly
+switch projects. Create or merge a `bifrost` entry into
+`<worktree>/.agents/mcp_config.json` from that worktree:
+
+```json
+{
+  "mcpServers": {
+    "bifrost": {
+      "command": "/absolute/path/to/bifrost",
+      "cwd": "/absolute/path/to/this/worktree",
+      "args": [
+        "--root",
+        ".",
+        "--mcp",
+        "symbol|extended"
+      ]
+    }
+  }
+}
+```
+
+`cwd` makes `--root .` resolve to this exact worktree. Do not omit either
+field: Bifrost must not infer its analyzer root from Antigravity's process
+working directory, plugin directory, or the selected Project. Antigravity does
+not currently provide Bifrost with a dynamic MCP workspace-root signal, so a
+rootless global server correctly remains unbound instead of following the
+active worktree.
+
+The local file contains an absolute, machine-specific worktree path. Keep it
+uncommitted and create it in each new worktree. An installation helper may
+derive the path with `git rev-parse --show-toplevel`, but it must merge only
+the `bifrost` entry and must not overwrite other MCP servers in the file.
 
 In Antigravity 2.x, create or select a Project that contains this same
 workspace: click the folder-plus icon beside **Projects**, choose **New
@@ -48,11 +85,14 @@ Project**, and add the checkout. Use the **Local** environment when validating
 an existing checkout. **New Worktree** intentionally creates another checkout,
 so its expected analyzer root will differ.
 
-Restart Antigravity or open **Settings -> Customizations** and click **Refresh**.
+Open **Settings -> Customizations** and click **Refresh** after creating or
+changing either MCP configuration. Refresh is normally enough; it restarts the
+MCP connection and reloads the tools without requiring a full Antigravity
+restart. Start a fresh conversation for the smoke test below. If Refresh still
+shows an old executable or workspace path, fully quit and reopen Antigravity
+so its MCP process and cached tool schemas are recreated.
 The **Installed MCP Servers** section should show `bifrost` with
-`search_symbols` and `query_code`. If an error still quotes an old executable
-or workspace path after Refresh, fully quit and reopen Antigravity so its MCP
-process and cached tool schemas are recreated.
+`search_symbols` and `query_code`.
 
 ## Add Skills
 

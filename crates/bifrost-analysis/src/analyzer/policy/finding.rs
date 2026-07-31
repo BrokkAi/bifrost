@@ -321,6 +321,7 @@ impl CertaintyReason {
 #[serde(rename_all = "snake_case")]
 pub enum PolicyIncompleteReason {
     Cancelled,
+    DeadlineExceeded,
     QueryResultLimit,
     BatchFindingLimit,
     ScannedFileBudget,
@@ -2350,6 +2351,22 @@ impl PolicyRun {
         &self.work
     }
 
+    pub(crate) fn replace_incomplete_reason(
+        &mut self,
+        from: PolicyIncompleteReason,
+        to: PolicyIncompleteReason,
+    ) -> Result<(), CompletionReasonError> {
+        let PolicyRunCompletion::Inconclusive { reasons } = &mut self.completion else {
+            return Ok(());
+        };
+        for reason in reasons.iter_mut().filter(|reason| **reason == from) {
+            *reason = to;
+        }
+        normalize_nonempty(reasons)?;
+        self.refresh_retained_bytes();
+        Ok(())
+    }
+
     pub(crate) fn validate_against_budget(
         &self,
         budget: &PolicyBudget,
@@ -3542,14 +3559,16 @@ mod tests {
     fn work_metrics_are_namespaced_sorted_and_unique() {
         let metrics = vec![
             PolicyWorkMetric::try_new("typestate.states", PolicyWorkUnit::Count, 2).unwrap(),
+            PolicyWorkMetric::try_new("policy.evaluation_steps", PolicyWorkUnit::Count, 4).unwrap(),
             PolicyWorkMetric::try_new("taint.propagation_states", PolicyWorkUnit::Count, 3)
                 .unwrap(),
         ];
         let work = PolicyWorkReport::try_new(1, 2, 3, 4, 5, 6, 7, 8, metrics).unwrap();
-        assert_eq!(work.metrics()[0].name(), "taint.propagation_states");
+        assert_eq!(work.metrics()[0].name(), "policy.evaluation_steps");
+        assert_eq!(work.metrics()[0].unit(), PolicyWorkUnit::Count);
         assert!(PolicyWorkMetric::try_new("scanned_files", PolicyWorkUnit::Count, 1).is_err());
         let duplicate =
-            PolicyWorkMetric::try_new("taint.propagation_states", PolicyWorkUnit::Rows, 4).unwrap();
+            PolicyWorkMetric::try_new("policy.evaluation_steps", PolicyWorkUnit::Rows, 4).unwrap();
         assert!(
             PolicyWorkReport::try_new(
                 0,
