@@ -139,6 +139,13 @@ scenarios = [
   "most_relevant_files",
   "scan_usages",
   "dead_code_smells",
+  "comment_density_files",
+  "comment_density_code_unit",
+  "exception_smells",
+  "structural_clone_smells",
+  "long_method_smells",
+  "secret_like_code",
+  "git_hotspots",
   "get_definition",
   "query_code",
 ]
@@ -151,6 +158,13 @@ usage_targets = [
 ]
 code_quality_probes = [
   { scenario = "dead_code_smells", file_paths = ["lib/application.js"], fq_names = ["tryRender"], expect_report_contains = ["Candidate symbols analyzed: 1"], expect_report_absent = ["no definition found", "not yet supported for smell analysis"] },
+  { scenario = "comment_density_files", file_paths = ["lib/response.js", "lib/application.js", "lib/request.js", "lib/utils.js", "lib/view.js"], expect_report_contains = ["### `lib/response.js`", "| `res.send` | 0 | 0 | 94 | 0 | 0 | 94 |"], expect_report_absent = ["(comment density unavailable; skipped)"] },
+  { scenario = "comment_density_code_unit", file_paths = ["lib/application.js"], fq_names = ["tryRender"], expect_report_contains = ["- Symbol: `tryRender`", "- Own: header 0, inline 0, span 7"], expect_report_absent = ["Comment density is unavailable"] },
+  { scenario = "exception_smells", file_paths = ["lib/application.js", "lib/view.js", "lib/response.js", "lib/request.js"], expect_report_contains = ["`tryRender` | `lib/application.js` | `generic-catch:<untyped>", "`tryStat` | `lib/view.js`"], expect_report_absent = ["unsupported"] },
+  { scenario = "structural_clone_smells", file_paths = ["test/app.all.js", "test/app.head.js", "test/app.options.js", "test/app.listen.js", "lib/application.js", "lib/response.js", "lib/utils.js", "lib/view.js"], expect_report_contains = ["`app.disable` (lib/application.js) | `app.enable` (lib/application.js)", "token-similarity:100"] },
+  { scenario = "long_method_smells", file_paths = ["lib/response.js", "lib/application.js", "lib/request.js"], expect_report_contains = ["- `res.send` in `lib/response.js:126-219` [score 119]", "high cyclomatic complexity 26"] },
+  { scenario = "secret_like_code", file_paths = ["test/req.signedCookies.js", "test/res.cookie.js", "lib/response.js"], expect_report_contains = ["| CURRENT | MEDIUM | `Credential assignment` | `lib/response.js:747` |"] },
+  { scenario = "git_hotspots", arguments = { since_iso = "2025-01-01T00:00:00Z", until_iso = "2026-05-18T00:00:00Z" }, expect_report_contains = ["- Analyzed commits: 143", "| `lib/response.js` | 9 | 26 | ABANDONWARE |"] },
 ]
 definition_queries = [
   { path = "lib/application.js", line = 574, column = 3, symbol = "tryRender", expected_status = "resolved", expected_fqn = "tryRender" },
