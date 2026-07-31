@@ -114,6 +114,12 @@ The observable outcomes are:
   records `timed_out`, runs the inline scorer, and excludes scoring time from agent wall time.
   Fresh r8 service `cimeval-r8-baseline-max.service` has all 30 workers active; a live turn-0
   trace proves the corrected model and effort.
+- [x] (2026-07-31 19:06Z) Added CIM-compatible localization extraction in brokkbench
+  `8f861239a8c`. It reconstructs Anvil's structured assistant/tool history, computes diagnostic
+  View A and canonical View B with semantic-result provenance, reads edits from the final patch,
+  and reports accuracy/recall at 1, 3, 5, 10, and 20 plus edit precision/recall. The first 25
+  completed r8 baseline cells localized with zero skips; their two views are identical and
+  partial Acc@5 is 44%, close to CIM's published 44.3% no-index result.
 - [ ] (2026-07-31 18:55Z) Prewarm dw10 serially on the A4000. The first attempt was stopped
   after 42 task revisions because it incorrectly selected stock Voyage's `parent_alpha=0.5`.
   Bifrost `bac89d82` adds an explicit fingerprinted `dw10` profile with the checkpoint's
@@ -353,6 +359,13 @@ The observable outcomes are:
   by accidentally counting the 862k mean cached reads as uncached usage.
   Evidence: r5 `report.json`, `leak-audit.json`, all terminal Mjolnir usage records, and the
   released CIM `results_public.csv`. Per the hard gate, no later seed has been scheduled.
+
+- Observation: Anvil's trace contains the complete structured messages needed to reproduce
+  CIM's dual-view localization rule without proxy logs or heuristic ACP-title parsing.
+  Evidence: each latest `llm_request` carries assistant tool arguments, tool-call IDs, and tool
+  results; `llm_response` supplies the terminal assistant step. On 25 completed no-semantic r8
+  cells, the adapted extractor produced zero skips, identical View A/View B metrics, and 44%
+  Acc@5 against CIM's published 44.3% no-index value.
 
 ## Decision Log
 
