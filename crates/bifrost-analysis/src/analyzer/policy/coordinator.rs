@@ -508,6 +508,7 @@ fn deadline_before_evaluation_outcome(
     Ok(PolicyBatchOutcome {
         report,
         taint_findings: Vec::new(),
+        taint_analysis_results: Vec::new(),
         exit_status: POLICY_EXIT_UNRELIABLE,
         max_retained_report_bytes: batch_budget.max_retained_report_bytes(),
         max_serialized_report_bytes: batch_budget.max_serialized_report_bytes(),
