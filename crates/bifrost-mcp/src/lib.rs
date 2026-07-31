@@ -4,9 +4,10 @@
 pub use brokk_bifrost_analysis::nlp;
 pub use brokk_bifrost_analysis::{
     AnalyzerConfig, CancellationToken, FilesystemProject, Project, ProjectFile, WorkspaceAnalyzer,
-    analyzer, cache_db, cancellation, code_quality, collect_workspace_files, diff_analysis,
-    file_tools, git_file, gitblob, hash, path_normalization, path_utils, profiling, searchtools,
-    searchtools_render, sexp, symbol_rename, workspace_document,
+    WorkspaceFileListingCache, analyzer, cache_db, cancellation, code_quality,
+    collect_workspace_files, diff_analysis, file_tools, git_file, gitblob, hash,
+    path_normalization, path_utils, profiling, searchtools, searchtools_render, sexp,
+    symbol_rename, workspace_document,
 };
 pub use brokk_bifrost_runtime::{CodeIntelligenceRuntime, code_intelligence};
 

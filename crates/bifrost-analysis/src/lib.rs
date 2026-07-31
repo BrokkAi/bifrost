@@ -52,9 +52,9 @@ pub use analyzer::{
     ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, SourceContent,
     TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
     TestProject, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
-    WorkspaceAnalyzer, collect_workspace_files, reset_rust_tree_parse_counters_for_test,
-    rust_tree_parse_count_for_test, rust_tree_parse_request_count_for_test,
-    rust_tree_parsed_bytes_for_test,
+    WorkspaceAnalyzer, WorkspaceFileListingCache, collect_workspace_files,
+    reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
+    rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
 };
 pub use cancellation::CancellationToken;
 pub use navigation::NavigationOperation;

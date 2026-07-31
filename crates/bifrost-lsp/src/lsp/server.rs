@@ -3230,6 +3230,10 @@ impl Project for ScopedProject {
         self.inner.is_gitignored(rel_path)
     }
 
+    fn invalidate_cached_file_listing(&self) {
+        self.inner.invalidate_cached_file_listing();
+    }
+
     fn read_source(&self, file: &ProjectFile) -> io::Result<String> {
         self.inner.read_source(file)
     }

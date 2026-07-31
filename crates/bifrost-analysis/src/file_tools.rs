@@ -279,14 +279,15 @@ pub fn find_filenames(
     params: FindFilenamesParams,
 ) -> FindFilenamesResult {
     let files = analyzer.project().all_files().unwrap_or_default();
-    find_filenames_in_files(files, params)
+    find_filenames_in_files(&files, params)
 }
 
 /// Match filename glob patterns against an already-collected workspace file
 /// listing. Callers that have no analyzer snapshot (or must not wait for one)
-/// can obtain the listing from an ignore-aware walk and call this directly.
-pub fn find_filenames_in_files(
-    files: impl IntoIterator<Item = ProjectFile>,
+/// can obtain the listing from an ignore-aware walk or the shared listing
+/// cache and call this directly.
+pub fn find_filenames_in_files<'a>(
+    files: impl IntoIterator<Item = &'a ProjectFile>,
     params: FindFilenamesParams,
 ) -> FindFilenamesResult {
     let limit = params.limit.max(1);
@@ -315,7 +316,7 @@ pub fn find_filenames_in_files(
 
     let mut matched: Vec<String> = Vec::new();
     for file in files {
-        let rel = rel_path_string(&file);
+        let rel = rel_path_string(file);
         let basename = file
             .rel_path()
             .file_name()
