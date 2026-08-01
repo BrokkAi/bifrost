@@ -17,8 +17,8 @@ default = []
 nlp = ["brokk-bifrost-analysis/nlp"]
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.17" }
-brokk-bifrost-runtime = { path = "../bifrost-runtime", version = "=0.8.17" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.18" }
+brokk-bifrost-runtime = { path = "../bifrost-runtime", version = "=0.8.18" }
 git2 = { version = "0.20.2", default-features = false }
 glob = "0.3.3"
 jaq-core = "3.0"
@@ -55,6 +55,6 @@ xee-xpath = "0.1.5"
 xot = "0.31"
 
 [dev-dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.17", features = ["test-support"] }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.18", features = ["test-support"] }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 tempfile = "3.23.0"

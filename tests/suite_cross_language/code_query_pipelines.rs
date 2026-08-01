@@ -5240,6 +5240,27 @@ fn cfg_pipeline_resolves_a_source_backed_procedure() {
 }
 
 #[test]
+fn procedure_of_bridges_a_ruby_top_level_function_to_its_semantic_method() {
+    let result = run(
+        &[("src/main.rb", "def target(value)\n  value\nend\n")],
+        json!({
+            "schema_version": 3,
+            "languages": ["ruby"],
+            "match": { "kind": "function", "name": "target" },
+            "steps": [{ "op": "procedure_of" }]
+        }),
+    );
+    let value = serialized(&result);
+
+    assert_eq!(value["results"].as_array().unwrap().len(), 1, "{value}");
+    assert_eq!(value["results"][0]["result_type"], "procedure");
+    assert_eq!(value["results"][0]["procedure_kind"], "method");
+    assert_eq!(value["results"][0]["path"], "src/main.rb");
+    assert_eq!(value["truncated"], false, "{value}");
+    assert!(value.get("diagnostics").is_none(), "{value}");
+}
+
+#[test]
 fn analyzer_only_cfg_pipeline_requires_workspace_semantic_services() {
     let project = InlineTestProject::new()
         .file("src/main.rs", "fn target() {}\n")

@@ -9,7 +9,7 @@ use super::{
     CodeQueryProcedure, CodeQueryProgramPoint, CodeQueryProgramPointBoundary,
     CodeQueryProgramPointRef, CodeQueryRange, CodeQuerySemanticCompleteness,
     CodeQuerySemanticEvidence, CodeQuerySemanticLimits, CodeQuerySemanticProof,
-    CodeQuerySemanticWork, DeclarationValue, SeedMatch,
+    CodeQuerySemanticWork, DeclarationValue, SeedMatch, seed_range,
 };
 use crate::analyzer::semantic::service::semantic_artifact_retained_bytes;
 use crate::analyzer::semantic::workspace_oracle::{
@@ -27,7 +27,7 @@ use crate::analyzer::structural::analysis_context::{
     ProtocolRef, QueryAnalysisContext, TaintResultRef, ValueFlowPlanRef,
 };
 use crate::analyzer::structural::query::WitnessTraversal;
-use crate::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
+use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{compute_line_starts, line_column_for_offset};
@@ -219,14 +219,7 @@ impl<'a> SemanticQueryContext<'a> {
     }
 
     pub(super) fn procedure_of_match(&mut self, seed: &SeedMatch) -> Vec<SemanticProcedureValue> {
-        let fact = seed.facts.node(seed.fact_match.node);
-        let span = fact.span();
-        let ranges = [Range {
-            start_byte: span.start_byte,
-            end_byte: span.end_byte,
-            start_line: fact.range.start_line,
-            end_line: fact.range.end_line,
-        }];
+        let ranges = [seed_range(seed)];
         let Some((artifact, source, quality)) = self.materialize(&seed.file) else {
             return Vec::new();
         };

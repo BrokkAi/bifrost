@@ -25,6 +25,7 @@ mod dataflow_clients;
 mod dataflow_ide;
 mod dataflow_summaries;
 mod dataflow_tabulation;
+mod dependency_semantic_pack;
 mod external_artifact_pack;
 mod icfg_contract;
 mod kotlin_semantic_diagnostics;

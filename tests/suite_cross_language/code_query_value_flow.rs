@@ -23,9 +23,9 @@ use serde_json::json;
 use crate::common::semantic_graph::SemanticGraph;
 use crate::common::{BuiltInlineTestProject, InlineTestProject};
 use crate::value_flow_conformance::{
-    ExpectedSinkOutcome, ResolvedValueFlowConformanceCase, ValueFlowConformanceCase,
-    assert_resolved_value_flow_conformance, direct_solver_work, direct_witness_symbol_sequences,
-    resolve_value_flow_conformance_case,
+    ExpectedSinkOutcome, ProcedureSelector, ResolvedValueFlowConformanceCase,
+    ValueFlowConformanceCase, assert_resolved_value_flow_conformance, direct_solver_work,
+    direct_witness_symbol_sequences, resolve_value_flow_conformance_case,
 };
 use crate::value_flow_scenarios::{
     with_go_exact_helper, with_java_ambiguous_call_negative, with_java_branch_merge,
@@ -1669,9 +1669,8 @@ fn php_helper_scenario_runs_through_direct_and_public_queries() {
 }
 
 #[test]
-#[ignore = "readiness probe for #1408: Ruby structural seeds do not bridge to semantic methods"]
 fn ruby_helper_scenario_runs_through_direct_and_public_queries() {
-    with_ruby_exact_helper(assert_shared_helper_scenario);
+    with_ruby_exact_helper(|case| assert_shared_helper_scenario_with_seed_kind(case, "function"));
 }
 
 #[test]
@@ -1829,11 +1828,38 @@ fn typescript_ambiguous_call_preserves_public_inconclusive_negative() {
 }
 
 fn assert_shared_helper_scenario(case: &ValueFlowConformanceCase<'_>) {
-    assert_shared_helper_scenario_with_status(case, case.expected_discovery_status);
+    assert_shared_helper_scenario_with_seed_kind_and_status(
+        case,
+        shared_scenario_seed_kind(case),
+        case.expected_discovery_status,
+    );
 }
 
 fn assert_shared_helper_scenario_with_status(
     case: &ValueFlowConformanceCase<'_>,
+    expected_public_status: SemanticInputStatus,
+) {
+    assert_shared_helper_scenario_with_seed_kind_and_status(
+        case,
+        shared_scenario_seed_kind(case),
+        expected_public_status,
+    );
+}
+
+fn assert_shared_helper_scenario_with_seed_kind(
+    case: &ValueFlowConformanceCase<'_>,
+    seed_kind: &str,
+) {
+    assert_shared_helper_scenario_with_seed_kind_and_status(
+        case,
+        seed_kind,
+        case.expected_discovery_status,
+    );
+}
+
+fn assert_shared_helper_scenario_with_seed_kind_and_status(
+    case: &ValueFlowConformanceCase<'_>,
+    seed_kind: &str,
     expected_public_status: SemanticInputStatus,
 ) {
     let resolved = resolve_value_flow_conformance_case(case);
@@ -1862,7 +1888,7 @@ fn assert_shared_helper_scenario_with_status(
         WORKSPACE_GENERATION,
         &ProtocolRegistrationSet::default(),
         &registrations,
-        &shared_scenario_query(case, SHARED_PLAN_REF, false),
+        &shared_scenario_query_with_seed_kind(case, SHARED_PLAN_REF, false, seed_kind),
         CodeQueryExecutionLimits::default(),
         None,
         summaries.lease(WORKSPACE_GENERATION).unwrap(),
@@ -1873,7 +1899,7 @@ fn assert_shared_helper_scenario_with_status(
         WORKSPACE_GENERATION,
         &ProtocolRegistrationSet::default(),
         &registrations,
-        &shared_scenario_rql_query(case, SHARED_PLAN_REF, false),
+        &shared_scenario_rql_query_with_seed_kind(case, SHARED_PLAN_REF, false, seed_kind),
         CodeQueryExecutionLimits::default(),
         None,
         summaries.lease(WORKSPACE_GENERATION).unwrap(),
@@ -1891,7 +1917,7 @@ fn assert_shared_helper_scenario_with_status(
         WORKSPACE_GENERATION,
         &ProtocolRegistrationSet::default(),
         &registrations,
-        &shared_scenario_query(case, SHARED_WITNESS_PLAN_REF, true),
+        &shared_scenario_query_with_seed_kind(case, SHARED_WITNESS_PLAN_REF, true, seed_kind),
         CodeQueryExecutionLimits::default(),
         None,
         summaries.lease(WORKSPACE_GENERATION).unwrap(),
@@ -1902,7 +1928,7 @@ fn assert_shared_helper_scenario_with_status(
         WORKSPACE_GENERATION,
         &ProtocolRegistrationSet::default(),
         &registrations,
-        &shared_scenario_rql_query(case, SHARED_WITNESS_PLAN_REF, true),
+        &shared_scenario_rql_query_with_seed_kind(case, SHARED_WITNESS_PLAN_REF, true, seed_kind),
         CodeQueryExecutionLimits::default(),
         None,
         summaries.lease(WORKSPACE_GENERATION).unwrap(),
@@ -1974,16 +2000,38 @@ fn shared_scenario_query(
     plan_ref: &str,
     with_witness: bool,
 ) -> CodeQuery {
-    let root = case
-        .procedures
-        .iter()
-        .find(|procedure| procedure.alias == case.root)
-        .expect("shared scenario root selector");
-    let kind = match root.kind {
+    shared_scenario_query_with_seed_kind(
+        case,
+        plan_ref,
+        with_witness,
+        shared_scenario_seed_kind(case),
+    )
+}
+
+fn shared_scenario_seed_kind(case: &ValueFlowConformanceCase<'_>) -> &'static str {
+    match shared_scenario_root(case).kind {
         ProcedureKind::Method => "method",
         ProcedureKind::Function => "function",
         other => panic!("unsupported shared scenario root kind {other:?}"),
-    };
+    }
+}
+
+fn shared_scenario_root<'case>(
+    case: &ValueFlowConformanceCase<'case>,
+) -> &'case ProcedureSelector<'case> {
+    case.procedures
+        .iter()
+        .find(|procedure| procedure.alias == case.root)
+        .expect("shared scenario root selector")
+}
+
+fn shared_scenario_query_with_seed_kind(
+    case: &ValueFlowConformanceCase<'_>,
+    plan_ref: &str,
+    with_witness: bool,
+    seed_kind: &str,
+) -> CodeQuery {
+    let root = shared_scenario_root(case);
     let mut steps = vec![
         json!({"op": "procedure_of"}),
         json!({"op": "value_flow", "plan_ref": plan_ref}),
@@ -1993,7 +2041,7 @@ fn shared_scenario_query(
     }
     CodeQuery::from_json(&json!({
         "schema_version": 6,
-        "match": {"kind": kind, "name": root.name},
+        "match": {"kind": seed_kind, "name": root.name},
         "steps": steps,
     }))
     .unwrap()
@@ -2009,24 +2057,16 @@ fn profiled_shared_scenario_query(
     CodeQuery::from_json(&value).unwrap()
 }
 
-fn shared_scenario_rql_query(
+fn shared_scenario_rql_query_with_seed_kind(
     case: &ValueFlowConformanceCase<'_>,
     plan_ref: &str,
     with_witness: bool,
+    seed_kind: &str,
 ) -> CodeQuery {
-    let root = case
-        .procedures
-        .iter()
-        .find(|procedure| procedure.alias == case.root)
-        .expect("shared scenario root selector");
-    let kind = match root.kind {
-        ProcedureKind::Method => "method",
-        ProcedureKind::Function => "function",
-        other => panic!("unsupported shared scenario root kind {other:?}"),
-    };
+    let root = shared_scenario_root(case);
     let root_name = serde_json::to_string(root.name).expect("RQL root name");
     let value_flow =
-        format!("(value-flow :plan-ref {plan_ref} (procedure-of ({kind} :name {root_name})))");
+        format!("(value-flow :plan-ref {plan_ref} (procedure-of ({seed_kind} :name {root_name})))");
     let source = if with_witness {
         format!("(witness :max-steps 256 :max-bytes 262144 {value_flow})")
     } else {
