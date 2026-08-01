@@ -560,6 +560,12 @@ jobs:
           node scripts/ci-timing.mjs --label rust-test-${{ matrix.target }} -- cargo test --target
           ${{ matrix.target }} ${{ matrix.cargo-flags }} ${{ matrix.test-args }}
 
+      - name: Semantic pack distribution tests
+        if: matrix.can-test
+        run: >-
+          node scripts/ci-timing.mjs --label semantic-pack-test-${{ matrix.target }} -- cargo test
+          -p brokk-bifrost-semantic-packs --target ${{ matrix.target }} ${{ matrix.test-args }}
+
   python:
     name: python (${{ matrix.target }})
     needs: [ci-impact, quick-policy, lint]

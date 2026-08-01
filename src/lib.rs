@@ -38,6 +38,7 @@ pub use brokk_bifrost_mcp::{
     scoped_project, searchtools_service, structured_data, tool_arguments,
 };
 pub use brokk_bifrost_runtime::{CodeIntelligenceRuntime, code_intelligence};
+pub use brokk_bifrost_semantic_packs as semantic_packs;
 
 /// Exact source revision embedded into every binary from this Cargo build.
 /// Benchmark clients use it to reject a stale sibling MCP server.

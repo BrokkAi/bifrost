@@ -48,8 +48,13 @@ Those issues will publish content through the interfaces established here.
 - [x] (2026-08-01 06:28Z) Drafted this implementation plan and selected a
   separate downstream distribution crate rather than moving generic pack
   support out of the analyzer.
-- [ ] Add the published `brokk-bifrost-semantic-packs` crate, package checks,
-  release ordering, and dependency-direction tests.
+- [x] (2026-08-01 06:44Z) Added the published
+  `brokk-bifrost-semantic-packs` crate, explicit embedded-pack registry,
+  package checks, release ordering, CI coverage, facade composition, and
+  dependency-direction tests. Two focused Rust tests, 33 Node graph/workflow
+  tests, strict Clippy, and the six-archive package gate passed; the gate
+  compiled both the facade and an analysis-only consumer from unpacked crate
+  archives.
 - [ ] Define and validate the compact release-index and asset-envelope
   contracts, including compatibility, provenance, checksums, sizes, notices,
   revocation, and deterministic serialization.
@@ -99,6 +104,13 @@ Those issues will publish content through the interfaces established here.
   `-32603`. A later two-file semantic-model summary completed in 6.1 seconds.
   Existing issues #1419 and #1423 own this behavior, including current-tip rmcp
   evidence from the parallel #1150 investigation.
+
+- Observation: This machine's default Rust tools mix rustup Cargo/rustc with
+  Homebrew rustdoc and Clippy even though both report Rust 1.96.
+  Evidence: unit tests passed, then the doctest rejected an analysis rlib built
+  by the rustup compiler as incompatible with Homebrew rustdoc. Setting
+  `RUSTDOC=/Users/dave/.cargo/bin/rustdoc` made the focused tests pass, and the
+  isolated strict Clippy gate passed with the complete Homebrew toolchain.
 
 ## Decision Log
 
@@ -157,10 +169,13 @@ Those issues will publish content through the interfaces established here.
 
 ## Outcomes & Retrospective
 
-Planning is complete. The chosen architecture agrees with the proposed crate
-split, with the important qualification that the analyzer continues to own the
-generic ability to consume semantic packs. No implementation milestone has
-been completed yet.
+Planning and the first implementation milestone are complete. The chosen
+architecture agrees with the proposed crate split, with the important
+qualification that the analyzer continues to own the generic ability to consume
+semantic packs. The workspace now enforces the one-way dependency, packages and
+publishes the new crate before the facade, and provides an explicit validated
+embedded-pack registry whose production inventory remains empty until #1152 or
+#1153 supplies reviewed content. Release-index and acquisition work remains.
 
 ## Context and Orientation
 
@@ -431,7 +446,7 @@ service. The service may depend on the new crate, analysis, and runtime. Analyze
 constructors remain neutral and direct analysis consumers continue to supply
 their own catalog and activation request.
 
-Revision note: 2026-08-01. Initial plan created after live issue and repository
-inspection. It records the user-proposed crate split, narrows the split to
-curated content and distribution policy, and explicitly excludes concurrent
-#1150 local dependency generation.
+Revision note: 2026-08-01 06:44Z. Updated after Milestone 1 implementation and
+validation to record the concrete package boundary, empty production registry,
+release/CI integration, analysis-only consumer proof, and local Rust toolchain
+discovery. The next milestone is the strict release index and asset envelope.

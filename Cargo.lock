@@ -255,6 +255,7 @@ dependencies = [
  "brokk-bifrost-lsp",
  "brokk-bifrost-mcp",
  "brokk-bifrost-runtime",
+ "brokk-bifrost-semantic-packs",
  "cap-fs-ext",
  "cap-std",
  "chrono",
@@ -447,6 +448,13 @@ dependencies = [
  "brokk-bifrost-analysis",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "brokk-bifrost-semantic-packs"
+version = "0.8.18"
+dependencies = [
+ "brokk-bifrost-analysis",
 ]
 
 [[package]]

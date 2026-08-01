@@ -4,6 +4,7 @@ set -euo pipefail
 
 readonly packages=(
   brokk-bifrost-analysis
+  brokk-bifrost-semantic-packs
   brokk-bifrost-runtime
   brokk-bifrost-mcp
   brokk-bifrost-lsp
@@ -23,6 +24,7 @@ cd "$repo_root"
 # resolvable while leaving each normalized archive manifest registry-ready.
 readonly cargo_patch_args=(
   --config 'patch.crates-io.brokk-bifrost-analysis.path="crates/bifrost-analysis"'
+  --config 'patch.crates-io.brokk-bifrost-semantic-packs.path="crates/bifrost-semantic-packs"'
   --config 'patch.crates-io.brokk-bifrost-runtime.path="crates/bifrost-runtime"'
   --config 'patch.crates-io.brokk-bifrost-mcp.path="crates/bifrost-mcp"'
   --config 'patch.crates-io.brokk-bifrost-lsp.path="crates/bifrost-lsp"'
@@ -95,6 +97,7 @@ require_archive_file brokk-bifrost-analysis migrations/cache/0001-current-baseli
 require_archive_file brokk-bifrost-analysis policy-packs/bifrost.code-smells/manifest.json
 require_archive_file brokk-bifrost-analysis resources/treesitter/java/definitions.scm
 require_archive_file brokk-bifrost-analysis testdata/semantic-model-packs/declarations-v1.json
+require_archive_file brokk-bifrost-semantic-packs src/lib.rs
 
 required_analysis_vendor_files=(
   vendor/tree-sitter-scala/LICENSE
@@ -181,6 +184,7 @@ full = ["brokk-bifrost/nlp", "brokk-bifrost/python"]
 
 [patch.crates-io]
 brokk-bifrost-analysis = { path = "$unpacked/brokk-bifrost-analysis-$version" }
+brokk-bifrost-semantic-packs = { path = "$unpacked/brokk-bifrost-semantic-packs-$version" }
 brokk-bifrost-runtime = { path = "$unpacked/brokk-bifrost-runtime-$version" }
 brokk-bifrost-mcp = { path = "$unpacked/brokk-bifrost-mcp-$version" }
 brokk-bifrost-lsp = { path = "$unpacked/brokk-bifrost-lsp-$version" }
@@ -195,4 +199,24 @@ CARGO_TARGET_DIR="$temporary/consumer-target" cargo check --quiet --manifest-pat
 PYO3_PYTHON="${PYO3_PYTHON:-python3}" CARGO_TARGET_DIR="$temporary/consumer-target" \
   cargo check --quiet --manifest-path "$consumer/Cargo.toml" --features full
 
-echo "Validated all five package archives and their unpacked default/full-feature consumer"
+readonly analysis_consumer="$temporary/analysis-consumer"
+mkdir -p "$analysis_consumer/src"
+cat > "$analysis_consumer/Cargo.toml" <<EOF
+[package]
+name = "bifrost-analysis-only-consumer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+brokk-bifrost-analysis = { path = "$unpacked/brokk-bifrost-analysis-$version" }
+EOF
+cat > "$analysis_consumer/src/main.rs" <<'EOF'
+fn main() {
+    let _ = brokk_bifrost_analysis::Language::Java;
+}
+EOF
+CARGO_TARGET_DIR="$temporary/consumer-target" \
+  cargo check --quiet --manifest-path "$analysis_consumer/Cargo.toml"
+
+echo "Validated all six package archives and their unpacked facade and analysis-only consumers"

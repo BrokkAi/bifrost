@@ -451,6 +451,19 @@ jobs:
       contents: read
       id-token: write
 
+  publish-crate-semantic-packs:
+    name: publish semantic packs crate after analysis
+    needs: [release-context, publish-crate-analysis]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-semantic-packs
+    permissions:
+      contents: read
+      id-token: write
+
   publish-crate-mcp:
     name: publish MCP crate after runtime
     needs: [release-context, publish-crate-runtime]
@@ -479,7 +492,7 @@ jobs:
 
   publish-crate-facade:
     name: publish facade crate after hosts
-    needs: [release-context, publish-crate-mcp, publish-crate-lsp]
+    needs: [release-context, publish-crate-mcp, publish-crate-lsp, publish-crate-semantic-packs]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
@@ -1005,6 +1018,7 @@ jobs:
       - promotion-evidence
       - release
       - publish-crate-analysis
+      - publish-crate-semantic-packs
       - publish-crate-runtime
       - publish-crate-mcp
       - publish-crate-lsp
@@ -1034,6 +1048,7 @@ jobs:
       PROMOTION_EVIDENCE: ${{ needs.promotion-evidence.result }}
       GITHUB_RELEASE: ${{ needs.release.result }}
       CRATE_ANALYSIS: ${{ needs.publish-crate-analysis.result }}
+      CRATE_SEMANTIC_PACKS: ${{ needs.publish-crate-semantic-packs.result }}
       CRATE_RUNTIME: ${{ needs.publish-crate-runtime.result }}
       CRATE_MCP: ${{ needs.publish-crate-mcp.result }}
       CRATE_LSP: ${{ needs.publish-crate-lsp.result }}
@@ -1066,6 +1081,7 @@ jobs:
             echo "| Common build, package, and smoke evidence | $PROMOTION_EVIDENCE |"
             echo "| GitHub Release | $GITHUB_RELEASE |"
             echo "| crates.io analysis | $CRATE_ANALYSIS |"
+            echo "| crates.io semantic packs | $CRATE_SEMANTIC_PACKS |"
             echo "| crates.io runtime | $CRATE_RUNTIME |"
             echo "| crates.io MCP | $CRATE_MCP |"
             echo "| crates.io LSP | $CRATE_LSP |"
