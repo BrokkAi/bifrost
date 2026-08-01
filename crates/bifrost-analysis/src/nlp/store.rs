@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -125,7 +125,24 @@ impl SemanticStore {
         bm25_tokenizer_version: &str,
     ) -> Result<bool> {
         let mut conn = self.conn.lock().expect("semantic store mutex poisoned");
-        let tx = conn.transaction()?;
+        let (stored_fp, stored_chunker, stored_bm25): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn.query_row(
+            "SELECT embed_fingerprint, chunker_version, bm25_tokenizer_version
+             FROM cache_state WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let matches = stored_fp.as_deref() == Some(fingerprint)
+            && stored_chunker.as_deref() == Some(chunker_version)
+            && stored_bm25.as_deref() == Some(bm25_tokenizer_version);
+        if matches {
+            return Ok(false);
+        }
+
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (stored_fp, stored_chunker, stored_bm25): (
             Option<String>,
             Option<String>,
@@ -643,6 +660,7 @@ fn decode_key_blob(blob: Vec<u8>) -> Result<[u8; 32]> {
 mod tests {
     use super::*;
     use std::process::Command;
+    use std::time::Duration;
 
     fn open_temp() -> (tempfile::TempDir, SemanticStore) {
         let temp = tempfile::TempDir::new().unwrap();
@@ -809,6 +827,29 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn matching_semantic_versions_do_not_wait_for_the_writer_slot() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = temp.path().join(crate::cache_db::CACHE_DB_FILE_NAME);
+        let writer = SemanticStore::open(&db).unwrap();
+        let reader = SemanticStore::open(&db).unwrap();
+        writer.ensure_index_compatible("fp", "ck", "bm").unwrap();
+
+        reader
+            .conn
+            .lock()
+            .unwrap()
+            .busy_timeout(Duration::from_millis(100))
+            .unwrap();
+        let mut writer_conn = writer.conn.lock().unwrap();
+        let writer_tx = writer_conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+
+        assert!(!reader.ensure_index_compatible("fp", "ck", "bm").unwrap());
+        writer_tx.rollback().unwrap();
     }
 
     #[test]
