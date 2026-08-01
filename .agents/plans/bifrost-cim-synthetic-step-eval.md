@@ -92,6 +92,15 @@ authorizes the remaining dw10 retrieval recipes.
   Evidence: an exact task-manifest/store comparison found zero missing images in the XFS store,
   which reports 91 images. The cimeval CLI regression suite passes 45 tests and Ruff passes after
   selecting `/mnt/containers/code_isnt_memory/storage.conf` at the orchestration boundary.
+- Observation: Diagnostic run r1 exposed two unnecessary shared-cache write transactions under
+  30-way startup. Matching analyzer epochs always reserved SQLite's writer slot, and a matching
+  semantic fingerprint always opened a transaction and rewrote identical `cache_state` values.
+  Five cells failed the analyzer-epoch check and one failed semantic invalidation while another
+  process persisted analysis. The fail-fast queue preserved 26 completed cells and cancelled the
+  rest after the original 30 workers drained.
+  Evidence: r1's six incomplete traces report `database is locked`; focused persistent-store
+  regressions hold an actual writer transaction and now pass matching analyzer and semantic reads
+  in 0.02-0.03 seconds. Bifrost fixes are `8c91d985` and `68fb3764`.
 
 ## Decision Log
 
@@ -125,6 +134,12 @@ authorizes the remaining dw10 retrieval recipes.
   Rationale: task images are campaign infrastructure and must not consume the space-constrained
   home filesystem, but this evaluation must not perturb agenteval's DeepSWE behavior.
   Date/Author: 2026-08-01 / Codex and user.
+- Decision: retain r1 only as an infrastructure diagnostic and run the reportable seed-0 gate from
+  scratch in r2 with one runtime identity.
+  Rationale: resuming r1 with a corrected Bifrost binary would violate the predeclared
+  single-runtime criterion even though the fixes affect only contention. Reusing the exact r1
+  run-manifest bytes preserves the frozen query manifest's task identity.
+  Date/Author: 2026-08-01 / Codex.
 
 ## Outcomes & Retrospective
 
@@ -255,7 +270,17 @@ on port 18765. Runtime v3 is `runtime/runtime-v3.tgz`, SHA-256
 `e8fdbe3`, Bifrost `c9dec2d6`, brokkbench `75bd146`, and Mjolnir `26a3084`. Its Bifrost binary
 SHA-256 is `425e963682acef41c5f4fc226958506a25e22b40e961cc67cfcd04f9dc1da915`.
 The host orchestration fix selecting the CIM store is brokkbench `685a926dd7f`; it does not alter
-the already-frozen remote runtime bytes, so runtime v3 remains the reportable bundle.
+the already-frozen remote runtime bytes, so runtime v3 remains the exact diagnostic-r1 bundle.
+
+Diagnostic r1 stopped with 26 completed cells and six lock-failed cells. The clean reportable run
+is `/mnt/optane/bifrost-nlp-resources/runs/dw10-cim-synthetic-20260801-r2`; it uses the same
+byte-identical run manifest (SHA-256
+`d8bf1a517bade527a03f861cab1e74751966f8fd1d345a2c09972d31363f5f40`) and frozen query manifest.
+Runtime v5 is `r1/runtime/runtime-v5.tgz`, SHA-256
+`d820fbaac2ac74c57d263c5fa336f5b2f8ac9b7ae6a9d4657da04182f55019ca`, with Bifrost
+`68fb3764` and binary SHA-256
+`85ec69a6a1cfe6d7c3359b1dd7b8c980493b1f0eadaa5fd3b791c9b3487bb5b5`. The reportable service is
+`cimeval-dw10-synthetic-seed0-r2.service`, pinned at 30 workers.
 
 ## Interfaces and Dependencies
 
@@ -287,3 +312,6 @@ hand-selected; the smoke criterion was infrastructure and treatment integrity.
 Revision note, 2026-08-01: Recorded that the XFS image store was complete and checkpointed the
 cimeval-only storage selection. The host orchestration change does not require rebuilding the
 immutable task runtime because none of its bytes enter the container.
+
+Revision note, 2026-08-01: Recorded r1's shared-cache contention diagnosis, both read-only fast
+paths, and the clean r2 restart required to retain one immutable runtime identity.
