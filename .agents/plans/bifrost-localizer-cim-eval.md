@@ -1,12 +1,12 @@
-# Serve Granite R2 and run a gated CIM-style evaluation
+# Serve Granite R2 and dw10 and run a gated CIM-style evaluation
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`,
 `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
-This document must be maintained in accordance with `.agents/PLANS.md`. It describes the first
-delivery of a larger localizer evaluation: implement and evaluate the smaller Granite R2
-fine-tune, then stop and report. The dw10 evaluation remains deferred, but its repository
-indexes are now being prepared in parallel at the user's direction.
+This document must be maintained in accordance with `.agents/PLANS.md`. It describes a gated
+localizer evaluation: implement and evaluate the smaller Granite R2 fine-tune first, then run
+the already-prewarmed dw10 fine-tune with only the best Granite retrieval recipe before the
+combined report.
 
 ## Purpose / Big Picture
 
@@ -25,10 +25,11 @@ precompute Granite indexes.
 
 After a sane three-seed baseline, run Granite R2 over the three requested retrieval arms and
 three seeds. Keep every evaluation and scoring phase pinned at 30 concurrent cells and observe
-the 60-core host for contention with the user's other workload. When Granite scoring and
-analysis are complete, stop. Report the commits and behavior changed in Bifrost, Anvil, and
-brokkbench, all validation performed, the baseline comparison, and the Granite results. Do not
-begin dw10 evaluation in this delivery; the user separately authorized prewarming its indexes.
+the 60-core host for contention with the user's other workload. While Granite's selective
+pristine verifier recovery finishes, run dw10 over three seeds using only
+`semantic-coedit-2-1`; do not repeat the all-signals or semantic-only arms for dw10. Report the
+commits and behavior changed in Bifrost, Anvil, and brokkbench, all validation performed, the
+baseline comparison, the Granite results, and the dw10 best-recipe results.
 
 The observable outcomes are:
 
@@ -43,8 +44,8 @@ The observable outcomes are:
    than `k` results by design.
 5. At final `k=20`, Granite retrieval uses nominal raw budgets `40/40/40`, `120/0/0`, and
    `80/0/40` for vector/BM25/co-edit in the three arms, with at most 20 final Anvil results.
-6. The completed first delivery accounts for 273 baseline cells and 819 Granite cells, subject
-   to outcome-blind exclusions, and ends with a report rather than proceeding to dw10.
+6. The completed campaign accounts for 273 baseline cells, 819 Granite cells, and 273 dw10
+   `semantic-coedit-2-1` cells, subject to outcome-blind exclusions.
 
 ## Progress
 
@@ -287,8 +288,10 @@ The observable outcomes are:
   history or Anvil's offline network namespace. Pristine recovery of inconclusive inline
   verifier failures continues at four jobs before outcome aggregation.
 - [ ] Score, leak-audit, analyze, and report the baseline and Granite results.
-- [ ] Run final validation, update this plan's retrospective, commit the Granite report, and
-  stop before running any dw10 evaluation arms.
+- [ ] Run dw10 `semantic-coedit-2-1` over seeds 0, 1, and 2 at concurrency 30, using its
+  separately fingerprinted cache and local A4000 sidecar.
+- [ ] Run final validation, update this plan's retrospective, and commit the Granite/dw10
+  report.
 
 ## Surprises & Discoveries
 
@@ -717,12 +720,12 @@ The observable outcomes are:
   image identity and reuse remain consistent.
   Date/Author: 2026-07-31, user and Codex.
 
-- Decision: stop after the Granite report and inventory changes across Bifrost, Anvil, and
-  brokkbench.
-  Rationale: the user wants to review the first model and implementation before authorizing the
-  dw10 evaluation phase. On 2026-07-31 the user separately authorized dw10 prewarming, which
-  does not authorize its evaluation arms.
-  Date/Author: 2026-07-31, user.
+- Decision: after the Granite campaign, evaluate dw10 only with `semantic-coedit-2-1` over all
+  three seeds; do not run a second three-arm grid.
+  Rationale: the user explicitly superseded the earlier Granite-only stopping point and chose
+  the best recipe to limit additional campaign cost while still comparing fine-tunes under the
+  same baseline, task set, final `k`, and no-history protocol.
+  Date/Author: 2026-08-01, user.
 
 - Decision: store dw10 and Granite embeddings in distinct per-repository cache namespaces.
   Rationale: a Bifrost database is safely shared across branches and worktrees, but its semantic
@@ -739,11 +742,9 @@ The observable outcomes are:
 
 ## Outcomes & Retrospective
 
-No implementation or evaluation outcome exists yet. At completion, record the three repository
-commit IDs, exact files/behavior changed, validation evidence, selected provider, concurrency
-observations, baseline sanity comparison, Granite arm results, exclusions, and remaining work.
-The final entry must distinguish the authorized dw10 prewarm from the still-deferred dw10
-evaluation.
+At completion, record the three repository commit IDs, exact files/behavior changed, validation
+evidence, selected provider, concurrency observations, baseline sanity comparison, Granite arm
+results, dw10 best-recipe result, exclusions, and remaining work.
 
 ## Context and Orientation
 
@@ -803,7 +804,8 @@ A cell is one `(instance, arm, seed)` run. The first delivery contains:
 
     baseline: 91 instances * 1 no-semantic arm * 3 seeds = 273 cells
     Granite:  91 instances * 3 retrieval arms * 3 seeds = 819 cells
-    total:                                                   1,092 cells
+    dw10:     91 instances * 1 retrieval arm  * 3 seeds = 273 cells
+    total:                                                   1,365 cells
 
 The Granite retrieval arms use final model-facing `k`, Anvil multiplier `m=2`, and Bifrost base
 depth `b=2k`:
