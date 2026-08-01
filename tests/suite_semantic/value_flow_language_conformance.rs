@@ -385,13 +385,11 @@ fn typescript_exact_indices_remain_distinct_in_memory_relations() {
 }
 
 #[test]
-#[ignore = "readiness probe for #1407: Java flattens nested field access paths"]
 fn java_over_bound_access_path_is_an_explicit_summary() {
     with_java_over_bound_field_flow(assert_value_flow_conformance);
 }
 
 #[test]
-#[ignore = "readiness probe for #1407: TypeScript flattens nested field access paths"]
 fn typescript_over_bound_access_path_is_an_explicit_summary() {
     with_typescript_over_bound_field_flow(assert_value_flow_conformance);
 }

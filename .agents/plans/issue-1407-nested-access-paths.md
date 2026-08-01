@@ -14,9 +14,9 @@ After this change, the oracle will reconstruct the full structured receiver chai
 
 - [x] (2026-08-01 07:45Z) Verified issue #1407, the clean attached issue branch, and current `origin/master` baseline.
 - [x] (2026-08-01 07:45Z) Diagnosed the shared oracle projection as the information-loss boundary and approved the implementation plan.
-- [ ] Implement a procedure-local load-result index and iterative access-path composition in the workspace value-flow oracle.
-- [ ] Add conservative ambiguity and cycle behavior plus semantic-work and cancellation accounting.
-- [ ] Activate the four existing Java and TypeScript readiness probes and add focused near-miss coverage where the shared scenarios do not already prove it.
+- [x] (2026-08-01 09:12Z) Implemented a procedure-local load-result index and iterative, bounded access-path composition in the workspace value-flow oracle.
+- [x] (2026-08-01 09:12Z) Added conservative ambiguity and cycle behavior, semantic-work charging, cancellation checks, and focused resolver regressions.
+- [x] (2026-08-01 09:12Z) Activated all four Java and TypeScript readiness probes; the shared exact-index scenarios remain the focused selector-identity near miss.
 - [ ] Run focused and broad Rust validation, the required policy selection, and specialist review.
 
 ## Surprises & Discoveries
@@ -29,6 +29,12 @@ After this change, the oracle will reconstruct the full structured receiver chai
 
 - Observation: Parallel and usage-scan Bifrost MCP calls exceeded their request budgets during diagnosis, independently of #1407.
   Evidence: Open issue #1419 owns the parallel-call family; focused rmcp `scan_usages_by_location` evidence was filed separately as #1434. Exact sequential symbol reads remained responsive and the implementation diagnosis did not rely on the failed calls.
+
+- Observation: Reconstructing the final path does not remove the intermediate receiver loads emitted while evaluating the nested expression.
+  Evidence: The strict direct-relation multiset contains two exact loads for every prefix from one through eight selectors, plus the final summarized store and load. The scenario now records those operational relations explicitly instead of weakening the assertion.
+
+- Observation: The direct relation snapshot becomes `Unknown` when it contains a summarized access path, while the public query result still reports the fixture's pre-existing unsupported exceptional-control-flow capability.
+  Evidence: The enabled direct probes require `SemanticInputStatus::Unknown`; the public JSON and RQL probes consistently report `semantic_status: "unsupported"` and `completion: "unsupported"`. The public test executor accepts that explicit outer-envelope expectation without changing the shared relation expectations.
 
 ## Decision Log
 
@@ -44,9 +50,13 @@ After this change, the oracle will reconstruct the full structured receiver chai
   Rationale: For an over-bound chain, stopping when the selector budget is reached would leave an intermediate temporary as the root. Traversal must find `box` while retaining only the root-nearest selectors required by `OracleLimits::access_path_length`.
   Date/Author: 2026-08-01 / Codex
 
+- Decision: Test malformed ambiguity and cycles against the private structured resolver rather than manufacturing source text or a full semantic artifact.
+  Rationale: These are defensive IR-shape behaviors, not language syntax behaviors. Small structured tests prove non-exact termination directly, while the Java and TypeScript suites prove real lowering and public serialization.
+  Date/Author: 2026-08-01 / Codex
+
 ## Outcomes & Retrospective
 
-Implementation has not started. The intended outcome is a shared structured fix with no source-text parsing, no Java/TypeScript-specific path walker, and direct/public conformance proving the exact bounded carrier shape.
+The shared implementation and focused acceptance probes are complete. The resolver walks only validated semantic IR, retains a bounded root-nearest selector prefix, and produces summary tails for truncation, ambiguity, cycles, and wildcard indices. Java and TypeScript direct/public probes now pass enabled; broad validation, policy checking, and specialist review remain.
 
 ## Context and Orientation
 
@@ -115,4 +125,4 @@ Issue #1407 is the behavior owner. Issue #1419 owns parallel MCP request-budget 
 
 No external dependency or public wire type should change. The implementation should add private, file-local resolver/index types next to `abstract_location` in `crates/bifrost-analysis/src/analyzer/semantic/workspace_oracle/value_flow.rs`. It must continue to construct public paths with `AccessPath::bounded` and existing `AccessPathRoot`, `AccessSelector`, `IndexSelector`, and `AccessPathTail` types.
 
-Revision note (2026-08-01): Created the initial self-contained implementation plan after issue diagnosis and user approval.
+Revision note (2026-08-01): Created the initial self-contained implementation plan after issue diagnosis and user approval. Updated it after the implementation and focused-test milestone with observed operational receiver loads and the distinct direct/public status envelopes.

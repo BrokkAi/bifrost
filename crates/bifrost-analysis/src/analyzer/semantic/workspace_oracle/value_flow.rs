@@ -3,6 +3,7 @@
 //! The implementation projects validated semantic IR rows into neutral oracle
 //! relations. It never reparses source or matches declarations by text.
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use super::WorkspaceSemanticOracle;
@@ -12,17 +13,17 @@ use super::common::{
 };
 use crate::analyzer::semantic::{
     AbstractLocation, AbstractObject, AbstractObjectIdentity, AccessPath, AccessPathRoot,
-    AccessSelector, AllocationHandle, CallArgumentEndpoint, CallArgumentExpansion,
+    AccessPathTail, AccessSelector, AllocationHandle, CallArgumentEndpoint, CallArgumentExpansion,
     CallArgumentGroup, CallArgumentMapping, CallArgumentMember, CallBinding, CallBindings,
     CallPassingMode, CandidateCoverage, CaptureSource, DispatchCandidate, EvidenceCompleteness,
-    EvidenceHandle, FormalMultiplicity, IndexSelector, MemoryLocationHandle, MemoryLocationKind,
+    EvidenceHandle, FormalMultiplicity, IndexSelector, MemoryLocationId, MemoryLocationKind,
     ObjectCardinality, OracleCallContext, OracleCandidate, OracleRelationArena,
     OracleRelationHandle, OracleRelationId, OracleRelationKind, OracleRelationOwner,
     OracleRelationRecord, ProcedureHandle, ProcedurePortHandle, ProgramPointHandle, ProofStatus,
     ScopedSemanticLocator, SemanticCapability, SemanticEffect, SemanticGapImpact, SemanticGapKind,
-    SemanticGapSubject, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValueKind,
-    SemanticWork, ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle, ValueFlowRelation,
-    ValueFlowRelationKind, ValueFlowSnapshot, ValueHandle,
+    SemanticGapSubject, SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest,
+    SemanticValueKind, SemanticWork, ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle,
+    ValueFlowRelation, ValueFlowRelationKind, ValueFlowSnapshot, ValueHandle, ValueId,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -101,65 +102,219 @@ fn location_value_reads(location: &MemoryLocationKind) -> usize {
     }
 }
 
-fn abstract_location(
+#[derive(Debug, Clone, Copy)]
+enum LoadOrigin {
+    Unique(MemoryLocationId),
+    Ambiguous,
+}
+
+#[derive(Debug)]
+enum AccessPathRootDraft {
+    Value(ValueId),
+    Static(SemanticLocator),
+    LexicalCell(MemoryLocationId),
+    Capture(MemoryLocationId),
+}
+
+#[derive(Debug)]
+enum AccessSelectorDraft {
+    Field(SemanticLocator),
+    Index(Option<ValueId>),
+}
+
+#[derive(Debug)]
+struct AccessPathDraft {
+    root: AccessPathRootDraft,
+    selectors: Vec<AccessSelectorDraft>,
+    tail: AccessPathTail,
+    work: SemanticWork,
+}
+
+fn memory_load_origins(
     procedure: &ProcedureHandle,
-    location: MemoryLocationHandle,
+    cancellation: &crate::CancellationToken,
+) -> Option<HashMap<ValueId, LoadOrigin>> {
+    let mut origins = HashMap::new();
+    for point in procedure.semantics().points() {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        for event in &point.events {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            let SemanticEffect::MemoryLoad {
+                location, result, ..
+            } = event.effect
+            else {
+                continue;
+            };
+            origins
+                .entry(result)
+                .and_modify(|origin| {
+                    if !matches!(origin, LoadOrigin::Unique(existing) if *existing == location) {
+                        *origin = LoadOrigin::Ambiguous;
+                    }
+                })
+                .or_insert(LoadOrigin::Unique(location));
+        }
+    }
+    Some(origins)
+}
+
+fn retain_selector(
+    selectors: &mut VecDeque<AccessSelectorDraft>,
+    selector: AccessSelectorDraft,
+    limit: usize,
+    summarized: &mut bool,
+) {
+    selectors.push_back(selector);
+    if selectors.len() > limit {
+        selectors.pop_front();
+        *summarized = true;
+    }
+}
+
+fn resolve_access_path<'location>(
+    location: MemoryLocationId,
+    load_origins: &HashMap<ValueId, LoadOrigin>,
+    selector_limit: usize,
+    cancellation: &crate::CancellationToken,
+    location_kind: impl Fn(MemoryLocationId) -> Option<&'location MemoryLocationKind>,
+) -> Result<Option<AccessPathDraft>, SemanticProviderError> {
+    let mut current = location;
+    let mut visited = HashSet::new();
+    let mut selectors = VecDeque::new();
+    let mut summarized = false;
+    let mut work = SemanticWork::default();
+
+    let root = loop {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        assert!(
+            visited.insert(current),
+            "access-path cycles are stopped before revisiting a location"
+        );
+        let kind = location_kind(current)
+            .ok_or_else(|| SemanticProviderError::internal("memory location handle is stale"))?;
+        let selector_count = usize::from(matches!(
+            kind,
+            MemoryLocationKind::Field { .. } | MemoryLocationKind::Index { .. }
+        ));
+        work = work.conservative_add(SemanticWork {
+            values: location_value_reads(kind),
+            memory_locations: 1,
+            nested_entries: selector_count,
+            ..SemanticWork::default()
+        });
+        let base = match kind {
+            MemoryLocationKind::Field { base, member } => {
+                retain_selector(
+                    &mut selectors,
+                    AccessSelectorDraft::Field(member.clone()),
+                    selector_limit,
+                    &mut summarized,
+                );
+                *base
+            }
+            MemoryLocationKind::Index { base, index } => {
+                retain_selector(
+                    &mut selectors,
+                    AccessSelectorDraft::Index(*index),
+                    selector_limit,
+                    &mut summarized,
+                );
+                *base
+            }
+            MemoryLocationKind::Static { member } => {
+                break AccessPathRootDraft::Static(member.clone());
+            }
+            MemoryLocationKind::LexicalCell { .. } => {
+                break AccessPathRootDraft::LexicalCell(current);
+            }
+            MemoryLocationKind::Capture { .. } => {
+                break AccessPathRootDraft::Capture(current);
+            }
+        };
+
+        match load_origins.get(&base) {
+            Some(LoadOrigin::Unique(next)) if !visited.contains(next) => current = *next,
+            Some(LoadOrigin::Unique(_)) | Some(LoadOrigin::Ambiguous) => {
+                summarized = true;
+                break AccessPathRootDraft::Value(base);
+            }
+            None => break AccessPathRootDraft::Value(base),
+        }
+    };
+
+    Ok(Some(AccessPathDraft {
+        root,
+        selectors: selectors.into_iter().rev().collect(),
+        tail: if summarized {
+            AccessPathTail::Summary
+        } else {
+            AccessPathTail::Exact
+        },
+        work,
+    }))
+}
+
+fn materialize_abstract_location(
+    procedure: &ProcedureHandle,
+    draft: AccessPathDraft,
     limits: crate::analyzer::semantic::OracleLimits,
 ) -> Result<(AbstractLocation, bool), SemanticProviderError> {
-    let row = procedure
-        .semantics()
-        .memory_location(location.id())
-        .ok_or_else(|| SemanticProviderError::internal("memory location handle is stale"))?;
-    let (identity, root, selectors) = match &row.kind {
-        MemoryLocationKind::Field { base, member } => {
-            let base = value_handle(procedure, *base)?;
-            let member =
-                ScopedSemanticLocator::new(Arc::clone(procedure.artifact()), member.clone())
-                    .map_err(|error| internal_contract("invalid field locator", error))?;
+    let (identity, root) = match draft.root {
+        AccessPathRootDraft::Value(value) => {
+            let value = value_handle(procedure, value)?;
             (
-                AbstractObjectIdentity::Value(base.clone()),
-                AccessPathRoot::Value(base),
-                vec![AccessSelector::Field(member)],
+                AbstractObjectIdentity::Value(value.clone()),
+                AccessPathRoot::Value(value),
             )
         }
-        MemoryLocationKind::Static { member } => {
-            let member =
-                ScopedSemanticLocator::new(Arc::clone(procedure.artifact()), member.clone())
-                    .map_err(|error| internal_contract("invalid static locator", error))?;
+        AccessPathRootDraft::Static(member) => {
+            let member = ScopedSemanticLocator::new(Arc::clone(procedure.artifact()), member)
+                .map_err(|error| internal_contract("invalid static locator", error))?;
             (
                 AbstractObjectIdentity::Static(member.clone()),
                 AccessPathRoot::Static(member),
-                Vec::new(),
             )
         }
-        MemoryLocationKind::Index { base, index } => {
-            let base = value_handle(procedure, *base)?;
-            let selector = match index {
-                Some(index) => IndexSelector::Exact(value_handle(procedure, *index)?),
-                None => IndexSelector::Any,
-            };
+        AccessPathRootDraft::LexicalCell(location) => {
+            let location = procedure.memory_location_handle(location).ok_or_else(|| {
+                SemanticProviderError::internal("lexical-cell root has a stale location")
+            })?;
             (
-                AbstractObjectIdentity::Value(base.clone()),
-                AccessPathRoot::Value(base),
-                vec![AccessSelector::Index(selector)],
+                AbstractObjectIdentity::LexicalCell(location.clone()),
+                AccessPathRoot::LexicalCell(location),
             )
         }
-        MemoryLocationKind::LexicalCell { .. } => (
-            AbstractObjectIdentity::LexicalCell(location.clone()),
-            AccessPathRoot::LexicalCell(location),
-            Vec::new(),
-        ),
-        MemoryLocationKind::Capture { .. } => {
-            let port = ProcedurePortHandle::capture(procedure.clone(), row.id)
+        AccessPathRootDraft::Capture(location) => {
+            let port = ProcedurePortHandle::capture(procedure.clone(), location)
                 .map_err(|error| internal_contract("invalid capture port", error))?;
             (
                 AbstractObjectIdentity::CaptureSlot(port.clone()),
                 AccessPathRoot::CaptureSlot(port),
-                Vec::new(),
             )
         }
     };
-    let path = AccessPath::exact(root, selectors, limits)
+    let selectors = draft
+        .selectors
+        .into_iter()
+        .map(|selector| match selector {
+            AccessSelectorDraft::Field(member) => {
+                ScopedSemanticLocator::new(Arc::clone(procedure.artifact()), member)
+                    .map(AccessSelector::Field)
+                    .map_err(|error| internal_contract("invalid field locator", error))
+            }
+            AccessSelectorDraft::Index(Some(index)) => value_handle(procedure, index)
+                .map(IndexSelector::Exact)
+                .map(AccessSelector::Index),
+            AccessSelectorDraft::Index(None) => Ok(AccessSelector::Index(IndexSelector::Any)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let path = AccessPath::bounded(root, selectors, draft.tail, limits)
         .map_err(|error| internal_contract("invalid semantic access path", error))?;
     let summary = !path.is_exact();
     let object = AbstractObject::new(identity, ObjectCardinality::Unknown)
@@ -603,6 +758,18 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
             }
         }
 
+        let load_origins = if interrupted.is_none() {
+            match memory_load_origins(procedure, request.cancellation) {
+                Some(origins) => origins,
+                None => {
+                    interrupted = Some(Interruption::Cancelled);
+                    HashMap::new()
+                }
+            }
+        } else {
+            HashMap::new()
+        };
+
         let mut drafts = Vec::new();
         let mut retained_evidence = 0usize;
         let mut truncated = false;
@@ -634,6 +801,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                     break 'points;
                 }
 
+                let mut access_path = None;
                 let relation_work = match &event.effect {
                     SemanticEffect::Assignment { .. } | SemanticEffect::ValueFlow { .. } => {
                         Some(SemanticWork {
@@ -652,49 +820,73 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                     }),
                     SemanticEffect::MemoryLoad { location, .. }
                     | SemanticEffect::MemoryStore { location, .. } => {
-                        let row = procedure
-                            .semantics()
-                            .memory_location(*location)
-                            .ok_or_else(|| {
-                                SemanticProviderError::internal(
-                                    "memory effect has a stale location ID",
-                                )
-                            })?;
-                        Some(SemanticWork {
-                            values: location_value_reads(&row.kind) + 1,
-                            memory_locations: 1,
+                        let Some(resolved) = resolve_access_path(
+                            *location,
+                            &load_origins,
+                            self.limits().access_path_length(),
+                            request.cancellation,
+                            |id| {
+                                procedure
+                                    .semantics()
+                                    .memory_location(id)
+                                    .map(|row| &row.kind)
+                            },
+                        )?
+                        else {
+                            interrupted = Some(Interruption::Cancelled);
+                            break 'points;
+                        };
+                        let work = resolved.work.conservative_add(SemanticWork {
+                            values: 1,
                             evidence: 1,
                             nested_entries: 1,
                             ..SemanticWork::default()
-                        })
+                        });
+                        access_path = Some(resolved);
+                        Some(work)
                     }
                     SemanticEffect::CaptureBind { capture } => {
                         let capture = procedure.semantics().capture(*capture).ok_or_else(|| {
                             SemanticProviderError::internal("capture effect has a stale ID")
                         })?;
-                        let (values, memory_locations) = match capture.captured {
-                            CaptureSource::Value(_) => (1, 1),
+                        let source_work = match capture.captured {
+                            CaptureSource::Value(_) => SemanticWork {
+                                values: 1,
+                                memory_locations: 1,
+                                ..SemanticWork::default()
+                            },
                             CaptureSource::Location(location) => {
-                                let source = procedure
-                                    .semantics()
-                                    .memory_location(location)
-                                    .ok_or_else(|| {
-                                        SemanticProviderError::internal(
-                                            "capture source has a stale location ID",
-                                        )
-                                    })?;
-                                (location_value_reads(&source.kind), 2)
+                                let Some(resolved) = resolve_access_path(
+                                    location,
+                                    &load_origins,
+                                    self.limits().access_path_length(),
+                                    request.cancellation,
+                                    |id| {
+                                        procedure
+                                            .semantics()
+                                            .memory_location(id)
+                                            .map(|row| &row.kind)
+                                    },
+                                )?
+                                else {
+                                    interrupted = Some(Interruption::Cancelled);
+                                    break 'points;
+                                };
+                                let work = resolved.work.conservative_add(SemanticWork {
+                                    memory_locations: 1,
+                                    ..SemanticWork::default()
+                                });
+                                access_path = Some(resolved);
+                                work
                             }
                         };
-                        Some(SemanticWork {
+                        Some(source_work.conservative_add(SemanticWork {
                             procedures: 1,
-                            values,
-                            memory_locations,
                             captures: 1,
                             evidence: 1,
                             nested_entries: 1,
                             ..SemanticWork::default()
-                        })
+                        }))
                     }
                     SemanticEffect::Throw { value: Some(_) } => Some(SemanticWork {
                         values: 1,
@@ -844,15 +1036,14 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                             false,
                         )
                     }
-                    SemanticEffect::MemoryLoad {
-                        location, result, ..
-                    } => {
-                        let location =
-                            procedure.memory_location_handle(*location).ok_or_else(|| {
-                                SemanticProviderError::internal("memory load has a stale location")
-                            })?;
-                        let (location, summary) =
-                            abstract_location(procedure, location, *self.limits())?;
+                    SemanticEffect::MemoryLoad { result, .. } => {
+                        let (location, summary) = materialize_abstract_location(
+                            procedure,
+                            access_path
+                                .take()
+                                .expect("memory loads resolve an access path"),
+                            *self.limits(),
+                        )?;
                         (
                             ValueFlowRelationKind::MemoryLoad,
                             ValueFlowEndpoint::Location(Box::new(location)),
@@ -860,15 +1051,14 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                             summary,
                         )
                     }
-                    SemanticEffect::MemoryStore {
-                        location, value, ..
-                    } => {
-                        let location =
-                            procedure.memory_location_handle(*location).ok_or_else(|| {
-                                SemanticProviderError::internal("memory store has a stale location")
-                            })?;
-                        let (location, summary) =
-                            abstract_location(procedure, location, *self.limits())?;
+                    SemanticEffect::MemoryStore { value, .. } => {
+                        let (location, summary) = materialize_abstract_location(
+                            procedure,
+                            access_path
+                                .take()
+                                .expect("memory stores resolve an access path"),
+                            *self.limits(),
+                        )?;
                         (
                             ValueFlowRelationKind::MemoryStore,
                             ValueFlowEndpoint::Value(value_handle(procedure, *value)?),
@@ -892,18 +1082,16 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                             CaptureSource::Value(value) => {
                                 ValueFlowEndpoint::Value(value_handle(procedure, value)?)
                             }
-                            CaptureSource::Location(location) => {
-                                let location = procedure
-                                    .memory_location_handle(location)
-                                    .ok_or_else(|| {
-                                        SemanticProviderError::internal(
-                                            "capture source location is stale",
-                                        )
-                                    })?;
-                                ValueFlowEndpoint::Location(Box::new(
-                                    abstract_location(procedure, location, *self.limits())?.0,
-                                ))
-                            }
+                            CaptureSource::Location(_) => ValueFlowEndpoint::Location(Box::new(
+                                materialize_abstract_location(
+                                    procedure,
+                                    access_path
+                                        .take()
+                                        .expect("capture locations resolve an access path"),
+                                    *self.limits(),
+                                )?
+                                .0,
+                            )),
                         };
                         (
                             ValueFlowRelationKind::Capture,
@@ -1423,5 +1611,67 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 work: staged.work,
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ambiguous_load_origin_summarizes_access_path() {
+        let base = ValueId::new(0);
+        let locations = [MemoryLocationKind::Index { base, index: None }];
+        let load_origins = HashMap::from([(base, LoadOrigin::Ambiguous)]);
+
+        let draft = resolve_access_path(
+            MemoryLocationId::new(0),
+            &load_origins,
+            8,
+            &crate::CancellationToken::default(),
+            |id| locations.get(id.index()),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(matches!(draft.root, AccessPathRootDraft::Value(value) if value == base));
+        assert_eq!(draft.selectors.len(), 1);
+        assert_eq!(draft.tail, AccessPathTail::Summary);
+    }
+
+    #[test]
+    fn cyclic_load_origins_terminate_with_summary() {
+        let first_base = ValueId::new(0);
+        let second_base = ValueId::new(1);
+        let first_location = MemoryLocationId::new(0);
+        let second_location = MemoryLocationId::new(1);
+        let locations = [
+            MemoryLocationKind::Index {
+                base: first_base,
+                index: None,
+            },
+            MemoryLocationKind::Index {
+                base: second_base,
+                index: None,
+            },
+        ];
+        let load_origins = HashMap::from([
+            (first_base, LoadOrigin::Unique(second_location)),
+            (second_base, LoadOrigin::Unique(first_location)),
+        ]);
+
+        let draft = resolve_access_path(
+            first_location,
+            &load_origins,
+            8,
+            &crate::CancellationToken::default(),
+            |id| locations.get(id.index()),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(matches!(draft.root, AccessPathRootDraft::Value(value) if value == second_base));
+        assert_eq!(draft.selectors.len(), 2);
+        assert_eq!(draft.tail, AccessPathTail::Summary);
     }
 }
