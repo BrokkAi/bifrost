@@ -2,9 +2,9 @@
   "name": "bifrost-vscode",
   "displayName": "Bifrost: Multi-Language LSP & MCP Server",
   "description": "Tree-sitter-backed code intelligence for definitions, references, symbols, hierarchy, rename, diagnostics, and MCP workflows.",
-  "version": "0.8.17",
+  "version": "0.8.18",
   "bifrost": {
-    "binaryVersion": "0.8.17",
+    "binaryVersion": "0.8.18",
     "archiveSha256": {
       "aarch64-pc-windows-msvc": "1bd4b8fb000462fab6b08f0d5d825584d8fad3fbbb6ee05d9074137225dea5c4",
       "aarch64-unknown-linux-gnu": "2e58b1a05a64df9ea8c88732e88ee5421d08c8f10a8b5484bdc19ce2212aac8b",
