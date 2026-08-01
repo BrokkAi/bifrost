@@ -17,7 +17,8 @@ After this change, the oracle will reconstruct the full structured receiver chai
 - [x] (2026-08-01 09:12Z) Implemented a procedure-local load-result index and iterative, bounded access-path composition in the workspace value-flow oracle.
 - [x] (2026-08-01 09:12Z) Added conservative ambiguity and cycle behavior, semantic-work charging, cancellation checks, and focused resolver regressions.
 - [x] (2026-08-01 09:12Z) Activated all four Java and TypeScript readiness probes; the shared exact-index scenarios remain the focused selector-identity near miss.
-- [ ] Run focused and broad Rust validation, the required policy selection, and specialist review.
+- [x] (2026-08-01 10:04Z) Ran focused and broad Rust validation plus all five specialist reviews; fixed the deduplicated budget-enforcement finding with incremental prepass/path charges and a low-budget regression.
+- [x] (2026-08-01 10:18Z) Reran formatting, featureless all-target Clippy, focused and full affected suites, the required policy selection, and targeted specialist verification; no review finding remains.
 
 ## Surprises & Discoveries
 
@@ -35,6 +36,12 @@ After this change, the oracle will reconstruct the full structured receiver chai
 
 - Observation: The direct relation snapshot becomes `Unknown` when it contains a summarized access path, while the public query result still reports the fixture's pre-existing unsupported exceptional-control-flow capability.
   Evidence: The enabled direct probes require `SemanticInputStatus::Unknown`; the public JSON and RQL probes consistently report `semantic_status: "unsupported"` and `completion: "unsupported"`. The public test executor accepts that explicit outer-envelope expectation without changing the shared relation expectations.
+
+- Observation: The initial implementation accumulated semantic work but charged it only after constructing the complete origin index or access-path draft.
+  Evidence: Security, DevOps, senior, and architecture reviewers independently identified that a tiny request budget could still pay the full prepass or chain traversal. The amended implementation charges each scanned point/event/index entry and each chased location through `WorkStager` before retaining results; a one-location budget regression proves the second hop is rejected immediately.
+
+- Observation: The required combined `bifrost.code-smells` policy scan cannot finish within the MCP host's fixed interactive deadline on this workspace.
+  Evidence: Cold and immediate warm rmcp runs both returned `status: unreliable` and `termination: deadline_exceeded` at about 5.0 seconds. Existing issue #1398 owns this behavior, and the current revision plus cold/warm timing evidence was added there.
 
 ## Decision Log
 
@@ -54,9 +61,13 @@ After this change, the oracle will reconstruct the full structured receiver chai
   Rationale: These are defensive IR-shape behaviors, not language syntax behaviors. Small structured tests prove non-exact termination directly, while the Java and TypeScript suites prove real lowering and public serialization.
   Date/Author: 2026-08-01 / Codex
 
+- Decision: Charge the origin-index prepass and every access-path hop incrementally through the existing `WorkStager` instead of relying on a post-construction aggregate charge.
+  Rationale: Semantic budgets are resource boundaries, not only accounting reports. Incremental charging prevents large procedures and deep chains from consuming unbounded work before returning the normal typed interruption.
+  Date/Author: 2026-08-01 / Codex
+
 ## Outcomes & Retrospective
 
-The shared implementation and focused acceptance probes are complete. The resolver walks only validated semantic IR, retains a bounded root-nearest selector prefix, and produces summary tails for truncation, ambiguity, cycles, and wildcard indices. Java and TypeScript direct/public probes now pass enabled; broad validation, policy checking, and specialist review remain.
+The shared implementation and acceptance probes are complete. The resolver walks only validated semantic IR, retains a bounded root-nearest selector prefix, produces summary tails for truncation, ambiguity, cycles, and wildcard indices, and enforces request budgets before every new scan allocation or chain hop. Java and TypeScript direct/public probes, both complete affected integration binaries, formatting, and featureless all-target Clippy pass. All five initial specialists and the targeted security, DevOps, and architecture re-reviews have no unresolved finding. The required policy result remains honestly recorded as unreliable: its repository-wide partial-discovery diagnostics and pre-existing findings are outside #1407, and existing issue #1398 owns the fixed-deadline failure observed during the first two runs.
 
 ## Context and Orientation
 

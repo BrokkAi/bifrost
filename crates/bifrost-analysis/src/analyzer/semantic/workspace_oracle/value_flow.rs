@@ -127,28 +127,48 @@ struct AccessPathDraft {
     root: AccessPathRootDraft,
     selectors: Vec<AccessSelectorDraft>,
     tail: AccessPathTail,
-    work: SemanticWork,
+}
+
+#[derive(Debug)]
+enum AccessPathResolution {
+    Resolved(AccessPathDraft),
+    Interrupted(Interruption),
 }
 
 fn memory_load_origins(
     procedure: &ProcedureHandle,
     cancellation: &crate::CancellationToken,
-) -> Option<HashMap<ValueId, LoadOrigin>> {
+    mut charge: impl FnMut(SemanticWork) -> Result<(), Interruption>,
+) -> Result<HashMap<ValueId, LoadOrigin>, Interruption> {
     let mut origins = HashMap::new();
     for point in procedure.semantics().points() {
         if cancellation.is_cancelled() {
-            return None;
+            return Err(Interruption::Cancelled);
         }
+        charge(SemanticWork {
+            program_points: 1,
+            ..SemanticWork::default()
+        })?;
         for event in &point.events {
             if cancellation.is_cancelled() {
-                return None;
+                return Err(Interruption::Cancelled);
             }
+            charge(SemanticWork {
+                events: 1,
+                ..SemanticWork::default()
+            })?;
             let SemanticEffect::MemoryLoad {
                 location, result, ..
             } = event.effect
             else {
                 continue;
             };
+            charge(SemanticWork {
+                values: 1,
+                memory_locations: 1,
+                nested_entries: 1,
+                ..SemanticWork::default()
+            })?;
             origins
                 .entry(result)
                 .and_modify(|origin| {
@@ -159,7 +179,7 @@ fn memory_load_origins(
                 .or_insert(LoadOrigin::Unique(location));
         }
     }
-    Some(origins)
+    Ok(origins)
 }
 
 fn retain_selector(
@@ -181,33 +201,36 @@ fn resolve_access_path<'location>(
     selector_limit: usize,
     cancellation: &crate::CancellationToken,
     location_kind: impl Fn(MemoryLocationId) -> Option<&'location MemoryLocationKind>,
-) -> Result<Option<AccessPathDraft>, SemanticProviderError> {
+    mut charge: impl FnMut(SemanticWork) -> Result<(), Interruption>,
+) -> Result<AccessPathResolution, SemanticProviderError> {
     let mut current = location;
     let mut visited = HashSet::new();
     let mut selectors = VecDeque::new();
     let mut summarized = false;
-    let mut work = SemanticWork::default();
 
     let root = loop {
         if cancellation.is_cancelled() {
-            return Ok(None);
+            return Ok(AccessPathResolution::Interrupted(Interruption::Cancelled));
         }
-        assert!(
-            visited.insert(current),
-            "access-path cycles are stopped before revisiting a location"
-        );
         let kind = location_kind(current)
             .ok_or_else(|| SemanticProviderError::internal("memory location handle is stale"))?;
         let selector_count = usize::from(matches!(
             kind,
             MemoryLocationKind::Field { .. } | MemoryLocationKind::Index { .. }
         ));
-        work = work.conservative_add(SemanticWork {
+        let step_work = SemanticWork {
             values: location_value_reads(kind),
             memory_locations: 1,
             nested_entries: selector_count,
             ..SemanticWork::default()
-        });
+        };
+        if let Err(stop) = charge(step_work) {
+            return Ok(AccessPathResolution::Interrupted(stop));
+        }
+        assert!(
+            visited.insert(current),
+            "access-path cycles are stopped before revisiting a location"
+        );
         let base = match kind {
             MemoryLocationKind::Field { base, member } => {
                 retain_selector(
@@ -248,7 +271,7 @@ fn resolve_access_path<'location>(
         }
     };
 
-    Ok(Some(AccessPathDraft {
+    Ok(AccessPathResolution::Resolved(AccessPathDraft {
         root,
         selectors: selectors.into_iter().rev().collect(),
         tail: if summarized {
@@ -256,7 +279,6 @@ fn resolve_access_path<'location>(
         } else {
             AccessPathTail::Exact
         },
-        work,
     }))
 }
 
@@ -759,10 +781,10 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
         }
 
         let load_origins = if interrupted.is_none() {
-            match memory_load_origins(procedure, request.cancellation) {
-                Some(origins) => origins,
-                None => {
-                    interrupted = Some(Interruption::Cancelled);
+            match memory_load_origins(procedure, request.cancellation, |work| staged.charge(work)) {
+                Ok(origins) => origins,
+                Err(stop) => {
+                    interrupted = Some(stop);
                     HashMap::new()
                 }
             }
@@ -820,7 +842,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                     }),
                     SemanticEffect::MemoryLoad { location, .. }
                     | SemanticEffect::MemoryStore { location, .. } => {
-                        let Some(resolved) = resolve_access_path(
+                        let resolved = match resolve_access_path(
                             *location,
                             &load_origins,
                             self.limits().access_path_length(),
@@ -831,17 +853,20 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                                     .memory_location(id)
                                     .map(|row| &row.kind)
                             },
-                        )?
-                        else {
-                            interrupted = Some(Interruption::Cancelled);
-                            break 'points;
+                            |work| staged.charge(work),
+                        )? {
+                            AccessPathResolution::Resolved(resolved) => resolved,
+                            AccessPathResolution::Interrupted(stop) => {
+                                interrupted = Some(stop);
+                                break 'points;
+                            }
                         };
-                        let work = resolved.work.conservative_add(SemanticWork {
+                        let work = SemanticWork {
                             values: 1,
                             evidence: 1,
                             nested_entries: 1,
                             ..SemanticWork::default()
-                        });
+                        };
                         access_path = Some(resolved);
                         Some(work)
                     }
@@ -856,7 +881,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                                 ..SemanticWork::default()
                             },
                             CaptureSource::Location(location) => {
-                                let Some(resolved) = resolve_access_path(
+                                let resolved = match resolve_access_path(
                                     location,
                                     &load_origins,
                                     self.limits().access_path_length(),
@@ -867,15 +892,18 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                                             .memory_location(id)
                                             .map(|row| &row.kind)
                                     },
-                                )?
-                                else {
-                                    interrupted = Some(Interruption::Cancelled);
-                                    break 'points;
+                                    |work| staged.charge(work),
+                                )? {
+                                    AccessPathResolution::Resolved(resolved) => resolved,
+                                    AccessPathResolution::Interrupted(stop) => {
+                                        interrupted = Some(stop);
+                                        break 'points;
+                                    }
                                 };
-                                let work = resolved.work.conservative_add(SemanticWork {
+                                let work = SemanticWork {
                                     memory_locations: 1,
                                     ..SemanticWork::default()
-                                });
+                                };
                                 access_path = Some(resolved);
                                 work
                             }
@@ -1630,9 +1658,12 @@ mod tests {
             8,
             &crate::CancellationToken::default(),
             |id| locations.get(id.index()),
+            |_| Ok(()),
         )
-        .unwrap()
         .unwrap();
+        let AccessPathResolution::Resolved(draft) = draft else {
+            panic!("unbudgeted access-path resolution must complete")
+        };
 
         assert!(matches!(draft.root, AccessPathRootDraft::Value(value) if value == base));
         assert_eq!(draft.selectors.len(), 1);
@@ -1666,12 +1697,55 @@ mod tests {
             8,
             &crate::CancellationToken::default(),
             |id| locations.get(id.index()),
+            |_| Ok(()),
         )
-        .unwrap()
         .unwrap();
+        let AccessPathResolution::Resolved(draft) = draft else {
+            panic!("unbudgeted access-path resolution must complete")
+        };
 
         assert!(matches!(draft.root, AccessPathRootDraft::Value(value) if value == second_base));
         assert_eq!(draft.selectors.len(), 2);
         assert_eq!(draft.tail, AccessPathTail::Summary);
+    }
+
+    #[test]
+    fn nested_access_path_stops_at_the_memory_location_budget() {
+        let first_base = ValueId::new(0);
+        let second_base = ValueId::new(1);
+        let first_location = MemoryLocationId::new(0);
+        let second_location = MemoryLocationId::new(1);
+        let locations = [
+            MemoryLocationKind::Index {
+                base: first_base,
+                index: None,
+            },
+            MemoryLocationKind::Index {
+                base: second_base,
+                index: None,
+            },
+        ];
+        let load_origins = HashMap::from([(first_base, LoadOrigin::Unique(second_location))]);
+        let mut limits = SemanticWork::default_limits();
+        limits.memory_locations = 1;
+        let mut budget = crate::analyzer::semantic::SemanticBudget::new(limits).unwrap();
+
+        let resolution = resolve_access_path(
+            first_location,
+            &load_origins,
+            8,
+            &crate::CancellationToken::default(),
+            |id| locations.get(id.index()),
+            |work| budget.charge(work).map_err(Interruption::Budget),
+        )
+        .unwrap();
+
+        let AccessPathResolution::Interrupted(Interruption::Budget(exceeded)) = resolution else {
+            panic!("the second location must exceed the one-location budget")
+        };
+        assert_eq!(exceeded.dimension().label(), "memory_locations");
+        assert_eq!(exceeded.limit(), 1);
+        assert_eq!(exceeded.attempted(), 2);
+        assert_eq!(budget.used().memory_locations, 1);
     }
 }
