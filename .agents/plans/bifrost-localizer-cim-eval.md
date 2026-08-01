@@ -56,7 +56,7 @@ The observable outcomes are:
 - [x] (2026-07-31 09:21Z) Inspected the Granite R2 and dw10 artifacts and the released CIM
   manifest, scoring code, statistics, and published results.
 - [x] (2026-07-31 09:38Z) Recorded the shared writable SQLite design for eval indexes.
-- [x] (2026-07-31, current revision) Narrowed the first delivery to Granite R2, added the
+- [x] (2026-07-31, initial campaign revision) Narrowed the initial delivery to Granite R2, added the
   no-semantic baseline gate, A4000 indexing, clone-first sequencing, 15 repository-shared
   indexes, and evaluation concurrency pinned at 30.
 - [x] (2026-07-31, implementation) Verified or completed all 15 upstream clones in parallel
@@ -151,10 +151,11 @@ The observable outcomes are:
   `/mnt/optane/bifrost-nlp-resources/runs/dw10-cim-20260731-r2`. Its sidecar was stopped after
   readiness so Granite could reuse the A4000 and port 18765. dw10 uses the separate
   per-repository `.bifrost/cache-dw10` namespace, so changing embedding fingerprints did not
-  invalidate the completed `.bifrost/cache` Granite databases. No dw10 evaluation was run.
-- [ ] Run the three Granite retrieval arms over seeds 0, 1, and 2 at concurrency 30. The final
-  queue is active as `cimeval-r8-granite-grid-mj26.service`; the reportable directory started
-  from exactly the 273 baseline completions.
+  invalidate the completed `.bifrost/cache` Granite databases. At this checkpoint no dw10
+  evaluation had run; it was subsequently authorized and completed below.
+- [x] (2026-08-01, complete) Run the three Granite retrieval arms over seeds 0, 1, and 2 at
+  concurrency 30. The reportable directory contains exactly the 273 baseline and 819 Granite
+  cells.
 - [x] (2026-07-31, campaign gate) Validated the immutable semantic runtime before the full
   queue. Two official Flipt sandbox cells ran concurrently against one shared repository DB;
   both completed and scored, both transient units exited successfully with zero restarts, and
@@ -285,8 +286,8 @@ The observable outcomes are:
   timeouts, and zero controller failures. Final localization produced 1,092/1,092 artifacts
   with zero skips or errors. The final leak audit covered all 1,092 cells and flagged zero;
   1,753 Git-history attempts and 72 network attempts were all mitigated by synthetic-root
-  history or Anvil's offline network namespace. Pristine recovery of inconclusive inline
-  verifier failures continues at four jobs before outcome aggregation.
+  history or Anvil's offline network namespace. Selective pristine recovery subsequently
+  produced a valid official score for every cell.
 - [x] (2026-08-01, final Granite report) Scored all 1,092 cells after selective pristine
   recovery, including successful versioned retries for all 29 first-pass verifier timeouts.
   The final report has no missing outcomes. Resolve rates are 52.0% baseline, 53.8% all
@@ -309,11 +310,16 @@ The observable outcomes are:
   reasoning, the `dw10` embedding profile, and no history. Seven cells selected semantic search.
   Localization completed 273/273 with no skips. The leak audit covered all 273 cells and flagged
   zero; all 440 Git-history attempts and 11 network attempts were mitigated by synthetic-root
-  history and Anvil's offline network namespace. Of the 273 initial outcomes, 261 are valid and
-  12 Transformers verifier failures are undergoing versioned third-pass pristine recovery at
-  four jobs.
-- [ ] Run final validation, update this plan's retrospective, and commit the Granite/dw10
-  report.
+  history and Anvil's offline network namespace. Of the 273 initial outcomes, 261 were valid;
+  versioned third-pass pristine recovery produced valid official scores for all 12 Transformers
+  verifier failures with zero retry failures. The final dw10 result is 146/273 (53.5%).
+- [x] (2026-08-01, final validation and report) Regenerated both final reports, completed the
+  paired analysis, updated this retrospective and repository inventory, and ran focused final
+  gates. Bifrost passes formatting, 47 NLP tests, the actual MCP semantic/registry tests, and
+  focused all-target NLP clippy; Anvil passes formatting and its 14 focused reranker/schema
+  tests; Mjolnir passes formatting, eight focused routing/effort tests, and clippy; brokkbench
+  passes all 39 cimeval tests and Ruff. The `bifrost-policy-checking` skill and policy tools are
+  not installed in this session, so no policy success is claimed.
 
 ## Surprises & Discoveries
 
@@ -764,29 +770,123 @@ The observable outcomes are:
 
 ## Outcomes & Retrospective
 
-At completion, record the three repository commit IDs, exact files/behavior changed, validation
-evidence, selected provider, concurrency observations, baseline sanity comparison, Granite arm
-results, dw10 best-recipe result, exclusions, and remaining work.
+The campaign is complete. It contains 1,365 reportable cells: 273 no-semantic baseline cells,
+819 Granite cells across three retrieval arms, and 273 dw10 cells for the selected vector plus
+co-edit recipe. There are no exclusions or missing scores. Every cell used Bedrock GPT-5.6 Luna
+at maximum reasoning in an official task image with synthetic-root/no-history Git exposure.
+
+### Results
+
+| Embedding / arm | Solved | Resolve | View B Acc@5 | Mean turns | Mean uncached tokens | Mean cost/cell | Total cost |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| no semantic baseline | 142/273 | 52.0% | 51.3% | 41.4 | 150,906 | $0.489 | $133.52 |
+| Granite all signals | 147/273 | 53.8% | 53.5% | 44.9 | 253,603 | $0.799 | $218.26 |
+| Granite semantic only | 149/273 | 54.6% | 49.5% | 44.5 | 233,317 | $0.749 | $204.58 |
+| Granite vector + co-edit 2:1 | 150/273 | 54.9% | 52.0% | 43.8 | 232,229 | $0.744 | $203.21 |
+| dw10 vector + co-edit 2:1 | 146/273 | 53.5% | 50.5% | 44.0 | 263,132 | $0.813 | $221.94 |
+
+Granite vector plus co-edit has the best observed task result, 2.93 percentage points above the
+baseline. Granite semantic only is +2.56 points and all signals is +1.83 points. Their paired
+per-instance resolve p-values against baseline are 0.170, 0.228, and 0.376 respectively, so the
+campaign does not establish that any Granite arm improves solve rate. The all-signals arm did
+not outperform either reduced arm; its extra BM25 leg increased tokens and cost without a
+measurable task benefit.
+
+dw10 finishes at 53.5%, 1.47 points above baseline and 1.47 points below comparable Granite.
+Against Granite it has 11 cell-level exclusive solves and 15 exclusive losses; the exact
+discordant-pair p-value is 0.557. The plan's CIM-style per-instance seed-mean Wilcoxon comparison
+also finds no difference (resolve p=0.206, View B Acc@5 p=0.328). Against baseline, dw10's
+resolve p-value is 0.533. dw10 therefore shows no evidence of an advantage over Granite and is
+also more expensive: $221.94 total and $1.520 per solve versus Granite vector plus co-edit's
+$203.21 and $1.355 per solve.
+
+Tool choice remained agent-controlled as in CIM. Only three Granite vector-plus-co-edit cells
+and seven dw10 cells selected semantic search, so the task-level comparison primarily measures
+the value of making each localizer available to the agent, not standalone retrieval quality.
+Every observed call realized the requested candidate budgets, returned at most final `k=20`,
+attached source context, and avoided fallback. dw10's seven calls all realized `80/0/40`; no
+final-k violation occurred. Some dw10 calls experienced large initial readiness/embedding queue
+waits under the shared 30-worker host, making the sparse latency samples unsuitable for a model
+speed comparison.
+
+The baseline is operationally sane beside CIM's published no-index references: its 52.0% solve
+rate is above CIM SC-OFF's 40.2%-43.9% and OpenCode's 44.4%-45.7%, plausibly reflecting Luna at
+maximum reasoning and a different agent. The report's old 5,000-30,000 mean-token predicate is
+not appropriate for maximum-reasoning Luna (observed baseline mean 150,906); task count, solve
+rate, turns, manual traces, and leak review pass. Seeds are independent pass@1 replicates, not a
+provider sampling-seed control.
+
+Generation produced 998 completed and 94 timed-out agents for the 1,092 baseline/Granite cells,
+plus 261 completed and 12 timed-out dw10 agents. Timeouts remained reportable and were officially
+scored. Localization covers all 1,365 cells. Leak audits flagged zero: all 2,193 history attempts
+and 83 network attempts were neutralized by the declared no-history and offline-shell controls.
+
+### Change inventory
+
+#### Bifrost (`/mnt/optane/bifrost-nlp`)
+
+- `23af0cfa` replaces the hardcoded Voyage contract with fingerprinted model profiles, dynamic
+  dimensions, configurable pooling/prefixes, and Granite R2 serving.
+- `501f21e6` exposes file-level materialization progress; `e36d4e6e` parallelizes extraction
+  across host cores while preserving deterministic serial ordering.
+- `bac89d82` adds the separately fingerprinted dw10 profile and its `parent_alpha=0.65` contract.
+- `71e8ac64` records embedding queue/service and readiness timings; `fcaf3a78` waits for the
+  initial semantic index without removing bounded stale-index behavior on later rebuilds.
+- `8c82afe3` isolates the real MCP missing-model test from shared checkout caches; `dc674f22`
+  keeps the affected NLP tests clean under the current all-target clippy gate.
+
+#### Anvil (`/mnt/optane/anvil-bifrost-nlp-ft`)
+
+- `e002ba4` makes model-facing `k` the documented final result ceiling (default/max 20), tells
+  the model that fewer results may be returned, forwards `m=2`, equalizes the three raw pools,
+  and accepts valid empty/fewer reranker selections without refilling.
+- `71c6346` provides bounded evaluation turns; `b385af1` runs offline shell commands inside an
+  isolated network namespace; `3885f50` advertises and forwards Bedrock maximum reasoning.
+- `709f227` freezes retrieval telemetry in reranker traces; `c4483eb` fetches the entire bounded
+  candidate pool in RRF-order batches and accepts compact file outlines, ensuring the reranker
+  receives source context.
+
+#### Mjolnir (`/mnt/optane/mjolnir-bifrost-nlp-ft`)
+
+- `3e046fc` routes an explicit provider-qualified model through an available Anvil server even
+  when a transient discovery snapshot omits it.
+- `f7ba210` parses and preserves the `+max` per-seat reasoning override.
+- `26a3084` seeds the selected Anvil process with its exact model and reasoning effort before
+  optional catalog discovery, removing that network call from startup correctness.
+
+#### brokkbench and sandbox infrastructure (`/home/jonathan/Projects/brokkbench`)
+
+- The campaign harness spans `e05760f759f` through `fbfc8cd61e1`. It adds an independent
+  `cimeval` workflow without changing agenteval defaults: official direct-Podman task images,
+  fail-closed Git/network controls, resumable Cartesian scheduling, immutable runtime identity,
+  model-specific shared caches, serial GPU prewarming, inline scoring, versioned pristine
+  recovery, CIM-compatible localization, leak auditing, retrieval telemetry, and paired reports.
+- Key checkpoints include `64a2da6131f` (one multi-seed worker pool), `02598f37ad9` (inline
+  scoring), `8f861239a8c` (localization), `6a94ce2b4ef`/`3ce7216dbc0` (telemetry/statistics),
+  `6c62b71b247`/`83a8979c9a5` (runtime identity), `a8d05bfc441`/`784e2e31aad` (selective versioned
+  scorer recovery), `401cb407962` (explicit history modes), and `fbfc8cd61e1` (per-cell embedding
+  profile identity).
+
+No product repository has an uncommitted campaign diff. brokkbench contains unrelated user
+changes and artifacts outside the owned `cimeval`/sandbox scope; those were preserved.
 
 ## Context and Orientation
 
 The primary Bifrost checkout is `/mnt/optane/bifrost-nlp`, branch `bifrost-nlp-ft`. Commit
 Bifrost work directly to that branch. Preserve the user's untracked `code_isnt_memory.md`.
 
-The three repositories whose changes must be reported are:
+The implementation ultimately changed four repositories:
 
 1. `/mnt/optane/bifrost-nlp`: Granite model serving, dynamic embedding shape, retrieval
    profiles, shared-cache validation, and Bifrost tests.
 2. `/home/jonathan/Projects/anvil`, developed through a clean worktree at
    `/mnt/optane/anvil-bifrost-nlp-ft`: model-facing schema, overfetch, bounded reranking,
    fallback, telemetry, and tests.
-3. `/home/jonathan/Projects/brokkbench`: minimal sandbox port forwarding plus a new, separate
+3. `/home/jonathan/Projects/mjolnir`, developed through
+   `/mnt/optane/mjolnir-bifrost-nlp-ft`: explicit Anvil routing, maximum effort parsing, and
+   deterministic startup configuration.
+4. `/home/jonathan/Projects/brokkbench`: minimal sandbox port forwarding plus a new, separate
    `cimeval` harness, tests, and analysis/reporting code.
-
-Mjolnir at `/home/jonathan/Projects/mjolnir` is the ACP client used to drive Anvil. No Mjolnir
-source change is planned, so it is not one of the three changed repositories. If an integration
-defect makes a Mjolnir change necessary, stop, create a worktree under `/mnt/optane`, record the
-expanded scope here, and include it as a fourth repository in the report.
 
 The Granite artifact is:
 
@@ -822,7 +922,7 @@ starts. The scrubbed sandbox must not expose future refs, reflogs, alternates, o
 objects. Sharing a host primary clone and Bifrost DB therefore does not weaken the cell's Git
 object isolation.
 
-A cell is one `(instance, arm, seed)` run. The first delivery contains:
+A cell is one `(instance, arm, seed)` run. The completed campaign contains:
 
     baseline: 91 instances * 1 no-semantic arm * 3 seeds = 273 cells
     Granite:  91 instances * 3 retrieval arms * 3 seeds = 819 cells
@@ -1139,8 +1239,9 @@ another GPU.
 Run focused Bifrost validation from `/mnt/optane/bifrost-nlp`:
 
     cargo fmt --check
-    scripts/with-isolated-cargo-target.sh cargo test -p bifrost-analysis --features nlp nlp::
-    scripts/with-isolated-cargo-target.sh cargo test -p bifrost-mcp --features nlp mcp_nlp
+    scripts/with-isolated-cargo-target.sh cargo test -p brokk-bifrost-analysis --features nlp nlp::
+    scripts/with-isolated-cargo-target.sh cargo test -p brokk-bifrost-mcp --features nlp semantic
+    scripts/with-isolated-cargo-target.sh cargo test -p brokk-bifrost-mcp --features nlp nlp_
     uv run --python 3.12 -- scripts/embedding_sidecar.py --selftest \
       --profile granite-r2 \
       --model-dir /home/jonathan/Projects/brokkbench/localizer/artifacts/granite-r2-small-v4-final
@@ -1228,21 +1329,23 @@ fallback.
 Baseline seed 0 passes only through the five-part sanity gate in Milestone 7. The other baseline
 seeds and every Granite cell remain blocked until it passes.
 
-Concurrency control passes when every generation and scoring phase uses 30 jobs, Granite
-initial indexing remains concurrency one, and saved load samples document any interference
-from the other workstation workload.
+Concurrency control passes when generation and primary inline scoring use 30 jobs, selective
+pristine scorer recovery uses its bounded four-job pool, Granite and dw10 initial indexing
+remain concurrency one, and saved load samples document any interference from the other
+workstation workload.
 
 The Granite evaluation passes when 819 expected cells are complete or outcome-blind excluded,
-all use one provider and main-model configuration, official scorers run after artifact capture
-in the task sandbox, leak audits are reviewed, result counts respect k, and the report
-regenerates without rerunning an LLM.
+all use one provider and main-model configuration, official scorers run inline in the task
+sandbox with selective versioned pristine recovery, leak audits are reviewed, result counts
+respect k, and the report regenerates without rerunning an LLM.
 
 Before completing Bifrost code changes, run the repository policy skill only if
 `bifrost-policy-checking` and its policy tools are actually installed. If absent, record that
 fact rather than claiming policy success.
 
-The delivery is complete only when the three-repository change inventory and baseline/Granite
-report are committed and execution has stopped before dw10.
+The delivery is complete only when the four-repository change inventory and baseline, Granite,
+and authorized dw10 best-recipe results are committed, every reportable cell has a valid score,
+and all campaign services have stopped.
 
 ## Idempotence and Recovery
 
