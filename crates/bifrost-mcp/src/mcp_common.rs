@@ -2795,9 +2795,12 @@ mod uri_tests {
             .bind_client_workspace(first.path().to_path_buf())
             .expect("bind first workspace");
         let prepared = service
-            .prepare_query_code(json!({
-                "match": { "kind": "function", "name": "firstTarget" }
-            }))
+            .prepare_query_code(
+                json!({
+                    "match": { "kind": "function", "name": "firstTarget" }
+                }),
+                None,
+            )
             .expect("prepare against first workspace");
         let accepted_generation = prepared.workspace_generation();
         let cancellations = McpRequestCancellations::default();
@@ -2879,14 +2882,17 @@ mod uri_tests {
         );
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
         let prepared = service
-            .prepare_query_code(json!({
-                "schema_version": 3,
-                "match": { "kind": "function", "name": "target" },
-                "steps": [
-                    { "op": "procedure_of" },
-                    { "op": "cfg_entry" }
-                ]
-            }))
+            .prepare_query_code(
+                json!({
+                    "schema_version": 3,
+                    "match": { "kind": "function", "name": "target" },
+                    "steps": [
+                        { "op": "procedure_of" },
+                        { "op": "cfg_entry" }
+                    ]
+                }),
+                None,
+            )
             .expect("query preparation");
         spawn_cancellable_tool_call(
             Arc::clone(&service),
@@ -2922,6 +2928,14 @@ mod uri_tests {
         let service = Arc::new(
             SearchToolsService::new_deferred_manual(dir.path().to_path_buf()).expect("service"),
         );
+        // Join the deferred build first: this test pins cancellation forwarding
+        // through the background spawn path into a partial payload, which is
+        // only reachable once the workspace snapshot exists. A request that is
+        // cancelled while the build is still pending fails fast with an
+        // explicit error instead (covered by the deadline tests).
+        service
+            .call_tool_value("search_symbols", json!({ "patterns": ["__warmup__"] }))
+            .expect("warmup joins the deferred build");
         let spec = build_server_spec(
             "test",
             vec![json!({

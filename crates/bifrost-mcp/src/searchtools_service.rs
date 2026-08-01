@@ -194,6 +194,11 @@ impl fmt::Display for SearchToolsServiceError {
     }
 }
 
+/// Error message for a request whose time budget expired while the deferred
+/// initial workspace build was still running. Also matched by the repository
+/// benchmark's prewarm loop to keep polling until the build completes.
+pub const WORKSPACE_SNAPSHOT_NOT_READY_MESSAGE: &str = "workspace snapshot was not ready within the request-wide time budget; retry after workspace initialization completes";
+
 impl std::error::Error for SearchToolsServiceError {}
 
 #[derive(Debug, Clone, PartialEq)]
@@ -915,7 +920,7 @@ impl SearchToolsService {
             );
         }
         if name == "query_code" {
-            let prepared = self.prepare_query_code(arguments)?;
+            let prepared = self.prepare_query_code(arguments, cancellation)?;
             return self.execute_prepared_query_code(prepared, cancellation);
         }
         if name == "list_policies" {
@@ -939,7 +944,8 @@ impl SearchToolsService {
             return self.handle_find_filenames(arguments, cancellation);
         }
 
-        let arguments = self.normalize_arguments_for_current_workspace(name, arguments)?;
+        let arguments =
+            self.normalize_arguments_for_current_workspace(name, arguments, cancellation)?;
         if name == "get_symbol_sources" {
             return self.handle_get_symbol_sources(
                 strip_legacy_kind_filter(arguments),
@@ -949,7 +955,12 @@ impl SearchToolsService {
         }
         let snapshot = {
             let _scope = profiling::scope("SearchToolsService::snapshot_for_query");
-            self.snapshot_for_query()?
+            // Deadline-aware: a request whose budget expires while the deferred
+            // initial build is still running gets an explicit retry error within
+            // its budget, instead of blocking through the whole build and then
+            // reporting a misleading zero-result "cancelled/partial" payload
+            // (#1199).
+            self.snapshot_for_query_with_cancellation(cancellation)?
         };
         if cancellation.is_some_and(CancellationToken::is_cancelled)
             && !matches!(
@@ -1225,7 +1236,7 @@ impl SearchToolsService {
             query_value_flows,
             query_taint_results,
             typestate_summary_lease,
-        } = self.prepare_query_code(arguments)?;
+        } = self.prepare_query_code(arguments, None)?;
         let result = self.query_code_result_for_snapshot(
             &snapshot,
             arguments,
@@ -1242,6 +1253,7 @@ impl SearchToolsService {
     pub(crate) fn prepare_query_code(
         &self,
         arguments: Value,
+        cancellation: Option<&CancellationToken>,
     ) -> Result<PreparedQueryCode, SearchToolsServiceError> {
         loop {
             let (generation, typestate_summaries) = {
@@ -1254,7 +1266,7 @@ impl SearchToolsService {
                     Arc::clone(&typestate_summaries),
                 )
             };
-            let snapshot = self.snapshot_for_query()?;
+            let snapshot = self.snapshot_for_query_with_cancellation(cancellation)?;
             let query_protocols = self.query_protocol_snapshot()?;
             let query_value_flows = self.query_value_flow_snapshot()?;
             let query_taint_results = self.query_taint_result_snapshot()?;
@@ -2032,7 +2044,7 @@ impl SearchToolsService {
             if cancellation.is_cancelled() {
                 if cancellation.is_timed_out() {
                     return Err(SearchToolsServiceError::deadline_exceeded(
-                        "workspace snapshot was not ready within the request-wide time budget; retry after workspace initialization completes",
+                        WORKSPACE_SNAPSHOT_NOT_READY_MESSAGE,
                     ));
                 }
                 return Err(SearchToolsServiceError::internal(
@@ -2362,7 +2374,7 @@ impl SearchToolsService {
         let params = serde_json::from_value::<SymbolLookupParams>(arguments).map_err(|err| {
             SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
         })?;
-        let initial_snapshot = self.snapshot_for_query()?;
+        let initial_snapshot = self.snapshot_for_query_with_cancellation(cancellation)?;
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return Err(SearchToolsServiceError::internal(
                 "get_symbol_sources was cancelled or exceeded its request-wide time budget",
@@ -3048,7 +3060,12 @@ impl SearchToolsService {
         &self,
         name: &str,
         arguments: Value,
+        cancellation: Option<&CancellationToken>,
     ) -> Result<Value, SearchToolsServiceError> {
+        // Deadline-aware: this runs before the snapshot acquisition on the
+        // generic tool path, so a blocking ensure_ready here would defeat the
+        // request-wide budget while the deferred initial build runs (#1199).
+        self.ensure_ready_with_cancellation(cancellation)?;
         let root = {
             let guard = self.read_session()?;
             let session = guard.as_ref().ok_or_else(Self::closed_error)?;
@@ -3532,6 +3549,73 @@ mod watcher_startup_tests {
         release_startup_tx
             .send(())
             .expect("release deferred watcher startup");
+    }
+
+    /// #1199: a request whose budget expires while the deferred initial build
+    /// is still running must fail fast with the explicit not-ready retry error,
+    /// not block through the build and then emit a zero-result
+    /// "cancelled/partial" payload that reads as "no such symbols".
+    #[test]
+    fn issue_1199_search_symbols_snapshot_deadline_returns_not_ready_error() {
+        let (_temp, root) = workspace("Deferred.java", "class Deferred {}\n");
+        let (startup_started_tx, startup_started_rx) = mpsc::channel();
+        let (release_startup_tx, release_startup_rx) = mpsc::sync_channel(1);
+        let release_startup_rx = Arc::new(Mutex::new(release_startup_rx));
+        let starter: WatcherStarter = Arc::new(move |project| {
+            startup_started_tx
+                .send(())
+                .expect("test should observe watcher startup");
+            release_startup_rx
+                .lock()
+                .expect("release lock")
+                .recv_timeout(Duration::from_secs(5))
+                .expect("test should release watcher startup");
+            ProjectChangeWatcher::start_polling_for_tests(project)
+        });
+        let service = unbound_watching_service(starter);
+        service
+            .bind_client_workspace(root)
+            .expect("client binding should start a deferred build");
+        startup_started_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("deferred build should reach watcher startup");
+        let cancellation = CancellationToken::default().with_timeout(Duration::ZERO);
+
+        let error = service
+            .call_tool_output_with_cancellation(
+                "search_symbols",
+                json!({
+                    "patterns": ["Deferred"],
+                    "include_tests": true,
+                    "limit": 40
+                }),
+                RenderOptions::default(),
+                Some(&cancellation),
+            )
+            .expect_err("expired request should not join the deferred build");
+
+        assert_eq!(error.code, SearchToolsServiceErrorCode::DeadlineExceeded);
+        assert_eq!(error.message, WORKSPACE_SNAPSHOT_NOT_READY_MESSAGE);
+        release_startup_tx
+            .send(())
+            .expect("release deferred watcher startup");
+
+        // Once the build completes, an unexpired request observes full results.
+        let output = service
+            .call_tool_output_with_cancellation(
+                "search_symbols",
+                json!({
+                    "patterns": ["Deferred"],
+                    "include_tests": true,
+                    "limit": 40
+                }),
+                RenderOptions::default(),
+                Some(&CancellationToken::default()),
+            )
+            .expect("post-build request should succeed")
+            .into_value();
+        assert_eq!(output["truncated"], false, "{output:#}");
+        assert_eq!(output["total_files"], 1, "{output:#}");
     }
 
     #[test]
@@ -4777,7 +4861,9 @@ mod query_protocol_tests {
     #[test]
     fn prepared_query_keeps_registration_snapshot_after_alias_removal() {
         let (_temp, service, protocol_ref) = protocol_service();
-        let prepared = service.prepare_query_code(query(&protocol_ref)).unwrap();
+        let prepared = service
+            .prepare_query_code(query(&protocol_ref), None)
+            .unwrap();
         assert!(service.unregister_query_protocol(&protocol_ref).unwrap());
 
         let prepared_value = service
@@ -4799,7 +4885,9 @@ mod query_protocol_tests {
     #[test]
     fn workspace_generation_advance_clears_live_registrations_but_not_prepared_snapshots() {
         let (_temp, service, protocol_ref) = protocol_service();
-        let prepared = service.prepare_query_code(query(&protocol_ref)).unwrap();
+        let prepared = service
+            .prepare_query_code(query(&protocol_ref), None)
+            .unwrap();
         let prepared_summaries = prepared.typestate_summary_lease.clone();
 
         service.advance_workspace_generation();

@@ -384,15 +384,27 @@ fn prewarm_interactive_session(session: &mut McpSession) -> Result<(), String> {
     // snapshot to materialize without making a scenario-specific assertion or
     // contributing a timing sample. The next request is therefore genuinely
     // warm while retaining the same MCP process and caches.
-    session
-        .call_tool(
+    //
+    // Each attempt is bounded by the server's request-wide budget (#1199): while
+    // the deferred initial build is still running the server answers with an
+    // explicit not-ready error, so keep polling until the snapshot is installed.
+    loop {
+        let result = session.call_tool(
             "search_symbols",
             json!({
                 "patterns": ["__bifrost_benchmark_prewarm__"],
                 "limit": 1,
             }),
-        )
-        .map(|_| ())
+        );
+        match result {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if error.contains(
+                    brokk_bifrost_mcp::benchmark_api::WORKSPACE_SNAPSHOT_NOT_READY_MESSAGE,
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn run_interactive_query_case(
