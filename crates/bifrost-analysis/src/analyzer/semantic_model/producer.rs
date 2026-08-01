@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 pub enum ExternalArtifactKind {
     JavaSourceJar,
     JavaClassJar,
+    ScalaSourceJar,
     DotNetAssembly,
 }
 

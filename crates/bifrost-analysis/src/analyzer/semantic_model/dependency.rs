@@ -710,6 +710,7 @@ fn artifact_kind_name(kind: ExternalArtifactKind) -> &'static str {
     match kind {
         ExternalArtifactKind::JavaSourceJar => "java_source_jar",
         ExternalArtifactKind::JavaClassJar => "java_class_jar",
+        ExternalArtifactKind::ScalaSourceJar => "scala_source_jar",
         ExternalArtifactKind::DotNetAssembly => "dotnet_assembly",
     }
 }

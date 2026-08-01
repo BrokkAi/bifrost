@@ -17,7 +17,7 @@ The first release is intentionally semantic rather than compiler-emulating. Pack
 - [x] (2026-08-01 18:05Z) Verified issue #1152, its closed prerequisites, the current issue branch, and `origin/master`; rebased the clean branch onto `origin/master` at `218f4cf5` with explicit user authorization.
 - [x] (2026-08-01 18:20Z) Diagnosed the existing Java producer, Scala source-JAR projection, semantic pack runtime, optional distribution crate, and release workflow boundaries.
 - [x] (2026-08-01 18:40Z) Recorded the approved source-exact and lazy-universal-root design in this ExecPlan.
-- [ ] Milestone 1: implement deterministic Scala source-archive API production and replace the lossy private Scala projection with the shared structured facts.
+- [x] (2026-08-01 20:15Z) Milestone 1: implemented deterministic Scala source-archive API production and replaced the lossy private Scala projection with the shared structured facts; focused producer and legacy-index tests pass.
 - [ ] Milestone 2: implement deterministic module-aware JDK source archive production and independent `java.base` activation.
 - [ ] Milestone 3: integrate compact lazy universal-root lookup and prove workspace/explicit-ancestor precedence.
 - [ ] Milestone 4: prove end-to-end activation, navigation, deterministic bytes, mismatch explanations, and bounded retained memory.
@@ -40,6 +40,12 @@ The first release is intentionally semantic rather than compiler-emulating. Pack
 
 - Observation: the first broad RMCP symbol search in this task crossed the interactive budget.
   Evidence: with `BIFROST_MCP_RMCP=on`, `search_symbols` failed after 5.015 seconds because the workspace snapshot was not ready; the identical warm retry returned complete results in 305 ms. Open issue #1423 already owns cold initialization and batching failures of this shape.
+
+- Observation: the reusable Scala source facts did not previously retain constructor parameter type paths or arity.
+  Evidence: archive production initially had declarations for primary constructors but no structured parameter signatures. Extending `scala_source_facts_from_tree` to collect the same AST-derived parameter paths used for methods made constructor signatures available without parsing source text.
+
+- Observation: artifact identity and semantic determinism are separate contracts.
+  Evidence: rebuilding logically identical ZIPs with different central-directory order changes the exact input SHA-256 activation evidence by design. The determinism test therefore copies identical artifact bytes to a second path and proves path independence; logical-order determinism remains covered by sorting emitted entries and facts before compilation.
 
 ## Decision Log
 
@@ -65,7 +71,7 @@ The first release is intentionally semantic rather than compiler-emulating. Pack
 
 ## Outcomes & Retrospective
 
-The design milestone is complete. The implementation has not yet changed analyzer behavior. Subsequent milestones will update this section with observable navigation, determinism, retained-memory, release-bundle, and validation results.
+Milestone 1 now provides a bounded `ScalaSourceJarPackProducer` that parses each Scala entry once, emits public/protected source-declared types and members with stable JVM identities, signatures, explicit hierarchy, companions/modules, type aliases, and extension surfaces, and sorts output deterministically. The legacy JVM external declaration index now projects Scala type shells from these produced facts instead of maintaining a second parser and visibility model. Three producer tests and the existing Scala source-JAR external-index test pass. Compiler-generated case-class APIs remain deliberately absent for #1153.
 
 ## Context and Orientation
 
@@ -193,3 +199,5 @@ The exact type may live in the downstream generation crate if generic analysis o
 The downstream release index must be canonical serialized data with a schema version, producer version, exact selectors, source and artifact digests, asset paths, byte sizes, license/notices, and revocation-compatible immutable identity. It may refer to downloadable assets, but generic analysis must not depend on this crate or network availability.
 
 Revision note (2026-08-01): created the initial self-contained plan after live issue diagnosis and user approval. The plan records source-exact Scala/JDK capture, lazy universal-root evaluation, the #1153 case-class boundary, reproducible release assets, and milestone validation.
+
+Revision note (2026-08-01): completed milestone 1. The implementation established Scala source archives as the authoritative structured path for both semantic packs and the legacy JVM type index, and recorded constructor-fact and exact-artifact determinism findings.

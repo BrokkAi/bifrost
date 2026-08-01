@@ -4,6 +4,7 @@ use crate::analyzer::java::declarations::{
 };
 use crate::analyzer::jvm::dependency_discovery::{discover_build_tools, discover_metadata};
 use crate::analyzer::jvm::java_artifact::JavaJarPackProducer;
+use crate::analyzer::jvm::scala_artifact::ScalaSourceJarPackProducer;
 use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProductionRequest, AuthoredPayload,
     AuthoredSemanticModelPack, CatalogCoordinate, Compatibility, Completeness,
@@ -765,6 +766,7 @@ impl JvmExternalDeclarationIndex {
         let entry_count = archive.len().min(MAX_ARCHIVE_ENTRIES);
         let mut total_bytes = 0u64;
         let mut java_facts = None;
+        let mut scala_indexed = false;
         for index in 0..entry_count {
             let Ok(entry) = archive.by_index(index) else {
                 continue;
@@ -779,6 +781,22 @@ impl JvmExternalDeclarationIndex {
                 MAX_TOTAL_ARCHIVE_BYTES.min(index_byte_budget),
                 &mut total_bytes,
             ) {
+                continue;
+            }
+            if matches!(language, SourceJarLanguage::Scala) {
+                if !scala_indexed {
+                    let mut facts = self
+                        .produce_scala_type_facts(artifact_path)
+                        .into_values()
+                        .collect::<Vec<_>>();
+                    facts.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+                    for fact in facts.into_iter().take(MAX_ANALYZER_SOURCE_TYPES) {
+                        if let Some(external_type) = scala_external_type(artifact_path, fact) {
+                            self.insert(external_type);
+                        }
+                    }
+                    scala_indexed = true;
+                }
                 continue;
             }
             let source_path = entry.name().to_string();
@@ -911,6 +929,56 @@ impl JvmExternalDeclarationIndex {
             .map(|fact| (fact.name.clone(), fact))
             .collect()
     }
+
+    fn produce_scala_type_facts(&mut self, artifact_path: &Path) -> HashMap<String, TypeFact> {
+        let production = ScalaSourceJarPackProducer.produce_exact_artifact(
+            &ArtifactProductionRequest {
+                path: artifact_path.to_path_buf(),
+                artifact_kind: ExternalArtifactKind::ScalaSourceJar,
+                pack_id: "bifrost.external.scala".to_owned(),
+                pack_version: env!("CARGO_PKG_VERSION").to_owned(),
+                ecosystem: "maven".to_owned(),
+                compatibility: Compatibility {
+                    bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                    toolchains: Vec::new(),
+                },
+                activation: vec![ActivationSelector {
+                    package: None,
+                    module: None,
+                    toolchain: Some(NameSelector {
+                        name: "jvm".to_owned(),
+                        version: None,
+                    }),
+                    targets: Vec::new(),
+                    configurations: Vec::new(),
+                    artifact_sha256: None,
+                }],
+                provenance: Provenance {
+                    source: "local dependency artifact".to_owned(),
+                    revision: None,
+                },
+                license: "NOASSERTION".to_owned(),
+                safety: Safety {
+                    generated_code_only: false,
+                    review_required: false,
+                },
+            },
+            &ArtifactProducerLimits::default(),
+        );
+        self.production_diagnostics
+            .extend(production.diagnostics.iter().cloned());
+        production
+            .pack
+            .into_iter()
+            .flat_map(|pack| pack.shards)
+            .flat_map(|shard| match shard.payload {
+                AuthoredPayload::DeclarationFacts { types, .. } => types,
+                AuthoredPayload::GeneratorRules { .. }
+                | AuthoredPayload::ProcedureSummaries { .. } => Vec::new(),
+            })
+            .map(|fact| (fact.name.clone(), fact))
+            .collect()
+    }
 }
 
 fn jvm_artifact_from_dependency(dependency: &ResolvedDependency) -> Option<ResolvedJvmArtifact> {
@@ -944,7 +1012,34 @@ fn discovery_producer_diagnostic(diagnostic: DependencyPackDiagnostic) -> Produc
 }
 
 fn apply_java_type_fact(external_type: &mut JvmExternalType, fact: &TypeFact) {
-    external_type.kind = match fact.type_kind {
+    external_type.kind = semantic_type_kind(fact.type_kind);
+    external_type.visibility = semantic_visibility(fact.visibility);
+}
+
+fn scala_external_type(artifact_path: &Path, fact: TypeFact) -> Option<JvmExternalType> {
+    let source_path = match fact.locator {
+        Locator::Source { path, .. } => path,
+        Locator::Artifact { .. } => return None,
+    };
+    let name = fact.name;
+    let (package_name, short_name) = name
+        .rsplit_once('.')
+        .map_or(("", name.as_str()), |(package, short)| (package, short));
+    (!short_name.is_empty()).then(|| JvmExternalType {
+        fqn: name.clone(),
+        package_name: package_name.to_owned(),
+        short_name: short_name.to_owned(),
+        kind: semantic_type_kind(fact.type_kind),
+        visibility: semantic_visibility(fact.visibility),
+        source: JvmExternalDeclarationSource::SourceJar {
+            artifact_path: artifact_path.to_path_buf(),
+            source_path,
+        },
+    })
+}
+
+fn semantic_type_kind(kind: TypeKind) -> JvmExternalTypeKind {
+    match kind {
         TypeKind::Interface | TypeKind::Trait => JvmExternalTypeKind::Interface,
         TypeKind::Enum => JvmExternalTypeKind::Enum,
         TypeKind::Annotation => JvmExternalTypeKind::Annotation,
@@ -954,13 +1049,16 @@ fn apply_java_type_fact(external_type: &mut JvmExternalType, fact: &TypeFact) {
         | TypeKind::Struct
         | TypeKind::Module
         | TypeKind::TypeAlias => JvmExternalTypeKind::Class,
-    };
-    external_type.visibility = match fact.visibility {
+    }
+}
+
+fn semantic_visibility(visibility: Visibility) -> JvmVisibility {
+    match visibility {
         Visibility::Public => JvmVisibility::Public,
         Visibility::Protected | Visibility::ProtectedInternal => JvmVisibility::Protected,
         Visibility::Package | Visibility::Internal => JvmVisibility::PackagePrivate,
         Visibility::Private => JvmVisibility::Private,
-    };
+    }
 }
 
 /// A source language Bifrost can read out of a published `-sources.jar`.
@@ -1008,7 +1106,7 @@ impl SourceJarLanguage {
     ) -> Vec<JvmExternalType> {
         match self {
             Self::Java => source_types(artifact_path, source_path, source),
-            Self::Scala => scala_source_types(artifact_path, source_path, source),
+            Self::Scala => unreachable!("Scala source JARs are indexed from semantic pack facts"),
             Self::Kotlin => kotlin_source_types(artifact_path, source_path, source),
         }
     }
@@ -1412,78 +1510,6 @@ fn source_types(artifact_path: &Path, source_path: &str, source: &str) -> Vec<Jv
     }
 
     result
-}
-
-fn scala_source_types(
-    artifact_path: &Path,
-    source_path: &str,
-    source: &str,
-) -> Vec<JvmExternalType> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
-        .expect("tree-sitter Scala language must load");
-    let Some(tree) = parser.parse(source, None) else {
-        return Vec::new();
-    };
-    if tree.root_node().has_error() {
-        return Vec::new();
-    }
-
-    let synthetic_file = ProjectFile::new(std::env::temp_dir(), "external.scala");
-    let parsed =
-        crate::analyzer::scala::declarations::parse_scala_file(&synthetic_file, source, &tree);
-    parsed
-        .declarations()
-        .iter()
-        .filter(|declaration| declaration.is_class())
-        .filter(|declaration| {
-            scala_source_declaration_node(&tree, &parsed, declaration).is_some_and(|node| {
-                crate::analyzer::scala::declarations::scala_declaration_is_public(node, source)
-            })
-        })
-        .filter_map(|declaration| {
-            let fqn = crate::analyzer::scala::scala_normalize_full_name(&declaration.fq_name());
-            let package_name = declaration.package_name().to_string();
-            let short_name =
-                crate::analyzer::scala::scala_normalize_full_name(declaration.short_name());
-            (!short_name.is_empty()).then(|| JvmExternalType {
-                fqn,
-                package_name,
-                short_name,
-                kind: JvmExternalTypeKind::Class,
-                visibility: JvmVisibility::Public,
-                source: JvmExternalDeclarationSource::SourceJar {
-                    artifact_path: artifact_path.to_path_buf(),
-                    source_path: source_path.to_string(),
-                },
-            })
-        })
-        // Source JARs are untrusted input. The index is deliberately
-        // best-effort, so stopping at a bounded number of public Scala types
-        // is preferable to retaining an arbitrarily large declaration set.
-        .take(MAX_ANALYZER_SOURCE_TYPES)
-        .collect()
-}
-
-fn scala_source_declaration_node<'tree>(
-    tree: &'tree tree_sitter::Tree,
-    parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
-    declaration: &crate::analyzer::CodeUnit,
-) -> Option<tree_sitter::Node<'tree>> {
-    let range = parsed.declaration_ranges(declaration).first()?;
-    let mut node = tree
-        .root_node()
-        .descendant_for_byte_range(range.start_byte, range.end_byte)?;
-    loop {
-        if matches!(
-            node.kind(),
-            "class_definition" | "object_definition" | "trait_definition" | "enum_definition"
-        ) {
-            return Some(node);
-        }
-        node = node.parent()?;
-    }
 }
 
 /// Public Kotlin types declared by one `.kt` entry of a source jar.

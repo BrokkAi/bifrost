@@ -19,10 +19,10 @@ use std::io::{Cursor, Read};
 use tree_sitter::Node;
 use zip::ZipArchive;
 
-const MAX_ARCHIVE_ENTRIES: usize = 10_000;
-const MAX_SOURCE_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
+pub(super) const MAX_ARCHIVE_ENTRIES: usize = 10_000;
+pub(super) const MAX_SOURCE_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CLASS_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_TOTAL_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
+pub(super) const MAX_TOTAL_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_CENTRAL_DIRECTORY_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -189,6 +189,7 @@ impl JavaJarPackProducer {
                 ExternalArtifactKind::JavaClassJar => {
                     entry_name.ends_with(".class") && !entry_name.ends_with("module-info.class")
                 }
+                ExternalArtifactKind::ScalaSourceJar => false,
                 ExternalArtifactKind::DotNetAssembly => false,
             };
             if !selected {
@@ -197,6 +198,7 @@ impl JavaJarPackProducer {
             let entry_limit = match request.artifact_kind {
                 ExternalArtifactKind::JavaSourceJar => MAX_SOURCE_ENTRY_BYTES,
                 ExternalArtifactKind::JavaClassJar => MAX_CLASS_ENTRY_BYTES,
+                ExternalArtifactKind::ScalaSourceJar => unreachable!(),
                 ExternalArtifactKind::DotNetAssembly => unreachable!(),
             };
             let next_total = total_bytes.saturating_add(entry.size());
@@ -250,6 +252,7 @@ impl JavaJarPackProducer {
                         "class entry did not contain supported bounded metadata",
                     ),
                 },
+                ExternalArtifactKind::ScalaSourceJar => unreachable!(),
                 ExternalArtifactKind::DotNetAssembly => unreachable!(),
             }
         }
@@ -309,13 +312,13 @@ impl JavaJarPackProducer {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ZipDirectoryStatus {
+pub(super) enum ZipDirectoryStatus {
     Valid,
     Invalid,
     Exceeded,
 }
 
-fn zip_directory_status(bytes: &[u8]) -> ZipDirectoryStatus {
+pub(super) fn zip_directory_status(bytes: &[u8]) -> ZipDirectoryStatus {
     const EOCD: &[u8; 4] = b"PK\x05\x06";
     const ZIP64_LOCATOR: &[u8; 4] = b"PK\x06\x07";
     const ZIP64_EOCD: &[u8; 4] = b"PK\x06\x06";
