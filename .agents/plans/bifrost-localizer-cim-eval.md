@@ -292,7 +292,8 @@ The observable outcomes are:
   The final report has no missing outcomes. Resolve rates are 52.0% baseline, 53.8% all
   signals, 54.6% semantic only, and 54.9% semantic plus co-edit; none of the paired resolve
   comparisons against baseline is statistically significant.
-- [ ] Run dw10 `semantic-coedit-2-1` over seeds 0, 1, and 2 at concurrency 30, using its
+- [x] (2026-08-01, generation complete) Run dw10 `semantic-coedit-2-1` over seeds 0, 1, and 2
+  at concurrency 30, using its
   separately fingerprinted cache and local A4000 sidecar.
   The full 273-cell Cartesian queue started on 2026-08-01 with Bedrock GPT-5.6 Luna at maximum
   reasoning, `--without-history`, inline scoring, the immutable dw10 runtime and tokenizer,
@@ -302,7 +303,15 @@ The observable outcomes are:
   data. The first reportable agent-selected DW10 retrieval call, Apollo seed 2, proves the live
   contract: it requested and realized exactly 80 vector, 0 BM25, and 40 co-edit candidates,
   deduplicated to 120, attached 60,968 context bytes, selected 12 results under final `k=20`,
-  and did not fall back. DW10 embedding service time was 255 ms.
+  and did not fall back. DW10 embedding service time was 255 ms. The controller exited
+  successfully with exactly 273 cells: 261 completed agents, 12 normal 1,800-second agent
+  timeouts, and zero runner failures. Every result records Bedrock GPT-5.6 Luna, maximum
+  reasoning, the `dw10` embedding profile, and no history. Seven cells selected semantic search.
+  Localization completed 273/273 with no skips. The leak audit covered all 273 cells and flagged
+  zero; all 440 Git-history attempts and 11 network attempts were mitigated by synthetic-root
+  history and Anvil's offline network namespace. Of the 273 initial outcomes, 261 are valid and
+  12 Transformers verifier failures are undergoing versioned third-pass pristine recovery at
+  four jobs.
 - [ ] Run final validation, update this plan's retrospective, and commit the Granite/dw10
   report.
 
