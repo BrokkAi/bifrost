@@ -30,6 +30,7 @@ pub use dependency::*;
 pub use identity::{MemberIdentity, TypeIdentity, member_declaration_id, type_declaration_id};
 pub use model::*;
 pub use overlay::*;
+pub(crate) use producer::read_exact_artifact_while;
 pub use producer::{
     ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
     BoundedProducerDiagnostics, ExactArtifact, ExternalArtifactKind, ExternalArtifactPackProducer,

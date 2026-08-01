@@ -43,7 +43,17 @@ pub struct ResolvedDependencyArtifact {
 pub struct ResolvedDependency {
     pub id: String,
     pub evidence: SemanticModelActivationEvidence,
+    /// Ordered, normalized ecosystem evidence that affects production but is
+    /// not itself an activation selector (for example an exact non-semver
+    /// coordinate or asset role).
+    pub provenance: Vec<DependencyProvenance>,
     pub artifacts: Vec<ResolvedDependencyArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyProvenance {
+    pub key: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +102,7 @@ pub trait DependencyPackAdapter {
         dependency: &ResolvedDependency,
         artifacts: &[ExactDependencyArtifact],
         limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
     ) -> DependencyPackProduction;
 }
 
@@ -229,6 +240,19 @@ pub fn prepare_dependency_semantic_packs(
             );
             continue;
         }
+        if dependency
+            .provenance
+            .iter()
+            .any(|entry| entry.key.is_empty() || entry.value.is_empty())
+        {
+            diagnostics.error(
+                "dependency.provenance",
+                Some(&dependency.id),
+                None,
+                "dependency provenance keys and values must not be empty",
+            );
+            continue;
+        }
         if dependency.artifacts.len() > limits.max_artifacts_per_dependency {
             diagnostics.error(
                 "limit.artifacts_per_dependency",
@@ -336,7 +360,8 @@ pub fn prepare_dependency_semantic_packs(
             cancelled = true;
             break;
         }
-        let production = adapter.produce(dependency, &exact_artifacts, &limits.producer);
+        let production =
+            adapter.produce(dependency, &exact_artifacts, &limits.producer, cancellation);
         diagnostics.suppressed = diagnostics
             .suppressed
             .saturating_add(production.suppressed_diagnostics);
@@ -457,8 +482,13 @@ fn dependency_input_digest(
     let mut hasher = CanonicalHasher::new(DEPENDENCY_INPUT_DOMAIN);
     hasher.field("adapter_name", adapter.adapter_name().as_bytes());
     hasher.field("adapter_version", adapter.adapter_version().as_bytes());
-    hasher.field("dependency_id", dependency.id.as_bytes());
     hash_evidence(&mut hasher, &dependency.evidence);
+    let mut provenance: Vec<_> = dependency.provenance.iter().collect();
+    provenance.sort_by(|left, right| (&left.key, &left.value).cmp(&(&right.key, &right.value)));
+    hasher.sequence("provenance", &provenance, |hasher, entry| {
+        hasher.field("key", entry.key.as_bytes());
+        hasher.field("value", entry.value.as_bytes());
+    });
     hasher.sequence("artifacts", artifacts, |hasher, artifact| {
         hasher.field("role", artifact.role.as_str().as_bytes());
         hasher.field("kind", artifact_kind_name(artifact.kind).as_bytes());

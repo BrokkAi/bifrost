@@ -1,3 +1,4 @@
+use crate::CancellationToken;
 use crate::analyzer::java::declarations::{determine_package_name, node_text, parse_tree};
 use crate::analyzer::semantic_model::{
     ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest, AuthoredPayload,
@@ -5,7 +6,7 @@ use crate::analyzer::semantic_model::{
     ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact, HierarchyKind, Locator,
     MemberFact, MemberIdentity, MemberKind, Parameter, Producer, ProducerDiagnostic,
     ProducerDiagnosticSeverity, Signature, TypeFact, TypeIdentity, TypeKind, TypeRef, Visibility,
-    WildcardVariance, member_declaration_id, read_exact_artifact, type_declaration_id,
+    WildcardVariance, member_declaration_id, read_exact_artifact_while, type_declaration_id,
 };
 use crate::hash::{HashMap, HashSet};
 use jclassfile::attributes::{Attribute, NestedClassFlags};
@@ -57,6 +58,26 @@ impl ExternalArtifactPackProducer for JavaJarPackProducer {
         request: &ArtifactProductionRequest,
         limits: &ArtifactProducerLimits,
     ) -> ArtifactProduction {
+        self.produce(request, limits, None)
+    }
+
+    fn produce_exact_artifact_with_cancellation(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> ArtifactProduction {
+        self.produce(request, limits, cancellation)
+    }
+}
+
+impl JavaJarPackProducer {
+    fn produce(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> ArtifactProduction {
         if !matches!(
             request.artifact_kind,
             ExternalArtifactKind::JavaSourceJar | ExternalArtifactKind::JavaClassJar
@@ -71,7 +92,9 @@ impl ExternalArtifactPackProducer for JavaJarPackProducer {
                 limits,
             );
         }
-        let artifact = match read_exact_artifact(&request.path, limits) {
+        let artifact = match read_exact_artifact_while(&request.path, limits, || {
+            cancellation.is_some_and(CancellationToken::is_cancelled)
+        }) {
             Ok(artifact) => artifact,
             Err(diagnostic) => return ArtifactProduction::failed(diagnostic, limits),
         };
@@ -130,6 +153,17 @@ impl ExternalArtifactPackProducer for JavaJarPackProducer {
             );
         }
         for index in 0..entry_limit {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return ArtifactProduction::failed(
+                    ProducerDiagnostic {
+                        severity: ProducerDiagnosticSeverity::Error,
+                        code: "artifact.cancelled".to_owned(),
+                        location: None,
+                        message: "Java archive production was cancelled".to_owned(),
+                    },
+                    limits,
+                );
+            }
             let Ok(mut entry) = archive.by_index(index) else {
                 diagnostics.warning(
                     "java.archive.entry",
@@ -214,6 +248,17 @@ impl ExternalArtifactPackProducer for JavaJarPackProducer {
                 .flat_map(|(_, source)| source_declared_type_names(source))
                 .collect::<HashSet<_>>();
             for (entry_name, source) in source_entries {
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    return ArtifactProduction::failed(
+                        ProducerDiagnostic {
+                            severity: ProducerDiagnosticSeverity::Error,
+                            code: "artifact.cancelled".to_owned(),
+                            location: None,
+                            message: "Java source production was cancelled".to_owned(),
+                        },
+                        limits,
+                    );
+                }
                 declarations.extend(source_api_types(
                     &entry_name,
                     &source,

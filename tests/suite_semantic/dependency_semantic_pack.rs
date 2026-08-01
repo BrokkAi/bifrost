@@ -39,6 +39,7 @@ impl DependencyPackAdapter for FixtureAdapter {
         _dependency: &ResolvedDependency,
         artifacts: &[ExactDependencyArtifact],
         _limits: &brokk_bifrost::analyzer::semantic_model::ArtifactProducerLimits,
+        _cancellation: Option<&CancellationToken>,
     ) -> DependencyPackProduction {
         self.productions.fetch_add(1, Ordering::Relaxed);
         assert_eq!(artifacts.len(), 1);
@@ -67,6 +68,7 @@ fn dependency(path: std::path::PathBuf) -> ResolvedDependency {
             configuration: Some("release".to_owned()),
             artifact_sha256: None,
         },
+        provenance: Vec::new(),
         artifacts: vec![ResolvedDependencyArtifact {
             role: DependencyArtifactRole::Binary,
             kind: ExternalArtifactKind::JavaClassJar,
@@ -246,8 +248,9 @@ fn partial_generated_pack_remains_partial_when_reused() {
             dependency: &ResolvedDependency,
             artifacts: &[ExactDependencyArtifact],
             limits: &brokk_bifrost::analyzer::semantic_model::ArtifactProducerLimits,
+            cancellation: Option<&CancellationToken>,
         ) -> DependencyPackProduction {
-            let mut production = self.0.produce(dependency, artifacts, limits);
+            let mut production = self.0.produce(dependency, artifacts, limits, cancellation);
             production.pack.as_mut().unwrap().completeness = Completeness::Partial;
             production
         }

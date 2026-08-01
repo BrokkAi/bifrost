@@ -1,6 +1,7 @@
 use super::{
     ActivationSelector, AuthoredSemanticModelPack, Compatibility, Completeness, Provenance, Safety,
 };
+use crate::CancellationToken;
 use crate::analyzer::canonical_hash::{lower_hex_string, sha256_bytes};
 use std::fs::File;
 use std::io::Read;
@@ -92,6 +93,26 @@ pub trait ExternalArtifactPackProducer {
         request: &ArtifactProductionRequest,
         limits: &ArtifactProducerLimits,
     ) -> ArtifactProduction;
+
+    fn produce_exact_artifact_with_cancellation(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> ArtifactProduction {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return ArtifactProduction::failed(
+                ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Error,
+                    code: "artifact.cancelled".to_owned(),
+                    location: None,
+                    message: "exact artifact production was cancelled".to_owned(),
+                },
+                limits,
+            );
+        }
+        self.produce_exact_artifact(request, limits)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -17,7 +17,7 @@ The behavior is observable with offline fixtures. Two workspaces that resolve th
 - [x] (2026-08-01 07:44Z) Recorded the approved implementation design in this ExecPlan.
 - [x] (2026-08-01 07:56Z) Milestone 1: added exact generated-production identity, transactional catalog registration and verified reuse, schema migration, and concurrency/integrity coverage.
 - [x] (2026-08-01 08:19Z) Milestone 2: added the shared exact-byte preparation coordinator, bounded profiles/diagnostics, cooperative file-read cancellation, compilation/installation boundaries, and reuse/invalidation tests.
-- [ ] Milestone 3: retain JVM coordinates and deterministically combine source and binary evidence.
+- [x] (2026-08-01 08:36Z) Milestone 3: retained JVM coordinate/origin evidence, added the Maven/Gradle/exact-path adapter, merged source-preferred and binary-only facts, and made JAR production cancellable between archive entries.
 - [ ] Milestone 4: retain .NET package, target, configuration, and asset-role provenance.
 - [ ] Milestone 5: compose dependency preparation with semantic-model activation and prove targeted invalidation.
 - [ ] Milestone 6: complete documentation, focused and broad validation, repository policy checking, and specialist review.
@@ -61,12 +61,17 @@ The behavior is observable with offline fixtures. Two workspaces that resolve th
 - Decision: Return dependency-pack preparation and coverage as an explicit result that can be composed with the existing activation request.
   Rationale: the coordinator must be useful to policy, MCP, LSP, and other hosts without owning their catalog path, workspace store, controls, or lifecycle. The existing activation runtime remains the only overlay/matcher authority.
   Date/Author: 2026-08-01 / Codex
+- Decision: Keep human-facing dependency IDs out of the production digest and add normalized non-selector provenance explicitly.
+  Rationale: explicit dependencies may use a path-derived diagnostic ID, but paths and filenames must not defeat byte-identical cross-workspace reuse. Exact Maven/Gradle coordinate fields and discovery origin still affect production through sorted provenance entries, including versions that are not valid semantic versions and therefore cannot fit `CatalogCoordinate.version`.
+  Date/Author: 2026-08-01 / Codex
 
 ## Outcomes & Retrospective
 
 Milestones 1 and 2 are complete. The catalog can derive a domain-separated production identity from exact input bytes plus producer/schema semantics, install a compiled pack and production binding in one writer transaction, verify compatible reuse from read-only or writable catalogs, reject key rebinding, and safely quarantine corrupt metadata. Schema v3 migrates without losing existing packs, and garbage collection removes obsolete production bindings through the manifest foreign key.
 
-The shared coordinator now reads only the resolved artifact paths under explicit byte/count limits, checks cancellation between 64 KiB reads and before lookup/production/compile/install, excludes paths and mtimes from the production identity, retains normalized activation evidence, validates adapter producer/schema/language/ecosystem claims, and never reports missing or partial coverage as complete. Five integration tests prove path-independent reuse, exact-byte invalidation, cancellation without publication, missing-artifact diagnostics, and partial-pack reuse; the focused catalog suite still passes 30 tests and the cooperative reader has direct unit coverage. Formatting, diff checks, and task-scoped library Clippy are clean. JVM and .NET adapters remain to be implemented.
+The shared coordinator now reads only the resolved artifact paths under explicit byte/count limits, checks cancellation between 64 KiB reads and before lookup/production/compile/install, excludes paths and mtimes from the production identity, retains normalized activation evidence and non-selector provenance, validates adapter producer/schema/language/ecosystem claims, and never reports missing or partial coverage as complete. Five integration tests prove path-independent reuse, exact-byte invalidation, cancellation without publication, missing-artifact diagnostics, and partial-pack reuse; the focused catalog suite still passes 30 tests and the cooperative reader has direct unit coverage. Formatting, diff checks, and task-scoped library Clippy are clean.
+
+The JVM adapter is also complete. Offline Maven and Gradle tool records now retain their exact coordinate and origin beside the resolved artifact path; repository and cache resolution carry the same evidence forward. The adapter treats a binary JAR plus optional source JAR as one ordered input, reruns the bounded producer with change detection, keeps source facts and locators for shared stable IDs, augments them with binary-only declarations, and reports disagreements as bounded partial coverage. JAR reads are cancellable between archive entries and source files. All 35 JVM unit tests and the five shared coordinator integration tests pass, including a real JDK-backed coordinate/source/binary reuse test. The .NET adapter remains to be implemented.
 
 ## Context and Orientation
 

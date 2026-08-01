@@ -71,7 +71,8 @@ pub(crate) use capabilities::{
 };
 pub use config::{
     AnalyzerConfig, CSharpAnalyzerConfig, JvmAnalyzerConfig, JvmDependencyDiscoveryConfig,
-    JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalDependencies, JvmMavenCoordinate,
+    JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalArtifactOrigin,
+    JvmExternalDependencies, JvmMavenCoordinate,
 };
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
@@ -118,6 +119,7 @@ pub use i_analyzer::{
 pub use java::JavaAnalyzer;
 pub use javascript::JavascriptAnalyzer;
 pub(crate) use js_ts::{AliasResolver, resolve_js_ts_module_specifier};
+pub use jvm::external::{JvmDependencyPackAdapter, resolve_jvm_semantic_pack_dependencies};
 pub use jvm::java_artifact::JavaJarPackProducer;
 pub use kotlin::KotlinAnalyzer;
 pub use model::SemanticDiagnostic;

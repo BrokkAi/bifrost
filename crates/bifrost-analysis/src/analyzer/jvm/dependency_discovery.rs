@@ -407,6 +407,7 @@ fn maven_dependency_list_args(report_path: &Path) -> Vec<String> {
 struct ToolArtifactRecord {
     coordinate: JvmMavenCoordinate,
     artifact_path: PathBuf,
+    origin: crate::analyzer::JvmExternalArtifactOrigin,
 }
 
 fn parse_maven_dependency_list(report: &[u8]) -> Vec<ToolArtifactRecord> {
@@ -441,6 +442,7 @@ fn parse_maven_dependency_line(line: &str) -> Option<ToolArtifactRecord> {
     Some(ToolArtifactRecord {
         coordinate: JvmMavenCoordinate::new(group_id, artifact_id, version),
         artifact_path: PathBuf::from(artifact_path.trim()),
+        origin: crate::analyzer::JvmExternalArtifactOrigin::MavenReport,
     })
 }
 
@@ -471,6 +473,7 @@ fn parse_gradle_dependency_jsonl(report: &[u8]) -> Vec<ToolArtifactRecord> {
                     record.version.trim(),
                 ),
                 artifact_path: PathBuf::from(record.file),
+                origin: crate::analyzer::JvmExternalArtifactOrigin::GradleReport,
             })
         })
         .collect()
@@ -488,10 +491,12 @@ fn add_tool_records(records: Vec<ToolArtifactRecord>, discovered: &mut Discovere
         {
             continue;
         }
-        discovered.coordinates.push(record.coordinate);
+        discovered.coordinates.push(record.coordinate.clone());
         discovered.artifact_paths.push(JvmExternalArtifact {
             artifact_path: record.artifact_path,
             source_artifact_path: None,
+            coordinate: Some(record.coordinate),
+            origin: record.origin,
         });
     }
 }
@@ -705,6 +710,22 @@ fn deduplicate_discovered(discovered: &mut DiscoveredJvmDependencies) {
         ))
     });
 
+    discovered.artifact_paths.sort_by(|left, right| {
+        (
+            &left.artifact_path,
+            &left.source_artifact_path,
+            left.coordinate.is_none(),
+            &left.coordinate,
+            left.origin,
+        )
+            .cmp(&(
+                &right.artifact_path,
+                &right.source_artifact_path,
+                right.coordinate.is_none(),
+                &right.coordinate,
+                right.origin,
+            ))
+    });
     let mut artifacts = HashSet::default();
     discovered.artifact_paths.retain(|artifact| {
         artifacts.insert((
@@ -712,9 +733,6 @@ fn deduplicate_discovered(discovered: &mut DiscoveredJvmDependencies) {
             artifact.source_artifact_path.clone(),
         ))
     });
-    discovered
-        .artifact_paths
-        .sort_by(|left, right| left.artifact_path.cmp(&right.artifact_path));
 }
 
 fn deduplicate_dependencies(dependencies: &mut JvmExternalDependencies) {
