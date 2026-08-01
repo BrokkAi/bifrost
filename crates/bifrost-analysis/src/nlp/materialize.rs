@@ -6,7 +6,7 @@
 //! cached (by content hash), and a blob whose OID is already present is never
 //! re-materialized. A group is materialized together so embedding batches well.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 
 use rayon::prelude::*;
 
@@ -254,17 +254,18 @@ pub fn embed_group(
         component_texts,
     } = extracted;
 
-    // 2. Embed component texts the store has never seen.
+    // 2. Load cached components, then embed the ones absent from that exact read.
+    // Keeping the decoded vectors in memory closes a cross-process GC race: a GC may
+    // delete a cached row after this read, but composition no longer needs to read it
+    // again. Concurrent inserts are harmless because persistence uses upserts.
     let all_component_keys: Vec<Key> = component_texts.iter().map(|(key, _)| *key).collect();
-    let missing: BTreeSet<Key> = metrics::time(&metrics::SQLITE_NS, || {
-        store.missing_component_hashes(&all_component_keys)
+    let mut available = metrics::time(&metrics::SQLITE_NS, || {
+        store.component_vectors(&all_component_keys)
     })
-    .map_err(|e| e.to_string())?
-    .into_iter()
-    .collect();
+    .map_err(|e| e.to_string())?;
     let to_embed: Vec<&(Key, String)> = component_texts
         .iter()
-        .filter(|(key, _)| missing.contains(key))
+        .filter(|(key, _)| !available.contains_key(key))
         .collect();
     // Just-embedded component vectors, kept in-memory; the writer persists them so
     // embed_group never holds the DB write lock during the GPU forward.
@@ -277,7 +278,19 @@ pub fn embed_group(
             format_args!("embed {} texts (max_bytes={max_bytes})", texts.len()),
             || embedder.embed_passages(&texts),
         )?;
+        if vectors.len() != to_embed.len() {
+            return Err(format!(
+                "embedder returned {} component vectors for {} texts",
+                vectors.len(),
+                to_embed.len()
+            ));
+        }
         component_items = to_embed.iter().map(|(key, _)| *key).zip(vectors).collect();
+        available.extend(component_items.iter().map(|(key, vector)| {
+            let rounded = super::quant::decode_vector(&super::quant::encode_vector(vector))
+                .unwrap_or_else(|_| vector.clone());
+            (*key, rounded)
+        }));
     }
 
     // 3. Compose missing chunk vectors from their (now cached) components.
@@ -304,28 +317,7 @@ pub fn embed_group(
                 }
             }
         }
-        // rq8-round the just-embedded components so compose sees the same precision as
-        // the cached ones (which were stored + read back as rq8 codes).
-        let mut available: HashMap<Key, Vec<f32>> = component_items
-            .iter()
-            .map(|(k, v)| {
-                let rounded = super::quant::decode_vector(&super::quant::encode_vector(v))
-                    .unwrap_or_else(|_| v.clone());
-                (*k, rounded)
-            })
-            .collect();
-        // Read only the components NOT just embedded — those aren't in the store yet
-        // (the writer persists them). A pure read => WAL-concurrent with the writer.
-        let cached_needed: Vec<Key> = needed
-            .iter()
-            .copied()
-            .filter(|k| !available.contains_key(k))
-            .collect();
-        let cached = metrics::time(&metrics::SQLITE_NS, || {
-            store.component_vectors(&cached_needed)
-        })
-        .map_err(|e| e.to_string())?;
-        available.extend(cached);
+        debug_assert!(needed.iter().all(|key| available.contains_key(key)));
         let mut emitted: BTreeSet<Key> = BTreeSet::new();
         metrics::trace(format_args!("compose {} vectors", missing_composed.len()));
         metrics::time(&metrics::COMPOSE_NS, || -> Result<(), String> {
@@ -425,7 +417,38 @@ pub fn write_group(store: &SemanticStore, embedded: EmbeddedGroup) -> Result<(),
 mod tests {
     use super::*;
     use crate::analyzer::{JavaAnalyzer, Language, TestProject};
-    use crate::nlp::engine::FakeHashEmbedder;
+    use crate::nlp::engine::{Embedder, FakeHashEmbedder, ModelProfile};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct GcOnProfile<'a> {
+        store: &'a SemanticStore,
+        fired: AtomicBool,
+    }
+
+    impl Embedder for GcOnProfile<'_> {
+        fn profile(&self) -> ModelProfile {
+            if !self.fired.swap(true, Ordering::SeqCst) {
+                self.store.gc(&HashSet::new()).unwrap();
+            }
+            crate::nlp::engine::VOYAGE_PROFILE
+        }
+
+        fn embed_passages(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+            panic!("cached components must not be re-embedded")
+        }
+
+        fn embed_query(&self, _text: &str) -> Result<Vec<f32>, String> {
+            unreachable!()
+        }
+
+        fn count_tokens(&self, _text: &str) -> usize {
+            unreachable!()
+        }
+
+        fn fingerprint(&self) -> String {
+            unreachable!()
+        }
+    }
 
     #[test]
     fn parallel_extraction_preserves_serial_chunk_and_component_order() {
@@ -463,5 +486,51 @@ mod tests {
         let parallel = pool.install(|| extract_group(&embedder, &analyzer, &targets));
 
         assert_eq!(parallel, serial);
+    }
+
+    #[test]
+    fn compose_survives_cached_component_gc_after_the_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SemanticStore::open(&temp.path().join("cache.db")).unwrap();
+        let child = component_key("child");
+        let parent = component_key("parent");
+        let composed = composed_key(&child, &parent, 0.5);
+        store
+            .upsert_component_vectors(&[(child, vec![1.0, 0.0]), (parent, vec![0.0, 1.0])])
+            .unwrap();
+        let extracted = ExtractedGroup {
+            pending_blobs: vec![PendingBlob {
+                oid: "oid".to_string(),
+                language: None,
+                chunks: vec![PendingChunk {
+                    chunk_ord: 0,
+                    kind: "function",
+                    symbol: None,
+                    start_line: None,
+                    end_line: None,
+                    fts_tokens: String::new(),
+                    hash: child,
+                    parent_summary_hash: Some(parent),
+                    composed_hash: composed,
+                }],
+            }],
+            component_texts: vec![(child, "child".to_string()), (parent, "parent".to_string())],
+        };
+        let embedder = GcOnProfile {
+            store: &store,
+            fired: AtomicBool::new(false),
+        };
+
+        let embedded = embed_group(&store, &embedder, extracted).unwrap();
+
+        assert!(embedder.fired.load(Ordering::SeqCst));
+        assert_eq!(embedded.composed_items.len(), 1);
+        assert_eq!(
+            store
+                .missing_component_hashes(&[child, parent])
+                .unwrap()
+                .len(),
+            2
+        );
     }
 }
