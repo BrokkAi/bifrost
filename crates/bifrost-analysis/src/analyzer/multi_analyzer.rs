@@ -1167,6 +1167,27 @@ impl IAnalyzer for MultiAnalyzer {
             })
     }
 
+    fn search_definitions_with_literal(
+        &self,
+        pattern: &str,
+        required_literal: &str,
+        language: Language,
+    ) -> BTreeSet<CodeUnit> {
+        // The pattern is language-specific, so only that language's delegate
+        // can produce matches the caller keeps; fanning out to every delegate
+        // multiplied lookup cost by the language count (#1430).
+        self.delegates
+            .get(&language)
+            .map(|delegate| {
+                delegate.analyzer().search_definitions_with_literal(
+                    pattern,
+                    required_literal,
+                    language,
+                )
+            })
+            .unwrap_or_default()
+    }
+
     fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
         self.delegates
             .values()

@@ -94,6 +94,12 @@ pub(super) fn java_generated_accessor_source_blocks(
     input: &str,
     anchor: Option<&str>,
 ) -> Vec<SourceBlock> {
+    // Lombok accessors only exist in Java workspaces; `resolve_enclosing_codeunits`
+    // below runs regex sweeps over the definition index, so skipping it when no
+    // Java is indexed keeps every not-found diagnostic path cheap (#1430).
+    if !analyzer.languages().contains(&Language::Java) {
+        return Vec::new();
+    }
     let lookup = strip_trailing_call_suffix(input.trim());
     let Some(member) = symbol_selector_leaf(Language::Java, &lookup) else {
         return Vec::new();
@@ -293,6 +299,8 @@ pub fn get_symbol_sources(
             // canonical symbol containing `/` (e.g. a Go import path) is never
             // misrouted as a filesystem path, and real namespace symbols like
             // `fmt::formatter` are never stolen by path-selector parsing.
+            let exact_scope =
+                crate::profiling::scope(format!("get_symbol_sources.exact[{symbol}]"));
             match resolve_selectable_definitions(analyzer, &symbol, exact_codeunit_resolution) {
                 SelectableDefinitionResolution::Resolved(code_units) => {
                     let sources = if file_anchored {
@@ -325,6 +333,10 @@ pub fn get_symbol_sources(
                 }
             }
 
+            drop(exact_scope);
+
+            let path_scope =
+                crate::profiling::scope(format!("get_symbol_sources.path_qualified[{symbol}]"));
             match split_path_qualified_definition_selector(analyzer, &symbol) {
                 Some(PathQualifiedSelector::Resolved { anchor, lookup }) => {
                     return match resolve_file_anchored_symbol_sources(
@@ -376,6 +388,10 @@ pub fn get_symbol_sources(
                 }
             }
 
+            drop(path_scope);
+
+            let file_pattern_scope =
+                crate::profiling::scope(format!("get_symbol_sources.file_patterns[{symbol}]"));
             let file_matches = resolve_file_patterns(analyzer, std::slice::from_ref(&symbol));
             if let Some(item) = file_matches.ambiguous_paths.first() {
                 return (index, SourceLookupOutcome::AmbiguousPath(item.clone()));
@@ -420,6 +436,10 @@ pub fn get_symbol_sources(
             // arm below, after resolution has had its say; `resolve_file_patterns`
             // above has already ruled out every real file for this input, so
             // the file reading is dead by the time we get here anyway.
+            drop(file_pattern_scope);
+
+            let _fuzzy_scope =
+                crate::profiling::scope(format!("get_symbol_sources.fuzzy[{symbol}]"));
             match resolve_selectable_definitions(analyzer, &symbol, resolve_codeunit_fuzzy) {
                 SelectableDefinitionResolution::Resolved(code_units) => {
                     let sources = preferred_source_blocks_for_resolved_units(analyzer, &code_units);
@@ -436,6 +456,9 @@ pub fn get_symbol_sources(
                     (index, SourceLookupOutcome::Ambiguous(item))
                 }
                 SelectableDefinitionResolution::NotFound(target) => {
+                    let _diagnostics_scope = crate::profiling::scope(format!(
+                        "get_symbol_sources.not_found_diagnostics[{symbol}]"
+                    ));
                     let generated = java_generated_accessor_source_blocks(analyzer, &symbol, None);
                     if !generated.is_empty() {
                         return (index, SourceLookupOutcome::Found(generated));

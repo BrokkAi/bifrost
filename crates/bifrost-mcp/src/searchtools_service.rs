@@ -2019,6 +2019,43 @@ impl SearchToolsService {
         Ok(())
     }
 
+    /// Block until any pending background workspace build finishes, honoring
+    /// only explicit cancellation -- never a request deadline. MCP hosts call
+    /// this before starting a request's budget clock so that one-time session
+    /// initialization (the deferred index build after binding a workspace) is
+    /// not billed to whichever tool calls happen to arrive first. Issues #1423
+    /// and #1419: a cold first batch against a large workspace exhausted every
+    /// request budget on index-build wait and returned nothing useful.
+    ///
+    /// This does not run the build itself; `ensure_ready` still joins the
+    /// finished handle and installs the session, which is cheap once the build
+    /// thread is done.
+    pub fn wait_workspace_ready(
+        &self,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), SearchToolsServiceError> {
+        loop {
+            let build_is_pending = match self.pending_build.try_lock() {
+                Ok(pending) => pending.as_ref().is_some_and(|handle| !handle.is_finished()),
+                Err(std::sync::TryLockError::WouldBlock) => true,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(SearchToolsServiceError::internal(
+                        "index build lock poisoned",
+                    ));
+                }
+            };
+            if !build_is_pending {
+                return Ok(());
+            }
+            if cancelled() {
+                return Err(SearchToolsServiceError::internal(
+                    "the tool call was cancelled while waiting for the workspace snapshot",
+                ));
+            }
+            std::thread::park_timeout(std::time::Duration::from_millis(5));
+        }
+    }
+
     fn ensure_ready_with_cancellation(
         &self,
         cancellation: Option<&CancellationToken>,

@@ -1056,6 +1056,16 @@ impl IAnalyzer for PythonAnalyzer {
         self.inner.search_definitions(pattern, auto_quote)
     }
 
+    fn search_definitions_with_literal(
+        &self,
+        pattern: &str,
+        required_literal: &str,
+        language: Language,
+    ) -> BTreeSet<CodeUnit> {
+        self.inner
+            .search_definitions_with_literal(pattern, required_literal, language)
+    }
+
     fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
         self.inner.lookup_candidates_by_short_name(symbol)
     }

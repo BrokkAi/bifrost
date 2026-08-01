@@ -1282,6 +1282,29 @@ impl ServerHandler for BifrostMcpHandler {
         let serial = serial_tool_request(&name);
         let _serial_guard = serial.then_some(state);
 
+        // Session initialization is not request work. A deferred index build
+        // runs in the background from the moment the workspace binds; a cold
+        // first batch that started its budget clock here would spend the whole
+        // budget waiting for that build and fail without observing a single
+        // file (#1423, #1419). Wait for the snapshot first -- honoring client
+        // cancellation but no deadline -- and only then start the clock. Warm
+        // requests observe no pending build and pass straight through.
+        if !serial {
+            let service = Arc::clone(&self.service);
+            let ct = context.ct.clone();
+            tokio::task::spawn_blocking(move || {
+                service.wait_workspace_ready(&|| ct.is_cancelled())
+            })
+            .await
+            .map_err(|error| {
+                ErrorData::internal_error(
+                    format!("workspace readiness wait panicked: {error}"),
+                    None,
+                )
+            })?
+            .map_err(|error| map_service_error(error.code, error.message))?;
+        }
+
         // One deadline spans admission and execution. Starting the clock after
         // admission would make the request budget mean "time spent analyzing"
         // while a client experiences queue wait plus a full budget -- and the
