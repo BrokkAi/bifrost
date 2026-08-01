@@ -399,6 +399,9 @@ pub fn get_symbol_sources(
             // `MetadataConfiguration.Properties` deliberately do not qualify;
             // they still need fuzzy resolution (#1196).
             if looks_like_explicit_source_file_target(&symbol) {
+                if let Some(item) = unsupported_selector_shape_not_found_input(analyzer, &symbol) {
+                    return (index, SourceLookupOutcome::NotFound(item));
+                }
                 return (
                     index,
                     SourceLookupOutcome::NotFound(file_not_found_input(symbol)),
