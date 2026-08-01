@@ -4,9 +4,11 @@ use brokk_bifrost::CancellationToken;
 use brokk_bifrost::analyzer::semantic_model::{
     CatalogCoordinate, CatalogOpenMode, CatalogOptions, Completeness, DependencyArtifactRole,
     DependencyPackAdapter, DependencyPackLimits, DependencyPackPreparationStatus,
-    DependencyPackProduction, ExactDependencyArtifact, ExternalArtifactKind, Producer,
-    ResolvedDependency, ResolvedDependencyArtifact, SemanticModelActivationEvidence,
-    SemanticPackCatalog, prepare_dependency_semantic_packs,
+    DependencyPackProduction, DependencyProvenance, ExactDependencyArtifact, ExternalArtifactKind,
+    Producer, ResolvedActiveSemanticModels, ResolvedDependency, ResolvedDependencyArtifact,
+    SemanticModelActivationEvidence, SemanticModelActivationRequest,
+    SemanticModelResolutionOutcome, SemanticModelRuntimeLimits, SemanticPackCatalog,
+    prepare_dependency_semantic_packs, resolve_active_semantic_models,
 };
 use semver::Version;
 
@@ -77,6 +79,22 @@ fn dependency(path: std::path::PathBuf) -> ResolvedDependency {
     }
 }
 
+fn activation_request() -> SemanticModelActivationRequest {
+    SemanticModelActivationRequest {
+        bifrost_version: Version::parse("0.8.17").unwrap(),
+        evidence: Vec::new(),
+        controls: Vec::new(),
+        limits: SemanticModelRuntimeLimits::default(),
+    }
+}
+
+fn ready(outcome: SemanticModelResolutionOutcome) -> ResolvedActiveSemanticModels {
+    match outcome {
+        SemanticModelResolutionOutcome::Ready(active) => active,
+        other => panic!("expected ready semantic models, got {other:#?}"),
+    }
+}
+
 #[test]
 fn identical_bytes_reuse_one_generated_production_across_paths() {
     let root = tempfile::tempdir().unwrap();
@@ -124,6 +142,13 @@ fn identical_bytes_reuse_one_generated_production_across_paths() {
     assert_eq!(first.evidence, second.evidence);
     assert_eq!(adapter.productions.load(Ordering::Relaxed), 1);
     assert_eq!(catalog.accounting().unwrap(), accounting);
+    assert_eq!(
+        second
+            .compose_activation_request(activation_request())
+            .unwrap()
+            .evidence,
+        second.evidence
+    );
 }
 
 #[test]
@@ -197,6 +222,11 @@ fn cancellation_before_artifact_read_publishes_nothing() {
     assert!(outcome.evidence.is_empty());
     assert_eq!(adapter.productions.load(Ordering::Relaxed), 0);
     assert_eq!(catalog.accounting().unwrap().object_count, 0);
+    assert!(
+        outcome
+            .compose_activation_request(activation_request())
+            .is_none()
+    );
 }
 
 #[test]
@@ -224,6 +254,11 @@ fn missing_artifact_is_partial_and_never_claims_empty_success() {
     assert!(outcome.evidence.is_empty());
     assert_eq!(outcome.diagnostics[0].code, "artifact.metadata");
     assert_eq!(adapter.productions.load(Ordering::Relaxed), 0);
+    assert!(
+        outcome
+            .compose_activation_request(activation_request())
+            .is_none()
+    );
 }
 
 #[test]
@@ -289,4 +324,190 @@ fn partial_generated_pack_remains_partial_when_reused() {
         DependencyPackPreparationStatus::Reused
     );
     assert_eq!(adapter.0.productions.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn changing_one_dependency_preserves_unrelated_production_and_overlay() {
+    struct DistinctAdapter;
+
+    impl DependencyPackAdapter for DistinctAdapter {
+        fn adapter_name(&self) -> &str {
+            "distinct-fixture"
+        }
+
+        fn adapter_version(&self) -> &str {
+            "1"
+        }
+
+        fn producer(&self) -> Producer {
+            Producer {
+                name: "artifact-scanner".to_owned(),
+                version: "2.0.0".to_owned(),
+            }
+        }
+
+        fn produce(
+            &self,
+            dependency: &ResolvedDependency,
+            artifacts: &[ExactDependencyArtifact],
+            _limits: &brokk_bifrost::analyzer::semantic_model::ArtifactProducerLimits,
+            _cancellation: Option<&CancellationToken>,
+        ) -> DependencyPackProduction {
+            let revision = artifacts[0].bytes()[0] as char;
+            let mut pack: brokk_bifrost::analyzer::semantic_model::AuthoredSemanticModelPack =
+                serde_json::from_slice(DECLARATIONS_JSON).unwrap();
+            pack.pack_id = format!("fixture.{}", dependency.id);
+            pack.compatibility.toolchains.clear();
+            pack.shards[0].id = format!("declarations.{}", dependency.id);
+            pack.shards[0].activation = vec![
+                brokk_bifrost::analyzer::semantic_model::ActivationSelector {
+                    package: None,
+                    module: Some(brokk_bifrost::analyzer::semantic_model::NameSelector {
+                        name: dependency.id.clone(),
+                        version: None,
+                    }),
+                    toolchain: None,
+                    targets: Vec::new(),
+                    configurations: Vec::new(),
+                    artifact_sha256: None,
+                },
+            ];
+            let brokk_bifrost::analyzer::semantic_model::AuthoredPayload::DeclarationFacts {
+                types,
+                members,
+                relations,
+            } = &mut pack.shards[0].payload
+            else {
+                unreachable!()
+            };
+            types.truncate(1);
+            types[0].id = format!("type.{}", dependency.id);
+            types[0].name = format!("com.acme.{}{revision}", dependency.id);
+            members.clear();
+            relations.clear();
+            DependencyPackProduction {
+                pack: Some(pack),
+                diagnostics: Vec::new(),
+                suppressed_diagnostics: 0,
+            }
+        }
+    }
+
+    fn distinct_dependency(id: &str, path: std::path::PathBuf) -> ResolvedDependency {
+        ResolvedDependency {
+            id: id.to_owned(),
+            evidence: SemanticModelActivationEvidence {
+                language: "java".to_owned(),
+                ecosystem: "maven".to_owned(),
+                package: None,
+                module: Some(CatalogCoordinate {
+                    name: id.to_owned(),
+                    version: None,
+                }),
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            },
+            provenance: vec![DependencyProvenance {
+                key: "fixture".to_owned(),
+                value: id.to_owned(),
+            }],
+            artifacts: vec![ResolvedDependencyArtifact {
+                role: DependencyArtifactRole::Binary,
+                kind: ExternalArtifactKind::JavaClassJar,
+                path,
+            }],
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let alpha = root.path().join("alpha.jar");
+    let beta = root.path().join("beta.jar");
+    std::fs::write(&alpha, b"1-alpha").unwrap();
+    std::fs::write(&beta, b"1-beta").unwrap();
+    let catalog = SemanticPackCatalog::open(
+        &root.path().join("catalog"),
+        CatalogOpenMode::ReadWrite,
+        CatalogOptions::default(),
+    )
+    .unwrap();
+    let first = prepare_dependency_semantic_packs(
+        &catalog,
+        &DistinctAdapter,
+        &[
+            distinct_dependency("alpha", alpha.clone()),
+            distinct_dependency("beta", beta.clone()),
+        ],
+        &DependencyPackLimits::default(),
+        None,
+    );
+    assert!(first.complete, "{:#?}", first.diagnostics);
+    let first_active = ready(resolve_active_semantic_models(
+        &catalog,
+        &first
+            .compose_activation_request(activation_request())
+            .unwrap(),
+        &CancellationToken::default(),
+    ));
+
+    std::fs::write(&alpha, b"2-alpha").unwrap();
+    let second = prepare_dependency_semantic_packs(
+        &catalog,
+        &DistinctAdapter,
+        &[
+            distinct_dependency("alpha", alpha),
+            distinct_dependency("beta", beta),
+        ],
+        &DependencyPackLimits::default(),
+        None,
+    );
+    let second_active = ready(resolve_active_semantic_models(
+        &catalog,
+        &second
+            .compose_activation_request(activation_request())
+            .unwrap(),
+        &CancellationToken::default(),
+    ));
+
+    assert!(first.complete && second.complete);
+    assert_eq!(
+        second.packs[0].status,
+        DependencyPackPreparationStatus::Generated
+    );
+    assert_eq!(
+        second.packs[1].status,
+        DependencyPackPreparationStatus::Reused
+    );
+    assert_ne!(first.packs[0].production, second.packs[0].production);
+    assert_eq!(first.packs[1].production, second.packs[1].production);
+    assert_eq!(
+        first_active.shards().len(),
+        2,
+        "{:#?}",
+        first_active.activation_report()
+    );
+    assert_eq!(
+        second_active.shards().len(),
+        2,
+        "{:#?}",
+        second_active.activation_report()
+    );
+    assert_ne!(
+        first_active.active_model_set_hash(),
+        second_active.active_model_set_hash()
+    );
+    assert_eq!(first_active.types_named("com.acme.alpha1").records.len(), 1);
+    assert!(
+        second_active
+            .types_named("com.acme.alpha1")
+            .records
+            .is_empty()
+    );
+    assert_eq!(
+        second_active.types_named("com.acme.alpha2").records.len(),
+        1
+    );
+    assert_eq!(first_active.types_named("com.acme.beta1").records.len(), 1);
+    assert_eq!(second_active.types_named("com.acme.beta1").records.len(), 1);
 }

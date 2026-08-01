@@ -7,8 +7,8 @@ use super::{
     ArtifactProducerLimits, AuthoredSemanticModelPack, CatalogError, CompilerOptions, Completeness,
     ExactArtifact, ExternalArtifactKind, GeneratedProduction, GeneratedProductionKey, Producer,
     ProducerDiagnostic, ProducerDiagnosticSeverity, SEMANTIC_MODEL_SCHEMA_VERSION,
-    SemanticModelActivationEvidence, SemanticPackCatalog, compile_pack,
-    producer::read_exact_artifact_while,
+    SemanticModelActivationEvidence, SemanticModelActivationRequest, SemanticPackCatalog,
+    compile_pack, producer::read_exact_artifact_while,
 };
 
 const DEPENDENCY_INPUT_DOMAIN: &[u8] = b"bifrost.semantic-pack.dependency-input.v1";
@@ -179,6 +179,25 @@ pub struct DependencyPackPreparationOutcome {
     pub complete: bool,
     pub cancelled: bool,
     pub profile: DependencyPackPreparationProfile,
+}
+
+impl DependencyPackPreparationOutcome {
+    /// Compose successfully prepared dependency evidence into a host-owned
+    /// activation request. A cancelled or wholly unavailable partial result
+    /// returns `None`, so callers cannot accidentally replace a previously
+    /// complete active set with authoritative empty dependency evidence.
+    pub fn compose_activation_request(
+        &self,
+        mut request: SemanticModelActivationRequest,
+    ) -> Option<SemanticModelActivationRequest> {
+        if self.cancelled || (!self.complete && self.packs.is_empty()) {
+            return None;
+        }
+        request.evidence.extend(self.evidence.iter().cloned());
+        request.evidence.sort();
+        request.evidence.dedup();
+        Some(request)
+    }
 }
 
 pub fn prepare_dependency_semantic_packs(
