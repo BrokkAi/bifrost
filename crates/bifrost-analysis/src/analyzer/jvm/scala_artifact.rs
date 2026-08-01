@@ -277,6 +277,7 @@ fn scala_entry_facts(
     let mut declarations = parsed.declarations().iter().collect::<Vec<_>>();
     declarations.sort_unstable_by_key(|unit| unit.fq_name());
     let mut types = Vec::new();
+    let mut type_index_by_name = HashMap::default();
     let mut type_ids = HashMap::default();
     let mut type_kinds = HashMap::default();
     let mut type_parameters_by_declaration = HashMap::default();
@@ -289,9 +290,6 @@ fn scala_entry_facts(
         else {
             continue;
         };
-        if !take_record(remaining_records, record_limit_hit) {
-            break;
-        }
         let Some(node) = declaration_node(tree, parsed, declaration) else {
             continue;
         };
@@ -321,7 +319,7 @@ fn scala_entry_facts(
         type_ids.insert(declaration.clone(), type_id.clone());
         type_kinds.insert(declaration.clone(), type_kind);
         type_parameters_by_declaration.insert(declaration.clone(), type_parameters.clone());
-        types.push(TypeFact {
+        let fact = TypeFact {
             id: type_id,
             name,
             type_kind,
@@ -336,7 +334,19 @@ fn scala_entry_facts(
                 path: entry_name.to_owned(),
                 symbol: Some(declaration.fq_name()),
             },
-        });
+        };
+        if let Some(&existing_index) = type_index_by_name.get(&fact.name) {
+            let existing: &mut TypeFact = &mut types[existing_index];
+            if existing.type_kind == TypeKind::Module && fact.type_kind != TypeKind::Module {
+                *existing = fact;
+            }
+            continue;
+        }
+        if !take_record(remaining_records, record_limit_hit) {
+            break;
+        }
+        type_index_by_name.insert(fact.name.clone(), types.len());
+        types.push(fact);
     }
 
     let mut members = Vec::new();
@@ -388,9 +398,25 @@ fn scala_entry_facts(
             .as_ref()
             .map_or(0, |signature| signature.type_parameters.len());
         let name = declaration.identifier().to_owned();
+        let owner_kind = type_kinds.get(owner).copied().unwrap_or(TypeKind::Class);
+        let is_static = owner_kind == TypeKind::Module;
+        let parameter_arity = signature.as_ref().map_or_else(
+            || {
+                callable.map_or(0, |callable| {
+                    callable
+                        .shape
+                        .iter()
+                        .map(|parameters| parameters.arity.total())
+                        .sum()
+                })
+            },
+            |signature| signature.parameters.len(),
+        );
         let id = member_declaration_id(MemberIdentity {
             owner_id,
             kind: member_kind,
+            is_static,
+            parameter_arity,
             name: &name,
             generic_arity,
             parameter_types: &parameter_types,
@@ -403,8 +429,6 @@ fn scala_entry_facts(
         {
             extension_surfaces.push((receiver, scala_normalize_full_name(&owner.fq_name())));
         }
-        let owner_kind = type_kinds.get(owner).copied().unwrap_or(TypeKind::Class);
-        let is_static = owner_kind == TypeKind::Module;
         members.push(MemberFact {
             id,
             owner: owner_id.clone(),
@@ -722,7 +746,7 @@ fn finish_production(
 mod tests {
     use super::*;
     use crate::analyzer::semantic_model::{
-        Compatibility, NameSelector, Provenance, Safety, compile_pack,
+        Compatibility, CompilerOptions, NameSelector, Provenance, Safety, compile_pack,
     };
     use crate::hash::HashSet;
     use std::io::Write;
@@ -739,7 +763,16 @@ trait Base[A] {
 class Child extends Base[String] {
   override protected def transform(value: String): String = value
   val label: String = "child"
+  def create: Child = this
 }
+
+object Child {
+  def create: Child = new Child
+  def `legal name`: String = "child"
+}
+
+trait Annotated[@specialized -A]
+case class Data(value: Int)
 
 object Syntax {
   extension (value: Child)
@@ -748,28 +781,32 @@ object Syntax {
 "#;
 
     fn request(path: std::path::PathBuf) -> ArtifactProductionRequest {
+        request_for_version(path, "2.13.0")
+    }
+
+    fn request_for_version(path: std::path::PathBuf, version: &str) -> ArtifactProductionRequest {
         ArtifactProductionRequest {
             path,
             artifact_kind: ExternalArtifactKind::ScalaSourceJar,
             pack_id: "bifrost.scala.fixture".to_owned(),
-            pack_version: "2.13.0".to_owned(),
+            pack_version: version.to_owned(),
             ecosystem: "maven".to_owned(),
             compatibility: Compatibility {
                 bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
                 toolchains: vec![crate::analyzer::semantic_model::VersionConstraint {
                     name: "scala".to_owned(),
-                    requirement: "=2.13.0".to_owned(),
+                    requirement: format!("={version}"),
                 }],
             },
             activation: vec![ActivationSelector {
                 package: Some(NameSelector {
                     name: "org.scala-lang:scala-library".to_owned(),
-                    version: Some("=2.13.0".to_owned()),
+                    version: Some(format!("={version}")),
                 }),
                 module: None,
                 toolchain: Some(NameSelector {
                     name: "scala".to_owned(),
-                    version: Some("=2.13.0".to_owned()),
+                    version: Some(format!("={version}")),
                 }),
                 targets: Vec::new(),
                 configurations: Vec::new(),
@@ -825,6 +862,14 @@ object Syntax {
             .iter()
             .find(|fact| fact.name == "scala.sample.Child")
             .unwrap();
+        assert_eq!(
+            types
+                .iter()
+                .filter(|fact| fact.name == "scala.sample.Child")
+                .count(),
+            1,
+            "class and companion should share one source-level type surface"
+        );
         assert!(
             child
                 .hierarchy
@@ -859,6 +904,27 @@ object Syntax {
                 .iter()
                 .any(|fact| fact.name == "display" && fact.is_static)
         );
+        let creates = members
+            .iter()
+            .filter(|fact| fact.owner == child.id && fact.name == "create")
+            .collect::<Vec<_>>();
+        assert_eq!(creates.len(), 2);
+        assert!(creates.iter().any(|fact| fact.is_static));
+        assert!(creates.iter().any(|fact| !fact.is_static));
+        assert_ne!(creates[0].id, creates[1].id);
+        assert!(members.iter().any(|fact| fact.name == "`legal name`"));
+        let annotated = types
+            .iter()
+            .find(|fact| fact.name == "scala.sample.Annotated")
+            .unwrap();
+        assert_eq!(annotated.type_parameters, ["A"]);
+        let data = types
+            .iter()
+            .find(|fact| fact.name == "scala.sample.Data")
+            .unwrap();
+        assert!(!members.iter().any(|fact| {
+            fact.owner == data.id && matches!(fact.name.as_str(), "copy" | "productElement")
+        }));
         compile_pack(&pack, &Default::default()).unwrap();
     }
 
@@ -916,5 +982,80 @@ object Syntax {
         assert!(visibility.contains(&ScalaDeclarationVisibility::Public));
         assert!(visibility.contains(&ScalaDeclarationVisibility::Protected));
         assert!(visibility.contains(&ScalaDeclarationVisibility::NonApi));
+    }
+
+    #[test]
+    #[ignore = "requires BIFROST_SCALA_STDLIB_SOURCE_JAR pointing to a pinned source JAR"]
+    fn pinned_scala_standard_library_source_smoke() {
+        let path = std::env::var_os("BIFROST_SCALA_STDLIB_SOURCE_JAR")
+            .map(std::path::PathBuf::from)
+            .expect("set BIFROST_SCALA_STDLIB_SOURCE_JAR");
+        let version = std::env::var("BIFROST_SCALA_STDLIB_VERSION")
+            .expect("set BIFROST_SCALA_STDLIB_VERSION");
+        let production = ScalaSourceJarPackProducer.produce_exact_artifact(
+            &request_for_version(path, &version),
+            &ArtifactProducerLimits::default(),
+        );
+        let pack = production.pack.expect("real Scala source JAR pack");
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &pack.shards[0].payload
+        else {
+            panic!("Scala source producer must emit declaration facts");
+        };
+        let compiled = compile_pack(&pack, &CompilerOptions::default()).unwrap_or_else(|errors| {
+            for error in &errors {
+                if let Some(index) = error
+                    .path
+                    .strip_prefix("$.shards[0].payload.members[")
+                    .and_then(|path| path.split(']').next())
+                    .and_then(|index| index.parse::<usize>().ok())
+                {
+                    eprintln!("invalid member: {:#?}", members[index]);
+                }
+                if let Some(index) = error
+                    .path
+                    .strip_prefix("$.shards[0].payload.types[")
+                    .and_then(|path| path.split(']').next())
+                    .and_then(|index| index.parse::<usize>().ok())
+                {
+                    eprintln!("invalid type: {:#?}", types[index]);
+                }
+            }
+            panic!("pack compilation failed: {errors:#?}");
+        });
+        eprintln!(
+            "Scala source smoke: types={}, members={}, stored_bytes={}, raw_bytes={}, completeness={:?}, diagnostics={:#?}",
+            types.len(),
+            members.len(),
+            compiled
+                .shards
+                .iter()
+                .map(|shard| shard.descriptor.stored_size)
+                .sum::<u64>(),
+            compiled
+                .shards
+                .iter()
+                .map(|shard| shard.descriptor.raw_size)
+                .sum::<u64>(),
+            production.completeness,
+            production.diagnostics
+        );
+        for expected in [
+            "scala.Any",
+            "scala.AnyRef",
+            "scala.AnyVal",
+            "scala.Predef",
+            "scala.collection.Iterable",
+        ] {
+            assert!(
+                types.iter().any(|fact| fact.name == expected),
+                "missing {expected}; diagnostics={:#?}",
+                production.diagnostics
+            );
+        }
+        assert!(
+            members.iter().any(|fact| fact.name == "hashCode"),
+            "scala.Any.hashCode should come from source; diagnostics={:#?}",
+            production.diagnostics
+        );
     }
 }

@@ -31,6 +31,7 @@ pub struct JavaJarPackProducer;
 #[derive(Debug)]
 pub(super) struct JavaApiType {
     pub(super) name: String,
+    pub(super) package_name: String,
     type_kind: TypeKind,
     pub(super) visibility: Visibility,
     is_abstract: bool,
@@ -551,6 +552,8 @@ pub(super) fn java_api_facts(
             let id = member_declaration_id(MemberIdentity {
                 owner_id: &type_id,
                 kind: member.member_kind,
+                is_static: member.is_static,
+                parameter_arity: parameter_types.len(),
                 name: &member.name,
                 generic_arity,
                 parameter_types: &parameter_types,
@@ -669,6 +672,7 @@ pub(super) fn source_api_types(
             );
             result.push(JavaApiType {
                 name: name.clone(),
+                package_name: package_name.clone(),
                 type_kind,
                 visibility,
                 is_abstract: modifiers.contains(&"abstract")
@@ -1106,10 +1110,21 @@ fn source_parameters(
         if !matches!(parameter.kind(), "formal_parameter" | "spread_parameter") {
             continue;
         }
-        let Some(type_node) = parameter.child_by_field_name("type") else {
+        let variable_declarator = (parameter.kind() == "spread_parameter").then(|| {
+            (0..parameter.named_child_count())
+                .filter_map(|index| parameter.named_child(index))
+                .find(|child| child.kind() == "variable_declarator")
+        });
+        let variable_declarator = variable_declarator.flatten();
+        let type_node = parameter.child_by_field_name("type").or_else(|| {
+            (0..parameter.named_child_count())
+                .filter_map(|index| parameter.named_child(index))
+                .find(|child| is_source_type_node(child.kind()))
+        });
+        let Some(type_node) = type_node else {
             continue;
         };
-        let Some(r#type) = source_type_ref(
+        let Some(mut r#type) = source_type_ref(
             type_node,
             source,
             resolution,
@@ -1125,8 +1140,23 @@ fn source_parameters(
             );
             return None;
         };
+        let trailing_dimensions = parameter
+            .child_by_field_name("dimensions")
+            .map_or(0, dimension_count)
+            + variable_declarator
+                .and_then(|declarator| declarator.child_by_field_name("dimensions"))
+                .map_or(0, dimension_count);
+        let array_depth = usize::from(parameter.kind() == "spread_parameter") + trailing_dimensions;
+        for _ in 0..array_depth {
+            r#type = TypeRef::Array {
+                element: Box::new(r#type),
+            };
+        }
         let name = parameter
             .child_by_field_name("name")
+            .or_else(|| {
+                variable_declarator.and_then(|declarator| declarator.child_by_field_name("name"))
+            })
             .map(|name| node_text(name, source).trim().to_owned());
         result.push(Parameter {
             name,
@@ -1136,6 +1166,18 @@ fn source_parameters(
         });
     }
     Some(result)
+}
+
+fn dimension_count(dimensions: Node<'_>) -> usize {
+    let count = (0..dimensions.child_count())
+        .filter_map(|index| dimensions.child(index))
+        .filter(|child| child.kind() == "[")
+        .count();
+    debug_assert!(
+        count > 0,
+        "Java dimensions node contains an array dimension"
+    );
+    count
 }
 
 fn source_hierarchy(
@@ -1215,17 +1257,24 @@ fn source_type_ref(
             let element = node
                 .child_by_field_name("element")
                 .or_else(|| node.child_by_field_name("type"))?;
-            Some(TypeRef::Array {
-                element: Box::new(source_type_ref(
-                    element,
-                    source,
-                    resolution,
-                    owner_parameters,
-                    member_parameters,
-                    depth + 1,
-                    max_depth,
-                )?),
-            })
+            let mut r#type = source_type_ref(
+                element,
+                source,
+                resolution,
+                owner_parameters,
+                member_parameters,
+                depth + 1,
+                max_depth,
+            )?;
+            let dimensions = node
+                .child_by_field_name("dimensions")
+                .map_or(1, dimension_count);
+            for _ in 0..dimensions {
+                r#type = TypeRef::Array {
+                    element: Box::new(r#type),
+                };
+            }
+            Some(r#type)
         }
         "generic_type" => {
             let base = node
@@ -1554,10 +1603,13 @@ fn terminal_identifier(node: Node<'_>, source: &str) -> Option<String> {
     }
 }
 
-pub(super) fn source_declared_type_names(source: &str) -> Vec<String> {
-    let Some(tree) = parse_tree(source) else {
-        return Vec::new();
-    };
+pub(super) struct JavaSourceDeclarationIndex {
+    pub(super) package_name: String,
+    pub(super) type_names: Vec<String>,
+}
+
+pub(super) fn source_declaration_index(source: &str) -> Option<JavaSourceDeclarationIndex> {
+    let tree = parse_tree(source)?;
     let root = tree.root_node();
     let package_name = determine_package_name(root, source);
     let mut result = Vec::new();
@@ -1593,7 +1645,16 @@ pub(super) fn source_declared_type_names(source: &str) -> Vec<String> {
             }
         }
     }
-    result
+    Some(JavaSourceDeclarationIndex {
+        package_name,
+        type_names: result,
+    })
+}
+
+pub(super) fn source_declared_type_names(source: &str) -> Vec<String> {
+    source_declaration_index(source)
+        .map(|index| index.type_names)
+        .unwrap_or_default()
 }
 
 enum ClassEntryResult {
@@ -1723,6 +1784,9 @@ fn class_api_type(
     };
     ClassEntryResult::Declaration(JavaApiType {
         name: name.clone(),
+        package_name: internal_name
+            .rsplit_once('/')
+            .map_or_else(String::new, |(package, _)| package.replace('/', ".")),
         type_kind,
         visibility,
         is_abstract: flags.contains(ClassFlags::ACC_ABSTRACT),
@@ -2298,6 +2362,11 @@ mod tests {
           public Surface() {}\n\
           protected List<T> copy(T input) { return null; }\n\
           public <U> U convert(U value) { return value; }\n\
+          public void arrays(int value) {}\n\
+          public void arrays(int[] value) {}\n\
+          public void arrays(int[][] value) {}\n\
+          public void spread() {}\n\
+          public void spread(String... values) {}\n\
           public static class Nested {}\n\
           private static class Hidden { public static class Leaks {} }\n\
         }\n";

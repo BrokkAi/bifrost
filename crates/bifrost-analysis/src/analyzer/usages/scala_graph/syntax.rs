@@ -434,17 +434,31 @@ fn record_generic_owner_facts(node: Node<'_>, source: &str, facts: &mut ScalaSou
             let mut cursor = parameters.walk();
             parameters
                 .named_children(&mut cursor)
+                .filter(|parameter| {
+                    matches!(
+                        parameter.kind(),
+                        "contravariant_type_parameter"
+                            | "covariant_type_parameter"
+                            | "identifier"
+                            | "operator_identifier"
+                            | "type_lambda"
+                            | "wildcard"
+                    )
+                })
                 .filter_map(|parameter| {
                     let name = parameter
                         .child_by_field_name("name")
                         .or_else(|| {
                             let mut cursor = parameter.walk();
                             parameter.named_children(&mut cursor).find(|child| {
-                                matches!(
-                                    child.kind(),
-                                    "identifier" | "operator_identifier" | "type_identifier"
-                                )
+                                matches!(child.kind(), "type_identifier" | "operator_identifier")
                             })
+                        })
+                        .or_else(|| {
+                            let mut cursor = parameter.walk();
+                            parameter
+                                .named_children(&mut cursor)
+                                .find(|child| child.kind() == "identifier")
                         })
                         .unwrap_or(parameter);
                     matches!(

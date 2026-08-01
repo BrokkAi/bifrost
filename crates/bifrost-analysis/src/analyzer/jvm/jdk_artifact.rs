@@ -1,8 +1,9 @@
 use super::java_artifact::{
     MAX_SOURCE_ENTRY_BYTES, ZipDirectoryStatus, apply_enclosing_visibility, java_api_facts,
-    source_api_types, source_declared_type_names, zip_directory_status_with_limits,
+    source_api_types, source_declaration_index, zip_directory_status_with_limits,
 };
 use crate::CancellationToken;
+use crate::analyzer::java::declarations::{node_text, parse_tree};
 use crate::analyzer::semantic_model::{
     ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest, AuthoredPayload,
     AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics, Completeness,
@@ -102,8 +103,8 @@ impl JdkSourceArchivePackProducer {
         };
         let mut diagnostics = BoundedProducerDiagnostics::new(limits);
         let mut entries = Vec::new();
-        let mut known_types = HashSet::default();
         let mut module_markers = HashSet::default();
+        let mut exports_by_module = HashMap::default();
         let mut layout_error = false;
         let mut total_bytes = 0u64;
         let entry_limit = archive.len().min(MAX_JDK_ARCHIVE_ENTRIES);
@@ -171,7 +172,45 @@ impl JdkSourceArchivePackProducer {
                 }
             };
             if is_module_marker {
-                module_markers.insert(module);
+                let next_total = total_bytes.saturating_add(entry.size());
+                if entry.size() > MAX_SOURCE_ENTRY_BYTES || next_total > MAX_JDK_TOTAL_SOURCE_BYTES
+                {
+                    diagnostics.error(
+                        "jdk.module_info.bytes",
+                        Some(entry_name),
+                        "module-info.java exceeded the bounded JDK source extraction budget",
+                    );
+                    layout_error = true;
+                    continue;
+                }
+                total_bytes = next_total;
+                let mut source = String::new();
+                if entry
+                    .by_ref()
+                    .take(MAX_SOURCE_ENTRY_BYTES.saturating_add(1))
+                    .read_to_string(&mut source)
+                    .is_err()
+                    || source.len() as u64 > MAX_SOURCE_ENTRY_BYTES
+                {
+                    diagnostics.error(
+                        "jdk.module_info.read",
+                        Some(entry_name),
+                        "could not read bounded module-info.java source",
+                    );
+                    layout_error = true;
+                    continue;
+                }
+                let Some(exports) = exported_module_packages(&source) else {
+                    diagnostics.error(
+                        "jdk.module_info.parse",
+                        Some(entry_name),
+                        "could not parse module-info.java exports structurally",
+                    );
+                    layout_error = true;
+                    continue;
+                };
+                module_markers.insert(module.clone());
+                exports_by_module.insert(module, exports);
                 continue;
             }
             let next_total = total_bytes.saturating_add(entry.size());
@@ -201,11 +240,20 @@ impl JdkSourceArchivePackProducer {
             }
             match String::from_utf8(bytes) {
                 Ok(source) => {
-                    known_types.extend(source_declared_type_names(&source));
+                    let Some(declarations) = source_declaration_index(&source) else {
+                        diagnostics.warning(
+                            "jdk.source.parse",
+                            Some(entry_name),
+                            "could not index JDK source package and declared names",
+                        );
+                        continue;
+                    };
                     entries.push(JdkSourceEntry {
                         archive_index: index,
                         module,
                         source_path: entry_name,
+                        package_name: declarations.package_name,
+                        type_names: declarations.type_names,
                     });
                 }
                 Err(_) => diagnostics.warning(
@@ -237,10 +285,19 @@ impl JdkSourceArchivePackProducer {
                 );
                 return failed_with_diagnostics(artifact.sha256(), diagnostics);
             }
+            entries.retain(|entry| {
+                exports_by_module
+                    .get(&entry.module)
+                    .is_some_and(|exports| exports.contains(&entry.package_name))
+            });
         }
         entries.sort_unstable_by(|left, right| {
             (&left.module, &left.source_path).cmp(&(&right.module, &right.source_path))
         });
+        let known_types = entries
+            .iter()
+            .flat_map(|entry| entry.type_names.iter().cloned())
+            .collect::<HashSet<_>>();
         let mut by_module = HashMap::<String, Vec<JdkSourceEntry>>::default();
         for entry in entries {
             by_module
@@ -293,6 +350,12 @@ impl JdkSourceArchivePackProducer {
                 ));
             }
             apply_enclosing_visibility(&mut declarations);
+            if self.layout == JdkSourceArchiveLayout::ModulePrefixed {
+                let exports = exports_by_module
+                    .get(&module)
+                    .expect("validated source module has a descriptor");
+                declarations.retain(|declaration| exports.contains(&declaration.package_name));
+            }
             declarations.retain(|declaration| {
                 matches!(
                     declaration.visibility,
@@ -396,6 +459,8 @@ struct JdkSourceEntry {
     archive_index: usize,
     module: String,
     source_path: String,
+    package_name: String,
+    type_names: Vec<String>,
 }
 
 fn archive_path_components(entry_name: &str) -> Option<Vec<&str>> {
@@ -430,6 +495,30 @@ fn valid_module_name(name: &str) -> bool {
     !segment_start
 }
 
+fn exported_module_packages(source: &str) -> Option<HashSet<String>> {
+    let tree = parse_tree(source)?;
+    if tree.root_node().has_error() {
+        return None;
+    }
+    let mut exports = HashSet::default();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "exports_module_directive" {
+            if node.child_by_field_name("modules").is_none() {
+                let package = node.child_by_field_name("package")?;
+                exports.insert(node_text(package, source).trim().to_owned());
+            }
+            continue;
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    Some(exports)
+}
+
 fn cancelled_production(limits: &ArtifactProducerLimits) -> ArtifactProduction {
     ArtifactProduction::failed(
         ProducerDiagnostic {
@@ -459,7 +548,9 @@ fn failed_with_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::semantic_model::{ActivationSelector, Compatibility, Provenance, Safety};
+    use crate::analyzer::semantic_model::{
+        ActivationSelector, Compatibility, CompilerOptions, Provenance, Safety, compile_pack,
+    };
     use std::fs::File;
     use std::io::Write;
     use tempfile::tempdir;
@@ -472,15 +563,25 @@ mod tests {
         write_zip(
             &archive,
             &[
-                ("java.sql/module-info.java", "module java.sql {}"),
+                (
+                    "java.sql/module-info.java",
+                    "module java.sql { exports java.sql; }",
+                ),
                 (
                     "java.sql/java/sql/Driver.java",
                     "package java.sql; public interface Driver { int major(); }",
                 ),
-                ("java.base/module-info.java", "module java.base {}"),
+                (
+                    "java.base/module-info.java",
+                    "module java.base { exports java.lang; exports internal to java.sql; }",
+                ),
                 (
                     "java.base/java/lang/Object.java",
                     "package java.lang; public class Object { public int hashCode() { return 0; } }",
+                ),
+                (
+                    "java.base/internal/Hidden.java",
+                    "package internal; public class Hidden {}",
                 ),
             ],
         );
@@ -504,6 +605,15 @@ mod tests {
                     && selector.artifact_sha256 == production.artifact_sha256
             }));
         }
+        let java_base = pack
+            .shards
+            .iter()
+            .find(|shard| shard.id == "declarations.jdk.java.base")
+            .unwrap();
+        let AuthoredPayload::DeclarationFacts { types, .. } = &java_base.payload else {
+            panic!("JDK producer must emit declaration facts");
+        };
+        assert!(types.iter().all(|fact| fact.name != "internal.Hidden"));
     }
 
     #[test]
@@ -527,7 +637,10 @@ mod tests {
         write_zip(
             &module_prefixed,
             &[
-                ("java.base/module-info.java", "module java.base {}"),
+                (
+                    "java.base/module-info.java",
+                    "module java.base { exports java.lang; }",
+                ),
                 (
                     "java.base/java/lang/Object.java",
                     "package java.lang; public class Object {}",
@@ -548,23 +661,99 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "requires BIFROST_JDK_SOURCE_ZIP pointing to a pinned JDK src.zip"]
+    fn pinned_jdk_source_archive_smoke() {
+        let path = std::env::var_os("BIFROST_JDK_SOURCE_ZIP")
+            .map(std::path::PathBuf::from)
+            .expect("set BIFROST_JDK_SOURCE_ZIP");
+        let version = std::env::var("BIFROST_JDK_VERSION").expect("set BIFROST_JDK_VERSION");
+        let production = JdkSourceArchivePackProducer::new(JdkSourceArchiveLayout::ModulePrefixed)
+            .produce_exact_artifact(
+                &request_for_version(path, &version),
+                &ArtifactProducerLimits::default(),
+            );
+        let pack = production.pack.expect("real JDK source pack");
+        let compiled = compile_pack(&pack, &CompilerOptions::default()).unwrap_or_else(|errors| {
+            for shard in &pack.shards {
+                let AuthoredPayload::DeclarationFacts { members, .. } = &shard.payload else {
+                    continue;
+                };
+                let mut by_id: HashMap<&str, Vec<_>> = HashMap::default();
+                for member in members {
+                    by_id.entry(&member.id).or_default().push(member);
+                }
+                for duplicates in by_id.values().filter(|members| members.len() > 1) {
+                    eprintln!("duplicate JDK members in {}: {duplicates:#?}", shard.id);
+                }
+            }
+            panic!("pack compilation failed: {errors:#?}");
+        });
+        assert!(pack.shards.len() > 1, "expected module shards");
+        let java_base = pack
+            .shards
+            .iter()
+            .find(|shard| shard.id == "declarations.jdk.java.base")
+            .expect("java.base shard");
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &java_base.payload else {
+            panic!("JDK source producer must emit declaration facts");
+        };
+        eprintln!(
+            "JDK source smoke: shards={}, java_base_types={}, java_base_members={}, stored_bytes={}, raw_bytes={}, completeness={:?}, diagnostics={:#?}",
+            pack.shards.len(),
+            types.len(),
+            members.len(),
+            compiled
+                .shards
+                .iter()
+                .map(|shard| shard.descriptor.stored_size)
+                .sum::<u64>(),
+            compiled
+                .shards
+                .iter()
+                .map(|shard| shard.descriptor.raw_size)
+                .sum::<u64>(),
+            production.completeness,
+            production.diagnostics
+        );
+        for expected in ["java.lang.Object", "java.lang.String", "java.util.List"] {
+            assert!(
+                types.iter().any(|fact| fact.name == expected),
+                "missing {expected}; diagnostics={:#?}",
+                production.diagnostics
+            );
+        }
+        assert!(
+            members.iter().any(|fact| fact.name == "hashCode"),
+            "java.lang.Object.hashCode should come from source; diagnostics={:#?}",
+            production.diagnostics
+        );
+    }
+
     fn request(path: std::path::PathBuf) -> ArtifactProductionRequest {
+        request_for_version(path, "21.0.2")
+    }
+
+    fn request_for_version(path: std::path::PathBuf, version: &str) -> ArtifactProductionRequest {
         ArtifactProductionRequest {
             path,
             artifact_kind: ExternalArtifactKind::JdkSourceZip,
             pack_id: "jdk-21".to_owned(),
-            pack_version: "21.0.2".to_owned(),
+            pack_version: version.to_owned(),
             ecosystem: "jdk".to_owned(),
             compatibility: Compatibility {
                 bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
-                toolchains: Vec::new(),
+                toolchains: vec![crate::analyzer::semantic_model::VersionConstraint {
+                    name: "jdk".to_owned(),
+                    requirement: format!("={version}"),
+                }],
             },
             activation: vec![ActivationSelector {
                 package: None,
                 module: None,
                 toolchain: Some(NameSelector {
                     name: "jdk".to_owned(),
-                    version: Some("21.0.2".to_owned()),
+                    version: Some(format!("={version}")),
                 }),
                 targets: Vec::new(),
                 configurations: Vec::new(),
@@ -572,9 +761,9 @@ mod tests {
             }],
             provenance: Provenance {
                 source: "OpenJDK".to_owned(),
-                revision: Some("jdk-21.0.2+13".to_owned()),
+                revision: Some(format!("jdk-{version}")),
             },
-            license: "GPL-2.0-with-classpath-exception".to_owned(),
+            license: "GPL-2.0-only WITH Classpath-exception-2.0".to_owned(),
             safety: Safety {
                 generated_code_only: false,
                 review_required: false,
