@@ -6828,8 +6828,32 @@ fn ensure_language_epochs_tx(
     conn: &mut Connection,
     entries: &[(String, String)],
 ) -> Result<HashMap<String, GenerationId>> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut generations = HashMap::default();
+    let mut all_match = true;
+    for (lang, analysis_epoch) in entries {
+        let stored: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT epoch, generation FROM analysis_epochs WHERE lang = ?1",
+                [lang],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match stored {
+            Some((stored_epoch, generation)) if stored_epoch == *analysis_epoch => {
+                generations.insert(lang.clone(), GenerationId(generation));
+            }
+            _ => {
+                all_match = false;
+                break;
+            }
+        }
+    }
+    if all_match {
+        return Ok(generations);
+    }
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    generations.clear();
     for (lang, analysis_epoch) in entries {
         let stored_epoch: Option<String> = tx
             .query_row(
@@ -9460,6 +9484,32 @@ mod tests {
                 *epoch == final_pair.0 && generation.0 == final_pair.1
             })
         );
+    }
+
+    #[test]
+    fn matching_persistent_epoch_does_not_wait_for_the_writer_slot() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = temp.path().join("cache.db");
+        let writer = AnalyzerStore::open_persistent(&db).unwrap();
+        let reader = AnalyzerStore::open_persistent(&db).unwrap();
+        let generation = writer.ensure_language_epoch_value("java", "same").unwrap();
+
+        reader
+            .conn
+            .lock()
+            .unwrap()
+            .busy_timeout(Duration::from_millis(100))
+            .unwrap();
+        let mut writer_conn = writer.conn.lock().unwrap();
+        let writer_tx = writer_conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+
+        assert_eq!(
+            reader.ensure_language_epoch_value("java", "same").unwrap(),
+            generation
+        );
+        writer_tx.rollback().unwrap();
     }
 
     #[test]
