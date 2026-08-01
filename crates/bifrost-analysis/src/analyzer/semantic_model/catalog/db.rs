@@ -7,7 +7,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use super::{CatalogError, CatalogOpenMode};
 
 pub(super) const CATALOG_DB_FILE_NAME: &str = "catalog.db";
-const CURRENT_CATALOG_VERSION: i64 = 3;
+const CURRENT_CATALOG_VERSION: i64 = 4;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIALIZATION_RETRY_BACKOFF: Duration = Duration::from_millis(5);
 const INITIALIZATION_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(100);
@@ -17,6 +17,8 @@ const LIFECYCLE_SQL: &str =
     include_str!("../../../../migrations/semantic-pack-catalog/0002-lifecycle.sql");
 const PROCEDURE_SUMMARIES_SQL: &str =
     include_str!("../../../../migrations/semantic-pack-catalog/0003-procedure-summaries.sql");
+const GENERATED_PRODUCTIONS_SQL: &str =
+    include_str!("../../../../migrations/semantic-pack-catalog/0004-generated-productions.sql");
 
 pub(super) fn open(root: &Path, mode: CatalogOpenMode) -> Result<Connection, CatalogError> {
     let path = root.join(CATALOG_DB_FILE_NAME);
@@ -163,6 +165,11 @@ fn migrate(connection: &mut Connection, mode: CatalogOpenMode) -> Result<(), Cat
         transaction
             .execute_batch(PROCEDURE_SUMMARIES_SQL)
             .map_err(|error| CatalogError::sqlite("apply procedure-summary migration", error))?;
+    }
+    if locked_version <= 3 {
+        transaction
+            .execute_batch(GENERATED_PRODUCTIONS_SQL)
+            .map_err(|error| CatalogError::sqlite("apply generated-production migration", error))?;
     }
     transaction
         .pragma_update(None, "user_version", CURRENT_CATALOG_VERSION)

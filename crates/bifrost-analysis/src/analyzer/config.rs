@@ -56,13 +56,25 @@ impl Default for JvmDependencyDiscoveryConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JvmExternalArtifact {
     pub artifact_path: PathBuf,
     pub source_artifact_path: Option<PathBuf>,
+    /// Exact coordinate evidence when the path came from dependency metadata
+    /// or an offline build-tool report. Explicit paths leave this unset.
+    pub coordinate: Option<JvmMavenCoordinate>,
+    pub origin: JvmExternalArtifactOrigin,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum JvmExternalArtifactOrigin {
+    #[default]
+    Explicit,
+    MavenReport,
+    GradleReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct JvmMavenCoordinate {
     pub group_id: String,
     pub artifact_id: String,

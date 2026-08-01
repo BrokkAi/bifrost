@@ -6,6 +6,7 @@
 mod artifact;
 mod catalog;
 mod compiler;
+mod dependency;
 mod identity;
 mod model;
 mod overlay;
@@ -25,9 +26,11 @@ pub use artifact::{
 };
 pub use catalog::*;
 pub use compiler::{CompilerOptions, CompressionPolicy, compile_pack, compile_source};
+pub use dependency::*;
 pub use identity::{MemberIdentity, TypeIdentity, member_declaration_id, type_declaration_id};
 pub use model::*;
 pub use overlay::*;
+pub(crate) use producer::read_exact_artifact_while;
 pub use producer::{
     ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
     BoundedProducerDiagnostics, ExactArtifact, ExternalArtifactKind, ExternalArtifactPackProducer,
