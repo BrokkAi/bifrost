@@ -119,6 +119,14 @@ pub fn read_exact_artifact(
     path: &Path,
     limits: &ArtifactProducerLimits,
 ) -> Result<ExactArtifact, ProducerDiagnostic> {
+    read_exact_artifact_while(path, limits, || false)
+}
+
+pub(crate) fn read_exact_artifact_while(
+    path: &Path,
+    limits: &ArtifactProducerLimits,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Result<ExactArtifact, ProducerDiagnostic> {
     let metadata = path.metadata().map_err(|error| ProducerDiagnostic {
         severity: ProducerDiagnosticSeverity::Error,
         code: "artifact.metadata".to_owned(),
@@ -158,17 +166,33 @@ pub fn read_exact_artifact(
         ),
     })?;
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(limits.max_artifact_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|error| ProducerDiagnostic {
-            severity: ProducerDiagnosticSeverity::Error,
-            code: "artifact.read".to_owned(),
-            location: None,
-            message: bounded_message(
-                format!("could not read exact artifact: {error}"),
-                limits.max_diagnostic_message_bytes,
-            ),
-        })?;
+    let mut reader = file.take(limits.max_artifact_bytes.saturating_add(1));
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        if is_cancelled() {
+            return Err(ProducerDiagnostic {
+                severity: ProducerDiagnosticSeverity::Error,
+                code: "artifact.cancelled".to_owned(),
+                location: None,
+                message: "exact artifact read was cancelled".to_owned(),
+            });
+        }
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| ProducerDiagnostic {
+                severity: ProducerDiagnosticSeverity::Error,
+                code: "artifact.read".to_owned(),
+                location: None,
+                message: bounded_message(
+                    format!("could not read exact artifact: {error}"),
+                    limits.max_diagnostic_message_bytes,
+                ),
+            })?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
     if bytes.len() as u64 > limits.max_artifact_bytes {
         return Err(ProducerDiagnostic {
             severity: ProducerDiagnosticSeverity::Error,
@@ -271,6 +295,7 @@ fn bounded_message(mut message: String, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::io::Write;
 
     #[test]
@@ -304,6 +329,23 @@ mod tests {
             .code,
             "limit.artifact_bytes"
         );
+    }
+
+    #[test]
+    fn exact_artifact_reader_can_cancel_between_chunks() {
+        let mut temp = tempfile::NamedTempFile::new().unwrap();
+        temp.write_all(&vec![b'x'; 128 * 1024]).unwrap();
+        let checks = Cell::new(0);
+
+        let diagnostic =
+            read_exact_artifact_while(temp.path(), &ArtifactProducerLimits::default(), || {
+                checks.set(checks.get() + 1);
+                checks.get() > 1
+            })
+            .unwrap_err();
+
+        assert_eq!(diagnostic.code, "artifact.cancelled");
+        assert_eq!(checks.get(), 2);
     }
 
     #[test]

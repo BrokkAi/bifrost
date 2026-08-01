@@ -16,7 +16,7 @@ The behavior is observable with offline fixtures. Two workspaces that resolve th
 - [x] (2026-08-01 07:44Z) Diagnosed the dependency-discovery, artifact-producer, compiler, catalog, activation-runtime, overlay, and analyzer-invalidation boundaries.
 - [x] (2026-08-01 07:44Z) Recorded the approved implementation design in this ExecPlan.
 - [x] (2026-08-01 07:56Z) Milestone 1: added exact generated-production identity, transactional catalog registration and verified reuse, schema migration, and concurrency/integrity coverage.
-- [ ] Milestone 2: add a shared bounded, cancellable dependency-pack preparation coordinator.
+- [x] (2026-08-01 08:19Z) Milestone 2: added the shared exact-byte preparation coordinator, bounded profiles/diagnostics, cooperative file-read cancellation, compilation/installation boundaries, and reuse/invalidation tests.
 - [ ] Milestone 3: retain JVM coordinates and deterministically combine source and binary evidence.
 - [ ] Milestone 4: retain .NET package, target, configuration, and asset-role provenance.
 - [ ] Milestone 5: compose dependency preparation with semantic-model activation and prove targeted invalidation.
@@ -38,6 +38,8 @@ The behavior is observable with offline fixtures. Two workspaces that resolve th
   Evidence: one opener enumerated a temporary file that another writer published before `DirEntry::metadata`, causing `stat staged catalog object` to fail with `NotFound`. Stale cleanup now treats disappearance during metadata/removal as successful concurrent progress, while preserving all other errors.
 - Observation: persistence and semantic integration harnesses belong to the workspace root package, not `brokk-bifrost-analysis`.
   Evidence: Cargo rejected `-p brokk-bifrost-analysis --test suite_persistence` and identified the `brokk-bifrost` package; the corrected milestone-1 command passed 30 focused tests.
+- Observation: the shell resolves Cargo and Rustc through rustup but resolves `cargo-clippy` from Homebrew, whose same-version compiler has a different build identity.
+  Evidence: ordinary and isolated `cargo clippy` failed with E0514 on a freshly compiled `cc` crate. Invoking rustup's matching `/Users/dave/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin/cargo-clippy` directly completed the milestone-2 library Clippy gate with `-D warnings`.
 
 ## Decision Log
 
@@ -62,7 +64,9 @@ The behavior is observable with offline fixtures. Two workspaces that resolve th
 
 ## Outcomes & Retrospective
 
-Milestone 1 is complete. The catalog can now derive a domain-separated production identity from exact input bytes plus producer/schema semantics, install a compiled pack and production binding in one writer transaction, verify compatible reuse from read-only or writable catalogs, reject key rebinding, and safely quarantine corrupt metadata. Schema v3 migrates without losing existing packs, and garbage collection removes obsolete production bindings through the manifest foreign key. The focused persistence slice passes 30 tests, including four concurrent installers; formatting and diff checks are clean. The shared preparation coordinator and ecosystem adapters remain to be implemented.
+Milestones 1 and 2 are complete. The catalog can derive a domain-separated production identity from exact input bytes plus producer/schema semantics, install a compiled pack and production binding in one writer transaction, verify compatible reuse from read-only or writable catalogs, reject key rebinding, and safely quarantine corrupt metadata. Schema v3 migrates without losing existing packs, and garbage collection removes obsolete production bindings through the manifest foreign key.
+
+The shared coordinator now reads only the resolved artifact paths under explicit byte/count limits, checks cancellation between 64 KiB reads and before lookup/production/compile/install, excludes paths and mtimes from the production identity, retains normalized activation evidence, validates adapter producer/schema/language/ecosystem claims, and never reports missing or partial coverage as complete. Five integration tests prove path-independent reuse, exact-byte invalidation, cancellation without publication, missing-artifact diagnostics, and partial-pack reuse; the focused catalog suite still passes 30 tests and the cooperative reader has direct unit coverage. Formatting, diff checks, and task-scoped library Clippy are clean. JVM and .NET adapters remain to be implemented.
 
 ## Context and Orientation
 

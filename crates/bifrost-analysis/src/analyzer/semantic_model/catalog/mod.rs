@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use super::{
     ActivationSelector, ArtifactEncoding, CompiledPackManifest, CompiledSemanticModelPack,
-    CompiledShard, CompiledShardDescriptor, DecodeLimits, NameSelector, PayloadKind,
+    CompiledShard, CompiledShardDescriptor, Completeness, DecodeLimits, NameSelector, PayloadKind,
     decode_manifest, decode_shard_for_manifest,
 };
 use crate::analyzer::canonical_hash::{CanonicalHasher, is_lower_sha256, lower_hex_string};
@@ -280,6 +280,7 @@ impl GeneratedProductionKey {
 pub struct GeneratedProduction {
     pub key: GeneratedProductionKey,
     pub manifest_digest: String,
+    pub completeness: Completeness,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -585,6 +586,7 @@ impl SemanticPackCatalog {
             production: GeneratedProduction {
                 key: key.clone(),
                 manifest_digest: install.manifest_digest.clone(),
+                completeness: pack.manifest.completeness,
             },
             install,
         })
@@ -655,6 +657,7 @@ impl SemanticPackCatalog {
             Ok(GeneratedProduction {
                 key: stored_key,
                 manifest_digest: manifest_digest.clone(),
+                completeness: manifest.completeness,
             })
         })();
         match validated {
@@ -732,6 +735,7 @@ impl SemanticPackCatalog {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn commit_install(
         &self,
         pack: &CompiledSemanticModelPack,
