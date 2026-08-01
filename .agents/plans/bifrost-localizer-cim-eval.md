@@ -224,6 +224,13 @@ The observable outcomes are:
   no fallback. Incremental localization covered 390 cells with no skips, and the subsequent
   392-cell leak audit reported zero unmitigated findings. The dedicated XFS container store
   retained 1.2 TiB free.
+- [x] (2026-08-01 04:15Z, 400-cell checkpoint) Rechecked the live queue after it crossed 400
+  frozen Granite cells. Every inspected cell still records Bedrock GPT-5.6 Luna, maximum
+  reasoning, and immutable runtime SHA-256
+  `f626e492783d6a559b29abe123e19e8e65bdf094baa0f43a21241fd5e137ad75`. The nine arm/seed
+  buckets remained balanced within three cells, the controller continued to refill all 30
+  worker slots after container handoffs, and no controller or generation failure was recorded.
+  The XFS container store retained 1.2 TiB free and `/mnt/optane` retained 261 GiB free.
 - [x] (2026-08-01, scorer recovery) The checkpoint exposed load-induced official scorer
   failures rather than agent outcomes: 22 early semantic RocketMQ Maven scorers exhausted the
   separate 1,800-second verifier budget during the concurrent compiler wave, while matching
