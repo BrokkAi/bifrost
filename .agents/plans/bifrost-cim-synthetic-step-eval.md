@@ -113,13 +113,21 @@ authorizes the remaining dw10 retrieval recipes.
   its regression forces GC after the read and passes.
 - Observation: R3 proved both shared-cache fixes under load and completed 61 cells before draining,
   but several nonempty synthetic batches consumed the entire 1,800-second outer cell budget. The
-  stuck phase was Anvil's disposable low-reasoning Bedrock relevance call after Bifrost returned
-  candidates, not embedding or retrieval. Because the killed traces lacked the required synthetic
-  end boundary, cimeval correctly failed closed and cancelled the still-queued cells.
-  Evidence: affected traces contain `cim_synthetic_step_start` and no rerank/end event; Anvil logs
-  enter both parallel semantic calls immediately and then stop after Bedrock backend initialization.
-  Anvil `e93b745` now applies a CIM-only 120-second total wall deadline so the existing deterministic
-  reciprocal-rank fallback is reachable when Bedrock hangs. Normal Anvil reranking is unchanged.
+  available trace proves only that Anvil entered each semantic call; it has no boundary between raw
+  Bifrost retrieval, candidate-context fetch, and the disposable relevance request. The earlier
+  attribution to Bedrock was therefore premature. The synthetic reranker also inherited the active
+  Bedrock Luna model, while DSV4 Flash was used only to freeze query strings.
+  Evidence: affected traces contain `cim_synthetic_step_start` and no rerank/end event, and their
+  logs contain no 300-second Bedrock HTTP/SSE timeout or retry. Anvil `e93b745`'s CIM-only 120-second
+  RRF fallback was rejected because it changes the retrieval treatment instead of identifying the
+  blocked phase.
+- Observation: the corrected r5 live smoke cleanly separated every phase. Three concurrent dw10
+  retrievals completed in 1.8-2.2 seconds, context fetches completed by 2.3 seconds, and explicitly
+  routed DSV4 Flash reranks completed in 13.4, 18.7, and 27.2 seconds with no fallback. The
+  synthetic end boundary was recorded before Bedrock Luna's first coding turn.
+  Evidence: `dw10-cim-synthetic-20260801-r5/cells/apache__dubbo-8414--semantic-coedit-2-1--seed-0`
+  records `utility_model=deepseek::deepseek-v4-flash`, provider-default effort, and
+  `fallback=false` for all three `semantic_search_rerank` events.
 
 ## Decision Log
 
@@ -165,13 +173,20 @@ authorizes the remaining dw10 retrieval recipes.
   with either fix would mix execution semantics. The longer deadline is confined to the requested
   benchmark mode; ordinary Anvil MCP calls remain capped at 300 seconds.
   Date/Author: 2026-08-01 / Codex.
-- Decision: retain r3 as a third infrastructure diagnostic and run r4 from scratch with the bounded
-  disposable reranker. Do not switch the reportable main-agent provider to OpenRouter.
-  Rationale: provider substitution would break the exact seed-0 pairing against the existing
-  Bedrock/Luna baseline. Anvil already defines deterministic RRF as the provider-failure behavior;
-  bounding only CIM's disposable call makes that existing behavior reachable without changing
-  ordinary Anvil or Luna's provider.
-  Date/Author: 2026-08-01 / Codex.
+- Decision: retain r3 and the immediately stopped r4 only as diagnostics. Add Anvil's product-level
+  `--utility-model`/`ANVIL_UTILITY_MODEL` selection for semantic reranking and auto permissions.
+  Explicit utility models use provider-default effort and must have an available provider at
+  startup; when unset, utility calls use the session model at low effort. History compaction remains
+  on the session model at low effort so its prefix-cache behavior is unchanged.
+  Rationale: DSV4 Flash should own the disposable relevance work, while Bedrock Luna at maximum
+  reasoning remains the reportable coding agent. Explicit routing also satisfies Anvil issue #313.
+  Date/Author: 2026-08-01 / Codex and user.
+- Decision: remove the CIM wall-timeout/RRF behavior from `e93b745`, fail CIM reranking closed, and
+  trace retrieval, context-fetch, utility-request, and stream-completion boundaries before another
+  campaign. Preserve ordinary Anvil's existing reranker fallback behavior.
+  Rationale: a fallback changes the experimental treatment and the existing trace cannot identify
+  which stage blocked. The next failure must be attributable rather than hidden.
+  Date/Author: 2026-08-01 / Codex and user.
 
 ## Outcomes & Retrospective
 
@@ -320,6 +335,16 @@ R3 is likewise diagnostic-only. R4 is `dw10-cim-synthetic-20260801-r4`; runtime 
 `a63bcd7adb4750b1cab060234504845e0174c2c668f7f146c144cbea333808f3`, Anvil binary SHA-256
 `ba49f150546de298269217e88fd266e89904aff02f129250f134151311684bcd`, and the unchanged Bifrost
 binary SHA-256 `a686ccca71ddfba04c40e49df6b34ace901fc766b23ff453a7d6472e5261fa7e`.
+
+The corrected run is `/mnt/optane/bifrost-nlp-resources/runs/dw10-cim-synthetic-20260801-r5`.
+Its runtime is `runtime/runtime-v6.tgz`, SHA-256
+`4f2f11f72bfb9a5a9c1183edc80baee59a02aff161afb52ab72148b4f3bb3869`, recording Anvil
+`af65c23`, brokkbench `9161af0`, Bifrost `098e71d6`, and Mjolnir `26a3084`. Anvil `af65c23`
+implements `--utility-model`/`ANVIL_UTILITY_MODEL`, session/low fallback, provider-default effort
+for an explicit utility model, model-aware usage accounting, phase tracing, and CIM fail-closed
+reranking. Brokkbench `9161af0` stages both provider credentials and validates the actual reranker
+model from the trace. Mjolnir required no source change because it deliberately passes its
+environment through to the Anvil child.
 
 ## Interfaces and Dependencies
 
