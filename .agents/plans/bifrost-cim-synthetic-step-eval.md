@@ -101,6 +101,16 @@ authorizes the remaining dw10 retrieval recipes.
   Evidence: r1's six incomplete traces report `database is locked`; focused persistent-store
   regressions hold an actual writer transaction and now pass matching analyzer and semantic reads
   in 0.02-0.03 seconds. Bifrost fixes are `8c91d985` and `68fb3764`.
+- Observation: Clean run r2 eliminated those SQLite lock failures, but its first 30-way wave
+  exposed two later startup races before Luna's first inference. Three synthetic searches reached
+  Anvil's ordinary fixed 300-second MCP deadline while queued behind the single A4000, and two
+  Bifrost processes saw a component row during an existence probe that another repository's
+  post-build GC removed before composition read it.
+  Evidence: r2 traces for `apache__dubbo-8414`, `apache__rocketmq-7563`, and
+  `huggingface__transformers-25884` report the 300-second MCP timeout; two other incomplete traces
+  report `component vector missing after embed`. The timeout is now 1,800 seconds only in CIM mode
+  at Anvil `8c2e8e6`, and Bifrost `ca6a3f20` retains decoded cached components across composition;
+  its regression forces GC after the read and passes.
 
 ## Decision Log
 
@@ -139,6 +149,12 @@ authorizes the remaining dw10 retrieval recipes.
   Rationale: resuming r1 with a corrected Bifrost binary would violate the predeclared
   single-runtime criterion even though the fixes affect only contention. Reusing the exact r1
   run-manifest bytes preserves the frozen query manifest's task identity.
+  Date/Author: 2026-08-01 / Codex.
+- Decision: retain r2 as a second infrastructure diagnostic and restart from scratch as r3 with
+  Anvil's CIM-only 1,800-second MCP deadline and Bifrost's atomic read/retain composition design.
+  Rationale: r2 contains one immutable runtime identity and valid completed cells, but resuming it
+  with either fix would mix execution semantics. The longer deadline is confined to the requested
+  benchmark mode; ordinary Anvil MCP calls remain capped at 300 seconds.
   Date/Author: 2026-08-01 / Codex.
 
 ## Outcomes & Retrospective
@@ -281,6 +297,9 @@ Runtime v5 is `r1/runtime/runtime-v5.tgz`, SHA-256
 `68fb3764` and binary SHA-256
 `85ec69a6a1cfe6d7c3359b1dd7b8c980493b1f0eadaa5fd3b791c9b3487bb5b5`. The reportable service is
 `cimeval-dw10-synthetic-seed0-r2.service`, pinned at 30 workers.
+R2 is retained as a diagnostic after the timeout/GC failures above; it is not a reportable mixed-
+runtime run. The next clean reportable directory is `dw10-cim-synthetic-20260801-r3` and will reuse
+the exact frozen run-manifest and query-manifest bytes with a newly recorded runtime.
 
 ## Interfaces and Dependencies
 
@@ -312,6 +331,9 @@ hand-selected; the smoke criterion was infrastructure and treatment integrity.
 Revision note, 2026-08-01: Recorded that the XFS image store was complete and checkpointed the
 cimeval-only storage selection. The host orchestration change does not require rebuilding the
 immutable task runtime because none of its bytes enter the container.
+
+Revision note, 2026-08-01: Recorded r2's CIM deadline and cross-process semantic-GC failures, their
+focused regression coverage, and the clean-r3 decision required to preserve one runtime identity.
 
 Revision note, 2026-08-01: Recorded r1's shared-cache contention diagnosis, both read-only fast
 paths, and the clean r2 restart required to retain one immutable runtime identity.
