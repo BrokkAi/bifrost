@@ -809,9 +809,11 @@ impl BifrostMcpHandler {
     /// Bifrost `CancellationToken` deep inside its traversals. A bridge task
     /// forwards one to the other, so an MCP cancellation stops the analyzer
     /// itself rather than merely dropping the handler's future and leaving a
-    /// blocking thread grinding. That is why this awaits the join handle even
-    /// after cancellation: what comes back is the analyzer's own truthful
-    /// "cancelled/incomplete" result.
+    /// blocking thread grinding. It awaits the analyzer's own truthful
+    /// "cancelled/incomplete" result while work completes within budget; once
+    /// the deadline expires, it returns promptly and leaves that bounded work
+    /// holding its analyzer slot until cancellation unwinds it.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_tool(
         &self,
         name: String,
