@@ -54,10 +54,14 @@ their own reviewed plan rather than expanding this one.
   The new base includes merged #1150 local-dependency pack generation.
 - [x] (2026-08-01 15:50Z) Narrowed this ExecPlan from the full future
   distribution system to the requested initial implementation boundary.
-- [ ] Re-run focused Rust, workspace graph/workflow, formatting, package, and
-  task-scoped Clippy checks against the rebased `0.8.18` base.
-- [ ] Review the final `origin/master...HEAD` diff for accidental coupling to
-  merged #1150 and update this plan with the final evidence and outcome.
+- [x] (2026-08-01 16:22Z) Re-ran focused Rust, workspace graph/workflow,
+  formatting, six-archive packaging, and task-scoped strict Clippy checks
+  against the rebased `0.8.18` base; every executable build and test gate
+  passed.
+- [x] (2026-08-01 16:22Z) Reviewed the final `origin/master...HEAD` diff. The
+  only semantic-model path changed is the generic public re-export in
+  `semantic_model/mod.rs`; #1150's dependency discovery, producer, caching,
+  and activation implementations are unchanged.
 
 ## Surprises & Discoveries
 
@@ -101,6 +105,19 @@ their own reviewed plan rather than expanding this one.
   `status=unreliable`, exit 2 after the nested-loop rule exhausted discovery and
   later rules were cancelled. Existing issues #1296 and #1423 own this behavior;
   no reported finding was in the initial implementation files.
+
+- Observation: The post-rebase policy rerun remained unreliable even though it
+  returned completed per-policy results.
+  Evidence: `run_policy` for `bifrost.code-smells` on 2026-08-01 returned
+  `status=unreliable`, exit 2, empty top-level execution metadata, and a report
+  too large for the MCP response budget. Surfaced findings were repository-wide
+  pre-existing locations outside the #1154 diff.
+
+- Observation: The rmcp workspace snapshot was briefly unavailable during the
+  final code-reading review.
+  Evidence: the first `get_summaries` call for the three boundary files failed
+  after five seconds with `workspace snapshot was not ready`; an identical
+  retry completed in 3.4 seconds after initialization.
 
 ## Decision Log
 
@@ -146,12 +163,21 @@ their own reviewed plan rather than expanding this one.
 
 ## Outcomes & Retrospective
 
-The code for this initial slice exists in the rebased branch but requires final
-post-rebase validation. The intended architecture is now concrete: generic
-analysis and merged #1150 local generation remain independent of curated
-Bifrost content; the facade composes both; package and CI metadata know about
-the sixth crate. No remote registry, automatic networking, lifecycle UI, or
-production pack content is claimed.
+The initial crate-boundary slice is implemented and validated on the rebased
+`0.8.18` base. Generic analysis and merged #1150 local generation remain
+independent of curated Bifrost content; the facade composes both; package and CI
+metadata know about the sixth crate. The two focused Rust tests, all 38 selected
+Node tests, formatting, task-scoped strict Clippy, dependency validation, and
+the package gate all pass. The package gate produced all six archives and
+compiled both unpacked consumer shapes, proving that the facade includes the
+new crate while an analysis-only consumer does not.
+
+The final diff changes no #1150 producer, dependency-discovery, cache, or
+activation implementation. The mandatory `bifrost.code-smells` run remains an
+explicit validation limitation: it returned `unreliable` with repository-wide
+pre-existing findings and no surfaced location in this issue's files. No remote
+registry, automatic networking, lifecycle UI, or production pack content is
+claimed; those remain follow-up work.
 
 ## Context and Orientation
 
@@ -347,8 +373,9 @@ The new crate has one direct workspace dependency:
 Do not add HTTP, filesystem discovery, database, CLI parsing, or product host
 dependencies in this initial slice.
 
-Revision note: 2026-08-01 15:50Z. Rewritten after rebasing onto current
-`origin/master` to scope the plan to the requested initial implementation. The
+Revision note: 2026-08-01 16:22Z. Rewritten after rebasing onto current
+`origin/master` to scope the plan to the requested initial implementation, then
+updated with the complete post-rebase validation evidence and outcome. The
 former full distribution roadmap was intentionally removed; release indexes,
 remote acquisition, lifecycle state, CLI commands, and production content now
 require separate follow-up planning.
