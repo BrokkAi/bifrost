@@ -35,6 +35,10 @@ fn jdk_pack_navigation_uses_explicit_hierarchy_then_lazy_object_fallback() {
                 "java.base/java/lang/Leaf.java",
                 "package java.lang; public class Leaf {}",
             ),
+            (
+                "java.base/java/lang/Contract.java",
+                "package java.lang; public interface Contract {}",
+            ),
         ],
     );
     let production = JdkSourceArchivePackProducer::new(JdkSourceArchiveLayout::ModulePrefixed)
@@ -84,7 +88,10 @@ fn jdk_pack_navigation_uses_explicit_hierarchy_then_lazy_object_fallback() {
     );
 
     let project = InlineTestProject::with_language(Language::Java)
-        .file("src/Main.java", "public class Main {}")
+        .file(
+            "src/Main.java",
+            "public class Main {} interface Contract {}",
+        )
         .build();
     let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
     let files_before = analyzer.analyzer().project().all_files().unwrap();
@@ -170,11 +177,18 @@ fn jdk_pack_navigation_uses_explicit_hierarchy_then_lazy_object_fallback() {
             .collect::<Vec<_>>(),
         vec!["java.lang.Object"]
     );
+    let contract = overlay.symbols_named("java.lang.Contract");
+    assert!(overlay.ancestors_of(contract.records[0]).records.is_empty());
 
     let navigation = get_symbol_ancestors(
         analyzer.analyzer(),
         SymbolLookupParams {
-            symbols: vec!["Main".to_owned(), "java.lang.Leaf".to_owned()],
+            symbols: vec![
+                "Main".to_owned(),
+                "Contract".to_owned(),
+                "java.lang.Leaf".to_owned(),
+                "java.lang.Contract".to_owned(),
+            ],
         },
     );
     assert!(
@@ -196,6 +210,16 @@ fn jdk_pack_navigation_uses_explicit_hierarchy_then_lazy_object_fallback() {
     assert!(navigation.ancestors.iter().any(|result| {
         result.symbol == "java.lang.Leaf" && result.ancestors == ["java.lang.Object"]
     }));
+    for interface in ["Contract", "java.lang.Contract"] {
+        assert!(
+            navigation
+                .ancestors
+                .iter()
+                .any(|result| { result.symbol == interface && result.ancestors.is_empty() }),
+            "{:#?}",
+            navigation.ancestors
+        );
+    }
     assert_eq!(
         files_before,
         analyzer.analyzer().project().all_files().unwrap()
@@ -312,7 +336,9 @@ fn scala_pack_navigation_uses_explicit_hierarchy_then_lazy_any_fallback() {
         navigation
             .ancestors
             .iter()
-            .any(|result| { result.symbol == "Main" && result.ancestors == ["scala.Any"] })
+            .any(|result| { result.symbol == "Main" && result.ancestors == ["scala.Any"] }),
+        "{:#?}",
+        navigation.ancestors
     );
     assert!(
         navigation

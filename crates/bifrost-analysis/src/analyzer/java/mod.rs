@@ -384,6 +384,10 @@ impl IAnalyzer for JavaAnalyzer {
         self.inner.direct_children(code_unit)
     }
 
+    fn declaration_syntax_kind(&self, code_unit: &CodeUnit) -> Option<&'static str> {
+        self.inner.declaration_syntax_kind(code_unit)
+    }
+
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
         self.inner.structural_parent_of(code_unit)
     }

@@ -2,8 +2,11 @@ use std::env;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
+use brokk_bifrost_analysis::analyzer::semantic_model::{
+    CatalogOpenMode, CatalogOptions, SemanticPackCatalog,
+};
 use brokk_bifrost_semantic_packs::release_bundle::{
-    BundleInput, generate_release_bundle, verify_release_bundle,
+    BundleInput, generate_release_bundle, install_release_bundle, verify_release_bundle,
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -42,11 +45,31 @@ fn main() -> Result<(), Box<dyn Error>> {
                 output_root.display()
             );
         }
+        "install" => {
+            let Some(catalog_root) = arguments.next().map(PathBuf::from) else {
+                return Err(usage().into());
+            };
+            if arguments.next().is_some() {
+                return Err(usage().into());
+            }
+            let catalog = SemanticPackCatalog::open(
+                &catalog_root,
+                CatalogOpenMode::ReadWrite,
+                CatalogOptions::default(),
+            )?;
+            let installed = install_release_bundle(&output_root, &catalog)?;
+            println!(
+                "installed {} pinned semantic packs from {} into {}",
+                installed.len(),
+                output_root.display(),
+                catalog_root.display()
+            );
+        }
         _ => return Err(usage().into()),
     }
     Ok(())
 }
 
 fn usage() -> &'static str {
-    "usage:\n  bifrost-semantic-pack generate OUTPUT SPEC ARTIFACT [SPEC ARTIFACT ...]\n  bifrost-semantic-pack verify OUTPUT"
+    "usage:\n  bifrost-semantic-pack generate OUTPUT SPEC ARTIFACT [SPEC ARTIFACT ...]\n  bifrost-semantic-pack verify OUTPUT\n  bifrost-semantic-pack install BUNDLE CATALOG"
 }

@@ -22,7 +22,7 @@ The first release is intentionally semantic rather than compiler-emulating. Pack
 - [x] (2026-08-01 23:30Z) Milestone 3: integrated compact lazy universal-root lookup, module-export filtering, source-precise Java array/varargs signatures, and real Scala/JDK pack compilation; focused tests and strict Clippy pass.
 - [x] (2026-08-02 00:30Z) Milestone 4: proved end-to-end activation, hierarchy/member/source navigation, deterministic JDK/Scala bytes, exact mismatch explanations, dependency-file isolation, and the raw-byte advantage of lazy root resolution.
 - [x] (2026-08-02 02:45Z) Milestone 5: added pinned JDK/Scala release inputs, content-addressed and self-verifying bundles, licenses/notices, real activation/lookup measurements, package gates, and immutable GitHub Release workflow assets.
-- [ ] Milestone 6: complete focused validation, repository policy checks, guided specialist review, and accepted fixes.
+- [x] (2026-08-02 06:05Z) Milestone 6: completed focused validation and guided specialist review, fixed accepted correctness/security/release findings, and reran the repository policy selection; the policy result remains explicitly failed as `unreliable` because four built-in performance rules report partial discovery.
 
 ## Surprises & Discoveries
 
@@ -60,7 +60,7 @@ The first release is intentionally semantic rather than compiler-emulating. Pack
   Evidence: Scala companions share source-level names with their classes, legal backticked names may contain spaces, and unresolved complex signatures still need overload arity. Java varargs, trailing dimensions, and multidimensional arrays were losing AST-carried shape. The producer and shared identity now preserve these distinctions; both pinned real archives compile successfully.
 
 - Observation: Scala 2.13.16 declares its universal roots in source.
-  Evidence: the pinned source JAR produced `scala.Any`, `AnyRef`, `AnyVal`, `Predef`, and collection APIs without synthetic declarations. The complete compiled pack contains 1,200 merged source-level type surfaces and 6,929 members, with 830,127 stored bytes and 4,380,375 raw bytes.
+  Evidence: the pinned source JAR produced `scala.Any`, `AnyRef`, `AnyVal`, `Predef`, and collection APIs without compiler-generated case-class declarations. The final complete compiled pack contains 8,271 records, with 844,646 stored bytes and 4,447,043 raw bytes; source-authored classes without an explicit parameter list receive one source-semantic zero-argument constructor.
 
 - Observation: a full JDK source pack is usable but honestly partial with the current type vocabulary.
   Evidence: Temurin 21.0.8 produced 44 compiled shards totaling 5,846,861 stored bytes and 34,890,611 raw bytes. Unsupported advanced source type shapes emit bounded warnings rather than guessed facts; the real smoke still validates and compiles the retained API.
@@ -73,6 +73,15 @@ The first release is intentionally semantic rather than compiler-emulating. Pack
 
 - Observation: member benchmarks must resolve source-level owners to stable type identities before querying the runtime index.
   Evidence: `ResolvedActiveSemanticModels::members_named` is keyed by owner declaration ID, not display name. The release measurement harness now performs the same indexed type-name-to-ID step as navigation and rejects a representative query that returns no records.
+
+- Observation: adding zero-argument constructors in the workspace Scala parser changes ordinary symbol resolution.
+  Evidence: `class Main` then produced both a class and constructor named `Main`, making the previously unique workspace lookup ambiguous. Empty constructors are now synthesized only at the source-archive merge boundary, after companion/type identities are known, leaving workspace parsing unchanged.
+
+- Observation: ambiguity is query-relative, not a permanent property of every symbol sharing a terminal name.
+  Evidence: a Scala type and its constructor legitimately share `Leaf`; unqualified `Leaf` is ambiguous while exact `scala.Leaf` remains unique. The overlay now marks duplicate stable identities globally and lets each name posting determine name ambiguity.
+
+- Observation: the final policy gate is not reliable enough to certify the branch.
+  Evidence: `bifrost.code-smells` returned status `unreliable` and exit 2 on both final reruns. Expensive-operation, file-read, parsing, serialization, and sort policies reported partial discovery or unavailable stable anchors. Changed-file prompts were reviewed as necessary per-notice secure reads, per-type extension ordering, per-module JDK ordering, and a one-time legacy Scala index ordering; none justified a code change, but the inconclusive status remains a failed validation result.
 
 ## Decision Log
 
@@ -108,6 +117,14 @@ The first release is intentionally semantic rather than compiler-emulating. Pack
   Rationale: the activated indexes already provide sub-microsecond warm lookups, while the integration fixture proves authored universal-root edges increase raw bytes. Adding stored root edges or another cache would increase both release and retained runtime size without improving the measured lookup class. JDK activation cost is dominated by generic index construction and should be optimized there if needed, not by duplicating universal-root data.
   Date/Author: 2026-08-02 / Codex
 
+- Decision: keep Java `Object` and Scala `Any` as semantic lazy roots rather than emulating every compiler-injected intermediate edge.
+  Rationale: explicit authored hierarchy always wins, Java interfaces receive no `Object` class parent, and the fallback is resolved only against a unique compatible active pack. This preserves the user's requested speed/memory bias without claiming compiler-precise inheritance.
+  Date/Author: 2026-08-02 / Codex
+
+- Decision: publish timing measurements beside, not inside, the deterministic release archive.
+  Rationale: generation and activation timings necessarily vary between runs. Canonical indexes, manifests, shards, notices, and `SHA256SUMS` remain reproducible; CI retains measurements as a separate artifact.
+  Date/Author: 2026-08-02 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 now provides a bounded `ScalaSourceJarPackProducer` that parses each Scala entry once, emits public/protected source-declared types and members with stable JVM identities, signatures, explicit hierarchy, companions/modules, type aliases, and extension surfaces, and sorts output deterministically. The legacy JVM external declaration index now projects Scala type shells from these produced facts instead of maintaining a second parser and visibility model. Three producer tests and the existing Scala source-JAR external-index test pass. Compiler-generated case-class APIs remain deliberately absent for #1153.
@@ -119,6 +136,10 @@ Milestone 3 adds semantic lazy-root traversal to `SemanticModelOverlay` and hier
 Milestone 4 extends that integration path through members and sources. `Object.hashCode` and `Predef.identity` navigate from an activated source pack to an honest external authored locator and typed presentation; JDK and Scala version mismatches remain inactive with actionable explanations. Identical JDK archive bytes compiled from different paths now produce identical manifest and shard bytes, matching the Scala determinism coverage. A paired fixture with and without one explicit `Object` edge proves the lazy representation emits fewer raw bytes, while the no-edge relation assertion proves it retains no per-type fallback relation. Scala case-class `copy` remains an explicit tested non-claim for #1153.
 
 Milestone 5 adds an explicit `bifrost-semantic-pack` release CLI and compact pinned specifications for Temurin 21.0.8+9 and scala-library 2.13.16. Generation verifies both outer and inner source identities, refuses non-identical overwrites, writes canonical content-addressed manifests/shards/notices plus `index.json`, `measurements.json`, and `SHA256SUMS`, and re-decodes every asset during verification. Two real generations produced byte-identical release indexes, manifests, and shards. The release workflow downloads only the pinned artifacts, verifies their SHA-256 values, generates and verifies the bundle from the validated release commit, creates a deterministic archive envelope, and attaches it immutably to the GitHub Release. Generated payloads remain absent from Git.
+
+Milestone 6 hardened the release boundary and the normal consumer path after five specialist reviews. Verification now cross-checks every indexed compiled field, notice and asset publication rejects symlink/path escapes and uses randomized no-clobber temporary files, timing data is excluded from the immutable release archive, downloads use bounded retries, and release-only dependencies are feature-gated. The CLI can verify and install a downloaded bundle into a durable catalog, while ordinary `org.scala-lang:scala-library` dependency evidence now selects the Scala source producer and exact Scala toolchain instead of the Java producer. Java interfaces no longer receive `Object`; Scala source packs include true zero-argument primary constructors without perturbing workspace parsing; exact qualified type names remain navigable beside same-named constructors.
+
+The final real bundle at `/tmp/bifrost-issue-1152-release-bundle-v5` verified 52,996 JDK records in 44 partial module shards and 8,271 complete Scala records in one shard, totaling 11 MiB. JDK generation took 45.7 seconds and activation 40.4 seconds with 13,536,446 retained model bytes; Scala generation took 4.7 seconds and activation 0.8 seconds with 6,287,179 retained bytes. Representative `Object`/`hashCode` and `Any`/`Predef.identity` lookups each resolved exactly one record with sub-microsecond warm timings. Formatting, task-scoped strict Clippy, focused producer/navigation/overlay tests, workflow tests, all six package archives, release generation, and bundle verification pass. The required policy gate remains failed as `unreliable` for analyzer partial-discovery reasons recorded above.
 
 ## Context and Orientation
 

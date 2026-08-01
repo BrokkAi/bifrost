@@ -81,10 +81,12 @@ jobs:
         shell: bash
         run: |
           mkdir -p "${RUNNER_TEMP}/semantic-pack-inputs" "${RUNNER_TEMP}/temurin"
-          curl --fail --location --silent --show-error \
+          curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
+            --retry-delay 5 --connect-timeout 30 \
             --output "${RUNNER_TEMP}/semantic-pack-inputs/scala-library-2.13.16-sources.jar" \
             "https://repo1.maven.org/maven2/org/scala-lang/scala-library/2.13.16/scala-library-2.13.16-sources.jar"
-          curl --fail --location --silent --show-error \
+          curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
+            --retry-delay 5 --connect-timeout 30 \
             --output "${RUNNER_TEMP}/semantic-pack-inputs/OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.8_9.tar.gz" \
             "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.8%2B9/OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.8_9.tar.gz"
           cd "${RUNNER_TEMP}/semantic-pack-inputs"
@@ -101,13 +103,15 @@ jobs:
       - name: Generate and verify semantic-pack bundle
         shell: bash
         run: |
-          cargo run --locked --release -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- generate \
+          cargo run --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- generate \
             "${RUNNER_TEMP}/bifrost-semantic-packs" \
             semantic-packs/jvm/temurin-jdk-21.0.8+9.json "${RUNNER_TEMP}/semantic-pack-inputs/src.zip" \
             semantic-packs/jvm/scala-library-2.13.16.json "${RUNNER_TEMP}/semantic-pack-inputs/scala-library-2.13.16-sources.jar"
-          cargo run --locked --release -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- verify \
+          cargo run --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- verify \
             "${RUNNER_TEMP}/bifrost-semantic-packs"
           mkdir -p dist
+          mv "${RUNNER_TEMP}/bifrost-semantic-packs/measurements.json" \
+            "dist/bifrost-semantic-packs-${{ needs.release-context.outputs.tag }}-measurements.json"
           tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
             -C "${RUNNER_TEMP}" -cf - bifrost-semantic-packs \
             | gzip -n > "dist/bifrost-semantic-packs-${{ needs.release-context.outputs.tag }}.tar.gz"
@@ -122,6 +126,7 @@ jobs:
           path: |
             dist/bifrost-semantic-packs-${{ needs.release-context.outputs.tag }}.tar.gz
             dist/bifrost-semantic-packs-${{ needs.release-context.outputs.tag }}.tar.gz.sha256
+            dist/bifrost-semantic-packs-${{ needs.release-context.outputs.tag }}-measurements.json
           if-no-files-found: error
 
   build-wheels:

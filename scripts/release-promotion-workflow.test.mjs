@@ -142,6 +142,11 @@ test("promotion evidence covers validation before every external publisher", () 
   assert.match(semanticPacks, /OpenJDK21U-jdk_aarch64_mac_hotspot_21\.0\.8_9\.tar\.gz/u);
   assert.match(semanticPacks, /bifrost-semantic-pack -- generate/u);
   assert.match(semanticPacks, /bifrost-semantic-pack -- verify/u);
+  assert.match(semanticPacks, /--retry 5 --retry-all-errors/u);
+  assert.match(
+    semanticPacks,
+    /mv .*measurements\.json.*-measurements\.json/su,
+  );
   assert.match(
     jobBlock(release, "release"),
     /dist\/bifrost-semantic-packs-\$\{\{ needs\.release-context\.outputs\.tag \}\}\.tar\.gz/u,

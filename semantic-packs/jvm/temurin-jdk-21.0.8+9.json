@@ -22,7 +22,7 @@
     "bifrost": ">=0.8.18, <0.9.0",
     "toolchains": [
       {
-        "name": "java",
+        "name": "jdk",
         "requirement": "=21.0.8"
       }
     ]
@@ -30,7 +30,7 @@
   "activation": [
     {
       "toolchain": {
-        "name": "java",
+        "name": "jdk",
         "version": "=21.0.8"
       },
       "targets": ["jvm"],
@@ -54,7 +54,7 @@
       "name": "java.base"
     },
     "toolchain": {
-      "name": "java",
+      "name": "jdk",
       "version": "=21.0.8"
     },
     "targets": ["jvm"],

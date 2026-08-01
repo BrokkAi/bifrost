@@ -75,7 +75,7 @@ impl ScalaSourceJarPackProducer {
         self.produce_loaded_artifact(request, limits, cancellation, &artifact)
     }
 
-    pub(crate) fn produce_loaded_artifact(
+    pub fn produce_loaded_artifact(
         &self,
         request: &ArtifactProductionRequest,
         limits: &ArtifactProducerLimits,
@@ -174,6 +174,7 @@ impl ScalaSourceJarPackProducer {
         let mut types = Vec::new();
         let mut members = Vec::new();
         let mut extension_surfaces = Vec::new();
+        let mut constructor_names_by_owner = HashMap::default();
         let mut remaining_records = limits.max_records;
         let mut record_limit_hit = false;
         for (entry_name, source) in entries {
@@ -198,6 +199,29 @@ impl ScalaSourceJarPackProducer {
             types.append(&mut entry_facts.types);
             members.append(&mut entry_facts.members);
             extension_surfaces.append(&mut entry_facts.extension_surfaces);
+            for (owner, name) in entry_facts.constructor_names_by_owner {
+                if let Some(previous) = constructor_names_by_owner.insert(owner, name.clone()) {
+                    debug_assert_eq!(previous, name);
+                }
+            }
+        }
+        let owners_with_constructors = members
+            .iter()
+            .filter(|member| member.member_kind == MemberKind::Constructor)
+            .map(|member| member.owner.clone())
+            .collect::<crate::hash::HashSet<_>>();
+        for (owner, name) in constructor_names_by_owner {
+            if owners_with_constructors.contains(&owner) {
+                continue;
+            }
+            if !take_record(&mut remaining_records, &mut record_limit_hit) {
+                break;
+            }
+            let fact = types
+                .iter()
+                .find(|fact| fact.id == owner)
+                .expect("constructor owner was produced with its source type");
+            members.push(empty_constructor_fact(fact, name));
         }
         if record_limit_hit {
             diagnostics.warning(
@@ -214,6 +238,9 @@ impl ScalaSourceJarPackProducer {
         members.sort_unstable_by(|left, right| {
             (&left.owner, &left.name, &left.id).cmp(&(&right.owner, &right.name, &right.id))
         });
+        for pair in members.windows(2) {
+            debug_assert_ne!(pair[0].id, pair[1].id, "duplicate Scala members: {pair:#?}");
+        }
         finish_production(request, artifact.sha256(), types, members, diagnostics)
     }
 }
@@ -263,6 +290,7 @@ struct ScalaEntryFacts {
     types: Vec<TypeFact>,
     members: Vec<MemberFact>,
     extension_surfaces: Vec<(Vec<String>, String)>,
+    constructor_names_by_owner: HashMap<String, String>,
 }
 
 fn scala_entry_facts(
@@ -281,6 +309,7 @@ fn scala_entry_facts(
     let mut type_ids = HashMap::default();
     let mut type_kinds = HashMap::default();
     let mut type_parameters_by_declaration = HashMap::default();
+    let mut constructor_names_by_owner = HashMap::default();
     for declaration in declarations
         .iter()
         .copied()
@@ -318,6 +347,9 @@ fn scala_entry_facts(
             .unwrap_or_default();
         type_ids.insert(declaration.clone(), type_id.clone());
         type_kinds.insert(declaration.clone(), type_kind);
+        if matches!(type_kind, TypeKind::Class | TypeKind::Enum) {
+            constructor_names_by_owner.insert(type_id.clone(), declaration.identifier().to_owned());
+        }
         type_parameters_by_declaration.insert(declaration.clone(), type_parameters.clone());
         let fact = TypeFact {
             id: type_id,
@@ -452,6 +484,36 @@ fn scala_entry_facts(
         types,
         members,
         extension_surfaces,
+        constructor_names_by_owner,
+    }
+}
+
+fn empty_constructor_fact(owner: &TypeFact, name: String) -> MemberFact {
+    MemberFact {
+        id: member_declaration_id(MemberIdentity {
+            owner_id: &owner.id,
+            kind: MemberKind::Constructor,
+            is_static: false,
+            parameter_arity: 0,
+            name: &name,
+            generic_arity: 0,
+            parameter_types: &[],
+            return_type: None,
+        }),
+        owner: owner.id.clone(),
+        name,
+        member_kind: MemberKind::Constructor,
+        visibility: owner.visibility,
+        is_static: false,
+        is_abstract: false,
+        is_virtual: false,
+        signature: Some(Signature {
+            type_parameters: Vec::new(),
+            parameters: Vec::new(),
+            returns: None,
+        }),
+        aliases: Vec::new(),
+        locator: owner.locator.clone(),
     }
 }
 
@@ -913,6 +975,20 @@ object Syntax {
         assert!(creates.iter().any(|fact| !fact.is_static));
         assert_ne!(creates[0].id, creates[1].id);
         assert!(members.iter().any(|fact| fact.name == "`legal name`"));
+        let child_constructors = members
+            .iter()
+            .filter(|fact| fact.owner == child.id && fact.member_kind == MemberKind::Constructor)
+            .collect::<Vec<_>>();
+        assert_eq!(child_constructors.len(), 1);
+        assert_eq!(
+            child_constructors[0]
+                .signature
+                .as_ref()
+                .expect("primary constructor signature")
+                .parameters
+                .len(),
+            0
+        );
         let annotated = types
             .iter()
             .find(|fact| fact.name == "scala.sample.Annotated")
@@ -922,6 +998,14 @@ object Syntax {
             .iter()
             .find(|fact| fact.name == "scala.sample.Data")
             .unwrap();
+        assert!(members.iter().any(|fact| {
+            fact.owner == data.id
+                && fact.member_kind == MemberKind::Constructor
+                && fact
+                    .signature
+                    .as_ref()
+                    .is_some_and(|signature| signature.parameters.len() == 1)
+        }));
         assert!(!members.iter().any(|fact| {
             fact.owner == data.id && matches!(fact.name.as_str(), "copy" | "productElement")
         }));

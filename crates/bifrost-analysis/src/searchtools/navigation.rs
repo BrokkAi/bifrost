@@ -1614,6 +1614,14 @@ fn append_active_universal_root(
     else {
         return;
     };
+    if language == "java"
+        && matches!(
+            analyzer.declaration_syntax_kind(code_unit),
+            Some("interface_declaration" | "annotation_type_declaration")
+        )
+    {
+        return;
+    }
     let Some(overlay) = analyzer.semantic_model_overlay() else {
         return;
     };

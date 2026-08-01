@@ -12,10 +12,10 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     ActivationSelector, ArtifactEncoding, ArtifactProducerLimits, CatalogCoordinate,
     CatalogOptions, Compatibility, CompiledSemanticModelPack, CompilerOptions, Completeness,
     DecodeLimits, DurablePackSource, DurablePackSourceKind, ExternalArtifactKind,
-    ExternalArtifactPackProducer, ProducerDiagnostic, Provenance, ResolvedActiveSemanticModels,
-    Safety, SemanticModelActivationEvidence, SemanticModelActivationRequest,
+    ProducerDiagnostic, Provenance, ResolvedActiveSemanticModels, Safety,
+    SemanticModelActivationEvidence, SemanticModelActivationRequest,
     SemanticModelResolutionOutcome, SemanticPackCatalog, compile_pack, decode_manifest,
-    decode_shard_for_manifest, resolve_active_semantic_models,
+    decode_shard_for_manifest, read_exact_artifact, resolve_active_semantic_models,
 };
 use brokk_bifrost_analysis::analyzer::{
     JdkSourceArchiveLayout, JdkSourceArchivePackProducer, ScalaSourceJarPackProducer,
@@ -23,6 +23,7 @@ use brokk_bifrost_analysis::analyzer::{
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tempfile::NamedTempFile;
 
 pub const JVM_PACK_SPEC_SCHEMA_VERSION: u32 = 1;
 pub const RELEASE_BUNDLE_SCHEMA_VERSION: u32 = 1;
@@ -197,6 +198,13 @@ pub struct BundleInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleasePackInstallation {
+    pub pack_id: String,
+    pub pack_version: String,
+    pub manifest_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BundleError(String);
 
 impl BundleError {
@@ -254,14 +262,15 @@ pub fn generate_release_bundle(
         generator: generator.clone(),
         packs,
     };
-    write_new_or_identical(&output_root.join("index.json"), &json_bytes(&index)?)?;
+    write_new_or_identical(output_root, Path::new("index.json"), &json_bytes(&index)?)?;
     let measurements = ReleaseBundleMeasurements {
         schema_version: RELEASE_BUNDLE_SCHEMA_VERSION,
         generator,
         packs: measurements,
     };
-    write_once(
-        &output_root.join("measurements.json"),
+    write_replace(
+        output_root,
+        Path::new("measurements.json"),
         &json_bytes(&measurements)?,
     )?;
     write_checksums(output_root, &index)?;
@@ -280,12 +289,14 @@ fn generate_one(
         BundleError::new(format!("parse spec {}: {error}", input.spec_path.display()))
     })?;
     validate_spec(&spec, &input.spec_path)?;
-    let (artifact_sha256, artifact_bytes) = sha256_file(&input.artifact_path)?;
-    if artifact_sha256 != spec.artifact.sha256 {
+    let producer_limits = ArtifactProducerLimits::default();
+    let artifact = read_exact_artifact(&input.artifact_path, &producer_limits)
+        .map_err(|diagnostic| BundleError::new(render_diagnostics(&[diagnostic])))?;
+    if artifact.sha256() != spec.artifact.sha256 {
         return Err(BundleError::new(format!(
             "artifact {} SHA-256 {} does not match pinned {}",
             input.artifact_path.display(),
-            artifact_sha256,
+            artifact.sha256(),
             spec.artifact.sha256
         )));
     }
@@ -324,18 +335,19 @@ fn generate_one(
                 PinnedJdkSourceLayout::ModulePrefixed => JdkSourceArchiveLayout::ModulePrefixed,
                 PinnedJdkSourceLayout::Flat => JdkSourceArchiveLayout::Flat,
             })
-            .produce_exact_artifact_with_cancellation(
+            .produce_loaded_artifact(
                 &request,
-                &ArtifactProducerLimits::default(),
+                &producer_limits,
                 Some(&cancellation),
+                &artifact,
             )
         }
-        PinnedJvmPackKind::ScalaSourceJar => ScalaSourceJarPackProducer
-            .produce_exact_artifact_with_cancellation(
-                &request,
-                &ArtifactProducerLimits::default(),
-                Some(&cancellation),
-            ),
+        PinnedJvmPackKind::ScalaSourceJar => ScalaSourceJarPackProducer.produce_loaded_artifact(
+            &request,
+            &producer_limits,
+            Some(&cancellation),
+            &artifact,
+        ),
     };
     if production.artifact_sha256.as_deref() != Some(spec.artifact.sha256.as_str()) {
         return Err(BundleError::new(
@@ -382,7 +394,7 @@ fn generate_one(
     let notices = copy_notices(output_root, &input.spec_path, &spec.notices)?;
     let measurement = measurement(
         &spec,
-        artifact_bytes,
+        artifact.bytes().len() as u64,
         &compiled,
         elapsed.as_millis().try_into().unwrap_or(u64::MAX),
         runtime_measurement,
@@ -396,7 +408,7 @@ fn generate_one(
             language: compiled.manifest.language.clone(),
             ecosystem: spec.ecosystem,
             artifact: spec.artifact,
-            artifact_bytes,
+            artifact_bytes: artifact.bytes().len() as u64,
             manifest: ReleaseAsset {
                 path: manifest_path,
                 sha256: manifest_sha256,
@@ -494,10 +506,26 @@ fn copy_notices(
     spec_path: &Path,
     notices: &[String],
 ) -> Result<Vec<ReleaseNotice>, BundleError> {
-    let spec_root = spec_path.parent().unwrap_or_else(|| Path::new("."));
+    let spec_root = fs::canonicalize(spec_path.parent().unwrap_or_else(|| Path::new(".")))
+        .map_err(|error| BundleError::new(format!("resolve spec directory: {error}")))?;
     let mut result = Vec::with_capacity(notices.len());
     for source_path in notices {
-        let bytes = fs::read(spec_root.join(source_path))
+        let unresolved = spec_root.join(source_path);
+        let metadata = fs::symlink_metadata(&unresolved)
+            .map_err(|error| BundleError::new(format!("inspect notice {source_path}: {error}")))?;
+        if metadata.file_type().is_symlink() {
+            return Err(BundleError::new(format!(
+                "notice {source_path} must not be a symbolic link"
+            )));
+        }
+        let resolved = fs::canonicalize(&unresolved)
+            .map_err(|error| BundleError::new(format!("resolve notice {source_path}: {error}")))?;
+        if !resolved.starts_with(&spec_root) {
+            return Err(BundleError::new(format!(
+                "notice {source_path} resolves outside its spec directory"
+            )));
+        }
+        let bytes = fs::read(&resolved)
             .map_err(|error| BundleError::new(format!("read notice {source_path}: {error}")))?;
         let sha256 = sha256_bytes(&bytes);
         let path = format!("notices/{sha256}.txt");
@@ -697,18 +725,8 @@ pub fn verify_release_bundle(output_root: &Path) -> Result<ReleaseBundleIndex, B
     }
     verify_checksums(output_root, &index)?;
     let measurements_path = output_root.join("measurements.json");
-    let measurements_bytes = fs::read(&measurements_path).map_err(|error| {
-        BundleError::new(format!("read {}: {error}", measurements_path.display()))
-    })?;
-    let measurements: ReleaseBundleMeasurements = serde_json::from_slice(&measurements_bytes)
-        .map_err(|error| {
-            BundleError::new(format!("parse {}: {error}", measurements_path.display()))
-        })?;
-    if measurements.schema_version != RELEASE_BUNDLE_SCHEMA_VERSION {
-        return Err(BundleError::new(format!(
-            "unsupported release measurements schema {}",
-            measurements.schema_version
-        )));
+    if measurements_path.exists() {
+        verify_measurements(&measurements_path, &index)?;
     }
     let limits = DecodeLimits::default();
     for pack in &index.packs {
@@ -721,6 +739,12 @@ pub fn verify_release_bundle(output_root: &Path) -> Result<ReleaseBundleIndex, B
             || manifest.semantic_sha256 != pack.manifest_semantic_sha256
             || manifest.content_sha256 != pack.manifest_content_sha256
             || manifest.shards.len() != pack.shards.len()
+            || manifest.language != pack.language
+            || manifest.ecosystem != pack.ecosystem
+            || manifest.completeness != pack.completeness
+            || manifest.compatibility != pack.compatibility
+            || manifest.provenance != pack.provenance
+            || manifest.license != pack.license
         {
             return Err(BundleError::new(format!(
                 "release index metadata does not match manifest for {}@{}",
@@ -735,6 +759,19 @@ pub fn verify_release_bundle(output_root: &Path) -> Result<ReleaseBundleIndex, B
                 .ok_or_else(|| {
                     BundleError::new(format!("missing indexed shard {}", descriptor.shard_id))
                 })?;
+            if indexed.encoding != descriptor.encoding
+                || indexed.raw_bytes != descriptor.raw_size
+                || indexed.records != descriptor.record_count
+                || indexed.semantic_sha256 != descriptor.semantic_sha256
+                || indexed.content_sha256 != descriptor.content_sha256
+                || indexed.asset.sha256 != descriptor.stored_sha256
+                || indexed.asset.bytes != descriptor.stored_size
+            {
+                return Err(BundleError::new(format!(
+                    "release index metadata does not match shard {}",
+                    descriptor.shard_id
+                )));
+            }
             let bytes = verify_asset(output_root, &indexed.asset)?;
             decode_shard_for_manifest(&manifest, descriptor, &bytes, &limits).map_err(|error| {
                 BundleError::new(format!("decode shard {}: {error}", descriptor.shard_id))
@@ -745,6 +782,73 @@ pub fn verify_release_bundle(output_root: &Path) -> Result<ReleaseBundleIndex, B
         }
     }
     Ok(index)
+}
+
+/// Verify and install every compiled pack in a downloaded release bundle.
+///
+/// Download policy remains outside ordinary analysis. Once a caller has
+/// selected and unpacked a bundle, this provides the explicit bridge into the
+/// durable catalog used by normal semantic-model activation.
+pub fn install_release_bundle(
+    bundle_root: &Path,
+    catalog: &SemanticPackCatalog,
+) -> Result<Vec<ReleasePackInstallation>, BundleError> {
+    let index = verify_release_bundle(bundle_root)?;
+    let limits = DecodeLimits::default();
+    index
+        .packs
+        .iter()
+        .map(|pack| {
+            let manifest_bytes = verify_asset(bundle_root, &pack.manifest)?;
+            let manifest = decode_manifest(&manifest_bytes, &limits).map_err(|error| {
+                BundleError::new(format!("decode manifest for {}: {error}", pack.pack_id))
+            })?;
+            let shards =
+                manifest
+                    .shards
+                    .iter()
+                    .map(|descriptor| {
+                        let indexed = pack
+                            .shards
+                            .iter()
+                            .find(|shard| shard.shard_id == descriptor.shard_id)
+                            .expect("verified bundle indexes every manifest shard");
+                        let bytes = verify_asset(bundle_root, &indexed.asset)?;
+                        Ok(brokk_bifrost_analysis::analyzer::semantic_model::CompiledShardArtifact {
+                        descriptor: descriptor.clone(),
+                        bytes,
+                    })
+                    })
+                    .collect::<Result<Vec<_>, BundleError>>()?;
+            let compiled = CompiledSemanticModelPack {
+                manifest,
+                manifest_bytes,
+                shards,
+            };
+            let installed = catalog
+                .install(
+                    &compiled,
+                    &DurablePackSource {
+                        kind: DurablePackSourceKind::PreShipped,
+                        source_id: format!(
+                            "release:{}@{}:{}",
+                            pack.pack_id, pack.pack_version, pack.manifest.sha256
+                        ),
+                    },
+                )
+                .map_err(|error| {
+                    BundleError::new(format!(
+                        "install {}@{}: {error}",
+                        pack.pack_id, pack.pack_version
+                    ))
+                })?;
+            Ok(ReleasePackInstallation {
+                pack_id: pack.pack_id.clone(),
+                pack_version: pack.pack_version.clone(),
+                manifest_digest: installed.manifest_digest,
+            })
+        })
+        .collect()
 }
 
 fn verify_checksums(output_root: &Path, index: &ReleaseBundleIndex) -> Result<(), BundleError> {
@@ -789,6 +893,57 @@ fn verify_asset(output_root: &Path, asset: &ReleaseAsset) -> Result<Vec<u8>, Bun
     Ok(bytes)
 }
 
+fn verify_measurements(
+    measurements_path: &Path,
+    index: &ReleaseBundleIndex,
+) -> Result<(), BundleError> {
+    let measurements_bytes = fs::read(measurements_path).map_err(|error| {
+        BundleError::new(format!("read {}: {error}", measurements_path.display()))
+    })?;
+    let measurements: ReleaseBundleMeasurements = serde_json::from_slice(&measurements_bytes)
+        .map_err(|error| {
+            BundleError::new(format!("parse {}: {error}", measurements_path.display()))
+        })?;
+    if measurements.schema_version != RELEASE_BUNDLE_SCHEMA_VERSION {
+        return Err(BundleError::new(format!(
+            "unsupported release measurements schema {}",
+            measurements.schema_version
+        )));
+    }
+    if measurements.generator != index.generator
+        || measurements.packs.len() != index.packs.len()
+        || measurements
+            .packs
+            .iter()
+            .zip(&index.packs)
+            .any(|(measurement, pack)| {
+                measurement.pack_id != pack.pack_id
+                    || measurement.pack_version != pack.pack_version
+                    || measurement.artifact_bytes != pack.artifact_bytes
+                    || measurement.manifest_bytes != pack.manifest.bytes
+                    || measurement.stored_shard_bytes
+                        != pack
+                            .shards
+                            .iter()
+                            .map(|shard| shard.asset.bytes)
+                            .sum::<u64>()
+                    || measurement.raw_shard_bytes
+                        != pack.shards.iter().map(|shard| shard.raw_bytes).sum::<u64>()
+                    || measurement.shard_count
+                        != u64::try_from(pack.shards.len()).unwrap_or(u64::MAX)
+                    || measurement.record_count
+                        != pack.shards.iter().map(|shard| shard.records).sum::<u64>()
+                    || measurement.completeness != pack.completeness
+                    || measurement.lookups.iter().any(|lookup| lookup.records == 0)
+            })
+    {
+        return Err(BundleError::new(
+            "release measurements do not match the indexed packs",
+        ));
+    }
+    Ok(())
+}
+
 fn write_content_addressed(
     output_root: &Path,
     relative: &str,
@@ -796,45 +951,114 @@ fn write_content_addressed(
 ) -> Result<(), BundleError> {
     let path = Path::new(relative);
     require_safe_relative(path)?;
-    write_new_or_identical(&output_root.join(path), bytes)
+    write_new_or_identical(output_root, path, bytes)
 }
 
-fn write_new_or_identical(path: &Path, bytes: &[u8]) -> Result<(), BundleError> {
-    if let Ok(existing) = fs::read(path) {
-        return if existing == bytes {
-            Ok(())
-        } else {
-            Err(BundleError::new(format!(
-                "refusing to overwrite non-identical release asset {}",
+fn write_new_or_identical(
+    output_root: &Path,
+    relative: &Path,
+    bytes: &[u8],
+) -> Result<(), BundleError> {
+    require_safe_relative(relative)?;
+    let path = output_root.join(relative);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(BundleError::new(format!(
+                "refusing symbolic-link release asset {}",
                 path.display()
-            )))
-        };
+            )));
+        }
+        Ok(_) => {
+            let existing = fs::read(&path).map_err(|error| {
+                BundleError::new(format!("read existing {}: {error}", path.display()))
+            })?;
+            return if existing == bytes {
+                Ok(())
+            } else {
+                Err(BundleError::new(format!(
+                    "refusing to overwrite non-identical release asset {}",
+                    path.display()
+                )))
+            };
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(BundleError::new(format!(
+                "inspect release asset {}: {error}",
+                path.display()
+            )));
+        }
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| BundleError::new(format!("create {}: {error}", parent.display())))?;
+        let root = fs::canonicalize(output_root).map_err(|error| {
+            BundleError::new(format!(
+                "resolve output root {}: {error}",
+                output_root.display()
+            ))
+        })?;
+        let resolved_parent = fs::canonicalize(parent).map_err(|error| {
+            BundleError::new(format!(
+                "resolve output directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+        if !resolved_parent.starts_with(root) {
+            return Err(BundleError::new(format!(
+                "release asset parent resolves outside the output root: {}",
+                parent.display()
+            )));
+        }
+        let mut temporary = NamedTempFile::new_in(parent).map_err(|error| {
+            BundleError::new(format!(
+                "create temporary asset in {}: {error}",
+                parent.display()
+            ))
+        })?;
+        temporary
+            .write_all(bytes)
+            .map_err(|error| BundleError::new(format!("write temporary asset: {error}")))?;
+        temporary
+            .as_file()
+            .sync_all()
+            .map_err(|error| BundleError::new(format!("sync temporary asset: {error}")))?;
+        temporary.persist_noclobber(&path).map_err(|error| {
+            BundleError::new(format!(
+                "publish release asset {}: {}",
+                path.display(),
+                error.error
+            ))
+        })?;
     }
-    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-    let mut file = File::create(&temporary)
-        .map_err(|error| BundleError::new(format!("create {}: {error}", temporary.display())))?;
-    file.write_all(bytes)
-        .map_err(|error| BundleError::new(format!("write {}: {error}", temporary.display())))?;
-    file.sync_all()
-        .map_err(|error| BundleError::new(format!("sync {}: {error}", temporary.display())))?;
-    fs::rename(&temporary, path).map_err(|error| {
-        BundleError::new(format!(
-            "publish {} as {}: {error}",
-            temporary.display(),
-            path.display()
-        ))
-    })
+    Ok(())
 }
 
-fn write_once(path: &Path, bytes: &[u8]) -> Result<(), BundleError> {
-    if path.exists() {
-        return Ok(());
-    }
-    write_new_or_identical(path, bytes)
+fn write_replace(output_root: &Path, relative: &Path, bytes: &[u8]) -> Result<(), BundleError> {
+    require_safe_relative(relative)?;
+    let path = output_root.join(relative);
+    let parent = path.parent().expect("relative output has a parent");
+    let mut temporary = NamedTempFile::new_in(parent).map_err(|error| {
+        BundleError::new(format!(
+            "create temporary observation in {}: {error}",
+            parent.display()
+        ))
+    })?;
+    temporary
+        .write_all(bytes)
+        .map_err(|error| BundleError::new(format!("write temporary observation: {error}")))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| BundleError::new(format!("sync temporary observation: {error}")))?;
+    temporary.persist(&path).map_err(|error| {
+        BundleError::new(format!(
+            "publish observation {}: {}",
+            path.display(),
+            error.error
+        ))
+    })?;
+    Ok(())
 }
 
 fn write_checksums(output_root: &Path, index: &ReleaseBundleIndex) -> Result<(), BundleError> {
@@ -847,11 +1071,11 @@ fn write_checksums(output_root: &Path, index: &ReleaseBundleIndex) -> Result<(),
         output.push_str(&path);
         output.push('\n');
     }
-    write_new_or_identical(&output_root.join("SHA256SUMS"), output.as_bytes())
+    write_new_or_identical(output_root, Path::new("SHA256SUMS"), output.as_bytes())
 }
 
 fn release_asset_paths(index: &ReleaseBundleIndex) -> Vec<String> {
-    let mut paths = vec!["index.json".to_owned(), "measurements.json".to_owned()];
+    let mut paths = vec!["index.json".to_owned()];
     for pack in &index.packs {
         paths.push(pack.manifest.path.clone());
         paths.extend(pack.shards.iter().map(|shard| shard.asset.path.clone()));
@@ -1022,6 +1246,10 @@ mod tests {
             fs::read(first.join("index.json")).unwrap(),
             fs::read(second.join("index.json")).unwrap()
         );
+        assert_eq!(
+            fs::read(first.join("SHA256SUMS")).unwrap(),
+            fs::read(second.join("SHA256SUMS")).unwrap()
+        );
         for pack in &first_index.packs {
             assert_eq!(
                 fs::read(first.join(&pack.manifest.path)).unwrap(),
@@ -1035,6 +1263,37 @@ mod tests {
             }
         }
         assert_eq!(verify_release_bundle(&first).unwrap(), first_index);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let installed = install_release_bundle(&first, &catalog).unwrap();
+        assert_eq!(installed.len(), 1);
+        let SemanticModelResolutionOutcome::Ready(active) = resolve_active_semantic_models(
+            &catalog,
+            &SemanticModelActivationRequest {
+                bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
+                evidence: vec![SemanticModelActivationEvidence {
+                    language: "scala".to_owned(),
+                    ecosystem: "maven".to_owned(),
+                    package: Some(CatalogCoordinate {
+                        name: "org.scala-lang:scala-library".to_owned(),
+                        version: Some(Version::parse("2.13.16").unwrap()),
+                    }),
+                    module: None,
+                    toolchain: Some(CatalogCoordinate {
+                        name: "scala".to_owned(),
+                        version: Some(Version::parse("2.13.16").unwrap()),
+                    }),
+                    target: Some("jvm".to_owned()),
+                    configuration: None,
+                    artifact_sha256: Some(first_index.packs[0].artifact.sha256.clone()),
+                }],
+                controls: Vec::new(),
+                limits: Default::default(),
+            },
+            &CancellationToken::default(),
+        ) else {
+            panic!("installed release pack must resolve through normal activation");
+        };
+        assert_eq!(active.types_named("scala.Any").records.len(), 1);
         fs::write(first.join("SHA256SUMS"), "invalid\n").unwrap();
         assert!(verify_release_bundle(&first).is_err());
     }

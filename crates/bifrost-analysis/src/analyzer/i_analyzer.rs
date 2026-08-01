@@ -502,6 +502,11 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn direct_children(&self, _code_unit: &CodeUnit) -> Vec<CodeUnit> {
         Vec::new()
     }
+    /// Return the declaration node's tree-sitter kind when structured syntax
+    /// for this exact code unit is available.
+    fn declaration_syntax_kind(&self, _code_unit: &CodeUnit) -> Option<&'static str> {
+        None
+    }
     /// Return the tree-sitter parse errors recorded for `file` during the
     /// most recent `analyze_file` pass. Returns `None` when the analyzer
     /// holds no state for this file (file outside the analyzer's language,

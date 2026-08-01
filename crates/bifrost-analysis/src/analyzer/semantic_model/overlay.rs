@@ -685,22 +685,33 @@ impl SemanticModelOverlay {
 }
 
 fn universal_root_name(symbol: &SemanticModelSymbol) -> Option<&'static str> {
-    if symbol.owner_id.is_some()
-        || !matches!(
-            symbol.kind,
-            SemanticModelSymbolKind::Class
-                | SemanticModelSymbolKind::Interface
-                | SemanticModelSymbolKind::Trait
-                | SemanticModelSymbolKind::Enum
-                | SemanticModelSymbolKind::Record
-                | SemanticModelSymbolKind::Module
-        )
-    {
+    if symbol.owner_id.is_some() {
         return None;
     }
     match symbol.language.as_str() {
-        "java" => Some("java.lang.Object"),
-        "scala" => Some("scala.Any"),
+        "java"
+            if matches!(
+                symbol.kind,
+                SemanticModelSymbolKind::Class
+                    | SemanticModelSymbolKind::Enum
+                    | SemanticModelSymbolKind::Record
+            ) =>
+        {
+            Some("java.lang.Object")
+        }
+        "scala"
+            if matches!(
+                symbol.kind,
+                SemanticModelSymbolKind::Class
+                    | SemanticModelSymbolKind::Interface
+                    | SemanticModelSymbolKind::Trait
+                    | SemanticModelSymbolKind::Enum
+                    | SemanticModelSymbolKind::Record
+                    | SemanticModelSymbolKind::Module
+            ) =>
+        {
+            Some("scala.Any")
+        }
         _ => None,
     }
 }
@@ -769,15 +780,7 @@ fn push_unique_posting(postings: &mut HashMap<String, Vec<usize>>, key: &str, in
 fn mark_symbol_identity_conflicts(symbols: &mut [SemanticModelSymbol]) {
     let mut identities: HashMap<String, Vec<usize>> = HashMap::default();
     for (index, symbol) in symbols.iter().enumerate() {
-        let mut keys = HashSet::from_iter([
-            format!("id:{}", symbol.id),
-            format!("name:{}", symbol.name),
-            format!("name:{}", symbol.qualified_name),
-        ]);
-        keys.extend(symbol.aliases.iter().map(|alias| format!("name:{alias}")));
-        for key in keys {
-            identities.entry(key).or_default().push(index);
-        }
+        identities.entry(symbol.id.clone()).or_default().push(index);
     }
     for posting in identities.values().filter(|posting| posting.len() > 1) {
         for &index in posting {

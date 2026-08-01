@@ -70,6 +70,16 @@ impl JdkSourceArchivePackProducer {
             Ok(artifact) => artifact,
             Err(diagnostic) => return ArtifactProduction::failed(diagnostic, limits),
         };
+        self.produce_loaded_artifact(request, limits, cancellation, &artifact)
+    }
+
+    pub fn produce_loaded_artifact(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+        artifact: &crate::analyzer::semantic_model::ExactArtifact,
+    ) -> ArtifactProduction {
         if zip_directory_status_with_limits(
             artifact.bytes(),
             MAX_JDK_ARCHIVE_ENTRIES,

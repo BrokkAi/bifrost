@@ -6,8 +6,8 @@ use crate::analyzer::jvm::dependency_discovery::{discover_build_tools, discover_
 use crate::analyzer::jvm::java_artifact::JavaJarPackProducer;
 use crate::analyzer::jvm::scala_artifact::ScalaSourceJarPackProducer;
 use crate::analyzer::semantic_model::{
-    ActivationSelector, ArtifactProducerLimits, ArtifactProductionRequest, AuthoredPayload,
-    AuthoredSemanticModelPack, CatalogCoordinate, Compatibility, Completeness,
+    ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
+    AuthoredPayload, AuthoredSemanticModelPack, CatalogCoordinate, Compatibility, Completeness,
     DependencyArtifactRole, DependencyDiscoveryOutcome, DependencyDiscoveryProfile,
     DependencyPackAdapter, DependencyPackDiagnostic, DependencyPackDiagnosticSeverity,
     DependencyPackLimits, DependencyPackProduction, DependencyProvenance, ExactDependencyArtifact,
@@ -228,7 +228,7 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
 
     fn producer(&self) -> Producer {
         Producer {
-            name: "bifrost-java-jar".to_owned(),
+            name: "bifrost-jvm-dependency".to_owned(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
         }
     }
@@ -240,7 +240,7 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
         limits: &ArtifactProducerLimits,
         cancellation: Option<&CancellationToken>,
     ) -> DependencyPackProduction {
-        let request = java_dependency_production_request(dependency);
+        let request = jvm_dependency_production_request(dependency);
         let mut diagnostics = Vec::new();
         let mut suppressed_diagnostics = 0usize;
         let mut source_pack = None;
@@ -250,12 +250,32 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
             let mut artifact_request = request.clone();
             artifact_request.path = artifact.path().to_owned();
             artifact_request.artifact_kind = artifact.kind();
-            let production = JavaJarPackProducer.produce_loaded_artifact(
-                &artifact_request,
-                limits,
-                cancellation,
-                artifact.exact(),
-            );
+            let production = match artifact.kind() {
+                ExternalArtifactKind::ScalaSourceJar => ScalaSourceJarPackProducer
+                    .produce_loaded_artifact(
+                        &artifact_request,
+                        limits,
+                        cancellation,
+                        artifact.exact(),
+                    ),
+                ExternalArtifactKind::JavaSourceJar | ExternalArtifactKind::JavaClassJar => {
+                    JavaJarPackProducer.produce_loaded_artifact(
+                        &artifact_request,
+                        limits,
+                        cancellation,
+                        artifact.exact(),
+                    )
+                }
+                kind => ArtifactProduction::failed(
+                    ProducerDiagnostic {
+                        severity: ProducerDiagnosticSeverity::Error,
+                        code: "artifact.kind".to_owned(),
+                        location: Some(artifact.path().to_string_lossy().into_owned()),
+                        message: format!("unsupported JVM dependency artifact kind {kind:?}"),
+                    },
+                    limits,
+                ),
+            };
             debug_assert_eq!(
                 production.artifact_sha256.as_deref(),
                 Some(artifact.sha256())
@@ -287,10 +307,11 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
             limits,
         );
         let mut pack = pack;
-        if let Some(pack) = pack.as_mut()
-            && (partial || !diagnostics.is_empty() || suppressed_diagnostics > 0)
-        {
-            pack.completeness = Completeness::Partial;
+        if let Some(pack) = pack.as_mut() {
+            pack.producer = self.producer();
+            if partial || !diagnostics.is_empty() || suppressed_diagnostics > 0 {
+                pack.completeness = Completeness::Partial;
+            }
         }
         DependencyPackProduction {
             pack,
@@ -301,6 +322,10 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
 }
 
 fn resolved_semantic_pack_dependency(artifact: ResolvedJvmArtifact) -> ResolvedDependency {
+    let scala_library = artifact
+        .coordinate
+        .as_ref()
+        .is_some_and(is_scala_library_coordinate);
     let coordinate_id = artifact.coordinate.as_ref().map(|coordinate| {
         format!(
             "{}:{}:{}",
@@ -349,11 +374,24 @@ fn resolved_semantic_pack_dependency(artifact: ResolvedJvmArtifact) -> ResolvedD
             },
         ]);
     }
+    let source_kind = if scala_library {
+        ExternalArtifactKind::ScalaSourceJar
+    } else {
+        ExternalArtifactKind::JavaSourceJar
+    };
     let artifacts = if is_source_jar(&artifact.artifact_path) {
         vec![ResolvedDependencyArtifact {
             role: DependencyArtifactRole::Sources,
-            kind: ExternalArtifactKind::JavaSourceJar,
+            kind: source_kind,
             path: artifact.artifact_path,
+        }]
+    } else if scala_library && artifact.source_artifact_path.is_some() {
+        vec![ResolvedDependencyArtifact {
+            role: DependencyArtifactRole::Sources,
+            kind: source_kind,
+            path: artifact
+                .source_artifact_path
+                .expect("source path was checked above"),
         }]
     } else {
         let mut artifacts = vec![ResolvedDependencyArtifact {
@@ -364,7 +402,7 @@ fn resolved_semantic_pack_dependency(artifact: ResolvedJvmArtifact) -> ResolvedD
         if let Some(source_artifact_path) = artifact.source_artifact_path {
             artifacts.push(ResolvedDependencyArtifact {
                 role: DependencyArtifactRole::Sources,
-                kind: ExternalArtifactKind::JavaSourceJar,
+                kind: source_kind,
                 path: source_artifact_path,
             });
         }
@@ -373,7 +411,7 @@ fn resolved_semantic_pack_dependency(artifact: ResolvedJvmArtifact) -> ResolvedD
     ResolvedDependency {
         id,
         evidence: SemanticModelActivationEvidence {
-            language: "java".to_owned(),
+            language: if scala_library { "scala" } else { "java" }.to_owned(),
             ecosystem: ecosystem.to_owned(),
             package,
             module: (artifact.origin == JvmDependencyOrigin::ExplicitPath).then(|| {
@@ -382,7 +420,13 @@ fn resolved_semantic_pack_dependency(artifact: ResolvedJvmArtifact) -> ResolvedD
                     version: None,
                 }
             }),
-            toolchain: None,
+            toolchain: scala_library.then(|| CatalogCoordinate {
+                name: "scala".to_owned(),
+                version: artifact
+                    .coordinate
+                    .as_ref()
+                    .and_then(|coordinate| Version::parse(&coordinate.version).ok()),
+            }),
             target: Some("jvm".to_owned()),
             configuration: None,
             artifact_sha256: None,
@@ -390,6 +434,14 @@ fn resolved_semantic_pack_dependency(artifact: ResolvedJvmArtifact) -> ResolvedD
         provenance,
         artifacts,
     }
+}
+
+fn is_scala_library_coordinate(coordinate: &JvmMavenCoordinate) -> bool {
+    coordinate.group_id == "org.scala-lang"
+        && matches!(
+            coordinate.artifact_id.as_str(),
+            "scala-library" | "scala3-library_3"
+        )
 }
 
 fn jvm_dependency_origin_name(origin: JvmDependencyOrigin) -> &'static str {
@@ -402,18 +454,31 @@ fn jvm_dependency_origin_name(origin: JvmDependencyOrigin) -> &'static str {
     }
 }
 
-fn java_dependency_production_request(
-    dependency: &ResolvedDependency,
-) -> ArtifactProductionRequest {
+fn jvm_dependency_production_request(dependency: &ResolvedDependency) -> ArtifactProductionRequest {
     ArtifactProductionRequest {
         path: PathBuf::new(),
         artifact_kind: ExternalArtifactKind::JavaClassJar,
-        pack_id: "bifrost.external.java".to_owned(),
+        pack_id: format!("bifrost.external.{}", dependency.evidence.language),
         pack_version: env!("CARGO_PKG_VERSION").to_owned(),
         ecosystem: dependency.evidence.ecosystem.clone(),
         compatibility: Compatibility {
             bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
-            toolchains: Vec::new(),
+            toolchains: dependency
+                .evidence
+                .toolchain
+                .as_ref()
+                .map(
+                    |coordinate| crate::analyzer::semantic_model::VersionConstraint {
+                        name: coordinate.name.clone(),
+                        requirement: coordinate
+                            .version
+                            .as_ref()
+                            .map(|version| format!("={version}"))
+                            .unwrap_or_else(|| "*".to_owned()),
+                    },
+                )
+                .into_iter()
+                .collect(),
         },
         activation: vec![ActivationSelector {
             package: dependency
@@ -438,7 +503,17 @@ fn java_dependency_production_request(
                         .as_ref()
                         .map(|version| format!("={version}")),
                 }),
-            toolchain: None,
+            toolchain: dependency
+                .evidence
+                .toolchain
+                .as_ref()
+                .map(|coordinate| NameSelector {
+                    name: coordinate.name.clone(),
+                    version: coordinate
+                        .version
+                        .as_ref()
+                        .map(|version| format!("={version}")),
+                }),
             targets: dependency.evidence.target.clone().into_iter().collect(),
             configurations: dependency
                 .evidence
@@ -1996,6 +2071,64 @@ mod tests {
             DependencyPackPreparationStatus::Reused
         );
         assert_eq!(first.packs[0].production, second.packs[0].production);
+    }
+
+    #[test]
+    fn scala_library_dependency_uses_source_pack_and_exact_toolchain_evidence() {
+        use crate::analyzer::semantic_model::{
+            CatalogOptions, DependencyPackLimits, DependencyPackPreparationStatus,
+            SemanticPackCatalog, prepare_dependency_semantic_packs,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let source_jar = temp.path().join("scala-library-2.13.16-sources.jar");
+        write_zip_entry(
+            &source_jar,
+            "scala/example/LibraryApi.scala",
+            b"package scala.example\ntrait LibraryApi { def value: String }\n",
+        );
+        let dependency = resolved_semantic_pack_dependency(ResolvedJvmArtifact {
+            artifact_path: temp.path().join("scala-library-2.13.16.jar"),
+            source_artifact_path: Some(source_jar),
+            coordinate: Some(JvmMavenCoordinate::new(
+                "org.scala-lang",
+                "scala-library",
+                "2.13.16",
+            )),
+            origin: JvmDependencyOrigin::MavenRepository,
+        });
+
+        assert_eq!(dependency.evidence.language, "scala");
+        assert_eq!(
+            dependency.evidence.toolchain,
+            Some(CatalogCoordinate {
+                name: "scala".to_owned(),
+                version: Some(Version::parse("2.13.16").unwrap()),
+            })
+        );
+        assert_eq!(dependency.artifacts.len(), 1);
+        assert_eq!(
+            dependency.artifacts[0].kind,
+            ExternalArtifactKind::ScalaSourceJar
+        );
+
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &[dependency],
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert!(prepared.complete, "{:#?}", prepared.diagnostics);
+        assert_eq!(prepared.profile.artifacts_read, 1);
+        assert_eq!(prepared.packs.len(), 1);
+        assert_eq!(
+            prepared.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+        assert_eq!(prepared.packs[0].evidence.language, "scala");
     }
 
     #[test]
