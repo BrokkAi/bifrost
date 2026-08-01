@@ -1,8 +1,8 @@
 use super::*;
 use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::js_ts::syntax::{
-    JsTsLexicalBindingIndex, direct_property_definitions, is_declaration_identifier,
-    is_explicit_object_literal_key, slice,
+    JsTsImportBinder, JsTsLexicalBindingIndex, MAX_STATIC_IMPORT_BINDINGS_PER_NAME,
+    direct_property_definitions, is_declaration_identifier, is_explicit_object_literal_key, slice,
 };
 use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::typescript::ts_is_global_internal_module;
@@ -206,51 +206,56 @@ pub(super) fn resolve_js_ts(
     }
 
     if let Some((qualifier, name)) = reference.split_once('.') {
-        if let Some(binding) = jsts_visible_import_binding(
+        let visible_bindings = jsts_all_visible_import_bindings(
             imports,
             &lexical_bindings,
             tree.root_node(),
             qualifier,
             site.focus_start_byte,
-        ) && matches!(
-            binding.kind,
-            ImportKind::Namespace | ImportKind::CommonJsRequire
+        );
+        let namespace_outcomes = visible_bindings
+            .iter()
+            .filter(|binding| {
+                matches!(
+                    binding.kind,
+                    ImportKind::Namespace | ImportKind::CommonJsRequire
+                )
+            })
+            .map(|binding| {
+                resolve_js_ts_module_binding(
+                    file,
+                    language,
+                    &binding.module_specifier,
+                    name,
+                    analyzer,
+                    support,
+                    Some(aliases),
+                    value_position,
+                )
+            })
+            .collect::<Vec<_>>();
+        if let Some(outcome) = merge_js_ts_binding_outcomes(
+            analyzer,
+            reference,
+            namespace_outcomes,
+            imports.was_truncated(qualifier),
         ) {
-            return resolve_js_ts_module_binding(
-                file,
-                language,
-                &binding.module_specifier,
-                name,
-                analyzer,
-                support,
-                Some(aliases),
-                value_position,
-            );
+            return outcome;
         }
-        let imported_receiver_binding = jsts_visible_import_binding(
-            imports,
-            &lexical_bindings,
-            tree.root_node(),
-            qualifier,
-            site.focus_start_byte,
-        )
-        .filter(|binding| matches!(binding.kind, ImportKind::Named | ImportKind::Default));
-        let receiver_candidates = if let Some(binding) = imported_receiver_binding {
-            let exported_name = match binding.kind {
-                ImportKind::Named => binding.imported_name.as_deref().unwrap_or(qualifier),
-                ImportKind::Default => "default",
-                _ => qualifier,
-            };
-            resolve_js_ts_module_binding_candidates(
+        let imported_receiver_binding =
+            !visible_bindings.is_empty() && imports.direct_bindings_for(qualifier).next().is_some();
+        let receiver_candidates = if imported_receiver_binding {
+            resolve_js_ts_direct_import_candidates(
                 analyzer,
                 support,
                 language,
                 file,
-                &binding.module_specifier,
-                exported_name,
+                imports,
+                qualifier,
                 Some(aliases),
                 value_position,
             )
+            .unwrap_or_default()
         } else {
             let mut same_file = support.file_identifier(file, qualifier);
             if value_position {
@@ -261,7 +266,7 @@ pub(super) fn resolve_js_ts(
             same_file
         };
         let generic_member_candidates =
-            if language == Language::JavaScript && imported_receiver_binding.is_some() {
+            if language == Language::JavaScript && imported_receiver_binding {
                 jsts_file_scoped_member_candidates(
                     analyzer,
                     support,
@@ -291,7 +296,7 @@ pub(super) fn resolve_js_ts(
             before_byte: site.range.start_byte,
         };
         if language == Language::JavaScript
-            && imported_receiver_binding.is_none()
+            && !imported_receiver_binding
             && let Some(local_candidates) = focused.and_then(|node| {
                 jsts_exact_local_dotted_candidates(
                     dotted_lookup,
@@ -309,9 +314,7 @@ pub(super) fn resolve_js_ts(
                 format!("`{reference}` did not resolve to an indexed JS/TS definition"),
             );
         }
-        if (imported_receiver_binding.is_some() || program_binding)
-            && !generic_member_candidates.is_empty()
-        {
+        if (imported_receiver_binding || program_binding) && !generic_member_candidates.is_empty() {
             return js_ts_candidates_outcome(analyzer, generic_member_candidates);
         }
         match jsts_receiver_provider_member_candidates(
@@ -328,7 +331,7 @@ pub(super) fn resolve_js_ts(
                     jsts_value_space_candidates(analyzer, candidates)
                 };
                 if language == Language::JavaScript
-                    && imported_receiver_binding.is_none()
+                    && !imported_receiver_binding
                     && let Some(local_candidates) = focused.and_then(|node| {
                         jsts_exact_local_dotted_candidates(
                             dotted_lookup,
@@ -452,30 +455,24 @@ pub(super) fn resolve_js_ts(
         );
     }
 
-    if let Some(binding) = jsts_visible_import_binding(
-        imports,
-        &lexical_bindings,
-        tree.root_node(),
+    if let Some(outcome) = resolve_js_ts_visible_module_bindings(
+        jsts_visible_import_bindings(
+            imports,
+            &lexical_bindings,
+            tree.root_node(),
+            reference,
+            site.focus_start_byte,
+        ),
+        imports.was_truncated(reference),
+        file,
+        language,
         reference,
-        site.focus_start_byte,
+        analyzer,
+        support,
+        Some(aliases),
+        value_position,
     ) {
-        let exported_name = match binding.kind {
-            ImportKind::Named => binding.imported_name.as_deref().unwrap_or(reference),
-            ImportKind::Default => "default",
-            ImportKind::Namespace | ImportKind::CommonJsRequire | ImportKind::Glob => reference,
-        };
-        if matches!(binding.kind, ImportKind::Named | ImportKind::Default) {
-            return resolve_js_ts_module_binding(
-                file,
-                language,
-                &binding.module_specifier,
-                exported_name,
-                analyzer,
-                support,
-                Some(aliases),
-                value_position,
-            );
-        }
+        return outcome;
     }
 
     let same_file_candidates = support.file_identifier(file, reference);
@@ -506,6 +503,115 @@ pub(super) fn resolve_js_ts(
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed JS/TS definition"),
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_js_ts_visible_module_bindings(
+    bindings: Vec<&crate::analyzer::usages::ImportBinding>,
+    bindings_truncated: bool,
+    file: &ProjectFile,
+    language: Language,
+    reference: &str,
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    aliases: Option<&AliasResolver>,
+    value_position: bool,
+) -> Option<DefinitionLookupOutcome> {
+    let outcomes = bindings
+        .into_iter()
+        .map(|binding| {
+            let exported_name = match binding.kind {
+                ImportKind::Named => binding.imported_name.as_deref().unwrap_or(reference),
+                ImportKind::Default => "default",
+                _ => unreachable!("bindings were filtered to direct module imports"),
+            };
+            resolve_js_ts_module_binding(
+                file,
+                language,
+                &binding.module_specifier,
+                exported_name,
+                analyzer,
+                support,
+                aliases,
+                value_position,
+            )
+        })
+        .collect::<Vec<_>>();
+    merge_js_ts_binding_outcomes(analyzer, reference, outcomes, bindings_truncated)
+}
+
+fn merge_js_ts_binding_outcomes(
+    analyzer: &dyn IAnalyzer,
+    reference: &str,
+    mut outcomes: Vec<DefinitionLookupOutcome>,
+    bindings_truncated: bool,
+) -> Option<DefinitionLookupOutcome> {
+    if outcomes.is_empty() {
+        return None;
+    }
+    if outcomes.len() == 1 && !bindings_truncated {
+        return outcomes.pop();
+    }
+
+    let mut definitions = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut crossed_external_boundary = false;
+    let mut unresolved_import = false;
+    for outcome in outcomes {
+        match outcome.status {
+            DefinitionLookupStatus::UnresolvableImportBoundary => crossed_external_boundary = true,
+            DefinitionLookupStatus::NoDefinition
+            | DefinitionLookupStatus::UnsupportedLanguage
+            | DefinitionLookupStatus::InvalidLocation
+            | DefinitionLookupStatus::NotFound => unresolved_import = true,
+            DefinitionLookupStatus::Resolved | DefinitionLookupStatus::Ambiguous => {}
+        }
+        definitions.extend(outcome.definitions);
+        diagnostics.extend(outcome.diagnostics);
+    }
+    let mut outcome = if definitions.is_empty() {
+        DefinitionLookupOutcome {
+            status: DefinitionLookupStatus::Ambiguous,
+            reference: None,
+            definitions,
+            lexical_definition: None,
+            diagnostics,
+        }
+    } else {
+        let mut outcome = js_ts_candidates_outcome(analyzer, definitions);
+        outcome.status = DefinitionLookupStatus::Ambiguous;
+        outcome.diagnostics.extend(diagnostics);
+        outcome
+    };
+    outcome.diagnostics.push(DefinitionLookupDiagnostic {
+        kind: "ambiguous_definition".to_string(),
+        message: format!("`{reference}` is supplied by multiple visible imports"),
+    });
+    if crossed_external_boundary {
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            kind: PARTIAL_IMPORT_BOUNDARY_DIAGNOSTIC.to_string(),
+            message: format!(
+                "at least one competing import for `{reference}` crosses the indexed workspace boundary"
+            ),
+        });
+    }
+    if unresolved_import {
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            kind: PARTIAL_IMPORT_UNRESOLVED_DIAGNOSTIC.to_string(),
+            message: format!(
+                "at least one competing import for `{reference}` could not be resolved"
+            ),
+        });
+    }
+    if bindings_truncated {
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            kind: IMPORT_BINDINGS_TRUNCATED_DIAGNOSTIC.to_string(),
+            message: format!(
+                "competing imports for `{reference}` exceeded the per-name limit of {MAX_STATIC_IMPORT_BINDINGS_PER_NAME}"
+            ),
+        });
+    }
+    Some(outcome)
 }
 
 fn jsts_candidate_is_bare_declaration(
@@ -592,7 +698,7 @@ fn ts_contextual_object_literal_key_candidates(
     source: &str,
     tree: &Tree,
     site: &ResolvedReferenceSite,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
 ) -> Vec<CodeUnit> {
     let Some(node) =
@@ -644,7 +750,7 @@ fn ts_contextual_object_literal_owners(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     object: Node<'_>,
 ) -> Vec<CodeUnit> {
@@ -810,6 +916,45 @@ pub(crate) fn resolve_js_ts_module_binding_candidates(
         }
     }
     candidates
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_js_ts_direct_import_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    language: Language,
+    file: &ProjectFile,
+    imports: &JsTsImportBinder,
+    name: &str,
+    aliases: Option<&AliasResolver>,
+    value_position: bool,
+) -> Option<Vec<CodeUnit>> {
+    let mut saw_direct_import = false;
+    let mut candidates = Vec::new();
+    for binding in imports.direct_bindings_for(name) {
+        saw_direct_import = true;
+        let exported_name = match binding.kind {
+            ImportKind::Named => binding.imported_name.as_deref().unwrap_or(name),
+            ImportKind::Default => "default",
+            _ => unreachable!("direct bindings contain only named/default imports"),
+        };
+        candidates.extend(resolve_js_ts_module_binding_candidates(
+            analyzer,
+            support,
+            language,
+            file,
+            &binding.module_specifier,
+            exported_name,
+            aliases,
+            value_position,
+        ));
+    }
+    if !saw_direct_import {
+        return None;
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    Some(candidates)
 }
 
 /// Resolve a dotted FQN within one exact declaration file. JS/TS FQNs omit module
@@ -1008,17 +1153,32 @@ fn jsts_exact_local_dotted_candidates(
     Some(candidates)
 }
 
-fn jsts_visible_import_binding<'a>(
-    imports: &'a ImportBinder,
+fn jsts_all_visible_import_bindings<'a>(
+    imports: &'a JsTsImportBinder,
     lexical_bindings: &JsTsLexicalBindingIndex,
     root: Node<'_>,
     name: &str,
     byte: usize,
-) -> Option<&'a crate::analyzer::usages::ImportBinding> {
-    let binding = imports.bindings.get(name)?;
-    lexical_bindings
-        .is_program_binding_at(name, byte, root)
-        .then_some(binding)
+) -> Vec<&'a crate::analyzer::usages::ImportBinding> {
+    if lexical_bindings.is_program_binding_at(name, byte, root) {
+        imports.bindings_for(name).collect()
+    } else {
+        Vec::new()
+    }
+}
+
+fn jsts_visible_import_bindings<'a>(
+    imports: &'a JsTsImportBinder,
+    lexical_bindings: &JsTsLexicalBindingIndex,
+    root: Node<'_>,
+    name: &str,
+    byte: usize,
+) -> Vec<&'a crate::analyzer::usages::ImportBinding> {
+    if lexical_bindings.is_program_binding_at(name, byte, root) {
+        imports.direct_bindings_for(name).collect()
+    } else {
+        Vec::new()
+    }
 }
 
 fn jsts_focused_reference_receiver_property<'tree>(
@@ -1882,7 +2042,7 @@ fn ts_call_preserves_argument_shape(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     call: Node<'_>,
     argument_index: usize,
@@ -2023,7 +2183,7 @@ fn ts_local_receiver_owner_candidates(
     source: &str,
     tree: &Tree,
     site: &ResolvedReferenceSite,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     receiver: &str,
 ) -> Vec<CodeUnit> {
@@ -2047,7 +2207,7 @@ pub(crate) fn ts_receiver_owner_candidates_at_byte(
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     receiver: &str,
     byte: usize,
@@ -2073,7 +2233,7 @@ fn ts_receiver_owner_candidates_at_byte_with_resolution(
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     receiver: &str,
     byte: usize,
@@ -2158,7 +2318,7 @@ fn ts_receiver_owners_from_parameters(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     scope: Node<'_>,
     receiver: &str,
@@ -2229,7 +2389,7 @@ fn ts_receiver_owners_from_contextual_callback(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     scope: Node<'_>,
     receiver: &str,
@@ -2442,7 +2602,7 @@ fn ts_receiver_owners_from_local_bindings(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     scope: Node<'_>,
     receiver: &str,
@@ -2478,7 +2638,7 @@ fn ts_collect_receiver_owners_from_bindings(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     node: Node<'_>,
     root_id: usize,
@@ -2579,7 +2739,7 @@ fn ts_expression_property_owners(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     expression: Node<'_>,
     depth: usize,
@@ -2689,7 +2849,7 @@ fn jsts_local_new_receiver_owner_candidates(
     language: Language,
     source: &str,
     root: Node<'_>,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     receiver: &str,
     before_byte: usize,
@@ -2729,7 +2889,7 @@ fn jsts_collect_local_new_receiver_owner_candidates(
     source: &str,
     node: Node<'_>,
     root_id: usize,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     receiver: &str,
     before_byte: usize,
@@ -2822,7 +2982,7 @@ fn jsts_local_receiver_value_owner_candidates(
     language: Language,
     source: &str,
     root: Node<'_>,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     value: Node<'_>,
     _before_byte: usize,
@@ -2888,7 +3048,7 @@ fn jsts_call_expression_callees(
     file: &ProjectFile,
     language: Language,
     source: &str,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     function: Node<'_>,
 ) -> Vec<CodeUnit> {
@@ -2914,7 +3074,7 @@ fn jsts_constructor_owner_candidates(
     file: &ProjectFile,
     language: Language,
     source: &str,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     constructor: Node<'_>,
     value_position: bool,
@@ -2922,29 +3082,23 @@ fn jsts_constructor_owner_candidates(
     let Some(name) = jsts_constructor_name(constructor, source) else {
         return Vec::new();
     };
-    let mut candidates = if let Some(binding) = imports.bindings.get(name) {
-        let exported_name = match binding.kind {
-            ImportKind::Named => binding.imported_name.as_deref().unwrap_or(name),
-            ImportKind::Default => "default",
-            ImportKind::Namespace | ImportKind::CommonJsRequire | ImportKind::Glob => name,
-        };
-        if matches!(binding.kind, ImportKind::Named | ImportKind::Default) {
-            resolve_js_ts_module_binding_candidates(
-                analyzer,
-                support,
-                language,
-                file,
-                &binding.module_specifier,
-                exported_name,
-                Some(aliases),
-                value_position,
-            )
-        } else {
+    let mut candidates = resolve_js_ts_direct_import_candidates(
+        analyzer,
+        support,
+        language,
+        file,
+        imports,
+        name,
+        Some(aliases),
+        value_position,
+    )
+    .unwrap_or_else(|| {
+        if imports.binding(name).is_some() {
             Vec::new()
+        } else {
+            support.file_identifier(file, name)
         }
-    } else {
-        support.file_identifier(file, name)
-    };
+    });
     candidates.retain(|unit| unit.is_class());
     sort_units(&mut candidates);
     candidates.dedup();
@@ -2967,7 +3121,7 @@ fn ts_call_expression_callees(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     function: Node<'_>,
     depth: usize,
@@ -2990,7 +3144,7 @@ fn ts_call_expression_callees(
             .get(object.start_byte()..object.end_byte())
             .map(str::trim)
             .filter(|namespace| !namespace.is_empty())
-            && let Some(binding) = imports.bindings.get(namespace)
+            && let Some(binding) = imports.binding(namespace)
             && matches!(
                 binding.kind,
                 ImportKind::Namespace | ImportKind::CommonJsRequire
@@ -3040,7 +3194,7 @@ fn ts_expression_receiver_owners(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     expression: Node<'_>,
     depth: usize,
@@ -3097,7 +3251,7 @@ fn ts_identifier_candidates(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     name: &str,
     value_position: bool,
@@ -3122,34 +3276,28 @@ fn jsts_identifier_candidates(
     language: Language,
     file: &ProjectFile,
     _source: &str,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     name: &str,
     value_position: bool,
 ) -> Vec<CodeUnit> {
-    let mut candidates = if let Some(binding) = imports.bindings.get(name) {
-        let exported_name = match binding.kind {
-            ImportKind::Named => binding.imported_name.as_deref().unwrap_or(name),
-            ImportKind::Default => "default",
-            ImportKind::Namespace | ImportKind::CommonJsRequire | ImportKind::Glob => name,
-        };
-        if matches!(binding.kind, ImportKind::Named | ImportKind::Default) {
-            resolve_js_ts_module_binding_candidates(
-                analyzer,
-                support,
-                language,
-                file,
-                &binding.module_specifier,
-                exported_name,
-                Some(aliases),
-                value_position,
-            )
-        } else {
+    let mut candidates = resolve_js_ts_direct_import_candidates(
+        analyzer,
+        support,
+        language,
+        file,
+        imports,
+        name,
+        Some(aliases),
+        value_position,
+    )
+    .unwrap_or_else(|| {
+        if imports.binding(name).is_some() {
             Vec::new()
+        } else {
+            support.file_identifier(file, name)
         }
-    } else {
-        support.file_identifier(file, name)
-    };
+    });
     if value_position {
         candidates = jsts_value_space_candidates(analyzer, candidates);
     } else {
@@ -3164,7 +3312,7 @@ pub(crate) fn ts_resolve_type_text_to_property_owners(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     type_text: &str,
     depth: usize,
@@ -3497,7 +3645,7 @@ fn ts_collect_return_property_owners(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     node: Node<'_>,
     root_id: usize,
@@ -3554,7 +3702,7 @@ fn ts_field_signature_type_owners(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
-    imports: &ImportBinder,
+    imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     field: &CodeUnit,
     depth: usize,

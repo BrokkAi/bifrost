@@ -234,13 +234,15 @@ impl ValueFlowQueryState {
         let semantic_status = analysis_semantic_status(&analysis);
         let completion = public_completion(semantic_status, &analysis.result);
         let solver_termination = public_termination(analysis.result.result().termination());
-        let ambiguous = matches!(
-            analysis.plan.discovery_status(),
-            SemanticInputStatus::Ambiguous
-        ) || matches!(
-            analysis.result.result().coverage().semantic_status(),
-            SemanticInputStatus::Ambiguous
-        );
+        let ambiguous = analysis.plan.has_ambiguous_dispatch()
+            || matches!(
+                analysis.plan.discovery_status(),
+                SemanticInputStatus::Ambiguous
+            )
+            || matches!(
+                analysis.result.result().coverage().semantic_status(),
+                SemanticInputStatus::Ambiguous
+            );
         let mut meetings_by_sink = HashMap::default();
         for meeting in analysis.result.meetings() {
             meetings_by_sink
