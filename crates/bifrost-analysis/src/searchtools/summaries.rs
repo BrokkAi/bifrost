@@ -453,6 +453,7 @@ fn summarize_symbol_targets_with_cancellation(
     targets: Vec<String>,
     cancellation: Option<&crate::CancellationToken>,
 ) -> SummaryResult {
+    let _scope = profiling::scope("searchtools::summarize_symbol_targets");
     let mut summaries = Vec::new();
     let mut not_found = Vec::new();
     let mut ambiguous = Vec::new();
@@ -461,6 +462,7 @@ fn summarize_symbol_targets_with_cancellation(
         if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
             break;
         }
+        let _target_scope = profiling::scope(format!("summarize_symbol_target[{target}]"));
         if looks_like_explicit_source_file_target(&target) {
             match resolve_selectable_definitions(analyzer, &target, exact_codeunit_resolution) {
                 SelectableDefinitionResolution::Resolved(code_units) => {

@@ -570,6 +570,26 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String>;
     fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String>;
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit>;
+    /// `search_definitions` for one language's non-literal `pattern` whose
+    /// every match is nevertheless guaranteed by the caller to contain
+    /// `required_literal` as a substring. Persisted stores use the literal as
+    /// a substring prefilter instead of regex-scanning the whole declaration
+    /// index, and multi-language workspaces route to `language`'s delegate
+    /// alone instead of fanning the query out to every delegate -- the
+    /// generated suffix patterns of symbol lookup are built per language and
+    /// always require their terminal segment verbatim, and the combination of
+    /// a whole-index regex scan fanned out per language pair made
+    /// unresolvable symbol targets take seconds (#1430, #1419).
+    /// Implementations that cannot exploit the hints fall back to a plain
+    /// `search_definitions`; callers must still filter candidates by language.
+    fn search_definitions_with_literal(
+        &self,
+        pattern: &str,
+        _required_literal: &str,
+        _language: Language,
+    ) -> BTreeSet<CodeUnit> {
+        self.search_definitions(pattern, false)
+    }
     /// Candidate declarations whose persisted short names match a qualified
     /// lookup input. Implementations return an empty set when they cannot
     /// answer this cheaply; callers retain their broader lookup path then.

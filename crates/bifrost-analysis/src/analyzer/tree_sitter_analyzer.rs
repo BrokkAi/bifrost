@@ -5741,6 +5741,15 @@ where
         pattern: &str,
         auto_quote: bool,
     ) -> Option<BTreeSet<CodeUnit>> {
+        self.sql_search_definitions_with_literal(pattern, auto_quote, None)
+    }
+
+    fn sql_search_definitions_with_literal(
+        &self,
+        pattern: &str,
+        auto_quote: bool,
+        required_literal: Option<&str>,
+    ) -> Option<BTreeSet<CodeUnit>> {
         if pattern.is_empty() {
             return Some(BTreeSet::new());
         }
@@ -5759,10 +5768,23 @@ where
             .build()
             .ok()?;
         let storage_languages = self.storage_language_keys_for_queries();
+        // A bare-literal pattern is its own substring prefilter; otherwise a
+        // caller-supplied required literal serves the same role for patterns
+        // the caller proves always contain it (regex filtering below stays
+        // authoritative either way).
+        let substring_prefilter = literal_ascii_search_substring(&pattern)
+            .or_else(|| required_literal.and_then(literal_ascii_search_substring));
+        let _scope = crate::profiling::scope(format!(
+            "sql_search_definitions[{pattern}][substring_prefilter={}]",
+            substring_prefilter.is_some()
+                && self
+                    .adapter
+                    .persisted_content_qualifier_supports_substring_search()
+        ));
         let rows = if self
             .adapter
             .persisted_content_qualifier_supports_substring_search()
-            && literal_ascii_search_substring(&pattern).is_some()
+            && let Some(substring) = substring_prefilter
         {
             self.store_query_or_record(
                 self.store_context
@@ -5770,7 +5792,7 @@ where
                     .declaration_candidate_rows_by_literal_substring_for_langs(
                         &storage_languages,
                         self.store_context.generations.as_ref(),
-                        &pattern,
+                        substring,
                     ),
                 format!("searching definitions for `{pattern}`"),
             )?
@@ -7443,6 +7465,16 @@ where
 
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
         self.sql_search_definitions(pattern, auto_quote)
+            .unwrap_or_default()
+    }
+
+    fn search_definitions_with_literal(
+        &self,
+        pattern: &str,
+        required_literal: &str,
+        _language: Language,
+    ) -> BTreeSet<CodeUnit> {
+        self.sql_search_definitions_with_literal(pattern, false, Some(required_literal))
             .unwrap_or_default()
     }
 
