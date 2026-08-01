@@ -32,6 +32,10 @@ reranker.
 - Execution: official task images through brokkbench direct-Podman sandboxes, with generation and
   inline scoring in the same container. Held-out patch conflicts use the versioned pristine
   fallback scorer.
+- Repository history: this campaign uniformly replaces Git history with one tree-identical root
+  commit. A subsequently implemented default preserves only task-head-reachable ancestry, with
+  `--without-history` retaining this campaign's protocol, but that code was not loaded into the
+  running campaign.
 - Concurrency: 30 cells throughout the baseline and Granite campaigns.
 - Indexes: one live SQLite database per upstream repository and model, shared across task
   revisions, arms, and seeds. Granite inference and index construction run on the local A4000.

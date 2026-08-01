@@ -248,6 +248,16 @@ The observable outcomes are:
   Ruff and all 33 cimeval tests pass. The regenerated outcome-blind leak audit inspected 804
   frozen cells and reported zero unmitigated findings; all observed history/network attempts
   were neutralized by synthetic-root history or the offline shell namespace.
+- [x] (2026-08-01, explicit history protocol) Brokkbench `a50ed197f07` adds a fail-closed
+  sanitizer for subsequent campaigns that retains the original task-head commit and exactly its
+  reachable ancestors while deleting every other ref, reflog, remote, and object. Official
+  Transformers and Pro Flipt image smokes verified exact object closure in 5.8 and 12.1 seconds;
+  Flipt lost 15,533 non-task-head objects and 236 extra refs. Brokkbench `401cb407962` makes this
+  the safe default and adds `cimeval run --without-history` for the prior tree-identical
+  synthetic-root protocol. Each result freezes its history mode and resume rejects a mismatch.
+  All 39 cimeval tests and Ruff pass. The active controller loaded the prior implementation, so
+  the current baseline and Granite cells remain uniformly no-history; this campaign will finish
+  before any task-head-history comparison is started.
 - [x] (2026-07-31, implementation) Brokkbench `64a2da6131f` extends the existing
   multi-arm scheduler with `--seeds`, so the full 91-task by three-arm by three-seed Granite
   matrix can enter one 819-cell queue. A single 30-worker pool now remains occupied through
@@ -597,6 +607,16 @@ The observable outcomes are:
   Rationale: this preserves arbitrary local build/test commands and Bedrock access without
   relying on command-text filters, while physically removing all three observed leak paths.
   Date/Author: 2026-07-31, Codex.
+
+- Decision: finish r8 under its uniformly loaded synthetic-root/no-history protocol, expose
+  only task-head-reachable ancestry by default in subsequent campaigns, and retain an explicit
+  `--without-history` mode for controlled comparisons.
+  Rationale: no history is a defensible and internally consistent current control, while
+  changing a live controller would mix agent capabilities. Future runs should retain legitimate
+  pre-task `log` and `blame` information but must physically exclude post-head solution objects;
+  an official Pro image contained 237 refs and 15,533 objects outside the task-head closure, so
+  a plain checkout is not an adequate leak boundary.
+  Date/Author: 2026-08-01, user and Codex.
 
 - Decision: r1 is an invalid diagnostic run, r2 is an unused preflight attempt, and r3/r4 are
   invalid task-environment runs. The first reportable campaign identity is now
