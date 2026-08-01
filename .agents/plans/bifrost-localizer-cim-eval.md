@@ -241,6 +241,13 @@ The observable outcomes are:
   all 32 cimeval tests, formatting, and Ruff pass. The running controller is not restarted;
   after all generation cells freeze, a controlled-concurrency explicit rescore will recover
   every failed verifier without changing agent patches or the immutable semantic runtime.
+- [x] (2026-08-01, report denominator repair) A provisional comparison exposed that the report
+  treated `scorer_failed` as an unresolved model outcome. Brokkbench `4c7e9d89800` now keeps
+  those cells in completed-generation and trajectory/cost accounting but excludes them from
+  scored/resolved denominators and paired resolve tests until a valid fallback score exists.
+  Ruff and all 33 cimeval tests pass. The regenerated outcome-blind leak audit inspected 804
+  frozen cells and reported zero unmitigated findings; all observed history/network attempts
+  were neutralized by synthetic-root history or the offline shell namespace.
 - [x] (2026-07-31, implementation) Brokkbench `64a2da6131f` extends the existing
   multi-arm scheduler with `--seeds`, so the full 91-task by three-arm by three-seed Granite
   matrix can enter one 819-cell queue. A single 30-worker pool now remains occupied through
