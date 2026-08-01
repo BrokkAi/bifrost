@@ -4,7 +4,8 @@ use std::sync::Arc;
 use brokk_bifrost::analyzer::dataflow::{SemanticInputStatus, SolverBudgetDimension, SolverWork};
 use brokk_bifrost::analyzer::semantic::{
     CancellationToken, EvidenceCompleteness, OracleCallContext, ProcedureHandle, ProcedureKind,
-    ProofStatus, SemanticBudget, SemanticRequest, ValueFlowOracle, ValueFlowRelationKind,
+    ProofStatus, SemanticBudget, SemanticCapability, SemanticRequest, ValueFlowOracle,
+    ValueFlowRelationKind,
 };
 use brokk_bifrost::analyzer::structural::{
     CodeQuery, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, ProtocolRegistrationSet,
@@ -1773,15 +1774,27 @@ fn typescript_exact_indices_preserve_distinct_public_location_symbols() {
 }
 
 #[test]
-#[ignore = "readiness probe for #1407: Java flattens nested field access paths"]
 fn java_over_bound_access_path_preserves_public_summary_negative() {
-    with_java_over_bound_field_flow(assert_shared_helper_scenario);
+    with_java_over_bound_field_flow(|case| {
+        assert_shared_helper_scenario_with_status(
+            case,
+            SemanticInputStatus::Unsupported {
+                capability: SemanticCapability::ExceptionalControlFlow,
+            },
+        );
+    });
 }
 
 #[test]
-#[ignore = "readiness probe for #1407: TypeScript flattens nested field access paths"]
 fn typescript_over_bound_access_path_preserves_public_summary_negative() {
-    with_typescript_over_bound_field_flow(assert_shared_helper_scenario);
+    with_typescript_over_bound_field_flow(|case| {
+        assert_shared_helper_scenario_with_status(
+            case,
+            SemanticInputStatus::Unsupported {
+                capability: SemanticCapability::ExceptionalControlFlow,
+            },
+        );
+    });
 }
 
 #[test]
@@ -1815,12 +1828,39 @@ fn typescript_ambiguous_call_preserves_public_inconclusive_negative() {
 }
 
 fn assert_shared_helper_scenario(case: &ValueFlowConformanceCase<'_>) {
-    assert_shared_helper_scenario_with_seed_kind(case, shared_scenario_seed_kind(case));
+    assert_shared_helper_scenario_with_seed_kind_and_status(
+        case,
+        shared_scenario_seed_kind(case),
+        case.expected_discovery_status,
+    );
+}
+
+fn assert_shared_helper_scenario_with_status(
+    case: &ValueFlowConformanceCase<'_>,
+    expected_public_status: SemanticInputStatus,
+) {
+    assert_shared_helper_scenario_with_seed_kind_and_status(
+        case,
+        shared_scenario_seed_kind(case),
+        expected_public_status,
+    );
 }
 
 fn assert_shared_helper_scenario_with_seed_kind(
     case: &ValueFlowConformanceCase<'_>,
     seed_kind: &str,
+) {
+    assert_shared_helper_scenario_with_seed_kind_and_status(
+        case,
+        seed_kind,
+        case.expected_discovery_status,
+    );
+}
+
+fn assert_shared_helper_scenario_with_seed_kind_and_status(
+    case: &ValueFlowConformanceCase<'_>,
+    seed_kind: &str,
+    expected_public_status: SemanticInputStatus,
 ) {
     let resolved = resolve_value_flow_conformance_case(case);
     assert_resolved_value_flow_conformance(case, &resolved);
@@ -1870,7 +1910,7 @@ fn assert_shared_helper_scenario_with_seed_kind(
         "{} RQL and JSON endpoint responses",
         case.name
     );
-    assert_public_sink_outcomes(case, &resolved, &endpoints);
+    assert_public_sink_outcomes(case, &resolved, &endpoints, expected_public_status);
 
     let witnesses = execute_workspace_request_with_analysis_registration_lease(
         &resolved.analyzer,
@@ -2039,6 +2079,7 @@ fn assert_public_sink_outcomes(
     case: &ValueFlowConformanceCase<'_>,
     resolved: &ResolvedValueFlowConformanceCase,
     response: &serde_json::Value,
+    expected_public_status: SemanticInputStatus,
 ) {
     let rows = response["results"].as_array().unwrap();
     assert_eq!(
@@ -2132,14 +2173,14 @@ fn assert_public_sink_outcomes(
             );
             assert_eq!(
                 row["semantic_status"],
-                case.expected_discovery_status.label(),
+                expected_public_status.label(),
                 "{} {} semantic status",
                 case.name,
                 sink.alias
             );
             assert_eq!(
                 row["completion"],
-                expected_public_completion(case),
+                expected_public_completion(case, expected_public_status),
                 "{} {} completion",
                 case.name,
                 sink.alias
@@ -2251,11 +2292,14 @@ fn assert_public_sink_outcomes(
     }
 }
 
-fn expected_public_completion(case: &ValueFlowConformanceCase<'_>) -> &'static str {
-    if case.expected_result_complete && case.expected_discovery_status.is_complete() {
+fn expected_public_completion(
+    case: &ValueFlowConformanceCase<'_>,
+    expected_public_status: SemanticInputStatus,
+) -> &'static str {
+    if case.expected_result_complete && expected_public_status.is_complete() {
         return "complete";
     }
-    match case.expected_discovery_status {
+    match expected_public_status {
         SemanticInputStatus::Cancelled => "cancelled",
         SemanticInputStatus::ExceededBudget { .. } => "budget_exhausted",
         SemanticInputStatus::Unsupported { .. } => "unsupported",
