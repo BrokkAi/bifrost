@@ -34,9 +34,12 @@ authorizes the remaining dw10 retrieval recipes.
 - [x] (2026-08-01) Generated and froze all 91 direct-provider DSV4 Flash query records: 104
   queries total, including 53 empty task lists; manifest SHA-256
   `48b30dbce1e6f285689ff27662fcc17791450a12ae5a363447d7e44cc755aefd`.
-- [ ] (2026-08-01) Fix and validate the cross-language summary projection panic discovered by the
-  first real smoke; the focused ownership regression passes and runtime rebuild remains.
-- [ ] Build immutable runtime artifacts and pass one real nonempty-query smoke cell.
+- [x] (2026-08-01) Fixed the cross-language summary projection panic, added the ownership
+  regression, and rebuilt Bifrost at `c9dec2d6`.
+- [x] (2026-08-01) Built immutable runtime v3 and passed the real nonempty-query Apache Dubbo
+  smoke through synthetic retrieval, max-reasoning Bedrock Luna, artifact validation, and inline
+  official scoring.
+- [ ] Pull all 91 pinned official images into `/mnt/containers` before launching the queue.
 - [ ] Run, score, localize, and audit the 91-cell dw10 seed-0 gate at concurrency 30.
 - [ ] Apply the statistical decision tree, update this retrospective, and commit the result.
 
@@ -74,6 +77,12 @@ authorizes the remaining dw10 retrieval recipes.
   six measurement tests were ignored.
   Evidence: `cargo test -p brokk-bifrost-analysis --lib` on 2026-08-01; the sole failure explicitly
   says `Java producer parity tests require javac and jar`.
+- Observation: The corrected Apache Dubbo smoke executed all three generated searches at k=20 as
+  one synthetic batch before Luna's first request, completed normally, and was scored inline. It
+  did not resolve the task. Luna used 556 tool executions and the whole cell took 1,099 seconds,
+  including 170 seconds of scoring, so campaign tails may be long even with the 30-job scheduler.
+  Evidence: completed cell `apache__dubbo-8414--semantic-coedit-2-1--seed-0` in the seed-0 run;
+  runtime v3 and query identities passed cimeval's completion validation.
 
 ## Decision Log
 
@@ -227,9 +236,10 @@ The seed-0 run is
 `/mnt/optane/bifrost-nlp-resources/runs/dw10-cim-synthetic-20260801-r1`. Its frozen query manifest
 is `querygen/manifest.json`; the count distribution is 0:53, 1:3, 2:12, 3:18, 4:3, 5:1, and 6:1.
 The dw10 embedding sidecar is `cimeval-dw10-synthetic-r1-sidecar.service`, bound to the local A4000
-on port 18765. Runtime v2 records Anvil `e8fdbe3`, Bifrost `22995539`, brokkbench `75bd146`, and
-Mjolnir `26a3084`; it is superseded for execution by the pending runtime containing the analyzer
-ownership fix.
+on port 18765. Runtime v3 is `runtime/runtime-v3.tgz`, SHA-256
+`85f9d5ed6ed7952b3c9552c48ef9d19c5e918fc0c42f2b4bf91ba1646bd94145`, and records Anvil
+`e8fdbe3`, Bifrost `c9dec2d6`, brokkbench `75bd146`, and Mjolnir `26a3084`. Its Bifrost binary
+SHA-256 is `425e963682acef41c5f4fc226958506a25e22b40e961cc67cfcd04f9dc1da915`.
 
 ## Interfaces and Dependencies
 
@@ -253,3 +263,7 @@ cross-provider failover.
 Revision note, 2026-08-01: Recorded the frozen query corpus and the real-smoke analyzer panic. The
 fix extends the existing foreign-file ownership rule to summary projections rather than weakening
 generation-map invariants for files the adapter owns.
+
+Revision note, 2026-08-01: Recorded the corrected runtime v3 and successful end-to-end smoke. The
+smoke's unresolved official score is retained as a valid experimental observation, not retried or
+hand-selected; the smoke criterion was infrastructure and treatment integrity.
