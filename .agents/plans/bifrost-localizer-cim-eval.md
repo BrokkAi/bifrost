@@ -894,7 +894,7 @@ existing sandbox/agenteval targeted tests demonstrate no default behavior change
 ### Milestone 6: prewarm Granite while baseline seed 0 runs
 
 Lock the delivery to one provider before reportable cells. Try
-`bedrock::openai.gpt-5.6-luna` with medium main-agent reasoning. Run ten sequential
+`bedrock::openai.gpt-5.6-luna` with maximum main-agent reasoning. Run ten sequential
 structured/tool calls and the two benchmark-family no-semantic smoke. If any call has an
 unrecovered transport/stream/protocol error, select
 `openrouter::openai/gpt-5.6-luna` instead and repeat preflight. Use the same provider for the
