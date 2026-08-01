@@ -141,6 +141,10 @@ test("promotion evidence covers validation before every external publisher", () 
     jobBlock(release, "publish-crate-runtime"),
     /^    needs: \[release-context, publish-crate-analysis\]$/mu,
   );
+  assert.match(
+    jobBlock(release, "publish-crate-semantic-packs"),
+    /^    needs: \[release-context, publish-crate-analysis\]$/mu,
+  );
   for (const host of ["mcp", "lsp"]) {
     assert.match(
       jobBlock(release, `publish-crate-${host}`),
@@ -149,7 +153,7 @@ test("promotion evidence covers validation before every external publisher", () 
   }
   assert.match(
     jobBlock(release, "publish-crate-facade"),
-    /^    needs: \[release-context, publish-crate-mcp, publish-crate-lsp\]$/mu,
+    /^    needs: \[release-context, publish-crate-mcp, publish-crate-lsp, publish-crate-semantic-packs\]$/mu,
   );
   assert.match(cratePublisher, /^      package:/mu);
 });

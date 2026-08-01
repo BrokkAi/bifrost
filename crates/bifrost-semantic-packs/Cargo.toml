@@ -1,0 +1,15 @@
+[package]
+name = "brokk-bifrost-semantic-packs"
+version.workspace = true
+edition.workspace = true
+description = "Optional prebuilt semantic-pack distribution for brokk-bifrost"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+
+[lib]
+name = "brokk_bifrost_semantic_packs"
+
+[dependencies]
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.18" }
