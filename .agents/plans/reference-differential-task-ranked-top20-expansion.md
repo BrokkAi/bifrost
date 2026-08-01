@@ -118,8 +118,11 @@ the focus.
     isolated C# tests whose wall-clock budgets failed only under extreme
     unrelated host load pass. Focused featureless Clippy passes with warnings
     denied, and final read-only review found no correctness, lifecycle, or
-    concurrency defect. Commit, pushed-head replay, merge, and closure remain;
-    do not start rank sixteen first.
+    concurrency defect. Commit `e087290f` has an exact clean replay at
+    `bifrost_dirty=false`: 258/258 files, 651,656 candidates, 10,000 sites,
+    697/697 targets, zero missing, and zero actionable findings in 114.5
+    seconds. Merge to `origin/master` and closure remain; do not start rank
+    sixteen first.
 - [ ] Complete C++ ranks eleven through twenty and publish its evidence and
   user summary.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
@@ -234,6 +237,16 @@ the focus.
   repository-depth-first gate uses those isolated green reruns plus the broad
   run's otherwise-green evidence instead of repeatedly competing with the same
   host saturation.
+
+- Observation: the exact committed-head Unicorn replay completed cleanly at
+  Bifrost `e087290f89ffb619033331ed2e3347cafbc43f2d` with
+  `bifrost_dirty=false` and repository head
+  `7c5db94191defc1e04a4f66f4eb1220903cba837`. It audited 258/258 files,
+  651,656 structured candidates, 10,000 sampled sites, and 697/697 inverse
+  targets with zero missing classifications and zero actionable findings in
+  114.5 seconds. The JSONL and log SHA-256 values are
+  `a866b742e4c94af8f0d324a675625b6dd95364eb1814cb79501383ab09cae8d7`
+  and `8870a3eb9d03bca2e5f060ee316bf885578668c783a57d429c2e29c2c75363f1`.
 
 ## Decision Log
 
