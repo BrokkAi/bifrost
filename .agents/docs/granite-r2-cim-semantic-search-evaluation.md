@@ -90,7 +90,46 @@ with task duration and therefore not outcome-blind.
 
 ## Change inventory
 
-To be finalized with exact commits and validation evidence after the campaign. The implementation
-spans Bifrost model/index/retrieval behavior, Anvil overfetch and reranking, Mjolnir provider and
-effort routing, and brokkbench sandbox, scoring, provenance, audit, localization, scheduling, and
-reporting infrastructure.
+The outcome-independent implementation is committed. Final validation evidence and any
+outcome-driven reporting commits will be added after the campaign.
+
+### Bifrost
+
+- `23af0cfa`: model-profile abstraction and Granite R2 sidecar contract, including dynamic
+  embedding width, CLS pooling, prefixes, parent composition, fingerprints, and retrieval-arm
+  budgets.
+- `501f21e6`: observable index-materialization progress for campaign monitoring.
+- `e36d4e6e`: core-parallel extraction with deterministic result ordering.
+- `bac89d82`: separate fingerprinted dw10 profile with its checkpoint's parent alpha.
+- `71e8ac64`: retrieval and embedding queue/service timing telemetry.
+- `fcaf3a78`: wait for initial semantic-index readiness without removing the bounded stale-index
+  fallback used during later rebuilds.
+
+### Anvil
+
+- `e002ba4`: document `k<=20` as the final result ceiling, overfetch Bifrost by `m=2`, provide
+  equal nominal candidate opportunity across the three profiles, and let the reranker return
+  fewer than `k` without refilling.
+- `71c6346`: bounded evaluation turns through the environment.
+- `b385af1`: physical network isolation for shell children in offline evaluation mode.
+- `3885f50`: advertise and forward Bedrock GPT maximum reasoning effort.
+- `709f227`: freeze Bifrost retrieval timing diagnostics in the reranker trace.
+- `c4483eb`: bounded RRF-order context batches and support for compact degraded file outlines.
+
+### Mjolnir
+
+- `3e046fc`: route an explicit provider-qualified model through an available Anvil server even
+  when it is absent from the discovery snapshot.
+- `f7ba210`: parse and preserve the `+max` per-seat reasoning override.
+- `26a3084`: seed the selected Anvil process with its exact model and reasoning effort before
+  optional catalog discovery.
+
+### brokkbench and sandbox infrastructure
+
+The cimeval harness begins at `e05760f759f` and is refined through `6c62b71b247`. The major
+delivered behaviors are resumable multi-arm/multi-seed scheduling, official direct-Podman task
+images, fail-closed history/network leak controls, shared model-specific Bifrost caches, serial
+GPU prewarming, inline scoring with selective pristine fallback, preservation of timed-out and
+failed cells, CIM-compatible localization, leak auditing, cost/statistical reporting, candidate
+telemetry, and immutable per-cell runtime identity. OCI layers live on the dedicated XFS store
+at `/mnt/containers/code_isnt_memory/podman-storage`.
