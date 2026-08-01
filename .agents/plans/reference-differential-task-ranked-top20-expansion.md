@@ -84,6 +84,42 @@ the focus.
     `bf8b8eae4c3eab979a5de990a4629dba94999e4798d2dc84e7bdd6236a2f1efd`.
     No issue was warranted. Final language replay and durable publication are
     still required.
+  - [x] (2026-08-01 06:01Z) Completed C rank twelve
+    `raphw__byte-buddy` at pinned head `fe2f8d0`. Its clean envelope audited
+    1/1 eligible production C file, 176 sites, and 4/4 inverse targets with
+    zero missing rows, errors, limits, skips, or truncation. Raw JSONL SHA-256
+    is `1a214a8353323286ae58b2d95f7c52cca6d1e56c0b5d919df4bba3c402c8ba0d`.
+    No issue was warranted.
+  - [x] (2026-08-01 06:03Z) Completed C rank thirteen
+    `LMCache__LMCache` at pinned head `495cc9a`. Its selector-faithful C
+    envelope has zero eligible/audited files because the clone contains C++
+    and CUDA sources but no `.c` translation unit. It reported zero missing
+    rows and errors. Raw JSONL SHA-256 is
+    `d03adff79d74616fe930727ae6a4e380811275818c3353bf13caa13a1d53618c`.
+    No issue was warranted.
+  - [x] (2026-08-01 06:12Z) Completed C rank fourteen
+    `DaveGamble__cJSON` at pinned head `fb16e5c`. Its clean envelope audited
+    6/6 eligible files, 5,291 sites, and 115/115 inverse targets with zero
+    missing rows, errors, limits, skips, or truncation. Raw JSONL SHA-256 is
+    `3200574f2c40c98440417fca1a3b3283fe1b785131e348a9a34180ba99c52f11`.
+    No issue was warranted.
+  - [ ] C rank fifteen `unicorn-engine__unicorn` is the sole active repository.
+    Its mandatory 250,000-candidate supplement is correctness-clean across
+    258/258 files, 651,656 candidates, 10,000 sites, and 697/697 targets, but
+    the inverse phase exposed severe shared-cache contention. Issue #1433 was
+    searched across open and closed history, created, assigned only to
+    `jbellis`, and verified before product edits. The current immutable
+    live-source snapshot reduced the same clean 8-worker envelope to 91.6
+    seconds. The completed fix also bulk-hydrates the bounded authoritative
+    file set and publishes immutable file-state/range data for the request.
+    Its follow-up profile has no repeated file-state-fetch or cache-lock frame
+    above 0.5% self cost. All 47 analyzer tests, the focused C++ inverse-batch
+    tests, the focused immutable-snapshot lifecycle regression, and the three
+    isolated C# tests whose wall-clock budgets failed only under extreme
+    unrelated host load pass. Focused featureless Clippy passes with warnings
+    denied, and final read-only review found no correctness, lifecycle, or
+    concurrency defect. Commit, pushed-head replay, merge, and closure remain;
+    do not start rank sixteen first.
 - [ ] Complete C++ ranks eleven through twenty and publish its evidence and
   user summary.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
@@ -136,6 +172,68 @@ the focus.
   accepts `.c` only, so the clean zero-file envelope is an honest corpus
   bucketing result. This matches the prior accepted BitcoinAddressFinder
   precedent; do not substitute another repository or silently widen to headers.
+
+- Observation: Unicorn's correctness-clean supplement exposed a separate
+  performance regression in broad C type targets. The 8-worker run completed
+  in 415.7 seconds, with individual target lifetimes up to 311.69 seconds,
+  15,861,694 voluntary context switches, and 17.33% of user-cycle samples in
+  futex mutex contention. An exact isolated `float64` inverse query took 1.1
+  seconds versus 18.28 seconds in the shared run. `source_snapshot_file_states`
+  is immutable after analyzer construction but every `ranges` call currently
+  serializes on its mutable LRU mutex and writes touch metadata. This is owned
+  by assigned issue #1433; correctness evidence alone does not close rank
+  fifteen while the legitimate symbols-path latency regression remains.
+
+- Observation: the one-worker control completed the same clean 697-target
+  envelope in 365.0 seconds; its `DisasContext` query took about 24.5 seconds,
+  versus 311.69 seconds with eight workers. Removing only the immutable
+  source-snapshot LRU mutex left the eight-worker replay at 421.6 seconds and
+  `DisasContext` at 316.29 seconds, proving that change was necessary but not
+  sufficient. The remaining hot path was the same request's coarse
+  `QueryReadCache` mutex: every live-OID, hydrated-state, and prepared-syntax
+  cache hit still serialized. The complete #1433 fix therefore also uses
+  concurrent read guards, write guards only for cache insertion/lifecycle, and
+  a read-fast/write-recheck path for prepared-syntax cells.
+
+- Observation: publishing the fully validated live-OID map as an immutable
+  request snapshot removed the dominant shared-cache serialization. The exact
+  8-worker supplement remained correctness-clean and fell from 415.7 seconds
+  at the issue baseline (199.4 seconds after the independent-cache split) to
+  91.6 seconds, while the one-worker control is 365.0 seconds. The result JSONL
+  SHA-256 is `fce69a42057b47882d18c5e60dd6ab1e7e80d24af066fb8e693ed66348fb9554`
+  and the timing log SHA-256 is
+  `685ab38879ad7bea025153b45acad509b4ce2a0cd4fdcf1131666b2f6c116448`.
+  A 55,752-sample follow-up profile lost zero samples and reduced
+  `resolve_live_source_for_file` to 2.88% self cost, but exposed the next
+  in-scope shared-state layer: `fetch_file_state_for_key_with_source` at
+  38.10% and `RwLock::read_contended` at 7.71%. Issue #1433 therefore stays
+  open until the same batch also publishes immutable file-state/range data.
+
+- Observation: publishing a bounded immutable file-state snapshot completed
+  the contention fix. A 72,231-sample profile lost zero samples and has neither
+  repeated `fetch_file_state_for_key_with_source` nor request-cache lock
+  contention above 0.5% self cost; the remaining leading costs are tree-sitter
+  traversal, byte comparison, dirty-state retry, path hashing, and range
+  projection. Its JSONL, timing log, perf data, and profile JSONL SHA-256 values
+  are respectively
+  `3e08d1fd1b9cf70bcca6f72febd8b880f1091b3ee1b044cca5d021a0f7ad5004`,
+  `aed07c0610bb6ded4e8fea3b2580a5aa3063a0141d504ddd01ef8baeebc950cf`,
+  `32aaf8c0130a868177573234fcc677af72b0d3e83361c24939f5190a8ac5a538`,
+  and `0f278941c4a81f661950e10149d7036844b9af654ea99962596977aa1cf06783`.
+  That run's 193.4-second wall time is not comparable because unrelated host
+  load averages were roughly 119/174/149 during the replay; the cycle profile,
+  correctness result, and removal of the contended frames are the acceptance
+  evidence.
+
+- Observation: the featureless full test run reached thousands of passing
+  tests across the analyzer, policy, cross-language, issue, and usage suites.
+  Three C# usage tests with explicit wall-clock budgets failed while unrelated
+  host load was extreme; each passed when rerun alone, including the final
+  exact-source build after the bounded file-state prewarm change. This is an
+  environmental scheduling failure rather than a semantic regression, so the
+  repository-depth-first gate uses those isolated green reruns plus the broad
+  run's otherwise-green evidence instead of repeatedly competing with the same
+  host saturation.
 
 ## Decision Log
 
@@ -539,3 +637,9 @@ Revision note (2026-08-01): Recorded the clean release-runner build, exact C
 dry-run, and C rank-eleven `sudo-rs` zero-file completion. The live selector is
 authoritative even when a repository contains no translation unit for its
 corpus bucket, so the literal rank is retained and no substitute is introduced.
+
+Revision note (2026-08-01): Recorded Unicorn #1433's immutable live-source and
+file-state snapshots, clean correctness replays, cycle profiles, environmental
+wall-time caveat, broad and isolated test evidence, focused Clippy result, and
+the behavior-focused request-snapshot lifecycle regression required by final
+review.
