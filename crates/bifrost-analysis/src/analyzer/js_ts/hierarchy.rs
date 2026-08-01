@@ -226,19 +226,27 @@ fn resolve_imported_type(
         );
     };
 
-    let Some(binding) = index.import_binding(source_file, local_name) else {
-        return Vec::new();
-    };
-    if binding.kind != ImportKind::Namespace {
-        return Vec::new();
+    let mut candidates = Vec::new();
+    for binding in index
+        .import_bindings(source_file, local_name)
+        .filter(|binding| binding.kind == ImportKind::Namespace)
+    {
+        let module_files = resolve_js_ts_module_specifier(
+            source_file,
+            &binding.module_specifier,
+            language,
+            Some(alias_resolver),
+        );
+        candidates.extend(exported_type_declarations(
+            analyzer,
+            index,
+            &module_files,
+            namespace_export,
+        ));
     }
-    let module_files = resolve_js_ts_module_specifier(
-        source_file,
-        &binding.module_specifier,
-        language,
-        Some(alias_resolver),
-    );
-    exported_type_declarations(analyzer, index, &module_files, namespace_export)
+    candidates.sort();
+    candidates.dedup();
+    candidates
 }
 
 fn resolve_local_import_binding(
@@ -249,22 +257,30 @@ fn resolve_local_import_binding(
     source_file: &ProjectFile,
     local_name: &str,
 ) -> Vec<CodeUnit> {
-    let Some(binding) = index.import_binding(source_file, local_name) else {
-        return Vec::new();
-    };
-    let module_files = resolve_js_ts_module_specifier(
-        source_file,
-        &binding.module_specifier,
-        language,
-        Some(alias_resolver),
-    );
-    let exported_name = match binding.kind {
-        ImportKind::Default => "default",
-        ImportKind::Named => binding.imported_name.as_deref().unwrap_or(local_name),
-        ImportKind::CommonJsRequire => binding.imported_name.as_deref().unwrap_or("default"),
-        ImportKind::Namespace | ImportKind::Glob => return Vec::new(),
-    };
-    exported_type_declarations(analyzer, index, &module_files, exported_name)
+    let mut candidates = Vec::new();
+    for binding in index.import_bindings(source_file, local_name) {
+        let exported_name = match binding.kind {
+            ImportKind::Default => "default",
+            ImportKind::Named => binding.imported_name.as_deref().unwrap_or(local_name),
+            ImportKind::CommonJsRequire => binding.imported_name.as_deref().unwrap_or("default"),
+            ImportKind::Namespace | ImportKind::Glob => continue,
+        };
+        let module_files = resolve_js_ts_module_specifier(
+            source_file,
+            &binding.module_specifier,
+            language,
+            Some(alias_resolver),
+        );
+        candidates.extend(exported_type_declarations(
+            analyzer,
+            index,
+            &module_files,
+            exported_name,
+        ));
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
 }
 
 fn exported_type_declarations(

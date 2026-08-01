@@ -3108,7 +3108,7 @@ fn with_ambiguous_call_negative<T>(
         expected_discovery_status,
         expected_discovery_complete: false,
         expected_result_complete: false,
-        expected_public_ambiguous: language == Language::Java,
+        expected_public_ambiguous: true,
         expected_location_relations: &[],
         expected_meetings: &meetings,
     })

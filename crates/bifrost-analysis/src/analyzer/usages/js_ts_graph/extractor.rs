@@ -1,7 +1,7 @@
 use crate::analyzer::js_ts::imports::require_call_module_specifier;
 use crate::analyzer::js_ts::syntax::{
-    JsTsLexicalBindingIndex, JsTsLexicalBindingScope, direct_property_definitions,
-    is_commonjs_require_declarator, is_declaration_identifier,
+    JsTsImportBinder, JsTsLexicalBindingIndex, JsTsLexicalBindingScope,
+    direct_property_definitions, is_commonjs_require_declarator, is_declaration_identifier,
     is_lexically_nested_type_declaration, is_object_in_member_expression,
     is_property_key_in_member, nested_type_identifier_parts, slice, static_member_receiver,
 };
@@ -19,7 +19,7 @@ use crate::analyzer::usages::js_ts_graph::resolver::{
     unbound_browser_global_property,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::model::{ExportEntry, ExportIndex, ImportBinder, UsageHit};
+use crate::analyzer::usages::model::{ExportEntry, ExportIndex, UsageHit};
 use crate::analyzer::usages::parsed_tree::js_ts_tree_sitter_language_for_file;
 use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
 use crate::analyzer::{AliasResolver, CodeUnit, IAnalyzer, Language, ProjectFile, Range};
@@ -284,7 +284,7 @@ pub(super) struct ScanCtx<'a> {
     target_is_static_member: bool,
     target_owner: Option<&'a CodeUnit>,
     target_owner_source: Option<&'a ProjectFile>,
-    imports: ImportBinder,
+    imports: JsTsImportBinder,
     aliases: AliasResolver,
     receiver_facts: JsTsReceiverFactProvider<'a, 'a>,
     lexical_bindings: Option<JsTsLexicalBindingIndex>,
@@ -2181,15 +2181,15 @@ mod tests {
         let tree = parse_js(src);
         let binder = compute_import_binder(src, &tree);
         assert_eq!(
-            binder.bindings.get("Foo").map(|b| b.kind),
+            binder.binding("Foo").map(|b| b.kind),
             Some(ImportKind::Default)
         );
         assert_eq!(
-            binder.bindings.get("baz").map(|b| b.kind),
+            binder.binding("baz").map(|b| b.kind),
             Some(ImportKind::Named)
         );
         assert_eq!(
-            binder.bindings.get("ns").map(|b| b.kind),
+            binder.binding("ns").map(|b| b.kind),
             Some(ImportKind::Namespace)
         );
     }

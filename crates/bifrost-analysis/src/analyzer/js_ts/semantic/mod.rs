@@ -2,6 +2,9 @@
 
 use tree_sitter::Node;
 
+use crate::analyzer::js_ts::syntax::{
+    JsTsImportBinder, JsTsLexicalBindingIndex, compute_import_binder,
+};
 use crate::analyzer::lexical_definitions::formal_parameter_slots;
 use crate::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
@@ -15,8 +18,8 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
 
-const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v7";
-const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v8";
+const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v8";
+const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v9";
 
 #[derive(Debug, Clone, Copy)]
 enum JsTsSemanticFlavor {
@@ -165,6 +168,9 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
                 )
             })
             .collect::<HashMap<_, _>>();
+        let imports = compute_import_binder(prepared.source(), prepared.tree());
+        let lexical_bindings =
+            JsTsLexicalBindingIndex::build(prepared.tree().root_node(), prepared.source());
         let mut bound_capture_targets = HashSet::default();
         lower_procedure_batch(
             &specs,
@@ -177,6 +183,8 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
                     prepared,
                     spec,
                     &procedure_targets,
+                    &imports,
+                    &lexical_bindings,
                     capture_binding_expected,
                     staged_budget,
                     cancellation,
@@ -318,6 +326,8 @@ struct CleanupRegion<'tree> {
 
 struct LoweringContext<'tree, 'targets> {
     prepared: &'tree PreparedSyntaxTree,
+    imports: &'targets JsTsImportBinder,
+    lexical_bindings: &'targets JsTsLexicalBindingIndex,
     session: ProcedureLoweringSession<'targets>,
     expression_values: HashMap<usize, ValueId>,
     parameters: HashMap<Box<str>, ValueId>,

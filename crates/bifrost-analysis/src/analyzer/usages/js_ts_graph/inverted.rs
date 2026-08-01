@@ -80,19 +80,19 @@ where
                 let binder = compute_import_binder(source, &parsed.tree);
                 let mut named_imports: HashMap<String, String> = HashMap::default();
                 let mut namespace_locals: HashSet<String> = HashSet::default();
-                for (local, binding) in &binder.bindings {
+                for (local, binding) in binder.all_bindings() {
                     match binding.kind {
                         ImportKind::Named => {
                             named_imports.insert(
-                                local.clone(),
+                                local.to_string(),
                                 binding
                                     .imported_name
                                     .clone()
-                                    .unwrap_or_else(|| local.clone()),
+                                    .unwrap_or_else(|| local.to_string()),
                             );
                         }
                         ImportKind::Namespace | ImportKind::CommonJsRequire | ImportKind::Glob => {
-                            namespace_locals.insert(local.clone());
+                            namespace_locals.insert(local.to_string());
                         }
                         // Default imports need the target module's default-export name.
                         ImportKind::Default => {}

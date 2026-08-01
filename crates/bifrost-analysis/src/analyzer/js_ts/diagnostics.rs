@@ -107,18 +107,16 @@ fn collect_js_ts_semantic_diagnostics(
     let root = tree.root_node();
     let import_binder = compute_import_binder(source, &tree);
     let known_imports = import_binder
-        .bindings
-        .keys()
+        .names()
         .filter(|name| !name.is_empty())
-        .cloned()
+        .map(str::to_string)
         .collect();
     let unresolved_external_imports = import_binder
-        .bindings
-        .iter()
+        .all_bindings()
         .filter_map(|(local, binding)| {
             let module = binding.module_specifier.as_str();
             let resolved = resolve_js_ts_module_specifier(file, module, language, Some(aliases));
-            (!module.starts_with('.') && resolved.is_empty()).then(|| local.clone())
+            (!module.starts_with('.') && resolved.is_empty()).then(|| local.to_string())
         })
         .collect();
     let same_file_declarations = analyzer

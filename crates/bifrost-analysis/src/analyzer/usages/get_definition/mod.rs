@@ -1,4 +1,5 @@
 use crate::analyzer::common::language_for_file;
+use crate::analyzer::js_ts::syntax::JsTsImportBinder;
 use crate::analyzer::lexical_definitions::{
     LexicalBindingResolution, LexicalDefinition, resolve_lexical_binding,
 };
@@ -97,6 +98,9 @@ use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Parser, Tree};
 
 pub(crate) const NAVIGATION_TARGETS_TRUNCATED_DIAGNOSTIC: &str = "navigation_targets_truncated";
+pub(crate) const PARTIAL_IMPORT_BOUNDARY_DIAGNOSTIC: &str = "partial_import_boundary";
+pub(crate) const PARTIAL_IMPORT_UNRESOLVED_DIAGNOSTIC: &str = "partial_import_unresolved";
+pub(crate) const IMPORT_BINDINGS_TRUNCATED_DIAGNOSTIC: &str = "import_bindings_truncated";
 pub(crate) const CPP_NAVIGATION_STRUCTURE_UNAVAILABLE_DIAGNOSTIC: &str =
     "cpp_navigation_structure_unavailable";
 
@@ -709,7 +713,7 @@ pub fn resolve_call_reference_definition_with_source(
 
 #[derive(Clone)]
 pub(super) struct JsTsDefinitionContext {
-    pub(super) imports: ImportBinder,
+    pub(super) imports: JsTsImportBinder,
     pub(super) aliases: Arc<AliasResolver>,
     pub(super) syntax_index: Arc<JsTsReceiverSyntaxIndex>,
 }
@@ -1850,7 +1854,7 @@ mod tests {
         assert_eq!(context.js_ts_contexts.len(), 1);
         assert!(Arc::ptr_eq(&first.aliases, &second.aliases));
         assert!(Arc::ptr_eq(&first.syntax_index, &second.syntax_index));
-        assert_eq!(first.imports.bindings, second.imports.bindings);
+        assert_eq!(first.imports, second.imports);
     }
 
     #[test]

@@ -677,15 +677,15 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
             | None => DispatchQuality::Unknown,
             Some(DefinitionLookupStatus::UnresolvableImportBoundary) => DispatchQuality::Complete,
         };
-        let quality = if result.candidates().is_empty()
-            && status_quality == DispatchQuality::Ambiguous
+        let quality = if status_quality == DispatchQuality::Ambiguous
             && matches!(
                 materialization_quality,
                 DispatchQuality::Complete | DispatchQuality::Ambiguous | DispatchQuality::Unproven
             ) {
-            // A zero-body ambiguous lookup still has a precise ambiguity
-            // classification. Dynamic/open-world incompleteness must not
-            // collapse that typed outcome into generic Unproven.
+            // Ambiguous lookup remains the precise dispatch classification
+            // when its retained candidates are merely unproven or partial.
+            // Candidate evidence must not collapse the set-level ambiguity
+            // into generic Unproven.
             DispatchQuality::Ambiguous
         } else {
             merge_dispatch_quality(status_quality, materialization_quality)
