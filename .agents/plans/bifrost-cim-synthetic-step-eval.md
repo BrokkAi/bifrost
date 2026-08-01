@@ -1,0 +1,226 @@
+# Evaluate dw10 with a CIM-only synthetic semantic-search step
+
+This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`,
+`Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
+This document is maintained in accordance with `.agents/PLANS.md`.
+
+## Purpose / Big Picture
+
+The completed Granite/dw10 campaign in `.agents/plans/bifrost-localizer-cim-eval.md`
+rarely exercised `semantic_search`, so its model comparison was dominated by ordinary coding-agent
+variance. This extension gives every task only the semantic searches that an independent query
+generator judges clearly necessary at startup. DeepSeek V4 Flash sees the task description and
+produces a variable-length query list. Anvil executes those queries as a synthetic tool-call batch
+before GPT-5.6 Luna's first inference; Luna sees the queries and results but never the DeepSeek
+request, response, or reasoning.
+
+The first reportable gate is deliberately small: 91 dw10 `semantic-coedit-2-1` cells for seed 0.
+It is compared with seed 0 of the existing no-semantic Bedrock/Luna baseline. Only a statistically
+significant positive paired result authorizes seeds 1 and 2. A significant three-seed result then
+authorizes the remaining dw10 retrieval recipes.
+
+## Progress
+
+- [x] (2026-08-01) Inspected SuperCoder's conditional prompt/tool guidance, Anvil's P2T forced-step
+  representation, cimeval's cell runner/reporting path, and localizer query generation.
+- [x] (2026-08-01) Locked the design with the user: CIM-only behavior, non-prescriptive tool
+  descriptions, DSV4 Flash task-only queries, no requested query count, k=20 per query, and a
+  seed-0 gate against the existing baseline.
+- [x] (2026-08-01) Implemented and focused-tested Anvil's CIM mode, synthetic initial tool step,
+  trace boundaries, and non-prescriptive CIM-only description hierarchy.
+- [x] (2026-08-01) Implemented and unit-tested frozen cimeval query generation, identity checks,
+  per-cell configuration and trace validation, synthetic/agent telemetry, and reference-run
+  statistics.
+- [ ] Build immutable runtime artifacts and pass one real nonempty-query smoke cell.
+- [ ] Run, score, localize, and audit the 91-cell dw10 seed-0 gate at concurrency 30.
+- [ ] Apply the statistical decision tree, update this retrospective, and commit the result.
+
+## Surprises & Discoveries
+
+- Observation: SuperCoder did not rely on a neutral tool schema. Its index-enabled system prompt
+  says to prefer `codebase_search`, and the tool description says `USE THIS FIRST`; the released
+  evaluation reports about 1.4 engine calls per cell. Anvil's prior description merely stated what
+  semantic search does.
+  Evidence: `/mnt/optane/bifrost-nlp-resources/SuperCoder/crates/agent/src/agent/prompt.rs` and
+  `/mnt/optane/bifrost-nlp-resources/supercoder-eval/README.md`.
+- Observation: Anvil's P2T mode already represents assistant tool-call batches and tool results,
+  but enabling P2T also changes the tool catalog and turn accounting. CIM must reuse the message
+  shape without enabling P2T.
+  Evidence: `/mnt/optane/anvil-bifrost-nlp-ft/src/p2t.rs` and `src/tool_loop.rs`.
+- Observation: brokkbench's unqualified DeepSeek aliases deliberately fail over to a corresponding
+  OpenRouter model when the direct provider exhausts retries. Provider qualification still entered
+  that failover tier, so it did not guarantee that DSV4 Flash generated the frozen queries.
+  Evidence: `client.CachingClient.ask`; provider-qualified requests now retain their selected
+  provider, with a regression test, while ordinary aliases preserve their existing failover.
+- Observation: Anvil's full test suite has one unrelated dynamic Bedrock-model preset failure:
+  `enrichment_attaches_family_specific_presets` now observes a `max` effort from discovery where
+  the fixture expects the older list ending at `xhigh`. All 1,223 other tests pass, including the
+  new CIM tests, and `cargo clippy --all-targets -- -D warnings` passes.
+  Evidence: full gate on 2026-08-01; no CIM code participates in model-card enrichment.
+
+## Decision Log
+
+- Decision: gate all synthetic-step and tool-description changes behind `BRK_CIM_EVAL`; ordinary
+  Anvil remains byte-for-byte behaviorally unchanged when the flag is absent.
+  Rationale: this is benchmark instrumentation, not a new normal-agent policy.
+  Date/Author: 2026-08-01 / Codex and user.
+- Decision: DeepSeek receives only the task description and may return zero or more queries. The
+  prompt supplies no desired count and says to emit only clearly necessary starting searches,
+  because Luna may search again later. Every emitted query executes independently at final k=20.
+  Rationale: fixed-count generation would flood Luna with redundant context and bias the test.
+  Date/Author: 2026-08-01 / Codex and user.
+- Decision: generate once per task and reuse the immutable query manifest across seeds and arms.
+  Rationale: query-generator sampling must not become an arm or seed confounder.
+  Date/Author: 2026-08-01 / Codex.
+- Decision: use seed 0 as the first evaluation point. Compare its 91 binary outcomes with the
+  existing baseline seed 0 using a two-sided exact discordant-pair test at p<0.05. Proceed only
+  when dw10 has more exclusive solves. After seeds 1 and 2, use CIM's per-instance seed-mean paired
+  Wilcoxon gate at p<0.05.
+  Rationale: this spends only one seed before evidence clears the requested noise bar.
+  Date/Author: 2026-08-01 / Codex and user.
+- Decision: Bedrock Luna at maximum reasoning is mandatory for reportable cells.
+  Rationale: changing provider would invalidate comparison with the existing baseline.
+  Date/Author: 2026-08-01 / Codex.
+- Decision: invoke query generation as `deepseek::deepseek-v4-flash`, not through the unqualified
+  alias, and fail rather than substitute another provider.
+  Rationale: the query model is part of the frozen experimental treatment.
+  Date/Author: 2026-08-01 / Codex.
+
+## Outcomes & Retrospective
+
+Implementation and seed-0 results are pending. At the stopping point, record query-count and
+context distributions, synthetic versus agent-selected calls, official resolve/localization/cost
+results, paired statistics, leak findings, exact commits, and whether the next gate opened.
+
+## Context and Orientation
+
+The primary planning checkout is `/mnt/optane/bifrost-nlp` on `bifrost-nlp-ft`. Bifrost's dw10
+embedding support and shared per-repository caches are already complete; no retrieval change is
+planned. Anvil development occurs in `/mnt/optane/anvil-bifrost-nlp-ft`. Its `src/tools/mod.rs`
+assembles built-in and MCP tool descriptions, while `src/tool_loop.rs` executes a model response's
+tool calls and records the exact replay messages later fed back to the model. `src/p2t.rs` contains
+the existing serializable forced-step message types.
+
+The evaluation harness is `/home/jonathan/Projects/brokkbench/cimeval`. `cell.py` creates one
+official task container, installs the immutable runtime, and starts `remote/run_task.sh`.
+`report.py` reads cell traces and official scores. The existing baseline and original dw10 results
+are under `/mnt/optane/bifrost-nlp-resources/runs/granite-r2-cim-20260731-r8` and
+`/mnt/optane/bifrost-nlp-resources/runs/dw10-cim-20260731-r2` respectively.
+
+A synthetic step is a batch of assistant tool calls inserted by the harness, rather than emitted
+by Luna. It follows the original user task in Luna's message sequence. The resulting tool messages
+are normal `semantic_search` results, so CIM View B localization continues to treat their paths as
+pointers until Luna explicitly reads, greps, or edits them.
+
+## Plan of Work
+
+In Anvil, add a small CIM configuration module modeled after P2T's environment loading. Require
+`BRK_CIM_EVAL=1` and an absolute `BRK_CIM_CONFIG` JSON path with schema version 1, query-manifest
+identity, k=20, and an ordered query array. Reject simultaneous CIM/P2T/training modes. When CIM is
+enabled and semantic search is advertised, rewrite the relevant descriptions so semantic search is
+preferred for behavior/concept discovery while symbol, summary, grep, and file tools retain clear
+exact-hook roles. Do not use mandatory wording. With semantic search absent, leave the current
+descriptions intact.
+
+Before the first ordinary model request, convert the configured queries into one assistant
+tool-call batch with stable call IDs, execute it through the existing semantic reranker, append
+the assistant and tool-result messages to the live context and replay records, and continue with
+Luna without decrementing its turn budget. Add explicit start/end trace records so reports can
+separate synthetic from agent-selected calls. An empty query list is a successful no-op. Any
+malformed config, missing semantic tool, or failed synthetic call is a setup failure.
+
+In brokkbench, add `cimeval/querygen.py` and a `querygen` CLI command. Use the existing
+`client.CachingClient` with provider-qualified model `deepseek::deepseek-v4-flash`, temperature
+zero, and a strict object containing a
+single string-array `queries` property. The prompt sees only `CimTask.problem_statement`; it says
+that Luna can follow up, asks only for clearly necessary starting searches, rejects redundant
+queries and queries already served by obvious task hooks, and explicitly permits an empty array.
+Persist one immutable, resumable record per instance plus an aggregate manifest containing prompt,
+model, response, and content hashes. Normalize whitespace and exact case-insensitive
+duplicates only; never use gold data or hand selection.
+
+Extend the cell configuration and remote runner to copy the selected task's CIM config into the
+container and set the two CIM environment variables. Record the query identity and observed step
+status in `result.json`; completed-cell reuse must reject identity drift. Extend reports to mark
+rerank events inside the CIM step as synthetic, retain later calls as agent-selected, summarize
+query counts and context bytes, and load an explicit immutable reference run for baseline rows.
+
+After unit validation, generate all 91 query records at concurrency 30, inspect count/outlier
+distributions without outcomes, and run one real smoke. Then run only dw10
+`semantic-coedit-2-1`, seed 0, at concurrency 30 in official sandbox images. Score inline with
+the existing selective pristine recovery, localize, and leak-audit. If the exact paired p-value is
+below 0.05 and direction is positive, run seeds 1 and 2; otherwise stop as specified in the
+Decision Log. Only a positive significant three-seed gate authorizes dw10 `all-signals` and
+`semantic-only`.
+
+## Concrete Steps
+
+From `/mnt/optane/anvil-bifrost-nlp-ft`, run focused development gates:
+
+    cargo fmt --check
+    cargo test cim
+    cargo test semantic_search_description
+    cargo clippy --all-targets -- -D warnings
+
+From `/home/jonathan/Projects/brokkbench`, run:
+
+    uv run pytest -q cimeval
+    uv run ruff check cimeval
+    uv run python -m cimeval querygen --run-dir <new-run> --jobs 30
+
+Build a new immutable runtime bundle using cimeval's existing `runtime` command, start the dw10
+sidecar on the verified local A4000, and use the established `.bifrost/cache-dw10` caches. Run the
+smoke and reportable queue with `--arms semantic-coedit-2-1 --seeds 0 --jobs 30`, maximum reasoning,
+`--without-history`, inline scoring, and the frozen query manifest.
+
+## Validation and Acceptance
+
+With CIM variables absent, Anvil's tests must prove tool descriptions, messages, tool execution,
+and turn limits are unchanged. With CIM enabled, tests must prove the description hierarchy,
+stable k=20 call batch, exact message order, empty-list no-op, no turn consumption, persisted replay,
+and fail-closed errors. P2T/training combinations must fail before any model call.
+
+Querygen tests must prove task-only prompts, variable and empty lists, whitespace/case-insensitive
+deduplication, immutable resume identity, schema/failure handling, and that raw DeepSeek content
+never enters the generated Anvil configuration or Luna trace. Report tests must prove external
+baseline validation and synthetic-versus-agent telemetry separation.
+
+The smoke passes only if every generated query appears as a k=20 semantic call before the first
+Luna inference, every result has normal retrieval/reranker telemetry and context, and no DeepSeek
+message appears in Luna's request. The seed-0 gate is reportable only with 91 valid official scores,
+91 localization artifacts, a reviewed 91-cell leak audit, one consistent query/runtime identity,
+and no unaccounted synthetic-step failure.
+
+## Idempotence and Recovery
+
+Query generation and cell execution are resumable by immutable completion markers. A matching
+record is reused; any identity mismatch fails rather than overwriting. If the query prompt changes,
+create a new query-manifest version and run directory rather than modifying completed records. A
+provider outage pauses the Bedrock queue; it does not authorize an OpenRouter substitution. Stop
+the embedding sidecar and transient campaign services after each reporting gate.
+
+## Artifacts and Notes
+
+The new reportable run lives under `/mnt/optane/bifrost-nlp-resources/runs/` with a descriptive
+`dw10-cim-synthetic` prefix. Large task images continue to use
+`/mnt/containers/code_isnt_memory`. Record all exact run paths, bundle hashes, service names, and
+commits here as they become known.
+
+## Interfaces and Dependencies
+
+Anvil's private interface is two environment variables: `BRK_CIM_EVAL=1` and
+`BRK_CIM_CONFIG=/absolute/path/config.json`. The version-1 JSON object contains
+`schema_version: 1`, `query_manifest_sha256`, `k: 20`, and `queries: string[]`. It is an internal
+benchmark contract and is not advertised as normal Anvil configuration.
+
+The query generator uses only brokkbench's existing `CachingClient`; no new provider library is
+introduced. The cell continues to use Bifrost's existing `semantic_search` schema and Anvil's
+existing transparent reranker. Mjolnir remains the ACP driver and requires no change.
+
+Revision note, 2026-08-01: Created this follow-up plan after the original campaign showed only
+three comparable Granite and seven dw10 agent-selected semantic calls. The new design adds a
+CIM-only synthetic query step and a seed-0 statistical spending gate.
+
+Revision note, 2026-08-01: Recorded the completed Anvil/cimeval implementation and the decision to
+pin query generation to DeepSeek's direct provider rather than permit brokkbench's normal
+cross-provider failover.
