@@ -607,6 +607,10 @@ impl SemanticPackCatalog {
                  FROM catalog_generated_productions AS gp
                  JOIN catalog_packs AS p
                    ON p.manifest_digest = gp.manifest_digest
+                 JOIN catalog_sources AS source
+                   ON source.manifest_digest = gp.manifest_digest
+                  AND source.source_kind = 'generated'
+                  AND source.source_id = 'production:' || gp.production_digest
                  WHERE gp.production_digest = ?1 AND p.state = 'verified'",
                 [&key.production_digest],
                 |row| {
@@ -654,6 +658,7 @@ impl SemanticPackCatalog {
                 ));
             }
             validate_generated_pack_identity(key, &manifest)?;
+            self.validate_generated_objects(&manifest_digest, &manifest)?;
             Ok(GeneratedProduction {
                 key: stored_key,
                 manifest_digest: manifest_digest.clone(),
@@ -673,6 +678,56 @@ impl SemanticPackCatalog {
                 Ok(None)
             }
         }
+    }
+
+    fn validate_generated_objects(
+        &self,
+        manifest_digest: &str,
+        manifest: &CompiledPackManifest,
+    ) -> Result<(), CatalogError> {
+        for descriptor in &manifest.shards {
+            let (relative_path, stored_size) = {
+                let connection = self
+                    .connection
+                    .lock()
+                    .expect("semantic-pack catalog connection mutex poisoned");
+                connection
+                    .query_row(
+                        "SELECT o.relative_path, o.stored_size
+                         FROM catalog_pack_shards AS ps
+                         JOIN catalog_objects AS o
+                           ON o.stored_digest = ps.stored_digest
+                         WHERE ps.manifest_digest = ?1
+                           AND ps.shard_id = ?2
+                           AND ps.stored_digest = ?3",
+                        params![
+                            manifest_digest,
+                            &descriptor.shard_id,
+                            &descriptor.stored_sha256
+                        ],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        CatalogError::sqlite("lookup generated production object", error)
+                    })?
+                    .ok_or_else(|| {
+                        CatalogError::Integrity(format!(
+                            "generated production is missing shard {}",
+                            descriptor.shard_id
+                        ))
+                    })?
+            };
+            let bytes = storage::read(
+                &self.root,
+                &relative_path,
+                &descriptor.stored_sha256,
+                stored_size,
+            )?;
+            decode_shard_for_manifest(manifest, descriptor, &bytes, &self.options.decode_limits)
+                .map_err(|error| CatalogError::Artifact(error.to_string()))?;
+        }
+        Ok(())
     }
 
     fn install_with(
@@ -1980,6 +2035,7 @@ impl SemanticPackCatalog {
                            AND NOT EXISTS(
                              SELECT 1 FROM catalog_sources AS sources
                              WHERE sources.manifest_digest = packs.manifest_digest
+                               AND sources.source_kind <> 'generated'
                            )
                            AND NOT EXISTS(
                              SELECT 1 FROM catalog_pins AS pins

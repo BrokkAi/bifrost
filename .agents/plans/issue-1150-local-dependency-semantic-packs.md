@@ -20,7 +20,7 @@ The behavior is observable with offline fixtures. Two workspaces that resolve th
 - [x] (2026-08-01 08:36Z) Milestone 3: retained JVM coordinate/origin evidence, added the Maven/Gradle/exact-path adapter, merged source-preferred and binary-only facts, and made JAR production cancellable between archive entries.
 - [x] (2026-08-01 08:49Z) Milestone 4: retained .NET package/target/configuration/asset-role/project provenance, preferred reference assets, added exact assembly preparation/reuse, and made metadata walks cancellable.
 - [x] (2026-08-01 08:58Z) Milestone 5: added guarded activation-request composition and proved exact single-dependency invalidation with unrelated production and overlay stability.
-- [ ] Milestone 6: complete documentation, focused and broad validation, repository policy checking, and specialist review.
+- [x] (2026-08-01 09:40Z) Milestone 6: documented the host/discovery/cache lifecycle, completed broad validation and the five-specialist review, fixed the accepted cache-identity, discovery-completeness, GC, target-selection, corruption, diagnostic-reuse, shared-discovery, and duplicate-read findings, and reran the repository policy selection.
 
 ## Surprises & Discoveries
 
@@ -40,6 +40,12 @@ The behavior is observable with offline fixtures. Two workspaces that resolve th
   Evidence: Cargo rejected `-p brokk-bifrost-analysis --test suite_persistence` and identified the `brokk-bifrost` package; the corrected milestone-1 command passed 30 focused tests.
 - Observation: the shell resolves Cargo and Rustc through rustup but resolves `cargo-clippy` from Homebrew, whose same-version compiler has a different build identity.
   Evidence: ordinary and isolated `cargo clippy` failed with E0514 on a freshly compiled `cc` crate. Invoking rustup's matching `/Users/dave/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin/cargo-clippy` directly completed the milestone-2 library Clippy gate with `-D warnings`.
+- Observation: path exclusion was initially inconsistent with producer output.
+  Evidence: explicit JVM/.NET dependency IDs and binary artifact locators contained local filenames while the generated-production key deliberately omitted paths. The final adapters use constant authored provenance plus content-addressed artifact locators, and renamed-identical JAR/DLL tests prove one manifest is reused.
+- Observation: successful artifact resolution needs its own completeness boundary before pack preparation.
+  Evidence: missing Maven/Gradle coordinates and malformed `project.assets.json` inputs previously collapsed to an empty dependency vector, which is indistinguishable from a project with no dependencies. `DependencyDiscoveryOutcome` now carries bounded diagnostics, cancellation, completeness, and profile data into `prepare_discovered_dependency_semantic_packs`.
+- Observation: the repository policy selection remains unreliable at whole-workspace scale.
+  Evidence: the final 2026-08-01 `bifrost.code-smells` run completed seven policies, while expensive-nested-loop, file-read-in-loop, parsing-in-loop, serialization-in-loop, and sort-in-loop exhausted discovery budgets; file-read and serialization also lacked stable anchors. No finding points to a line introduced by this issue. The sleep finding at `semantic_model/catalog/db.rs:88` predates this branch.
 
 ## Decision Log
 
@@ -64,6 +70,15 @@ The behavior is observable with offline fixtures. Two workspaces that resolve th
 - Decision: Keep human-facing dependency IDs out of the production digest and add normalized non-selector provenance explicitly.
   Rationale: explicit dependencies may use a path-derived diagnostic ID, but paths and filenames must not defeat byte-identical cross-workspace reuse. Exact Maven/Gradle coordinate fields and discovery origin still affect production through sorted provenance entries, including versions that are not valid semantic versions and therefore cannot fit `CatalogCoordinate.version`.
   Date/Author: 2026-08-01 / Codex
+- Decision: Make every generated manifest a pure function of the production key.
+  Rationale: cross-workspace reuse requires paths and filenames to stay out of identity, so adapters normalize authored provenance and artifact locators instead of adding local paths back to the key. Output-affecting producer/compiler profiles are hashed because limits and compression can change facts, completeness, or stored representation.
+  Date/Author: 2026-08-01 / Codex
+- Decision: Treat generated source rows as cache attribution rather than permanent garbage-collection roots.
+  Rationale: pins, active sets, and leases already protect live packs. Ignoring generated-only sources during reachability permits ordinary dependency churn to age out, with manifest deletion cascading to the production mapping.
+  Date/Author: 2026-08-01 / Codex
+- Decision: Reproduce partial packs instead of returning diagnostic-free partial cache hits.
+  Rationale: completeness without its actionable cause is insufficient dependency coverage. Reproduction uses the same exact retained bytes and bounded producer, while complete productions continue to take the fast verified reuse path.
+  Date/Author: 2026-08-01 / Codex
 
 ## Outcomes & Retrospective
 
@@ -75,7 +90,11 @@ The JVM adapter is also complete. Offline Maven and Gradle tool records now reta
 
 The .NET adapter is complete as well. `project.assets.json` traversal now keeps the target framework key, package name/version, compile/reference/runtime role, project-reference flag, and project-output configuration instead of returning only paths. Reference assets deterministically outrank compile and runtime duplicates for the same target/package/configuration/assembly, while separate targets and Debug/Release-style outputs stay distinct. Exact assembly preparation detects post-hash changes, compiles through the shared coordinator, and reuses verified productions. Metadata row decoding and type/member walks check cancellation in bounded batches. All 13 focused C# external/producer tests pass, including reference-vs-runtime preference, two-target retention, project-output configuration, exact cache reuse, and mid-metadata cancellation.
 
-Activation composition is complete. `DependencyPackPreparationOutcome::compose_activation_request` merges and deduplicates exact evidence into a host-owned request, but returns no request after cancellation or wholly unavailable partial preparation, preventing accidental replacement of a previously complete active set with authoritative empty evidence. A two-dependency integration test changes only alpha's bytes and proves alpha receives a new production and overlay type, beta reuses the exact prior production and retains its overlay record, and the active-model-set hash changes. The six coordinator, 12 runtime, and 11 overlay tests pass; task-scoped library Clippy, formatting, and diff checks are clean. Documentation, final policy validation, and specialist review remain.
+Activation composition is complete. `DependencyPackPreparationOutcome::compose_activation_request` merges and deduplicates exact evidence into a host-owned request, but returns no request after cancellation or wholly unavailable partial preparation, preventing accidental replacement of a previously complete active set with authoritative empty evidence. A two-dependency integration test changes only alpha's bytes and proves alpha receives a new production and overlay type, beta reuses the exact prior production and retains its overlay record, and the active-model-set hash changes. The seven coordinator, 12 runtime, and 11 overlay tests pass; task-scoped library Clippy, formatting, and diff checks are clean.
+
+Milestone 6 closed the issues found by the guided security, duplication, senior-development, DevOps, and architecture reviews. Discovery now returns an explicit bounded outcome; unresolved coordinates, malformed assets, and cancellation remain incomplete and cannot compose authoritative emptiness. JVM and C# legacy indexes consume that same discovery result. Generated identity includes every output-affecting profile, while authored provenance and artifact locators are path-independent; coordinator-retained exact bytes feed producers directly, eliminating the duplicate read and its TOCTOU branch. Generated lookup requires its source binding and fully verifies shard objects. Partial packs are reproduced with diagnostics. Generated-only sources are evictable, and .NET project-output selection matches the exact target framework/RID before a deterministic cap.
+
+Final validation passed 1,915 featureless analysis-library tests (six ignored), 32 focused catalog tests, seven dependency-pack integration tests, 16 C# and 21 JVM external-dependency tests, two external-artifact integration tests, 12 runtime tests, 11 overlay tests, the documentation fixture, formatting, diff checks, and strict featureless all-target Clippy. The Astro documentation build produced 59 pages and checked 5,687 internal links. Browser-level visual inspection could not run because this Codex session had no browser backend; the generated HTML contains the new section and API names. The final combined policy rerun remains `unreliable` for the five pre-existing whole-repository budget/stable-anchor failures recorded above, with no issue-introduced finding.
 
 ## Context and Orientation
 
@@ -261,3 +280,5 @@ The final API may accept a `Project` and ecosystem configuration through adapter
 Use existing `serde`, `serde_json`, `semver`, `sha2`, `rusqlite`, `zip`, `tempfile`, project/process helpers, and `CancellationToken`. Do not add a package-manager client, network dependency, compiler driver, platform-directory resolver, regex parser, or another compression/hash implementation.
 
 Plan revision note, 2026-08-01 07:44Z: Created the initial decision-complete ExecPlan after live issue/dependency verification, code-intelligence diagnosis, independent specialist diagnosis, user approval, and review of `.agents/PLANS.md`. It fixes the explicit catalog boundary, production identity, source/binary merge, compatibility projection, coverage, cancellation, and milestone validation strategy.
+
+Plan revision note, 2026-08-01 09:40Z: Completed milestone 6 after the required five-specialist review. Recorded and fixed the discovered identity-purity, discovery-completeness, generated-GC, exact .NET target, object-verification, partial-diagnostic, shared-discovery, and duplicate-read gaps; updated the public host contract and final validation/policy evidence.

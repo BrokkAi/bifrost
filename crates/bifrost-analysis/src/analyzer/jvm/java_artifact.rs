@@ -3,10 +3,11 @@ use crate::analyzer::java::declarations::{determine_package_name, node_text, par
 use crate::analyzer::semantic_model::{
     ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest, AuthoredPayload,
     AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics, Completeness,
-    ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact, HierarchyKind, Locator,
-    MemberFact, MemberIdentity, MemberKind, Parameter, Producer, ProducerDiagnostic,
-    ProducerDiagnosticSeverity, Signature, TypeFact, TypeIdentity, TypeKind, TypeRef, Visibility,
-    WildcardVariance, member_declaration_id, read_exact_artifact_while, type_declaration_id,
+    ExactArtifact, ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact,
+    HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, Parameter, Producer,
+    ProducerDiagnostic, ProducerDiagnosticSeverity, Signature, TypeFact, TypeIdentity, TypeKind,
+    TypeRef, Visibility, WildcardVariance, member_declaration_id, read_exact_artifact_while,
+    type_declaration_id,
 };
 use crate::hash::{HashMap, HashSet};
 use jclassfile::attributes::{Attribute, NestedClassFlags};
@@ -98,6 +99,16 @@ impl JavaJarPackProducer {
             Ok(artifact) => artifact,
             Err(diagnostic) => return ArtifactProduction::failed(diagnostic, limits),
         };
+        self.produce_loaded_artifact(request, limits, cancellation, &artifact)
+    }
+
+    pub(crate) fn produce_loaded_artifact(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+        artifact: &ExactArtifact,
+    ) -> ArtifactProduction {
         let jar_name = match artifact.path().file_name().and_then(|name| name.to_str()) {
             Some(name) => name.to_owned(),
             None => {

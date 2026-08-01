@@ -649,11 +649,6 @@ fn generated_production_is_removed_with_garbage_collected_pack() {
     let pack = compiled_pack();
     let key = generated_key(&pack, 'f');
     catalog.install_generated(&key, &pack).unwrap();
-    assert!(
-        catalog
-            .remove_source(&source(DurablePackSourceKind::Generated, &key.source_id(),))
-            .unwrap()
-    );
     assert_eq!(
         catalog
             .garbage_collect(&CatalogGcOptions {
@@ -677,6 +672,56 @@ fn generated_production_is_removed_with_garbage_collected_pack() {
             )
             .unwrap(),
         0
+    );
+}
+
+#[test]
+fn generated_lookup_rejects_corrupt_shard_objects() {
+    let root = TempDir::new().unwrap();
+    let catalog = SemanticPackCatalog::open(
+        root.path(),
+        CatalogOpenMode::ReadWrite,
+        CatalogOptions::default(),
+    )
+    .unwrap();
+    let pack = compiled_pack();
+    let key = generated_key(&pack, '9');
+    catalog.install_generated(&key, &pack).unwrap();
+    let connection = Connection::open(root.path().join("catalog.db")).unwrap();
+    let relative_path: String = connection
+        .query_row(
+            "SELECT relative_path FROM catalog_objects LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(connection);
+    fs::write(root.path().join(relative_path), b"corrupt").unwrap();
+
+    assert!(catalog.generated_production(&key).unwrap().is_none());
+    assert_eq!(catalog.accounting().unwrap().quarantined_pack_count, 1);
+}
+
+#[test]
+fn generated_lookup_requires_its_source_binding() {
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let pack = compiled_pack();
+    let key = generated_key(&pack, '8');
+    catalog.install_generated(&key, &pack).unwrap();
+    catalog
+        .pin(&pack.manifest.content_sha256, "test-pin")
+        .unwrap();
+    assert!(
+        catalog
+            .remove_source(&source(DurablePackSourceKind::Generated, &key.source_id()))
+            .unwrap()
+    );
+
+    assert!(catalog.generated_production(&key).unwrap().is_none());
+    assert!(
+        catalog
+            .unpin(&pack.manifest.content_sha256, "test-pin")
+            .unwrap()
     );
 }
 

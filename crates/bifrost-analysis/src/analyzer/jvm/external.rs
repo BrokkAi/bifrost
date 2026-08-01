@@ -7,11 +7,13 @@ use crate::analyzer::jvm::java_artifact::JavaJarPackProducer;
 use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProductionRequest, AuthoredPayload,
     AuthoredSemanticModelPack, CatalogCoordinate, Compatibility, Completeness,
-    DependencyArtifactRole, DependencyPackAdapter, DependencyPackProduction, DependencyProvenance,
-    ExactDependencyArtifact, ExternalArtifactKind, ExternalArtifactPackProducer, MemberFact,
-    NameSelector, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance,
-    ResolvedDependency, ResolvedDependencyArtifact, Safety, SemanticModelActivationEvidence,
-    TypeFact, TypeKind, Visibility,
+    DependencyArtifactRole, DependencyDiscoveryOutcome, DependencyDiscoveryProfile,
+    DependencyPackAdapter, DependencyPackDiagnostic, DependencyPackDiagnosticSeverity,
+    DependencyPackLimits, DependencyPackProduction, DependencyProvenance, ExactDependencyArtifact,
+    ExternalArtifactKind, ExternalArtifactPackProducer, Locator, MemberFact, NameSelector,
+    Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance, ResolvedDependency,
+    ResolvedDependencyArtifact, Safety, SemanticModelActivationEvidence, TypeFact, TypeKind,
+    Visibility,
 };
 use crate::analyzer::{
     JvmAnalyzerConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalArtifactOrigin,
@@ -108,18 +110,110 @@ pub struct JvmDependencyPackAdapter;
 pub fn resolve_jvm_semantic_pack_dependencies(
     config: &JvmAnalyzerConfig,
     project: &dyn Project,
-) -> Vec<ResolvedDependency> {
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+) -> DependencyDiscoveryOutcome {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return cancelled_discovery("JVM dependency discovery was cancelled");
+    }
     let mut dependencies = config.external_dependencies.clone();
     if config.dependency_discovery.mode != JvmDependencyDiscoveryMode::Disabled {
         discover_metadata(project).merge_into(&mut dependencies);
     }
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return cancelled_discovery("JVM dependency discovery was cancelled");
+    }
     if config.dependency_discovery.mode == JvmDependencyDiscoveryMode::OfflineBuildTools {
         discover_build_tools(project, &config.dependency_discovery).merge_into(&mut dependencies);
     }
-    resolve_configured_artifacts(&dependencies, project.root())
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return cancelled_discovery("JVM dependency discovery was cancelled");
+    }
+    let metadata_inputs_considered = dependencies
+        .artifact_paths
+        .len()
+        .saturating_add(dependencies.coordinates.len());
+    let resolved = resolve_configured_artifacts(&dependencies, project.root());
+    let mut resolved_coordinates = crate::hash::HashSet::default();
+    for artifact in &resolved {
+        if let Some(coordinate) = &artifact.coordinate {
+            resolved_coordinates.insert(coordinate.clone());
+        }
+    }
+    let mut diagnostics = Vec::new();
+    for coordinate in &dependencies.coordinates {
+        if !resolved_coordinates.contains(coordinate) {
+            diagnostics.push(DependencyPackDiagnostic {
+                severity: DependencyPackDiagnosticSeverity::Error,
+                code: "jvm.dependency_unresolved".to_owned(),
+                dependency_id: Some(jvm_coordinate_id(coordinate)),
+                location: None,
+                message: format!(
+                    "exact local artifact was not found for {}",
+                    jvm_coordinate_id(coordinate)
+                ),
+            });
+        }
+    }
+    let mut resolved: Vec<_> = resolved
         .into_iter()
         .map(resolved_semantic_pack_dependency)
-        .collect()
+        .collect();
+    let mut suppressed_diagnostics = 0;
+    if resolved.len() > limits.max_dependencies {
+        suppressed_diagnostics = resolved.len() - limits.max_dependencies;
+        resolved.truncate(limits.max_dependencies);
+        diagnostics.push(DependencyPackDiagnostic {
+            severity: DependencyPackDiagnosticSeverity::Error,
+            code: "limit.dependencies".to_owned(),
+            dependency_id: None,
+            location: None,
+            message: format!(
+                "JVM dependency discovery exceeded the configured limit {}",
+                limits.max_dependencies
+            ),
+        });
+    }
+    if diagnostics.len() > limits.max_diagnostics {
+        suppressed_diagnostics =
+            suppressed_diagnostics.saturating_add(diagnostics.len() - limits.max_diagnostics);
+        diagnostics.truncate(limits.max_diagnostics);
+    }
+    DependencyDiscoveryOutcome {
+        profile: DependencyDiscoveryProfile {
+            metadata_inputs_considered,
+            dependencies_resolved: resolved.len(),
+        },
+        dependencies: resolved,
+        complete: diagnostics.is_empty() && suppressed_diagnostics == 0,
+        diagnostics,
+        suppressed_diagnostics,
+        cancelled: false,
+    }
+}
+
+fn cancelled_discovery(message: &str) -> DependencyDiscoveryOutcome {
+    DependencyDiscoveryOutcome {
+        dependencies: Vec::new(),
+        diagnostics: vec![DependencyPackDiagnostic {
+            severity: DependencyPackDiagnosticSeverity::Error,
+            code: "discovery.cancelled".to_owned(),
+            dependency_id: None,
+            location: None,
+            message: message.to_owned(),
+        }],
+        suppressed_diagnostics: 0,
+        complete: false,
+        cancelled: true,
+        profile: DependencyDiscoveryProfile::default(),
+    }
+}
+
+fn jvm_coordinate_id(coordinate: &JvmMavenCoordinate) -> String {
+    format!(
+        "{}:{}:{}",
+        coordinate.group_id, coordinate.artifact_id, coordinate.version
+    )
 }
 
 impl DependencyPackAdapter for JvmDependencyPackAdapter {
@@ -155,29 +249,26 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
             let mut artifact_request = request.clone();
             artifact_request.path = artifact.path().to_owned();
             artifact_request.artifact_kind = artifact.kind();
-            let production = JavaJarPackProducer.produce_exact_artifact_with_cancellation(
+            let production = JavaJarPackProducer.produce_loaded_artifact(
                 &artifact_request,
                 limits,
                 cancellation,
+                artifact.exact(),
             );
-            if production.artifact_sha256.as_deref() != Some(artifact.sha256()) {
-                diagnostics.push(ProducerDiagnostic {
-                    severity: ProducerDiagnosticSeverity::Error,
-                    code: "artifact.changed_during_production".to_owned(),
-                    location: Some(artifact.path().to_string_lossy().into_owned()),
-                    message: "exact artifact bytes changed after preparation hashed them"
-                        .to_owned(),
-                });
-                partial = true;
-                continue;
-            }
+            debug_assert_eq!(
+                production.artifact_sha256.as_deref(),
+                Some(artifact.sha256())
+            );
             partial |= production.completeness == Completeness::Partial;
             diagnostics.extend(production.diagnostics);
             suppressed_diagnostics =
                 suppressed_diagnostics.saturating_add(production.suppressed_diagnostics);
             match (artifact.role(), production.pack) {
                 (DependencyArtifactRole::Sources, Some(pack)) => source_pack = Some(pack),
-                (DependencyArtifactRole::Binary, Some(pack)) => binary_pack = Some(pack),
+                (DependencyArtifactRole::Binary, Some(mut pack)) => {
+                    normalize_artifact_locators(&mut pack, artifact.sha256());
+                    binary_pack = Some(pack);
+                }
                 (_, Some(_)) => diagnostics.push(ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
                     code: "artifact.role".to_owned(),
@@ -284,7 +375,12 @@ fn resolved_semantic_pack_dependency(artifact: ResolvedJvmArtifact) -> ResolvedD
             language: "java".to_owned(),
             ecosystem: ecosystem.to_owned(),
             package,
-            module: None,
+            module: (artifact.origin == JvmDependencyOrigin::ExplicitPath).then(|| {
+                CatalogCoordinate {
+                    name: "local-jvm-artifact".to_owned(),
+                    version: None,
+                }
+            }),
             toolchain: None,
             target: Some("jvm".to_owned()),
             configuration: None,
@@ -330,7 +426,17 @@ fn java_dependency_production_request(
                         .as_ref()
                         .map(|version| format!("={version}")),
                 }),
-            module: None,
+            module: dependency
+                .evidence
+                .module
+                .as_ref()
+                .map(|coordinate| NameSelector {
+                    name: coordinate.name.clone(),
+                    version: coordinate
+                        .version
+                        .as_ref()
+                        .map(|version| format!("={version}")),
+                }),
             toolchain: None,
             targets: dependency.evidence.target.clone().into_iter().collect(),
             configurations: dependency
@@ -342,7 +448,7 @@ fn java_dependency_production_request(
             artifact_sha256: None,
         }],
         provenance: Provenance {
-            source: format!("local dependency {}", dependency.id),
+            source: "exact local JVM dependency".to_owned(),
             revision: None,
         },
         license: "NOASSERTION".to_owned(),
@@ -350,6 +456,27 @@ fn java_dependency_production_request(
             generated_code_only: false,
             review_required: false,
         },
+    }
+}
+
+fn normalize_artifact_locators(pack: &mut AuthoredSemanticModelPack, artifact_sha256: &str) {
+    let path = format!("sha256-{artifact_sha256}.artifact");
+    for shard in &mut pack.shards {
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &mut shard.payload else {
+            continue;
+        };
+        for locator in types
+            .iter_mut()
+            .map(|fact| &mut fact.locator)
+            .chain(members.iter_mut().map(|fact| &mut fact.locator))
+        {
+            if let Locator::Artifact {
+                path: locator_path, ..
+            } = locator
+            {
+                *locator_path = path.clone();
+            }
+        }
     }
 }
 
@@ -482,16 +609,25 @@ impl JvmExternalDeclarationIndex {
     }
 
     pub(crate) fn build_for_project(config: &JvmAnalyzerConfig, project: &dyn Project) -> Self {
-        let mut dependencies = config.external_dependencies.clone();
-        if config.dependency_discovery.mode != JvmDependencyDiscoveryMode::Disabled {
-            discover_metadata(project).merge_into(&mut dependencies);
-        }
-        if config.dependency_discovery.mode == JvmDependencyDiscoveryMode::OfflineBuildTools {
-            discover_build_tools(project, &config.dependency_discovery)
-                .merge_into(&mut dependencies);
-        }
-        let artifacts = resolve_configured_artifacts(&dependencies, project.root());
-        Self::build_from_artifacts(artifacts)
+        let discovery = resolve_jvm_semantic_pack_dependencies(
+            config,
+            project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        let artifacts = discovery
+            .dependencies
+            .iter()
+            .filter_map(jvm_artifact_from_dependency)
+            .collect();
+        let mut index = Self::build_from_artifacts(artifacts);
+        index.production_diagnostics.extend(
+            discovery
+                .diagnostics
+                .into_iter()
+                .map(discovery_producer_diagnostic),
+        );
+        index
     }
 
     fn build_from_artifacts(artifacts: Vec<ResolvedJvmArtifact>) -> Self {
@@ -774,6 +910,36 @@ impl JvmExternalDeclarationIndex {
             })
             .map(|fact| (fact.name.clone(), fact))
             .collect()
+    }
+}
+
+fn jvm_artifact_from_dependency(dependency: &ResolvedDependency) -> Option<ResolvedJvmArtifact> {
+    let binary = dependency
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.role == DependencyArtifactRole::Binary);
+    let source = dependency
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.role == DependencyArtifactRole::Sources);
+    let primary = binary.or(source)?;
+    Some(ResolvedJvmArtifact {
+        artifact_path: primary.path.clone(),
+        source_artifact_path: binary.and(source).map(|source| source.path.clone()),
+        coordinate: None,
+        origin: JvmDependencyOrigin::ExplicitPath,
+    })
+}
+
+fn discovery_producer_diagnostic(diagnostic: DependencyPackDiagnostic) -> ProducerDiagnostic {
+    ProducerDiagnostic {
+        severity: match diagnostic.severity {
+            DependencyPackDiagnosticSeverity::Warning => ProducerDiagnosticSeverity::Warning,
+            DependencyPackDiagnosticSeverity::Error => ProducerDiagnosticSeverity::Error,
+        },
+        code: diagnostic.code,
+        location: diagnostic.location,
+        message: diagnostic.message,
     }
 }
 
@@ -1742,7 +1908,12 @@ mod tests {
                 ..crate::analyzer::JvmDependencyDiscoveryConfig::default()
             },
         };
-        let dependencies = resolve_jvm_semantic_pack_dependencies(&config, &project);
+        let dependencies = resolve_jvm_semantic_pack_dependencies(
+            &config,
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
 
         assert_eq!(dependencies.len(), 1);
         assert_eq!(dependencies[0].id, "com.example:external-lib:1.2.3");
@@ -1793,6 +1964,125 @@ mod tests {
         assert_eq!(
             first.packs[0].status,
             DependencyPackPreparationStatus::Generated
+        );
+        assert_eq!(
+            second.packs[0].status,
+            DependencyPackPreparationStatus::Reused
+        );
+        assert_eq!(first.packs[0].production, second.packs[0].production);
+    }
+
+    #[test]
+    fn unresolved_jvm_coordinate_is_actionable_incomplete_discovery() {
+        use crate::analyzer::semantic_model::{
+            DependencyPackLimits, prepare_discovered_dependency_semantic_packs,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let project = TestProject::new(root.path(), Language::Java);
+        let config = JvmAnalyzerConfig {
+            external_dependencies: JvmExternalDependencies {
+                coordinates: vec![JvmMavenCoordinate {
+                    group_id: "com.example".to_owned(),
+                    artifact_id: "missing".to_owned(),
+                    version: "1.0.0".to_owned(),
+                }],
+                repository_roots: vec![root.path().join("repository")],
+                ..JvmExternalDependencies::default()
+            },
+            dependency_discovery: crate::analyzer::JvmDependencyDiscoveryConfig {
+                mode: JvmDependencyDiscoveryMode::Disabled,
+                ..crate::analyzer::JvmDependencyDiscoveryConfig::default()
+            },
+        };
+        let limits = DependencyPackLimits::default();
+        let discovery = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+
+        assert!(!discovery.complete);
+        assert!(discovery.dependencies.is_empty());
+        assert_eq!(discovery.diagnostics[0].code, "jvm.dependency_unresolved");
+        let catalog = crate::analyzer::semantic_model::SemanticPackCatalog::open_ephemeral(
+            Default::default(),
+        )
+        .unwrap();
+        let prepared = prepare_discovered_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            discovery,
+            &limits,
+            None,
+        );
+        assert!(!prepared.complete);
+        assert!(
+            prepared
+                .compose_activation_request(
+                    crate::analyzer::semantic_model::SemanticModelActivationRequest {
+                        bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                        evidence: Vec::new(),
+                        controls: Vec::new(),
+                        limits: Default::default(),
+                    }
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn renamed_identical_jars_reuse_one_path_independent_manifest() {
+        use crate::analyzer::semantic_model::{
+            CatalogOptions, DependencyPackLimits, DependencyPackPreparationStatus,
+            SemanticPackCatalog, prepare_dependency_semantic_packs,
+        };
+
+        let Some(fixture) = ExternalJarFixture::new(true) else {
+            return;
+        };
+        let copies = tempfile::tempdir().unwrap();
+        let first_binary = copies.path().join("first.jar");
+        let second_binary = copies.path().join("renamed.jar");
+        fs::copy(fixture.binary_jar_path(), &first_binary).unwrap();
+        fs::copy(fixture.binary_jar_path(), &second_binary).unwrap();
+        let project = TestProject::new(copies.path(), Language::Java);
+        let config = |binary| JvmAnalyzerConfig {
+            external_dependencies: JvmExternalDependencies {
+                artifact_paths: vec![JvmExternalArtifact {
+                    artifact_path: binary,
+                    source_artifact_path: None,
+                    ..JvmExternalArtifact::default()
+                }],
+                ..JvmExternalDependencies::default()
+            },
+            dependency_discovery: crate::analyzer::JvmDependencyDiscoveryConfig {
+                mode: JvmDependencyDiscoveryMode::Disabled,
+                ..Default::default()
+            },
+        };
+        let limits = DependencyPackLimits::default();
+        let first_dependencies =
+            resolve_jvm_semantic_pack_dependencies(&config(first_binary), &project, &limits, None);
+        let second_dependencies =
+            resolve_jvm_semantic_pack_dependencies(&config(second_binary), &project, &limits, None);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let first = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &first_dependencies,
+            &limits,
+            None,
+        );
+        let second = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &second_dependencies,
+            &limits,
+            None,
+        );
+
+        assert!(
+            first.complete && second.complete,
+            "first={:#?}\nsecond={:#?}",
+            first,
+            second
         );
         assert_eq!(
             second.packs[0].status,

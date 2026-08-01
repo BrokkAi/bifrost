@@ -80,6 +80,10 @@ impl ExactDependencyArtifact {
         self.artifact.bytes()
     }
 
+    pub(crate) fn exact(&self) -> &ExactArtifact {
+        &self.artifact
+    }
+
     pub fn sha256(&self) -> &str {
         self.artifact.sha256()
     }
@@ -179,6 +183,46 @@ pub struct DependencyPackPreparationOutcome {
     pub complete: bool,
     pub cancelled: bool,
     pub profile: DependencyPackPreparationProfile,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DependencyDiscoveryProfile {
+    pub metadata_inputs_considered: usize,
+    pub dependencies_resolved: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyDiscoveryOutcome {
+    pub dependencies: Vec<ResolvedDependency>,
+    pub diagnostics: Vec<DependencyPackDiagnostic>,
+    pub suppressed_diagnostics: usize,
+    pub complete: bool,
+    pub cancelled: bool,
+    pub profile: DependencyDiscoveryProfile,
+}
+
+impl DependencyDiscoveryOutcome {
+    pub fn complete(dependencies: Vec<ResolvedDependency>) -> Self {
+        Self {
+            profile: DependencyDiscoveryProfile {
+                metadata_inputs_considered: 0,
+                dependencies_resolved: dependencies.len(),
+            },
+            dependencies,
+            diagnostics: Vec::new(),
+            suppressed_diagnostics: 0,
+            complete: true,
+            cancelled: false,
+        }
+    }
+}
+
+impl std::ops::Deref for DependencyDiscoveryOutcome {
+    type Target = [ResolvedDependency];
+
+    fn deref(&self) -> &Self::Target {
+        &self.dependencies
+    }
 }
 
 impl DependencyPackPreparationOutcome {
@@ -337,7 +381,7 @@ pub fn prepare_dependency_semantic_packs(
         }
 
         let producer = adapter.producer();
-        let input_digest = dependency_input_digest(adapter, dependency, &exact_artifacts);
+        let input_digest = dependency_input_digest(adapter, dependency, &exact_artifacts, limits);
         let key = match GeneratedProductionKey::new(
             input_digest.clone(),
             producer.name.clone(),
@@ -355,7 +399,7 @@ pub fn prepare_dependency_semantic_packs(
             break;
         }
         match catalog.generated_production(&key) {
-            Ok(Some(production)) => {
+            Ok(Some(production)) if production.completeness == Completeness::Complete => {
                 let activation_evidence = activation_evidence(dependency, &input_digest);
                 evidence.push(activation_evidence.clone());
                 packs.push(PreparedDependencyPack {
@@ -368,6 +412,7 @@ pub fn prepare_dependency_semantic_packs(
                 profile.reused_packs += 1;
                 continue;
             }
+            Ok(Some(_)) => {}
             Ok(None) => {}
             Err(error) => {
                 diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error);
@@ -381,6 +426,12 @@ pub fn prepare_dependency_semantic_packs(
         }
         let production =
             adapter.produce(dependency, &exact_artifacts, &limits.producer, cancellation);
+        let production_has_errors = production
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == ProducerDiagnosticSeverity::Error)
+            || production.suppressed_diagnostics > 0;
+        let production_has_diagnostics = !production.diagnostics.is_empty();
         diagnostics.suppressed = diagnostics
             .suppressed
             .saturating_add(production.suppressed_diagnostics);
@@ -390,6 +441,17 @@ pub fn prepare_dependency_semantic_packs(
         let Some(mut pack) = production.pack else {
             continue;
         };
+        if production_has_errors {
+            pack.completeness = Completeness::Partial;
+        }
+        if pack.completeness == Completeness::Partial && !production_has_diagnostics {
+            diagnostics.error(
+                "production.partial",
+                Some(&dependency.id),
+                None,
+                "dependency producer returned partial semantic coverage",
+            );
+        }
         if pack.producer != producer || pack.schema_version != SEMANTIC_MODEL_SCHEMA_VERSION {
             diagnostics.error(
                 "production.identity_mismatch",
@@ -493,10 +555,42 @@ pub fn prepare_dependency_semantic_packs(
     }
 }
 
+pub fn prepare_discovered_dependency_semantic_packs(
+    catalog: &SemanticPackCatalog,
+    adapter: &dyn DependencyPackAdapter,
+    discovery: DependencyDiscoveryOutcome,
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+) -> DependencyPackPreparationOutcome {
+    let mut outcome = prepare_dependency_semantic_packs(
+        catalog,
+        adapter,
+        &discovery.dependencies,
+        limits,
+        cancellation,
+    );
+    let mut diagnostics = discovery.diagnostics;
+    diagnostics.append(&mut outcome.diagnostics);
+    if diagnostics.len() > limits.max_diagnostics {
+        outcome.suppressed_diagnostics = outcome
+            .suppressed_diagnostics
+            .saturating_add(diagnostics.len() - limits.max_diagnostics);
+        diagnostics.truncate(limits.max_diagnostics);
+    }
+    outcome.suppressed_diagnostics = outcome
+        .suppressed_diagnostics
+        .saturating_add(discovery.suppressed_diagnostics);
+    outcome.complete &= discovery.complete;
+    outcome.cancelled |= discovery.cancelled;
+    outcome.diagnostics = diagnostics;
+    outcome
+}
+
 fn dependency_input_digest(
     adapter: &dyn DependencyPackAdapter,
     dependency: &ResolvedDependency,
     artifacts: &[ExactDependencyArtifact],
+    limits: &DependencyPackLimits,
 ) -> String {
     let mut hasher = CanonicalHasher::new(DEPENDENCY_INPUT_DOMAIN);
     hasher.field("adapter_name", adapter.adapter_name().as_bytes());
@@ -513,7 +607,67 @@ fn dependency_input_digest(
         hasher.field("kind", artifact_kind_name(artifact.kind).as_bytes());
         hasher.field("sha256", artifact.sha256().as_bytes());
     });
+    hash_production_profile(&mut hasher, limits);
     lower_hex_string(&hasher.finish())
+}
+
+fn hash_production_profile(hasher: &mut CanonicalHasher, limits: &DependencyPackLimits) {
+    let producer = limits.producer;
+    for (field, value) in [
+        ("producer_max_artifact_bytes", producer.max_artifact_bytes),
+        ("producer_max_records", producer.max_records as u64),
+        (
+            "producer_max_signature_depth",
+            producer.max_signature_depth as u64,
+        ),
+        ("producer_max_diagnostics", producer.max_diagnostics as u64),
+        (
+            "producer_max_diagnostic_message_bytes",
+            producer.max_diagnostic_message_bytes as u64,
+        ),
+        (
+            "compiler_max_source_bytes",
+            limits.compiler.max_source_bytes as u64,
+        ),
+        (
+            "compiler_max_manifest_bytes",
+            limits.compiler.max_manifest_bytes as u64,
+        ),
+        (
+            "compiler_max_stored_shard_bytes",
+            limits.compiler.max_stored_shard_bytes as u64,
+        ),
+        (
+            "compiler_max_raw_shard_bytes",
+            limits.compiler.max_raw_shard_bytes as u64,
+        ),
+        (
+            "compiler_max_total_raw_bytes",
+            limits.compiler.max_total_raw_bytes,
+        ),
+        ("compiler_max_shards", limits.compiler.max_shards as u64),
+        (
+            "compiler_max_records_per_shard",
+            limits.compiler.max_records_per_shard as u64,
+        ),
+        (
+            "compiler_max_records_per_pack",
+            limits.compiler.max_records_per_pack as u64,
+        ),
+        (
+            "compiler_max_text_bytes",
+            limits.compiler.max_text_bytes as u64,
+        ),
+        ("compiler_max_depth", limits.compiler.max_depth as u64),
+    ] {
+        hasher.field(field, &value.to_be_bytes());
+    }
+    let compression = match limits.compiler.compression {
+        super::CompressionPolicy::Automatic => "automatic",
+        super::CompressionPolicy::AlwaysRaw => "raw",
+        super::CompressionPolicy::AlwaysDeflate => "deflate",
+    };
+    hasher.field("compiler_compression", compression.as_bytes());
 }
 
 fn hash_evidence(hasher: &mut CanonicalHasher, evidence: &SemanticModelActivationEvidence) {

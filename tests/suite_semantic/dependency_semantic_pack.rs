@@ -194,6 +194,45 @@ fn changed_artifact_bytes_invalidate_only_the_exact_production() {
 }
 
 #[test]
+fn output_affecting_generation_limits_have_distinct_production_keys() {
+    let root = tempfile::tempdir().unwrap();
+    let artifact = root.path().join("widget.jar");
+    std::fs::write(&artifact, b"same artifact").unwrap();
+    let catalog = SemanticPackCatalog::open(
+        &root.path().join("catalog"),
+        CatalogOpenMode::ReadWrite,
+        CatalogOptions::default(),
+    )
+    .unwrap();
+    let adapter = FixtureAdapter::default();
+    let default_limits = DependencyPackLimits::default();
+    let mut constrained_limits = default_limits;
+    constrained_limits.producer.max_records -= 1;
+
+    let first = prepare_dependency_semantic_packs(
+        &catalog,
+        &adapter,
+        &[dependency(artifact.clone())],
+        &default_limits,
+        None,
+    );
+    let second = prepare_dependency_semantic_packs(
+        &catalog,
+        &adapter,
+        &[dependency(artifact)],
+        &constrained_limits,
+        None,
+    );
+
+    assert!(first.complete && second.complete);
+    assert_ne!(
+        first.packs[0].production.key,
+        second.packs[0].production.key
+    );
+    assert_eq!(adapter.productions.load(Ordering::Relaxed), 2);
+}
+
+#[test]
 fn cancellation_before_artifact_read_publishes_nothing() {
     let root = tempfile::tempdir().unwrap();
     let artifact = root.path().join("widget.jar");
@@ -262,7 +301,7 @@ fn missing_artifact_is_partial_and_never_claims_empty_success() {
 }
 
 #[test]
-fn partial_generated_pack_remains_partial_when_reused() {
+fn partial_generated_pack_is_reproduced_with_actionable_diagnostic() {
     struct PartialAdapter(FixtureAdapter);
 
     impl DependencyPackAdapter for PartialAdapter {
@@ -321,9 +360,10 @@ fn partial_generated_pack_remains_partial_when_reused() {
     assert_eq!(second.packs[0].completeness, Completeness::Partial);
     assert_eq!(
         second.packs[0].status,
-        DependencyPackPreparationStatus::Reused
+        DependencyPackPreparationStatus::Generated
     );
-    assert_eq!(adapter.0.productions.load(Ordering::Relaxed), 1);
+    assert_eq!(second.diagnostics[0].code, "production.partial");
+    assert_eq!(adapter.0.productions.load(Ordering::Relaxed), 2);
 }
 
 #[test]
