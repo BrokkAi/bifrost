@@ -1711,7 +1711,15 @@ fn bifrost_cli_toolset_exposes_classify_test_files() {
 #[test]
 #[cfg(feature = "nlp")]
 fn bifrost_semantic_search_fails_cleanly_without_models() {
-    let fixture_root = repository_fixture_root("testcode-java");
+    let fixture = InlineTestProject::with_language(Language::Java)
+        .file("Config.java", "class Config {}\n")
+        .build();
+    let git_init = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(fixture.root())
+        .status()
+        .expect("initialize semantic-search test repository");
+    assert!(git_init.success(), "git init failed: {git_init}");
 
     let mut command = Command::new(mcp_server_binary());
     command
@@ -1725,7 +1733,7 @@ fn bifrost_semantic_search_fails_cleanly_without_models() {
         )
         .arg("--force-semantic-cpu")
         .arg("--root")
-        .arg(&fixture_root)
+        .arg(fixture.root())
         .arg("--mcp")
         .arg("nlp")
         .stdin(Stdio::piped())
