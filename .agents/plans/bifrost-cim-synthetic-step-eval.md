@@ -111,6 +111,15 @@ authorizes the remaining dw10 retrieval recipes.
   report `component vector missing after embed`. The timeout is now 1,800 seconds only in CIM mode
   at Anvil `8c2e8e6`, and Bifrost `ca6a3f20` retains decoded cached components across composition;
   its regression forces GC after the read and passes.
+- Observation: R3 proved both shared-cache fixes under load and completed 61 cells before draining,
+  but several nonempty synthetic batches consumed the entire 1,800-second outer cell budget. The
+  stuck phase was Anvil's disposable low-reasoning Bedrock relevance call after Bifrost returned
+  candidates, not embedding or retrieval. Because the killed traces lacked the required synthetic
+  end boundary, cimeval correctly failed closed and cancelled the still-queued cells.
+  Evidence: affected traces contain `cim_synthetic_step_start` and no rerank/end event; Anvil logs
+  enter both parallel semantic calls immediately and then stop after Bedrock backend initialization.
+  Anvil `e93b745` now applies a CIM-only 120-second total wall deadline so the existing deterministic
+  reciprocal-rank fallback is reachable when Bedrock hangs. Normal Anvil reranking is unchanged.
 
 ## Decision Log
 
@@ -155,6 +164,13 @@ authorizes the remaining dw10 retrieval recipes.
   Rationale: r2 contains one immutable runtime identity and valid completed cells, but resuming it
   with either fix would mix execution semantics. The longer deadline is confined to the requested
   benchmark mode; ordinary Anvil MCP calls remain capped at 300 seconds.
+  Date/Author: 2026-08-01 / Codex.
+- Decision: retain r3 as a third infrastructure diagnostic and run r4 from scratch with the bounded
+  disposable reranker. Do not switch the reportable main-agent provider to OpenRouter.
+  Rationale: provider substitution would break the exact seed-0 pairing against the existing
+  Bedrock/Luna baseline. Anvil already defines deterministic RRF as the provider-failure behavior;
+  bounding only CIM's disposable call makes that existing behavior reachable without changing
+  ordinary Anvil or Luna's provider.
   Date/Author: 2026-08-01 / Codex.
 
 ## Outcomes & Retrospective
@@ -300,6 +316,10 @@ Runtime v5 is `r1/runtime/runtime-v5.tgz`, SHA-256
 R2 is retained as a diagnostic after the timeout/GC failures above; it is not a reportable mixed-
 runtime run. The next clean reportable directory is `dw10-cim-synthetic-20260801-r3` and will reuse
 the exact frozen run-manifest and query-manifest bytes with a newly recorded runtime.
+R3 is likewise diagnostic-only. R4 is `dw10-cim-synthetic-20260801-r4`; runtime v7 has SHA-256
+`a63bcd7adb4750b1cab060234504845e0174c2c668f7f146c144cbea333808f3`, Anvil binary SHA-256
+`ba49f150546de298269217e88fd266e89904aff02f129250f134151311684bcd`, and the unchanged Bifrost
+binary SHA-256 `a686ccca71ddfba04c40e49df6b34ace901fc766b23ff453a7d6472e5261fa7e`.
 
 ## Interfaces and Dependencies
 
@@ -334,6 +354,9 @@ immutable task runtime because none of its bytes enter the container.
 
 Revision note, 2026-08-01: Recorded r2's CIM deadline and cross-process semantic-GC failures, their
 focused regression coverage, and the clean-r3 decision required to preserve one runtime identity.
+
+Revision note, 2026-08-01: Recorded r3's disposable Bedrock reranker hangs, the CIM-only bounded
+fallback design, and immutable runtime v7 for the clean r4 restart.
 
 Revision note, 2026-08-01: Recorded r1's shared-cache contention diagnosis, both read-only fast
 paths, and the clean r2 restart required to retain one immutable runtime identity.
