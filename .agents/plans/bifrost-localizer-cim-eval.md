@@ -287,7 +287,11 @@ The observable outcomes are:
   1,753 Git-history attempts and 72 network attempts were all mitigated by synthetic-root
   history or Anvil's offline network namespace. Pristine recovery of inconclusive inline
   verifier failures continues at four jobs before outcome aggregation.
-- [ ] Score, leak-audit, analyze, and report the baseline and Granite results.
+- [x] (2026-08-01, final Granite report) Scored all 1,092 cells after selective pristine
+  recovery, including successful versioned retries for all 29 first-pass verifier timeouts.
+  The final report has no missing outcomes. Resolve rates are 52.0% baseline, 53.8% all
+  signals, 54.6% semantic only, and 54.9% semantic plus co-edit; none of the paired resolve
+  comparisons against baseline is statistically significant.
 - [ ] Run dw10 `semantic-coedit-2-1` over seeds 0, 1, and 2 at concurrency 30, using its
   separately fingerprinted cache and local A4000 sidecar.
 - [ ] Run final validation, update this plan's retrospective, and commit the Granite/dw10

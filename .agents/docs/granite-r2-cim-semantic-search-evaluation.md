@@ -1,8 +1,7 @@
 # Granite R2 Semantic Search Evaluation
 
-Status: generation, localization, and leakage validation are complete. Pristine recovery of
-inconclusive inline verifier failures is in progress; Granite outcome tables remain intentionally
-absent until every reportable cell has a valid official score.
+Status: complete. All 1,092 cells have final official scores, localization artifacts, and leak
+audits. The broader campaign continues with the separately reported dw10 best-recipe arm.
 
 ## Question
 
@@ -51,15 +50,15 @@ reranker.
 ## No-semantic baseline sanity gate
 
 The max-reasoning Luna baseline completed, localized, scored, and leak-audited all 273 cells.
-It resolved 140/273 (51.3%) with zero leak flags.
+It resolved 142/273 (52.0%) with zero leak flags.
 
 | Seed | Resolved | Resolve rate | View B Acc@5 | Mean turns | Mean cost/cell |
 | ---: | ---: | ---: | ---: | ---: | ---: |
 | 0 | 49/91 | 53.8% | 50.5% | 39.6 | $0.491 |
 | 1 | 48/91 | 52.7% | 52.7% | 42.3 | $0.508 |
-| 2 | 43/91 | 47.3% | 50.5% | 42.3 | $0.469 |
+| 2 | 45/91 | 49.5% | 50.5% | 42.3 | $0.469 |
 
-Total baseline cost was $133.52, or $0.954 per solve. The outcome is operationally sane beside
+Total baseline cost was $133.52, or $0.940 per solve. The outcome is operationally sane beside
 CIM's published no-index references: SC-OFF resolved 43.9%, 41.5%, and 40.2% across its three
 seeds, while OpenCode resolved 44.4%, 45.7%, and 45.7%. The comparison is deliberately loose:
 the agent, model, maximum reasoning behavior, and token usage differ from CIM.
@@ -98,14 +97,34 @@ Final localization produced 1,092/1,092 artifacts with zero skips or errors. The
 covered all 1,092 cells and flagged zero: 1,753 Git-history attempts were neutralized by the
 synthetic-root protocol and 72 network attempts by Anvil's offline shell namespace.
 
-Outcome tables will be populated after the remaining inconclusive inline verifier failures have
-valid pristine scores. No partial outcome estimate is reported here because an incomplete score
-denominator is not outcome-blind.
+Inline scoring was conclusive for 551 cells. Selective pristine recovery produced valid scores
+for the other 541; 29 verifier timeouts in the first recovery pass all succeeded in the versioned
+third pass. The final report therefore has no missing outcomes.
+
+| Arm | Resolved | Resolve rate | View B Acc@5 | Mean turns | Mean uncached tokens | Mean cost/cell |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| baseline | 142/273 | 52.0% | 51.3% | 41.4 | 150,906 | $0.489 |
+| all signals | 147/273 | 53.8% | 53.5% | 44.9 | 253,603 | $0.799 |
+| semantic only | 149/273 | 54.6% | 49.5% | 44.5 | 233,317 | $0.749 |
+| semantic + co-edit 2:1 | 150/273 | 54.9% | 52.0% | 43.8 | 232,229 | $0.744 |
+
+The vector-plus-co-edit recipe has the highest observed solve rate, 2.93 percentage points above
+baseline, followed by semantic only at +2.56 points and all signals at +1.83 points. These are
+small descriptive differences, not statistically established improvements: paired Wilcoxon
+resolve p-values versus baseline are 0.170, 0.228, and 0.376 respectively. Pairwise retrieval-arm
+resolve comparisons are also non-significant. All retrieval arms cost materially more than the
+baseline; vector plus co-edit was the least expensive semantic arm at $203.21 total and $1.355
+per solve.
+
+The report's legacy automated sanity predicate marks the baseline false solely because its
+5,000-30,000 mean-token band predates maximum-reasoning Luna; the observed mean is 150,906.
+Resolve rate, task count, turn count, trace review, and leak review all pass, so this is a stale
+threshold rather than an operational failure.
 
 ## Change inventory
 
-The outcome-independent implementation is committed. Final validation evidence and any
-outcome-driven reporting commits will be added after the campaign.
+The outcome-independent implementation and final Granite outcome report are committed. The
+dw10 extension uses the same harness and will be reported separately when complete.
 
 ### Bifrost
 
