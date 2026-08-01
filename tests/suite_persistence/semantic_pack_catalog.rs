@@ -6,8 +6,8 @@ use std::time::Duration;
 use brokk_bifrost::analyzer::semantic_model::{
     AuthoredSemanticModelPack, CatalogCoordinate, CatalogError, CatalogGcOptions, CatalogMiss,
     CatalogOpenMode, CatalogOptions, CatalogPackSourceKind, DurablePackSource,
-    DurablePackSourceKind, SemanticPackCatalog, SemanticPackSelectorQuery, SessionPackSource,
-    SessionPackSourceKind, SourceFormat, compile_pack, compile_source,
+    DurablePackSourceKind, GeneratedProductionKey, SemanticPackCatalog, SemanticPackSelectorQuery,
+    SessionPackSource, SessionPackSourceKind, SourceFormat, compile_pack, compile_source,
 };
 use brokk_bifrost::analyzer::semantic_model::{CompiledSemanticModelPack, CompilerOptions};
 use brokk_bifrost::analyzer::store::{
@@ -54,6 +54,16 @@ fn source(kind: DurablePackSourceKind, id: &str) -> DurablePackSource {
         kind,
         source_id: id.to_owned(),
     }
+}
+
+fn generated_key(pack: &CompiledSemanticModelPack, input: char) -> GeneratedProductionKey {
+    GeneratedProductionKey::new(
+        input.to_string().repeat(64),
+        pack.manifest.producer.name.clone(),
+        pack.manifest.producer.version.clone(),
+        pack.manifest.schema_version,
+    )
+    .unwrap()
 }
 
 fn matching_query() -> SemanticPackSelectorQuery {
@@ -484,6 +494,193 @@ fn concurrent_installers_publish_one_complete_pack() {
 }
 
 #[test]
+fn generated_production_reuses_exact_input_and_rejects_changed_semantics() {
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let pack = compiled_pack();
+    let key = generated_key(&pack, 'a');
+
+    assert!(catalog.generated_production(&key).unwrap().is_none());
+    let first = catalog.install_generated(&key, &pack).unwrap();
+    assert!(first.install.inserted_manifest);
+    assert_eq!(first.install.inserted_objects, 1);
+    assert_eq!(
+        catalog.generated_production(&key).unwrap(),
+        Some(first.production.clone())
+    );
+
+    let second = catalog.install_generated(&key, &pack).unwrap();
+    assert!(!second.install.inserted_manifest);
+    assert_eq!(second.install.inserted_objects, 0);
+    assert_eq!(second.production, first.production);
+
+    let changed_input = generated_key(&pack, 'b');
+    assert!(
+        catalog
+            .generated_production(&changed_input)
+            .unwrap()
+            .is_none()
+    );
+    let changed_producer = GeneratedProductionKey::new(
+        key.input_digest(),
+        key.producer_name(),
+        "different-producer-version",
+        key.schema_version(),
+    )
+    .unwrap();
+    assert!(
+        catalog
+            .generated_production(&changed_producer)
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        catalog.install_generated(&changed_producer, &pack),
+        Err(CatalogError::Integrity(_))
+    ));
+}
+
+#[test]
+fn generated_production_key_cannot_rebind_to_different_manifest() {
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let first_pack = compiled_pack();
+    let second_pack = compiled_pack_version("1.0.1");
+    let key = generated_key(&first_pack, 'c');
+    catalog.install_generated(&key, &first_pack).unwrap();
+
+    let error = catalog
+        .install_generated(&key, &second_pack)
+        .expect_err("one production key cannot identify two manifests");
+    assert!(matches!(error, CatalogError::Integrity(_)));
+    assert_eq!(
+        catalog
+            .generated_production(&key)
+            .unwrap()
+            .unwrap()
+            .manifest_digest,
+        first_pack.manifest.content_sha256
+    );
+}
+
+#[test]
+fn concurrent_generated_installers_publish_one_production() {
+    let root = TempDir::new().unwrap();
+    let pack = Arc::new(compiled_pack());
+    let key = Arc::new(generated_key(&pack, 'd'));
+    let barrier = Arc::new(Barrier::new(4));
+    let mut workers = Vec::new();
+    for _ in 0..4 {
+        let root = root.path().to_owned();
+        let pack = Arc::clone(&pack);
+        let key = Arc::clone(&key);
+        let barrier = Arc::clone(&barrier);
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            SemanticPackCatalog::open(&root, CatalogOpenMode::ReadWrite, CatalogOptions::default())
+                .unwrap()
+                .install_generated(&key, &pack)
+                .unwrap()
+        }));
+    }
+
+    let outcomes: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| outcome.install.inserted_manifest)
+            .count(),
+        1
+    );
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| outcome.production == outcomes[0].production)
+    );
+
+    let catalog = SemanticPackCatalog::open(
+        root.path(),
+        CatalogOpenMode::ReadOnly,
+        CatalogOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        catalog.generated_production(&key).unwrap(),
+        Some(outcomes[0].production.clone())
+    );
+}
+
+#[test]
+fn corrupt_generated_production_is_quarantined_as_a_safe_miss() {
+    let root = TempDir::new().unwrap();
+    let catalog = SemanticPackCatalog::open(
+        root.path(),
+        CatalogOpenMode::ReadWrite,
+        CatalogOptions::default(),
+    )
+    .unwrap();
+    let pack = compiled_pack();
+    let key = generated_key(&pack, 'e');
+    catalog.install_generated(&key, &pack).unwrap();
+    let connection = Connection::open(root.path().join("catalog.db")).unwrap();
+    connection
+        .execute(
+            "UPDATE catalog_packs SET manifest_bytes = X'00'
+             WHERE manifest_digest = ?1",
+            [&pack.manifest.content_sha256],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(catalog.generated_production(&key).unwrap().is_none());
+    assert_eq!(catalog.accounting().unwrap().quarantined_pack_count, 1);
+}
+
+#[test]
+fn generated_production_is_removed_with_garbage_collected_pack() {
+    let root = TempDir::new().unwrap();
+    let catalog = SemanticPackCatalog::open(
+        root.path(),
+        CatalogOpenMode::ReadWrite,
+        CatalogOptions::default(),
+    )
+    .unwrap();
+    let pack = compiled_pack();
+    let key = generated_key(&pack, 'f');
+    catalog.install_generated(&key, &pack).unwrap();
+    assert!(
+        catalog
+            .remove_source(&source(DurablePackSourceKind::Generated, &key.source_id(),))
+            .unwrap()
+    );
+    assert_eq!(
+        catalog
+            .garbage_collect(&CatalogGcOptions {
+                minimum_age: Duration::ZERO,
+                max_packs: 100,
+                max_objects: 100,
+            })
+            .unwrap()
+            .pruned_packs,
+        1
+    );
+
+    assert!(catalog.generated_production(&key).unwrap().is_none());
+    let connection = Connection::open(root.path().join("catalog.db")).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM catalog_generated_productions",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn read_only_catalog_supports_lookup_but_rejects_install() {
     let root = TempDir::new().unwrap();
     let pack = compiled_pack();
@@ -542,7 +739,7 @@ fn newer_catalog_schema_is_rejected_without_mutation() {
     );
     let database = root.path().join("catalog.db");
     let connection = Connection::open(&database).unwrap();
-    connection.pragma_update(None, "user_version", 4).unwrap();
+    connection.pragma_update(None, "user_version", 5).unwrap();
     drop(connection);
     let before = fs::read(&database).unwrap();
 
@@ -556,8 +753,8 @@ fn newer_catalog_schema_is_rejected_without_mutation() {
     assert!(matches!(
         error,
         CatalogError::CatalogTooNew {
-            found: 4,
-            supported: 3
+            found: 5,
+            supported: 4
         }
     ));
     assert_eq!(fs::read(database).unwrap(), before);
@@ -598,7 +795,7 @@ fn catalog_migrations_preserve_existing_catalog_rows() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        3
+        4
     );
     assert_eq!(
         connection
@@ -641,6 +838,9 @@ fn procedure_summary_migration_preserves_version_two_pack_rows() {
 
     let database = root.path().join("catalog.db");
     let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch("DROP TABLE catalog_generated_productions;")
+        .unwrap();
     connection.pragma_update(None, "user_version", 2).unwrap();
     drop(connection);
 
@@ -667,7 +867,62 @@ fn procedure_summary_migration_preserves_version_two_pack_rows() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        3
+        4
+    );
+}
+
+#[test]
+fn generated_production_migration_preserves_version_three_pack_rows() {
+    let root = TempDir::new().unwrap();
+    let pack = compiled_pack();
+    {
+        let catalog = SemanticPackCatalog::open(
+            root.path(),
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        catalog
+            .install(
+                &pack,
+                &source(DurablePackSourceKind::Installed, "pre-production-migration"),
+            )
+            .unwrap();
+    }
+
+    let database = root.path().join("catalog.db");
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch("DROP TABLE catalog_generated_productions;")
+        .unwrap();
+    connection.pragma_update(None, "user_version", 3).unwrap();
+    drop(connection);
+
+    let catalog = SemanticPackCatalog::open(
+        root.path(),
+        CatalogOpenMode::ReadWrite,
+        CatalogOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(catalog.candidates(&matching_query()).unwrap().len(), 1);
+
+    let connection = Connection::open(database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE name = 'catalog_generated_productions'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
     );
 }
 

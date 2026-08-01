@@ -266,9 +266,11 @@ pub(super) fn cleanup_stale_staging(
         let entry = entry.map_err(|error| CatalogError::io("read staged catalog object", error))?;
         let path = entry.path();
         reject_symlink(&path, "staged catalog object")?;
-        let metadata = entry
-            .metadata()
-            .map_err(|error| CatalogError::io("stat staged catalog object", error))?;
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(CatalogError::io("stat staged catalog object", error)),
+        };
         if !metadata.is_file() {
             continue;
         }
@@ -278,9 +280,16 @@ pub(super) fn cleanup_stale_staging(
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age >= minimum_age);
         if old_enough {
-            fs::remove_file(path)
-                .map_err(|error| CatalogError::io("remove stale staged catalog object", error))?;
-            removed += 1;
+            match fs::remove_file(path) {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(CatalogError::io(
+                        "remove stale staged catalog object",
+                        error,
+                    ));
+                }
+            }
         }
     }
     Ok(())

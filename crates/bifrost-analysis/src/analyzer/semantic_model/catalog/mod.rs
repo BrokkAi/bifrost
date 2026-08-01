@@ -19,6 +19,7 @@ use super::{
     CompiledShard, CompiledShardDescriptor, DecodeLimits, NameSelector, PayloadKind,
     decode_manifest, decode_shard_for_manifest,
 };
+use crate::analyzer::canonical_hash::{CanonicalHasher, is_lower_sha256, lower_hex_string};
 use crate::analyzer::store::{
     AnalyzerStore, SemanticPackActivationSourceKind, SemanticPackActiveReference,
     SemanticPackActiveSet,
@@ -195,6 +196,96 @@ pub struct InstallOutcome {
     pub manifest_digest: String,
     pub inserted_manifest: bool,
     pub inserted_objects: usize,
+}
+
+const GENERATED_PRODUCTION_DOMAIN: &[u8] = b"bifrost.semantic-pack.generated-production.v1";
+
+/// Exact semantic inputs that identify one generated semantic-pack production.
+///
+/// `input_digest` is computed by the ecosystem adapter over its normalized
+/// activation evidence and ordered artifact kinds and byte digests. Paths and
+/// mtimes must not participate so identical artifacts can be reused by another
+/// workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedProductionKey {
+    production_digest: String,
+    input_digest: String,
+    producer_name: String,
+    producer_version: String,
+    schema_version: u32,
+}
+
+impl GeneratedProductionKey {
+    pub fn new(
+        input_digest: impl Into<String>,
+        producer_name: impl Into<String>,
+        producer_version: impl Into<String>,
+        schema_version: u32,
+    ) -> Result<Self, CatalogError> {
+        let input_digest = input_digest.into();
+        let producer_name = producer_name.into();
+        let producer_version = producer_version.into();
+        if !is_lower_sha256(&input_digest) {
+            return Err(CatalogError::Integrity(
+                "generated-production input digest must be lowercase SHA-256".to_owned(),
+            ));
+        }
+        if producer_name.is_empty() || producer_version.is_empty() || schema_version == 0 {
+            return Err(CatalogError::Integrity(
+                "generated-production producer identity and schema version must be non-empty"
+                    .to_owned(),
+            ));
+        }
+        let production_digest = generated_production_digest(
+            &input_digest,
+            &producer_name,
+            &producer_version,
+            schema_version,
+        );
+        Ok(Self {
+            production_digest,
+            input_digest,
+            producer_name,
+            producer_version,
+            schema_version,
+        })
+    }
+
+    pub fn production_digest(&self) -> &str {
+        &self.production_digest
+    }
+
+    pub fn input_digest(&self) -> &str {
+        &self.input_digest
+    }
+
+    pub fn producer_name(&self) -> &str {
+        &self.producer_name
+    }
+
+    pub fn producer_version(&self) -> &str {
+        &self.producer_version
+    }
+
+    pub fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub fn source_id(&self) -> String {
+        format!("production:{}", self.production_digest)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedProduction {
+    pub key: GeneratedProductionKey,
+    pub manifest_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedInstallOutcome {
+    pub production: GeneratedProduction,
+    pub install: InstallOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -474,6 +565,123 @@ impl SemanticPackCatalog {
         pack: &CompiledSemanticModelPack,
         source: &DurablePackSource,
     ) -> Result<InstallOutcome, CatalogError> {
+        self.install_with(pack, source, |_, _, _| Ok(()))
+    }
+
+    pub fn install_generated(
+        &self,
+        key: &GeneratedProductionKey,
+        pack: &CompiledSemanticModelPack,
+    ) -> Result<GeneratedInstallOutcome, CatalogError> {
+        validate_generated_pack_identity(key, &pack.manifest)?;
+        let source = DurablePackSource {
+            kind: DurablePackSourceKind::Generated,
+            source_id: key.source_id(),
+        };
+        let install = self.install_with(pack, &source, |transaction, manifest, now| {
+            insert_generated_production(transaction, key, manifest, now)
+        })?;
+        Ok(GeneratedInstallOutcome {
+            production: GeneratedProduction {
+                key: key.clone(),
+                manifest_digest: install.manifest_digest.clone(),
+            },
+            install,
+        })
+    }
+
+    pub fn generated_production(
+        &self,
+        key: &GeneratedProductionKey,
+    ) -> Result<Option<GeneratedProduction>, CatalogError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        let row = connection
+            .query_row(
+                "SELECT gp.input_digest, gp.producer_name, gp.producer_version,
+                        gp.schema_version, gp.manifest_digest, p.manifest_bytes
+                 FROM catalog_generated_productions AS gp
+                 JOIN catalog_packs AS p
+                   ON p.manifest_digest = gp.manifest_digest
+                 WHERE gp.production_digest = ?1 AND p.state = 'verified'",
+                [&key.production_digest],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, u32>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| CatalogError::sqlite("lookup generated production", error))?;
+        drop(connection);
+        let Some((
+            input_digest,
+            producer_name,
+            producer_version,
+            schema_version,
+            manifest_digest,
+            manifest_bytes,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let validated = (|| -> Result<GeneratedProduction, CatalogError> {
+            let stored_key = GeneratedProductionKey::new(
+                input_digest,
+                producer_name,
+                producer_version,
+                schema_version,
+            )?;
+            if stored_key != *key {
+                return Err(CatalogError::Integrity(
+                    "generated-production row does not match its canonical key".to_owned(),
+                ));
+            }
+            let manifest = decode_manifest(&manifest_bytes, &self.options.decode_limits)
+                .map_err(|error| CatalogError::Artifact(error.to_string()))?;
+            if manifest.content_sha256 != manifest_digest {
+                return Err(CatalogError::Integrity(
+                    "generated-production manifest key does not match decoded manifest".to_owned(),
+                ));
+            }
+            validate_generated_pack_identity(key, &manifest)?;
+            Ok(GeneratedProduction {
+                key: stored_key,
+                manifest_digest: manifest_digest.clone(),
+            })
+        })();
+        match validated {
+            Ok(production) => Ok(Some(production)),
+            Err(error) => {
+                self.rejected_manifests
+                    .lock()
+                    .expect("semantic-pack rejection mutex poisoned")
+                    .insert(manifest_digest.clone());
+                if self.mode == CatalogOpenMode::ReadWrite {
+                    self.quarantine(&manifest_digest, "generated_production_failure", &error)?;
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    fn install_with(
+        &self,
+        pack: &CompiledSemanticModelPack,
+        source: &DurablePackSource,
+        record_install: impl FnOnce(
+            &Transaction<'_>,
+            &CompiledPackManifest,
+            i64,
+        ) -> Result<(), CatalogError>,
+    ) -> Result<InstallOutcome, CatalogError> {
         self.require_writable()?;
         if source.source_id.is_empty() {
             return Err(CatalogError::Integrity(
@@ -498,8 +706,15 @@ impl SemanticPackCatalog {
         }
 
         let now = crate::cache_db::now_unix_seconds();
-        let install_result =
-            self.commit_install(pack, source, &validated, &published, &installation_id, now);
+        let install_result = self.commit_install(
+            pack,
+            source,
+            &validated,
+            &published,
+            &installation_id,
+            now,
+            record_install,
+        );
         match install_result {
             Ok(inserted_manifest) => {
                 self.rejected_manifests
@@ -525,6 +740,11 @@ impl SemanticPackCatalog {
         published: &[PathBuf],
         installation_id: &str,
         now: i64,
+        record_install: impl FnOnce(
+            &Transaction<'_>,
+            &CompiledPackManifest,
+            i64,
+        ) -> Result<(), CatalogError>,
     ) -> Result<bool, CatalogError> {
         let mut connection = self
             .connection
@@ -583,6 +803,7 @@ impl SemanticPackCatalog {
                 ],
             )
             .map_err(|error| CatalogError::sqlite("insert pack source", error))?;
+        record_install(&transaction, &validated.manifest, now)?;
         transaction
             .execute(
                 "UPDATE catalog_packs
@@ -2124,6 +2345,77 @@ fn insert_manifest(
         )
         .map_err(|error| CatalogError::sqlite("insert pack manifest", error))?;
     Ok(!existed)
+}
+
+fn generated_production_digest(
+    input_digest: &str,
+    producer_name: &str,
+    producer_version: &str,
+    schema_version: u32,
+) -> String {
+    let mut hasher = CanonicalHasher::new(GENERATED_PRODUCTION_DOMAIN);
+    hasher.field("input_digest", input_digest.as_bytes());
+    hasher.field("producer_name", producer_name.as_bytes());
+    hasher.field("producer_version", producer_version.as_bytes());
+    hasher.field("schema_version", &schema_version.to_be_bytes());
+    lower_hex_string(&hasher.finish())
+}
+
+fn validate_generated_pack_identity(
+    key: &GeneratedProductionKey,
+    manifest: &CompiledPackManifest,
+) -> Result<(), CatalogError> {
+    if manifest.producer.name != key.producer_name
+        || manifest.producer.version != key.producer_version
+        || manifest.schema_version != key.schema_version
+    {
+        return Err(CatalogError::Integrity(
+            "generated-production producer or schema does not match compiled pack".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn insert_generated_production(
+    transaction: &Transaction<'_>,
+    key: &GeneratedProductionKey,
+    manifest: &CompiledPackManifest,
+    now: i64,
+) -> Result<(), CatalogError> {
+    validate_generated_pack_identity(key, manifest)?;
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO catalog_generated_productions(
+               production_digest, input_digest, producer_name, producer_version,
+               schema_version, manifest_digest, created_at
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                &key.production_digest,
+                &key.input_digest,
+                &key.producer_name,
+                &key.producer_version,
+                key.schema_version,
+                &manifest.content_sha256,
+                now,
+            ],
+        )
+        .map_err(|error| CatalogError::sqlite("insert generated production", error))?;
+    let stored_manifest: String = transaction
+        .query_row(
+            "SELECT manifest_digest
+             FROM catalog_generated_productions
+             WHERE production_digest = ?1",
+            [&key.production_digest],
+            |row| row.get(0),
+        )
+        .map_err(|error| CatalogError::sqlite("verify generated production", error))?;
+    if stored_manifest != manifest.content_sha256 {
+        return Err(CatalogError::Integrity(format!(
+            "generated-production key {} is already bound to a different manifest",
+            key.production_digest
+        )));
+    }
+    Ok(())
 }
 
 fn insert_object(

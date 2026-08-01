@@ -15,7 +15,7 @@ The behavior is observable with offline fixtures. Two workspaces that resolve th
 - [x] (2026-08-01 07:44Z) Verified live issue #1150, its closed prerequisites #1146, #1147, and #1149, the clean prepared branch, and current remote state.
 - [x] (2026-08-01 07:44Z) Diagnosed the dependency-discovery, artifact-producer, compiler, catalog, activation-runtime, overlay, and analyzer-invalidation boundaries.
 - [x] (2026-08-01 07:44Z) Recorded the approved implementation design in this ExecPlan.
-- [ ] Milestone 1: add an exact generated-production identity and reusable catalog lookup/registration.
+- [x] (2026-08-01 07:56Z) Milestone 1: added exact generated-production identity, transactional catalog registration and verified reuse, schema migration, and concurrency/integrity coverage.
 - [ ] Milestone 2: add a shared bounded, cancellable dependency-pack preparation coordinator.
 - [ ] Milestone 3: retain JVM coordinates and deterministically combine source and binary evidence.
 - [ ] Milestone 4: retain .NET package, target, configuration, and asset-role provenance.
@@ -34,6 +34,10 @@ The behavior is observable with offline fixtures. Two workspaces that resolve th
   Evidence: activating both as equal-rank `Generated` packs can create conflicts. The legacy index instead lets source facts win while retaining binary-only types.
 - Observation: the prepared branch was current at initial diagnosis but was five commits behind `origin/master` when implementation began.
   Evidence: `git rev-list --left-right --count origin/master...HEAD` returned `5 0` at `1c2f1923`. Repository rules prohibit branch movement without explicit authorization, so implementation continues on the existing branch.
+- Observation: concurrent catalog opens exposed a pre-existing staging cleanup race once generated installs exercised four writers at once.
+  Evidence: one opener enumerated a temporary file that another writer published before `DirEntry::metadata`, causing `stat staged catalog object` to fail with `NotFound`. Stale cleanup now treats disappearance during metadata/removal as successful concurrent progress, while preserving all other errors.
+- Observation: persistence and semantic integration harnesses belong to the workspace root package, not `brokk-bifrost-analysis`.
+  Evidence: Cargo rejected `-p brokk-bifrost-analysis --test suite_persistence` and identified the `brokk-bifrost` package; the corrected milestone-1 command passed 30 focused tests.
 
 ## Decision Log
 
@@ -58,7 +62,7 @@ The behavior is observable with offline fixtures. Two workspaces that resolve th
 
 ## Outcomes & Retrospective
 
-Implementation has not started. The approved design and exact repository boundaries are recorded. Update this section after every milestone with achieved behavior, validation evidence, and remaining gaps.
+Milestone 1 is complete. The catalog can now derive a domain-separated production identity from exact input bytes plus producer/schema semantics, install a compiled pack and production binding in one writer transaction, verify compatible reuse from read-only or writable catalogs, reject key rebinding, and safely quarantine corrupt metadata. Schema v3 migrates without losing existing packs, and garbage collection removes obsolete production bindings through the manifest foreign key. The focused persistence slice passes 30 tests, including four concurrent installers; formatting and diff checks are clean. The shared preparation coordinator and ecosystem adapters remain to be implemented.
 
 ## Context and Orientation
 
@@ -92,37 +96,37 @@ Work from `/Users/dave/.codex/worktrees/29b8/bifrost` on branch `1150-generate-a
 
 After milestone 1 run:
 
-    cargo test -p brokk-bifrost-analysis --test suite_persistence -- semantic_pack_catalog::
+    cargo test -p brokk-bifrost --test suite_persistence -- semantic_pack_catalog::
     cargo fmt --all -- --check
     git diff --check
 
 After milestone 2 run:
 
     cargo test -p brokk-bifrost-analysis --lib semantic_model::dependency
-    cargo test -p brokk-bifrost-analysis --test suite_semantic -- dependency_semantic_pack::
+    cargo test -p brokk-bifrost --test suite_semantic -- dependency_semantic_pack::
     cargo fmt --all -- --check
     git diff --check
 
 After milestones 3 and 4 run:
 
     cargo test -p brokk-bifrost-analysis --lib dependency_discovery
-    cargo test -p brokk-bifrost-analysis --test suite_semantic -- external_artifact_pack::
-    cargo test -p brokk-bifrost-analysis --test suite_semantic -- dependency_semantic_pack::
+    cargo test -p brokk-bifrost --test suite_semantic -- external_artifact_pack::
+    cargo test -p brokk-bifrost --test suite_semantic -- dependency_semantic_pack::
     cargo fmt --all -- --check
     git diff --check
 
 After milestone 5 run:
 
-    cargo test -p brokk-bifrost-analysis --test suite_semantic -- semantic_model_runtime::
-    cargo test -p brokk-bifrost-analysis --test suite_semantic -- semantic_model_overlay::
-    cargo test -p brokk-bifrost-analysis --test suite_semantic -- dependency_semantic_pack::
+    cargo test -p brokk-bifrost --test suite_semantic -- semantic_model_runtime::
+    cargo test -p brokk-bifrost --test suite_semantic -- semantic_model_overlay::
+    cargo test -p brokk-bifrost --test suite_semantic -- dependency_semantic_pack::
 
 For final task-scoped validation run:
 
     cargo fmt --all -- --check
     cargo test -p brokk-bifrost-analysis --lib
-    cargo test -p brokk-bifrost-analysis --test suite_persistence -- semantic_pack_catalog::
-    cargo test -p brokk-bifrost-analysis --test suite_semantic -- dependency_semantic_pack:: external_artifact_pack:: semantic_model_runtime:: semantic_model_overlay::
+    cargo test -p brokk-bifrost --test suite_persistence -- semantic_pack_catalog::
+    cargo test -p brokk-bifrost --test suite_semantic -- dependency_semantic_pack:: external_artifact_pack:: semantic_model_runtime:: semantic_model_overlay::
     scripts/with-isolated-cargo-target.sh cargo clippy -p brokk-bifrost-analysis --all-targets -- -D warnings
     git diff --check
 
