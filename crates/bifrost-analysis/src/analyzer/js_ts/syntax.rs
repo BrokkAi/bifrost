@@ -88,6 +88,14 @@ impl JsTsImportBinder {
             .map(|binding| &binding.binding)
     }
 
+    pub(crate) fn resolvable_direct_bindings_for(
+        &self,
+        local_name: &str,
+    ) -> impl Iterator<Item = &ImportBinding> {
+        self.bindings_for(local_name)
+            .filter(|binding| matches!(binding.kind, ImportKind::Named | ImportKind::Default))
+    }
+
     pub(crate) fn has_competing_direct_imports(&self, local_name: &str) -> bool {
         self.direct_bindings_for(local_name).nth(1).is_some()
     }
@@ -804,6 +812,7 @@ relay();
         let imports = compute_import_binder(source, &tree);
 
         assert_eq!(imports.direct_bindings_for("relay").count(), 1);
+        assert_eq!(imports.resolvable_direct_bindings_for("relay").count(), 2);
         assert!(!imports.has_competing_direct_imports("relay"));
     }
 

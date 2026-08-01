@@ -242,8 +242,11 @@ pub(super) fn resolve_js_ts(
         ) {
             return outcome;
         }
-        let imported_receiver_binding =
-            !visible_bindings.is_empty() && imports.direct_bindings_for(qualifier).next().is_some();
+        let imported_receiver_binding = !visible_bindings.is_empty()
+            && imports
+                .resolvable_direct_bindings_for(qualifier)
+                .next()
+                .is_some();
         let receiver_candidates = if imported_receiver_binding {
             resolve_js_ts_direct_import_candidates(
                 analyzer,
@@ -931,7 +934,7 @@ pub(crate) fn resolve_js_ts_direct_import_candidates(
 ) -> Option<Vec<CodeUnit>> {
     let mut saw_direct_import = false;
     let mut candidates = Vec::new();
-    for binding in imports.direct_bindings_for(name) {
+    for binding in imports.resolvable_direct_bindings_for(name) {
         saw_direct_import = true;
         let exported_name = match binding.kind {
             ImportKind::Named => binding.imported_name.as_deref().unwrap_or(name),
@@ -1175,7 +1178,7 @@ fn jsts_visible_import_bindings<'a>(
     byte: usize,
 ) -> Vec<&'a crate::analyzer::usages::ImportBinding> {
     if lexical_bindings.is_program_binding_at(name, byte, root) {
-        imports.direct_bindings_for(name).collect()
+        imports.resolvable_direct_bindings_for(name).collect()
     } else {
         Vec::new()
     }
