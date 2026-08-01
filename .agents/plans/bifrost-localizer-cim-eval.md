@@ -294,6 +294,12 @@ The observable outcomes are:
   comparisons against baseline is statistically significant.
 - [ ] Run dw10 `semantic-coedit-2-1` over seeds 0, 1, and 2 at concurrency 30, using its
   separately fingerprinted cache and local A4000 sidecar.
+  The full 273-cell Cartesian queue started on 2026-08-01 with Bedrock GPT-5.6 Luna at maximum
+  reasoning, `--without-history`, inline scoring, the immutable dw10 runtime and tokenizer,
+  port 18765, `cache-dw10`, and exactly 30 workers. A one-cell live attempt was deliberately
+  discarded before this queue because the agent made 118 model requests without choosing the
+  semantic tool; it had no completed result or score and therefore contributes no campaign
+  data.
 - [ ] Run final validation, update this plan's retrospective, and commit the Granite/dw10
   report.
 
