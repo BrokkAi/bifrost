@@ -5876,16 +5876,24 @@ fn apply_pipeline_step(
             continue;
         }
         let expansions = match (&row.value, step) {
-            (PipelineValue::StructuralMatch(seed), QueryStep::ProcedureOf) => semantic
-                .as_mut()
-                .expect("CFG query service exists for semantic steps")
-                .cfg()
-                .procedure_of_match(seed)
-                .into_iter()
-                .map(SemanticPipelineValue::Procedure)
-                .map(PipelineValue::Semantic)
-                .map(pipeline_expansion)
-                .collect(),
+            (PipelineValue::StructuralMatch(seed), QueryStep::ProcedureOf) => {
+                let declaration =
+                    exact_callable_declaration_value(analyzer, seed, &mut enclosing_declarations);
+                let mut semantic = semantic
+                    .as_mut()
+                    .expect("CFG query service exists for semantic steps")
+                    .cfg();
+                let procedures = match declaration {
+                    Some(declaration) => semantic.procedure_of_declaration(&declaration),
+                    None => semantic.procedure_of_match(seed),
+                };
+                procedures
+                    .into_iter()
+                    .map(SemanticPipelineValue::Procedure)
+                    .map(PipelineValue::Semantic)
+                    .map(pipeline_expansion)
+                    .collect()
+            }
             (PipelineValue::Declaration(declaration), QueryStep::ProcedureOf) => semantic
                 .as_mut()
                 .expect("CFG query service exists for semantic steps")
@@ -7892,22 +7900,35 @@ impl EnclosingDeclarationIndex {
             })
             .cloned()
     }
+
+    fn exact(&self, seed_range: Range) -> Option<DeclarationValue> {
+        self.exact
+            .iter()
+            .find(|declaration| {
+                declaration.range.start_byte == seed_range.start_byte
+                    && declaration.range.end_byte == seed_range.end_byte
+            })
+            .cloned()
+    }
 }
 
-fn enclosing_declaration_value(
-    analyzer: &dyn IAnalyzer,
-    seed: &SeedMatch,
-    declarations_by_file: &mut HashMap<ProjectFile, EnclosingDeclarationIndex>,
-) -> (Option<DeclarationValue>, bool) {
+fn seed_range(seed: &SeedMatch) -> Range {
     let fact = seed.facts.node(seed.fact_match.node);
     let span = fact.span();
-    let seed_range = Range {
+    Range {
         start_byte: span.start_byte,
         end_byte: span.end_byte,
         start_line: fact.range.start_line,
         end_line: fact.range.end_line,
-    };
-    let declarations = declarations_by_file
+    }
+}
+
+fn declaration_index_for_seed<'a>(
+    analyzer: &dyn IAnalyzer,
+    seed: &SeedMatch,
+    declarations_by_file: &'a mut HashMap<ProjectFile, EnclosingDeclarationIndex>,
+) -> &'a EnclosingDeclarationIndex {
+    declarations_by_file
         .entry(seed.file.clone())
         .or_insert_with(|| {
             let mut declarations = EnclosingDeclarationIndex::default();
@@ -7916,11 +7937,34 @@ fn enclosing_declaration_value(
             }
             declarations.sort();
             declarations
-        });
+        })
+}
+
+fn enclosing_declaration_value(
+    analyzer: &dyn IAnalyzer,
+    seed: &SeedMatch,
+    declarations_by_file: &mut HashMap<ProjectFile, EnclosingDeclarationIndex>,
+) -> (Option<DeclarationValue>, bool) {
+    let declarations = declaration_index_for_seed(analyzer, seed, declarations_by_file);
     (
-        declarations.enclosing(seed_range),
+        declarations.enclosing(seed_range(seed)),
         declarations.projection_omitted,
     )
+}
+
+fn exact_callable_declaration_value(
+    analyzer: &dyn IAnalyzer,
+    seed: &SeedMatch,
+    declarations_by_file: &mut HashMap<ProjectFile, EnclosingDeclarationIndex>,
+) -> Option<DeclarationValue> {
+    let fact = seed.facts.node(seed.fact_match.node);
+    if !matches!(
+        fact.kind,
+        NormalizedKind::Function | NormalizedKind::Method | NormalizedKind::Constructor
+    ) {
+        return None;
+    }
+    declaration_index_for_seed(analyzer, seed, declarations_by_file).exact(seed_range(seed))
 }
 
 fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {

@@ -1744,6 +1744,7 @@ pub(crate) fn procedures_for_definition_with_limits(
         return progress.failed(status);
     }
     let mut exact = Vec::new();
+    let mut boundary_aligned = Vec::new();
     let mut enclosing = Vec::new();
     for procedure in artifact.procedures() {
         if let Err(status) = progress.examine() {
@@ -1754,6 +1755,7 @@ pub(crate) fn procedures_for_definition_with_limits(
         }
         let span = procedure.locator().anchor().span();
         let mut exact_match = false;
+        let mut boundary_aligned_match = false;
         let mut enclosing_match = false;
         for range in &ranges {
             if let Err(status) = progress.examine() {
@@ -1765,6 +1767,8 @@ pub(crate) fn procedures_for_definition_with_limits(
                 exact_match = true;
                 break;
             }
+            boundary_aligned_match |= range.start_byte == span.start_byte() as usize
+                || range.end_byte == span.end_byte() as usize;
             enclosing_match |= (range.start_byte <= span.start_byte() as usize
                 && range.end_byte >= span.end_byte() as usize)
                 || (span.start_byte() as usize <= range.start_byte
@@ -1772,6 +1776,8 @@ pub(crate) fn procedures_for_definition_with_limits(
         }
         let target = if exact_match {
             &mut exact
+        } else if boundary_aligned_match {
+            &mut boundary_aligned
         } else if enclosing_match {
             &mut enclosing
         } else {
@@ -1779,7 +1785,13 @@ pub(crate) fn procedures_for_definition_with_limits(
         };
         target.push(procedure);
     }
-    let matches = if exact.is_empty() { enclosing } else { exact };
+    let matches = if !exact.is_empty() {
+        exact
+    } else if !boundary_aligned.is_empty() {
+        boundary_aligned
+    } else {
+        enclosing
+    };
     let matches = match sort_procedures_by_locator(matches, &mut progress) {
         Ok(matches) => matches,
         Err(status) => return progress.failed(status),
@@ -2279,6 +2291,73 @@ mod tests {
         assert_eq!(cancelled.status, ProcedureRangeLookupStatus::Cancelled);
         assert_eq!(cancelled.examined, 0);
         assert!(cancelled.handles.is_empty());
+    }
+
+    #[test]
+    fn declaration_procedure_lookup_excludes_nested_same_named_ruby_method() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Ruby,
+            &[(
+                "nested.rb",
+                "def target(value)\n  def target(value)\n    value\n  end\n  value\nend\n",
+            )],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "nested.rb");
+        let analyzer = fixture.analyzer.analyzer();
+        let definition = analyzer
+            .get_definitions("target")
+            .into_iter()
+            .max_by_key(|definition| {
+                analyzer
+                    .ranges(definition)
+                    .into_iter()
+                    .map(|range| range.end_byte.saturating_sub(range.start_byte))
+                    .max()
+                    .unwrap_or_default()
+            })
+            .expect("outer target definition");
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("Ruby semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("Ruby semantic artifact");
+        let matching_procedures = artifact
+            .procedures()
+            .iter()
+            .filter(|procedure| procedure_matches_definition(procedure, &definition))
+            .count();
+        assert_eq!(
+            matching_procedures, 2,
+            "fixture must contain outer and nested same-name procedures"
+        );
+
+        let lookup = procedures_for_definition_with_limits(
+            analyzer,
+            &definition,
+            &artifact,
+            usize::MAX,
+            &cancellation,
+        );
+
+        assert_eq!(lookup.status, ProcedureRangeLookupStatus::Complete);
+        assert_eq!(lookup.handles.len(), 1, "nested same-name procedure leaked");
+        assert_eq!(
+            lookup.handles[0]
+                .semantics()
+                .locator()
+                .anchor()
+                .span()
+                .start_byte(),
+            0,
+            "the outer declaration must resolve to the outer procedure"
+        );
     }
 
     #[test]
