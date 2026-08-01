@@ -55,6 +55,11 @@ Those issues will publish content through the interfaces established here.
   tests, strict Clippy, and the six-archive package gate passed; the gate
   compiled both the facade and an analysis-only consumer from unpacked crate
   archives.
+- [x] (2026-08-01 06:49Z) Completed the post-milestone repository policy review.
+  `list_policies` exposed correctness and performance categories, and one
+  `run_policy` request selected `bifrost.code-smells` with no repository policy
+  roots. The result was `unreliable`/exit 2 under the existing whole-workspace
+  budget failure; no finding points into Milestone 1 files.
 - [ ] Define and validate the compact release-index and asset-envelope
   contracts, including compatibility, provenance, checksums, sizes, notices,
   revocation, and deterministic serialization.
@@ -111,6 +116,16 @@ Those issues will publish content through the interfaces established here.
   by the rustup compiler as incompatible with Homebrew rustdoc. Setting
   `RUSTDOC=/Users/dave/.cargo/bin/rustdoc` made the focused tests pass, and the
   isolated strict Clippy gate passed with the complete Homebrew toolchain.
+
+- Observation: The required whole-workspace policy gate still cannot establish
+  a trustworthy result at current tip.
+  Evidence: `run_policy({policy_packs:["bifrost.code-smells"],
+  evaluation_date:"2026-08-01",fail_on:"warning"})` returned
+  `status=unreliable`, `exit_status=2` after five seconds. Three known
+  dynamic-evaluation findings completed outside this change; the nested-loop
+  rule exhausted its budget after 1,110 files and 29,055,861 bytes, and later
+  policies were cancelled. Existing issues #1296 and #1423 own the incomplete
+  run behavior.
 
 ## Decision Log
 
@@ -446,7 +461,8 @@ service. The service may depend on the new crate, analysis, and runtime. Analyze
 constructors remain neutral and direct analysis consumers continue to supply
 their own catalog and activation request.
 
-Revision note: 2026-08-01 06:44Z. Updated after Milestone 1 implementation and
-validation to record the concrete package boundary, empty production registry,
-release/CI integration, analysis-only consumer proof, and local Rust toolchain
-discovery. The next milestone is the strict release index and asset envelope.
+Revision note: 2026-08-01 06:49Z. Updated after Milestone 1 implementation,
+validation, and policy review to record the concrete package boundary, empty
+production registry, release/CI integration, analysis-only consumer proof,
+local Rust toolchain discovery, and the existing unreliable policy budget
+boundary. The next milestone is the strict release index and asset envelope.
