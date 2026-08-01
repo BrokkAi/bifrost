@@ -277,6 +277,15 @@ The observable outcomes are:
   Bifrost/Anvil tests, formatting, Ruff, and the A4000 real-Granite smoke pass. The semantic
   runtime bundle records Bifrost `71e8ac64`, Anvil `709f227`, Mjolnir `f7ba210`, and brokkbench
   `83a8979c9a5`.
+- [x] (2026-08-01, complete generation and analysis lattice) The frozen campaign contains
+  exactly 1,092 cells: 91 tasks in every arm/seed bucket for the 273-cell baseline and 819-cell
+  Granite grid. Every cell records Bedrock GPT-5.6 Luna at maximum reasoning. The 30-worker
+  controller exited successfully with 998 completed agent runs, 94 normal 1,800-second agent
+  timeouts, and zero controller failures. Final localization produced 1,092/1,092 artifacts
+  with zero skips or errors. The final leak audit covered all 1,092 cells and flagged zero;
+  1,753 Git-history attempts and 72 network attempts were all mitigated by synthetic-root
+  history or Anvil's offline network namespace. Pristine recovery of inconclusive inline
+  verifier failures continues at four jobs before outcome aggregation.
 - [ ] Score, leak-audit, analyze, and report the baseline and Granite results.
 - [ ] Run final validation, update this plan's retrospective, commit the Granite report, and
   stop before running any dw10 evaluation arms.

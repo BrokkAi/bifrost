@@ -1,7 +1,8 @@
 # Granite R2 Semantic Search Evaluation
 
-Status: semantic campaign in progress. This report records finalized methodology and baseline
-results; Granite outcome tables remain intentionally absent until all reportable cells finish.
+Status: generation, localization, and leakage validation are complete. Pristine recovery of
+inconclusive inline verifier failures is in progress; Granite outcome tables remain intentionally
+absent until every reportable cell has a valid official score.
 
 ## Question
 
@@ -88,9 +89,18 @@ selected 12 results under final `k=20`, did not fall back, and completed retriev
 
 ## Granite results
 
-To be populated after all 819 semantic cells complete, followed by localization and the final
-leak audit. No partial outcome estimate is reported here because completion order is correlated
-with task duration and therefore not outcome-blind.
+The complete frozen lattice contains 1,092 cells: 91 tasks for every arm and seed across the
+273-cell baseline and 819-cell Granite grid. All records use Bedrock GPT-5.6 Luna at maximum
+reasoning. The controller exited successfully with 998 completed agent runs, 94 normal
+1,800-second agent timeouts, and no controller/infrastructure failures.
+
+Final localization produced 1,092/1,092 artifacts with zero skips or errors. The leakage audit
+covered all 1,092 cells and flagged zero: 1,753 Git-history attempts were neutralized by the
+synthetic-root protocol and 72 network attempts by Anvil's offline shell namespace.
+
+Outcome tables will be populated after the remaining inconclusive inline verifier failures have
+valid pristine scores. No partial outcome estimate is reported here because an incomplete score
+denominator is not outcome-blind.
 
 ## Change inventory
 
