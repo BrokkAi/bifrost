@@ -72,6 +72,18 @@ the focus.
   and complete the eleven explicit runner dry-runs.
 - [ ] Complete C ranks eleven through twenty and publish its evidence and user
   summary.
+  - [x] (2026-08-01 05:47Z) Built release runner `913e3d98` outside the
+    sandbox at niceness 10 with normal Cargo storage; SHA-256
+    `dad8dab06932e8890ed0521b1cf61738dafa8a0e8f18a17377aa6422ba9ae95b`.
+    The explicit all-ten C dry-run returned exactly the selected slugs.
+  - [x] (2026-08-01 05:47Z) Completed C rank eleven
+    `trifectatechfoundation__sudo-rs` at pinned head `f48bb86`. Its clean
+    selector-faithful envelope has zero eligible/audited files, zero missing,
+    and zero file errors because the clone has no `.c` translation unit (207
+    Rust files and one header). Raw JSONL SHA-256 is
+    `bf8b8eae4c3eab979a5de990a4629dba94999e4798d2dc84e7bdd6236a2f1efd`.
+    No issue was warranted. Final language replay and durable publication are
+    still required.
 - [ ] Complete C++ ranks eleven through twenty and publish its evidence and
   user summary.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
@@ -117,6 +129,14 @@ the focus.
   clone-locally ignored rather than deleted; unrelated untracked files remain
   visible and must be dispositioned before accepting that repository.
 
+- Observation: C rank eleven `sudo-rs` has no C translation unit even though
+  the live task selector places it in the C slice.
+  Evidence: the pinned clone has 207 `.rs` files and one
+  `src/pam/wrapper.h`, but no `.c` file. C frontier eligibility intentionally
+  accepts `.c` only, so the clean zero-file envelope is an honest corpus
+  bucketing result. This matches the prior accepted BitcoinAddressFinder
+  precedent; do not substitute another repository or silently widen to headers.
+
 ## Decision Log
 
 - Decision: Treat this as a new ranks-eleven-through-twenty expansion rather
@@ -160,9 +180,10 @@ the focus.
 ## Outcomes & Retrospective
 
 The expansion is in progress. The exact 110-repository scope has been derived
-from the live filtered selector, but no rank-eleven-through-twenty repository
-envelope is accepted until the preflight, clean baseline, exhaustive residual
-audit, and language closure process below prove it.
+from the live filtered selector. C rank eleven is locally complete as an honest
+zero-file envelope with no issue scope; the remaining 109 repository
+transitions, C final certification, durable evidence publication, and campaign
+gates remain.
 
 ## Context and Orientation
 
@@ -513,3 +534,8 @@ until the current repository has clean replay evidence and all owned issues are
 closed. Recorded independent selector and C preflight results, input hashes,
 generated-cache cleanliness handling, live per-language reselection, and the
 Python 3.12 final gate.
+
+Revision note (2026-08-01): Recorded the clean release-runner build, exact C
+dry-run, and C rank-eleven `sudo-rs` zero-file completion. The live selector is
+authoritative even when a repository contains no translation unit for its
+corpus bucket, so the literal rank is retained and no substitute is introduced.
