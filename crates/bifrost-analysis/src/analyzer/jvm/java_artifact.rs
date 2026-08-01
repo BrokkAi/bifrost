@@ -29,10 +29,10 @@ const MAX_CENTRAL_DIRECTORY_BYTES: u64 = 32 * 1024 * 1024;
 pub struct JavaJarPackProducer;
 
 #[derive(Debug)]
-struct JavaApiType {
-    name: String,
+pub(super) struct JavaApiType {
+    pub(super) name: String,
     type_kind: TypeKind,
-    visibility: Visibility,
+    pub(super) visibility: Visibility,
     is_abstract: bool,
     is_sealed: bool,
     type_parameters: Vec<String>,
@@ -190,6 +190,7 @@ impl JavaJarPackProducer {
                     entry_name.ends_with(".class") && !entry_name.ends_with("module-info.class")
                 }
                 ExternalArtifactKind::ScalaSourceJar => false,
+                ExternalArtifactKind::JdkSourceZip => false,
                 ExternalArtifactKind::DotNetAssembly => false,
             };
             if !selected {
@@ -199,6 +200,7 @@ impl JavaJarPackProducer {
                 ExternalArtifactKind::JavaSourceJar => MAX_SOURCE_ENTRY_BYTES,
                 ExternalArtifactKind::JavaClassJar => MAX_CLASS_ENTRY_BYTES,
                 ExternalArtifactKind::ScalaSourceJar => unreachable!(),
+                ExternalArtifactKind::JdkSourceZip => unreachable!(),
                 ExternalArtifactKind::DotNetAssembly => unreachable!(),
             };
             let next_total = total_bytes.saturating_add(entry.size());
@@ -253,6 +255,7 @@ impl JavaJarPackProducer {
                     ),
                 },
                 ExternalArtifactKind::ScalaSourceJar => unreachable!(),
+                ExternalArtifactKind::JdkSourceZip => unreachable!(),
                 ExternalArtifactKind::DotNetAssembly => unreachable!(),
             }
         }
@@ -319,6 +322,14 @@ pub(super) enum ZipDirectoryStatus {
 }
 
 pub(super) fn zip_directory_status(bytes: &[u8]) -> ZipDirectoryStatus {
+    zip_directory_status_with_limits(bytes, MAX_ARCHIVE_ENTRIES, MAX_CENTRAL_DIRECTORY_BYTES)
+}
+
+pub(super) fn zip_directory_status_with_limits(
+    bytes: &[u8],
+    max_entries: usize,
+    max_directory_bytes: u64,
+) -> ZipDirectoryStatus {
     const EOCD: &[u8; 4] = b"PK\x05\x06";
     const ZIP64_LOCATOR: &[u8; 4] = b"PK\x06\x07";
     const ZIP64_EOCD: &[u8; 4] = b"PK\x06\x06";
@@ -336,8 +347,8 @@ pub(super) fn zip_directory_status(bytes: &[u8]) -> ZipDirectoryStatus {
         return ZipDirectoryStatus::Invalid;
     };
     if entries != u16::MAX && directory_bytes != u32::MAX {
-        return if usize::from(entries) <= MAX_ARCHIVE_ENTRIES
-            && u64::from(directory_bytes) <= MAX_CENTRAL_DIRECTORY_BYTES
+        return if usize::from(entries) <= max_entries
+            && u64::from(directory_bytes) <= max_directory_bytes
         {
             ZipDirectoryStatus::Valid
         } else {
@@ -362,7 +373,7 @@ pub(super) fn zip_directory_status(bytes: &[u8]) -> ZipDirectoryStatus {
     let Some(directory_bytes) = little_u64(bytes, zip64_offset + 40) else {
         return ZipDirectoryStatus::Invalid;
     };
-    if entries <= MAX_ARCHIVE_ENTRIES as u64 && directory_bytes <= MAX_CENTRAL_DIRECTORY_BYTES {
+    if entries <= max_entries as u64 && directory_bytes <= max_directory_bytes {
         ZipDirectoryStatus::Valid
     } else {
         ZipDirectoryStatus::Exceeded
@@ -387,7 +398,7 @@ fn little_u64(bytes: &[u8], offset: usize) -> Option<u64> {
     ))
 }
 
-fn apply_enclosing_visibility(declarations: &mut [JavaApiType]) {
+pub(super) fn apply_enclosing_visibility(declarations: &mut [JavaApiType]) {
     let visibility_by_name = declarations
         .iter()
         .map(|declaration| (declaration.name.clone(), declaration.visibility))
@@ -411,100 +422,7 @@ fn finish_production(
     declarations: Vec<JavaApiType>,
     mut diagnostics: BoundedProducerDiagnostics,
 ) -> ArtifactProduction {
-    let mut type_ids = HashMap::default();
-    for declaration in &declarations {
-        type_ids.insert(
-            declaration.name.clone(),
-            type_declaration_id(TypeIdentity {
-                ecosystem: "jvm",
-                name: &declaration.name,
-            }),
-        );
-    }
-    let mut types = Vec::new();
-    let mut members = Vec::new();
-    for declaration in declarations {
-        if types.len().saturating_add(members.len()) >= limits.max_records {
-            diagnostics.warning(
-                "limit.records",
-                None,
-                format!(
-                    "producer stopped after {} declaration records",
-                    limits.max_records
-                ),
-            );
-            break;
-        }
-        let type_id = type_ids
-            .get(&declaration.name)
-            .expect("parsed Java type receives an id")
-            .clone();
-        types.push(TypeFact {
-            id: type_id.clone(),
-            name: declaration.name,
-            type_kind: declaration.type_kind,
-            visibility: declaration.visibility,
-            is_abstract: declaration.is_abstract,
-            is_sealed: declaration.is_sealed,
-            type_parameters: declaration.type_parameters,
-            hierarchy: declaration.hierarchy,
-            aliases: Vec::new(),
-            extension_surfaces: Vec::new(),
-            locator: declaration.locator,
-        });
-        for member in declaration.members {
-            if types.len().saturating_add(members.len()) >= limits.max_records {
-                diagnostics.warning(
-                    "limit.records",
-                    None,
-                    format!(
-                        "producer stopped after {} declaration records",
-                        limits.max_records
-                    ),
-                );
-                break;
-            }
-            let parameter_types = member
-                .signature
-                .as_ref()
-                .map(|signature| {
-                    signature
-                        .parameters
-                        .iter()
-                        .map(|parameter| parameter.r#type.clone())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let generic_arity = member
-                .signature
-                .as_ref()
-                .map_or(0, |signature| signature.type_parameters.len());
-            let id = member_declaration_id(MemberIdentity {
-                owner_id: &type_id,
-                kind: member.member_kind,
-                name: &member.name,
-                generic_arity,
-                parameter_types: &parameter_types,
-                return_type: member
-                    .signature
-                    .as_ref()
-                    .and_then(|signature| signature.returns.as_ref()),
-            });
-            members.push(MemberFact {
-                id,
-                owner: type_id.clone(),
-                name: member.name,
-                member_kind: member.member_kind,
-                visibility: member.visibility,
-                is_static: member.is_static,
-                is_abstract: member.is_abstract,
-                is_virtual: member.is_virtual,
-                signature: member.signature,
-                aliases: Vec::new(),
-                locator: member.locator,
-            });
-        }
-    }
+    let (types, members) = java_api_facts(declarations, limits.max_records, &mut diagnostics);
     if types.is_empty() {
         diagnostics.error(
             "java.archive.no_external_declarations",
@@ -563,7 +481,103 @@ fn finish_production(
     }
 }
 
-fn source_api_types(
+pub(super) fn java_api_facts(
+    declarations: Vec<JavaApiType>,
+    max_records: usize,
+    diagnostics: &mut BoundedProducerDiagnostics,
+) -> (Vec<TypeFact>, Vec<MemberFact>) {
+    let mut type_ids = HashMap::default();
+    for declaration in &declarations {
+        type_ids.insert(
+            declaration.name.clone(),
+            type_declaration_id(TypeIdentity {
+                ecosystem: "jvm",
+                name: &declaration.name,
+            }),
+        );
+    }
+    let mut types = Vec::new();
+    let mut members = Vec::new();
+    for declaration in declarations {
+        if types.len().saturating_add(members.len()) >= max_records {
+            diagnostics.warning(
+                "limit.records",
+                None,
+                format!("producer stopped after {} declaration records", max_records),
+            );
+            break;
+        }
+        let type_id = type_ids
+            .get(&declaration.name)
+            .expect("parsed Java type receives an id")
+            .clone();
+        types.push(TypeFact {
+            id: type_id.clone(),
+            name: declaration.name,
+            type_kind: declaration.type_kind,
+            visibility: declaration.visibility,
+            is_abstract: declaration.is_abstract,
+            is_sealed: declaration.is_sealed,
+            type_parameters: declaration.type_parameters,
+            hierarchy: declaration.hierarchy,
+            aliases: Vec::new(),
+            extension_surfaces: Vec::new(),
+            locator: declaration.locator,
+        });
+        for member in declaration.members {
+            if types.len().saturating_add(members.len()) >= max_records {
+                diagnostics.warning(
+                    "limit.records",
+                    None,
+                    format!("producer stopped after {} declaration records", max_records),
+                );
+                break;
+            }
+            let parameter_types = member
+                .signature
+                .as_ref()
+                .map(|signature| {
+                    signature
+                        .parameters
+                        .iter()
+                        .map(|parameter| parameter.r#type.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let generic_arity = member
+                .signature
+                .as_ref()
+                .map_or(0, |signature| signature.type_parameters.len());
+            let id = member_declaration_id(MemberIdentity {
+                owner_id: &type_id,
+                kind: member.member_kind,
+                name: &member.name,
+                generic_arity,
+                parameter_types: &parameter_types,
+                return_type: member
+                    .signature
+                    .as_ref()
+                    .and_then(|signature| signature.returns.as_ref()),
+            });
+            members.push(MemberFact {
+                id,
+                owner: type_id.clone(),
+                name: member.name,
+                member_kind: member.member_kind,
+                visibility: member.visibility,
+                is_static: member.is_static,
+                is_abstract: member.is_abstract,
+                is_virtual: member.is_virtual,
+                signature: member.signature,
+                aliases: Vec::new(),
+                locator: member.locator,
+            });
+        }
+    }
+    (types, members)
+}
+
+pub(super) fn source_api_types(
     source_path: &str,
     source: &str,
     known_types: &HashSet<String>,
@@ -1540,7 +1554,7 @@ fn terminal_identifier(node: Node<'_>, source: &str) -> Option<String> {
     }
 }
 
-fn source_declared_type_names(source: &str) -> Vec<String> {
+pub(super) fn source_declared_type_names(source: &str) -> Vec<String> {
     let Some(tree) = parse_tree(source) else {
         return Vec::new();
     };

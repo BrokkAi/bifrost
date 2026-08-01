@@ -18,7 +18,7 @@ The first release is intentionally semantic rather than compiler-emulating. Pack
 - [x] (2026-08-01 18:20Z) Diagnosed the existing Java producer, Scala source-JAR projection, semantic pack runtime, optional distribution crate, and release workflow boundaries.
 - [x] (2026-08-01 18:40Z) Recorded the approved source-exact and lazy-universal-root design in this ExecPlan.
 - [x] (2026-08-01 20:15Z) Milestone 1: implemented deterministic Scala source-archive API production and replaced the lossy private Scala projection with the shared structured facts; focused producer and legacy-index tests pass.
-- [ ] Milestone 2: implement deterministic module-aware JDK source archive production and independent `java.base` activation.
+- [x] (2026-08-01 21:25Z) Milestone 2: implemented deterministic module-aware JDK source archive production with explicit flat/module-prefixed layouts and independent `java.base` activation; focused JDK and Java producer tests pass.
 - [ ] Milestone 3: integrate compact lazy universal-root lookup and prove workspace/explicit-ancestor precedence.
 - [ ] Milestone 4: prove end-to-end activation, navigation, deterministic bytes, mismatch explanations, and bounded retained memory.
 - [ ] Milestone 5: add pinned release inputs, content-addressed release bundles, licenses/notices, measurements, and release workflow integration.
@@ -47,6 +47,12 @@ The first release is intentionally semantic rather than compiler-emulating. Pack
 - Observation: artifact identity and semantic determinism are separate contracts.
   Evidence: rebuilding logically identical ZIPs with different central-directory order changes the exact input SHA-256 activation evidence by design. The determinism test therefore copies identical artifact bytes to a second path and proves path independence; logical-order determinism remains covered by sorting emitted entries and facts before compilation.
 
+- Observation: ordinary dependency-JAR extraction bounds are not suitable JDK source bounds.
+  Evidence: the Java producer's 10,000-entry and 128 MiB extracted-source limits could reject or truncate a full JDK `src.zip`. The JDK producer now has separate bounded limits of 100,000 entries, 1 GiB extracted source, and a 128 MiB central directory while the exact compressed artifact remains governed by caller-provided producer limits.
+
+- Observation: full JDK generation does not need to retain every uncompressed source file at once.
+  Evidence: the producer records bounded archive indices and declared type names in its first pass, then rereads and fully parses one source entry at a time. This retains only exact ZIP bytes, compact entry metadata, known names, and produced declarations rather than duplicating the archive as a large `Vec<String>`.
+
 ## Decision Log
 
 - Decision: derive Scala standard-library APIs from source archives using Bifrost's existing structured Scala parser.
@@ -72,6 +78,8 @@ The first release is intentionally semantic rather than compiler-emulating. Pack
 ## Outcomes & Retrospective
 
 Milestone 1 now provides a bounded `ScalaSourceJarPackProducer` that parses each Scala entry once, emits public/protected source-declared types and members with stable JVM identities, signatures, explicit hierarchy, companions/modules, type aliases, and extension surfaces, and sorts output deterministically. The legacy JVM external declaration index now projects Scala type shells from these produced facts instead of maintaining a second parser and visibility model. Three producer tests and the existing Scala source-JAR external-index test pass. Compiler-generated case-class APIs remain deliberately absent for #1153.
+
+Milestone 2 adds `JdkSourceArchivePackProducer` with caller-declared `ModulePrefixed` and `Flat` layouts. Modern archives must provide a `module-info.java` marker for every source-bearing module; flat production rejects module-prefixed markers instead of guessing. Each module emits an independently activated, deterministically ordered shard, with flat archives assigned explicitly to `java.base`. The producer reuses the Java AST conversion and stable identities, supports JDK-scale bounded archives, and avoids retaining all source text. Two JDK tests and all four Java artifact producer tests pass under strict Clippy.
 
 ## Context and Orientation
 
@@ -201,3 +209,5 @@ The downstream release index must be canonical serialized data with a schema ver
 Revision note (2026-08-01): created the initial self-contained plan after live issue diagnosis and user approval. The plan records source-exact Scala/JDK capture, lazy universal-root evaluation, the #1153 case-class boundary, reproducible release assets, and milestone validation.
 
 Revision note (2026-08-01): completed milestone 1. The implementation established Scala source archives as the authoritative structured path for both semantic packs and the legacy JVM type index, and recorded constructor-fact and exact-artifact determinism findings.
+
+Revision note (2026-08-01): completed milestone 2. The implementation added explicit JDK archive layouts, per-module shards, JDK-scale bounded extraction, and a two-pass low-retention source walk while reusing the existing Java AST conversion.
