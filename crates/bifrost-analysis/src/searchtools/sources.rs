@@ -392,6 +392,22 @@ pub fn get_symbol_sources(
                 };
             }
 
+            // Exact symbol lookup and literal/file-pattern resolution have
+            // already had precedence. An explicit source path that survived
+            // both cannot resolve, so do not send it through the workspace-wide
+            // fuzzy symbol fallback. Dotted symbol spellings such as
+            // `MetadataConfiguration.Properties` deliberately do not qualify;
+            // they still need fuzzy resolution (#1196).
+            if looks_like_explicit_source_file_target(&symbol) {
+                if let Some(item) = unsupported_selector_shape_not_found_input(analyzer, &symbol) {
+                    return (index, SourceLookupOutcome::NotFound(item));
+                }
+                return (
+                    index,
+                    SourceLookupOutcome::NotFound(file_not_found_input(symbol)),
+                );
+            }
+
             // File *shape* only decides how an unresolvable target is
             // reported; it must never gate symbol resolution. A real member
             // name can end in a segment that also spells a file extension --
