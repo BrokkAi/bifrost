@@ -1,4 +1,4 @@
-# Package and distribute optional prebuilt semantic packs
+# Establish the optional prebuilt semantic-pack crate boundary
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises &
 Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to
@@ -8,410 +8,298 @@ This document must be maintained in accordance with `.agents/PLANS.md`.
 
 ## Purpose / Big Picture
 
-Bifrost's protocol-neutral analyzer already understands semantic-model packs:
-versioned, content-addressed descriptions of declarations, relationships, and
-procedure summaries that are not ordinary workspace source. It does not yet
-have a product layer that ships Bifrost-curated packs, obtains larger prebuilt
-packs safely, or lets a user inspect and control those installed resources.
+Bifrost's analyzer can compile, store, select, and apply semantic-model packs:
+typed descriptions of declarations and behavior that are not ordinary workspace
+source. The analyzer should not force every embedding product to ship Bifrost's
+curated pack inventory. Conversely, the normal `brokk-bifrost` driver should
+have one clear place from which it can obtain Bifrost-curated packs.
 
-After this work, the published `brokk-bifrost` driver will compose the generic
-analyzer with a new published `brokk-bifrost-semantic-packs` crate. The new
-crate will own Bifrost-curated embedded resources, release indexes, explicit
-download/install orchestration, and user-facing lifecycle operations. The
-`brokk-bifrost-analysis` crate will not depend on that crate. An embedding
-product can therefore use analysis, runtime, LSP, or MCP packages with only
-its own semantic packs, while the normal Bifrost binary gets curated defaults.
+This initial implementation establishes that Cargo boundary and nothing more.
+It adds a published `brokk-bifrost-semantic-packs` crate downstream of
+`brokk-bifrost-analysis`. The new crate validates and explicitly registers
+embedded compiled packs with the existing generic catalog. The root
+`brokk-bifrost` facade depends on both crates, while analysis, runtime, MCP, and
+LSP packages do not depend on the curated-pack crate. A consumer can therefore
+exclude Bifrost's curated rules by depending on the lower-level packages and
+registering its own packs.
 
-The result will be observable in three ways. A package-graph test will prove
-that `brokk-bifrost-analysis` has no dependency on the new distribution crate.
-An integration test will install the same fixture once as an embedded pack and
-once from a release index and prove that the catalog stores one logical digest.
-The `bifrost semantic-packs list`, `status`, `install`, `update`, `rollback`,
-`disable`, and `gc` commands will show where packs came from, why they are or
-are not usable, and will remain deterministic while offline.
+The implementation is observable through unit tests that decode a fixture pack,
+register it twice without duplicating its logical identity, and reject a broken
+registry before catalog mutation. Workspace graph tests reject the forbidden
+`brokk-bifrost-analysis -> brokk-bifrost-semantic-packs` edge. The package gate
+builds six crate archives and compiles both a facade consumer and a consumer
+that depends only on `brokk-bifrost-analysis`.
 
-This issue does not generate packs from locally resolved project dependencies;
-issue #1150 owns that work. It also does not author the production JDK/Scala
-packs from #1152 or the initial generated-code behavior models from #1153.
-Those issues will publish content through the interfaces established here.
+This initial slice does not close all of issue #1154. It deliberately defers
+release-index schemas, remote acquisition, update/rollback policy, CLI lifecycle
+commands, and production JDK/Scala or generated-code content. Those are
+follow-up milestones after the package boundary has landed and should receive
+their own reviewed plan rather than expanding this one.
 
 ## Progress
 
-- [x] (2026-08-01 06:28Z) Refreshed the worktree and remote state and verified
-  that the issue branch and `origin/master` both point at `1c2f1923`.
-- [x] (2026-08-01 06:28Z) Read live issues #1144, #1145, #1146, #1147, #1150,
-  #1152, #1153, and #1154 and fixed the boundary between distribution, local
-  dependency generation, and curated content authoring.
-- [x] (2026-08-01 06:28Z) Inspected the current Cargo workspace, package and
-  release checks, analyzer semantic-pack compiler/catalog/runtime, facade, and
-  CLI composition points.
-- [x] (2026-08-01 06:28Z) Drafted this implementation plan and selected a
-  separate downstream distribution crate rather than moving generic pack
-  support out of the analyzer.
-- [x] (2026-08-01 06:44Z) Added the published
-  `brokk-bifrost-semantic-packs` crate, explicit embedded-pack registry,
-  package checks, release ordering, CI coverage, facade composition, and
-  dependency-direction tests. Two focused Rust tests, 33 Node graph/workflow
-  tests, strict Clippy, and the six-archive package gate passed; the gate
-  compiled both the facade and an analysis-only consumer from unpacked crate
-  archives.
-- [x] (2026-08-01 06:49Z) Completed the post-milestone repository policy review.
-  `list_policies` exposed correctness and performance categories, and one
-  `run_policy` request selected `bifrost.code-smells` with no repository policy
-  roots. The result was `unreliable`/exit 2 under the existing whole-workspace
-  budget failure; no finding points into Milestone 1 files.
-- [ ] Define and validate the compact release-index and asset-envelope
-  contracts, including compatibility, provenance, checksums, sizes, notices,
-  revocation, and deterministic serialization.
-- [ ] Implement explicit offline-by-default acquisition and atomic catalog
-  installation with bounded transfer, digest, size, and compatibility checks.
-- [ ] Implement durable desired-state history for pin, disable, update,
-  downgrade, rollback, and garbage collection without placing network or
-  product policy in `brokk-bifrost-analysis`.
-- [ ] Add driver composition and user-facing `semantic-packs` list, status,
-  explain, install, update, rollback, disable, and gc commands.
-- [ ] Extend release automation, third-party notices, package verification,
-  lifecycle tests, staged-binary smoke tests, formatting, Clippy, and repository
-  policy validation.
+- [x] (2026-08-01 06:28Z) Inspected issue #1154, its closed schema/catalog/runtime
+  prerequisites, sibling content issues #1152/#1153, and the separately active
+  #1150 local-dependency work.
+- [x] (2026-08-01 06:44Z) Implemented the downstream
+  `brokk-bifrost-semantic-packs` package, explicit embedded registry, facade
+  composition, dependency graph rules, CI selection, release publication order,
+  package checks, and focused tests.
+- [x] (2026-08-01 06:49Z) Ran the initial focused tests, graph/workflow tests,
+  strict task-scoped Clippy, six-archive packaging gate, and repository policy
+  check; recorded the pre-existing unreliable whole-workspace policy boundary.
+- [x] (2026-08-01 15:50Z) Fetched current origin state and rebased the three
+  #1154 commits onto `origin/master` at `4e716f57`. Resolved the sole conflict by
+  retaining master's `0.8.18` release version on every workspace dependency.
+  The new base includes merged #1150 local-dependency pack generation.
+- [x] (2026-08-01 15:50Z) Narrowed this ExecPlan from the full future
+  distribution system to the requested initial implementation boundary.
+- [ ] Re-run focused Rust, workspace graph/workflow, formatting, package, and
+  task-scoped Clippy checks against the rebased `0.8.18` base.
+- [ ] Review the final `origin/master...HEAD` diff for accidental coupling to
+  merged #1150 and update this plan with the final evidence and outcome.
 
 ## Surprises & Discoveries
 
-- Observation: The generic analyzer already contains nearly all of the trusted
-  local storage boundary required by #1154.
-  Evidence: `SemanticPackCatalog::install` validates canonical manifests and
-  shards before atomic publication; the catalog also exposes sources, pins,
-  active sets, leases, accounting, quarantine, and garbage collection.
+- Observation: The generic analyzer already owns the trusted local mechanics
+  needed by an embedded-content crate.
+  Evidence: `crates/bifrost-analysis/src/analyzer/semantic_model/` exposes the
+  compiled artifact contract, defensive decoding, `SemanticPackCatalog`,
+  session sources, activation, overlays, and content-addressed identity.
 
-- Observation: The facade package is already a composition package over four
-  published implementation crates, so a fifth downstream crate follows an
-  established release shape.
-  Evidence: root `Cargo.toml` depends on `brokk-bifrost-analysis`,
-  `brokk-bifrost-runtime`, `brokk-bifrost-mcp`, and `brokk-bifrost-lsp`, while
-  `.github/workflows/release.yml` publishes them in dependency order before
-  `brokk-bifrost`.
+- Observation: #1150 merged into `origin/master` before this plan was narrowed.
+  Evidence: master commit `4e716f57` is `Generate and cache semantic packs from
+  exact local dependencies (#1436)`.
 
-- Observation: The issue's production content belongs to later sibling issues.
-  Evidence: #1152 depends on #1154 and owns JDK/Scala release assets; #1153 owns
-  curated Scala/Lombok/macro behavior models. #1154 must therefore ship a
-  fixture-backed distribution mechanism without inventing those packs here.
+- Observation: The merged #1150 implementation strengthens the proposed
+  boundary rather than replacing it.
+  Evidence: local dependency discovery and generation now live in the generic
+  analysis layer; Bifrost-curated embedded content still has no reason to flow
+  back into that layer. The new crate remains downstream of analysis.
 
-- Observation: Semantic packs are not a global analyzer configuration today.
-  Evidence: `AnalyzerConfig` contains general, JVM, and C# configuration, while
-  active semantic models are acquired explicitly from a caller-provided
-  `SemanticPackCatalog` and activation request. The driver can compose bundled
-  content without adding product defaults to `AnalyzerConfig`.
+- Observation: Production curated content is owned by later issues.
+  Evidence: #1152 owns reproducible JDK/Scala release assets and depends on
+  #1154; #1153 owns initial Scala, Lombok, and explicit workspace behavior
+  models. This slice leaves `BIFROST_EMBEDDED_PACKS` empty rather than inventing
+  unreviewed product behavior.
 
-- Observation: Broad parallel Bifrost intelligence calls remain unreliable on
-  the rmcp host at this revision, but narrow warm calls work.
-  Evidence: a parallel `search_symbols` request with patterns `Semantic.*`,
-  `Model.*`, `Pack.*`, and `Built.*` returned a cancelled zero-file result, and
-  `get_summaries` for `Cargo.toml` and `crates` returned request-budget error
-  `-32603`. A later two-file semantic-model summary completed in 6.1 seconds.
-  Existing issues #1419 and #1423 own this behavior, including current-tip rmcp
-  evidence from the parallel #1150 investigation.
+- Observation: The only rebase conflict was a release version change.
+  Evidence: the old issue commit added `=0.8.17` package edges while current
+  master is `0.8.18`; keeping all master dependencies and adding the new edge at
+  `=0.8.18` completed the rebase without semantic conflict.
 
-- Observation: This machine's default Rust tools mix rustup Cargo/rustc with
-  Homebrew rustdoc and Clippy even though both report Rust 1.96.
-  Evidence: unit tests passed, then the doctest rejected an analysis rlib built
-  by the rustup compiler as incompatible with Homebrew rustdoc. Setting
-  `RUSTDOC=/Users/dave/.cargo/bin/rustdoc` made the focused tests pass, and the
-  isolated strict Clippy gate passed with the complete Homebrew toolchain.
+- Observation: Local Rust command resolution mixes rustup Cargo/rustc with
+  Homebrew rustdoc/Clippy.
+  Evidence: the initial doctest rejected an LLVM-distinct rlib until rustdoc was
+  pinned to `/Users/dave/.cargo/bin/rustdoc`; isolated Clippy passed using the
+  complete Homebrew toolchain. Rebased validation must keep one toolchain per
+  command.
 
-- Observation: The required whole-workspace policy gate still cannot establish
-  a trustworthy result at current tip.
-  Evidence: `run_policy({policy_packs:["bifrost.code-smells"],
-  evaluation_date:"2026-08-01",fail_on:"warning"})` returned
-  `status=unreliable`, `exit_status=2` after five seconds. Three known
-  dynamic-evaluation findings completed outside this change; the nested-loop
-  rule exhausted its budget after 1,110 files and 29,055,861 bytes, and later
-  policies were cancelled. Existing issues #1296 and #1423 own the incomplete
-  run behavior.
+- Observation: The whole-workspace policy pack does not currently finish
+  reliably within its MCP budget.
+  Evidence: the initial `bifrost.code-smells` run returned
+  `status=unreliable`, exit 2 after the nested-loop rule exhausted discovery and
+  later rules were cancelled. Existing issues #1296 and #1423 own this behavior;
+  no reported finding was in the initial implementation files.
 
 ## Decision Log
 
-- Decision: Create `crates/bifrost-semantic-packs` with package name
-  `brokk-bifrost-semantic-packs`, and make it depend on
-  `brokk-bifrost-analysis`; never add the reverse dependency.
-  Rationale: The analyzer owns the generic artifact, catalog, activation, and
-  overlay contracts. The new crate owns Bifrost's content and distribution
-  policy. Depending downstream reuses the trusted contracts without making
-  custom analyzer consumers compile or ship curated resources.
+- Decision: Add `crates/bifrost-semantic-packs` with published package name
+  `brokk-bifrost-semantic-packs` and dependency
+  `brokk-bifrost-analysis = "=0.8.18"`.
+  Rationale: Curated bytes and distribution defaults consume the generic pack
+  contract. Keeping the dependency downstream makes them optional for analysis
+  consumers and prevents a cycle.
   Date/Author: 2026-08-01 / Codex
 
-- Decision: Keep the generic semantic-model module inside
-  `brokk-bifrost-analysis` for this issue.
-  Rationale: Moving schema, compiler, catalog, runtime, and overlay types into a
-  separate neutral crate would be a large unrelated refactor and would not
-  improve optionality: analysis must understand those types to apply any
-  caller-supplied pack. The optional boundary is bundled content and network
-  lifecycle policy, not the capability to consume semantic facts.
+- Decision: Keep compiler, artifact, catalog, activation, and overlay types in
+  `brokk-bifrost-analysis`.
+  Rationale: Every consumer-provided pack needs those generic capabilities.
+  Moving them would be an unrelated refactor and would not make curated content
+  more optional.
   Date/Author: 2026-08-01 / Codex
 
-- Decision: Make `brokk-bifrost` depend on the new crate as its standard driver
-  composition, while keeping embedded content selectable through an explicit
-  driver configuration rather than silently registering it in analyzer
-  constructors.
-  Rationale: The product binary should provide the complete Bifrost tool set,
-  but libraries and tests need deterministic control over which rules are
-  active. Explicit composition also lets a custom host reuse the facade's
-  protocols without accepting Bifrost's defaults.
+- Decision: Let the root `brokk-bifrost` facade depend on and re-export the new
+  crate, but do not add it to runtime, MCP, or LSP dependencies.
+  Rationale: The root is the complete product driver. Lower-level packages are
+  composition points for embedders that want their own semantic rules.
   Date/Author: 2026-08-01 / Codex
 
-- Decision: Do not add a second semantic-pack format.
-  Rationale: The compiled pack manifest already binds schema, producer,
-  selectors, provenance, license, shard digests, encodings, and sizes. A release
-  index should reference those immutable artifacts and add only transport-level
-  information such as asset URL, total download bytes, notice asset, revocation,
-  and publication provenance.
+- Decision: Require explicit registry invocation and avoid static/global
+  registration.
+  Rationale: Tests and custom drivers must control the active pack inventory.
+  Merely linking the crate must not silently change analyzer correctness.
   Date/Author: 2026-08-01 / Codex
 
-- Decision: Keep automatic network access off and model acquisition as an
-  explicit operation with an injected transport.
-  Rationale: Missing network or registry state must not alter local correctness.
-  An injected bounded transport makes offline behavior and corrupt/interrupted
-  downloads testable without a live service and lets embedding products choose
-  their own HTTP/authentication implementation.
+- Decision: Leave the production embedded registry empty in this slice.
+  Rationale: The package boundary can be proven with a compiled test fixture;
+  #1152 and #1153 own reviewed production content. An empty registry is more
+  honest than shipping placeholder behavior.
   Date/Author: 2026-08-01 / Codex
 
-- Decision: Store lifecycle intent and history in the distribution crate's own
-  small state database or file, while continuing to store immutable pack bytes
-  and analyzer activation authority in `SemanticPackCatalog`.
-  Rationale: Update channels, disabled registries, rollback history, and desired
-  versions are product policy, not semantic truth. Putting those rows in the
-  analyzer catalog would couple every custom host to Bifrost's distribution
-  semantics and blur the existing catalog's trusted local-content role.
+- Decision: Treat release indexes, downloading, lifecycle state, and CLI
+  commands as follow-up work outside this initial plan.
+  Rationale: Those features introduce network, persistence, rollback, and
+  supply-chain policy. They should not obscure review of the fundamental Cargo
+  dependency boundary.
   Date/Author: 2026-08-01 / Codex
 
 ## Outcomes & Retrospective
 
-Planning and the first implementation milestone are complete. The chosen
-architecture agrees with the proposed crate split, with the important
-qualification that the analyzer continues to own the generic ability to consume
-semantic packs. The workspace now enforces the one-way dependency, packages and
-publishes the new crate before the facade, and provides an explicit validated
-embedded-pack registry whose production inventory remains empty until #1152 or
-#1153 supplies reviewed content. Release-index and acquisition work remains.
+The code for this initial slice exists in the rebased branch but requires final
+post-rebase validation. The intended architecture is now concrete: generic
+analysis and merged #1150 local generation remain independent of curated
+Bifrost content; the facade composes both; package and CI metadata know about
+the sixth crate. No remote registry, automatic networking, lifecycle UI, or
+production pack content is claimed.
 
 ## Context and Orientation
 
-The repository root is both a Cargo workspace and the `brokk-bifrost` facade
-package. `Cargo.toml` lists implementation packages under `crates/` and the
-facade re-exports their public APIs from `src/lib.rs`. The facade's
-`src/bin/bifrost.rs` is the end-user driver and manually parses its command-line
-options. `scripts/check-workspace-packages.sh` packages every publishable crate,
-unpacks the archives, patches their registry dependencies to those local
-archives, and compiles a consumer. `.github/workflows/release.yml` publishes
-implementation crates in dependency order and publishes the facade last.
+The repository root is both a Cargo workspace and the `brokk-bifrost` facade.
+The workspace members are declared in root `Cargo.toml`. The generic analyzer
+is `crates/bifrost-analysis`; protocol hosts are `crates/bifrost-mcp` and
+`crates/bifrost-lsp`; `crates/bifrost-runtime` is the typed shared driver
+runtime. `src/lib.rs` re-exports the packages that form the complete facade.
 
-Generic semantic-pack support is under
-`crates/bifrost-analysis/src/analyzer/semantic_model/`. `artifact.rs` defines
-the canonical compiled manifest and shard envelope. `catalog/mod.rs` stores
-immutable verified objects, pack sources, pins, activations, and leases.
-`runtime.rs` selects compatible candidates from caller-provided evidence and
-controls, hydrates the generation-scoped in-memory matcher, and produces an
-explanation report. `overlay.rs` maps active modeled facts into navigation and
-query results. These types are useful to every host, including hosts that never
-use Bifrost-curated content, so they remain in the analysis crate.
+Semantic-model support lives under
+`crates/bifrost-analysis/src/analyzer/semantic_model/`. A compiled semantic pack
+contains canonical manifest bytes and one or more verified shard byte strings.
+`SemanticPackCatalog::register_session_pack` accepts a validated pack and a
+session source such as `Embedded`; a session pack is visible for that catalog
+instance but is not copied into durable storage. The manifest's content digest
+is the logical pack identity.
 
-The new `crates/bifrost-semantic-packs/` package is a distribution layer. A
-"release index" is a small canonical JSON document that lists immutable pack
-assets and enough metadata to reject an asset before download when it is
-incompatible, revoked, or too large. A "transport" is a caller-provided object
-that reads bytes for an explicit asset request. An "embedded pack" is an
-immutable compiled manifest and its shards included in a binary or library
-archive. Embedded and downloaded copies with the same manifest digest are one
-logical pack because the existing catalog is content-addressed.
+The new `crates/bifrost-semantic-packs/src/lib.rs` defines
+`EmbeddedSemanticPack`, a borrowed manifest and shard-byte view;
+`EmbeddedPackRegistry`, an explicitly invoked registry; and
+`BIFROST_EMBEDDED_PACKS`, the empty production inventory. `decode` uses the
+analysis crate's `decode_manifest` and `decode_shard_for_manifest`, then builds
+the existing `CompiledSemanticModelPack`. `register_all` decodes every entry
+before registering session sources and returns source IDs plus manifest
+digests.
 
-Issue #1150 may later call `SemanticPackCatalog::install` with packs generated
-from exact local dependency artifacts. It must not depend on the new release
-index, transport, update history, or Bifrost-curated embedded registry. This
-plan will avoid editing #1150's dependency-discovery and producer adapters.
+`scripts/check-workspace-dependencies.mjs` is the enforced workspace dependency
+graph. `scripts/check-workspace-packages.sh` packages every published crate,
+unpacks the archives, and compiles consumers. `.github/workflows/ci.yml` selects
+the new crate's tests in the Rust matrix. `.github/workflows/release.yml`
+publishes analysis first, then the semantic-pack crate, and allows the facade to
+publish only after both protocol hosts and semantic packs are visible.
 
 ## Plan of Work
 
-Milestone 1 establishes the package boundary without pretending that production
-packs from #1152 or #1153 already exist. Add
-`crates/bifrost-semantic-packs/Cargo.toml` and `src/lib.rs`, define an explicit
-`EmbeddedPackRegistry` over validated compiled bytes, and add a small test-only
-fixture registry. Update the workspace, facade dependency, package checker,
-workspace dependency checker, CI impact rules, and release publication graph.
-Add a package-graph regression that proves `brokk-bifrost-analysis` does not
-depend on `brokk-bifrost-semantic-packs`. Package both crates and compile a
-consumer that can choose analysis without the distribution package.
+First, preserve the new crate boundary after the rebase. Confirm root
+`Cargo.toml`, `crates/bifrost-semantic-packs/Cargo.toml`, and `Cargo.lock` all use
+workspace version `0.8.18`. Run the workspace dependency validator and its tests
+to prove that semantic packs may depend on analysis, analysis may not depend on
+semantic packs, runtime/MCP/LSP remain independent, and the facade may compose
+the new package.
 
-Milestone 2 defines the release trust envelope. In the new crate, add a strict
-version-one release index with denied unknown fields, canonical serialization,
-explicit Bifrost/schema/producer compatibility, selectors copied from the
-compiled manifest for pre-download filtering, source commit and input artifact
-digests, license and notice references, exact manifest/shard URLs, stored
-SHA-256 digests, and byte sizes. Decode under explicit count, string, and byte
-limits. Validate that index metadata agrees exactly with the decoded compiled
-manifest and shard descriptors. Add deterministic JSON fixtures and corruption,
-unknown-field, size, compatibility, provenance, notice, and revocation tests.
+Second, validate embedded pack behavior. Run the new crate's unit tests with a
+single consistent Rust toolchain. Confirm the valid fixture decodes and repeated
+registration returns the same logical digest. Confirm the invalid multi-entry
+registry produces a shard-count error before the valid first entry appears in
+catalog accounting. Inspect the public API to ensure construction and
+registration remain explicit and no global initializer mutates catalog state.
 
-Milestone 3 implements acquisition without implicit networking. Define a
-`PackTransport` trait whose bounded read method receives one asset descriptor
-and a cancellation token. Supply a filesystem implementation for local release
-mirrors and an HTTP implementation only if the facade explicitly enables and
-configures one. Stream each object to a uniquely named staging file under a
-temporary directory, reject content that exceeds its declared size, verify the
-exact stored digest and final size, decode the complete pack, then call
-`SemanticPackCatalog::install`. Remove staging state on every failure. Tests
-will simulate interruption, truncation, oversize, digest mismatch, manifest
-disagreement, incompatible versions, and concurrent identical installs.
+Third, validate packaging and release metadata. Run Node tests for CI impact,
+workspace graph, CI workflow, and release-promotion workflow. Run the six-crate
+package gate with Python 3.12 so the facade's full `python` feature can link.
+Confirm it compiles both unpacked consumers: one facade consumer and one
+analysis-only consumer with no semantic-pack dependency.
 
-Milestone 4 adds distribution policy outside the analyzer. Define a durable
-`PackStateStore` that records configured release sources, opt-in network policy,
-desired pack selectors, pins, disables, successful install history, and the
-previous known-good manifest digest. Implement install, update, explicit
-downgrade, rollback, disable/enable, and garbage-collection planning as
-separate operations rather than mode flags. A failed acquisition must leave
-the current desired and active state unchanged. Activation controls supplied to
-the analyzer come from this state store plus explicit workspace controls, but
-the analyzer remains the authority that explains compatibility and conflicts.
-
-Milestone 5 composes the normal driver. Add a facade module that resolves an
-explicit semantic-pack root, registers the embedded registry as session packs,
-opens the durable catalog/state store, and supplies activation context to tool
-execution. Extend `src/bin/bifrost.rs` with a `semantic-packs` command family for
-`list`, `status`, `explain`, `install`, `update`, `rollback`, `disable`,
-`enable`, and `gc`. Read-only commands must never contact the network. Mutating
-commands contact only explicitly configured sources and print the origin,
-manifest digest, compatibility, activation state, and reason. Preserve direct
-construction paths for custom hosts and tests that supply no bundled registry.
-
-Milestone 6 makes distribution releasable. Extend the release workflow so the
-new crate publishes after analysis and before the facade. Add a deterministic
-asset-index generation and verification command for later #1152/#1153 jobs;
-do not commit large generated payloads. Require notices for every non-Bifrost
-input, verify all asset digests and sizes before GitHub Release publication,
-and fail if the compact index names an absent asset. Run package archives,
-focused lifecycle tests, a staged-binary offline/install/rollback smoke, Cargo
-formatting, focused featureless Clippy/tests, and the repository code-smell
-policy pack.
+Finally, run formatting, task-scoped strict Clippy, and `git diff --check`.
+Inspect `git diff origin/master...HEAD` and specifically search for edits to
+#1150's dependency discovery, producer, and activation paths; there should be
+none. Update `Progress`, `Surprises & Discoveries`, and `Outcomes &
+Retrospective` with exact post-rebase evidence. Commit only the plan update and
+any fixes required by validation; do not begin the deferred release-index or
+network lifecycle implementation under this plan.
 
 ## Concrete Steps
 
 Work from `/Users/dave/.codex/worktrees/cd36/bifrost` on the existing
 `1154-package-and-distribute-compatible-prebuilt-semantic-packs-safely` branch.
-Do not create or switch branches. At the beginning and after each milestone,
-run:
+The branch is based on `origin/master` commit `4e716f57`; do not create or switch
+branches.
 
-    git status --short --branch
+Run the dependency and workflow checks:
+
+    node scripts/check-workspace-dependencies.mjs
+    node --test scripts/check-workspace-dependencies.test.mjs \
+      scripts/ci-impact.test.mjs \
+      scripts/ci-impact-workflow.test.mjs \
+      scripts/release-promotion-workflow.test.mjs
+
+Run the focused Rust tests with rustup rustdoc to avoid mixing toolchains:
+
+    RUSTDOC=/Users/dave/.cargo/bin/rustdoc \
+      cargo test -p brokk-bifrost-semantic-packs
+
+Run formatting and isolated task-scoped Clippy:
+
+    cargo fmt --all -- --check
+    RUSTC=/opt/homebrew/bin/rustc \
+      RUSTDOC=/opt/homebrew/bin/rustdoc \
+      scripts/with-isolated-cargo-target.sh \
+      /opt/homebrew/bin/cargo clippy \
+      -p brokk-bifrost-semantic-packs --all-targets -- -D warnings
+
+Run the package gate with an explicit Python 3.12 interpreter:
+
+    PYO3_PYTHON=/Users/dave/.local/share/uv/python/cpython-3.12.11-macos-aarch64-none/bin/python3.12 \
+      bash scripts/check-workspace-packages.sh
+
+The package gate may require registry network access. It must end with:
+
+    Validated all six package archives and their unpacked facade and analysis-only consumers
+
+Finish with:
+
     git diff --check
-
-For Milestone 1, run the package and dependency checks plus focused tests:
-
-    cargo fmt --all -- --check
-    cargo test -p brokk-bifrost-semantic-packs
-    bash scripts/check-workspace-packages.sh
-    node --test scripts/check-workspace-dependencies.test.mjs scripts/ci-impact.test.mjs
-
-The package checker must report six archives, including
-`brokk-bifrost-semantic-packs`, and both its default consumer and the
-analysis-only consumer must compile.
-
-For Milestones 2 through 4, use focused package tests during development:
-
-    cargo test -p brokk-bifrost-semantic-packs
-
-Tests that exercise catalog behavior should use temporary catalog and state
-roots and fixture transports. They must not read the user's cache, mutate
-process-global network settings, or contact the internet.
-
-For Milestone 5, build the staged binary and run the lifecycle smoke against a
-temporary root and local fixture release mirror. The exact CLI spelling may be
-adjusted once the existing manual parser is extended, but the final plan must
-record the actual commands. The expected sequence is:
-
-    cargo run -- semantic-packs status --offline --root <temporary-root>
-    cargo run -- semantic-packs install fixture.pack --source <fixture-index>
-    cargo run -- semantic-packs disable fixture.pack --root <temporary-root>
-    cargo run -- semantic-packs rollback fixture.pack --root <temporary-root>
-
-Status must work with no source available. Install must show the verified
-digest. Disable must retain bytes while preventing activation. Rollback must
-restore the previously successful digest without downloading it again.
-
-Before completing the issue, run the practical featureless Rust gate because
-this work does not touch NLP or Python:
-
-    cargo fmt --all -- --check
-    cargo test -p brokk-bifrost-semantic-packs
-    cargo test -p brokk-bifrost-analysis semantic_model
-    cargo test -p brokk-bifrost
-    scripts/with-isolated-cargo-target.sh cargo clippy -p brokk-bifrost-semantic-packs -p brokk-bifrost --all-targets -- -D warnings
-    bash scripts/check-workspace-packages.sh
-
-Then use the installed Bifrost policy tool to run `bifrost.code-smells` together
-with every executable repository policy root named by the repository in one
-request. A `finding` requires review or correction. An `unreliable` result is a
-failed validation and must be reported with its owning issue rather than called
-green.
+    git diff --name-only origin/master...HEAD
+    git status --short --branch
 
 ## Validation and Acceptance
 
-The crate boundary is accepted when Cargo metadata and a regression test show
-that `brokk-bifrost-analysis` has no dependency path to
-`brokk-bifrost-semantic-packs`, while the `brokk-bifrost` facade does. A custom
-consumer must compile using only analysis and must be able to register its own
-compiled fixture with `SemanticPackCatalog`.
+Acceptance requires all focused Rust and Node tests to pass on the rebased
+`0.8.18` base. `cargo metadata` validation must show exactly six expected
+workspace packages. It must reject an analysis-to-semantic-packs dependency and
+require semantic-packs-to-analysis with an exact workspace version.
 
-The release contract is accepted when semantically identical indexes serialize
-to identical bytes, every asset is bound by exact digest and size, and malformed,
-unknown-schema, revoked, incompatible, or notice-incomplete entries are rejected
-before activation. Release metadata must agree with the canonical compiled
-manifest rather than becoming a second semantic authority.
+The embedded registry is accepted when valid canonical manifest/shard bytes
+register as `SessionPackSourceKind::Embedded`, repeated registration preserves
+one manifest digest, and a later invalid entry prevents earlier registry entries
+from being registered in the tested catalog. The production registry must be
+empty and registration must require an explicit call.
 
-Installation is accepted when interrupted, corrupt, oversized, incompatible,
-or partially downloaded packs never appear as catalog candidates or replace a
-known-good desired version. Installing an embedded and downloaded copy with the
-same digest must produce one logical catalog identity while preserving both
-origins for inspection.
+Packaging is accepted when all six archives remain below the configured size
+budget, the semantic-pack archive includes its `Cargo.toml` and `src/lib.rs`,
+the unpacked facade consumer compiles, and the unpacked analysis-only consumer
+compiles without a dependency on the new crate. Release workflow tests must
+show that semantic packs publish after analysis and the facade waits for them.
 
-Lifecycle behavior is accepted when offline status/list/explain are complete;
-network access occurs only during an explicit configured operation; pin,
-disable, update, downgrade, rollback, and GC tests pass; and rollback reuses a
-verified cached digest atomically. Missing registries must report unavailable
-coverage without changing analyzer results that do not depend on the missing
-pack.
-
-Release behavior is accepted when package checks include the new crate,
-third-party notices cover every indexed input, generated payloads are absent
-from Git, the compact release index cannot publish before all named assets and
-checksums exist, and the facade publishes only after its new dependency.
+The final diff must not modify merged #1150 local artifact discovery or pack
+generation. It must not add a network dependency, registry URL, update state,
+CLI command, large generated payload, or production semantic rule. Those are
+explicitly outside this initial implementation.
 
 ## Idempotence and Recovery
 
-All release assets are immutable and content-addressed, so retrying a verified
-install is a logical no-op. Downloads use unique temporary staging paths and
-publish through the existing catalog only after complete verification; a crash
-may leave an unreferenced staging file but never an active partial pack. Startup
-and explicit cleanup may remove stale staging files that are older than the
-configured safety window and are not open by a live process.
+All validation commands are read-only except Cargo build outputs and temporary
+package directories. The package script creates a unique temporary directory
+and removes it through its shell trap. The isolated Cargo-target helper likewise
+removes its marked target on success, failure, or interruption.
 
-State changes write a new desired-state generation atomically. Keep the prior
-known-good digest until the replacement has been installed and validated.
-Rollback selects that retained digest and never reconstructs bytes from mutable
-metadata. If the state database is newer than the running binary, open it
-read-only for status where safe and refuse mutation with an actionable error.
+`EmbeddedPackRegistry::register_all` is safe to repeat because the catalog
+deduplicates the same manifest digest and session source. Tests use an ephemeral
+catalog and do not touch user cache state.
 
-Milestone commits must stage only files changed by this plan. If another task
-advances #1150 concurrently, refresh from the shared base only when explicitly
-authorized and resolve overlap by preserving #1150's local-artifact generation
-boundary. Do not edit or discard unrelated worktree changes.
+If the rebase validation uncovers a semantic conflict with merged #1150, stop
+and record the exact overlap rather than changing #1150 behavior under this
+plan. The completed rebase can be inspected with `git reflog`; do not reset or
+discard commits. Stage and commit only files changed for this initial slice.
 
 ## Artifacts and Notes
-
-Live issue state at plan creation:
-
-    #1145 closed: authoring schema and deterministic compiler
-    #1146 closed: content-addressed catalog and lifecycle
-    #1147 closed: generation-scoped runtime matcher
-    #1150 open: exact local dependency generation, worked separately
-    #1152 open: JDK and Scala prebuilt content, depends on #1154
-    #1153 open: initial curated generated-code behavior models
-    #1154 open: this distribution and packaging work
 
 The intended dependency shape is:
 
@@ -421,48 +309,46 @@ The intended dependency shape is:
     brokk-bifrost-semantic-packs
               ^
               |
-        brokk-bifrost facade/driver
+        brokk-bifrost facade
 
 `brokk-bifrost-runtime`, `brokk-bifrost-mcp`, and `brokk-bifrost-lsp` continue
-to depend on generic analysis/runtime packages and do not gain a dependency on
-Bifrost-curated content.
+to depend only on generic analysis/runtime packages. Merged #1150 is part of the
+analysis side of this boundary and does not depend on the new crate.
+
+Initial implementation commits after the rebase are:
+
+    841ee8a4 Plan optional semantic pack distribution
+    06a2d754 Add optional semantic pack distribution crate
+    83b2abea Record semantic pack milestone review
+
+These hashes are historical evidence for this branch state and may change if a
+later authorized rebase rewrites them again.
 
 ## Interfaces and Dependencies
 
-In `crates/bifrost-semantic-packs/src/embedded.rs`, define a small registry that
-returns immutable `CompiledSemanticModelPack` values or manifest/shard byte
-views suitable for `SemanticPackCatalog::register_session_pack`. The registry
-must not perform global registration in a constructor or static initializer.
+`EmbeddedSemanticPack::new(source_id, manifest_bytes, shard_bytes)` constructs a
+borrowed view without decoding or registering anything.
 
-In `crates/bifrost-semantic-packs/src/release.rs`, define strict versioned DTOs
-for `SemanticPackReleaseIndex`, `SemanticPackRelease`, and `ReleaseAsset`. They
-must use `serde` with unknown-field rejection and share digest/compatibility
-validation helpers with the compiled artifact contract where possible.
+`EmbeddedSemanticPack::decode(&DecodeLimits)` returns the analysis crate's
+`CompiledSemanticModelPack` only after canonical manifest decoding, shard-count
+agreement, and manifest-bound shard decoding.
 
-In `crates/bifrost-semantic-packs/src/transport.rs`, define a cancellable,
-bounded `PackTransport` interface. Keep the interface about reading an explicit
-asset; registry discovery, authentication, retries, and network policy belong
-to the caller or concrete transport and must not leak into the analyzer.
+`EmbeddedPackRegistry::register_all(&SemanticPackCatalog, &DecodeLimits)` first
+decodes every entry, then explicitly registers each as an embedded session
+source and returns `Vec<EmbeddedPackRegistration>`.
 
-In `crates/bifrost-semantic-packs/src/installer.rs`, define a `PackInstaller`
-that accepts a release entry, transport, `SemanticPackCatalog`, limits, and
-cancellation token. It returns a structured installed/already-present outcome
-or a typed failure. It must verify transport metadata and compiled semantic
-metadata before invoking the catalog install operation.
+`BIFROST_EMBEDDED_PACKS` is a public empty registry prepared for reviewed
+content from #1152/#1153. Adding production bytes is not part of this plan.
 
-In `crates/bifrost-semantic-packs/src/state.rs`, define a durable state store
-and separate operation types for install, update, downgrade, rollback, enable,
-disable, pin, unpin, and GC. Avoid a shared mode flag. Expose a method that
-derives `SemanticModelActivationControl` values for the generic analyzer
-runtime without making analysis depend on this crate.
+The new crate has one direct workspace dependency:
 
-In the root facade, add a driver-level semantic-pack configuration and lifecycle
-service. The service may depend on the new crate, analysis, and runtime. Analyzer
-constructors remain neutral and direct analysis consumers continue to supply
-their own catalog and activation request.
+    brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.18" }
 
-Revision note: 2026-08-01 06:49Z. Updated after Milestone 1 implementation,
-validation, and policy review to record the concrete package boundary, empty
-production registry, release/CI integration, analysis-only consumer proof,
-local Rust toolchain discovery, and the existing unreliable policy budget
-boundary. The next milestone is the strict release index and asset envelope.
+Do not add HTTP, filesystem discovery, database, CLI parsing, or product host
+dependencies in this initial slice.
+
+Revision note: 2026-08-01 15:50Z. Rewritten after rebasing onto current
+`origin/master` to scope the plan to the requested initial implementation. The
+former full distribution roadmap was intentionally removed; release indexes,
+remote acquisition, lifecycle state, CLI commands, and production content now
+require separate follow-up planning.
