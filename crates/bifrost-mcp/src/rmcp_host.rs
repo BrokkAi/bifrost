@@ -820,12 +820,13 @@ impl BifrostMcpHandler {
         deadline: Instant,
         request_correlation_id: Option<String>,
         mcp_cancellation: McpCancellationToken,
+        permit: AnalyzerPermit,
     ) -> Result<CallToolResult, ErrorData> {
         // The deadline was set when the request was accepted, not when it
         // reached the analyzer, so time already spent queueing counts against
         // it. A request that waited most of its budget gets what remains.
         let bifrost_cancellation = crate::CancellationToken::default().with_deadline(deadline);
-        let _in_flight = self.in_flight.register(
+        let in_flight = self.in_flight.register(
             workspace_scope.unwrap_or_else(|| self.service.workspace_generation()),
             bifrost_cancellation.clone(),
         );
@@ -845,16 +846,25 @@ impl BifrostMcpHandler {
             render_line_numbers: self.render_options.render_line_numbers,
         };
         let profiled_name = name.clone();
-        let output = tokio::task::spawn_blocking(move || {
+        let execution_name = name.clone();
+        let execution_cancellation = bifrost_cancellation.clone();
+        let mut output = tokio::task::spawn_blocking(move || {
+            // Keep both the analyzer slot and the revocation registration until
+            // cooperative cancellation has actually unwound the blocking work.
+            // A timed-out client call must not free capacity for another scan
+            // while its original scan is still consuming CPU.
+            let _permit = permit;
+            let _in_flight = in_flight;
+            let _bridge_guard = bridge_guard;
             let _execution_scope =
                 profiling::scope(format!("mcp_request.execution[{profiled_name}]"));
             let output = service.call_tool_output_with_cancellation(
-                &name,
+                &execution_name,
                 arguments,
                 render_options,
-                Some(&bifrost_cancellation),
+                Some(&execution_cancellation),
             )?;
-            let output = if name == "get_summaries" {
+            let output = if execution_name == "get_summaries" {
                 fit_get_summaries_output_to_budget(service.as_ref(), output, render_options)?
             } else {
                 output
@@ -864,17 +874,24 @@ impl BifrostMcpHandler {
             // without the raw id, which is client-controlled, ever being
             // logged. Shared with the fallback host so both emit the same
             // value for the same wire id.
-            Ok::<_, crate::SearchToolsServiceError>(if name == "run_policy" {
+            Ok::<_, crate::SearchToolsServiceError>(if execution_name == "run_policy" {
                 attach_run_policy_correlation(output, request_correlation_id.as_deref())
             } else {
                 output
             })
-        })
-        .await
-        .map_err(|error| {
-            ErrorData::internal_error(format!("MCP tool execution panicked: {error}"), None)
-        })?;
-        drop(bridge_guard);
+        });
+        let output = tokio::select! {
+            output = &mut output => output.map_err(|error| {
+                ErrorData::internal_error(format!("MCP tool execution panicked: {error}"), None)
+            })?,
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                bifrost_cancellation.cancel();
+                return Err(ErrorData::internal_error(
+                    format!("{name} exhausted its {:?} request budget; cancellation continues in the background", mcp_analyzer_request_budget()),
+                    None,
+                ));
+            }
+        };
 
         // The workspace can be rebound while a call runs. Returning results
         // computed against a scope the client has since revoked would leak the
@@ -1279,7 +1296,7 @@ impl ServerHandler for BifrostMcpHandler {
             )
             .await
         };
-        let _permit = match admission {
+        let permit = match admission {
             Ok(Admission::Granted(permit)) => permit,
             Ok(Admission::Cancelled) => {
                 return Err(ErrorData::internal_error(
@@ -1338,6 +1355,7 @@ impl ServerHandler for BifrostMcpHandler {
                 deadline,
                 correlation_id,
                 context.ct.clone(),
+                permit,
             )
             .await?
             .into())

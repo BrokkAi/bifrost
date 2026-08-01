@@ -39,7 +39,15 @@ Current Codex does not advertise standard roots. For any rootless connection who
 
 ## Protocol Revisions
 
-With `BIFROST_MCP_RMCP=on` (see below), Bifrost speaks MCP through [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk), the official Rust SDK, and accepts every revision that SDK knows, including `2025-11-25` and `2026-07-28`. The negotiated revision is whatever the client asks for; nothing else needs configuring. Without that variable, Bifrost serves `2025-11-25` from its hand-written implementation and none of the rest of this section applies.
+With `BIFROST_MCP_RMCP=on` (see below), Bifrost speaks MCP through [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk), the official Rust SDK, and accepts every revision that SDK knows, including `2025-11-25` and `2026-07-28`. The negotiated revision is whatever the client asks for. Without that variable, Bifrost serves `2025-11-25` from its hand-written implementation and none of the rest of this section applies.
+
+## Request budget
+
+Analyzer-backed MCP requests have a five-second wall-clock budget by default. Set
+`BIFROST_MCP_REQUEST_BUDGET_SECS` to a whole number from 5 through 60 to change
+that process-wide cap; benchmark sessions set it to 60 seconds. Expired rmcp
+requests return promptly while their cancelled analyzer work retains its slot
+until it stops, so repeated timeouts cannot overcommit the analyzer pool.
 
 A `2026-07-28` client gets three things a `2025-11-25` client does not. `server/discover` answers before any handshake, so a client can inspect Bifrost's capabilities without opening a session. Results carry the `resultType` discriminator. And `tools/list`, `resources/list`, and `resources/read` carry SEP-2549 cache hints: the tool list is `private` for five minutes because it is fixed for the life of the process but differs between servers started in different modes, and the agent-guidance resource is `public` for an hour because it is compiled into the binary. Tool results are never cacheable, because every one depends on the bound workspace and the current contents of its files. A `2025-11-25` client sees none of these fields.
 

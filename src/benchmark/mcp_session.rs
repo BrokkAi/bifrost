@@ -10,8 +10,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use brokk_bifrost_mcp::benchmark_api::{
-    BENCHMARK_MCP_REQUEST_BUDGET_SECS, BENCHMARK_MCP_REQUEST_BUDGET_SECS_ENV,
-    BENCHMARK_PROFILE_BOUNDARY_MARKER, BENCHMARK_PROFILE_BOUNDARY_METHOD, MCP_FILE_WATCHER_ENV,
+    BENCHMARK_MCP_REQUEST_BUDGET_SECS, BENCHMARK_PROFILE_BOUNDARY_MARKER,
+    BENCHMARK_PROFILE_BOUNDARY_METHOD, MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV, MCP_FILE_WATCHER_ENV,
 };
 
 const STDERR_TAIL_CAPACITY_BYTES: usize = 256 * 1024;
@@ -487,7 +487,7 @@ impl McpSession {
             // to observe complete results. Interactive cases still enforce
             // their own five-second p95 budget in the runner.
             .env(
-                BENCHMARK_MCP_REQUEST_BUDGET_SECS_ENV,
+                MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV,
                 BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string(),
             );
         if no_line_numbers {
