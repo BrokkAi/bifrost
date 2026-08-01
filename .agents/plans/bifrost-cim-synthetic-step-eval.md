@@ -365,6 +365,24 @@ run and query manifests, respectively SHA-256
 service is `cimeval-dw10-synthetic-seed0-r6.service`, with all 91 jobs submitted to one scheduler
 at concurrency 30.
 
+R6 finished after one primary invocation and one immutable `--resume` recovery invocation. The
+recovery converted timeout/incomplete cells without rerunning any `COMPLETE` cell. Eighty-seven
+cells have valid official scores and localization artifacts; 41 resolve (47.13%). Per the user's
+instruction to count remaining stragglers as failures, the campaign result is 41/91 (45.05%). The
+four remaining cells repeatedly hit the configured 1,800-second task deadline and are not sampled
+again. Against the max-reasoning Luna baseline seed 0, the 87 exact pairs contain two gains and
+nine losses: mean difference -8.05 percentage points, exact p=0.06543. This is neither positive
+nor significant, so the spending gate fails and seeds 1 and 2 are not run. The three-seed baseline
+comparison is likewise ineligible with one current seed (mean difference -5.36 points,
+p=0.16998).
+
+Telemetry validates the treatment: 93 synthetic calls and one later agent-selected call, all on
+the `semantic-coedit-2-1` profile with realized 80 vector, 40 co-edit, and zero BM25 candidates;
+there are zero fallbacks, zero final-k violations, and zero candidate-without-context calls. The
+87 cells contain 53 deliberate querygen abstentions and 93 total generated queries. Localization
+covers all 87 scored cells. Leak audit covers all 87 and flags zero; history and network attempts
+were neutralized by synthetic-root history and the offline shell namespace.
+
 ## Interfaces and Dependencies
 
 Anvil's private interface is two environment variables: `BRK_CIM_EVAL=1` and
@@ -408,3 +426,7 @@ paths, and the clean r2 restart required to retain one immutable runtime identit
 Revision note, 2026-08-01: Reclassified r5 as diagnostic after its strict provenance validator
 rejected deliberate zero-query steps, recorded the host-side fix and validation, and launched a
 clean immutable r6 campaign at concurrency 30.
+
+Revision note, 2026-08-01: Recorded r6's final 41/87 scored result, four timeout failures, paired
+negative comparison, strict reranker telemetry, localization, and zero-flag leak audit. The
+positive-significance gate failed, so the campaign stops after dw10 seed 0.
