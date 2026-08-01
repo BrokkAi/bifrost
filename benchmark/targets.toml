@@ -78,7 +78,7 @@ code_quality_probes = [
   { scenario = "test_assertion_smells", file_paths = ["gson/src/test/java/com/google/gson/GsonTest.java", "gson/src/test/java/com/google/gson/GsonBuilderTest.java", "gson/src/test/java/com/google/gson/functional/PrimitiveTest.java", "gson/src/test/java/com/google/gson/functional/CollectionTest.java"], expect_report_contains = ["| 5 | `no-assertions` | 0 | `com.google.gson.GsonBuilderTest` |", "anonymous-test-double, reusable-test-double-candidate"] },
   { scenario = "structural_clone_smells", file_paths = ["gson/src/main/java/com/google/gson/internal/bind/TypeAdapters.java", "gson/src/main/java/com/google/gson/Gson.java", "gson/src/main/java/com/google/gson/GsonBuilder.java", "gson/src/main/java/com/google/gson/internal/LinkedTreeMap.java"], expect_report_contains = ["`com.google.gson.GsonBuilder.addDeserializationExclusionStrategy` (gson/src/main/java/com/google/gson/GsonBuilder.java) | `com.google.gson.GsonBuilder.addSerializationExclusionStrategy`", "token-similarity:100"] },
   { scenario = "long_method_smells", file_paths = ["gson/src/main/java/com/google/gson/Gson.java", "gson/src/main/java/com/google/gson/internal/bind/TypeAdapters.java", "gson/src/main/java/com/google/gson/stream/JsonReader.java"], expect_report_contains = ["- `com.google.gson.stream.JsonReader` in `gson/src/main/java/com/google/gson/stream/JsonReader.java:212-1916` [score 805]", "contains high-complexity workflow (CC 49)"] },
-  { scenario = "secret_like_code", file_paths = ["gson/src/main/java/com/google/gson/Gson.java"], expect_report_contains = ["| CURRENT | MEDIUM | `Credential assignment` | `gson/src/main/java/com/google/gson/internal/bind/JsonTreeReader.java:146` |"] },
+  { scenario = "secret_like_code", file_paths = ["gson/src/main/java/com/google/gson/Gson.java"], arguments = { max_commits = 200 }, expect_report_contains = ["| CURRENT | MEDIUM | `Credential assignment` | `gson/src/main/java/com/google/gson/internal/bind/JsonTreeReader.java:146` |"] },
   { scenario = "git_hotspots", arguments = { since_iso = "2025-01-01T00:00:00Z", until_iso = "2026-01-01T00:00:00Z", max_commits = 150, max_files = 20 }, expect_report_contains = ["- Analyzed commits: 98", "| `pom.xml` | 32 | 0 | ACTIVE |"] },
 ]
 definition_queries = [
@@ -175,7 +175,7 @@ code_quality_probes = [
   { scenario = "structural_clone_smells", file_paths = ["include/fmt/format.h", "include/fmt/base.h", "include/fmt/printf.h", "include/fmt/xchar.h"], expect_report_contains = ["`basic_format_args.get` (include/fmt/base.h)", "token-similarity:100"] },
   { scenario = "test_assertion_smells", file_paths = ["test/format-test.cc", "test/chrono-test.cc", "test/base-test.cc", "test/color-test.cc"], expect_report_contains = ["| 5 | `no-assertions` | 0 | `test/base-test.cc` |"] },
   { scenario = "long_method_smells", file_paths = ["include/fmt/format.h", "include/fmt/base.h", "include/fmt/chrono.h"], expect_report_contains = ["- `detail.parse_chrono_format` in `include/fmt/chrono.h:631-773` [score 448]", "high cyclomatic complexity 82"] },
-  { scenario = "secret_like_code", file_paths = ["include/fmt/base.h"], expect_report_contains = ["| MEDIUM | `Credential assignment` | `support/docopt.py:336` |"] },
+  { scenario = "secret_like_code", file_paths = ["include/fmt/base.h"], arguments = { max_commits = 200 }, expect_report_contains = ["| MEDIUM | `Credential assignment` | `support/docopt.py:336` |"] },
   { scenario = "git_hotspots", arguments = { since_iso = "2025-06-01T00:00:00Z", until_iso = "2026-06-03T00:00:00Z", max_files = 20 }, expect_report_contains = ["- Analyzed commits: 361", "| `include/fmt/base.h` | 75 | 19 | HOTSPOT |"] },
 ]
 definition_queries = [
@@ -225,7 +225,7 @@ code_quality_probes = [
   { scenario = "exception_smells", file_paths = ["lib/application.js", "lib/view.js", "lib/response.js", "lib/request.js"], expect_report_contains = ["`tryRender` | `lib/application.js` | `generic-catch:<untyped>", "`tryStat` | `lib/view.js`"], expect_report_absent = ["unsupported"] },
   { scenario = "structural_clone_smells", file_paths = ["test/app.all.js", "test/app.head.js", "test/app.options.js", "test/app.listen.js", "lib/application.js", "lib/response.js", "lib/utils.js", "lib/view.js"], expect_report_contains = ["`app.disable` (lib/application.js) | `app.enable` (lib/application.js)", "token-similarity:100"] },
   { scenario = "long_method_smells", file_paths = ["lib/response.js", "lib/application.js", "lib/request.js"], expect_report_contains = ["- `res.send` in `lib/response.js:126-219` [score 119]", "high cyclomatic complexity 26"] },
-  { scenario = "secret_like_code", file_paths = ["test/req.signedCookies.js", "test/res.cookie.js", "lib/response.js"], expect_report_contains = ["| CURRENT | MEDIUM | `Credential assignment` | `lib/response.js:747` |"] },
+  { scenario = "secret_like_code", file_paths = ["test/req.signedCookies.js", "test/res.cookie.js", "lib/response.js"], arguments = { max_commits = 200 }, expect_report_contains = ["| CURRENT | MEDIUM | `Credential assignment` | `lib/response.js:747` |"] },
   { scenario = "git_hotspots", arguments = { since_iso = "2025-01-01T00:00:00Z", until_iso = "2026-05-18T00:00:00Z" }, expect_report_contains = ["- Analyzed commits: 143", "| `lib/response.js` | 9 | 26 | ABANDONWARE |"] },
 ]
 definition_queries = [
@@ -503,7 +503,7 @@ code_quality_probes = [
   { scenario = "test_assertion_smells", file_paths = ["tests/Dapper.Tests/MiscTests.cs", "tests/Dapper.Tests/AsyncTests.cs", "tests/Dapper.Tests/SqlBuilderTests.cs"], arguments = { min_score = 1 }, expect_report_contains = ["| 2 | `nullness-only` | 178 | `tests/Dapper.Tests/AsyncTests.cs::TestBasicStringUsageAsync` |"] },
   { scenario = "structural_clone_smells", file_paths = ["Dapper/CommandDefinition.cs", "Dapper/DbString.cs", "Dapper/DynamicParameters.cs", "Dapper.SqlBuilder/SqlBuilder.cs"], expect_report_contains = ["`Dapper.SqlBuilder.GroupBy` (Dapper.SqlBuilder/SqlBuilder.cs) | `Dapper.SqlBuilder.Having` (Dapper.SqlBuilder/SqlBuilder.cs)", "token-similarity:100"] },
   { scenario = "long_method_smells", file_paths = ["Dapper/SqlMapper.cs", "Dapper/DynamicParameters.cs"], expect_report_contains = ["- `Dapper.SqlMapper` in `Dapper/SqlMapper.cs:31-4114` [score 2113]", "contains high-complexity workflow (CC 109)"] },
-  { scenario = "secret_like_code", file_paths = ["Dapper/DbString.cs"], expect_report_contains = ["| `Credential assignment` | `Dapper/CommandDefinition.cs:95` |"] },
+  { scenario = "secret_like_code", file_paths = ["Dapper/DbString.cs"], arguments = { max_commits = 200 }, expect_report_contains = ["| `Credential assignment` | `Dapper/CommandDefinition.cs:95` |"] },
   { scenario = "git_hotspots", arguments = { since_iso = "2023-06-01T00:00:00Z", until_iso = "2026-05-17T00:00:00Z", max_files = 20 }, expect_report_contains = ["- Analyzed commits: 102", "| `Dapper/SqlMapper.cs` | 24 | 109 | HOTSPOT |"] },
 ]
 definition_queries = [
