@@ -31,6 +31,11 @@ authorizes the remaining dw10 retrieval recipes.
 - [x] (2026-08-01) Implemented and unit-tested frozen cimeval query generation, identity checks,
   per-cell configuration and trace validation, synthetic/agent telemetry, and reference-run
   statistics.
+- [x] (2026-08-01) Generated and froze all 91 direct-provider DSV4 Flash query records: 104
+  queries total, including 53 empty task lists; manifest SHA-256
+  `48b30dbce1e6f285689ff27662fcc17791450a12ae5a363447d7e44cc755aefd`.
+- [ ] (2026-08-01) Fix and validate the cross-language summary projection panic discovered by the
+  first real smoke; the focused ownership regression passes and runtime rebuild remains.
 - [ ] Build immutable runtime artifacts and pass one real nonempty-query smoke cell.
 - [ ] Run, score, localize, and audit the 91-cell dw10 seed-0 gate at concurrency 30.
 - [ ] Apply the statistical decision tree, update this retrospective, and commit the result.
@@ -57,6 +62,18 @@ authorizes the remaining dw10 retrieval recipes.
   the fixture expects the older list ending at `xhigh`. All 1,223 other tests pass, including the
   new CIM tests, and `cargo clippy --all-targets -- -D warnings` passes.
   Evidence: full gate on 2026-08-01; no CIM code participates in model-card enrichment.
+- Observation: The first real Apache Dubbo smoke failed before Luna's first request because NLP
+  extraction fanned a Rust file into a Java analyzer. `summary_file_projection` derived the
+  foreign `rust` storage key and indexed the Java analyzer's generation map with it, panicking in
+  four Rayon workers. Full file-state hydration already refused this legitimate multi-analyzer
+  fan-out; summary projection lacked the same ownership boundary.
+  Evidence: task-container Anvil stderr from the interrupted smoke, with four panics at
+  `tree_sitter_analyzer.rs:6957`; the trace contains a synthetic-step start and no end.
+- Observation: The analyzer library gate after the ownership fix passed 1,880 tests and the new
+  regression, with one environment-only failure because this host image lacks `javac` and `jar`;
+  six measurement tests were ignored.
+  Evidence: `cargo test -p brokk-bifrost-analysis --lib` on 2026-08-01; the sole failure explicitly
+  says `Java producer parity tests require javac and jar`.
 
 ## Decision Log
 
@@ -206,6 +223,14 @@ The new reportable run lives under `/mnt/optane/bifrost-nlp-resources/runs/` wit
 `/mnt/containers/code_isnt_memory`. Record all exact run paths, bundle hashes, service names, and
 commits here as they become known.
 
+The seed-0 run is
+`/mnt/optane/bifrost-nlp-resources/runs/dw10-cim-synthetic-20260801-r1`. Its frozen query manifest
+is `querygen/manifest.json`; the count distribution is 0:53, 1:3, 2:12, 3:18, 4:3, 5:1, and 6:1.
+The dw10 embedding sidecar is `cimeval-dw10-synthetic-r1-sidecar.service`, bound to the local A4000
+on port 18765. Runtime v2 records Anvil `e8fdbe3`, Bifrost `22995539`, brokkbench `75bd146`, and
+Mjolnir `26a3084`; it is superseded for execution by the pending runtime containing the analyzer
+ownership fix.
+
 ## Interfaces and Dependencies
 
 Anvil's private interface is two environment variables: `BRK_CIM_EVAL=1` and
@@ -224,3 +249,7 @@ CIM-only synthetic query step and a seed-0 statistical spending gate.
 Revision note, 2026-08-01: Recorded the completed Anvil/cimeval implementation and the decision to
 pin query generation to DeepSeek's direct provider rather than permit brokkbench's normal
 cross-provider failover.
+
+Revision note, 2026-08-01: Recorded the frozen query corpus and the real-smoke analyzer panic. The
+fix extends the existing foreign-file ownership rule to summary projections rather than weakening
+generation-map invariants for files the adapter owns.

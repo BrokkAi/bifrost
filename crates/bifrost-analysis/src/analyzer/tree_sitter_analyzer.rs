@@ -3240,6 +3240,13 @@ where
             .collect()
     }
 
+    fn owns_storage_language_key(&self, storage_key: &str) -> bool {
+        self.adapter
+            .storage_language_keys()
+            .iter()
+            .any(|(known, _)| known == storage_key)
+    }
+
     pub(crate) fn fetch_file_state(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
         let oid = self.resolve_live_oid_for_file(file)?;
         let key = Self::transient_cache_key(oid, file);
@@ -3271,12 +3278,7 @@ where
         // that `storage_language_key_for_file` derives the key from the
         // file itself (#1195), index a foreign key absent from
         // `store_context.generations`. Answer honestly: no state.
-        if !self
-            .adapter
-            .storage_language_keys()
-            .iter()
-            .any(|(known, _)| known == &storage_key)
-        {
+        if !self.owns_storage_language_key(&storage_key) {
             return None;
         }
         if let Some(state) = self.retry_dirty_file_state(key, &storage_key) {
@@ -6938,6 +6940,13 @@ where
         if self.project.has_overlay(file) {
             return None;
         }
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        // Multi-analyzer consumers may fan out a file to every provider. A
+        // foreign file has no summary in this analyzer and, critically, no
+        // generation entry in this analyzer's storage context.
+        if !self.owns_storage_language_key(&storage_key) {
+            return None;
+        }
         let oid = self.resolve_live_oid_for_file(file)?;
         let cache_key = Self::transient_cache_key(oid, file);
         if let Some(projection) = self
@@ -6948,7 +6957,6 @@ where
         {
             return Some(projection);
         }
-        let storage_key = self.adapter.storage_language_key_for_file(file);
         let projection = self
             .store_query_or_record(
                 self.store_context.store.summary_file_projection(
@@ -9924,6 +9932,21 @@ mod tests {
             "persisted projection should render method summaries"
         );
         assert_eq!(analyzer.inner().full_hydration_count_for_test(), 0);
+    }
+
+    #[test]
+    fn file_summary_refuses_files_owned_by_another_language_analyzer() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let foreign_file = ProjectFile::new(root.clone(), "src/lib.rs");
+        foreign_file
+            .write("pub fn foreign() {}\n")
+            .expect("rust source");
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
+        let analyzer = JavaAnalyzer::new(project);
+
+        assert!(analyzer.summary_file_projection(&foreign_file).is_none());
     }
 
     #[test]
