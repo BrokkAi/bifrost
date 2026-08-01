@@ -215,6 +215,25 @@ The observable outcomes are:
   89,166 bytes of source context; selected 12 results beneath final `k=20`; and did not fall
   back. Retrieval took 84.9 ms, including 18.6 ms of Granite service time. This proves that the
   context repair is active in the immutable runtime rather than merely covered by unit tests.
+- [x] (2026-08-01, 100-cell checkpoint) Audited the first 100 frozen Granite cells without
+  inspecting partial outcome rates. All used maximum reasoning and runtime SHA-256
+  `f626e492783d6a559b29abe123e19e8e65bdf094baa0f43a21241fd5e137ad75`; arms and seeds
+  remained balanced. Frozen reportable traces now prove all three final-`k=20` contracts:
+  all-signals requested and realized 40/40/40 vector/BM25/co-edit candidates, semantic-only
+  120/0/0, and semantic-coedit 80/0/40. Every observed reranker call had nonempty context and
+  no fallback. Incremental localization covered 390 cells with no skips, and the subsequent
+  392-cell leak audit reported zero unmitigated findings. The dedicated XFS container store
+  retained 1.2 TiB free.
+- [x] (2026-08-01, scorer recovery) The checkpoint exposed load-induced official scorer
+  failures rather than agent outcomes: 22 early semantic RocketMQ Maven scorers exhausted the
+  separate 1,800-second verifier budget during the concurrent compiler wave, while matching
+  baseline scorers normally finished in 4-11 minutes. Three baseline cells also retained an
+  earlier `scorer_failed` result. Brokkbench `a8d05bfc441` now treats an inline
+  `scorer_failed` result as inconclusive, preserves it, and routes resume or explicit `score`
+  through the existing pristine fallback container. The focused 14-test scoring/report gate,
+  all 32 cimeval tests, formatting, and Ruff pass. The running controller is not restarted;
+  after all generation cells freeze, a controlled-concurrency explicit rescore will recover
+  every failed verifier without changing agent patches or the immutable semantic runtime.
 - [x] (2026-07-31, implementation) Brokkbench `64a2da6131f` extends the existing
   multi-arm scheduler with `--seeds`, so the full 91-task by three-arm by three-seed Granite
   matrix can enter one 819-cell queue. A single 30-worker pool now remains occupied through
