@@ -299,7 +299,10 @@ The observable outcomes are:
   port 18765, `cache-dw10`, and exactly 30 workers. A one-cell live attempt was deliberately
   discarded before this queue because the agent made 118 model requests without choosing the
   semantic tool; it had no completed result or score and therefore contributes no campaign
-  data.
+  data. The first reportable agent-selected DW10 retrieval call, Apollo seed 2, proves the live
+  contract: it requested and realized exactly 80 vector, 0 BM25, and 40 co-edit candidates,
+  deduplicated to 120, attached 60,968 context bytes, selected 12 results under final `k=20`,
+  and did not fall back. DW10 embedding service time was 255 ms.
 - [ ] Run final validation, update this plan's retrospective, and commit the Granite/dw10
   report.
 
