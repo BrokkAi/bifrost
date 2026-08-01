@@ -336,7 +336,15 @@ R3 is likewise diagnostic-only. R4 is `dw10-cim-synthetic-20260801-r4`; runtime 
 `ba49f150546de298269217e88fd266e89904aff02f129250f134151311684bcd`, and the unchanged Bifrost
 binary SHA-256 `a686ccca71ddfba04c40e49df6b34ace901fc766b23ff453a7d6472e5261fa7e`.
 
-The corrected run is `/mnt/optane/bifrost-nlp-resources/runs/dw10-cim-synthetic-20260801-r5`.
+The r5 run is retained as a diagnostic. Its scheduler exposed a host-side provenance-validation
+bug: 53 frozen records deliberately contain zero queries, but brokkbench `9161af0` required a
+reranker event whenever a utility model was configured. Those cells correctly emitted completed
+zero-query synthetic-step traces and could not emit a reranker event. Brokkbench `ac167d37b67`
+now requires utility-model reranker provenance only when `query_count > 0`, with a regression test
+for deliberate querygen abstention. The complete cimeval suite passes (48 tests) and Ruff passes.
+
+The r5 directory is
+`/mnt/optane/bifrost-nlp-resources/runs/dw10-cim-synthetic-20260801-r5`.
 Its runtime is `runtime/runtime-v6.tgz`, SHA-256
 `4f2f11f72bfb9a5a9c1183edc80baee59a02aff161afb52ab72148b4f3bb3869`, recording Anvil
 `af65c23`, brokkbench `9161af0`, Bifrost `098e71d6`, and Mjolnir `26a3084`. Anvil `af65c23`
@@ -345,6 +353,17 @@ for an explicit utility model, model-aware usage accounting, phase tracing, and 
 reranking. Brokkbench `9161af0` stages both provider credentials and validates the actual reranker
 model from the trace. Mjolnir required no source change because it deliberately passes its
 environment through to the Anvil child.
+
+The clean reportable restart is
+`/mnt/optane/bifrost-nlp-resources/runs/dw10-cim-synthetic-20260801-r6`. It carries byte-identical
+run and query manifests, respectively SHA-256
+`d8bf1a517bade527a03f861cab1e74751966f8fd1d345a2c09972d31363f5f40` and
+`48b30dbce1e6f285689ff27662fcc17791450a12ae5a363447d7e44cc755aefd`. Its immutable runtime is
+`runtime/runtime-v8.tgz`, SHA-256
+`d4f308c58e1416a06eeeffe78345dda03ca2224187526855e0f4e8bfa7996f73`, recording Anvil
+`af65c23`, brokkbench `ac167d37b67`, Bifrost `17d1e250`, and Mjolnir `26a3084`. The reportable
+service is `cimeval-dw10-synthetic-seed0-r6.service`, with all 91 jobs submitted to one scheduler
+at concurrency 30.
 
 ## Interfaces and Dependencies
 
@@ -385,3 +404,7 @@ fallback design, and immutable runtime v7 for the clean r4 restart.
 
 Revision note, 2026-08-01: Recorded r1's shared-cache contention diagnosis, both read-only fast
 paths, and the clean r2 restart required to retain one immutable runtime identity.
+
+Revision note, 2026-08-01: Reclassified r5 as diagnostic after its strict provenance validator
+rejected deliberate zero-query steps, recorded the host-side fix and validation, and launched a
+clean immutable r6 campaign at concurrency 30.
