@@ -39,7 +39,8 @@ authorizes the remaining dw10 retrieval recipes.
 - [x] (2026-08-01) Built immutable runtime v3 and passed the real nonempty-query Apache Dubbo
   smoke through synthetic retrieval, max-reasoning Bedrock Luna, artifact validation, and inline
   official scoring.
-- [ ] Pull all 91 pinned official images into `/mnt/containers` before launching the queue.
+- [x] (2026-08-01) Verified all 91 pinned official images in the dedicated XFS Podman store and
+  taught cimeval run/score/preflight to select that store without changing agenteval.
 - [ ] Run, score, localize, and audit the 91-cell dw10 seed-0 gate at concurrency 30.
 - [ ] Apply the statistical decision tree, update this retrospective, and commit the result.
 
@@ -83,6 +84,14 @@ authorizes the remaining dw10 retrieval recipes.
   including 170 seconds of scoring, so campaign tails may be long even with the 30-job scheduler.
   Evidence: completed cell `apache__dubbo-8414--semantic-coedit-2-1--seed-0` in the seed-0 run;
   runtime v3 and query identities passed cimeval's completion validation.
+- Observation: The frozen image set was already complete in
+  `/mnt/containers/code_isnt_memory/podman-storage`; cimeval had silently used Podman's default
+  per-user graph root instead. Accidental duplicate pulls reduced the home filesystem to 2.3 GB
+  free before they were stopped. Removing only unreferenced duplicate task-image tags recovered
+  it to 46 GB free; no broad prune or stopped-container deletion was performed.
+  Evidence: an exact task-manifest/store comparison found zero missing images in the XFS store,
+  which reports 91 images. The cimeval CLI regression suite passes 45 tests and Ruff passes after
+  selecting `/mnt/containers/code_isnt_memory/storage.conf` at the orchestration boundary.
 
 ## Decision Log
 
@@ -111,6 +120,11 @@ authorizes the remaining dw10 retrieval recipes.
   alias, and fail rather than substitute another provider.
   Rationale: the query model is part of the frozen experimental treatment.
   Date/Author: 2026-08-01 / Codex.
+- Decision: cimeval alone selects the dedicated CIM XFS Podman graph root before run, score, and
+  preflight operations; agenteval and other sandbox consumers retain their existing storage.
+  Rationale: task images are campaign infrastructure and must not consume the space-constrained
+  home filesystem, but this evaluation must not perturb agenteval's DeepSWE behavior.
+  Date/Author: 2026-08-01 / Codex and user.
 
 ## Outcomes & Retrospective
 
@@ -240,6 +254,8 @@ on port 18765. Runtime v3 is `runtime/runtime-v3.tgz`, SHA-256
 `85f9d5ed6ed7952b3c9552c48ef9d19c5e918fc0c42f2b4bf91ba1646bd94145`, and records Anvil
 `e8fdbe3`, Bifrost `c9dec2d6`, brokkbench `75bd146`, and Mjolnir `26a3084`. Its Bifrost binary
 SHA-256 is `425e963682acef41c5f4fc226958506a25e22b40e961cc67cfcd04f9dc1da915`.
+The host orchestration fix selecting the CIM store is brokkbench `685a926dd7f`; it does not alter
+the already-frozen remote runtime bytes, so runtime v3 remains the reportable bundle.
 
 ## Interfaces and Dependencies
 
@@ -267,3 +283,7 @@ generation-map invariants for files the adapter owns.
 Revision note, 2026-08-01: Recorded the corrected runtime v3 and successful end-to-end smoke. The
 smoke's unresolved official score is retained as a valid experimental observation, not retried or
 hand-selected; the smoke criterion was infrastructure and treatment integrity.
+
+Revision note, 2026-08-01: Recorded that the XFS image store was complete and checkpointed the
+cimeval-only storage selection. The host orchestration change does not require rebuilding the
+immutable task runtime because none of its bytes enter the container.
