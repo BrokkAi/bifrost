@@ -585,9 +585,23 @@ mod tests {
                 ),
             ],
         );
+        let renamed_archive = fixture.path().join("renamed-src.zip");
+        std::fs::copy(&archive, &renamed_archive).unwrap();
         let production = JdkSourceArchivePackProducer::new(JdkSourceArchiveLayout::ModulePrefixed)
             .produce_exact_artifact(&request(archive), &ArtifactProducerLimits::default());
         let pack = production.pack.expect("JDK pack");
+        let renamed_pack =
+            JdkSourceArchivePackProducer::new(JdkSourceArchiveLayout::ModulePrefixed)
+                .produce_exact_artifact(
+                    &request(renamed_archive),
+                    &ArtifactProducerLimits::default(),
+                )
+                .pack
+                .expect("renamed JDK pack");
+        let compiled = compile_pack(&pack, &CompilerOptions::default()).unwrap();
+        let renamed_compiled = compile_pack(&renamed_pack, &CompilerOptions::default()).unwrap();
+        assert_eq!(compiled.manifest_bytes, renamed_compiled.manifest_bytes);
+        assert_eq!(compiled.shards, renamed_compiled.shards);
         assert_eq!(
             pack.shards
                 .iter()

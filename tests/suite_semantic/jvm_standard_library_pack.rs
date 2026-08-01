@@ -5,7 +5,7 @@ use brokk_bifrost::analyzer::semantic_model::*;
 use brokk_bifrost::analyzer::{
     JdkSourceArchiveLayout, JdkSourceArchivePackProducer, ScalaSourceJarPackProducer,
 };
-use brokk_bifrost::searchtools::{SymbolLookupParams, get_symbol_ancestors};
+use brokk_bifrost::searchtools::{SymbolLookupParams, get_symbol_ancestors, get_symbol_sources};
 use brokk_bifrost::{AnalyzerConfig, CancellationToken, Language};
 use semver::Version;
 use zip::write::SimpleFileOptions;
@@ -47,11 +47,41 @@ fn jdk_pack_navigation_uses_explicit_hierarchy_then_lazy_object_fallback() {
         "{:#?}",
         production.diagnostics
     );
-    let compiled = compile_pack(
-        production.pack.as_ref().expect("JDK pack"),
-        &CompilerOptions::default(),
-    )
-    .unwrap();
+    let authored_pack = production.pack.as_ref().expect("JDK pack");
+    let compiled = compile_pack(authored_pack, &CompilerOptions::default()).unwrap();
+    let mut explicit_roots = authored_pack.clone();
+    let AuthoredPayload::DeclarationFacts { types, .. } = &mut explicit_roots.shards[0].payload
+    else {
+        panic!("JDK fixture emits declaration facts");
+    };
+    types
+        .iter_mut()
+        .find(|fact| fact.name == "java.lang.Leaf")
+        .expect("Leaf fact")
+        .hierarchy
+        .push(HierarchyFact {
+            hierarchy_kind: HierarchyKind::Extends,
+            target: TypeRef::Named {
+                name: "java.lang.Object".to_owned(),
+                arguments: Vec::new(),
+                nullable: false,
+            },
+        });
+    let explicit_compiled = compile_pack(&explicit_roots, &CompilerOptions::default()).unwrap();
+    let lazy_raw_bytes = compiled
+        .shards
+        .iter()
+        .map(|shard| shard.descriptor.raw_size)
+        .sum::<u64>();
+    let explicit_raw_bytes = explicit_compiled
+        .shards
+        .iter()
+        .map(|shard| shard.descriptor.raw_size)
+        .sum::<u64>();
+    assert!(
+        lazy_raw_bytes < explicit_raw_bytes,
+        "lazy={lazy_raw_bytes}, explicit={explicit_raw_bytes}"
+    );
 
     let project = InlineTestProject::with_language(Language::Java)
         .file("src/Main.java", "public class Main {}")
@@ -87,6 +117,32 @@ fn jdk_pack_navigation_uses_explicit_hierarchy_then_lazy_object_fallback() {
         .analyzer()
         .semantic_model_overlay()
         .expect("active JDK overlay");
+
+    let object = overlay.symbols_named("java.lang.Object");
+    let object_members = overlay.members_of(&object.records[0].id);
+    let hash_code = object_members
+        .records
+        .iter()
+        .find(|member| member.qualified_name == "java.lang.Object.hashCode")
+        .expect("source-declared Object.hashCode");
+    let sources = get_symbol_sources(
+        analyzer.analyzer(),
+        SymbolLookupParams {
+            symbols: vec![hash_code.qualified_name.clone()],
+        },
+    );
+    assert!(sources.not_found.is_empty(), "{:#?}", sources.not_found);
+    assert_eq!(sources.sources.len(), 1);
+    assert!(
+        sources.sources[0]
+            .text
+            .contains("External authored declaration")
+    );
+    assert!(
+        sources.sources[0]
+            .text
+            .contains("java.base/java/lang/Object.java#java.lang.Object.hashCode")
+    );
 
     let parent = overlay.symbols_named("java.lang.Parent");
     let parent_ancestors = overlay.ancestors_of(parent.records[0]);
@@ -169,7 +225,7 @@ fn scala_pack_navigation_uses_explicit_hierarchy_then_lazy_any_fallback() {
         &archive,
         &[(
             "scala/Core.scala",
-            "package scala\ntrait Any\nclass Parent extends Any\nclass Leaf\n",
+            "package scala\ntrait Any\nclass AnyVal extends Any\nobject Predef { def identity[A](value: A): A = value }\nclass Parent extends Any\nclass Leaf\n",
         )],
     );
     let production = ScalaSourceJarPackProducer.produce_exact_artifact(
@@ -210,6 +266,25 @@ fn scala_pack_navigation_uses_explicit_hierarchy_then_lazy_any_fallback() {
         panic!("Scala pack must activate");
     };
     let overlay = analyzer.analyzer().semantic_model_overlay().unwrap();
+    let predef = overlay.symbols_named("scala.Predef");
+    let predef_members = overlay.members_of(&predef.records[0].id);
+    let identity = predef_members
+        .records
+        .iter()
+        .find(|member| member.qualified_name == "scala.Predef.identity")
+        .expect("source-declared Predef.identity");
+    let sources = get_symbol_sources(
+        analyzer.analyzer(),
+        SymbolLookupParams {
+            symbols: vec![identity.qualified_name.clone()],
+        },
+    );
+    assert!(sources.not_found.is_empty(), "{:#?}", sources.not_found);
+    assert!(
+        sources.sources[0]
+            .text
+            .contains("scala/Core.scala#scala.Predef$.identity")
+    );
     for name in ["scala.Parent", "scala.Leaf"] {
         let matched = overlay.symbols_named(name);
         let ancestors = overlay.ancestors_of(matched.records[0]);
@@ -245,6 +320,24 @@ fn scala_pack_navigation_uses_explicit_hierarchy_then_lazy_any_fallback() {
             .iter()
             .any(|result| { result.symbol == "scala.Leaf" && result.ancestors == ["scala.Any"] })
     );
+
+    let SemanticModelRuntimeOutcome::Ready { active, .. } = acquire_active_semantic_models(
+        analyzer.analyzer(),
+        &catalog,
+        None,
+        &scala_activation_request_for_version(
+            production.artifact_sha256.as_deref().unwrap(),
+            "3.3.3",
+        ),
+        &CancellationToken::default(),
+    ) else {
+        panic!("a complete Scala mismatch is still a ready empty model set");
+    };
+    assert!(active.shards().is_empty());
+    assert!(active.activation_report().explanations.iter().any(|entry| {
+        entry.status == SemanticModelActivationStatus::Incompatible
+            && entry.reason.contains("does not satisfy")
+    }));
 }
 
 fn production_request(path: std::path::PathBuf) -> ArtifactProductionRequest {
@@ -349,6 +442,13 @@ fn scala_production_request(path: std::path::PathBuf) -> ArtifactProductionReque
 }
 
 fn scala_activation_request(artifact_sha256: &str) -> SemanticModelActivationRequest {
+    scala_activation_request_for_version(artifact_sha256, "2.13.16")
+}
+
+fn scala_activation_request_for_version(
+    artifact_sha256: &str,
+    version: &str,
+) -> SemanticModelActivationRequest {
     SemanticModelActivationRequest {
         bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
         evidence: vec![SemanticModelActivationEvidence {
@@ -356,12 +456,12 @@ fn scala_activation_request(artifact_sha256: &str) -> SemanticModelActivationReq
             ecosystem: "maven".to_owned(),
             package: Some(CatalogCoordinate {
                 name: "org.scala-lang:scala-library".to_owned(),
-                version: Some(Version::parse("2.13.16").unwrap()),
+                version: Some(Version::parse(version).unwrap()),
             }),
             module: None,
             toolchain: Some(CatalogCoordinate {
                 name: "scala".to_owned(),
-                version: Some(Version::parse("2.13.16").unwrap()),
+                version: Some(Version::parse(version).unwrap()),
             }),
             target: None,
             configuration: None,

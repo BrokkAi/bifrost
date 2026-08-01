@@ -20,7 +20,7 @@ The first release is intentionally semantic rather than compiler-emulating. Pack
 - [x] (2026-08-01 20:15Z) Milestone 1: implemented deterministic Scala source-archive API production and replaced the lossy private Scala projection with the shared structured facts; focused producer and legacy-index tests pass.
 - [x] (2026-08-01 21:25Z) Milestone 2: implemented deterministic module-aware JDK source archive production with explicit flat/module-prefixed layouts and independent `java.base` activation; focused JDK and Java producer tests pass.
 - [x] (2026-08-01 23:30Z) Milestone 3: integrated compact lazy universal-root lookup, module-export filtering, source-precise Java array/varargs signatures, and real Scala/JDK pack compilation; focused tests and strict Clippy pass.
-- [ ] Milestone 4: complete end-to-end member/source navigation, deterministic bytes, mismatch explanations, and bounded retained-memory measurements; activation and hierarchy navigation coverage is in place.
+- [x] (2026-08-02 00:30Z) Milestone 4: proved end-to-end activation, hierarchy/member/source navigation, deterministic JDK/Scala bytes, exact mismatch explanations, dependency-file isolation, and the raw-byte advantage of lazy root resolution.
 - [ ] Milestone 5: add pinned release inputs, content-addressed release bundles, licenses/notices, measurements, and release workflow integration.
 - [ ] Milestone 6: complete focused validation, repository policy checks, guided specialist review, and accepted fixes.
 
@@ -65,6 +65,9 @@ The first release is intentionally semantic rather than compiler-emulating. Pack
 - Observation: a full JDK source pack is usable but honestly partial with the current type vocabulary.
   Evidence: Temurin 21.0.8 produced 44 compiled shards totaling 5,846,861 stored bytes and 34,890,611 raw bytes. Unsupported advanced source type shapes emit bounded warnings rather than guessed facts; the real smoke still validates and compiles the retained API.
 
+- Observation: an external `Locator::Source` was previously downgraded to a virtual model URI unless its path was already a workspace file.
+  Evidence: source-pack members carried the correct archive path and symbol, but `authored_anchor` returned `None` when project lookup failed. The overlay now preserves external authored anchors with a zero range, and `get_symbol_sources` renders the exact archive locator plus the typed semantic description without adding the archive entry to `Project::all_files()`.
+
 ## Decision Log
 
 - Decision: derive Scala standard-library APIs from source archives using Bifrost's existing structured Scala parser.
@@ -102,6 +105,8 @@ Milestone 1 now provides a bounded `ScalaSourceJarPackProducer` that parses each
 Milestone 2 adds `JdkSourceArchivePackProducer` with caller-declared `ModulePrefixed` and `Flat` layouts. Modern archives must provide a `module-info.java` marker for every source-bearing module; flat production rejects module-prefixed markers instead of guessing. Each module emits an independently activated, deterministically ordered shard, with flat archives assigned explicitly to `java.base`. The producer reuses the Java AST conversion and stable identities, supports JDK-scale bounded archives, and avoids retaining all source text. Two JDK tests and all four Java artifact producer tests pass under strict Clippy.
 
 Milestone 3 adds semantic lazy-root traversal to `SemanticModelOverlay` and hierarchy navigation. Explicit ancestors are traversed iteratively first; only a unique active `java.lang.Object` or `scala.Any` is appended when a type has no authored `extends` edge. The integration suite proves workspace and model-only navigation, explicit-parent precedence, inactive version behavior, and that dependency sources never enter the project file set. Real Scala 2.13.16 and Temurin 21.0.8 archives now compile end to end. Their failures uncovered and fixed companion merging, legal Scala escaped identifiers, annotated generic names, static/arity member identity, JDK module exports, and structured Java varargs/array dimensions. Focused Scala, Java, JDK, and semantic integration tests plus task-scoped strict Clippy pass.
+
+Milestone 4 extends that integration path through members and sources. `Object.hashCode` and `Predef.identity` navigate from an activated source pack to an honest external authored locator and typed presentation; JDK and Scala version mismatches remain inactive with actionable explanations. Identical JDK archive bytes compiled from different paths now produce identical manifest and shard bytes, matching the Scala determinism coverage. A paired fixture with and without one explicit `Object` edge proves the lazy representation emits fewer raw bytes, while the no-edge relation assertion proves it retains no per-type fallback relation. Scala case-class `copy` remains an explicit tested non-claim for #1153.
 
 ## Context and Orientation
 
@@ -235,3 +240,5 @@ Revision note (2026-08-01): completed milestone 1. The implementation establishe
 Revision note (2026-08-01): completed milestone 2. The implementation added explicit JDK archive layouts, per-module shards, JDK-scale bounded extraction, and a two-pass low-retention source walk while reusing the existing Java AST conversion.
 
 Revision note (2026-08-01): completed milestone 3. Lazy universal roots now use the overlay's existing indexes without authored edge expansion or redundant caching. Real Scala 2.13.16 and Temurin 21.0.8 source artifacts compile successfully, module exports bound the JDK surface, and source-shape fixes preserve companions, escaped identifiers, varargs, and multidimensional arrays.
+
+Revision note (2026-08-02): completed milestone 4. Activated fixture packs now prove hierarchy, member, and external-source navigation, mismatched versions, deterministic bytes, project-file isolation, and smaller raw output without authored universal-root edges.

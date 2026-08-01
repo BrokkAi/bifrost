@@ -1445,18 +1445,31 @@ fn authored_anchor(
         analyzer.project().file_by_abs_path(path)
     } else {
         analyzer.project().file_by_rel_path(path)
-    }?;
-    let unit = analyzer.definitions(symbol).find(|unit| {
-        unit.source() == &file && (unit.fq_name() == symbol || unit.identifier() == symbol)
-    })?;
-    let range = analyzer
-        .ranges(&unit)
-        .into_iter()
-        .min_by_key(|range| (range.start_line, range.start_byte))?;
+    };
+    if let Some(file) = file
+        && let Some(unit) = analyzer.definitions(symbol).find(|unit| {
+            unit.source() == &file && (unit.fq_name() == symbol || unit.identifier() == symbol)
+        })
+        && let Some(range) = analyzer
+            .ranges(&unit)
+            .into_iter()
+            .min_by_key(|range| (range.start_line, range.start_byte))
+    {
+        return Some(SemanticModelAuthoredAnchor {
+            path: file.rel_path().to_string_lossy().replace('\\', "/"),
+            symbol: unit.fq_name(),
+            range: range.into(),
+        });
+    }
     Some(SemanticModelAuthoredAnchor {
-        path: file.rel_path().to_string_lossy().replace('\\', "/"),
-        symbol: unit.fq_name(),
-        range: range.into(),
+        path: path.to_string_lossy().replace('\\', "/"),
+        symbol: symbol.to_owned(),
+        range: SemanticModelRange {
+            start_byte: 0,
+            end_byte: 0,
+            start_line: 0,
+            end_line: 0,
+        },
     })
 }
 
