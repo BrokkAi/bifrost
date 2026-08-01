@@ -144,51 +144,6 @@ fn assemble_group(extracted: Vec<ExtractedBlob>) -> ExtractedGroup {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::analyzer::{JavaAnalyzer, Language, TestProject};
-    use crate::nlp::engine::FakeHashEmbedder;
-
-    #[test]
-    fn parallel_extraction_preserves_serial_chunk_and_component_order() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let files = [
-            ProjectFile::new(root.clone(), "Alpha.java"),
-            ProjectFile::new(root.clone(), "Beta.java"),
-            ProjectFile::new(root.clone(), "Gamma.java"),
-        ];
-        files[0]
-            .write("class Alpha { void shared() {} void alpha() {} }\n")
-            .unwrap();
-        files[1]
-            .write("class Beta { void shared() {} void beta() {} }\n")
-            .unwrap();
-        files[2].write("class Gamma { void gamma() {} }\n").unwrap();
-        let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
-        let embedder = FakeHashEmbedder::new(16);
-        let targets: Vec<_> = files
-            .into_iter()
-            .enumerate()
-            .map(|(index, file)| BlobTarget {
-                file,
-                oid: format!("oid-{index}"),
-                language: Some("java".to_string()),
-            })
-            .collect();
-
-        let serial = extract_group_serial(&embedder, &analyzer, &targets);
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(3)
-            .build()
-            .unwrap();
-        let parallel = pool.install(|| extract_group(&embedder, &analyzer, &targets));
-
-        assert_eq!(parallel, serial);
-    }
-}
-
 fn extract_blob(
     embedder: &dyn Embedder,
     analyzer: &dyn IAnalyzer,
@@ -464,4 +419,49 @@ pub fn write_group(store: &SemanticStore, embedded: EmbeddedGroup) -> Result<(),
         .map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{JavaAnalyzer, Language, TestProject};
+    use crate::nlp::engine::FakeHashEmbedder;
+
+    #[test]
+    fn parallel_extraction_preserves_serial_chunk_and_component_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let files = [
+            ProjectFile::new(root.clone(), "Alpha.java"),
+            ProjectFile::new(root.clone(), "Beta.java"),
+            ProjectFile::new(root.clone(), "Gamma.java"),
+        ];
+        files[0]
+            .write("class Alpha { void shared() {} void alpha() {} }\n")
+            .unwrap();
+        files[1]
+            .write("class Beta { void shared() {} void beta() {} }\n")
+            .unwrap();
+        files[2].write("class Gamma { void gamma() {} }\n").unwrap();
+        let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
+        let embedder = FakeHashEmbedder::new(16);
+        let targets: Vec<_> = files
+            .into_iter()
+            .enumerate()
+            .map(|(index, file)| BlobTarget {
+                file,
+                oid: format!("oid-{index}"),
+                language: Some("java".to_string()),
+            })
+            .collect();
+
+        let serial = extract_group_serial(&embedder, &analyzer, &targets);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap();
+        let parallel = pool.install(|| extract_group(&embedder, &analyzer, &targets));
+
+        assert_eq!(parallel, serial);
+    }
 }
