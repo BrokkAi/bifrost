@@ -333,6 +333,8 @@ pub struct CodeQueryDeclaration {
     pub id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_range: Option<CodeQueryRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_model: Option<Box<crate::analyzer::semantic_model::SemanticModelProvenance>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

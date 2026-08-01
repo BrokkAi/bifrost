@@ -324,7 +324,14 @@ pub struct SemanticPackCatalog {
     rejected_manifests: Mutex<HashSet<String>>,
     lookup_hits: AtomicU64,
     lookup_misses: AtomicU64,
+    mutation_generation: AtomicU64,
     _ephemeral_root: Option<TempDir>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SemanticPackCatalogCacheIdentity {
+    pub(crate) mutation_generation: u64,
+    pub(crate) sqlite_data_version: u64,
 }
 
 #[derive(Clone)]
@@ -443,6 +450,7 @@ impl SemanticPackCatalog {
             rejected_manifests: Mutex::new(HashSet::new()),
             lookup_hits: AtomicU64::new(0),
             lookup_misses: AtomicU64::new(0),
+            mutation_generation: AtomicU64::new(0),
             _ephemeral_root: None,
         })
     }
@@ -498,6 +506,7 @@ impl SemanticPackCatalog {
                     .lock()
                     .expect("semantic-pack rejection mutex poisoned")
                     .remove(&validated.manifest.content_sha256);
+                self.record_mutation();
                 Ok(InstallOutcome {
                     manifest_digest: validated.manifest.content_sha256,
                     inserted_manifest,
@@ -686,6 +695,7 @@ impl SemanticPackCatalog {
                 shards: validated.shards,
                 source: source.clone(),
             });
+            self.record_mutation();
         }
         Ok(digest)
     }
@@ -787,14 +797,18 @@ impl SemanticPackCatalog {
             .connection
             .lock()
             .expect("semantic-pack catalog connection mutex poisoned");
-        connection
+        let removed = connection
             .execute(
                 "DELETE FROM catalog_sources
                  WHERE source_kind = ?1 AND source_id = ?2",
                 params![source.kind.as_str(), &source.source_id],
             )
             .map(|deleted| deleted != 0)
-            .map_err(|error| CatalogError::sqlite("remove semantic-pack source", error))
+            .map_err(|error| CatalogError::sqlite("remove semantic-pack source", error))?;
+        if removed {
+            self.record_mutation();
+        }
+        Ok(removed)
     }
 
     pub fn replace_workspace_active_set(
@@ -1879,12 +1893,16 @@ impl SemanticPackCatalog {
                 }
             }
         }
-        Ok(CatalogGcOutcome {
+        let outcome = CatalogGcOutcome {
             pruned_packs: pack_digests.len(),
             pruned_objects,
             reclaimed_bytes,
             pruned_expired_leases,
-        })
+        };
+        if outcome.pruned_packs != 0 {
+            self.record_mutation();
+        }
+        Ok(outcome)
     }
 
     fn quarantine(
@@ -1927,7 +1945,27 @@ impl SemanticPackCatalog {
             .map_err(|source| CatalogError::sqlite("record quarantine", source))?;
         transaction
             .commit()
-            .map_err(|source| CatalogError::sqlite("commit pack quarantine", source))
+            .map_err(|source| CatalogError::sqlite("commit pack quarantine", source))?;
+        self.record_mutation();
+        Ok(())
+    }
+
+    pub(crate) fn cache_identity(&self) -> Result<SemanticPackCatalogCacheIdentity, CatalogError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        let sqlite_data_version = connection
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .map_err(|error| CatalogError::sqlite("read catalog data version", error))?;
+        Ok(SemanticPackCatalogCacheIdentity {
+            mutation_generation: self.mutation_generation.load(Ordering::Relaxed),
+            sqlite_data_version,
+        })
+    }
+
+    fn record_mutation(&self) {
+        self.mutation_generation.fetch_add(1, Ordering::Relaxed);
     }
 
     fn require_writable(&self) -> Result<(), CatalogError> {

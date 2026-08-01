@@ -27,6 +27,8 @@ pub struct SourceBlock {
     pub presentation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_model: Option<crate::analyzer::semantic_model::SemanticModelProvenance>,
 }
 
 pub(super) enum SourceLookupOutcome {
@@ -278,6 +280,11 @@ pub fn get_symbol_sources(
         .into_par_iter()
         .enumerate()
         .map(|(index, symbol)| {
+            if symbol.starts_with("bifrost-model://")
+                && let Some(outcome) = semantic_model_source_outcome(analyzer, &symbol)
+            {
+                return (index, outcome);
+            }
             let file_anchored = matches!(
                 split_workspace_definition_selector(analyzer, &symbol),
                 DefinitionSelector::FileAnchored { .. }
@@ -417,6 +424,9 @@ pub fn get_symbol_sources(
                     if !generated.is_empty() {
                         return (index, SourceLookupOutcome::Found(generated));
                     }
+                    if let Some(outcome) = semantic_model_source_outcome(analyzer, &symbol) {
+                        return (index, outcome);
+                    }
                     if let Some(item) =
                         unsupported_selector_shape_not_found_input(analyzer, &symbol)
                     {
@@ -453,6 +463,62 @@ pub fn get_symbol_sources(
         not_found,
         ambiguous,
         ambiguous_paths,
+    }
+}
+
+fn semantic_model_source_outcome(
+    analyzer: &dyn IAnalyzer,
+    symbol: &str,
+) -> Option<SourceLookupOutcome> {
+    let overlay = analyzer.semantic_model_overlay()?;
+    let mut modeled = if symbol.starts_with("bifrost-model://") {
+        overlay.symbols_at_uri(symbol)
+    } else {
+        overlay.symbols_with_id(symbol)
+    };
+    if modeled.records.is_empty() {
+        modeled = overlay.symbols_named(symbol);
+    }
+    match modeled.disposition {
+        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique => {
+            let model = modeled.records[0];
+            match &model.location {
+                crate::analyzer::semantic_model::SemanticModelLocation::Model(_) => {
+                    Some(SourceLookupOutcome::Found(vec![
+                        semantic_model_source_block(model),
+                    ]))
+                }
+                crate::analyzer::semantic_model::SemanticModelLocation::Authored(anchor) => {
+                    let units = analyzer
+                        .definitions(&anchor.symbol)
+                        .filter(|unit| {
+                            unit.source()
+                                .rel_path()
+                                .to_string_lossy()
+                                .replace('\\', "/")
+                                == anchor.path
+                        })
+                        .collect::<Vec<_>>();
+                    let sources = preferred_source_blocks_for_resolved_units(analyzer, &units);
+                    (!sources.is_empty()).then_some(SourceLookupOutcome::Found(sources))
+                }
+            }
+        }
+        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict => {
+            Some(SourceLookupOutcome::Ambiguous(AmbiguousSymbol {
+                target: symbol.to_string(),
+                matches: modeled
+                    .records
+                    .iter()
+                    .map(|record| record.location.identity().to_string())
+                    .collect(),
+                note: Some(
+                    "conflicting active semantic-model declarations have no authoritative source"
+                        .to_string(),
+                ),
+            }))
+        }
+        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty => None,
     }
 }
 
@@ -505,12 +571,15 @@ fn source_blocks_for_code_unit_with_cache(
                 label: display_symbol_for_target(code_unit),
                 path: rel_path_string(code_unit.source()),
                 start_line,
-                end_line: start_line + text.lines().count().saturating_sub(1),
+                // Same CR-aware line table as start_line: text.lines() counts
+                // only \n, which undercounts rows on CR-only files (#1431).
+                end_line: line_number_at_offset(&content, range.end_byte.saturating_sub(1)),
                 text,
                 canonical_selector: canonical_selector.clone(),
                 occurrence_role,
                 presentation: None,
                 note: None,
+                semantic_model: None,
             })
         })
         .collect()
@@ -565,6 +634,7 @@ pub(super) fn file_outline_source_block(
         occurrence_role: None,
         presentation,
         note: Some(note),
+        semantic_model: None,
     })
 }
 
@@ -615,6 +685,7 @@ pub(super) fn include_fallback_source_block(
             "no indexed declarations found in this file; showing its top-level #include lines, not the full source"
                 .to_string(),
         ),
+        semantic_model: None,
     })
 }
 
@@ -634,6 +705,7 @@ pub(super) fn excerpt_fallback_source_block(
         occurrence_role: None,
         presentation: sampled.presentation,
         note: Some(note),
+        semantic_model: None,
     })
 }
 
@@ -689,10 +761,55 @@ pub(super) fn module_file_listing_blocks(
                     occurrence_role: None,
                     presentation: Some("file_listing".to_string()),
                     note: Some(note),
+                    semantic_model: None,
                 }
             })
         })
         .collect()
+}
+
+fn semantic_model_source_block(
+    symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
+) -> SourceBlock {
+    let signature = symbol
+        .signature
+        .as_deref()
+        .map(|signature| format!("\nSignature: {signature}"))
+        .unwrap_or_default();
+    let text = format!(
+        "Modeled declaration (not authored source)\nSymbol: {}\nKind: {:?}{}\nOrigin: {:?}\nPack: {}@{}\nProducer: {}@{}\nRecord: {}\nRule: {}\nProof: {:?}\nCompleteness: {:?}\nAmbiguous: {}\nActivation: {}\nMatched evidence: {:?}",
+        symbol.qualified_name,
+        symbol.kind,
+        signature,
+        symbol.provenance.origin,
+        symbol.provenance.pack_id,
+        symbol.provenance.pack_version,
+        symbol.provenance.producer,
+        symbol.provenance.producer_version,
+        symbol.provenance.record_id,
+        symbol.provenance.rule_id.as_deref().unwrap_or("none"),
+        symbol.provenance.proof,
+        symbol.provenance.completeness,
+        symbol.provenance.ambiguous,
+        symbol.provenance.activation.reason,
+        symbol.provenance.activation.matched_evidence,
+    );
+    let range = symbol.location.range();
+    SourceBlock {
+        label: symbol.qualified_name.clone(),
+        path: symbol.location.identity().to_string(),
+        start_line: range.start_line,
+        end_line: range.end_line,
+        text,
+        canonical_selector: Some(symbol.location.identity().to_string()),
+        occurrence_role: None,
+        presentation: Some("semantic_model".to_string()),
+        note: Some(
+            "This is a typed semantic-model description, not generated or authored source text."
+                .to_string(),
+        ),
+        semantic_model: Some(symbol.provenance.clone()),
+    }
 }
 
 pub(super) fn module_outline_source_note(

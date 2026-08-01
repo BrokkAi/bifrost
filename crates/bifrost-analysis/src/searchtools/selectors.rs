@@ -42,6 +42,8 @@ pub struct DefinitionCandidate {
     pub canonical_selector: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub occurrence_role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_model: Option<crate::analyzer::semantic_model::SemanticModelProvenance>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -236,6 +238,7 @@ pub(super) fn lexical_definition_candidate(
         signature: (!signature.is_empty()).then_some(signature),
         canonical_selector: None,
         occurrence_role: None,
+        semantic_model: None,
         language: language_name(language_for_file(file)),
     })
 }
@@ -537,6 +540,28 @@ fn definition_candidate_from_range_base(
         language: language_name(language),
         canonical_selector: None,
         occurrence_role: None,
+        semantic_model: None,
+    }
+}
+
+pub(super) fn semantic_model_definition_candidate(
+    symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
+) -> DefinitionCandidate {
+    let range = symbol.location.range();
+    DefinitionCandidate {
+        name: symbol.name.clone(),
+        fqn: Some(symbol.qualified_name.clone()),
+        path: symbol.location.identity().to_string(),
+        start_line: range.start_line,
+        start_column: None,
+        end_line: range.end_line,
+        end_column: None,
+        kind: format!("{:?}", symbol.kind).to_ascii_lowercase(),
+        signature: symbol.signature.clone(),
+        language: symbol.language.clone(),
+        canonical_selector: Some(symbol.location.identity().to_string()),
+        occurrence_role: None,
+        semantic_model: Some(symbol.provenance.clone()),
     }
 }
 

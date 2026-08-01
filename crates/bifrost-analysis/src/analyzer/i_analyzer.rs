@@ -237,6 +237,12 @@ impl AnalyzerSnapshotCaches {
     ) -> &crate::analyzer::semantic_model::SemanticModelRuntimeCache {
         &self.semantic_models
     }
+
+    fn semantic_model_overlay(
+        &self,
+    ) -> Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>> {
+        self.semantic_models.overlay()
+    }
 }
 
 /// Every workspace file bucketed by basename, captured by one ignore-aware
@@ -712,6 +718,15 @@ pub trait IAnalyzer: Send + Sync + Any {
         &self,
     ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
         Vec::new()
+    }
+
+    /// The complete semantic declaration overlay published for this analyzer
+    /// snapshot, if active semantic models have been acquired successfully.
+    fn semantic_model_overlay(
+        &self,
+    ) -> Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>> {
+        self.snapshot_caches()
+            .and_then(AnalyzerSnapshotCaches::semantic_model_overlay)
     }
 
     /// Snapshot-owned immutable derived query layers. Concrete analyzers keep

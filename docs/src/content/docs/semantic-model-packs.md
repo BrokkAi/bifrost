@@ -14,8 +14,9 @@ operations belong to the catalog and generation-scoped runtime described below.
 
 > **Current runtime boundary:** Bifrost can compile, defensively decode,
 > install, strictly activate, and match semantic-model packs for one analyzer
-> generation. Projection into synthetic analyzer declarations and model URIs
-> remains a separate overlay step. Procedure-summary payloads are
+> generation. A successful runtime acquisition also publishes an immutable
+> declaration overlay for normal navigation and query result surfaces.
+> Procedure-summary payloads are
 > activation-neutral: compiling, installing, selecting, loading, or activating
 > one does not yet change value-flow results.
 
@@ -130,6 +131,57 @@ a canonical activation-request key and retain only complete immutable
 runtimes. Before publication, the runtime rechecks source generations and
 coordinates selected catalog references with the workspace store. A failed or
 incomplete build preserves the previous active set.
+
+### Projection into synthetic analyzer declarations and model URIs
+
+A ready declaration runtime publishes one immutable overlay in the analyzer
+snapshot cache. The overlay owns typed type, member, hierarchy, and relation
+rows plus exact indexes by stable fact ID, qualified name, alias, and location.
+It is not part of the project filesystem: overlay records never appear in
+`Project::all_files()`, never become `ProjectFile` values, and never trigger
+file watching or source-cache operations.
+
+The overlay also evaluates active generator-rule shards against the analyzer's
+normalized structural facts. Schema-v1 language-construct and annotation
+triggers, scalar matched-node/enclosing-declaration/argument captures, bounded
+template expressions, and typed declaration, relation, and alias emissions are
+supported. Fully qualified annotation triggers require the same qualified
+spelling in the decorator AST span; an unqualified same-name annotation is not
+a match. Resolved-owner/call triggers and repeated argument captures remain
+inactive until the analyzer can supply their typed resolver evidence; Bifrost
+does not replace that missing evidence with source-text matching.
+
+Every overlay declaration has one honest location. If the pack's locator names
+a real declaration in the current analyzer snapshot and the exact symbol and
+path resolve, navigation uses that authored anchor and its real declaration
+range. Otherwise Bifrost creates a deterministic, percent-encoded
+`bifrost-model://v1/<pack-semantic-digest>/<record-kind>/<stable-record-id>`
+URI with a deterministic virtual range. A model URI is a portable identity and
+navigation target, not generated source. Source-reading tools render a bounded
+typed description explicitly labeled as modeled content.
+
+A unique `navigates_to` relation on a model-only declaration is followed by
+definition and declaration navigation. Its target may be another unique
+modeled declaration or an exact authored symbol. Multiple or conflicting
+navigation targets fail closed, and an absent target is reported instead of
+falling back to the model declaration.
+
+Symbol search, symbol locations, definition and modeled-usage results,
+CodeQuery declaration projections, MCP and Python JSON, and LSP workspace
+symbol/type-hierarchy values preserve the overlay provenance. It includes the
+active-model hash, pack semantic digest and identity/version, producer and
+version, stable record ID, catalog source and activation explanation, origin,
+proof kind, completeness, and ambiguity. Model relations are reported as
+semantic facts and do not invent source snippets or call-site ranges.
+
+Authored workspace declarations and exact navigable artifact declarations win
+over model-only locations. A unique model fact fills information that authored
+analysis does not have. Equivalent facts deduplicate; equal-rank differing
+facts remain ambiguous, and definition, usage, hierarchy, and query consumers
+must not select one. Catalog mutation generation and SQLite data-version are
+part of runtime cache identity, so an install, replacement, quarantine, or
+source removal cannot leave an old overlay attached to an unchanged analyzer
+snapshot and activation request.
 
 Accounting reports deduplicated installed and active bytes, physical objects,
 logical and active shards, sources, lookup hits and misses, quarantined packs,

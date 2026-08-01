@@ -1,10 +1,16 @@
-use lsp_types::{GotoDefinitionParams, GotoDefinitionResponse, Location};
+use lsp_types::{GotoDefinitionParams, GotoDefinitionResponse, Location, Position, Range, Uri};
 
 use crate::analyzer::{Project, WorkspaceAnalyzer};
-use crate::lsp::conversion::byte_range_to_lsp_range;
+use crate::lsp::conversion::{
+    byte_range_to_lsp_range, path_to_uri_string, position_to_byte_offset,
+};
 use crate::lsp::handlers::broad_symbol::navigation_target_at_position;
-use crate::lsp::handlers::util::{NavigationLocationCache, navigation_target_location};
+use crate::lsp::handlers::util::{
+    NavigationLocationCache, identifier_span_at_offset, navigation_target_location,
+    read_document_for_uri,
+};
 use crate::navigation::NavigationOperation;
+use crate::text_utils::compute_line_starts;
 
 /// Resolve `textDocument/definition`. Strategy:
 /// 1. Read the file at `uri` and find the identifier under the cursor.
@@ -19,13 +25,15 @@ pub fn handle(
 ) -> Option<GotoDefinitionResponse> {
     let uri = &params.text_document_position_params.text_document.uri;
     let analyzer = workspace.analyzer();
-    let target = navigation_target_at_position(
+    let Some(target) = navigation_target_at_position(
         analyzer,
         project,
         uri,
         &params.text_document_position_params.position,
         operation,
-    )?;
+    ) else {
+        return model_definition_at_position(analyzer, project, params);
+    };
     if let Some(definition) = target.lexical_definition {
         let range =
             byte_range_to_lsp_range(&target.content, &target.line_starts, &definition.name_range);
@@ -44,7 +52,61 @@ pub fn handle(
         }
     }
     if locations.is_empty() {
-        return None;
+        return model_definition_at_position(analyzer, project, params);
     }
     Some(GotoDefinitionResponse::Array(locations))
+}
+
+fn model_definition_at_position(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
+    project: &dyn Project,
+    params: &GotoDefinitionParams,
+) -> Option<GotoDefinitionResponse> {
+    let position = &params.text_document_position_params.position;
+    let uri = &params.text_document_position_params.text_document.uri;
+    let (_file, content, line_starts) = read_document_for_uri(project, uri)?;
+    let offset = position_to_byte_offset(&content, &line_starts, position);
+    let (start, end) = identifier_span_at_offset(&content, offset)?;
+    let name = content.get(start..end)?;
+    let overlay = analyzer.semantic_model_overlay()?;
+    let matched = overlay.symbols_named(name);
+    if matched.disposition
+        != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+    {
+        return None;
+    }
+    let symbol = matched.records[0];
+    let (uri, range): (Uri, Range) = match &symbol.location {
+        crate::analyzer::semantic_model::SemanticModelLocation::Authored(anchor) => {
+            let file = project.file_by_rel_path(std::path::Path::new(&anchor.path))?;
+            let source = project.read_source(&file).ok()?;
+            let starts = compute_line_starts(&source);
+            let range = crate::analyzer::Range {
+                start_byte: anchor.range.start_byte,
+                end_byte: anchor.range.end_byte,
+                start_line: anchor.range.start_line,
+                end_line: anchor.range.end_line,
+            };
+            (
+                path_to_uri_string(&file.abs_path()).parse().ok()?,
+                byte_range_to_lsp_range(&source, &starts, &range),
+            )
+        }
+        crate::analyzer::semantic_model::SemanticModelLocation::Model(location) => (
+            location.uri.parse().ok()?,
+            Range {
+                start: Position {
+                    line: u32::try_from(location.range.start_line.saturating_sub(1))
+                        .unwrap_or(u32::MAX),
+                    character: 0,
+                },
+                end: Position {
+                    line: u32::try_from(location.range.end_line.saturating_sub(1))
+                        .unwrap_or(u32::MAX),
+                    character: 0,
+                },
+            },
+        ),
+    };
+    Some(GotoDefinitionResponse::Array(vec![Location { uri, range }]))
 }
