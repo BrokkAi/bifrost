@@ -914,6 +914,11 @@ impl IAnalyzer for MultiAnalyzer {
         }
     }
 
+    fn declaration_syntax_kind(&self, code_unit: &CodeUnit) -> Option<&'static str> {
+        self.delegate_for_code_unit(code_unit)
+            .and_then(|delegate| delegate.analyzer().declaration_syntax_kind(code_unit))
+    }
+
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
         self.delegate_for_code_unit(code_unit)
             .and_then(|delegate| delegate.analyzer().parent_of(code_unit))

@@ -1521,23 +1521,35 @@ fn scala_modifier_prefix(node: Node<'_>, source: &str) -> String {
     }
 }
 
-pub(crate) fn scala_declaration_is_public(node: Node<'_>, source: &str) -> bool {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if !matches!(child.kind(), "modifiers" | "access_modifier") {
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ScalaDeclarationVisibility {
+    Public,
+    Protected,
+    NonApi,
+}
+
+pub(crate) fn scala_declaration_visibility(node: Node<'_>) -> ScalaDeclarationVisibility {
+    let mut stack = vec![node];
+    while let Some(candidate) = stack.pop() {
+        if candidate.kind() == "access_modifier" {
+            let mut cursor = candidate.walk();
+            for child in candidate.children(&mut cursor) {
+                match child.kind() {
+                    "private" => return ScalaDeclarationVisibility::NonApi,
+                    "protected" => return ScalaDeclarationVisibility::Protected,
+                    _ => {}
+                }
+            }
             continue;
         }
-        let modifier = scala_node_text(child, source).trim();
-        if modifier.split_whitespace().any(|word| {
-            matches!(
-                word.trim_matches(['[', ']', '(', ')', ',']),
-                "private" | "protected"
-            )
-        }) {
-            return false;
-        }
+        let mut cursor = candidate.walk();
+        stack.extend(
+            candidate
+                .named_children(&mut cursor)
+                .filter(|child| matches!(child.kind(), "modifiers" | "access_modifier")),
+        );
     }
-    true
+    ScalaDeclarationVisibility::Public
 }
 
 fn scala_pattern_names(node: Node<'_>, source: &str) -> Vec<String> {

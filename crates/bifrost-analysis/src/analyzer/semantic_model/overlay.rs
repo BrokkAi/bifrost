@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::Path;
 
 use serde::Serialize;
@@ -445,6 +446,103 @@ impl SemanticModelOverlay {
         self.relation_match(self.relations_to.get(id))
     }
 
+    /// Resolve a model type's transitive ancestors without materializing
+    /// universal-root edges for every declaration in the overlay.
+    pub fn ancestors_of(
+        &self,
+        symbol: &SemanticModelSymbol,
+    ) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
+        let mut records = Vec::new();
+        let mut queue = VecDeque::from([symbol]);
+        let mut seen = HashSet::from_iter([symbol.id.as_str()]);
+        let mut conflict = symbol.provenance.ambiguous;
+        while let Some(current) = queue.pop_front() {
+            let direct = self.direct_ancestors_of(current);
+            conflict |= direct.disposition == SemanticModelOverlayDisposition::Conflict;
+            for ancestor in direct.records {
+                if seen.insert(&ancestor.id) {
+                    records.push(ancestor);
+                    queue.push_back(ancestor);
+                }
+            }
+        }
+        let disposition = if conflict {
+            SemanticModelOverlayDisposition::Conflict
+        } else if records.is_empty() {
+            SemanticModelOverlayDisposition::Empty
+        } else {
+            SemanticModelOverlayDisposition::Unique
+        };
+        SemanticModelOverlayMatch {
+            records,
+            disposition,
+        }
+    }
+
+    /// Return the active universal root for Java or Scala when it is uniquely
+    /// present. The name indexes are already retained by the overlay, so this
+    /// lazy lookup is cheaper than another per-type cache or authored edge.
+    pub fn universal_root_for_language(
+        &self,
+        language: &str,
+    ) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
+        let root = match language {
+            "java" => "java.lang.Object",
+            "scala" => "scala.Any",
+            _ => return self.symbol_match(None),
+        };
+        self.symbols_named(root)
+    }
+
+    fn direct_ancestors_of(
+        &self,
+        symbol: &SemanticModelSymbol,
+    ) -> SemanticModelOverlayMatch<'_, SemanticModelSymbol> {
+        let hierarchy = self
+            .relations_from(&symbol.id)
+            .records
+            .into_iter()
+            .filter(|relation| {
+                matches!(
+                    relation.kind.as_str(),
+                    "extends" | "implements" | "uses_trait"
+                )
+            })
+            .collect::<Vec<_>>();
+        let has_class_parent = hierarchy.iter().any(|relation| relation.kind == "extends");
+        let mut records = Vec::new();
+        let mut conflict = hierarchy
+            .iter()
+            .any(|relation| relation.provenance.ambiguous);
+        for relation in hierarchy {
+            let mut matched = self.symbols_with_id(&relation.to);
+            if matched.records.is_empty() {
+                matched = self.symbols_named(&relation.to);
+            }
+            conflict |= matched.disposition == SemanticModelOverlayDisposition::Conflict;
+            records.extend(matched.records);
+        }
+        if !has_class_parent
+            && universal_root_name(symbol).is_some_and(|root| root != symbol.qualified_name)
+        {
+            let root = self.universal_root_for_language(&symbol.language);
+            conflict |= root.disposition == SemanticModelOverlayDisposition::Conflict;
+            records.extend(root.records);
+        }
+        records.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+        records.dedup_by(|left, right| left.id == right.id);
+        SemanticModelOverlayMatch {
+            disposition: if conflict {
+                SemanticModelOverlayDisposition::Conflict
+            } else if records.is_empty() {
+                SemanticModelOverlayDisposition::Empty
+            } else {
+                SemanticModelOverlayDisposition::Unique
+            },
+            records,
+        }
+    }
+
     fn rebuild_indexes(
         &mut self,
         cancellation: &crate::CancellationToken,
@@ -586,6 +684,38 @@ impl SemanticModelOverlay {
     }
 }
 
+fn universal_root_name(symbol: &SemanticModelSymbol) -> Option<&'static str> {
+    if symbol.owner_id.is_some() {
+        return None;
+    }
+    match symbol.language.as_str() {
+        "java"
+            if matches!(
+                symbol.kind,
+                SemanticModelSymbolKind::Class
+                    | SemanticModelSymbolKind::Enum
+                    | SemanticModelSymbolKind::Record
+            ) =>
+        {
+            Some("java.lang.Object")
+        }
+        "scala"
+            if matches!(
+                symbol.kind,
+                SemanticModelSymbolKind::Class
+                    | SemanticModelSymbolKind::Interface
+                    | SemanticModelSymbolKind::Trait
+                    | SemanticModelSymbolKind::Enum
+                    | SemanticModelSymbolKind::Record
+                    | SemanticModelSymbolKind::Module
+            ) =>
+        {
+            Some("scala.Any")
+        }
+        _ => None,
+    }
+}
+
 impl SemanticModelProvenance {
     fn retained_string_bytes(&self) -> usize {
         let evidence = &self.activation.matched_evidence;
@@ -650,15 +780,7 @@ fn push_unique_posting(postings: &mut HashMap<String, Vec<usize>>, key: &str, in
 fn mark_symbol_identity_conflicts(symbols: &mut [SemanticModelSymbol]) {
     let mut identities: HashMap<String, Vec<usize>> = HashMap::default();
     for (index, symbol) in symbols.iter().enumerate() {
-        let mut keys = HashSet::from_iter([
-            format!("id:{}", symbol.id),
-            format!("name:{}", symbol.name),
-            format!("name:{}", symbol.qualified_name),
-        ]);
-        keys.extend(symbol.aliases.iter().map(|alias| format!("name:{alias}")));
-        for key in keys {
-            identities.entry(key).or_default().push(index);
-        }
+        identities.entry(symbol.id.clone()).or_default().push(index);
     }
     for posting in identities.values().filter(|posting| posting.len() > 1) {
         for &index in posting {
@@ -1326,18 +1448,31 @@ fn authored_anchor(
         analyzer.project().file_by_abs_path(path)
     } else {
         analyzer.project().file_by_rel_path(path)
-    }?;
-    let unit = analyzer.definitions(symbol).find(|unit| {
-        unit.source() == &file && (unit.fq_name() == symbol || unit.identifier() == symbol)
-    })?;
-    let range = analyzer
-        .ranges(&unit)
-        .into_iter()
-        .min_by_key(|range| (range.start_line, range.start_byte))?;
+    };
+    if let Some(file) = file
+        && let Some(unit) = analyzer.definitions(symbol).find(|unit| {
+            unit.source() == &file && (unit.fq_name() == symbol || unit.identifier() == symbol)
+        })
+        && let Some(range) = analyzer
+            .ranges(&unit)
+            .into_iter()
+            .min_by_key(|range| (range.start_line, range.start_byte))
+    {
+        return Some(SemanticModelAuthoredAnchor {
+            path: file.rel_path().to_string_lossy().replace('\\', "/"),
+            symbol: unit.fq_name(),
+            range: range.into(),
+        });
+    }
     Some(SemanticModelAuthoredAnchor {
-        path: file.rel_path().to_string_lossy().replace('\\', "/"),
-        symbol: unit.fq_name(),
-        range: range.into(),
+        path: path.to_string_lossy().replace('\\', "/"),
+        symbol: symbol.to_owned(),
+        range: SemanticModelRange {
+            start_byte: 0,
+            end_byte: 0,
+            start_line: 0,
+            end_line: 0,
+        },
     })
 }
 

@@ -6952,6 +6952,28 @@ where
             .unwrap_or_default()
     }
 
+    fn declaration_syntax_kind(&self, code_unit: &CodeUnit) -> Option<&'static str> {
+        let syntax = self.prepared_syntax(code_unit.source())?;
+        let mut node = syntax.declaration_node(code_unit)?;
+        let fallback = node.kind();
+        loop {
+            if matches!(
+                node.kind(),
+                "class_declaration"
+                    | "interface_declaration"
+                    | "annotation_type_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+            ) {
+                return Some(node.kind());
+            }
+            node = node.parent()?;
+            if node.kind() == "program" {
+                return Some(fallback);
+            }
+        }
+    }
+
     fn summary_file_projection(&self, file: &ProjectFile) -> Option<Arc<SummaryFileProjection>> {
         let _scope = profiling::scope(format!(
             "TreeSitterAnalyzer::{:?}::summary_file_projection",

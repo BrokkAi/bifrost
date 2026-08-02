@@ -4,9 +4,13 @@ use crate::analyzer::java::declarations::{
 };
 use crate::analyzer::jvm::dependency_discovery::{discover_build_tools, discover_metadata};
 use crate::analyzer::jvm::java_artifact::JavaJarPackProducer;
+use crate::analyzer::jvm::jdk_artifact::{
+    JdkSourceArchivePackProducer, detect_jdk_source_archive_layout,
+};
+use crate::analyzer::jvm::scala_artifact::ScalaSourceJarPackProducer;
 use crate::analyzer::semantic_model::{
-    ActivationSelector, ArtifactProducerLimits, ArtifactProductionRequest, AuthoredPayload,
-    AuthoredSemanticModelPack, CatalogCoordinate, Compatibility, Completeness,
+    ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
+    AuthoredPayload, AuthoredSemanticModelPack, CatalogCoordinate, Compatibility, Completeness,
     DependencyArtifactRole, DependencyDiscoveryOutcome, DependencyDiscoveryProfile,
     DependencyPackAdapter, DependencyPackDiagnostic, DependencyPackDiagnosticSeverity,
     DependencyPackLimits, DependencyPackProduction, DependencyProvenance, ExactDependencyArtifact,
@@ -24,7 +28,8 @@ use jclassfile::attributes::{Attribute, NestedClassFlags};
 use jclassfile::class_file::{ClassFile, ClassFlags};
 use jclassfile::constant_pool::ConstantPool;
 use semver::Version;
-use std::fs::File;
+use std::ffi::OsString;
+use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use tree_sitter::Parser;
@@ -129,7 +134,7 @@ pub fn resolve_jvm_semantic_pack_dependencies(
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return cancelled_discovery("JVM dependency discovery was cancelled");
     }
-    let metadata_inputs_considered = dependencies
+    let mut metadata_inputs_considered = dependencies
         .artifact_paths
         .len()
         .saturating_add(dependencies.coordinates.len());
@@ -159,6 +164,19 @@ pub fn resolve_jvm_semantic_pack_dependencies(
         .into_iter()
         .map(resolved_semantic_pack_dependency)
         .collect();
+    let jdk_discovery = discover_jdk_semantic_pack_dependencies(
+        config,
+        project.root(),
+        config
+            .standard_library_discovery
+            .discover_java_home
+            .then(|| std::env::var_os("JAVA_HOME"))
+            .flatten(),
+    );
+    metadata_inputs_considered =
+        metadata_inputs_considered.saturating_add(jdk_discovery.inputs_considered);
+    resolved.extend(jdk_discovery.dependencies);
+    diagnostics.extend(jdk_discovery.diagnostics);
     let mut suppressed_diagnostics = 0;
     if resolved.len() > limits.max_dependencies {
         suppressed_diagnostics = resolved.len() - limits.max_dependencies;
@@ -185,7 +203,10 @@ pub fn resolve_jvm_semantic_pack_dependencies(
             dependencies_resolved: resolved.len(),
         },
         dependencies: resolved,
-        complete: diagnostics.is_empty() && suppressed_diagnostics == 0,
+        complete: !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == DependencyPackDiagnosticSeverity::Error)
+            && suppressed_diagnostics == 0,
         diagnostics,
         suppressed_diagnostics,
         cancelled: false,
@@ -216,6 +237,148 @@ fn jvm_coordinate_id(coordinate: &JvmMavenCoordinate) -> String {
     )
 }
 
+#[derive(Debug, Default)]
+struct JdkDiscovery {
+    dependencies: Vec<ResolvedDependency>,
+    diagnostics: Vec<DependencyPackDiagnostic>,
+    inputs_considered: usize,
+}
+
+fn discover_jdk_semantic_pack_dependencies(
+    config: &JvmAnalyzerConfig,
+    project_root: &Path,
+    java_home: Option<OsString>,
+) -> JdkDiscovery {
+    let mut candidates: Vec<(PathBuf, bool)> = config
+        .standard_library_discovery
+        .jdk_homes
+        .iter()
+        .map(|home| (resolve_path(project_root, home), true))
+        .collect();
+    if let Some(java_home) = java_home.filter(|value| !value.is_empty()) {
+        candidates.push((resolve_path(project_root, Path::new(&java_home)), false));
+    }
+
+    let mut discovery = JdkDiscovery {
+        inputs_considered: candidates.len(),
+        ..JdkDiscovery::default()
+    };
+    let mut seen_homes = crate::hash::HashSet::default();
+    let mut dependency_by_version = crate::hash::HashMap::default();
+    for (candidate, configured) in candidates {
+        let home = fs::canonicalize(&candidate).unwrap_or(candidate);
+        if !seen_homes.insert(home.clone()) {
+            continue;
+        }
+        let version = match read_jdk_release_version(&home) {
+            Ok(version) => version,
+            Err(message) => {
+                discovery.diagnostics.push(DependencyPackDiagnostic {
+                    severity: if configured {
+                        DependencyPackDiagnosticSeverity::Error
+                    } else {
+                        DependencyPackDiagnosticSeverity::Warning
+                    },
+                    code: "jdk.home.invalid".to_owned(),
+                    dependency_id: None,
+                    location: Some(home.to_string_lossy().into_owned()),
+                    message,
+                });
+                continue;
+            }
+        };
+        let source = [home.join("lib").join("src.zip"), home.join("src.zip")]
+            .into_iter()
+            .find(|path| path.is_file());
+        let dependency = resolved_jdk_dependency(version.clone(), source);
+        match dependency_by_version.entry(version) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(discovery.dependencies.len());
+                discovery.dependencies.push(dependency);
+            }
+            std::collections::hash_map::Entry::Occupied(entry)
+                if discovery.dependencies[*entry.get()].artifacts.is_empty()
+                    && !dependency.artifacts.is_empty() =>
+            {
+                discovery.dependencies[*entry.get()] = dependency;
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {}
+        }
+    }
+    discovery
+}
+
+fn read_jdk_release_version(home: &Path) -> Result<Version, String> {
+    const MAX_RELEASE_BYTES: u64 = 64 * 1024;
+
+    let release_path = home.join("release");
+    let metadata = fs::metadata(&release_path)
+        .map_err(|error| format!("JDK home does not contain a readable release file: {error}"))?;
+    if !metadata.is_file() || metadata.len() > MAX_RELEASE_BYTES {
+        return Err("JDK release file is not a bounded regular file".to_owned());
+    }
+    let mut release_bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(&release_path)
+        .and_then(|file| {
+            file.take(MAX_RELEASE_BYTES.saturating_add(1))
+                .read_to_end(&mut release_bytes)
+        })
+        .map_err(|error| format!("could not read JDK release file: {error}"))?;
+    if release_bytes.len() as u64 > MAX_RELEASE_BYTES {
+        return Err("JDK release file grew beyond the bounded read limit".to_owned());
+    }
+    let release = std::str::from_utf8(&release_bytes)
+        .map_err(|error| format!("JDK release file is not valid UTF-8 text: {error}"))?;
+    let mut values = release.lines().filter_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key == "JAVA_VERSION").then_some(value.trim().trim_matches('"'))
+    });
+    let raw = values
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "JDK release file does not declare JAVA_VERSION".to_owned())?;
+    if values.next().is_some() {
+        return Err("JDK release file declares JAVA_VERSION more than once".to_owned());
+    }
+    Version::parse(raw).map_err(|error| {
+        format!("JDK JAVA_VERSION {raw:?} is not an exact semantic version: {error}")
+    })
+}
+
+fn resolved_jdk_dependency(
+    version: Version,
+    source_archive: Option<PathBuf>,
+) -> ResolvedDependency {
+    ResolvedDependency {
+        id: format!("jdk:{version}"),
+        evidence: SemanticModelActivationEvidence {
+            language: "java".to_owned(),
+            ecosystem: "jdk".to_owned(),
+            package: None,
+            module: None,
+            toolchain: Some(CatalogCoordinate {
+                name: "jdk".to_owned(),
+                version: Some(version.clone()),
+            }),
+            target: Some("jvm".to_owned()),
+            configuration: None,
+            artifact_sha256: None,
+        },
+        provenance: vec![DependencyProvenance {
+            key: "version".to_owned(),
+            value: version.to_string(),
+        }],
+        artifacts: source_archive
+            .map(|path| ResolvedDependencyArtifact {
+                role: DependencyArtifactRole::Sources,
+                kind: ExternalArtifactKind::JdkSourceZip,
+                path,
+            })
+            .into_iter()
+            .collect(),
+    }
+}
+
 impl DependencyPackAdapter for JvmDependencyPackAdapter {
     fn adapter_name(&self) -> &str {
         "bifrost-jvm-dependency"
@@ -227,9 +390,17 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
 
     fn producer(&self) -> Producer {
         Producer {
-            name: "bifrost-java-jar".to_owned(),
+            name: "bifrost-jvm-dependency".to_owned(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
         }
+    }
+
+    fn can_produce(&self, dependency: &ResolvedDependency) -> bool {
+        dependency.evidence.language != "scala"
+            || dependency
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.kind == ExternalArtifactKind::ScalaSourceJar)
     }
 
     fn produce(
@@ -239,7 +410,7 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
         limits: &ArtifactProducerLimits,
         cancellation: Option<&CancellationToken>,
     ) -> DependencyPackProduction {
-        let request = java_dependency_production_request(dependency);
+        let request = jvm_dependency_production_request(dependency);
         let mut diagnostics = Vec::new();
         let mut suppressed_diagnostics = 0usize;
         let mut source_pack = None;
@@ -249,12 +420,44 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
             let mut artifact_request = request.clone();
             artifact_request.path = artifact.path().to_owned();
             artifact_request.artifact_kind = artifact.kind();
-            let production = JavaJarPackProducer.produce_loaded_artifact(
-                &artifact_request,
-                limits,
-                cancellation,
-                artifact.exact(),
-            );
+            let production = match artifact.kind() {
+                ExternalArtifactKind::ScalaSourceJar => ScalaSourceJarPackProducer
+                    .produce_loaded_artifact(
+                        &artifact_request,
+                        limits,
+                        cancellation,
+                        artifact.exact(),
+                    ),
+                ExternalArtifactKind::JavaSourceJar | ExternalArtifactKind::JavaClassJar => {
+                    JavaJarPackProducer.produce_loaded_artifact(
+                        &artifact_request,
+                        limits,
+                        cancellation,
+                        artifact.exact(),
+                    )
+                }
+                ExternalArtifactKind::JdkSourceZip => {
+                    match detect_jdk_source_archive_layout(artifact.exact()) {
+                        Ok(layout) => JdkSourceArchivePackProducer::new(layout)
+                            .produce_loaded_artifact(
+                                &artifact_request,
+                                limits,
+                                cancellation,
+                                artifact.exact(),
+                            ),
+                        Err(diagnostic) => ArtifactProduction::failed(diagnostic, limits),
+                    }
+                }
+                kind => ArtifactProduction::failed(
+                    ProducerDiagnostic {
+                        severity: ProducerDiagnosticSeverity::Error,
+                        code: "artifact.kind".to_owned(),
+                        location: Some(artifact.path().to_string_lossy().into_owned()),
+                        message: format!("unsupported JVM dependency artifact kind {kind:?}"),
+                    },
+                    limits,
+                ),
+            };
             debug_assert_eq!(
                 production.artifact_sha256.as_deref(),
                 Some(artifact.sha256())
@@ -286,10 +489,11 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
             limits,
         );
         let mut pack = pack;
-        if let Some(pack) = pack.as_mut()
-            && (partial || !diagnostics.is_empty() || suppressed_diagnostics > 0)
-        {
-            pack.completeness = Completeness::Partial;
+        if let Some(pack) = pack.as_mut() {
+            pack.producer = self.producer();
+            if partial || !diagnostics.is_empty() || suppressed_diagnostics > 0 {
+                pack.completeness = Completeness::Partial;
+            }
         }
         DependencyPackProduction {
             pack,
@@ -300,6 +504,10 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
 }
 
 fn resolved_semantic_pack_dependency(artifact: ResolvedJvmArtifact) -> ResolvedDependency {
+    let scala_library = artifact
+        .coordinate
+        .as_ref()
+        .is_some_and(is_scala_library_coordinate);
     let coordinate_id = artifact.coordinate.as_ref().map(|coordinate| {
         format!(
             "{}:{}:{}",
@@ -316,10 +524,14 @@ fn resolved_semantic_pack_dependency(artifact: ResolvedJvmArtifact) -> ResolvedD
                 .to_string_lossy()
         )
     });
-    let ecosystem = match artifact.origin {
-        JvmDependencyOrigin::MavenReport | JvmDependencyOrigin::MavenRepository => "maven",
-        JvmDependencyOrigin::GradleReport | JvmDependencyOrigin::GradleCache => "gradle",
-        JvmDependencyOrigin::ExplicitPath => "jvm",
+    let ecosystem = if scala_library {
+        "maven"
+    } else {
+        match artifact.origin {
+            JvmDependencyOrigin::MavenReport | JvmDependencyOrigin::MavenRepository => "maven",
+            JvmDependencyOrigin::GradleReport | JvmDependencyOrigin::GradleCache => "gradle",
+            JvmDependencyOrigin::ExplicitPath => "jvm",
+        }
     };
     let package = artifact
         .coordinate
@@ -348,11 +560,24 @@ fn resolved_semantic_pack_dependency(artifact: ResolvedJvmArtifact) -> ResolvedD
             },
         ]);
     }
+    let source_kind = if scala_library {
+        ExternalArtifactKind::ScalaSourceJar
+    } else {
+        ExternalArtifactKind::JavaSourceJar
+    };
     let artifacts = if is_source_jar(&artifact.artifact_path) {
         vec![ResolvedDependencyArtifact {
             role: DependencyArtifactRole::Sources,
-            kind: ExternalArtifactKind::JavaSourceJar,
+            kind: source_kind,
             path: artifact.artifact_path,
+        }]
+    } else if scala_library && artifact.source_artifact_path.is_some() {
+        vec![ResolvedDependencyArtifact {
+            role: DependencyArtifactRole::Sources,
+            kind: source_kind,
+            path: artifact
+                .source_artifact_path
+                .expect("source path was checked above"),
         }]
     } else {
         let mut artifacts = vec![ResolvedDependencyArtifact {
@@ -363,7 +588,7 @@ fn resolved_semantic_pack_dependency(artifact: ResolvedJvmArtifact) -> ResolvedD
         if let Some(source_artifact_path) = artifact.source_artifact_path {
             artifacts.push(ResolvedDependencyArtifact {
                 role: DependencyArtifactRole::Sources,
-                kind: ExternalArtifactKind::JavaSourceJar,
+                kind: source_kind,
                 path: source_artifact_path,
             });
         }
@@ -372,7 +597,7 @@ fn resolved_semantic_pack_dependency(artifact: ResolvedJvmArtifact) -> ResolvedD
     ResolvedDependency {
         id,
         evidence: SemanticModelActivationEvidence {
-            language: "java".to_owned(),
+            language: if scala_library { "scala" } else { "java" }.to_owned(),
             ecosystem: ecosystem.to_owned(),
             package,
             module: (artifact.origin == JvmDependencyOrigin::ExplicitPath).then(|| {
@@ -381,7 +606,13 @@ fn resolved_semantic_pack_dependency(artifact: ResolvedJvmArtifact) -> ResolvedD
                     version: None,
                 }
             }),
-            toolchain: None,
+            toolchain: scala_library.then(|| CatalogCoordinate {
+                name: "scala".to_owned(),
+                version: artifact
+                    .coordinate
+                    .as_ref()
+                    .and_then(|coordinate| Version::parse(&coordinate.version).ok()),
+            }),
             target: Some("jvm".to_owned()),
             configuration: None,
             artifact_sha256: None,
@@ -389,6 +620,14 @@ fn resolved_semantic_pack_dependency(artifact: ResolvedJvmArtifact) -> ResolvedD
         provenance,
         artifacts,
     }
+}
+
+fn is_scala_library_coordinate(coordinate: &JvmMavenCoordinate) -> bool {
+    coordinate.group_id == "org.scala-lang"
+        && matches!(
+            coordinate.artifact_id.as_str(),
+            "scala-library" | "scala3-library_3"
+        )
 }
 
 fn jvm_dependency_origin_name(origin: JvmDependencyOrigin) -> &'static str {
@@ -401,18 +640,31 @@ fn jvm_dependency_origin_name(origin: JvmDependencyOrigin) -> &'static str {
     }
 }
 
-fn java_dependency_production_request(
-    dependency: &ResolvedDependency,
-) -> ArtifactProductionRequest {
+fn jvm_dependency_production_request(dependency: &ResolvedDependency) -> ArtifactProductionRequest {
     ArtifactProductionRequest {
         path: PathBuf::new(),
         artifact_kind: ExternalArtifactKind::JavaClassJar,
-        pack_id: "bifrost.external.java".to_owned(),
+        pack_id: format!("bifrost.external.{}", dependency.evidence.language),
         pack_version: env!("CARGO_PKG_VERSION").to_owned(),
         ecosystem: dependency.evidence.ecosystem.clone(),
         compatibility: Compatibility {
             bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
-            toolchains: Vec::new(),
+            toolchains: dependency
+                .evidence
+                .toolchain
+                .as_ref()
+                .map(
+                    |coordinate| crate::analyzer::semantic_model::VersionConstraint {
+                        name: coordinate.name.clone(),
+                        requirement: coordinate
+                            .version
+                            .as_ref()
+                            .map(|version| format!("={version}"))
+                            .unwrap_or_else(|| "*".to_owned()),
+                    },
+                )
+                .into_iter()
+                .collect(),
         },
         activation: vec![ActivationSelector {
             package: dependency
@@ -437,7 +689,17 @@ fn java_dependency_production_request(
                         .as_ref()
                         .map(|version| format!("={version}")),
                 }),
-            toolchain: None,
+            toolchain: dependency
+                .evidence
+                .toolchain
+                .as_ref()
+                .map(|coordinate| NameSelector {
+                    name: coordinate.name.clone(),
+                    version: coordinate
+                        .version
+                        .as_ref()
+                        .map(|version| format!("={version}")),
+                }),
             targets: dependency.evidence.target.clone().into_iter().collect(),
             configurations: dependency
                 .evidence
@@ -765,6 +1027,7 @@ impl JvmExternalDeclarationIndex {
         let entry_count = archive.len().min(MAX_ARCHIVE_ENTRIES);
         let mut total_bytes = 0u64;
         let mut java_facts = None;
+        let mut scala_indexed = false;
         for index in 0..entry_count {
             let Ok(entry) = archive.by_index(index) else {
                 continue;
@@ -779,6 +1042,22 @@ impl JvmExternalDeclarationIndex {
                 MAX_TOTAL_ARCHIVE_BYTES.min(index_byte_budget),
                 &mut total_bytes,
             ) {
+                continue;
+            }
+            if matches!(language, SourceJarLanguage::Scala) {
+                if !scala_indexed {
+                    let mut facts = self
+                        .produce_scala_type_facts(artifact_path)
+                        .into_values()
+                        .collect::<Vec<_>>();
+                    facts.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+                    for fact in facts.into_iter().take(MAX_ANALYZER_SOURCE_TYPES) {
+                        if let Some(external_type) = scala_external_type(artifact_path, fact) {
+                            self.insert(external_type);
+                        }
+                    }
+                    scala_indexed = true;
+                }
                 continue;
             }
             let source_path = entry.name().to_string();
@@ -911,9 +1190,66 @@ impl JvmExternalDeclarationIndex {
             .map(|fact| (fact.name.clone(), fact))
             .collect()
     }
+
+    fn produce_scala_type_facts(&mut self, artifact_path: &Path) -> HashMap<String, TypeFact> {
+        let production = ScalaSourceJarPackProducer.produce_exact_artifact(
+            &ArtifactProductionRequest {
+                path: artifact_path.to_path_buf(),
+                artifact_kind: ExternalArtifactKind::ScalaSourceJar,
+                pack_id: "bifrost.external.scala".to_owned(),
+                pack_version: env!("CARGO_PKG_VERSION").to_owned(),
+                ecosystem: "maven".to_owned(),
+                compatibility: Compatibility {
+                    bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                    toolchains: Vec::new(),
+                },
+                activation: vec![ActivationSelector {
+                    package: None,
+                    module: None,
+                    toolchain: Some(NameSelector {
+                        name: "jvm".to_owned(),
+                        version: None,
+                    }),
+                    targets: Vec::new(),
+                    configurations: Vec::new(),
+                    artifact_sha256: None,
+                }],
+                provenance: Provenance {
+                    source: "local dependency artifact".to_owned(),
+                    revision: None,
+                },
+                license: "NOASSERTION".to_owned(),
+                safety: Safety {
+                    generated_code_only: false,
+                    review_required: false,
+                },
+            },
+            &ArtifactProducerLimits::default(),
+        );
+        self.production_diagnostics
+            .extend(production.diagnostics.iter().cloned());
+        production
+            .pack
+            .into_iter()
+            .flat_map(|pack| pack.shards)
+            .flat_map(|shard| match shard.payload {
+                AuthoredPayload::DeclarationFacts { types, .. } => types,
+                AuthoredPayload::GeneratorRules { .. }
+                | AuthoredPayload::ProcedureSummaries { .. } => Vec::new(),
+            })
+            .map(|fact| (fact.name.clone(), fact))
+            .collect()
+    }
 }
 
 fn jvm_artifact_from_dependency(dependency: &ResolvedDependency) -> Option<ResolvedJvmArtifact> {
+    if dependency
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.kind == ExternalArtifactKind::JdkSourceZip)
+    {
+        return None;
+    }
     let binary = dependency
         .artifacts
         .iter()
@@ -944,7 +1280,34 @@ fn discovery_producer_diagnostic(diagnostic: DependencyPackDiagnostic) -> Produc
 }
 
 fn apply_java_type_fact(external_type: &mut JvmExternalType, fact: &TypeFact) {
-    external_type.kind = match fact.type_kind {
+    external_type.kind = semantic_type_kind(fact.type_kind);
+    external_type.visibility = semantic_visibility(fact.visibility);
+}
+
+fn scala_external_type(artifact_path: &Path, fact: TypeFact) -> Option<JvmExternalType> {
+    let source_path = match fact.locator {
+        Locator::Source { path, .. } => path,
+        Locator::Artifact { .. } => return None,
+    };
+    let name = fact.name;
+    let (package_name, short_name) = name
+        .rsplit_once('.')
+        .map_or(("", name.as_str()), |(package, short)| (package, short));
+    (!short_name.is_empty()).then(|| JvmExternalType {
+        fqn: name.clone(),
+        package_name: package_name.to_owned(),
+        short_name: short_name.to_owned(),
+        kind: semantic_type_kind(fact.type_kind),
+        visibility: semantic_visibility(fact.visibility),
+        source: JvmExternalDeclarationSource::SourceJar {
+            artifact_path: artifact_path.to_path_buf(),
+            source_path,
+        },
+    })
+}
+
+fn semantic_type_kind(kind: TypeKind) -> JvmExternalTypeKind {
+    match kind {
         TypeKind::Interface | TypeKind::Trait => JvmExternalTypeKind::Interface,
         TypeKind::Enum => JvmExternalTypeKind::Enum,
         TypeKind::Annotation => JvmExternalTypeKind::Annotation,
@@ -954,13 +1317,16 @@ fn apply_java_type_fact(external_type: &mut JvmExternalType, fact: &TypeFact) {
         | TypeKind::Struct
         | TypeKind::Module
         | TypeKind::TypeAlias => JvmExternalTypeKind::Class,
-    };
-    external_type.visibility = match fact.visibility {
+    }
+}
+
+fn semantic_visibility(visibility: Visibility) -> JvmVisibility {
+    match visibility {
         Visibility::Public => JvmVisibility::Public,
         Visibility::Protected | Visibility::ProtectedInternal => JvmVisibility::Protected,
         Visibility::Package | Visibility::Internal => JvmVisibility::PackagePrivate,
         Visibility::Private => JvmVisibility::Private,
-    };
+    }
 }
 
 /// A source language Bifrost can read out of a published `-sources.jar`.
@@ -1008,7 +1374,7 @@ impl SourceJarLanguage {
     ) -> Vec<JvmExternalType> {
         match self {
             Self::Java => source_types(artifact_path, source_path, source),
-            Self::Scala => scala_source_types(artifact_path, source_path, source),
+            Self::Scala => unreachable!("Scala source JARs are indexed from semantic pack facts"),
             Self::Kotlin => kotlin_source_types(artifact_path, source_path, source),
         }
     }
@@ -1414,78 +1780,6 @@ fn source_types(artifact_path: &Path, source_path: &str, source: &str) -> Vec<Jv
     result
 }
 
-fn scala_source_types(
-    artifact_path: &Path,
-    source_path: &str,
-    source: &str,
-) -> Vec<JvmExternalType> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&crate::analyzer::scala::language::LANGUAGE.into())
-        .expect("tree-sitter Scala language must load");
-    let Some(tree) = parser.parse(source, None) else {
-        return Vec::new();
-    };
-    if tree.root_node().has_error() {
-        return Vec::new();
-    }
-
-    let synthetic_file = ProjectFile::new(std::env::temp_dir(), "external.scala");
-    let parsed =
-        crate::analyzer::scala::declarations::parse_scala_file(&synthetic_file, source, &tree);
-    parsed
-        .declarations()
-        .iter()
-        .filter(|declaration| declaration.is_class())
-        .filter(|declaration| {
-            scala_source_declaration_node(&tree, &parsed, declaration).is_some_and(|node| {
-                crate::analyzer::scala::declarations::scala_declaration_is_public(node, source)
-            })
-        })
-        .filter_map(|declaration| {
-            let fqn = crate::analyzer::scala::scala_normalize_full_name(&declaration.fq_name());
-            let package_name = declaration.package_name().to_string();
-            let short_name =
-                crate::analyzer::scala::scala_normalize_full_name(declaration.short_name());
-            (!short_name.is_empty()).then(|| JvmExternalType {
-                fqn,
-                package_name,
-                short_name,
-                kind: JvmExternalTypeKind::Class,
-                visibility: JvmVisibility::Public,
-                source: JvmExternalDeclarationSource::SourceJar {
-                    artifact_path: artifact_path.to_path_buf(),
-                    source_path: source_path.to_string(),
-                },
-            })
-        })
-        // Source JARs are untrusted input. The index is deliberately
-        // best-effort, so stopping at a bounded number of public Scala types
-        // is preferable to retaining an arbitrarily large declaration set.
-        .take(MAX_ANALYZER_SOURCE_TYPES)
-        .collect()
-}
-
-fn scala_source_declaration_node<'tree>(
-    tree: &'tree tree_sitter::Tree,
-    parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
-    declaration: &crate::analyzer::CodeUnit,
-) -> Option<tree_sitter::Node<'tree>> {
-    let range = parsed.declaration_ranges(declaration).first()?;
-    let mut node = tree
-        .root_node()
-        .descendant_for_byte_range(range.start_byte, range.end_byte)?;
-    loop {
-        if matches!(
-            node.kind(),
-            "class_definition" | "object_definition" | "trait_definition" | "enum_definition"
-        ) {
-            return Some(node);
-        }
-        node = node.parent()?;
-    }
-}
-
 /// Public Kotlin types declared by one `.kt` entry of a source jar.
 ///
 /// Kotlin identities are already source-level (issue #1236): no `FooKt` file
@@ -1806,6 +2100,122 @@ mod tests {
     const SOURCE_JAR: &str = "external-lib-1.2.3-sources.jar";
 
     #[test]
+    fn configured_jdk_home_discovers_and_generates_exact_source_pack() {
+        use crate::analyzer::JvmStandardLibraryDiscoveryConfig;
+        use crate::analyzer::semantic_model::{
+            CatalogOptions, DependencyPackPreparationStatus, SemanticPackCatalog,
+            prepare_dependency_semantic_packs,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let relative_home = PathBuf::from("toolchains").join("jdk-21");
+        let home = root.path().join(&relative_home);
+        fs::create_dir_all(home.join("lib")).unwrap();
+        fs::write(home.join("release"), "JAVA_VERSION=\"21.0.8\"\n").unwrap();
+        let source_archive = home.join("lib").join("src.zip");
+        write_zip_entries(
+            &source_archive,
+            &[
+                (
+                    "java.base/module-info.java",
+                    b"module java.base { exports java.lang; }" as &[u8],
+                ),
+                (
+                    "java.base/java/lang/Object.java",
+                    b"package java.lang; public class Object {}",
+                ),
+            ],
+        );
+        let project = TestProject::new(root.path(), Language::Java);
+        let config = JvmAnalyzerConfig {
+            dependency_discovery: crate::analyzer::JvmDependencyDiscoveryConfig {
+                mode: JvmDependencyDiscoveryMode::Disabled,
+                ..Default::default()
+            },
+            standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
+                jdk_homes: vec![relative_home],
+                discover_java_home: false,
+            },
+            ..JvmAnalyzerConfig::default()
+        };
+        let limits = DependencyPackLimits::default();
+
+        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+
+        assert!(discovered.complete, "{:#?}", discovered.diagnostics);
+        assert_eq!(discovered.dependencies.len(), 1);
+        assert_eq!(discovered.dependencies[0].id, "jdk:21.0.8");
+        assert_eq!(discovered.dependencies[0].evidence.ecosystem, "jdk");
+        assert_eq!(
+            discovered.dependencies[0].artifacts[0].path,
+            fs::canonicalize(source_archive).unwrap()
+        );
+
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        assert!(prepared.complete, "{:#?}", prepared.diagnostics);
+        assert_eq!(prepared.packs.len(), 1);
+        assert_eq!(
+            prepared.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+        assert!(prepared.packs[0].evidence.artifact_sha256.is_some());
+    }
+
+    #[test]
+    fn java_home_without_sources_produces_exact_evidence_for_prebuilt_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("portable-jdk-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("release"), "JAVA_VERSION=\"21.0.8\"\n").unwrap();
+        let config = JvmAnalyzerConfig::default();
+
+        let discovered = discover_jdk_semantic_pack_dependencies(
+            &config,
+            root.path(),
+            Some(home.as_os_str().to_owned()),
+        );
+
+        assert!(discovered.diagnostics.is_empty());
+        assert_eq!(discovered.dependencies.len(), 1);
+        assert!(discovered.dependencies[0].artifacts.is_empty());
+        assert_eq!(
+            discovered.dependencies[0]
+                .evidence
+                .toolchain
+                .as_ref()
+                .and_then(|coordinate| coordinate.version.as_ref()),
+            Some(&Version::parse("21.0.8").unwrap())
+        );
+    }
+
+    #[test]
+    fn invalid_environment_jdk_home_is_a_warning_without_guessed_version() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("not-a-jdk");
+
+        let discovered = discover_jdk_semantic_pack_dependencies(
+            &JvmAnalyzerConfig::default(),
+            root.path(),
+            Some(missing.as_os_str().to_owned()),
+        );
+
+        assert!(discovered.dependencies.is_empty());
+        assert_eq!(discovered.diagnostics.len(), 1);
+        assert_eq!(
+            discovered.diagnostics[0].severity,
+            DependencyPackDiagnosticSeverity::Warning
+        );
+        assert_eq!(discovered.diagnostics[0].code, "jdk.home.invalid");
+    }
+
+    #[test]
     fn java_external_declaration_indexes_coordinate_and_prefers_source_jar() {
         let Some(fixture) = ExternalJarFixture::new(true) else {
             return;
@@ -1907,6 +2317,10 @@ mod tests {
                 mode: JvmDependencyDiscoveryMode::Disabled,
                 ..crate::analyzer::JvmDependencyDiscoveryConfig::default()
             },
+            standard_library_discovery: crate::analyzer::JvmStandardLibraryDiscoveryConfig {
+                discover_java_home: false,
+                ..Default::default()
+            },
         };
         let dependencies = resolve_jvm_semantic_pack_dependencies(
             &config,
@@ -1973,6 +2387,98 @@ mod tests {
     }
 
     #[test]
+    fn scala_library_dependency_uses_source_pack_and_exact_toolchain_evidence() {
+        use crate::analyzer::semantic_model::{
+            CatalogOptions, DependencyPackLimits, DependencyPackPreparationStatus,
+            SemanticPackCatalog, prepare_dependency_semantic_packs,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let source_jar = temp.path().join("scala-library-2.13.16-sources.jar");
+        write_zip_entry(
+            &source_jar,
+            "scala/example/LibraryApi.scala",
+            b"package scala.example\ntrait LibraryApi { def value: String }\n",
+        );
+        let dependency = resolved_semantic_pack_dependency(ResolvedJvmArtifact {
+            artifact_path: temp.path().join("scala-library-2.13.16.jar"),
+            source_artifact_path: Some(source_jar),
+            coordinate: Some(JvmMavenCoordinate::new(
+                "org.scala-lang",
+                "scala-library",
+                "2.13.16",
+            )),
+            origin: JvmDependencyOrigin::MavenRepository,
+        });
+
+        assert_eq!(dependency.evidence.language, "scala");
+        assert_eq!(
+            dependency.evidence.toolchain,
+            Some(CatalogCoordinate {
+                name: "scala".to_owned(),
+                version: Some(Version::parse("2.13.16").unwrap()),
+            })
+        );
+        assert_eq!(dependency.artifacts.len(), 1);
+        assert_eq!(
+            dependency.artifacts[0].kind,
+            ExternalArtifactKind::ScalaSourceJar
+        );
+
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &[dependency],
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert!(prepared.complete, "{:#?}", prepared.diagnostics);
+        assert_eq!(prepared.profile.artifacts_read, 1);
+        assert_eq!(prepared.packs.len(), 1);
+        assert_eq!(
+            prepared.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+        assert_eq!(prepared.packs[0].evidence.language, "scala");
+    }
+
+    #[test]
+    fn scala_library_without_sources_waits_for_compatible_prebuilt_pack() {
+        use crate::analyzer::semantic_model::{
+            CatalogOptions, SemanticPackCatalog, prepare_dependency_semantic_packs,
+        };
+
+        let dependency = resolved_semantic_pack_dependency(ResolvedJvmArtifact {
+            artifact_path: PathBuf::from("scala-library-2.13.16.jar"),
+            source_artifact_path: None,
+            coordinate: Some(JvmMavenCoordinate::new(
+                "org.scala-lang",
+                "scala-library",
+                "2.13.16",
+            )),
+            origin: JvmDependencyOrigin::GradleCache,
+        });
+        assert_eq!(dependency.evidence.ecosystem, "maven");
+        assert!(!JvmDependencyPackAdapter.can_produce(&dependency));
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &[dependency],
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert!(!prepared.complete);
+        assert_eq!(prepared.profile.artifacts_read, 0);
+        assert_eq!(prepared.diagnostics.len(), 1);
+        assert_eq!(prepared.diagnostics[0].code, "dependency.pack_unavailable");
+    }
+
+    #[test]
     fn unresolved_jvm_coordinate_is_actionable_incomplete_discovery() {
         use crate::analyzer::semantic_model::{
             DependencyPackLimits, prepare_discovered_dependency_semantic_packs,
@@ -1993,6 +2499,10 @@ mod tests {
             dependency_discovery: crate::analyzer::JvmDependencyDiscoveryConfig {
                 mode: JvmDependencyDiscoveryMode::Disabled,
                 ..crate::analyzer::JvmDependencyDiscoveryConfig::default()
+            },
+            standard_library_discovery: crate::analyzer::JvmStandardLibraryDiscoveryConfig {
+                discover_java_home: false,
+                ..Default::default()
             },
         };
         let limits = DependencyPackLimits::default();
@@ -2054,6 +2564,10 @@ mod tests {
             },
             dependency_discovery: crate::analyzer::JvmDependencyDiscoveryConfig {
                 mode: JvmDependencyDiscoveryMode::Disabled,
+                ..Default::default()
+            },
+            standard_library_discovery: crate::analyzer::JvmStandardLibraryDiscoveryConfig {
+                discover_java_home: false,
                 ..Default::default()
             },
         };
@@ -2279,6 +2793,10 @@ mod tests {
                 dependency_discovery: crate::analyzer::JvmDependencyDiscoveryConfig {
                     mode: crate::analyzer::JvmDependencyDiscoveryMode::Disabled,
                     ..crate::analyzer::JvmDependencyDiscoveryConfig::default()
+                },
+                standard_library_discovery: crate::analyzer::JvmStandardLibraryDiscoveryConfig {
+                    discover_java_home: false,
+                    ..Default::default()
                 },
             },
             ..AnalyzerConfig::default()
@@ -2967,6 +3485,20 @@ mod tests {
         )
         .unwrap();
         zip.write_all(bytes).unwrap();
+        zip.finish().unwrap();
+    }
+
+    fn write_zip_entries(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for (entry_name, bytes) in entries {
+            zip.start_file(
+                *entry_name,
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+            zip.write_all(bytes).unwrap();
+        }
         zip.finish().unwrap();
     }
 }
