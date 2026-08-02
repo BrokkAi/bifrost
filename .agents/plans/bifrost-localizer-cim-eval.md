@@ -364,6 +364,18 @@ The observable outcomes are:
   its provenance check counted all reranks in the trajectory; brokkbench `3b7a7791928` scopes
   the invariant to the unique synthetic start/end interval. Resuming r3 preserved its 16
   already frozen valid results and reran only unfinished cells.
+- [x] (2026-08-02 15:01Z) Inspected the published SuperCoder harness, its released evaluation
+  artifact, the native Rust LLM abstraction, the Go context engine, and brokkbench's existing
+  CIM sandbox/scoring primitives. Confirmed that the headless runner can be adapted directly
+  to streaming Responses without an HTTP translation proxy and that DW10 requires distinct
+  passage/query calls rather than an OpenAI-compatible embedding shim.
+- [ ] Implement SuperCoder's Responses-only benchmark transport, semantic-only context-tool
+  mode, durable trajectory tracing, and native DW10 sidecar embedding client.
+- [ ] Add the isolated brokkbench `sceval` orchestrator, build and validate the immutable
+  runtime, pre-index all 91 task revisions on the A4000, and run the 546-cell ON/OFF grid at
+  concurrency 30.
+- [ ] Score, audit, analyze, report, commit the final repository inventories, and stop all
+  campaign services.
 
 ## Surprises & Discoveries
 
@@ -638,7 +650,42 @@ The observable outcomes are:
   and two later agent-origin reranks. Scoping validation to the interval retains the strict
   synthetic invariant without forbidding normal follow-up use.
 
+- Observation: SuperCoder's current agent loop already calls every conversational model through
+  `LlmProvider::chat_completion`; only the concrete client speaks Chat Completions or Anthropic.
+  Evidence: `crates/agent/src/agent/loop_.rs` depends on the trait, while direct HTTP endpoint and
+  SSE selection are confined to `crates/agent/src/llm/client.rs`.
+
+- Observation: SuperCoder's context engine currently embeds indexed passages and retrieval
+  queries through the same `Embed` method, which is incorrect for DW10's asymmetric training
+  contract.
+  Evidence: the pipeline calls `Embed`, the vector retriever calls `EmbedSingle`, and Bifrost's
+  sidecar protocol explicitly requires `kind=passage` or `kind=query` and applies different
+  prefixes.
+
 ## Decision Log
+
+- Decision: evaluate DW10 through the actual SuperCoder Coding harness with two arms only:
+  no context engine and vector semantic search.
+  Rationale: the prior Anvil runs improved localization but not solving. Holding the harness
+  constant while toggling only SuperCoder's semantic tool tests whether its prompt/tool loop
+  explains the paper's solve-rate improvement. Graph and BM25 are intentionally excluded, so
+  this is a semantic-only causal ablation rather than an exact reproduction of paper SC-ON.
+  Date/Author: 2026-08-02, user and Codex.
+
+- Decision: add a native streaming Responses implementation behind SuperCoder's existing
+  provider trait and use no Chat Completions fallback in the benchmark path.
+  Rationale: GPT-5.6 Luna is served through Responses, and a native implementation preserves
+  streaming, tool calls, usage, and response continuation without introducing a proxy-shaped
+  confound. Existing desktop transports remain untouched because the campaign does not need to
+  remove them.
+  Date/Author: 2026-08-02, user and Codex.
+
+- Decision: pre-index each of the 91 task-head revisions once and share that immutable base
+  index across both later ON seeds.
+  Rationale: identical task revisions produce identical initial retrieval, while rebuilding
+  them per seed would repeat hundreds of A4000 passage-embedding jobs. The report will disclose
+  this resource difference from the paper's internal generation infrastructure.
+  Date/Author: 2026-08-02, Codex.
 
 - Decision: this delivery implements and evaluates Granite R2 only.
   Rationale: Granite is the smaller checkpoint and gives the fastest end-to-end validation of
@@ -1360,6 +1407,71 @@ event per query, stable input-order query sections, no cross-query deduplication
 results and five signatures per result, no source-body/code-fence leakage, no CIM fallback or
 hang, and valid scores for the checkpoint cells or explicit infrastructure failures.
 
+### Milestone 11: reproduce the semantic ablation in the actual SuperCoder harness
+
+Use the checked-out SuperCoder harness at
+`/mnt/optane/bifrost-nlp-resources/SuperCoder` and the released 91-task frame. Add a native
+streaming OpenAI Responses transport behind its existing `LlmProvider` trait. The benchmark
+runner selects this transport explicitly, sends GPT-5.6 Luna `reasoning.effort=max`, continues
+tool turns with `previous_response_id`, and never falls back to Chat Completions. A continuation
+is reusable only when the next normalized history extends the assistant tool-call response that
+created it; history compaction or any other rewrite starts a fresh Responses chain from the full
+current history. Keep the desktop application's existing transports unchanged.
+
+Add a semantic-only context mode to the headless runner. The ON arm exposes
+`codebase_search`, forces vector retrieval, and never exposes `codebase_graph` or lets the model
+choose BM25, graph, hybrid, or multi retrieval. Preserve SuperCoder's current full code excerpts,
+default and maximum `k=20`, two-kibibyte cap per excerpt, and index-first prompt guidance with
+the graph-specific wording removed. The OFF arm receives the same Coding prompt and ordinary
+tools but no context-engine block or tool.
+
+Change the Go context engine's embedding interface to distinguish passage batches from single
+queries. Add a native client for Bifrost's framed TCP sidecar protocol, verify the ready frame
+reports profile `dw10` and dimension 512, and propagate the sidecar's queue and service timings
+to structured logs. SuperCoder's own chunker remains responsible for forming indexed passages;
+the existing Bifrost sidecar applies DW10's passage/query prefixes, tokenizer, truncation,
+pooling, and normalization.
+
+Add a separate `sceval` package in brokkbench rather than adding harness conditionals to
+Anvil-specific `cimeval.cell.CellRunner`. Reuse cimeval's immutable task manifest, worktrees,
+task-head history scrub, official direct-Podman sandboxes, inline scoring, selective pristine
+recovery, load sampling, localization, and leak audit. Store the host context-engine stack and
+all large layers under `/mnt/containers/code_isnt_memory/supercoder-dw10`. Pre-index each of the
+91 task-head worktrees once at A4000 concurrency one using the task `instance_id` as the engine
+identity. All three ON seeds reuse that immutable base index; the agent tool's existing local
+overlay represents edits made during a trajectory.
+
+Write every cell's trace incrementally as JSON Lines so a timeout still leaves useful evidence.
+Record the full logical history, wire input, tool schema, response identifiers, assembled text
+and reasoning, exact function arguments, exact agent-visible tool results, retries, token and
+cache usage, first-token and total latency, compaction/reset events, semantic query and raw
+ranked results, modified files, patch, and termination. Never record credentials or HTTP auth
+headers. Derive the released scorer's `proxy_trace.json` representation from this versioned raw
+trace instead of weakening the detailed trace to fit the published shape.
+
+After unit tests, run one streamed Luna tool-loop/compaction smoke, one tiny real DW10
+index/search smoke, and one matched official-image ON/OFF cell. Then publish readiness records
+for all 91 indexes. Queue seed zero as one interleaved 182-cell list and, once infrastructure and
+trace integrity are sane, queue seeds one and two as one interleaved 364-cell list. Generation
+and inline scoring stay fixed at concurrency 30, use a 30-minute agent timeout, and set the
+runner's iteration ceiling high enough that wall time is the only practical cap. A null or
+negative seed-zero semantic result does not stop later seeds; only an infrastructure or
+integrity failure does.
+
+Report the full intention-to-treat frame and the new run's outcome-blind legitimate paired
+intersection. Include resolve by seed and mean of seed means, per-instance pass@1, paired
+Wilcoxon, localization Views A and B, cost, turns, tokens, wall time, search uptake, query and
+gold-result ranks, and the funnel from gold returned through targeted/read, edited, and solved.
+Audit matched ON-only and OFF-only solves using the detailed traces. Compare with both the
+published CIM semantic delta and the completed Anvil DW10 result, while stating that this
+vector-only arm is not the paper's multi-signal SC-ON. Stop all campaign services after the
+report.
+
+Acceptance requires native streamed Responses with maximum Luna reasoning, exactly one
+semantic-search capability difference between arms, no graph/BM25 retrieval, at most 20 search
+results per call, 91 reusable ready indexes, valid traces and scores for all 546 cells or
+explicit outcome-blind infrastructure exclusions, and zero unmitigated leakage findings.
+
 ## Concrete Steps
 
 Network, Podman, host GPU, and localhost-binding operations must run outside the restricted
@@ -1609,3 +1721,8 @@ Revision note, 2026-08-02: Added the post-campaign compact multi-query milestone
 one independent reranker per query, keeps Bifrost scalar, replaces caller-visible excerpts with
 classifier-selected Bifrost signature locators, caps generated queries at three, and defines a
 34-cell queried-DW10 checkpoint before any broader rerun.
+
+Revision note, 2026-08-02: Added the actual-SuperCoder semantic-only ablation. It uses native
+streaming Responses with maximum-reasoning Luna, SuperCoder's own chunks and full excerpts,
+DW10 passage/query embeddings on the A4000, shared task-head indexes, an isolated brokkbench
+orchestrator, and a 546-cell ON/OFF grid with detailed causal traces.
