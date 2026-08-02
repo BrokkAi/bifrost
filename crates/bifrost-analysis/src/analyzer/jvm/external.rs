@@ -1315,6 +1315,7 @@ fn semantic_type_kind(kind: TypeKind) -> JvmExternalTypeKind {
         TypeKind::Class
         | TypeKind::Delegate
         | TypeKind::Struct
+        | TypeKind::Union
         | TypeKind::Module
         | TypeKind::TypeAlias => JvmExternalTypeKind::Class,
     }

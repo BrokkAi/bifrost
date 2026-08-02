@@ -10,6 +10,7 @@ mod graph_support;
 mod hierarchy;
 mod imports;
 pub(crate) mod lexical_scope;
+mod rustdoc_artifact;
 mod semantic;
 pub(crate) mod structural;
 mod tests;
@@ -47,6 +48,7 @@ pub(crate) use imports::{
     resolve_rust_import_package_scoped, resolve_rust_module_segments_with_crate,
     rust_crate_root_package, rust_focused_use_path,
 };
+pub use rustdoc_artifact::RustdocJsonPackProducer;
 use tests::detect_rust_test_assertion_smells;
 
 use graph_support::RustPackageFileIndex;

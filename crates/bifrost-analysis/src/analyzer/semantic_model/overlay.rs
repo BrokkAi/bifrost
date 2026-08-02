@@ -53,6 +53,7 @@ pub enum SemanticModelSymbolKind {
     Interface,
     Trait,
     Struct,
+    Union,
     Enum,
     Record,
     Module,
@@ -63,6 +64,8 @@ pub enum SemanticModelSymbolKind {
     Field,
     Property,
     Constant,
+    Static,
+    Macro,
     Event,
 }
 
@@ -1609,6 +1612,7 @@ fn type_kind(kind: TypeKind) -> SemanticModelSymbolKind {
         TypeKind::Interface => SemanticModelSymbolKind::Interface,
         TypeKind::Trait => SemanticModelSymbolKind::Trait,
         TypeKind::Struct => SemanticModelSymbolKind::Struct,
+        TypeKind::Union => SemanticModelSymbolKind::Union,
         TypeKind::Enum => SemanticModelSymbolKind::Enum,
         TypeKind::Record => SemanticModelSymbolKind::Record,
         TypeKind::Module => SemanticModelSymbolKind::Module,
@@ -1624,6 +1628,8 @@ fn member_kind(kind: MemberKind) -> SemanticModelSymbolKind {
         MemberKind::Field => SemanticModelSymbolKind::Field,
         MemberKind::Property => SemanticModelSymbolKind::Property,
         MemberKind::Constant => SemanticModelSymbolKind::Constant,
+        MemberKind::Static => SemanticModelSymbolKind::Static,
+        MemberKind::Macro => SemanticModelSymbolKind::Macro,
         MemberKind::Event => SemanticModelSymbolKind::Event,
     }
 }

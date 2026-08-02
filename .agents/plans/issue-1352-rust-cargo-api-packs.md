@@ -17,7 +17,7 @@ The behavior is observable through offline integration fixtures. One fixture sup
 - [x] (2026-08-02 09:31Z) Received approval for the implementation design and recorded this self-contained ExecPlan.
 - [x] (2026-08-02 09:43Z) Milestone 1: pinned `rustdoc-types` format 60, added the passive configuration records and bounded typed Cargo metadata, lockfile, and rustdoc readers, and passed four offline boundary tests.
 - [x] (2026-08-02 09:50Z) Milestone 2: validated selected Cargo targets, walked the resolved graph iteratively, matched exact lockfile records, emitted `RustdocJson` dependencies, and passed eight focused discovery/provenance tests.
-- [ ] Milestone 3: produce deterministic Rust declaration packs, adding only the shared semantic IR required to describe Rust APIs honestly.
+- [x] (2026-08-02 10:18Z) Milestone 3: added the pinned rustdoc producer, neutral union/static/macro kinds, deterministic public API projection, explicit blanket-implementation diagnostics, and five focused producer tests.
 - [ ] Milestone 4: connect exact-byte reuse, activation, overlay navigation, and invalidation.
 - [ ] Milestone 5: add end-to-end edge-case coverage, latency/memory measurements, user-facing documentation, and final validation.
 - [ ] Milestone 6: complete the five-specialist review, triage findings, rerun validation, and prepare delivery.
@@ -36,6 +36,8 @@ The behavior is observable through offline integration fixtures. One fixture sup
   Evidence: current-tip `BIFROST_MCP_RMCP=on` calls returned `-32603`; the warm-call evidence was added to open issue #1448. Narrow retries and local reads remained usable.
 - Observation: exact target validation requires the Cargo metadata package target list, while exact dependency reachability requires named `resolve.nodes[].deps[]` edges rather than the older flat dependency ID list.
   Evidence: the Milestone 2 fixture now rejects a selected name/kind absent from its package and rejects an explicitly bound rustdoc artifact that is not reachable from any selected root target.
+- Observation: `cargo clippy` initially mixed the rustup Cargo/Rustc with Homebrew's same-version but metadata-incompatible `clippy-driver`.
+  Evidence: both the shared target and a first isolated target failed with E0514 for `cc`; putting `/Users/dave/.cargo/bin` first in PATH made the repository's isolated-target clippy gate pass and clean up its target.
 
 ## Decision Log
 
@@ -51,8 +53,8 @@ The behavior is observable through offline integration fixtures. One fixture sup
 - Decision: Reuse `DependencyPackAdapter`, `prepare_discovered_dependency_semantic_packs`, the generated-production catalog, activation runtime, and overlay rather than create a Rust-specific cache or index.
   Rationale: issues #1149, #1150, and #1148 established these neutral contracts specifically so ecosystem adapters do not duplicate lifecycle, integrity, and overlay logic.
   Date/Author: 2026-08-02 / Codex
-- Decision: Extend the shared declaration IR only where Rust requires an honest language-neutral concept.
-  Rationale: unions, static members, macro declarations, generic constraints, and implementations occur outside Rust too. Encoding them as fake classes, methods, or source strings would corrupt navigation and future consumers.
+- Decision: Extend the shared declaration IR only with union types plus static and macro members; project typed where-clause references through existing relations and concrete implementations through existing hierarchy/member ownership.
+  Rationale: those three missing kinds cannot be represented honestly. The existing typed references, `References` relations, hierarchy facts, and member owners already preserve generic constraints and concrete impl behavior without a parallel implementation record. Blanket or non-concrete impls have no honest owner in the current overlay and therefore produce explicit partial diagnostics instead of invented facts.
   Date/Author: 2026-08-02 / Codex
 - Decision: Use stable artifact locators derived from package and rustdoc item identity, never local registry, git-checkout, or target paths.
   Rationale: local paths differ across workspaces and must not defeat cache reuse or appear as authored `ProjectFile` ranges. The overlay already maps artifact-only declarations to stable model URIs.
@@ -63,6 +65,8 @@ The behavior is observable through offline integration fixtures. One fixture sup
 Milestone 1 is complete. `AnalyzerConfig` now has a default-empty Rust dependency API evidence surface, and the analysis crate pins `rustdoc-types 0.60.0` with default features disabled. The prototype reads Cargo metadata, `Cargo.lock`, and rustdoc JSON only through the existing cancellable bounded exact-artifact reader, rejects unsupported Cargo metadata, lockfile, configured rustdoc, and observed rustdoc versions, checks the rustdoc target against the explicit selection, and normalizes feature ordering before later identity work. Four focused tests passed; they construct all files in temporary directories and execute no child process.
 
 Milestone 2 is complete. Public discovery resolves configuration-relative evidence paths, validates selected package/name/kind targets, computes graph reachability with an iterative queue, requires one exact name/version/source lockfile record for every bound artifact, and checks rustdoc crate version against Cargo package version. It emits package/module/toolchain/target/configuration activation evidence plus sorted source kind, exact source, checksum, stable selected-target label, explicit and metadata feature, dependency rename, rustdoc toolchain, and format provenance. Local package paths and metadata package IDs are excluded from production provenance. Eight focused tests pass, including complete public discovery, unreachable-package and missing-lockfile failures, rename/checksum/feature retention, target mismatch, version mismatch boundary, and cancellation.
+
+Milestone 3 is complete. `RustdocJsonPackProducer` validates artifact kind, format 60, crate version, activation target, cancellation, byte/record/signature/diagnostic budgets, and root shape before iteratively deriving public reachability and stable paths. It emits crate/module/type declarations, unions, traits and aliases, fields, variants, functions, methods, constants, statics, public declarative/procedural macros, signatures, generic and where-clause references, concrete trait hierarchy, associated items, and renamed re-export aliases. Local artifact paths never enter locators, external-crate records are not copied into the package pack, and blanket/non-concrete implementations remain explicit partial outcomes. Five focused producer tests and sixteen semantic-model artifact tests pass; the focused test also compiles the authored pack. The rustup-matched isolated clippy gate passes with warnings denied.
 
 ## Context and Orientation
 
@@ -208,3 +212,5 @@ Plan revision note, 2026-08-02 09:31Z: Created the initial decision-complete Exe
 Plan revision note, 2026-08-02 09:43Z: Recorded Milestone 1 completion after the pinned decoder compiled and four focused passive-ingestion tests passed. The implemented boundary checks the observed rustdoc version before full decode, uses existing bounded exact-artifact reads for all three inputs, and retains typed decoded records for exact package resolution in Milestone 2.
 
 Plan revision note, 2026-08-02 09:50Z: Recorded Milestone 2 completion after eight exact discovery tests passed. The resolver now validates selected targets and graph reachability, binds one exact lockfile entry, retains normalized activation and production provenance, and exposes a public passive discovery API without adding cache walking or a process runner.
+
+Plan revision note, 2026-08-02 10:18Z: Recorded Milestone 3 completion after five producer tests, semantic-model regression tests, formatting, and a warning-denied isolated clippy gate passed. The shared IR grew only union/static/macro kinds; typed relations and hierarchy/member ownership cover where clauses and concrete implementations, while blanket implementations remain explicit partial coverage.

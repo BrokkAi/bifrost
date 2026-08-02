@@ -1,0 +1,1878 @@
+use std::collections::VecDeque;
+
+use rustdoc_types::{
+    Crate as RustdocCrate, GenericArg, GenericArgs, GenericBound, Generics, Id, Item, ItemEnum,
+    Path as RustdocPath, StructKind, Term, Type, VariantKind, Visibility as RustVisibility,
+    WherePredicate,
+};
+use serde::Deserialize;
+
+use crate::CancellationToken;
+use crate::analyzer::canonical_hash::{lower_hex_string, sha256_bytes};
+use crate::analyzer::semantic_model::{
+    ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest, AuthoredPayload,
+    AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics, Completeness,
+    ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact, HierarchyKind, Locator,
+    MemberFact, MemberIdentity, MemberKind, Parameter, Producer, ProducerDiagnostic,
+    ProducerDiagnosticSeverity, RelationFact, RelationKind, Signature, TypeFact, TypeIdentity,
+    TypeKind, TypeRef, Visibility, member_declaration_id, read_exact_artifact_while,
+    type_declaration_id,
+};
+use crate::hash::{HashMap, HashSet};
+
+const ARTIFACT_LOCATOR_PATH: &str = "rustdoc/api.json";
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RustdocJsonPackProducer;
+
+#[derive(Debug, Deserialize)]
+struct RustdocVersionEnvelope {
+    format_version: u32,
+}
+
+impl ExternalArtifactPackProducer for RustdocJsonPackProducer {
+    fn produce_exact_artifact(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+    ) -> ArtifactProduction {
+        produce(request, limits, None)
+    }
+
+    fn produce_exact_artifact_with_cancellation(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> ArtifactProduction {
+        produce(request, limits, cancellation)
+    }
+}
+
+fn produce(
+    request: &ArtifactProductionRequest,
+    limits: &ArtifactProducerLimits,
+    cancellation: Option<&CancellationToken>,
+) -> ArtifactProduction {
+    if request.artifact_kind != ExternalArtifactKind::RustdocJson {
+        return failed(
+            limits,
+            "rust.rustdoc.wrong_artifact_kind",
+            "Rust rustdoc producer requires a rustdoc_json artifact",
+        );
+    }
+    let artifact = match read_exact_artifact_while(&request.path, limits, || {
+        cancellation.is_some_and(CancellationToken::is_cancelled)
+    }) {
+        Ok(artifact) => artifact,
+        Err(diagnostic) => return ArtifactProduction::failed(diagnostic, limits),
+    };
+    let envelope: RustdocVersionEnvelope = match serde_json::from_slice(artifact.bytes()) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            return failed(
+                limits,
+                "rust.rustdoc.invalid_json",
+                format!("could not decode rustdoc JSON version: {error}"),
+            );
+        }
+    };
+    if envelope.format_version != rustdoc_types::FORMAT_VERSION {
+        return failed(
+            limits,
+            "rust.rustdoc.unsupported_version",
+            format!(
+                "rustdoc JSON format {} is unsupported; this producer accepts {}",
+                envelope.format_version,
+                rustdoc_types::FORMAT_VERSION
+            ),
+        );
+    }
+    let document: RustdocCrate = match serde_json::from_slice(artifact.bytes()) {
+        Ok(document) => document,
+        Err(error) => {
+            return failed(
+                limits,
+                "rust.rustdoc.invalid_json",
+                format!(
+                    "could not decode rustdoc JSON format {}: {error}",
+                    rustdoc_types::FORMAT_VERSION
+                ),
+            );
+        }
+    };
+    if document.crate_version.as_deref() != Some(request.pack_version.as_str()) {
+        return failed(
+            limits,
+            "rust.rustdoc.crate_version_mismatch",
+            format!(
+                "rustdoc crate version {:?} does not match requested package version {}",
+                document.crate_version, request.pack_version
+            ),
+        );
+    }
+    if request.activation.iter().any(|selector| {
+        !selector.targets.is_empty() && !selector.targets.contains(&document.target.triple)
+    }) {
+        return failed(
+            limits,
+            "rust.rustdoc.target_mismatch",
+            format!(
+                "rustdoc target {} does not match requested activation targets",
+                document.target.triple
+            ),
+        );
+    }
+    produce_document(request, limits, artifact.sha256(), &document, cancellation)
+}
+
+fn produce_document(
+    request: &ArtifactProductionRequest,
+    limits: &ArtifactProducerLimits,
+    artifact_sha256: &str,
+    document: &RustdocCrate,
+    cancellation: Option<&CancellationToken>,
+) -> ArtifactProduction {
+    let mut diagnostics = BoundedProducerDiagnostics::new(limits);
+    let Some(root) = document.index.get(&document.root) else {
+        diagnostics.error(
+            "rust.rustdoc.missing_root",
+            None,
+            "rustdoc JSON root item is absent from the item index",
+        );
+        return finish(
+            request,
+            artifact_sha256,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            diagnostics,
+        );
+    };
+    if !matches!(root.inner, ItemEnum::Module(_)) {
+        diagnostics.error(
+            "rust.rustdoc.invalid_root",
+            None,
+            "rustdoc JSON root item is not a module",
+        );
+        return finish(
+            request,
+            artifact_sha256,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            diagnostics,
+        );
+    }
+
+    let mut ordered_items = document.index.values().collect::<Vec<_>>();
+    ordered_items.sort_by_key(|item| item.id);
+    let parents = parent_index(&ordered_items);
+    let names = item_names(document, root, &ordered_items, &parents);
+    let visible = visible_items(document, &ordered_items, &parents);
+
+    let mut type_ids = HashMap::default();
+    for item in &ordered_items {
+        if item.crate_id == root.crate_id && visible.contains(&item.id) && is_type_item(&item.inner)
+        {
+            let Some(name) = names.get(&item.id) else {
+                diagnostics.warning(
+                    "rust.rustdoc.missing_item_path",
+                    Some(format!("item.{}", item.id.0)),
+                    "externally visible type has no stable rustdoc path",
+                );
+                continue;
+            };
+            type_ids.insert(
+                item.id,
+                type_declaration_id(TypeIdentity {
+                    ecosystem: "cargo",
+                    name,
+                }),
+            );
+        }
+    }
+
+    let mut types = Vec::new();
+    let mut members = Vec::new();
+    let mut relations = Vec::new();
+    let mut type_position = HashMap::default();
+
+    for item in &ordered_items {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            diagnostics.error(
+                "artifact.cancelled",
+                None,
+                "rustdoc artifact production was cancelled",
+            );
+            break;
+        }
+        if item.crate_id != root.crate_id
+            || !visible.contains(&item.id)
+            || !is_type_item(&item.inner)
+        {
+            continue;
+        }
+        if types.len().saturating_add(members.len()) >= limits.max_records {
+            diagnostics.warning(
+                "limit.records",
+                None,
+                format!(
+                    "producer stopped after {} declaration records",
+                    limits.max_records
+                ),
+            );
+            break;
+        }
+        let (Some(name), Some(id)) = (names.get(&item.id), type_ids.get(&item.id)) else {
+            continue;
+        };
+        let (type_kind, generics, hierarchy) =
+            type_shape(item, document, &type_ids, limits, &mut diagnostics);
+        type_position.insert(item.id, types.len());
+        types.push(TypeFact {
+            id: id.clone(),
+            name: name.clone(),
+            type_kind,
+            visibility: semantic_visibility(&item.visibility),
+            is_abstract: matches!(item.inner, ItemEnum::Trait(_)),
+            is_sealed: false,
+            type_parameters: generic_names(generics),
+            hierarchy,
+            aliases: Vec::new(),
+            extension_surfaces: Vec::new(),
+            locator: locator(name, item),
+        });
+        push_generic_relations(id, generics, document, &type_ids, &mut relations);
+        if let ItemEnum::TypeAlias(alias) = &item.inner {
+            push_type_relations(id, &alias.type_, document, &type_ids, &mut relations);
+        }
+        if let ItemEnum::AssocType {
+            type_: Some(default),
+            ..
+        } = &item.inner
+        {
+            push_type_relations(id, default, document, &type_ids, &mut relations);
+        }
+    }
+
+    let projection = RustdocProjectionIndex {
+        document,
+        visible: &visible,
+        parents: &parents,
+        names: &names,
+        type_ids: &type_ids,
+        type_position: &type_position,
+    };
+    apply_impl_hierarchy(
+        &ordered_items,
+        &projection,
+        &mut types,
+        limits,
+        &mut diagnostics,
+    );
+
+    for item in &ordered_items {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            break;
+        }
+        if item.crate_id != root.crate_id
+            || !visible.contains(&item.id)
+            || is_type_item(&item.inner)
+        {
+            continue;
+        }
+        let Some(mut member_kind) = member_kind(&item.inner) else {
+            continue;
+        };
+        if types.len().saturating_add(members.len()) >= limits.max_records {
+            diagnostics.warning(
+                "limit.records",
+                None,
+                format!(
+                    "producer stopped after {} declaration records",
+                    limits.max_records
+                ),
+            );
+            break;
+        }
+        let Some(owner_name) = owner_name(item.id, &parents, document, &names) else {
+            diagnostics.warning(
+                "rust.rustdoc.missing_member_owner",
+                Some(format!("item.{}", item.id.0)),
+                "externally visible member has no representable declaration owner",
+            );
+            continue;
+        };
+        if member_kind == MemberKind::Function
+            && parents
+                .get(&item.id)
+                .and_then(|parent| document.index.get(parent))
+                .is_some_and(|parent| !matches!(parent.inner, ItemEnum::Module(_)))
+        {
+            member_kind = MemberKind::Method;
+        }
+        let Some(owner_item_id) = type_id_for_name(&owner_name, &names, &type_ids) else {
+            diagnostics.warning(
+                "rust.rustdoc.missing_member_owner",
+                Some(format!("item.{}", item.id.0)),
+                format!("member owner {owner_name} is not an emitted declaration"),
+            );
+            continue;
+        };
+        let Some(name) = item.name.as_deref() else {
+            continue;
+        };
+        let mut signature = member_signature(item, document, &type_ids, limits, &mut diagnostics);
+        if member_kind == MemberKind::Method
+            && let Some(signature) = signature.as_mut()
+        {
+            for parameter in &mut signature.parameters {
+                replace_self_type(
+                    &mut parameter.r#type,
+                    &owner_item_id,
+                    0,
+                    limits.max_signature_depth,
+                );
+            }
+            if let Some(returns) = &mut signature.returns {
+                replace_self_type(returns, &owner_item_id, 0, limits.max_signature_depth);
+            }
+        }
+        let is_static = match &item.inner {
+            ItemEnum::Function(function) => !function
+                .sig
+                .inputs
+                .iter()
+                .any(|(name, _)| name == "self" || name.ends_with(" self")),
+            _ => true,
+        };
+        let parameter_types = signature
+            .as_ref()
+            .map(|signature| {
+                signature
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.r#type.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let member_id = member_declaration_id(MemberIdentity {
+            owner_id: &owner_item_id,
+            kind: member_kind,
+            is_static,
+            parameter_arity: parameter_types.len(),
+            name,
+            generic_arity: signature
+                .as_ref()
+                .map_or(0, |signature| signature.type_parameters.len()),
+            parameter_types: &parameter_types,
+            return_type: signature
+                .as_ref()
+                .and_then(|signature| signature.returns.as_ref()),
+        });
+        let path = names
+            .get(&item.id)
+            .cloned()
+            .unwrap_or_else(|| format!("{owner_name}.{name}"));
+        if let Some(signature) = signature.as_ref() {
+            for parameter in &signature.parameters {
+                push_type_ref_relations(&member_id, &parameter.r#type, &mut relations);
+            }
+            if let Some(returns) = &signature.returns {
+                push_type_ref_relations(&member_id, returns, &mut relations);
+            }
+        }
+        if let ItemEnum::Function(function) = &item.inner {
+            push_generic_relations(
+                &member_id,
+                &function.generics,
+                document,
+                &type_ids,
+                &mut relations,
+            );
+        }
+        members.push(MemberFact {
+            id: member_id,
+            owner: owner_item_id,
+            name: name.to_owned(),
+            member_kind,
+            visibility: semantic_visibility(&item.visibility),
+            is_static,
+            is_abstract: matches!(&item.inner, ItemEnum::Function(function) if !function.has_body),
+            is_virtual: false,
+            signature,
+            aliases: Vec::new(),
+            locator: locator(&path, item),
+        });
+    }
+
+    apply_reexports(
+        &ordered_items,
+        &projection,
+        &mut types,
+        &mut members,
+        &mut diagnostics,
+    );
+    types.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+    members.sort_by(|left, right| {
+        left.owner
+            .cmp(&right.owner)
+            .then(left.name.cmp(&right.name))
+            .then(left.id.cmp(&right.id))
+    });
+    relations.sort_by(|left, right| left.id.cmp(&right.id));
+    relations.dedup_by(|left, right| left.id == right.id);
+    finish(
+        request,
+        artifact_sha256,
+        types,
+        members,
+        relations,
+        diagnostics,
+    )
+}
+
+fn parent_index(items: &[&Item]) -> HashMap<Id, Id> {
+    let mut parents = HashMap::default();
+    for item in items {
+        let mut children = child_ids(&item.inner);
+        children.sort();
+        for child in children {
+            parents.entry(child).or_insert(item.id);
+        }
+    }
+    parents
+}
+
+fn item_names(
+    document: &RustdocCrate,
+    root: &Item,
+    items: &[&Item],
+    parents: &HashMap<Id, Id>,
+) -> HashMap<Id, String> {
+    let mut names = document
+        .paths
+        .iter()
+        .map(|(id, summary)| (*id, summary.path.join(".")))
+        .collect::<HashMap<_, _>>();
+    names.entry(root.id).or_insert_with(|| {
+        root.name
+            .clone()
+            .unwrap_or_else(|| "crate".to_owned())
+            .replace('-', "_")
+    });
+    let mut unresolved = items.iter().map(|item| item.id).collect::<VecDeque<_>>();
+    let mut stalled = 0_usize;
+    while let Some(id) = unresolved.pop_front() {
+        if names.contains_key(&id) {
+            stalled = 0;
+            continue;
+        }
+        let Some(item) = document.index.get(&id) else {
+            continue;
+        };
+        let derived = match &item.inner {
+            ItemEnum::Impl(implementation) => resolved_type_name(&implementation.for_, document),
+            _ => parents
+                .get(&id)
+                .and_then(|parent| names.get(parent))
+                .zip(item.name.as_ref())
+                .map(|(parent, name)| format!("{parent}.{name}")),
+        };
+        if let Some(name) = derived {
+            names.insert(id, name);
+            stalled = 0;
+        } else {
+            unresolved.push_back(id);
+            stalled += 1;
+            if stalled >= unresolved.len().saturating_add(1) {
+                break;
+            }
+        }
+    }
+    names
+}
+
+fn visible_items(
+    document: &RustdocCrate,
+    items: &[&Item],
+    parents: &HashMap<Id, Id>,
+) -> HashSet<Id> {
+    let mut visible = HashSet::default();
+    let mut queue = VecDeque::from([document.root]);
+    while let Some(id) = queue.pop_front() {
+        if !visible.insert(id) {
+            continue;
+        }
+        let Some(item) = document.index.get(&id) else {
+            continue;
+        };
+        let mut children = child_ids(&item.inner);
+        children.sort();
+        for child in children {
+            let Some(child_item) = document.index.get(&child) else {
+                continue;
+            };
+            let inherited = matches!(item.inner, ItemEnum::Trait(_) | ItemEnum::Enum(_))
+                || matches!(&item.inner, ItemEnum::Impl(implementation) if implementation.trait_.is_some());
+            let structural = matches!(child_item.inner, ItemEnum::Impl(_));
+            if matches!(child_item.visibility, RustVisibility::Public) || inherited || structural {
+                queue.push_back(child);
+            }
+            if let ItemEnum::Use(import) = &child_item.inner
+                && matches!(child_item.visibility, RustVisibility::Public)
+                && let Some(target) = import.id
+            {
+                queue.push_back(target);
+            }
+        }
+    }
+    for item in items {
+        if item.crate_id == document.index[&document.root].crate_id
+            && matches!(item.visibility, RustVisibility::Public)
+            && parents.get(&item.id).is_none()
+            && document.paths.contains_key(&item.id)
+        {
+            visible.insert(item.id);
+        }
+    }
+    visible
+}
+
+fn child_ids(inner: &ItemEnum) -> Vec<Id> {
+    match inner {
+        ItemEnum::Module(module) => module.items.clone(),
+        ItemEnum::Struct(structure) => {
+            let mut ids = match &structure.kind {
+                StructKind::Unit => Vec::new(),
+                StructKind::Tuple(fields) => fields.iter().flatten().copied().collect(),
+                StructKind::Plain { fields, .. } => fields.clone(),
+            };
+            ids.extend(structure.impls.iter().copied());
+            ids
+        }
+        ItemEnum::Union(union) => union.fields.iter().chain(&union.impls).copied().collect(),
+        ItemEnum::Enum(enumeration) => enumeration
+            .variants
+            .iter()
+            .chain(&enumeration.impls)
+            .copied()
+            .collect(),
+        ItemEnum::Trait(trait_) => trait_
+            .items
+            .iter()
+            .chain(&trait_.implementations)
+            .copied()
+            .collect(),
+        ItemEnum::Impl(implementation) => implementation.items.clone(),
+        _ => Vec::new(),
+    }
+}
+
+fn is_type_item(inner: &ItemEnum) -> bool {
+    matches!(
+        inner,
+        ItemEnum::Module(_)
+            | ItemEnum::Struct(_)
+            | ItemEnum::Union(_)
+            | ItemEnum::Enum(_)
+            | ItemEnum::Trait(_)
+            | ItemEnum::TraitAlias(_)
+            | ItemEnum::TypeAlias(_)
+            | ItemEnum::AssocType { .. }
+    )
+}
+
+fn type_shape<'a>(
+    item: &'a Item,
+    document: &RustdocCrate,
+    type_ids: &HashMap<Id, String>,
+    limits: &ArtifactProducerLimits,
+    diagnostics: &mut BoundedProducerDiagnostics,
+) -> (TypeKind, &'a Generics, Vec<HierarchyFact>) {
+    let (kind, generics, bounds) = match &item.inner {
+        ItemEnum::Module(_) => (TypeKind::Module, empty_generics(), &[][..]),
+        ItemEnum::Struct(structure) => (TypeKind::Struct, &structure.generics, &[][..]),
+        ItemEnum::Union(union) => (TypeKind::Union, &union.generics, &[][..]),
+        ItemEnum::Enum(enumeration) => (TypeKind::Enum, &enumeration.generics, &[][..]),
+        ItemEnum::Trait(trait_) => (TypeKind::Trait, &trait_.generics, trait_.bounds.as_slice()),
+        ItemEnum::TraitAlias(alias) => (
+            TypeKind::TypeAlias,
+            &alias.generics,
+            alias.params.as_slice(),
+        ),
+        ItemEnum::TypeAlias(alias) => (TypeKind::TypeAlias, &alias.generics, &[][..]),
+        ItemEnum::AssocType {
+            generics, bounds, ..
+        } => (TypeKind::TypeAlias, generics, bounds.as_slice()),
+        _ => unreachable!("type_shape is called only for type items"),
+    };
+    let hierarchy = bounds
+        .iter()
+        .filter_map(|bound| match bound {
+            GenericBound::TraitBound { trait_, .. } => Some(HierarchyFact {
+                hierarchy_kind: HierarchyKind::Extends,
+                target: path_type_ref(trait_, document, type_ids, limits, diagnostics, 0),
+            }),
+            _ => None,
+        })
+        .collect();
+    (kind, generics, hierarchy)
+}
+
+fn empty_generics() -> &'static Generics {
+    static EMPTY: std::sync::OnceLock<Generics> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| Generics {
+        params: Vec::new(),
+        where_predicates: Vec::new(),
+    })
+}
+
+fn generic_names(generics: &Generics) -> Vec<String> {
+    generics
+        .params
+        .iter()
+        .map(|param| param.name.clone())
+        .collect()
+}
+
+fn member_kind(inner: &ItemEnum) -> Option<MemberKind> {
+    match inner {
+        ItemEnum::Function(_) => Some(MemberKind::Function),
+        ItemEnum::StructField(_) => Some(MemberKind::Field),
+        ItemEnum::Variant(_) => Some(MemberKind::Constant),
+        ItemEnum::Constant { .. } | ItemEnum::AssocConst { .. } => Some(MemberKind::Constant),
+        ItemEnum::Static(_) => Some(MemberKind::Static),
+        ItemEnum::Macro(_) | ItemEnum::ProcMacro(_) => Some(MemberKind::Macro),
+        _ => None,
+    }
+}
+
+fn member_signature(
+    item: &Item,
+    document: &RustdocCrate,
+    type_ids: &HashMap<Id, String>,
+    limits: &ArtifactProducerLimits,
+    diagnostics: &mut BoundedProducerDiagnostics,
+) -> Option<Signature> {
+    let (parameters, returns, type_parameters) = match &item.inner {
+        ItemEnum::Function(function) => (
+            function
+                .sig
+                .inputs
+                .iter()
+                .map(|(name, ty)| Parameter {
+                    name: Some(name.clone()),
+                    r#type: rust_type_ref(ty, document, type_ids, limits, diagnostics, 0),
+                    optional: false,
+                    variadic: false,
+                })
+                .collect(),
+            function
+                .sig
+                .output
+                .as_ref()
+                .map(|ty| rust_type_ref(ty, document, type_ids, limits, diagnostics, 0)),
+            generic_names(&function.generics),
+        ),
+        ItemEnum::StructField(ty)
+        | ItemEnum::Constant { type_: ty, .. }
+        | ItemEnum::AssocConst { type_: ty, .. } => (
+            Vec::new(),
+            Some(rust_type_ref(
+                ty,
+                document,
+                type_ids,
+                limits,
+                diagnostics,
+                0,
+            )),
+            Vec::new(),
+        ),
+        ItemEnum::Static(static_) => (
+            Vec::new(),
+            Some(rust_type_ref(
+                &static_.type_,
+                document,
+                type_ids,
+                limits,
+                diagnostics,
+                0,
+            )),
+            Vec::new(),
+        ),
+        ItemEnum::Variant(variant) => {
+            let fields = match &variant.kind {
+                VariantKind::Plain => Vec::new(),
+                VariantKind::Tuple(fields) => fields.iter().flatten().copied().collect(),
+                VariantKind::Struct { fields, .. } => fields.clone(),
+            };
+            let parameters = fields
+                .iter()
+                .enumerate()
+                .filter_map(|(index, id)| document.index.get(id).map(|field| (index, field)))
+                .filter_map(|(index, field)| match &field.inner {
+                    ItemEnum::StructField(ty) => Some(Parameter {
+                        name: field.name.clone().or_else(|| Some(index.to_string())),
+                        r#type: rust_type_ref(ty, document, type_ids, limits, diagnostics, 0),
+                        optional: false,
+                        variadic: false,
+                    }),
+                    _ => None,
+                })
+                .collect();
+            (parameters, None, Vec::new())
+        }
+        ItemEnum::Macro(_) | ItemEnum::ProcMacro(_) => return None,
+        _ => return None,
+    };
+    Some(Signature {
+        type_parameters,
+        parameters,
+        returns,
+    })
+}
+
+fn replace_self_type(ty: &mut TypeRef, owner: &str, depth: usize, max_depth: usize) {
+    if depth >= max_depth {
+        return;
+    }
+    if matches!(ty, TypeRef::TypeParameter { name } if name == "Self") {
+        *ty = TypeRef::Declared {
+            id: owner.to_owned(),
+            arguments: Vec::new(),
+            nullable: false,
+        };
+        return;
+    }
+    let next = depth + 1;
+    match ty {
+        TypeRef::Declared { arguments, .. } | TypeRef::Named { arguments, .. } => {
+            for argument in arguments {
+                replace_self_type(argument, owner, next, max_depth);
+            }
+        }
+        TypeRef::Array { element }
+        | TypeRef::ByRef { element }
+        | TypeRef::Wildcard {
+            bound: Some(element),
+            ..
+        } => replace_self_type(element, owner, next, max_depth),
+        TypeRef::Tuple { elements } => {
+            for element in elements {
+                replace_self_type(element, owner, next, max_depth);
+            }
+        }
+        TypeRef::Function { parameters, result } => {
+            for parameter in parameters {
+                replace_self_type(parameter, owner, next, max_depth);
+            }
+            replace_self_type(result, owner, next, max_depth);
+        }
+        TypeRef::TypeParameter { .. } | TypeRef::Wildcard { bound: None, .. } => {}
+    }
+}
+
+fn rust_type_ref(
+    ty: &Type,
+    document: &RustdocCrate,
+    type_ids: &HashMap<Id, String>,
+    limits: &ArtifactProducerLimits,
+    diagnostics: &mut BoundedProducerDiagnostics,
+    depth: usize,
+) -> TypeRef {
+    if depth >= limits.max_signature_depth {
+        diagnostics.warning(
+            "limit.signature_depth",
+            None,
+            format!(
+                "Rust signature exceeded depth {}",
+                limits.max_signature_depth
+            ),
+        );
+        return named_type("_");
+    }
+    let next = depth + 1;
+    match ty {
+        Type::ResolvedPath(path) => {
+            path_type_ref(path, document, type_ids, limits, diagnostics, next)
+        }
+        Type::Generic(name) => TypeRef::TypeParameter { name: name.clone() },
+        Type::Primitive(name) => named_type(name),
+        Type::Tuple(elements) => TypeRef::Tuple {
+            elements: elements
+                .iter()
+                .map(|element| {
+                    rust_type_ref(element, document, type_ids, limits, diagnostics, next)
+                })
+                .collect(),
+        },
+        Type::Slice(element) | Type::Array { type_: element, .. } => TypeRef::Array {
+            element: Box::new(rust_type_ref(
+                element,
+                document,
+                type_ids,
+                limits,
+                diagnostics,
+                next,
+            )),
+        },
+        Type::RawPointer { type_, .. } | Type::BorrowedRef { type_, .. } => TypeRef::ByRef {
+            element: Box::new(rust_type_ref(
+                type_,
+                document,
+                type_ids,
+                limits,
+                diagnostics,
+                next,
+            )),
+        },
+        Type::FunctionPointer(pointer) => TypeRef::Function {
+            parameters: pointer
+                .sig
+                .inputs
+                .iter()
+                .map(|(_, ty)| rust_type_ref(ty, document, type_ids, limits, diagnostics, next))
+                .collect(),
+            result: Box::new(
+                pointer
+                    .sig
+                    .output
+                    .as_ref()
+                    .map(|ty| rust_type_ref(ty, document, type_ids, limits, diagnostics, next))
+                    .unwrap_or_else(|| named_type("()")),
+            ),
+        },
+        Type::Pat { type_, .. } => {
+            rust_type_ref(type_, document, type_ids, limits, diagnostics, next)
+        }
+        Type::DynTrait(dyn_trait) => named_type(
+            &dyn_trait
+                .traits
+                .iter()
+                .map(|trait_| normalized_path(&trait_.trait_, document))
+                .collect::<Vec<_>>()
+                .join(" + "),
+        ),
+        Type::ImplTrait(bounds) => named_type(
+            &bounds
+                .iter()
+                .filter_map(|bound| match bound {
+                    GenericBound::TraitBound { trait_, .. } => {
+                        Some(normalized_path(trait_, document))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" + "),
+        ),
+        Type::QualifiedPath {
+            name, self_type, ..
+        } => named_type(&format!(
+            "{}.{}",
+            rendered_type_name(self_type, document),
+            name
+        )),
+        Type::Infer => named_type("_"),
+    }
+}
+
+fn path_type_ref(
+    path: &RustdocPath,
+    document: &RustdocCrate,
+    type_ids: &HashMap<Id, String>,
+    limits: &ArtifactProducerLimits,
+    diagnostics: &mut BoundedProducerDiagnostics,
+    depth: usize,
+) -> TypeRef {
+    let arguments = path
+        .args
+        .as_deref()
+        .map(|args| generic_argument_types(args, document, type_ids, limits, diagnostics, depth))
+        .unwrap_or_default();
+    if let Some(id) = type_ids.get(&path.id) {
+        TypeRef::Declared {
+            id: id.clone(),
+            arguments,
+            nullable: false,
+        }
+    } else {
+        TypeRef::Named {
+            name: normalized_path(path, document),
+            arguments,
+            nullable: false,
+        }
+    }
+}
+
+fn generic_argument_types(
+    args: &GenericArgs,
+    document: &RustdocCrate,
+    type_ids: &HashMap<Id, String>,
+    limits: &ArtifactProducerLimits,
+    diagnostics: &mut BoundedProducerDiagnostics,
+    depth: usize,
+) -> Vec<TypeRef> {
+    match args {
+        GenericArgs::AngleBracketed { args, .. } => args
+            .iter()
+            .filter_map(|argument| match argument {
+                GenericArg::Type(ty) => Some(rust_type_ref(
+                    ty,
+                    document,
+                    type_ids,
+                    limits,
+                    diagnostics,
+                    depth,
+                )),
+                _ => None,
+            })
+            .collect(),
+        GenericArgs::Parenthesized { inputs, output } => {
+            let mut types = inputs
+                .iter()
+                .map(|ty| rust_type_ref(ty, document, type_ids, limits, diagnostics, depth))
+                .collect::<Vec<_>>();
+            if let Some(output) = output {
+                types.push(rust_type_ref(
+                    output,
+                    document,
+                    type_ids,
+                    limits,
+                    diagnostics,
+                    depth,
+                ));
+            }
+            types
+        }
+        GenericArgs::ReturnTypeNotation => Vec::new(),
+    }
+}
+
+fn named_type(name: &str) -> TypeRef {
+    TypeRef::Named {
+        name: name.to_owned(),
+        arguments: Vec::new(),
+        nullable: false,
+    }
+}
+
+fn normalized_path(path: &RustdocPath, document: &RustdocCrate) -> String {
+    document
+        .paths
+        .get(&path.id)
+        .map(|summary| summary.path.join("."))
+        .unwrap_or_else(|| path.path.replace("::", "."))
+}
+
+fn rendered_type_name(ty: &Type, document: &RustdocCrate) -> String {
+    match ty {
+        Type::ResolvedPath(path) => normalized_path(path, document),
+        Type::Generic(name) | Type::Primitive(name) => name.clone(),
+        Type::BorrowedRef { type_, .. } | Type::RawPointer { type_, .. } => {
+            rendered_type_name(type_, document)
+        }
+        Type::Slice(type_) | Type::Array { type_, .. } | Type::Pat { type_, .. } => {
+            rendered_type_name(type_, document)
+        }
+        Type::QualifiedPath {
+            name, self_type, ..
+        } => {
+            format!("{}.{}", rendered_type_name(self_type, document), name)
+        }
+        _ => "_".to_owned(),
+    }
+}
+
+fn resolved_type_name(ty: &Type, document: &RustdocCrate) -> Option<String> {
+    match ty {
+        Type::ResolvedPath(path) => Some(normalized_path(path, document)),
+        _ => None,
+    }
+}
+
+fn owner_name(
+    id: Id,
+    parents: &HashMap<Id, Id>,
+    document: &RustdocCrate,
+    names: &HashMap<Id, String>,
+) -> Option<String> {
+    let parent = *parents.get(&id)?;
+    let item = document.index.get(&parent)?;
+    match &item.inner {
+        ItemEnum::Impl(implementation) => resolved_type_name(&implementation.for_, document),
+        _ => names.get(&parent).cloned(),
+    }
+}
+
+fn type_id_for_name(
+    name: &str,
+    names: &HashMap<Id, String>,
+    type_ids: &HashMap<Id, String>,
+) -> Option<String> {
+    names
+        .iter()
+        .find(|(id, candidate)| candidate.as_str() == name && type_ids.contains_key(id))
+        .and_then(|(id, _)| type_ids.get(id))
+        .cloned()
+}
+
+fn semantic_visibility(visibility: &RustVisibility) -> Visibility {
+    match visibility {
+        RustVisibility::Public => Visibility::Public,
+        RustVisibility::Crate => Visibility::Internal,
+        RustVisibility::Restricted { .. } => Visibility::Package,
+        RustVisibility::Default => Visibility::Public,
+    }
+}
+
+fn locator(path: &str, item: &Item) -> Locator {
+    Locator::Artifact {
+        path: ARTIFACT_LOCATOR_PATH.to_owned(),
+        symbol: format!("{path}#{}", item.id.0),
+    }
+}
+
+struct RustdocProjectionIndex<'a> {
+    document: &'a RustdocCrate,
+    visible: &'a HashSet<Id>,
+    parents: &'a HashMap<Id, Id>,
+    names: &'a HashMap<Id, String>,
+    type_ids: &'a HashMap<Id, String>,
+    type_position: &'a HashMap<Id, usize>,
+}
+
+fn apply_impl_hierarchy(
+    items: &[&Item],
+    projection: &RustdocProjectionIndex<'_>,
+    types: &mut [TypeFact],
+    limits: &ArtifactProducerLimits,
+    diagnostics: &mut BoundedProducerDiagnostics,
+) {
+    for item in items {
+        let ItemEnum::Impl(implementation) = &item.inner else {
+            continue;
+        };
+        if !projection.visible.contains(&item.id) || implementation.is_negative {
+            continue;
+        }
+        if implementation.blanket_impl.is_some() {
+            diagnostics.warning(
+                "rust.rustdoc.blanket_impl_unprojected",
+                Some(format!("item.{}", item.id.0)),
+                "blanket implementation has no concrete declaration owner and was not projected",
+            );
+            continue;
+        }
+        let Some(owner_name) = resolved_type_name(&implementation.for_, projection.document) else {
+            diagnostics.warning(
+                "rust.rustdoc.nonconcrete_impl_unprojected",
+                Some(format!("item.{}", item.id.0)),
+                "implementation target has no concrete rustdoc declaration owner",
+            );
+            continue;
+        };
+        let Some(owner_item) = projection
+            .names
+            .iter()
+            .find(|(id, name)| {
+                name.as_str() == owner_name && projection.type_position.contains_key(id)
+            })
+            .map(|(id, _)| *id)
+        else {
+            continue;
+        };
+        let Some(trait_) = &implementation.trait_ else {
+            continue;
+        };
+        let target = path_type_ref(
+            trait_,
+            projection.document,
+            projection.type_ids,
+            limits,
+            diagnostics,
+            0,
+        );
+        let position = projection.type_position[&owner_item];
+        let hierarchy = HierarchyFact {
+            hierarchy_kind: HierarchyKind::Implements,
+            target,
+        };
+        if !types[position].hierarchy.contains(&hierarchy) {
+            types[position].hierarchy.push(hierarchy);
+        }
+    }
+}
+
+fn push_generic_relations(
+    from: &str,
+    generics: &Generics,
+    document: &RustdocCrate,
+    type_ids: &HashMap<Id, String>,
+    relations: &mut Vec<RelationFact>,
+) {
+    for predicate in &generics.where_predicates {
+        match predicate {
+            WherePredicate::BoundPredicate { type_, bounds, .. } => {
+                push_raw_type_relations(from, type_, document, type_ids, relations);
+                for bound in bounds {
+                    push_bound_relations(from, bound, document, type_ids, relations);
+                }
+            }
+            WherePredicate::EqPredicate { lhs, rhs } => {
+                push_raw_type_relations(from, lhs, document, type_ids, relations);
+                if let Term::Type(rhs) = rhs {
+                    push_raw_type_relations(from, rhs, document, type_ids, relations);
+                }
+            }
+            WherePredicate::LifetimePredicate { .. } => {}
+        }
+    }
+    for param in &generics.params {
+        if let rustdoc_types::GenericParamDefKind::Type {
+            bounds, default, ..
+        } = &param.kind
+        {
+            for bound in bounds {
+                push_bound_relations(from, bound, document, type_ids, relations);
+            }
+            if let Some(default) = default {
+                push_raw_type_relations(from, default, document, type_ids, relations);
+            }
+        }
+    }
+}
+
+fn push_bound_relations(
+    from: &str,
+    bound: &GenericBound,
+    document: &RustdocCrate,
+    type_ids: &HashMap<Id, String>,
+    relations: &mut Vec<RelationFact>,
+) {
+    if let GenericBound::TraitBound { trait_, .. } = bound
+        && let Some(to) = type_ids.get(&trait_.id)
+    {
+        push_relation(from, to, relations);
+    }
+    let _ = document;
+}
+
+fn push_type_relations(
+    from: &str,
+    ty: &Type,
+    document: &RustdocCrate,
+    type_ids: &HashMap<Id, String>,
+    relations: &mut Vec<RelationFact>,
+) {
+    push_raw_type_relations(from, ty, document, type_ids, relations);
+}
+
+fn push_raw_type_relations(
+    from: &str,
+    ty: &Type,
+    document: &RustdocCrate,
+    type_ids: &HashMap<Id, String>,
+    relations: &mut Vec<RelationFact>,
+) {
+    let mut stack = vec![ty];
+    while let Some(current) = stack.pop() {
+        match current {
+            Type::ResolvedPath(path) => {
+                if let Some(to) = type_ids.get(&path.id) {
+                    push_relation(from, to, relations);
+                }
+                if let Some(args) = path.args.as_deref() {
+                    push_generic_arg_types(args, &mut stack);
+                }
+            }
+            Type::Tuple(types) => stack.extend(types),
+            Type::Slice(type_)
+            | Type::Array { type_, .. }
+            | Type::Pat { type_, .. }
+            | Type::RawPointer { type_, .. }
+            | Type::BorrowedRef { type_, .. } => stack.push(type_),
+            Type::FunctionPointer(pointer) => {
+                stack.extend(pointer.sig.inputs.iter().map(|(_, ty)| ty));
+                if let Some(output) = &pointer.sig.output {
+                    stack.push(output);
+                }
+            }
+            Type::QualifiedPath {
+                self_type, trait_, ..
+            } => {
+                stack.push(self_type);
+                if let Some(trait_) = trait_
+                    && let Some(to) = type_ids.get(&trait_.id)
+                {
+                    push_relation(from, to, relations);
+                }
+            }
+            Type::DynTrait(dyn_trait) => {
+                for trait_ in &dyn_trait.traits {
+                    if let Some(to) = type_ids.get(&trait_.trait_.id) {
+                        push_relation(from, to, relations);
+                    }
+                }
+            }
+            Type::ImplTrait(bounds) => {
+                for bound in bounds {
+                    push_bound_relations(from, bound, document, type_ids, relations);
+                }
+            }
+            Type::Generic(_) | Type::Primitive(_) | Type::Infer => {}
+        }
+    }
+}
+
+fn push_generic_arg_types<'a>(args: &'a GenericArgs, stack: &mut Vec<&'a Type>) {
+    match args {
+        GenericArgs::AngleBracketed { args, .. } => {
+            stack.extend(args.iter().filter_map(|argument| match argument {
+                GenericArg::Type(ty) => Some(ty),
+                _ => None,
+            }));
+        }
+        GenericArgs::Parenthesized { inputs, output } => {
+            stack.extend(inputs);
+            if let Some(output) = output {
+                stack.push(output);
+            }
+        }
+        GenericArgs::ReturnTypeNotation => {}
+    }
+}
+
+fn push_type_ref_relations(from: &str, ty: &TypeRef, relations: &mut Vec<RelationFact>) {
+    let mut stack = vec![ty];
+    while let Some(current) = stack.pop() {
+        match current {
+            TypeRef::Declared { id, arguments, .. } => {
+                push_relation(from, id, relations);
+                stack.extend(arguments);
+            }
+            TypeRef::Named { arguments, .. } => stack.extend(arguments),
+            TypeRef::Array { element }
+            | TypeRef::ByRef { element }
+            | TypeRef::Wildcard {
+                bound: Some(element),
+                ..
+            } => stack.push(element),
+            TypeRef::Tuple { elements } => stack.extend(elements),
+            TypeRef::Function { parameters, result } => {
+                stack.extend(parameters);
+                stack.push(result);
+            }
+            TypeRef::TypeParameter { .. } | TypeRef::Wildcard { bound: None, .. } => {}
+        }
+    }
+}
+
+fn push_relation(from: &str, to: &str, relations: &mut Vec<RelationFact>) {
+    let mut bytes = Vec::with_capacity(from.len() + to.len() + 1);
+    bytes.extend_from_slice(from.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(to.as_bytes());
+    relations.push(RelationFact {
+        id: format!("relation.{}", lower_hex_string(&sha256_bytes(&bytes))),
+        relation_kind: RelationKind::References,
+        from: from.to_owned(),
+        to: to.to_owned(),
+    });
+}
+
+fn apply_reexports(
+    items: &[&Item],
+    projection: &RustdocProjectionIndex<'_>,
+    types: &mut [TypeFact],
+    members: &mut [MemberFact],
+    diagnostics: &mut BoundedProducerDiagnostics,
+) {
+    for item in items {
+        let ItemEnum::Use(import) = &item.inner else {
+            continue;
+        };
+        if !projection.visible.contains(&item.id) {
+            continue;
+        }
+        if import.is_glob {
+            diagnostics.warning(
+                "rust.rustdoc.glob_reexport_unexpanded",
+                Some(format!("item.{}", item.id.0)),
+                "glob re-export cannot be mapped to exact aliases from this rustdoc record",
+            );
+            continue;
+        }
+        let Some(target) = import.id else {
+            diagnostics.warning(
+                "rust.rustdoc.reexport_target_unavailable",
+                Some(format!("item.{}", item.id.0)),
+                "public re-export target is absent from rustdoc JSON",
+            );
+            continue;
+        };
+        let Some(parent_name) = projection
+            .parents
+            .get(&item.id)
+            .and_then(|parent| projection.names.get(parent))
+        else {
+            continue;
+        };
+        let alias = format!("{parent_name}.{}", import.name);
+        if let Some(position) = projection.type_position.get(&target) {
+            if !types[*position].aliases.contains(&alias) {
+                types[*position].aliases.push(alias);
+            }
+            continue;
+        }
+        let Some(target_name) = projection.names.get(&target) else {
+            diagnostics.warning(
+                "rust.rustdoc.reexport_target_unavailable",
+                Some(format!("item.{}", item.id.0)),
+                "public re-export target has no stable rustdoc path",
+            );
+            continue;
+        };
+        if let Some(member) = members.iter_mut().find(|member| {
+            member.locator
+                == Locator::Artifact {
+                    path: ARTIFACT_LOCATOR_PATH.to_owned(),
+                    symbol: format!("{target_name}#{}", target.0),
+                }
+        }) && !member.aliases.contains(&alias)
+        {
+            member.aliases.push(alias);
+        }
+    }
+}
+
+fn finish(
+    request: &ArtifactProductionRequest,
+    artifact_sha256: &str,
+    types: Vec<TypeFact>,
+    members: Vec<MemberFact>,
+    relations: Vec<RelationFact>,
+    mut diagnostics: BoundedProducerDiagnostics,
+) -> ArtifactProduction {
+    if types.is_empty() {
+        diagnostics.error(
+            "rust.rustdoc.no_external_declarations",
+            None,
+            "rustdoc JSON contains no externally visible Rust declarations",
+        );
+        let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
+        return ArtifactProduction {
+            artifact_sha256: Some(artifact_sha256.to_owned()),
+            pack: None,
+            completeness: Completeness::Partial,
+            diagnostics,
+            suppressed_diagnostics,
+        };
+    }
+    let mut activation = request.activation.clone();
+    for selector in &mut activation {
+        selector.artifact_sha256 = Some(artifact_sha256.to_owned());
+    }
+    let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
+    let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
+        Completeness::Complete
+    } else {
+        Completeness::Partial
+    };
+    ArtifactProduction {
+        artifact_sha256: Some(artifact_sha256.to_owned()),
+        pack: Some(AuthoredSemanticModelPack {
+            schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
+            pack_id: request.pack_id.clone(),
+            version: request.pack_version.clone(),
+            producer: Producer {
+                name: "bifrost-rustdoc-json".to_owned(),
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+            },
+            language: "rust".to_owned(),
+            ecosystem: request.ecosystem.clone(),
+            compatibility: request.compatibility.clone(),
+            provenance: request.provenance.clone(),
+            license: request.license.clone(),
+            completeness,
+            safety: request.safety.clone(),
+            shards: vec![AuthoredShard {
+                id: "declarations.rust.external".to_owned(),
+                activation,
+                payload: AuthoredPayload::DeclarationFacts {
+                    types,
+                    members,
+                    relations,
+                },
+            }],
+        }),
+        completeness,
+        diagnostics,
+        suppressed_diagnostics,
+    }
+}
+
+fn failed(
+    limits: &ArtifactProducerLimits,
+    code: &str,
+    message: impl Into<String>,
+) -> ArtifactProduction {
+    ArtifactProduction::failed(
+        ProducerDiagnostic {
+            severity: ProducerDiagnosticSeverity::Error,
+            code: code.to_owned(),
+            location: None,
+            message: message.into(),
+        },
+        limits,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustdoc_types::{
+        Abi, Function, FunctionHeader, FunctionSignature, GenericParamDef, GenericParamDefKind,
+        Impl, ItemKind, ItemSummary, Module, Struct, Target, Trait, TraitBoundModifier, Use,
+    };
+    use std::fs;
+
+    use crate::analyzer::semantic_model::{
+        ActivationSelector, Compatibility, CompilerOptions, NameSelector, Provenance, Safety,
+        compile_pack,
+    };
+
+    fn item(id: u32, name: Option<&str>, visibility: RustVisibility, inner: ItemEnum) -> Item {
+        Item {
+            id: Id(id),
+            crate_id: 0,
+            name: name.map(str::to_owned),
+            span: None,
+            visibility,
+            docs: None,
+            links: std::collections::HashMap::new(),
+            attrs: Vec::new(),
+            deprecation: None,
+            stability: None,
+            const_stability: None,
+            inner,
+        }
+    }
+
+    fn generics() -> Generics {
+        Generics {
+            params: Vec::new(),
+            where_predicates: Vec::new(),
+        }
+    }
+
+    fn path(id: u32, path: &str) -> RustdocPath {
+        RustdocPath {
+            path: path.to_owned(),
+            id: Id(id),
+            args: None,
+        }
+    }
+
+    fn function(inputs: Vec<(String, Type)>, output: Option<Type>, generics: Generics) -> Function {
+        Function {
+            sig: FunctionSignature {
+                inputs,
+                output,
+                is_c_variadic: false,
+            },
+            generics,
+            header: FunctionHeader {
+                is_const: false,
+                is_unsafe: false,
+                is_async: false,
+                abi: Abi::Rust,
+            },
+            has_body: true,
+            default_unstable: None,
+        }
+    }
+
+    fn document(blanket_impl: bool) -> RustdocCrate {
+        let widget = path(1, "widget::Widget");
+        let display = path(2, "widget::Display");
+        let mut index = std::collections::HashMap::new();
+        index.insert(
+            Id(0),
+            item(
+                0,
+                Some("widget"),
+                RustVisibility::Default,
+                ItemEnum::Module(Module {
+                    is_crate: true,
+                    items: vec![Id(1), Id(2), Id(3), Id(4), Id(5), Id(6)],
+                    is_stripped: false,
+                }),
+            ),
+        );
+        index.insert(
+            Id(1),
+            item(
+                1,
+                Some("Widget"),
+                RustVisibility::Public,
+                ItemEnum::Struct(Struct {
+                    kind: StructKind::Unit,
+                    generics: generics(),
+                    impls: vec![Id(7)],
+                }),
+            ),
+        );
+        index.insert(
+            Id(2),
+            item(
+                2,
+                Some("Display"),
+                RustVisibility::Public,
+                ItemEnum::Trait(Trait {
+                    is_auto: false,
+                    is_unsafe: false,
+                    is_dyn_compatible: true,
+                    items: vec![Id(9)],
+                    generics: generics(),
+                    bounds: Vec::new(),
+                    implementations: vec![Id(7)],
+                }),
+            ),
+        );
+        index.insert(
+            Id(3),
+            item(
+                3,
+                Some("convert"),
+                RustVisibility::Public,
+                ItemEnum::Function(function(
+                    vec![("value".to_owned(), Type::Generic("T".to_owned()))],
+                    Some(Type::ResolvedPath(widget.clone())),
+                    Generics {
+                        params: vec![GenericParamDef {
+                            name: "T".to_owned(),
+                            kind: GenericParamDefKind::Type {
+                                bounds: Vec::new(),
+                                default: None,
+                                is_synthetic: false,
+                            },
+                        }],
+                        where_predicates: vec![WherePredicate::BoundPredicate {
+                            type_: Type::Generic("T".to_owned()),
+                            bounds: vec![GenericBound::TraitBound {
+                                trait_: display.clone(),
+                                generic_params: Vec::new(),
+                                modifier: TraitBoundModifier::None,
+                            }],
+                            generic_params: Vec::new(),
+                        }],
+                    },
+                )),
+            ),
+        );
+        index.insert(
+            Id(4),
+            item(
+                4,
+                Some("Gadget"),
+                RustVisibility::Public,
+                ItemEnum::Use(Use {
+                    source: "widget::Widget".to_owned(),
+                    name: "Gadget".to_owned(),
+                    id: Some(Id(1)),
+                    is_glob: false,
+                }),
+            ),
+        );
+        index.insert(
+            Id(5),
+            item(
+                5,
+                Some("make_widget"),
+                RustVisibility::Public,
+                ItemEnum::Macro("macro_rules! make_widget".to_owned()),
+            ),
+        );
+        index.insert(
+            Id(6),
+            item(
+                6,
+                Some("DEFAULT_WIDGET"),
+                RustVisibility::Public,
+                ItemEnum::Static(rustdoc_types::Static {
+                    type_: Type::ResolvedPath(widget.clone()),
+                    is_mutable: false,
+                    expr: "Widget".to_owned(),
+                    is_unsafe: false,
+                }),
+            ),
+        );
+        index.insert(
+            Id(7),
+            item(
+                7,
+                None,
+                RustVisibility::Default,
+                ItemEnum::Impl(Impl {
+                    is_unsafe: false,
+                    generics: generics(),
+                    provided_trait_methods: Vec::new(),
+                    trait_: Some(display),
+                    for_: if blanket_impl {
+                        Type::Generic("T".to_owned())
+                    } else {
+                        Type::ResolvedPath(widget)
+                    },
+                    items: vec![Id(8)],
+                    is_negative: false,
+                    is_synthetic: false,
+                    blanket_impl: blanket_impl.then(|| Type::Generic("T".to_owned())),
+                }),
+            ),
+        );
+        index.insert(
+            Id(8),
+            item(
+                8,
+                Some("render"),
+                RustVisibility::Default,
+                ItemEnum::Function(function(
+                    vec![(
+                        "&self".to_owned(),
+                        Type::BorrowedRef {
+                            lifetime: None,
+                            is_mutable: false,
+                            type_: Box::new(Type::Generic("Self".to_owned())),
+                        },
+                    )],
+                    Some(Type::Primitive("str".to_owned())),
+                    generics(),
+                )),
+            ),
+        );
+        index.insert(
+            Id(9),
+            item(
+                9,
+                Some("render"),
+                RustVisibility::Default,
+                ItemEnum::Function(function(
+                    vec![("&self".to_owned(), Type::Generic("Self".to_owned()))],
+                    None,
+                    generics(),
+                )),
+            ),
+        );
+
+        let paths = [
+            (0, vec!["widget"], ItemKind::Module),
+            (1, vec!["widget", "Widget"], ItemKind::Struct),
+            (2, vec!["widget", "Display"], ItemKind::Trait),
+            (3, vec!["widget", "convert"], ItemKind::Function),
+            (5, vec!["widget", "make_widget"], ItemKind::Macro),
+            (6, vec!["widget", "DEFAULT_WIDGET"], ItemKind::Static),
+        ]
+        .into_iter()
+        .map(|(id, path, kind)| {
+            (
+                Id(id),
+                ItemSummary {
+                    crate_id: 0,
+                    path: path.into_iter().map(str::to_owned).collect(),
+                    kind,
+                },
+            )
+        })
+        .collect();
+        RustdocCrate {
+            root: Id(0),
+            crate_version: Some("1.2.3".to_owned()),
+            includes_private: false,
+            index,
+            paths,
+            external_crates: std::collections::HashMap::new(),
+            target: Target {
+                triple: "x86_64-unknown-linux-gnu".to_owned(),
+                target_features: Vec::new(),
+            },
+            format_version: rustdoc_types::FORMAT_VERSION,
+        }
+    }
+
+    fn request(path: std::path::PathBuf) -> ArtifactProductionRequest {
+        ArtifactProductionRequest {
+            path,
+            artifact_kind: ExternalArtifactKind::RustdocJson,
+            pack_id: "cargo.widget".to_owned(),
+            pack_version: "1.2.3".to_owned(),
+            ecosystem: "cargo".to_owned(),
+            compatibility: Compatibility {
+                bifrost: "*".to_owned(),
+                toolchains: Vec::new(),
+            },
+            activation: vec![ActivationSelector {
+                package: Some(NameSelector {
+                    name: "widget".to_owned(),
+                    version: Some("1.2.3".to_owned()),
+                }),
+                module: None,
+                toolchain: None,
+                targets: vec!["x86_64-unknown-linux-gnu".to_owned()],
+                configurations: vec!["default".to_owned()],
+                artifact_sha256: None,
+            }],
+            provenance: Provenance {
+                source: "registry+https://github.com/rust-lang/crates.io-index".to_owned(),
+                revision: None,
+            },
+            license: "MIT".to_owned(),
+            safety: Safety {
+                generated_code_only: true,
+                review_required: false,
+            },
+        }
+    }
+
+    #[test]
+    fn rustdoc_projection_preserves_api_shapes_relations_and_reexports() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), serde_json::to_vec(&document(false)).unwrap()).unwrap();
+        let production = RustdocJsonPackProducer.produce_exact_artifact(
+            &request(file.path().to_path_buf()),
+            &ArtifactProducerLimits::default(),
+        );
+
+        assert_eq!(
+            production.completeness,
+            Completeness::Complete,
+            "{:#?}",
+            production.diagnostics
+        );
+        let pack = production.pack.unwrap();
+        compile_pack(&pack, &CompilerOptions::default()).unwrap();
+        let AuthoredPayload::DeclarationFacts {
+            types,
+            members,
+            relations,
+        } = &pack.shards[0].payload
+        else {
+            panic!("expected declaration facts")
+        };
+        let widget = types
+            .iter()
+            .find(|fact| fact.name == "widget.Widget")
+            .unwrap();
+        assert!(widget.aliases.contains(&"widget.Gadget".to_owned()));
+        assert!(
+            widget
+                .hierarchy
+                .iter()
+                .any(|fact| fact.hierarchy_kind == HierarchyKind::Implements)
+        );
+        assert!(
+            members
+                .iter()
+                .any(|fact| fact.name == "render" && fact.member_kind == MemberKind::Method)
+        );
+        assert!(
+            members
+                .iter()
+                .any(|fact| fact.member_kind == MemberKind::Macro)
+        );
+        assert!(
+            members
+                .iter()
+                .any(|fact| fact.member_kind == MemberKind::Static)
+        );
+        assert!(relations.iter().any(|relation| relation.to == widget.id));
+        let display = types
+            .iter()
+            .find(|fact| fact.name == "widget.Display")
+            .unwrap();
+        assert!(relations.iter().any(|relation| relation.to == display.id));
+    }
+
+    #[test]
+    fn blanket_impl_is_an_explicit_partial_outcome() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), serde_json::to_vec(&document(true)).unwrap()).unwrap();
+        let production = RustdocJsonPackProducer.produce_exact_artifact(
+            &request(file.path().to_path_buf()),
+            &ArtifactProducerLimits::default(),
+        );
+
+        assert_eq!(production.completeness, Completeness::Partial);
+        assert!(
+            production
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "rust.rustdoc.blanket_impl_unprojected")
+        );
+    }
+
+    #[test]
+    fn unsupported_format_fails_before_full_decode() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            file.path(),
+            serde_json::to_vec(&serde_json::json!({
+                "format_version": rustdoc_types::FORMAT_VERSION + 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let production = RustdocJsonPackProducer.produce_exact_artifact(
+            &request(file.path().to_path_buf()),
+            &ArtifactProducerLimits::default(),
+        );
+
+        assert!(production.pack.is_none());
+        assert_eq!(
+            production.diagnostics[0].code,
+            "rust.rustdoc.unsupported_version"
+        );
+    }
+
+    #[test]
+    fn crate_version_and_target_must_match_the_request() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut mismatched = document(false);
+        mismatched.crate_version = Some("9.9.9".to_owned());
+        fs::write(file.path(), serde_json::to_vec(&mismatched).unwrap()).unwrap();
+        let version = RustdocJsonPackProducer.produce_exact_artifact(
+            &request(file.path().to_path_buf()),
+            &ArtifactProducerLimits::default(),
+        );
+        assert_eq!(
+            version.diagnostics[0].code,
+            "rust.rustdoc.crate_version_mismatch"
+        );
+
+        let mut mismatched = document(false);
+        mismatched.target.triple = "aarch64-apple-darwin".to_owned();
+        fs::write(file.path(), serde_json::to_vec(&mismatched).unwrap()).unwrap();
+        let target = RustdocJsonPackProducer.produce_exact_artifact(
+            &request(file.path().to_path_buf()),
+            &ArtifactProducerLimits::default(),
+        );
+        assert_eq!(target.diagnostics[0].code, "rust.rustdoc.target_mismatch");
+    }
+
+    #[test]
+    fn cancellation_stops_before_rustdoc_decode() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), serde_json::to_vec(&document(false)).unwrap()).unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let production = RustdocJsonPackProducer.produce_exact_artifact_with_cancellation(
+            &request(file.path().to_path_buf()),
+            &ArtifactProducerLimits::default(),
+            Some(&cancellation),
+        );
+
+        assert!(production.pack.is_none());
+        assert_eq!(production.diagnostics[0].code, "artifact.cancelled");
+    }
+}

@@ -1199,7 +1199,7 @@ fn semantic_visibility(visibility: CSharpVisibility) -> Visibility {
 fn external_type_kind(kind: TypeKind) -> CSharpExternalTypeKind {
     match kind {
         TypeKind::Interface | TypeKind::Trait => CSharpExternalTypeKind::Interface,
-        TypeKind::Struct | TypeKind::Record => CSharpExternalTypeKind::Struct,
+        TypeKind::Struct | TypeKind::Union | TypeKind::Record => CSharpExternalTypeKind::Struct,
         TypeKind::Enum => CSharpExternalTypeKind::Enum,
         TypeKind::Delegate => CSharpExternalTypeKind::Delegate,
         TypeKind::Class | TypeKind::Annotation | TypeKind::Module | TypeKind::TypeAlias => {
@@ -1211,10 +1211,14 @@ fn external_type_kind(kind: TypeKind) -> CSharpExternalTypeKind {
 fn external_member_kind(kind: MemberKind) -> CSharpExternalMemberKind {
     match kind {
         MemberKind::Constructor => CSharpExternalMemberKind::Constructor,
-        MemberKind::Field | MemberKind::Constant => CSharpExternalMemberKind::Field,
+        MemberKind::Field | MemberKind::Constant | MemberKind::Static => {
+            CSharpExternalMemberKind::Field
+        }
         MemberKind::Property => CSharpExternalMemberKind::Property,
         MemberKind::Event => CSharpExternalMemberKind::Event,
-        MemberKind::Method | MemberKind::Function => CSharpExternalMemberKind::Method,
+        MemberKind::Method | MemberKind::Function | MemberKind::Macro => {
+            CSharpExternalMemberKind::Method
+        }
     }
 }
 

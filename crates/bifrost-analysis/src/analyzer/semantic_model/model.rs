@@ -269,6 +269,7 @@ pub enum TypeKind {
     Interface,
     Trait,
     Struct,
+    Union,
     Enum,
     Record,
     Module,
@@ -320,6 +321,8 @@ pub enum MemberKind {
     Field,
     Property,
     Constant,
+    Static,
+    Macro,
     Event,
 }
 
